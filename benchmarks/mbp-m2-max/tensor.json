@@ -1,0 +1,605 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "alloc/mem/u8/360p",
+      "p95_us": 0,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 32,
+      "mean_us": 28,
+      "median_us": 28,
+      "min_us": 28,
+      "name": "alloc/mem/u8/720p",
+      "p95_us": 28,
+      "p99_us": 32
+    },
+    {
+      "iterations": 100,
+      "max_us": 88,
+      "mean_us": 67,
+      "median_us": 65,
+      "min_us": 65,
+      "name": "alloc/mem/u8/1080p",
+      "p95_us": 74,
+      "p99_us": 87
+    },
+    {
+      "iterations": 100,
+      "max_us": 344,
+      "mean_us": 326,
+      "median_us": 323,
+      "min_us": 323,
+      "name": "alloc/mem/u8/4K",
+      "p95_us": 336,
+      "p99_us": 339
+    },
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/u8/360p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/u8/720p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/u8/1080p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/u8/4K",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "alloc/mem/i8/360p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 39,
+      "mean_us": 36,
+      "median_us": 36,
+      "min_us": 36,
+      "name": "alloc/mem/i8/720p",
+      "p95_us": 36,
+      "p99_us": 38
+    },
+    {
+      "iterations": 100,
+      "max_us": 93,
+      "mean_us": 81,
+      "median_us": 81,
+      "min_us": 81,
+      "name": "alloc/mem/i8/1080p",
+      "p95_us": 84,
+      "p99_us": 86
+    },
+    {
+      "iterations": 100,
+      "max_us": 338,
+      "mean_us": 280,
+      "median_us": 265,
+      "min_us": 258,
+      "name": "alloc/mem/i8/4K",
+      "p95_us": 326,
+      "p99_us": 332
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/i8/360p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/i8/720p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/i8/1080p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/mem/i8/4K",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 4,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "alloc/shm/u8/360p",
+      "p95_us": 3,
+      "p99_us": 3
+    },
+    {
+      "iterations": 100,
+      "max_us": 4,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 1,
+      "name": "alloc/shm/u8/720p",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "alloc/shm/u8/1080p",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 3,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "alloc/shm/u8/4K",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 3,
+      "mean_us": 1,
+      "median_us": 1,
+      "min_us": 1,
+      "name": "map/shm/u8/360p",
+      "p95_us": 1,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 1,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/shm/u8/720p",
+      "p95_us": 0,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 1,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/shm/u8/1080p",
+      "p95_us": 1,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 1,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/shm/u8/4K",
+      "p95_us": 1,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 3,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "alloc/shm/i8/360p",
+      "p95_us": 2,
+      "p99_us": 3
+    },
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "alloc/shm/i8/720p",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "alloc/shm/i8/1080p",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "alloc/shm/i8/4K",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 1,
+      "mean_us": 1,
+      "median_us": 1,
+      "min_us": 1,
+      "name": "map/shm/i8/360p",
+      "p95_us": 1,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 1,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/shm/i8/720p",
+      "p95_us": 1,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 1,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/shm/i8/1080p",
+      "p95_us": 1,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 1,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/shm/i8/4K",
+      "p95_us": 1,
+      "p99_us": 1
+    },
+    {
+      "iterations": 100,
+      "max_us": 19,
+      "mean_us": 17,
+      "median_us": 17,
+      "min_us": 16,
+      "name": "alloc/dma/u8/360p",
+      "p95_us": 18,
+      "p99_us": 19
+    },
+    {
+      "iterations": 100,
+      "max_us": 17,
+      "mean_us": 16,
+      "median_us": 16,
+      "min_us": 16,
+      "name": "alloc/dma/u8/720p",
+      "p95_us": 16,
+      "p99_us": 17
+    },
+    {
+      "iterations": 100,
+      "max_us": 16,
+      "mean_us": 16,
+      "median_us": 16,
+      "min_us": 16,
+      "name": "alloc/dma/u8/1080p",
+      "p95_us": 16,
+      "p99_us": 16
+    },
+    {
+      "iterations": 100,
+      "max_us": 17,
+      "mean_us": 16,
+      "median_us": 16,
+      "min_us": 16,
+      "name": "alloc/dma/u8/4K",
+      "p95_us": 17,
+      "p99_us": 17
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/u8/360p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/u8/720p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/u8/1080p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/u8/4K",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 20,
+      "mean_us": 17,
+      "median_us": 17,
+      "min_us": 16,
+      "name": "alloc/dma/i8/360p",
+      "p95_us": 17,
+      "p99_us": 17
+    },
+    {
+      "iterations": 100,
+      "max_us": 16,
+      "mean_us": 16,
+      "median_us": 16,
+      "min_us": 16,
+      "name": "alloc/dma/i8/720p",
+      "p95_us": 16,
+      "p99_us": 16
+    },
+    {
+      "iterations": 100,
+      "max_us": 26,
+      "mean_us": 17,
+      "median_us": 16,
+      "min_us": 16,
+      "name": "alloc/dma/i8/1080p",
+      "p95_us": 20,
+      "p99_us": 22
+    },
+    {
+      "iterations": 100,
+      "max_us": 26,
+      "mean_us": 17,
+      "median_us": 17,
+      "min_us": 16,
+      "name": "alloc/dma/i8/4K",
+      "p95_us": 18,
+      "p99_us": 21
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/i8/360p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/i8/720p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/i8/1080p",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 0,
+      "mean_us": 0,
+      "median_us": 0,
+      "min_us": 0,
+      "name": "map/dma/i8/4K",
+      "p95_us": 0,
+      "p99_us": 0
+    },
+    {
+      "iterations": 100,
+      "max_us": 24,
+      "mean_us": 15,
+      "median_us": 14,
+      "min_us": 14,
+      "name": "memcpy/mem/360p",
+      "p95_us": 19,
+      "p99_us": 24
+    },
+    {
+      "iterations": 100,
+      "max_us": 104,
+      "mean_us": 90,
+      "median_us": 89,
+      "min_us": 80,
+      "name": "memcpy/mem/720p",
+      "p95_us": 101,
+      "p99_us": 102
+    },
+    {
+      "iterations": 100,
+      "max_us": 322,
+      "mean_us": 257,
+      "median_us": 255,
+      "min_us": 245,
+      "name": "memcpy/mem/1080p",
+      "p95_us": 275,
+      "p99_us": 302
+    },
+    {
+      "iterations": 100,
+      "max_us": 800,
+      "mean_us": 695,
+      "median_us": 688,
+      "min_us": 671,
+      "name": "memcpy/mem/4K",
+      "p95_us": 729,
+      "p99_us": 753
+    },
+    {
+      "iterations": 100,
+      "max_us": 67,
+      "mean_us": 46,
+      "median_us": 44,
+      "min_us": 44,
+      "name": "memcpy/shm/360p",
+      "p95_us": 55,
+      "p99_us": 66
+    },
+    {
+      "iterations": 100,
+      "max_us": 249,
+      "mean_us": 213,
+      "median_us": 211,
+      "min_us": 206,
+      "name": "memcpy/shm/720p",
+      "p95_us": 232,
+      "p99_us": 246
+    },
+    {
+      "iterations": 100,
+      "max_us": 537,
+      "mean_us": 505,
+      "median_us": 502,
+      "min_us": 492,
+      "name": "memcpy/shm/1080p",
+      "p95_us": 523,
+      "p99_us": 533
+    },
+    {
+      "iterations": 100,
+      "max_us": 1807,
+      "mean_us": 1697,
+      "median_us": 1691,
+      "min_us": 1659,
+      "name": "memcpy/shm/4K",
+      "p95_us": 1760,
+      "p99_us": 1788
+    },
+    {
+      "iterations": 100,
+      "max_us": 15,
+      "mean_us": 14,
+      "median_us": 14,
+      "min_us": 14,
+      "name": "memcpy/dma/360p",
+      "p95_us": 14,
+      "p99_us": 14
+    },
+    {
+      "iterations": 100,
+      "max_us": 103,
+      "mean_us": 84,
+      "median_us": 82,
+      "min_us": 76,
+      "name": "memcpy/dma/720p",
+      "p95_us": 94,
+      "p99_us": 100
+    },
+    {
+      "iterations": 100,
+      "max_us": 309,
+      "mean_us": 251,
+      "median_us": 247,
+      "min_us": 245,
+      "name": "memcpy/dma/1080p",
+      "p95_us": 274,
+      "p99_us": 287
+    },
+    {
+      "iterations": 100,
+      "max_us": 698,
+      "mean_us": 617,
+      "median_us": 614,
+      "min_us": 599,
+      "name": "memcpy/dma/4K",
+      "p95_us": 663,
+      "p99_us": 686
+    }
+  ],
+  "timestamp": "unix:1779645694"
+}

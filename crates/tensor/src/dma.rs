@@ -3,19 +3,33 @@
 
 use crate::{
     error::{Error, Result},
-    TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
+    TensorMemory, TensorTrait,
 };
-use log::{trace, warn};
 use num_traits::Num;
 use std::{
-    ffi::c_void,
     fmt,
     num::NonZero,
-    ops::{Deref, DerefMut},
     os::fd::{AsRawFd, OwnedFd},
-    ptr::NonNull,
-    sync::{Arc, Mutex},
 };
+
+/// Derive a [`crate::BufferIdentity`] from an fd's `(st_dev, st_ino)`.
+///
+/// `dup` (and therefore `from_fd` importing a producer's cloned fd) preserves
+/// the inode, so this yields the same identity in every process that holds
+/// the buffer -- the property a downstream GL import cache keys on. dma-buf
+/// inodes all live on one anonymous mount, so `st_ino` alone would already be
+/// unique; folding in `st_dev` costs nothing and drops the assumption that
+/// stays true.
+// `st_dev`/`st_ino` are `i32`/`u64` on Darwin but `u64`/`u64` on Linux, so
+// exactly one of these casts is a clippy::unnecessary_cast on any given
+// platform; both are needed for the expression to compile on both. Note this
+// file is `target_os = "linux"`-gated, so a macOS `cargo clippy` never sees it
+// at all -- the Linux lane is the only one that catches a lint here.
+#[allow(clippy::unnecessary_cast)]
+fn identity_from_stat(stat: &nix::sys::stat::FileStat) -> crate::BufferIdentity {
+    let key = ((stat.st_dev as u64) << 32) ^ (stat.st_ino as u64);
+    crate::BufferIdentity::derived(crate::IdentityKind::DmaBuf, key)
+}
 
 /// A tensor backed by DMA (Direct Memory Access) memory.
 ///
@@ -64,7 +78,15 @@ impl<T> TensorTrait<T> for DmaTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    #[cfg(target_os = "linux")]
+    // `dma-heap` is excluded from the dependency graph under Miri (see
+    // Cargo.toml's `[target.'cfg(all(target_os = "linux", not(miri)))'.
+    // dependencies]`): `dma-heap 0.4.1` fails to type-check at all under
+    // Miri (its hardcoded `u32` ioctl opcode constant conflicts with
+    // `rustix`'s Miri-forced libc backend, whose `Opcode` is `u64` on this
+    // target), so this real-allocation branch must agree -- every normal
+    // (non-Miri) build is unaffected, `not(miri)` is only ever true when
+    // `cargo miri` is doing the compiling.
+    #[cfg(all(target_os = "linux", not(miri)))]
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         use log::debug;
         use nix::sys::stat::fstat;
@@ -100,17 +122,19 @@ where
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
             _drm_attachment: drm_attachment,
-            identity: crate::BufferIdentity::new(),
+            identity: identity_from_stat(&stat),
             buf_size,
             mmap_offset: 0,
             is_imported: false,
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(miri))))]
     fn new(_shape: &[usize], _name: Option<&str>) -> Result<Self> {
         Err(Error::NotImplemented(
-            "DMA tensors are not supported on this platform".to_owned(),
+            "DMA tensor allocation is unavailable (not Linux, or running \
+             under Miri, which cannot execute the real ioctls)"
+                .to_owned(),
         ))
     }
 
@@ -124,23 +148,15 @@ where
             return Err(Error::InvalidSize(0));
         }
 
-        // fstat may return st_size=0 for DMA-BUF fds on some kernels;
-        // fall back to logical_size in that case.
-        let buf_size = {
-            #[cfg(target_os = "linux")]
-            {
-                use nix::sys::stat::fstat;
-                match fstat(&fd) {
-                    Ok(stat) if stat.st_size > 0 && stat.st_size as usize >= logical_size => {
-                        stat.st_size as usize
-                    }
-                    _ => logical_size,
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                logical_size
-            }
+        // One fstat serves two purposes below: buf_size (with a fallback for
+        // kernels that report st_size=0 on DMA-BUF fds) and, further down,
+        // this tensor's identity. Calling it twice risked the two derived
+        // values disagreeing if the fd's backing changed between calls.
+        let stat = nix::sys::stat::fstat(&fd)?;
+        let buf_size = if stat.st_size > 0 && stat.st_size as usize >= logical_size {
+            stat.st_size as usize
+        } else {
+            logical_size
         };
 
         // Do NOT attempt a DRM attachment for foreign (imported) DMA-BUF fds.
@@ -161,7 +177,11 @@ where
             _marker: std::marker::PhantomData,
             #[cfg(target_os = "linux")]
             _drm_attachment: drm_attachment,
-            identity: crate::BufferIdentity::new(),
+            // dup() preserves (st_dev, st_ino), so an imported tensor gets
+            // the same identity as the producer's -- what lets a GL import
+            // cache hit across a library boundary instead of missing every
+            // frame on a fresh counter value.
+            identity: identity_from_stat(&stat),
             buf_size,
             mmap_offset: 0,
             #[cfg(target_os = "linux")]
@@ -174,7 +194,7 @@ where
     }
 
     fn memory(&self) -> TensorMemory {
-        TensorMemory::Dma
+        TensorMemory::DmaBuf
     }
 
     fn name(&self) -> String {
@@ -202,14 +222,11 @@ where
         Ok(())
     }
 
-    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
-        Ok(TensorMap::Dma(DmaMap::new(
-            self.fd.try_clone()?,
-            &self.shape,
-            self.buf_size,
-            self.mmap_offset,
-            access,
-        )?))
+    fn map_with<'a>(&self, access: crate::CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.map_inner(None, access)
     }
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
@@ -291,6 +308,32 @@ where
     }
 }
 
+/// Keepalive that owns a DMA-BUF map's **cache-coherency bracket**.
+///
+/// `host_pin` deliberately performs no sync — that is the whole point of
+/// separating a pin's lifetime from its coherency window. A *map* is the
+/// opposite: it promises coherent CPU access for its duration, so it issues
+/// `DMA_BUF_SYNC_START` on acquire and the matching `..._END` on drop, exactly
+/// as the deleted `DmaMap` did.
+///
+/// Getting this wrong does not crash: a missing invalidate yields
+/// stale-but-plausible pixels, which is how it reached hardware unnoticed and
+/// showed up as accuracy deltas rather than failures.
+pub(crate) struct DmaSyncBracket {
+    fd: std::os::fd::OwnedFd,
+    access: crate::CpuAccess,
+    _mapping: std::sync::Arc<crate::pin::MmapOwner>,
+}
+
+impl Drop for DmaSyncBracket {
+    fn drop(&mut self) {
+        // Direction must match the START, or the kernel skips the writeback.
+        if let Err(e) = crate::dmabuf::sync_access(&self.fd, false, self.access) {
+            log::error!("DMA_BUF_SYNC_END failed: {e}");
+        }
+    }
+}
+
 impl<T> DmaTensor<T>
 where
     T: Num + Clone + Send + Sync + std::fmt::Debug + Send + Sync,
@@ -312,7 +355,11 @@ where
     /// - `InvalidArgument` if `byte_size < shape.product() * sizeof(T)`
     ///   (the request would lose data)
     /// - `IoError` if the DMA-heap allocation fails
-    #[cfg(target_os = "linux")]
+    // `static`-only: called from `Tensor::image_with_stride` (`lib.rs`,
+    // `impl<T> Tensor<T>`), which is itself `#[cfg(feature = "static")]`.
+    // `dynamic`'s `image_with_stride` drives `ef_tensor_image_with_stride_alloc`
+    // instead, never this method directly.
+    #[cfg(all(target_os = "linux", feature = "static", not(miri)))]
     pub(crate) fn new_with_byte_size(
         shape: &[usize],
         byte_size: usize,
@@ -381,44 +428,46 @@ where
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
             _drm_attachment: drm_attachment,
-            identity: crate::BufferIdentity::new(),
+            identity: identity_from_stat(&stat),
             buf_size,
             mmap_offset: 0,
             is_imported: false,
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(miri))))]
     pub(crate) fn new_with_byte_size(
         _shape: &[usize],
         _byte_size: usize,
         _name: Option<&str>,
     ) -> Result<Self> {
         Err(Error::NotImplemented(
-            "DMA tensors are not supported on this platform".to_owned(),
+            "DMA tensor allocation is unavailable (not Linux, or running \
+             under Miri, which cannot execute the real ioctls)"
+                .to_owned(),
         ))
     }
 
     /// Map this DMA tensor with an explicit total byte size.
     ///
     /// Used by `Tensor::map()` for self-allocated strided tensors — the
-    /// returned `DmaMap` exposes the full `byte_size` bytes via
+    /// returned view exposes the full `byte_size` bytes via
     /// `as_slice()`/`as_mut_slice()`, not just the shape-derived logical
     /// count. Callers are expected to iterate rows with
     /// `Tensor::effective_row_stride()` so they don't read past the end.
-    pub(crate) fn map_with_byte_size(
+    ///
+    /// `static`-only: the sole caller, `impl<T> TensorMapTrait<T> for
+    /// Tensor<T>` in `lib.rs`, is itself `#[cfg(feature = "static")]`.
+    #[cfg(feature = "static")]
+    pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,
         access: crate::CpuAccess,
-    ) -> Result<DmaMap<T>> {
-        DmaMap::new_with_byte_size(
-            self.fd.try_clone()?,
-            &self.shape,
-            self.buf_size,
-            self.mmap_offset,
-            byte_size,
-            access,
-        )
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.map_inner(Some(byte_size), access)
     }
 
     pub fn try_clone(&self) -> Result<Self> {
@@ -447,288 +496,147 @@ where
     }
 }
 
-#[derive(Debug)]
-pub struct DmaMap<T>
+impl<T> DmaTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    ptr: Arc<Mutex<DmaPtr>>,
-    fd: OwnedFd,
-    shape: Vec<usize>,
-    /// Actual mmap'd size (may be > shape.product() * sizeof(T) for padded buffers).
-    mmap_size: usize,
-    /// Byte offset into the mmap'd region where tensor data begins.
-    offset: usize,
-    /// Optional override for `as_slice().len() * sizeof(T)`. When `None`,
-    /// `as_slice()` returns `shape.product()` elements (the traditional
-    /// logical view). When `Some(bytes)`, `as_slice()` returns `bytes /
-    /// sizeof(T)` elements, exposing the full padded buffer. Used for
-    /// self-allocated strided DMA tensors where the mmap'd region has
-    /// row-padding between logical rows and callers need to iterate via
-    /// `row_stride` rather than a packed `width * bpp` layout.
-    byte_size_override: Option<usize>,
-    /// Access direction this map was taken with: selects the dma-buf sync
-    /// direction (replayed symmetrically at unmap) and gates mutable
-    /// access (`map_read()` maps reject `as_mut_slice`).
-    access: crate::CpuAccess,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<T> DmaMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    pub fn new(
-        fd: OwnedFd,
-        shape: &[usize],
-        buf_size: usize,
-        offset: usize,
-        access: crate::CpuAccess,
-    ) -> Result<Self> {
-        Self::new_internal(fd, shape, buf_size, offset, None, access)
-    }
-
-    /// Construct a DmaMap whose `as_slice()` exposes the full padded
-    /// buffer rather than the shape-derived logical byte count. Used by
-    /// `Tensor::map()` for self-allocated strided DMA tensors so CPU
-    /// iteration can respect `row_stride` without going past the end
-    /// of the returned slice.
+    /// Shared map constructor.
     ///
-    /// Crate-private: the only caller is `Tensor::map()`, which already
-    /// performs the outer `stride × height <= buf_size - offset` check.
-    /// Keeping this API `pub(crate)` ensures an unchecked `byte_size`
-    /// can never be fed in from outside the crate.
-    pub(crate) fn new_with_byte_size(
-        fd: OwnedFd,
-        shape: &[usize],
-        buf_size: usize,
-        offset: usize,
-        byte_size: usize,
-        access: crate::CpuAccess,
-    ) -> Result<Self> {
-        Self::new_internal(fd, shape, buf_size, offset, Some(byte_size), access)
-    }
-
-    fn new_internal(
-        fd: OwnedFd,
-        shape: &[usize],
-        buf_size: usize,
-        offset: usize,
+    /// Carries forward every check the deleted `DmaMap::new_internal`
+    /// performed, with the same error variants — these are asserted by the
+    /// tests below, and a mapping that slipped past them would SIGBUS on
+    /// access rather than fail cleanly.
+    fn map_inner<'a>(
+        &self,
         byte_size_override: Option<usize>,
         access: crate::CpuAccess,
-    ) -> Result<Self> {
-        if shape.is_empty() {
-            return Err(Error::InvalidSize(0));
-        }
-
-        let logical_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        let t_size = std::mem::size_of::<T>();
+        let logical_size = self.shape.iter().product::<usize>() * t_size;
         if logical_size == 0 {
             return Err(Error::InvalidSize(0));
         }
-
-        // Use the buffer's actual size (from fstat at DmaTensor creation).
-        // as_slice() uses the logical element count from shape.
-        // When an offset is present (sub-region of a larger DMA-BUF), verify
-        // that offset + logical_size fits within the allocated buffer — mapping
-        // beyond buf_size would cause SIGBUS on access.
-        let total_needed = offset
+        let total_needed = self
+            .mmap_offset
             .checked_add(logical_size)
             .ok_or(Error::InvalidSize(0))?;
-        if total_needed > buf_size {
-            warn!(
-                "DmaMap: offset={} + logical_size={} = {} exceeds buf_size={} (fd={})",
-                offset,
-                logical_size,
-                total_needed,
-                buf_size,
-                fd.as_raw_fd()
-            );
+        if total_needed > self.buf_size {
             return Err(Error::InvalidSize(total_needed));
         }
-        if std::mem::size_of::<T>() > 1 && !offset.is_multiple_of(std::mem::align_of::<T>()) {
+        if t_size > 1 && !self.mmap_offset.is_multiple_of(std::mem::align_of::<T>()) {
             return Err(Error::InvalidOperation(format!(
-                "DmaMap: offset {} is not aligned to align_of::<T>()={}",
-                offset,
+                "DMA map: offset {} not aligned to align_of::<T>()={}",
+                self.mmap_offset,
                 std::mem::align_of::<T>()
             )));
         }
-
-        // Defense in depth: even though `new_with_byte_size` is crate-private
-        // and its callers validate upstream, verify the override is non-zero,
-        // sizeof::<T>()-aligned, and fits inside the mapped region. Any breach
-        // would otherwise turn into an out-of-bounds slice in `as_slice()`.
         if let Some(byte_size) = byte_size_override {
             if byte_size == 0 {
                 return Err(Error::InvalidSize(0));
             }
-            let t_size = std::mem::size_of::<T>();
             if t_size > 1 && !byte_size.is_multiple_of(t_size) {
                 return Err(Error::InvalidOperation(format!(
-                    "DmaMap: byte_size_override {byte_size} is not a multiple of sizeof::<T>()={t_size}"
+                    "DMA map: byte_size {byte_size} is not a multiple of size_of::<T>()={t_size}"
                 )));
             }
-            let available = buf_size.saturating_sub(offset);
-            if byte_size > available {
+            if self.mmap_offset.saturating_add(byte_size) > self.buf_size {
                 return Err(Error::InvalidSize(byte_size));
             }
         }
+        Ok(crate::view::HostView::new(
+            self.scoped_pin(access)?,
+            self.shape.clone(),
+            byte_size_override,
+            access,
+        ))
+    }
 
-        let mmap_size = buf_size;
-
-        #[cfg(target_os = "linux")]
-        {
-            // The sync direction tells the kernel exactly which cache
-            // maintenance this CPU access needs: a read-only map skips the
-            // writeback at END, a write-only map skips the invalidate at
-            // START. The direction MUST match at end (stored below).
-            trace!(
-                "DmaMap: sync start fd={} size={mmap_size} access={access:?}",
-                fd.as_raw_fd()
-            );
-            let sync = match (access.reads(), access.writes()) {
-                (true, false) => crate::dmabuf::start_read(&fd),
-                (false, true) => crate::dmabuf::start_write(&fd),
-                _ => crate::dmabuf::start_readwrite(&fd),
-            };
-            if let Err(e) = sync {
-                warn!(
-                    "DmaMap: DMA_BUF_IOCTL_SYNC(START) failed fd={}: {e}",
-                    fd.as_raw_fd()
-                );
-                return Err(Error::NixError(e));
-            }
-        }
-
+    /// Map for CPU access: pin the address **and** open the coherency window.
+    ///
+    /// This is what `map_with` uses. Unlike [`host_pin`](Self::host_pin) it
+    /// issues `DMA_BUF_SYNC_START` now and the matching `..._END` when the
+    /// returned pin's keepalive drops, so the bracket lasts exactly as long as
+    /// the view does.
+    pub(crate) fn scoped_pin<'a>(
+        &self,
+        access: crate::CpuAccess,
+    ) -> crate::Result<crate::pin::HostPin<'a>>
+    where
+        T: 'a,
+    {
+        let mmap_size = self.buf_size;
         let ptr = unsafe {
             nix::sys::mman::mmap(
                 None,
                 NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?,
                 nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
                 nix::sys::mman::MapFlags::MAP_SHARED,
-                &fd,
+                &self.fd,
                 0,
             )?
         };
+        let base = std::ptr::NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?;
+        let mapping = std::sync::Arc::new(crate::pin::MmapOwner::new(base, mmap_size));
 
-        trace!("Mapping DMA memory: {ptr:?}");
-        let dma_ptr = DmaPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?);
-        Ok(DmaMap {
-            ptr: Arc::new(Mutex::new(dma_ptr)),
+        let fd = self.fd.try_clone()?;
+        crate::dmabuf::sync_access(&fd, true, access).map_err(Error::NixError)?;
+
+        let data = unsafe { mapping.base().add(self.mmap_offset) };
+        let len = mmap_size.saturating_sub(self.mmap_offset);
+        let keepalive = std::sync::Arc::new(DmaSyncBracket {
             fd,
-            shape: shape.to_vec(),
-            mmap_size,
-            offset,
-            byte_size_override,
             access,
-            _marker: std::marker::PhantomData,
-        })
-    }
-}
-
-impl<T> Deref for DmaMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    type Target = [T];
-
-    fn deref(&self) -> &[T] {
-        self.as_slice()
-    }
-}
-
-impl<T> DerefMut for DmaMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn deref_mut(&mut self) -> &mut [T] {
-        self.as_mut_slice()
-    }
-}
-
-#[derive(Debug)]
-struct DmaPtr(NonNull<c_void>);
-impl Deref for DmaPtr {
-    type Target = NonNull<c_void>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-unsafe impl Send for DmaPtr {}
-
-impl<T> TensorMapTrait<T> for DmaMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn shape(&self) -> &[usize] {
-        &self.shape
+            _mapping: mapping,
+        });
+        Ok(crate::pin::HostPin::new(keepalive, data, len))
     }
 
-    fn unmap(&mut self) {
-        let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
+    /// Establish a persistent host mapping over this DMA-BUF.
+    ///
+    /// Unlike [`map_with`](TensorTrait::map_with) this performs **no** sync
+    /// bracketing: the mapping's lifetime and the coherency window are now
+    /// separate concerns, which is the whole point. Callers bracket with
+    /// [`Tensor::sync_for_cpu`](crate::Tensor::sync_for_cpu).
+    ///
+    /// `static`-only: called only from `TensorStorage::pin_host`
+    /// (`lib.rs`), itself `#[cfg(feature = "static")]`.
+    #[cfg(feature = "static")]
+    pub(crate) fn host_pin<'a>(&self) -> crate::Result<crate::pin::HostPin<'a>>
+    where
+        T: 'a,
+    {
+        let mmap_size = self.buf_size;
+        let ptr = unsafe {
+            nix::sys::mman::mmap(
+                None,
+                NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?,
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                nix::sys::mman::MapFlags::MAP_SHARED,
+                &self.fd,
+                0,
+            )?
+        };
+        let base = std::ptr::NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?;
+        let mapping = std::sync::Arc::new(crate::pin::MmapOwner::new(base, mmap_size));
 
-        if let Err(e) = unsafe { nix::sys::mman::munmap(**ptr, self.mmap_size) } {
-            warn!("Failed to unmap DMA memory: {e}");
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            // Same direction as the START sync (see `new_internal`).
-            let sync = match (self.access.reads(), self.access.writes()) {
-                (true, false) => crate::dmabuf::end_read(&self.fd),
-                (false, true) => crate::dmabuf::end_write(&self.fd),
-                _ => crate::dmabuf::end_readwrite(&self.fd),
-            };
-            if let Err(e) = sync {
-                warn!("Failed to end CPU access on DMA memory: {e}");
-            }
-        }
-    }
-
-    fn as_slice(&self) -> &[T] {
-        let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
-        let base = unsafe { (ptr.as_ptr() as *const u8).add(self.offset) as *const T };
-        unsafe { std::slice::from_raw_parts(base, self.slice_len_elems()) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [T] {
-        crate::assert_map_writable(self.access.writes(), "Dma");
-        let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
-        let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
-        unsafe { std::slice::from_raw_parts_mut(base, self.slice_len_elems()) }
-    }
-}
-
-impl<T> DmaMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    /// Number of `T` elements exposed by `as_slice()`. Honours
-    /// `byte_size_override` when set (for strided tensors the caller
-    /// wants the full padded mmap exposed, not just `shape.product()`).
-    /// Falls back to the shape-derived logical element count.
-    fn slice_len_elems(&self) -> usize {
-        match self.byte_size_override {
-            Some(bytes) => bytes / std::mem::size_of::<T>(),
-            None => self.shape.iter().product(),
-        }
-    }
-}
-
-impl<T> Drop for DmaMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn drop(&mut self) {
-        trace!("DmaMap dropped, unmapping memory");
-        self.unmap();
+        // Offset-adjusted, so a strided or sub-region tensor does not hand back
+        // the raw mmap base -- requirement 2 of issue #134.
+        let data = unsafe { mapping.base().add(self.mmap_offset) };
+        // Everything addressable from this tensor's offset. Tensor::pin_host
+        // narrows to the logical extent; a map guard keeps this wider window
+        // so it can expose stride-padded rows.
+        let len = mmap_size.saturating_sub(self.mmap_offset);
+        Ok(crate::pin::HostPin::new(mapping, data, len))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TensorMapTrait;
 
     /// Returns a valid fd backed by /dev/null.  The new error paths in
     /// DmaMap::new() all fire before any fd-specific syscall (mmap,
@@ -746,12 +654,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_dma_map_offset_exceeds_buf_size() {
         let fd = dummy_fd();
-        // shape=[4096] u8 → logical_size=4096; offset=4096 → total_needed=8192
-        // buf_size=4096 < 8192 → error
-        let result = DmaMap::<u8>::new(fd, &[4096], 4096, 4096, crate::CpuAccess::ReadWrite);
+        let mut t = DmaTensor::<u8>::from_fd(fd, &[4096], None).expect("import");
+        t.buf_size = 4096;
+        t.mmap_offset = 4096;
+        let result = t.map_inner(None, crate::CpuAccess::ReadWrite);
         match result {
             Err(Error::InvalidSize(n)) => assert_eq!(n, 8192),
-            other => panic!("expected InvalidSize(8192), got {:?}", other),
+            other => panic!("expected InvalidSize(8192), got {other:?}"),
         }
     }
 
@@ -760,13 +669,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_dma_map_misaligned_offset() {
         let fd = dummy_fd();
-        // shape=[1024] u32 → logical_size=4096; offset=3 (not aligned to 4)
-        // buf_size=8192 so total_needed check passes; alignment check fires
-        let result = DmaMap::<u32>::new(fd, &[1024], 8192, 3, crate::CpuAccess::ReadWrite);
+        let mut t = DmaTensor::<u32>::from_fd(fd, &[1024], None).expect("import");
+        t.buf_size = 8192;
+        t.mmap_offset = 3;
+        let result = t.map_inner(None, crate::CpuAccess::ReadWrite);
         assert!(
             matches!(result, Err(Error::InvalidOperation(_))),
-            "expected InvalidOperation for misaligned offset, got {:?}",
-            result
+            "expected InvalidOperation for misaligned offset, got {result:?}"
         );
     }
 
@@ -775,32 +684,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_dma_map_offset_overflow() {
         let fd = dummy_fd();
-        // offset=usize::MAX, shape=[1] u8 → checked_add overflows
-        let result = DmaMap::<u8>::new(
-            fd,
-            &[1],
-            usize::MAX,
-            usize::MAX,
-            crate::CpuAccess::ReadWrite,
-        );
-        assert!(
-            matches!(result, Err(Error::InvalidSize(0))),
-            "expected InvalidSize(0) on overflow, got {:?}",
-            result
-        );
+        let mut t = DmaTensor::<u8>::from_fd(fd, &[1], None).expect("import");
+        t.buf_size = 4096;
+        t.mmap_offset = usize::MAX;
+        let result = t.map_inner(None, crate::CpuAccess::ReadWrite);
+        match result {
+            Err(Error::InvalidSize(n)) => assert_eq!(n, 0),
+            other => panic!("expected InvalidSize(0), got {other:?}"),
+        }
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_dma_map_with_offset() {
-        use crate::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
+        use crate::{Tensor, TensorMemory, TensorTrait};
 
         // Skip if DMA heap not available
         let total_size: usize = 4096 * 4; // 16KB
         let offset: usize = 4096; // 4KB offset
         let data_size: usize = 4096; // 4KB of data after offset
 
-        let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+        let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
                 eprintln!("SKIPPED: DMA not available");

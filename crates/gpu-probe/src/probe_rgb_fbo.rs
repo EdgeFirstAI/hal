@@ -76,7 +76,7 @@ pub fn run(ctx: &GpuContext) -> bool {
     let byte_count = (pitch * height) as usize;
 
     // Allocate DMA tensor
-    let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::Dma), None) {
+    let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {:42} SKIP (DMA alloc failed: {e})", "FBO completeness");

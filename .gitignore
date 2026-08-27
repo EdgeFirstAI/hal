@@ -1,5 +1,8 @@
 /dist
 /target
+# A bare `cargo build` inside a standalone leaf (crates/*-capi et al.) drops
+# its own target/ there; the sanctioned invocation uses --target-dir target.
+/crates/*/target/
 /venv
 __pycache__
 *.pyc
@@ -62,12 +65,22 @@ env.sh
 # folded into the main code or deleted once the experiment concludes.
 /spikes/
 
-# C API build artifacts
-crates/capi/build/
-
 # Large binary model artifacts kept outside the repo. Tracked fixtures
 # (testdata/decoder/*.safetensors) survive because gitignore only
 # affects untracked files; new vetted fixtures need `git add -f`.
 *.tflite
 *.onnx
 /benchmarks/docker/coco-smoke/
+
+# maturin develop drops built extensions into the package source tree
+crates/python-*/python/edgefirst/*/_*.so
+crates/python-*/python/edgefirst/*/_*.pyd
+crates/python-*/python/edgefirst/*/_*.dylib
+
+# python-tensor/build.rs copies libedgefirst_tensor.so (+ its .so.0
+# symlink) into the package source tree too, so maturin bundles it beside
+# _tensor.cpython-*.so the same way it bundles the extension itself --
+# same reason as the underscore-prefixed extensions above, just without
+# the leading underscore this one crate's shared library carries.
+crates/python-tensor/python/edgefirst/tensor/libedgefirst_tensor.so*
+crates/python-tensor/python/edgefirst/tensor/libedgefirst_tensor.*.dylib

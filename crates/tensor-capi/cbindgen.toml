@@ -1,0 +1,148 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# cbindgen configuration for edgefirst/tensor.h.
+#
+# NOTE: the include guard is written by hand in `header`/`trailer` rather than
+# via cbindgen's `include_guard`, which wraps only the *generated* body and
+# leaves `header` and `trailer` outside it. Without the hand-written guard, the
+# two forward-declared typedefs in `header` and the generated struct/function
+# declarations between them would be re-emitted on a second #include and fail
+# to compile with a redefinition.
+
+language = "C"
+# Every accessor sits inside `extern "C" { }`, so a C++ translation unit can
+# already include this header -- except the C23-backed-enum block cbindgen
+# emits for `#[repr(u32)]` enums assumed `__STDC_VERSION__` is the only way a
+# fixed underlying type is legal, which is false in C++ (every standard
+# version). Without this, `#if __STDC_VERSION__ >= 202311L` is false under
+# any `c++` compiler (the macro is C-only, so the preprocessor treats it as
+# 0), so the fallback `typedef uint32_t ef_dtype;` runs -- and collides with
+# the enum tag `ef_dtype`, which C++ (unlike C) already made a type name by
+# itself. `cpp_compat` teaches cbindgen to spell the condition
+# `defined(__cplusplus) || __STDC_VERSION__ >= 202311L` and to skip the
+# colliding typedef under `__cplusplus`, so the same header compiles under
+# both C and C++17.
+cpp_compat = true
+autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
+include_version = true
+documentation = true
+documentation_style = "doxy"
+documentation_length = "full"
+
+header = """
+#ifndef EDGEFIRST_TENSOR_H
+#define EDGEFIRST_TENSOR_H
+
+/**
+ * @file tensor.h
+ * @brief EdgeFirst tensor C API
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
+ *
+ * The one tensor header. Every EdgeFirst application includes this — they all
+ * need at least ef_tensor_free() — and every sibling library's header includes
+ * it rather than restating the tensor surface.
+ *
+ * The handle is fully opaque. Every accessor is an exported function of
+ * libedgefirst_tensor, the single implementation home of the tensor type: a
+ * tensor from ef_image_processor_create_image() and one from ef_tensor_new()
+ * are the same kind of object and behave identically, ef_tensor_free()
+ * included.
+ *
+ * Three surfaces, and a layout appears in exactly one of them:
+ *   - Opaque handle + exported accessors, for in-process access.
+ *   - A builder, for construction, with sticky errors.
+ *   - A (blob, fds) pair, for IPC. Fds travel out of band; a struct with an
+ *     fd field is meaningless across a process boundary.
+ */
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief An opaque tensor handle.
+ */
+typedef struct ef_tensor ef_tensor;
+
+/**
+ * @brief Opaque builder handle.
+ *
+ * Forward-declared so callers can write `ef_tensor_builder *` without the
+ * `struct` keyword. The definition is private to the library: construction
+ * state is not part of the ABI.
+ */
+typedef struct ef_tensor_builder ef_tensor_builder;
+"""
+
+trailer = """
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* EDGEFIRST_TENSOR_H */
+"""
+
+[export]
+prefix = ""
+# The handle's real layout (`EfTensorImpl`) is implementation machinery, not
+# ABI: the handle is fully opaque and no internal struct appears in the header.
+exclude = [
+  "EfTensor",
+  "EfTensorImpl",
+  "EfTensorBuilder",
+]
+# cbindgen only emits types reachable from an `extern "C"` signature. The
+# vocabulary enums are not: the setters take `uint32_t` on purpose, because
+# transmuting an out-of-range value from C into a Rust enum is undefined
+# behaviour, whereas validating an integer is not. C still gets named
+# enumerators; Rust still validates. Include them explicitly.
+include = [
+  "EfDtype",
+  "EfStorageKind",
+  "EfCpuAccess",
+  "EfCompression",
+  "EfErrorClass",
+  "EfLogLevel",
+]
+
+[export.rename]
+"EfTensor" = "ef_tensor"
+"EfTensorBuilder" = "ef_tensor_builder"
+"EfTensorImageDesc" = "ef_tensor_image_desc"
+"EfTensorPlane" = "ef_tensor_plane"
+"EfImageDescView" = "ef_image_desc_view"
+"EfDtype" = "ef_dtype"
+"EfStorageKind" = "ef_storage_kind"
+"EfCpuAccess" = "ef_cpu_access"
+"EfTensorView" = "ef_tensor_view"
+"EfQuantizationInfo" = "ef_quantization_info"
+"EfCompression" = "ef_compression"
+"EfErrorClass" = "ef_error_class"
+"EfLogLevel" = "ef_log_level"
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+
+[struct]
+rename_fields = "SnakeCase"
+
+[fn]
+rename_args = "SnakeCase"
+args = "auto"
+sort_by = "None"
+
+[parse]
+parse_deps = true
+include = ["edgefirst-tensor-abi"]
+clean = false

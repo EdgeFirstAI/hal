@@ -102,8 +102,8 @@ fn main() {
         bench_backend::<i8>(&mut suite, TensorMemory::Shm, "shm", "i8");
 
         if is_gpu_buffer_available() {
-            bench_backend::<u8>(&mut suite, TensorMemory::Dma, "dma", "u8");
-            bench_backend::<i8>(&mut suite, TensorMemory::Dma, "dma", "i8");
+            bench_backend::<u8>(&mut suite, TensorMemory::DmaBuf, "dma", "u8");
+            bench_backend::<i8>(&mut suite, TensorMemory::DmaBuf, "dma", "i8");
         } else {
             println!(
                 "\n  {:50} [skipped: GPU buffer (DMA-buf / IOSurface) unavailable]",
@@ -117,7 +117,7 @@ fn main() {
     {
         bench_memcpy(&mut suite, TensorMemory::Shm, "shm");
         if is_gpu_buffer_available() {
-            bench_memcpy(&mut suite, TensorMemory::Dma, "dma");
+            bench_memcpy(&mut suite, TensorMemory::DmaBuf, "dma");
         } else {
             println!(
                 "\n  {:50} [skipped: GPU buffer (DMA-buf / IOSurface) unavailable]",

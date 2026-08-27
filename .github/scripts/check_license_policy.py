@@ -16,27 +16,32 @@ from typing import Set, List, Dict, Tuple
 LICENSE_OVERRIDES = {
     "sublime_fuzzy@0.7.0": "Apache-2.0",  # Confirmed from upstream repo
     "dma-heap@0.4.1": "MIT",  # Confirmed from upstream: https://github.com/mripard/dma-heap/
-    # Internal crates - all Apache-2.0 (workspace.package.license)
-    # Versioned entries (from cargo-cyclonedx)
-    "edgefirst-hal@0.5.0": "Apache-2.0",
-    "edgefirst-hal-capi@0.5.0": "Apache-2.0",
-    "edgefirst-decoder@0.5.0": "Apache-2.0",
-    "edgefirst-image@0.5.0": "Apache-2.0",
-    "edgefirst-tensor@0.5.0": "Apache-2.0",
-    "edgefirst-tracker@0.5.0": "Apache-2.0",
-    "edgefirst_hal@0.5.0": "Apache-2.0",  # Python package name
+    # Internal crates - all Apache-2.0 (workspace.package.license).
+    # cargo-cyclonedx sometimes emits @unknown instead of the workspace
+    # version, so the unversioned form is the one that actually matches.
     "g2d-sys@1.2.0": "Apache-2.0",
-    "edgefirst-bench@0.8.0": "Apache-2.0",
-    "gpu-probe@0.8.0": "Apache-2.0",
-    # Unversioned entries (from scancode source scan)
     "edgefirst-bench@unknown": "Apache-2.0",
-    "edgefirst-hal@unknown": "Apache-2.0",
-    "edgefirst-hal-capi@unknown": "Apache-2.0",
+    "edgefirst-codec@unknown": "Apache-2.0",
     "edgefirst-decoder@unknown": "Apache-2.0",
+    "edgefirst-decoder-abi@unknown": "Apache-2.0",
+    "edgefirst-egl@unknown": "Apache-2.0",
+    "edgefirst-gl@unknown": "Apache-2.0",
     "edgefirst-image@unknown": "Apache-2.0",
     "edgefirst-tensor@unknown": "Apache-2.0",
+    "edgefirst-tensor-abi@unknown": "Apache-2.0",
+    "edgefirst-tensor-ffi@unknown": "Apache-2.0",
     "edgefirst-tracker@unknown": "Apache-2.0",
-    "edgefirst_hal@unknown": "Apache-2.0",
+    "edgefirst-codec-capi@unknown": "Apache-2.0",
+    "edgefirst-decoder-capi@unknown": "Apache-2.0",
+    "edgefirst-image-capi@unknown": "Apache-2.0",
+    "edgefirst-tensor-capi@unknown": "Apache-2.0",
+    "edgefirst-tracker-capi@unknown": "Apache-2.0",
+    "edgefirst-python-common@unknown": "Apache-2.0",
+    "edgefirst-python-codec@unknown": "Apache-2.0",
+    "edgefirst-python-decoder@unknown": "Apache-2.0",
+    "edgefirst-python-image@unknown": "Apache-2.0",
+    "edgefirst-python-tensor@unknown": "Apache-2.0",
+    "edgefirst-python-tracker@unknown": "Apache-2.0",
     "gpu-probe@unknown": "Apache-2.0",
 }
 

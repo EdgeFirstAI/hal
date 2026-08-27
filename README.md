@@ -2,8 +2,8 @@
 
 [![Build Status](https://github.com/EdgeFirstAI/hal/workflows/CI/badge.svg)](https://github.com/EdgeFirstAI/hal/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Crates.io](https://img.shields.io/crates/v/edgefirst-hal.svg)](https://crates.io/crates/edgefirst-hal)
-[![PyPI](https://img.shields.io/pypi/v/edgefirst-hal.svg)](https://pypi.org/project/edgefirst-hal/)
+[![Crates.io](https://img.shields.io/crates/v/edgefirst-tensor.svg)](https://crates.io/crates/edgefirst-tensor)
+[![PyPI](https://img.shields.io/pypi/v/edgefirst-tensor.svg)](https://pypi.org/project/edgefirst-tensor/)
 
 The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust workspace providing
 hardware-accelerated tensor management, image processing, ML model output
@@ -28,70 +28,90 @@ everywhere else.
 
 ### Installation
 
-Python:
+Python — install only the pieces you need:
 
 ```bash
-pip install edgefirst-hal
+pip install edgefirst-tensor    # the zero-copy tensor core
+pip install edgefirst-codec     # JPEG/PNG decode (needs tensor)
+pip install edgefirst-image     # convert/resize/draw (needs tensor, not decoder)
+pip install edgefirst-decoder   # YOLO/ModelPack post-processing
+pip install edgefirst-tracker   # ByteTrack (standalone)
 ```
+
+Each is a self-contained wheel under the `edgefirst.` namespace; they
+compose without any one pulling in the others.
 
 Rust:
 
-```toml
-[dependencies]
-edgefirst-hal = "0.28"
+```sh
+cargo add edgefirst-codec
+cargo add edgefirst-image   # add only what you use
 ```
 
-C: download a release archive from
-[GitHub Releases](https://github.com/EdgeFirstAI/hal/releases) and link
-against `libedgefirst_hal.so` (or `.a`); see
-[`crates/capi/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/README.md)
-for full instructions.
+C: download `edgefirst-hal-<version>-<target>.tar.gz` (Linux) or `.zip`
+(Windows, macOS) from
+[GitHub Releases](https://github.com/EdgeFirstAI/hal/releases). The archive is
+relocatable — see [`packaging/c/INSTALL.txt`](packaging/c/INSTALL.txt) for
+pkg-config, runtime search path, and a JPEG→tensor example. Link
+`libedgefirst_tensor` plus any of codec / image / decoder / tracker. Headers
+live under `include/edgefirst/` (`tensor.h`, `codec.h`, `image.h`, `decoder.h`,
+`tracker.h`, `detect.h`). Windows ships `bin/*.dll` and `lib/*.lib` import
+libraries. **No ABI stability is offered before 1.0.**
 
 ### Basic usage
 
 **Python:**
 
 ```python
-import edgefirst_hal as ef
+from edgefirst.codec import Tensor, decode_file_into
+from edgefirst.decoder import Decoder
+from edgefirst.image import ImageProcessor, PixelFormat
 
-# Decode into a tensor you own. A real pipeline allocates once and reuses
-# the tensor every frame; JPEG decodes to its native Nv12, PNG to Rgb/Rgba/Grey.
-info = ef.Tensor.peek_image_info_file("image.jpg")
-src = ef.Tensor.image(info.width, info.height, info.format)
-src.decode_image_file("image.jpg")
+processor = ImageProcessor()
 
-processor = ef.ImageProcessor()
-model_input = processor.create_image(640, 640, ef.PixelFormat.Rgb)
+# Decode straight into a DMA/PBO-backed tensor for zero-copy convert(). A
+# real pipeline allocates once and reuses the tensor every frame; JPEG
+# decodes to its native Nv12, PNG to Rgb/Rgba/Grey. decode_file_into() is
+# edgefirst.codec's free function for decoding into a tensor from *another*
+# edgefirst.* package -- create_image() tensors can't be a decode_image()
+# method's `self`, so this is the entry point that makes them decodable.
+info = Tensor.peek_image_info_file("image.jpg")
+# info.format is edgefirst.codec's own PixelFormat, and create_image() below
+# is edgefirst.image's -- each package has its own type objects, but
+# PixelFormat is a value type: it compares/hashes by value and is accepted
+# in argument position across packages, so info.format works directly here.
+src = processor.create_image(info.width, info.height, info.format, "uint8", "readwrite")
+decode_file_into(src, "image.jpg")
+
+model_input = processor.create_image(640, 640, PixelFormat.Rgb, "uint8", "readwrite")
 
 # convert() handles the colour conversion and the resize in one call.
 # Omit letterbox= to stretch to fill instead of preserving aspect ratio.
 processor.convert(src, model_input, letterbox=[114, 114, 114, 255])
 
 # outputs is the list of Tensors your inference engine produced from model_input.
-decoder = ef.Decoder(model_config, score_threshold=0.5, iou_threshold=0.45)
+decoder = Decoder(model_config, score_threshold=0.5, iou_threshold=0.45)
 boxes, scores, classes, masks = decoder.decode(outputs)
 
-# Fused decode + draw: masks never leave Rust.
-processor.draw_masks(decoder, outputs, model_input)
+# Fused decode + draw lives on the decoder so image-only installs stay decoder-free.
+decoder.draw_onto(processor, outputs, model_input)
 ```
 
-`ef.set_output_format(ef.PixelFormat.Rgb)` (4:4:4 sources) or
-`ef.set_output_format(ef.PixelFormat.Nv12)` (any colour source) opts a
+`edgefirst.codec.set_output_format(PixelFormat.Rgb)` (4:4:4 sources) or
+`set_output_format(PixelFormat.Nv12)` (any colour source) opts a
 JPEG decode into fusing that colour conversion into the decode itself,
-in place of decode-then-`convert()`; `ef.set_dct_method(ef.DctMethod.Fast)`
+in place of decode-then-`convert()`; `set_dct_method(DctMethod.Fast)`
 trades a small, bounded accuracy loss for a faster IDCT. See
-[`crates/python/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/README.md#quick-start).
+[`crates/python-codec/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-codec/README.md#quick-start).
 
 **Rust:**
 
-The umbrella `edgefirst-hal` crate re-exports its sub-crates as modules,
-so a single `edgefirst-hal = "0.28"` dependency is enough. There's no need
-to list `edgefirst-image` / `edgefirst-tensor` separately in `Cargo.toml`.
+Depend on the crates you use. There is no umbrella `edgefirst-hal` crate.
 
 ```rust
-use edgefirst_hal::image::{ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-use edgefirst_hal::image::codec::{ImageDecoder, ImageLoad};
-use edgefirst_hal::tensor::{PixelFormat, DType, CpuAccess};
+use edgefirst_codec::{ImageDecoder, ImageLoad};
+use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_tensor::{CpuAccess, DType, PixelFormat};
 
 let bytes = std::fs::read("image.jpg")?;
 let mut processor = ImageProcessor::new()?;
@@ -128,16 +148,16 @@ unprefixed `edgefirst_image::*` / `edgefirst_tensor::*` paths above.
 **C:**
 
 ```c
-#include <edgefirst/hal.h>
+#include <edgefirst/image.h>
+#include <edgefirst/tensor.h>
 
-struct hal_image_processor *proc = hal_image_processor_new();
-/* `src` is decoded from disk with hal_tensor_decode_image_file(), or
- * imported from a DMA-BUF fd with hal_import_image() / hal_tensor_from_fd().
- * See the C API README for the full allocate-then-decode pattern. */
-struct hal_tensor *src = /* ... */;
-struct hal_tensor *dst = hal_image_processor_create_image(
-    proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
-hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+ef_image_processor *proc = ef_image_processor_new();
+/* `src` is decoded with libedgefirst_codec (`ef_image_decoder_decode_file_into`)
+ * or wrapped from a dma-buf with `ef_tensor_builder_wrap`. */
+ef_tensor *src = /* ... */;
+ef_tensor *dst = ef_image_processor_create_image(
+    proc, 640, 640, /* format/dtype/access: see image.h */);
+ef_image_processor_convert(proc, src, dst, /* rotation, flip, crop */);
 ```
 
 ### Zero-copy CUDA (TensorRT) input
@@ -150,7 +170,7 @@ fall back to the host `map()` when CUDA is unavailable:
 **Rust:**
 
 ```rust
-use edgefirst_hal::tensor::{Tensor, TensorTrait, is_cuda_available};
+use edgefirst_tensor::{is_cuda_available, TensorTrait};
 
 // At pipeline startup — check once
 if is_cuda_available() {
@@ -172,10 +192,10 @@ if let Some(cuda) = dst.cuda_map() {
 **Python:**
 
 ```python
-import edgefirst_hal as ef
+from edgefirst.image import ImageProcessor, PixelFormat
 
-proc = ef.ImageProcessor()
-dst = proc.create_image(640, 640, ef.PixelFormat.PlanarRgb, "float16")
+proc = ImageProcessor()
+dst = proc.create_image(640, 640, PixelFormat.PlanarRgb, "float16")
 
 for frame in camera_frames:
     proc.convert(frame, dst)
@@ -221,10 +241,10 @@ is what the merge uses to lift boxes back to full-frame coordinates.
 **Rust:**
 
 ```rust
-use edgefirst_hal::image::{ImageProcessor, ImageProcessorTrait, TilingConfig};
-use edgefirst_hal::decoder::{DecoderBuilder, DetectBox, Nms, Segmentation};
-use edgefirst_hal::decoder::tiling::{MergeConfig, TiledFrameAccumulator};
-use edgefirst_hal::tensor::{CpuAccess, DType, PixelFormat};
+use edgefirst_image::{ImageProcessor, ImageProcessorTrait, TilingConfig};
+use edgefirst_decoder::{DecoderBuilder, DetectBox, Nms, Segmentation};
+use edgefirst_decoder::tiling::{MergeConfig, TiledFrameAccumulator};
+use edgefirst_tensor::{CpuAccess, DType, PixelFormat};
 
 // 640x640 tiles with at least 20% overlap. The realized overlap is
 // redistributed evenly so every tile is full-size and the last one lands flush.
@@ -273,16 +293,17 @@ let detections = acc.finalize_normalized();
 **Python:**
 
 ```python
-import edgefirst_hal as ef
+from edgefirst.image import TilingConfig, PixelFormat
+from edgefirst.decoder import TiledFrameAccumulator, MergeConfig
 
-cfg = ef.TilingConfig(640, 640, overlap=0.2)
+cfg = TilingConfig(640, 640, overlap=0.2)
 placements = processor.plan_tiles(src.width, src.height, cfg)
 
-batch = processor.alloc_tile_batch(len(placements), cfg, ef.PixelFormat.Rgb)
+batch = processor.alloc_tile_batch(len(placements), cfg, PixelFormat.Rgb)
 placements = processor.tile_into(src, batch, cfg)
 
-acc = ef.TiledFrameAccumulator(
-    (float(src.width), float(src.height)), len(placements), ef.MergeConfig())
+acc = TiledFrameAccumulator(
+    (float(src.width), float(src.height)), len(placements), MergeConfig())
 
 for tile_outputs, placement in tile_results:
     boxes, scores, classes, _masks = decoder.decode(tile_outputs)
@@ -310,60 +331,48 @@ been joined.
 > full-frame downscaled pass as one more `push_tile` at `origin=(0, 0)`,
 > `crop_size=frame_dims`.
 
-The C API mirrors the same split (`hal_image_processor_plan_tiles` /
-`_tile_into` / `_tile_one` on the input side, `hal_tiled_frame_accumulator_*`
+The C API mirrors the same split (`ef_image_processor_plan_tiles` /
+`ef_image_processor_tile_into` / `ef_image_processor_tile_one` on the input side, `ef_tiled_frame_accumulator_*`
 on the output side). Full per-language detail lives in
 [image/README.md § Tiled Preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/README.md#tiled-preprocessing-sahi)
 and
 [decoder/README.md § Tiled Inference](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/README.md#tiled-inference-sahi).
 
 Per-language quick-starts and richer examples live in each crate's README:
-[Rust (`edgefirst-hal`)](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/README.md),
-[C API](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/README.md),
-[Python](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/README.md).
+[Rust](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/README.md),
+[C API](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/README.md),
+[Python](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-tensor/README.md).
 
 ## System Architecture
 
 ```mermaid
 graph TB
     subgraph "EdgeFirst HAL Ecosystem"
-        Python["Python Bindings (edgefirst-hal)<br/>PyO3"]
-        CAPI["C API (edgefirst-hal-capi)<br/>cbindgen"]
-        Main["Umbrella crate (edgefirst-hal)<br/>Re-exports"]
+        PyT["edgefirst-tensor<br/>wheel"]
+        PyC["edgefirst-codec<br/>wheel"]
+        PyI["edgefirst-image<br/>wheel"]
+        PyD["edgefirst-decoder<br/>wheel"]
+        PyK["edgefirst-tracker<br/>wheel"]
 
-        Python --> Main
-        CAPI --> Main
+        TensorSo["libedgefirst_tensor.so"]
+        CodecSo["libedgefirst_codec.so"]
+        ImageSo["libedgefirst_image.so"]
+        DecoderSo["libedgefirst_decoder.so"]
+        TrackerSo["libedgefirst_tracker.so"]
 
-        Tensor["edgefirst-tensor<br/>Zero-copy buffers"]
-        Codec["edgefirst-codec<br/>Image decode"]
-        Image["edgefirst-image<br/>Format conv + draw"]
-        Decoder["edgefirst-decoder<br/>Model output decode"]
-        Tracker["edgefirst-tracker<br/>ByteTrack"]
+        PyT --> TensorSo
+        PyC --> CodecSo
+        PyC --> TensorSo
+        PyI --> ImageSo
+        PyI --> TensorSo
+        PyD --> DecoderSo
+        PyD --> TensorSo
+        PyK --> TrackerSo
 
-        Main --> Tensor
-        Main --> Codec
-        Main --> Image
-        Main --> Decoder
-        Main -.->|tracker feature| Tracker
-        CAPI --> Tracker
-
-        Codec --> Tensor
-        Image --> Tensor
-        Image --> Decoder
-        Image -.optional.-> G2D["g2d-sys<br/>NXP i.MX"]
+        CodecSo --> TensorSo
+        ImageSo --> TensorSo
+        DecoderSo --> TensorSo
     end
-
-    Tensor -.-> DMA["Linux DMA-Heap<br/>Shared Memory"]
-    Decoder -.-> PostProc["Model Output<br/>Post-Processing"]
-
-    style Python fill:#e1f5ff
-    style CAPI fill:#e1f5ff
-    style Main fill:#fff4e1
-    style Tensor fill:#e8f5e9
-    style Codec fill:#e8f5e9
-    style Image fill:#e8f5e9
-    style Decoder fill:#e8f5e9
-    style Tracker fill:#e8f5e9
 ```
 
 ## Core Components
@@ -375,9 +384,12 @@ graph TB
 | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | OpenGL / G2D / CPU image processor + mask rendering | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md) |
 | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | YOLO + ModelPack post-processing, NMS, proto-mask APIs | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md) |
 | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) | ByteTrack multi-object tracking | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/TESTING.md) |
-| [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | Umbrella + tracing subscriber | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/TESTING.md) |
-| [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | C ABI + Delegate DMA-BUF framework | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/TESTING.md) |
-| `crates/python/` (PyPI: `edgefirst-hal`) | PyO3 bindings, numpy buffer protocol | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md) |
+| [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) | C ABI: `libedgefirst_tensor.so` + `edgefirst/tensor.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/tests/c/) |
+| [`edgefirst-codec-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec-capi/) | C ABI: `libedgefirst_codec.so` + `edgefirst/codec.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec-capi/tests/c/) |
+| [`edgefirst-image-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/) | C ABI: `libedgefirst_image.so` + `edgefirst/image.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/tests/c/) |
+| [`edgefirst-decoder-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/) | C ABI: `libedgefirst_decoder.so` + `edgefirst/decoder.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/tests/c/) |
+| [`edgefirst-tracker-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/) | C ABI: `libedgefirst_tracker.so` + `edgefirst/tracker.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/tests/c/) |
+| `crates/python-*` (five PyPI wheels) | PyO3 bindings; each links `libedgefirst_tensor.so` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md) |
 
 The deep dive on each component (class diagrams, supported operations,
 backend dispatch, performance considerations) lives in the per-crate
@@ -433,8 +445,10 @@ for frame in camera_frames {
 ```
 
 ```python
-proc = ef.ImageProcessor()
-dst = proc.create_image(640, 640, ef.PixelFormat.Rgb)
+from edgefirst.image import ImageProcessor, PixelFormat
+
+proc = ImageProcessor()
+dst = proc.create_image(640, 640, PixelFormat.Rgb)
 for frame in camera_frames:
     proc.convert(frame, dst)
     run_inference(dst)
@@ -499,18 +513,19 @@ struct stat st;
 if (fstat(fd, &st) != 0) continue;
 BufferKey key = { .inode = st.st_ino, .offset = plane_offset };
 
-struct hal_tensor *tensor = lookup_tensor(cache, &key);
+struct ef_tensor *tensor = lookup_tensor(cache, &key);
 if (!tensor) {
-    struct hal_plane_descriptor *pd = hal_plane_descriptor_new(fd);
-    if (!pd) { perror("hal_plane_descriptor_new"); continue; }
-    tensor = hal_import_image(proc, pd, NULL, w, h,
-                              HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8,
-                              NULL /* colorimetry: NULL = default */);
-    // pd is consumed by hal_import_image (success or failure)
-    if (!tensor) { perror("hal_import_image"); continue; }
+    ef_tensor_builder *b = ef_tensor_builder_new();
+    if (!b) { perror("ef_tensor_builder_new"); continue; }
+    ef_tensor_builder_dtype(b, EF_DTYPE_U8);
+    ef_tensor_builder_format(b, "NV12");
+    ef_tensor_builder_add_plane(b, fd, plane_offset, 0, 0, 0, 0);
+    tensor = ef_tensor_builder_wrap(b);
+    ef_tensor_builder_free(b);
+    if (!tensor) { perror("ef_tensor_builder_wrap"); continue; }
     insert_tensor(cache, &key, tensor);
 }
-hal_image_processor_convert(proc, tensor, dst, /* ... */);
+ef_image_processor_convert(proc, tensor, dst, /* rotation, flip, crop */);
 ```
 
 ```python
@@ -589,7 +604,9 @@ For local benchmarking on supporting hosts, enable them via `RUSTFLAGS`:
 ```bash
 # Orin Nano (Cortex-A78AE) — exclude the PyO3 binding (cross-Python toolchain not configured)
 RUSTFLAGS="-C target-cpu=cortex-a78ae" cargo build --release \
-  --target aarch64-unknown-linux-gnu --workspace --exclude edgefirst_hal
+  --target aarch64-unknown-linux-gnu --workspace --exclude edgefirst-python-tensor \
+  --exclude edgefirst-python-codec --exclude edgefirst-python-image \
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker
 
 # Generic aarch64 with FEAT_FP16 (do NOT use on Cortex-A53 / imx8mp)
 RUSTFLAGS="-C target-feature=+fp16" cargo build --release \
@@ -654,7 +671,7 @@ parameter:
 | `MaskResolution::Scaled { width, height }` | `(roi_h, roi_w, 1)` u8 binary at requested resolution | dot → sigmoid → upsample to `(W, H)` → threshold (`>127`) | All COCO / IoU / mAP evaluation |
 
 ```python
-import edgefirst_hal as hal
+from edgefirst.image import MaskResolution
 
 # Wrong: threshold then upsample → blocky edges, mAP regression.
 tiles = proc.materialize_masks(boxes, scores, classes, proto_data, letterbox=lb)
@@ -665,7 +682,7 @@ for tile, box in zip(tiles, boxes):
 # Right: HAL upsamples-then-thresholds inside its batched-GEMM kernel.
 tiles = proc.materialize_masks(boxes, scores, classes, proto_data,
                                letterbox=lb,
-                               resolution=hal.MaskResolution.Scaled(W, H))
+                               resolution=MaskResolution.Scaled(W, H))
 for tile, box in zip(tiles, boxes):
     canvas[y:y+h, x:x+w] = (tile[:, :, 0] > 127).astype(np.uint8)
 ```
@@ -689,6 +706,61 @@ caller code.
 | [image/ARCHITECTURE.md § Performance Considerations](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#performance-considerations) | Architecture | Backend dispatch and per-instance caches; see also [§ GL Concurrency Model](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) for the per-driver `GL_MUTEX` policy |
 | [TESTING.md § Validating Optimizations](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#validating-optimizations) | Testing | Confirming your integration follows the rules |
 | [BENCHMARKS.md](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md) | Benchmarks | Empirical cost of breaking each rule, per platform |
+
+## Toolchain and Platform Floors
+
+Two version floors are project policy. Both are chosen, not derived from
+whatever hardware happens to be on hand, and both are deliberately
+conservative — raising either one drops users.
+
+| Floor | Value | Applies to |
+|-------|-------|-----------|
+| Rust (MSRV) | **1.94.0** | Everything. Declared as `rust-version`, so cargo refuses an older toolchain with a clear error rather than a wall of syntax failures. CI gates on the same version. |
+| glibc | **2.35** | Cross-compiled Linux binaries (Ubuntu 22.04's glibc, matching the CI runners). |
+
+The MSRV is set once in `[workspace.package]` and inherited by every
+crate. The workspace uses `resolver = "3"`, the MSRV-aware resolver, so
+`rust-version` also constrains **dependency selection**: `cargo update`
+will not pull a dependency release that requires a newer compiler.
+Raising the MSRV is therefore a user-visible change, not just a build
+detail — bump it here, in the CI `RUST_STABLE_VERSION`, and in the
+CHANGELOG together.
+
+No source change was needed to support 1.94.0; it records the floor the
+code already met. Verified against a real 1.94.0 toolchain across the
+combinations that compile genuinely different code:
+
+| Checked on 1.94.0 | Covers |
+|---|---|
+| macOS host, all crates, `--all-targets` | IOSurface, ANGLE/GL, the PyO3 bindings |
+| `aarch64-unknown-linux-gnu`, `--all-targets` | DMA-BUF, SHM, the `dmabuf` ioctls, G2D |
+| `edgefirst-tensor --features tracing` | `trace.rs`, which is **off** by default |
+| `edgefirst-tensor --no-default-features --features static` | the `ndarray`-free build |
+| `edgefirst-codec --no-default-features --features static` | PNG/V4L2/nvJPEG all gated out |
+| `edgefirst-image --features tracker` | the optional tracker path |
+
+`--no-default-features` always needs `static` (or `dynamic`) named alongside
+it: `edgefirst-tensor`'s two backend features are mutually exclusive and one
+is required, so `--no-default-features` with neither is a compile error, not
+a fallback to a default.
+
+The `python-*` crates cannot be cross-compiled without
+`PYO3_CROSS_PYTHON_VERSION` or an `abi3-py3*` feature, so they are covered
+by the host build rather than the Linux one.
+
+The glibc floor is what
+[`scripts/on-target-test.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-test.sh)
+builds against (`cargo-zigbuild --target
+<arch>-unknown-linux-gnu.2.35`), so one binary set runs on every supported
+target. Building against a newer glibc links symbols an older loader cannot
+resolve, and the failure appears only at run time on the oldest device you
+own. Override for a one-off with `GLIBC=<version>`; change the default in
+the script and here together.
+
+Published Python wheels use a **separate, lower** floor — manylinux2014
+(glibc 2.17), via `maturin --zig --compatibility manylinux2014` — because
+they are built for the wider PyPI audience rather than for our targets.
+`make wheel` applies it.
 
 ## Platform Support
 
@@ -742,8 +814,10 @@ at runtime the HAL logs a warning and falls back to the CPU backend.
 >   below). The HAL finds it automatically.
 > - **Build without macOS/iOS GL** — the HAL's default features include
 >   `opengl`, but you can disable it (`--no-default-features --features
->   ndarray,tracing`) to build the CPU-only path, which needs no ANGLE at
->   all.
+>   static,ndarray,tracing`) to build the CPU-only path, which needs no
+>   ANGLE at all. `static` is required alongside `--no-default-features`:
+>   `edgefirst-tensor`'s two backend features are mutually exclusive and one
+>   is required, so naming neither is a compile error, not a fallback.
 
 ### Installing ANGLE (macOS)
 
@@ -830,8 +904,9 @@ and no env var is needed.
 
 ### When you don't need this setup
 
-- **`pip install edgefirst-hal`** — the macOS wheel ships ANGLE bundled
-  alongside the Python extension; no separate install required.
+- **`pip install edgefirst-image`** (or any of the five wheels) — the macOS
+  wheel ships ANGLE bundled alongside the Python extension; no separate
+  install required.
 - **EdgeFirst-signed binary distribution** — official binary releases
   bundle ANGLE re-signed under the EdgeFirst Apple Developer ID. Install
   and run with no additional setup.
@@ -855,7 +930,9 @@ the same ANGLE-over-Metal GL backend as macOS. The supported targets are:
 > with `scripts/fetch-angle.sh` (no credentials needed). If you would
 > rather not fetch ANGLE at all, you can still build the Rust library
 > for iOS with the `opengl` feature disabled:
-> `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`.
+> `cargo build --target aarch64-apple-ios --no-default-features --features static,ndarray,tracing`
+> (`static` is required alongside `--no-default-features` — `edgefirst-tensor`'s
+> two backend features are mutually exclusive and one is required).
 > The Rust `cargo build` itself (with `opengl`) succeeds without ANGLE
 > present — see [How the GL backend resolves ANGLE on iOS](#how-the-gl-backend-resolves-angle-on-ios).
 
@@ -873,20 +950,17 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 ### Build
 
-The one-command entry point builds for both targets and validates the link
-closure against the ANGLE xcframeworks:
+This repo's mobile responsibility is the native Rust API compiling (and
+linting clean) on the iOS targets — not a C artifact, not Swift bindings,
+not app packaging. `mobile-sdk` binds to these crates directly via
+[boltffi](https://github.com/EdgeFirstAI) and owns everything above that
+line. Build the sibling crates directly:
 
 ```bash
-scripts/build-ios.sh                 # device + sim, build + link-validate
-scripts/build-ios.sh device          # device only
-scripts/build-ios.sh --no-validate   # build only, skip link validation
-```
-
-Or build the library closure directly:
-
-```bash
-cargo build --target aarch64-apple-ios     --release -p edgefirst-hal
-cargo build --target aarch64-apple-ios-sim --release -p edgefirst-hal
+cargo build --target aarch64-apple-ios     --release \
+  -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
+cargo build --target aarch64-apple-ios-sim --release \
+  -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 ```
 
 ### How the GL backend resolves ANGLE on iOS
@@ -929,24 +1003,24 @@ dependencies:
 
 ### What is validated vs. deferred
 
-`scripts/validate-ios-link.sh` builds the production C API staticlib
-(`libedgefirst_hal.a` — a Rust staticlib archives the full HAL closure)
-and links a test executable referencing real C API entry points against
-the ANGLE xcframeworks + the Apple system frameworks the HAL references
-via `#[link(kind = "framework")]` (`IOSurface`, `CoreFoundation`,
-`Metal`). It also verifies with `nm` that the archive carries the
-IOSurface references and that the ANGLE binaries export the EGL
-entry-point names the runtime loader will look up. This proves the
-native symbol closure of the shipped artifact is complete.
+CI's `build-ios` job proves the Rust API — including the iOS-only
+`IOSurface` backend and the GL platform seam — compiles and lints clean for
+`aarch64-apple-ios` and `aarch64-apple-ios-sim`. It links nothing and
+produces no artifact for shipping; that this repo's mobile responsibility
+stops there is deliberate, not an oversight.
 
-What is **not** covered by this effort (future work):
+What is **not** covered here, because it belongs to `mobile-sdk`:
 
-- **Swift bindings** — a C/Swift API surface and a ship-able HAL
-  `.xcframework`. The Rust staticlib is the deliverable here.
+- **boltffi bindings and Swift/Kotlin packaging** — whether the result is
+  a monolith `.xcframework` or a modular one is `mobile-sdk`'s call, not
+  this repo's.
+- **Link-closure validation against the ANGLE xcframeworks + Apple system
+  frameworks** (`IOSurface`, `CoreFoundation`, `Metal`) — that is a
+  property of whatever `mobile-sdk` ships, not of this crate's `.rlib`.
 - **Runtime validation** — actual EGL initialization on a device or
-  simulator requires the app shell (a future effort). The internal
-  `hal-mobile` assessment already proved the ANGLE-over-Metal + IOSurface
-  path works on iPhone 17 Pro (`GL_EXT_color_buffer_half_float` present).
+  simulator requires the app shell. The internal `hal-mobile` assessment
+  already proved the ANGLE-over-Metal + IOSurface path works on iPhone 17
+  Pro (`GL_EXT_color_buffer_half_float` present).
 
 ### fp16 / target features
 
@@ -986,29 +1060,31 @@ cargo install cargo-ndk
 
 ### Building
 
+This repo's mobile responsibility is the native Rust API compiling (and
+linting clean) on the Android targets — not a C artifact, not Kotlin
+bindings, not app packaging. `mobile-sdk` binds to these crates directly
+via [boltffi](https://github.com/EdgeFirstAI) and owns everything above
+that line. Build the sibling crates directly, both ABIs at API 26:
+
 ```bash
-# HAL + C API (the future JNI library) for both ABIs at API 26:
-scripts/build-android.sh
-# or directly:
-cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release -p edgefirst-hal
+cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release \
+  -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 ```
 
-### Link validation
+### What is validated vs. deferred
 
-`scripts/validate-android-link.sh [arm64|x86_64]` builds the production
-C API staticlib (`libedgefirst_hal.a` — a Rust staticlib archives the
-full HAL closure), verifies with `llvm-nm` that the archive carries the
-AHardwareBuffer references and that the NDK's API-26 stubs export every
-EGL/GLES entry point the runtime resolves dynamically, then links a test
-executable referencing real C API entry points against the NDK system
-libraries. CI runs this for both ABIs on every PR
-(`build-android` lane).
+CI's `build-android` job proves the Rust API — including the
+Android-only `AHardwareBuffer` backend and the GL platform seam —
+compiles and lints clean for `aarch64-linux-android` and
+`x86_64-linux-android`. It links nothing and produces no artifact for
+shipping.
 
-What is **not** covered by this effort (future work):
+What is **not** covered here, because it belongs elsewhere:
 
-- **Kotlin bindings** — a JNI/Kotlin API surface, like the Swift API on
-  iOS. The `edgefirst-hal-capi` cdylib (`libedgefirst_hal.so`) is the
-  deliverable here.
+- **boltffi bindings and Kotlin packaging** — `mobile-sdk`'s
+  responsibility, not this repo's.
+- **Link-closure validation against the NDK system libraries** — a
+  property of whatever `mobile-sdk` ships, not of this crate's `.rlib`.
 - **Runtime validation** — on-device GL correctness and performance run
   via the internal `hal-mobile` AWS Device Farm harness, which drives
   the real `ImageProcessor` through JNI (see TESTING.md § Android
@@ -1028,46 +1104,48 @@ consume it directly — no `map()`, no CPU readback:
 ```c
 // Allocate once, reuse every frame (Rule 1). F16 NCHW model input;
 // auto-select yields an AHardwareBuffer when the GL backend is active —
-// assert hal_tensor_memory_type(dst) == HAL_TENSOR_MEMORY_DMA at startup.
-HalTensor* dst = hal_image_processor_create_image(
-    proc, 640, 640, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_F16, HAL_CPU_ACCESS_NONE);
+// assert ef_tensor_storage_kind(dst) == EF_STORAGE_KIND_DMA_BUF at startup.
+ef_tensor *dst = ef_image_processor_create_image(
+    proc, 640, 640, "rgb8_planar", EF_DTYPE_F16, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_NONE);
 
 // One-time: hand the SAME buffer to the NPU runtime.
-AHardwareBuffer* ahb = hal_tensor_hardware_buffer_ptr(dst);
+AHardwareBuffer* ahb = ef_tensor_hardware_buffer_ptr(dst);
 ANeuralNetworksMemory* mem;
 ANeuralNetworksMemory_createFromAHardwareBuffer(ahb, &mem);   // NNAPI
 // (LiteRT: wrap `ahb` via TfLiteAHardwareBufferAttachment instead.)
 
 // Per frame: when convert() returns, the GPU has finished writing and
 // the handle contents are safe to execute against.
-hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE,
-                            HAL_FLIP_NONE, &letterbox);
+ef_image_processor_convert(proc, src, dst, 0 /* rotation none */,
+                            0 /* flip none */, &letterbox);
 // ... ANeuralNetworksExecution_setInputFromMemory(exec, 0, NULL, mem, 0, bytes);
 ```
 
 For a pipelined handoff that skips the blocking GPU sync entirely, use
-`hal_image_processor_convert_fence()`: it returns a sync-fence fd
+`ef_image_processor_convert_fence()`: it returns a sync-fence fd
 (`EGL_ANDROID_native_fence_sync`) the NPU runtime waits on instead
 (`ANeuralNetworksExecution_startComputeWithDependencies`), or `-1` with
 the work already synced on drivers without fence support.
 
 **Flatness**: gralloc chooses the row pitch and may pad it (observed on
 the S26 Ultra: 640-px planar F16 → 1536-byte rows, natural 1280). Check
-`hal_tensor_recorded_row_stride(dst)`:
+`ef_tensor_row_stride(dst)`:
 
 - `0` — the buffer IS the flat `[1, C, H, W]` stream; hand it off as-is.
 - nonzero — describe the pitch to the runtime, pick a width whose pitch
   the device does not pad, or fall back to
-  `hal_tensor_copy_to_flat(dst, buf, len)` (~0.3 ms at 2.4 MB — still
+  `ef_tensor_copy_to(dst, buf, len)` (~0.3 ms at 2.4 MB — still
   cheaper than a full CPU convert, but no longer zero-copy; profile).
 
-**INT8 NPUs**: allocate the destination as `HAL_PIXEL_FORMAT_RGB` /
-`HAL_PIXEL_FORMAT_RGBA` with `HAL_DTYPE_U8` or `HAL_DTYPE_I8` (NHWC,
+**INT8 NPUs**: allocate the destination as `"rgb8"` /
+`"rgba8"` with `EF_DTYPE_U8` or `EF_DTYPE_I8` (NHWC,
 zero-copy on Android via the RGBA8888 texel packing) and attach the
 model's quantization so consumers agree on the scale:
 
 ```c
-hal_tensor_set_quantization(dst, /*scale=*/1.0f / 255.0f, /*zero_point=*/0);
+float scale = 1.0f / 255.0f;
+int32_t zp = 0;
+ef_tensor_quantization_set(dst, /*axis=*/-1, &scale, &zp, 1);
 ```
 
 The I8 path applies the `^0x80` bias in-shader during the convert — the
@@ -1080,21 +1158,21 @@ consume it natively (UBWC data formats declared at context-binary
 preparation); other NPU stacks take the linear default:
 
 ```c
-HalImageDesc* desc = hal_image_desc_new(640, 640, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
-hal_image_desc_set_compression(desc, HAL_COMPRESSION_ANY);   // linear fallback is counted
-HalTensor* dst = hal_image_processor_create_image_desc(proc, desc);
-hal_image_desc_free(desc);
-// hal_tensor_compression(dst) records the scheme actually allocated
-// (HAL_COMPRESSION_UBWC on Adreno, ..._NONE = linear fallback — see
-// hal_compression_fallback_count()).
+ef_tensor_image_desc *desc = ef_tensor_image_desc_new(640, 640, "rgba8", EF_DTYPE_U8);
+ef_tensor_image_desc_set_compression(desc, 1);   // 1 = any scheme; linear fallback is counted
+ef_tensor *dst = ef_image_processor_create_image_desc(proc, desc);
+ef_tensor_image_desc_free(desc);
+// ef_tensor_compression(dst) records the scheme actually allocated
+// (EF_COMPRESSION_UBWC on Adreno, EF_COMPRESSION_NONE = linear fallback — see
+// ef_compression_fallback_count()).
 ```
 
-Compression requires `HAL_CPU_ACCESS_NONE` (CPU mapping pins the layout
+Compression requires `EF_CPU_ACCESS_NONE` (CPU mapping pins the layout
 linear) and a compressed tensor has no meaningful linear row stride —
 it is a hardware-to-hardware handle only.
 
 **macOS parity**: the same pattern works with
-`hal_tensor_iosurface_ref()` — wrap the IOSurface in a `CVPixelBuffer`
+`ef_tensor_iosurface_ref()` — wrap the IOSurface in a `CVPixelBuffer`
 (`CVPixelBufferCreateWithIOSurface`) for CoreML/ANE input; `convert()`
 returning likewise guarantees GPU completion.
 
@@ -1113,11 +1191,12 @@ the common workflows (`make test`, `make bench`, `make build`,
 `make format lint check`) with the right flags and gates.
 
 For Python wheels, see
-[`crates/python/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/README.md)
+[`crates/python-tensor/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-tensor/README.md)
 and
-[`crates/python/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md).
-For the C library and consumer linking, see
-[`crates/capi/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/README.md).
+[`crates/python-common/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md).
+For the C libraries and consumer linking, see
+[`crates/tensor-capi/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/README.md)
+and the sibling `*-capi` READMEs.
 
 ## Environment Variables
 
@@ -1236,8 +1315,8 @@ component.
 Python:
 
 ```python
-import edgefirst_hal as hal
-with hal.Tracing("/tmp/trace.json"):
+from edgefirst.tensor import Tracing
+with Tracing("/tmp/trace.json"):
     # ... run inference pipeline ...
     pass
 ```
@@ -1245,7 +1324,7 @@ with hal.Tracing("/tmp/trace.json"):
 Rust:
 
 ```rust
-use edgefirst_hal::trace::{start_tracing, stop_tracing};
+use edgefirst_tensor::trace::{start_tracing, stop_tracing};
 
 start_tracing("/tmp/trace.json").expect("start tracing");
 // ... inference pipeline ...
@@ -1255,10 +1334,10 @@ stop_tracing(); // flushes and closes the trace file
 C:
 
 ```c
-#include <edgefirst/hal.h>
-hal_start_tracing("/tmp/trace.json");
+#include <edgefirst/tensor.h>
+ef_start_tracing("/tmp/trace.json");
 /* ... inference pipeline ... */
-hal_stop_tracing();
+ef_stop_tracing();
 ```
 
 ### Viewing traces
@@ -1303,35 +1382,44 @@ The tracing infrastructure complements the rules in the
 
 ```mermaid
 graph TD
-    EF[edgefirst-hal<br/>umbrella]
     Tensor[edgefirst-tensor]
+    Codec[edgefirst-codec]
     Image[edgefirst-image]
     Decoder[edgefirst-decoder]
     Tracker[edgefirst-tracker<br/>optional]
     G2D[g2d-sys<br/>optional]
 
-    EF --> Tensor
-    EF --> Image
-    EF --> Decoder
     Image --> Tensor
     Image --> Decoder
+    Image --> Codec
     Image -.optional.-> G2D
     Image -.->|tracker feature| Tracker
+    Decoder --> Tensor
     Decoder -.->|tracker feature| Tracker
+    Codec --> Tensor
 
-    Python[edgefirst_hal<br/>PyO3]
-    CAPI[edgefirst-hal-capi]
+    Python[edgefirst.{tensor,codec,image,decoder,tracker}<br/>PyO3]
+    TensorC[libedgefirst_tensor]
+    ImageC[libedgefirst_image]
+    CodecC[libedgefirst_codec]
+    DecoderC[libedgefirst_decoder]
+    TrackerC[libedgefirst_tracker]
 
-    Python --> EF
-    CAPI --> EF
-    CAPI --> Tensor
-    CAPI --> Image
-    CAPI --> Decoder
-    CAPI --> Tracker
+    Python --> Tensor
+    Python --> Image
+    Python --> Decoder
+    TensorC --> Tensor
+    ImageC --> Image
+    CodecC --> Codec
+    DecoderC --> Decoder
+    TrackerC --> Tracker
 
-    style EF fill:#fff4e1
     style Python fill:#e1f5ff
-    style CAPI fill:#e1f5ff
+    style TensorC fill:#e1f5ff
+    style ImageC fill:#e1f5ff
+    style CodecC fill:#e1f5ff
+    style DecoderC fill:#e1f5ff
+    style TrackerC fill:#e1f5ff
     style Tracker fill:#e8f5e9
 ```
 

@@ -731,7 +731,7 @@ per-decode sync stalls the worker.
 `ImageDecoder::decode_into` (and the trait-method `Tensor::load_image`) emits a
 [`tracing::trace_span!`] tree describing each phase of the JPEG/PNG decode.
 Spans are captured by
-[`edgefirst_hal::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs)
+[`edgefirst_tensor::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/trace.rs)
 into Chrome JSON for Perfetto. The cost when no subscriber is active is a single
 relaxed atomic load per call site.
 

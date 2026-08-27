@@ -21,14 +21,9 @@ import time
 import zipfile
 
 import numpy as np
-
-from edgefirst_hal import (
-    Decoder,
-    ImageProcessor,
-    Tensor,
-    PixelFormat,
-    probe_egl_displays,
-)
+from edgefirst.codec import Tensor
+from edgefirst.decoder import Decoder
+from edgefirst.image import ImageProcessor, PixelFormat, probe_egl_displays
 
 # Default model path (yolov8n-seg INT8 TFLite from the test matrix)
 DEFAULT_MODEL = os.path.expanduser(
@@ -149,8 +144,11 @@ def get_target_info():
         if displays:
             info["egl_display"] = str(displays[0].kind)
             info["egl_description"] = displays[0].description
-    except Exception:
-        pass  # defaults already set
+    except (RuntimeError, OSError) as e:
+        # Best-effort: this is a benchmark banner, not an assertion. Narrowed
+        # from `except Exception` so a genuine bug in probe_egl_displays()
+        # surfaces instead of silently degrading the banner.
+        info["egl_display"] = f"probe failed: {e}"
     return info
 
 
@@ -189,7 +187,7 @@ def bench_fused_path(decoder, processor, dst, outputs, n_iter):
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
-        boxes, scores, classes = processor.draw_masks(decoder, outputs, dst)
+        boxes, _scores, _classes = decoder.draw_onto(processor, outputs, dst)
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
@@ -259,7 +257,7 @@ def main():
         displays = probe_egl_displays()
         if displays:
             for d in displays:
-                print(f"  {str(d.kind):40s} {d.description}")
+                print(f"  {d.kind!s:40s} {d.description}")
             gpu_display = displays[0].kind
             print(f"  -> Using: {gpu_display} (highest priority)")
         else:
@@ -379,7 +377,7 @@ def main():
                 processor.set_int8_interpolation(mode)
                 # Warmup for this mode
                 bench_fused_path(decoder, processor, dst, outputs, args.warmup)
-                fused_times, fused_dets = bench_fused_path(
+                fused_times, _fused_dets = bench_fused_path(
                     decoder, processor, dst, outputs, args.iterations
                 )
                 report(f"fused [int8 {mode}]", fused_times)
@@ -389,7 +387,7 @@ def main():
                 thresh_results[f"draw_masks_{mode}"] = compute_stats(fused_times)
         else:
             # No interpolation API — benchmark single fused path
-            fused_times, fused_dets = bench_fused_path(
+            fused_times, _fused_dets = bench_fused_path(
                 decoder, processor, dst, outputs, args.iterations
             )
             report("draw_masks() [fused]", fused_times)

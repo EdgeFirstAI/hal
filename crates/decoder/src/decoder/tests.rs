@@ -210,10 +210,10 @@ mod decoder_builder_tests {
         for (b_shape, s_shape) in shapes {
             let mut bt = Tensor::<i8>::new(b_shape, Some(TensorMemory::Mem), None).unwrap();
             bt.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
-            owned.push(TensorDyn::I8(bt));
+            owned.push(bt.into());
             let mut st = Tensor::<i8>::new(s_shape, Some(TensorMemory::Mem), None).unwrap();
             st.set_quantization(TQ::per_tensor(0.00392, -128)).unwrap();
-            owned.push(TensorDyn::I8(st));
+            owned.push(st.into());
         }
         let inputs: Vec<&TensorDyn> = owned.iter().collect();
 
@@ -2671,7 +2671,7 @@ outputs:
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&det_data);
             }
-            TensorDyn::F32(t)
+            t.into()
         };
 
         // Protos (1, NM, PH, PW) NCHW. Channel k filled with value
@@ -2690,7 +2690,7 @@ outputs:
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&proto_data);
             }
-            TensorDyn::F32(t)
+            t.into()
         };
 
         let inputs: Vec<&TensorDyn> = vec![&det_tensor, &protos_tensor];
@@ -2716,7 +2716,10 @@ outputs:
         for (b, m) in out_boxes.iter().zip(out_masks.iter()) {
             let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
             let mean: f32 = {
-                let s = &m.segmentation;
+                use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+                let t = m.segmentation.as_u8().expect("mask must be U8");
+                let map = t.map_read().expect("map mask");
+                let s = map.as_slice();
                 let total: u32 = s.iter().map(|&v| v as u32).sum();
                 total as f32 / s.len() as f32
             };
@@ -2824,7 +2827,7 @@ outputs:
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&det_data);
             }
-            TensorDyn::F32(t)
+            t.into()
         };
         // Protos in NCHW (1, 2, 8, 8) all-ones — any proto channel
         // contributes identically, so the sign of mask_coefs dominates
@@ -2836,7 +2839,7 @@ outputs:
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&proto_data);
             }
-            TensorDyn::F32(t)
+            t.into()
         };
 
         let inputs: Vec<&TensorDyn> = vec![&det_tensor, &protos_tensor];
@@ -2856,7 +2859,10 @@ outputs:
         for (b, m) in out_boxes.iter().zip(out_masks.iter()) {
             let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
             let mean: f32 = {
-                let s = &m.segmentation;
+                use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+                let t = m.segmentation.as_u8().expect("mask must be U8");
+                let map = t.map_read().expect("map mask");
+                let s = map.as_slice();
                 let total: u32 = s.iter().map(|&v| v as u32).sum();
                 total as f32 / s.len() as f32
             };
@@ -2952,7 +2958,7 @@ outputs:
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&det_data);
             }
-            TensorDyn::F16(t)
+            t.into()
         };
 
         let proto_data = vec![half::f16::from_f32(1.0); NM * PH * PW];
@@ -2963,7 +2969,7 @@ outputs:
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&proto_data);
             }
-            TensorDyn::F16(t)
+            t.into()
         };
 
         let inputs: Vec<&TensorDyn> = vec![&det_tensor, &protos_tensor];
@@ -2980,7 +2986,10 @@ outputs:
         for (b, m) in out_boxes.iter().zip(out_masks.iter()) {
             let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
             let mean: f32 = {
-                let s = &m.segmentation;
+                use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+                let t = m.segmentation.as_u8().expect("mask must be U8");
+                let map = t.map_read().expect("map mask");
+                let s = map.as_slice();
                 let total: u32 = s.iter().map(|&v| v as u32).sum();
                 total as f32 / s.len() as f32
             };
@@ -3920,21 +3929,21 @@ outputs:
         /// Construct a TensorDyn with the given values. Helper for the
         /// end-to-end decode test below.
         fn make_i16(shape: &[usize], values: &[i16]) -> edgefirst_tensor::TensorDyn {
-            use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
+            use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
             let t = Tensor::<i16>::new(shape, Some(TensorMemory::Mem), None).unwrap();
             let mut m = t.map().unwrap();
             m.as_mut_slice()[..values.len()].copy_from_slice(values);
             drop(m);
-            TensorDyn::I16(t)
+            t.into()
         }
 
         fn make_i8(shape: &[usize], values: &[i8]) -> edgefirst_tensor::TensorDyn {
-            use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
+            use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
             let t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
             let mut m = t.map().unwrap();
             m.as_mut_slice()[..values.len()].copy_from_slice(values);
             drop(m);
-            TensorDyn::I8(t)
+            t.into()
         }
 
         #[test]
@@ -4098,12 +4107,12 @@ outputs:
             fn zero_tensor_i8(shape: &[usize]) -> TensorDyn {
                 let t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
                 let _ = t.map().unwrap(); // default-zeroed
-                TensorDyn::I8(t)
+                t.into()
             }
             fn zero_tensor_u8(shape: &[usize]) -> TensorDyn {
                 let t = Tensor::<u8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
                 let _ = t.map().unwrap();
-                TensorDyn::U8(t)
+                t.into()
             }
 
             // Shapes copied from the real edgefirst.json so binding by

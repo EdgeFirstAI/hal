@@ -47,7 +47,22 @@ fi
 COVERAGE="${COVERAGE:-0}"
 COV_LCOV="${COV_LCOV:-target/coverage_rust.lcov}"
 
-WS_EXCLUDES=(--workspace --exclude gpu-probe --exclude edgefirst-bench)
+# Python crates request edgefirst-tensor's `dynamic` feature. --workspace
+# unions features across every member, so leaving them in activates
+# `static` (workspace default) and `dynamic` at once and trips tensor's
+# mutual-exclusion guard (E0252 / infinite-size recursive types). Same
+# exclude set as the other --workspace lanes in test.yml.
+WS_EXCLUDES=(
+    --workspace
+    --exclude gpu-probe
+    --exclude edgefirst-bench
+    --exclude edgefirst-python-tensor
+    --exclude edgefirst-python-codec
+    --exclude edgefirst-python-image
+    --exclude edgefirst-python-decoder
+    --exclude edgefirst-python-tracker
+    --exclude edgefirst-python-common
+)
 
 # dma_test_formats un-gates the gl/tests.rs zero-copy tier on macOS
 # (IOSurface-backed @Dma fixtures). MUST be identical across the build

@@ -1,0 +1,125 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 100,
+      "max_us": 181,
+      "mean_us": 144,
+      "median_us": 144,
+      "min_us": 114,
+      "name": "materialize_masks/proto_res/i8",
+      "p95_us": 161,
+      "p99_us": 173
+    },
+    {
+      "iterations": 100,
+      "max_us": 148,
+      "mean_us": 120,
+      "median_us": 119,
+      "min_us": 99,
+      "name": "materialize_masks/proto_res/f32",
+      "p95_us": 137,
+      "p99_us": 144
+    },
+    {
+      "iterations": 100,
+      "max_us": 139,
+      "mean_us": 117,
+      "median_us": 114,
+      "min_us": 105,
+      "name": "materialize_masks/proto_res/f16",
+      "p95_us": 131,
+      "p99_us": 136
+    },
+    {
+      "iterations": 100,
+      "max_us": 458,
+      "mean_us": 430,
+      "median_us": 429,
+      "min_us": 419,
+      "name": "materialize_masks/scaled_640x640/i8",
+      "p95_us": 446,
+      "p99_us": 450
+    },
+    {
+      "iterations": 100,
+      "max_us": 243,
+      "mean_us": 219,
+      "median_us": 218,
+      "min_us": 207,
+      "name": "materialize_masks/scaled_640x640/f32",
+      "p95_us": 232,
+      "p99_us": 238
+    },
+    {
+      "iterations": 100,
+      "max_us": 256,
+      "mean_us": 227,
+      "median_us": 225,
+      "min_us": 217,
+      "name": "materialize_masks/scaled_640x640/f16",
+      "p95_us": 241,
+      "p99_us": 244
+    },
+    {
+      "iterations": 100,
+      "max_us": 61,
+      "mean_us": 48,
+      "median_us": 48,
+      "min_us": 46,
+      "name": "decode_masks/proto",
+      "p95_us": 51,
+      "p99_us": 55
+    },
+    {
+      "iterations": 100,
+      "max_us": 274,
+      "mean_us": 247,
+      "median_us": 245,
+      "min_us": 243,
+      "name": "decode_masks/materialize",
+      "p95_us": 260,
+      "p99_us": 268
+    },
+    {
+      "iterations": 100,
+      "max_us": 52,
+      "mean_us": 43,
+      "median_us": 42,
+      "min_us": 42,
+      "name": "proto_extraction",
+      "p95_us": 46,
+      "p99_us": 50
+    },
+    {
+      "iterations": 100,
+      "max_us": 232,
+      "mean_us": 216,
+      "median_us": 215,
+      "min_us": 215,
+      "name": "draw_decoded_masks",
+      "p95_us": 222,
+      "p99_us": 228
+    },
+    {
+      "iterations": 100,
+      "max_us": 7021,
+      "mean_us": 6882,
+      "median_us": 6864,
+      "min_us": 6761,
+      "name": "draw_proto_masks",
+      "p95_us": 6960,
+      "p99_us": 7000
+    },
+    {
+      "iterations": 100,
+      "max_us": 456,
+      "mean_us": 423,
+      "median_us": 419,
+      "min_us": 417,
+      "name": "hybrid_materialize_and_draw",
+      "p95_us": 442,
+      "p99_us": 452
+    }
+  ],
+  "timestamp": "unix:1779645789"
+}

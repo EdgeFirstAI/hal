@@ -1,0 +1,38 @@
+[package]
+name = "edgefirst-python-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "_image"
+crate-type = ["cdylib"]
+
+[features]
+default = ["tracing", "dynamic"]
+tracing = ["edgefirst-tensor/tracing"]
+abi3-py38 = ["pyo3/abi3-py38", "edgefirst-python-common/abi3-py38"]
+abi3-py311 = ["pyo3/abi3-py311", "edgefirst-python-common/abi3-py311"]
+# Forwards to edgefirst-tensor's own static/dynamic features (single-
+# tensor-home, task P2), same pattern as edgefirst-tracker/-codec/
+# -decoder and python-common. `dynamic` is the real default; `static`
+# exists so G13 (the differential gate) can build a genuine comparison
+# venv from the same commit as the dynamic one.
+static = ["edgefirst-tensor/static", "edgefirst-python-common/static"]
+dynamic = ["edgefirst-tensor/dynamic", "edgefirst-python-common/dynamic"]
+
+[dependencies]
+edgefirst-python-common = { path = "../python-common", default-features = false, features = ["image"] }
+edgefirst-tensor = { workspace = true, default-features = false }
+numpy = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true, features = ["resolve-config"] }
+rustc_version = { workspace = true }

@@ -363,7 +363,7 @@ pub fn run_verify(ctx: &GpuContext) {
         let src_w = dst_w;
         let src_h = dst_h;
         let src_bytes = (src_w * src_h * 4) as usize;
-        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::Dma), None) {
+        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(e) => {
                 println!("  SKIP {label}: src DMA allocation failed: {e}");
@@ -431,7 +431,7 @@ fn verify_packed_r8(ctx: &GpuContext, src_tex: u32, src_w: u32, src_h: u32, vao:
     let dst_w = src_w * 3;
     let dst_h = src_h;
     let dst_bytes = (dst_w * dst_h) as usize; // R8 = 1 byte/pixel
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
@@ -535,7 +535,7 @@ fn verify_packed_rgba8(
     let dst_w = src_w * 3 / 4;
     let dst_h = src_h;
     let dst_bytes = (dst_w * dst_h * 4) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
@@ -641,7 +641,7 @@ fn verify_planar_r8_1pass(
     let dst_w = src_w;
     let dst_h = src_h * 3;
     let dst_bytes = (dst_w * dst_h) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
@@ -742,7 +742,7 @@ fn verify_planar_r8_3pass(
     let dst_w = src_w;
     let dst_h = src_h * 3;
     let dst_bytes = (dst_w * dst_h) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
@@ -868,7 +868,7 @@ fn verify_planar_rgba8_1pass(
     let dst_w = src_w / 4;
     let dst_h = src_h * 3;
     let dst_bytes = (dst_w * dst_h * 4) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
@@ -974,7 +974,7 @@ fn verify_planar_rgba8_3pass(
     let dst_w = src_w / 4;
     let dst_h = src_h * 3;
     let dst_bytes = (dst_w * dst_h * 4) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
@@ -1104,7 +1104,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
     for &(src_w, src_h, dst_w, dst_h, label) in configs {
         // Allocate source RGBA tensor
         let src_bytes = (src_w * src_h * 4) as usize;
-        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::Dma), None) {
+        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(e) => {
                 println!("  SKIP {label}: src DMA allocation failed: {e}");
@@ -1125,7 +1125,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
         // Probe R8 support once per config
         let r8_supported = {
             let test_size = (dst_w * dst_h) as usize;
-            match Tensor::<u8>::new(&[test_size], Some(TensorMemory::Dma), None) {
+            match Tensor::<u8>::new(&[test_size], Some(TensorMemory::DmaBuf), None) {
                 Ok(t) => {
                     let fd = t.clone_fd().unwrap();
                     let ok = try_create_r8_egl_image(ctx, fd.as_raw_fd(), dst_w, dst_h).is_some();
@@ -1267,7 +1267,7 @@ fn bench_packed_r8(
     let out_w = dst_w * 3;
     let out_h = dst_h;
     let dst_bytes = (out_w * out_h) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
@@ -1350,7 +1350,7 @@ fn bench_packed_rgba8(
     let out_w = dst_w * 3 / 4;
     let out_h = dst_h;
     let dst_bytes = (out_w * out_h * 4) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
@@ -1438,7 +1438,7 @@ fn bench_planar_r8_1pass(
     let out_w = dst_w;
     let out_h = dst_h * 3;
     let dst_bytes = (out_w * out_h) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
@@ -1527,7 +1527,7 @@ fn bench_planar_r8_3pass(
     let out_w = dst_w;
     let out_h = dst_h * 3;
     let dst_bytes = (out_w * out_h) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
@@ -1634,7 +1634,7 @@ fn bench_planar_rgba8_1pass(
     let out_w = dst_w / 4;
     let out_h = dst_h * 3;
     let dst_bytes = (out_w * out_h * 4) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
@@ -1717,7 +1717,7 @@ fn bench_planar_rgba8_3pass(
     let out_w = dst_w / 4;
     let out_h = dst_h * 3;
     let dst_bytes = (out_w * out_h * 4) as usize;
-    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+    let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");

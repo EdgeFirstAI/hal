@@ -3,16 +3,20 @@
 
 use crate::{
     error::{Error, Result},
-    TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
+    TensorMemory, TensorTrait,
 };
-use log::trace;
 use num_traits::Num;
-use std::{
-    cell::UnsafeCell,
-    fmt,
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::{cell::UnsafeCell, fmt, sync::Arc};
+
+/// Derive a [`crate::BufferIdentity`] from a host allocation's base address.
+///
+/// Process-local, which is exactly `Mem`'s documented scope: two views of the
+/// same allocation within this process see the same pointer, but the key is
+/// never looked at across a process boundary, so pointer reuse after `free`
+/// carries no cross-process ABA hazard the way a reused inode would.
+fn identity_from_ptr<T>(data: &MemBacking<T>) -> crate::BufferIdentity {
+    crate::BufferIdentity::derived(crate::IdentityKind::HostPtr, data.base_ptr() as u64)
+}
 
 /// Interior-mutable backing allocation for `MemTensor`.
 ///
@@ -132,7 +136,9 @@ impl<T> MemBacking<T> {
         // `UnsafeCell<T>` is `#[repr(transparent)]` over `T`, so its layout
         // equals `T`'s; allocating an array of it round-trips on `Box` drop.
         let layout = Layout::array::<UnsafeCell<T>>(n).expect("allocation layout overflow");
-        let ptr = alloc_zeroed(layout) as *mut UnsafeCell<T>;
+        // SAFETY: `layout` is non-zero-sized (`n > 0` per the caller
+        // contract above).
+        let ptr = unsafe { alloc_zeroed(layout) } as *mut UnsafeCell<T>;
         if ptr.is_null() {
             handle_alloc_error(layout);
         }
@@ -141,8 +147,8 @@ impl<T> MemBacking<T> {
         // the contract above. `Box::from_raw` over a slice built from the same
         // `(ptr, n)` and element type deallocates with the matching
         // `Layout::array::<UnsafeCell<T>>(n)` on drop.
-        let slice = std::slice::from_raw_parts_mut(ptr, n);
-        MemBacking::Owned(Box::from_raw(slice))
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, n) };
+        MemBacking::Owned(unsafe { Box::from_raw(slice) })
     }
 }
 
@@ -198,12 +204,14 @@ where
                 capacity: byte_capacity,
             });
         }
+        let data = Arc::new(MemBacking::zeroed_fast(cap_elems));
+        let identity = identity_from_ptr(&data);
         Ok(MemTensor {
             name: name.unwrap_or("mem_tensor").to_owned(),
             shape: shape.to_vec(),
-            data: Arc::new(MemBacking::zeroed_fast(cap_elems)),
+            data,
             offset: 0,
-            identity: crate::BufferIdentity::new(),
+            identity,
         })
     }
 
@@ -213,11 +221,14 @@ where
     /// `byte_size <= capacity_bytes()` first; `map_inner` re-checks against the
     /// backing allocation. `Mem` is always HAL-owned, so the backing covers the
     /// full requested range.
-    pub(crate) fn map_with_byte_size(
+    pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,
         access: crate::CpuAccess,
-    ) -> Result<TensorMap<T>> {
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_inner(Some(byte_size), access)
     }
 
@@ -227,11 +238,14 @@ where
     /// that the exposed window `[offset, offset + exposed)` fits the backing
     /// allocation and that `offset` is aligned to `align_of::<T>()` (mirrors
     /// `DmaMap`'s bounds + alignment checks).
-    fn map_inner(
+    fn map_inner<'a>(
         &self,
         byte_size_override: Option<usize>,
         access: crate::CpuAccess,
-    ) -> Result<TensorMap<T>> {
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         let elem = std::mem::size_of::<T>();
         let exposed = match byte_size_override {
             Some(bytes) => bytes,
@@ -256,54 +270,87 @@ where
                 std::mem::align_of::<T>()
             )));
         }
-        Ok(TensorMap::Mem(MemMap {
-            // Keep the backing allocation alive for the map's lifetime so the
-            // map stays valid even if the source tensor is dropped first.
-            backing: Arc::clone(&self.data),
-            offset: self.offset,
-            shape: self.shape.clone(),
+        // The pin keeps the backing allocation alive for the view's lifetime,
+        // so the view stays valid even if the source tensor drops first --
+        // previously MemMap's own Arc::clone of `data`.
+        Ok(crate::view::HostView::new(
+            self.host_pin(),
+            self.shape.clone(),
             byte_size_override,
-            writable: access.writes(),
-            _marker: std::marker::PhantomData,
-        }))
+            access,
+        ))
     }
 
     /// Wrap externally-owned memory as a `MemTensor` without taking ownership
     /// of the allocation (no copy). The tensor borrows
-    /// `[ptr, ptr + shape.product() * size_of::<T>())`; `owner`, when `Some`,
-    /// co-owns the *source* so the borrowed memory outlives this tensor (and
-    /// any [`view`](Self::view) or map derived from it). The foreign pointer is
+    /// `[ptr, ptr + capacity_elems.max(shape.product()) * size_of::<T>())`
+    /// but reports the logical `shape` given; `owner`, when `Some`, co-owns
+    /// the *source* so the borrowed memory outlives this tensor (and any
+    /// [`view`](Self::view) or map derived from it). The foreign pointer is
     /// never freed by this type — only `owner`'s destructor runs on drop.
+    ///
+    /// `capacity_elems` records headroom beyond the tight `shape.product()`
+    /// footprint -- pass `0` for none (the ordinary case: exactly
+    /// `shape.product()` elements). This is the consumer half of the
+    /// cross-package capsule protocol's `capacity` field
+    /// (`Tensor::from_foreign_with_capacity`'s docs): a producer's pool
+    /// tensor, or one padded to a decoder's pitch/MCU alignment, is larger
+    /// than the shape it currently reports, and without recording that here
+    /// the imported alias would be clamped to today's shape and unable to
+    /// grow back into memory the producer actually has. `capacity_elems`
+    /// below the shape's element count is clamped up to it, never down.
     ///
     /// # Safety
     ///
     /// `ptr` must be non-null, aligned to `align_of::<T>()`, and valid for
-    /// `shape.product()` elements of `T` for as long as this tensor — and every
-    /// view/map sharing its backing — is alive. Passing an `owner` that co-owns
-    /// the source (e.g. an `Arc` whose `Drop` frees it) is the supported way to
-    /// uphold that lifetime contract.
-    pub(crate) unsafe fn from_foreign(
+    /// `capacity_elems` elements of `T` (or `shape.product()`, whichever is
+    /// larger) for as long as this tensor — and every view/map sharing its
+    /// backing — is alive. Passing an `owner` that co-owns the source (e.g.
+    /// an `Arc` whose `Drop` frees it) is the supported way to uphold that
+    /// lifetime contract.
+    pub(crate) unsafe fn from_foreign_with_capacity(
         ptr: *mut T,
         shape: &[usize],
+        capacity_elems: usize,
         owner: Option<crate::ForeignOwner>,
         name: Option<&str>,
     ) -> Self {
         let len: usize = shape.iter().product();
+        let data = Arc::new(MemBacking::Foreign {
+            ptr: ptr as *mut UnsafeCell<T>,
+            len: capacity_elems.max(len),
+            _owner: owner,
+        });
+        let identity = identity_from_ptr(&data);
         MemTensor {
             name: name.unwrap_or("foreign_mem_tensor").to_owned(),
             shape: shape.to_vec(),
-            data: Arc::new(MemBacking::Foreign {
-                ptr: ptr as *mut UnsafeCell<T>,
-                len,
-                _owner: owner,
-            }),
+            data,
             offset: 0,
-            identity: crate::BufferIdentity::new(),
+            identity,
         }
     }
 
     /// Set the byte offset of the logical window into the backing allocation.
     /// Validated against the allocation at `map()` time.
+    /// Host pin over this tensor's logical window.
+    ///
+    /// `Mem` needs no mapping step: the backing allocation is never resized
+    /// after creation, so `base_ptr` is already stable for the life of the
+    /// `Arc`. Cloning that `Arc` IS the keepalive, which is why pinning host
+    /// memory costs an refcount bump and nothing else.
+    pub(crate) fn host_pin<'a>(&self) -> crate::pin::HostPin<'a>
+    where
+        T: 'a,
+    {
+        let base = unsafe { (self.data.base_ptr() as *mut u8).add(self.offset) };
+        // capacity_bytes() is ALREADY relative to this tensor's window start
+        // ("the allocation minus its window start"), so subtracting `offset`
+        // again would zero a subview whose window is exactly its capacity.
+        let len = self.capacity_bytes();
+        crate::pin::HostPin::new(self.data.clone(), base, len)
+    }
+
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
     }
@@ -325,12 +372,14 @@ where
         let element_count: usize = shape.iter().product();
 
         let name = name.unwrap_or("mem_tensor").to_owned();
+        let data = Arc::new(MemBacking::zeroed(element_count));
+        let identity = identity_from_ptr(&data);
         Ok(MemTensor {
             name,
             shape: shape.to_vec(),
-            data: Arc::new(MemBacking::zeroed(element_count)),
+            data,
             offset: 0,
-            identity: crate::BufferIdentity::new(),
+            identity,
         })
     }
 
@@ -377,7 +426,10 @@ where
         Ok(())
     }
 
-    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+    fn map_with<'a>(&self, access: crate::CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_inner(None, access)
     }
 
@@ -467,104 +519,11 @@ where
     }
 }
 
-#[derive(Debug)]
-pub struct MemMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    /// Keep-alive of the backing allocation. Owning the `Arc` (rather than a
-    /// raw pointer) ensures the buffer outlives the map even if the source
-    /// tensor is dropped first.
-    backing: Arc<MemBacking<T>>,
-    /// Byte offset of the mapped window into `backing`.
-    offset: usize,
-    shape: Vec<usize>,
-    /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
-    /// (the full padded allocation) instead of `shape.product()`. Mirrors
-    /// `DmaMap`'s override for self-allocated strided tensors whose rows are
-    /// padded; callers iterate via `row_stride`.
-    byte_size_override: Option<usize>,
-    /// Whether mutable access is permitted (`map_read()` maps are not) —
-    /// enforced uniformly across backends by `assert_map_writable`.
-    writable: bool,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<T> Deref for MemMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    type Target = [T];
-
-    fn deref(&self) -> &[T] {
-        self.as_slice()
-    }
-}
-
-impl<T> DerefMut for MemMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn deref_mut(&mut self) -> &mut [T] {
-        self.as_mut_slice()
-    }
-}
-
-impl<T> TensorMapTrait<T> for MemMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-
-    fn len(&self) -> usize {
-        match self.byte_size_override {
-            Some(bytes) => bytes / std::mem::size_of::<T>(),
-            None => self.shape.iter().product(),
-        }
-    }
-
-    fn unmap(&mut self) {
-        trace!("Unmapping MemMap memory");
-    }
-
-    fn as_slice(&self) -> &[T] {
-        // SAFETY: the window `[offset, offset + len*size_of::<T>())` was bounds-
-        // and alignment-checked in `MemTensor::map()`; `backing` keeps the
-        // allocation alive; the base pointer is stable (never reallocated).
-        let base = unsafe { (self.backing.base_ptr() as *const u8).add(self.offset) as *const T };
-        unsafe { std::slice::from_raw_parts(base, self.len()) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [T] {
-        crate::assert_map_writable(self.writable, "Mem");
-        // SAFETY: as `as_slice`, plus: the backing elements are `UnsafeCell`, so
-        // `base_ptr()` carries write provenance and interior mutation through
-        // the shared `Arc` is sound. Distinct sub-region views address
-        // non-overlapping windows (the documented `subview` disjointness
-        // contract, matching `DmaMap`), so the `&mut` windows never alias.
-        // Keep the byte-offset arithmetic on `*mut u8` (not `*const u8`) so the
-        // write provenance from `base_ptr()` is preserved through the cast — the
-        // whole reason the backing is `UnsafeCell` rather than `Arc<Vec<T>>`.
-        let base = unsafe { (self.backing.base_ptr() as *mut u8).add(self.offset) as *mut T };
-        unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
-    }
-}
-
-impl<T> Drop for MemMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn drop(&mut self) {
-        self.unmap();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TensorMapTrait, TensorMemory, TensorTrait};
+    use crate::TensorMapTrait;
+    use crate::{TensorMemory, TensorTrait};
 
     #[test]
     fn test_new_valid_shape() {
@@ -742,7 +701,7 @@ mod tests {
         // through the tensor must land in the caller's own allocation (zero-copy).
         let mut vec: Vec<i32> = vec![0; 4];
         let ptr = vec.as_mut_ptr();
-        let t = unsafe { MemTensor::<i32>::from_foreign(ptr, &[4], None, None) };
+        let t = unsafe { MemTensor::<i32>::from_foreign_with_capacity(ptr, &[4], 0, None, None) };
         assert_eq!(t.shape(), &[4]);
         assert_eq!(t.memory(), TensorMemory::Mem);
         {
@@ -761,8 +720,15 @@ mod tests {
         let mut vec: Vec<u8> = vec![0u8; 6];
         let ptr = vec.as_mut_ptr();
         let owner: crate::ForeignOwner = Box::new(vec); // keep the heap buffer alive
-        let t =
-            unsafe { MemTensor::<u8>::from_foreign(ptr, &[2, 3], Some(owner), Some("foreign")) };
+        let t = unsafe {
+            MemTensor::<u8>::from_foreign_with_capacity(
+                ptr,
+                &[2, 3],
+                0,
+                Some(owner),
+                Some("foreign"),
+            )
+        };
         {
             let mut m = t.map().unwrap();
             m.as_mut_slice().copy_from_slice(&[1, 2, 3, 4, 5, 6]);
@@ -796,7 +762,8 @@ mod tests {
             _buf: buf,
             flag: flag.clone(),
         });
-        let t = unsafe { MemTensor::<u8>::from_foreign(ptr, &[4], Some(owner), None) };
+        let t =
+            unsafe { MemTensor::<u8>::from_foreign_with_capacity(ptr, &[4], 0, Some(owner), None) };
 
         // `map()` returns an owned `Arc` clone, so the map outlives the tensor.
         let m = t.map().unwrap();
@@ -811,5 +778,17 @@ mod tests {
             flag.load(Ordering::SeqCst),
             "owner Drop (the free) must fire on the last reference drop"
         );
+    }
+
+    #[test]
+    fn two_mem_tensors_do_not_share_an_identity() {
+        // A `HostPtr` key derived from a shared counter would be
+        // indistinguishable from one derived from a real, distinct
+        // allocation -- this pins the derivation to the actual base pointer
+        // of each backing.
+        let a = MemTensor::<u8>::new(&[8], None).unwrap();
+        let b = MemTensor::<u8>::new(&[8], None).unwrap();
+        assert_eq!(a.buffer_identity().kind(), crate::IdentityKind::HostPtr);
+        assert_ne!(a.buffer_identity().id(), b.buffer_identity().id());
     }
 }

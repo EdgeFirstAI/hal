@@ -28,7 +28,7 @@
 # zigbuild).
 #
 # Usage:
-#   ./benchmarks/scripts/decode-ab-sweep.sh imx8mp-frdm imx95-pro rpi5-hailo sebstation
+#   ./benchmarks/scripts/decode-ab-sweep.sh imx8mp-frdm imx95-pro rpi5-hailo x86-desktop
 #
 # Env:
 #   LIMIT / WARMUP / ROUNDS / PIN / CARGO_PROFILE   as decode-ab-publish.sh
@@ -47,15 +47,15 @@ REMOTE_COCO="${EDGEFIRST_BENCH_COCO_REMOTE:-/data/coco/val2017}"
 # Corpus identity (val2017, val2017-yuv420, jpeg-yuv420, …): names the
 # results subdirectory so control-corpus runs never overwrite the primary,
 # and extends the remote fallback search to ~/corpora/<name> (hosts where
-# /data is not writable, e.g. adis-uav1).
+# /data is not writable).
 CORPUS_NAME="$(basename "${REMOTE_COCO}")"
-# Home-relative: /tmp is quota-limited tmpfs on some hosts (sebstation).
+# Home-relative: /tmp is quota-limited tmpfs on some hosts.
 REMOTE_BIN_DIR="edgefirst-bench-decode-sweep"
 
 if [[ $# -gt 0 ]]; then
   TARGETS=("$@")
 else
-  TARGETS=(imx8mp-frdm imx95-pro rpi5-hailo sebstation)
+  TARGETS=(imx8mp-frdm imx95-pro rpi5-hailo x86-desktop)
 fi
 
 remote_coco_path() {

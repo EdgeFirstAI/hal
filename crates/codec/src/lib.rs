@@ -52,6 +52,7 @@ mod exif;
 mod jpeg;
 mod options;
 mod pixel;
+#[cfg(feature = "png")]
 mod png;
 mod traits;
 

@@ -100,181 +100,183 @@ pub(crate) unsafe fn nchw_to_nhwc_u8_neon(
     c: usize,
     dst: &mut [u8],
 ) {
-    use core::arch::aarch64::*;
-    let hw = h * w;
-    debug_assert_eq!(src.len(), hw * c);
-    debug_assert_eq!(dst.len(), hw * c);
-    debug_assert!(hw >= 16 && c >= 16);
+    unsafe {
+        use core::arch::aarch64::*; // NOSONAR
+        let hw = h * w;
+        debug_assert_eq!(src.len(), hw * c);
+        debug_assert_eq!(dst.len(), hw * c);
+        debug_assert!(hw >= 16 && c >= 16);
 
-    let src_ptr = src.as_ptr();
-    let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dst.as_mut_ptr();
 
-    // 16-wide tile counts. Tail rows / columns are scalar; the kernel
-    // is most useful when both dims are exact multiples of 16 (channel
-    // counts of 32 / 64 / 80 are the common per-scale cases).
-    let n_tiles_hw = hw / 16;
-    let n_tiles_c = c / 16;
+        // 16-wide tile counts. Tail rows / columns are scalar; the kernel
+        // is most useful when both dims are exact multiples of 16 (channel
+        // counts of 32 / 64 / 80 are the common per-scale cases).
+        let n_tiles_hw = hw / 16;
+        let n_tiles_c = c / 16;
 
-    for tile_c in 0..n_tiles_c {
-        let c_base = tile_c * 16;
-        for tile_hw in 0..n_tiles_hw {
-            let hw_base = tile_hw * 16;
+        for tile_c in 0..n_tiles_c {
+            let c_base = tile_c * 16;
+            for tile_hw in 0..n_tiles_hw {
+                let hw_base = tile_hw * 16;
 
-            // Load 16 source rows of 16 bytes — each row is 16 spatial
-            // positions of one channel.
-            let r0 = vld1q_u8(src_ptr.add((c_base) * hw + hw_base));
-            let r1 = vld1q_u8(src_ptr.add((c_base + 1) * hw + hw_base));
-            let r2 = vld1q_u8(src_ptr.add((c_base + 2) * hw + hw_base));
-            let r3 = vld1q_u8(src_ptr.add((c_base + 3) * hw + hw_base));
-            let r4 = vld1q_u8(src_ptr.add((c_base + 4) * hw + hw_base));
-            let r5 = vld1q_u8(src_ptr.add((c_base + 5) * hw + hw_base));
-            let r6 = vld1q_u8(src_ptr.add((c_base + 6) * hw + hw_base));
-            let r7 = vld1q_u8(src_ptr.add((c_base + 7) * hw + hw_base));
-            let r8 = vld1q_u8(src_ptr.add((c_base + 8) * hw + hw_base));
-            let r9 = vld1q_u8(src_ptr.add((c_base + 9) * hw + hw_base));
-            let r10 = vld1q_u8(src_ptr.add((c_base + 10) * hw + hw_base));
-            let r11 = vld1q_u8(src_ptr.add((c_base + 11) * hw + hw_base));
-            let r12 = vld1q_u8(src_ptr.add((c_base + 12) * hw + hw_base));
-            let r13 = vld1q_u8(src_ptr.add((c_base + 13) * hw + hw_base));
-            let r14 = vld1q_u8(src_ptr.add((c_base + 14) * hw + hw_base));
-            let r15 = vld1q_u8(src_ptr.add((c_base + 15) * hw + hw_base));
+                // Load 16 source rows of 16 bytes — each row is 16 spatial
+                // positions of one channel.
+                let r0 = vld1q_u8(src_ptr.add((c_base) * hw + hw_base));
+                let r1 = vld1q_u8(src_ptr.add((c_base + 1) * hw + hw_base));
+                let r2 = vld1q_u8(src_ptr.add((c_base + 2) * hw + hw_base));
+                let r3 = vld1q_u8(src_ptr.add((c_base + 3) * hw + hw_base));
+                let r4 = vld1q_u8(src_ptr.add((c_base + 4) * hw + hw_base));
+                let r5 = vld1q_u8(src_ptr.add((c_base + 5) * hw + hw_base));
+                let r6 = vld1q_u8(src_ptr.add((c_base + 6) * hw + hw_base));
+                let r7 = vld1q_u8(src_ptr.add((c_base + 7) * hw + hw_base));
+                let r8 = vld1q_u8(src_ptr.add((c_base + 8) * hw + hw_base));
+                let r9 = vld1q_u8(src_ptr.add((c_base + 9) * hw + hw_base));
+                let r10 = vld1q_u8(src_ptr.add((c_base + 10) * hw + hw_base));
+                let r11 = vld1q_u8(src_ptr.add((c_base + 11) * hw + hw_base));
+                let r12 = vld1q_u8(src_ptr.add((c_base + 12) * hw + hw_base));
+                let r13 = vld1q_u8(src_ptr.add((c_base + 13) * hw + hw_base));
+                let r14 = vld1q_u8(src_ptr.add((c_base + 14) * hw + hw_base));
+                let r15 = vld1q_u8(src_ptr.add((c_base + 15) * hw + hw_base));
 
-            // Stage 1: pair-wise byte interleave (TRN1/TRN2 .16b).
-            let a0 = vtrn1q_u8(r0, r1);
-            let a1 = vtrn2q_u8(r0, r1);
-            let a2 = vtrn1q_u8(r2, r3);
-            let a3 = vtrn2q_u8(r2, r3);
-            let a4 = vtrn1q_u8(r4, r5);
-            let a5 = vtrn2q_u8(r4, r5);
-            let a6 = vtrn1q_u8(r6, r7);
-            let a7 = vtrn2q_u8(r6, r7);
-            let a8 = vtrn1q_u8(r8, r9);
-            let a9 = vtrn2q_u8(r8, r9);
-            let a10 = vtrn1q_u8(r10, r11);
-            let a11 = vtrn2q_u8(r10, r11);
-            let a12 = vtrn1q_u8(r12, r13);
-            let a13 = vtrn2q_u8(r12, r13);
-            let a14 = vtrn1q_u8(r14, r15);
-            let a15 = vtrn2q_u8(r14, r15);
+                // Stage 1: pair-wise byte interleave (TRN1/TRN2 .16b).
+                let a0 = vtrn1q_u8(r0, r1);
+                let a1 = vtrn2q_u8(r0, r1);
+                let a2 = vtrn1q_u8(r2, r3);
+                let a3 = vtrn2q_u8(r2, r3);
+                let a4 = vtrn1q_u8(r4, r5);
+                let a5 = vtrn2q_u8(r4, r5);
+                let a6 = vtrn1q_u8(r6, r7);
+                let a7 = vtrn2q_u8(r6, r7);
+                let a8 = vtrn1q_u8(r8, r9);
+                let a9 = vtrn2q_u8(r8, r9);
+                let a10 = vtrn1q_u8(r10, r11);
+                let a11 = vtrn2q_u8(r10, r11);
+                let a12 = vtrn1q_u8(r12, r13);
+                let a13 = vtrn2q_u8(r12, r13);
+                let a14 = vtrn1q_u8(r14, r15);
+                let a15 = vtrn2q_u8(r14, r15);
 
-            // Stage 2: pair-wise halfword interleave (TRN1/TRN2 .8h).
-            macro_rules! trn_h {
-                ($lo:expr, $hi:expr, $kind:ident) => {
-                    vreinterpretq_u8_u16($kind(
-                        vreinterpretq_u16_u8($lo),
-                        vreinterpretq_u16_u8($hi),
-                    ))
-                };
+                // Stage 2: pair-wise halfword interleave (TRN1/TRN2 .8h).
+                macro_rules! trn_h {
+                    ($lo:expr, $hi:expr, $kind:ident) => {
+                        vreinterpretq_u8_u16($kind(
+                            vreinterpretq_u16_u8($lo),
+                            vreinterpretq_u16_u8($hi),
+                        ))
+                    };
+                }
+                let b0 = trn_h!(a0, a2, vtrn1q_u16);
+                let b1 = trn_h!(a1, a3, vtrn1q_u16);
+                let b2 = trn_h!(a0, a2, vtrn2q_u16);
+                let b3 = trn_h!(a1, a3, vtrn2q_u16);
+                let b4 = trn_h!(a4, a6, vtrn1q_u16);
+                let b5 = trn_h!(a5, a7, vtrn1q_u16);
+                let b6 = trn_h!(a4, a6, vtrn2q_u16);
+                let b7 = trn_h!(a5, a7, vtrn2q_u16);
+                let b8 = trn_h!(a8, a10, vtrn1q_u16);
+                let b9 = trn_h!(a9, a11, vtrn1q_u16);
+                let b10 = trn_h!(a8, a10, vtrn2q_u16);
+                let b11 = trn_h!(a9, a11, vtrn2q_u16);
+                let b12 = trn_h!(a12, a14, vtrn1q_u16);
+                let b13 = trn_h!(a13, a15, vtrn1q_u16);
+                let b14 = trn_h!(a12, a14, vtrn2q_u16);
+                let b15 = trn_h!(a13, a15, vtrn2q_u16);
+
+                // Stage 3: pair-wise word interleave (TRN1/TRN2 .4s).
+                macro_rules! trn_s {
+                    ($lo:expr, $hi:expr, $kind:ident) => {
+                        vreinterpretq_u8_u32($kind(
+                            vreinterpretq_u32_u8($lo),
+                            vreinterpretq_u32_u8($hi),
+                        ))
+                    };
+                }
+                let d0 = trn_s!(b0, b4, vtrn1q_u32);
+                let d1 = trn_s!(b1, b5, vtrn1q_u32);
+                let d2 = trn_s!(b2, b6, vtrn1q_u32);
+                let d3 = trn_s!(b3, b7, vtrn1q_u32);
+                let d4 = trn_s!(b0, b4, vtrn2q_u32);
+                let d5 = trn_s!(b1, b5, vtrn2q_u32);
+                let d6 = trn_s!(b2, b6, vtrn2q_u32);
+                let d7 = trn_s!(b3, b7, vtrn2q_u32);
+                let d8 = trn_s!(b8, b12, vtrn1q_u32);
+                let d9 = trn_s!(b9, b13, vtrn1q_u32);
+                let d10 = trn_s!(b10, b14, vtrn1q_u32);
+                let d11 = trn_s!(b11, b15, vtrn1q_u32);
+                let d12 = trn_s!(b8, b12, vtrn2q_u32);
+                let d13 = trn_s!(b9, b13, vtrn2q_u32);
+                let d14 = trn_s!(b10, b14, vtrn2q_u32);
+                let d15 = trn_s!(b11, b15, vtrn2q_u32);
+
+                // Stage 4: pair-wise doubleword interleave (TRN1/TRN2 .2d).
+                macro_rules! trn_d {
+                    ($lo:expr, $hi:expr, $kind:ident) => {
+                        vreinterpretq_u8_u64($kind(
+                            vreinterpretq_u64_u8($lo),
+                            vreinterpretq_u64_u8($hi),
+                        ))
+                    };
+                }
+                let t0 = trn_d!(d0, d8, vtrn1q_u64);
+                let t1 = trn_d!(d1, d9, vtrn1q_u64);
+                let t2 = trn_d!(d2, d10, vtrn1q_u64);
+                let t3 = trn_d!(d3, d11, vtrn1q_u64);
+                let t4 = trn_d!(d4, d12, vtrn1q_u64);
+                let t5 = trn_d!(d5, d13, vtrn1q_u64);
+                let t6 = trn_d!(d6, d14, vtrn1q_u64);
+                let t7 = trn_d!(d7, d15, vtrn1q_u64);
+                let t8 = trn_d!(d0, d8, vtrn2q_u64);
+                let t9 = trn_d!(d1, d9, vtrn2q_u64);
+                let t10 = trn_d!(d2, d10, vtrn2q_u64);
+                let t11 = trn_d!(d3, d11, vtrn2q_u64);
+                let t12 = trn_d!(d4, d12, vtrn2q_u64);
+                let t13 = trn_d!(d5, d13, vtrn2q_u64);
+                let t14 = trn_d!(d6, d14, vtrn2q_u64);
+                let t15 = trn_d!(d7, d15, vtrn2q_u64);
+
+                // Store 16 destination rows of 16 bytes — each row is 16
+                // channels at one spatial position.
+                vst1q_u8(dst_ptr.add((hw_base) * c + c_base), t0);
+                vst1q_u8(dst_ptr.add((hw_base + 1) * c + c_base), t1);
+                vst1q_u8(dst_ptr.add((hw_base + 2) * c + c_base), t2);
+                vst1q_u8(dst_ptr.add((hw_base + 3) * c + c_base), t3);
+                vst1q_u8(dst_ptr.add((hw_base + 4) * c + c_base), t4);
+                vst1q_u8(dst_ptr.add((hw_base + 5) * c + c_base), t5);
+                vst1q_u8(dst_ptr.add((hw_base + 6) * c + c_base), t6);
+                vst1q_u8(dst_ptr.add((hw_base + 7) * c + c_base), t7);
+                vst1q_u8(dst_ptr.add((hw_base + 8) * c + c_base), t8);
+                vst1q_u8(dst_ptr.add((hw_base + 9) * c + c_base), t9);
+                vst1q_u8(dst_ptr.add((hw_base + 10) * c + c_base), t10);
+                vst1q_u8(dst_ptr.add((hw_base + 11) * c + c_base), t11);
+                vst1q_u8(dst_ptr.add((hw_base + 12) * c + c_base), t12);
+                vst1q_u8(dst_ptr.add((hw_base + 13) * c + c_base), t13);
+                vst1q_u8(dst_ptr.add((hw_base + 14) * c + c_base), t14);
+                vst1q_u8(dst_ptr.add((hw_base + 15) * c + c_base), t15);
             }
-            let b0 = trn_h!(a0, a2, vtrn1q_u16);
-            let b1 = trn_h!(a1, a3, vtrn1q_u16);
-            let b2 = trn_h!(a0, a2, vtrn2q_u16);
-            let b3 = trn_h!(a1, a3, vtrn2q_u16);
-            let b4 = trn_h!(a4, a6, vtrn1q_u16);
-            let b5 = trn_h!(a5, a7, vtrn1q_u16);
-            let b6 = trn_h!(a4, a6, vtrn2q_u16);
-            let b7 = trn_h!(a5, a7, vtrn2q_u16);
-            let b8 = trn_h!(a8, a10, vtrn1q_u16);
-            let b9 = trn_h!(a9, a11, vtrn1q_u16);
-            let b10 = trn_h!(a8, a10, vtrn2q_u16);
-            let b11 = trn_h!(a9, a11, vtrn2q_u16);
-            let b12 = trn_h!(a12, a14, vtrn1q_u16);
-            let b13 = trn_h!(a13, a15, vtrn1q_u16);
-            let b14 = trn_h!(a12, a14, vtrn2q_u16);
-            let b15 = trn_h!(a13, a15, vtrn2q_u16);
 
-            // Stage 3: pair-wise word interleave (TRN1/TRN2 .4s).
-            macro_rules! trn_s {
-                ($lo:expr, $hi:expr, $kind:ident) => {
-                    vreinterpretq_u8_u32($kind(
-                        vreinterpretq_u32_u8($lo),
-                        vreinterpretq_u32_u8($hi),
-                    ))
-                };
+            // Right edge: hw % 16 columns. Scalar tail walks the unfilled
+            // spatial positions, each touching 16 channels at this c-tile.
+            let hw_tail_start = n_tiles_hw * 16;
+            for hw_idx in hw_tail_start..hw {
+                for ci in 0..16 {
+                    let src_idx = (c_base + ci) * hw + hw_idx;
+                    let dst_idx = hw_idx * c + (c_base + ci);
+                    *dst.get_unchecked_mut(dst_idx) = *src.get_unchecked(src_idx);
+                }
             }
-            let d0 = trn_s!(b0, b4, vtrn1q_u32);
-            let d1 = trn_s!(b1, b5, vtrn1q_u32);
-            let d2 = trn_s!(b2, b6, vtrn1q_u32);
-            let d3 = trn_s!(b3, b7, vtrn1q_u32);
-            let d4 = trn_s!(b0, b4, vtrn2q_u32);
-            let d5 = trn_s!(b1, b5, vtrn2q_u32);
-            let d6 = trn_s!(b2, b6, vtrn2q_u32);
-            let d7 = trn_s!(b3, b7, vtrn2q_u32);
-            let d8 = trn_s!(b8, b12, vtrn1q_u32);
-            let d9 = trn_s!(b9, b13, vtrn1q_u32);
-            let d10 = trn_s!(b10, b14, vtrn1q_u32);
-            let d11 = trn_s!(b11, b15, vtrn1q_u32);
-            let d12 = trn_s!(b8, b12, vtrn2q_u32);
-            let d13 = trn_s!(b9, b13, vtrn2q_u32);
-            let d14 = trn_s!(b10, b14, vtrn2q_u32);
-            let d15 = trn_s!(b11, b15, vtrn2q_u32);
-
-            // Stage 4: pair-wise doubleword interleave (TRN1/TRN2 .2d).
-            macro_rules! trn_d {
-                ($lo:expr, $hi:expr, $kind:ident) => {
-                    vreinterpretq_u8_u64($kind(
-                        vreinterpretq_u64_u8($lo),
-                        vreinterpretq_u64_u8($hi),
-                    ))
-                };
-            }
-            let t0 = trn_d!(d0, d8, vtrn1q_u64);
-            let t1 = trn_d!(d1, d9, vtrn1q_u64);
-            let t2 = trn_d!(d2, d10, vtrn1q_u64);
-            let t3 = trn_d!(d3, d11, vtrn1q_u64);
-            let t4 = trn_d!(d4, d12, vtrn1q_u64);
-            let t5 = trn_d!(d5, d13, vtrn1q_u64);
-            let t6 = trn_d!(d6, d14, vtrn1q_u64);
-            let t7 = trn_d!(d7, d15, vtrn1q_u64);
-            let t8 = trn_d!(d0, d8, vtrn2q_u64);
-            let t9 = trn_d!(d1, d9, vtrn2q_u64);
-            let t10 = trn_d!(d2, d10, vtrn2q_u64);
-            let t11 = trn_d!(d3, d11, vtrn2q_u64);
-            let t12 = trn_d!(d4, d12, vtrn2q_u64);
-            let t13 = trn_d!(d5, d13, vtrn2q_u64);
-            let t14 = trn_d!(d6, d14, vtrn2q_u64);
-            let t15 = trn_d!(d7, d15, vtrn2q_u64);
-
-            // Store 16 destination rows of 16 bytes — each row is 16
-            // channels at one spatial position.
-            vst1q_u8(dst_ptr.add((hw_base) * c + c_base), t0);
-            vst1q_u8(dst_ptr.add((hw_base + 1) * c + c_base), t1);
-            vst1q_u8(dst_ptr.add((hw_base + 2) * c + c_base), t2);
-            vst1q_u8(dst_ptr.add((hw_base + 3) * c + c_base), t3);
-            vst1q_u8(dst_ptr.add((hw_base + 4) * c + c_base), t4);
-            vst1q_u8(dst_ptr.add((hw_base + 5) * c + c_base), t5);
-            vst1q_u8(dst_ptr.add((hw_base + 6) * c + c_base), t6);
-            vst1q_u8(dst_ptr.add((hw_base + 7) * c + c_base), t7);
-            vst1q_u8(dst_ptr.add((hw_base + 8) * c + c_base), t8);
-            vst1q_u8(dst_ptr.add((hw_base + 9) * c + c_base), t9);
-            vst1q_u8(dst_ptr.add((hw_base + 10) * c + c_base), t10);
-            vst1q_u8(dst_ptr.add((hw_base + 11) * c + c_base), t11);
-            vst1q_u8(dst_ptr.add((hw_base + 12) * c + c_base), t12);
-            vst1q_u8(dst_ptr.add((hw_base + 13) * c + c_base), t13);
-            vst1q_u8(dst_ptr.add((hw_base + 14) * c + c_base), t14);
-            vst1q_u8(dst_ptr.add((hw_base + 15) * c + c_base), t15);
         }
 
-        // Right edge: hw % 16 columns. Scalar tail walks the unfilled
-        // spatial positions, each touching 16 channels at this c-tile.
-        let hw_tail_start = n_tiles_hw * 16;
-        for hw_idx in hw_tail_start..hw {
-            for ci in 0..16 {
-                let src_idx = (c_base + ci) * hw + hw_idx;
-                let dst_idx = hw_idx * c + (c_base + ci);
+        // Bottom edge: c % 16 channel rows. Scalar tail covers all spatial
+        // positions for any unaligned trailing channel block.
+        let c_tail_start = n_tiles_c * 16;
+        for hw_idx in 0..hw {
+            for ci in c_tail_start..c {
+                let src_idx = ci * hw + hw_idx;
+                let dst_idx = hw_idx * c + ci;
                 *dst.get_unchecked_mut(dst_idx) = *src.get_unchecked(src_idx);
             }
-        }
-    }
-
-    // Bottom edge: c % 16 channel rows. Scalar tail covers all spatial
-    // positions for any unaligned trailing channel block.
-    let c_tail_start = n_tiles_c * 16;
-    for hw_idx in 0..hw {
-        for ci in c_tail_start..c {
-            let src_idx = ci * hw + hw_idx;
-            let dst_idx = hw_idx * c + ci;
-            *dst.get_unchecked_mut(dst_idx) = *src.get_unchecked(src_idx);
         }
     }
 }

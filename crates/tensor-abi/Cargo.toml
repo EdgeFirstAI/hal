@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-tensor-abi"
+description = "Layout-only C ABI contract: plain values and vocabulary enumerators, declared once"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+# NO dependencies, ever. This crate is pure layout; anything it depended on
+# would be dragged into every consumer, including the future dynamic backend
+# whose whole point is linking no implementation.
+[lints]
+workspace = true
+
+[dependencies]

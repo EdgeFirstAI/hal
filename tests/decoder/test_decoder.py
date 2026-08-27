@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
-import edgefirst_hal
+import edgefirst.decoder as ef
 import numpy as np
 import pytest
 
 
 def numpy_to_tensor(arr, mem=None):
-    import edgefirst_hal
+    import edgefirst.decoder as ef
 
     dtype_map = {
         "int8": "int8",
@@ -27,7 +27,7 @@ def numpy_to_tensor(arr, mem=None):
     if hal_dtype is None:
         raise ValueError(f"Unsupported numpy dtype: {arr.dtype}")
     arr = np.ascontiguousarray(arr)
-    tensor = edgefirst_hal.Tensor(list(arr.shape), dtype=hal_dtype, mem=mem)
+    tensor = ef.Tensor(list(arr.shape), dtype=hal_dtype, mem=mem)
     with tensor.map() as m:
         dst = np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape)
         np.copyto(dst, arr)
@@ -49,7 +49,7 @@ def test_from_json():
     with open("testdata/modelpack_split.json") as f:
         config = f.read()
 
-    decoder = edgefirst_hal.Decoder.new_from_json_str(config, 0.45, 0.45)
+    decoder = ef.Decoder.new_from_json_str(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
     assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
     assert np.allclose(scores, [0.99240804])
@@ -71,7 +71,7 @@ def test_from_yaml():
     with open("testdata/modelpack_split.yaml") as f:
         config = f.read()
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
     assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
     assert np.allclose(scores, [0.99240804])
@@ -90,7 +90,7 @@ def test_from_json_v2_ara2_int8():
     with open("testdata/ara2_int8_edgefirst.json") as f:
         config = f.read()
 
-    decoder = edgefirst_hal.Decoder.new_from_json_str(config, 0.25, 0.5)
+    decoder = ef.Decoder.new_from_json_str(config, 0.25, 0.5)
 
     xy = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
     wh = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
@@ -125,7 +125,7 @@ def test_from_dict_json():
         config = f.read()
 
     config = json.loads(config)
-    decoder = edgefirst_hal.Decoder(config, 0.45, 0.45)
+    decoder = ef.Decoder(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
     assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
     assert np.allclose(scores, [0.99240804])
@@ -151,7 +151,7 @@ def test_from_dict_yaml():
         config = f.read()
 
     config = yaml.safe_load(config)
-    decoder = edgefirst_hal.Decoder(config, 0.45, 0.45)
+    decoder = ef.Decoder(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
     assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
     assert np.allclose(scores, [0.99240804])
@@ -208,7 +208,7 @@ def test_from_dict_v2_minimal():
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(cfg)
+    decoder = ef.Decoder(cfg)
     assert decoder is not None
 
 
@@ -225,7 +225,7 @@ def test_from_dict_v2_ara2_full_surface():
     with open("testdata/ara2_int8_edgefirst.json") as f:
         cfg = json.load(f)
 
-    decoder = edgefirst_hal.Decoder(cfg, 0.25, 0.5)
+    decoder = ef.Decoder(cfg, 0.25, 0.5)
 
     xy = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
     wh = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
@@ -256,7 +256,7 @@ def test_from_dict_v2_rejects_unsupported_schema_version():
         ],
     }
     with pytest.raises(Exception) as exc_info:
-        edgefirst_hal.Decoder(cfg)
+        ef.Decoder(cfg)
     msg = str(exc_info.value)
     assert "QuantTuple" not in msg, f"v1 error leaked into v2 path: {msg}"
     assert "99" in msg or "not supported" in msg.lower() or "NotSupported" in msg
@@ -326,7 +326,7 @@ def test_from_dict_v2_mask_coefs_type_tag():
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(cfg)
+    decoder = ef.Decoder(cfg)
     assert decoder is not None
 
 
@@ -347,16 +347,16 @@ def test_nms():
     with open("testdata/modelpack_split.yaml") as f:
         config = f.read()
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.0, 1.0)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.0, 1.0)
     # Raise max_det so the iou=1.0 fast-path returns ALL anchors, not just
     # the top 300.  Without this the reference set is truncated and HAL NMS
     # (which processes the full set) can produce survivors that TF NMS never
     # sees, causing false-positive mismatches.
     decoder.max_det = 100_000
-    boxes, scores, classes, masks = decoder.decode([output0, output1], 100000)
+    boxes, scores, classes, _masks = decoder.decode([output0, output1], 100000)
 
-    for iou in range(0, 100):
-        for score in range(0, 100):
+    for iou in range(100):
+        for score in range(100):
             iou_threshold = iou / 100
             score_threshold = score / 100
             indices = tf.image.non_max_suppression(
@@ -402,7 +402,7 @@ def test_yolo_det():
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(config, 0.2, 0.7)
+    decoder = ef.Decoder(config, 0.2, 0.7)
     output = numpy_to_tensor(
         np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
             1, 84, 8400
@@ -442,7 +442,7 @@ def test_context_switch():
                 },
             ],
         }
-        decoder = edgefirst_hal.Decoder(config, 0.25, 0.7)
+        decoder = ef.Decoder(config, 0.25, 0.7)
         output = numpy_to_tensor(
             np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
                 1, 84, 8400
@@ -481,7 +481,7 @@ def test_context_switch():
         with open("testdata/modelpack_split.json") as f:
             config = f.read()
 
-        decoder = edgefirst_hal.Decoder.new_from_json_str(config, 0.8, 0.5)
+        decoder = ef.Decoder.new_from_json_str(config, 0.8, 0.5)
 
         for _ in range(100):
             boxes, scores, classes, masks = decoder.decode([output0, output1])
@@ -513,10 +513,10 @@ def test_context_switch():
 
 def test_new_from_outputs_yolov8():
     """Test Decoder.new_from_outputs with a single detection output (YOLOv8 style)."""
-    output = edgefirst_hal.Output.detection(shape=[1, 84, 8400]).with_quantization(
+    output = ef.Output.detection(shape=[1, 84, 8400]).with_quantization(
         scale=0.0040811873, zero_point=-123
     )
-    decoder = edgefirst_hal.Decoder.new_from_outputs(
+    decoder = ef.Decoder.new_from_outputs(
         outputs=[output],
         score_threshold=0.2,
         iou_threshold=0.7,
@@ -542,21 +542,21 @@ def test_new_from_outputs_yolov8():
 
 def test_new_from_outputs_yolov8_split():
     """Test Decoder.new_from_outputs with split boxes + scores outputs."""
-    boxes_output = edgefirst_hal.Output.boxes(
+    boxes_output = ef.Output.boxes(
         dshape=[
-            (edgefirst_hal.DimName.Batch, 1),
-            (edgefirst_hal.DimName.BoxCoords, 4),
-            (edgefirst_hal.DimName.NumBoxes, 8400),
+            (ef.DimName.Batch, 1),
+            (ef.DimName.BoxCoords, 4),
+            (ef.DimName.NumBoxes, 8400),
         ]
     )
-    scores_output = edgefirst_hal.Output.scores(
+    scores_output = ef.Output.scores(
         dshape=[
-            (edgefirst_hal.DimName.Batch, 1),
-            (edgefirst_hal.DimName.NumClasses, 80),
-            (edgefirst_hal.DimName.NumBoxes, 8400),
+            (ef.DimName.Batch, 1),
+            (ef.DimName.NumClasses, 80),
+            (ef.DimName.NumBoxes, 8400),
         ]
     )
-    decoder = edgefirst_hal.Decoder.new_from_outputs(
+    decoder = ef.Decoder.new_from_outputs(
         outputs=[boxes_output, scores_output],
         score_threshold=0.2,
         iou_threshold=0.7,
@@ -569,7 +569,7 @@ def test_new_from_outputs_yolov8_split():
     boxes_arr = np.ascontiguousarray(dequantized[:, :4, :])
     scores_arr = np.ascontiguousarray(dequantized[:, 4:, :])
 
-    boxes, scores, classes, masks = decoder.decode(
+    boxes, scores, _classes, masks = decoder.decode(
         [numpy_to_tensor(boxes_arr), numpy_to_tensor(scores_arr)]
     )
     assert len(boxes) > 0
@@ -579,10 +579,10 @@ def test_new_from_outputs_yolov8_split():
 
 def test_output_with_quantization():
     """Test that with_quantization setter works correctly."""
-    output = edgefirst_hal.Output.detection(shape=[1, 84, 8400]).with_quantization(
+    output = ef.Output.detection(shape=[1, 84, 8400]).with_quantization(
         scale=0.0040811873, zero_point=-123
     )
-    decoder = edgefirst_hal.Decoder.new_from_outputs(
+    decoder = ef.Decoder.new_from_outputs(
         outputs=[output],
         score_threshold=0.2,
         iou_threshold=0.7,
@@ -592,7 +592,7 @@ def test_output_with_quantization():
             1, 84, 8400
         )
     )
-    boxes, scores, classes, masks = decoder.decode([model_output])
+    boxes, _scores, _classes, _masks = decoder.decode([model_output])
     # Should produce the same results as the dict-based config
     assert np.allclose(
         boxes,
@@ -605,15 +605,15 @@ def test_output_with_quantization():
 
 def test_output_with_dshape():
     """Test Output creation with named dimensions (dshape)."""
-    output = edgefirst_hal.Output.detection(
+    output = ef.Output.detection(
         dshape=[
-            (edgefirst_hal.DimName.Batch, 1),
-            (edgefirst_hal.DimName.NumFeatures, 84),
-            (edgefirst_hal.DimName.NumBoxes, 8400),
+            (ef.DimName.Batch, 1),
+            (ef.DimName.NumFeatures, 84),
+            (ef.DimName.NumBoxes, 8400),
         ]
     ).with_quantization(scale=0.0040811873, zero_point=-123)
 
-    decoder = edgefirst_hal.Decoder.new_from_outputs(
+    decoder = ef.Decoder.new_from_outputs(
         outputs=[output],
         score_threshold=0.2,
         iou_threshold=0.7,
@@ -623,7 +623,7 @@ def test_output_with_dshape():
             1, 84, 8400
         )
     )
-    boxes, scores, classes, masks = decoder.decode([model_output])
+    boxes, _scores, _classes, _masks = decoder.decode([model_output])
 
     assert np.allclose(
         boxes,
@@ -637,7 +637,7 @@ def test_output_with_dshape():
 def test_output_shape_or_dshape_required():
     """Test that providing neither shape nor dshape raises an error."""
     with pytest.raises(ValueError, match="Either 'shape' or 'dshape' must be provided"):
-        edgefirst_hal.Output.detection()
+        ef.Output.detection()
 
 
 def test_output_shape_and_dshape_exclusive():
@@ -645,32 +645,32 @@ def test_output_shape_and_dshape_exclusive():
     with pytest.raises(
         ValueError, match="Provide either 'shape' or 'dshape', not both"
     ):
-        edgefirst_hal.Output.detection(
+        ef.Output.detection(
             shape=[1, 84, 8400],
             dshape=[
-                (edgefirst_hal.DimName.Batch, 1),
-                (edgefirst_hal.DimName.NumFeatures, 84),
-                (edgefirst_hal.DimName.NumBoxes, 8400),
+                (ef.DimName.Batch, 1),
+                (ef.DimName.NumFeatures, 84),
+                (ef.DimName.NumBoxes, 8400),
             ],
         )
 
 
 def test_decoder_version():
     """Test that DecoderVersion enum variants are accessible."""
-    assert edgefirst_hal.DecoderVersion.Yolov5 is not None
-    assert edgefirst_hal.DecoderVersion.Yolov8 is not None
-    assert edgefirst_hal.DecoderVersion.Yolo11 is not None
-    assert edgefirst_hal.DecoderVersion.Yolo26 is not None
+    assert ef.DecoderVersion.Yolov5 is not None
+    assert ef.DecoderVersion.Yolov8 is not None
+    assert ef.DecoderVersion.Yolo11 is not None
+    assert ef.DecoderVersion.Yolo26 is not None
 
 
 def test_output_chaining():
     """Test that Output setter methods can be chained."""
     output = (
-        edgefirst_hal.Output.detection(shape=[1, 84, 8400])
+        ef.Output.detection(shape=[1, 84, 8400])
         .with_quantization(scale=0.004, zero_point=-123)
         .with_normalized(True)
     )
-    decoder = edgefirst_hal.Decoder.new_from_outputs(
+    decoder = ef.Decoder.new_from_outputs(
         outputs=[output],
         score_threshold=0.25,
         iou_threshold=0.7,
@@ -681,7 +681,7 @@ def test_output_chaining():
 def test_with_anchors_on_non_detection_raises():
     """Test that with_anchors() raises ValueError on non-detection outputs."""
     with pytest.raises(ValueError, match="with_anchors.*only valid for detection"):
-        edgefirst_hal.Output.boxes(shape=[1, 4, 8400]).with_anchors([(0.5, 0.5)])
+        ef.Output.boxes(shape=[1, 4, 8400]).with_anchors([(0.5, 0.5)])
 
 
 def test_with_normalized_on_unsupported_raises():
@@ -689,29 +689,29 @@ def test_with_normalized_on_unsupported_raises():
     with pytest.raises(
         ValueError, match="with_normalized.*only valid for detection or boxes"
     ):
-        edgefirst_hal.Output.scores(shape=[1, 80, 8400]).with_normalized(True)
+        ef.Output.scores(shape=[1, 80, 8400]).with_normalized(True)
 
 
 def test_factory_methods_protos():
     """Test that Output.protos() and mask_coefficients() factory methods work."""
     # 80 classes + 4 box coords + 32 mask coefficients = 116 num_features
     # protos: [batch, num_protos, height, width]
-    detection = edgefirst_hal.Output.detection(
+    detection = ef.Output.detection(
         dshape=[
-            (edgefirst_hal.DimName.Batch, 1),
-            (edgefirst_hal.DimName.NumFeatures, 116),
-            (edgefirst_hal.DimName.NumBoxes, 8400),
+            (ef.DimName.Batch, 1),
+            (ef.DimName.NumFeatures, 116),
+            (ef.DimName.NumBoxes, 8400),
         ]
     )
-    protos = edgefirst_hal.Output.protos(
+    protos = ef.Output.protos(
         dshape=[
-            (edgefirst_hal.DimName.Batch, 1),
-            (edgefirst_hal.DimName.NumProtos, 32),
-            (edgefirst_hal.DimName.Height, 160),
-            (edgefirst_hal.DimName.Width, 160),
+            (ef.DimName.Batch, 1),
+            (ef.DimName.NumProtos, 32),
+            (ef.DimName.Height, 160),
+            (ef.DimName.Width, 160),
         ]
     )
-    decoder = edgefirst_hal.Decoder.new_from_outputs(
+    decoder = ef.Decoder.new_from_outputs(
         outputs=[detection, protos],
         score_threshold=0.25,
     )
@@ -720,9 +720,9 @@ def test_factory_methods_protos():
 
 def test_factory_methods_modelpack():
     """Test that DecoderType.ModelPack can be passed to factory methods."""
-    output = edgefirst_hal.Output.detection(
+    output = ef.Output.detection(
         shape=[1, 17, 30, 18],
-        decoder=edgefirst_hal.DecoderType.ModelPack,
+        decoder=ef.DecoderType.ModelPack,
     )
     assert output is not None
 
@@ -744,7 +744,7 @@ def test_yolo_det_int8_hal(benchmark):
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(config, 0.25, 0.7)
+    decoder = ef.Decoder(config, 0.25, 0.7)
     output = numpy_to_tensor(
         np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
             1, 84, 8400

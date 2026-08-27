@@ -20,22 +20,17 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import os
 import sys
 import time
 import zipfile
-import io
 
 import numpy as np
-
-from edgefirst_hal import (
-    Decoder,
-    ImageProcessor,
-    Tensor,
-    PixelFormat,
-    probe_egl_displays,
-)
+from edgefirst.codec import Tensor
+from edgefirst.decoder import Decoder
+from edgefirst.image import ImageProcessor, PixelFormat, probe_egl_displays
 
 DEFAULT_MODEL = os.path.expanduser(
     "~/software/edgefirst-studio-ultralytics/workdir/test-matrix/"
@@ -139,7 +134,7 @@ def main():
     print(f"Warming up ({args.warmup} iters)...", file=sys.stderr)
     for _ in range(args.warmup):
         if args.path == "fused":
-            processor.draw_masks(decoder, outputs, dst)
+            decoder.draw_onto(processor, outputs, dst)
         else:
             boxes, scores, classes, masks = decoder.decode(outputs)
             processor.draw_decoded_masks(
@@ -152,7 +147,7 @@ def main():
 
     if args.path == "fused":
         for _ in range(args.iterations):
-            processor.draw_masks(decoder, outputs, dst)
+            decoder.draw_onto(processor, outputs, dst)
     else:
         for _ in range(args.iterations):
             boxes, scores, classes, masks = decoder.decode(outputs)

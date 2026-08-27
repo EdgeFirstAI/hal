@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-decoder-capi"
+description = "C API for EdgeFirst model output decoding"
+version = "0.29.0"
+edition = "2021"
+rust-version = "1.94.0"
+authors = ["Au-Zone Technologies <support@au-zone.com>"]
+homepage = "https://edgefirst.ai"
+repository = "https://github.com/EdgeFirstAI/hal"
+license = "Apache-2.0"
+publish = false # C library - distributed via GitHub Releases, not crates.io
+
+[lib]
+# The shipped artifact is libedgefirst_decoder.{a,so,dylib} -- NOT
+# `..._capi`. The `-capi` suffix names the *source crate*, mirroring the
+# `python-*` siblings; it must never reach a filename a consumer links against.
+# `rlib` is deliberately absent: it would collide with the edgefirst-decoder
+# crate's own libedgefirst_decoder.rlib, and nothing needs it.
+crate-type = ["staticlib", "cdylib"]
+name = "edgefirst_decoder"
+
+[features]
+default = ["tracing"]
+tracing = ["edgefirst-tensor/tracing"]
+
+# Links libedgefirst_tensor.so (dynamic backend + tensor-ffi declarations)
+# rather than embedding a private tensor copy.
+[dependencies]
+# `default-features = false` drops decoder's own `static` default so it does
+# not collide with `edgefirst-tensor/dynamic`. `tracker` is this leaf's
+# real requirement, spelled out explicitly.
+edgefirst-decoder = { version = "0.29.0", path = "../decoder", default-features = false, features = [
+    "tracker",
+] }
+uuid = { version = "1.23.3", features = ["v4"] }
+edgefirst-tensor = { version = "0.29.0", path = "../tensor", default-features = false, features = [
+    "dynamic",
+] }
+edgefirst-tensor-abi = { path = "../tensor-abi" }
+edgefirst-tensor-ffi = { path = "../tensor-ffi" }
+edgefirst-decoder-abi = { path = "../decoder-abi" }
+edgefirst-tracker = { version = "0.29.0", path = "../tracker", default-features = false, features = [
+    "tensor-boxes",
+] }
+errno = "0.3"
+libc = "0.2.186"
+log = "0.4.33"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+# Excluded from the workspace (see the root Cargo.toml's [workspace.exclude]
+# comment), so this crate inherits NEITHER the root's [workspace.lints] NOR
+# its [profile.release] -- both are restated here by hand. CONTRIBUTING.md
+# documents why and says to keep this in sync with the root manually.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+debug = false
+
+# Standalone package: stops cargo's upward workspace search. The resolver is
+# pinned to match the root workspace's behavior.
+[workspace]
+resolver = "3"

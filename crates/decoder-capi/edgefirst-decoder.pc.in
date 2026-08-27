@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# Requires edgefirst-tensor. Using this library means handling tensors --
+# tracking consumes detection lists declared in tensor.h, and
+# `ef_tensor_free` -- so the tensor API is part of this library's interface,
+# and a consumer should not have to discover that by a link error.
+
+# RELOCATABLE, deliberately -- do NOT hardcode a prefix here.
+#
+# These libraries ship as tarballs, and a tarball is extracted wherever the
+# user wants it. This file previously read `prefix=/usr`, which meant
+# pkg-config emitted `-I/usr/include` and `-L/usr/lib` and then ELIDED both as
+# system defaults -- so `pkg-config --cflags --libs` returned bare `-l` flags
+# with no search paths at all. Extracted anywhere other than over `/usr`, the
+# consumer's very first `#include <edgefirst/...>` failed. Nothing caught it
+# because these libraries were not released, so no compile had ever run
+# through this metadata.
+#
+# `${pcfiledir}` is the directory holding this .pc file. It sits at
+# <prefix>/lib/pkgconfig, so `../..` is the prefix wherever the tarball
+# landed. Installing to /usr still works: prefix resolves to /usr and
+# pkg-config elides the system paths, which is correct there.
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: edgefirst-decoder
+Description: EdgeFirst model output decoding
+Version: @VERSION@
+Requires: edgefirst-tensor
+Requires.private: edgefirst-decoder-abi
+Libs: -L${libdir} -ledgefirst_decoder
+Libs.private: -lm -ldl -lpthread
+Cflags: -I${includedir}

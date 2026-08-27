@@ -380,7 +380,7 @@ unsafe fn dmabuf_f16_render(ctx: &GpuContext, w: u32, h: u32) -> DmaF16Status {
     let pitch = w * bpp;
     let byte_count = (pitch * h) as usize;
 
-    let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::Dma), None) {
+    let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(e) => return DmaF16Status::AllocFailed(e.to_string()),
     };

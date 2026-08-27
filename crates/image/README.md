@@ -17,9 +17,8 @@ neighbours:
 - Depends on [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) for `TensorDyn`, `BufferIdentity`, and the `PboOps` trait it implements for the GL backend.
 - Depends unconditionally on [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) for `DetectBox`, `Segmentation`, and the proto-mask data feeding `draw_proto_masks` (there is no opt-out feature flag).
 - Optionally depends on [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) (feature `tracker`) for `draw_masks_tracked`.
-- Re-exported from [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) as `edgefirst_hal::image`.
-- Bridged to C via [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) (cbindgen-generated C ABI).
-- Bridged to Python via [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) (PyO3 binding over the Rust umbrella crate; does not go through the C ABI).
+- Bridged to C via [`edgefirst-image-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/) (`libedgefirst_image`, `edgefirst/image.h`).
+- Bridged to Python via [`crates/python-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-image/).
 
 ## Features
 

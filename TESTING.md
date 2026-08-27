@@ -16,9 +16,8 @@ lives in each sub-crate's `TESTING.md`:
 | `image` | [crates/image/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md) — GL gating, fp16 benches |
 | `decoder` | [crates/decoder/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md) |
 | `tracker` | [crates/tracker/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/TESTING.md) |
-| `hal` (umbrella) | [crates/hal/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/TESTING.md) |
-| `capi` (C API) | [crates/capi/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/TESTING.md) — C suite, header parity check |
-| `python` | [crates/python/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md) — maturin develop, slipcover |
+| `tensor` / `codec` / `image` / `decoder` / `tracker` C APIs | [crates/tensor-capi/](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) and sibling `*-capi` crates — C suite, header link-and-run |
+| `python-*` (five wheels) | [crates/python-common/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md) — maturin develop, slipcover, packaging gates |
 
 ---
 
@@ -35,15 +34,15 @@ lives in each sub-crate's `TESTING.md`:
 | `make test` | Run all tests (Rust + Python + C API) with coverage |
 | `make test-rust` | Run Rust tests only with `cargo-llvm-cov nextest` |
 | `make test-python` | Run Python tests with pytest (and slipcover if available) |
-| `make test-capi` | Build the C library and run C API integration tests |
+| `make test-capi-modular` | Build and test the five modular C libraries |
+| `make test-capi-link` | Compile headers as C11/C++17 and link-run one consumer per library |
+| `make test-ontarget` | Run the suite on the board fleet over SSH. Not part of `make test` — needs the boards reachable — but it is the **only** evidence that counts for DMA, G2D and embedded-GL work. `BOARDS='imx95-frdm rpi5-hailo'` selects a subset |
 | `make test-cuda` | CUDA device-pointer tests. Not part of `make test` — needs a CUDA GPU and `libcudart` at runtime, and skips cleanly without them |
 | `make bench` | Run the workspace Rust benchmarks (custom `harness = false` binaries backed by [`crates/bench`](https://github.com/EdgeFirstAI/hal/tree/main/crates/bench); not Criterion) |
 | `make build` | Build with coverage instrumentation (profiling profile) |
 | `make format lint check` | Pre-commit gate — required before every commit |
 
-C API tests are also available individually from
-[`crates/capi/tests/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/capi/tests)
-using their own Makefile.
+Each modular C library also has C tests under `crates/{tensor,codec,image,decoder,tracker}-capi/tests/`.
 
 ---
 
@@ -214,10 +213,10 @@ mod tests {
 Most crates under `crates/` carry their own Rust tests: `tensor`, `image`,
 `decoder`, `tracker`, `hal`, `capi`, and `bench`. The `gpu-probe` crate
 ships no `#[test]` modules — it is a runtime probe binary and is exercised
-indirectly through the tensor/image suites it informs. The `edgefirst_hal`
-Python crate is excluded from most workspace runs because it requires a
-live Python interpreter — see
-[`crates/python/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md).
+indirectly through the tensor/image suites it informs. The Python
+extension crates are excluded from most workspace runs because they
+require a live Python interpreter — see
+[`crates/python-common/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md).
 
 Cross-crate integration suites live in each crate's `tests/` directory;
 see the relevant per-crate `TESTING.md` for what each suite covers.
@@ -306,7 +305,9 @@ make test-rust
 make test-python
 
 # 4. Rust tests manually with nextest
-cargo nextest run --workspace --exclude edgefirst_hal -j 1
+cargo nextest run --workspace --exclude edgefirst-python-tensor \
+  --exclude edgefirst-python-codec --exclude edgefirst-python-image \
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker -j 1
 
 # 5. Tests for a specific crate
 cargo test -p edgefirst-image -- --test-threads=1
@@ -318,13 +319,12 @@ cargo test -p edgefirst-tensor -- --test-threads=1
 ### Per-language workflows
 
 Python: see
-[`crates/python/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md)
+[`crates/python-common/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md)
 for the `maturin develop` + `pytest` + `slipcover` workflow.
 
-C API: see
-[`crates/capi/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/TESTING.md)
-for the Makefile-based C test suite, valgrind integration, and the
-cbindgen header parity check.
+C API: `make test-capi-modular` and `make test-capi-link` cover the five
+libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`). Headers
+live in each leaf's `include/edgefirst/*.h`.
 
 ### Disabling hardware backends
 
@@ -369,38 +369,102 @@ The project primarily targets ARM64 embedded Linux (NXP i.MX 8M Plus,
 i.MX 95). Tests that exercise DMA or GPU acceleration must run on
 physical hardware.
 
-### Step 1 — Cross-compile tests
+**CI already runs the hardware suite on its own runners.** This script is
+for the boards CI does not have — running the same suite against whatever
+hardware you have on hand is how you catch behaviour that differs by SoC
+rather than only on the one runner CI owns. A macOS or x86_64 development
+host cannot exercise DMA-BUF, G2D or embedded GL at all, so a green local
+run says very little about a change to those paths.
 
-Use `cargo-zigbuild` to produce test binaries without running them.
-Exclude the Python crate (PyO3 requires a target Python installation):
+### The one command
 
-```bash
-cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
-  --workspace --exclude edgefirst_hal
-```
-
-Test binaries land in `target/aarch64-unknown-linux-gnu/release/deps/`.
-
-### Step 2 — Copy binaries to target
-
-```bash
-scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_image-* user@target:/tmp/hal-tests/
-scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_tensor-* user@target:/tmp/hal-tests/
-scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_decoder-* user@target:/tmp/hal-tests/
-
-# Also copy testdata
-scp -r testdata/ user@target:/tmp/hal-tests/
-```
-
-### Step 3 — Run on target
+Hosts are yours to supply — the script has no built-in list. Anything
+reachable by `ssh <host>` works; put the connection details in
+`~/.ssh/config`.
 
 ```bash
-ssh user@target 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./edgefirst_image-<hash> --test-threads=1'
+./scripts/on-target-test.sh imx95-frdm imx8mp-frdm rpi5-hailo
+EDGEFIRST_TARGETS="imx95-frdm orin-nano" ./scripts/on-target-test.sh
+CRATES="edgefirst-tensor" ./scripts/on-target-test.sh imx95-frdm
 ```
+
+[`scripts/on-target-test.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-test.sh)
+probes each host, cross-builds with `cargo-zigbuild`, rsyncs the binaries
+and `testdata/`, runs each binary with the mandatory `--test-threads=1`,
+and prints a pass/fail/skip matrix. Logs land in
+`target/on-target-results/<host>/`. It exits non-zero if any host reported
+a test failure; an unreachable host is reported as `UNREACHABLE` and does
+not mask a real failure elsewhere.
+
+Two details worth knowing:
+
+- **Binaries come from cargo's JSON output**, not a `<hash>` glob. Globbing
+  picks up stale binaries from earlier builds, which is how you end up
+  confidently testing code you did not just change.
+- **Builds use the project's declared glibc floor** (2.35 — see
+  [README § Toolchain and Platform Floors](https://github.com/EdgeFirstAI/hal/blob/main/README.md#toolchain-and-platform-floors)),
+  so one binary set runs on every supported target. It is a chosen policy,
+  not something derived from whichever hosts happen to answer; building
+  against a newer glibc links symbols an older loader cannot resolve, and
+  that failure shows up only at run time on the oldest device you own.
+  Override for a one-off with `GLIBC=<version>`.
+- **Per-host behaviour is probed, not named.** A host exposing
+  `/dev/galcore` automatically gets `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1`,
+  because the Vivante driver has an intermittent double-free that otherwise
+  masquerades as a regression in whatever you just changed. The workaround
+  keys off the hardware, so it applies to any Vivante board.
+
+### What a given board can actually exercise
+
+The script records each host's device nodes to
+`target/on-target-results/<host>/capabilities.txt`. Read it before
+concluding anything — hardware absence is common and not always obvious:
+
+- A kernel built **without `CONFIG_DMABUF_HEAPS`** has no `/dev/dma_heap`
+  at all and never will (Tegra-based boards are the usual case). Their
+  zero-copy path is a vendor allocator plus CUDA, not DMA-BUF. That is a
+  property of the kernel, not a setup gap.
+- `/dev/dma_heap/*` is often **root-only**, so an unprivileged run gets
+  `EACCES` and `is_dma_available()` returns false even though the node
+  exists. A udev rule granting a group access fixes it.
+
+In both cases the DMA tests skip and the suite still reports green.
+
+### Reading the results
+
+A **skip is not a pass.** Each board's `capabilities.txt` records the
+device nodes present, so a skipped hardware test is attributable to a named
+missing node. When reporting on-target results, say which board skipped
+what and why — never summarise a run that skipped every DMA test as
+"passing".
+
+> **libtest hides skip reasons.** A hardware-gated test that returns early
+> prints `... ok`, identical to one that did the work — and libtest captures
+> `println!`/`eprintln!`, replaying it only for **failing** tests. So the
+> absence of a skip message is *not* evidence that a test ran. Announce
+> skips through a channel that bypasses the capture: `log::warn!`, or
+> `writeln!(&mut std::io::stderr(), …)` as `crates/tensor/tests/pin.rs`
+> does. Both hold their own handle to the real stderr. Cross-check against
+> the board's `capabilities.txt` before claiming a hardware path was
+> exercised.
 
 The `--test-threads=1` flag is mandatory on target for the same reasons
 as local development — CMA pool exhaustion risk is higher on embedded
 boards with limited memory.
+
+### Manual fallback
+
+If you need to run a single binary by hand:
+
+```bash
+cargo-zigbuild test --target aarch64-unknown-linux-gnu.2.35 --release --no-run \
+  -p edgefirst-tensor -p edgefirst-image
+rsync -az target/aarch64-unknown-linux-gnu/release/deps/<binary> testdata imx95-frdm:/tmp/hal-tests/
+ssh imx95-frdm 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./<binary> --test-threads=1'
+```
+
+The `python-*` crates are excluded from cross-builds — PyO3 requires a
+target Python installation.
 
 CI automates this flow in
 [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).
@@ -408,48 +472,29 @@ Binaries are stripped on the build host (split debuginfo preserved for
 coverage attribution) and uploaded as the `hardware-test-binaries`
 artifact for the hardware runner to download.
 
-### iOS (build + link validation only)
+### iOS (build + lint the native Rust API only)
 
-The HAL builds for `aarch64-apple-ios` (device) and `aarch64-apple-ios-sim`
-(simulator). There is **no runtime test** for iOS — runtime EGL bring-up
-requires the app shell (a future Swift-bindings effort). What CI validates
-is:
-
-1. The Rust library closure compiles for both iOS targets (default features
-   incl. `opengl`).
-2. The native symbol closure links cleanly against the ANGLE xcframeworks +
-   the Apple system frameworks the HAL references (`IOSurface`,
-   `CoreFoundation`, `Metal`).
-
-> **ANGLE note:** the link-validation step fetches the signed ANGLE
-> xcframeworks from the **public**
-> [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)
-> release via `scripts/fetch-angle.sh` (no credentials needed). If you
-> would rather not fetch ANGLE, you can still do step 1 (the `cargo build`)
-> without it:
->
-> ```bash
-> cargo build --target aarch64-apple-ios     --no-default-features --features ndarray,tracing
-> cargo build --target aarch64-apple-ios-sim --no-default-features --features ndarray,tracing
-> ```
+This repo's mobile responsibility on iOS is the native Rust API compiling
+and linting clean for `aarch64-apple-ios` (device) and
+`aarch64-apple-ios-sim` (simulator) — not a C artifact, not link-closure
+validation, not runtime testing. `mobile-sdk` binds to these crates
+directly via boltffi and owns everything above that line, including
+validating the link closure against the ANGLE xcframeworks and the Apple
+system frameworks (`IOSurface`, `CoreFoundation`, `Metal`) the HAL
+references.
 
 ```bash
-# Build + link-validate both targets:
-scripts/build-ios.sh
-
-# Link validation only (after a build):
-scripts/validate-ios-link.sh device
-scripts/validate-ios-link.sh sim
+cargo clippy --target aarch64-apple-ios --workspace \
+  --exclude gpu-probe --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-bench \
+  -- -D warnings
+cargo build --target aarch64-apple-ios --release \
+  -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 ```
 
-The link validation auto-fetches the signed ANGLE xcframeworks from the
-[`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
-release via `scripts/fetch-angle.sh` (no credentials needed — the release is
-public; a `GH_TOKEN`/`GITHUB_TOKEN` is honored if set but not required).
-Because ANGLE's EGL/GLES symbols are
-resolved at runtime via `libloading`, the validation additionally runs
-`nm` on the ANGLE binaries to confirm the EGL entry-point names are
-exported — that is the real "ANGLE symbol closure resolves" check.
+This `cargo build` succeeds without the ANGLE xcframeworks present — see
+[README.md § How the GL backend resolves ANGLE on iOS](https://github.com/EdgeFirstAI/hal/blob/main/README.md#how-the-gl-backend-resolves-angle-on-ios).
+`scripts/fetch-angle.sh` remains for the macOS test lane's own coverage of
+the ANGLE-backed GL path; it is unrelated to iOS build verification.
 
 ---
 
@@ -483,10 +528,14 @@ count**. If `misses` grows linearly with frame count, the calling code
 is creating new tensor objects per frame — review the cache key (Rule 3
 in the Optimization Guide).
 
-The cache also logs `EglImageCache: swept N dead entries` when tensors
-are dropped while their entries are still in the cache. Frequent sweeps
-in a steady-state pipeline are a sign of leaked or churned tensor
-objects.
+Churned tensor objects are no longer a source of misses: identities are
+derived from the buffer's system key and entries outlive the tensor
+that produced them, so a buffer re-imported fresh every frame hits the
+entry the first frame created. Misses that keep climbing now point at
+the *key* rather than the tensor's lifetime — a geometry change
+(`configure_image` reusing a pool buffer at a new size), or a working
+set larger than `EDGEFIRST_EGL_CACHE_CAPACITY` evicting entries before
+they are reused.
 
 ### Verifying backend selection
 
@@ -588,10 +637,8 @@ fn test_steady_state_no_realloc() {
 }
 ```
 
-For the C API,
-[`bench_preproc`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/bench_preproc.c)
-is the reference reproduction of the allocate-once / reuse-every-frame
-pattern and serves as both a benchmark and a regression test.
+For the C API, `make test-capi-link` is the smoke check that a consumer can
+compile against each header and link the matching library.
 
 ### Verifying the inode-keyed cache (V4L2 / libcamera integrations)
 
@@ -630,7 +677,7 @@ pin this:
 
 Both run in CI. If the perf-sanity test fails, suspect a regression in
 `numpy.ascontiguousarray` behaviour or in the Path-3 dispatch logic in
-[`crates/python/src/tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tensor.rs).
+[`crates/python-common/src/tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/src/tensor.rs).
 
 ### Verifying `MaskResolution` selection in COCO validators
 
@@ -640,12 +687,12 @@ not the default `Proto`. Downstream validators should pin this with a
 small assertion at the materialize call site:
 
 ```python
-import edgefirst_hal as hal
+from edgefirst.image import MaskResolution
 
 masks = proc.materialize_masks(
     boxes, scores, classes, proto_data,
     letterbox=letterbox_norm,
-    resolution=hal.MaskResolution.Scaled(orig_w, orig_h),
+    resolution=MaskResolution.Scaled(orig_w, orig_h),
 )
 # Smoke-check the contract: tile shape (h, w, 1) uint8 at orig-image
 # resolution, binary {0, 255} after upsample-then-threshold.
@@ -763,7 +810,7 @@ PBO allocation is unavailable, so they are *not* part of `make test`.
 |------------------------|--------|
 | `gl::tests::convert_f32_pbo_cuda_map_{roundtrip,numeric}` | RGBA→Rgb F32 PBO → device ptr; 256-byte alignment; numeric match |
 | `gl::tests::jpeg_{nv12,nv16,nv24,grey}_convert_cuda_devptr` | full Jetson flow per native format: JPEG decode → NVxx/GREY → convert → PBO → `cuda_map` (colorimetry-correct) |
-| C-API `cuda_devptr_roundtrip` (`crates/capi/tests`) | `hal_tensor_cuda_map` → `hal_tensor_cuda_device_ptr` → `hal_tensor_cuda_unmap` |
+| C-API CUDA map (`crates/tensor-capi`) | `ef_tensor_cuda_map` → `ef_tensor_cuda_device_ptr` → `ef_tensor_cuda_unmap` |
 
 A **dev PC** typically has only the NVIDIA driver (no CUDA toolkit). Install the
 runtime into the local venv and run via the Makefile, which points the HAL's
@@ -792,7 +839,9 @@ To run the on-target CUDA tests manually:
 ```bash
 # Cross-compile (GPU probe + tensor tests)
 cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
-  --workspace --exclude edgefirst_hal
+  --workspace --exclude edgefirst-python-tensor \
+  --exclude edgefirst-python-codec --exclude edgefirst-python-image \
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker
 
 # Deploy and run on orin-nano
 scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_tensor-* \
@@ -910,12 +959,13 @@ attribution still works during the post-target coverage merge.
 
 ## Android On-Device Validation (Device Farm)
 
-No CI runner can execute Android GL — the `build-android` lane is
-compile + clippy + link-validation only (`validate-android-link.sh`
-proves the native symbol closure against the NDK stubs). On-device
-correctness and performance are therefore gated by the internal
-hal-mobile Device Farm harness, which builds against the HAL and
-drives its validation cells through JNI from an instrumented test.
+No CI runner can execute Android GL — the `build-android` lane builds and
+lints the native Rust API only (`edgefirst-tensor`, `-image`, `-codec`,
+`-decoder`, `-tracker`). Link-closure validation against the NDK system
+libraries belongs to `mobile-sdk`, which binds to these crates via
+boltffi. On-device correctness and performance are gated by the internal
+hal-mobile Device Farm harness, which builds against the HAL and drives
+its validation cells through JNI from an instrumented test.
 
 Every pure decision the Android FFI layer relies on — lock-usage mapping,
 descriptor geometry, the vendor classifier, identity interning — is additionally
@@ -976,8 +1026,8 @@ devices where the optimization silently can't engage.
 | `DMA-heap allocation failed` on target | CMA pool exhaustion from parallel tests | Reduce parallelism; use `-j 1` |
 | `cargo-nextest not found` | Tool not installed | `cargo install cargo-nextest` |
 | `cargo-llvm-cov not found` | Tool not installed | `cargo install cargo-llvm-cov --locked` |
-| Python tests fail with `ModuleNotFoundError` | Bindings not built | `maturin develop -m crates/python/Cargo.toml` |
-| C API tests fail with `libedgefirst_hal.so not found` | C library not built | `cargo build --release -p edgefirst-hal-capi` |
+| Python tests fail with `ModuleNotFoundError` | Bindings not built | `maturin develop -m crates/python-tensor/Cargo.toml` |
+| C API tests fail with `libedgefirst_tensor.so not found` | Modular C libraries not built | `make capi-libs` |
 | GL tests all skip | No EGL display available | Expected on headless CI; set `DISPLAY` or use a virtual framebuffer |
 | `EDGEFIRST_TESTDATA_DIR not set` panic | Running cross-compiled bench without env | Export `EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata` on target |
 | CI fmt / clippy failure | Local gate skipped | Run `make format lint check` before committing |

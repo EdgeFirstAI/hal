@@ -45,6 +45,22 @@ pub(crate) struct CudaTable {
 
 static TABLE: OnceLock<Option<CudaTable>> = OnceLock::new();
 
+// Miri cannot execute `dlopen` -- it is a foreign function Miri's
+// interpreter refuses outright ("can't call foreign function `dlopen`"),
+// not merely a syscall it emulates differently. `Tensor::new` calls
+// `try_init_dma_cuda` unconditionally on Linux (`lib.rs`), which calls
+// `is_cuda_available` -> `table` -> `load` before it even checks whether
+// the tensor is DMA-backed, so this fires on every tensor construction
+// under Miri, DMA or not. Reporting "unavailable" here is not suppressing
+// a finding: this module's own contract is "absent libcudart => every CUDA
+// path degrades to `None`" (see the module doc), and under Miri libcudart
+// is, honestly, never going to be found.
+#[cfg(miri)]
+fn load() -> Option<CudaTable> {
+    None
+}
+
+#[cfg(not(miri))]
 fn load() -> Option<CudaTable> {
     let lib = ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"]
         .iter()
@@ -100,7 +116,7 @@ pub unsafe fn memcpy_device_to_host(
     count: usize,
 ) -> bool {
     match table() {
-        Some(t) => (t.memcpy)(host, device, count, CUDA_MEMCPY_DEVICE_TO_HOST) == 0,
+        Some(t) => unsafe { (t.memcpy)(host, device, count, CUDA_MEMCPY_DEVICE_TO_HOST) == 0 },
         None => false,
     }
 }
@@ -127,7 +143,7 @@ pub fn stream_create() -> Option<CudaStream> {
 /// destroyed.
 pub unsafe fn stream_synchronize(stream: CudaStream) -> bool {
     match table() {
-        Some(t) => (t.stream_synchronize)(stream) == 0,
+        Some(t) => unsafe { (t.stream_synchronize)(stream) == 0 },
         None => false,
     }
 }
@@ -140,7 +156,7 @@ pub unsafe fn stream_synchronize(stream: CudaStream) -> bool {
 /// used after this call.
 pub unsafe fn stream_destroy(stream: CudaStream) {
     if let Some(t) = table() {
-        let _ = (t.stream_destroy)(stream);
+        let _ = unsafe { (t.stream_destroy)(stream) };
     }
 }
 
@@ -263,29 +279,48 @@ pub(crate) struct CudaExternalMemoryBufferDesc {
 /// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
 /// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
 /// by gpu-probe O5 on Orin. Best-effort: returns `None` on failure.
-#[cfg(target_os = "linux")]
+// `static`-only: the sole caller, `Tensor::try_init_dma_cuda` (`lib.rs`), is
+// itself `#[cfg(feature = "static")]` (it reads `self.storage:
+// TensorStorage`, a `static`-only field). The rest of this module
+// (`CudaHandle`, `CudaMap`, `gl_register_buffer`, ...) stays available under
+// `dynamic` -- `dynamic_tensor::Tensor::cuda`/`cuda_map` return their types.
+#[cfg(all(target_os = "linux", feature = "static"))]
 pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mut c_void)> {
-    use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
     let t = table()?;
     // cudaExternalMemoryHandleTypeOpaqueFd TAKES OWNERSHIP of the fd on a
     // successful import (CUDA closes it at cudaDestroyExternalMemory). The
     // caller's fd is owned by TensorStorage::Dma and closed on tensor drop,
     // so hand CUDA a dup to avoid a double-close.
-    let dup_fd = unsafe { BorrowedFd::borrow_raw(fd) }
+    // Keep the dup as OwnedFd until CUDA tells us whether it consumed it.
+    // `into_raw_fd` before the call left a window where a failed import that
+    // still closed the fd (observed on discrete NVIDIA + /dev/dma_heap) made
+    // `OwnedFd::from_raw_fd` + drop trip Rust's IO-safety abort.
+    let dup = unsafe { BorrowedFd::borrow_raw(fd) }
         .try_clone_to_owned()
-        .ok()?
-        .into_raw_fd();
+        .ok()?;
     let mut desc: CudaExternalMemoryHandleDesc = unsafe { std::mem::zeroed() };
     desc.type_ = CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD as c_int;
-    desc.handle_fd = dup_fd;
+    desc.handle_fd = dup.as_raw_fd();
     desc.size = size as u64;
     let mut ext: ExternalMemory = std::ptr::null_mut();
-    if unsafe { (t.import_external_memory)(&mut ext, &desc as *const _ as *const c_void) } != 0 {
-        // Import failed → CUDA did NOT take ownership; reclaim and close the dup.
-        drop(unsafe { OwnedFd::from_raw_fd(dup_fd) });
+    let rc = unsafe { (t.import_external_memory)(&mut ext, &desc as *const _ as *const c_void) };
+    if rc != 0 {
+        log::debug!("cudaImportExternalMemory(OpaqueFd, size={size}) failed: cudaError {rc}");
+        // CUDA docs: a failed import does not consume the fd. Discrete NVIDIA
+        // drivers have been observed to close it anyway; reclaim via libc so
+        // an already-closed dup does not trip Rust's IO-safety abort.
+        let raw = dup.into_raw_fd();
+        if unsafe { libc::close(raw) } != 0 {
+            log::debug!(
+                "reclaim of CUDA-import dup fd {raw} after failed import: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         return None;
     }
-    // Success: CUDA now owns dup_fd; it is closed by cudaDestroyExternalMemory.
+    // Success: CUDA now owns the dup; it is closed by cudaDestroyExternalMemory.
+    let _ = dup.into_raw_fd();
     let bdesc = CudaExternalMemoryBufferDesc {
         offset: 0,
         size: size as u64,

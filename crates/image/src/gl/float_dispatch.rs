@@ -13,7 +13,7 @@
 //! on [`FloatRenderPath::PboF16Nchw`] / [`PboF32Nhwc`] / [`ZeroCopyF16Nchw`].
 //!
 //! [`ZeroCopyF16Nchw`] deliberately covers BOTH platforms' zero-copy F16
-//! render targets: a macOS IOSurface tensor reports `TensorMemory::Dma`
+//! render targets: a macOS IOSurface tensor reports `TensorMemory::DmaBuf`
 //! (IOSurface shares the `Dma` memory slot), so the same
 //! `(Rgba, PlanarRgb, F16, Dma)` tuple that selects the Linux DMA-BUF render
 //! selects the IOSurface render on macOS — which buffer object backs the
@@ -47,7 +47,7 @@ pub(super) enum FloatRenderPath {
     PboF32Nhwc,
     /// RGBA → PlanarRgb F16 into a zero-copy GPU buffer destination via
     /// `convert_float_to_zero_copy` — a DMA-BUF on Linux, an IOSurface on
-    /// macOS (both report `TensorMemory::Dma`).
+    /// macOS (both report `TensorMemory::DmaBuf`).
     ZeroCopyF16Nchw,
 }
 
@@ -59,13 +59,13 @@ pub(super) enum FloatRenderPath {
 /// callers can fall through to the existing u8 path.
 ///
 /// This is the single definition of the float-path decision. A
-/// [`TensorMemory::Dma`] destination means "the platform's zero-copy GPU
+/// [`TensorMemory::DmaBuf`] destination means "the platform's zero-copy GPU
 /// buffer" — a DMA-BUF on Linux, an IOSurface on macOS (they share the
-/// `Dma` slot — see [`edgefirst_tensor::TensorMemory::Dma`]); the platform
+/// `Dma` slot — see [`edgefirst_tensor::TensorMemory::DmaBuf`]); the platform
 /// seam, not this classifier, resolves which import backs the render.
 ///
 /// [`TensorMemory::Pbo`]: edgefirst_tensor::TensorMemory::Pbo
-/// [`TensorMemory::Dma`]: edgefirst_tensor::TensorMemory::Dma
+/// [`TensorMemory::DmaBuf`]: edgefirst_tensor::TensorMemory::DmaBuf
 pub(super) fn classify_float_render(
     src: edgefirst_tensor::PixelFormat,
     dst: edgefirst_tensor::PixelFormat,
@@ -78,7 +78,7 @@ pub(super) fn classify_float_render(
         (Rgba, PlanarRgb, DType::F16, TensorMemory::Pbo) if support.f16 => {
             FloatRenderPath::PboF16Nchw
         }
-        (Rgba, PlanarRgb, DType::F16, TensorMemory::Dma) if support.f16 => {
+        (Rgba, PlanarRgb, DType::F16, TensorMemory::DmaBuf) if support.f16 => {
             FloatRenderPath::ZeroCopyF16Nchw
         }
         (Rgba, Rgb, DType::F32, TensorMemory::Pbo) if support.f32 => FloatRenderPath::PboF32Nhwc,
@@ -126,7 +126,7 @@ mod tests {
                 PixelFormat::Rgba,
                 PixelFormat::PlanarRgb,
                 DType::F16,
-                TensorMemory::Dma,
+                TensorMemory::DmaBuf,
                 YES
             ),
             FloatRenderPath::ZeroCopyF16Nchw

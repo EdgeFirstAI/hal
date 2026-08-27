@@ -10,15 +10,14 @@ ModelPack ``tests/test_tiled_merge.py``.
 
 import numpy as np
 import pytest
-
-from edgefirst_hal import (
+from edgefirst.decoder import (
     MatchMetric,
     MergeConfig,
     TiledFrameAccumulator,
-    TilePlacement,
     lift_tile_boxes,
     merge_tiled_detections,
 )
+from edgefirst.image import TilePlacement
 
 
 def _triple(boxes, scores, classes):
@@ -221,7 +220,7 @@ def test_accumulator_out_of_order_equals_in_order():
 
 
 def test_accumulator_dedups_duplicate_push():
-    frame, (p0, t0), (p1, t1) = _seam_tiles()
+    frame, (p0, t0), (_p1, _t1) = _seam_tiles()
     acc = TiledFrameAccumulator(frame, 2, MergeConfig())
     assert acc.push_tile(*t0, p0) is True
     # Duplicate index is ignored (idempotent under at-least-once delivery).

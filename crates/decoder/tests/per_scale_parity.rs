@@ -12,13 +12,26 @@
 //! Tests gracefully skip when `tflite_runtime` is not available or the
 //! fixture model files are missing.
 
+/// Emit a skip notice that survives libtest's output capture.
+///
+/// libtest captures `println!`/`eprintln!` and replays it only for **failing**
+/// tests, so a test that skips and returns prints `... ok` with its reason
+/// discarded — indistinguishable from one that did the work. Writing to
+/// `std::io::stderr()` directly bypasses that. See TESTING.md.
+macro_rules! skip_note {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = write!(&mut std::io::stderr(), "SKIPPED: ");
+        let _ = writeln!(&mut std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const REFERENCE_SCRIPT: &str = "scripts/per_scale_decode_reference.py";
-const FIXTURES_DIR: &str = "testdata/per_scale";
 
 /// Workspace root, resolved from this crate's manifest dir.
 /// `cargo test` sets CWD = `<workspace>/crates/decoder`, so we walk up two
@@ -37,8 +50,21 @@ fn reference_script_path() -> PathBuf {
 
 /// Path to the per-scale fixtures directory.
 #[allow(dead_code)]
+/// Root of the `testdata/` tree.
+///
+/// `EDGEFIRST_TESTDATA_DIR` wins when set; the `workspace_root()` fallback is
+/// baked in at COMPILE time, so a cross-compiled binary carries the build
+/// host's absolute path. That is why 12 of these tests skipped silently on
+/// every board — they looked for `/Users/.../crates/decoder/../../testdata`,
+/// found nothing, and reported `... ok`.
+fn testdata_root() -> PathBuf {
+    std::env::var("EDGEFIRST_TESTDATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("testdata"))
+}
+
 fn fixtures_dir_path() -> PathBuf {
-    workspace_root().join(FIXTURES_DIR)
+    testdata_root().join("per_scale")
 }
 
 /// Returns true when the Python reference is runnable in this env.
@@ -121,9 +147,23 @@ fn per_scale_parity_harness_compiles() {
     assert!(close_within_ulp(1.0_f32, 1.0_f32, 1));
 }
 
+/// True only when the source repo is present at the compiled-in path.
+///
+/// These two tests assert *repo layout*, so they are meaningless for a
+/// cross-compiled binary deployed to a board, where only the test binary and
+/// `testdata/` exist. Without this guard they fail on every target — an
+/// assertion about the build host masquerading as a product defect.
+fn repo_is_present() -> bool {
+    workspace_root().join("Cargo.toml").exists()
+}
+
 /// Verifies the Python script exists at the expected path.
 #[test]
 fn python_reference_script_exists_in_repo() {
+    if !repo_is_present() {
+        skip_note!("source repo not present (deployed on-target run)");
+        return;
+    }
     let p = reference_script_path();
     assert!(p.exists(), "expected {p:?} to exist; check repo layout");
 }
@@ -131,6 +171,10 @@ fn python_reference_script_exists_in_repo() {
 /// Verifies the fixtures dir exists.
 #[test]
 fn fixtures_dir_exists_in_repo() {
+    if !repo_is_present() {
+        skip_note!("source repo not present (deployed on-target run)");
+        return;
+    }
     let p = fixtures_dir_path();
     assert!(p.exists(), "expected {p:?} to exist; created in Task 13");
 }
@@ -634,8 +678,8 @@ fn synthetic_ltrb_nchw_and_nhwc_produce_identical_detections() {
 #[test]
 #[ignore = "external real-model fixture; this is Python-only smoke and does not exercise HAL decode"]
 fn parity_yolov8n_seg_per_scale_int8() {
-    let model = workspace_root()
-        .join(FIXTURES_DIR)
+    let model = testdata_root()
+        .join("per_scale")
         .join("yolov8n_seg_per_scale_int8.tflite");
     if !model.exists() {
         eprintln!(
@@ -645,14 +689,14 @@ fn parity_yolov8n_seg_per_scale_int8() {
         return;
     }
     if !python_reference_available() {
-        eprintln!("skipping: tflite_runtime not importable in Python env");
+        skip_note!("tflite_runtime not importable in Python env");
         return;
     }
     let py_result = run_python_reference(&model, None);
     let py_result = match py_result {
         Some(v) => v,
         None => {
-            eprintln!("skipping: Python reference failed to run");
+            skip_note!("Python reference failed to run");
             return;
         }
     };
@@ -660,7 +704,7 @@ fn parity_yolov8n_seg_per_scale_int8() {
         .get("num_detections")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    eprintln!("python reference detected {n} boxes on synthetic input");
+    skip_note!("python reference detected {n} boxes on synthetic input");
     // TODO: after the inference layer is integrated, run
     // HAL on the same synthetic input and compare detection counts +
     // per-detection scores within ~2 ulp f32. Currently we just
@@ -670,15 +714,15 @@ fn parity_yolov8n_seg_per_scale_int8() {
 #[test]
 #[ignore = "external real-model fixture; this is Python-only smoke and does not exercise HAL decode"]
 fn parity_yolo26n_seg_per_scale_int8() {
-    let model = workspace_root()
-        .join(FIXTURES_DIR)
+    let model = testdata_root()
+        .join("per_scale")
         .join("yolo26n_seg_per_scale_int8.tflite");
     if !model.exists() {
-        eprintln!("skipping: yolo26n fixture not present");
+        skip_note!("yolo26n fixture not present");
         return;
     }
     if !python_reference_available() {
-        eprintln!("skipping: tflite_runtime not importable");
+        skip_note!("tflite_runtime not importable");
         return;
     }
     let py_result = run_python_reference(&model, None);
@@ -690,7 +734,7 @@ fn parity_yolo26n_seg_per_scale_int8() {
         .get("num_detections")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    eprintln!("python reference detected {n} boxes on synthetic input");
+    skip_note!("python reference detected {n} boxes on synthetic input");
 }
 
 #[test]
@@ -742,7 +786,7 @@ stnp.save_file({{
             return;
         }
         Err(e) => {
-            eprintln!("skip: python not available: {e}");
+            skip_note!("python not available: {e}");
             return;
         }
     }
@@ -801,11 +845,11 @@ stnp.save_file({{
     match out {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
-            eprintln!("skip: python: {}", String::from_utf8_lossy(&o.stderr));
+            skip_note!("python: {}", String::from_utf8_lossy(&o.stderr));
             return;
         }
         Err(e) => {
-            eprintln!("skip: python: {e}");
+            skip_note!("python: {e}");
             return;
         }
     }
@@ -867,7 +911,9 @@ stnp.save_file({{
     match out {
         Ok(o) if o.status.success() => {}
         _ => {
-            eprintln!("skip: python");
+            skip_note!(
+                "python3 with numpy/safetensors unavailable; cannot build the synthetic fixture"
+            );
             return;
         }
     }
@@ -925,7 +971,9 @@ stnp.save_file({{
     match out {
         Ok(o) if o.status.success() => {}
         _ => {
-            eprintln!("skip");
+            skip_note!(
+                "python3 with numpy/safetensors unavailable; cannot build the synthetic fixture"
+            );
             return;
         }
     }
@@ -988,7 +1036,9 @@ stnp.save_file({{
     match out {
         Ok(o) if o.status.success() => {}
         _ => {
-            eprintln!("skip");
+            skip_note!(
+                "python3 with numpy/safetensors unavailable; cannot build the synthetic fixture"
+            );
             return;
         }
     }
@@ -1006,8 +1056,7 @@ stnp.save_file({{
 
 #[test]
 fn fixture_loader_returns_not_present_for_missing_path() {
-    let nonexistent =
-        workspace_root().join("testdata/decoder/this-fixture-does-not-exist.safetensors");
+    let nonexistent = testdata_root().join("decoder/this-fixture-does-not-exist.safetensors");
     let err = common::per_scale_fixture::PerScaleFixture::load(&nonexistent)
         .err()
         .expect("expected an error for a nonexistent path");
@@ -1422,7 +1471,7 @@ fn assert_pre_nms_parity(fix: &common::per_scale_fixture::PerScaleFixture, model
 }
 
 fn fixture_path(basename: &str) -> std::path::PathBuf {
-    workspace_root().join("testdata/decoder").join(basename)
+    testdata_root().join("decoder").join(basename)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1438,7 +1487,7 @@ fn yolov8n_seg_per_scale_smoke_detection_count() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("fixture load failed: {e}"),
@@ -1485,7 +1534,7 @@ fn assert_per_scale_decode_with_masks_succeeds(model_label: &str, fixture_filena
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("fixture load failed: {e}"),
@@ -1568,7 +1617,7 @@ fn yolov8n_seg_per_scale_end_to_end_parity() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1582,7 +1631,7 @@ fn yolov8n_seg_per_scale_class_aware_superset() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1596,7 +1645,7 @@ fn yolov8n_seg_per_scale_pre_nms_parity() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture not present");
+            skip_note!("fixture not present");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1625,7 +1674,7 @@ fn yolov8n_seg_pre_nms_top_k_sensitivity() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture not present");
+            skip_note!("fixture not present");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1731,7 +1780,7 @@ fn yolo11n_seg_per_scale_smoke_detection_count() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("fixture load failed: {e}"),
@@ -1769,7 +1818,7 @@ fn yolo11n_seg_per_scale_end_to_end_parity() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1783,7 +1832,7 @@ fn yolo11n_seg_per_scale_class_aware_superset() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1797,7 +1846,7 @@ fn yolo11n_seg_per_scale_pre_nms_parity() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture not present");
+            skip_note!("fixture not present");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1827,7 +1876,7 @@ fn yolo26n_seg_per_scale_smoke_detection_count() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("fixture load failed: {e}"),
@@ -1865,7 +1914,7 @@ fn yolo26n_seg_per_scale_end_to_end_parity() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1879,7 +1928,7 @@ fn yolo26n_seg_per_scale_class_aware_superset() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("{e}"),
@@ -1893,7 +1942,7 @@ fn yolo26n_seg_per_scale_pre_nms_parity() {
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture not present");
+            skip_note!("fixture not present");
             return;
         }
         Err(e) => panic!("{e}"),

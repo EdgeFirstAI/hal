@@ -134,7 +134,7 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
     // Zero-copy probe covers IOSurface on macOS too — is_dma_available()
     // is false there and would silently measure CPU-heap converts.
     let mem = if cell.use_dma && edgefirst_tensor::is_gpu_buffer_available() {
-        Some(TensorMemory::Dma)
+        Some(TensorMemory::DmaBuf)
     } else {
         Some(TensorMemory::Mem)
     };

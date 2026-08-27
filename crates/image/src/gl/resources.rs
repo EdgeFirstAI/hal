@@ -107,7 +107,7 @@ impl Texture {
         if Platform::PERSISTENT_TEX_BINDINGS && self.bound_egl_key == Some(key) {
             return Ok(false);
         }
-        Platform::attach_tex_image_2d(display, handle)?;
+        unsafe { Platform::attach_tex_image_2d(display, handle)? };
         if Platform::PERSISTENT_TEX_BINDINGS {
             self.bound_egl_key = Some(key);
         }
@@ -131,7 +131,7 @@ impl Texture {
         if Platform::PERSISTENT_TEX_BINDINGS && self.bound_egl_key == Some(key) {
             return Ok(false);
         }
-        Platform::attach_tex_image_external(display, handle)?;
+        unsafe { Platform::attach_tex_image_external(display, handle)? };
         if Platform::PERSISTENT_TEX_BINDINGS {
             self.bound_egl_key = Some(key);
         }

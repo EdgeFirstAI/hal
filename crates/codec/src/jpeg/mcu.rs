@@ -729,15 +729,52 @@ where
                                     // IDCT to a local block, then copy the columns that
                                     // fit — writing through would corrupt the next
                                     // row's left edge.
-                                    let mut tmp = [0u8; 64];
-                                    idct_into(
-                                        has_ac, last_k, &coeffs, quant, &mut tmp, 8, idct_fn,
-                                        idct_dc_fn,
-                                    );
-                                    let cols = grid_row_stride - x_offset; // < 8
-                                    for r in 0..8 {
-                                        let d = dst_off + r * grid_row_stride;
-                                        dst[d..d + cols].copy_from_slice(&tmp[r * 8..r * 8 + cols]);
+                                    //
+                                    // `cols` saturates to 0 instead of underflowing when
+                                    // the block starts at or past `grid_row_stride`
+                                    // (`x_offset >= grid_row_stride`). That is not a
+                                    // caller error: `decode_image`'s own upfront check
+                                    // (above) only requires `grid_row_stride` to cover the
+                                    // image's even-rounded *logical* width, not the wider
+                                    // MCU-aligned width this loop iterates over — any width
+                                    // not a multiple of the MCU pixel width (16 for 4:2:0)
+                                    // hits this by design, on a perfectly
+                                    // legitimate, upfront-validated buffer. A block wholly
+                                    // past the edge carries no pixels that belong in `dst`
+                                    // at all (pure MCU padding), so it is simply not
+                                    // written — the same clip this branch already applies
+                                    // to a *partial* spill, generalised to zero columns
+                                    // instead of underflowing into a huge value that wraps
+                                    // back into an in-range-looking but inverted slice
+                                    // range (the panic this originally guarded against).
+                                    let cols = grid_row_stride.saturating_sub(x_offset); // 0..8
+                                    if cols > 0 {
+                                        let mut tmp = [0u8; 64];
+                                        idct_into(
+                                            has_ac, last_k, &coeffs, quant, &mut tmp, 8, idct_fn,
+                                            idct_dc_fn,
+                                        );
+                                        for r in 0..8 {
+                                            let d = dst_off + r * grid_row_stride;
+                                            let end = d + cols;
+                                            if end > dst.len() {
+                                                // Unlike the horizontal MCU-padding overshoot
+                                                // clipped above, this IS a genuine
+                                                // destination-size fault: `dst` doesn't hold
+                                                // as many rows as the image needs at this
+                                                // stride. Blame the destination, not the
+                                                // JPEG -- reuse the tensor crate's own
+                                                // capacity vocabulary rather than
+                                                // `InvalidData`.
+                                                return Err(CodecError::Tensor(
+                                                    edgefirst_tensor::Error::InsufficientCapacity {
+                                                        needed: end,
+                                                        capacity: dst.len(),
+                                                    },
+                                                ));
+                                            }
+                                            dst[d..end].copy_from_slice(&tmp[r * 8..r * 8 + cols]);
+                                        }
                                     }
                                 }
                             } else {
@@ -1286,7 +1323,7 @@ fn downsample_uv_row_2x2(cb0: &[u8], cb1: &[u8], cr0: &[u8], cr1: &[u8], dst: &m
         // SAFETY: bounds asserted above; the loop reads 16 input bytes and
         // writes 16 output bytes per 8 pairs.
         unsafe {
-            use core::arch::aarch64::*;
+            use core::arch::aarch64::*; // NOSONAR
             while i + 8 <= n {
                 let s = i * 2;
                 // Pairwise-add within each row (u8→u16), add rows, then a
@@ -1341,7 +1378,7 @@ fn downsample_uv_row_v2(cb0: &[u8], cb1: &[u8], cr0: &[u8], cr1: &[u8], dst: &mu
     {
         // SAFETY: bounds asserted above.
         unsafe {
-            use core::arch::aarch64::*;
+            use core::arch::aarch64::*; // NOSONAR
             while i + 16 <= n {
                 // vhaddq: truncating halving add — matches (a+b)/2.
                 let b = vhaddq_u8(vld1q_u8(cb0.as_ptr().add(i)), vld1q_u8(cb1.as_ptr().add(i)));
@@ -1575,9 +1612,9 @@ unsafe fn interleave_uv_row_neon(cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize)
 #[target_feature(enable = "sse2")]
 unsafe fn interleave_uv_row_sse2(cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize) {
     #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
+    use core::arch::x86::*; // NOSONAR
     #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
+    use core::arch::x86_64::*; // NOSONAR
     let mut i = 0usize;
     while i + 16 <= n {
         let b = _mm_loadu_si128(cb.as_ptr().add(i) as *const __m128i);
@@ -1649,6 +1686,90 @@ mod tests {
                     .join(name)
             });
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// Task 10b, defect B: `grid_row_stride` need only cover the *logical*
+    /// even-rounded width (the public `decode_image`'s own upfront check,
+    /// above) to be accepted -- it does not have to cover the *MCU-aligned*
+    /// width the block loop actually writes to. 500 is not a multiple of 16
+    /// (the 4:2:0 MCU pixel width: 2 luma blocks × 8px), so the right-edge
+    /// MCU at column 496 spills a block whose columns run to 504 — 4 bytes
+    /// past a `grid_row_stride=500` buffer. This exact width×format
+    /// (coco_420_odd.jpg, 500×375 NV12) is what the reported bug panicked
+    /// on: `dst[504..500]` (`cols` underflowed, then wrapped back into a
+    /// deceptively small-looking but inverted range) -- reachable from
+    /// Python via `decode_into` on a `HOST` import whose capacity/stride
+    /// didn't survive the cross-package round trip (the other half of
+    /// defect B, fixed in `edgefirst_tensor::protocol`/`import_descriptor`).
+    ///
+    /// A `grid_row_stride` that only covers the logical width is not caller
+    /// error -- `decode_image`'s own upfront check accepts exactly this, and
+    /// it is the normal case for any 4:2:0 width not a multiple of 16 -- so
+    /// the fix clips the out-of-range MCU padding (the same clip this
+    /// function's sibling branch already applies to a *partial* spill,
+    /// generalised to zero columns) rather than erroring. Verified two ways:
+    /// the call must succeed (not panic, not error), and every real pixel
+    /// column of every luma row must match a reference decode into a
+    /// generously-padded buffer, proving the clip drops only MCU padding,
+    /// never image data.
+    #[test]
+    fn undersized_row_stride_clips_padding_instead_of_panicking() {
+        let jpeg = test_jpeg("coco_420_odd.jpg");
+        let headers = super::super::markers::parse_markers(&jpeg).unwrap();
+        let fmt = super::super::native_format(&headers).unwrap();
+        assert_eq!(fmt, PixelFormat::Nv12, "precondition: 4:2:0 source");
+        let img_w = headers.header.width as usize;
+        let img_h = headers.header.height as usize;
+        assert_eq!(
+            (img_w, img_h),
+            (500, 375),
+            "precondition: the reported dims"
+        );
+        assert!(
+            !img_w.is_multiple_of(16),
+            "precondition: width must not already be MCU-aligned, or this \
+             test cannot reproduce the right-edge spill"
+        );
+
+        let total_rows = fmt.combined_plane_height(img_h).unwrap();
+
+        // Reference: a stride with room well past the MCU-aligned width, so
+        // every block (including the right-edge one) writes through the
+        // direct (non-clipping) path.
+        let ref_stride = img_w.next_multiple_of(64);
+        let mut ref_scratch = McuScratch::new(&headers);
+        let mut reference = vec![0u8; ref_stride * total_rows];
+        decode_image(
+            &jpeg,
+            &headers,
+            &mut ref_scratch,
+            &mut reference,
+            ref_stride,
+            fmt,
+            false,
+        )
+        .unwrap();
+
+        // Under test: the logical (even-rounded), NOT MCU-aligned, stride --
+        // exactly what `decode_image`'s own upfront `grid_row_stride <
+        // min_stride` check accepts as sufficient. This is what previously
+        // panicked.
+        let stride = img_w.next_multiple_of(2);
+        let mut scratch = McuScratch::new(&headers);
+        let mut dst = vec![0u8; stride * total_rows]; // exactly `needed`, no slack
+        decode_image(&jpeg, &headers, &mut scratch, &mut dst, stride, fmt, false)
+            .expect("an MCU-unaligned row stride must clip the padding, not panic or error");
+
+        // Every real luma column of every luma row (the direct-write path
+        // this fix touches) must match the reference exactly.
+        for row in 0..img_h {
+            let got = &dst[row * stride..row * stride + img_w];
+            let want = &reference[row * ref_stride..row * ref_stride + img_w];
+            assert_eq!(
+                got, want,
+                "luma row {row} diverges from the reference decode"
+            );
+        }
     }
 
     /// Kernel parity: the structured NV12 downsample rows must match

@@ -514,73 +514,75 @@ pub fn jaccard_batch4(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [b
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn jaccard_batch4_neon(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [bool; 4] {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
 
-    let zero = vdupq_n_f32(0.0);
-    let iou_v = vdupq_n_f32(iou);
+        let zero = vdupq_n_f32(0.0);
+        let iou_v = vdupq_n_f32(iou);
 
-    // Reference box broadcast.
-    let a_xmin = vdupq_n_f32(a.xmin);
-    let a_ymin = vdupq_n_f32(a.ymin);
-    let a_xmax = vdupq_n_f32(a.xmax);
-    let a_ymax = vdupq_n_f32(a.ymax);
-    let area_a = vmulq_f32(vsubq_f32(a_xmax, a_xmin), vsubq_f32(a_ymax, a_ymin));
+        // Reference box broadcast.
+        let a_xmin = vdupq_n_f32(a.xmin);
+        let a_ymin = vdupq_n_f32(a.ymin);
+        let a_xmax = vdupq_n_f32(a.xmax);
+        let a_ymax = vdupq_n_f32(a.ymax);
+        let area_a = vmulq_f32(vsubq_f32(a_xmax, a_xmin), vsubq_f32(a_ymax, a_ymin));
 
-    // Load 4 boxes (each BoundingBox is [xmin, ymin, xmax, ymax]).
-    let b0 = vld1q_f32(&boxes[0].xmin as *const f32);
-    let b1 = vld1q_f32(&boxes[1].xmin as *const f32);
-    let b2 = vld1q_f32(&boxes[2].xmin as *const f32);
-    let b3 = vld1q_f32(&boxes[3].xmin as *const f32);
+        // Load 4 boxes (each BoundingBox is [xmin, ymin, xmax, ymax]).
+        let b0 = vld1q_f32(&boxes[0].xmin as *const f32);
+        let b1 = vld1q_f32(&boxes[1].xmin as *const f32);
+        let b2 = vld1q_f32(&boxes[2].xmin as *const f32);
+        let b3 = vld1q_f32(&boxes[3].xmin as *const f32);
 
-    // AoS → SoA transpose (4×4).
-    let t01_lo = vtrn1q_f32(b0, b1); // xmin0,xmin1,xmax0,xmax1
-    let t01_hi = vtrn2q_f32(b0, b1); // ymin0,ymin1,ymax0,ymax1
-    let t23_lo = vtrn1q_f32(b2, b3);
-    let t23_hi = vtrn2q_f32(b2, b3);
+        // AoS → SoA transpose (4×4).
+        let t01_lo = vtrn1q_f32(b0, b1); // xmin0,xmin1,xmax0,xmax1
+        let t01_hi = vtrn2q_f32(b0, b1); // ymin0,ymin1,ymax0,ymax1
+        let t23_lo = vtrn1q_f32(b2, b3);
+        let t23_hi = vtrn2q_f32(b2, b3);
 
-    let b_xmin = vreinterpretq_f32_f64(vtrn1q_f64(
-        vreinterpretq_f64_f32(t01_lo),
-        vreinterpretq_f64_f32(t23_lo),
-    ));
-    let b_ymin = vreinterpretq_f32_f64(vtrn1q_f64(
-        vreinterpretq_f64_f32(t01_hi),
-        vreinterpretq_f64_f32(t23_hi),
-    ));
-    let b_xmax = vreinterpretq_f32_f64(vtrn2q_f64(
-        vreinterpretq_f64_f32(t01_lo),
-        vreinterpretq_f64_f32(t23_lo),
-    ));
-    let b_ymax = vreinterpretq_f32_f64(vtrn2q_f64(
-        vreinterpretq_f64_f32(t01_hi),
-        vreinterpretq_f64_f32(t23_hi),
-    ));
+        let b_xmin = vreinterpretq_f32_f64(vtrn1q_f64(
+            vreinterpretq_f64_f32(t01_lo),
+            vreinterpretq_f64_f32(t23_lo),
+        ));
+        let b_ymin = vreinterpretq_f32_f64(vtrn1q_f64(
+            vreinterpretq_f64_f32(t01_hi),
+            vreinterpretq_f64_f32(t23_hi),
+        ));
+        let b_xmax = vreinterpretq_f32_f64(vtrn2q_f64(
+            vreinterpretq_f64_f32(t01_lo),
+            vreinterpretq_f64_f32(t23_lo),
+        ));
+        let b_ymax = vreinterpretq_f32_f64(vtrn2q_f64(
+            vreinterpretq_f64_f32(t01_hi),
+            vreinterpretq_f64_f32(t23_hi),
+        ));
 
-    // Intersection.
-    let left = vmaxq_f32(a_xmin, b_xmin);
-    let top = vmaxq_f32(a_ymin, b_ymin);
-    let right = vminq_f32(a_xmax, b_xmax);
-    let bottom = vminq_f32(a_ymax, b_ymax);
-    let w = vmaxq_f32(vsubq_f32(right, left), zero);
-    let h = vmaxq_f32(vsubq_f32(bottom, top), zero);
-    let intersection = vmulq_f32(w, h);
+        // Intersection.
+        let left = vmaxq_f32(a_xmin, b_xmin);
+        let top = vmaxq_f32(a_ymin, b_ymin);
+        let right = vminq_f32(a_xmax, b_xmax);
+        let bottom = vminq_f32(a_ymax, b_ymax);
+        let w = vmaxq_f32(vsubq_f32(right, left), zero);
+        let h = vmaxq_f32(vsubq_f32(bottom, top), zero);
+        let intersection = vmulq_f32(w, h);
 
-    // Area B.
-    let area_b = vmulq_f32(vsubq_f32(b_xmax, b_xmin), vsubq_f32(b_ymax, b_ymin));
+        // Area B.
+        let area_b = vmulq_f32(vsubq_f32(b_xmax, b_xmin), vsubq_f32(b_ymax, b_ymin));
 
-    // Union = area_a + area_b - intersection.
-    let union = vsubq_f32(vaddq_f32(area_a, area_b), intersection);
+        // Union = area_a + area_b - intersection.
+        let union = vsubq_f32(vaddq_f32(area_a, area_b), intersection);
 
-    // Test: intersection > iou * union (equivalent to IoU > threshold).
-    let iou_union = vmulq_f32(iou_v, union);
-    let mask = vcgtq_f32(intersection, iou_union);
+        // Test: intersection > iou * union (equivalent to IoU > threshold).
+        let iou_union = vmulq_f32(iou_v, union);
+        let mask = vcgtq_f32(intersection, iou_union);
 
-    // Extract per-lane results.
-    [
-        vgetq_lane_u32(mask, 0) != 0,
-        vgetq_lane_u32(mask, 1) != 0,
-        vgetq_lane_u32(mask, 2) != 0,
-        vgetq_lane_u32(mask, 3) != 0,
-    ]
+        // Extract per-lane results.
+        [
+            vgetq_lane_u32(mask, 0) != 0,
+            vgetq_lane_u32(mask, 1) != 0,
+            vgetq_lane_u32(mask, 2) != 0,
+            vgetq_lane_u32(mask, 3) != 0,
+        ]
+    }
 }
 
 #[cfg(test)]

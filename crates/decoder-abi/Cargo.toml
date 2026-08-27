@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-decoder-abi"
+description = "Layout-only C ABI contract for the EdgeFirst detection vocabulary"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+# NO dependencies, ever. `edgefirst-image` and `edgefirst-tracker` depend on
+# this crate precisely so they can name decoder's types without linking
+# decoder's implementation; a dependency here would defeat that.
+[lints]
+workspace = true
+
+[dependencies]

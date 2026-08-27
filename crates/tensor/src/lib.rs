@@ -24,10 +24,11 @@ assert_eq!(tensor.name(), "test_tensor");
 The main structures and traits provided by the `edgefirst_tensor` crate are [`TensorTrait`] and
 [`TensorMapTrait`], which define the behavior of Tensors and their memory mappings, respectively.
 The [`Tensor<T>`] struct wraps a backend-specific storage with optional image format metadata
-([`PixelFormat`]), while the [`TensorMap`] enum provides access to the underlying data. The
+([`PixelFormat`]); mapping a tensor yields a [`HostView`], which implements
+[`TensorMapTrait`] and derefs to the underlying elements. The
 [`TensorDyn`] type-erased enum wraps `Tensor<T>` for runtime element-type dispatch.
 
-[`TensorMemory::Dma`] is one variant with three implementations behind it — a Linux DMA-heap DMA-BUF,
+[`TensorMemory::DmaBuf`] is one variant with three implementations behind it — a Linux DMA-heap DMA-BUF,
 a macOS/iOS `IOSurfaceRef`, or an Android `AHardwareBuffer`. Callers ask for `Dma` and get whichever
 the platform provides, so portable code never branches on the mechanism.
 
@@ -42,7 +43,35 @@ than [`Tensor::new`]. Two things set them apart:
   reject an EGLImage import at an unaligned pitch. Read the real pitch from
   [`Tensor::effective_row_stride`]; don't assume `width * bpp`.
  */
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "static", feature = "dynamic"))]
+compile_error!(
+    "edgefirst-tensor: `static` and `dynamic` are mutually exclusive. \
+     A consumer building the C-API leaves wants `--no-default-features \
+     --features dynamic`; everything else wants the default."
+);
+
+// The workspace declares `default-features = false` for this crate, so
+// nothing arrives here by accident anymore -- every consumer names a
+// backend explicitly. Before that change `static` was always a default and
+// this state was unreachable; now a manifest that forgot to ask for either
+// backend back builds an empty `tensor_dyn` module and fails on confusing
+// `E0432: unresolved import` errors instead of a message that names the
+// actual problem.
+#[cfg(not(any(feature = "static", feature = "dynamic")))]
+compile_error!(
+    "edgefirst-tensor: exactly one backend must be enabled. This crate has \
+     `default-features = false` at the workspace level, so every consumer \
+     must name one explicitly: `features = [\"static\"]` for Rust consumers, \
+     or `[\"dynamic\"]` for the C-API leaves."
+);
+
+// `static`-only: every constructor/accessor here is reached exclusively
+// through `TensorStorage`'s `AHardwareBuffer` variant (`impl<T> Tensor<T>`,
+// gated `#[cfg(feature = "static")]`); under `dynamic` nothing calls into
+// it, which clippy's dead-code lint on Android correctly flags without this
+// gate. Not `#[allow]`-ed: an `allow` here would hide the next real
+// dead-code signal in this module, the opposite of what a gate does.
+#[cfg(all(target_os = "android", feature = "static"))]
 mod ahardwarebuffer;
 // Pure AHardwareBuffer layout logic (format table, descriptor geometry,
 // overflow-checked shape math) — cfg-free so it compiles and unit-tests
@@ -50,21 +79,55 @@ mod ahardwarebuffer;
 #[allow(dead_code)]
 mod ahardwarebuffer_layout;
 pub mod colorimetry;
+#[cfg(feature = "tracing")]
+pub mod trace;
+
 pub mod covguard;
 mod cuda;
-#[cfg(target_os = "linux")]
+mod detect;
+// `static`-gated as well as Linux-gated. `DmaTensor` is storage, and only
+// the `static` backend has storage -- `TensorStorage` itself is already
+// `#[cfg(feature = "static")]`, and the `dynamic` backend reaches a
+// DMA-BUF's fd through `ef_tensor_plane_at` instead of ever constructing
+// one. Until task P2b's F3, this module was kept alive under `dynamic` by a
+// single always-`None` `Tensor::as_dma` whose signature named `DmaTensor`;
+// removing that stub revealed the whole module (the tensor, the sync
+// ioctls, the DRM PRIME helpers, the mmap owner) as dead code there --
+// twenty-six dead-code warnings' worth. It was always dead; one method
+// hid it.
+#[cfg(all(target_os = "linux", feature = "static"))]
 mod dma;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "static"))]
 mod dmabuf;
 mod error;
 mod format;
+// Layout table is backend-agnostic (pure FourCC math). Storage
+// (`IoSurfaceTensor`) is `static`-only; `dynamic` reads IOSurface handles
+// through `ef_tensor_*`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+mod iosurface_layout;
+// `static`-only, same reasoning as `ahardwarebuffer` above: reached only
+// through `TensorStorage`'s `IoSurface` variant.
+#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "static"))]
 mod iosurface;
+pub mod lens;
+// `static`-only: `MemTensor` backs `TensorStorage::Mem`, `impl<T> Tensor<T>`
+// only. `dynamic`'s host-memory allocation goes through `ef_tensor_new`/
+// `ef_tensor_builder_alloc` in `libedgefirst_tensor.so` instead -- there is
+// no local `MemTensor` under `dynamic` to be dead code, so the whole module
+// gates rather than an internal `#[allow]`.
+#[cfg(feature = "static")]
 mod mem;
 mod pbo;
-#[cfg(unix)]
+pub mod pin;
+pub mod protocol;
+// `static`-only, same reasoning as `mem` above: `ShmTensor` backs
+// `TensorStorage::Shm`, `impl<T> Tensor<T>` only.
+#[cfg(all(unix, feature = "static"))]
 mod shm;
 mod tensor_dyn;
+pub mod view;
+mod vocabulary;
 pub use colorimetry::{
     ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry, MatrixWeights, RangeScaling,
 };
@@ -88,40 +151,70 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
 // `TensorStorage` / `TensorMap` enums without leaking into the public API.
 // Exceptions kept public: `Pbo*` is a GL extension point implemented by the
 // image crate, and `image_iosurface_layout` is a public helper.
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "static"))]
 pub use crate::ahardwarebuffer::image_ahardwarebuffer_layout;
-#[cfg(target_os = "android")]
-pub(crate) use crate::ahardwarebuffer::{AHardwareBufferMap, AHardwareBufferTensor};
-#[cfg(target_os = "linux")]
-pub(crate) use crate::dma::{DmaMap, DmaTensor};
+#[cfg(all(target_os = "android", feature = "static"))]
+pub(crate) use crate::ahardwarebuffer::AHardwareBufferTensor;
+#[cfg(all(target_os = "linux", feature = "static"))]
+pub(crate) use crate::dma::DmaTensor;
+#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "static"))]
+pub(crate) use crate::iosurface::IoSurfaceTensor;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use crate::iosurface::image_iosurface_layout;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(crate) use crate::iosurface::{IoSurfaceMap, IoSurfaceTensor};
-pub(crate) use crate::mem::{MemMap, MemTensor};
-pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
-#[cfg(unix)]
-pub(crate) use crate::shm::{ShmMap, ShmTensor};
+pub use crate::iosurface_layout::image_iosurface_layout;
+#[cfg(feature = "static")]
+pub(crate) use crate::mem::MemTensor;
+pub use crate::pbo::{PboMapping, PboOps, PboTensor};
+#[cfg(all(unix, feature = "static"))]
+pub(crate) use crate::shm::ShmTensor;
 pub use cuda::{
     gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
     is_cuda_available, memcpy_device_to_host, stream_create, stream_destroy, stream_synchronize,
     CudaGlOps, CudaHandle, CudaMap, CudaStream,
 };
+pub use detect::{unletter_norm, BoundingBox, DetectBox, ProtoData, ProtoLayout, Segmentation};
 pub use error::{Error, Result};
-pub use format::{ChromaLayout, PixelFormat, PixelLayout};
+// Static-backend-implementation code: backs `tensor-capi`'s own
+// `ef_tensor_export`/`ef_tensor_import` (the static cdylib's `TensorDyn`
+// serialization), the one caller in the whole workspace. It calls
+// `TensorDyn::new`/`from_fd` and reads fields (`.quantization()`,
+// `.colorimetry()`, `.pin_host()`, ...) that only the `static` backend's
+// richer `TensorDyn` surface has, so it never compiled under `dynamic` in
+// fact even though nothing gated it -- see `PRIMITIVE-INVENTORY.md`'s
+// "structural findings".
+#[cfg(feature = "static")]
+pub mod blob;
+#[cfg(feature = "static")]
+pub use blob::{
+    BlobError, BlobHeader, BlobPlane, BlobStrings, BlobView, Regions, TransportMode, HEADER_LEN,
+    PLANE_RECORD_LEN,
+};
+pub use format::{ChromaLayout, PixelFormat, PixelLayout, PlaneGeometry};
+pub use lens::Element;
 use num_traits::Num;
+pub use pin::HostPin;
+pub use protocol::{
+    dtype as tensor_dtype, dtype_to_dtype, format as tensor_format, format_from_code,
+    kind as tensor_kind, SendPtr, TensorDesc, ABI_VERSION,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::{
     fmt,
-    ops::{Deref, DerefMut},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
     },
 };
-pub use tensor_dyn::TensorDyn;
+// `static`'s `Tensor<T>` is declared directly above, in this file; there is
+// nothing to re-export for it. `dynamic`'s lives in `tensor_dyn` (see that
+// module's docs) and is re-exported here under the same crate-root name so
+// both backends present the same `edgefirst_tensor::Tensor` to callers.
+#[cfg(feature = "dynamic")]
+pub use tensor_dyn::Tensor;
+pub use tensor_dyn::{Raw, TensorDyn};
+pub use view::HostView;
+pub use vocabulary::vocabulary_demo;
 
 /// Opaque keep-alive handle for a foreign-memory tensor (see
 /// [`Tensor::from_foreign`] / [`TensorDyn::from_foreign_ptr`]).
@@ -431,22 +524,34 @@ pub struct ViewOrigin {
     pub y: usize,
 }
 
-/// Element type discriminant for runtime type identification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(u8)]
-#[non_exhaustive]
-pub enum DType {
-    U8,
-    I8,
-    U16,
-    I16,
-    U32,
-    I32,
-    U64,
-    I64,
-    F16,
-    F32,
-    F64,
+// Declared through `ef_vocabulary!` (see `vocabulary.rs`): `.code()` is this
+// crate's wire numbering, mirrored by `protocol::dtype` and the C ABI's
+// `hal_dtype`. Both surfaces are generated from the same per-variant literal
+// below rather than re-typed by hand, and `dtype_codes_are_unchanged_by_the_macro`
+// in `tests/vocabulary.rs` pins them against the values already shipping.
+crate::ef_vocabulary! {
+    /// Element type discriminant for runtime type identification.
+    #[derive(Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub enum DType {
+        U8 = 0, "u8", U8,
+        I8 = 1, "i8", I8,
+        U16 = 2, "u16", U16,
+        I16 = 3, "i16", I16,
+        U32 = 4, "u32", U32,
+        I32 = 5, "i32", I32,
+        U64 = 6, "u64", U64,
+        I64 = 7, "i64", I64,
+        F16 = 8, "f16", F16,
+        F32 = 9, "f32", F32,
+        F64 = 10, "f64", F64,
+    }
+    // `#[doc(hidden)]`: this module has to be `pub` for `protocol::dtype`'s
+    // `pub use` re-export below to compile, but it is emission plumbing, not
+    // a second documented API for the same eleven codes -- `protocol::dtype`
+    // is the canonical, documented path.
+    #[doc(hidden)]
+    pub mod dtype_wire;
 }
 
 impl DType {
@@ -460,21 +565,10 @@ impl DType {
         }
     }
 
-    /// Short type name (e.g., "u8", "f32", "f16").
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Self::U8 => "u8",
-            Self::I8 => "i8",
-            Self::U16 => "u16",
-            Self::I16 => "i16",
-            Self::U32 => "u32",
-            Self::I32 => "i32",
-            Self::U64 => "u64",
-            Self::I64 => "i64",
-            Self::F16 => "f16",
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-        }
+    /// Short type name (e.g., "u8", "f32", "f16"). Identical to
+    /// [`DType::as_str`]; kept as its own method for existing callers.
+    pub fn name(&self) -> &'static str {
+        self.as_str()
     }
 }
 
@@ -493,7 +587,10 @@ impl fmt::Display for DType {
 /// `f16` / `f32` / `f64`, `None` otherwise). Used by the macOS IOSurface
 /// image constructors (FourCC / pixel-format lookup) and by the `Mem`
 /// backing's `alloc_zeroed` fast path (these types' `T::zero()` is the
-/// all-zeros bit pattern), so it is compiled on every target.
+/// all-zeros bit pattern), so it is compiled on every target -- but only
+/// under `static`: every call site lives in `impl<T> Tensor<T>`, itself
+/// `#[cfg(feature = "static")]`.
+#[cfg(feature = "static")]
 pub(crate) fn dtype_of<T: 'static>() -> Option<DType> {
     use std::any::TypeId;
     let id = TypeId::of::<T>();
@@ -541,7 +638,11 @@ mod sealed {
     impl Sealed for i32 {}
     impl Sealed for u64 {}
     impl Sealed for i64 {}
-    // Deliberately NOT implemented for f16 / f32 / f64.
+    // f16 / f32 / f64 are sealed too (crate::lens::Element covers all
+    // eleven element types), but deliberately NOT given `IntegerType` below.
+    impl Sealed for half::f16 {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
 }
 
 /// Integer element types that may carry quantization metadata.
@@ -769,6 +870,14 @@ impl Quantization {
     ///   - `scale.len() != shape[axis]` for per-channel
     ///   - per-channel without axis (reject)
     ///   - per-tensor with redundant axis (reject)
+    ///
+    /// `static`-only: `Tensor::set_quantization` is `impl<T> Tensor<T>`,
+    /// itself `#[cfg(feature = "static")]`. `dynamic`'s
+    /// `TensorDyn::set_quantization` (`dynamic_backend.rs`) sends the raw
+    /// scale/zero-point/axis over FFI and lets `libedgefirst_tensor.so`
+    /// validate them on its own (`static`) side instead of calling this
+    /// method locally.
+    #[cfg(feature = "static")]
     pub(crate) fn validate(&self, shape: &[usize]) -> Result<()> {
         // `Quantization` is `Deserialize`, so malformed JSON like
         // `{"scale": [], "zero_point": []}` could otherwise produce an
@@ -954,9 +1063,6 @@ fn deserialize_opt_scalar_or_vec_i32<'de, D: serde::Deserializer<'de>>(
     de.deserialize_option(V)
 }
 
-/// Monotonic counter for buffer identity IDs.
-static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
-
 /// Count of tensor maps requested beyond the buffer's declared
 /// [`CpuAccess`] (including any CPU map of a `CpuAccess::None` buffer).
 /// Undeclared CPU access is a pipeline smell: it forfeits layout
@@ -975,6 +1081,13 @@ pub fn unplanned_cpu_access_count() -> u64 {
 /// Record an unplanned CPU access on `identity_id`, warning once per
 /// buffer (a steady-state pipeline maps the same buffer every frame — a
 /// per-map warn would flood the log; repeats count silently).
+///
+/// `static`-only: the sole caller is `impl<T> TensorMapTrait<T> for
+/// Tensor<T>` in `lib.rs`, itself `#[cfg(feature = "static")]`.
+/// [`unplanned_cpu_access_count`] stays available under `dynamic` too --
+/// it just always reads 0 there, honestly reflecting that this backend
+/// produces no such telemetry.
+#[cfg(feature = "static")]
 pub(crate) fn note_unplanned_cpu_access(identity_id: u64, backend: &str, detail: &str) {
     UNPLANNED_CPU_ACCESS.fetch_add(1, Ordering::Relaxed);
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
@@ -1072,22 +1185,39 @@ pub enum Compression {
     Scheme(CompressionScheme),
 }
 
-/// Vendor tile-compression schemes the HAL recognizes and records.
-///
-/// Unrecognized platforms record `None` (linear) — there is deliberately
-/// no `Unknown` variant; a scheme is only recorded when the vendor is
-/// positively identified.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionScheme {
-    /// Qualcomm Adreno Universal Bandwidth Compression.
-    Ubwc,
-    /// Arm Mali/Immortalis Framebuffer Compression.
-    Afbc,
-    /// Imagination PowerVR Image Compression (Google Tensor G5+).
-    Pvric,
-    /// Samsung Xclipse (AMD RDNA) Delta Color Compression.
-    Dcc,
+// Declared through `ef_vocabulary!` (see `vocabulary.rs`). This vocabulary
+// gained a wire numbering when `ef_tensor_compression` was added: the
+// dynamic backend reads a scheme back across the C boundary, so the enum
+// needs codes that cannot drift from the C enumerators. Hand-writing that
+// mapping in `edgefirst-tensor-capi` was the alternative and it is strictly
+// worse -- `#[non_exhaustive]` makes a cross-crate `match` require a
+// wildcard arm, so a scheme added here would silently map to "linear"
+// there. Generated from one declaration, it cannot.
+//
+// Code 0 is deliberately unassigned and reserved for "linear" -- the state
+// this crate spells `Option::None`, which has no variant to carry a code of
+// its own. The C side names it `EF_COMPRESSION_NONE`.
+crate::ef_vocabulary! {
+    /// Vendor tile-compression schemes the HAL recognizes and records.
+    ///
+    /// Unrecognized platforms record `None` (linear) — there is deliberately
+    /// no `Unknown` variant; a scheme is only recorded when the vendor is
+    /// positively identified.
+    #[non_exhaustive]
+    pub enum CompressionScheme {
+        /// Qualcomm Adreno Universal Bandwidth Compression.
+        Ubwc = 1, "ubwc", UBWC,
+        /// Arm Mali/Immortalis Framebuffer Compression.
+        Afbc = 2, "afbc", AFBC,
+        /// Imagination PowerVR Image Compression (Google Tensor G5+).
+        Pvric = 3, "pvric", PVRIC,
+        /// Samsung Xclipse (AMD RDNA) Delta Color Compression.
+        Dcc = 4, "dcc", DCC,
+    }
+    // `#[doc(hidden)]` for the same reason `dtype_wire` is: emission
+    // plumbing for `const`-only consumers, not a second documented API.
+    #[doc(hidden)]
+    pub mod compression_wire;
 }
 
 /// Count of image allocations that requested [`Compression::Any`] but
@@ -1105,6 +1235,12 @@ pub fn compression_fallback_count() -> u64 {
 }
 
 /// Record a `Compression::Any` request resolving linear.
+///
+/// `static`-only: the sole caller is `Tensor::image_desc` (`impl<T>
+/// Tensor<T>`), itself `#[cfg(feature = "static")]`.
+/// [`compression_fallback_count`] stays available under `dynamic` too --
+/// it just always reads 0 there.
+#[cfg(feature = "static")]
 pub(crate) fn note_compression_fallback(detail: &str) {
     COMPRESSION_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     log::debug!("compression request fell back to linear: {detail}");
@@ -1225,22 +1361,77 @@ impl ImageDesc {
     }
 }
 
+/// What kind of system key an identity was derived from. Participates in the
+/// id so that, say, inode 7 and IOSurfaceID 7 cannot collide.
+///
+/// Invariant every variant must uphold: the key passed to
+/// [`BufferIdentity::derived`] is unique among live buffers of that kind
+/// **that own an allocation**. There is no "no identity" case — where no
+/// system-wide key exists a process-local one does (a pointer, a GL name),
+/// and a process-local key is exactly as sound as a system-wide one:
+/// pointer/name reuse after free is the same ABA hazard as inode reuse, and
+/// is mitigated the same way, by the retaining cache (see the design spec's
+/// Task 6).
+///
+/// The allocation qualifier is load-bearing, not a hedge. A zero-element
+/// tensor (`[0, num_protos]`, the tracker's "no detections this frame"
+/// sentinel — see [`crate::mem`]) owns no allocation, so its `Vec` yields the
+/// dangling well-aligned pointer `align_of::<T>()`. Every zero-element
+/// `Tensor<f32>` in a process therefore shares one identity, and can even
+/// collide across kinds with a small integer key from another variant.
+///
+/// That is safe rather than tolerated: an identity exists to answer "are
+/// these the same bytes?", and buffers with no bytes have nothing to alias.
+/// Nor can they reach an import cache — both GPU import paths require a
+/// dma-buf fd or an IOSurface ref and reject anything else, so a `HostPtr`
+/// identity is never a cache key. Do not "fix" this by minting a distinct id
+/// per empty tensor: that reintroduces a counter, which is the state this
+/// whole design exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityKind {
+    /// `(st_dev, st_ino)` of a dma-buf or memfd. Survives `dup`, and is the
+    /// same value in every process that holds the buffer.
+    DmaBuf,
+    Shm,
+    /// `IOSurfaceGetID`.
+    IoSurface,
+    /// `AHardwareBuffer_getId`, API 31+.
+    AHardwareBufferId,
+    /// The `AHardwareBuffer*` pointer, pre-API-31 where no id exists.
+    /// Process-local: unique among live buffers here, meaningless elsewhere.
+    AHardwareBufferPtr,
+    /// A host mapping address. Process-local.
+    HostPtr,
+    /// A GL buffer name. Valid only in the context that created it.
+    Pbo,
+}
+
 /// Unique identity for a tensor's underlying buffer.
 ///
-/// Created fresh on every buffer allocation or import. The `id` is a monotonic
-/// u64 used as a cache key. The `guard` is an `Arc<()>` whose weak references
-/// allow downstream caches to detect when the buffer has been dropped.
+/// Created fresh on every buffer allocation or import. The `id` is a cache
+/// key, `kind` records what system key (if any) it was derived from, and the
+/// `guard` is an `Arc<()>` whose weak references allow downstream caches to
+/// detect when the buffer has been dropped.
 #[derive(Debug, Clone)]
 pub struct BufferIdentity {
     id: u64,
+    kind: IdentityKind,
     guard: Arc<()>,
 }
 
 impl BufferIdentity {
-    /// Create a new unique buffer identity.
-    pub fn new() -> Self {
+    /// Derive an identity from a key the operating system already guarantees.
+    ///
+    /// Deliberately NOT a counter: two independently-linked copies of this
+    /// crate must derive the same id for the same buffer, or a consumer's
+    /// import cache misses every frame. See the design spec, "The core finding".
+    pub fn derived(kind: IdentityKind, key: u64) -> Self {
+        // Mix the discriminant into the high bits so different kinds with the
+        // same numeric key never collide.
+        let id = ((kind as u64) << 56) ^ key;
         Self {
-            id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed),
+            id,
+            kind,
             guard: Arc::new(()),
         }
     }
@@ -1250,35 +1441,24 @@ impl BufferIdentity {
         self.id
     }
 
+    /// What kind of system key this identity was derived from.
+    pub fn kind(&self) -> IdentityKind {
+        self.kind
+    }
+
     /// Returns a weak reference to the buffer guard. Goes dead when the
     /// owning Tensor is dropped (and no clones remain).
     pub fn weak(&self) -> Weak<()> {
         Arc::downgrade(&self.guard)
     }
-
-    /// Rebuild an identity from interned parts — crate-private: only the
-    /// Android `AHardwareBuffer_getId` intern table may resurrect an
-    /// existing identity (arbitrary construction would forge cache hits).
-    // Only the Android AHardwareBuffer intern path uses these today.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub(crate) fn from_parts(id: u64, guard: Arc<()>) -> Self {
-        Self { id, guard }
-    }
-
-    /// The strong guard handle (for the intern table's mint path).
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub(crate) fn guard_arc(&self) -> Arc<()> {
-        Arc::clone(&self.guard)
-    }
 }
 
-impl Default for BufferIdentity {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(target_os = "linux")]
+// `static`-only from here through `fs_magic` below: every use site lives in
+// `impl<T> TensorStorage<T>` (`from_fd`'s DMA-BUF-vs-tmpfs classification),
+// itself `#[cfg(feature = "static")]`. `dynamic`'s `from_fd`
+// (`dynamic_backend.rs`) drives `ef_tensor_builder_wrap` instead, which
+// does this same classification inside `libedgefirst_tensor.so`.
+#[cfg(all(target_os = "linux", feature = "static"))]
 use nix::sys::stat::{major, minor};
 
 /// Filesystem magic of the internal `dma_buf` mount, from
@@ -1286,13 +1466,13 @@ use nix::sys::stat::{major, minor};
 ///
 /// This is stable UAPI and is the only reliable way to recognize a DMA-BUF
 /// fd — see [`TensorStorage::from_fd`] for why `st_dev` cannot be used.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "static"))]
 const DMA_BUF_MAGIC: u32 = 0x444d_4142;
 
 /// Filesystem magic of tmpfs, from `include/uapi/linux/magic.h`
 /// (`TMPFS_MAGIC`). Covers both POSIX `shm_open` segments under `/dev/shm`
 /// and anonymous `memfd_create` files.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "static"))]
 const TMPFS_MAGIC: u32 = 0x0102_1994;
 
 /// Normalize a raw `fstatfs` `f_type` to the 32-bit unsigned magic that
@@ -1309,7 +1489,7 @@ const TMPFS_MAGIC: u32 = 0x0102_1994;
 ///
 /// Every magic is a 32-bit quantity, so truncating back to `u32` recovers
 /// the true value from all four representations and loses nothing.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "static"))]
 const fn fs_magic(raw: i64) -> u32 {
     raw as u32
 }
@@ -1350,7 +1530,7 @@ where
     ///
     /// | Filesystem | Magic | Resulting [`TensorMemory`] |
     /// |------------|-------|----------------------------|
-    /// | `dma_buf` | `DMA_BUF_MAGIC` (`0x444d4142`) | [`TensorMemory::Dma`] |
+    /// | `dma_buf` | `DMA_BUF_MAGIC` (`0x444d4142`) | [`TensorMemory::DmaBuf`] |
     /// | `tmpfs` (`/dev/shm` **and** `memfd`) | `TMPFS_MAGIC` (`0x01021994`) | [`TensorMemory::Shm`] |
     /// | anything else | — | *rejected* — see Errors |
     ///
@@ -1406,12 +1586,12 @@ where
     /// use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
     ///
     /// # fn main() -> edgefirst_tensor::Result<()> {
-    /// let src = Tensor::<u8>::new(&[480, 640, 3], Some(TensorMemory::Dma), None)?;
+    /// let src = Tensor::<u8>::new(&[480, 640, 3], Some(TensorMemory::DmaBuf), None)?;
     ///
     /// // Round-tripping a DMA-BUF fd preserves the backend — the import is
     /// // still zero-copy, and still eligible for GPU/NPU paths.
     /// let imported = Tensor::<u8>::from_fd(src.clone_fd()?, src.shape(), None)?;
-    /// assert_eq!(imported.memory(), TensorMemory::Dma);
+    /// assert_eq!(imported.memory(), TensorMemory::DmaBuf);
     /// # Ok(())
     /// # }
     /// ```
@@ -1474,12 +1654,23 @@ where
     ///
     /// Prefer the typed wrappers [`map_read`](Self::map_read) /
     /// [`map_write`](Self::map_write) / [`map_mut`](Self::map_mut).
-    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>>;
+    /// Map for CPU access.
+    ///
+    /// Like [`pin_host`](Tensor::pin_host), `'a` bounds how long the backing
+    /// allocation lives rather than borrowing the tensor: the returned view
+    /// shares ownership through the pin's keepalive, so a map can coexist with
+    /// a `&mut` on the same tensor.
+    fn map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a;
 
     /// Map the tensor read-write (equivalent to
     /// `map_with(CpuAccess::ReadWrite)` — the historical `map()`
     /// behavior).
-    fn map(&self) -> Result<TensorMap<T>> {
+    fn map<'a>(&self) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_with(CpuAccess::ReadWrite)
     }
 
@@ -1487,19 +1678,28 @@ where
     /// `as_mut_slice`; on macOS this takes the read-only IOSurface lock
     /// (skips the unlock flush), on Linux the dma-buf read-direction
     /// sync.
-    fn map_read(&self) -> Result<TensorMap<T>> {
+    fn map_read<'a>(&self) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_with(CpuAccess::Read)
     }
 
     /// Map the tensor for CPU writing (fill-only: reading through a
     /// write map may see write-combined memory — do not read the slice).
-    fn map_write(&self) -> Result<TensorMap<T>> {
+    fn map_write<'a>(&self) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_with(CpuAccess::Write)
     }
 
     /// Map the tensor read-write (alias of [`map`](Self::map) with the
     /// intent spelled out).
-    fn map_mut(&self) -> Result<TensorMap<T>> {
+    fn map_mut<'a>(&self) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_with(CpuAccess::ReadWrite)
     }
 
@@ -1560,6 +1760,16 @@ where
     /// Get a mutable slice to the data in this tensor map.
     fn as_mut_slice(&mut self) -> &mut [T];
 
+    /// Whether this mapping permits writes -- i.e. whether the coherency
+    /// bracket it holds will flush on release.
+    ///
+    /// The single source of truth for a binding that has to advertise
+    /// mutability to a foreign consumer (the Python buffer protocol's
+    /// `readonly` flag, say). Deriving that from the access a caller
+    /// *requested* instead would leave the advertisement agreeing with the
+    /// request while both disagreed with the mapping actually taken.
+    fn is_writable(&self) -> bool;
+
     #[cfg(feature = "ndarray")]
     /// Get an ndarray ArrayView of the tensor data.
     fn view(&'_ self) -> Result<ndarray::ArrayView<'_, T, ndarray::Dim<ndarray::IxDynImpl>>> {
@@ -1582,74 +1792,234 @@ where
     }
 }
 
-/// Which memory backend a tensor is (or should be) allocated from.
-///
-/// Pass `Some(..)` to a constructor to pin the backend, or `None` to
-/// auto-select. Auto-selection differs by constructor: [`Tensor::new`] tries
-/// `Dma` → `Shm` → `Mem`, while the image constructors try `Dma` → `Mem` and
-/// skip `Shm`. `EDGEFIRST_TENSOR_FORCE_MEM=1` short-circuits either chain to
-/// `Mem`, which is how tests run on hosts without DMA-heap permissions.
-///
-/// A pinned request has no fallback: if the backend cannot serve it, the
-/// constructor fails rather than quietly giving you something slower.
-/// [`TensorTrait::memory`] reports what a tensor actually ended up with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TensorMemory {
-    /// Platform-native zero-copy GPU buffer.
+// Declared through `ef_vocabulary!` (see `vocabulary.rs`). Before this, the
+// same four backings were numbered three different ways -- Rust's implicit
+// discriminants (`Dma=0, Shm=1, Mem=2, Pbo=3`), the C ABI's
+// `hal_tensor_memory` (`MEM=0, DMA=1, SHM=2, PBO=3`), and Python's
+// `PyTensorMemory`, which had no explicit discriminants at all and a
+// `#[cfg(unix)]` variant in the middle of the list, so its numbering
+// depended on the target OS. The canonical assignment below is the one all
+// of them converge on; `hal_tensor_memory` is the single explicitly-mapped
+// outlier that keeps its own released values (see `to_hal_tensor_memory` in
+// the capi crate).
+//
+// Note this is NOT `protocol::kind`, which is a genuinely different
+// vocabulary and stays so: `kind` describes what a `TensorDesc`'s `handle`
+// and `ptr` fields MEAN to an importer, and both `Mem` and `Shm` mean the
+// same thing there (`kind::HOST`, host-addressable pointer, no handle). A
+// vocabulary that collapses two variants into one cannot also be the
+// vocabulary that distinguishes them. `kind_of()` in `protocol.rs` is the
+// mapping between them.
+crate::ef_vocabulary! {
+    /// Which memory backend a tensor is (or should be) allocated from.
     ///
-    /// On Linux this is a DMA-BUF (`DmaTensor` in `crates/tensor/src/dma.rs`)
-    /// allocated via the DRM/dma-heap subsystem. On macOS this is an
-    /// IOSurface (`IoSurfaceTensor` in `crates/tensor/src/iosurface.rs`).
-    /// Both fit into the same `TensorStorage::Dma` slot at the trait
-    /// level — the public C API discriminant (`HalTensorMemory::Dma=1`)
-    /// works on both platforms with no ABI break.
+    /// Pass `Some(..)` to a constructor to pin the backend, or `None` to
+    /// auto-select. Auto-selection differs by constructor: [`Tensor::new`]
+    /// tries `DmaBuf` → `Mem`, while the image constructors try `DmaBuf` →
+    /// `Mem` and skip `Shm`. `EDGEFIRST_TENSOR_FORCE_MEM=1` short-circuits
+    /// either chain to `Mem`, which is how tests run on hosts without
+    /// DMA-heap permissions.
     ///
-    /// Allows hardware-accelerated paths (OpenGL backend on Linux via
-    /// `EGL_EXT_image_dma_buf_import`; macOS via
-    /// `EGL_ANGLE_iosurface_client_buffer`). CPU access via `map()`
-    /// incurs cache-coherency overhead on Linux DMA-BUF and is similar
-    /// in cost on IOSurface; SHM/Mem are cheaper for CPU-only workloads.
-    Dma,
-    #[cfg(unix)]
-    /// POSIX Shared Memory allocation. Suitable for inter-process
-    /// communication, but not suitable for hardware acceleration.
-    Shm,
+    /// A pinned request has no fallback: if the backend cannot serve it, the
+    /// constructor fails rather than quietly giving you something slower.
+    /// [`TensorTrait::memory`] reports what a tensor actually ended up with.
+    ///
+    /// # Every variant exists on every platform
+    ///
+    /// This is a namespace of codes, not a list of what this build can
+    /// allocate -- [`TensorMemory::is_available`] answers the latter, at
+    /// runtime. `Shm` used to be `#[cfg(unix)]`, which shifted every
+    /// variant declared after it on a non-unix build and made the
+    /// numbering a compile-time detail of the host. It also made a
+    /// cross-platform recording unreadable: a blob captured on Linux
+    /// carries `"dmabuf"`, and a macOS consumer has to be able to NAME
+    /// that backing in order to report "cannot materialise here" instead
+    /// of failing with an unrecognised code.
+    ///
+    /// # `#[non_exhaustive]`
+    ///
+    /// Match this with a wildcard arm. The variant list is expected to
+    /// keep growing -- `IoSurface` and `Cuda` were added here, Windows
+    /// backings and a real CUDA device backing are named as coming -- and
+    /// this attribute is what keeps a closed-source consumer's
+    /// `match memory { .. }` compiling across those additions. It protects
+    /// DOWNSTREAM, not this crate: inside `edgefirst-tensor` the matches
+    /// stay exhaustive and compile-enforced. Same rule as [`DType`],
+    /// [`Compression`] and [`PixelFormat`], which `TensorMemory` was the
+    /// lone exception to.
+    #[non_exhaustive]
+    pub enum TensorMemory {
+        /// Regular system memory allocation. Available everywhere; the
+        /// floor every auto-selection chain ends on.
+        Mem = 0, "mem", MEM,
+        /// POSIX Shared Memory allocation. Suitable for inter-process
+        /// communication, but not for hardware acceleration. Only
+        /// allocatable on unix; nameable everywhere.
+        Shm = 1, "shm", SHM,
+        /// Platform-native zero-copy GPU buffer.
+        ///
+        /// On Linux this is a DMA-BUF (`DmaTensor` in
+        /// `crates/tensor/src/dma.rs`) allocated via the DRM/dma-heap
+        /// subsystem. On macOS/iOS it is currently also this variant that
+        /// yields an IOSurface, and on Android an AHardwareBuffer: they
+        /// share the `TensorStorage::Dma` slot at the trait level, and the
+        /// public C API discriminant (`HAL_TENSOR_MEMORY_DMA = 1`) covers
+        /// all three with no ABI break. `IoSurface` below is the code for
+        /// naming that backing specifically; no backend reports it yet.
+        ///
+        /// Allows hardware-accelerated paths (OpenGL backend on Linux via
+        /// `EGL_EXT_image_dma_buf_import`; macOS via
+        /// `EGL_ANGLE_iosurface_client_buffer`). CPU access via `map()`
+        /// incurs cache-coherency overhead on Linux DMA-BUF and is similar
+        /// in cost on IOSurface; SHM/Mem are cheaper for CPU-only workloads.
+        DmaBuf = 2, "dmabuf", DMABUF,
+        /// Apple IOSurface, named specifically rather than through the
+        /// portable `DmaBuf` spelling.
+        ///
+        /// Defined as a code so a descriptor or recording that names an
+        /// IOSurface is parseable on every platform. **No backend produces
+        /// or accepts it yet** -- macOS/iOS allocate and report `DmaBuf`.
+        /// Pinning a request to it fails with `NotImplemented`.
+        IoSurface = 3, "iosurface", IOSURFACE,
+        /// OpenGL Pixel Buffer Object memory. Created by `ImageProcessor`
+        /// when DMA-buf is unavailable but OpenGL is present -- never by
+        /// [`Tensor::new`], which has no GL context to create it in.
+        Pbo = 4, "pbo", PBO,
+        /// CUDA device memory: a device pointer, not host-addressable.
+        ///
+        /// Defined as a code for the same reason as `IoSurface`. **No
+        /// backend produces or accepts it yet**; pinning a request to it
+        /// fails with `NotImplemented`.
+        Cuda = 5, "cuda", CUDA,
+    }
+    // `#[doc(hidden)]`: `pub` so the const-only form is reachable by an FFI
+    // or cbindgen consumer, but it is emission plumbing rather than a second
+    // documented API -- `TensorMemory::code()` is the documented path, and
+    // the two are generated from the same literal.
+    #[doc(hidden)]
+    pub mod tensor_memory_wire;
+}
 
-    /// Regular system memory allocation
-    Mem,
+impl TensorMemory {
+    /// Whether this backing can actually be allocated in this process, now.
+    ///
+    /// A runtime question, not a compile-time one, which is why it is a
+    /// method on the vocabulary rather than a `cfg` on the variant:
+    /// `DmaBuf` needs `/dev/dma_heap` to exist *and* this process to have
+    /// permission on it (a container, a user outside the `video`/`render`
+    /// groups, and a stock desktop give three different answers on the same
+    /// kernel), and `Shm` needs a writable `/dev/shm`. Each probe allocates
+    /// once and caches.
+    ///
+    /// Reports what can be *allocated*, which is not the same as what can be
+    /// *named*: every variant is nameable on every platform (that is the
+    /// point of the vocabulary), and the ones this build cannot serve say so
+    /// here rather than by being absent from the enum.
+    ///
+    /// Three variants answer `false` unconditionally today, for reasons
+    /// worth stating rather than hiding behind a probe that cannot fail:
+    ///
+    /// * `IoSurface` -- no backend produces or accepts it yet; macOS/iOS
+    ///   serve IOSurface under the `DmaBuf` spelling, so `DmaBuf` is the
+    ///   variant that answers `true` there.
+    /// * `Pbo` -- PBO tensors are created by `ImageProcessor::create_image`
+    ///   with a GL context current, never by [`Tensor::new`]. This crate
+    ///   holds no GL context and cannot see one; ask the image crate
+    ///   whether a GL backend is live.
+    /// * `Cuda` -- there is no CUDA backing in this crate at all. Probing
+    ///   for `libcuda` would answer `true` on a Jetson while every
+    ///   allocation still failed, which is worse than answering `false`.
+    pub fn is_available(self) -> bool {
+        match self {
+            // Always: the fallback every constructor chain ends on. If this
+            // could fail, allocation would have no floor left.
+            TensorMemory::Mem => true,
+            TensorMemory::Shm => is_shm_available(),
+            // Today `DmaBuf` is the portable spelling of "platform-native
+            // zero-copy GPU buffer", so it is the portable probe that
+            // answers for it -- true on macOS/iOS (IOSurface) and Android
+            // (AHardwareBuffer) as well as Linux.
+            TensorMemory::DmaBuf => is_gpu_buffer_available(),
+            TensorMemory::IoSurface | TensorMemory::Pbo | TensorMemory::Cuda => false,
+        }
+    }
 
-    /// OpenGL Pixel Buffer Object memory. Created by ImageProcessor
-    /// when DMA-buf is unavailable but OpenGL is present.
-    Pbo,
+    /// The error to return when a caller pins a request to a backing this
+    /// build knows the name of but cannot serve.
+    ///
+    /// Deliberately not `unreachable!()`. `IoSurface` and `Cuda` are
+    /// unreachable *today* only because no backend reports them yet; the
+    /// day one does, an `unreachable!()` written now becomes a panic in
+    /// library code reached from an ordinary caller request. A "this build
+    /// cannot do that" error is the same information without the crash, and
+    /// it is what every other unservable request here already returns.
+    ///
+    /// `static`-only: every call site is inside `impl<T> TensorStorage<T>`
+    /// (`TensorStorage::new`), itself `#[cfg(feature = "static")]`.
+    #[cfg(feature = "static")]
+    pub(crate) fn unsupported_here(self) -> Error {
+        let reason = match self {
+            // Not reachable: `Mem` is servable on every target. Stated
+            // rather than panicked on, for the reason above.
+            TensorMemory::Mem => "Mem is servable on every platform, so this should not happen",
+            TensorMemory::Shm => "POSIX shared memory is unix-only",
+            TensorMemory::DmaBuf => {
+                "this target has no platform GPU-buffer allocator (DMA-BUF is Linux, \
+                 IOSurface macOS/iOS, AHardwareBuffer Android)"
+            }
+            TensorMemory::IoSurface => {
+                "no backend produces or accepts IOSurface under its own code yet -- \
+                 macOS/iOS allocate and report TensorMemory::DmaBuf"
+            }
+            TensorMemory::Pbo => {
+                "PBO tensors are created by ImageProcessor::create_image with a GL \
+                 context current, never by Tensor::new"
+            }
+            TensorMemory::Cuda => "there is no CUDA backing in this build",
+        };
+        Error::NotImplemented(format!(
+            "TensorMemory::{self:?} is not supported by this build: {reason}"
+        ))
+    }
 }
 
 impl From<TensorMemory> for String {
+    /// The wire string, via [`TensorMemory::as_str`] -- one spelling, not a
+    /// second one maintained alongside it.
+    ///
+    /// `DmaBuf` renders as `"dmabuf"`, not the `"dma"` this impl used to
+    /// emit. `TryFrom<&str>` still accepts `"dma"` so anything that
+    /// persisted the old spelling keeps parsing; the benchmark result keys
+    /// in `.github/scripts` spell it `"dma"` but build that string
+    /// themselves and never went through this impl.
     fn from(memory: TensorMemory) -> Self {
-        match memory {
-            TensorMemory::Dma => "dma".to_owned(),
-            #[cfg(unix)]
-            TensorMemory::Shm => "shm".to_owned(),
-            TensorMemory::Mem => "mem".to_owned(),
-            TensorMemory::Pbo => "pbo".to_owned(),
-        }
+        memory.as_str().to_owned()
     }
 }
 
 impl TryFrom<&str> for TensorMemory {
     type Error = Error;
 
+    /// Parses [`TensorMemory::as_str`]'s spelling, plus the legacy `"dma"`
+    /// alias for `DmaBuf`.
     fn try_from(s: &str) -> Result<Self> {
-        match s {
-            "dma" => Ok(TensorMemory::Dma),
-            #[cfg(unix)]
-            "shm" => Ok(TensorMemory::Shm),
-            "mem" => Ok(TensorMemory::Mem),
-            "pbo" => Ok(TensorMemory::Pbo),
-            _ => Err(Error::InvalidMemoryType(s.to_owned())),
-        }
+        TensorMemory::from_str_code(s)
+            .or(if s == "dma" {
+                Some(TensorMemory::DmaBuf)
+            } else {
+                None
+            })
+            .ok_or_else(|| Error::InvalidMemoryType(s.to_owned()))
     }
 }
 
+// Everything from here through the end of `impl<T> TensorTrait<T> for
+// Tensor<T>` below is the `static` backend's storage-owning `Tensor<T>`:
+// `TensorStorage<T>` (the per-memory-backend enum) and the `Tensor<T>`
+// struct that wraps it. `dynamic`'s `Tensor<T>` is a different, much
+// smaller type -- a typed lens over `TensorDyn` with no storage of its
+// own -- defined in `tensor_dyn/dynamic_tensor.rs` and re-exported below.
+#[cfg(feature = "static")]
 #[derive(Debug)]
 #[allow(dead_code)] // Variants are constructed by downstream crates via pub(crate) helpers
 pub(crate) enum TensorStorage<T>
@@ -1659,7 +2029,7 @@ where
     /// Platform-native zero-copy GPU buffer. Inner type differs per
     /// target: `DmaTensor` on Linux (DMA-BUF fd), `IoSurfaceTensor` on
     /// macOS (CFRetained IOSurface). The shared variant name keeps the
-    /// public `TensorMemory::Dma` discriminant stable across platforms.
+    /// public `TensorMemory::DmaBuf` discriminant stable across platforms.
     #[cfg(target_os = "linux")]
     Dma(DmaTensor<T>),
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1672,6 +2042,7 @@ where
     Pbo(PboTensor<T>),
 }
 
+#[cfg(feature = "static")]
 impl<T> TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -1707,15 +2078,15 @@ where
     fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         match memory {
             #[cfg(target_os = "linux")]
-            Some(TensorMemory::Dma) => {
+            Some(TensorMemory::DmaBuf) => {
                 DmaTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
-            Some(TensorMemory::Dma) => {
+            Some(TensorMemory::DmaBuf) => {
                 IoSurfaceTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
             #[cfg(target_os = "android")]
-            Some(TensorMemory::Dma) => {
+            Some(TensorMemory::DmaBuf) => {
                 AHardwareBufferTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
             #[cfg(not(any(
@@ -1724,8 +2095,8 @@ where
                 target_os = "ios",
                 target_os = "android"
             )))]
-            Some(TensorMemory::Dma) => Err(crate::error::Error::NotImplemented(
-                "TensorMemory::Dma is only available on Linux (DMA-BUF), macOS/iOS (IOSurface), \
+            Some(TensorMemory::DmaBuf) => Err(crate::error::Error::NotImplemented(
+                "TensorMemory::DmaBuf is only available on Linux (DMA-BUF), macOS/iOS (IOSurface), \
                  and Android (AHardwareBuffer)"
                     .to_owned(),
             )),
@@ -1733,12 +2104,17 @@ where
             Some(TensorMemory::Shm) => {
                 ShmTensor::<T>::new(shape, name).map(TensorStorage::Shm)
             }
+            #[cfg(not(unix))]
+            Some(m @ TensorMemory::Shm) => Err(m.unsupported_here()),
             Some(TensorMemory::Mem) => {
                 MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
             }
             Some(TensorMemory::Pbo) => Err(crate::error::Error::NotImplemented(
                 "PboTensor cannot be created via Tensor::new() — use ImageProcessor::create_image()".to_owned(),
             )),
+            // Defined codes with no backing behind them yet. An error, not
+            // an `unreachable!()` -- see `unsupported_here`.
+            Some(m @ (TensorMemory::IoSurface | TensorMemory::Cuda)) => Err(m.unsupported_here()),
             None => {
                 if std::env::var("EDGEFIRST_TENSOR_FORCE_MEM")
                     .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
@@ -1781,7 +2157,7 @@ where
                         // tiny tensors) and a lock/unlock cache-maintenance
                         // round trip on every map(). Zero-copy image tensors
                         // come from `Tensor::image(..)`; callers that want a
-                        // BLOB (NNAPI handoff) request `TensorMemory::Dma`
+                        // BLOB (NNAPI handoff) request `TensorMemory::DmaBuf`
                         // explicitly.
                         MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
                     }
@@ -1859,7 +2235,7 @@ where
     /// Allocate an image-formatted IOSurface-backed storage (macOS).
     ///
     /// Used by `Tensor::image()` when the caller requests
-    /// `TensorMemory::Dma` and the format has an IOSurface FourCC
+    /// `TensorMemory::DmaBuf` and the format has an IOSurface FourCC
     /// mapping (YUYV, RGBA, BGRA today). Falls back to `new_with_byte_size`
     /// otherwise.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1878,7 +2254,7 @@ where
     /// Allocate an image-formatted AHardwareBuffer-backed storage (Android).
     ///
     /// Used by `Tensor::image()` when the caller requests
-    /// `TensorMemory::Dma` and the format has an AHardwareBuffer format
+    /// `TensorMemory::DmaBuf` and the format has an AHardwareBuffer format
     /// mapping (RGBA8 and the RGBA16F float paths today). Falls back to
     /// `new_with_byte_size` otherwise.
     #[cfg(target_os = "android")]
@@ -1956,6 +2332,7 @@ where
     }
 }
 
+#[cfg(feature = "static")]
 impl<T> TensorTrait<T> for TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -1993,7 +2370,7 @@ where
                 target_os = "ios",
                 target_os = "android"
             ))]
-            TensorStorage::Dma(_) => TensorMemory::Dma,
+            TensorStorage::Dma(_) => TensorMemory::DmaBuf,
             #[cfg(unix)]
             TensorStorage::Shm(_) => TensorMemory::Shm,
             TensorStorage::Mem(_) => TensorMemory::Mem,
@@ -2081,7 +2458,10 @@ where
         }
     }
 
-    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>> {
+    fn map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         match self {
             #[cfg(any(
                 target_os = "linux",
@@ -2141,6 +2521,11 @@ where
 /// When `format` is `Some`, this tensor represents an image. Width, height,
 /// and channels are derived from `shape` + `format`. When `format` is `None`,
 /// this is a raw tensor (identical to the pre-refactoring behavior).
+///
+/// This is the `static` backend's `Tensor<T>` -- it owns its storage. See
+/// `tensor_dyn/dynamic_tensor.rs` for `dynamic`'s `Tensor<T>`, a typed lens
+/// with no storage of its own.
+#[cfg(feature = "static")]
 #[derive(Debug)]
 pub struct Tensor<T>
 where
@@ -2188,6 +2573,7 @@ where
     view_origin: Option<ViewOrigin>,
 }
 
+#[cfg(feature = "static")]
 impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -2263,6 +2649,42 @@ where
         owner: Option<crate::ForeignOwner>,
         name: Option<&str>,
     ) -> Result<Self> {
+        // SAFETY: forwarded to `from_foreign_with_capacity`'s contract; `0`
+        // clamps to the tight shape-derived footprint below, i.e. no extra
+        // headroom -- identical to this function's own prior behaviour.
+        unsafe { Self::from_foreign_with_capacity(ptr, shape, 0, owner, name) }
+    }
+
+    /// [`Self::from_foreign`], additionally recording that the allocation
+    /// behind `ptr` holds at least `capacity_bytes` bytes -- headroom beyond
+    /// the tight `shape.product() * size_of::<T>()` footprint that a later
+    /// [`configure_image`](Self::configure_image) / `set_logical_shape` can
+    /// grow into without erroring.
+    ///
+    /// This is the consumer half of the cross-package capsule protocol's
+    /// [`crate::protocol::TensorDesc::capacity`]: a producer's pool tensor
+    /// (allocated for its largest expected image, holding a smaller one
+    /// today) reports its real allocation size so the imported alias
+    /// inherits the same headroom instead of being clamped to today's
+    /// logical shape. `capacity_bytes` below the tight footprint is clamped
+    /// up to it, never down -- the shape-implied floor always holds.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::from_foreign`], except `ptr` must be valid for
+    /// `capacity_bytes` bytes (or the tight shape footprint, whichever is
+    /// larger), not just the shape-implied footprint.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidSize`] if `shape` is empty.
+    pub unsafe fn from_foreign_with_capacity(
+        ptr: *mut T,
+        shape: &[usize],
+        capacity_bytes: usize,
+        owner: Option<crate::ForeignOwner>,
+        name: Option<&str>,
+    ) -> Result<Self> {
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
@@ -2280,8 +2702,235 @@ where
                     "from_foreign: shape.product() overflows usize (shape={shape:?})"
                 ))
             })?;
-        let mem = MemTensor::<T>::from_foreign(ptr, shape, owner, name);
+        let capacity_elems = capacity_bytes / std::mem::size_of::<T>();
+        // SAFETY: this function's own contract (see its doc comment) is
+        // exactly `MemTensor::from_foreign_with_capacity`'s contract.
+        let mem = unsafe {
+            MemTensor::<T>::from_foreign_with_capacity(ptr, shape, capacity_elems, owner, name)
+        };
         Ok(Self::wrap(TensorStorage::Mem(mem)))
+    }
+
+    /// Pin a stable host address for this tensor's data.
+    ///
+    /// The returned [`HostPin`] carries **no borrow of the tensor**, so a
+    /// caller can pin once at init and still pass `&mut self` to
+    /// `ImageProcessor::convert` every frame. That borrow conflict is the
+    /// blocker reported in [#134](https://github.com/EdgeFirstAI/hal/issues/134).
+    ///
+    /// The address stays valid until the pin is dropped, and survives
+    /// re-layout: `configure_image` and `set_logical_shape` only rewrite the
+    /// logical shape after a capacity check, and every backend's pin owns its
+    /// own mapping, so nothing can move underneath it.
+    ///
+    /// A pin is therefore a **snapshot**, not a tracker: [`HostPin::len`]
+    /// reports the extent at pin time and does not follow a later re-layout.
+    /// That is the safe direction — the window always stays inside the
+    /// allocation — but it means a caller who re-layouts should re-pin if it
+    /// wants the new extent.
+    ///
+    /// The address is **not** a coherency guarantee: on non-coherent backends
+    /// bracket CPU access with
+    /// [`sync_for_cpu`](Self::sync_for_cpu) and
+    /// [`sync_for_device`](Self::sync_for_device), which are no-ops where the
+    /// backend does not require them.
+    ///
+    /// # Cost
+    ///
+    /// On `Mem` this is an `Arc` refcount bump — the backing allocation is
+    /// never resized, so its base pointer is already stable. Other backends
+    /// establish a mapping once and reuse it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] when `access` is [`CpuAccess::None`]: a
+    ///   pinned mapping is CPU access by definition, so this is an error
+    ///   rather than a warn-and-stage.
+    /// - [`Error::NotImplemented`] for the two backends that **cannot** pin,
+    ///   rather than merely not having been wired yet: a PBO
+    ///   (`glMapBufferRange` establishes the address and the visibility
+    ///   together, and there is no `GL_MAP_PERSISTENT_BIT` in GLES) and an
+    ///   AHardwareBuffer (`AHardwareBuffer_lock` is what yields the address at
+    ///   all, so there is no address outside the lock). Both name
+    ///   `map()`/`map_with()` as the alternative. `Mem`, `Shm`, DMA-BUF and
+    ///   IOSurface all pin.
+    pub fn pin_host<'a>(&self, access: CpuAccess) -> Result<HostPin<'a>>
+    where
+        T: 'a,
+    {
+        if access == CpuAccess::None {
+            return Err(Error::InvalidArgument(
+                "pin_host: CpuAccess::None is not a valid pin; a pinned mapping \
+                 is CPU access by definition"
+                    .to_owned(),
+            ));
+        }
+        // Backends yield everything addressable from the tensor's offset;
+        // narrow to the logical extent so a consumer cannot mistake pitch
+        // padding for data. A map guard keeps the wider window.
+        let logical = self.len() * std::mem::size_of::<T>();
+        let pin = match &self.storage {
+            TensorStorage::Mem(m) => Ok(m.host_pin()),
+            #[cfg(unix)]
+            TensorStorage::Shm(s) => s.host_pin(),
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(d) => d.host_pin(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            TensorStorage::Dma(s) => s.host_pin(),
+            // AHardwareBuffer cannot support a pin at all, and that is a
+            // platform contract rather than missing work: the NDK exposes no
+            // way to obtain a CPU address outside AHardwareBuffer_lock, so a
+            // "persistent" address would mean holding the lock for the pin's
+            // lifetime -- which blocks the GPU from the buffer and makes any
+            // further lock undefined. Both are the opposite of what a pin is
+            // for. Say so, rather than implying a TODO.
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(_) => Err(Error::NotImplemented(
+                "pin_host: AHardwareBuffer has no host address outside \
+                 AHardwareBuffer_lock, so it cannot hand out one that outlives \
+                 a guard. Use map()/map_with() for CPU access; for zero-copy \
+                 handoff pass the buffer itself."
+                    .to_owned(),
+            )),
+            // PBO is the same shape of constraint as AHardwareBuffer:
+            // glMapBufferRange's pointer is valid only until glUnmapBuffer, and
+            // this backend maps with MAP_READ_BIT | MAP_WRITE_BIT -- no
+            // GL_MAP_PERSISTENT_BIT, and no glBufferStorage anywhere. Holding
+            // the map open for the pin's lifetime would keep the buffer mapped
+            // across GL work, which is exactly what a PBO is not for.
+            //
+            // Persistent mapping (EXT_buffer_storage on GLES) would make this
+            // implementable, but that is a buffer-allocation feature, not
+            // wiring -- it changes how every PBO is created and needs fences
+            // for coherency.
+            TensorStorage::Pbo(_) => Err(Error::NotImplemented(
+                "pin_host: a PBO has no host address outside \
+                 glMapBufferRange/glUnmapBuffer, so it cannot hand out one that \
+                 outlives a guard. Use map()/map_with(). Persistent mapping \
+                 (EXT_buffer_storage, GL_MAP_PERSISTENT_BIT) is not used by this \
+                 backend."
+                    .to_owned(),
+            )),
+        }?;
+        Ok(pin.narrowed(logical))
+    }
+
+    /// Make CPU reads/writes of this tensor coherent — the CPU is about to
+    /// access the buffer.
+    ///
+    /// Corresponds to `DMA_BUF_SYNC_START`, and the name matches the Linux
+    /// kernel DMA API for the same reason: `for_cpu` says who is about to
+    /// touch the memory, which is what the caller actually knows.
+    ///
+    /// Pair with [`sync_for_device`](Self::sync_for_device).
+    ///
+    /// # Which backends owe maintenance
+    ///
+    /// | backend | behaviour |
+    /// |---|---|
+    /// | `Mem`, `Shm` | **no-op** — plain CPU memory, coherent by construction |
+    /// | `Dma` (Linux DMA-BUF) | one `DMA_BUF_IOCTL_SYNC`, direction-tagged |
+    /// | `Dma` (macOS/iOS IOSurface) | `IOSurfaceLock` / `IOSurfaceUnlock`, options matched to `access` |
+    /// | `Dma` (Android AHardwareBuffer) | [`Error::NotImplemented`] — no sync independent of the lock |
+    /// | `Pbo` | [`Error::NotImplemented`] — no coherency window independent of the map |
+    ///
+    /// Only the first row is a no-op, so "bracket unconditionally and pay
+    /// nothing" holds for `Mem`/`Shm` alone. The two that report
+    /// `NotImplemented` do so because their platform fuses addressing and
+    /// coherency into one call — `AHardwareBuffer_lock` and
+    /// `glMapBufferRange` each perform the maintenance *as* they hand out the
+    /// address, so a separate bracket would have to nest inside a map guard
+    /// that already owns the pair. Both name `map()`/`map_with()` as the
+    /// alternative. They previously fell through a wildcard and answered
+    /// `Ok(())`, which is worse than an error because the symptom is
+    /// stale-but-plausible pixels rather than a failure. The match is
+    /// exhaustive so a new backend cannot inherit that silence — it must state
+    /// its coherency story to compile.
+    ///
+    /// # Cost
+    ///
+    /// `Mem`/`Shm`: nothing. `Dma` on Linux: one ioctl. IOSurface: one
+    /// lock/unlock pair.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] when `access` is [`CpuAccess::None`], which
+    /// describes no access to make coherent.
+    pub fn sync_for_cpu(&self, access: CpuAccess) -> Result<()> {
+        Self::check_sync_access(access)?;
+        match &self.storage {
+            // Plain CPU memory: coherent by construction.
+            TensorStorage::Mem(_) => Ok(()),
+            #[cfg(unix)]
+            TensorStorage::Shm(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(d) => {
+                // The direction tells the kernel which maintenance this access
+                // needs: a read-only bracket skips the writeback at END, a
+                // write-only one skips the invalidate at START. It MUST match
+                // the direction passed to sync_for_device.
+                crate::dmabuf::sync_access(&d.fd, true, access).map_err(Error::NixError)
+            }
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            TensorStorage::Dma(s) => s.sync_for_cpu(access),
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(_) => Err(Error::NotImplemented(
+                "sync_for_cpu: AHardwareBuffer has no sync independent of its \
+                 lock. AHardwareBuffer_lock both establishes the address and \
+                 performs the cache invalidate, and the NDK leaves locking an \
+                 already-locked buffer undefined, so a bracket on top of a map \
+                 guard would nest. Use map()/map_with(), which owns the pair."
+                    .to_owned(),
+            )),
+            TensorStorage::Pbo(_) => Err(Error::NotImplemented(
+                "sync_for_cpu: a PBO has no coherency window independent of its \
+                 map -- glMapBufferRange establishes the address and the \
+                 visibility together, and glUnmapBuffer publishes the writes. \
+                 Use map()/map_with(), which owns the pair."
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// Release the buffer back to the device — the CPU is done accessing it.
+    ///
+    /// Corresponds to `DMA_BUF_SYNC_END`. See
+    /// [`sync_for_cpu`](Self::sync_for_cpu) for the pairing and cost.
+    pub fn sync_for_device(&self, access: CpuAccess) -> Result<()> {
+        Self::check_sync_access(access)?;
+        match &self.storage {
+            TensorStorage::Mem(_) => Ok(()),
+            #[cfg(unix)]
+            TensorStorage::Shm(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(d) => {
+                crate::dmabuf::sync_access(&d.fd, false, access).map_err(Error::NixError)
+            }
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            TensorStorage::Dma(s) => s.sync_for_device(access),
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(_) => Err(Error::NotImplemented(
+                "sync_for_device: AHardwareBuffer has no sync independent of \
+                 its lock — see sync_for_cpu. Use map()/map_with()."
+                    .to_owned(),
+            )),
+            TensorStorage::Pbo(_) => Err(Error::NotImplemented(
+                "sync_for_device: a PBO has no coherency window independent of \
+                 its map -- see sync_for_cpu. Use map()/map_with()."
+                    .to_owned(),
+            )),
+        }
+    }
+
+    fn check_sync_access(access: CpuAccess) -> Result<()> {
+        if access == CpuAccess::None {
+            return Err(Error::InvalidArgument(
+                "sync_for_cpu/sync_for_device: CpuAccess::None describes no \
+                 access to synchronise"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Construct a tensor from a 3-D ndarray view. Respects strides — one
@@ -2410,7 +3059,7 @@ where
                     Some(TensorMemory::Mem) | Some(TensorMemory::Shm) | Some(TensorMemory::Pbo)
                 ) {
                     return Err(Error::InvalidArgument(format!(
-                        "image_desc: Compression::Scheme({requested:?}) requires                          hardware memory (TensorMemory::Dma or auto-select), got {:?}",
+                        "image_desc: Compression::Scheme({requested:?}) requires                          hardware memory (TensorMemory::DmaBuf or auto-select), got {:?}",
                         desc.memory
                     )));
                 }
@@ -2442,7 +3091,7 @@ where
                     desc.width,
                     desc.height,
                     desc.format,
-                    Some(TensorMemory::Dma),
+                    Some(TensorMemory::DmaBuf),
                     desc.access,
                 ) {
                     Ok(t) => t,
@@ -2463,7 +3112,7 @@ where
                 let eligible =
                     crate::ahardwarebuffer_layout::compression_eligible(desc.format, desc.dtype);
                 let scheme = crate::ahardwarebuffer::device_compression_scheme();
-                let is_ahb = t.memory() == TensorMemory::Dma;
+                let is_ahb = t.memory() == TensorMemory::DmaBuf;
                 match (request, scheme) {
                     (_, Some(s)) if eligible && is_ahb => {
                         t.set_compression_unchecked(Some(s));
@@ -2534,7 +3183,7 @@ where
     /// - [`Error::InvalidArgument`] if `width` × `height` is not a valid size
     ///   for `format` (for example odd dimensions where the format's chroma
     ///   subsampling forbids them), or, on macOS with an explicit
-    ///   [`TensorMemory::Dma`], if the format cannot be expressed as an
+    ///   [`TensorMemory::DmaBuf`], if the format cannot be expressed as an
     ///   image-formatted IOSurface at this width. The message names the
     ///   aligned width to use.
     /// - Whatever the chosen backend returns if the allocation itself fails —
@@ -2563,11 +3212,11 @@ where
     where
         T: 'static,
     {
-        // Shape comes from the shared `PixelFormat::image_shape` helper (packed /
+        // Shape comes from the shared `PixelFormat::allocation_shape` helper (packed /
         // planar / semi-planar NV12·NV16). NV12 supports odd dimensions via the
         // `H + ceil(H/2)` combined-plane height.
         // The `T: 'static` bound is required by the macOS IOSurface path below.
-        let shape = format.image_shape(width, height).ok_or_else(|| {
+        let shape = format.allocation_shape(width, height).ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "invalid dimensions {width}x{height} for format {format:?}"
             ))
@@ -2586,7 +3235,7 @@ where
         // wrong stride.
         //
         // Explicit-Dma contract: when the caller passes
-        // `Some(TensorMemory::Dma)` they have asked for an
+        // `Some(TensorMemory::DmaBuf)` they have asked for an
         // **image-formatted IOSurface**. Silently downgrading to the
         // generic 'L008' byte-bag when alignment fails buries the
         // mismatch — the caller only finds out hours later when ANGLE
@@ -2597,7 +3246,7 @@ where
         // so the caller can either pick aligned dimensions, request
         // SHM/Mem explicitly, or pass `memory=None` for auto-select.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if matches!(memory, Some(TensorMemory::Dma)) {
+        if matches!(memory, Some(TensorMemory::DmaBuf)) {
             // For planar formats the IOSurface stacks channels
             // vertically (channels * height rows), so the row stride is
             // single-channel width * sizeof(T). Packed formats keep the
@@ -2618,7 +3267,7 @@ where
             // generic byte-bag GL can't bind. Both fail loudly rather than
             // silently downgrade.
             let has_image_fourcc = dtype_of::<T>()
-                .and_then(|dt| crate::iosurface::image_iosurface_layout(format, dt))
+                .and_then(|dt| crate::iosurface_layout::image_iosurface_layout(format, dt))
                 .is_some();
             let padded_ok = has_image_fourcc && format.layout() != PixelLayout::Planar;
             if !natural_row_bytes.is_multiple_of(64) && !padded_ok {
@@ -2683,7 +3332,7 @@ where
                     std::any::type_name::<T>()
                 ))
             })?;
-            if crate::iosurface::image_iosurface_layout(format, dtype).is_none() {
+            if crate::iosurface_layout::image_iosurface_layout(format, dtype).is_none() {
                 return Err(Error::InvalidArgument(format!(
                     "Tensor::image: no zero-copy IOSurface mapping exists for \
                      {format:?}/{dtype:?} on macOS/iOS (supported: \
@@ -2745,7 +3394,7 @@ where
         // macOS where IOSurface's 64-BYTE alignment keeps model-sized F16
         // surfaces naturally flat.
         #[cfg(target_os = "android")]
-        if matches!(memory, Some(TensorMemory::Dma)) {
+        if matches!(memory, Some(TensorMemory::DmaBuf)) {
             // Explicit-Dma contract (mirrors the macOS block above): the
             // caller asked for an image-formatted, GL-importable
             // AHardwareBuffer, so an unmapped combination or a gralloc
@@ -2874,7 +3523,7 @@ where
         // `used_stride` is the actual row pitch of the storage created below.
         let (storage, used_stride) = match memory {
             #[cfg(target_os = "linux")]
-            Some(TensorMemory::Dma) => (
+            Some(TensorMemory::DmaBuf) => (
                 TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None)?,
                 aligned_stride,
             ),
@@ -2973,7 +3622,7 @@ where
     ///
     /// # Supported memory
     ///
-    /// Currently only `TensorMemory::Dma` is supported. PBO and Mem
+    /// Currently only `TensorMemory::DmaBuf` is supported. PBO and Mem
     /// storage don't go through EGLImage import so they don't need
     /// pitch alignment; if you pass any other memory type this returns
     /// `NotImplemented`. `None` (auto-select) is treated as `Dma`.
@@ -3046,12 +3695,12 @@ where
             let shape = vec![height, width, format.channels()];
 
             let storage = match memory {
-                Some(TensorMemory::Dma) | None => {
+                Some(TensorMemory::DmaBuf) | None => {
                     TensorStorage::<T>::new_dma_with_byte_size(&shape, total_byte_size, None)?
                 }
                 Some(other) => {
                     return Err(Error::NotImplemented(format!(
-                        "image_with_stride: only TensorMemory::Dma is supported, got {other:?}"
+                        "image_with_stride: only TensorMemory::DmaBuf is supported, got {other:?}"
                     )));
                 }
             };
@@ -3164,7 +3813,7 @@ where
     /// For NV12/NV16/NV24 the buffer width is rounded up to even (a chroma-plane
     /// interleaving requirement); the true odd width is reported by the decoder
     /// in `ImageInfo` and trimmed by a `convert()` crop. See
-    /// [`PixelFormat::image_shape`].
+    /// [`PixelFormat::allocation_shape`].
     ///
     /// When the backing has a fixed physical row pitch (an IOSurface's
     /// 64-aligned `bytesPerRow`) that exceeds the new format's natural row
@@ -3180,7 +3829,7 @@ where
         height: usize,
         format: PixelFormat,
     ) -> Result<()> {
-        let shape = format.image_shape(width, height).ok_or_else(|| {
+        let shape = format.allocation_shape(width, height).ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "invalid dimensions {width}x{height} for format {format:?}"
             ))
@@ -3213,7 +3862,7 @@ where
             PixelLayout::Packed => (width * channels * elem, height),
             PixelLayout::Planar => (width * elem, channels * height),
         };
-        let needs_align = self.storage.memory() == TensorMemory::Dma
+        let needs_align = self.storage.memory() == TensorMemory::DmaBuf
             || format.layout() == PixelLayout::SemiPlanar;
 
         let active_stride = if let Some(pitch) = self.storage.backing_row_stride() {
@@ -3307,7 +3956,7 @@ where
     /// returns the exact logical height (including odd heights) only because
     /// the logical dimensions are tracked separately from the physical shape —
     /// `configure_image` stores the actual `(width, height)` in the format's
-    /// `image_shape`, which round-trips losslessly via these accessors.
+    /// `allocation_shape`, which round-trips losslessly via these accessors.
     pub fn height(&self) -> Option<usize> {
         let fmt = self.format?;
         let shape = self.shape();
@@ -3899,7 +4548,7 @@ where
             .and_then(|yo| yo.checked_add(region.x.checked_mul(bpp)?))
             .ok_or(Error::InvalidSize(region.y))?;
         let sub_shape = fmt
-            .image_shape(region.width, region.height)
+            .allocation_shape(region.width, region.height)
             .ok_or_else(|| Error::InvalidShape(format!("view(): invalid shape for {fmt:?}")))?;
         let mut t = self.subview(offset, &sub_shape)?;
         // A multi-row sub-rect must advance rows by the PARENT pitch so each row
@@ -3963,6 +4612,30 @@ where
         }
     }
 
+    /// The GL buffer ID backing this tensor (for GL backends / the
+    /// cross-package protocol's `handle`). `None` when the tensor is not
+    /// PBO-backed.
+    pub fn pbo_id(&self) -> Option<u32> {
+        self.as_pbo().map(PboTensor::buffer_id)
+    }
+
+    /// The C-ABI `PboOpsVtable` address backing this tensor (for the
+    /// cross-package protocol's `ptr` under `kind::PBO`; see
+    /// [`crate::protocol::TensorDesc::ptr`]'s doc comment). `None` when the
+    /// tensor is not PBO-backed.
+    pub fn pbo_vtable_ptr(&self) -> Option<*const std::ffi::c_void> {
+        self.as_pbo()
+            .map(|p| p.pbo_vtable() as *const _ as *const std::ffi::c_void)
+    }
+
+    /// A type-erased keepalive that must stay alive for at least as long as
+    /// [`Self::pbo_vtable_ptr`]'s address is used -- see
+    /// [`PboTensor::pbo_keepalive`]'s own doc comment. `None` when the
+    /// tensor is not PBO-backed.
+    pub fn pbo_keepalive(&self) -> Option<Arc<dyn Send + Sync>> {
+        self.as_pbo().map(PboTensor::pbo_keepalive)
+    }
+
     /// Downcast to DMA tensor reference (for EGL import, G2D).
     #[cfg(target_os = "linux")]
     pub fn as_dma(&self) -> Option<&DmaTensor<T>> {
@@ -3995,8 +4668,17 @@ where
     }
 
     /// Construct a Tensor from a PBO tensor (for GL backends that allocate PBOs).
-    pub fn from_pbo(pbo: PboTensor<T>) -> Self {
-        Self {
+    ///
+    /// Infallible in this backend (`Ok` always) -- kept as `Result` to match
+    /// `dynamic`'s own `Tensor::from_pbo` (`dynamic_tensor.rs`), which
+    /// genuinely can fail: it must allocate a real `ef_tensor_*` handle
+    /// alongside `pbo` to carry shape/dtype/format metadata (this backend
+    /// has nowhere else to put it), an allocation this backend never
+    /// needed since it just wraps `pbo` into `TensorStorage::Pbo` directly.
+    /// One shared, fallible signature lets `edgefirst-image`'s own call
+    /// sites (`gl/threaded.rs`) stay backend-agnostic.
+    pub fn from_pbo(pbo: PboTensor<T>) -> Result<Self> {
+        Ok(Self {
             storage: TensorStorage::Pbo(pbo),
             format: None,
             chroma: None,
@@ -4008,7 +4690,7 @@ where
             cpu_access: CpuAccess::ReadWrite,
             compression: None,
             view_origin: None,
-        }
+        })
     }
 
     /// The CUDA registration for this tensor, if any (set at creation on CUDA devices).
@@ -4087,6 +4769,7 @@ where
 // Quantization accessors — type-gated to integer element types via the
 // sealed `IntegerType` trait. Calling `.quantization()` on a `Tensor<f32>`
 // produces a compile error, not a runtime one.
+#[cfg(feature = "static")]
 impl<T> Tensor<T>
 where
     T: IntegerType + Num + Clone + fmt::Debug + Send + Sync,
@@ -4121,6 +4804,189 @@ where
     }
 }
 
+#[cfg(feature = "static")]
+fn map_strided_host_view<'a, T>(
+    tensor: &Tensor<T>,
+    stride: usize,
+    access: CpuAccess,
+) -> Result<crate::view::HostView<'a, T>>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync + 'a,
+{
+    // Rows sit at `stride`-byte spacing. The row count is the first
+    // shape dim for packed `[H, W, C]` and semi-planar `[H*k, W]`,
+    // but planar `[C, H, W]` stacks C planes of H rows — its surface
+    // row count is `C × H` (`shape[0]` alone would expose a 3-row
+    // window and truncate the map; first hit by Android planar-F16
+    // AHardwareBuffers, whose gralloc pads the pitch — macOS/Linux
+    // planar pitches happen to be naturally aligned so no stride was
+    // ever recorded there).
+    let rows = strided_map_rows(tensor)?;
+    let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
+        Error::InvalidOperation(format!(
+            "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
+        ))
+    })?;
+    map_strided_storage(tensor, stride, rows, total_bytes, access)
+}
+
+#[cfg(feature = "static")]
+fn strided_map_rows<T>(tensor: &Tensor<T>) -> Result<usize>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    match tensor.format.map(|f| f.layout()) {
+        Some(PixelLayout::Planar) => {
+            let s = tensor.shape();
+            if s.len() < 2 {
+                return Err(Error::InvalidOperation(
+                    "Tensor::map: strided planar mapping requires [C, H, W] shape".into(),
+                ));
+            }
+            s[0].checked_mul(s[1]).ok_or_else(|| {
+                Error::InvalidOperation(format!(
+                    "Tensor::map: planar rows {} × {} overflows usize",
+                    s[0], s[1]
+                ))
+            })
+        }
+        _ => tensor.shape().first().copied().ok_or_else(|| {
+            Error::InvalidOperation(
+                "Tensor::map: strided mapping requires a non-empty shape".into(),
+            )
+        }),
+    }
+}
+
+#[cfg(feature = "static")]
+fn map_strided_storage<'a, T>(
+    tensor: &Tensor<T>,
+    _stride: usize,
+    _rows: usize,
+    total_bytes: usize,
+    access: CpuAccess,
+) -> Result<crate::view::HostView<'a, T>>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync + 'a,
+{
+    match &tensor.storage {
+        #[cfg(target_os = "linux")]
+        TensorStorage::Dma(dma) => {
+            // `set_row_stride()` only validates `stride >= min_stride`,
+            // not that `stride × rows` fits the DMA-BUF, so re-check
+            // here — mapping past `buf_size` would SIGBUS on access.
+            // `buf_size` is real kernel truth either way, not the
+            // importer's say-so: for a self-allocated tensor it is
+            // the allocation size; for an imported one it is
+            // `fstat`-derived when the kernel reports a usable size
+            // (`DmaTensor::from_fd`), or the declared logical size in
+            // the rare fallback -- either way an out-of-range mmap
+            // against the real dma-buf is still rejected by the
+            // kernel, so this bound stays sound regardless.
+            let available_bytes = dma.buf_size.saturating_sub(dma.mmap_offset);
+            if total_bytes > available_bytes {
+                return Err(Error::InvalidOperation(format!(
+                    "Tensor::map: strided mapping needs {total_bytes} bytes \
+                     but DMA buffer only has {available_bytes} available \
+                     (buf_size={}, mmap_offset={}, stride={_stride}, rows={_rows}); \
+                     the row_stride was likely set larger than the original allocation",
+                    dma.buf_size, dma.mmap_offset
+                )));
+            }
+            dma.map_with_byte_size(total_bytes, access)
+        }
+        TensorStorage::Mem(mem) => {
+            let capacity = tensor.storage.capacity_bytes();
+            if total_bytes > capacity {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity,
+                });
+            }
+            mem.map_with_byte_size(total_bytes, access)
+        }
+        #[cfg(unix)]
+        TensorStorage::Shm(shm) => {
+            let capacity = tensor.storage.capacity_bytes();
+            if total_bytes > capacity {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity,
+                });
+            }
+            shm.map_with_byte_size(total_bytes, access)
+        }
+        // macOS/iOS: `TensorStorage::Dma` is the IOSurface. The lock yields
+        // the full surface base address, and the row pitch
+        // (`IOSurfaceGetBytesPerRow`) is known from the API for both
+        // self-allocated and imported surfaces — unlike a foreign
+        // DMA-BUF — so a strided CPU view is sound and zero-copy.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        TensorStorage::Dma(io) => {
+            // A sub-view's window is `buf_size − view_offset`; the strided
+            // span must fit the window, not the whole surface.
+            let available = io.buf_size.saturating_sub(io.view_offset);
+            if total_bytes > available {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity: available,
+                });
+            }
+            io.map_with_byte_size(total_bytes, access)
+        }
+        // Android: `TensorStorage::Dma` is the AHardwareBuffer. The lock
+        // yields the full buffer base address, and the row pitch is
+        // known from the allocator-filled descriptor — so a strided CPU
+        // view is sound and zero-copy, same as IOSurface.
+        #[cfg(target_os = "android")]
+        TensorStorage::Dma(ahb) => {
+            // A sub-view's window is `buf_size − view_offset`; the strided
+            // span must fit the window, not the whole buffer.
+            let available = ahb.buf_size.saturating_sub(ahb.view_offset);
+            if total_bytes > available {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity: available,
+                });
+            }
+            ahb.map_with_byte_size(total_bytes, access)
+        }
+        TensorStorage::Pbo(pbo) => {
+            // PBO: the GPU-side allocation may have a padded row stride
+            // (e.g. 64-byte aligned). Expose the full padded buffer so a
+            // CPU producer (JPEG decoder) and a strided convert source
+            // can iterate rows via `effective_row_stride()` without
+            // running past the slice — the logical `pbo.map()` view would
+            // stop after `shape.product()` and lose bytes past row 0.
+            // A sub-view's window is `capacity − view_offset`.
+            let available = pbo.capacity_bytes().saturating_sub(pbo.view_offset);
+            if total_bytes > available {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity: available,
+                });
+            }
+            pbo.map_with_byte_size(total_bytes, access)
+        }
+        // Every `TensorStorage` variant this build can construct is
+        // matched explicitly above (Mem/Shm/Dma/Pbo, each cfg-gated
+        // to the platforms it exists on) -- this catch-all exists
+        // only so the match stays exhaustive across every
+        // OS/cfg combination without a matching arm on every one of
+        // them, not because any variant is meant to fall through to
+        // it. `#[allow(unreachable_patterns)]` because on any given
+        // platform it genuinely is unreachable.
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::InvalidOperation(
+            "CPU mapping of strided tensors is supported only for HAL-allocated \
+             Mem/Shm (any platform), DMA (Linux, self-allocated or imported), \
+             IOSurface (macOS), and PBO"
+                .into(),
+        )),
+    }
+}
+
+#[cfg(feature = "static")]
 impl<T> TensorTrait<T> for Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -4163,6 +5029,16 @@ where
         self.storage.shape()
     }
 
+    /// Bytes available in the underlying allocation, from this tensor's
+    /// window start -- may exceed [`TensorTrait::size`] when the backing
+    /// carries spare room beyond the current logical shape (a pitch-aligned
+    /// image, or a pool tensor sized for a larger image than it holds
+    /// today). See [`crate::protocol::TensorDesc::capacity`], the
+    /// cross-package descriptor field this backs.
+    fn capacity_bytes(&self) -> usize {
+        self.storage.capacity_bytes()
+    }
+
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         if self.chroma.is_some() {
             return Err(Error::InvalidOperation(
@@ -4182,7 +5058,30 @@ where
         Ok(())
     }
 
-    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>> {
+    /// Set the logical shape to any shape whose bytes fit the allocation,
+    /// without [`reshape`](TensorTrait::reshape)'s equal-count constraint.
+    ///
+    /// Overridden rather than inherited, which it was not for most of this
+    /// crate's life. The trait's default body is `self.reshape(shape)`, so
+    /// a caller reaching this through `Tensor<T>` silently got the strict
+    /// rule under a name that promises the opposite -- on both backends,
+    /// which is why G13 cannot see it.
+    ///
+    /// The capacity-aware implementations were never dead: every storage
+    /// type has one, and [`Tensor::configure_image`] reaches them by
+    /// calling `self.storage.set_logical_shape(..)` directly. That is the
+    /// pool-reuse path -- a decode into an oversized reusable buffer
+    /// reconfiguring it to a smaller image without reallocating -- and it
+    /// worked precisely because it bypassed this method. This forwards the
+    /// same way, so the two agree.
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        self.storage.set_logical_shape(shape)
+    }
+
+    fn map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         let _span = tracing::trace_span!(
             "tensor.map",
             memory = ?self.storage.memory(),
@@ -4223,157 +5122,38 @@ where
         //     the JPEG decoder mmaps it and convert() reads it, both iterating
         //     by `row_stride`. Checked against the PBO capacity below.
         //
-        // Foreign DMA-BUFs (`from_fd()` + `set_row_stride()`, the V4L2 /
-        // GStreamer case) and IOSurface are rejected: their layout comes from an
-        // external allocator / GPU driver the HAL cannot validate for a strided
-        // CPU view, and they are intended for the GPU path. (Earlier this
-        // rejected *all* non-Linux strided maps with "DMA backing is Linux-only"
-        // — that was an unimplemented path, not a platform limit; HAL-owned
-        // Mem/Shm/PBO are trivially mappable and now are.)
+        // A strided **imported** DMA-BUF is accepted here too (Task 10b): the
+        // `stride × rows <= buf_size` check just below is exactly what a
+        // self-allocated Dma tensor relies on for its own soundness, and
+        // `buf_size` for an imported fd is `fstat`-derived when the kernel
+        // reports a usable size (`stat.st_size > 0` and at least the
+        // declared shape's logical size; `DmaTensor::from_fd`) -- kernel
+        // truth, not a caller's claim, in that case. The rare fallback (a
+        // kernel that reports `st_size <= 0` for a DMA-BUF fd) uses the
+        // declared logical size instead; that is not a hole here either, since
+        // an out-of-range mmap against the real dma-buf is still rejected by
+        // the kernel regardless of what this crate believed `buf_size` was.
+        // So the check is equally load-bearing regardless of who allocated
+        // the buffer. What
+        // changed is only *which* callers can now reach this path: the
+        // cross-package capsule protocol reconstructs an imported alias of a
+        // HAL-owned Dma tensor and then calls `configure_image`, which
+        // computes its stride with the exact same alignment rule a
+        // self-allocated `Tensor::image()` used — so the value being
+        // bounds-checked here is HAL-computed and format/width-derived, not
+        // read from an external driver. Rejecting it unconditionally used to
+        // make every foreign-imported GPU-backed destination fail any CPU
+        // write path (the JPEG decoder's MCU writer among them) even when the
+        // write was provably in-bounds. `set_row_stride()` was already
+        // "trust the caller, bounds-check the map" for every *other* backing
+        // (Mem/Shm/self-allocated Dma/PBO) — singling out imported Dma out
+        // for a stricter standard was the inconsistency, not the trust model
+        // itself. IOSurface keeps its own always-allowed strided path
+        // unconditionally (see its arm below): a live `IOSurfaceRef` reports
+        // its real `bytesPerRow` from the OS regardless of who allocated it,
+        // so there was never anything to distrust there.
         if let Some(stride) = self.row_stride {
-            // Rows sit at `stride`-byte spacing. The row count is the first
-            // shape dim for packed `[H, W, C]` and semi-planar `[H*k, W]`,
-            // but planar `[C, H, W]` stacks C planes of H rows — its surface
-            // row count is `C × H` (`shape[0]` alone would expose a 3-row
-            // window and truncate the map; first hit by Android planar-F16
-            // AHardwareBuffers, whose gralloc pads the pitch — macOS/Linux
-            // planar pitches happen to be naturally aligned so no stride was
-            // ever recorded there).
-            let rows = match self.format.map(|f| f.layout()) {
-                Some(PixelLayout::Planar) => {
-                    let s = self.shape();
-                    if s.len() < 2 {
-                        return Err(Error::InvalidOperation(
-                            "Tensor::map: strided planar mapping requires [C, H, W] shape".into(),
-                        ));
-                    }
-                    s[0].checked_mul(s[1]).ok_or_else(|| {
-                        Error::InvalidOperation(format!(
-                            "Tensor::map: planar rows {} × {} overflows usize",
-                            s[0], s[1]
-                        ))
-                    })?
-                }
-                _ => *self.shape().first().ok_or_else(|| {
-                    Error::InvalidOperation(
-                        "Tensor::map: strided mapping requires a non-empty shape".into(),
-                    )
-                })?,
-            };
-            let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
-                Error::InvalidOperation(format!(
-                    "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
-                ))
-            })?;
-
-            match &self.storage {
-                #[cfg(target_os = "linux")]
-                TensorStorage::Dma(dma) if !dma.is_imported => {
-                    // `set_row_stride()` only validates `stride >= min_stride`,
-                    // not that `stride × rows` fits the DMA-BUF, so re-check
-                    // here — mapping past `buf_size` would SIGBUS on access.
-                    let available_bytes = dma.buf_size.saturating_sub(dma.mmap_offset);
-                    if total_bytes > available_bytes {
-                        return Err(Error::InvalidOperation(format!(
-                            "Tensor::map: strided mapping needs {total_bytes} bytes \
-                             but DMA buffer only has {available_bytes} available \
-                             (buf_size={}, mmap_offset={}, stride={stride}, rows={rows}); \
-                             the row_stride was likely set larger than the original allocation",
-                            dma.buf_size, dma.mmap_offset
-                        )));
-                    }
-                    return dma
-                        .map_with_byte_size(total_bytes, access)
-                        .map(TensorMap::Dma);
-                }
-                TensorStorage::Mem(mem) => {
-                    let capacity = self.storage.capacity_bytes();
-                    if total_bytes > capacity {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity,
-                        });
-                    }
-                    return mem.map_with_byte_size(total_bytes, access);
-                }
-                #[cfg(unix)]
-                TensorStorage::Shm(shm) => {
-                    let capacity = self.storage.capacity_bytes();
-                    if total_bytes > capacity {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity,
-                        });
-                    }
-                    return shm.map_with_byte_size(total_bytes, access);
-                }
-                // macOS/iOS: `TensorStorage::Dma` is the IOSurface. The lock yields
-                // the full surface base address, and the row pitch
-                // (`IOSurfaceGetBytesPerRow`) is known from the API for both
-                // self-allocated and imported surfaces — unlike a foreign
-                // DMA-BUF — so a strided CPU view is sound and zero-copy.
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                TensorStorage::Dma(io) => {
-                    // A sub-view's window is `buf_size − view_offset`; the strided
-                    // span must fit the window, not the whole surface.
-                    let available = io.buf_size.saturating_sub(io.view_offset);
-                    if total_bytes > available {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity: available,
-                        });
-                    }
-                    return io.map_with_byte_size(total_bytes, access);
-                }
-                // Android: `TensorStorage::Dma` is the AHardwareBuffer. The lock
-                // yields the full buffer base address, and the row pitch is
-                // known from the allocator-filled descriptor — so a strided CPU
-                // view is sound and zero-copy, same as IOSurface.
-                #[cfg(target_os = "android")]
-                TensorStorage::Dma(ahb) => {
-                    // A sub-view's window is `buf_size − view_offset`; the strided
-                    // span must fit the window, not the whole buffer.
-                    let available = ahb.buf_size.saturating_sub(ahb.view_offset);
-                    if total_bytes > available {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity: available,
-                        });
-                    }
-                    return ahb.map_with_byte_size(total_bytes, access);
-                }
-                TensorStorage::Pbo(pbo) => {
-                    // PBO: the GPU-side allocation may have a padded row stride
-                    // (e.g. 64-byte aligned). Expose the full padded buffer so a
-                    // CPU producer (JPEG decoder) and a strided convert source
-                    // can iterate rows via `effective_row_stride()` without
-                    // running past the slice — the logical `pbo.map()` view would
-                    // stop after `shape.product()` and lose bytes past row 0.
-                    // A sub-view's window is `capacity − view_offset`.
-                    let available = pbo.capacity_bytes().saturating_sub(pbo.view_offset);
-                    if total_bytes > available {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity: available,
-                        });
-                    }
-                    return pbo.map_with_byte_size(total_bytes, access);
-                }
-                // Reachable on Linux for an IMPORTED DMA-BUF (the `Dma` arm above
-                // is guarded `if !dma.is_imported`). On macOS/Windows every
-                // storage variant is matched explicitly, so this catch-all is
-                // unreachable there — allow it rather than cfg-gating per platform.
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(Error::InvalidOperation(
-                        "CPU mapping of strided tensors is supported only for HAL-allocated \
-                         Mem/Shm (any platform), self-allocated DMA (Linux), IOSurface \
-                         (macOS), and PBO; imported DMA-BUF without self-allocation is \
-                         GPU-path only"
-                            .into(),
-                    ));
-                }
-            }
+            return map_strided_host_view(self, stride, access);
         }
         // Offset tensors are supported for storages that apply the offset
         // inside their own `map()`: DMA (`DmaMap`/IOSurface adjust the mapped
@@ -4410,129 +5190,6 @@ where
     }
 }
 
-pub enum TensorMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    #[cfg(target_os = "linux")]
-    Dma(DmaMap<T>),
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    IoSurface(IoSurfaceMap<T>),
-    #[cfg(target_os = "android")]
-    HardwareBuffer(AHardwareBufferMap<T>),
-    #[cfg(unix)]
-    Shm(ShmMap<T>),
-    Mem(MemMap<T>),
-    Pbo(PboMap<T>),
-}
-
-impl<T> TensorMapTrait<T> for TensorMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn shape(&self) -> &[usize] {
-        match self {
-            #[cfg(target_os = "linux")]
-            TensorMap::Dma(map) => map.shape(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            TensorMap::IoSurface(map) => map.shape(),
-            #[cfg(target_os = "android")]
-            TensorMap::HardwareBuffer(map) => map.shape(),
-            #[cfg(unix)]
-            TensorMap::Shm(map) => map.shape(),
-            TensorMap::Mem(map) => map.shape(),
-            TensorMap::Pbo(map) => map.shape(),
-        }
-    }
-
-    fn unmap(&mut self) {
-        match self {
-            #[cfg(target_os = "linux")]
-            TensorMap::Dma(map) => map.unmap(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            TensorMap::IoSurface(map) => map.unmap(),
-            #[cfg(target_os = "android")]
-            TensorMap::HardwareBuffer(map) => map.unmap(),
-            #[cfg(unix)]
-            TensorMap::Shm(map) => map.unmap(),
-            TensorMap::Mem(map) => map.unmap(),
-            TensorMap::Pbo(map) => map.unmap(),
-        }
-    }
-
-    fn as_slice(&self) -> &[T] {
-        match self {
-            #[cfg(target_os = "linux")]
-            TensorMap::Dma(map) => map.as_slice(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            TensorMap::IoSurface(map) => map.deref(),
-            #[cfg(target_os = "android")]
-            TensorMap::HardwareBuffer(map) => map.deref(),
-            #[cfg(unix)]
-            TensorMap::Shm(map) => map.as_slice(),
-            TensorMap::Mem(map) => map.as_slice(),
-            TensorMap::Pbo(map) => map.as_slice(),
-        }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [T] {
-        match self {
-            #[cfg(target_os = "linux")]
-            TensorMap::Dma(map) => map.as_mut_slice(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            TensorMap::IoSurface(map) => map.deref_mut(),
-            #[cfg(target_os = "android")]
-            TensorMap::HardwareBuffer(map) => map.deref_mut(),
-            #[cfg(unix)]
-            TensorMap::Shm(map) => map.as_mut_slice(),
-            TensorMap::Mem(map) => map.as_mut_slice(),
-            TensorMap::Pbo(map) => map.as_mut_slice(),
-        }
-    }
-}
-
-impl<T> Deref for TensorMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    type Target = [T];
-
-    fn deref(&self) -> &[T] {
-        match self {
-            #[cfg(target_os = "linux")]
-            TensorMap::Dma(map) => map.deref(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            TensorMap::IoSurface(map) => map.deref(),
-            #[cfg(target_os = "android")]
-            TensorMap::HardwareBuffer(map) => map.deref(),
-            #[cfg(unix)]
-            TensorMap::Shm(map) => map.deref(),
-            TensorMap::Mem(map) => map.deref(),
-            TensorMap::Pbo(map) => map.deref(),
-        }
-    }
-}
-
-impl<T> DerefMut for TensorMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn deref_mut(&mut self) -> &mut [T] {
-        match self {
-            #[cfg(target_os = "linux")]
-            TensorMap::Dma(map) => map.deref_mut(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            TensorMap::IoSurface(map) => map.deref_mut(),
-            #[cfg(target_os = "android")]
-            TensorMap::HardwareBuffer(map) => map.deref_mut(),
-            #[cfg(unix)]
-            TensorMap::Shm(map) => map.deref_mut(),
-            TensorMap::Mem(map) => map.deref_mut(),
-            TensorMap::Pbo(map) => map.deref_mut(),
-        }
-    }
-}
-
 // ============================================================================
 // Platform availability helpers
 // ============================================================================
@@ -4554,7 +5211,8 @@ static IOSURFACE_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new
 /// This function caches its result after the first call.
 #[cfg(target_os = "linux")]
 pub fn is_dma_available() -> bool {
-    *DMA_AVAILABLE.get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
+    *DMA_AVAILABLE
+        .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None).is_ok())
 }
 
 /// Always returns `false` on non-Linux platforms.
@@ -4576,7 +5234,7 @@ pub fn is_iosurface_available() -> bool {
     *IOSURFACE_AVAILABLE.get_or_init(|| {
         // Probe via the same Dma path — on macOS/iOS this routes through
         // IoSurfaceTensor::new.
-        Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok()
+        Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None).is_ok()
     })
 }
 
@@ -4600,7 +5258,7 @@ pub fn is_ahardwarebuffer_available() -> bool {
     *AHARDWAREBUFFER_AVAILABLE.get_or_init(|| {
         // Probe via the same Dma path — on Android this routes through
         // AHardwareBufferTensor::new.
-        Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok()
+        Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None).is_ok()
     })
 }
 
@@ -4704,42 +5362,42 @@ mod image_tests {
     use super::*;
 
     #[test]
-    fn image_shape_per_layout() {
+    fn allocation_shape_per_layout() {
         assert_eq!(
-            PixelFormat::Rgb.image_shape(640, 480),
+            PixelFormat::Rgb.allocation_shape(640, 480),
             Some(vec![480, 640, 3])
         );
         assert_eq!(
-            PixelFormat::Grey.image_shape(640, 480),
+            PixelFormat::Grey.allocation_shape(640, 480),
             Some(vec![480, 640, 1])
         );
         assert_eq!(
-            PixelFormat::Nv12.image_shape(640, 480),
+            PixelFormat::Nv12.allocation_shape(640, 480),
             Some(vec![720, 640])
         );
         // Odd height: combined-plane height is `481 + ceil(481/2)` = 481 + 241
         // = 722 rows. Logical height is recovered as `722 * 2 / 3` = 481.
         assert_eq!(
-            PixelFormat::Nv12.image_shape(640, 481),
+            PixelFormat::Nv12.allocation_shape(640, 481),
             Some(vec![722, 640])
         );
         // Odd width: shape carries the LOGICAL width (641).
         // The 64-aligned stride (>= 642) is stored separately on the Tensor.
         assert_eq!(
-            PixelFormat::Nv12.image_shape(641, 480),
+            PixelFormat::Nv12.allocation_shape(641, 480),
             Some(vec![720, 641])
         );
         // NV16 odd width: same — logical width in shape, stride separate.
         assert_eq!(
-            PixelFormat::Nv16.image_shape(641, 480),
+            PixelFormat::Nv16.allocation_shape(641, 480),
             Some(vec![960, 641])
         );
         assert_eq!(
-            PixelFormat::PlanarRgb.image_shape(640, 480),
+            PixelFormat::PlanarRgb.allocation_shape(640, 480),
             Some(vec![3, 480, 640])
         );
         assert_eq!(
-            PixelFormat::Nv16.image_shape(640, 480),
+            PixelFormat::Nv16.allocation_shape(640, 480),
             Some(vec![960, 640])
         );
     }
@@ -4793,7 +5451,7 @@ mod image_tests {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
         // RGBA u8 at width=4 → 4*4 = 16 bytes/row, not 64-byte aligned. RGBA has
-        // a real IOSurface FourCC, so an explicit `Some(TensorMemory::Dma)`
+        // a real IOSurface FourCC, so an explicit `Some(TensorMemory::DmaBuf)`
         // request now allocates a padded image IOSurface (64-aligned
         // `bytes_per_row`) and records the stride — a fully zero-copy buffer GL
         // can bind and the CPU can map via the strided path. (Previously this
@@ -4803,7 +5461,7 @@ mod image_tests {
             4,
             4,
             PixelFormat::Rgba,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect("padded RGBA IOSurface should allocate");
@@ -4842,7 +5500,7 @@ mod image_tests {
             10,
             10,
             PixelFormat::Rgb,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect_err("RGB f32 with 12 B/pixel and non-aligned width must be rejected");
@@ -4878,7 +5536,7 @@ mod image_tests {
             10,
             10,
             PixelFormat::Rgb,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect_err("Rgb u8 width%4!=0 must be rejected");
@@ -4892,11 +5550,11 @@ mod image_tests {
             12,
             4,
             PixelFormat::Rgb,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect("width 12 Rgb u8 must allocate padded");
-        assert_eq!(t.memory(), TensorMemory::Dma);
+        assert_eq!(t.memory(), TensorMemory::DmaBuf);
         assert!(
             t.row_stride()
                 .is_some_and(|s| s >= 64 && s.is_multiple_of(64)),
@@ -4909,7 +5567,7 @@ mod image_tests {
             640,
             8,
             PixelFormat::Rgb,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect("width 640 Rgb u8 must allocate flat");
@@ -4919,11 +5577,11 @@ mod image_tests {
             640,
             8,
             PixelFormat::Rgb,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect("Rgb i8 shares the RGBA8888 mapping");
-        assert_eq!(t.memory(), TensorMemory::Dma);
+        assert_eq!(t.memory(), TensorMemory::DmaBuf);
     }
 
     #[test]
@@ -4937,7 +5595,7 @@ mod image_tests {
             16,
             16,
             PixelFormat::PlanarRgb,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect_err("width=16 PlanarRgb F16 is 32-byte row, must reject");
@@ -4947,7 +5605,7 @@ mod image_tests {
             32,
             8,
             PixelFormat::PlanarRgb,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .expect("width=32 PlanarRgb F16 is 64-byte row, must succeed");
@@ -4989,7 +5647,7 @@ mod image_tests {
             1688,
             PixelFormat::Rgba,
             stride,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -5044,34 +5702,63 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn image_tensor_with_stride_rejects_foreign_strided_map() {
-        // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = crate::tests::fd_lock_shared();
-        // A FOREIGN (imported via from_fd) DMA tensor with row_stride set
-        // should still refuse CPU mapping — external allocator owns the
-        // layout. This protects the V4L2 / GStreamer use case.
+    fn image_tensor_foreign_strided_map_is_bounds_checked_not_refused() {
+        // An imported (foreign) DMA-BUF with a row stride used to be refused
+        // outright. That changed deliberately: the cross-package capsule
+        // protocol reconstructs an imported alias of a HAL-owned Dma tensor,
+        // and refusing every strided CPU map broke the flagship
+        // create_image() -> decode_file_into() -> convert() pipeline on Linux.
         //
-        // We simulate a foreign import by wrapping our own allocation's
-        // fd via `from_fd` and calling set_row_stride manually. The
-        // `is_imported` flag on from_fd is true by construction.
+        // What replaced the refusal is a bounds check against `buf_size`,
+        // which for an imported fd is `fstat`-derived kernel truth rather
+        // than the caller's claim. So the property worth testing is no longer
+        // "foreign strided maps fail" but "they succeed exactly when they
+        // fit" -- which is what actually keeps the mapping sound.
+        //
+        // This test previously asserted the old refusal and went red on every
+        // board with a dma-heap when the behaviour changed, unnoticed because
+        // it needs both Linux and a dma-heap: it skips on macOS and on Orin
+        // (nvmap, no CONFIG_DMABUF_HEAPS).
         if !is_dma_available() {
             eprintln!("SKIPPED: DMA heap not available");
             return;
         }
-        // Allocate a backing buffer large enough for a 320×240 BGRA8 image.
-        let backing = Tensor::<u8>::new(&[240 * 320 * 4], Some(TensorMemory::Dma), None).unwrap();
-        let fd = backing.clone_fd().unwrap();
-        // Import it via from_fd — this marks is_imported=true.
-        let shape = [240usize, 320, 4];
-        let storage = TensorStorage::<u8>::from_fd(fd, &shape, None).unwrap();
-        let mut t = Tensor::<u8>::wrap(storage);
-        t.set_format(PixelFormat::Bgra).unwrap();
-        t.set_row_stride(320 * 4).unwrap(); // natural, but still marks it as strided
-        let err = t.map();
-        assert!(
-            matches!(err, Err(Error::InvalidOperation(_))),
-            "foreign strided map should error"
-        );
+        let backing =
+            Tensor::<u8>::new(&[240 * 320 * 4], Some(TensorMemory::DmaBuf), None).unwrap();
+
+        // In bounds: the natural stride for the declared image fits the
+        // allocation, so the map must succeed.
+        {
+            let fd = backing.clone_fd().unwrap();
+            let shape = [240usize, 320, 4];
+            let storage = TensorStorage::<u8>::from_fd(fd, &shape, None).unwrap();
+            let mut t = Tensor::<u8>::wrap(storage);
+            t.set_format(PixelFormat::Bgra).unwrap();
+            t.set_row_stride(320 * 4).unwrap();
+            assert!(
+                t.map().is_ok(),
+                "an in-bounds strided map of an imported DMA-BUF must be \
+                 accepted -- refusing it is what broke decode-into-GPU-tensor"
+            );
+        }
+
+        // Out of bounds: a stride the allocation cannot back must still be
+        // refused, and the error must say so. This is the half that carries
+        // the soundness.
+        {
+            let fd = backing.clone_fd().unwrap();
+            let shape = [240usize, 320, 4];
+            let storage = TensorStorage::<u8>::from_fd(fd, &shape, None).unwrap();
+            let mut t = Tensor::<u8>::wrap(storage);
+            t.set_format(PixelFormat::Bgra).unwrap();
+            // Double the pitch: 240 rows x 2560 bytes is twice the allocation.
+            t.set_row_stride(320 * 4 * 2).unwrap();
+            let err = t.map();
+            assert!(
+                matches!(err, Err(Error::InvalidOperation(_))),
+                "a strided map larger than the DMA allocation must be refused"
+            );
+        }
     }
 
     #[test]
@@ -5096,7 +5783,7 @@ mod image_tests {
             480,
             PixelFormat::Rgba,
             3072,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -5144,7 +5831,7 @@ mod image_tests {
             480,
             PixelFormat::Rgba,
             2400,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         );
         assert!(matches!(err, Err(Error::InvalidArgument(_))));
@@ -5156,13 +5843,13 @@ mod image_tests {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
         // NV12 is SemiPlanar → not supported. (Linux-only because
-        // `TensorMemory::Dma` itself is a Linux-only enum variant.)
+        // `TensorMemory::DmaBuf` itself is a Linux-only enum variant.)
         let err = Tensor::<u8>::image_with_stride(
             640,
             480,
             PixelFormat::Nv12,
             640,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         );
         assert!(matches!(err, Err(Error::NotImplemented(_))));
@@ -5415,7 +6102,7 @@ mod cpu_access_tests {
     fn iosurface_read_only_lock_roundtrip() {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
-        let Ok(t) = Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None) else {
+        let Ok(t) = Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None) else {
             eprintln!("SKIPPED: IOSurface unavailable");
             return;
         };
@@ -5483,7 +6170,7 @@ mod tests {
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
         // Auto-select priority is Dma > Mem; Shm is never auto-selected.
         match dma_enabled {
-            true => assert_eq!(tensor.memory(), TensorMemory::Dma),
+            true => assert_eq!(tensor.memory(), TensorMemory::DmaBuf),
             false => assert_eq!(tensor.memory(), TensorMemory::Mem),
         }
     }
@@ -5498,7 +6185,7 @@ mod tests {
         // contexts where IOSurfaceCreate fails. Shm is never auto-selected.
         let m = tensor.memory();
         assert!(
-            matches!(m, TensorMemory::Dma | TensorMemory::Mem),
+            matches!(m, TensorMemory::DmaBuf | TensorMemory::Mem),
             "Unexpected auto-fallback result on macOS/iOS: {m:?}"
         );
     }
@@ -5555,7 +6242,7 @@ mod tests {
 
         const DUMMY_VALUE: f32 = 12.34;
 
-        assert_eq!(tensor.memory(), TensorMemory::Dma);
+        assert_eq!(tensor.memory(), TensorMemory::DmaBuf);
         assert_eq!(tensor.name(), "test_tensor");
         assert_eq!(tensor.shape(), &shape);
         assert_eq!(tensor.size(), 2 * 3 * 4 * std::mem::size_of::<f32>());
@@ -5577,7 +6264,7 @@ mod tests {
             )
             .expect("Failed to create tensor from fd");
 
-            assert_eq!(shared.memory(), TensorMemory::Dma);
+            assert_eq!(shared.memory(), TensorMemory::DmaBuf);
             assert_eq!(shared.name(), "test_tensor_shared");
             assert_eq!(shared.shape(), &shape);
 
@@ -5626,6 +6313,10 @@ mod tests {
     #[cfg(unix)]
     fn test_shm_tensor() {
         let _lock = crate::tests::fd_lock_shared();
+        if !is_shm_available() {
+            log::warn!("SKIPPED: test_shm_tensor - SHM allocation unavailable on this platform");
+            return;
+        }
         let shape = vec![2, 3, 4];
         let tensor =
             ShmTensor::<f32>::new(&shape, Some("test_tensor")).expect("Failed to create tensor");
@@ -5890,7 +6581,7 @@ mod tests {
 
         // Dma == DMA-BUF on Linux, IOSurface on macOS; same public variant.
         if crate::is_gpu_buffer_available() {
-            assert_shares(TensorMemory::Dma, "Dma");
+            assert_shares(TensorMemory::DmaBuf, "Dma");
         }
     }
 
@@ -6036,7 +6727,7 @@ mod tests {
         let _lock = crate::tests::fd_lock_shared();
         // Identical sub-view semantics across Dma (shared fd) and Mem (shared
         // Arc): same offsets → same logical windows → same partition.
-        let dma = match Tensor::<u8>::new(&[8], Some(TensorMemory::Dma), None) {
+        let dma = match Tensor::<u8>::new(&[8], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(_) => {
                 eprintln!("SKIPPED: DMA not available");
@@ -6069,7 +6760,7 @@ mod tests {
         // batched-render-to-DMA case). Mirrors
         // `mem_strided_subview_maps_offset_and_byte_size` on a Dma parent.
         let _lock = crate::tests::fd_lock_shared();
-        let parent = match Tensor::<u8>::new(&[2048], Some(TensorMemory::Dma), None) {
+        let parent = match Tensor::<u8>::new(&[2048], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(_) => {
                 eprintln!("SKIPPED: DMA not available");
@@ -6113,7 +6804,7 @@ mod tests {
             4,
             PixelFormat::Rgba,
             64,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
@@ -6199,7 +6890,7 @@ mod tests {
 
         // Self-check — see `test_shm_no_fd_leaks`.
         {
-            let probe = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Dma), None)
+            let probe = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::DmaBuf), None)
                 .expect("Failed to create tensor");
             assert!(
                 open_fd_count(DMA_FD_TARGETS) > baseline,
@@ -6210,7 +6901,7 @@ mod tests {
         }
 
         for _ in 0..100 {
-            let tensor = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Dma), None)
+            let tensor = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::DmaBuf), None)
                 .expect("Failed to create tensor");
             let mut map = tensor.map().unwrap();
             map.as_mut_slice().fill(233);
@@ -6236,7 +6927,7 @@ mod tests {
         }
 
         let baseline = open_fd_count(DMA_FD_TARGETS);
-        let orig = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Dma), None).unwrap();
+        let orig = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::DmaBuf), None).unwrap();
 
         // Self-check — see `test_shm_no_fd_leaks`.
         let held = open_fd_count(DMA_FD_TARGETS);
@@ -6251,7 +6942,7 @@ mod tests {
                 Tensor::<u8>::from_fd(orig.clone_fd().unwrap(), orig.shape(), None).unwrap();
             assert_eq!(
                 tensor.memory(),
-                TensorMemory::Dma,
+                TensorMemory::DmaBuf,
                 "DMA-BUF fd must import as Dma, not be silently downgraded"
             );
             let mut map = tensor.map().unwrap();
@@ -6324,7 +7015,7 @@ mod tests {
         }
     }
 
-    /// A DMA-BUF fd must import as [`TensorMemory::Dma`].
+    /// A DMA-BUF fd must import as [`TensorMemory::DmaBuf`].
     ///
     /// Regression test for the `st_dev` minor-number classifier, which
     /// hardcoded `9 | 10` as "this is DMA". Those minors come from
@@ -6342,14 +7033,14 @@ mod tests {
             return;
         }
 
-        let orig = Tensor::<u8>::new(&[64, 64], Some(TensorMemory::Dma), None).unwrap();
-        assert_eq!(orig.memory(), TensorMemory::Dma);
+        let orig = Tensor::<u8>::new(&[64, 64], Some(TensorMemory::DmaBuf), None).unwrap();
+        assert_eq!(orig.memory(), TensorMemory::DmaBuf);
 
         let imported = Tensor::<u8>::from_fd(orig.clone_fd().unwrap(), orig.shape(), None).unwrap();
 
         assert_eq!(
             imported.memory(),
-            TensorMemory::Dma,
+            TensorMemory::DmaBuf,
             "a DMA-BUF fd must import as Dma"
         );
     }
@@ -6516,19 +7207,31 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_identity_unique() {
-        let id1 = BufferIdentity::new();
-        let id2 = BufferIdentity::new();
-        assert_ne!(
+    fn test_buffer_identity_derived_equality() {
+        // Two identities derived from the same kind and key must be equal —
+        // that is the whole point of `derived`: two independently-linked
+        // copies of this crate, each importing the same underlying buffer,
+        // have to agree on its id without talking to each other.
+        let id1 = BufferIdentity::derived(IdentityKind::DmaBuf, 4242);
+        let id2 = BufferIdentity::derived(IdentityKind::DmaBuf, 4242);
+        assert_eq!(
             id1.id(),
             id2.id(),
-            "Two identities should have different ids"
+            "Identities derived from the same kind and key should match"
+        );
+
+        // A different key still yields a different id.
+        let id3 = BufferIdentity::derived(IdentityKind::DmaBuf, 4243);
+        assert_ne!(
+            id1.id(),
+            id3.id(),
+            "Identities derived from different keys should differ"
         );
     }
 
     #[test]
     fn test_buffer_identity_clone_shares_guard() {
-        let id1 = BufferIdentity::new();
+        let id1 = BufferIdentity::derived(IdentityKind::DmaBuf, 4242);
         let weak = id1.weak();
         assert!(
             weak.upgrade().is_some(),
@@ -6869,7 +7572,7 @@ mod tests {
             100,
             64,
             PixelFormat::Grey,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -6960,10 +7663,17 @@ mod tests {
     fn test_shm_available_and_usable() {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
-        assert!(
-            is_shm_available(),
-            "SHM memory allocation should be available on Unix systems"
-        );
+        // "Unix" is not one platform here: Android is unix but its bionic libc
+        // has no POSIX shared memory, so allocation legitimately reports
+        // NotImplemented (see shm.rs module docs). Asserting availability
+        // outright fails there for a documented reason.
+        if !is_shm_available() {
+            log::warn!(
+                "SKIPPED: test_shm_available_and_usable - SHM allocation \
+                 unavailable on this platform"
+            );
+            return;
+        }
 
         // Create a tensor with SHM backing
         let tensor = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Shm), None)

@@ -294,8 +294,8 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
     let allow_hw = output_fmt == native_fmt;
 
     // NV12 supports odd dimensions. Odd *height* gives a `H + ceil(H/2)`
-    // combined-plane height (`PixelFormat::image_shape`). Odd *width* rounds the
-    // tensor's buffer width up to even (also via `image_shape`), so the MCU
+    // combined-plane height (`PixelFormat::allocation_shape`). Odd *width* rounds the
+    // tensor's buffer width up to even (also via `allocation_shape`), so the MCU
     // writer's `ceil(width/2)` chroma columns are byte-aligned; the reported
     // `ImageInfo.width` below stays the true odd value for a downstream crop.
 

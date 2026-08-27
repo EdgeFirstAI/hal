@@ -1,15 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
-    PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
+    DType, PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
+use edgefirst_tensor::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::time::Instant;
 
-use super::cache::CachedImport;
 use super::EglDisplayKind;
 
 use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
@@ -473,7 +472,7 @@ fn warn_slow_path_once(call_site: &str, failing_setup: &str, err: &crate::Error)
 /// the returned reference — the chroma `Box<Tensor<T>>` would also be
 /// reinterpreted and its drop glue could theoretically differ.
 unsafe fn tensor_i8_as_u8_mut(t: &mut Tensor<i8>) -> &mut Tensor<u8> {
-    &mut *(t as *mut Tensor<i8> as *mut Tensor<u8>)
+    unsafe { &mut *(t as *mut Tensor<i8> as *mut Tensor<u8>) }
 }
 
 /// Reinterpret a `&Tensor<i8>` as `&Tensor<u8>`.
@@ -482,18 +481,20 @@ unsafe fn tensor_i8_as_u8_mut(t: &mut Tensor<i8>) -> &mut Tensor<u8> {
 /// Same rationale as [`tensor_i8_as_u8_mut`]. The returned reference must not
 /// be used to access `chroma()`.
 unsafe fn tensor_i8_as_u8(t: &Tensor<i8>) -> &Tensor<u8> {
-    &*(t as *const Tensor<i8> as *const Tensor<u8>)
+    unsafe { &*(t as *const Tensor<i8> as *const Tensor<u8>) }
 }
 
 /// Extract `&Tensor<u8>` and `PixelFormat` from a `&TensorDyn` source.
 /// For I8 sources, reinterprets the bytes as u8.
 fn dyn_to_u8_src(src: &TensorDyn) -> crate::Result<(&Tensor<u8>, PixelFormat)> {
-    match src {
-        TensorDyn::U8(t) => {
+    match src.dtype() {
+        DType::U8 => {
+            let t = src.as_typed::<u8>().expect("dtype checked");
             let fmt = t.format().ok_or(Error::NotAnImage)?;
             Ok((t, fmt))
         }
-        TensorDyn::I8(t) => {
+        DType::I8 => {
+            let t = src.as_typed::<i8>().expect("dtype checked");
             let fmt = t.format().ok_or(Error::NotAnImage)?;
             // SAFETY: i8/u8 are layout-identical
             Ok((unsafe { tensor_i8_as_u8(t) }, fmt))
@@ -508,12 +509,14 @@ fn dyn_to_u8_src(src: &TensorDyn) -> crate::Result<(&Tensor<u8>, PixelFormat)> {
 /// Extract `&mut Tensor<u8>`, `PixelFormat`, and `is_int8` from a `&mut TensorDyn` destination.
 /// For I8 destinations, reinterprets the bytes as u8 and sets `is_int8 = true`.
 fn dyn_to_u8_dst(dst: &mut TensorDyn) -> crate::Result<(&mut Tensor<u8>, PixelFormat, bool)> {
-    match dst {
-        TensorDyn::U8(t) => {
+    match dst.dtype() {
+        DType::U8 => {
+            let t = dst.as_typed_mut::<u8>().expect("dtype checked");
             let fmt = t.format().ok_or(Error::NotAnImage)?;
             Ok((t, fmt, false))
         }
-        TensorDyn::I8(t) => {
+        DType::I8 => {
+            let t = dst.as_typed_mut::<i8>().expect("dtype checked");
             let fmt = t.format().ok_or(Error::NotAnImage)?;
             // SAFETY: i8/u8 are layout-identical
             Ok((unsafe { tensor_i8_as_u8_mut(t) }, fmt, true))
@@ -542,7 +545,7 @@ impl ImageProcessorTrait for GLProcessorST {
         // writes the sub-region correctly via offset + parent stride.
         if dst.view_origin().is_some()
             && !(self.gl_context.transfer_backend.is_zero_copy()
-                && dst.memory() == TensorMemory::Dma
+                && dst.memory() == TensorMemory::DmaBuf
                 && matches!(
                     dst.dtype(),
                     edgefirst_tensor::DType::U8 | edgefirst_tensor::DType::I8
@@ -762,12 +765,95 @@ fn software_gl_override_enabled() -> bool {
     std::env::var_os("EDGEFIRST_ALLOW_SOFTWARE_GL").is_some_and(|v| v == "1")
 }
 
+/// Per-cache import-cache capacity when neither the caller nor the
+/// environment asks for one. See
+/// [`ImageProcessorConfig::egl_cache_capacity`](crate::ImageProcessorConfig::egl_cache_capacity)
+/// for what the number bounds, and `with_cache_capacity` for why it is 16.
+const DEFAULT_EGL_CACHE_CAPACITY: usize = 16;
+
+/// Resolve the import-cache capacity: config > environment > default.
+///
+/// Pure so the precedence is unit-testable without a GL context or a mutated
+/// process environment — the caller passes the raw
+/// `EDGEFIRST_EGL_CACHE_CAPACITY` value. Config wins over the environment so
+/// a stray env var in a deployment cannot silently override an embedder that
+/// measured its own pool. Zero and unparseable values are rejected at both
+/// levels and fall through, since a zero-capacity cache would evict every
+/// entry it inserted.
+fn resolve_egl_cache_capacity(config: Option<usize>, env: Option<&str>) -> usize {
+    config
+        .filter(|&c| c > 0)
+        .or_else(|| env.and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0))
+        .unwrap_or(DEFAULT_EGL_CACHE_CAPACITY)
+}
+
 /// Decide whether to reject an initialized GL context for being a software
 /// renderer. Pure so it is unit-testable without touching the environment or a
 /// real GL context: reject only when the renderer is software AND the override
 /// is not enabled.
 fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool) -> bool {
     is_software_renderer && !override_enabled
+}
+
+fn parse_nv_path_pref() -> NvPathPref {
+    match std::env::var("EDGEFIRST_NV_CONVERT_PATH") {
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "sampler" | "external" | "a" => NvPathPref::ForceSampler,
+            "shader" | "r8" | "b" => NvPathPref::ForceShader,
+            "auto" | "" => NvPathPref::Auto,
+            other => {
+                log::warn!(
+                    "EDGEFIRST_NV_CONVERT_PATH={other:?} not recognised \
+                     (expected sampler|shader|auto), using auto"
+                );
+                NvPathPref::Auto
+            }
+        },
+        Err(_) => NvPathPref::Auto,
+    }
+}
+
+fn parse_colorimetry_env() -> Option<crate::ColorimetryMode> {
+    match std::env::var("EDGEFIRST_COLORIMETRY") {
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "exact" => Some(crate::ColorimetryMode::Exact),
+            "fast" => Some(crate::ColorimetryMode::Fast),
+            "" => None,
+            other => {
+                log::warn!(
+                    "EDGEFIRST_COLORIMETRY={other:?} not recognised \
+                     (expected fast|exact), ignoring"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+fn apply_forced_transfer(backend: &mut TransferBackend) {
+    let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER") else {
+        return;
+    };
+    let forced = match val.to_ascii_lowercase().as_str() {
+        "dmabuf" | "dma" => Some(TransferBackend::DmaBuf),
+        "pbo" => Some(TransferBackend::Pbo),
+        "sync" => Some(TransferBackend::Sync),
+        other => {
+            log::warn!(
+                "EDGEFIRST_FORCE_TRANSFER={other:?} not recognised \
+                 (expected dmabuf|pbo|sync), ignoring"
+            );
+            None
+        }
+    };
+    if let Some(forced) = forced {
+        log::info!(
+            "EDGEFIRST_FORCE_TRANSFER override: {:?} → {forced:?}",
+            backend
+        );
+        *backend = forced;
+    }
 }
 
 /// GL_RENDERER-derived driver traits that feed per-driver policy.
@@ -858,50 +944,57 @@ struct GlSupport {
 /// high-water mark, so the fallback path costs no per-call allocation
 /// after the first read of a given size.
 unsafe fn read_pixels_into(w: usize, h: usize, format: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
-    let direct = format == edgefirst_gl::gl::RGBA || {
-        let mut impl_fmt = 0i32;
-        let mut impl_type = 0i32;
-        edgefirst_gl::gl::GetIntegerv(
-            edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_FORMAT,
-            &mut impl_fmt,
-        );
-        edgefirst_gl::gl::GetIntegerv(
-            edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_TYPE,
-            &mut impl_type,
-        );
-        impl_fmt as u32 == format && impl_type as u32 == edgefirst_gl::gl::UNSIGNED_BYTE
-    };
-    if direct {
+    unsafe {
+        let direct = format == edgefirst_gl::gl::RGBA || {
+            let mut impl_fmt = 0i32;
+            let mut impl_type = 0i32;
+            edgefirst_gl::gl::GetIntegerv(
+                edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_FORMAT,
+                &mut impl_fmt,
+            );
+            edgefirst_gl::gl::GetIntegerv(
+                edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_TYPE,
+                &mut impl_type,
+            );
+            impl_fmt as u32 == format && impl_type as u32 == edgefirst_gl::gl::UNSIGNED_BYTE
+        };
+        if direct {
+            edgefirst_gl::gl::ReadPixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                format,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
+                out.as_mut_ptr() as *mut c_void,
+            );
+            return;
+        }
+        let channels = match format {
+            edgefirst_gl::gl::RGB => 3,
+            edgefirst_gl::gl::RED => 1,
+            _ => 4,
+        };
+        if scratch.len() < w * h * 4 {
+            scratch.resize(w * h * 4, 0);
+        }
         edgefirst_gl::gl::ReadPixels(
             0,
             0,
             w as i32,
             h as i32,
-            format,
+            edgefirst_gl::gl::RGBA,
             edgefirst_gl::gl::UNSIGNED_BYTE,
-            out.as_mut_ptr() as *mut c_void,
+            scratch.as_mut_ptr() as *mut c_void,
         );
-        return;
-    }
-    let channels = match format {
-        edgefirst_gl::gl::RGB => 3,
-        edgefirst_gl::gl::RED => 1,
-        _ => 4,
-    };
-    if scratch.len() < w * h * 4 {
-        scratch.resize(w * h * 4, 0);
-    }
-    edgefirst_gl::gl::ReadPixels(
-        0,
-        0,
-        w as i32,
-        h as i32,
-        edgefirst_gl::gl::RGBA,
-        edgefirst_gl::gl::UNSIGNED_BYTE,
-        scratch.as_mut_ptr() as *mut c_void,
-    );
-    for (px, dst_px) in scratch.chunks_exact(4).zip(out.chunks_exact_mut(channels)) {
-        dst_px.copy_from_slice(&px[..channels]);
+        for (px, dst_px) in scratch
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(out.chunks_exact_mut(channels))
+        {
+            dst_px.copy_from_slice(&px[..channels]);
+        }
     }
 }
 
@@ -937,7 +1030,18 @@ impl GLProcessorST {
         }
     }
 
-    pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
+    /// Build a processor.
+    ///
+    /// `capacity` is the per-cache import-cache bound
+    /// ([`ImageProcessorConfig::egl_cache_capacity`]); `None` (or `Some(0)`)
+    /// defers to `EDGEFIRST_EGL_CACHE_CAPACITY` and then to the default —
+    /// see [`resolve_egl_cache_capacity`].
+    ///
+    /// [`ImageProcessorConfig::egl_cache_capacity`]: crate::ImageProcessorConfig::egl_cache_capacity
+    pub fn new(
+        kind: Option<EglDisplayKind>,
+        capacity: Option<usize>,
+    ) -> Result<GLProcessorST, crate::Error> {
         // Display bring-up goes through the platform seam — the contract a
         // future platform (Windows/ANGLE) implements instead of forking this
         // engine. On Linux this delegates straight to `GlContext::new`.
@@ -1159,41 +1263,49 @@ impl GLProcessorST {
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
 
-        // EGLImage cache capacity (per cache: src / dst / nv_r8). The key carries
-        // geometry, so a pool buffer reused at N distinct sizes needs N live
-        // EGLImages to avoid evict/re-import churn; a parallel decode pool wants
-        // headroom for (pool slots × distinct sizes). Capacity is the eviction
-        // bound only — EGLImages are lightweight views into the tensor's existing
-        // DMA-BUF (no pixel copy) and are created on demand, so a large default is
-        // free for fixed-dimension workloads (live camera) that only ever use a
-        // size or two. Override with EDGEFIRST_EGL_CACHE_CAPACITY for high-
-        // cardinality varied-size streams (e.g. dataset validation).
-        const DEFAULT_EGL_CACHE_CAPACITY: usize = 64;
-        let egl_cache_capacity = std::env::var("EDGEFIRST_EGL_CACHE_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&c| c > 0)
-            .unwrap_or(DEFAULT_EGL_CACHE_CAPACITY);
+        // EGLImage cache capacity (per cache: src / dst / nv_r8). What the
+        // number MEANS -- a buffer count and not a size, its scope, and the
+        // pinned-memory formula -- is documented once, on
+        // `ImageProcessorConfig::egl_cache_capacity`, which is what a caller
+        // reads. What follows is only why the DEFAULT is 16.
+        //
+        // Entries are retained past the lifetime of the tensor that produced
+        // them (the point of `CachedImport`), and a retained import pins its
+        // buffer, so capacity bounds memory rather than handle count. At 4K
+        // NV12 (12.4 MB/frame) that is 199 MB per cache at 16, against 796 MB
+        // per cache at the pre-retention default of 64 -- and the three-cache
+        // upper bound at 64, 2.39 GB, exceeds total RAM on the i.MX 8M Plus
+        // and i.MX 95, with CMA a fraction of RAM again. (The three-cache
+        // totals are upper bounds, not exact figures: `src` and `nv_r8` often
+        // hold two imports of the SAME source buffer, and two entries naming
+        // one buffer pin it once. The per-cache column is exact, and it is
+        // what the decision turns on.)
+        //
+        // 64 was chosen when capacity bounded handles, and was justified as
+        // free for fixed-dimension workloads while naming dataset validation
+        // -- a high-cardinality varied-size stream -- as the case needing an
+        // override. Retention inverts that: high cardinality is exactly where
+        // every frame is a distinct allocation and the cache fills with 64
+        // different buffers. 16 covers a realistic producer pool (V4L2
+        // capture, typically 4-8 buffers over one or two sizes) with headroom.
+        //
+        // The failure modes are asymmetric: a miss costs one
+        // eglCreateImageKHR (100 us - 1 ms on Mali/Vivante/V3D), while
+        // exhausting CMA costs the frame or the process. The default belongs
+        // on the safe side, with the config field and the environment
+        // variable as the documented answers for a caller that has measured.
+        let egl_cache_capacity = resolve_egl_cache_capacity(
+            capacity,
+            std::env::var("EDGEFIRST_EGL_CACHE_CAPACITY")
+                .ok()
+                .as_deref(),
+        );
 
         // NV* conversion-path preference. `auto` (default) prefers the portable,
         // colorimetry-exact in-shader ShaderR8 path; `sampler`/`shader` force a
         // path for benchmarking / platform bring-up (an impossible force warns
         // and falls back). Mirrors the EDGEFIRST_FORCE_TRANSFER idiom below.
-        let nv_path_pref = match std::env::var("EDGEFIRST_NV_CONVERT_PATH") {
-            Ok(v) => match v.to_ascii_lowercase().as_str() {
-                "sampler" | "external" | "a" => NvPathPref::ForceSampler,
-                "shader" | "r8" | "b" => NvPathPref::ForceShader,
-                "auto" | "" => NvPathPref::Auto,
-                other => {
-                    log::warn!(
-                        "EDGEFIRST_NV_CONVERT_PATH={other:?} not recognised \
-                         (expected sampler|shader|auto), using auto"
-                    );
-                    NvPathPref::Auto
-                }
-            },
-            Err(_) => NvPathPref::Auto,
-        };
+        let nv_path_pref = parse_nv_path_pref();
         if nv_path_pref != NvPathPref::Auto {
             log::info!("EDGEFIRST_NV_CONVERT_PATH override: {nv_path_pref:?}");
         }
@@ -1202,21 +1314,7 @@ impl GLProcessorST {
         // processor's lifetime (set_colorimetry_mode logs and keeps it);
         // otherwise the config default is Fast (issue #106 policy) and
         // `set_colorimetry_mode` may change it.
-        let colorimetry_env = match std::env::var("EDGEFIRST_COLORIMETRY") {
-            Ok(v) => match v.to_ascii_lowercase().as_str() {
-                "exact" => Some(crate::ColorimetryMode::Exact),
-                "fast" => Some(crate::ColorimetryMode::Fast),
-                "" => None,
-                other => {
-                    log::warn!(
-                        "EDGEFIRST_COLORIMETRY={other:?} not recognised \
-                         (expected fast|exact), ignoring"
-                    );
-                    None
-                }
-            },
-            Err(_) => None,
-        };
+        let colorimetry_env = parse_colorimetry_env();
         if let Some(mode) = colorimetry_env {
             log::info!("EDGEFIRST_COLORIMETRY override: {mode:?}");
         }
@@ -1367,27 +1465,7 @@ impl GLProcessorST {
 
         // Allow env-var override for benchmarking specific transfer paths.
         // Values: "dmabuf", "pbo", "sync" (case-insensitive).
-        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER") {
-            let forced = match val.to_ascii_lowercase().as_str() {
-                "dmabuf" | "dma" => Some(TransferBackend::DmaBuf),
-                "pbo" => Some(TransferBackend::Pbo),
-                "sync" => Some(TransferBackend::Sync),
-                other => {
-                    log::warn!(
-                        "EDGEFIRST_FORCE_TRANSFER={other:?} not recognised \
-                         (expected dmabuf|pbo|sync), ignoring"
-                    );
-                    None
-                }
-            };
-            if let Some(backend) = forced {
-                log::info!(
-                    "EDGEFIRST_FORCE_TRANSFER override: {:?} → {backend:?}",
-                    converter.gl_context.transfer_backend
-                );
-                converter.gl_context.transfer_backend = backend;
-            }
-        }
+        apply_forced_transfer(&mut converter.gl_context.transfer_backend);
 
         log::debug!(
             "GLConverter created (transfer={:?})",
@@ -1410,7 +1488,7 @@ impl GLProcessorST {
             64,
             64,
             PixelFormat::Rgba,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::Write,
         ) {
             Ok(img) => img,
@@ -1428,7 +1506,7 @@ impl GLProcessorST {
                     return false;
                 }
             };
-            for pixel in map.chunks_exact_mut(4) {
+            for pixel in map.as_chunks_mut::<4>().0 {
                 pixel[0] = 255; // R
                 pixel[1] = 0; // G
                 pixel[2] = 0; // B
@@ -1441,7 +1519,7 @@ impl GLProcessorST {
             64,
             64,
             PixelFormat::Rgba,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::Read,
         ) {
             Ok(img) => img,
@@ -1612,7 +1690,7 @@ impl GLProcessorST {
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
             if src_fmt == PixelFormat::Vyuy
                 && self.gl_context.transfer_backend.is_dma()
-                && src.memory() == TensorMemory::Dma
+                && src.memory() == TensorMemory::DmaBuf
             {
                 log::warn!(
                     "VYUY format not supported via EGL DMA-BUF import; \
@@ -1806,7 +1884,7 @@ impl GLProcessorST {
         };
 
         let is_dma = match memory {
-            TensorMemory::Dma => match self.setup_draw_renderbuffer_dma(dst, dst_fmt) {
+            TensorMemory::DmaBuf => match self.setup_draw_renderbuffer_dma(dst, dst_fmt) {
                 Ok(()) => {
                     if log::log_enabled!(log::Level::Trace) {
                         log::trace!(
@@ -1859,7 +1937,7 @@ impl GLProcessorST {
                     "background dimensions do not match dst".into(),
                 ));
             }
-            if is_dma && bg.memory() == TensorMemory::Dma {
+            if is_dma && bg.memory() == TensorMemory::DmaBuf {
                 edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
                 let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
                 self.draw_camera_texture_eglimage(
@@ -1937,7 +2015,7 @@ impl GLProcessorST {
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
                     let mut dst_map = dst.map_mut()?;
-                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    for chunk in dst_map.as_mut_slice().as_chunks_mut::<4>().0 {
                         chunk.swap(0, 2);
                     }
                 }
@@ -1955,7 +2033,7 @@ impl GLProcessorST {
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
-                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    for chunk in dst_map.as_mut_slice().as_chunks_mut::<4>().0 {
                         chunk.swap(0, 2);
                     }
                 }
@@ -2006,7 +2084,7 @@ impl GLProcessorST {
         };
 
         let is_dma = match memory {
-            TensorMemory::Dma => match self.setup_draw_renderbuffer_dma(dst, dst_fmt) {
+            TensorMemory::DmaBuf => match self.setup_draw_renderbuffer_dma(dst, dst_fmt) {
                 Ok(()) => {
                     if log::log_enabled!(log::Level::Trace) {
                         log::trace!(
@@ -2050,7 +2128,7 @@ impl GLProcessorST {
                     "background dimensions do not match dst".into(),
                 ));
             }
-            if is_dma && bg.memory() == TensorMemory::Dma {
+            if is_dma && bg.memory() == TensorMemory::DmaBuf {
                 edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
                 let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
                 self.draw_camera_texture_eglimage(
@@ -2121,7 +2199,7 @@ impl GLProcessorST {
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
                     let mut dst_map = dst.map_mut()?;
-                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    for chunk in dst_map.as_mut_slice().as_chunks_mut::<4>().0 {
                         chunk.swap(0, 2);
                     }
                 }
@@ -2139,7 +2217,7 @@ impl GLProcessorST {
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
-                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    for chunk in dst_map.as_mut_slice().as_chunks_mut::<4>().0 {
                         chunk.swap(0, 2);
                     }
                 }
@@ -2154,7 +2232,7 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         fmt: PixelFormat,
     ) -> bool {
-        if backend.is_zero_copy() && img.memory() == TensorMemory::Dma {
+        if backend.is_zero_copy() && img.memory() == TensorMemory::DmaBuf {
             // Zero-copy import path supports:
             //   Path A (samplerExternalOES): RGBA, GREY, YUYV, NV12
             //   Path B (R8 texelFetch shader): NV16, NV24 (contiguous only)
@@ -2198,7 +2276,7 @@ impl GLProcessorST {
         if fmt == PixelFormat::Bgra && !has_bgra {
             return false;
         }
-        if backend.is_zero_copy() && img.memory() == TensorMemory::Dma {
+        if backend.is_zero_copy() && img.memory() == TensorMemory::DmaBuf {
             matches!(
                 fmt,
                 PixelFormat::Rgba
@@ -2659,7 +2737,7 @@ impl GLProcessorST {
                     dst_map.as_mut_slice(),
                 );
                 if dst_fmt == PixelFormat::Bgra {
-                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    for chunk in dst_map.as_mut_slice().as_chunks_mut::<4>().0 {
                         chunk.swap(0, 2);
                     }
                 }
@@ -2701,7 +2779,7 @@ impl GLProcessorST {
                             ));
                         }
                         let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, len);
-                        for chunk in slice.chunks_exact_mut(4) {
+                        for chunk in slice.as_chunks_mut::<4>().0 {
                             chunk.swap(0, 2);
                         }
                         edgefirst_gl::gl::UnmapBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER);
@@ -2780,7 +2858,7 @@ impl GLProcessorST {
             if is_bgra {
                 // Swap R↔B to convert BGRA→RGBA for the RGBA texture.
                 swapped_buf = map.as_slice().to_vec();
-                for chunk in swapped_buf.chunks_exact_mut(4) {
+                for chunk in swapped_buf.as_chunks_mut::<4>().0 {
                     chunk.swap(0, 2);
                 }
                 swapped_buf.as_ptr() as *const c_void
@@ -2861,7 +2939,7 @@ impl GLProcessorST {
         };
         let swapped: Option<Vec<u8>> = if src_fmt == PixelFormat::Bgra {
             let mut v = src_slice.to_vec();
-            for chunk in v.chunks_exact_mut(4) {
+            for chunk in v.as_chunks_mut::<4>().0 {
                 chunk.swap(0, 2);
             }
             Some(v)
@@ -3526,7 +3604,7 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.transfer_backend.is_zero_copy() && src.memory() == TensorMemory::Dma {
+        if self.gl_context.transfer_backend.is_zero_copy() && src.memory() == TensorMemory::DmaBuf {
             // Choose the NV* path (ShaderR8 vs ExternalSampler) honoring the
             // EDGEFIRST_NV_CONVERT_PATH preference. See `select_nv_path`: Auto
             // prefers the portable, colorimetry-exact in-shader ShaderR8 for
@@ -4562,7 +4640,7 @@ impl GLProcessorST {
         // is accepted only when its RG attach succeeds.
         let zero_copy_attach = if !self.gl_context.transfer_backend.is_dma()
             && self.gl_context.transfer_backend.is_zero_copy()
-            && src.memory() == TensorMemory::Dma
+            && src.memory() == TensorMemory::DmaBuf
             && matches!(
                 src_fmt,
                 PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::Yuyv
@@ -5186,10 +5264,6 @@ impl GLProcessorST {
         let id = BufferImportKey::from_tensor(img, img_fmt, false);
         let luma_id = id.luma_id;
 
-        if self.nv_r8_egl_cache.sweep() {
-            self.nv_r8_texture.invalidate_egl_binding();
-        }
-
         {
             let ts = self.nv_r8_egl_cache.next_timestamp();
             if let Some(cached) = self.nv_r8_egl_cache.entries.get_mut(&id) {
@@ -5206,20 +5280,7 @@ impl GLProcessorST {
         self.nv_r8_texture.invalidate_egl_binding();
 
         let handle = Platform::import_handle(&egl_image_obj);
-        let guard = img.buffer_identity().weak();
-        if self.nv_r8_egl_cache.entries.len() >= self.nv_r8_egl_cache.capacity {
-            self.nv_r8_egl_cache.evict_lru();
-        }
-        let ts = self.nv_r8_egl_cache.next_timestamp();
-        self.nv_r8_egl_cache.entries.insert(
-            id,
-            super::cache::CachedImport {
-                import: egl_image_obj,
-                last_used: ts,
-                guard,
-                renderbuffer: None,
-            },
-        );
+        self.nv_r8_egl_cache.insert(id, egl_image_obj, None);
         Ok(handle)
     }
 
@@ -5241,21 +5302,6 @@ impl GLProcessorST {
         // its parent key; a source view keys on its own region.
         let id = BufferImportKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
         let luma_id = id.luma_id;
-
-        // Sweep dead entries opportunistically before looking up.
-        // Invalidate texture binding state since sweep may remove a bound entry.
-        match cache {
-            CacheKind::Src => {
-                if self.src_egl_cache.sweep() {
-                    self.invalidate_src_textures();
-                }
-            }
-            CacheKind::Dst => {
-                if self.dst_egl_cache.sweep() {
-                    self.invalidate_dst_textures();
-                }
-            }
-        }
 
         {
             let egl_cache = match cache {
@@ -5311,32 +5357,18 @@ impl GLProcessorST {
         }
 
         let handle = Platform::import_handle(&egl_image_obj);
-        let guard = img.buffer_identity().weak();
         let egl_cache = match cache {
             CacheKind::Src => &mut self.src_egl_cache,
             CacheKind::Dst => &mut self.dst_egl_cache,
         };
-        // Evict least-recently-used entry if at capacity.
-        if egl_cache.entries.len() >= egl_cache.capacity {
-            egl_cache.evict_lru();
-        }
-        let ts = egl_cache.next_timestamp();
-        egl_cache.entries.insert(
-            id,
-            CachedImport {
-                import: egl_image_obj,
-                guard,
-                renderbuffer: rbo,
-                last_used: ts,
-            },
-        );
+        egl_cache.insert(id, egl_image_obj, rbo);
         Ok(handle)
     }
 
     /// Look up the renderbuffer ID for a cached destination EGLImage.
     fn cached_dst_renderbuffer<T>(&self, img: &Tensor<T>, fmt: PixelFormat) -> Option<u32>
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         let id = BufferImportKey::from_tensor(img, fmt, true);
         self.dst_egl_cache
@@ -5369,15 +5401,12 @@ impl GLProcessorST {
         packed: super::platform::PackedImportFormat,
     ) -> Result<PlatformHandle, crate::Error>
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         // Keyed identically to `cached_dst_renderbuffer` and the logical-dims
         // dst path: the packed render dims derive deterministically from the
         // tensor's logical geometry, so `from_tensor` is a consistent key.
         let id = BufferImportKey::from_tensor(img, img_fmt, true);
-        if self.dst_egl_cache.sweep() {
-            self.invalidate_dst_textures();
-        }
 
         let ts = self.dst_egl_cache.next_timestamp();
         if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
@@ -5390,10 +5419,6 @@ impl GLProcessorST {
         log::trace!("ImportCache dst (RGB) miss: id={:#x}", id.luma_id);
         // Invalidate dst texture binding state on cache miss (new EGLImage creation).
         self.invalidate_dst_textures();
-
-        if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
-            self.dst_egl_cache.evict_lru();
-        }
 
         let egl_image_obj =
             Platform::import_buffer_packed(&self.gl_context, img, width, height, packed)?;
@@ -5418,17 +5443,7 @@ impl GLProcessorST {
             None
         };
 
-        let guard = img.buffer_identity().weak();
-        let ts = self.dst_egl_cache.next_timestamp();
-        self.dst_egl_cache.entries.insert(
-            id,
-            CachedImport {
-                import: egl_image_obj,
-                guard,
-                renderbuffer: rbo,
-                last_used: ts,
-            },
-        );
+        self.dst_egl_cache.insert(id, egl_image_obj, rbo);
         Ok(handle)
     }
 
@@ -5913,13 +5928,17 @@ impl GLProcessorST {
                     m.as_slice(),
                 )
                 .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
-                let quantization = edgefirst_decoder::Quantization::new(scale, zp);
+                // Pass the pair straight through: the scale/zero_point were read
+                // from the tensor's own `edgefirst_tensor::Quantization`, and
+                // wrapping them in the decoder's near-identical type only to
+                // unwrap them one level down was a pure adapter.
+                let quantization = (scale, zp);
                 self.render_proto_segmentation_int8(
                     plan,
                     detect,
                     coeff_slice,
                     protos_view,
-                    &quantization,
+                    quantization,
                     height,
                     width,
                     num_protos,
@@ -6115,7 +6134,7 @@ impl GLProcessorST {
         detect: &[DetectBox],
         mask_coefficients: &[f32],
         protos: ndarray::ArrayView3<'_, i8>,
-        quantization: &edgefirst_decoder::Quantization,
+        quantization: (f32, i32),
         height: usize,
         width: usize,
         num_protos: usize,
@@ -6240,8 +6259,8 @@ impl GLProcessorST {
             );
         }
 
-        let proto_scale = quantization.scale;
-        let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
+        let (proto_scale, proto_zp) = quantization;
+        let proto_scaled_zp = -(proto_zp as f32) * proto_scale;
 
         match plan.program {
             super::proto_dispatch::ProtoProgram::Int8Nearest
@@ -6292,7 +6311,7 @@ impl GLProcessorST {
         &mut self,
         detect: &[DetectBox],
         mask_coefficients: &[f32],
-        quantization: &edgefirst_decoder::Quantization,
+        quantization: (f32, i32),
         height: usize,
         width: usize,
         num_protos: usize,
@@ -6326,8 +6345,8 @@ impl GLProcessorST {
             Self::set_proto_tex_params(texture_target, edgefirst_gl::gl::LINEAR);
         }
 
-        let proto_scale = quantization.scale;
-        let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
+        let (proto_scale, proto_zp) = quantization;
+        let proto_scaled_zp = -(proto_zp as f32) * proto_scale;
 
         let dequant_program = &self.proto_dequant_int8_program;
         edgefirst_gl::use_program(dequant_program.id);
@@ -6491,6 +6510,19 @@ impl GLProcessorST {
             return Ok(());
         }
 
+        // Rank guard BEFORE indexing shape()[2] -- see the same guard in the
+        // CPU dispatcher. A TensorDyn mask can be any rank, and this is
+        // reachable from the public draw_decoded_masks.
+        if let Some(bad) = segmentation
+            .iter()
+            .find(|s| s.segmentation.shape().len() != 3)
+        {
+            return Err(crate::Error::InvalidShape(format!(
+                "segmentation must be [H, W, C], got {:?}",
+                bad.segmentation.shape()
+            )));
+        }
+
         let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
@@ -6502,10 +6534,13 @@ impl GLProcessorST {
                 right: cvt_screen_coord(seg.xmax),
                 bottom: cvt_screen_coord(seg.ymin),
             };
-            let segment = seg.segmentation.as_standard_layout();
-            let slice = segment.as_slice().ok_or(Error::Internal(
-                "Cannot get slice of segmentation".to_owned(),
+            // A TensorDyn is contiguous by construction, so unlike the former
+            // Array3 there is no as_standard_layout() copy to make first.
+            let segment = seg.segmentation.as_u8().ok_or(Error::Internal(
+                "segmentation must be a U8 tensor".to_owned(),
             ))?;
+            let segment_map = segment.map_read()?;
+            let slice = segment_map.as_slice();
 
             self.render_modelpack_segmentation(
                 dst_roi,
@@ -6532,10 +6567,11 @@ impl GLProcessorST {
                     bottom: cvt_screen_coord(seg.ymin),
                 };
 
-                let segment = seg.segmentation.as_standard_layout();
-                let slice = segment.as_slice().ok_or(Error::Internal(
-                    "Cannot get slice of segmentation".to_owned(),
+                let segment = seg.segmentation.as_u8().ok_or(Error::Internal(
+                    "segmentation must be a U8 tensor".to_owned(),
                 ))?;
+                let segment_map = segment.map_read()?;
+                let slice = segment_map.as_slice();
 
                 self.render_yolo_segmentation(
                     dst_roi,
@@ -6947,7 +6983,44 @@ impl GLProcessorST {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::should_reject_software_gl;
+    use super::{
+        resolve_egl_cache_capacity, should_reject_software_gl, DEFAULT_EGL_CACHE_CAPACITY,
+    };
+
+    #[test]
+    fn cache_capacity_config_beats_environment() {
+        // The precedence that matters: an embedder that measured its own pool
+        // must not be silently overridden by a stray env var in a deployment.
+        assert_eq!(resolve_egl_cache_capacity(Some(4), Some("64")), 4);
+    }
+
+    #[test]
+    fn cache_capacity_falls_back_through_env_to_default() {
+        assert_eq!(resolve_egl_cache_capacity(None, Some("64")), 64);
+        assert_eq!(
+            resolve_egl_cache_capacity(None, None),
+            DEFAULT_EGL_CACHE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn cache_capacity_rejects_zero_and_garbage_at_both_levels() {
+        // A zero-capacity cache would evict every entry it inserted, so zero
+        // is refused wherever it comes from and the next source is consulted.
+        assert_eq!(resolve_egl_cache_capacity(Some(0), Some("32")), 32);
+        assert_eq!(
+            resolve_egl_cache_capacity(Some(0), Some("0")),
+            DEFAULT_EGL_CACHE_CAPACITY
+        );
+        assert_eq!(
+            resolve_egl_cache_capacity(None, Some("plenty")),
+            DEFAULT_EGL_CACHE_CAPACITY
+        );
+        assert_eq!(
+            resolve_egl_cache_capacity(None, Some("-1")),
+            DEFAULT_EGL_CACHE_CAPACITY
+        );
+    }
 
     // The override env reader (`software_gl_override_enabled`) is a thin
     // `var_os == "1"` wrapper; it is exercised end-to-end by the GL-init path

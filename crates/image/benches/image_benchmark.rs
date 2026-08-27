@@ -143,7 +143,7 @@ fn bench_load(suite: &mut BenchSuite) {
             let name = "load/dma/RGBA/zidane";
             let result = run_bench(name, WARMUP, ITERATIONS, || {
                 let img =
-                    load_image_bench(zidane, Some(PixelFormat::Rgba), Some(TensorMemory::Dma))
+                    load_image_bench(zidane, Some(PixelFormat::Rgba), Some(TensorMemory::DmaBuf))
                         .expect("Failed to load JPEG");
                 std::hint::black_box(img);
             });
@@ -687,7 +687,7 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
                 h,
                 fmt,
                 DType::U8,
-                Some(TensorMemory::Dma),
+                Some(TensorMemory::DmaBuf),
                 edgefirst_tensor::CpuAccess::ReadWrite,
             ) else {
                 println!("  {:50} [skipped: DMA allocation failed]", name);

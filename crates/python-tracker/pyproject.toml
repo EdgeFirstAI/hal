@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "edgefirst-tracker"
+dynamic = ["version"]
+description = "Multi-object tracking with ByteTrack for edge AI video analytics"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["tracking", "bytetrack", "object-tracking", "kalman-filter", "edge-ai"]
+authors = [{name = "Au-Zone Technologies", email = "support@au-zone.com"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://edgefirst.ai"
+Repository = "https://github.com/EdgeFirstAI/hal"
+Documentation = "https://github.com/EdgeFirstAI/hal/blob/main/crates/python-tracker/README.md"
+Changelog = "https://github.com/EdgeFirstAI/hal/blob/main/CHANGELOG.md"
+Issues = "https://github.com/EdgeFirstAI/hal/issues"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "edgefirst.tracker._tracker"
+python-source = "python"

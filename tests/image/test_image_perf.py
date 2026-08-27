@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
-import os
 import math
+import os
 
-from edgefirst_hal import Tensor, ImageProcessor, Flip, PixelFormat, Rotation
 import numpy as np
+import pytest
+from edgefirst.codec import Tensor as CodecTensor
+from edgefirst.codec import decode_into
+from edgefirst.image import Flip, ImageProcessor, PixelFormat, Rotation, Tensor
 
 pytestmark = pytest.mark.benchmark
 
@@ -42,10 +44,19 @@ def _tensor_from_bytes(data, fmt):
     decodes natively and then converts to the requested ``fmt`` — mirroring the
     new recommended decode-then-convert pipeline. Production code should follow
     the same pattern explicitly.
+
+    ``Tensor`` (the destination, from ``edgefirst.image``) and
+    ``peek_image_info``/``decode_into`` (from ``edgefirst.codec``) are two
+    different packages -- this is the documented cross-package pipeline
+    (`ImageProcessor.create_image()`-style destination, decoded via
+    `edgefirst.codec`), not a same-module decode. `Tensor.peek_image_info`/
+    `.decode_image` never existed on `edgefirst.image.Tensor`; this helper
+    used to call them anyway and was invisible because this whole module is
+    deselected by the `benchmark` marker in every default suite run.
     """
-    info = Tensor.peek_image_info(data)
+    info = CodecTensor.peek_image_info(data)
     native = Tensor.image(info.width, info.height, info.format, access="readwrite")
-    native.decode_image(data)
+    decode_into(native, data)
     if native.format == fmt:
         return native
     out = Tensor.image(info.width, info.height, fmt, access="readwrite")
@@ -120,9 +131,7 @@ def test_resize_cpu_rgba_to_rgba(benchmark):
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
@@ -141,23 +150,15 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
-            (src.height, src.width, 4)
-        )
-        d = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 4)
-        )
+        arr = np.asarray(m.numpy())
+        d = np.asarray(d.numpy())
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
-        arr_cv2 = np.frombuffer(d_cv2.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
+        arr_cv2 = np.asarray(d_cv2.numpy()).reshape((dst_cv2.height, dst_cv2.width, 4))
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -175,9 +176,7 @@ def test_resize_gl_rgba_to_rgba(benchmark):
     benchmark(gl_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
@@ -197,9 +196,7 @@ def test_resize_g2d_rgba_to_rgba(benchmark):
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
@@ -213,9 +210,7 @@ def test_resize_cpu_rgba_to_rgb(benchmark):
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 3)
-        )
+        arr_dst = np.asarray(d.numpy()).reshape((dst.height, dst.width, 3))
         expected = load_image("testdata/zidane.jpg", "RGB", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
@@ -237,23 +232,15 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
-            (src.height, src.width, 4)
-        )
-        d = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 3)
-        )
+        arr = np.asarray(m.numpy())
+        d = np.asarray(d.numpy()).reshape((dst_cv2.height, dst_cv2.width, 3))
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 3)
-        )
-        arr_cv2 = np.frombuffer(d_cv2.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 3)
-        )
+        arr_dst = np.asarray(d.numpy()).reshape((dst.height, dst.width, 3))
+        arr_cv2 = np.asarray(d_cv2.numpy()).reshape((dst_cv2.height, dst_cv2.width, 3))
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -270,9 +257,7 @@ def test_resize_g2d_rgba_to_rgb(benchmark):
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 3)
-        )
+        arr_dst = np.asarray(d.numpy()).reshape((dst.height, dst.width, 3))
         expected = load_image("testdata/zidane.jpg", "RGB", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
@@ -289,15 +274,13 @@ def test_resize_cpu_yuyv_to_rgba(benchmark):
     src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
+        np.asarray(m.numpy()).flat[:] = src_array
 
     dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         expected = load_bytes_to_image(expected_bytes, "RGBA", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -313,7 +296,7 @@ def test_resize_cv2_yuyv_to_rgba(benchmark):
     src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
+        np.asarray(m.numpy()).flat[:] = src_array
 
     dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
     dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
@@ -326,23 +309,15 @@ def test_resize_cv2_yuyv_to_rgba(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
-            (src.height, src.width, 2)
-        )
-        d = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 4)
-        )
+        arr = np.asarray(m.numpy()).reshape((src.height, src.width, 2))
+        d = np.asarray(d.numpy())
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
-        arr_cv2 = np.frombuffer(d_cv2.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
+        arr_cv2 = np.asarray(d_cv2.numpy()).reshape((dst_cv2.height, dst_cv2.width, 4))
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -358,7 +333,7 @@ def test_resize_gl_yuyv_to_rgba(benchmark):
     src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
+        np.asarray(m.numpy()).flat[:] = src_array
 
     dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
@@ -369,9 +344,7 @@ def test_resize_gl_yuyv_to_rgba(benchmark):
 
     benchmark(gl_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         expected = load_bytes_to_image(expected_bytes, "RGBA", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -388,7 +361,7 @@ def test_resize_g2d_yuyv_to_rgba(benchmark):
     src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
+        np.asarray(m.numpy()).flat[:] = src_array
 
     dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
@@ -399,9 +372,7 @@ def test_resize_g2d_yuyv_to_rgba(benchmark):
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         expected = load_bytes_to_image(expected_bytes, "RGBA", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -418,15 +389,13 @@ def test_resize_cpu_yuyv_to_rgb(benchmark):
     src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
+        np.asarray(m.numpy()).flat[:] = src_array
 
     dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 3)
-        )
+        arr_dst = np.asarray(d.numpy()).reshape((dst.height, dst.width, 3))
         expected = load_bytes_to_image(expected_bytes, "RGB", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -442,7 +411,7 @@ def test_resize_cv2_yuyv_to_rgb(benchmark):
     src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
+        np.asarray(m.numpy()).flat[:] = src_array
 
     dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
     dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
@@ -455,23 +424,15 @@ def test_resize_cv2_yuyv_to_rgb(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
-            (src.height, src.width, 2)
-        )
-        d = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 3)
-        )
+        arr = np.asarray(m.numpy()).reshape((src.height, src.width, 2))
+        d = np.asarray(d.numpy()).reshape((dst_cv2.height, dst_cv2.width, 3))
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 3)
-        )
-        arr_cv2 = np.frombuffer(d_cv2.numpy(), dtype=np.uint8).reshape(
-            (dst_cv2.height, dst_cv2.width, 3)
-        )
+        arr_dst = np.asarray(d.numpy()).reshape((dst.height, dst.width, 3))
+        arr_cv2 = np.asarray(d_cv2.numpy()).reshape((dst_cv2.height, dst_cv2.width, 3))
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -487,7 +448,7 @@ def test_resize_g2d_yuyv_to_rgb(benchmark):
     src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
+        np.asarray(m.numpy()).flat[:] = src_array
 
     dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
@@ -498,9 +459,7 @@ def test_resize_g2d_yuyv_to_rgb(benchmark):
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 3)
-        )
+        arr_dst = np.asarray(d.numpy()).reshape((dst.height, dst.width, 3))
         expected = load_bytes_to_image(expected_bytes, "RGB", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -541,9 +500,7 @@ def test_cpu_rotate_90(benchmark):
         rotate=Image.ROTATE_270,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
 
@@ -556,12 +513,8 @@ def test_cv2_rotate_90(benchmark):
     dst = Tensor.image(src.height, src.width, PixelFormat.Rgba, access="readwrite")
 
     with src.map() as m, dst.map() as d:
-        arr_src = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
-            (src.height, src.width, 4)
-        )
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_src = np.asarray(m.numpy())
+        arr_dst = np.asarray(d.numpy())
 
         def rotate_90(arr_src, arr_dst):
             cv2.rotate(arr_src, cv2.ROTATE_90_CLOCKWISE, dst=arr_dst)
@@ -575,9 +528,7 @@ def test_cv2_rotate_90(benchmark):
         rotate=Image.ROTATE_270,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
 
@@ -603,9 +554,7 @@ def test_gl_rotate_90(benchmark):
         rotate=Image.ROTATE_270,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
 
@@ -631,9 +580,7 @@ def test_g2d_rotate_90(benchmark):
         rotate=Image.ROTATE_270,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
 
@@ -655,9 +602,7 @@ def test_cpu_rotate_180(benchmark):
         rotate=Image.ROTATE_180,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
 
@@ -670,12 +615,8 @@ def test_cv2_rotate_180(benchmark):
     dst = Tensor.image(src.width, src.height, PixelFormat.Rgba, access="readwrite")
 
     with src.map() as m, dst.map() as d:
-        arr_src = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
-            (src.height, src.width, 4)
-        )
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_src = np.asarray(m.numpy())
+        arr_dst = np.asarray(d.numpy())
 
         def rotate_180(arr_src, arr_dst):
             cv2.rotate(arr_src, cv2.ROTATE_180, dst=arr_dst)
@@ -689,9 +630,7 @@ def test_cv2_rotate_180(benchmark):
         rotate=Image.ROTATE_180,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
 
@@ -717,9 +656,7 @@ def test_gl_rotate_180(benchmark):
         rotate=Image.ROTATE_180,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS
 
 
@@ -743,7 +680,5 @@ def test_g2d_rotate_180(benchmark):
         rotate=Image.ROTATE_180,
     )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.numpy(), dtype=np.uint8).reshape(
-            (dst.height, dst.width, 4)
-        )
+        arr_dst = np.asarray(d.numpy())
         assert calculate_similarity_rms_u8(arr_dst, expected) > JPEG_NV12_RMS

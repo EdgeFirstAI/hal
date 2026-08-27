@@ -21,24 +21,48 @@ import sys
 from pathlib import Path
 
 # Workspace crates that share the workspace version
+# The edgefirst-hal meta-crate was deleted in 0.29: it was re-exports plus
+# trace.rs, and depending on it made every consumer link the whole tree.
 WORKSPACE_CRATES = [
-    "edgefirst-hal",
+    "edgefirst-codec",
     "edgefirst-decoder",
+    "edgefirst-decoder-abi",
     "edgefirst-image",
     "edgefirst-tensor",
+    "edgefirst-tensor-abi",
+    "edgefirst-tensor-ffi",
     "edgefirst-tracker",
 ]
 
-# Workspace leaf crates (not referenced as dependencies by other crates)
-WORKSPACE_LEAF_CRATES = [
-    "edgefirst-hal-capi",
-]
+# Workspace leaf crates (not referenced as dependencies by other crates).
+# The C monolith `edgefirst-hal-capi` is gone; modular C libraries live in
+# STANDALONE_LEAF_CRATES (workspace-excluded).
+WORKSPACE_LEAF_CRATES = []
 
-# Python package name (uses underscore)
-PYTHON_PACKAGE = "edgefirst_hal"
+# Python extension crates. Four self-contained modules since 0.29; their
+# distributions take the version dynamically from Cargo.toml.
+PYTHON_CRATES = [
+    "edgefirst-python-common",
+    "edgefirst-python-tensor",
+    "edgefirst-python-codec",
+    "edgefirst-python-image",
+    "edgefirst-python-decoder",
+    "edgefirst-python-tracker",
+]
 
 # Crates with independent versions (not checked against workspace version)
 INDEPENDENT_CRATES = {}
+
+# The five modular C-API leaves (Plan R2): standalone packages excluded from
+# the root workspace, so their versions never show up in the root Cargo.lock.
+# Each carries its own Cargo.lock next to its manifest.
+STANDALONE_LEAF_CRATES = [
+    "edgefirst-tensor-capi",
+    "edgefirst-image-capi",
+    "edgefirst-codec-capi",
+    "edgefirst-decoder-capi",
+    "edgefirst-tracker-capi",
+]
 
 
 def read_file(path: str) -> str:
@@ -97,7 +121,7 @@ def check_cargo_lock(version: str) -> list[str]:
     errors = []
     content = read_file("Cargo.lock")
 
-    all_crates = WORKSPACE_CRATES + WORKSPACE_LEAF_CRATES + [PYTHON_PACKAGE]
+    all_crates = WORKSPACE_CRATES + WORKSPACE_LEAF_CRATES + PYTHON_CRATES
     for crate in all_crates:
         # Match [[package]] entries: name = "crate-name" followed by version = "X.Y.Z"
         pattern = rf'\[\[package\]\]\s*\nname = "{re.escape(crate)}"\nversion = "([^"]+)"'
@@ -112,32 +136,65 @@ def check_cargo_lock(version: str) -> list[str]:
                         f"expected '{version}'"
                     )
 
+    # The standalone leaves are excluded from the root workspace, so check
+    # each one's own Cargo.lock for its own package instead.
+    for crate in STANDALONE_LEAF_CRATES:
+        crate_dir = crate.removeprefix("edgefirst-")
+        lock_path = f"crates/{crate_dir}/Cargo.lock"
+        content = read_file(lock_path)
+        pattern = rf'\[\[package\]\]\s*\nname = "{re.escape(crate)}"\nversion = "([^"]+)"'
+        matches = re.findall(pattern, content)
+        if not matches:
+            errors.append(f"{lock_path}: {crate} not found")
+        else:
+            for found_version in matches:
+                if found_version != version:
+                    errors.append(
+                        f"{lock_path}: {crate} version is '{found_version}', "
+                        f"expected '{version}'"
+                    )
+
     return errors
 
 
 def check_pyproject_toml(version: str) -> list[str]:
-    """Check Python package version in pyproject.toml."""
+    """Check the five Python distributions.
+
+    Since 0.29 they take their version dynamically from Cargo.toml, so there is
+    no literal to drift. What CAN drift is each dependent's `~=` pin on
+    edgefirst-tensor -- and a stale pin means publishing something nobody can
+    install, which PyPI will not let you correct in place.
+    """
     errors = []
-    pyproject = Path("crates/python/pyproject.toml")
+    packages = ["tensor", "codec", "image", "decoder", "tracker"]
+    major_minor = ".".join(version.split(".")[:2])
 
-    if not pyproject.exists():
-        errors.append("crates/python/pyproject.toml: file not found")
-        return errors
+    for pkg in packages:
+        pyproject = Path(f"crates/python-{pkg}/pyproject.toml")
+        if not pyproject.exists():
+            errors.append(f"{pyproject}: file not found")
+            continue
 
-    content = pyproject.read_text()
-    m = re.search(r'^version\s*=\s*"([^"]+)"', content, re.MULTILINE)
-    if m:
-        py_version = m.group(1)
-        if py_version != version:
+        content = pyproject.read_text()
+
+        if 'dynamic = ["version"]' not in content:
             errors.append(
-                f"crates/python/pyproject.toml: version is '{py_version}', "
-                f"expected '{version}'"
+                f"{pyproject}: expected `dynamic = [\"version\"]` so the version "
+                f"comes from Cargo.toml rather than a literal that can drift"
             )
-    else:
-        errors.append("crates/python/pyproject.toml: version field not found")
+
+        pin = re.search(r'edgefirst-tensor\s*~=\s*([0-9][0-9.]*)', content)
+        if pin:
+            pinned = pin.group(1)
+            if not pinned.startswith(major_minor):
+                errors.append(
+                    f"{pyproject}: pins edgefirst-tensor ~= {pinned}, "
+                    f"but the workspace is at {version}"
+                )
+        elif pkg not in ("tensor", "tracker"):
+            errors.append(f"{pyproject}: no edgefirst-tensor pin found")
 
     return errors
-
 
 def check_changelog(version: str) -> list[str]:
     """Check CHANGELOG.md has an entry for this version."""
@@ -199,20 +256,18 @@ def check_notice(version: str) -> list[str]:
                         f"expected '{version}'"
                     )
 
-    # Check Python crate
-    py_entries = [l for l in lines if f"* {PYTHON_PACKAGE} " in l]
-    for entry in py_entries:
-        m = re.search(rf"\* {re.escape(PYTHON_PACKAGE)} (\S+)", entry)
-        if m:
-            found_version = m.group(1)
-            if found_version != version:
+    # Check the Python extension crates
+    for pkg in PYTHON_CRATES:
+        for entry in [l for l in lines if f"* {pkg} " in l]:
+            m = re.search(rf"\* {re.escape(pkg)} (\S+)", entry)
+            if m and m.group(1) != version:
                 errors.append(
-                    f"NOTICE: {PYTHON_PACKAGE} has version '{found_version}', "
+                    f"NOTICE: {pkg} has version '{m.group(1)}', "
                     f"expected '{version}'"
                 )
 
     # Check for stale "unknown" version entries for internal crates
-    all_internal = WORKSPACE_CRATES + WORKSPACE_LEAF_CRATES + [PYTHON_PACKAGE]
+    all_internal = WORKSPACE_CRATES + WORKSPACE_LEAF_CRATES + PYTHON_CRATES
     for crate in all_internal:
         unknown_entries = [l for l in lines if f"* {crate} unknown" in l]
         if unknown_entries:

@@ -206,14 +206,14 @@ fn main() {
     {
         "mem" => Some(TensorMemory::Mem),
         #[cfg(target_os = "linux")]
-        "dma" => Some(TensorMemory::Dma),
+        "dma" => Some(TensorMemory::DmaBuf),
         "shm" => Some(TensorMemory::Shm),
         _ => None, // auto-select: DMA if available, else Mem
     };
     let mem_label = mem_type.map_or("auto", |m| match m {
         TensorMemory::Mem => "Mem",
         #[cfg(target_os = "linux")]
-        TensorMemory::Dma => "Dma",
+        TensorMemory::DmaBuf => "Dma",
         TensorMemory::Shm => "Shm",
         _ => "other",
     });

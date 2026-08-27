@@ -16,7 +16,6 @@ as a feature by the decoder and image crates:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) calls `Tracker::update` from `decode_tracked()`.
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) calls `draw_masks_tracked()` to render masks for tracked detections and surface track info to the caller. Colour stability per track UUID is the planned use of `ColorMode::Track`, but `Track` currently aliases `Instance` (detection-order colouring) — the slot is reserved so the API surface won't change once the per-UUID palette lands.
-- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) (feature `tracker`) re-exports the crate as `edgefirst_hal::tracker`.
 
 ## Algorithms
 
@@ -140,11 +139,11 @@ pub trait Tracker<T: DetectionBox> {
 
 ## Integration with edgefirst-decoder
 
-When used via `edgefirst-hal` or `edgefirst-decoder`, the `tracker` feature flag must be enabled:
+When used via `edgefirst-decoder`, the `tracker` feature flag must be enabled:
 
 ```toml
 [dependencies]
-edgefirst-hal = { version = "0.28", features = ["tracker"] }
+edgefirst-decoder = { version = "0.29", features = ["tracker"] }
 ```
 
 Or when depending on the decoder directly:

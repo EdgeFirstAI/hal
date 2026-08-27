@@ -41,7 +41,7 @@ use crate::configs::DimName;
 use crate::schema::{self, padding_axes, squeeze_padding_dims, LogicalOutput, SchemaV2};
 // `squeeze_padding_dims` is re-used by plan_channel_concat below.
 use crate::{dequantize_cpu_chunked, DecoderError, DecoderResult, Quantization};
-use edgefirst_tensor::{TensorDyn, TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{DType, TensorDyn, TensorMapTrait, TensorTrait};
 
 /// Compiled merge program for one schema v2 document.
 ///
@@ -413,8 +413,9 @@ fn find_axis_permutation(from: &[usize], to: &[usize]) -> Option<Vec<usize>> {
 /// intentionally promoted rather than kept native.
 fn tensor_to_f32(t: &TensorDyn, quant: Option<Quantization>) -> DecoderResult<ArrayD<f32>> {
     let shape = t.shape().to_vec();
-    match t {
-        TensorDyn::F16(tensor) => {
+    match t.dtype() {
+        DType::F16 => {
+            let tensor = t.as_typed::<half::f16>().expect("dtype checked");
             let m = tensor
                 .map()
                 .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
@@ -425,29 +426,27 @@ fn tensor_to_f32(t: &TensorDyn, quant: Option<Quantization>) -> DecoderResult<Ar
             m.as_slice().convert_to_f32_slice(&mut out);
             Ok(Array::from_shape_vec(IxDyn(&shape), out)?)
         }
-        TensorDyn::F32(tensor) => {
+        DType::F32 => {
+            let tensor = t.as_typed::<f32>().expect("dtype checked");
             let m = tensor
                 .map()
                 .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
             let view = ArrayViewD::from_shape(IxDyn(&shape), m.as_slice())?;
             Ok(view.to_owned())
         }
-        TensorDyn::F64(tensor) => {
+        DType::F64 => {
+            let tensor = t.as_typed::<f64>().expect("dtype checked");
             let m = tensor
                 .map()
                 .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
             let view = ArrayViewD::from_shape(IxDyn(&shape), m.as_slice())?;
             Ok(view.mapv(|v| v as f32))
         }
-        TensorDyn::U8(_)
-        | TensorDyn::I8(_)
-        | TensorDyn::U16(_)
-        | TensorDyn::I16(_)
-        | TensorDyn::U32(_)
-        | TensorDyn::I32(_) => dequantize_integer_tensor(t, quant, &shape),
+        DType::U8 | DType::I8 | DType::U16 | DType::I16 | DType::U32 | DType::I32 => {
+            dequantize_integer_tensor(t, quant, &shape)
+        }
         other => Err(DecoderError::NotSupported(format!(
-            "merge: unsupported tensor dtype {:?}",
-            other.dtype()
+            "merge: unsupported tensor dtype {other:?}"
         ))),
     }
 }
@@ -461,20 +460,21 @@ fn dequantize_integer_tensor(
     let total: usize = shape.iter().product();
     let mut out = vec![0.0_f32; total];
     macro_rules! dq {
-        ($tensor:expr) => {{
-            let m = $tensor
+        ($ty:ty) => {{
+            let tensor = t.as_typed::<$ty>().expect("dtype checked");
+            let m = tensor
                 .map()
                 .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
             dequantize_cpu_chunked(m.as_slice(), quant, &mut out);
         }};
     }
-    match t {
-        TensorDyn::U8(tensor) => dq!(tensor),
-        TensorDyn::I8(tensor) => dq!(tensor),
-        TensorDyn::U16(tensor) => dq!(tensor),
-        TensorDyn::I16(tensor) => dq!(tensor),
-        TensorDyn::U32(tensor) => dq!(tensor),
-        TensorDyn::I32(tensor) => dq!(tensor),
+    match t.dtype() {
+        DType::U8 => dq!(u8),
+        DType::I8 => dq!(i8),
+        DType::U16 => dq!(u16),
+        DType::I16 => dq!(i16),
+        DType::U32 => dq!(u32),
+        DType::I32 => dq!(i32),
         _ => unreachable!("dequantize_integer_tensor called on non-integer dtype"),
     }
     let arr = Array::from_shape_vec(IxDyn(shape), out)?;
@@ -538,7 +538,7 @@ mod tests {
         let slice = m.as_mut_slice();
         slice[..values.len()].copy_from_slice(values);
         drop(m);
-        TensorDyn::U8(t)
+        t.into()
     }
 
     fn make_i16_tensor(shape: &[usize], values: &[i16]) -> TensorDyn {
@@ -547,7 +547,7 @@ mod tests {
         let slice = m.as_mut_slice();
         slice[..values.len()].copy_from_slice(values);
         drop(m);
-        TensorDyn::I16(t)
+        t.into()
     }
 
     fn make_f32_tensor(shape: &[usize], values: &[f32]) -> TensorDyn {
@@ -556,7 +556,7 @@ mod tests {
         let slice = m.as_mut_slice();
         slice[..values.len()].copy_from_slice(values);
         drop(m);
-        TensorDyn::F32(t)
+        t.into()
     }
 
     fn make_f16_tensor(shape: &[usize], values: &[f32]) -> TensorDyn {
@@ -567,7 +567,7 @@ mod tests {
             *dst = half::f16::from_f32(src);
         }
         drop(m);
-        TensorDyn::F16(t)
+        t.into()
     }
 
     #[test]

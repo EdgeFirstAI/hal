@@ -285,7 +285,7 @@ impl V4l2Context {
         dst_stride: usize,
     ) -> Result<ImageInfo, DecodeErr> {
         let needed = ((data.len() + 4095) & !4095) as u32;
-        let dma_capable = dst.memory() == TensorMemory::Dma;
+        let dma_capable = dst.memory() == TensorMemory::DmaBuf;
         let dst_capacity = dst.capacity_bytes();
 
         // Hardware decode requires DMA buffers (the HAL is DMABUF-centric).
@@ -840,7 +840,7 @@ impl V4l2Context {
             SCRATCH_ROW_BYTES,
             rows,
             PixelFormat::Grey,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             // The decoder hardware writes the capture planes; the CPU only
             // reads them during copy-out (`map_read` syncs the read
             // direction).
@@ -1702,17 +1702,17 @@ mod tests {
         const CAP: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         let Some(dev) = device::probe() else {
-            eprintln!("skip: no v4l2 jpeg decoder on this host");
+            log::warn!("skip: no v4l2 jpeg decoder on this host");
             return;
         };
         if dev.api != ApiVariant::MultiPlanar {
-            eprintln!("skip: device is not multi-planar");
+            log::warn!("skip: device is not multi-planar");
             return;
         }
         let (Some(jpeg_a), Some(jpeg_b)) =
             (testdata_file("zidane.jpg"), testdata_file("giraffe.jpg"))
         else {
-            eprintln!("skip: testdata not found (set EDGEFIRST_TESTDATA_DIR)");
+            log::warn!("skip: testdata not found (set EDGEFIRST_TESTDATA_DIR)");
             return;
         };
 
@@ -1722,12 +1722,12 @@ mod tests {
             4096,
             1024,
             PixelFormat::Grey,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("skip: no DMA heap ({e})");
+                log::warn!("skip: no DMA heap ({e})");
                 return;
             }
         };
@@ -2025,7 +2025,7 @@ mod tests {
                 4096,
                 rows,
                 PixelFormat::Grey,
-                Some(TensorMemory::Dma),
+                Some(TensorMemory::DmaBuf),
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .ok()?;
@@ -2097,14 +2097,14 @@ mod tests {
     #[ignore = "on-target hardware probe; run with --ignored --nocapture on a JPEG M2M device"]
     fn probe_decode_throughput() {
         let Some(jpeg) = testdata_file("zidane.jpg") else {
-            eprintln!("skip: testdata not found (set EDGEFIRST_TESTDATA_DIR)");
+            log::warn!("skip: testdata not found (set EDGEFIRST_TESTDATA_DIR)");
             return;
         };
         let frames = 300usize;
 
         for depth in [1u32, 2, 4] {
             let Some(dev) = device::probe() else {
-                eprintln!("skip: no v4l2 jpeg decoder");
+                log::warn!("skip: no v4l2 jpeg decoder");
                 return;
             };
             match run_throughput(&dev, &jpeg, depth, frames) {
@@ -2121,7 +2121,7 @@ mod tests {
                 match device::probe() {
                     Some(d) => devs.push(d),
                     None => {
-                        eprintln!("skip: could not open context");
+                        log::warn!("skip: could not open context");
                         return;
                     }
                 }

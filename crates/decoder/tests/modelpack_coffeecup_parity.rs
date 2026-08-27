@@ -19,6 +19,20 @@
 //! Fixtures are regenerated with
 //! ``scripts/decoder_generate_modelpack_fixture.py``.
 
+/// Emit a skip notice that survives libtest's output capture.
+///
+/// libtest captures `println!`/`eprintln!` and replays it only for **failing**
+/// tests, so a test that skips and returns prints `... ok` with its reason
+/// discarded — indistinguishable from one that did the work. Writing to
+/// `std::io::stderr()` directly bypasses that. See TESTING.md.
+macro_rules! skip_note {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = write!(&mut std::io::stderr(), "SKIPPED: ");
+        let _ = writeln!(&mut std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod common;
 
 use std::path::PathBuf;
@@ -26,14 +40,22 @@ use std::path::PathBuf;
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox, Segmentation};
 use edgefirst_tensor::TensorDyn;
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+/// Root of the `testdata/` tree. `EDGEFIRST_TESTDATA_DIR` wins when set; the
+/// manifest-relative fallback is baked in at compile time and so is useless
+/// for a cross-compiled on-target run.
+fn testdata_root() -> PathBuf {
+    std::env::var("EDGEFIRST_TESTDATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("testdata")
+        })
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    workspace_root().join("testdata/decoder").join(name)
+    testdata_root().join("decoder").join(name)
 }
 
 fn iou_xyxy(a: &[f32; 4], b: &[f32; 4]) -> f32 {
@@ -54,7 +76,7 @@ fn assert_coffeecup_parity(fixture_filename: &str, score_tol: f32, iou_floor: f3
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
-            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
             return;
         }
         Err(e) => panic!("fixture load failed: {e}"),

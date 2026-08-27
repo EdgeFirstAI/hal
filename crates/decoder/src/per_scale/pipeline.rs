@@ -49,45 +49,28 @@ pub(crate) fn quant_from_tensor(
             zero_point: q.zero_point().and_then(|z| z.first().copied()).unwrap_or(0),
         }
     }
-    match t {
-        TensorDyn::I8(t) => t
-            .quantization()
-            .map(convert_quant)
-            .ok_or(DecoderError::QuantMissing {
-                dtype: DType::I8,
-                role,
-                level,
-            }),
-        TensorDyn::U8(t) => t
-            .quantization()
-            .map(convert_quant)
-            .ok_or(DecoderError::QuantMissing {
-                dtype: DType::U8,
-                role,
-                level,
-            }),
-        TensorDyn::I16(t) => {
-            t.quantization()
+    macro_rules! quant {
+        ($ty:ty, $dtype:ident) => {
+            t.as_typed::<$ty>()
+                .expect("dtype checked")
+                .quantization()
                 .map(convert_quant)
                 .ok_or(DecoderError::QuantMissing {
-                    dtype: DType::I16,
+                    dtype: DType::$dtype,
                     role,
                     level,
                 })
-        }
-        TensorDyn::U16(t) => {
-            t.quantization()
-                .map(convert_quant)
-                .ok_or(DecoderError::QuantMissing {
-                    dtype: DType::U16,
-                    role,
-                    level,
-                })
-        }
-        TensorDyn::F16(_) | TensorDyn::F32(_) => Ok(Quantization::identity()),
+        };
+    }
+    match t.dtype() {
+        DType::I8 => quant!(i8, I8),
+        DType::U8 => quant!(u8, U8),
+        DType::I16 => quant!(i16, I16),
+        DType::U16 => quant!(u16, U16),
+        DType::F16 | DType::F32 => Ok(Quantization::identity()),
         other => Err(DecoderError::DtypeMismatch {
             expected: DType::I8,
-            actual: other.dtype(),
+            actual: other,
             role,
             level,
         }),
@@ -121,44 +104,28 @@ pub(crate) fn box_per_channel_quant_from_tensor(
         }
         Some((q.scale(), q.zero_point().unwrap_or(&[])))
     }
-    match t {
-        TensorDyn::I8(t) => match t.quantization() {
-            Some(q) => Ok(extract(q)),
-            None => Err(DecoderError::QuantMissing {
-                dtype: DType::I8,
-                role: "boxes",
-                level,
-            }),
-        },
-        TensorDyn::U8(t) => match t.quantization() {
-            Some(q) => Ok(extract(q)),
-            None => Err(DecoderError::QuantMissing {
-                dtype: DType::U8,
-                role: "boxes",
-                level,
-            }),
-        },
-        TensorDyn::I16(t) => match t.quantization() {
-            Some(q) => Ok(extract(q)),
-            None => Err(DecoderError::QuantMissing {
-                dtype: DType::I16,
-                role: "boxes",
-                level,
-            }),
-        },
-        TensorDyn::U16(t) => match t.quantization() {
-            Some(q) => Ok(extract(q)),
-            None => Err(DecoderError::QuantMissing {
-                dtype: DType::U16,
-                role: "boxes",
-                level,
-            }),
-        },
+    macro_rules! quant {
+        ($ty:ty, $dtype:ident) => {
+            match t.as_typed::<$ty>().expect("dtype checked").quantization() {
+                Some(q) => Ok(extract(q)),
+                None => Err(DecoderError::QuantMissing {
+                    dtype: DType::$dtype,
+                    role: "boxes",
+                    level,
+                }),
+            }
+        };
+    }
+    match t.dtype() {
+        DType::I8 => quant!(i8, I8),
+        DType::U8 => quant!(u8, U8),
+        DType::I16 => quant!(i16, I16),
+        DType::U16 => quant!(u16, U16),
         // Float tensors: no per-channel quant from NPUs — use per-tensor (identity).
-        TensorDyn::F16(_) | TensorDyn::F32(_) => Ok(None),
+        DType::F16 | DType::F32 => Ok(None),
         other => Err(DecoderError::DtypeMismatch {
             expected: DType::I8,
-            actual: other.dtype(),
+            actual: other,
             role: "boxes",
             level,
         }),
@@ -822,8 +789,9 @@ where
     let map_fail = |e: edgefirst_tensor::Error| {
         DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
     };
-    match t {
-        TensorDyn::I8(tensor) => {
+    macro_rules! nchw {
+        ($ty:ty, $ensure:ident, $variant:ident) => {{
+            let tensor = t.as_typed::<$ty>().expect("dtype checked");
             let m = tensor.map().map_err(map_fail)?;
             let src = m.as_slice();
             if src.len() != n {
@@ -832,78 +800,21 @@ where
                     src.len()
                 )));
             }
-            let dst = scratch.ensure_i8(n);
+            let dst = scratch.$ensure(n);
             nchw_to_nhwc(src, h, w, c, dst);
-            f(InputView::I8(dst))
-        }
-        TensorDyn::U8(tensor) => {
-            let m = tensor.map().map_err(map_fail)?;
-            let src = m.as_slice();
-            if src.len() != n {
-                return Err(DecoderError::InvalidShape(format!(
-                    "{role} (level {level}): NCHW src len {} != h*w*c {n}",
-                    src.len()
-                )));
-            }
-            let dst = scratch.ensure_u8(n);
-            nchw_to_nhwc(src, h, w, c, dst);
-            f(InputView::U8(dst))
-        }
-        TensorDyn::I16(tensor) => {
-            let m = tensor.map().map_err(map_fail)?;
-            let src = m.as_slice();
-            if src.len() != n {
-                return Err(DecoderError::InvalidShape(format!(
-                    "{role} (level {level}): NCHW src len {} != h*w*c {n}",
-                    src.len()
-                )));
-            }
-            let dst = scratch.ensure_i16(n);
-            nchw_to_nhwc(src, h, w, c, dst);
-            f(InputView::I16(dst))
-        }
-        TensorDyn::U16(tensor) => {
-            let m = tensor.map().map_err(map_fail)?;
-            let src = m.as_slice();
-            if src.len() != n {
-                return Err(DecoderError::InvalidShape(format!(
-                    "{role} (level {level}): NCHW src len {} != h*w*c {n}",
-                    src.len()
-                )));
-            }
-            let dst = scratch.ensure_u16(n);
-            nchw_to_nhwc(src, h, w, c, dst);
-            f(InputView::U16(dst))
-        }
-        TensorDyn::F16(tensor) => {
-            let m = tensor.map().map_err(map_fail)?;
-            let src = m.as_slice();
-            if src.len() != n {
-                return Err(DecoderError::InvalidShape(format!(
-                    "{role} (level {level}): NCHW src len {} != h*w*c {n}",
-                    src.len()
-                )));
-            }
-            let dst = scratch.ensure_f16(n);
-            nchw_to_nhwc(src, h, w, c, dst);
-            f(InputView::F16(dst))
-        }
-        TensorDyn::F32(tensor) => {
-            let m = tensor.map().map_err(map_fail)?;
-            let src = m.as_slice();
-            if src.len() != n {
-                return Err(DecoderError::InvalidShape(format!(
-                    "{role} (level {level}): NCHW src len {} != h*w*c {n}",
-                    src.len()
-                )));
-            }
-            let dst = scratch.ensure_f32(n);
-            nchw_to_nhwc(src, h, w, c, dst);
-            f(InputView::F32(dst))
-        }
+            f(InputView::$variant(dst))
+        }};
+    }
+    match t.dtype() {
+        DType::I8 => nchw!(i8, ensure_i8, I8),
+        DType::U8 => nchw!(u8, ensure_u8, U8),
+        DType::I16 => nchw!(i16, ensure_i16, I16),
+        DType::U16 => nchw!(u16, ensure_u16, U16),
+        DType::F16 => nchw!(half::f16, ensure_f16, F16),
+        DType::F32 => nchw!(f32, ensure_f32, F32),
         other => Err(DecoderError::DtypeMismatch {
             expected: edgefirst_tensor::DType::I8,
-            actual: other.dtype(),
+            actual: other,
             role,
             level,
         }),
@@ -916,46 +827,25 @@ fn with_mapped_input<F>(t: &TensorDyn, role: &'static str, level: usize, f: F) -
 where
     F: FnOnce(InputView<'_>) -> DecoderResult<()>,
 {
-    match t {
-        TensorDyn::I8(tensor) => {
+    macro_rules! mapped {
+        ($ty:ty, $variant:ident) => {{
+            let tensor = t.as_typed::<$ty>().expect("dtype checked");
             let m = tensor.map().map_err(|e| {
                 DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
             })?;
-            f(InputView::I8(m.as_slice()))
-        }
-        TensorDyn::U8(tensor) => {
-            let m = tensor.map().map_err(|e| {
-                DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
-            })?;
-            f(InputView::U8(m.as_slice()))
-        }
-        TensorDyn::I16(tensor) => {
-            let m = tensor.map().map_err(|e| {
-                DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
-            })?;
-            f(InputView::I16(m.as_slice()))
-        }
-        TensorDyn::U16(tensor) => {
-            let m = tensor.map().map_err(|e| {
-                DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
-            })?;
-            f(InputView::U16(m.as_slice()))
-        }
-        TensorDyn::F16(tensor) => {
-            let m = tensor.map().map_err(|e| {
-                DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
-            })?;
-            f(InputView::F16(m.as_slice()))
-        }
-        TensorDyn::F32(tensor) => {
-            let m = tensor.map().map_err(|e| {
-                DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
-            })?;
-            f(InputView::F32(m.as_slice()))
-        }
+            f(InputView::$variant(m.as_slice()))
+        }};
+    }
+    match t.dtype() {
+        DType::I8 => mapped!(i8, I8),
+        DType::U8 => mapped!(u8, U8),
+        DType::I16 => mapped!(i16, I16),
+        DType::U16 => mapped!(u16, U16),
+        DType::F16 => mapped!(half::f16, F16),
+        DType::F32 => mapped!(f32, F32),
         other => Err(DecoderError::DtypeMismatch {
             expected: edgefirst_tensor::DType::I8, // arbitrary; we just want to flag mismatch
-            actual: other.dtype(),
+            actual: other,
             role,
             level,
         }),
@@ -1003,12 +893,12 @@ mod tests {
     /// Helper for tests.
     fn mk_i8_tensor(shape: &[usize]) -> TensorDyn {
         let t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
-        TensorDyn::I8(t)
+        t.into()
     }
 
     fn mk_f32_tensor(shape: &[usize]) -> TensorDyn {
         let t = Tensor::<f32>::new(shape, Some(TensorMemory::Mem), None).unwrap();
-        TensorDyn::F32(t)
+        t.into()
     }
 
     #[test]
@@ -1036,7 +926,7 @@ mod tests {
         use edgefirst_tensor::Quantization as TQ;
         let mut t = Tensor::<i8>::new(&[1, 2, 2, 4], Some(TensorMemory::Mem), None).unwrap();
         t.set_quantization(TQ::per_tensor(0.1, -10)).unwrap();
-        let dyn_t = TensorDyn::I8(t);
+        let dyn_t: TensorDyn = t.into();
         let q = quant_from_tensor(&dyn_t, "boxes", 0).unwrap();
         assert!((q.scale - 0.1).abs() < 1e-7);
         assert_eq!(q.zero_point, -10);
@@ -1123,23 +1013,23 @@ mod tests {
             // boxes
             let mut t = Tensor::<i8>::new(&lvl.box_shape, Some(TensorMemory::Mem), None).unwrap();
             t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
-            inputs_owned.push(TensorDyn::I8(t));
+            inputs_owned.push(t.into());
             // scores
             let mut t = Tensor::<i8>::new(&lvl.score_shape, Some(TensorMemory::Mem), None).unwrap();
             t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
-            inputs_owned.push(TensorDyn::I8(t));
+            inputs_owned.push(t.into());
             // mask_coefs
             if let Some(s) = &lvl.mc_shape {
                 let mut t = Tensor::<i8>::new(s, Some(TensorMemory::Mem), None).unwrap();
                 t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
-                inputs_owned.push(TensorDyn::I8(t));
+                inputs_owned.push(t.into());
             }
         }
         // protos
         if let Some(s) = &plan.proto_shape {
             let mut t = Tensor::<i8>::new(s, Some(TensorMemory::Mem), None).unwrap();
             t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
-            inputs_owned.push(TensorDyn::I8(t));
+            inputs_owned.push(t.into());
         }
         let inputs: Vec<&TensorDyn> = inputs_owned.iter().collect();
 

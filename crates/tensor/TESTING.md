@@ -68,7 +68,7 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
 - **Import classification tests** (`test_from_fd_dma_imports_as_dma`,
   `test_from_fd_shm_imports_as_shm`,
   `test_from_fd_rejects_unknown_filesystem`) pin the `from_fd` contract:
-  a DMA-BUF fd must come back as `TensorMemory::Dma`, a tmpfs fd as
+  a DMA-BUF fd must come back as `TensorMemory::DmaBuf`, a tmpfs fd as
   `Shm`, and anything else must be rejected with `UnknownBufferType`
   rather than assumed to be shared memory. The unknown case uses a pipe —
   `pipefs` is another `get_anon_bdev()` pseudo-filesystem, so it shares
@@ -213,4 +213,4 @@ CI matrix notes.
 - Project testing patterns: [../../TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md)
 - Validating optimizations: [TESTING.md#validating-optimizations](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#validating-optimizations)
 - Image-side PBO testing: [../image/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md)
-- C API DMA tests: [../capi/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/TESTING.md)
+- C API DMA tests: [../tensor-capi/](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/)

@@ -141,31 +141,33 @@ pub(super) fn widen_u8_to_f32_norm(src: &[u8], dst: &mut [f32]) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn widen_u8_to_f32_norm_neon(src: &[u8], dst: &mut [f32]) {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
 
-    let n = src.len();
-    let sp = src.as_ptr();
-    let dp = dst.as_mut_ptr();
-    let denom = vdupq_n_f32(255.0);
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        let denom = vdupq_n_f32(255.0);
 
-    let mut i = 0usize;
-    while i + 16 <= n {
-        let v = vld1q_u8(sp.add(i)); // 16 × u8
-        let lo = vmovl_u8(vget_low_u8(v)); // 8 × u16
-        let hi = vmovl_u8(vget_high_u8(v)); // 8 × u16
-        let f0 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo))), denom);
-        let f1 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo))), denom);
-        let f2 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi))), denom);
-        let f3 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi))), denom);
-        vst1q_f32(dp.add(i), f0);
-        vst1q_f32(dp.add(i + 4), f1);
-        vst1q_f32(dp.add(i + 8), f2);
-        vst1q_f32(dp.add(i + 12), f3);
-        i += 16;
-    }
-    while i < n {
-        *dp.add(i) = *sp.add(i) as f32 / 255.0;
-        i += 1;
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let v = vld1q_u8(sp.add(i)); // 16 × u8
+            let lo = vmovl_u8(vget_low_u8(v)); // 8 × u16
+            let hi = vmovl_u8(vget_high_u8(v)); // 8 × u16
+            let f0 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo))), denom);
+            let f1 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo))), denom);
+            let f2 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi))), denom);
+            let f3 = vdivq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi))), denom);
+            vst1q_f32(dp.add(i), f0);
+            vst1q_f32(dp.add(i + 4), f1);
+            vst1q_f32(dp.add(i + 8), f2);
+            vst1q_f32(dp.add(i + 12), f3);
+            i += 16;
+        }
+        while i < n {
+            *dp.add(i) = *sp.add(i) as f32 / 255.0;
+            i += 1;
+        }
     }
 }
 
@@ -225,25 +227,27 @@ pub(super) fn widen_u8_to_f16_norm(src: &[u8], dst: &mut [half::f16]) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn widen_u8_to_f16_norm_fp16(src: &[u8], dst: &mut [half::f16]) {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
 
-    let n = src.len();
-    let sp = src.as_ptr();
-    let dp = dst.as_mut_ptr() as *mut u16; // half::f16 is repr(transparent) over u16
-    let d255 = vdupq_n_u16(half::f16::from_f32(255.0).to_bits());
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr() as *mut u16; // half::f16 is repr(transparent) over u16
+        let d255 = vdupq_n_u16(half::f16::from_f32(255.0).to_bits());
 
-    let mut i = 0usize;
-    while i + 16 <= n {
-        let v = vld1q_u8(sp.add(i)); // 16 × u8
-        let lo = vmovl_u8(vget_low_u8(v)); // 8 × u16 (0..=255)
-        let hi = vmovl_u8(vget_high_u8(v)); // 8 × u16
-        vst1q_u16(dp.add(i), ucvtf_div255_f16x8(lo, d255));
-        vst1q_u16(dp.add(i + 8), ucvtf_div255_f16x8(hi, d255));
-        i += 16;
-    }
-    while i < n {
-        *dst.get_unchecked_mut(i) = half::f16::from_f32(*sp.add(i) as f32 / 255.0);
-        i += 1;
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let v = vld1q_u8(sp.add(i)); // 16 × u8
+            let lo = vmovl_u8(vget_low_u8(v)); // 8 × u16 (0..=255)
+            let hi = vmovl_u8(vget_high_u8(v)); // 8 × u16
+            vst1q_u16(dp.add(i), ucvtf_div255_f16x8(lo, d255));
+            vst1q_u16(dp.add(i + 8), ucvtf_div255_f16x8(hi, d255));
+            i += 16;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) = half::f16::from_f32(*sp.add(i) as f32 / 255.0);
+            i += 1;
+        }
     }
 }
 
@@ -260,17 +264,19 @@ unsafe fn widen_u8_to_f16_norm_fp16(src: &[u8], dst: &mut [half::f16]) {
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn ucvtf_div255_f16x8(u16_lanes: uint16x8_t, divisor_f16: uint16x8_t) -> uint16x8_t {
-    let result: uint16x8_t;
-    core::arch::asm!(
-        ".arch_extension fp16",
-        "ucvtf {r:v}.8h, {x:v}.8h",
-        "fdiv {r:v}.8h, {r:v}.8h, {d:v}.8h",
-        r = out(vreg) result,
-        x = in(vreg) u16_lanes,
-        d = in(vreg) divisor_f16,
-        options(pure, nomem, nostack),
-    );
-    result
+    unsafe {
+        let result: uint16x8_t;
+        core::arch::asm!(
+            ".arch_extension fp16",
+            "ucvtf {r:v}.8h, {x:v}.8h",
+            "fdiv {r:v}.8h, {r:v}.8h, {d:v}.8h",
+            r = out(vreg) result,
+            x = in(vreg) u16_lanes,
+            d = in(vreg) divisor_f16,
+            options(pure, nomem, nostack),
+        );
+        result
+    }
 }
 
 /// NEON deinterleave: 16 pixels/iteration via `vld3q_u8` (RGB) or `vld4q_u8`
@@ -291,53 +297,55 @@ unsafe fn deinterleave_row_neon(
     w: usize,
     src_ch: usize,
 ) {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
 
-    let sp = src.as_ptr();
-    let rp = r.as_mut_ptr();
-    let gp = g.as_mut_ptr();
-    let bp = b.as_mut_ptr();
-    // Collapse the alpha plane to a raw pointer once; the loop uses the (Copy)
-    // pointer so the borrow on `a` does not need to persist.
-    let ap: Option<*mut u8> = a.map(|s| s.as_mut_ptr());
+        let sp = src.as_ptr();
+        let rp = r.as_mut_ptr();
+        let gp = g.as_mut_ptr();
+        let bp = b.as_mut_ptr();
+        // Collapse the alpha plane to a raw pointer once; the loop uses the (Copy)
+        // pointer so the borrow on `a` does not need to persist.
+        let ap: Option<*mut u8> = a.map(|s| s.as_mut_ptr());
 
-    let mut x = 0usize;
-    if src_ch == 3 {
-        while x + 16 <= w {
-            let v = vld3q_u8(sp.add(x * 3));
-            vst1q_u8(rp.add(x), v.0);
-            vst1q_u8(gp.add(x), v.1);
-            vst1q_u8(bp.add(x), v.2);
-            x += 16;
-        }
-    } else {
-        while x + 16 <= w {
-            let v = vld4q_u8(sp.add(x * 4));
-            vst1q_u8(rp.add(x), v.0);
-            vst1q_u8(gp.add(x), v.1);
-            vst1q_u8(bp.add(x), v.2);
-            if let Some(ap) = ap {
-                vst1q_u8(ap.add(x), v.3);
+        let mut x = 0usize;
+        if src_ch == 3 {
+            while x + 16 <= w {
+                let v = vld3q_u8(sp.add(x * 3));
+                vst1q_u8(rp.add(x), v.0);
+                vst1q_u8(gp.add(x), v.1);
+                vst1q_u8(bp.add(x), v.2);
+                x += 16;
             }
-            x += 16;
-        }
-    }
-
-    // Scalar tail for the remaining < 16 pixels. The alpha write is gated on
-    // `src_ch == 4` (an alpha byte only exists in a 4-channel source), so
-    // `sp.add(x * src_ch + 3)` can never read past the row even if a caller
-    // wrongly pairs `Some(a)` with a 3-channel source.
-    let write_alpha = src_ch == 4;
-    while x < w {
-        *rp.add(x) = *sp.add(x * src_ch);
-        *gp.add(x) = *sp.add(x * src_ch + 1);
-        *bp.add(x) = *sp.add(x * src_ch + 2);
-        if write_alpha {
-            if let Some(ap) = ap {
-                *ap.add(x) = *sp.add(x * src_ch + 3);
+        } else {
+            while x + 16 <= w {
+                let v = vld4q_u8(sp.add(x * 4));
+                vst1q_u8(rp.add(x), v.0);
+                vst1q_u8(gp.add(x), v.1);
+                vst1q_u8(bp.add(x), v.2);
+                if let Some(ap) = ap {
+                    vst1q_u8(ap.add(x), v.3);
+                }
+                x += 16;
             }
         }
-        x += 1;
+
+        // Scalar tail for the remaining < 16 pixels. The alpha write is gated on
+        // `src_ch == 4` (an alpha byte only exists in a 4-channel source), so
+        // `sp.add(x * src_ch + 3)` can never read past the row even if a caller
+        // wrongly pairs `Some(a)` with a 3-channel source.
+        let write_alpha = src_ch == 4;
+        while x < w {
+            *rp.add(x) = *sp.add(x * src_ch);
+            *gp.add(x) = *sp.add(x * src_ch + 1);
+            *bp.add(x) = *sp.add(x * src_ch + 2);
+            if write_alpha {
+                if let Some(ap) = ap {
+                    *ap.add(x) = *sp.add(x * src_ch + 3);
+                }
+            }
+            x += 1;
+        }
     }
 }
 

@@ -1,0 +1,25 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 100,
+      "max_us": 564,
+      "mean_us": 415,
+      "median_us": 409,
+      "min_us": 387,
+      "name": "convert/1920x1080/YUYV->RGBA",
+      "p95_us": 462,
+      "p99_us": 494
+    },
+    {
+      "iterations": 100,
+      "max_us": 560,
+      "mean_us": 464,
+      "median_us": 457,
+      "min_us": 419,
+      "name": "convert/3840x2160/YUYV->RGBA",
+      "p95_us": 520,
+      "p99_us": 558
+    }
+  ],
+  "timestamp": "unix:1779645860"
+}

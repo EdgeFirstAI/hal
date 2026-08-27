@@ -1,0 +1,43 @@
+[package]
+name = "edgefirst-python-tensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "_tensor"
+crate-type = ["cdylib"]
+
+[features]
+default = ["tracing", "dynamic"]
+tracing = ["edgefirst-tensor/tracing"]
+abi3-py38 = ["pyo3/abi3-py38", "edgefirst-python-common/abi3-py38"]
+abi3-py311 = ["pyo3/abi3-py311", "edgefirst-python-common/abi3-py311"]
+# Forwards to edgefirst-tensor's own static/dynamic features instead of
+# pinning one on the dependency line, same pattern as edgefirst-tracker/
+# -image/-decoder/-codec and python-common (single-tensor-home, task P2).
+# `dynamic` is the real default -- P2's own mandate -- but G13 (the
+# differential gate proving the two backends agree test for test) needs a
+# genuine static-linked comparison build too, and `--no-default-features
+# --features static` now produces one from the SAME commit the dynamic
+# build comes from, rather than an aging separate checkout. See
+# build.rs's own comment on the one place that distinction matters at
+# build time.
+static = ["edgefirst-tensor/static", "edgefirst-python-common/static"]
+dynamic = ["edgefirst-tensor/dynamic", "edgefirst-python-common/dynamic"]
+
+[dependencies]
+edgefirst-python-common = { path = "../python-common", default-features = false, features = ["tensor"] }
+edgefirst-tensor = { workspace = true, default-features = false }
+numpy = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true, features = ["resolve-config"] }
+rustc_version = { workspace = true }

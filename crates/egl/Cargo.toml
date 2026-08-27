@@ -7,12 +7,26 @@ authors = [
     "Au-Zone Technologies <support@au-zone.com>",
 ]
 edition = "2021"
+rust-version.workspace = true
 description = "Rust bindings for the Khronos EGL API (maintained fork of khronos-egl)"
 documentation = "https://docs.rs/edgefirst-egl"
 repository.workspace = true
 readme = "README.md"
 keywords = ["egl", "gl", "khronos", "opengl"]
 license = "MIT OR Apache-2.0"
+
+# Not `workspace = true` (Cargo requires that to be the table's only key):
+# this crate is a trimmed, maintained fork of `khronos-egl` (see src/lib.rs's
+# module doc), and `unsafe_op_in_unsafe_fn` alone would need touching ~670
+# call sites across the forked upstream source to satisfy. That churn is the
+# wrong trade here -- it would diverge this fork from upstream for a lint
+# with no behavior change, making future upstream fixes harder to port
+# rather than catching a real bug. `unexpected_cfgs` is inherited explicitly
+# (duplicated from `[workspace.lints.rust]`, not overridden) since a table
+# with `workspace = true` cannot also carry a per-lint override.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unsafe_op_in_unsafe_fn = "allow"
 
 [dependencies]
 libc = { workspace = true }

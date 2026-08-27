@@ -212,7 +212,7 @@ impl TransferBackend {
         self == TransferBackend::DmaBuf
     }
 
-    /// Returns `true` if the platform can import `TensorMemory::Dma`
+    /// Returns `true` if the platform can import `TensorMemory::DmaBuf`
     /// tensors zero-copy: DMA-BUF EGLImages on Linux, IOSurface pbuffers
     /// on macOS. Path-selection sites use this; probes that are
     /// specifically about DMA-BUF semantics (e.g. the render-roundtrip

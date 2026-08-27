@@ -53,10 +53,14 @@ extra setup. The **OpenGL (GPU) backend on Apple platforms needs ANGLE**
   Homebrew tap instead (`brew install startergo/angle/angle`, then re-sign
   the dylibs — see README). On **iOS** there is no Homebrew equivalent, so
   use `scripts/fetch-angle.sh` (or build the CPU-only path:
-  `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`).
+  `cargo build --target aarch64-apple-ios --no-default-features --features static,ndarray,tracing`).
 - Either way, you can contribute to the Linux/CPU paths without any ANGLE
   at all — just disable the `opengl` feature
-  (`--no-default-features --features ndarray,tracing`).
+  (`--no-default-features --features static,ndarray,tracing`). `static` is
+  required: `edgefirst-tensor`'s `static`/`dynamic` backend features are
+  mutually exclusive and one of them must be named explicitly whenever
+  `--no-default-features` is passed — omitting both is a compile error, not
+  a fallback to a default.
 
 ### Clone and Build
 
@@ -71,9 +75,18 @@ cargo build --workspace
 # Run tests — single-threaded, always (see below)
 cargo test --workspace -- --test-threads=1
 
+# The five C-API leaves (tensor-capi, image-capi, codec-capi, decoder-capi,
+# tracker-capi) are excluded from the workspace and untouched by the two
+# commands above — each resolves its own static/dynamic feature set. Build
+# and test them per crate, sharing the workspace's target directory:
+cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
+EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --manifest-path crates/tensor-capi/Cargo.toml \
+  --target-dir target -- --test-threads=1
+# ...or `make test-capi-modular` to run all five at once, as CI does.
+
 # Build Python bindings (optional)
 pip install maturin
-maturin develop -m crates/python/Cargo.toml
+maturin develop -m crates/python-tensor/Cargo.toml
 
 # Run Python tests (requires Python bindings)
 python -m pytest tests/
@@ -144,11 +157,16 @@ cargo test --workspace -- --test-threads=1
 # Linting, exactly as CI runs it (plain `cargo clippy` will let CI failures through)
 cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
 
+# The five excluded C-API leaves need their own clippy pass, per crate,
+# with the workspace's target directory (see `make lint`):
+cargo clippy --manifest-path crates/tensor-capi/Cargo.toml --all-targets \
+  --target-dir target -- -D warnings
+
 # Format code
 cargo fmt --all
 
 # Build and test Python bindings
-maturin develop -m crates/python/Cargo.toml
+maturin develop -m crates/python-tensor/Cargo.toml
 python -m pytest tests/
 ```
 
@@ -214,6 +232,26 @@ cargo fmt --all
 cargo clippy --workspace
 ```
 
+The five excluded C-API leaves (`tensor-capi`, `image-capi`, `codec-capi`,
+`decoder-capi`, `tracker-capi`) need their own clippy pass, per crate, with
+the workspace's target directory — see [Clone and Build](#clone-and-build)
+above, or run `make lint-capi-modular` to cover all five at once.
+
+**The five leaves also carry their own `[lints]` and `[profile.release]`
+tables, hand-copied from the root `Cargo.toml`, and must be kept in sync by
+hand.** Being excluded from the workspace (see the root `Cargo.toml`'s
+`[workspace] exclude` comment) means they inherit *nothing* from it — not
+`[workspace.lints]`, not `[profile.release]` — because each is its own
+standalone one-crate workspace (`[workspace] resolver = "3"` at the bottom
+of each leaf's manifest stops cargo's upward search), and `lints.workspace =
+true` only works for an actual member of the workspace it names. Cargo has
+no mechanism to propagate either table across that boundary automatically.
+Concretely: if you change `[workspace.lints.rust]` or `[profile.release]` at
+the root, update all five leaves' copies in the same commit, or they will
+silently drift — a leaf built with a stale profile is exactly how this
+project ended up shipping an unstripped, non-LTO `.so` with 17,035 symbols
+alongside a workspace built with LTO and stripping.
+
 ### Python Code
 
 For Python bindings:
@@ -267,7 +305,7 @@ mod tests {
 
 ```python
 import pytest
-from edgefirst_hal import Tensor, TensorMemory, PixelFormat
+from edgefirst.tensor import Tensor, TensorMemory, PixelFormat
 
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.SHM])
@@ -293,7 +331,9 @@ python -m pytest tests/ -v
 
 # With coverage — what `make test-rust` runs
 cargo install cargo-llvm-cov --locked
-cargo llvm-cov nextest --workspace --exclude edgefirst_hal \
+cargo llvm-cov nextest --workspace --exclude edgefirst-python-tensor \
+  --exclude edgefirst-python-codec --exclude edgefirst-python-image \
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker \
   --lcov --output-path target/rust-coverage.lcov -j 1
 
 # With coverage (Python, after building with instrumentation)
@@ -302,7 +342,10 @@ python -m slipcover -m pytest tests/
 ```
 
 The Python crate is excluded from workspace Rust runs because it needs a live
-Python interpreter. [TESTING.md](TESTING.md) covers cross-compilation, on-target
+Python interpreter. The five C-API leaves are excluded from `cargo test
+--workspace` too — see [Clone and Build](#clone-and-build) for the per-crate
+invocation, or run `make test-capi-modular` to cover all five at once, as CI
+does. [TESTING.md](TESTING.md) covers cross-compilation, on-target
 runs, and the hardware gating rules.
 
 ## CI/CD Workflows
@@ -314,7 +357,10 @@ The project uses GitHub Actions for continuous integration. Workflows are in `.g
 Runs on every push and PR to `main`, `develop`, or `release/**`:
 
 - **Formatting check**: `cargo fmt --all -- --check` (advisory)
-- **Linting**: `cargo clippy --workspace --all-targets ... -- -D warnings`
+- **Linting**: `cargo clippy --workspace --all-targets ... -- -D warnings`, plus a
+  separate "Run Clippy (modular C-API leaves)" step (`make lint-capi-modular`)
+  covering the five excluded C-API leaves, which the workspace-wide pass does
+  not reach
 - **Multi-platform testing**: x86_64, aarch64, NXP i.MX8M Plus hardware
 - **Software GL**: the image crate's GL tests under Mesa llvmpipe, covering GL paths
   no hardware runner reaches

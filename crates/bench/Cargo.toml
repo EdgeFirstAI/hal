@@ -2,12 +2,16 @@
 name = "edgefirst-bench"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Lightweight micro-benchmark harness for EdgeFirst crates"
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
+
+[lints]
+workspace = true
 
 [dependencies]
 serde_json = { workspace = true }

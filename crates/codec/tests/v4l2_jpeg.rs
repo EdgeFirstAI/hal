@@ -17,6 +17,20 @@
 //! backend, and the workspace test convention is `-j 1` already.
 #![cfg(all(target_os = "linux", feature = "v4l2"))]
 
+/// Emit a skip notice that survives libtest's output capture.
+///
+/// libtest captures `println!`/`eprintln!` and replays it only for **failing**
+/// tests, so a test that skips and returns prints `... ok` with its reason
+/// discarded — indistinguishable from one that did the work. Writing to
+/// `std::io::stderr()` directly bypasses that. See TESTING.md.
+macro_rules! skip_note {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = write!(&mut std::io::stderr(), "SKIPPED: ");
+        let _ = writeln!(&mut std::io::stderr(), $($arg)*);
+    }};
+}
+
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
 
@@ -386,12 +400,12 @@ fn v4l2_zero_copy_dma_nv12() {
         1280,
         720,
         PixelFormat::Nv12,
-        Some(TensorMemory::Dma),
+        Some(TensorMemory::DmaBuf),
         edgefirst_tensor::CpuAccess::ReadWrite,
     ) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("skip v4l2_zero_copy_dma_nv12: no DMA allocation ({e})");
+            skip_note!("v4l2_zero_copy_dma_nv12: no DMA allocation ({e})");
             return;
         }
     };

@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# cbindgen configuration for edgefirst/tensor.h.
+#
+# NOTE: the include guard is written by hand in `header`/`trailer` rather than
+# via cbindgen's `include_guard`, which wraps only the *generated* body and
+# leaves `header` and `trailer` outside it. Everything below the trailer marker
+# -- the vtable struct and every `static inline` accessor -- would then be
+# re-emitted on a second #include and fail to compile with a redefinition.
+#
+# NOTE: cbindgen emits declarations for `extern "C"` functions only. It cannot
+# emit a `static inline` body, and `static inline` is the entire mechanism that
+# makes the vtable accessors non-interposable. Those therefore live in the
+# hand-written `trailer` below, not in generated output.
+
+language = "C"
+autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
+include_version = true
+documentation = true
+documentation_style = "doxy"
+documentation_length = "full"
+
+header = """
+#ifndef EDGEFIRST_TRACKER_H
+#define EDGEFIRST_TRACKER_H
+
+/**
+ * @file tracker.h
+ * @brief EdgeFirst multi-object tracking C API
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
+ *
+ * Associates detections across frames, giving each object a stable identity.
+ *
+ * Takes detections as a plain `(const ef_detect_box *, size_t)` pair — the
+ * same view `ef_detect_box_list_data()`/`_len()` give back — so this library
+ * needs only the by-value `ef_detect_box` type, declared in
+ * edgefirst/detect.h, and never links the decoder.
+ */
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "edgefirst/detect.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief An opaque tracker.
+ *
+ * Forward-declared so callers write `ef_bytetrack *` without the `struct`
+ * keyword. Its definition is private: tracker state is not part of the ABI.
+ */
+typedef struct ef_bytetrack ef_bytetrack;
+
+/** @brief An opaque list of tracks. */
+typedef struct ef_track_info_list ef_track_info_list;
+"""
+
+trailer = """
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* EDGEFIRST_TRACKER_H */
+"""
+
+[export]
+prefix = ""
+# `EfDetectBox` (used by `ef_bytetrack_update`'s signature) comes from
+# edgefirst/decoder.h, which this header includes. The `EfTensor*` family is
+# unused by this crate today but excluded defensively, matching the sibling
+# `-capi` crates: they are declared once, in edgefirst/tensor.h. Emitting any
+# of these again here would be a second, conflicting definition.
+exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDetectBox", "EfDetectBoxList", "EfByteTrack", "EfTrackInfoList"]
+
+
+[export.rename]
+"EfTensor" = "ef_tensor"
+"EfByteTrack" = "ef_bytetrack"
+"EfTrackInfoList" = "ef_track_info_list"
+"EfTrackInfo" = "ef_track_info"
+"EfDetectBoxList" = "ef_detect_box_list"
+"EfDetectBox" = "ef_detect_box"
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+
+[struct]
+rename_fields = "SnakeCase"
+
+[fn]
+rename_args = "SnakeCase"
+args = "auto"
+sort_by = "None"
+
+[parse]
+parse_deps = false
+clean = false

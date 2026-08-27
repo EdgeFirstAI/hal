@@ -48,9 +48,26 @@ echo "[1/5] Generating dependency SBOM with cargo-cyclonedx (${#HAL_TARGETS[@]} 
 # pollute the merge with stale internal-crate versions (breaking
 # verify_version.py / NOTICE). Always start from a clean slate.
 find crates -maxdepth 2 -type f -name '*.cdx.json' -delete
+
+# The five modular C-API leaves (crates/*-capi) are excluded from the
+# workspace (see Cargo.toml's [workspace].exclude) because the
+# static/dynamic feature switch is mutually exclusive and cargo unifies
+# features across one invocation's package set. `--all` above only
+# enumerates workspace MEMBERS, so these five silently drop out of
+# dependency-SBOM attribution unless generated explicitly here, once per
+# leaf per target via --manifest-path. `--all` is kept for symmetry with
+# the workspace loop above; cargo-cyclonedx accepts it on a
+# single-package manifest without error (it just means "all members of
+# this one-package workspace").
+LEAF_CRATES=(tensor-capi image-capi codec-capi decoder-capi tracker-capi)
 for t in "${HAL_TARGETS[@]}"; do
     echo "  target: ${t}"
     cargo cyclonedx --format json --all --target "${t}" --target-in-filename
+    for leaf in "${LEAF_CRATES[@]}"; do
+        echo "  target: ${t}  leaf: ${leaf}"
+        cargo cyclonedx --format json --all --target "${t}" --target-in-filename \
+            --manifest-path "crates/${leaf}/Cargo.toml"
+    done
 done
 
 # Merge all crate SBOMs into a single dependency SBOM

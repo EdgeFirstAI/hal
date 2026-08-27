@@ -68,7 +68,7 @@ const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 /// default linker search path. Leaked at first load to avoid
 /// dlclose-during-shutdown crashes (same pattern as Linux's `EGL_LIB` in
 /// `context.rs` and the macOS ANGLE loader).
-static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
+static EGL_LIB: OnceLock<&libloading::Library> = OnceLock::new();
 
 fn load_egl_lib() -> Result<&'static libloading::Library> {
     if let Some(lib) = EGL_LIB.get() {
@@ -445,7 +445,12 @@ impl GlPlatform for AndroidEgl {
     }
 
     unsafe fn attach_tex_image_2d(_display: &AndroidGlContext, handle: egl::Image) -> Result<()> {
-        edgefirst_gl::gl::EGLImageTargetTexture2DOES(edgefirst_gl::gl::TEXTURE_2D, handle.as_ptr());
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                edgefirst_gl::gl::TEXTURE_2D,
+                handle.as_ptr(),
+            );
+        }
         Ok(())
     }
 
@@ -466,10 +471,12 @@ impl GlPlatform for AndroidEgl {
         _display: &AndroidGlContext,
         handle: egl::Image,
     ) -> Result<()> {
-        edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
-            edgefirst_gl::gl::RENDERBUFFER,
-            handle.as_ptr(),
-        );
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+                edgefirst_gl::gl::RENDERBUFFER,
+                handle.as_ptr(),
+            );
+        }
         Ok(())
     }
 
@@ -550,7 +557,7 @@ impl GlPlatform for AndroidEgl {
         _fmt: super::PackedImportFormat,
     ) -> Result<AndroidEglImage>
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         let ptr = tensor_ahb_ptr(img)?;
         // The AHardwareBuffer is self-describing — the import cannot

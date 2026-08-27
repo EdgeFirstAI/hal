@@ -150,21 +150,32 @@ impl DmaImportAttrs {
             (src_w, src_h, pixel_format_to_drm(src_fmt)?, src_channels)
         };
 
-        let dma = src.as_dma().ok_or_else(|| {
-            Error::NotImplemented(format!(
-                "OpenGL EGLImage requires DMA tensor, got {:?}",
-                src.memory()
-            ))
-        })?;
-        let fd = dma.fd.as_raw_fd();
+        // `dmabuf()`, not `as_dma().fd`. Both reach the same file
+        // descriptor and both are on `Tensor<T>` with the same signature on
+        // either backend -- but `as_dma` downcasts to `DmaTensor<T>`, which
+        // is `static`-backend-internal storage that the `dynamic` backend
+        // has no instance of and returns `None` for unconditionally. Going
+        // through it meant a genuinely DMA-backed tensor was refused here
+        // under `dynamic`, silently declining the zero-copy EGLImage import
+        // and falling back to a PBO copy. Nothing failed and nothing said
+        // so. See task P2b's review, F3.
+        let fd = src
+            .dmabuf()
+            .map_err(|e| {
+                Error::NotImplemented(format!(
+                    "OpenGL EGLImage requires DMA tensor, got {:?} ({e})",
+                    src.memory()
+                ))
+            })?
+            .as_raw_fd();
 
         // For multiplane NV12, get the UV plane's fd from the chroma tensor
         let uv_fd = if src.is_multiplane() {
             let chroma = src.chroma().unwrap();
-            let chroma_dma = chroma.as_dma().ok_or_else(|| {
-                Error::NotImplemented("Multiplane chroma tensor must be DMA-backed".to_string())
+            let chroma_fd = chroma.dmabuf().map_err(|e| {
+                Error::NotImplemented(format!("Multiplane chroma tensor must be DMA-backed ({e})"))
             })?;
-            Some(chroma_dma.fd.as_raw_fd())
+            Some(chroma_fd.as_raw_fd())
         } else {
             None
         };
@@ -320,7 +331,7 @@ impl DmaImportAttrs {
 
         // Combined (luma + chroma) height — mirrors the PlanarRgb R8 import
         // (`src_h * 3` for 3-channel planar; here it is format-dependent).
-        // Combined (luma + chroma) buffer height, matching `PixelFormat::image_shape`:
+        // Combined (luma + chroma) buffer height, matching `PixelFormat::allocation_shape`:
         //   NV12 (4:2:0): H luma + H/2 chroma          = H + ⌈H/2⌉
         //   NV16 (4:2:2): H luma + H chroma (W bytes/row) = 2H
         //   NV24 (4:4:4): H luma + 2H chroma (2W bytes/row laid out as 2H rows of W) = 3H
@@ -332,13 +343,17 @@ impl DmaImportAttrs {
             Error::NotImplemented(format!("Path-B R8 import: {src_fmt:?} is not semi-planar"))
         })?;
 
-        let dma = src.as_dma().ok_or_else(|| {
-            Error::NotImplemented(format!(
-                "OpenGL Path-B R8 import requires DMA tensor, got {:?}",
-                src.memory()
-            ))
-        })?;
-        let fd = dma.fd.as_raw_fd();
+        // See the EGLImage import above for why this is `dmabuf()` and not
+        // `as_dma().fd`.
+        let fd = src
+            .dmabuf()
+            .map_err(|e| {
+                Error::NotImplemented(format!(
+                    "OpenGL Path-B R8 import requires DMA tensor, got {:?} ({e})",
+                    src.memory()
+                ))
+            })?
+            .as_raw_fd();
         let plane0_offset = src.plane_offset().unwrap_or(0);
 
         Ok(DmaImportAttrs {
@@ -445,8 +460,8 @@ mod tests {
         if !is_dma_available() {
             return None;
         }
-        match Tensor::<u8>::new(&[bytes], Some(TensorMemory::Dma), Some(name)) {
-            Ok(t) if t.memory() == TensorMemory::Dma => Some(t),
+        match Tensor::<u8>::new(&[bytes], Some(TensorMemory::DmaBuf), Some(name)) {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => Some(t),
             _ => None,
         }
     }
@@ -490,7 +505,7 @@ mod tests {
             64,
             PixelFormat::Rgba,
             320,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
@@ -1225,7 +1240,7 @@ mod tests {
                 64,
                 PixelFormat::Rgba,
                 aligned,
-                Some(edgefirst_tensor::TensorMemory::Dma),
+                Some(edgefirst_tensor::TensorMemory::DmaBuf),
                 edgefirst_tensor::CpuAccess::ReadWrite,
             ) {
                 Ok(t) => t,
@@ -1263,7 +1278,7 @@ mod tests {
             64,
             PixelFormat::Bgra,
             aligned,
-            Some(edgefirst_tensor::TensorMemory::Dma),
+            Some(edgefirst_tensor::TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,

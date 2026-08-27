@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# cbindgen configuration for edgefirst/tensor.h.
+#
+# NOTE: the include guard is written by hand in `header`/`trailer` rather than
+# via cbindgen's `include_guard`, which wraps only the *generated* body and
+# leaves `header` and `trailer` outside it. Everything below the trailer marker
+# -- the vtable struct and every `static inline` accessor -- would then be
+# re-emitted on a second #include and fail to compile with a redefinition.
+#
+# NOTE: cbindgen emits declarations for `extern "C"` functions only. It cannot
+# emit a `static inline` body, and `static inline` is the entire mechanism that
+# makes the vtable accessors non-interposable. Those therefore live in the
+# hand-written `trailer` below, not in generated output.
+
+language = "C"
+autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
+include_version = true
+documentation = true
+documentation_style = "doxy"
+documentation_length = "full"
+
+header = """
+#ifndef EDGEFIRST_DECODER_H
+#define EDGEFIRST_DECODER_H
+
+/**
+ * @file decoder.h
+ * @brief EdgeFirst model output decoding C API
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
+ *
+ * Turns raw model output tensors into detections and segmentation masks.
+ *
+ * Configuration is a builder: set fields on an `ef_decoder_params`, then build
+ * a decoder from it. Exactly one configuration source must be supplied — an
+ * output list, JSON, YAML, or a file — because two sources disagreeing has no
+ * defined resolution.
+ *
+ * Detections come back as `ef_detect_box_list`. The box / mask / tile
+ * layouts themselves live in header-only `edgefirst/detect.h`.
+ */
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "edgefirst/detect.h"
+#include "edgefirst/tensor.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief An opaque decoder.
+ *
+ * Forward-declared so callers write `ef_decoder *` without the `struct`
+ * keyword. Its definition is private: decoder state is not part of the ABI.
+ */
+typedef struct ef_decoder ef_decoder;
+
+/** @brief Opaque decoder configuration, built up field by field. */
+typedef struct ef_decoder_params ef_decoder_params;
+
+/** @brief An opaque list of segmentation masks. */
+typedef struct ef_segmentation_list ef_segmentation_list;
+
+/** @brief Prototype tensors from `ef_decoder_decode_proto`. */
+typedef struct ef_proto_data ef_proto_data;
+
+/** @brief Decoder-local ByteTrack handle. */
+typedef struct ef_decoder_tracker ef_decoder_tracker;
+
+/** @brief Track list from `ef_decoder_decode_tracked`. */
+typedef struct ef_decoder_track_list ef_decoder_track_list;
+"""
+
+trailer = """
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* EDGEFIRST_DECODER_H */
+"""
+
+[export]
+prefix = ""
+# EfTensor/EfTensorImpl/EfTensorPlane are declared once, in edgefirst/tensor.h,
+# which this header includes; excluding them here avoids emitting a second,
+# conflicting definition. `EfDetectBox` and `EfDetectBoxList` are NOT excluded:
+# this library is their one implementation home, so this header is where they
+# get declared.
+exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderParams", "EfSegmentationList", "EfDetectBox", "EfSegmentation", "EfMergeConfig", "TilePlacement", "EfTilePlacement", "EfProtoData", "EfDecoderTracker", "EfDecoderTrackList"]
+
+
+[export.rename]
+"EfTensor" = "ef_tensor"
+"EfDecoder" = "ef_decoder"
+"EfDecoderParams" = "ef_decoder_params"
+"EfSegmentationList" = "ef_segmentation_list"
+"EfSegmentation" = "ef_segmentation"
+"EfMergeConfig" = "ef_merge_config"
+"EfTilePlacement" = "ef_tile_placement"
+"EfTiledFrameAccumulator" = "ef_tiled_frame_accumulator"
+"EfDetectBoxList" = "ef_detect_box_list"
+"EfDetectBox" = "ef_detect_box"
+"EfProtoData" = "ef_proto_data"
+"EfDecoderTracker" = "ef_decoder_tracker"
+"EfDecoderTrackList" = "ef_decoder_track_list"
+"EfDecoderTrack" = "ef_decoder_track"
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+
+[struct]
+rename_fields = "SnakeCase"
+
+[fn]
+rename_args = "SnakeCase"
+args = "auto"
+sort_by = "None"
+
+[parse]
+# `ef_segmentation` and `ef_merge_config` are declared in `edgefirst-decoder-abi`
+# now, not locally -- decoding model output into detections and masks is what
+# this library *is*, so its ABI types live in the zero-dependency sibling that
+# `edgefirst-image` and `edgefirst-tracker` can name without linking this
+# library's implementation. `include` restricts parsing to just that crate;
+# `edgefirst-tensor-abi`'s types stay out-of-band via `#include "edgefirst/tensor.h"`
+# and the `exclude` list below, exactly as before.
+parse_deps = true
+include = ["edgefirst-decoder-abi"]
+clean = false

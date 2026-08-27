@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(dead_code)]
-use nix::{ioctl_read, ioctl_write_ptr};
+use nix::ioctl_write_ptr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::OnceLock;
 
 const DMA_BUF_BASE: u8 = b'b';
 const DMA_BUF_IOCTL_SYNC: u8 = 0;
-const DMA_BUF_IOCTL_PHYS: u8 = 10;
 
 const DMA_BUF_SYNC_READ: u64 = 1 << 0;
 const DMA_BUF_SYNC_WRITE: u64 = 1 << 1;
@@ -28,53 +26,39 @@ ioctl_write_ptr!(
     DmaBufSync
 );
 
-ioctl_read!(
-    ioctl_dma_buf_phys,
-    DMA_BUF_BASE,
-    DMA_BUF_IOCTL_PHYS,
-    std::ffi::c_ulong
-);
-
 fn sync(fd: &OwnedFd, flags: u64) -> nix::Result<()> {
     let sync = DmaBufSync { flags };
     unsafe { ioctl_dma_buf_sync(fd.as_raw_fd(), &sync) }?;
     Ok(())
 }
 
-pub(crate) fn start_read(fd: &OwnedFd) -> nix::Result<()> {
-    sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START)
-}
-
-pub(crate) fn end_read(fd: &OwnedFd) -> nix::Result<()> {
-    sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END)
-}
-
-pub(crate) fn start_write(fd: &OwnedFd) -> nix::Result<()> {
-    sync(fd, DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_START)
-}
-
-pub(crate) fn end_write(fd: &OwnedFd) -> nix::Result<()> {
-    sync(fd, DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END)
-}
-
-pub(crate) fn start_readwrite(fd: &OwnedFd) -> nix::Result<()> {
-    sync(
-        fd,
-        DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_START,
-    )
-}
-
-pub(crate) fn end_readwrite(fd: &OwnedFd) -> nix::Result<()> {
-    sync(
-        fd,
-        DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END,
-    )
-}
-
-pub(crate) fn phys(fd: &OwnedFd) -> nix::Result<u64> {
-    let mut phys: u64 = 0;
-    unsafe { ioctl_dma_buf_phys(fd.as_raw_fd(), &mut phys) }?;
-    Ok(phys)
+/// Issue `DMA_BUF_IOCTL_SYNC` for one direction and one half of the bracket.
+///
+/// Replaces six near-identical wrappers. The direction matters: a read-only
+/// bracket lets the kernel skip the writeback at END, a write-only one skips
+/// the invalidate at START — so `start` and `end` MUST be called with the same
+/// `access`, or the maintenance one half performed is undone by the other
+/// half's omission.
+pub(crate) fn sync_access(fd: &OwnedFd, start: bool, access: crate::CpuAccess) -> nix::Result<()> {
+    let mut flags = 0;
+    if access.reads() {
+        flags |= DMA_BUF_SYNC_READ;
+    }
+    if access.writes() {
+        flags |= DMA_BUF_SYNC_WRITE;
+    }
+    // Callers reject CpuAccess::None before reaching here, but a zero
+    // direction would issue a no-op ioctl that silently maintains nothing;
+    // treat it as read-write, matching what the six wrappers' dispatch did.
+    if flags == 0 {
+        flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE;
+    }
+    flags |= if start {
+        DMA_BUF_SYNC_START
+    } else {
+        DMA_BUF_SYNC_END
+    };
+    sync(fd, flags)
 }
 
 // =============================================================================

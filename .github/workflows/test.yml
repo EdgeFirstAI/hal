@@ -25,6 +25,7 @@
 # - taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4 (v2.78.0)
 # - SonarSource/sonarqube-scan-action@59db25f34e16620e48ab4bb9e4a5dce155cb5432 (v8.0.0)
 # - EnricoMi/publish-unit-test-result-action@c950f6fb443cb5af20a377fd0dfaa78838901040 (v2.23.0)
+# - ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 (v1.13.0)
 #
 # Runner Notes:
 # - ubuntu-22.04: Standard GitHub-hosted runner, 4 vCPU (x86_64, used for I/O-bound
@@ -128,7 +129,26 @@ jobs:
           cache-on-failure: true
 
       - name: Run doc tests
-        run: cargo test --doc --workspace --all-features
+        # The five modular C-API leaves (tensor/image/codec/decoder/tracker-capi)
+        # are excluded from the workspace, so --workspace does not reach their
+        # doctests. No separate step is needed for them here: doctests do not
+        # apply to these crates at all -- their crate-type is staticlib/cdylib
+        # only (no rlib), so cargo never compiles or runs doctests for them
+        # regardless of invocation. `make test-capi-modular`
+        # (build-and-test-x86, build-and-test-macos, build-arm) still runs
+        # plain `cargo test` per leaf for their regular unit/integration tests.
+        #
+        # NOT `--all-features`: edgefirst-tensor's `static`/`dynamic` backend
+        # features are mutually exclusive by design (see the `compile_error!`
+        # guards in crates/tensor/src/lib.rs) -- `--all-features` enables both
+        # at once and can never work again, on this crate specifically, no
+        # matter how the rest of the tree changes. `make test-doc` runs the
+        # same doctests with the workspace's real feature set (RUST_FEATURES
+        # in the Makefile) and the same python-crate excludes (their doc
+        # comments are Python `__doc__`, not Rust) -- delegating to it here
+        # keeps this step and local development running the identical
+        # command instead of two copies that can drift apart.
+        run: make test-doc
 
   # ===========================================================================
   # Build and Test on x86_64 (GitHub-hosted runner with Docker)
@@ -158,7 +178,7 @@ jobs:
       - name: Install OpenCV build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev libopencv-dev
+          sudo apt-get install -y clang libclang-dev libopencv-dev pkg-config
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -183,7 +203,7 @@ jobs:
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
         with:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
-          components: llvm-tools-preview, rustfmt, clippy
+          components: llvm-tools-preview, rustfmt, clippy, miri, rust-src
 
       - name: Set Rust stable as default toolchain
         run: rustup default ${{ env.RUST_STABLE_VERSION }}
@@ -204,14 +224,55 @@ jobs:
         # The authoritative gate is the local `make format` pre-commit step
         # (see .github/copilot-instructions.md). This emits a GitHub annotation
         # so drift is visible in the PR checks UI without failing the job.
+        # The five modular C-API leaves (tensor/image/codec/decoder/tracker-capi)
+        # are excluded from the workspace, so `--all` above never reaches them;
+        # check each leaf individually with the same advisory mechanism.
         run: |
           if ! cargo fmt --all -- --check; then
             echo "::warning title=Rust formatting drift::Run 'make format' before committing — CI does not block on formatting."
           fi
+          for c in tensor-capi image-capi codec-capi decoder-capi tracker-capi; do
+            if ! cargo fmt --manifest-path crates/$c/Cargo.toml -- --check; then
+              echo "::warning title=Rust formatting drift ($c)::Run 'make format' before committing — CI does not block on formatting."
+            fi
+          done
 
       - name: Run Clippy
         # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
-        run: cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
+        # --exclude the four python-* crates for the same reason lines 619-622's
+        # iOS lane already does: they request edgefirst-tensor's `dynamic`
+        # feature while every other member wants `static` (default), and
+        # --workspace unions features across all members, activating both at
+        # once on one edgefirst-tensor unit -- a guaranteed compile failure
+        # (crates/tensor/src/lib.rs's own mutual-exclusion guard), not a lint
+        # finding. Confirmed by running this exact line before the fix: 17
+        # errors, twelve of them this wall (`Tensor`/`TensorDyn` defined
+        # multiple times, recursive types with infinite size, three failed
+        # python-crate build scripts); the other 5 are pre-existing, unrelated
+        # clippy drift in crates/decoder/src/modelpack.rs.
+        run: cargo clippy --workspace --all-targets --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
+
+      - name: Run Clippy (modular C-API leaves)
+        # The five modular C-API leaves (tensor/image/codec/decoder/tracker-capi)
+        # are standalone packages excluded from --workspace above; lint them
+        # via the Makefile lane that's the single source of truth for their
+        # invocation shape (--manifest-path/--target-dir).
+        run: make lint-capi-modular
+
+      - name: Run Clippy (edgefirst-tensor, dynamic backend)
+        # The --workspace clippy above runs on default features, i.e. the
+        # STATIC backend, and cannot also cover the dynamic one -- the two
+        # are mutually exclusive (crates/tensor/src/lib.rs's compile_error!),
+        # so --workspace can only ever select one. Without this the dynamic
+        # backend was linted by nobody.
+        run: make lint-tensor-dynamic
+
+      - name: Package and smoke the C archive
+        # A PR that breaks header packaging, a .pc file, or the SONAME chain
+        # must fail here — not on a tag, after PyPI has already published.
+        run: |
+          make package
+          ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.tar.gz
 
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
@@ -221,32 +282,74 @@ jobs:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
         run: |
           source /tmp/coverage-env.sh
-          venv/bin/maturin build \
-            --manifest-path crates/python/Cargo.toml \
-            --out target/wheels \
-            --profile profiling \
-            --features abi3-py311
-          venv/bin/pip install target/wheels/*.whl
+          # Four self-contained extension modules since 0.29. Each is built
+          # and installed; the bindings they share live in python-common, which
+          # is where the instrumented line coverage actually lands.
+          for pkg in tensor codec image decoder tracker; do
+            venv/bin/maturin build \
+              --manifest-path "crates/python-$pkg/Cargo.toml" \
+              --out target/wheels \
+              --profile profiling \
+              --features abi3-py311 \
+              --auditwheel skip
+          done
+          # --no-deps: every edgefirst-* sibling is in this same wheel set, built
+          # from this commit. Resolving the `~=` pins would let pip fetch a
+          # PUBLISHED sibling from PyPI over the locally built one, so the suite
+          # would silently test released code instead of this branch. Third-party
+          # runtime deps are installed by the steps above.
+          venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
 
       - name: Run Rust tests with coverage
         run: |
 
           # Run tests but don't generate report yet - we'll combine with Python test coverage
           # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+          # --exclude the four python-* crates: they request edgefirst-tensor's
+          # `dynamic` feature while --workspace unions features across every
+          # member, activating `static` (default, from everything else) and
+          # `dynamic` at once and tripping edgefirst-tensor's own
+          # mutual-exclusion guard. Same defect as the clippy lane above.
           cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
+            --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
             --no-report -j 1 \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
-      - name: Build C API library
-        run: |
-          cargo build --release -p edgefirst-hal-capi
-          ln -sf libedgefirst_hal.so target/release/libedgefirst_hal.so.0
+      - name: Run modular C-API tests
+        # The five modular C-API leaves left --workspace's llvm-cov nextest run
+        # above (standalone packages, not workspace members). `make
+        # test-capi-modular` builds and tests them via plain `cargo test`
+        # (EF_REQUIRE_FRESH_ARTIFACTS=1), the Makefile lane that's the single
+        # source of truth for their invocation shape.
+        run: make test-capi-modular
 
-      - name: Run C API tests
-        run: |
+      - name: Compile and link C headers
+        run: make test-capi-link
 
-          cd crates/capi/tests
-          make test 2>&1 | tee ../../../target/test-metrics-capi-x86_64.txt
+      - name: Two-library C user
+        run: make test-two-library-user
+
+      - name: Single-tensor-home architecture gates
+        # G7 (scripts/miri.sh) is cannot_measure -- a hard fail -- when the
+        # nightly Miri component is missing. Install it on the same pinned
+        # nightly this job already uses; the script reads RUST_NIGHTLY_VERSION.
+        env:
+          RUST_NIGHTLY_VERSION: ${{ env.RUST_NIGHTLY_VERSION }}
+        run: |
+          cargo +${{ env.RUST_NIGHTLY_VERSION }} miri setup
+          make check-single-home
+
+      - name: Run edgefirst-tensor dynamic-backend tests
+        # Same reason as the clippy step above: the nextest run is
+        # --workspace on default features, so it exercises only the static
+        # backend. This lane builds libedgefirst_tensor.so and runs the
+        # dynamic backend's integration targets against it -- including
+        # every gate in dynamic_primitives.rs and the whole
+        # protocol_roundtrip.rs suite, which until now ran only by hand.
+        # Linux only: `dynamic-test-link` resolves the library through
+        # LD_LIBRARY_PATH, and the macOS equivalent (DYLD_LIBRARY_PATH,
+        # plus SIP's handling of it) is untested.
+        run: make test-tensor-dynamic
 
       - name: Run Python tests with coverage
         run: |
@@ -266,6 +369,9 @@ jobs:
             --lcov --output-path target/coverage_rust.lcov
           echo "=== Coverage summary ==="
           echo "Source files in coverage: $(grep -c '^SF:' target/coverage_rust.lcov)"
+          # The split into four dynamic objects can silently UNDER-report rather
+          # than error, so assert attribution explicitly.
+          bash tests/packaging/check_coverage_split.sh target/coverage_rust.lcov
           echo "PyO3 files with coverage:"
           grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
           echo "=== Sample coverage data for crates/python ==="
@@ -384,16 +490,28 @@ jobs:
       - name: Run Clippy
         # Use default features only (no OpenCV, no Linux-specific hardware features)
         # Exclude Linux-only crates (gpu-probe, edgefirst-bench) that depend on DMA, EGL, DRM
-        run: cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench -- -D warnings
+        # Exclude the four python-* crates: they request edgefirst-tensor's `dynamic`
+        # feature while --workspace unions features across every member, activating
+        # `static` (default) and `dynamic` at once -- the same mutual-exclusion
+        # failure fixed above and at the iOS lane (lines 619-622).
+        run: cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
+
+      - name: Run Clippy (modular C-API leaves)
+        # The five modular C-API leaves (tensor/image/codec/decoder/tracker-capi)
+        # are standalone packages excluded from --workspace above; lint them
+        # via the Makefile lane that's the single source of truth for their
+        # invocation shape (--manifest-path/--target-dir).
+        run: make lint-capi-modular
 
       - name: Run Rust tests with coverage
         # scripts/test-macos.sh builds with --tests, signs every binary
         # with entitlements.plist (disables library validation so an
         # ad-hoc-signed test binary can dlopen the Developer-ID-signed
         # ANGLE framework), then forwards to nextest. The script already
-        # injects `--workspace --exclude gpu-probe --exclude edgefirst-bench`,
-        # so we only add the runner-specific `-j 1` here. Without the
-        # sign step the GL tests SIGKILL and silently skip.
+        # injects `--workspace --exclude gpu-probe --exclude edgefirst-bench`
+        # and the python crates (static+dynamic unification), so we only add
+        # the runner-specific `-j 1` here. Without the sign step the GL tests
+        # SIGKILL and silently skip.
         #
         # COVERAGE=1 instruments the build via cargo-llvm-cov (show-env), so
         # the codesign step stays between build and run — this is what lets
@@ -412,14 +530,62 @@ jobs:
           ./scripts/test-macos.sh -j 1 \
             2>&1 | tee target/test-metrics-rust-macos.txt
 
-      - name: Build C API library
-        run: cargo build --release -p edgefirst-hal-capi
+      - name: Run modular C-API tests
+        # The five modular C-API leaves left --workspace's nextest run above
+        # (standalone packages, not workspace members). `make
+        # test-capi-modular` builds and tests them via plain `cargo test`
+        # (EF_REQUIRE_FRESH_ARTIFACTS=1), the Makefile lane that's the single
+        # source of truth for their invocation shape.
+        run: make test-capi-modular
 
-      - name: Run C API tests
+      - name: Compile and link C headers
+        run: make test-capi-link
+
+      - name: Two-library C user
+        run: make test-two-library-user
+
+      - name: Package and smoke the C archive (macOS)
+        # PR gate for the macOS zip path (dylib names inside a .zip).
+        # release.yml's build-capi macOS rows would otherwise be the first
+        # time that branch of package-capi.sh ever ran — after a tag.
         run: |
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkgconf
+          fi
+          make package
+          ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.zip
 
-          cd crates/capi/tests
-          make test 2>&1 | tee ../../../target/test-metrics-capi-macos.txt
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run GPU Python tests
+        # Linux pytest skips @pytest.mark.gpu (no real GPU; software GL is
+        # opted out). macOS must run and pass via ANGLE. Codesign the venv
+        # interpreter with disable-library-validation so dlopen of ANGLE
+        # does not SIGKILL the process (same entitlement as test-macos.sh).
+        # --auditwheel skip matches the x86/aarch64 lanes: on macOS it
+        # skips delocate, which cannot locate @rpath/libedgefirst_tensor.N.dylib
+        # (the copy is bundled via python-source, not on the dyld search path).
+        env:
+          HAL_TEST_REQUIRE_GL: "1"
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install maturin pytest numpy pillow
+          for pkg in tensor codec image decoder tracker; do
+            venv/bin/maturin build \
+              --manifest-path "crates/python-$pkg/Cargo.toml" \
+              --out target/wheels \
+              --release \
+              --features abi3-py311 \
+              --auditwheel skip
+          done
+          venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
+          PY=$(python3 -c "import os; print(os.path.realpath('venv/bin/python3'))")
+          codesign --force --sign - --entitlements entitlements.plist "$PY"
+          venv/bin/python -m pytest tests/ -m gpu -v --tb=short
 
       - name: Coverage summary (macOS)
         # Tool-free per-lane visibility: overall lines plus the GL-engine
@@ -476,30 +642,30 @@ jobs:
           ignore_runs: true
 
   # ===========================================================================
-  # Build + link-validate on iOS (aarch64 device + simulator)
+  # Build the native Rust API for iOS (aarch64 device + simulator)
   #
-  # Verifies the HAL Rust library closure (default features incl. `opengl`)
-  # compiles for the iOS targets, and that the native symbol closure links
-  # cleanly against the ANGLE xcframeworks + Apple system frameworks. There
-  # is no runtime test (no device/simulator in CI) — runtime EGL bring-up on
-  # device is a future Swift-bindings effort. See README.md § iOS.
+  # This repo's mobile responsibility is the native Rust API compiling on
+  # iOS -- not a C artifact, not a binding, not packaging. `mobile-sdk`
+  # binds to these crates directly via boltffi and owns everything above
+  # that line (Swift/Kotlin, monolith-vs-modular packaging, XCFrameworks).
+  # See README.md § iOS.
   #
-  # gpu-probe (Linux-only binary), edgefirst_hal (python), and
-  # edgefirst-bench are excluded from the workspace build. The C API is
-  # INCLUDED — its staticlib is the iOS embedding artifact and the
-  # link-closure anchor.
+  # There is no runtime test (no device/simulator in CI) — this lane is
+  # compile + clippy only, which is also what makes it the thing standing
+  # between the iOS-only code paths (IOSurface, the GL platform seam) and
+  # them silently rotting unbuilt again: that already happened once, for
+  # months, invisible to every x86_64 Linux lane, until this branch's own
+  # b3ebae79 turned unsafe_op_in_unsafe_fn into a hard error and P6's
+  # cross-build audit finally reached these files.
+  #
+  # gpu-probe (Linux-only binary), the four python-* cdylibs, and
+  # edgefirst-bench are excluded from the workspace build.
   # ===========================================================================
   build-ios:
-    name: Build & Link (iOS)
+    name: Build & Lint (iOS, native Rust API)
     runs-on: macos-latest
     permissions:
       contents: read
-    env:
-      # scripts/fetch-angle.sh downloads the ANGLE xcframeworks from the public
-      # EdgeFirstAI/angle-package release. No token is required (the release is
-      # public); GH_TOKEN is passed only so `gh release download` uses it when
-      # present and gets a higher API rate limit.
-      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout code
@@ -522,43 +688,45 @@ jobs:
       - name: Run Clippy (iOS device)
         # Lint the cfg-gated iOS code paths (the GL platform seam + IOSurface
         # backend) that no other lane compiles. Excludes Linux-only / python /
-        # bench crates; the C API is included. -D warnings keeps the lane a
-        # hard gate.
+        # bench crates. The C API happens to be workspace-covered too (it
+        # wraps the same Rust crates) but is not what this lane exists to
+        # verify -- mobile consumes the Rust API directly, not the C API, so
+        # there is no separate C-API-leaves clippy pass here the way the
+        # x86_64/Windows lanes have one. -D warnings keeps the lane a hard
+        # gate.
         run: |
           cargo clippy --target aarch64-apple-ios \
             --workspace \
             --exclude gpu-probe \
-            --exclude edgefirst_hal --exclude edgefirst-bench \
+            --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common --exclude edgefirst-bench \
             -- -D warnings
 
-      - name: Build HAL for iOS (device + simulator)
+      - name: Build the native Rust API for iOS (device + simulator)
+        # The five sibling crates mobile-sdk consumes via boltffi --
+        # not the five modular C-API leaves. This repo's mobile
+        # responsibility ends at "the Rust API compiles"; bindings and
+        # packaging are mobile-sdk's.
         run: |
-          cargo build --target aarch64-apple-ios      --release -p edgefirst-hal -p edgefirst-hal-capi
-          cargo build --target aarch64-apple-ios-sim  --release -p edgefirst-hal -p edgefirst-hal-capi
-
-      - name: Validate iOS link closure (device + simulator)
-        # scripts/validate-ios-link.sh fetches the signed ANGLE xcframeworks
-        # from the EdgeFirstAI/angle-package release via scripts/fetch-angle.sh,
-        # then links the production C API staticlib (libedgefirst_hal.a,
-        # built by the step above) against the xcframeworks + Apple system
-        # frameworks.
-        run: |
-          bash scripts/validate-ios-link.sh device
-          bash scripts/validate-ios-link.sh sim
+          cargo build --target aarch64-apple-ios      --release -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
+          cargo build --target aarch64-apple-ios-sim  --release -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 
   # ===========================================================================
-  # Build & Link Check for Android (arm64 device + x86_64 emulator ABIs)
+  # Build the native Rust API for Android (arm64 device + x86_64 emulator ABIs)
   #
-  # Mirrors the iOS lane's decision: compile + clippy + link-closure
-  # validation only, no emulator runtime — GitHub runners have no GPU, so
-  # the Android emulator would exercise SwiftShader software GL rather
-  # than a real Adreno/Mali driver and add flakiness without signal.
-  # On-device GL correctness and the performance gates run via the
-  # internal hal-mobile AWS Device Farm harness (Galaxy S26 Ultra pool);
-  # see TESTING.md § Android On-Device Validation.
+  # Mirrors the iOS lane's decision: compile + clippy only, no emulator
+  # runtime — GitHub runners have no GPU, so the Android emulator would
+  # exercise SwiftShader software GL rather than a real Adreno/Mali driver
+  # and add flakiness without signal. On-device GL correctness and the
+  # performance gates run via the internal hal-mobile AWS Device Farm
+  # harness (Galaxy S26 Ultra pool); see TESTING.md § Android On-Device
+  # Validation.
+  #
+  # As with iOS: this repo's mobile responsibility is the native Rust API
+  # compiling on Android, not a C artifact -- `mobile-sdk` binds to these
+  # crates directly via boltffi.
   # ===========================================================================
   build-android:
-    name: Build & Link (Android)
+    name: Build & Lint (Android, native Rust API)
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -579,7 +747,7 @@ jobs:
         # Pin our own NDK rather than using the runner image's preinstalled
         # copies, whose versions drift with image updates. r27c is the LTS
         # release; the HAL's API floor (26) is set per-invocation via
-        # cargo-ndk's -P flag and scripts/validate-android-link.sh.
+        # cargo-ndk's -P flag.
         uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779  # v1.6.0
         with:
           ndk-version: r27c
@@ -597,34 +765,30 @@ jobs:
       - name: Run Clippy (Android arm64)
         # Lint the cfg-gated Android code paths (the GL platform seam +
         # AHardwareBuffer backend) that no other lane compiles. Excludes
-        # Linux-only gpu-probe, the python crate, and the bench harness;
-        # the C API is INCLUDED — its cdylib is the future JNI library.
-        # -D warnings keeps the lane a hard gate.
+        # Linux-only gpu-probe, the python crates, and the bench harness.
+        # The C API happens to be workspace-covered too (it wraps the same
+        # Rust crates) but is not what this lane exists to verify -- mobile
+        # consumes the Rust API directly, not the C API. -D warnings keeps
+        # the lane a hard gate.
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           cargo ndk -t arm64-v8a -P 26 clippy \
             --workspace \
-            --exclude gpu-probe --exclude edgefirst_hal --exclude edgefirst-bench \
+            --all-targets \
+            --exclude gpu-probe --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common --exclude edgefirst-bench \
             -- -D warnings
 
-      - name: Build HAL for Android (arm64 device + x86_64 emulator)
+      - name: Build the native Rust API for Android (arm64 device + x86_64 emulator)
+        # The five sibling crates mobile-sdk consumes via boltffi -- not
+        # the five modular C-API leaves. This repo's mobile responsibility
+        # ends at "the Rust API compiles"; bindings and packaging are
+        # mobile-sdk's.
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release \
-            -p edgefirst-hal -p edgefirst-hal-capi
-
-      - name: Validate Android link closure (arm64 + x86_64)
-        # Links the production C API staticlib (libedgefirst_hal.a, built
-        # by the step above) against the NDK system libraries, after
-        # verifying the AHardwareBuffer references and the NDK API-26 stub
-        # exports with llvm-nm.
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          bash scripts/validate-android-link.sh arm64
-          bash scripts/validate-android-link.sh x86_64
+            -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 
   # ===========================================================================
   # Build Check on Windows (verify Windows compilation before release)
@@ -647,6 +811,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
 
+      - name: Set up MSVC Developer Command Prompt
+        # Prepends the Visual Studio PATH so MSVC `link.exe` wins. Not
+        # sufficient on this job's default Git bash: `/usr/bin/link.exe`
+        # (coreutils `link`) still shadows MSVC. Cargo steps below use
+        # pwsh so the MSVC directory is actually first.
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
@@ -654,7 +825,45 @@ jobs:
           cache-on-failure: true
 
       - name: Check workspace compiles on Windows
-        run: cargo check --workspace --exclude gpu-probe
+        # --exclude the four python-* crates: same feature-unification failure
+        # as the other --workspace lanes in this file (edgefirst-tensor's
+        # `static`/`dynamic` mutual exclusion). Confirmed by reproducing this
+        # exact command locally: 11 errors (`Tensor`/`TensorDyn` defined
+        # multiple times, recursive types with infinite size) before the fix.
+        # pwsh: Git bash's `/usr/bin/link.exe` shadows MSVC `link.exe`.
+        shell: pwsh
+        run: cargo check --workspace --exclude gpu-probe --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common
+
+      - name: Check modular C-API leaves compile on Windows
+        # The five modular C-API leaves are standalone packages excluded from
+        # --workspace above. No Makefile is invoked here (this job's style is
+        # raw cargo, matching the step above), so this loop mirrors the
+        # Makefile's check-capi-modular recipe shape by hand.
+        shell: pwsh
+        run: |
+          foreach ($c in @('tensor-capi','image-capi','codec-capi','decoder-capi','tracker-capi')) {
+            cargo check --manifest-path "crates/$c/Cargo.toml" --target-dir target
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Build modular C-API leaves (Windows, release)
+        # Isolated from the bash packaging step so cargo uses MSVC link.exe.
+        shell: pwsh
+        run: |
+          foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
+            cargo build --release --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Package and smoke the C archive (Windows)
+        # PR gate for the Windows packaging path (DLL + import-lib selection).
+        # release.yml's build-capi Windows row would otherwise be the first
+        # time that branch of package-capi.sh ever ran — after a tag.
+        shell: bash
+        run: |
+          mkdir -p dist
+          ./scripts/package-capi.sh --target x86_64-windows --libdir target/release --outdir dist
+          ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.zip
 
   # ===========================================================================
   # Software-GL coverage (Mesa llvmpipe)
@@ -779,7 +988,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3-dev clang libclang-dev libopencv-dev
+          sudo apt-get install -y build-essential python3-dev clang libclang-dev libopencv-dev lld
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -834,16 +1043,24 @@ jobs:
         run: |
           source /tmp/coverage-env.sh
           # No zig/manylinux - target glibc (2.41) is newer than Ubuntu 22.04 (2.35)
-          venv/bin/maturin build \
-            --manifest-path crates/python/Cargo.toml \
-            --out target/wheels \
-            --profile profiling \
-            --features abi3-py311
+          for pkg in tensor codec image decoder tracker; do
+            venv/bin/maturin build \
+              --manifest-path "crates/python-$pkg/Cargo.toml" \
+              --out target/wheels \
+              --profile profiling \
+              --features abi3-py311 \
+              --auditwheel skip
+          done
 
       - name: Build runner test binaries (no-run)
         run: |
           source /tmp/coverage-env.sh
-          cargo nextest run --no-run --cargo-profile profiling --features default,opencv --workspace
+          # --exclude the four python-* crates: --workspace unions features
+          # across every member, so without this edgefirst-tensor gets both
+          # `static` (default) and `dynamic` (python-*'s request) activated
+          # at once and fails its own mutual-exclusion guard.
+          cargo nextest run --no-run --cargo-profile profiling --features default,opencv --workspace \
+            --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common
           mkdir -p runner-test-binaries
           find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
             ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" ! -name "*.so" \
@@ -874,24 +1091,18 @@ jobs:
           echo "Instrumented test binaries:"
           ls -la hardware-test-binaries/ || echo "No test binaries found"
 
-      - name: Build C API library
-        run: |
-          cargo build --release -p edgefirst-hal-capi
-          ln -sf libedgefirst_hal.so target/release/libedgefirst_hal.so.0
-
-      - name: Build C API tests
-        run: |
-          cd crates/capi/tests
-          make all
-          cd ../../..
-          # Copy C API artifacts for testing
-          mkdir -p hardware-capi-tests
-          cp target/release/libedgefirst_hal.so hardware-capi-tests/
-          cp target/release/libedgefirst_hal.so.0 hardware-capi-tests/
-          cp target/release/libedgefirst_hal.a hardware-capi-tests/ 2>/dev/null || true
-          cp crates/capi/build/test_all hardware-capi-tests/
-          echo "C API test artifacts:"
-          ls -la hardware-capi-tests/
+      - name: Build and test modular C-API crates (aarch64)
+        # The five modular C-API leaves (tensor/image/codec/decoder/tracker-capi)
+        # are standalone packages excluded from --workspace, so the nextest
+        # --no-run build above never reaches them, and test-arm's pre-built
+        # binary sweep has no runner-test-binaries/ entries for them either.
+        # Run them here instead, natively on this runner (full checkout +
+        # toolchain), rather than trying to ship their artifacts to test-arm:
+        # `make test-capi-modular` rebuilds each leaf's cdylib fresh
+        # (capi-libs prerequisite) then runs its tests with
+        # EF_REQUIRE_FRESH_ARTIFACTS=1, which hard-fails on a stale artifact
+        # instead of the silent skip the old cross-job binary sweep risked.
+        run: make test-capi-modular
 
       - name: Prepare stripped binaries for hardware deployment
         run: |
@@ -916,17 +1127,6 @@ jobs:
               && strip --strip-debug "$bin"
           done
 
-          mkdir -p hardware-capi-tests-stripped
-          cp -a hardware-capi-tests/. hardware-capi-tests-stripped/
-          # libedgefirst_hal.a is consumed at link time only; running tests
-          # on the target dynamic-links against the .so. Drop the static
-          # archive from the hardware deployment artifact.
-          rm -f hardware-capi-tests-stripped/libedgefirst_hal.a
-          for bin in hardware-capi-tests-stripped/test_all \
-                     hardware-capi-tests-stripped/libedgefirst_hal.so*; do
-            [ -f "$bin" ] && strip --strip-debug "$bin" 2>/dev/null || true
-          done
-
           # Python wheels — use the venv's `wheel` to unpack and repack so the
           # PEP 376 RECORD manifest (SHA256 hashes of every file) is
           # regenerated after the embedded .so files are stripped. pip will
@@ -944,7 +1144,6 @@ jobs:
 
           echo "=== Hardware deployment artifact sizes (stripped vs original) ==="
           du -sh hardware-test-binaries/ hardware-test-binaries-stripped/
-          du -sh hardware-capi-tests/ hardware-capi-tests-stripped/
           du -sh target/wheels/ target/wheels-stripped/
 
       - name: Upload runner test artifacts
@@ -954,9 +1153,6 @@ jobs:
           path: |
             runner-test-binaries/
             target/wheels/*.whl
-            hardware-capi-tests/
-            target/release/libedgefirst_hal.so
-            target/release/libedgefirst_hal.so.0
           retention-days: 7
 
       - name: Upload hardware test artifacts (stripped, fast on-target download)
@@ -966,7 +1162,6 @@ jobs:
           path: |
             target/wheels-stripped/*.whl
             hardware-test-binaries-stripped/
-            hardware-capi-tests-stripped/
           retention-days: 7
 
       - name: Upload coverage instrumented binaries (for profraw processing)
@@ -1022,7 +1217,12 @@ jobs:
           venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark
           venv/bin/pip install tensorflow pyyaml numpy pillow opencv-python-headless psutil safetensors
           # Install Python bindings from pre-built wheel
-          venv/bin/pip install target/wheels/*.whl
+          # --no-deps: every edgefirst-* sibling is in this same wheel set, built
+          # from this commit. Resolving the `~=` pins would let pip fetch a
+          # PUBLISHED sibling from PyPI over the locally built one, so the suite
+          # would silently test released code instead of this branch. Third-party
+          # runtime deps are installed by the steps above.
+          venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
 
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
@@ -1057,20 +1257,6 @@ jobs:
             fi
           done
           [ $TEST_FAILED -eq 0 ] || exit 1
-
-      - name: Run C API tests
-        env:
-          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
-        run: |
-
-          if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
-            echo "=== Running C API tests ==="
-            chmod +x hardware-capi-tests/test_all
-            export LD_LIBRARY_PATH=$(pwd)/hardware-capi-tests:$LD_LIBRARY_PATH
-            hardware-capi-tests/test_all 2>&1 | tee build/test-metrics-capi-aarch64.txt
-          else
-            echo "C API test binary not found, skipping"
-          fi
 
       - name: Run Python tests with coverage
         env:
@@ -1119,11 +1305,12 @@ jobs:
               fi
             fi
           done
-          # Include Python .so for PyO3 coverage
-          PY_SO=$(find venv/ -name "edgefirst_hal*.so" -type f | head -1)
-          if [ -n "$PY_SO" ]; then
+          # Include every extension module .so for PyO3 coverage. There are
+          # four since 0.29, and taking only the first would silently drop
+          # three quarters of the binding coverage.
+          for PY_SO in $(find venv/ -path "*/edgefirst/*" -name "_*.so" -type f); do
             OBJECT_ARGS="$OBJECT_ARGS --object=$PY_SO"
-          fi
+          done
 
           if [ -z "$FIRST_OBJ" ]; then
             echo "No ELF binaries found, creating empty coverage"
@@ -1191,8 +1378,7 @@ jobs:
       - name: Clean workspace
         run: |
           rm -rf build/ venv/ target/ rust-tests/ testdata/ \
-                 hardware-test-binaries-stripped/ \
-                 hardware-capi-tests-stripped/ 2>/dev/null || true
+                 hardware-test-binaries-stripped/ 2>/dev/null || true
           find . -name "*.gcda" -o -name "*.profraw" -delete 2>/dev/null || true
 
       - name: Checkout code
@@ -1221,7 +1407,12 @@ jobs:
           # Install Python bindings from pre-built wheel (stripped for fast
           # download; coverage processing on the host uses the unstripped
           # copy from coverage-binaries-aarch64).
-          venv/bin/pip install target/wheels-stripped/*.whl
+          # --no-deps: every edgefirst-* sibling is in this same wheel set, built
+          # from this commit. Resolving the `~=` pins would let pip fetch a
+          # PUBLISHED sibling from PyPI over the locally built one, so the suite
+          # would silently test released code instead of this branch. Third-party
+          # runtime deps are installed by the steps above.
+          venv/bin/pip install --no-deps --force-reinstall target/wheels-stripped/*.whl
 
       - name: Debug environment info
         run: |
@@ -1313,33 +1504,6 @@ jobs:
           done
           [ $TEST_FAILED -eq 0 ] || exit 1
 
-      - name: Run C API tests
-        env:
-          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
-        run: |
-
-          if [ -d "hardware-capi-tests-stripped" ] && [ -f "hardware-capi-tests-stripped/test_all" ]; then
-            echo "=== Running C API tests on hardware ==="
-            chmod +x hardware-capi-tests-stripped/test_all
-            export LD_LIBRARY_PATH=$(pwd)/hardware-capi-tests-stripped:$LD_LIBRARY_PATH
-            # Same SIGABRT-on-exit issue as Python tests — the Vivante EGL
-            # driver may crash during library unload after all tests pass.
-            # Use the test summary output as the source of truth.
-            EXIT_CODE=0
-            hardware-capi-tests-stripped/test_all 2>&1 | tee build/test-metrics-capi-imx8mp.txt || EXIT_CODE=$?
-
-            if [ $EXIT_CODE -ne 0 ]; then
-              if grep -q 'Failed: 0' build/test-metrics-capi-imx8mp.txt; then
-                echo "::warning::C API test process exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
-              else
-                echo "::error::C API tests failed with exit code $EXIT_CODE"
-                exit $EXIT_CODE
-              fi
-            fi
-          else
-            echo "C API test binary not found, skipping"
-          fi
-
       - name: Generate JUnit XML from Rust results
         if: always()
         run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
@@ -1376,9 +1540,6 @@ jobs:
           fi
           if [ -f build/rust_hardware_results.xml ]; then
             echo "- Rust tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
-          fi
-          if [ -f build/test-metrics-capi-imx8mp.txt ]; then
-            echo "- C API tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
           fi
 
 

@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
-import numpy as np
-from edgefirst_hal import Tensor, TensorMemory, PixelFormat
+import gc
+import io
 import os
 import sys
-import pytest
-import gc
 
+import numpy as np
+import pytest
+from edgefirst.tensor import PixelFormat, Tensor, TensorMemory
+
+from tests.dma_skip import image_or_skip_dma, tensor_or_skip_dma
 
 # fmt: off
 DTYPE_PARAMS = [
@@ -52,7 +55,7 @@ def test_dtype(dtype, size, fmt, itemsize, val1, val2):
             with pytest.raises(ValueError):
                 _ = v[0, 0, 0, 0, 0]
         else:
-            n = np.frombuffer(m.numpy(), dtype=tensor.dtype).reshape(tensor.shape)
+            n = np.asarray(m.numpy())
             assert n[0, 0, 0, 0, 0] == val1
             assert n[0, 0, 0, 0, 1] == val2
     with pytest.raises(BufferError):
@@ -65,11 +68,13 @@ def test_dtype(dtype, size, fmt, itemsize, val1, val2):
 )
 def test_from_fd_dma():
     try:
-        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        tensor = tensor_or_skip_dma(
+            [100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF
+        )
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
 
-    assert tensor.memory == TensorMemory.DMA
+    assert tensor.memory == TensorMemory.DMABUF
 
     tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
 
@@ -93,11 +98,13 @@ def test_from_fd_dma():
 )
 def test_dma_zero_copy_perf():
     try:
-        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        tensor = tensor_or_skip_dma(
+            [100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF
+        )
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
 
-    assert tensor.memory == TensorMemory.DMA
+    assert tensor.memory == TensorMemory.DMABUF
 
     import time
 
@@ -209,7 +216,7 @@ def test_shm_zero_copy_perf():
 
 def tensor_fd_func(mem_type: TensorMemory):
     try:
-        original = Tensor([100, 100, 3], dtype="uint8", mem=mem_type)
+        original = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=mem_type)
         del original
     except (AttributeError, RuntimeError):
         pytest.skip(f"{mem_type} memory not supported on this platform")
@@ -231,7 +238,7 @@ def test_dma_no_fd_leaks():
     except AttributeError:
         pytest.skip("num_fds not supported on this platform")
 
-    tensor_fd_func(TensorMemory.DMA)
+    tensor_fd_func(TensorMemory.DMABUF)
 
     gc.collect()
     end_fds = proc.num_fds()
@@ -261,7 +268,7 @@ def test_shm_no_fd_leaks():
 
 def tensor_from_fd_func(mem_type: TensorMemory):
     try:
-        original = Tensor([100, 100, 3], dtype="uint8", mem=mem_type)
+        original = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=mem_type)
         # Probe .fd here too: some backends for this memory type construct
         # fine but have no fd (e.g. macOS DMA is IOSurface-backed, whose
         # clone_fd is NotImplemented — use surface_id() instead).
@@ -289,7 +296,7 @@ def test_dma_fd_leak_with_from_fd():
     except AttributeError:
         pytest.skip("num_fds not supported on this platform")
 
-    tensor_from_fd_func(TensorMemory.DMA)
+    tensor_from_fd_func(TensorMemory.DMABUF)
     gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, (
@@ -357,7 +364,7 @@ FROM_NUMPY_DTYPE_PARAMS = [
 def _read_tensor(tensor, dtype):
     """Read all tensor data back via map() as a shaped numpy array."""
     with tensor.map() as m:
-        return np.frombuffer(m.numpy(), dtype=dtype).reshape(tensor.shape).copy()
+        return np.asarray(m.numpy()).copy()
 
 
 @pytest.mark.parametrize("dtype", FROM_NUMPY_DTYPE_PARAMS)
@@ -619,7 +626,7 @@ def test_from_numpy_non_array():
 @pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
 def test_iosurface_probes_dispatch_per_platform():
     """The four probe functions should reflect platform reality."""
-    import edgefirst_hal as hal
+    import edgefirst.tensor as hal
 
     assert hal.is_shm_available() is True, "macOS has POSIX shm"
     assert hal.is_dma_available() is False, "macOS has no Linux DMA-BUF heap"
@@ -631,13 +638,13 @@ def test_iosurface_probes_dispatch_per_platform():
 @pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
 def test_iosurface_id_is_some_for_dma_tensor():
     """A DMA-allocated tensor on macOS reports a non-None IOSurfaceID."""
-    import edgefirst_hal as hal
+    import edgefirst.tensor as hal
 
     if not hal.is_iosurface_available():
         pytest.skip("IOSurface not available on this host")
 
-    t = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMA)
-    assert t.memory == TensorMemory.DMA
+    t = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMABUF)
+    assert t.memory == TensorMemory.DMABUF
     assert t.iosurface_id is not None
     assert t.iosurface_id != 0, "0 is the error sentinel"
     assert t.iosurface_ref is not None
@@ -656,17 +663,17 @@ def test_iosurface_id_is_none_for_mem_tensor():
 @pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
 def test_iosurface_roundtrip_via_from_iosurface():
     """from_iosurface(t.iosurface_ref) recovers a tensor sharing the same surface."""
-    import edgefirst_hal as hal
+    import edgefirst.tensor as hal
 
     if not hal.is_iosurface_available():
         pytest.skip("IOSurface not available on this host")
 
-    t = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMA)
+    t = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMABUF)
     original_id = t.iosurface_id
     original_ref = t.iosurface_ref
 
     imported = Tensor.from_iosurface(original_ref, [720, 1280, 4], dtype="uint8")
-    assert imported.memory == TensorMemory.DMA
+    assert imported.memory == TensorMemory.DMABUF
     assert imported.iosurface_id == original_id, "re-imported ID must match"
     assert imported.iosurface_ref == original_ref, "re-imported ref must match"
 
@@ -683,14 +690,14 @@ def test_iosurface_from_null_raises():
 )
 def test_iosurface_unavailable_on_non_macos():
     """Non-macOS platforms expose the probe but it always returns False."""
-    import edgefirst_hal as hal
+    import edgefirst.tensor as hal
 
     assert hal.is_iosurface_available() is False
 
 
 def test_is_cuda_available_returns_bool():
     """is_cuda_available() must be callable and return a bool (True or False)."""
-    import edgefirst_hal as hal
+    import edgefirst.tensor as hal
 
     result = hal.is_cuda_available()
     assert isinstance(result, bool)
@@ -715,7 +722,7 @@ def test_cuda_map_falls_back_to_map():
 
 def test_colorimetry_roundtrip():
     """Colorimetry set/get on a tensor is faithful and defaults to None."""
-    import edgefirst_hal as hal
+    import edgefirst.tensor as hal
 
     t = Tensor.image(1280, 720, PixelFormat.Nv12, access="readwrite")
     assert t.colorimetry is None
@@ -740,7 +747,7 @@ def test_colorimetry_roundtrip():
 
 def test_colorimetry_construct_and_repr():
     """Colorimetry is constructible with optional kwargs (default None)."""
-    import edgefirst_hal as hal
+    import edgefirst.tensor as hal
 
     empty = hal.Colorimetry()
     assert empty.space is None
@@ -769,7 +776,7 @@ def test_colorimetry_construct_and_repr():
 def test_view_partitions_image_via_numpy():
     """Two row-band views of one RGBA image are written independently through
     numpy and partition the parent buffer (zero-copy, no aliasing)."""
-    from edgefirst_hal import Region
+    from edgefirst.tensor import Region
 
     # 4x2 RGBA image → shape [H=2, W=4, C=4]; each row is one band.
     parent = Tensor.image(
@@ -791,7 +798,7 @@ def test_view_partitions_image_via_numpy():
 
 def test_view_rejects_out_of_bounds():
     """A region exceeding the image bounds is rejected at view() creation."""
-    from edgefirst_hal import Region
+    from edgefirst.tensor import Region
 
     parent = Tensor.image(
         8, 8, format=PixelFormat.Rgba, mem=TensorMemory.MEM, access="readwrite"
@@ -800,3 +807,130 @@ def test_view_rejects_out_of_bounds():
         parent.view(Region(0, 0, 9, 8))
     # An in-bounds region is accepted.
     parent.view(Region(2, 2, 4, 4))
+
+
+# ─── mapped CPU-access direction ────────────────────────────────────────────
+#
+# `map()` owns its coherency bracket in both directions. Until this was
+# plumbed through, Python could only ever take a ReadWrite bracket, so a
+# reader paid a full-buffer cache writeback on release that it never needed
+# -- invisible on coherent x86/macOS, real per-frame cost on Arm DMA-BUF.
+
+
+@pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
+def test_map_read_yields_a_readonly_view(mem):
+    """A read-only map must advertise itself as such to the buffer protocol.
+
+    Not cosmetic: releasing a `"read"` map deliberately skips the cache
+    writeback, so a write through such a view would be silently discarded on
+    a non-coherent backing. Advertising it read-only is what turns that
+    silent data loss into an exception at the point of the mistake.
+    """
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    with t.map("read") as view:
+        assert memoryview(view).readonly is True
+        arr = np.asarray(view)
+        assert arr.flags["WRITEABLE"] is False
+        with pytest.raises(ValueError):
+            arr[0, 0, 0] = 1
+
+
+def test_map_readwrite_is_the_default_and_is_writable():
+    """The default direction stays ReadWrite, so existing code is unaffected."""
+    t = Tensor.image(
+        8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
+    )
+    with t.map() as view:  # no argument
+        assert memoryview(view).readonly is False
+        np.asarray(view)[0, 0, 0] = 7
+    with t.map("readwrite") as view:  # explicit, same thing
+        assert memoryview(view).readonly is False
+        assert np.asarray(view)[0, 0, 0] == 7
+
+
+def test_map_read_refuses_a_writable_buffer_request():
+    """PEP 3118: a consumer asking for a writable buffer over a read-only map
+    must be refused, not quietly handed a read-only one.
+
+    Differential rather than absolute: the *same* `readinto` call must fail on
+    a `"read"` map and succeed on a `"readwrite"` one. That matters because
+    CPython's argument converter catches our BufferError and substitutes its
+    own TypeError, so asserting a specific exception type would be asserting
+    CPython's behaviour rather than ours -- and asserting "it raises" alone
+    would still pass if `__getbuffer__` were broken for every map.
+    """
+    t = Tensor.image(
+        8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
+    )
+    payload = b"\x01" * 8
+
+    with t.map("read") as view:
+        assert len(bytearray(view)) > 0  # read path still works
+        writable_request = io.BytesIO(payload)
+        with pytest.raises((BufferError, TypeError)):
+            writable_request.readinto(view)
+
+    with t.map("readwrite") as view:
+        assert io.BytesIO(payload).readinto(view) == len(payload)
+
+
+def test_map_rejects_access_none_and_garbage():
+    """`none` is not a mapping, and an unknown direction is not silently
+    coerced to the permissive default."""
+    t = Tensor.image(
+        8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
+    )
+    with pytest.raises((ValueError, RuntimeError)):
+        t.map("none")
+    with pytest.raises((ValueError, RuntimeError)):
+        t.map("readwrit")
+
+
+# ---------------------------------------------------------------------------
+# The read-only contract, on every door that reaches the buffer.
+#
+# `__getbuffer__` refused a writable request from the start; these cover the
+# two paths that did not. `numpy()` matters most: on the abi3 wheel
+# `__getbuffer__` is compiled out entirely and `numpy()` is the ONLY buffer
+# path, so a hard-coded writable flag there means no enforcement at all on the
+# artifact users actually install.
+
+
+@pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
+def test_numpy_of_a_read_map_is_not_writable(mem):
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    m = t.map("read")
+    arr = np.asarray(m.numpy())
+    assert not arr.flags.writeable, (
+        "numpy() must derive its flag from the mapping; a writable view over a "
+        "read-only bracket silently discards writes at unmap"
+    )
+
+
+@pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
+def test_numpy_of_a_readwrite_map_is_writable(mem):
+    """The other half: the guard must not have broken the normal path."""
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    m = t.map("readwrite")
+    arr = np.asarray(m.numpy())
+    assert arr.flags.writeable
+    arr.flat[0] = 42
+    assert arr.flat[0] == 42
+
+
+@pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
+def test_setitem_on_a_read_map_raises_a_catchable_error(mem):
+    """Not a PanicException: that derives from BaseException, so an ordinary
+    `except Exception` would not catch it and a frame loop would die."""
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    m = t.map("read")
+    with pytest.raises(Exception, match="read-only"):
+        m[0] = 7
+
+
+@pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
+def test_setitem_on_a_readwrite_map_still_works(mem):
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    m = t.map("readwrite")
+    m[0] = 7
+    assert m[0] == 7

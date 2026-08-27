@@ -7,7 +7,7 @@ use crate::colorimetry::effective_colorimetry;
 use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Result, Rotation};
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait,
-    TensorTrait,
+    TensorMemory, TensorTrait,
 };
 use four_char_code::FourCharCode;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
@@ -194,7 +194,7 @@ impl G2DProcessor {
         }
 
         // Source/placement already validated by `Crop::resolve` at the entry.
-        let src = src_dyn.as_u8().unwrap();
+        let src = src_dyn.as_typed::<u8>().unwrap();
         // For i8 destinations, reinterpret as u8 for G2D (same byte layout).
         // The XOR 0x80 post-pass is applied after the blit completes.
         let dst = if is_int8_dst {
@@ -205,10 +205,10 @@ impl G2DProcessor {
             // reinterpreted reference is used only for shape/fd access and the
             // G2D blit (which operates on raw DMA bytes). It does not outlive
             // dst_dyn and is never stored.
-            let i8_tensor = dst_dyn.as_i8_mut().unwrap();
+            let i8_tensor = dst_dyn.as_typed_mut::<i8>().unwrap();
             unsafe { &mut *(i8_tensor as *mut Tensor<i8> as *mut Tensor<u8>) }
         } else {
-            dst_dyn.as_u8_mut().unwrap()
+            dst_dyn.as_typed_mut::<u8>().unwrap()
         };
 
         let mut src_surface = tensor_to_g2d_surface(src)?;
@@ -451,12 +451,18 @@ fn draw_empty_frame_g2d(
             "G2D only supports u8 destination tensors".to_string(),
         ));
     }
-    let dst = dst_dyn.as_u8_mut().ok_or(Error::NotAnImage)?;
+    let dst = dst_dyn.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
 
     // DMA-only: G2D operates on physical addresses. A Mem-backed dst means
     // we're on the wrong backend — surface a dispatch error so the caller
     // can fall back.
-    if dst.as_dma().is_none() {
+    // A capability probe, so it asks the backend-agnostic question.
+    // `as_dma()` answers `None` for EVERY tensor on the `dynamic` backend
+    // -- `DmaTensor<T>` is `static`-internal storage it never constructs --
+    // so this used to decline G2D unconditionally there, silently giving up
+    // the i.MX hardware path on the exact tensors it was written for. See
+    // task P2b's review, F3.
+    if TensorTrait::memory(dst) != TensorMemory::DmaBuf {
         return Err(Error::NotImplemented(
             "g2d only supports Dma memory".to_string(),
         ));
@@ -494,8 +500,9 @@ fn draw_empty_frame_g2d(
                     "G2D only supports u8 background tensors".to_string(),
                 ));
             }
-            let bg = bg_dyn.as_u8().ok_or(Error::NotAnImage)?;
-            if bg.as_dma().is_none() {
+            let bg = bg_dyn.as_typed::<u8>().ok_or(Error::NotAnImage)?;
+            // Backend-agnostic probe -- see the `dst` check above.
+            if TensorTrait::memory(bg) != TensorMemory::DmaBuf {
                 return Err(Error::NotImplemented(
                     "g2d background must be Dma-backed".to_string(),
                 ));
@@ -528,10 +535,12 @@ fn chroma_subsample_shifts(fmt: PixelFormat) -> (u32, u32) {
 /// The tensor must be backed by DMA memory and must have a pixel format set.
 fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
     let fmt = img.format().ok_or(Error::NotAnImage)?;
-    let dma = img
-        .as_dma()
-        .ok_or_else(|| Error::NotImplemented("g2d only supports Dma memory".to_string()))?;
-    let phys: G2DPhysical = dma.fd.as_raw_fd().try_into()?;
+    // `dmabuf()`, not `as_dma().fd`: same file descriptor, but reachable on
+    // both backends. See the probe above.
+    let fd = img
+        .dmabuf()
+        .map_err(|e| Error::NotImplemented(format!("g2d only supports Dma memory ({e})")))?;
+    let phys: G2DPhysical = fd.as_raw_fd().try_into()?;
 
     // NV12 is a two-plane format: Y plane followed by interleaved UV plane.
     // planes[0] = Y plane start, planes[1] = UV plane start (Y size = width * height)
@@ -545,10 +554,10 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
         if img.is_multiplane() {
             // Multiplane: UV in separate DMA-BUF, get its physical address
             let chroma = img.chroma().unwrap();
-            let chroma_dma = chroma.as_dma().ok_or_else(|| {
-                Error::NotImplemented("g2d multiplane chroma must be DMA-backed".to_string())
+            let chroma_fd = chroma.dmabuf().map_err(|e| {
+                Error::NotImplemented(format!("g2d multiplane chroma must be DMA-backed ({e})"))
             })?;
-            let uv_phys: G2DPhysical = chroma_dma.fd.as_raw_fd().try_into()?;
+            let uv_phys: G2DPhysical = chroma_fd.as_raw_fd().try_into()?;
             let chroma_offset = img.chroma().and_then(|c| c.plane_offset()).unwrap_or(0) as u64;
             [
                 base_addr + luma_offset,
@@ -688,7 +697,7 @@ mod g2d_tests {
             720,
             g2d_in_fmt,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
 
@@ -697,7 +706,7 @@ mod g2d_tests {
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
-            src2.as_u8()
+            src2.as_typed::<u8>()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
@@ -711,7 +720,7 @@ mod g2d_tests {
             dst_height,
             g2d_out_fmt,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d_converter = G2DProcessor::new()?;
@@ -823,7 +832,7 @@ mod g2d_tests {
             dst_height,
             PixelFormat::Rgb,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         cpu_converter.convert(
@@ -840,14 +849,14 @@ mod g2d_tests {
             720,
             g2d_in_fmt,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
 
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
-            src2.as_u8()
+            src2.as_typed::<u8>()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
@@ -861,7 +870,7 @@ mod g2d_tests {
             dst_height,
             g2d_out_fmt,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d_converter = G2DProcessor::new()?;
@@ -926,11 +935,11 @@ mod g2d_tests {
             dst_height,
             PixelFormat::Rgb,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         reference
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()
             .unwrap()
@@ -950,14 +959,14 @@ mod g2d_tests {
             720,
             g2d_in_fmt,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
 
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
-            src2.as_u8()
+            src2.as_typed::<u8>()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
@@ -971,11 +980,11 @@ mod g2d_tests {
             dst_height,
             g2d_out_fmt,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         g2d_dst
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()
             .unwrap()
@@ -1043,13 +1052,13 @@ mod g2d_tests {
             PixelFormat::Rgb => image::RgbImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_u8().unwrap().map().unwrap().to_vec(),
+                img1.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
             )
             .unwrap(),
             PixelFormat::Rgba => image::RgbaImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_u8().unwrap().map().unwrap().to_vec(),
+                img1.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
@@ -1061,13 +1070,13 @@ mod g2d_tests {
             PixelFormat::Rgb => image::RgbImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_u8().unwrap().map().unwrap().to_vec(),
+                img2.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
             )
             .unwrap(),
             PixelFormat::Rgba => image::RgbaImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_u8().unwrap().map().unwrap().to_vec(),
+                img2.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
@@ -1113,7 +1122,7 @@ mod g2d_tests {
             memory,
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        let mut map = img.as_u8().unwrap().map()?;
+        let mut map = img.as_typed::<u8>().unwrap().map()?;
         let dst = map.as_mut_slice();
         if bytes.len() > dst.len() {
             return Err(crate::Error::InvalidShape(format!(
@@ -1138,7 +1147,7 @@ mod g2d_tests {
             1280,
             720,
             PixelFormat::Nv12,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             &edgefirst_bench::testdata::read("camera720p.nv12"),
         )?;
 
@@ -1157,7 +1166,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgba,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
@@ -1187,11 +1196,11 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         cpu_dst
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
+            .copy_from_slice(dst.as_typed::<u8>().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgba_reference")
     }
@@ -1208,7 +1217,7 @@ mod g2d_tests {
             1280,
             720,
             PixelFormat::Nv12,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             &edgefirst_bench::testdata::read("camera720p.nv12"),
         )?;
 
@@ -1227,7 +1236,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgb,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
@@ -1257,11 +1266,11 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         cpu_dst
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
+            .copy_from_slice(dst.as_typed::<u8>().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgb_reference")
     }
@@ -1278,7 +1287,7 @@ mod g2d_tests {
             1280,
             720,
             PixelFormat::Yuyv,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )?;
 
@@ -1297,7 +1306,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgba,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
@@ -1327,11 +1336,11 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         cpu_dst
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
+            .copy_from_slice(dst.as_typed::<u8>().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgba_reference")
     }
@@ -1348,7 +1357,7 @@ mod g2d_tests {
             1280,
             720,
             PixelFormat::Yuyv,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )?;
 
@@ -1367,7 +1376,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgb,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
@@ -1397,11 +1406,11 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         cpu_dst
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
+            .copy_from_slice(dst.as_typed::<u8>().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgb_reference")
     }
@@ -1434,14 +1443,14 @@ mod g2d_tests {
             720,
             g2d_in_fmt,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut cpu_converter = CPUProcessor::new();
 
         if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
-            src2.as_u8()
+            src2.as_typed::<u8>()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
@@ -1458,7 +1467,7 @@ mod g2d_tests {
             720,
             PixelFormat::Bgra,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let src2_dyn = src2;
@@ -1491,7 +1500,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgba,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let src2_dyn2 = src2;
@@ -1520,11 +1529,11 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         bgra_cpu
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(bgra_dst.as_u8().unwrap().map()?.as_slice());
+            .copy_from_slice(bgra_dst.as_typed::<u8>().unwrap().map()?.as_slice());
 
         let rgba_cpu = TensorDyn::image(
             1280,
@@ -1535,22 +1544,24 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         rgba_cpu
-            .as_u8()
+            .as_typed::<u8>()
             .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(rgba_dst.as_u8().unwrap().map()?.as_slice());
+            .copy_from_slice(rgba_dst.as_typed::<u8>().unwrap().map()?.as_slice());
 
         // Verify PixelFormat::Bgra output has R↔B swapped vs PixelFormat::Rgba output
-        let bgra_map = bgra_cpu.as_u8().unwrap().map()?;
-        let rgba_map = rgba_cpu.as_u8().unwrap().map()?;
+        let bgra_map = bgra_cpu.as_typed::<u8>().unwrap().map()?;
+        let rgba_map = rgba_cpu.as_typed::<u8>().unwrap().map()?;
         let bgra_buf = bgra_map.as_slice();
         let rgba_buf = rgba_map.as_slice();
 
         assert_eq!(bgra_buf.len(), rgba_buf.len());
         for (i, (bc, rc)) in bgra_buf
-            .chunks_exact(4)
-            .zip(rgba_buf.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(rgba_buf.as_chunks::<4>().0)
             .enumerate()
         {
             assert_eq!(
@@ -1595,7 +1606,7 @@ mod g2d_tests {
             width,
             height,
             fmt,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         if let Some(o) = offset {
@@ -1628,7 +1639,7 @@ mod g2d_tests {
             640,
             480,
             PixelFormat::Rgba,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -1648,7 +1659,7 @@ mod g2d_tests {
             640,
             480,
             PixelFormat::Rgba,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -1711,7 +1722,7 @@ mod g2d_tests {
             640,
             480,
             PixelFormat::Nv12,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -1751,9 +1762,9 @@ mod g2d_tests {
 
         // Create luma and chroma as separate DMA tensors
         let mut luma =
-            Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Dma), Some("luma")).unwrap();
+            Tensor::<u8>::new(&[480, 640], Some(TensorMemory::DmaBuf), Some("luma")).unwrap();
         let mut chroma =
-            Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Dma), Some("chroma")).unwrap();
+            Tensor::<u8>::new(&[240, 640], Some(TensorMemory::DmaBuf), Some("chroma")).unwrap();
 
         // Get baseline physical addresses with no offsets
         let luma_base = {
@@ -1816,7 +1827,7 @@ mod g2d_tests {
         let chroma_h = h.div_ceil(2);
         let chroma_w = w.div_ceil(2);
 
-        let bound = t.as_u8().unwrap();
+        let bound = t.as_typed::<u8>().unwrap();
         let mut m = bound.map().unwrap();
         let buf = m.as_mut_slice();
         let uv_start = stride * h;
@@ -1852,8 +1863,8 @@ mod g2d_tests {
         tol: u32,
     ) -> (u32, Option<(usize, usize, usize)>) {
         let channels = 4usize; // RGBA
-        let g2d_t = g2d_dst.as_u8().unwrap();
-        let cpu_t = cpu_dst.as_u8().unwrap();
+        let g2d_t = g2d_dst.as_typed::<u8>().unwrap();
+        let cpu_t = cpu_dst.as_typed::<u8>().unwrap();
         let g2d_stride = g2d_t.effective_row_stride().unwrap_or(w * channels);
         let cpu_stride = cpu_t.effective_row_stride().unwrap_or(w * channels);
         let g2d_map = g2d_t.map().unwrap();
@@ -1910,7 +1921,7 @@ mod g2d_tests {
             h,
             PixelFormat::Nv12,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -1952,7 +1963,7 @@ mod g2d_tests {
             h,
             PixelFormat::Rgba,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -2023,7 +2034,7 @@ mod g2d_tests {
             h,
             PixelFormat::Nv12,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
@@ -2065,7 +2076,7 @@ mod g2d_tests {
             h,
             PixelFormat::Rgba,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();

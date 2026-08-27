@@ -21,16 +21,22 @@ use std::path::PathBuf;
 
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder};
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+/// Root of the `testdata/` tree. `EDGEFIRST_TESTDATA_DIR` wins when set; the
+/// manifest-relative fallback is baked in at compile time and so is useless
+/// for a cross-compiled on-target run.
+fn testdata_root() -> PathBuf {
+    std::env::var("EDGEFIRST_TESTDATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("testdata")
+        })
 }
 
 fn fixture_path(stem: &str) -> PathBuf {
-    workspace_root()
-        .join("testdata/decoder")
-        .join(format!("{stem}.json"))
+    testdata_root().join("decoder").join(format!("{stem}.json"))
 }
 
 fn build_from_fixture(stem: &str) -> (SchemaV2, edgefirst_decoder::Decoder) {

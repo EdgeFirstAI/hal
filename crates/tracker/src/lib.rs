@@ -91,6 +91,25 @@ pub trait DetectionBox: Debug + Clone {
     fn label(&self) -> usize;
 }
 
+/// The shared detection vocabulary satisfies the tracker's input contract.
+///
+/// The impl lives here rather than in `edgefirst-decoder` because the orphan
+/// rule requires it: `DetectionBox` is this crate's trait and
+/// [`DetectBox`](edgefirst_tensor::DetectBox) is `edgefirst-tensor`'s type, so
+/// the crate that owns the trait is the only sound home for it.
+#[cfg(feature = "tensor-boxes")]
+impl DetectionBox for edgefirst_tensor::DetectBox {
+    fn bbox(&self) -> [f32; 4] {
+        self.bbox.into()
+    }
+    fn score(&self) -> f32 {
+        self.score
+    }
+    fn label(&self) -> usize {
+        self.label
+    }
+}
+
 /// A minimal detection box for unit tests and doc examples.
 ///
 /// This type is **not** intended for production use. It is `#[doc(hidden)]` in

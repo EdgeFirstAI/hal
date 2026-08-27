@@ -369,7 +369,7 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **RAM** | 32 GB unified memory |
 | **OS** | macOS 26+ (`aarch64-apple-darwin`) |
 | **G2D** | No (Linux-only) |
-| **DMA-buf** | No (Linux-only); HAL maps `TensorMemory::Dma` onto IOSurface for zero-copy bind |
+| **DMA-buf** | No (Linux-only); HAL maps `TensorMemory::DmaBuf` onto IOSurface for zero-copy bind |
 | **GL Transfer Backend** | IOSurface (zero-copy via `EGL_ANGLE_iosurface_client_buffer`) |
 | **Notes** | Apple Silicon developer platform. ANGLE supplies `libEGL.dylib` and `libGLESv2.dylib` — either the signed EdgeFirst release via `scripts/fetch-angle.sh` or the Homebrew tap — and translates GLES 3.0 → Metal, so the same shader source used on Linux GPUs runs unchanged. Since 0.25.0 macOS runs the shared GL engine and inherits its full conversion matrix; the GL rows in the tables below predate that and still reflect the old YUYV→RGBA-only backend (Known Gap #17). |
 
@@ -584,9 +584,9 @@ library path/version, governor, clocks) written next to them. Decoder state:
 register-cached bit cursor, fast-AC terminator baking, entropy-derived IDCT
 tiers, paired-coefficient probe (High tier), dedicated 4:4:4 MCU loop,
 SSE4.1 fused-RGB block kernel. The orin-nano row was captured on the
-fallback unit (`adis-uav1`, Orin Nano Super devkit; the prior capture
+fallback unit (an alternate Orin Nano Super devkit; the prior capture
 established its turbo baseline matches orin-nano within 0.1%). x86-desktop
-is `sebstation` (same i9-11900K host as prior x86 captures). mbp-m2-max is
+is the same i9-11900K host as prior x86 captures. mbp-m2-max is
 this Apple Silicon MacBook itself, run in-process rather than over SSH (the
 board label has no separate host, hence a committed local-runner script,
 `decode-ab-sweep-macos-local.sh`, instead of an SSH target). macOS has no
@@ -643,7 +643,7 @@ readable — see the per-cell `spread=[lo,hi]` values in each host's
 | | | RGB | **1.176** | 1.068 | 1.601 | 1.518 | 2.119 | 2.345 | 2.833 | 3.025 | 6.6% (hal) |
 
 **Re-confirmed 2026-08-15** on all six boards, `orin-nano` reachable directly
-for the first time since v3.9 (no `adis-uav1` stand-in needed) — every board
+for the first time since v3.9 (no stand-in unit needed) — every board
 lands within round-to-round noise of the table above (e.g. A78AE YUV/RGB
 1.38×/1.37× published → 1.39×/1.37× fresh; M2 Max 1.40×/1.36× → 1.40×/1.36×
 exact). No codec change since this table was captured; table is unchanged.
@@ -787,7 +787,7 @@ is now measured, using a 2×2 nearest-neighbour (box) chroma upsample fused
 into the write — not libjpeg's fancy/triangle filter, a deliberate
 speed/accuracy tradeoff. **The box upsample is opt-in, not the default**: it
 only engages behind `set_output_format(Some(Rgb))` (Rust) /
-`hal_codec_set_output_format(HAL_PIXEL_FORMAT_RGB)` (C) /
+`ef_image_decoder_set_output_format(d, "RGB")` (C) /
 `set_output_format(PixelFormat.Rgb)` (Python) — the same explicit gate every
 fused decode output already goes through. A caller who never calls that API
 gets the native `Nv12` decode (no chroma resampling of any kind) regardless
@@ -956,7 +956,7 @@ TJFLAG_FASTUPSAMPLE` p50 ÷ EdgeFirst `fast` p50):
 | imx95-pro (A55) | 1.07× | 1.02× | 1.13× |
 | rpi5-hailo (A76) | 1.29× | 1.20× | 1.28× |
 | orin-nano (A78AE) | 1.36× | 1.32× | 1.42× |
-| sebstation (Rocket Lake) | 1.05× | 1.02× | 1.06× |
+| x86-desktop (Rocket Lake) | 1.05× | 1.02× | 1.06× |
 | mbp-m2-max (M2 Max) | 1.37× | 1.32× | 1.35× |
 
 The pattern the accurate class already showed holds exactly: the single loss
@@ -1204,7 +1204,7 @@ cost of GL output at native sizes, not harness overhead. NV12-native consumers s
 read the decode-only column; RGB consumers the full-cost columns.
 
 **Jetson Orin nvJPEG (GPU_HYBRID, RGB out), p50 ms** — captured on the
-orin-nano stand-in (`adis-uav1`), per-frame engagement verified via
+orin-nano stand-in unit, per-frame engagement verified via
 `codec.decode_jpeg.nvjpeg_*` tracing spans:
 
 | Corpus | nvJPEG | EdgeFirst CPU |
@@ -1274,8 +1274,8 @@ Per-board libjpeg-turbo package and compiler, from each host's
 | imx8mp-frdm | A53 | 3.0.1-r0 | Yocto/OE recipe (`libturbojpeg0`) | GCC 14.3.0 |
 | imx95-pro | A55 | 1:3.1.2-r0 | Yocto/OE recipe (`libturbojpeg0`) | GCC 15.2.0 |
 | rpi5-hailo | A76 | 1:2.1.5-4 | Raspberry Pi OS / Debian apt (`libturbojpeg0`) | GCC 14.2.0 |
-| orin-nano (adis-uav1 stand-in) | A78AE | 2.1.2-0ubuntu1 | Ubuntu apt (`libturbojpeg`) | GCC 11.4.0 |
-| x86-desktop (sebstation) | Rocket Lake | 1:2.1.5-4ubuntu4 | Ubuntu apt (`libturbojpeg0`) | GCC 15.2.0 |
+| orin-nano (stand-in unit) | A78AE | 2.1.2-0ubuntu1 | Ubuntu apt (`libturbojpeg`) | GCC 11.4.0 |
+| x86-desktop | Rocket Lake | 1:2.1.5-4ubuntu4 | Ubuntu apt (`libturbojpeg0`) | GCC 15.2.0 |
 | mbp-m2-max | M2 Max | 3.2.0 (bottled) | Homebrew (`jpeg-turbo`) | Apple clang 21.0.0 (macOS 27.0) |
 
 Six of six hosts now have full provenance. None of the five Linux/Yocto
@@ -1310,8 +1310,8 @@ except the turbo binary, 3 rounds, n=200, COCO val2017:
 |-------|------|------------------------------|----------------------------------|-------|
 | imx8mp-frdm | A53 | 7.657 / 7.944 ms | 7.448 / 7.763 ms | **−2.7% / −2.3%** (only real host: 3.0.1→3.1.2 is a genuine, if small, upgrade) |
 | rpi5-hailo | A76 | 3.162 / 3.377 ms | 3.165 / 3.370 ms | +0.1% / −0.2% (noise) |
-| orin-nano (adis-uav1) | A78AE | 5.143 / 5.524 ms | 5.153 / 5.501 ms | +0.2% / −0.4% (noise) |
-| x86-desktop (sebstation) | Rocket Lake | 1.433 / 1.507 ms | 1.451 / 1.523 ms | +1.3% / +1.1% (noise, source-built marginally *slower*) |
+| orin-nano (stand-in unit) | A78AE | 5.143 / 5.524 ms | 5.153 / 5.501 ms | +0.2% / −0.4% (noise) |
+| x86-desktop | Rocket Lake | 1.433 / 1.507 ms | 1.451 / 1.523 ms | +1.3% / +1.1% (noise, source-built marginally *slower*) |
 
 **The confound doesn't reproduce.** On the three boards carrying the biggest
 leads (A76, A78AE, x86-desktop — all on turbo 2.1.x), upgrading to a
@@ -1361,9 +1361,9 @@ reader wants to check a fifth core class.
 # image crate, stb_image, Wuffs; provenance.txt written per host; results
 # land under results/<host>/decode-ab-sweep/<corpus>/)
 # orin-nano is directly reachable again as of this revision (was the
-# adis-uav1 fallback in v3.9–v3.14; EDGEFIRST_BENCH_ORIN_FALLBACK still
+# stand-in fallback in v3.9-v3.14; EDGEFIRST_BENCH_ORIN_FALLBACK still
 # exists for the next time it isn't).
-./benchmarks/scripts/decode-ab-sweep.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano sebstation
+./benchmarks/scripts/decode-ab-sweep.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano x86-desktop
 
 # Same sweep against a control corpus (staged by scripts/sync-corpus.sh)
 EDGEFIRST_BENCH_COCO_REMOTE=/data/corpora/val2017-yuv420 \
@@ -2022,7 +2022,7 @@ with the env-gated `EDGEFIRST_LEGACY_MATERIALIZE=1` toggle.
 
 `Tensor.from_numpy()` (and the implicit numpy → HAL conversions used by
 `Decoder.decode_proto()` and friends) selects one of three paths in
-`copy_numpy_to_tensor_dyn` (`crates/python/src/tensor.rs:339`) based on
+`copy_numpy_to_tensor_dyn` (`crates/python-common/src/tensor.rs:339`) based on
 the source array's strides:
 
 | Path | Source layout | Strategy |
@@ -2060,11 +2060,9 @@ manual workaround) in `tests/test_tensor.py`.
 
 ## C API Preprocessing Benchmark (`bench_preproc`)
 
-This section documents results from the C API preprocessing benchmark, which measures end-to-end `hal_image_processor_convert()` latency as seen by a C caller — including EGL/DMA-buf import, GPU dispatch, readback, and any tensor lifecycle overhead. The benchmark is the primary evidence base for the tensor reuse recommendations in ARCHITECTURE.md.
+This section documents results from the C API preprocessing benchmark, which measures end-to-end `ef_image_processor_convert()` latency as seen by a C caller — including EGL/DMA-buf import, GPU dispatch, readback, and any tensor lifecycle overhead.
 
-**Source:** `crates/capi/tests/bench_preproc.c`
-
-**Reference:** ARCHITECTURE.md § "C API Performance Recommendations (DMA-BUF / EGL Path)"
+**Source:** historical `crates/capi/tests/bench_preproc.c` (removed with the monolith). C callers now use `ef_image_processor_convert` from `edgefirst-image-capi`.
 
 ### Test Configuration
 
@@ -2171,7 +2169,7 @@ Recreating the output tensor on every frame forces a new DMA-buf allocation, a n
 | i.MX 8MP (Vivante) | 3.39 ms | 5.61 ms | **1.7×** | 3.44 ms | 1.01× |
 | x86 (GTX 1080 PBO) | 1.22 ms | 1.23 ms | **1.0×** | 1.27 ms | 1.04× |
 
-The reuse baseline uses a single source tensor held alive across all 100 frames. The recreate variant calls `hal_tensor_free` and `hal_image_processor_create_image` on the **source** tensor every frame before converting (the destination tensor is reused). The buffer pool variant rotates through four pre-allocated source tensors in round-robin order (simulating a V4L2 buffer pool with multiple frames in flight).
+The reuse baseline uses a single source tensor held alive across all 100 frames. The recreate variant calls `ef_tensor_free` and `ef_image_processor_create_image` on the **source** tensor every frame before converting (the destination tensor is reused). The buffer pool variant rotates through four pre-allocated source tensors in round-robin order (simulating a V4L2 buffer pool with multiple frames in flight).
 
 **Buffer pool matches single-tensor reuse on both embedded platforms** (1.01–1.04×). This confirms that the EGL image cache works correctly as long as the same buffer objects are reused — the pool size does not matter as long as each buffer is seen again before its cache entry is evicted. The recreate penalty is entirely attributable to EGL import overhead, not to DMA-buf allocation itself.
 
@@ -2193,18 +2191,15 @@ On i.MX 8MP, where the per-convert budget is already tighter due to Vivante driv
 ### Running `bench_preproc`
 
 ```bash
-# Cross-compile for aarch64
-cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release -p edgefirst-hal-capi
-
-# The C benchmark is built by the capi crate's build.rs; the binary is at:
-#   target/aarch64-unknown-linux-gnu/release/bench_preproc
-
-# Deploy and run on target
-scp target/aarch64-unknown-linux-gnu/release/bench_preproc user@target:/tmp/
-ssh user@target '/tmp/bench_preproc'
+# Cross-compile the modular C libraries for aarch64
+cargo build --release --target aarch64-unknown-linux-gnu \
+  --manifest-path crates/image-capi/Cargo.toml --target-dir target
 ```
 
-The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_heap/system`) and an EGL display. On x86 with NVIDIA, it automatically falls back to the PBO path.
+The historical `bench_preproc` binary shipped with the monolith and is gone.
+C callers now link `libedgefirst_image` and call `ef_image_processor_convert`.
+
+The image library requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_heap/system`) and an EGL display. On x86 with NVIDIA, it automatically falls back to the PBO path.
 
 > **CI environments:** Set `EDGEFIRST_FORCE_BACKEND=cpu` to skip software GL
 > detection overhead. Without this, the GL backend will attempt EGL init,
@@ -2392,12 +2387,12 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 3.15 | 2026-08-15 | Response to this round's review: standardize accuracy measurement on TurboJPEG `islow` and remove `djpeg` from the measurement path. Blocking: `djpeg` retired entirely — `stb_bench`/`wuffs_bench` gained a `--parity` mode (dlopen'd `islow`, no CLI, shared via `cbench.h`) replacing the old ad hoc "measured against djpeg" doc-comment claims with real, reproducible, in-process numbers across all six corpora (stb: max&#124;Δ&#124; 3, mean 0.012–0.058; Wuffs: bit-exact on every corpus); `rgb_parity` generalized (`--engine edgefirst-accurate&#124;edgefirst-fast&#124;zune&#124;image&#124;turbo-ifast`, `--reference matched&#124;accurate`, `--yplane`) so `islow` is the single accuracy reference for every arm, `islow` never measured against itself. New Table A (conformance, matched filter class) / Table B (accuracy cost, always vs accurate `islow`) close the two previously-unmeasured coverage gaps the review flagged: EdgeFirst's 4:4:4 direct-write RGB path (52.0 dB vs `islow`, isolated to colour-conversion rounding — no chroma resampling involved on a 4:4:4 source, so this also reframes the box-upsample path's ~51 dB figure as mostly a colour-conversion cost, not a chroma-upsample one) and EdgeFirst's native YUV/Y-plane path (57.3 dB, tighter than RGB as expected with colour conversion removed). Confirmed decisions: zune-jpeg and the `image` crate both stay as separate arms (measured wrapper overhead 5.3–22.7% across all six boards, exceeding round-to-round spread on five of six); `make-coco-yuv420.sh`'s corpus-generation `djpeg&#124;cjpeg` use is out of scope (one-time, not a measurement path). **Fast-class matched sweep completed**: extended from 3 boards × 2 corpora to all 6 boards × 3 native-4:2:0 corpora — confirms the single loss cell (`imx8mp-frdm`/CLIC 4:2:0, 0.96×) and, newly measured, its recovery on the DRI corpus (1.09×), exactly the outcome predicted but not yet checked in v3.14. `orin-nano` reachable directly again (missing `libturbojpeg`, fixed via `apt install libturbojpeg0-dev`) — no longer needs the `adis-uav1` stand-in; re-confirmed within noise against the existing published board table. Full AWS Batch 30-job matrix re-run (fresh instances, same image, no codec change) — re-confirms the published cloud table within measurement noise on every spot-checked cell. Medium: qualified "no loss cell" inline (one clause: "against turbo's default configuration"); reframed the in-order/out-of-order discussion as two distinct mechanisms (in-order-ARM headroom; x86's mature SIMD closing the gap from the comparator's side) rather than one axis with an exception; added an explicit RGB quoting rule (matched tables, not the fancy-upsample ones, are what claims should cite) alongside the existing IDCT one. |
+| 3.15 | 2026-08-15 | Response to this round's review: standardize accuracy measurement on TurboJPEG `islow` and remove `djpeg` from the measurement path. Blocking: `djpeg` retired entirely — `stb_bench`/`wuffs_bench` gained a `--parity` mode (dlopen'd `islow`, no CLI, shared via `cbench.h`) replacing the old ad hoc "measured against djpeg" doc-comment claims with real, reproducible, in-process numbers across all six corpora (stb: max&#124;Δ&#124; 3, mean 0.012–0.058; Wuffs: bit-exact on every corpus); `rgb_parity` generalized (`--engine edgefirst-accurate&#124;edgefirst-fast&#124;zune&#124;image&#124;turbo-ifast`, `--reference matched&#124;accurate`, `--yplane`) so `islow` is the single accuracy reference for every arm, `islow` never measured against itself. New Table A (conformance, matched filter class) / Table B (accuracy cost, always vs accurate `islow`) close the two previously-unmeasured coverage gaps the review flagged: EdgeFirst's 4:4:4 direct-write RGB path (52.0 dB vs `islow`, isolated to colour-conversion rounding — no chroma resampling involved on a 4:4:4 source, so this also reframes the box-upsample path's ~51 dB figure as mostly a colour-conversion cost, not a chroma-upsample one) and EdgeFirst's native YUV/Y-plane path (57.3 dB, tighter than RGB as expected with colour conversion removed). Confirmed decisions: zune-jpeg and the `image` crate both stay as separate arms (measured wrapper overhead 5.3–22.7% across all six boards, exceeding round-to-round spread on five of six); `make-coco-yuv420.sh`'s corpus-generation `djpeg&#124;cjpeg` use is out of scope (one-time, not a measurement path). **Fast-class matched sweep completed**: extended from 3 boards × 2 corpora to all 6 boards × 3 native-4:2:0 corpora — confirms the single loss cell (`imx8mp-frdm`/CLIC 4:2:0, 0.96×) and, newly measured, its recovery on the DRI corpus (1.09×), exactly the outcome predicted but not yet checked in v3.14. `orin-nano` reachable directly again (missing `libturbojpeg`, fixed via `apt install libturbojpeg0-dev`) — no longer needs the stand-in unit; re-confirmed within noise against the existing published board table. Full AWS Batch 30-job matrix re-run (fresh instances, same image, no codec change) — re-confirms the published cloud table within measurement noise on every spot-checked cell. Medium: qualified "no loss cell" inline (one clause: "against turbo's default configuration"); reframed the in-order/out-of-order discussion as two distinct mechanisms (in-order-ARM headroom; x86's mature SIMD closing the gap from the comparator's side) rather than one axis with an exception; added an explicit RGB quoting rule (matched tables, not the fancy-upsample ones, are what claims should cite) alongside the existing IDCT one. |
 | 3.14 | 2026-08-14 | Response to `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md` — the pre-tag release checklist. Blocking: built a pixel-parity harness (`benchmarks/modules/rgb_parity`, dlopen-linked against libjpeg-turbo) comparing EdgeFirst's box-upsample RGB against turbo `TJFLAG_FASTUPSAMPLE`, including a phase-shift diagnostic (does a ±1px shift ever score better than zero-shift, the direct signature of a replication-phase bug); across all four local native-4:2:0 corpora, 0 images out of 720 total show a shift beating zero-shift, and worst-case PSNR is 51.2–51.3 dB (max|Δ| 3) — the phase is confirmed correct, closing the item as measured rather than assumed. Also fixed: `set_output_format(Some(Rgb))` on a source that is neither 4:4:4-equivalent nor native 4:2:0 (4:2:2, 4:1:1, greyscale) now returns `CodecError::UnsupportedFormat` instead of silently substituting the native NV12/NV16/Grey format — closes a real silent-substitution gap the review identified (item #3), covered by a new integration test. Added `expand_row_2x`/`write_rgb_rows_420` unit tests at `1×1`, odd×even, even×odd, and odd×odd (item #2). Added `ChromaUpsample` (`#[non_exhaustive]`, `Box` only for now) and `ImageDecoder::set_chroma_upsample` so a future fancy-upsample mode is an additive enum variant, not a breaking API change (item #4). Added direct (non-dispatch) parity tests for the SSE4.1 and NEON fused-RGB block kernels — the prior test only ever exercised whichever tier the CI/dev host's own CPU happened to select (item #5). Measurement gating the tag: re-ran the fast-class RGB comparison against matched `ifast + TJFLAG_FASTUPSAMPLE` (item #6, 3 boards × 2 corpora, targeted at where the accurate class already showed a loss) — found a real loss cell on `imx8mp-frdm`/CLIC 4:2:0 (**0.96×**, non-overlapping round spreads), the largest matched-comparator loss either accuracy class has shown; the same in-order-core effect already accepted for the accurate class, published as-is rather than treated as a pre-tag blocker, per the review's own "publish as-is" option. |
 | 3.13 | 2026-08-14 | Response to `docs/BENCHMARKS_JPEG_REVIEW_v3.12.md`. Blocking: added the matched-accuracy-class turbo comparison the review asked for — a `TJFLAG_FASTUPSAMPLE` (box/nearest-neighbour, same IDCT accuracy class) column alongside every RGB-arm `islow`/fancy-upsample table, boards and AWS. This surfaces a real, previously-hidden result: on the two in-order cores (A53, A55), EdgeFirst's RGB lead over turbo collapses to near-parity or a narrow **loss** (0.97×–0.98×) on two of three native-4:2:0 corpora once turbo's own box upsample is the comparison, though EdgeFirst stays ahead on the DRI corpus on those same boards and on every out-of-order core (boards and all five AWS queues) throughout. High: resolved the turbo-version "confound" the review flagged (packaged-turbo-version appeared correlated with EdgeFirst's lead size) by source-building libjpeg-turbo 3.1.2 and A/B-testing it same-host, same-kernel against the packaged build via a new `EDGEFIRST_TURBOJPEG_LIB` override — on 4 physical boards plus an AWS Graviton4 control, the source build is within measurement noise of packaged turbo everywhere (largest delta 2.7%, on the one board already close to target version); documented the better-supported explanation (in-order vs out-of-order core class, consistent with this project's existing JPEG entropy-decode tier-gating). Medium: added a macOS QoS scheduling hint (`pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)`, advisory-only — macOS has no accessible core-affinity API) plus a 5-round default (up from 3) to the mbp-m2-max local runner, cutting its worst observed cross-round spread from 7.7% to 6.6% (7.0%→2.9% on the specific arm the review flagged); re-captured mbp-m2-max's full six-corpus sweep under the new protocol. Also: added container/build provenance capture (compiler, rustc, packaged-turbo package+version, base-image OS release) to every AWS Batch job's output, confirming the container's packaged turbo (2.1.5-2, Debian bookworm) is a distinct dimension from the AL2023 EC2 host AMI the review asked to disambiguate. |
 | 3.12 | 2026-08-14 | Response to the v3.11 pre-publication review (`docs/BENCHMARKS_JPEG_REVIEW_v3.11.md`). Blocking: v0.22.1 `Image Codec Decode` JPEG rows marked superseded in place; nvJPEG June-vs-August conclusions reconciled (pre-optimization CPU baseline / single fixture vs corpus / full `load_image` vs decode-only); the "two releases behind" banner scoped to the GL/preprocessing matrix only. High: implemented the fused native-4:2:0→RGB decode path (`write_rgb_rows_420`, box chroma upsample) that was the one previously-unmeasured cell a libjpeg-turbo-literate reader would expect EdgeFirst to lose on — it wins everywhere instead, including a fast-class sweep with no loss cell; measured zune's `neon` feature is genuinely engaged (1.16–1.20× A/B on rpi5-hailo, not inferred from a features table); measured Wuffs' RGB row is on its 3-byte swizzle slow path (1.52–1.59× behind its native 4-byte output); published per-board libjpeg-turbo version/package-source/compiler table (none of the five original hosts actually run turbo 3.2+). Medium: added a Max-spread column to the headline table (and corrected the "sub-1%" prose it was previously not measuring); unified ratio (not percentage) framing throughout with YUV/RGB labels; quantified the zune greyscale-skip asymmetry at exactly zero images in the n=200 sample; ran a second independently-launched AWS instance per queue (bounds instance-bin variance at ≤0.6% on 4/5 queues, confirms a real ~7% effect on the m7i queue that barely moves the published ratio); added `mbp-m2-max` to the eight-arm sweep (largest accurate-class lead of any board, 1.41×). Follow-up same revision: rebuilt and pushed the multi-arch `edgefirst-hal-jpeg-bench` container against the fused-RGB codec and re-ran the full 30-job AWS Batch matrix (5 queues × 6 corpora, not just the val2017 headline) — EdgeFirst fastest in every cloud cell, YUV and RGB, on every corpus; the prior revision's m7i cross-corpus DRI anomaly does not reproduce on a fresh, all-corpora capture (every queue now shows a physically sensible positive DRI penalty). |
 | 3.11 | 2026-08-13 | JPEG decode section re-captured and expanded for publication: eight arms (stb_image and Wuffs added, both pixel-parity-verified against djpeg accurate — Wuffs bit-exact, stb ±3 LSB), median-of-3-interleaved-rounds protocol with per-round spread, mean, and nonparametric 95% median CIs, identical strided image selection for every arm, and per-host build/run provenance. New sections: control corpora (val2017-yuv420 / lossless val2017-dri / CLIC 2025 4:2:0+4:4:4+DRI — the zune-vs-turbo gap is shown to be general, not corpus-driven, and the DRI claim is measured), AWS cloud baselines (Graviton2/3/4, Sapphire Rapids, Genoa — EdgeFirst fastest in every cell, largest leads on Graviton), hardware decoders (i.MX 95 V4L2 decode-only + full-res NV*→RGB second pass via CPU/GL with decode/convert split; Orin nvJPEG scoped as shared-CUDA-core GPU_HYBRID), and build & run provenance. Headline: accurate beats turbo `islow` everywhere (+12.9% A53 … +27.7% A78AE; 1.43–1.54× on Graviton). |
-| 3.10 | 2026-08-13 | JPEG decode section rebuilt as the six-arm sweep (`decode-ab-sweep.sh`): EdgeFirst accurate + opt-in `fast` (`DctMethod::Fast`) vs turbo `islow`/`ifast`, zune-jpeg, and the image crate, across A53/A55/A76/A78AE/Rocket Lake. Accurate beats both turbo kernels everywhere (+11.7% A53 … +28.7% A78AE vs `islow`); `fast` beats `ifast` by 14–32% with its accuracy envelope stated (cosine ≥ 0.99985, PSNR ≥ 42 dB, max Δ 24 over 1000 COCO images). x86 re-captured after the SSE4.1 fused-RGB block-kernel fix. orin-nano row captured on the `adis-uav1` fallback (turbo baseline within 0.1% of the prior capture). |
+| 3.10 | 2026-08-13 | JPEG decode section rebuilt as the six-arm sweep (`decode-ab-sweep.sh`): EdgeFirst accurate + opt-in `fast` (`DctMethod::Fast`) vs turbo `islow`/`ifast`, zune-jpeg, and the image crate, across A53/A55/A76/A78AE/Rocket Lake. Accurate beats both turbo kernels everywhere (+11.7% A53 … +28.7% A78AE vs `islow`); `fast` beats `ifast` by 14–32% with its accuracy envelope stated (cosine ≥ 0.99985, PSNR ≥ 42 dB, max Δ 24 over 1000 COCO images). x86 re-captured after the SSE4.1 fused-RGB block-kernel fix. orin-nano row captured on the stand-in fallback (turbo baseline within 0.1% of the prior capture). |
 | 3.9 | 2026-06-16 | 0.25.0 release refresh: full bench matrix re-collected on the converged-GL-engine code across imx8mp-frdm, imx95-frdm, rpi5-hailo, and jetson-orin-nano, plus the existing mbp-m2-max rows. Confirms the GL-convergence captures within measurement noise (imx95 GL 1080p YUYV→RGBA letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no GPU regressions. Allocation table updated for the imx8mp DMA-alloc improvement (38 ms → 1.8 ms at 720p). macOS GL rows remain the pre-convergence capture (Known Gap #17). |
 | 3.8 | 2026-05-24 | macOS GL backend lands via ANGLE + IOSurface. `TensorMemory::Dma` extended to back IOSurface on macOS, with `is_gpu_buffer_available()` as the portable probe. Capture buffer-infrastructure numbers on mbp-m2-max for Mem/Shm/Dma (alloc 16 µs constant for IOSurface, memcpy 2–2.7× faster than SHM at every resolution). YUYV→RGBA same-size convert: 1.3× at 1080p, 4.8× at 4K vs CPU. Add mbp-m2-max **CPU-only** rows to letterbox / decoder / mask-decode / codec tables; add mbp-m2-max **GL** rows (YUYV→RGBA only) to the same-size format-conversion and 4K-convert tables. Letterbox GL rows pending Gap #17 closure. |
 | 3.7 | 2026-05-22 | Add macOS platform (Apple M2 Max, `mbp-m2-max`) with CPU baseline benchmarks. |

@@ -3,8 +3,8 @@
 
 use super::CPUProcessor;
 use crate::Result;
-use edgefirst_decoder::{DetectBox, Segmentation};
-use ndarray::Axis;
+use edgefirst_tensor::DetectBox;
+use edgefirst_tensor::{Segmentation, TensorMapTrait, TensorTrait};
 use rayon::prelude::*;
 
 impl CPUProcessor {
@@ -19,11 +19,14 @@ impl CPUProcessor {
         segmentation: &Segmentation,
         opacity: f32,
     ) -> Result<()> {
-        use ndarray_stats::QuantileExt;
-
         let seg = &segmentation.segmentation;
         let [seg_height, seg_width, seg_classes] = *seg.shape() else {
-            unreachable!("Array3 did not have [usize; 3] as shape");
+            // A TensorDyn can carry any rank, so unlike the former Array3 this
+            // is genuinely reachable for a malformed mask.
+            return Err(crate::Error::InvalidShape(format!(
+                "segmentation must be [H, W, C], got {:?}",
+                seg.shape()
+            )));
         };
         let start_y = (dst_h as f32 * segmentation.ymin).round();
         let end_y = (dst_h as f32 * segmentation.ymax).round();
@@ -38,14 +41,42 @@ impl CPUProcessor {
         let end_x_u = (end_x as usize).min(dst_w);
         let end_y_u = (end_y as usize).min(dst_h);
 
-        let argmax = seg.map_axis(Axis(2), |r| r.argmax().unwrap());
+        // Per-pixel argmax over the class axis, by a direct scan of the
+        // contiguous `[H, W, C]` bytes rather than
+        // `map_axis(Axis(2), |r| r.argmax())`. Same result — ties resolve to
+        // the lowest class index, as `ndarray_stats`' argmax does — but it
+        // drops this crate's only `ndarray-stats` use and avoids the
+        // `Array2<usize>` that `map_axis` allocates per mask.
+        if seg_classes > u16::MAX as usize {
+            // An error, not a panic: this function returns Result and the mask
+            // is caller-supplied through a public API.
+            return Err(crate::Error::InvalidShape(format!(
+                "semantic segmentation with {seg_classes} classes exceeds the \
+                 u16 argmax index"
+            )));
+        }
+        let seg_u8 = seg.as_typed::<u8>().ok_or_else(|| {
+            crate::Error::InvalidShape(format!("segmentation must be U8, got {:?}", seg.dtype()))
+        })?;
+        let seg_map = seg_u8.map_read()?;
+        let seg_flat = seg_map.as_slice();
+        let mut argmax = vec![0u16; seg_height * seg_width];
+        for (px, out) in argmax.iter_mut().enumerate() {
+            let row = &seg_flat[px * seg_classes..(px + 1) * seg_classes];
+            let mut best = 0usize;
+            let mut best_v = row[0];
+            for (c, &v) in row.iter().enumerate().skip(1) {
+                if v > best_v {
+                    best_v = v;
+                    best = c;
+                }
+            }
+            *out = best as u16;
+        }
         let get_value_at_nearest = |x: f32, y: f32| -> usize {
-            let x = x.round() as usize;
-            let y = y.round() as usize;
-            argmax
-                .get([y.min(seg_height - 1), x.min(seg_width - 1)])
-                .copied()
-                .unwrap_or(0)
+            let x = (x.round() as usize).min(seg_width - 1);
+            let y = (y.round() as usize).min(seg_height - 1);
+            argmax[y * seg_width + x] as usize
         };
 
         for y in start_y_u..end_y_u {
@@ -92,9 +123,30 @@ impl CPUProcessor {
     ) -> Result<()> {
         let seg = &segmentation.segmentation;
         let [seg_height, seg_width, classes] = *seg.shape() else {
-            unreachable!("Array3 did not have [usize;3] as shape");
+            // A TensorDyn can carry any rank, so unlike the former Array3 this
+            // is genuinely reachable for a malformed mask.
+            return Err(crate::Error::InvalidShape(format!(
+                "segmentation must be [H, W, C], got {:?}",
+                seg.shape()
+            )));
         };
-        debug_assert_eq!(classes, 1);
+        // Promoted from `debug_assert_eq!(classes, 1)`. This renderer is for
+        // instance masks; a semantic mask reaching it means the caller mixed
+        // channel counts in one list, and the dispatcher picks the path from
+        // `segmentation[0]` alone. Rendering channel 0 of a multi-class mask
+        // as if it were an instance mask is not meaningful output, and in a
+        // release build the old debug assertion caught nothing at all.
+        if classes != 1 {
+            return Err(crate::Error::InvalidShape(format!(
+                "instance mask must be [H, W, 1], got [{seg_height}, {seg_width}, {classes}]; \
+                 a semantic mask cannot share a list with instance masks"
+            )));
+        }
+        let seg_u8 = seg.as_typed::<u8>().ok_or_else(|| {
+            crate::Error::InvalidShape(format!("segmentation must be U8, got {:?}", seg.dtype()))
+        })?;
+        let seg_map = seg_u8.map_read()?;
+        let seg_flat = seg_map.as_slice();
 
         let start_y = (dst_h as f32 * segmentation.ymin).round();
         let end_y = (dst_h as f32 * segmentation.ymax).round();
@@ -113,7 +165,23 @@ impl CPUProcessor {
             for x in start_x_u..end_x_u {
                 let seg_x = ((x as f32 - start_x) * scale_x) as usize;
                 let seg_y = ((y as f32 - start_y) * scale_y) as usize;
-                let val = *seg.get([seg_y, seg_x, 0]).unwrap_or(&0);
+                // Channel 0 of an `[H, W, C]` contiguous buffer is at
+                // `(y * W + x) * C`, NOT `y * W + x`. The former Array3 read
+                // `.get([seg_y, seg_x, 0])` was correct for any C; dropping
+                // the stride made it correct only for C == 1, and since the
+                // read stays in bounds a C > 1 mask would silently render the
+                // wrong bytes past the debug_assert. Reachable because the
+                // semantic/instance split is decided from segmentation[0]
+                // alone, so a list whose first mask is C == 1 routes any later
+                // C > 1 mask here.
+                //
+                // Out-of-range reads yielded 0 through `Array3::get`; preserve
+                // that rather than clamping, which would smear the edge pixel.
+                let val = if seg_y < seg_height && seg_x < seg_width {
+                    seg_flat[(seg_y * seg_width + seg_x) * classes]
+                } else {
+                    0
+                };
 
                 if val < 127 {
                     continue;
@@ -153,7 +221,7 @@ impl CPUProcessor {
         const LINE_THICKNESS: usize = 3;
 
         for (idx, d) in detect.iter().enumerate() {
-            use edgefirst_decoder::BoundingBox;
+            use edgefirst_tensor::BoundingBox;
 
             let color_index = color_mode.index(idx, d.label);
             let [r, g, b, _] = self.colors[color_index % self.colors.len()];
@@ -225,7 +293,7 @@ impl CPUProcessor {
         detect: &[crate::DetectBox],
         proto_data: &crate::ProtoData,
         letterbox: Option<[f32; 4]>,
-    ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
         use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
 
         let _span = tracing::trace_span!(
@@ -246,12 +314,8 @@ impl CPUProcessor {
         }
         // Interpret shape based on physical layout.
         let (proto_h, proto_w, num_protos) = match proto_data.layout {
-            edgefirst_decoder::ProtoLayout::Nhwc => {
-                (proto_shape[0], proto_shape[1], proto_shape[2])
-            }
-            edgefirst_decoder::ProtoLayout::Nchw => {
-                (proto_shape[1], proto_shape[2], proto_shape[0])
-            }
+            edgefirst_tensor::ProtoLayout::Nhwc => (proto_shape[0], proto_shape[1], proto_shape[2]),
+            edgefirst_tensor::ProtoLayout::Nchw => (proto_shape[1], proto_shape[2], proto_shape[0]),
         };
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
@@ -297,7 +361,7 @@ impl CPUProcessor {
         {
             let coeff_t = proto_data
                 .mask_coefficients
-                .as_i8()
+                .as_typed::<i8>()
                 .expect("I8 coefficients");
             let coeff_m = coeff_t.map()?;
             let coeff_quant = coeff_t.quantization().ok_or_else(|| {
@@ -305,7 +369,7 @@ impl CPUProcessor {
                     "I8 mask_coefficients require quantization metadata".into(),
                 )
             })?;
-            let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+            let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
             let proto_m = proto_t.map()?;
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
@@ -340,13 +404,13 @@ impl CPUProcessor {
         {
             let coeff_t = proto_data
                 .mask_coefficients
-                .as_i16()
+                .as_typed::<i16>()
                 .expect("I16 coefficients");
             let coeff_m = coeff_t.map()?;
             // Skip the integer fast path when coefficient quantization is
             // absent — the f32 fallback below handles raw i16 by widening.
             if let Some(coeff_quant) = coeff_t.quantization() {
-                let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+                let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
                 let proto_m = proto_t.map()?;
                 let proto_quant = proto_t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
@@ -379,7 +443,7 @@ impl CPUProcessor {
         // I8 (from quantized models — kept raw with quantization), or I16.
         // For the mask kernel we always need an f32 view (the multiply-accumulate
         // is done in f32 for precision). Map once and widen once outside the loop.
-        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw
+        if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
             && proto_data.protos.dtype() != DType::I8
         {
             return Err(crate::Error::NotSupported(
@@ -392,7 +456,7 @@ impl CPUProcessor {
             DType::F32 => {
                 let t = proto_data
                     .mask_coefficients
-                    .as_f32()
+                    .as_typed::<f32>()
                     .expect("dtype matched F32");
                 let m = t.map()?;
                 coeff_f32_storage = m.as_slice().to_vec();
@@ -401,7 +465,7 @@ impl CPUProcessor {
             DType::F16 => {
                 let t = proto_data
                     .mask_coefficients
-                    .as_f16()
+                    .as_typed::<half::f16>()
                     .expect("dtype matched F16");
                 let m = t.map()?;
                 coeff_f32_storage = m.as_slice().iter().map(|v| v.to_f32()).collect();
@@ -410,7 +474,7 @@ impl CPUProcessor {
             DType::I8 => {
                 let t = proto_data
                     .mask_coefficients
-                    .as_i8()
+                    .as_typed::<i8>()
                     .expect("dtype matched I8");
                 let m = t.map()?;
                 coeff_f32_storage = if let Some(q) = t.quantization() {
@@ -436,7 +500,7 @@ impl CPUProcessor {
             DType::I16 => {
                 let t = proto_data
                     .mask_coefficients
-                    .as_i16()
+                    .as_typed::<i16>()
                     .expect("dtype matched I16");
                 let m = t.map()?;
                 coeff_f32_storage = if let Some(q) = t.quantization() {
@@ -473,46 +537,49 @@ impl CPUProcessor {
         // PR #51 (EDGEAI-1244 f16 refactor) inadvertently removed.
         match proto_data.protos.dtype() {
             DType::I8 => {
-                let t = proto_data.protos.as_i8().expect("dtype matched I8");
+                let t = proto_data
+                    .protos
+                    .as_typed::<i8>()
+                    .expect("dtype matched I8");
                 let quant = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
                 let m = t.map()?;
                 let src_slice = m.as_slice();
-                let transposed_storage =
-                    if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
-                        // Guard the proto geometry before the per-plane slice so
-                        // an undersized or overflowing (e.g. imported `from_fd`)
-                        // proto tensor yields `InvalidShape` instead of a wrapped
-                        // `hw` slipping past the bounds check (panic/SIGBUS).
-                        let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
-                            crate::Error::InvalidShape(format!(
-                                "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
-                            ))
-                        })?;
-                        let need = hw.checked_mul(num_protos).ok_or_else(|| {
-                            crate::Error::InvalidShape(format!(
-                                "proto NCHW size overflow (hw={hw}, n={num_protos})"
-                            ))
-                        })?;
-                        if src_slice.len() < need {
-                            return Err(crate::Error::InvalidShape(format!(
-                                "proto buffer {} bytes < {need} (proto_h={proto_h}, \
+                let transposed_storage = if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
+                {
+                    // Guard the proto geometry before the per-plane slice so
+                    // an undersized or overflowing (e.g. imported `from_fd`)
+                    // proto tensor yields `InvalidShape` instead of a wrapped
+                    // `hw` slipping past the bounds check (panic/SIGBUS).
+                    let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
+                        crate::Error::InvalidShape(format!(
+                            "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
+                        ))
+                    })?;
+                    let need = hw.checked_mul(num_protos).ok_or_else(|| {
+                        crate::Error::InvalidShape(format!(
+                            "proto NCHW size overflow (hw={hw}, n={num_protos})"
+                        ))
+                    })?;
+                    if src_slice.len() < need {
+                        return Err(crate::Error::InvalidShape(format!(
+                            "proto buffer {} bytes < {need} (proto_h={proto_h}, \
                                  proto_w={proto_w}, num_protos={num_protos})",
-                                src_slice.len()
-                            )));
+                            src_slice.len()
+                        )));
+                    }
+                    let mut nhwc = vec![0i8; need];
+                    for c in 0..num_protos {
+                        let plane = &src_slice[c * hw..(c + 1) * hw];
+                        for px in 0..hw {
+                            nhwc[px * num_protos + c] = plane[px];
                         }
-                        let mut nhwc = vec![0i8; need];
-                        for c in 0..num_protos {
-                            let plane = &src_slice[c * hw..(c + 1) * hw];
-                            for px in 0..hw {
-                                nhwc[px * num_protos + c] = plane[px];
-                            }
-                        }
-                        Some(nhwc)
-                    } else {
-                        None
-                    };
+                    }
+                    Some(nhwc)
+                } else {
+                    None
+                };
                 let protos_slice = transposed_storage.as_deref().unwrap_or(src_slice);
                 detect
                     .par_iter()
@@ -533,14 +600,17 @@ impl CPUProcessor {
                             roi_w,
                             num_protos,
                         )?;
-                        Ok(seg_from_roi(
+                        seg_from_roi(
                             mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
-                        ))
+                        )
                     })
                     .collect()
             }
             DType::F32 => {
-                let t = proto_data.protos.as_f32().expect("dtype matched F32");
+                let t = proto_data
+                    .protos
+                    .as_typed::<f32>()
+                    .expect("dtype matched F32");
                 let m = t.map()?;
                 let protos_slice = m.as_slice();
                 detect
@@ -561,14 +631,17 @@ impl CPUProcessor {
                             roi_w,
                             num_protos,
                         );
-                        Ok(seg_from_roi(
+                        seg_from_roi(
                             mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
-                        ))
+                        )
                     })
                     .collect()
             }
             DType::F16 => {
-                let t = proto_data.protos.as_f16().expect("dtype matched F16");
+                let t = proto_data
+                    .protos
+                    .as_typed::<half::f16>()
+                    .expect("dtype matched F16");
                 let m = t.map()?;
                 let protos_slice = m.as_slice();
                 detect
@@ -589,9 +662,9 @@ impl CPUProcessor {
                             roi_w,
                             num_protos,
                         );
-                        Ok(seg_from_roi(
+                        seg_from_roi(
                             mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
-                        ))
+                        )
                     })
                     .collect()
             }
@@ -620,7 +693,7 @@ impl CPUProcessor {
         letterbox: Option<[f32; 4]>,
         width: u32,
         height: u32,
-    ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
         use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
 
         let _span = tracing::trace_span!(
@@ -648,12 +721,8 @@ impl CPUProcessor {
         }
         // Interpret shape based on physical layout.
         let (proto_h, proto_w, num_protos) = match proto_data.layout {
-            edgefirst_decoder::ProtoLayout::Nhwc => {
-                (proto_shape[0], proto_shape[1], proto_shape[2])
-            }
-            edgefirst_decoder::ProtoLayout::Nchw => {
-                (proto_shape[1], proto_shape[2], proto_shape[0])
-            }
+            edgefirst_tensor::ProtoLayout::Nhwc => (proto_shape[0], proto_shape[1], proto_shape[2]),
+            edgefirst_tensor::ProtoLayout::Nchw => (proto_shape[1], proto_shape[2], proto_shape[0]),
         };
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
@@ -683,7 +752,7 @@ impl CPUProcessor {
         {
             let coeff_t = proto_data
                 .mask_coefficients
-                .as_i8()
+                .as_typed::<i8>()
                 .expect("I8 coefficients");
             let coeff_m = coeff_t.map()?;
             let coeff_quant = coeff_t.quantization().ok_or_else(|| {
@@ -691,7 +760,7 @@ impl CPUProcessor {
                     "I8 mask_coefficients require quantization metadata".into(),
                 )
             })?;
-            let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+            let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
             let proto_m = proto_t.map()?;
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
@@ -725,13 +794,13 @@ impl CPUProcessor {
         {
             let coeff_t = proto_data
                 .mask_coefficients
-                .as_i16()
+                .as_typed::<i16>()
                 .expect("I16 coefficients");
             let coeff_m = coeff_t.map()?;
             // Skip the integer fast path when coefficient quantization is
             // absent — the f32 fallback below handles raw i16 by widening.
             if let Some(coeff_quant) = coeff_t.quantization() {
-                let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+                let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
                 let proto_m = proto_t.map()?;
                 let proto_quant = proto_t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
@@ -758,7 +827,7 @@ impl CPUProcessor {
         }
 
         // Fallback: widen coefficients to f32 for the float-path kernels.
-        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw
+        if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
             && proto_data.protos.dtype() != DType::I8
         {
             return Err(crate::Error::NotSupported(
@@ -768,18 +837,21 @@ impl CPUProcessor {
         }
         let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
-                let t = proto_data.mask_coefficients.as_f32().expect("F32");
+                let t = proto_data.mask_coefficients.as_typed::<f32>().expect("F32");
                 let m = t.map()?;
                 m.as_slice().to_vec()
             }
             DType::F16 => {
-                let t = proto_data.mask_coefficients.as_f16().expect("F16");
+                let t = proto_data
+                    .mask_coefficients
+                    .as_typed::<half::f16>()
+                    .expect("F16");
                 let m = t.map()?;
                 m.as_slice().iter().map(|v| v.to_f32()).collect()
             }
             DType::I8 => {
                 // Dequantize I8 coefficients to f32 for the float proto path.
-                let t = proto_data.mask_coefficients.as_i8().expect("I8");
+                let t = proto_data.mask_coefficients.as_typed::<i8>().expect("I8");
                 let m = t.map()?;
                 let q = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape(
@@ -802,7 +874,7 @@ impl CPUProcessor {
                     .collect()
             }
             DType::I16 => {
-                let t = proto_data.mask_coefficients.as_i16().expect("I16");
+                let t = proto_data.mask_coefficients.as_typed::<i16>().expect("I16");
                 let m = t.map()?;
                 if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
@@ -832,7 +904,7 @@ impl CPUProcessor {
 
         match proto_data.protos.dtype() {
             DType::F32 => {
-                let t = proto_data.protos.as_f32().expect("F32");
+                let t = proto_data.protos.as_typed::<f32>().expect("F32");
                 let m = t.map()?;
                 scaled_segmentations_f32_slice(
                     detect,
@@ -847,7 +919,7 @@ impl CPUProcessor {
                 )
             }
             DType::F16 => {
-                let t = proto_data.protos.as_f16().expect("F16");
+                let t = proto_data.protos.as_typed::<half::f16>().expect("F16");
                 let m = t.map()?;
                 scaled_segmentations_f16_slice(
                     detect,
@@ -862,46 +934,46 @@ impl CPUProcessor {
                 )
             }
             DType::I8 => {
-                let t = proto_data.protos.as_i8().expect("I8");
+                let t = proto_data.protos.as_typed::<i8>().expect("I8");
                 let m = t.map()?;
                 let quant = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
                 let src_slice = m.as_slice();
-                let transposed_storage =
-                    if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
-                        // Guard the proto geometry before the per-plane slice so
-                        // an undersized or overflowing (e.g. imported `from_fd`)
-                        // proto tensor yields `InvalidShape` instead of a wrapped
-                        // `hw` slipping past the bounds check (panic/SIGBUS).
-                        let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
-                            crate::Error::InvalidShape(format!(
-                                "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
-                            ))
-                        })?;
-                        let need = hw.checked_mul(num_protos).ok_or_else(|| {
-                            crate::Error::InvalidShape(format!(
-                                "proto NCHW size overflow (hw={hw}, n={num_protos})"
-                            ))
-                        })?;
-                        if src_slice.len() < need {
-                            return Err(crate::Error::InvalidShape(format!(
-                                "proto buffer {} bytes < {need} (proto_h={proto_h}, \
+                let transposed_storage = if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
+                {
+                    // Guard the proto geometry before the per-plane slice so
+                    // an undersized or overflowing (e.g. imported `from_fd`)
+                    // proto tensor yields `InvalidShape` instead of a wrapped
+                    // `hw` slipping past the bounds check (panic/SIGBUS).
+                    let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
+                        crate::Error::InvalidShape(format!(
+                            "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
+                        ))
+                    })?;
+                    let need = hw.checked_mul(num_protos).ok_or_else(|| {
+                        crate::Error::InvalidShape(format!(
+                            "proto NCHW size overflow (hw={hw}, n={num_protos})"
+                        ))
+                    })?;
+                    if src_slice.len() < need {
+                        return Err(crate::Error::InvalidShape(format!(
+                            "proto buffer {} bytes < {need} (proto_h={proto_h}, \
                                  proto_w={proto_w}, num_protos={num_protos})",
-                                src_slice.len()
-                            )));
+                            src_slice.len()
+                        )));
+                    }
+                    let mut nhwc = vec![0i8; need];
+                    for c in 0..num_protos {
+                        let plane = &src_slice[c * hw..(c + 1) * hw];
+                        for px in 0..hw {
+                            nhwc[px * num_protos + c] = plane[px];
                         }
-                        let mut nhwc = vec![0i8; need];
-                        for c in 0..num_protos {
-                            let plane = &src_slice[c * hw..(c + 1) * hw];
-                            for px in 0..hw {
-                                nhwc[px * num_protos + c] = plane[px];
-                            }
-                        }
-                        Some(nhwc)
-                    } else {
-                        None
-                    };
+                    }
+                    Some(nhwc)
+                } else {
+                    None
+                };
                 let protos_slice = transposed_storage.as_deref().unwrap_or(src_slice);
                 scaled_segmentations_i8_slice(
                     detect,
@@ -939,6 +1011,19 @@ impl CPUProcessor {
 /// Map a detection bbox in normalised letterboxed coords to its ROI in
 /// the proto plane (floor xmin/ymin, ceil xmax/ymax, clamp to plane bounds).
 /// Returns `(x0, y0, x1, y1, roi_w, roi_h)` where roi_w/h are guaranteed ≥ 1.
+/// Materialise an ndarray mask into the [`TensorDyn`] that
+/// [`Segmentation`] carries.
+///
+/// `materialize_masks` still computes mask values with ndarray; this converts
+/// once at the point the value becomes a `Segmentation`. Making that output
+/// natively `TensorDyn` — which would let this crate drop `ndarray` entirely
+/// — is deliberately out of scope for the decoupling work.
+fn mask_to_tensor(mask: ndarray::ArrayView3<'_, u8>) -> Result<edgefirst_tensor::TensorDyn> {
+    edgefirst_tensor::Tensor::from_arrayview3(mask)
+        .map(edgefirst_tensor::TensorDyn::from)
+        .map_err(|e| crate::Error::InvalidShape(format!("mask -> TensorDyn: {e}")))
+}
+
 fn bbox_to_proto_roi(
     det: &DetectBox,
     proto_w: usize,
@@ -974,18 +1059,18 @@ fn seg_from_roi(
     inv_lw: f32,
     ly0: f32,
     inv_lh: f32,
-) -> edgefirst_decoder::Segmentation {
+) -> Result<Segmentation> {
     let seg_xmin = ((x0 as f32 / proto_w as f32) - lx0) * inv_lw;
     let seg_ymin = ((y0 as f32 / proto_h as f32) - ly0) * inv_lh;
     let seg_xmax = ((x1 as f32 / proto_w as f32) - lx0) * inv_lw;
     let seg_ymax = ((y1 as f32 / proto_h as f32) - ly0) * inv_lh;
-    edgefirst_decoder::Segmentation {
+    Ok(Segmentation {
         xmin: seg_xmin.clamp(0.0, 1.0),
         ymin: seg_ymin.clamp(0.0, 1.0),
         xmax: seg_xmax.clamp(0.0, 1.0),
         ymax: seg_ymax.clamp(0.0, 1.0),
-        segmentation: mask,
-    }
+        segmentation: mask_to_tensor(mask.view())?,
+    })
 }
 
 // =============================================================================
@@ -1017,8 +1102,8 @@ fn proto_segmentations_i8_i8(
     inv_lw: f32,
     ly0: f32,
     inv_lh: f32,
-    layout: edgefirst_decoder::ProtoLayout,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    layout: edgefirst_tensor::ProtoLayout,
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
@@ -1055,7 +1140,7 @@ fn proto_segmentations_i8_i8(
     // Precompute per-pixel proto sums for zero-point correction.
     let proto_sums: Vec<i32> = if zp_c != 0 {
         match layout {
-            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+            edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
                     let base = px_idx * num_protos;
                     protos[base..base + num_protos]
@@ -1064,7 +1149,7 @@ fn proto_segmentations_i8_i8(
                         .sum()
                 })
                 .collect(),
-            edgefirst_decoder::ProtoLayout::Nchw => {
+            edgefirst_tensor::ProtoLayout::Nchw => {
                 let mut sums = vec![0i32; hw];
                 for c in 0..num_protos {
                     let plane = &protos[c * hw..];
@@ -1096,7 +1181,7 @@ fn proto_segmentations_i8_i8(
             let mut mask_buf = vec![0u8; roi_h * roi_w];
 
             match layout {
-                edgefirst_decoder::ProtoLayout::Nhwc => {
+                edgefirst_tensor::ProtoLayout::Nhwc => {
                     let stride_y = proto_w * num_protos;
                     #[cfg(target_arch = "aarch64")]
                     {
@@ -1174,7 +1259,7 @@ fn proto_segmentations_i8_i8(
                         }
                     }
                 }
-                edgefirst_decoder::ProtoLayout::Nchw => {
+                edgefirst_tensor::ProtoLayout::Nchw => {
                     // Channel-major accumulation: for each channel, accumulate
                     // coeff[c] * proto[c, py, px] across the ROI. Each channel
                     // plane is contiguous, giving excellent sequential read access.
@@ -1212,9 +1297,9 @@ fn proto_segmentations_i8_i8(
 
             let mask = ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
                 .expect("mask_buf length matches roi_h * roi_w");
-            Ok(seg_from_roi(
+            seg_from_roi(
                 mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
-            ))
+            )
         })
         .collect()
 }
@@ -1234,8 +1319,8 @@ fn proto_segmentations_i16_i8(
     inv_lw: f32,
     ly0: f32,
     inv_lh: f32,
-    layout: edgefirst_decoder::ProtoLayout,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    layout: edgefirst_tensor::ProtoLayout,
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
@@ -1272,7 +1357,7 @@ fn proto_segmentations_i16_i8(
     // Precompute per-pixel proto sums for zero-point correction.
     let proto_sums: Vec<i32> = if zp_c != 0 {
         match layout {
-            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+            edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
                     let base = px_idx * num_protos;
                     protos[base..base + num_protos]
@@ -1281,7 +1366,7 @@ fn proto_segmentations_i16_i8(
                         .sum()
                 })
                 .collect(),
-            edgefirst_decoder::ProtoLayout::Nchw => {
+            edgefirst_tensor::ProtoLayout::Nchw => {
                 let mut sums = vec![0i32; hw];
                 for c in 0..num_protos {
                     let plane = &protos[c * hw..];
@@ -1310,7 +1395,7 @@ fn proto_segmentations_i16_i8(
             let mut mask_buf = vec![0u8; roi_h * roi_w];
 
             match layout {
-                edgefirst_decoder::ProtoLayout::Nhwc => {
+                edgefirst_tensor::ProtoLayout::Nhwc => {
                     let stride_y = proto_w * num_protos;
                     #[cfg(target_arch = "aarch64")]
                     {
@@ -1357,7 +1442,7 @@ fn proto_segmentations_i16_i8(
                         }
                     }
                 }
-                edgefirst_decoder::ProtoLayout::Nchw => {
+                edgefirst_tensor::ProtoLayout::Nchw => {
                     // Channel-major accumulation: for each channel, accumulate
                     // coeff[c] * proto[c, py, px] across the ROI. Each channel
                     // plane is contiguous, giving excellent sequential read access.
@@ -1395,9 +1480,9 @@ fn proto_segmentations_i16_i8(
 
             let mask = ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
                 .expect("mask_buf length matches roi_h * roi_w");
-            Ok(seg_from_roi(
+            seg_from_roi(
                 mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
-            ))
+            )
         })
         .collect()
 }
@@ -1563,55 +1648,57 @@ unsafe fn fused_dot_sign_f16_slice_f16c(
     roi_w: usize,
     num_protos: usize,
 ) -> ndarray::Array3<u8> {
-    use core::arch::x86_64::{
-        _mm256_castps256_ps128, _mm256_cvtph_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
-        _mm256_loadu_ps, _mm256_setzero_ps, _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps,
-        _mm_loadu_si128,
-    };
+    unsafe {
+        use core::arch::x86_64::{
+            _mm256_castps256_ps128, _mm256_cvtph_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
+            _mm256_loadu_ps, _mm256_setzero_ps, _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps,
+            _mm_loadu_si128,
+        };
 
-    let stride_y = proto_w * num_protos;
-    let chunks8 = num_protos / 8;
-    let mut mask_buf = vec![0u8; roi_h * roi_w];
+        let stride_y = proto_w * num_protos;
+        let chunks8 = num_protos / 8;
+        let mut mask_buf = vec![0u8; roi_h * roi_w];
 
-    for y in 0..roi_h {
-        let row_base = (y0 + y) * stride_y + x0 * num_protos;
-        let out_row = &mut mask_buf[y * roi_w..(y + 1) * roi_w];
-        for (x, out_px) in out_row.iter_mut().enumerate() {
-            let base = row_base + x * num_protos;
-            let mut acc_v = _mm256_setzero_ps();
-            let mut k = 0;
-            for _ in 0..chunks8 {
-                let p_ptr = protos
-                    .as_ptr()
-                    .add(base + k)
-                    .cast::<core::arch::x86_64::__m128i>();
-                let raw = _mm_loadu_si128(p_ptr);
-                let widened = _mm256_cvtph_ps(raw);
-                let coeffs_v = _mm256_loadu_ps(coeff.as_ptr().add(k));
-                acc_v = _mm256_fmadd_ps(coeffs_v, widened, acc_v);
-                k += 8;
-            }
-            // Horizontal reduce 8 → 1.
-            let lo = _mm256_castps256_ps128(acc_v);
-            let hi = _mm256_extractf128_ps::<1>(acc_v);
-            let sum4 = _mm_add_ps(lo, hi);
-            let sum2 = _mm_hadd_ps(sum4, sum4);
-            let sum1 = _mm_hadd_ps(sum2, sum2);
-            let mut acc = _mm_cvtss_f32(sum1);
+        for y in 0..roi_h {
+            let row_base = (y0 + y) * stride_y + x0 * num_protos;
+            let out_row = &mut mask_buf[y * roi_w..(y + 1) * roi_w];
+            for (x, out_px) in out_row.iter_mut().enumerate() {
+                let base = row_base + x * num_protos;
+                let mut acc_v = _mm256_setzero_ps();
+                let mut k = 0;
+                for _ in 0..chunks8 {
+                    let p_ptr = protos
+                        .as_ptr()
+                        .add(base + k)
+                        .cast::<core::arch::x86_64::__m128i>();
+                    let raw = _mm_loadu_si128(p_ptr);
+                    let widened = _mm256_cvtph_ps(raw);
+                    let coeffs_v = _mm256_loadu_ps(coeff.as_ptr().add(k));
+                    acc_v = _mm256_fmadd_ps(coeffs_v, widened, acc_v);
+                    k += 8;
+                }
+                // Horizontal reduce 8 → 1.
+                let lo = _mm256_castps256_ps128(acc_v);
+                let hi = _mm256_extractf128_ps::<1>(acc_v);
+                let sum4 = _mm_add_ps(lo, hi);
+                let sum2 = _mm_hadd_ps(sum4, sum4);
+                let sum1 = _mm_hadd_ps(sum2, sum2);
+                let mut acc = _mm_cvtss_f32(sum1);
 
-            // Scalar tail for num_protos % 8.
-            while k < num_protos {
-                acc += coeff[k] * protos[base + k].to_f32();
-                k += 1;
-            }
+                // Scalar tail for num_protos % 8.
+                while k < num_protos {
+                    acc += coeff[k] * protos[base + k].to_f32();
+                    k += 1;
+                }
 
-            if acc > 0.0 {
-                *out_px = 255;
+                if acc > 0.0 {
+                    *out_px = 255;
+                }
             }
         }
+        ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+            .expect("mask_buf length matches roi_h * roi_w")
     }
-    ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
-        .expect("mask_buf length matches roi_h * roi_w")
 }
 
 /// i8 protos (with quant) × f32 coefficients → sign threshold → binary {0, 255}.
@@ -1642,19 +1729,18 @@ fn fused_dequant_dot_sign_i8_slice(
         heap_scratch = vec![0.0_f32; num_protos];
         heap_scratch.as_mut_slice()
     };
-    let zp_offset: f32;
-    match quant.mode() {
+    let zp_offset: f32 = match quant.mode() {
         QuantMode::PerTensorSymmetric { scale } => {
             for k in 0..num_protos {
                 scaled_coeff[k] = coeff[k] * scale;
             }
-            zp_offset = 0.0;
+            0.0
         }
         QuantMode::PerTensor { scale, zero_point } => {
             for k in 0..num_protos {
                 scaled_coeff[k] = coeff[k] * scale;
             }
-            zp_offset = zero_point as f32 * scaled_coeff.iter().take(num_protos).sum::<f32>();
+            zero_point as f32 * scaled_coeff.iter().take(num_protos).sum::<f32>()
         }
         QuantMode::PerChannelSymmetric { scales, axis } => {
             if axis != 2 {
@@ -1666,7 +1752,7 @@ fn fused_dequant_dot_sign_i8_slice(
             for k in 0..num_protos {
                 scaled_coeff[k] = coeff[k] * scales[k];
             }
-            zp_offset = 0.0;
+            0.0
         }
         QuantMode::PerChannel {
             scales,
@@ -1682,11 +1768,11 @@ fn fused_dequant_dot_sign_i8_slice(
             for k in 0..num_protos {
                 scaled_coeff[k] = coeff[k] * scales[k];
             }
-            zp_offset = (0..num_protos)
+            (0..num_protos)
                 .map(|k| scaled_coeff[k] * zero_points[k] as f32)
-                .sum();
+                .sum()
         }
-    }
+    };
 
     let mut mask_buf = vec![0u8; roi_h * roi_w];
     for y in 0..roi_h {
@@ -1732,7 +1818,7 @@ fn scaled_segmentations_f32_slice(
     letterbox: Option<[f32; 4]>,
     width: u32,
     height: u32,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     scaled_run(
         detect,
         coeff_all,
@@ -1759,7 +1845,7 @@ fn scaled_segmentations_f16_slice(
     letterbox: Option<[f32; 4]>,
     width: u32,
     height: u32,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     scaled_run(
         detect,
         coeff_all,
@@ -1787,7 +1873,7 @@ fn scaled_segmentations_i8_slice(
     letterbox: Option<[f32; 4]>,
     width: u32,
     height: u32,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     use edgefirst_tensor::QuantMode;
     // Only per-tensor quantization supported on the scaled-path CPU kernel
     // today. Per-channel fits naturally into a future extension (would need
@@ -1856,35 +1942,37 @@ fn dot_i8_scalar(coeff: &[i8], proto: &[i8], n: usize) -> i32 {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i8_neon_base(coeff: *const i8, proto: *const i8, n: usize) -> i32 {
-    use std::arch::aarch64::*;
-    let mut acc = vdupq_n_s32(0);
-    let full_chunks = n / 16;
-    let mut offset = 0usize;
-    for _ in 0..full_chunks {
-        let c = vld1q_s8(coeff.add(offset));
-        let p = vld1q_s8(proto.add(offset));
-        // Widening multiply + pairwise accumulate (all aarch64).
-        let lo = vmull_s8(vget_low_s8(c), vget_low_s8(p));
-        let hi = vmull_high_s8(c, p);
-        acc = vpadalq_s16(acc, lo);
-        acc = vpadalq_s16(acc, hi);
-        offset += 16;
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
+        let mut acc = vdupq_n_s32(0);
+        let full_chunks = n / 16;
+        let mut offset = 0usize;
+        for _ in 0..full_chunks {
+            let c = vld1q_s8(coeff.add(offset));
+            let p = vld1q_s8(proto.add(offset));
+            // Widening multiply + pairwise accumulate (all aarch64).
+            let lo = vmull_s8(vget_low_s8(c), vget_low_s8(p));
+            let hi = vmull_high_s8(c, p);
+            acc = vpadalq_s16(acc, lo);
+            acc = vpadalq_s16(acc, hi);
+            offset += 16;
+        }
+        // Handle remaining elements (for num_protos=32, full_chunks=2, remainder=0)
+        let remainder = n - offset;
+        if remainder >= 8 {
+            let c = vld1_s8(coeff.add(offset));
+            let p = vld1_s8(proto.add(offset));
+            let prod = vmull_s8(c, p);
+            acc = vpadalq_s16(acc, prod);
+            offset += 8;
+        }
+        let mut scalar_acc = vaddvq_s32(acc);
+        while offset < n {
+            scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
+            offset += 1;
+        }
+        scalar_acc
     }
-    // Handle remaining elements (for num_protos=32, full_chunks=2, remainder=0)
-    let remainder = n - offset;
-    if remainder >= 8 {
-        let c = vld1_s8(coeff.add(offset));
-        let p = vld1_s8(proto.add(offset));
-        let prod = vmull_s8(c, p);
-        acc = vpadalq_s16(acc, prod);
-        offset += 8;
-    }
-    let mut scalar_acc = vaddvq_s32(acc);
-    while offset < n {
-        scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
-        offset += 1;
-    }
-    scalar_acc
 }
 
 /// NEON i8×i8→i32 dot product using sdot (ARMv8.2-A dotprod, A55+).
@@ -1893,35 +1981,37 @@ unsafe fn dot_i8_neon_base(coeff: *const i8, proto: *const i8, n: usize) -> i32 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i8_neon_dotprod(coeff: *const i8, proto: *const i8, n: usize) -> i32 {
-    use std::arch::aarch64::*;
-    let mut acc = vdupq_n_s32(0);
-    let full_chunks = n / 16;
-    let mut offset = 0usize;
-    for _ in 0..full_chunks {
-        let c = vld1q_s8(coeff.add(offset));
-        let p = vld1q_s8(proto.add(offset));
-        // Enable dotprod extension locally so the assembler accepts sdot
-        // even when compiling for baseline aarch64 (A53). At runtime we only
-        // reach this path when HWCAP confirms dotprod support.
-        let result: int32x4_t;
-        core::arch::asm!(
-            ".arch_extension dotprod",
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) acc => result,
-            a = in(vreg) c,
-            b = in(vreg) p,
-            options(pure, nomem, nostack),
-        );
-        acc = result;
-        offset += 16;
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
+        let mut acc = vdupq_n_s32(0);
+        let full_chunks = n / 16;
+        let mut offset = 0usize;
+        for _ in 0..full_chunks {
+            let c = vld1q_s8(coeff.add(offset));
+            let p = vld1q_s8(proto.add(offset));
+            // Enable dotprod extension locally so the assembler accepts sdot
+            // even when compiling for baseline aarch64 (A53). At runtime we only
+            // reach this path when HWCAP confirms dotprod support.
+            let result: int32x4_t;
+            core::arch::asm!(
+                ".arch_extension dotprod",
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+                acc = inout(vreg) acc => result,
+                a = in(vreg) c,
+                b = in(vreg) p,
+                options(pure, nomem, nostack),
+            );
+            acc = result;
+            offset += 16;
+        }
+        let mut scalar_acc = vaddvq_s32(acc);
+        // Tail: handle remainder (unlikely for num_protos=32, but correct)
+        while offset < n {
+            scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
+            offset += 1;
+        }
+        scalar_acc
     }
-    let mut scalar_acc = vaddvq_s32(acc);
-    // Tail: handle remainder (unlikely for num_protos=32, but correct)
-    while offset < n {
-        scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
-        offset += 1;
-    }
-    scalar_acc
 }
 
 /// Compute i16×i8 dot product → i32. Platform-agnostic scalar fallback.
@@ -1950,24 +2040,26 @@ fn dot_i16_i8_scalar(coeff: &[i16], proto: &[i8], n: usize) -> i32 {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i16_i8_neon(coeff: *const i16, proto: *const i8, n: usize) -> i32 {
-    use std::arch::aarch64::*;
-    let mut acc = vdupq_n_s32(0);
-    let full_chunks = n / 8;
-    let mut offset = 0usize;
-    for _ in 0..full_chunks {
-        let c = vld1q_s16(coeff.add(offset));
-        let p_raw = vld1_s8(proto.add(offset));
-        let p = vmovl_s8(p_raw);
-        acc = vmlal_s16(acc, vget_low_s16(c), vget_low_s16(p));
-        acc = vmlal_high_s16(acc, c, p);
-        offset += 8;
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
+        let mut acc = vdupq_n_s32(0);
+        let full_chunks = n / 8;
+        let mut offset = 0usize;
+        for _ in 0..full_chunks {
+            let c = vld1q_s16(coeff.add(offset));
+            let p_raw = vld1_s8(proto.add(offset));
+            let p = vmovl_s8(p_raw);
+            acc = vmlal_s16(acc, vget_low_s16(c), vget_low_s16(p));
+            acc = vmlal_high_s16(acc, c, p);
+            offset += 8;
+        }
+        let mut scalar_acc = vaddvq_s32(acc);
+        while offset < n {
+            scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
+            offset += 1;
+        }
+        scalar_acc
     }
-    let mut scalar_acc = vaddvq_s32(acc);
-    while offset < n {
-        scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
-        offset += 1;
-    }
-    scalar_acc
 }
 
 /// Compute the logit grid using the dotprod (sdot) path.
@@ -2059,8 +2151,8 @@ fn scaled_segmentations_i8_i8(
     letterbox: Option<[f32; 4]>,
     width: u32,
     height: u32,
-    layout: edgefirst_decoder::ProtoLayout,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    layout: edgefirst_tensor::ProtoLayout,
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
@@ -2096,8 +2188,15 @@ fn scaled_segmentations_i8_i8(
 
     let (lx0, lw, ly0, lh) = match letterbox {
         Some([lx0, ly0, lx1, ly1]) => {
-            let lw = (lx1 - lx0).max(f32::EPSILON);
-            let lh = (ly1 - ly0).max(f32::EPSILON);
+            // Unit scale on a degenerate axis, matching the canonical
+            // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
+            // earlier in this file. `.max(f32::EPSILON)` instead made a
+            // zero-span axis divide by ~1.2e-7, i.e. scale by ~8.5e37, so the
+            // same degenerate letterbox produced a hard clamp here and an
+            // identity map there -- two answers from one transform, which is
+            // exactly what hoisting the math into one home was meant to end.
+            let lw = if lx1 > lx0 { lx1 - lx0 } else { 1.0 };
+            let lh = if ly1 > ly0 { ly1 - ly0 } else { 1.0 };
             (lx0, lw, ly0, lh)
         }
         None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
@@ -2109,7 +2208,7 @@ fn scaled_segmentations_i8_i8(
     // Precompute proto_sum for the entire proto tensor (zero-point correction).
     let proto_sums: Vec<i32> = if zp_c != 0 {
         match layout {
-            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+            edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
                     let base = px_idx * num_protos;
                     let mut s: i32 = 0;
@@ -2119,7 +2218,7 @@ fn scaled_segmentations_i8_i8(
                     s
                 })
                 .collect(),
-            edgefirst_decoder::ProtoLayout::Nchw => {
+            edgefirst_tensor::ProtoLayout::Nchw => {
                 let mut sums = vec![0i32; hw];
                 for c in 0..num_protos {
                     let plane = &protos[c * hw..];
@@ -2189,7 +2288,7 @@ fn scaled_segmentations_i8_i8(
             // Step 2: Compute i32 logits at each proto-ROI pixel.
             let mut logits = vec![0_i32; roi_h * roi_w];
             match layout {
-                edgefirst_decoder::ProtoLayout::Nhwc => {
+                edgefirst_tensor::ProtoLayout::Nhwc => {
                     #[cfg(target_arch = "aarch64")]
                     {
                         if use_dotprod {
@@ -2245,7 +2344,7 @@ fn scaled_segmentations_i8_i8(
                         }
                     }
                 }
-                edgefirst_decoder::ProtoLayout::Nchw => {
+                edgefirst_tensor::ProtoLayout::Nchw => {
                     // Channel-major accumulation: contiguous reads per channel plane.
                     for c in 0..num_protos {
                         let plane = &protos[c * hw..];
@@ -2337,12 +2436,12 @@ fn scaled_segmentations_i8_i8(
 
             let tile = ndarray::Array3::from_shape_vec((bbox_h, bbox_w, 1), tile_buf)
                 .expect("tile_buf length matches bbox_h * bbox_w");
-            Ok(edgefirst_decoder::Segmentation {
+            Ok(edgefirst_tensor::Segmentation {
                 xmin,
                 ymin,
                 xmax,
                 ymax,
-                segmentation: tile,
+                segmentation: crate::cpu::masks::mask_to_tensor(tile.view())?,
             })
         })
         .collect()
@@ -2361,8 +2460,8 @@ fn scaled_segmentations_i16_i8(
     letterbox: Option<[f32; 4]>,
     width: u32,
     height: u32,
-    layout: edgefirst_decoder::ProtoLayout,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    layout: edgefirst_tensor::ProtoLayout,
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
@@ -2398,8 +2497,15 @@ fn scaled_segmentations_i16_i8(
 
     let (lx0, lw, ly0, lh) = match letterbox {
         Some([lx0, ly0, lx1, ly1]) => {
-            let lw = (lx1 - lx0).max(f32::EPSILON);
-            let lh = (ly1 - ly0).max(f32::EPSILON);
+            // Unit scale on a degenerate axis, matching the canonical
+            // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
+            // earlier in this file. `.max(f32::EPSILON)` instead made a
+            // zero-span axis divide by ~1.2e-7, i.e. scale by ~8.5e37, so the
+            // same degenerate letterbox produced a hard clamp here and an
+            // identity map there -- two answers from one transform, which is
+            // exactly what hoisting the math into one home was meant to end.
+            let lw = if lx1 > lx0 { lx1 - lx0 } else { 1.0 };
+            let lh = if ly1 > ly0 { ly1 - ly0 } else { 1.0 };
             (lx0, lw, ly0, lh)
         }
         None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
@@ -2411,7 +2517,7 @@ fn scaled_segmentations_i16_i8(
     // Precompute proto_sum for the entire proto tensor (zero-point correction).
     let proto_sums: Vec<i32> = if zp_c != 0 {
         match layout {
-            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+            edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
                     let base = px_idx * num_protos;
                     let mut s: i32 = 0;
@@ -2421,7 +2527,7 @@ fn scaled_segmentations_i16_i8(
                     s
                 })
                 .collect(),
-            edgefirst_decoder::ProtoLayout::Nchw => {
+            edgefirst_tensor::ProtoLayout::Nchw => {
                 let mut sums = vec![0i32; hw];
                 for c in 0..num_protos {
                     let plane = &protos[c * hw..];
@@ -2487,7 +2593,7 @@ fn scaled_segmentations_i16_i8(
             // Step 2: Compute i32 logits at each proto-ROI pixel.
             let mut logits = vec![0_i32; roi_h * roi_w];
             match layout {
-                edgefirst_decoder::ProtoLayout::Nhwc => {
+                edgefirst_tensor::ProtoLayout::Nhwc => {
                     #[cfg(target_arch = "aarch64")]
                     {
                         for ly_idx in 0..roi_h {
@@ -2527,7 +2633,7 @@ fn scaled_segmentations_i16_i8(
                         }
                     }
                 }
-                edgefirst_decoder::ProtoLayout::Nchw => {
+                edgefirst_tensor::ProtoLayout::Nchw => {
                     // Channel-major accumulation: contiguous reads per channel plane.
                     for c in 0..num_protos {
                         let plane = &protos[c * hw..];
@@ -2619,12 +2725,12 @@ fn scaled_segmentations_i16_i8(
 
             let tile = ndarray::Array3::from_shape_vec((bbox_h, bbox_w, 1), tile_buf)
                 .expect("tile_buf length matches bbox_h * bbox_w");
-            Ok(edgefirst_decoder::Segmentation {
+            Ok(edgefirst_tensor::Segmentation {
                 xmin,
                 ymin,
                 xmax,
                 ymax,
-                segmentation: tile,
+                segmentation: crate::cpu::masks::mask_to_tensor(tile.view())?,
             })
         })
         .collect()
@@ -2643,11 +2749,18 @@ fn scaled_run<P: Copy + Sync>(
     height: u32,
     acc_scale: f32,
     load_f32: impl Fn(&P, f32) -> f32 + Copy + Sync,
-) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     let (lx0, lw, ly0, lh) = match letterbox {
         Some([lx0, ly0, lx1, ly1]) => {
-            let lw = (lx1 - lx0).max(f32::EPSILON);
-            let lh = (ly1 - ly0).max(f32::EPSILON);
+            // Unit scale on a degenerate axis, matching the canonical
+            // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
+            // earlier in this file. `.max(f32::EPSILON)` instead made a
+            // zero-span axis divide by ~1.2e-7, i.e. scale by ~8.5e37, so the
+            // same degenerate letterbox produced a hard clamp here and an
+            // identity map there -- two answers from one transform, which is
+            // exactly what hoisting the math into one home was meant to end.
+            let lw = if lx1 > lx0 { lx1 - lx0 } else { 1.0 };
+            let lh = if ly1 > ly0 { ly1 - ly0 } else { 1.0 };
             (lx0, lw, ly0, lh)
         }
         None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
@@ -2811,12 +2924,12 @@ fn scaled_run<P: Copy + Sync>(
             // Wrap into the expected Array3<u8> shape [bbox_h, bbox_w, 1].
             let tile = ndarray::Array3::from_shape_vec((bbox_h, bbox_w, 1), tile_buf)
                 .expect("tile_buf length matches bbox_h * bbox_w");
-            Ok(edgefirst_decoder::Segmentation {
+            Ok(edgefirst_tensor::Segmentation {
                 xmin,
                 ymin,
                 xmax,
                 ymax,
-                segmentation: tile,
+                segmentation: crate::cpu::masks::mask_to_tensor(tile.view())?,
             })
         })
         .collect()
@@ -2825,7 +2938,7 @@ fn scaled_run<P: Copy + Sync>(
 #[cfg(test)]
 mod tests {
     use super::CPUProcessor;
-    use edgefirst_decoder::{BoundingBox, DetectBox, ProtoData, ProtoLayout};
+    use edgefirst_tensor::{BoundingBox, DetectBox, ProtoData, ProtoLayout};
     use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
 
     const PROTO_H: usize = 4;
@@ -2850,7 +2963,7 @@ mod tests {
         let t = t
             .with_quantization(Quantization::per_tensor(scale, zp))
             .unwrap();
-        TensorDyn::I8(t)
+        t.into()
     }
 
     fn make_i16_quant(shape: &[usize], data: &[i16], scale: f32, zp: i32) -> TensorDyn {
@@ -2858,17 +2971,17 @@ mod tests {
         let t = t
             .with_quantization(Quantization::per_tensor(scale, zp))
             .unwrap();
-        TensorDyn::I16(t)
+        t.into()
     }
 
     fn make_i16_raw(shape: &[usize], data: &[i16]) -> TensorDyn {
         let t = Tensor::<i16>::from_slice(data, shape).unwrap();
-        TensorDyn::I16(t)
+        t.into()
     }
 
     fn make_f32(shape: &[usize], data: &[f32]) -> TensorDyn {
         let t = Tensor::<f32>::from_slice(data, shape).unwrap();
-        TensorDyn::F32(t)
+        t.into()
     }
 
     fn gen_protos_i8(h: usize, w: usize, k: usize) -> Vec<i8> {
@@ -3036,13 +3149,22 @@ mod tests {
         assert_eq!(segs_f32.len(), segs_int.len());
         for (sf, si) in segs_f32.iter().zip(segs_int.iter()) {
             assert_eq!(sf.segmentation.shape(), si.segmentation.shape());
-            let total = sf.segmentation.len();
-            let mismatches = sf
+            use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+            let mf = sf
                 .segmentation
-                .iter()
-                .zip(si.segmentation.iter())
-                .filter(|(a, b)| a != b)
-                .count();
+                .as_typed::<u8>()
+                .unwrap()
+                .map_read()
+                .unwrap();
+            let mi = si
+                .segmentation
+                .as_typed::<u8>()
+                .unwrap()
+                .map_read()
+                .unwrap();
+            let (af, ai) = (mf.as_slice(), mi.as_slice());
+            let total = af.len();
+            let mismatches = af.iter().zip(ai.iter()).filter(|(a, b)| a != b).count();
             let pct = mismatches as f64 / total as f64 * 100.0;
             assert!(
                 pct < 5.0,
@@ -3138,13 +3260,22 @@ mod tests {
         assert_eq!(segs_f32.len(), segs_int.len());
         for (sf, si) in segs_f32.iter().zip(segs_int.iter()) {
             assert_eq!(sf.segmentation.shape(), si.segmentation.shape());
-            let total = sf.segmentation.len();
-            let mismatches = sf
+            use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+            let mf = sf
                 .segmentation
-                .iter()
-                .zip(si.segmentation.iter())
-                .filter(|(a, b)| a != b)
-                .count();
+                .as_typed::<u8>()
+                .unwrap()
+                .map_read()
+                .unwrap();
+            let mi = si
+                .segmentation
+                .as_typed::<u8>()
+                .unwrap()
+                .map_read()
+                .unwrap();
+            let (af, ai) = (mf.as_slice(), mi.as_slice());
+            let total = af.len();
+            let mismatches = af.iter().zip(ai.iter()).filter(|(a, b)| a != b).count();
             let pct = mismatches as f64 / total as f64 * 100.0;
             assert!(
                 pct < 5.0,

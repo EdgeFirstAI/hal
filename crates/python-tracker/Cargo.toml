@@ -1,0 +1,29 @@
+[package]
+name = "edgefirst-python-tracker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "_tracker"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+abi3-py38 = ["pyo3/abi3-py38", "edgefirst-python-common/abi3-py38"]
+abi3-py311 = ["pyo3/abi3-py311", "edgefirst-python-common/abi3-py311"]
+
+[dependencies]
+edgefirst-python-common = { path = "../python-common", default-features = false, features = ["tracker"] }
+numpy = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true, features = ["resolve-config"] }
+rustc_version = { workspace = true }

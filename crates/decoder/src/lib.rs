@@ -66,7 +66,7 @@ which can be used if the model type and output formats are known in advance.
 */
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
+use ndarray::{Array, Array2, ArrayView, ArrayView1, ArrayView3, Dimension};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 pub mod byte;
@@ -81,6 +81,17 @@ pub mod yolo;
 mod decoder;
 pub use decoder::*;
 
+// The detection vocabulary lives in edgefirst-tensor so edgefirst-image can
+// render from it without depending on this crate. Re-exported here so the
+// decoder's own modules keep resolving `crate::Segmentation`.
+pub use edgefirst_tensor::{BoundingBox, DetectBox, ProtoData, ProtoLayout, Segmentation};
+
+// TilePlacement is the contract between edgefirst-image (producer) and this
+// crate (consumer); it lives in edgefirst-decoder-abi so image can name it
+// without linking decoder. Re-exported here so the decoder's own modules
+// keep resolving `crate::tiling::TilePlacement`.
+pub use edgefirst_decoder_abi::TilePlacement;
+
 pub use configs::{DecoderVersion, Nms};
 pub use error::{DecoderError, DecoderResult};
 pub use per_scale::DecodeDtype;
@@ -89,6 +100,45 @@ use crate::{
     decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
     yolo::yolo_segmentation_to_mask,
 };
+
+/// Materialise an ndarray mask into the [`TensorDyn`] that
+/// [`Segmentation`] carries.
+///
+/// The decoder computes mask values with ndarray and converts once, here at
+/// the boundary. `Segmentation` holds a `TensorDyn` rather than an
+/// `Array3<u8>` so that `edgefirst-tensor` can own the type without taking an
+/// ndarray dependency, which is what lets `edgefirst-image` render masks
+/// without depending on this crate.
+fn mask_to_tensor(mask: ndarray::ArrayView3<'_, u8>) -> DecoderResult<edgefirst_tensor::TensorDyn> {
+    edgefirst_tensor::Tensor::from_arrayview3(mask)
+        .map(edgefirst_tensor::TensorDyn::from)
+        .map_err(|e| DecoderError::Internal(format!("mask -> TensorDyn: {e}")))
+}
+
+/// Float-epsilon comparison for `DetectBox`, as a test-only extension trait.
+///
+/// This is a TEST ASSERTION helper -- all 98 call sites are in this crate's
+/// test modules and there are none in production code -- so it does not belong
+/// on `edgefirst-tensor`'s public API, where the type move briefly put it. An
+/// extension trait keeps every call site written as
+/// `a.equal_within_delta(b, eps)` while confining the method to tests.
+#[cfg(test)]
+pub(crate) trait DetectBoxTestExt {
+    fn equal_within_delta(&self, rhs: &DetectBox, eps: f32) -> bool;
+}
+
+#[cfg(test)]
+impl DetectBoxTestExt for DetectBox {
+    fn equal_within_delta(&self, rhs: &DetectBox, eps: f32) -> bool {
+        let eq_delta = |a: f32, b: f32| (a - b).abs() <= eps;
+        self.label == rhs.label
+            && eq_delta(self.score, rhs.score)
+            && eq_delta(self.bbox.xmin, rhs.bbox.xmin)
+            && eq_delta(self.bbox.ymin, rhs.bbox.ymin)
+            && eq_delta(self.bbox.xmax, rhs.bbox.xmax)
+            && eq_delta(self.bbox.ymax, rhs.bbox.ymax)
+    }
+}
 
 /// Trait to convert bounding box formats to XYXY float format
 pub trait BBoxTypeTrait {
@@ -319,232 +369,6 @@ impl Default for Quantization {
     }
 }
 
-/// A detection box with f32 bbox and score
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct DetectBox {
-    pub bbox: BoundingBox,
-    /// model-specific score for this detection, higher implies more confidence
-    pub score: f32,
-    /// label index for this detection
-    pub label: usize,
-}
-
-/// A bounding box with f32 coordinates in XYXY format
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-#[repr(C)]
-pub struct BoundingBox {
-    /// left-most normalized coordinate of the bounding box
-    pub xmin: f32,
-    /// top-most normalized coordinate of the bounding box
-    pub ymin: f32,
-    /// right-most normalized coordinate of the bounding box
-    pub xmax: f32,
-    /// bottom-most normalized coordinate of the bounding box
-    pub ymax: f32,
-}
-
-// Guarantee that BoundingBox is 4 contiguous f32 fields for NEON vld1q_f32 loads.
-const _: () = assert!(std::mem::size_of::<BoundingBox>() == 4 * std::mem::size_of::<f32>());
-const _: () = assert!(std::mem::align_of::<BoundingBox>() == std::mem::align_of::<f32>());
-
-impl BoundingBox {
-    /// Creates a new BoundingBox from the given coordinates
-    pub fn new(xmin: f32, ymin: f32, xmax: f32, ymax: f32) -> Self {
-        Self {
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-        }
-    }
-
-    /// Transforms BoundingBox so that `xmin <= xmax` and `ymin <= ymax`
-    ///
-    /// ```
-    /// # use edgefirst_decoder::BoundingBox;
-    /// let bbox = BoundingBox::new(0.8, 0.6, 0.4, 0.2);
-    /// let canonical_bbox = bbox.to_canonical();
-    /// assert_eq!(canonical_bbox, BoundingBox::new(0.4, 0.2, 0.8, 0.6));
-    /// ```
-    pub fn to_canonical(&self) -> Self {
-        let xmin = self.xmin.min(self.xmax);
-        let xmax = self.xmin.max(self.xmax);
-        let ymin = self.ymin.min(self.ymax);
-        let ymax = self.ymin.max(self.ymax);
-        BoundingBox {
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-        }
-    }
-}
-
-impl From<BoundingBox> for [f32; 4] {
-    /// Converts a BoundingBox into an array of 4 f32 values in xmin, ymin,
-    /// xmax, ymax order
-    /// # Examples
-    /// ```
-    /// # use edgefirst_decoder::BoundingBox;
-    /// let bbox = BoundingBox {
-    ///     xmin: 0.1,
-    ///     ymin: 0.2,
-    ///     xmax: 0.3,
-    ///     ymax: 0.4,
-    /// };
-    /// let arr: [f32; 4] = bbox.into();
-    /// assert_eq!(arr, [0.1, 0.2, 0.3, 0.4]);
-    /// ```
-    fn from(b: BoundingBox) -> Self {
-        [b.xmin, b.ymin, b.xmax, b.ymax]
-    }
-}
-
-impl From<[f32; 4]> for BoundingBox {
-    // Converts an array of 4 f32 values in xmin, ymin, xmax, ymax order into a
-    // BoundingBox
-    fn from(arr: [f32; 4]) -> Self {
-        BoundingBox {
-            xmin: arr[0],
-            ymin: arr[1],
-            xmax: arr[2],
-            ymax: arr[3],
-        }
-    }
-}
-
-impl DetectBox {
-    /// Returns true if one detect box is equal to another detect box, within
-    /// the given `eps`
-    ///
-    /// # Examples
-    /// ```
-    /// # use edgefirst_decoder::DetectBox;
-    /// let box1 = DetectBox {
-    ///     bbox: edgefirst_decoder::BoundingBox {
-    ///         xmin: 0.1,
-    ///         ymin: 0.2,
-    ///         xmax: 0.3,
-    ///         ymax: 0.4,
-    ///     },
-    ///     score: 0.5,
-    ///     label: 1,
-    /// };
-    /// let box2 = DetectBox {
-    ///     bbox: edgefirst_decoder::BoundingBox {
-    ///         xmin: 0.101,
-    ///         ymin: 0.199,
-    ///         xmax: 0.301,
-    ///         ymax: 0.399,
-    ///     },
-    ///     score: 0.510,
-    ///     label: 1,
-    /// };
-    /// assert!(box1.equal_within_delta(&box2, 0.011));
-    /// ```
-    pub fn equal_within_delta(&self, rhs: &DetectBox, eps: f32) -> bool {
-        let eq_delta = |a: f32, b: f32| (a - b).abs() <= eps;
-        self.label == rhs.label
-            && eq_delta(self.score, rhs.score)
-            && eq_delta(self.bbox.xmin, rhs.bbox.xmin)
-            && eq_delta(self.bbox.ymin, rhs.bbox.ymin)
-            && eq_delta(self.bbox.xmax, rhs.bbox.xmax)
-            && eq_delta(self.bbox.ymax, rhs.bbox.ymax)
-    }
-}
-
-/// A segmentation result paired with the normalized bounding box that
-/// describes the spatial extent of `segmentation`.
-///
-/// The `xmin`/`ymin`/`xmax`/`ymax` fields describe the **mask region** —
-/// the proto-grid-aligned crop the `segmentation` tensor was sliced
-/// from. They are quantized to the proto grid step (`1/proto_height` and
-/// `1/proto_width`, typically `1/160`), so the region's origin floors and
-/// its extent ceils relative to the companion [`DetectBox`]'s `bbox`. The
-/// detection bbox itself stays un-snapped (see EDGEAI-1304); use
-/// `Segmentation` bounds for rendering masks, and `DetectBox.bbox` for
-/// IoU evaluation, drawing detection rectangles, etc. The mask region
-/// always encloses the detection bbox.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Segmentation {
-    /// Left-most normalized coordinate of the mask region (proto-grid
-    /// floor of the companion `DetectBox.bbox.xmin`).
-    pub xmin: f32,
-    /// Top-most normalized coordinate of the mask region (proto-grid
-    /// floor of the companion `DetectBox.bbox.ymin`).
-    pub ymin: f32,
-    /// Right-most normalized coordinate of the mask region (proto-grid
-    /// ceil of the companion `DetectBox.bbox.xmax`).
-    pub xmax: f32,
-    /// Bottom-most normalized coordinate of the mask region (proto-grid
-    /// ceil of the companion `DetectBox.bbox.ymax`).
-    pub ymax: f32,
-    /// 3D segmentation array of shape `(H, W, C)`.
-    ///
-    /// For instance segmentation (e.g. YOLO): `C=1` — per-instance mask with
-    /// continuous sigmoid confidence values quantized to u8 (0 = background,
-    /// 255 = full confidence). Renderers typically threshold at 128 (sigmoid
-    /// 0.5) or use smooth interpolation for anti-aliased edges.
-    ///
-    /// For semantic segmentation (e.g. ModelPack): `C=num_classes` — per-pixel
-    /// class scores where the object class is the argmax index.
-    pub segmentation: Array3<u8>,
-}
-
-/// Memory layout of the prototype tensor within [`ProtoData`].
-///
-/// Models may output protos in either channel-last (NHWC) or channel-first
-/// (NCHW) layout. The mask materialisation kernels dispatch on this field to
-/// avoid a costly per-frame transpose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProtoLayout {
-    /// Channel-last: tensor shape is `[H, W, K]`, contiguous along K.
-    /// This is the traditional layout produced by the `extract_proto_data`
-    /// path after transposing from NCHW model outputs.
-    Nhwc,
-    /// Channel-first: tensor shape is `[K, H, W]`, each channel plane is
-    /// contiguous. Skipping the NCHW→NHWC transpose saves ~3 ms per frame
-    /// on Cortex-A53/A55 targets (819 KB for 32×160×160 protos).
-    Nchw,
-}
-
-/// Raw prototype data for fused decode+render pipelines.
-///
-/// Holds post-NMS intermediate state before mask materialization, allowing the
-/// renderer to compute `mask_coeff @ protos` directly (e.g. in a GPU fragment
-/// shader) without materializing intermediate `Array3<u8>` masks.
-///
-/// Both fields are carried as [`TensorDyn`](edgefirst_tensor::TensorDyn) so downstream consumers (Rust, C
-/// API, Python) get zero-copy typed access through the HAL's shared tensor
-/// infrastructure. Dtype policy:
-///
-/// | Source model | protos dtype | mask_coefficients dtype | protos.quantization |
-/// |---|---|---|---|
-/// | int8 quantized | [`TensorDyn::I8`](edgefirst_tensor::TensorDyn::I8) | [`TensorDyn::I8`](edgefirst_tensor::TensorDyn::I8) (raw + quantization) | `Some(q)` |
-/// | f32 | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | `None` |
-/// | f16 (TensorRT fp16) | [`TensorDyn::F16`](edgefirst_tensor::TensorDyn::F16) | [`TensorDyn::F16`](edgefirst_tensor::TensorDyn::F16) | `None` |
-/// | f64 (narrowed) | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | `None` |
-///
-/// Quantization metadata lives on the proto tensor itself via
-/// [`edgefirst_tensor::Tensor::quantization`] — float tensors cannot carry
-/// quantization (compile-time gated on the `IntegerType` sealed trait).
-///
-/// `TensorDyn` is not `Clone`, so neither is `ProtoData`. Consumers that need
-/// to share the proto buffer across threads should use `TensorDyn::clone_fd`
-/// / `dmabuf_clone` to dup the backing fd.
-#[derive(Debug)]
-pub struct ProtoData {
-    /// Per-detection mask coefficients, shape `[num_detections, num_protos]`.
-    pub mask_coefficients: edgefirst_tensor::TensorDyn,
-    /// Prototype tensor.
-    ///
-    /// - When `layout == ProtoLayout::Nhwc`: shape is `[proto_h, proto_w, num_protos]`.
-    /// - When `layout == ProtoLayout::Nchw`: shape is `[num_protos, proto_h, proto_w]`.
-    pub protos: edgefirst_tensor::TensorDyn,
-    /// Physical memory layout of the `protos` tensor.
-    pub layout: ProtoLayout,
-}
-
 /// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score.
 ///
 ///  # Examples
@@ -761,7 +585,7 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
 /// on non-aarch64 targets or when the slice is too short to benefit from NEON.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn arg_max_i8(scores: &[i8]) -> (i8, usize) {
-    use std::arch::aarch64::*;
+    use std::arch::aarch64::*; // NOSONAR
 
     let n = scores.len();
     if n < 16 {
@@ -812,6 +636,7 @@ pub(crate) fn arg_max_i8(scores: &[i8]) -> (i8, usize) {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod decoder_tests {
     #![allow(clippy::excessive_precision)]
+    use crate::DetectBoxTestExt;
     use crate::{
         configs::{DecoderType, DimName, Protos},
         modelpack::{decode_modelpack_det, decode_modelpack_split_quant},
@@ -824,7 +649,6 @@ mod decoder_tests {
     use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
     use ndarray::Dimension;
     use ndarray::{array, s, Array2, Array3, Array4, Axis};
-    use ndarray_stats::DeviationExt;
     use num_traits::{AsPrimitive, PrimInt};
 
     fn compare_outputs(
@@ -849,32 +673,50 @@ mod decoder_tests {
                 [m_i8.xmin, m_i8.ymin, m_i8.xmax, m_i8.ymax],
                 [m_f32.xmin, m_f32.ymin, m_f32.xmax, m_f32.ymax],
             );
-            assert_eq!(m_i8.segmentation.shape(), m_f32.segmentation.shape());
-            let mask_i8 = m_i8.segmentation.map(|x| *x as i32);
-            let mask_f32 = m_f32.segmentation.map(|x| *x as i32);
-            let diff = &mask_i8 - &mask_f32;
-            for x in 0..diff.shape()[0] {
-                for y in 0..diff.shape()[1] {
-                    for z in 0..diff.shape()[2] {
-                        let val = diff[[x, y, z]];
-                        assert!(
-                            val.abs() <= 1,
-                            "Difference between mask0 and mask1 is greater than 1 at ({}, {}, {}): {}",
-                            x,
-                            y,
-                            z,
-                            val
-                        );
-                    }
-                }
+            let shape = m_i8.segmentation.shape().to_vec();
+            assert_eq!(shape, m_f32.segmentation.shape());
+            // `Segmentation` carries a TensorDyn, so compare the mapped bytes
+            // rather than going through ndarray element ops.
+            let (t_i8, t_f32) = (
+                m_i8.segmentation.as_u8().expect("mask must be U8"),
+                m_f32.segmentation.as_u8().expect("mask must be U8"),
+            );
+            let (map_i8, map_f32) = (
+                t_i8.map_read().expect("map i8 mask"),
+                t_f32.map_read().expect("map f32 mask"),
+            );
+            let (a, b) = (map_i8.as_slice(), map_f32.as_slice());
+            let (w, c) = (shape[1], shape[2]);
+            let mut sq_err = 0f64;
+            for (i, (&va, &vb)) in a.iter().zip(b.iter()).enumerate() {
+                let val = va as i32 - vb as i32;
+                assert!(
+                    val.abs() <= 1,
+                    "Difference between mask0 and mask1 is greater than 1 at ({}, {}, {}): {}",
+                    i / (w * c),
+                    (i / c) % w,
+                    i % c,
+                    val
+                );
+                sq_err += (val as f64) * (val as f64);
             }
-            let mean_sq_err = mask_i8.mean_sq_err(&mask_f32).unwrap();
+            let mean_sq_err = sq_err / a.len() as f64;
             assert!(
                 mean_sq_err < 1e-2,
                 "Mean Square Error between masks was greater than 1%: {:.2}%",
                 mean_sq_err * 100.0
             );
         }
+    }
+
+    /// Rebuild an owned `Array3<u8>` from a `Segmentation`'s `TensorDyn`, for
+    /// the ndarray-shaped test helpers that still want a view.
+    fn seg_view(s: &Segmentation) -> ndarray::Array3<u8> {
+        let t = s.segmentation.as_u8().expect("mask must be U8");
+        let m = t.map_read().expect("map mask");
+        let sh = s.segmentation.shape();
+        ndarray::Array3::from_shape_vec((sh[0], sh[1], sh[2]), m.as_slice().to_vec())
+            .expect("mask shape")
     }
 
     // ─── Shared test data loaders ────────────────────────
@@ -1198,7 +1040,7 @@ mod decoder_tests {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            segmentation: mask.into_owned(),
+            segmentation: crate::mask_to_tensor(mask.view()).unwrap(),
         }];
         compare_outputs((&[], &output_boxes), (&mask, &output_masks));
 
@@ -1218,8 +1060,8 @@ mod decoder_tests {
         // but scaled differently. However, it is expected that the mask after argmax
         // will be the same.
         compare_outputs((&[], &output_boxes), (&[], &[]));
-        let mask0 = segmentation_to_mask(mask[0].segmentation.view()).unwrap();
-        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view()).unwrap();
+        let mask0 = segmentation_to_mask(seg_view(&mask[0]).view()).unwrap();
+        let mask1 = segmentation_to_mask(seg_view(&output_masks[0]).view()).unwrap();
 
         assert_eq!(mask0, mask1);
     }
@@ -1305,12 +1147,12 @@ mod decoder_tests {
             .unwrap();
 
         compare_outputs((&[], &output_boxes), (&[], &[]));
-        let mask_u8 = segmentation_to_mask(output_masks_u8[0].segmentation.view()).unwrap();
-        let mask_i8 = segmentation_to_mask(output_masks_i8[0].segmentation.view()).unwrap();
-        let mask_u16 = segmentation_to_mask(output_masks_u16[0].segmentation.view()).unwrap();
-        let mask_i16 = segmentation_to_mask(output_masks_i16[0].segmentation.view()).unwrap();
-        let mask_u32 = segmentation_to_mask(output_masks_u32[0].segmentation.view()).unwrap();
-        let mask_i32 = segmentation_to_mask(output_masks_i32[0].segmentation.view()).unwrap();
+        let mask_u8 = segmentation_to_mask(seg_view(&output_masks_u8[0]).view()).unwrap();
+        let mask_i8 = segmentation_to_mask(seg_view(&output_masks_i8[0]).view()).unwrap();
+        let mask_u16 = segmentation_to_mask(seg_view(&output_masks_u16[0]).view()).unwrap();
+        let mask_i16 = segmentation_to_mask(seg_view(&output_masks_i16[0]).view()).unwrap();
+        let mask_u32 = segmentation_to_mask(seg_view(&output_masks_u32[0]).view()).unwrap();
+        let mask_i32 = segmentation_to_mask(seg_view(&output_masks_i32[0]).view()).unwrap();
         assert_eq!(mask_u8, mask_i8);
         assert_eq!(mask_u8, mask_u16);
         assert_eq!(mask_u8, mask_i16);
@@ -1394,7 +1236,7 @@ mod decoder_tests {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            segmentation: mask.into_owned(),
+            segmentation: crate::mask_to_tensor(mask.view()).unwrap(),
         }];
         let correct_boxes = [DetectBox {
             bbox: BoundingBox {
@@ -1429,8 +1271,8 @@ mod decoder_tests {
         // output is the same as the quantized output but scaled differently.
         // However, it is expected that the mask after argmax will be the same.
         compare_outputs((&correct_boxes, &output_boxes), (&[], &[]));
-        let mask0 = segmentation_to_mask(mask[0].segmentation.view()).unwrap();
-        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view()).unwrap();
+        let mask0 = segmentation_to_mask(seg_view(&mask[0]).view()).unwrap();
+        let mask1 = segmentation_to_mask(seg_view(&output_masks[0]).view()).unwrap();
 
         assert_eq!(mask0, mask1);
     }
@@ -1532,7 +1374,7 @@ mod decoder_tests {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            segmentation: mask.into_owned(),
+            segmentation: crate::mask_to_tensor(mask.view()).unwrap(),
         }];
         let correct_boxes = [DetectBox {
             bbox: BoundingBox {
@@ -1568,8 +1410,8 @@ mod decoder_tests {
         // output is the same as the quantized output but scaled differently.
         // However, it is expected that the mask after argmax will be the same.
         compare_outputs((&correct_boxes, &output_boxes), (&[], &[]));
-        let mask0 = segmentation_to_mask(mask[0].segmentation.view()).unwrap();
-        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view()).unwrap();
+        let mask0 = segmentation_to_mask(seg_view(&mask[0]).view()).unwrap();
+        let mask1 = segmentation_to_mask(seg_view(&output_masks[0]).view()).unwrap();
 
         assert_eq!(mask0, mask1);
     }
@@ -1813,7 +1655,7 @@ mod decoder_tests {
 
         assert_eq!(
             cropped_mask,
-            segmentation_to_mask(output_masks[1].segmentation.view()).unwrap()
+            segmentation_to_mask(seg_view(&output_masks[1]).view()).unwrap()
         );
     }
 
@@ -1932,8 +1774,8 @@ mod decoder_tests {
 
         // Masks must match pixel-for-pixel
         for (i, (cm, rm)) in cfg_masks.iter().zip(&ref_masks).enumerate() {
-            let cm_arr = segmentation_to_mask(cm.segmentation.view()).unwrap();
-            let rm_arr = segmentation_to_mask(rm.segmentation.view()).unwrap();
+            let cm_arr = segmentation_to_mask(seg_view(cm).view()).unwrap();
+            let rm_arr = segmentation_to_mask(seg_view(rm).view()).unwrap();
             assert_eq!(
                 cm_arr, rm_arr,
                 "mask {i} pixel mismatch between config-driven and reference paths"
@@ -2429,7 +2271,7 @@ mod decoder_tests {
                 ymin: 0.0,
                 xmax: 1.0,
                 ymax: 1.0,
-                segmentation: mask.into_owned(),
+                segmentation: crate::mask_to_tensor(mask.view()).unwrap(),
             }];
             let correct_boxes = [DetectBox {
                 bbox: BoundingBox {
@@ -3852,8 +3694,8 @@ outputs:
             );
         }
         for (cm, rm) in cfg_masks.iter().zip(&ref_masks) {
-            let cm_arr = segmentation_to_mask(cm.segmentation.view()).unwrap();
-            let rm_arr = segmentation_to_mask(rm.segmentation.view()).unwrap();
+            let cm_arr = segmentation_to_mask(seg_view(cm).view()).unwrap();
+            let rm_arr = segmentation_to_mask(seg_view(rm).view()).unwrap();
             assert_eq!(
                 cm_arr, rm_arr,
                 "NHWC-declared mask must match reference pixel-for-pixel"
@@ -4217,8 +4059,8 @@ outputs:
             );
         }
         for (bm, dm) in bare_masks.iter().zip(&dshaped_masks) {
-            let bm_arr = segmentation_to_mask(bm.segmentation.view()).unwrap();
-            let dm_arr = segmentation_to_mask(dm.segmentation.view()).unwrap();
+            let bm_arr = segmentation_to_mask(seg_view(bm).view()).unwrap();
+            let dm_arr = segmentation_to_mask(seg_view(dm).view()).unwrap();
             assert_eq!(
                 bm_arr, dm_arr,
                 "dshape-omitted mask must match dshape-populated pixel-for-pixel"
@@ -4312,6 +4154,7 @@ outputs:
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod decoder_tracked_tests {
 
+    use crate::DetectBoxTestExt;
     use edgefirst_tracker::{ByteTrackBuilder, Tracker};
     use ndarray::{array, s, Array, Array2, Array3, Array4, ArrayView, Axis, Dimension};
     use num_traits::{AsPrimitive, Float, PrimInt};

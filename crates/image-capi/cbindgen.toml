@@ -1,0 +1,135 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# cbindgen configuration for edgefirst/tensor.h.
+#
+# NOTE: the include guard is written by hand in `header`/`trailer` rather than
+# via cbindgen's `include_guard`, which wraps only the *generated* body and
+# leaves `header` and `trailer` outside it. Everything below the trailer marker
+# -- the vtable struct and every `static inline` accessor -- would then be
+# re-emitted on a second #include and fail to compile with a redefinition.
+#
+# NOTE: cbindgen emits declarations for `extern "C"` functions only. It cannot
+# emit a `static inline` body, and `static inline` is the entire mechanism that
+# makes the vtable accessors non-interposable. Those therefore live in the
+# hand-written `trailer` below, not in generated output.
+
+language = "C"
+autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
+include_version = true
+documentation = true
+documentation_style = "doxy"
+documentation_length = "full"
+
+header = """
+#ifndef EDGEFIRST_IMAGE_H
+#define EDGEFIRST_IMAGE_H
+
+/**
+ * @file image.h
+ * @brief EdgeFirst image processing C API
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
+ *
+ * Hardware-accelerated image processing: conversion, scaling and colour
+ * handling across GL, G2D and CPU backends.
+ *
+ * This library MINTS tensors. `ef_image_processor_create_image` returns an
+ * `ef_tensor`, and allocating a PBO is the one operation that genuinely
+ * requires a processor, because only the GL context owner can create one.
+ *
+ * A tensor from here is an ordinary `ef_tensor`. There is one tensor
+ * header, `edgefirst/tensor.h`. Detection primitives used when drawing
+ * masks live in header-only `edgefirst/detect.h`.
+ */
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "edgefirst/detect.h"
+#include "edgefirst/tensor.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief An opaque image processor.
+ *
+ * Forward-declared so callers write `ef_image_processor *` without the `struct`
+ * keyword. Its definition is private: processor state is not part of the ABI.
+ */
+typedef struct ef_image_processor ef_image_processor;
+
+/** @brief An owned list of materialized masks. */
+typedef struct ef_mask_list ef_mask_list;
+
+/** @brief Opaque list of tile specs from `ef_tile_grid`. */
+typedef struct ef_tile_spec_list ef_tile_spec_list;
+
+/** @brief Opaque list of tile placements from plan/tile_into. */
+typedef struct ef_tile_placement_list ef_tile_placement_list;
+"""
+
+trailer = """
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* EDGEFIRST_IMAGE_H */
+"""
+
+[export]
+prefix = ""
+# EfTensor/EfTensorImpl/EfTensorPlane/EfTensorImageDesc are declared once, in
+# edgefirst/tensor.h, which this header includes; excluding them here avoids
+# emitting a second, conflicting definition.
+exclude = [
+  "EfTensor",
+  "EfTensorImpl",
+  "EfTensorPlane",
+  "EfTensorImageDesc",
+  "EfImageProcessor",
+  "EfMaskList",
+  "EfTileSpecList",
+  "EfTilePlacementList",
+  "EfTilePlacement",
+  "EfDetectBox",
+  "EfSegmentation",
+]
+
+
+[export.rename]
+"EfTensor" = "ef_tensor"
+"EfImageProcessor" = "ef_image_processor"
+"EfTensorImageDesc" = "ef_tensor_image_desc"
+"EfCrop" = "ef_crop"
+"EfTilingConfig" = "ef_tiling_config"
+"EfTileSpec" = "ef_tile_spec"
+"EfTilePlacement" = "ef_tile_placement"
+"EfMaskList" = "ef_mask_list"
+"EfTileSpecList" = "ef_tile_spec_list"
+"EfTilePlacementList" = "ef_tile_placement_list"
+"EfDetectBox" = "ef_detect_box"
+"EfSegmentation" = "ef_segmentation"
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+
+[struct]
+rename_fields = "SnakeCase"
+
+[fn]
+rename_args = "SnakeCase"
+args = "auto"
+sort_by = "None"
+
+[parse]
+parse_deps = true
+include = ["edgefirst-decoder-abi"]
+clean = false

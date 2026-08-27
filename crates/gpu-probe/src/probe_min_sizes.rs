@@ -45,7 +45,7 @@ fn try_egl_image(ctx: &GpuContext, fourcc: u32, bpp: u32, w: u32, h: u32) -> boo
     let pitch = w * bpp;
     let byte_count = (pitch * h) as usize;
 
-    let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::Dma), None) {
+    let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
         Err(_) => return false,
     };

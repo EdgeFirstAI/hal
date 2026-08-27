@@ -23,20 +23,25 @@ use edgefirst_decoder::{
     DecoderBuilder,
 };
 
-/// Workspace root, resolved from this crate's manifest dir. Mirrors the
-/// helper in `per_scale_parity.rs` — `cargo test` runs with CWD set to
-/// `<workspace>/crates/decoder`, so we walk up two levels to find
-/// `testdata/`.
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+/// Root of the `testdata/` tree.
+///
+/// `EDGEFIRST_TESTDATA_DIR` wins when set. The manifest-relative fallback is
+/// baked in at **compile** time, so a cross-compiled binary carries the build
+/// host's absolute path and can never find fixtures on target — which is
+/// exactly how this test failed on every board until the env var was honoured.
+fn testdata_root() -> PathBuf {
+    std::env::var("EDGEFIRST_TESTDATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("testdata")
+        })
 }
 
 fn fixture_path(stem: &str) -> PathBuf {
-    workspace_root()
-        .join("testdata/decoder")
-        .join(format!("{stem}.json"))
+    testdata_root().join("decoder").join(format!("{stem}.json"))
 }
 
 /// Parse the JSON schema and build a [`Decoder`], returning both so the

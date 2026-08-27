@@ -297,12 +297,14 @@ unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_voi
         ))
     })?;
 
-    let dict = CFDictionaryCreateMutable(
-        std::ptr::null(),
-        0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks,
-    );
+    let dict = unsafe {
+        CFDictionaryCreateMutable(
+            std::ptr::null(),
+            0,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+    };
     if dict.is_null() {
         return Err(Error::Io(std::io::Error::other(
             "CFDictionaryCreateMutable returned null",
@@ -312,27 +314,32 @@ unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_voi
     let set_num = |key: &str, value: i64| -> Result<(), Error> {
         let key_c =
             std::ffi::CString::new(key).map_err(|e| Error::Internal(format!("CString: {e}")))?;
-        let key_cf =
-            CFStringCreateWithCString(std::ptr::null(), key_c.as_ptr(), K_CF_STRING_ENCODING_UTF8);
+        let key_cf = unsafe {
+            CFStringCreateWithCString(std::ptr::null(), key_c.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+        };
         if key_cf.is_null() {
             return Err(Error::Io(std::io::Error::other(
                 "CFStringCreateWithCString returned null",
             )));
         }
-        let value_cf = CFNumberCreate(
-            std::ptr::null(),
-            K_CF_NUMBER_LONG_TYPE,
-            &value as *const i64 as *const std::ffi::c_void,
-        );
+        let value_cf = unsafe {
+            CFNumberCreate(
+                std::ptr::null(),
+                K_CF_NUMBER_LONG_TYPE,
+                &value as *const i64 as *const std::ffi::c_void,
+            )
+        };
         if value_cf.is_null() {
-            CFRelease(key_cf);
+            unsafe { CFRelease(key_cf) };
             return Err(Error::Io(std::io::Error::other(
                 "CFNumberCreate returned null",
             )));
         }
-        CFDictionarySetValue(dict, key_cf, value_cf);
-        CFRelease(key_cf);
-        CFRelease(value_cf);
+        unsafe {
+            CFDictionarySetValue(dict, key_cf, value_cf);
+            CFRelease(key_cf);
+            CFRelease(value_cf);
+        }
         Ok(())
     };
 
@@ -347,7 +354,7 @@ unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_voi
     })();
 
     if let Err(e) = result {
-        CFRelease(dict);
+        unsafe { CFRelease(dict) };
         return Err(e);
     }
     Ok(dict)
@@ -367,9 +374,9 @@ pub(super) unsafe fn create_image_iosurface(
     height: usize,
 ) -> Result<*mut std::ffi::c_void, Error> {
     let layout = ImageLayout::for_format(fmt, dtype, width, height)?;
-    let dict = build_image_props(&layout)?;
-    let surface = IOSurfaceCreate(dict);
-    CFRelease(dict);
+    let dict = unsafe { build_image_props(&layout)? };
+    let surface = unsafe { IOSurfaceCreate(dict) };
+    unsafe { CFRelease(dict) };
     if surface.is_null() {
         return Err(Error::Io(std::io::Error::other(
             "IOSurfaceCreate returned null — likely memory pressure or invalid layout",
@@ -428,7 +435,8 @@ pub(super) unsafe fn create_iosurface_pbuffer(
                 "eglCreatePbufferFromClientBuffer not exported by ANGLE libEGL",
             ))
         })?;
-    let create_pbuffer: FnCreatePbufferFromClientBuffer = std::mem::transmute(create_pbuffer_ptr);
+    let create_pbuffer: FnCreatePbufferFromClientBuffer =
+        unsafe { std::mem::transmute(create_pbuffer_ptr) };
 
     let gl_internal_format = layout.gl_internal_format()?;
     let gl_type = layout.gl_type()?;
@@ -453,13 +461,15 @@ pub(super) unsafe fn create_iosurface_pbuffer(
     // DIAGNOSTIC: trace every input to eglCreatePbufferFromClientBuffer
     // so we can correlate failures with the actual arguments. Hot loop
     // safe — only logged at trace level.
-    let raw = create_pbuffer(
-        display.as_ptr(),
-        EGL_IOSURFACE_ANGLE,
-        surface_ref as egl::EGLClientBuffer,
-        config.as_ptr(),
-        attribs.as_ptr(),
-    );
+    let raw = unsafe {
+        create_pbuffer(
+            display.as_ptr(),
+            EGL_IOSURFACE_ANGLE,
+            surface_ref as egl::EGLClientBuffer,
+            config.as_ptr(),
+            attribs.as_ptr(),
+        )
+    };
     if raw.is_null() {
         let egl_err = egl.get_error();
         return Err(Error::Io(std::io::Error::other(format!(
@@ -475,7 +485,7 @@ pub(super) unsafe fn create_iosurface_pbuffer(
             bpe = layout.bytes_per_element,
         ))));
     }
-    Ok(egl::Surface::from_ptr(raw))
+    Ok(unsafe { egl::Surface::from_ptr(raw) })
 }
 
 /// Extract the IOSurface backing a tensor (macOS only).
@@ -484,9 +494,9 @@ pub(super) unsafe fn create_iosurface_pbuffer(
 /// The returned pointer is borrowed — its lifetime is tied to the
 /// underlying tensor.
 pub(super) fn tensor_iosurface_ref(tensor: &Tensor<u8>) -> Option<*mut std::ffi::c_void> {
-    // Inspect the tensor's memory backend; only TensorMemory::Dma (which
+    // Inspect the tensor's memory backend; only TensorMemory::DmaBuf (which
     // is IOSurface-backed on macOS) carries the right inner type.
-    if !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::Dma) {
+    if !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::DmaBuf) {
         return None;
     }
     tensor.iosurface_ref()

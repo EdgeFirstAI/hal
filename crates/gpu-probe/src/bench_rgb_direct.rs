@@ -27,7 +27,7 @@ fn fill_solid_rgba(tensor: &Tensor<u8>, pixel: [u8; 4]) {
         .map()
         .expect("failed to map tensor for fill_solid_rgba");
     let slice = map.as_mut_slice();
-    for chunk in slice.chunks_exact_mut(4) {
+    for chunk in slice.as_chunks_mut::<4>().0 {
         chunk.copy_from_slice(&pixel);
     }
 }
@@ -39,7 +39,7 @@ fn verify_rgb_pixels(tensor: &Tensor<u8>, expected: [u8; 3], tolerance: u8) -> b
         .map()
         .expect("failed to map tensor for verify_rgb_pixels");
     let slice = map.as_slice();
-    for (i, chunk) in slice.chunks_exact(3).enumerate() {
+    for (i, chunk) in slice.as_chunks::<3>().0.iter().enumerate() {
         for c in 0..3 {
             let diff = (chunk[c] as i16 - expected[c] as i16).unsigned_abs() as u8;
             if diff > tolerance {
@@ -159,8 +159,8 @@ pub fn run_verify(ctx: &GpuContext) -> bool {
         let src_bytes = (w * h * 4) as usize;
         let dst_bytes = (w * h * 3) as usize;
 
-        let src = Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::Dma), None);
-        let dst = Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None);
+        let src = Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::DmaBuf), None);
+        let dst = Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None);
 
         match (src, dst) {
             (Ok(src), Ok(dst)) => {
@@ -338,14 +338,14 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
         let src_bytes = (src_w * src_h * 4) as usize;
         let dst_bytes = (dst_w * dst_h * 3) as usize;
 
-        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::Dma), None) {
+        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(e) => {
                 println!("  SKIP {label}: src DMA allocation failed: {e}");
                 continue;
             }
         };
-        let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+        let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(e) => {
                 println!("  SKIP {label}: dst DMA allocation failed: {e}");

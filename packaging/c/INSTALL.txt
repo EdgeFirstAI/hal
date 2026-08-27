@@ -1,0 +1,82 @@
+EdgeFirst HAL — C libraries
+===========================
+
+This archive is relocatable. Extract it anywhere; the pkg-config files derive
+`prefix` from their own location, so they work from an arbitrary directory.
+
+  tar xzf edgefirst-hal-<version>-<target>.tar.gz   # Linux
+  unzip edgefirst-hal-<version>-<target>.zip        # Windows, macOS
+  cd edgefirst-hal-<version>-<target>
+
+Point pkg-config at the extracted tree:
+
+  export PKG_CONFIG_PATH="$PWD/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+Compile a consumer. `edgefirst-codec` pulls `edgefirst-tensor` through
+`Requires:`, so a JPEG decoder is two libraries and one pkg-config invocation:
+
+  cc -std=c11 -o decode decode.c $(pkg-config --cflags --libs edgefirst-codec)
+
+Runtime. `Libs:` does not embed an rpath, so a binary that linked against this
+tree will not find the .so files unless you also set one of:
+
+  export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"   # Linux
+  export DYLD_LIBRARY_PATH="$PWD/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"  # macOS
+  cc ... -Wl,-rpath,"$PWD/lib" ...
+  # or install into a directory listed by ldconfig (Linux) / install_name_tool (macOS)
+
+Windows. The archive is `bin/*.dll` (load) and `lib/*.lib` (link). The
+`.lib` files are DLL import libraries, not the Rust staticlib cargo also
+writes during the build. Link against `lib\`, put `bin\` on PATH or copy
+the DLLs next to the executable. There is no SONAME chain on Windows:
+
+  cl /I include decode.c /link /LIBPATH:lib edgefirst_codec.lib edgefirst_tensor.lib
+  copy bin\edgefirst_codec.dll . & copy bin\edgefirst_tensor.dll .
+
+ABI stability. These libraries ship SONAME `.so.0` (major 0). No ABI stability
+is offered before 1.0: a binary built against 0.x may misbehave if it loads a
+different 0.y. Pin the archive version you built against.
+
+Shared libraries only. The archive ships the C ABI: headers and the
+`.so` / `.dylib` / DLL (+ Windows import `.lib`) chain. It does not ship
+Rust staticlibs (`libedgefirst_*.a` or cargo's `edgefirst_*.lib`).
+
+Minimal usage (decode a JPEG into a tensor)
+-------------------------------------------
+
+  #include <edgefirst/codec.h>
+  #include <stdio.h>
+
+  int main(void) {
+      unsigned char jpeg[] = { /* ... */ };
+      ef_image_decoder *d = ef_image_decoder_new();
+      if (!d) return 1;
+      ef_tensor *dst = ef_tensor_image_alloc(640, 480, "NV12", EF_DTYPE_U8,
+                                             1, EF_STORAGE_KIND_MEM, EF_CPU_ACCESS_READ_WRITE);
+      if (!dst) { ef_image_decoder_free(d); return 1; }
+      if (ef_image_decoder_decode_into(d, jpeg, sizeof jpeg, dst) != 0) {
+          fprintf(stderr, "%s\n", ef_tensor_last_error_message());
+          ef_tensor_free(dst);
+          ef_image_decoder_free(d);
+          return 1;
+      }
+      ef_tensor_free(dst);
+      ef_image_decoder_free(d);
+      return 0;
+  }
+
+  cc -std=c11 -o decode decode.c $(pkg-config --cflags --libs edgefirst-codec)
+
+The five libraries, and what they need
+--------------------------------------
+
+  edgefirst-tensor    no sibling (the base)
+  edgefirst-codec     Requires: edgefirst-tensor
+  edgefirst-image     Requires: edgefirst-tensor; detect.h via decoder-abi
+  edgefirst-decoder   Requires: edgefirst-tensor; detect.h via decoder-abi
+  edgefirst-tracker   detections as a plain array; Requires.private: decoder
+
+`edgefirst/detect.h` is header-only. There is no `libedgefirst_detect`.
+
+Home: https://github.com/EdgeFirstAI/hal
+License: Apache-2.0 (see LICENSE)

@@ -17,8 +17,7 @@ operate on their own types.
 
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) consumes `Tensor<u8>` / `TensorDyn` for image processor input/output buffers and provides the `PboOps` trait impl that backs `PboTensor`.
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) reads model output via `Tensor<T>` and `TensorMap`.
-- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) re-exports this crate as `edgefirst_hal::tensor`.
-- [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) crosses the FFI boundary using `from_fd`, `clone_fd`, and `from_planes`.
+- [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) crosses the FFI boundary using `from_fd`, `clone_fd`, and `from_planes`.
 - [`gpu-probe`](https://github.com/EdgeFirstAI/hal/blob/main/crates/gpu-probe/) uses it to allocate the DMA-BUF round-trip buffer the probe verifies.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) and [`edgefirst-bench`](https://github.com/EdgeFirstAI/hal/blob/main/crates/bench/) do **not** depend on this crate — tracker works against `DetectionBox` and `nalgebra`, bench wraps `serde_json` for benchmark IO.
 
@@ -33,9 +32,17 @@ This crate has **no internal `edgefirst-*` dependencies**.
 | **Mem** | Standard heap allocation | General purpose, maximum compatibility |
 | **PBO** | OpenGL Pixel Buffer Object | GPU-accelerated image processing (created by `ImageProcessor`, never allocated by this crate) |
 
-`TensorMemory::Dma` is one variant on every platform. Ask for it and you get
+`TensorMemory::DmaBuf` is one variant on every platform. Ask for it and you get
 whichever of the three backings the OS provides, so portable code does not
 branch on the mechanism.
+
+So is every other variant: `TensorMemory` names storage codes rather than
+listing what this build can allocate, so a descriptor recorded on one platform
+is still nameable on another. `TensorMemory::is_available()` answers the
+"can I allocate this here, now" question at runtime — `/dev/dma_heap` can
+exist while the process lacks permission on it — and a request for a backing
+this build cannot serve returns an error rather than panicking. `IoSurface`
+and `Cuda` are defined as codes but no backend reports them yet.
 
 ## Features
 
@@ -63,7 +70,7 @@ map.as_mut_slice().fill(0.0);
 
 // Image tensors take a required CpuAccess declaration — see below.
 let frame = Tensor::<u8>::image(1920, 1080, PixelFormat::Rgba,
-                                Some(TensorMemory::Dma), CpuAccess::None)?;
+                                Some(TensorMemory::DmaBuf), CpuAccess::None)?;
 
 // Share via file descriptor (Linux DMA-BUF / POSIX shm).
 #[cfg(target_os = "linux")]
@@ -130,7 +137,7 @@ imx8mp.
 On macOS and Android the GL backend renders into the platform GPU buffer
 directly, so it has no need of PBOs. Probe with `is_gpu_buffer_available()`
 rather than the per-platform probes when all you need to know is whether
-`TensorMemory::Dma` will work.
+`TensorMemory::DmaBuf` will work.
 
 ## Feature Flags
 
@@ -273,13 +280,13 @@ for the full aliasing rules, DMA-BUF import path, and drop-order contract.
 ### C API
 
 ```c
-if (hal_is_cuda_available()) {
-    void *map = hal_tensor_cuda_map(tensor);
+if (ef_is_cuda_available()) {
+    void *map = ef_tensor_cuda_map(tensor);
     if (map) {
         size_t size   = 0;
-        void *dev_ptr = hal_tensor_cuda_device_ptr(map, &size);
+        void *dev_ptr = ef_tensor_cuda_device_ptr(map, &size);
         trt_enqueue(dev_ptr, size);
-        hal_tensor_cuda_unmap(map);  // must call before next convert()
+        ef_tensor_cuda_unmap(map);  // must call before next convert()
     }
 }
 ```
@@ -287,9 +294,9 @@ if (hal_is_cuda_available()) {
 ### Python
 
 ```python
-import edgefirst_hal as ef
+from edgefirst.tensor import is_cuda_available
 
-if ef.is_cuda_available():
+if is_cuda_available():
     cm = dst.cuda_map()          # returns CudaMap or None
     if cm is not None:
         with cm:                 # context manager — unmap on __exit__

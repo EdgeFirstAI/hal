@@ -3,20 +3,48 @@
 
 use crate::{
     error::{Error, Result},
-    TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
+    TensorMemory, TensorTrait,
 };
-use log::{debug, trace, warn};
+use log::{debug, trace};
 use nix::{sys::stat::fstat, unistd::ftruncate};
 use num_traits::Num;
 use std::{
-    ffi::c_void,
     fmt,
     num::NonZero,
-    ops::{Deref, DerefMut},
     os::fd::{AsRawFd, OwnedFd},
     ptr::NonNull,
-    sync::{Arc, Mutex},
 };
+
+/// Derive a [`crate::BufferIdentity`] for a POSIX shm segment from its fd's
+/// `(st_dev, st_ino)`, mirroring dma-buf's treatment: it survives `dup` (so
+/// `clone_fd`/`from_fd` importing a producer's fd yields the same identity),
+/// which is what lets a downstream GL import cache recognize the same buffer
+/// handed off between independently-linked copies of this crate.
+///
+/// That key is only usable where the platform actually populates it. Probed
+/// directly on this host (macOS 27, both with and without an intervening
+/// `shm_unlink`): `fstat` on a `shm_open` fd always reports `(st_dev,
+/// st_ino) = (0, 0)` -- Darwin's POSIX shm objects are not real vnodes with
+/// stable inode numbers. Using that pair unconditionally would collapse
+/// every live shm segment to ONE identity there, which is the exact defect
+/// this derivation exists to prevent. When the stat pair is all-zero, fall
+/// back to the raw fd number: it carries no cross-process meaning, but it
+/// IS unique among this process's currently-open fds (the same
+/// close/reuse hazard as any process-local key -- a pointer, a GL name --
+/// mitigated the same way per `IdentityKind`'s doc), which is what a
+/// same-process import cache actually needs.
+// `st_dev`/`st_ino` are `i32`/`u64` on Darwin but `u64`/`u64` on Linux, so
+// exactly one of these casts is a clippy::unnecessary_cast on any given
+// platform; both are needed for the expression to compile on both.
+#[allow(clippy::unnecessary_cast)]
+fn identity_from_stat(fd: &OwnedFd, stat: &nix::sys::stat::FileStat) -> crate::BufferIdentity {
+    if stat.st_dev == 0 && stat.st_ino == 0 {
+        return crate::BufferIdentity::derived(crate::IdentityKind::HostPtr, fd.as_raw_fd() as u64);
+    }
+    let key = ((stat.st_dev as u64) << 32) ^ (stat.st_ino as u64);
+    crate::BufferIdentity::derived(crate::IdentityKind::Shm, key)
+}
+
 #[derive(Debug)]
 pub struct ShmTensor<T>
 where
@@ -69,7 +97,7 @@ where
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )?;
         if let Err(e) = nix::sys::mman::shm_unlink(name) {
-            warn!("Failed to unlink shared memory: {e}");
+            log::warn!("Failed to unlink shared memory: {e}");
         }
         Ok(shm_fd)
     }
@@ -109,6 +137,8 @@ where
         };
         let shm_fd = Self::alloc_anon_fd(name.as_str())?;
         ftruncate(&shm_fd, byte_size as i64)?;
+        let stat = fstat(&shm_fd)?;
+        let identity = identity_from_stat(&shm_fd, &stat);
         Ok(ShmTensor::<T> {
             name,
             fd: shm_fd,
@@ -116,26 +146,32 @@ where
             offset: 0,
             byte_len: byte_size,
             _marker: std::marker::PhantomData,
-            identity: crate::BufferIdentity::new(),
+            identity,
         })
     }
 
     /// Map exposing `byte_size` bytes via `as_slice()` for self-allocated
     /// strided tensors whose rows are padded. The caller (`Tensor::map`)
     /// validates `byte_size <= capacity_bytes()` first.
-    pub(crate) fn map_with_byte_size(
+    pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,
         access: crate::CpuAccess,
-    ) -> Result<TensorMap<T>> {
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_inner(Some(byte_size), access)
     }
 
-    fn map_inner(
+    fn map_inner<'a>(
         &self,
         byte_size_override: Option<usize>,
         access: crate::CpuAccess,
-    ) -> Result<TensorMap<T>> {
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         let exposed = byte_size_override.unwrap_or_else(|| self.size());
         // Map the whole segment from fd offset 0 and apply `self.offset` in
         // `ShmMap::as_slice` — mmap cannot take a non-page-aligned fd offset,
@@ -171,16 +207,16 @@ where
         };
 
         trace!("Mapping shared memory: {ptr:?}");
-        let shm_ptr = ShmPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?);
-        Ok(TensorMap::Shm(ShmMap {
-            ptr: Arc::new(Mutex::new(shm_ptr)),
-            shape: self.shape.clone(),
-            offset: self.offset,
-            mmap_size,
+        let base = NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?;
+        let owner = std::sync::Arc::new(crate::pin::MmapOwner::new(base, mmap_size));
+        let data = unsafe { owner.base().add(self.offset) };
+        let len = mmap_size - self.offset;
+        Ok(crate::view::HostView::new(
+            crate::pin::HostPin::new(owner, data, len),
+            self.shape.clone(),
             byte_size_override,
-            writable: access.writes(),
-            _marker: std::marker::PhantomData,
-        }))
+            access,
+        ))
     }
 }
 
@@ -205,6 +241,7 @@ where
         ftruncate(&shm_fd, size as i64)?;
         let stat = fstat(&shm_fd)?;
         debug!("Shared memory stat: {stat:?}");
+        let identity = identity_from_stat(&shm_fd, &stat);
 
         Ok(ShmTensor::<T> {
             name: name.to_owned(),
@@ -213,7 +250,7 @@ where
             offset: 0,
             byte_len: size,
             _marker: std::marker::PhantomData,
-            identity: crate::BufferIdentity::new(),
+            identity,
         })
     }
 
@@ -227,10 +264,13 @@ where
             return Err(Error::InvalidSize(0));
         }
 
-        // The true logical length of an externally shared segment is unknown
-        // here; `fstat` is the only signal (exact on Linux, page-rounded on
-        // macOS). Fall back to the declared `size` when it is unavailable.
-        let byte_len = fstat(&fd).map(|s| s.st_size as usize).unwrap_or(size);
+        // One fstat serves two purposes below: byte_len (the true logical
+        // length of an externally shared segment is otherwise unknown --
+        // exact on Linux, page-rounded on macOS) and this tensor's identity,
+        // mirroring dma-buf's from_fd.
+        let stat = fstat(&fd)?;
+        let byte_len = stat.st_size as usize;
+        let identity = identity_from_stat(&fd, &stat);
 
         Ok(ShmTensor {
             name: name.unwrap_or("").to_owned(),
@@ -239,7 +279,7 @@ where
             offset: 0,
             byte_len,
             _marker: std::marker::PhantomData,
-            identity: crate::BufferIdentity::new(),
+            identity,
         })
     }
 
@@ -276,7 +316,10 @@ where
         Ok(())
     }
 
-    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+    fn map_with<'a>(&self, access: crate::CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         self.map_inner(None, access)
     }
 
@@ -354,6 +397,55 @@ where
     }
 }
 
+impl<T> ShmTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Establish a persistent host mapping over this segment.
+    ///
+    /// Unlike [`map_with`](TensorTrait::map_with) the mapping is owned by the
+    /// returned pin rather than by a guard, so the address stays valid for as
+    /// long as the pin lives. SHM is plain CPU memory, so there is no sync to
+    /// bracket — [`Tensor::sync_for_cpu`](crate::Tensor::sync_for_cpu) is a
+    /// documented no-op here.
+    pub(crate) fn host_pin<'a>(&self) -> crate::Result<crate::pin::HostPin<'a>>
+    where
+        T: 'a,
+    {
+        // Map the whole segment from fd offset 0 and apply `self.offset`
+        // afterwards: mmap cannot take a non-page-aligned fd offset, and this
+        // mirrors what map_with already does.
+        let mmap_size = self.capacity_bytes();
+        let size = NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?;
+        let ptr = unsafe {
+            nix::sys::mman::mmap(
+                None,
+                size,
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                nix::sys::mman::MapFlags::MAP_SHARED,
+                &self.fd,
+                0,
+            )?
+        };
+        let base = NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?;
+        let owner = std::sync::Arc::new(crate::pin::MmapOwner::new(base, mmap_size));
+
+        // Offset-adjusted, so a sub-region view hands back its own window
+        // rather than the raw mmap base.
+        if self.offset > mmap_size {
+            return Err(Error::InsufficientCapacity {
+                needed: self.offset,
+                capacity: mmap_size,
+            });
+        }
+        let data = unsafe { owner.base().add(self.offset) };
+        // Everything addressable from this tensor's offset; Tensor::pin_host
+        // narrows to the logical extent.
+        let len = mmap_size - self.offset;
+        Ok(crate::pin::HostPin::new(owner, data, len))
+    }
+}
+
 impl<T> AsRawFd for ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -363,118 +455,33 @@ where
     }
 }
 
-#[derive(Debug)]
-pub struct ShmMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    ptr: Arc<Mutex<ShmPtr>>,
-    shape: Vec<usize>,
-    /// Byte offset into the mmap'd segment where this map's window begins
-    /// (non-zero for sub-region views). `as_slice()` returns `base + offset`.
-    offset: usize,
-    /// Bytes actually mmap'd (the whole segment). `unmap()` munmaps exactly
-    /// this, independent of the logical `offset`/`len()` window.
-    mmap_size: usize,
-    /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
-    /// (the full padded window) instead of `shape.product()`.
-    byte_size_override: Option<usize>,
-    /// Whether mutable access is permitted (`map_read()` maps are not).
-    /// The mmap itself stays PROT_READ|PROT_WRITE (protection narrowing is
-    /// a follow-up); this enforces the API contract uniformly.
-    writable: bool,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<T> Deref for ShmMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    type Target = [T];
-
-    fn deref(&self) -> &[T] {
-        self.as_slice()
-    }
-}
-
-impl<T> DerefMut for ShmMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn deref_mut(&mut self) -> &mut [T] {
-        self.as_mut_slice()
-    }
-}
-
-#[derive(Debug)]
-struct ShmPtr(NonNull<c_void>);
-impl Deref for ShmPtr {
-    type Target = NonNull<c_void>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-unsafe impl Send for ShmPtr {}
-
-impl<T> TensorMapTrait<T> for ShmMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-
-    fn len(&self) -> usize {
-        match self.byte_size_override {
-            Some(bytes) => bytes / std::mem::size_of::<T>(),
-            None => self.shape.iter().product(),
-        }
-    }
-
-    fn unmap(&mut self) {
-        let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
-        // Munmap the whole mmap'd segment (`mmap_size`), not the logical window
-        // — `offset` only shifts where `as_slice()` reads, not the mapping.
-        let err = unsafe { nix::sys::mman::munmap(**ptr, self.mmap_size) };
-        if let Err(e) = err {
-            warn!("Failed to unmap shared memory: {e}");
-        }
-    }
-
-    fn as_slice(&self) -> &[T] {
-        let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
-        let base = unsafe { (ptr.as_ptr() as *const u8).add(self.offset) as *const T };
-        unsafe { std::slice::from_raw_parts(base, self.len()) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [T] {
-        crate::assert_map_writable(self.writable, "Shm");
-        let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
-        let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
-        unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
-    }
-}
-
-impl<T> Drop for ShmMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn drop(&mut self) {
-        trace!("ShmMap dropped, unmapping memory");
-        self.unmap();
-    }
-}
-
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::{TensorMapTrait, TensorMemory, TensorTrait};
+    use crate::TensorMapTrait;
+    use crate::{TensorMemory, TensorTrait};
+
+    /// Android's bionic libc has no POSIX shared memory, so `ShmTensor::new`
+    /// reports `NotImplemented` there (see the module docs). These tests
+    /// allocate, so they cannot run on that platform — skip loudly rather
+    /// than unwrapping a documented failure.
+    ///
+    /// Probing beats `cfg(target_os = "android")`: it also covers a host where
+    /// /dev/shm is absent or unwritable, which looks identical from here.
+    fn shm_or_skip(what: &str) -> bool {
+        if crate::is_shm_available() {
+            return true;
+        }
+        log::warn!("SKIPPED: {what} - SHM allocation unavailable on this platform");
+        false
+    }
 
     #[test]
     fn test_new_valid_shape() {
+        if !shm_or_skip("test_new_valid_shape") {
+            return;
+        }
         let tensor = ShmTensor::<u8>::new(&[2, 3, 4], None).unwrap();
         assert_eq!(tensor.shape(), &[2, 3, 4]);
         assert_eq!(tensor.memory(), TensorMemory::Shm);
@@ -484,6 +491,9 @@ mod tests {
 
     #[test]
     fn test_map_read_write() {
+        if !shm_or_skip("test_map_read_write") {
+            return;
+        }
         let tensor = ShmTensor::<u8>::new(&[4, 4], None).unwrap();
         let mut map = tensor.map().unwrap();
         map.as_mut_slice()[0] = 10;
@@ -495,6 +505,9 @@ mod tests {
 
     #[test]
     fn test_from_fd_roundtrip() {
+        if !shm_or_skip("test_from_fd_roundtrip") {
+            return;
+        }
         // Create tensor A and write data into it.
         let tensor_a = ShmTensor::<u8>::new(&[2, 4], None).unwrap();
         {
@@ -515,6 +528,9 @@ mod tests {
 
     #[test]
     fn test_reshape() {
+        if !shm_or_skip("test_reshape") {
+            return;
+        }
         let mut tensor = ShmTensor::<u8>::new(&[3, 4], None).unwrap();
         tensor.reshape(&[12]).unwrap();
         assert_eq!(tensor.shape(), &[12]);
@@ -524,5 +540,51 @@ mod tests {
         let result = tensor.reshape(&[7]);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::ShapeMismatch(_)));
+    }
+
+    #[test]
+    fn two_shm_tensors_do_not_share_an_identity() {
+        if !shm_or_skip("two_shm_tensors_do_not_share_an_identity") {
+            return;
+        }
+        let a = ShmTensor::<u8>::new(&[8], None).unwrap();
+        let b = ShmTensor::<u8>::new(&[8], None).unwrap();
+        // `Shm` where the platform's fstat gives a real inode (Linux); the
+        // `HostPtr`-tagged fd-number fallback where it does not (confirmed
+        // on macOS -- see `identity_from_stat`'s doc). Either way two
+        // distinct segments must not collide.
+        assert!(matches!(
+            a.buffer_identity().kind(),
+            crate::IdentityKind::Shm | crate::IdentityKind::HostPtr
+        ));
+        assert_ne!(a.buffer_identity().id(), b.buffer_identity().id());
+    }
+
+    #[test]
+    fn a_dup_of_the_same_shm_segment_has_the_same_identity() {
+        if !shm_or_skip("a_dup_of_the_same_shm_segment_has_the_same_identity") {
+            return;
+        }
+        // `from_fd` on a dup'd fd is what a cross-library import does. If dup
+        // changed the identity, every such import would miss the GL cache --
+        // the measured blocker this derivation exists to fix (mirrors the
+        // dma-buf test in `crates/tensor/tests/identity.rs`). This property
+        // only holds where the identity is keyed on the real `(st_dev,
+        // st_ino)` -- `dup` preserves the inode, but not the fd number the
+        // `HostPtr` fallback keys on where the platform's fstat gives no
+        // usable inode (see `identity_from_stat`'s doc). Skip loudly rather
+        // than asserting a property this platform cannot provide.
+        let a = ShmTensor::<u8>::new(&[8], None).unwrap();
+        if a.buffer_identity().kind() != crate::IdentityKind::Shm {
+            println!(
+                "SKIP: a_dup_of_the_same_shm_segment_has_the_same_identity - \
+                 this platform's fstat gives no usable shm inode, so identity \
+                 falls back to the fd number (see identity_from_stat)"
+            );
+            return;
+        }
+        let dup_fd = a.clone_fd().unwrap();
+        let dup = ShmTensor::<u8>::from_fd(dup_fd, &[8], None).unwrap();
+        assert_eq!(a.buffer_identity().id(), dup.buffer_identity().id());
     }
 }

@@ -1301,7 +1301,7 @@ impl CPUProcessor {
         let buf = map.as_mut_slice();
         super::guard_plane(buf.len(), stride, rows, row_bytes, "swizzle dst")?;
         for row in buf.chunks_mut(stride).take(rows) {
-            for chunk in row[..row_bytes].chunks_exact_mut(4) {
+            for chunk in row[..row_bytes].as_chunks_mut::<4>().0 {
                 chunk.swap(0, 2);
             }
         }

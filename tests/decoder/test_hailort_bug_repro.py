@@ -11,7 +11,7 @@ Mirrors the exact tensor-passing pattern that
      validator's `_prepare_raw_outputs` returns.
   3. Apply the in-place `x[:, [0, 2]] /= width` normalization in the
      same 3-dim-fancy-index style `check_normalized_boxes` uses.
-  4. Instantiate `edgefirst_hal.Tensor(shape, dtype).from_numpy(view)`
+  4. Instantiate `ef.Tensor(shape, dtype).from_numpy(view)`
      and pass to `decoder.decode(...)` exactly as the validator does.
   5. Check each surviving detection's mask was rendered from the
      mask_coef row at its own anchor index.
@@ -23,8 +23,8 @@ mask-to-detection index swap would flip the rendered mean by
 
 from __future__ import annotations
 
+import edgefirst.decoder as ef
 import numpy as np
-import edgefirst_hal
 
 
 def _build_combined_detection_tensor(
@@ -144,21 +144,21 @@ def test_hailort_validator_pattern_preserves_mask_detection_pairing():
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(
+    decoder = ef.Decoder(
         hal_metadata,
         score_threshold=0.5,
         iou_threshold=0.5,
-        nms=edgefirst_hal.Nms.ClassAgnostic,
+        nms=ef.Nms.ClassAgnostic,
     )
 
     # Pass tensors via from_numpy exactly like validator's
     # process_yolo_hal at runners/core.py:795-804.
-    det_tensor = edgefirst_hal.Tensor(list(detection.shape), dtype="float32")
+    det_tensor = ef.Tensor(list(detection.shape), dtype="float32")
     det_tensor.from_numpy(detection)
-    proto_tensor = edgefirst_hal.Tensor(list(protos.shape), dtype="float32")
+    proto_tensor = ef.Tensor(list(protos.shape), dtype="float32")
     proto_tensor.from_numpy(protos)
 
-    boxes, scores, classes, masks = decoder.decode(
+    boxes, _scores, _classes, masks = decoder.decode(
         [det_tensor, proto_tensor], max_boxes=100
     )
     assert len(boxes) == target_count, (
@@ -224,15 +224,15 @@ def test_hailort_validator_pattern_with_tensor_cache_across_frames():
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(
+    decoder = ef.Decoder(
         hal_metadata,
         score_threshold=0.5,
         iou_threshold=0.5,
-        nms=edgefirst_hal.Nms.ClassAgnostic,
+        nms=ef.Nms.ClassAgnostic,
     )
     # Cache-style reuse: allocate once, from_numpy each frame.
-    det_tensor = edgefirst_hal.Tensor([1, feat, total_anchors], dtype="float32")
-    proto_tensor = edgefirst_hal.Tensor([1, nm, 160, 160], dtype="float32")
+    det_tensor = ef.Tensor([1, feat, total_anchors], dtype="float32")
+    proto_tensor = ef.Tensor([1, nm, 160, 160], dtype="float32")
 
     protos = np.zeros((1, nm, 160, 160), dtype=np.float32)
     for k in range(nm):
@@ -306,7 +306,7 @@ def test_hailort_validator_pattern_with_tensor_cache_across_frames():
             parts, normalize_boxes=True, model_input=(width, height)
         )
         det_tensor.from_numpy(detection)
-        boxes, scores, classes, masks = decoder.decode(
+        boxes, _scores, _classes, masks = decoder.decode(
             [det_tensor, proto_tensor], max_boxes=100
         )
         assert len(boxes) == 10, (
@@ -447,17 +447,17 @@ def test_hailort_validator_pattern_dense_realistic_mask_coefs_match_numpy_refere
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(
+    decoder = ef.Decoder(
         hal_metadata,
         score_threshold=0.5,
         iou_threshold=0.5,
-        nms=edgefirst_hal.Nms.ClassAgnostic,
+        nms=ef.Nms.ClassAgnostic,
     )
-    det_tensor = edgefirst_hal.Tensor(list(detection.shape), dtype="float32")
+    det_tensor = ef.Tensor(list(detection.shape), dtype="float32")
     det_tensor.from_numpy(detection)
-    proto_tensor = edgefirst_hal.Tensor(list(protos.shape), dtype="float32")
+    proto_tensor = ef.Tensor(list(protos.shape), dtype="float32")
     proto_tensor.from_numpy(protos)
-    boxes, scores, classes, masks = decoder.decode(
+    boxes, _scores, _classes, masks = decoder.decode(
         [det_tensor, proto_tensor], max_boxes=100
     )
     assert len(boxes) == len(targets)
@@ -576,17 +576,17 @@ def test_hailort_validator_pattern_contiguous_control():
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(
+    decoder = ef.Decoder(
         hal_metadata,
         score_threshold=0.5,
         iou_threshold=0.5,
-        nms=edgefirst_hal.Nms.ClassAgnostic,
+        nms=ef.Nms.ClassAgnostic,
     )
-    det_tensor = edgefirst_hal.Tensor(list(detection.shape), dtype="float32")
+    det_tensor = ef.Tensor(list(detection.shape), dtype="float32")
     det_tensor.from_numpy(detection)
-    proto_tensor = edgefirst_hal.Tensor(list(protos.shape), dtype="float32")
+    proto_tensor = ef.Tensor(list(protos.shape), dtype="float32")
     proto_tensor.from_numpy(protos)
-    boxes, scores, classes, masks = decoder.decode(
+    boxes, _scores, _classes, masks = decoder.decode(
         [det_tensor, proto_tensor], max_boxes=100
     )
     assert len(boxes) == 10

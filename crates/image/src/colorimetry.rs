@@ -85,6 +85,11 @@ pub(crate) fn yuv_range(r: ColorRange) -> yuv::YuvRange {
 /// ```
 /// For limited range the luma gain is 255/219 and chroma scale 255/224; for
 /// full range both are 1.0.
+// Only the GL backend consumes these: they are *in-shader* coefficients.
+// Without `opengl` the struct and its constructor are genuinely dead, and
+// `--no-default-features` builds under `-D warnings` fail without this.
+// The unit tests below keep exercising it in every configuration.
+#[cfg_attr(not(feature = "opengl"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct YuvToRgbCoeffs {
     pub y_offset: f32,
@@ -97,6 +102,7 @@ pub(crate) struct YuvToRgbCoeffs {
 
 /// Compute the in-shader YUV→RGB coefficients for a resolved
 /// `(ColorEncoding, ColorRange)`. Pure; platform-neutral.
+#[cfg_attr(not(feature = "opengl"), allow(dead_code))]
 pub(crate) fn yuv_to_rgb_coeffs(encoding: ColorEncoding, range: ColorRange) -> YuvToRgbCoeffs {
     // Luma weights (kr, kb) and range swings come from the canonical source in
     // `edgefirst_tensor::colorimetry` so the GL coefficients stay in lockstep

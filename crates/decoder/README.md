@@ -16,9 +16,8 @@ side of the EdgeFirst HAL workspace:
 - Depends on [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) for reading model output buffers.
 - Optionally depends on [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) (feature `tracker`) for `decode_tracked()`.
 - Consumed by [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — its `DetectBox`, `Segmentation`, and proto-data outputs feed the `draw_decoded_masks` / `draw_proto_masks` / `draw_masks_tracked` rendering APIs.
-- Re-exported from [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) as `edgefirst_hal::decoder`.
-- Bridged to C via [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) (cbindgen-generated C ABI).
-- Bridged to Python via [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) (PyO3 binding over the Rust umbrella crate; does not go through the C ABI).
+- Bridged to C via [`edgefirst-decoder-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/) (`libedgefirst_decoder`, `edgefirst/decoder.h`).
+- Bridged to Python via [`crates/python-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-decoder/).
 
 ## Supported Models
 
