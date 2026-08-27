@@ -59,6 +59,7 @@ FILTER="${FILTER:-}"
 REMOTE_DIR="${REMOTE_DIR:-/tmp/hal-ontarget}"
 SYNC_TESTDATA="${SYNC_TESTDATA:-1}"
 RESULTS="${ROOT}/target/on-target-results"
+readonly RULE='============================================================'
 
 if [[ $# -gt 0 ]]; then
   TARGETS=("$@")
@@ -78,7 +79,7 @@ USAGE
   exit 2
 fi
 
-ssh_q() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$@"; }
+ssh_q() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$@"; return "$?"; }
 
 mkdir -p "${RESULTS}"
 
@@ -162,7 +163,11 @@ print(f"    {len(set(out))} test binaries")
 PY
 }
 
-list_for_arch() { echo "${RESULTS}/bins-$1.txt"; }
+list_for_arch() {
+  local arch="$1"
+  echo "${RESULTS}/bins-${arch}.txt"
+  return 0
+}
 
 # The five C-API libraries + the G3 two-library-user binary (single-tensor-
 # home, task 12 / G8): `on-target-test.sh` deployed Rust test binaries only
@@ -252,7 +257,10 @@ build_libs_for() {
 # Always the plain repo `target` dir (see build_libs_for's own comment for
 # why) -- kept as a function, matching list_for_arch's shape, rather than a
 # bare constant, so both build steps read symmetrically at their call sites.
-list_libdir_for_arch() { echo "target"; }
+list_libdir_for_arch() {
+  echo "target"
+  return 0
+}
 
 for arch in aarch64 x86_64; do
   needed=0
@@ -270,10 +278,10 @@ overall=0
 for i in "${!OK_HOSTS[@]}"; do
   target="${OK_HOSTS[$i]}"; arch="${OK_ARCH[$i]}"; caps="${OK_CAPS[$i]}"
   echo
-  echo "============================================================"
+  echo "${RULE}"
   echo "==> ${target}   (${arch})"
   echo "    ${caps}"
-  echo "============================================================"
+  echo "${RULE}"
 
   listfile="$(list_for_arch "${arch}")"
 
@@ -427,14 +435,14 @@ done
 # Matrix
 # ---------------------------------------------------------------------------
 echo
-echo "============================================================"
+echo "${RULE}"
 printf "%-20s %-12s %-8s %s\n" "HOST" "RESULT" "ARCH" "DETAIL"
 echo "------------------------------------------------------------"
 for row in "${SUMMARY[@]}"; do
   IFS='|' read -r b r a d <<< "${row}"
   printf "%-20s %-12s %-8s %s\n" "$b" "$r" "$a" "$d"
 done
-echo "============================================================"
+echo "${RULE}"
 echo "A skipped test is not a passed test. Check each host's"
 echo "capabilities.txt to attribute skips to a missing device node."
 echo "logs: ${RESULTS}"

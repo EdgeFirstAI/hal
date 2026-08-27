@@ -25,12 +25,12 @@ for l in tensor image codec decoder tracker; do INCS="${INCS} -Icrates/${l}-capi
 for dup in crates/image-capi/include/edgefirst/detect.h \
            crates/decoder-capi/include/edgefirst/detect.h \
            crates/tracker-capi/include/edgefirst/detect.h; do
-  if [ -e "${dup}" ]; then
+  if [[ -e "${dup}" ]]; then
     echo "FAIL ${dup} duplicates crates/decoder-abi/include/edgefirst/detect.h"
     fails=$((fails+1))
   fi
 done
-if [ ! -s crates/decoder-abi/include/edgefirst/detect.h ]; then
+if [[ ! -s crates/decoder-abi/include/edgefirst/detect.h ]]; then
   echo "FAIL crates/decoder-abi/include/edgefirst/detect.h is missing or empty -- cannot measure"
   fails=$((fails+1))
 fi
@@ -49,7 +49,7 @@ fi
 ran_link=0
 for l in tensor image codec decoder tracker; do
   h="crates/${l}-capi/include/edgefirst/${l}.h"
-  if [ ! -s "${h}" ] || [ ! -r "${h}" ]; then
+  if [[ ! -s "${h}" ]] || [[ ! -r "${h}" ]]; then
     echo "FAIL ${h} is missing, empty, or unreadable -- cannot measure"
     fails=$((fails+1))
     continue
@@ -62,7 +62,7 @@ for l in tensor image codec decoder tracker; do
     || { echo "FAIL ${h} as C++17"; fails=$((fails+1)); }
 
   src="crates/${l}-capi/tests/c/test_link_and_run.c"
-  if [ ! -f "${src}" ]; then
+  if [[ ! -f "${src}" ]]; then
     echo "FAIL ${l}: no ${src} -- link-and-run cannot be measured for this library"
     fails=$((fails+1))
     continue
@@ -71,7 +71,7 @@ for l in tensor image codec decoder tracker; do
     Darwin) so="${LIBDIR}/libedgefirst_${l}.dylib" ;;
     *) so="${LIBDIR}/libedgefirst_${l}.so" ;;
   esac
-  if [ ! -s "${so}" ] || [ ! -r "${so}" ]; then
+  if [[ ! -s "${so}" ]] || [[ ! -r "${so}" ]]; then
     echo "FAIL ${l}: ${so} is missing, empty, or unreadable -- cannot link"
     fails=$((fails+1))
     continue
@@ -96,10 +96,10 @@ done
 # silently skipped every library (e.g. every `[ -f "${src}" ]` check failing
 # open) would also leave `fails` at 0. `ran_link` is independent of pass/fail
 # outcome and must be exactly 5 (one per library) for this run to count.
-if [ "${ran_link}" -ne 5 ]; then
+if [[ "${ran_link}" -ne 5 ]]; then
   echo "FAIL: only ${ran_link}/5 libraries were actually linked and run -- cannot measure the rest"
   fails=$((fails+1))
 fi
 
-[ "${fails}" -eq 0 ] && { echo "ALL HEADERS COMPILE AND ALL LIBRARIES RUN"; exit 0; }
+[[ "${fails}" -eq 0 ]] && { echo "ALL HEADERS COMPILE AND ALL LIBRARIES RUN"; exit 0; }
 echo "${fails} FAILURE(S)"; exit 1

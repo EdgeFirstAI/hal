@@ -795,6 +795,67 @@ fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool)
     is_software_renderer && !override_enabled
 }
 
+fn parse_nv_path_pref() -> NvPathPref {
+    match std::env::var("EDGEFIRST_NV_CONVERT_PATH") {
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "sampler" | "external" | "a" => NvPathPref::ForceSampler,
+            "shader" | "r8" | "b" => NvPathPref::ForceShader,
+            "auto" | "" => NvPathPref::Auto,
+            other => {
+                log::warn!(
+                    "EDGEFIRST_NV_CONVERT_PATH={other:?} not recognised \
+                     (expected sampler|shader|auto), using auto"
+                );
+                NvPathPref::Auto
+            }
+        },
+        Err(_) => NvPathPref::Auto,
+    }
+}
+
+fn parse_colorimetry_env() -> Option<crate::ColorimetryMode> {
+    match std::env::var("EDGEFIRST_COLORIMETRY") {
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "exact" => Some(crate::ColorimetryMode::Exact),
+            "fast" => Some(crate::ColorimetryMode::Fast),
+            "" => None,
+            other => {
+                log::warn!(
+                    "EDGEFIRST_COLORIMETRY={other:?} not recognised \
+                     (expected fast|exact), ignoring"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+fn apply_forced_transfer(backend: &mut TransferBackend) {
+    let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER") else {
+        return;
+    };
+    let forced = match val.to_ascii_lowercase().as_str() {
+        "dmabuf" | "dma" => Some(TransferBackend::DmaBuf),
+        "pbo" => Some(TransferBackend::Pbo),
+        "sync" => Some(TransferBackend::Sync),
+        other => {
+            log::warn!(
+                "EDGEFIRST_FORCE_TRANSFER={other:?} not recognised \
+                 (expected dmabuf|pbo|sync), ignoring"
+            );
+            None
+        }
+    };
+    if let Some(forced) = forced {
+        log::info!(
+            "EDGEFIRST_FORCE_TRANSFER override: {:?} → {forced:?}",
+            backend
+        );
+        *backend = forced;
+    }
+}
+
 /// GL_RENDERER-derived driver traits that feed per-driver policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RendererTraits {
@@ -1244,21 +1305,7 @@ impl GLProcessorST {
         // colorimetry-exact in-shader ShaderR8 path; `sampler`/`shader` force a
         // path for benchmarking / platform bring-up (an impossible force warns
         // and falls back). Mirrors the EDGEFIRST_FORCE_TRANSFER idiom below.
-        let nv_path_pref = match std::env::var("EDGEFIRST_NV_CONVERT_PATH") {
-            Ok(v) => match v.to_ascii_lowercase().as_str() {
-                "sampler" | "external" | "a" => NvPathPref::ForceSampler,
-                "shader" | "r8" | "b" => NvPathPref::ForceShader,
-                "auto" | "" => NvPathPref::Auto,
-                other => {
-                    log::warn!(
-                        "EDGEFIRST_NV_CONVERT_PATH={other:?} not recognised \
-                         (expected sampler|shader|auto), using auto"
-                    );
-                    NvPathPref::Auto
-                }
-            },
-            Err(_) => NvPathPref::Auto,
-        };
+        let nv_path_pref = parse_nv_path_pref();
         if nv_path_pref != NvPathPref::Auto {
             log::info!("EDGEFIRST_NV_CONVERT_PATH override: {nv_path_pref:?}");
         }
@@ -1267,21 +1314,7 @@ impl GLProcessorST {
         // processor's lifetime (set_colorimetry_mode logs and keeps it);
         // otherwise the config default is Fast (issue #106 policy) and
         // `set_colorimetry_mode` may change it.
-        let colorimetry_env = match std::env::var("EDGEFIRST_COLORIMETRY") {
-            Ok(v) => match v.to_ascii_lowercase().as_str() {
-                "exact" => Some(crate::ColorimetryMode::Exact),
-                "fast" => Some(crate::ColorimetryMode::Fast),
-                "" => None,
-                other => {
-                    log::warn!(
-                        "EDGEFIRST_COLORIMETRY={other:?} not recognised \
-                         (expected fast|exact), ignoring"
-                    );
-                    None
-                }
-            },
-            Err(_) => None,
-        };
+        let colorimetry_env = parse_colorimetry_env();
         if let Some(mode) = colorimetry_env {
             log::info!("EDGEFIRST_COLORIMETRY override: {mode:?}");
         }
@@ -1432,27 +1465,7 @@ impl GLProcessorST {
 
         // Allow env-var override for benchmarking specific transfer paths.
         // Values: "dmabuf", "pbo", "sync" (case-insensitive).
-        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER") {
-            let forced = match val.to_ascii_lowercase().as_str() {
-                "dmabuf" | "dma" => Some(TransferBackend::DmaBuf),
-                "pbo" => Some(TransferBackend::Pbo),
-                "sync" => Some(TransferBackend::Sync),
-                other => {
-                    log::warn!(
-                        "EDGEFIRST_FORCE_TRANSFER={other:?} not recognised \
-                         (expected dmabuf|pbo|sync), ignoring"
-                    );
-                    None
-                }
-            };
-            if let Some(backend) = forced {
-                log::info!(
-                    "EDGEFIRST_FORCE_TRANSFER override: {:?} → {backend:?}",
-                    converter.gl_context.transfer_backend
-                );
-                converter.gl_context.transfer_backend = backend;
-            }
-        }
+        apply_forced_transfer(&mut converter.gl_context.transfer_backend);
 
         log::debug!(
             "GLConverter created (transfer={:?})",

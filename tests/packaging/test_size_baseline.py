@@ -23,8 +23,10 @@ def test_baseline_script_emits_required_keys(tmp_path):
     out = tmp_path / "b.json"
     subprocess.run(["bash", "scripts/size_baseline.sh", str(out)], check=True)
     data = json.loads(out.read_text())
-    assert "artifacts" in data and "wheels" in data
-    assert data["commit"] and data["rustc"]
+    assert "artifacts" in data
+    assert "wheels" in data
+    assert data["commit"]
+    assert data["rustc"]
 
 
 @pytest.mark.skipif(

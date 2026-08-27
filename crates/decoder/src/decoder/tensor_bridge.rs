@@ -217,7 +217,7 @@ fn map_quantized_tensors(outputs: &[&TensorDyn]) -> Result<MappedOutputs, Decode
 pub(super) fn quantized_views(
     maps: &[QuantizedMap],
 ) -> Result<Vec<ArrayViewDQuantized<'_>>, DecoderError> {
-    maps.iter().map(|m| m.as_view()).collect()
+    maps.iter().map(QuantizedMap::as_view).collect()
 }
 
 /// Convert a slice of `HostView<'static, f16>` into `ArrayViewD<f16>` views.

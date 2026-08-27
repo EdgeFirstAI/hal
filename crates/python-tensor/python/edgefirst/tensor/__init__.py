@@ -7,7 +7,7 @@ every sibling.
 
 from typing import Optional, Protocol
 
-from ._tensor import *  # noqa: F403
+from ._tensor import *
 from ._tensor import __doc__  # noqa: F401
 
 

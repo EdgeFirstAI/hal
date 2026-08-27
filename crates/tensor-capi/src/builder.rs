@@ -303,7 +303,7 @@ unsafe fn cstr(p: *const c_char) -> Option<String> {
         if p.is_null() {
             return None;
         }
-        CStr::from_ptr(p).to_str().ok().map(|s| s.to_string())
+        CStr::from_ptr(p).to_str().ok().map(str::to_string)
     }
 }
 

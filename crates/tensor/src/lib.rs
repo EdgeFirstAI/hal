@@ -4805,6 +4805,188 @@ where
 }
 
 #[cfg(feature = "static")]
+fn map_strided_host_view<'a, T>(
+    tensor: &Tensor<T>,
+    stride: usize,
+    access: CpuAccess,
+) -> Result<crate::view::HostView<'a, T>>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync + 'a,
+{
+    // Rows sit at `stride`-byte spacing. The row count is the first
+    // shape dim for packed `[H, W, C]` and semi-planar `[H*k, W]`,
+    // but planar `[C, H, W]` stacks C planes of H rows — its surface
+    // row count is `C × H` (`shape[0]` alone would expose a 3-row
+    // window and truncate the map; first hit by Android planar-F16
+    // AHardwareBuffers, whose gralloc pads the pitch — macOS/Linux
+    // planar pitches happen to be naturally aligned so no stride was
+    // ever recorded there).
+    let rows = strided_map_rows(tensor)?;
+    let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
+        Error::InvalidOperation(format!(
+            "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
+        ))
+    })?;
+    map_strided_storage(tensor, stride, rows, total_bytes, access)
+}
+
+#[cfg(feature = "static")]
+fn strided_map_rows<T>(tensor: &Tensor<T>) -> Result<usize>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    match tensor.format.map(|f| f.layout()) {
+        Some(PixelLayout::Planar) => {
+            let s = tensor.shape();
+            if s.len() < 2 {
+                return Err(Error::InvalidOperation(
+                    "Tensor::map: strided planar mapping requires [C, H, W] shape".into(),
+                ));
+            }
+            s[0].checked_mul(s[1]).ok_or_else(|| {
+                Error::InvalidOperation(format!(
+                    "Tensor::map: planar rows {} × {} overflows usize",
+                    s[0], s[1]
+                ))
+            })
+        }
+        _ => tensor.shape().first().copied().ok_or_else(|| {
+            Error::InvalidOperation(
+                "Tensor::map: strided mapping requires a non-empty shape".into(),
+            )
+        }),
+    }
+}
+
+#[cfg(feature = "static")]
+fn map_strided_storage<'a, T>(
+    tensor: &Tensor<T>,
+    _stride: usize,
+    _rows: usize,
+    total_bytes: usize,
+    access: CpuAccess,
+) -> Result<crate::view::HostView<'a, T>>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync + 'a,
+{
+    match &tensor.storage {
+        #[cfg(target_os = "linux")]
+        TensorStorage::Dma(dma) => {
+            // `set_row_stride()` only validates `stride >= min_stride`,
+            // not that `stride × rows` fits the DMA-BUF, so re-check
+            // here — mapping past `buf_size` would SIGBUS on access.
+            // `buf_size` is real kernel truth either way, not the
+            // importer's say-so: for a self-allocated tensor it is
+            // the allocation size; for an imported one it is
+            // `fstat`-derived when the kernel reports a usable size
+            // (`DmaTensor::from_fd`), or the declared logical size in
+            // the rare fallback -- either way an out-of-range mmap
+            // against the real dma-buf is still rejected by the
+            // kernel, so this bound stays sound regardless.
+            let available_bytes = dma.buf_size.saturating_sub(dma.mmap_offset);
+            if total_bytes > available_bytes {
+                return Err(Error::InvalidOperation(format!(
+                    "Tensor::map: strided mapping needs {total_bytes} bytes \
+                     but DMA buffer only has {available_bytes} available \
+                     (buf_size={}, mmap_offset={}, stride={_stride}, rows={_rows}); \
+                     the row_stride was likely set larger than the original allocation",
+                    dma.buf_size, dma.mmap_offset
+                )));
+            }
+            dma.map_with_byte_size(total_bytes, access)
+        }
+        TensorStorage::Mem(mem) => {
+            let capacity = tensor.storage.capacity_bytes();
+            if total_bytes > capacity {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity,
+                });
+            }
+            mem.map_with_byte_size(total_bytes, access)
+        }
+        #[cfg(unix)]
+        TensorStorage::Shm(shm) => {
+            let capacity = tensor.storage.capacity_bytes();
+            if total_bytes > capacity {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity,
+                });
+            }
+            shm.map_with_byte_size(total_bytes, access)
+        }
+        // macOS/iOS: `TensorStorage::Dma` is the IOSurface. The lock yields
+        // the full surface base address, and the row pitch
+        // (`IOSurfaceGetBytesPerRow`) is known from the API for both
+        // self-allocated and imported surfaces — unlike a foreign
+        // DMA-BUF — so a strided CPU view is sound and zero-copy.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        TensorStorage::Dma(io) => {
+            // A sub-view's window is `buf_size − view_offset`; the strided
+            // span must fit the window, not the whole surface.
+            let available = io.buf_size.saturating_sub(io.view_offset);
+            if total_bytes > available {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity: available,
+                });
+            }
+            io.map_with_byte_size(total_bytes, access)
+        }
+        // Android: `TensorStorage::Dma` is the AHardwareBuffer. The lock
+        // yields the full buffer base address, and the row pitch is
+        // known from the allocator-filled descriptor — so a strided CPU
+        // view is sound and zero-copy, same as IOSurface.
+        #[cfg(target_os = "android")]
+        TensorStorage::Dma(ahb) => {
+            // A sub-view's window is `buf_size − view_offset`; the strided
+            // span must fit the window, not the whole buffer.
+            let available = ahb.buf_size.saturating_sub(ahb.view_offset);
+            if total_bytes > available {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity: available,
+                });
+            }
+            ahb.map_with_byte_size(total_bytes, access)
+        }
+        TensorStorage::Pbo(pbo) => {
+            // PBO: the GPU-side allocation may have a padded row stride
+            // (e.g. 64-byte aligned). Expose the full padded buffer so a
+            // CPU producer (JPEG decoder) and a strided convert source
+            // can iterate rows via `effective_row_stride()` without
+            // running past the slice — the logical `pbo.map()` view would
+            // stop after `shape.product()` and lose bytes past row 0.
+            // A sub-view's window is `capacity − view_offset`.
+            let available = pbo.capacity_bytes().saturating_sub(pbo.view_offset);
+            if total_bytes > available {
+                return Err(Error::InsufficientCapacity {
+                    needed: total_bytes,
+                    capacity: available,
+                });
+            }
+            pbo.map_with_byte_size(total_bytes, access)
+        }
+        // Every `TensorStorage` variant this build can construct is
+        // matched explicitly above (Mem/Shm/Dma/Pbo, each cfg-gated
+        // to the platforms it exists on) -- this catch-all exists
+        // only so the match stays exhaustive across every
+        // OS/cfg combination without a matching arm on every one of
+        // them, not because any variant is meant to fall through to
+        // it. `#[allow(unreachable_patterns)]` because on any given
+        // platform it genuinely is unreachable.
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::InvalidOperation(
+            "CPU mapping of strided tensors is supported only for HAL-allocated \
+             Mem/Shm (any platform), DMA (Linux, self-allocated or imported), \
+             IOSurface (macOS), and PBO"
+                .into(),
+        )),
+    }
+}
+
+#[cfg(feature = "static")]
 impl<T> TensorTrait<T> for Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -4971,158 +5153,7 @@ where
         // its real `bytesPerRow` from the OS regardless of who allocated it,
         // so there was never anything to distrust there.
         if let Some(stride) = self.row_stride {
-            // Rows sit at `stride`-byte spacing. The row count is the first
-            // shape dim for packed `[H, W, C]` and semi-planar `[H*k, W]`,
-            // but planar `[C, H, W]` stacks C planes of H rows — its surface
-            // row count is `C × H` (`shape[0]` alone would expose a 3-row
-            // window and truncate the map; first hit by Android planar-F16
-            // AHardwareBuffers, whose gralloc pads the pitch — macOS/Linux
-            // planar pitches happen to be naturally aligned so no stride was
-            // ever recorded there).
-            let rows = match self.format.map(|f| f.layout()) {
-                Some(PixelLayout::Planar) => {
-                    let s = self.shape();
-                    if s.len() < 2 {
-                        return Err(Error::InvalidOperation(
-                            "Tensor::map: strided planar mapping requires [C, H, W] shape".into(),
-                        ));
-                    }
-                    s[0].checked_mul(s[1]).ok_or_else(|| {
-                        Error::InvalidOperation(format!(
-                            "Tensor::map: planar rows {} × {} overflows usize",
-                            s[0], s[1]
-                        ))
-                    })?
-                }
-                _ => *self.shape().first().ok_or_else(|| {
-                    Error::InvalidOperation(
-                        "Tensor::map: strided mapping requires a non-empty shape".into(),
-                    )
-                })?,
-            };
-            let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
-                Error::InvalidOperation(format!(
-                    "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
-                ))
-            })?;
-
-            match &self.storage {
-                #[cfg(target_os = "linux")]
-                TensorStorage::Dma(dma) => {
-                    // `set_row_stride()` only validates `stride >= min_stride`,
-                    // not that `stride × rows` fits the DMA-BUF, so re-check
-                    // here — mapping past `buf_size` would SIGBUS on access.
-                    // `buf_size` is real kernel truth either way, not the
-                    // importer's say-so: for a self-allocated tensor it is
-                    // the allocation size; for an imported one it is
-                    // `fstat`-derived when the kernel reports a usable size
-                    // (`DmaTensor::from_fd`), or the declared logical size in
-                    // the rare fallback -- either way an out-of-range mmap
-                    // against the real dma-buf is still rejected by the
-                    // kernel, so this bound stays sound regardless.
-                    let available_bytes = dma.buf_size.saturating_sub(dma.mmap_offset);
-                    if total_bytes > available_bytes {
-                        return Err(Error::InvalidOperation(format!(
-                            "Tensor::map: strided mapping needs {total_bytes} bytes \
-                             but DMA buffer only has {available_bytes} available \
-                             (buf_size={}, mmap_offset={}, stride={stride}, rows={rows}); \
-                             the row_stride was likely set larger than the original allocation",
-                            dma.buf_size, dma.mmap_offset
-                        )));
-                    }
-                    return dma.map_with_byte_size(total_bytes, access);
-                }
-                TensorStorage::Mem(mem) => {
-                    let capacity = self.storage.capacity_bytes();
-                    if total_bytes > capacity {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity,
-                        });
-                    }
-                    return mem.map_with_byte_size(total_bytes, access);
-                }
-                #[cfg(unix)]
-                TensorStorage::Shm(shm) => {
-                    let capacity = self.storage.capacity_bytes();
-                    if total_bytes > capacity {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity,
-                        });
-                    }
-                    return shm.map_with_byte_size(total_bytes, access);
-                }
-                // macOS/iOS: `TensorStorage::Dma` is the IOSurface. The lock yields
-                // the full surface base address, and the row pitch
-                // (`IOSurfaceGetBytesPerRow`) is known from the API for both
-                // self-allocated and imported surfaces — unlike a foreign
-                // DMA-BUF — so a strided CPU view is sound and zero-copy.
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                TensorStorage::Dma(io) => {
-                    // A sub-view's window is `buf_size − view_offset`; the strided
-                    // span must fit the window, not the whole surface.
-                    let available = io.buf_size.saturating_sub(io.view_offset);
-                    if total_bytes > available {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity: available,
-                        });
-                    }
-                    return io.map_with_byte_size(total_bytes, access);
-                }
-                // Android: `TensorStorage::Dma` is the AHardwareBuffer. The lock
-                // yields the full buffer base address, and the row pitch is
-                // known from the allocator-filled descriptor — so a strided CPU
-                // view is sound and zero-copy, same as IOSurface.
-                #[cfg(target_os = "android")]
-                TensorStorage::Dma(ahb) => {
-                    // A sub-view's window is `buf_size − view_offset`; the strided
-                    // span must fit the window, not the whole buffer.
-                    let available = ahb.buf_size.saturating_sub(ahb.view_offset);
-                    if total_bytes > available {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity: available,
-                        });
-                    }
-                    return ahb.map_with_byte_size(total_bytes, access);
-                }
-                TensorStorage::Pbo(pbo) => {
-                    // PBO: the GPU-side allocation may have a padded row stride
-                    // (e.g. 64-byte aligned). Expose the full padded buffer so a
-                    // CPU producer (JPEG decoder) and a strided convert source
-                    // can iterate rows via `effective_row_stride()` without
-                    // running past the slice — the logical `pbo.map()` view would
-                    // stop after `shape.product()` and lose bytes past row 0.
-                    // A sub-view's window is `capacity − view_offset`.
-                    let available = pbo.capacity_bytes().saturating_sub(pbo.view_offset);
-                    if total_bytes > available {
-                        return Err(Error::InsufficientCapacity {
-                            needed: total_bytes,
-                            capacity: available,
-                        });
-                    }
-                    return pbo.map_with_byte_size(total_bytes, access);
-                }
-                // Every `TensorStorage` variant this build can construct is
-                // matched explicitly above (Mem/Shm/Dma/Pbo, each cfg-gated
-                // to the platforms it exists on) -- this catch-all exists
-                // only so the match stays exhaustive across every
-                // OS/cfg combination without a matching arm on every one of
-                // them, not because any variant is meant to fall through to
-                // it. `#[allow(unreachable_patterns)]` because on any given
-                // platform it genuinely is unreachable.
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(Error::InvalidOperation(
-                        "CPU mapping of strided tensors is supported only for HAL-allocated \
-                         Mem/Shm (any platform), DMA (Linux, self-allocated or imported), \
-                         IOSurface (macOS), and PBO"
-                            .into(),
-                    ));
-                }
-            }
+            return map_strided_host_view(self, stride, access);
         }
         // Offset tensors are supported for storages that apply the offset
         // inside their own `map()`: DMA (`DmaMap`/IOSurface adjust the mapped

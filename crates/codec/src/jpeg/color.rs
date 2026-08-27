@@ -182,7 +182,7 @@ unsafe fn ycbcr_half_neon(
     core::arch::aarch64::uint8x8_t,
     core::arch::aarch64::uint8x8_t,
 ) {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::*; // NOSONAR
     let c128 = vdupq_n_s16(128);
     let cb2 = vshlq_n_s16::<1>(vsubq_s16(cbv, c128));
     let cr2 = vshlq_n_s16::<1>(vsubq_s16(crv, c128));
@@ -200,7 +200,7 @@ unsafe fn ycbcr_half_neon(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn ycbcr_to_rgb_row_neon(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize) {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::*; // NOSONAR
 
     let mut i = 0usize;
     while i + 16 <= n {
@@ -252,7 +252,7 @@ unsafe fn ycbcr_to_rgb_block8_neon(
     y0: usize,
     rows: usize,
 ) {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::*; // NOSONAR
     for r in 0..rows {
         let src = r * 8;
         let (rv, gv, bv) = ycbcr_half_neon(
@@ -281,7 +281,7 @@ unsafe fn ycbcr_to_rgb_block16_neon(
     y: usize,
     rows: usize,
 ) {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::*; // NOSONAR
     for r in 0..rows {
         let src = r * 8;
         let yq = vcombine_u8(vld1_u8(y0.as_ptr().add(src)), vld1_u8(y1.as_ptr().add(src)));

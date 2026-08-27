@@ -8,8 +8,9 @@ import sys
 
 import numpy as np
 import pytest
-from tests.dma_skip import image_or_skip_dma, tensor_or_skip_dma
 from edgefirst.tensor import PixelFormat, Tensor, TensorMemory
+
+from tests.dma_skip import image_or_skip_dma, tensor_or_skip_dma
 
 # fmt: off
 DTYPE_PARAMS = [
@@ -67,7 +68,9 @@ def test_dtype(dtype, size, fmt, itemsize, val1, val2):
 )
 def test_from_fd_dma():
     try:
-        tensor = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
+        tensor = tensor_or_skip_dma(
+            [100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF
+        )
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
 
@@ -95,7 +98,9 @@ def test_from_fd_dma():
 )
 def test_dma_zero_copy_perf():
     try:
-        tensor = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
+        tensor = tensor_or_skip_dma(
+            [100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF
+        )
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
 
@@ -861,8 +866,9 @@ def test_map_read_refuses_a_writable_buffer_request():
 
     with t.map("read") as view:
         assert len(bytearray(view)) > 0  # read path still works
+        writable_request = io.BytesIO(payload)
         with pytest.raises((BufferError, TypeError)):
-            io.BytesIO(payload).readinto(view)
+            writable_request.readinto(view)
 
     with t.map("readwrite") as view:
         assert io.BytesIO(payload).readinto(view) == len(payload)
@@ -918,10 +924,8 @@ def test_setitem_on_a_read_map_raises_a_catchable_error(mem):
     `except Exception` would not catch it and a frame loop would die."""
     t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     m = t.map("read")
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(Exception, match="read-only"):
         m[0] = 7
-    assert "read-only" in str(excinfo.value)
-    assert isinstance(excinfo.value, Exception)
 
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])

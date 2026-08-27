@@ -58,7 +58,7 @@ def test_concurrent_setter_during_decode_raises_not_corrupts():
         try:
             while not stop.is_set():
                 decoder.decode(model_output)
-        except Exception as e:  # pragma: no cover - diagnostic only
+        except Exception as e:  # noqa: BLE001  # pragma: no cover - diagnostic only
             decode_errors.append(e)
             stop.set()
 

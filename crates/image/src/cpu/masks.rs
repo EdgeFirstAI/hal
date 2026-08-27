@@ -1943,7 +1943,7 @@ fn dot_i8_scalar(coeff: &[i8], proto: &[i8], n: usize) -> i32 {
 #[inline(always)]
 unsafe fn dot_i8_neon_base(coeff: *const i8, proto: *const i8, n: usize) -> i32 {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
         let mut acc = vdupq_n_s32(0);
         let full_chunks = n / 16;
         let mut offset = 0usize;
@@ -1982,7 +1982,7 @@ unsafe fn dot_i8_neon_base(coeff: *const i8, proto: *const i8, n: usize) -> i32 
 #[inline(always)]
 unsafe fn dot_i8_neon_dotprod(coeff: *const i8, proto: *const i8, n: usize) -> i32 {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
         let mut acc = vdupq_n_s32(0);
         let full_chunks = n / 16;
         let mut offset = 0usize;
@@ -2041,7 +2041,7 @@ fn dot_i16_i8_scalar(coeff: &[i16], proto: &[i8], n: usize) -> i32 {
 #[inline(always)]
 unsafe fn dot_i16_i8_neon(coeff: *const i16, proto: *const i8, n: usize) -> i32 {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
         let mut acc = vdupq_n_s32(0);
         let full_chunks = n / 8;
         let mut offset = 0usize;

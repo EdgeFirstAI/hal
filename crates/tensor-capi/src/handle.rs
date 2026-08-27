@@ -681,7 +681,7 @@ pub unsafe extern "C" fn ef_tensor_name(t: *const EfTensor) -> *mut c_char {
         };
         let name = inner.name().replace('\0', "?");
         CString::new(name)
-            .map(|s| s.into_raw())
+            .map(CString::into_raw)
             .unwrap_or(std::ptr::null_mut())
     }))
     .unwrap_or(std::ptr::null_mut())

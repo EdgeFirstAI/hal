@@ -123,123 +123,7 @@ fn restore_descriptor_metadata(
     };
     if let Some(fmt) = format {
         t.set_format(fmt)?;
-
-        // Restore the producer's physical row pitch (the row dimension
-        // convention documented on `protocol::from_parts`) so a decode
-        // that reconfigures this import within its allocation --
-        // `configure_image`'s pool-reuse path -- keeps writing at the
-        // producer's real stride instead of recomputing a tighter one
-        // that only fits today's logical shape. Without this, `capacity`
-        // alone is not enough: `configure_image` only *prefers* a prior
-        // stride when one is recorded, so a fresh import with no stride
-        // still picks a freshly-computed (and possibly narrower) pitch.
-        //
-        // `HOST` and `DMABUF`. Historical note: restoring a stride for an
-        // imported `DMABUF` used to be actively harmful -- `Tensor::map`'s
-        // strided path rejected any imported (non-self-allocated) DMA-BUF
-        // outright, so recording one here would have made a foreign
-        // DMA-BUF's CPU map fail with `InvalidOperation`. That was fixed
-        // at the map site instead (a strided imported DMA-BUF is now
-        // accepted there, bounds-checked against `buf_size` exactly like
-        // a self-allocated one is -- `fstat`-derived kernel truth when
-        // the kernel reports a usable size, the declared logical size in
-        // the rare fallback, and either way an out-of-range mmap is still
-        // rejected by the kernel), which is what makes restoring it here
-        // safe: the same argument that justified loosening `Tensor::map`
-        // applies verbatim to the value being restored here -- it is
-        // bounds-checked again by `set_row_stride`'s caller
-        // (`configure_image`, later) and by `Tensor::map` itself at write
-        // time, so an oversized or malformed producer-reported stride
-        // cannot cause an OOB write even though it is trusted without
-        // independent verification.
-        // Confirmed load-bearing, not just anticipated: a pool-sized
-        // (oversized) DMA-BUF-backed destination decoding a smaller
-        // image lost its real pitch without this, recomputing a
-        // tighter one instead -- silent misalignment for any GPU
-        // consumer reading at the true (wider) physical pitch.
-        //
-        // `IOSURFACE` is not included: nothing has reported this gap for
-        // it, and unlike `DMABUF` its CPU-mapping was never restricted by
-        // `is_imported` in the first place, so there is no known-broken
-        // case pulling it in yet. The same argument would apply if one
-        // surfaces.
-        if matches!(
-            desc.kind,
-            crate::protocol::kind::HOST | crate::protocol::kind::DMABUF
-        ) {
-            let row_dim = match fmt.layout() {
-                crate::PixelLayout::Planar if desc.ndim as usize >= 3 => 1,
-                _ => 0,
-            };
-            if desc.ndim as usize >= 2 {
-                // `strides` is signed to leave room for a future flip
-                // (negative stride); nothing produces one today, and
-                // `set_row_stride` has no way to express it, so a
-                // negative value here is simply skipped rather than
-                // reinterpreted as a huge unsigned pitch.
-                if let Some(&stride_bytes) = desc.strides().get(row_dim) {
-                    if let Ok(stride_bytes) = usize::try_from(stride_bytes) {
-                        // `set_row_stride` enforces only a minimum
-                        // (`stride >= min_stride`); it explicitly does no
-                        // size validation, by design (it is pure layout
-                        // metadata, reused by `strides_follow_row_stride
-                        // _not_shape`-style tests that never touch a real
-                        // allocation). Import is not that case: `desc` is
-                        // an untrusted cross-package payload, and an
-                        // oversized stride here would otherwise be
-                        // caught only downstream, by whichever consumer
-                        // happens to multiply it out first
-                        // (`Tensor::map`'s strided path, or
-                        // `configure_image`'s own capacity check). The
-                        // multiply below is checked -- the descriptor's
-                        // stride is untrusted input, so it must not wrap
-                        // into a small-looking value that passes a
-                        // capacity comparison it should fail.
-                        //
-                        // `desc.strides()` is in bytes, so there is no
-                        // element->byte conversion here (and no second
-                        // multiply that could overflow) any more.
-                        let rows: usize = match fmt.layout() {
-                            crate::PixelLayout::Planar if shape.len() >= 2 => {
-                                shape[0].saturating_mul(shape[1])
-                            }
-                            _ => shape.first().copied().unwrap_or(0),
-                        };
-                        let capacity = t.capacity_bytes();
-                        match stride_bytes.checked_mul(rows) {
-                            Some(needed) if needed <= capacity => {
-                                if let Err(e) = t.set_row_stride(stride_bytes) {
-                                    log::warn!(
-                                        "import_descriptor: producer row_stride \
-                                             {stride_bytes} bytes rejected for {fmt:?} \
-                                             ({e}); keeping the freshly-imported tight \
-                                             pitch instead"
-                                    );
-                                }
-                            }
-                            Some(needed) => {
-                                log::warn!(
-                                    "import_descriptor: producer row_stride \
-                                         {stride_bytes} bytes × {rows} rows needs {needed} \
-                                         bytes, exceeding this import's capacity \
-                                         {capacity}; keeping the freshly-imported tight \
-                                         pitch instead of trusting an oversized descriptor"
-                                );
-                            }
-                            None => {
-                                log::warn!(
-                                    "import_descriptor: producer row_stride \
-                                         {stride_bytes} bytes × {rows} rows overflows \
-                                         usize computing bytes needed; keeping the \
-                                         freshly-imported tight pitch instead of trusting \
-                                         a malformed descriptor"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        restore_imported_row_stride(t, desc, shape, fmt);
     }
 
     // Colorimetry does not participate in `set_format`'s validation, so
@@ -252,4 +136,139 @@ fn restore_descriptor_metadata(
     });
 
     Ok(())
+}
+
+/// Restore the producer's physical row pitch (the row dimension
+/// convention documented on `protocol::from_parts`) so a decode
+/// that reconfigures this import within its allocation --
+/// `configure_image`'s pool-reuse path -- keeps writing at the
+/// producer's real stride instead of recomputing a tighter one
+/// that only fits today's logical shape. Without this, `capacity`
+/// alone is not enough: `configure_image` only *prefers* a prior
+/// stride when one is recorded, so a fresh import with no stride
+/// still picks a freshly-computed (and possibly narrower) pitch.
+///
+/// `HOST` and `DMABUF`. Historical note: restoring a stride for an
+/// imported `DMABUF` used to be actively harmful -- `Tensor::map`'s
+/// strided path rejected any imported (non-self-allocated) DMA-BUF
+/// outright, so recording one here would have made a foreign
+/// DMA-BUF's CPU map fail with `InvalidOperation`. That was fixed
+/// at the map site instead (a strided imported DMA-BUF is now
+/// accepted there, bounds-checked against `buf_size` exactly like
+/// a self-allocated one is -- `fstat`-derived kernel truth when
+/// the kernel reports a usable size, the declared logical size in
+/// the rare fallback, and either way an out-of-range mmap is still
+/// rejected by the kernel), which is what makes restoring it here
+/// safe: the same argument that justified loosening `Tensor::map`
+/// applies verbatim to the value being restored here -- it is
+/// bounds-checked again by `set_row_stride`'s caller
+/// (`configure_image`, later) and by `Tensor::map` itself at write
+/// time, so an oversized or malformed producer-reported stride
+/// cannot cause an OOB write even though it is trusted without
+/// independent verification.
+/// Confirmed load-bearing, not just anticipated: a pool-sized
+/// (oversized) DMA-BUF-backed destination decoding a smaller
+/// image lost its real pitch without this, recomputing a
+/// tighter one instead -- silent misalignment for any GPU
+/// consumer reading at the true (wider) physical pitch.
+///
+/// `IOSURFACE` is not included: nothing has reported this gap for
+/// it, and unlike `DMABUF` its CPU-mapping was never restricted by
+/// `is_imported` in the first place, so there is no known-broken
+/// case pulling it in yet. The same argument would apply if one
+/// surfaces.
+fn restore_imported_row_stride(
+    t: &mut TensorDyn,
+    desc: &TensorDesc,
+    shape: &[usize],
+    fmt: crate::PixelFormat,
+) {
+    if !matches!(
+        desc.kind,
+        crate::protocol::kind::HOST | crate::protocol::kind::DMABUF
+    ) {
+        return;
+    }
+    let row_dim = match fmt.layout() {
+        crate::PixelLayout::Planar if desc.ndim as usize >= 3 => 1,
+        _ => 0,
+    };
+    if (desc.ndim as usize) < 2 {
+        return;
+    }
+    // `strides` is signed to leave room for a future flip
+    // (negative stride); nothing produces one today, and
+    // `set_row_stride` has no way to express it, so a
+    // negative value here is simply skipped rather than
+    // reinterpreted as a huge unsigned pitch.
+    let Some(&stride_bytes) = desc.strides().get(row_dim) else {
+        return;
+    };
+    let Ok(stride_bytes) = usize::try_from(stride_bytes) else {
+        return;
+    };
+    // `set_row_stride` enforces only a minimum
+    // (`stride >= min_stride`); it explicitly does no
+    // size validation, by design (it is pure layout
+    // metadata, reused by `strides_follow_row_stride
+    // _not_shape`-style tests that never touch a real
+    // allocation). Import is not that case: `desc` is
+    // an untrusted cross-package payload, and an
+    // oversized stride here would otherwise be
+    // caught only downstream, by whichever consumer
+    // happens to multiply it out first
+    // (`Tensor::map`'s strided path, or
+    // `configure_image`'s own capacity check). The
+    // multiply below is checked -- the descriptor's
+    // stride is untrusted input, so it must not wrap
+    // into a small-looking value that passes a
+    // capacity comparison it should fail.
+    //
+    // `desc.strides()` is in bytes, so there is no
+    // element->byte conversion here (and no second
+    // multiply that could overflow) any more.
+    let rows: usize = match fmt.layout() {
+        crate::PixelLayout::Planar if shape.len() >= 2 => shape[0].saturating_mul(shape[1]),
+        _ => shape.first().copied().unwrap_or(0),
+    };
+    apply_imported_row_stride(t, fmt, stride_bytes, rows);
+}
+
+fn apply_imported_row_stride(
+    t: &mut TensorDyn,
+    fmt: crate::PixelFormat,
+    stride_bytes: usize,
+    rows: usize,
+) {
+    let capacity = t.capacity_bytes();
+    match stride_bytes.checked_mul(rows) {
+        Some(needed) if needed <= capacity => {
+            if let Err(e) = t.set_row_stride(stride_bytes) {
+                log::warn!(
+                    "import_descriptor: producer row_stride \
+                         {stride_bytes} bytes rejected for {fmt:?} \
+                         ({e}); keeping the freshly-imported tight \
+                         pitch instead"
+                );
+            }
+        }
+        Some(needed) => {
+            log::warn!(
+                "import_descriptor: producer row_stride \
+                     {stride_bytes} bytes × {rows} rows needs {needed} \
+                     bytes, exceeding this import's capacity \
+                     {capacity}; keeping the freshly-imported tight \
+                     pitch instead of trusting an oversized descriptor"
+            );
+        }
+        None => {
+            log::warn!(
+                "import_descriptor: producer row_stride \
+                     {stride_bytes} bytes × {rows} rows overflows \
+                     usize computing bytes needed; keeping the \
+                     freshly-imported tight pitch instead of trusting \
+                     a malformed descriptor"
+            );
+        }
+    }
 }

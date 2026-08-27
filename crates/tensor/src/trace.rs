@@ -116,7 +116,9 @@ impl std::error::Error for TracingError {}
 /// Returns [`TracingError::SubscriberInstallFailed`] if another tracing
 /// subscriber was installed by user code outside the HAL.
 pub fn start_tracing(path: &str) -> Result<(), TracingError> {
-    let mut lock = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lock = GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if lock.is_some() {
         return Err(TracingError::AlreadyActive);
     }
@@ -147,14 +149,19 @@ pub fn start_tracing(path: &str) -> Result<(), TracingError> {
 /// No-op if no session is active. After this call the trace file is complete
 /// and can be loaded into <https://ui.perfetto.dev/>.
 pub fn stop_tracing() {
-    let mut lock = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lock = GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Dropping the FlushGuard flushes remaining spans and closes the file.
     lock.take();
 }
 
 /// Returns `true` if a trace capture session is currently active.
 pub fn is_tracing_active() -> bool {
-    GUARD.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
 }
 
 #[cfg(test)]

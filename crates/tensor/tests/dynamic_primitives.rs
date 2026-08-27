@@ -1057,6 +1057,7 @@ fn view_region_distinguishes_out_of_bounds_from_every_other_refusal() {
 /// `dmabuf_clone` refuses a tensor that is not DMA-backed rather than
 /// handing back some other fd, and returns a real, independently-owned fd
 /// when it is.
+#[cfg(target_os = "linux")]
 #[test]
 fn dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd() {
     let host: TensorDyn = bare_u8(&[4, 4]).into();
@@ -1468,6 +1469,7 @@ fn a_retagged_pbo_still_resolves_its_buffer_id_vtable_and_map() {
 /// (`memory()`) and "give me the fd" (`dmabuf()`). Both are implemented on
 /// both backends with the same signature. This pins them together, because
 /// a caller needs both to hold before it can import.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask() {
     let dma = match Tensor::<u8>::new(&[64, 64], Some(TensorMemory::DmaBuf), None) {

@@ -107,16 +107,19 @@ def test_plan_tiles_counts_match_grid():
 
 def test_plan_tiles_rejects_bad_overlap():
     proc = ImageProcessor()
+    too_high = TilingConfig(640, 640, overlap=1.0)
     with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
-        proc.plan_tiles(1920, 1080, TilingConfig(640, 640, overlap=1.0))
+        proc.plan_tiles(1920, 1080, too_high)
+    too_low = TilingConfig(640, 640, overlap=-0.1)
     with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
-        proc.plan_tiles(1920, 1080, TilingConfig(640, 640, overlap=-0.1))
+        proc.plan_tiles(1920, 1080, too_low)
 
 
 def test_alloc_tile_batch_rejects_zero_tile_size():
     proc = ImageProcessor()
+    zero_tile = TilingConfig(0, 640)
     with pytest.raises(RuntimeError, match="tile size must be non-zero"):
-        proc.alloc_tile_batch(4, TilingConfig(0, 640))
+        proc.alloc_tile_batch(4, zero_tile)
 
 
 # --- GPU round-trip (gated) ----------------------------------------------

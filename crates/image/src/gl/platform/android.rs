@@ -68,7 +68,7 @@ const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 /// default linker search path. Leaked at first load to avoid
 /// dlclose-during-shutdown crashes (same pattern as Linux's `EGL_LIB` in
 /// `context.rs` and the macOS ANGLE loader).
-static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
+static EGL_LIB: OnceLock<&libloading::Library> = OnceLock::new();
 
 fn load_egl_lib() -> Result<&'static libloading::Library> {
     if let Some(lib) = EGL_LIB.get() {

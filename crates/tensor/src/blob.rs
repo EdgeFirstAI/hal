@@ -767,36 +767,9 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
     let fmt = t.format();
     // The addressing grid, not the allocation: for a subsampled format these
     // differ, and the blob carries the grid because extent comes from planes.
-    let shape: Vec<u64> = match fmt {
-        Some(f) => {
-            let (w, h) = image_dims(t, f)?;
-            f.addressing_shape(w, h)
-                .ok_or_else(|| {
-                    crate::Error::InvalidArgument(format!("no addressing shape for {f:?}"))
-                })?
-                .iter()
-                .map(|d| *d as u64)
-                .collect()
-        }
-        None => t.shape().iter().map(|d| *d as u64).collect(),
-    };
+    let shape = export_addressing_shape(t, fmt)?;
     let esz = t.dtype().size() as i64;
-    let strides: Vec<i64> = {
-        let mut acc = esz;
-        let mut v = vec![0i64; shape.len()];
-        for i in (0..shape.len()).rev() {
-            v[i] = acc;
-            acc *= shape[i] as i64;
-        }
-        if let (Some(rs), true) = (t.row_stride(), shape.len() >= 2) {
-            let row_dim = match fmt.map(|f| f.layout()) {
-                Some(crate::PixelLayout::Planar) if shape.len() >= 3 => 1,
-                _ => 0,
-            };
-            v[row_dim] = rs as i64;
-        }
-        v
-    };
+    let strides = export_c_strides(t, fmt, &shape, esz);
 
     let quant = t.quantization();
     let (quant_axis, scales, zeros): (i32, &[f32], &[i32]) = match quant {
@@ -819,21 +792,7 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
 
     // Plane geometry: from the format's table when this is an image, otherwise
     // a single plane spanning the whole allocation.
-    let geoms: Vec<crate::PlaneGeometry> = match fmt {
-        Some(f) => {
-            let (w, h) = image_dims(t, f)?;
-            let rs = t
-                .effective_row_stride()
-                .unwrap_or(w * f.channels() * esz as usize);
-            f.plane_table(w, h, rs)
-                .ok_or_else(|| crate::Error::InvalidArgument(format!("no plane table for {f:?}")))?
-        }
-        None => vec![crate::PlaneGeometry {
-            offset: 0,
-            stride: t.capacity_bytes() as u64,
-            size: t.capacity_bytes() as u64,
-        }],
-    };
+    let geoms = export_plane_geoms(t, fmt, esz)?;
 
     // Bytes, only when inlining. `pin_host` is the one read here; reference
     // mode performs no syscalls at all.
@@ -863,48 +822,7 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
     };
 
     let mut planes_buf = Vec::new();
-    for g in &geoms {
-        let data: &[u8] = match mode {
-            TransportMode::Inline => {
-                let start = g.offset as usize;
-                let end = start
-                    .checked_add(g.size as usize)
-                    .ok_or(crate::Error::InvalidSize(g.size as usize))?;
-                all_bytes
-                    .get(start..end)
-                    .ok_or(crate::Error::InvalidSize(end))?
-            }
-            TransportMode::Reference => &[],
-        };
-        write_plane(
-            &BlobPlane {
-                handle,
-                // Ignored when inline, and zeroed so the record cannot be
-                // misread as pointing into a handle it does not have.
-                offset: if mode == TransportMode::Inline {
-                    0
-                } else {
-                    g.offset
-                },
-                stride: g.stride,
-                // Inline: `size` describes `data`, per the schema's own rule.
-                size: if mode == TransportMode::Inline {
-                    data.len() as u64
-                } else {
-                    g.size
-                },
-                used: if mode == TransportMode::Inline {
-                    data.len() as u64
-                } else {
-                    g.size
-                },
-                modifier: 0,
-                handle_bytes: &[],
-                data,
-            },
-            &mut planes_buf,
-        );
-    }
+    write_export_planes(&geoms, mode, handle, all_bytes, &mut planes_buf)?;
 
     let strings_bytes = strings_encoded_len(&strings);
     let header = BlobHeader {
@@ -950,6 +868,121 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
     header.size = out.len() as u64;
     header.write_to(&mut out);
     Ok((out, fds))
+}
+
+fn export_addressing_shape(
+    t: &crate::TensorDyn,
+    fmt: Option<crate::PixelFormat>,
+) -> crate::Result<Vec<u64>> {
+    match fmt {
+        Some(f) => {
+            let (w, h) = image_dims(t, f)?;
+            Ok(f.addressing_shape(w, h)
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!("no addressing shape for {f:?}"))
+                })?
+                .iter()
+                .map(|d| *d as u64)
+                .collect())
+        }
+        None => Ok(t.shape().iter().map(|d| *d as u64).collect()),
+    }
+}
+
+fn export_c_strides(
+    t: &crate::TensorDyn,
+    fmt: Option<crate::PixelFormat>,
+    shape: &[u64],
+    esz: i64,
+) -> Vec<i64> {
+    let mut acc = esz;
+    let mut v = vec![0i64; shape.len()];
+    for i in (0..shape.len()).rev() {
+        v[i] = acc;
+        acc *= shape[i] as i64;
+    }
+    if let (Some(rs), true) = (t.row_stride(), shape.len() >= 2) {
+        let row_dim = match fmt.map(|f| f.layout()) {
+            Some(crate::PixelLayout::Planar) if shape.len() >= 3 => 1,
+            _ => 0,
+        };
+        v[row_dim] = rs as i64;
+    }
+    v
+}
+
+fn export_plane_geoms(
+    t: &crate::TensorDyn,
+    fmt: Option<crate::PixelFormat>,
+    esz: i64,
+) -> crate::Result<Vec<crate::PlaneGeometry>> {
+    match fmt {
+        Some(f) => {
+            let (w, h) = image_dims(t, f)?;
+            let rs = t
+                .effective_row_stride()
+                .unwrap_or(w * f.channels() * esz as usize);
+            f.plane_table(w, h, rs)
+                .ok_or_else(|| crate::Error::InvalidArgument(format!("no plane table for {f:?}")))
+        }
+        None => Ok(vec![crate::PlaneGeometry {
+            offset: 0,
+            stride: t.capacity_bytes() as u64,
+            size: t.capacity_bytes() as u64,
+        }]),
+    }
+}
+
+fn write_export_planes(
+    geoms: &[crate::PlaneGeometry],
+    mode: TransportMode,
+    handle: i64,
+    all_bytes: &[u8],
+    planes_buf: &mut Vec<u8>,
+) -> crate::Result<()> {
+    for g in geoms {
+        let data: &[u8] = match mode {
+            TransportMode::Inline => {
+                let start = g.offset as usize;
+                let end = start
+                    .checked_add(g.size as usize)
+                    .ok_or(crate::Error::InvalidSize(g.size as usize))?;
+                all_bytes
+                    .get(start..end)
+                    .ok_or(crate::Error::InvalidSize(end))?
+            }
+            TransportMode::Reference => &[],
+        };
+        write_plane(
+            &BlobPlane {
+                handle,
+                // Ignored when inline, and zeroed so the record cannot be
+                // misread as pointing into a handle it does not have.
+                offset: if mode == TransportMode::Inline {
+                    0
+                } else {
+                    g.offset
+                },
+                stride: g.stride,
+                // Inline: `size` describes `data`, per the schema's own rule.
+                size: if mode == TransportMode::Inline {
+                    data.len() as u64
+                } else {
+                    g.size
+                },
+                used: if mode == TransportMode::Inline {
+                    data.len() as u64
+                } else {
+                    g.size
+                },
+                modifier: 0,
+                handle_bytes: &[],
+                data,
+            },
+            planes_buf,
+        );
+    }
+    Ok(())
 }
 
 /// Recover an image's logical width and height from its allocation shape.
@@ -1040,33 +1073,8 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
     // All planes inline, or none. A frame mixing transport modes has no
     // coherent meaning: one storage_kind, pid and fence_fd cover every plane,
     // so half of them cannot be somewhere else.
-    let inline = planes.first().map(|p| p.is_inline()).unwrap_or(true);
-    if planes.iter().any(|p| p.is_inline() != inline) {
-        return Err(crate::Error::InvalidArgument(
-            "blob mixes inline and referenced planes; a tensor has one transport mode".into(),
-        ));
-    }
-    for p in &planes {
-        if p.is_inline() {
-            // The schemas validator's own rules, enforced on the way in too.
-            if p.size as usize != p.data.len() {
-                return Err(crate::Error::InvalidArgument(format!(
-                    "inline plane declares size {} but carries {} bytes",
-                    p.size,
-                    p.data.len()
-                )));
-            }
-            if p.modifier != 0 || !p.handle_bytes.is_empty() {
-                return Err(crate::Error::InvalidArgument(
-                    "inline plane must have modifier 0 and no handle_bytes".into(),
-                ));
-            }
-        } else if !p.data.is_empty() {
-            return Err(crate::Error::InvalidArgument(
-                "referenced plane must not also carry inline bytes".into(),
-            ));
-        }
-    }
+    let inline = planes.first().map(BlobPlane::is_inline).unwrap_or(true);
+    validate_import_planes(&planes, inline)?;
 
     let dtype = crate::protocol::dtype_to_dtype(h.dtype)
         .ok_or_else(|| crate::Error::NotImplemented(format!("blob dtype code {}", h.dtype)))?;
@@ -1090,87 +1098,7 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
         }
         #[cfg(unix)]
         {
-            // Reference mode. Every plane's `handle` is an index into `fds`, and
-            // the index is bounded before use: it arrived from an untrusted blob,
-            // and an out-of-range read here would hand an arbitrary descriptor to
-            // `dup`.
-            let first = planes.first().ok_or_else(|| {
-                crate::Error::InvalidArgument("referenced blob carries no planes".into())
-            })?;
-            let idx = usize::try_from(first.handle).map_err(|_| {
-                crate::Error::InvalidArgument(format!(
-                    "plane handle {} is not an index",
-                    first.handle
-                ))
-            })?;
-            let raw = *fds.get(idx).ok_or_else(|| {
-                crate::Error::InvalidArgument(format!(
-                    "plane handle indexes fd {idx} but only {} were provided",
-                    fds.len()
-                ))
-            })?;
-            for p in &planes {
-                let i = usize::try_from(p.handle).unwrap_or(usize::MAX);
-                if i >= fds.len() {
-                    return Err(crate::Error::InvalidArgument(format!(
-                        "plane handle indexes fd {i} but only {} were provided",
-                        fds.len()
-                    )));
-                }
-            }
-
-            let grid: Vec<usize> = v.shape().iter().map(|d| *d as usize).collect();
-            let alloc_shape: Vec<usize> = match format {
-                Some(f) => {
-                    let (w, h_px) = dims_from_grid(f, &grid)?;
-                    f.allocation_shape(w, h_px).ok_or_else(|| {
-                        crate::Error::InvalidShape(format!("no allocation shape for {f:?}"))
-                    })?
-                }
-                None => grid.clone(),
-            };
-
-            // The table entry is a PLATFORM handle, not universally a file
-            // descriptor: on Linux it is a dma-buf fd, on macOS an IOSurface ID.
-            // Dispatching on `storage_kind` rather than assuming an fd is required
-            // -- treating an IOSurface ID as an fd yields EBADF, which is how this
-            // gap was found.
-            let mut t = match crate::TensorMemory::from_code(h.storage_kind) {
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                Some(crate::TensorMemory::DmaBuf) | Some(crate::TensorMemory::IoSurface) => {
-                    let id = u32::try_from(raw).map_err(|_| {
-                        crate::Error::InvalidArgument(format!("{raw} is not an IOSurface id"))
-                    })?;
-                    crate::TensorDyn::from_iosurface_id(id, &alloc_shape, dtype, None)?
-                }
-                #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
-                Some(crate::TensorMemory::DmaBuf) | Some(crate::TensorMemory::Shm) => {
-                    use std::os::fd::{BorrowedFd, OwnedFd};
-                    // Import dups: the result is independent and the producer may
-                    // die immediately, which is what removes the keepalive protocol.
-                    // SAFETY: `raw` is live for this call -- the caller owns it and
-                    // has not yet closed its own copy. Borrow, never adopt.
-                    let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
-                    let owned: OwnedFd = borrowed
-                        .try_clone_to_owned()
-                        .map_err(crate::Error::IoError)?;
-                    crate::TensorDyn::from_fd(owned, &alloc_shape, dtype, None)?
-                }
-                other => {
-                    return Err(crate::Error::NotImplemented(format!(
-                        "reference-mode import for {other:?} on this platform"
-                    )))
-                }
-            };
-            if let Some(f) = format {
-                t.set_format(f)?;
-            }
-            if first.stride > 0 {
-                // The producer's pitch, which the shape alone cannot express.
-                let _ = t.set_row_stride(first.stride as usize);
-            }
-            t.set_colorimetry(colorimetry_from(&strings));
-            return Ok(t);
+            return import_referenced_blob(&v, &h, &planes, fds, format, &strings, dtype);
         }
     }
 
@@ -1178,15 +1106,7 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
     // carries; the buffer that backs it is larger for a subsampled format, and
     // sizing from the grid would undersize NV12 by a third.
     let grid: Vec<usize> = v.shape().iter().map(|d| *d as usize).collect();
-    let alloc_shape: Vec<usize> = match format {
-        Some(f) => {
-            let (w, h_px) = dims_from_grid(f, &grid)?;
-            f.allocation_shape(w, h_px).ok_or_else(|| {
-                crate::Error::InvalidShape(format!("no allocation shape for {f:?}"))
-            })?
-        }
-        None => grid.clone(),
-    };
+    let alloc_shape = alloc_shape_from_grid(format, &grid)?;
 
     let mut t = crate::TensorDyn::new(&alloc_shape, dtype, Some(crate::TensorMemory::Mem), None)?;
     if let Some(f) = format {
@@ -1197,44 +1117,7 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
     // zeroes `offset` on an inline plane (it names a position inside a handle
     // that is not being carried), so the layout is rebuilt from the plane
     // table rather than trusted from the wire.
-    {
-        let pin = t.pin_host(crate::CpuAccess::Write)?;
-        let dst = unsafe { std::slice::from_raw_parts_mut(pin.as_mut_ptr(), pin.len()) };
-        let geoms: Vec<crate::PlaneGeometry> = match format {
-            Some(f) => {
-                let (w, h_px) = dims_from_grid(f, &grid)?;
-                let rs = t
-                    .effective_row_stride()
-                    .unwrap_or(w * f.channels() * dtype.size());
-                f.plane_table(w, h_px, rs).ok_or_else(|| {
-                    crate::Error::InvalidShape(format!("no plane table for {f:?}"))
-                })?
-            }
-            None => vec![crate::PlaneGeometry {
-                offset: 0,
-                stride: dst.len() as u64,
-                size: dst.len() as u64,
-            }],
-        };
-        if geoms.len() != planes.len() {
-            return Err(crate::Error::InvalidArgument(format!(
-                "blob carries {} planes but {:?} has {}",
-                planes.len(),
-                format,
-                geoms.len()
-            )));
-        }
-        for (g, p) in geoms.iter().zip(&planes) {
-            let start = g.offset as usize;
-            let end = start
-                .checked_add(p.data.len())
-                .ok_or(crate::Error::InvalidSize(p.data.len()))?;
-            let slot = dst
-                .get_mut(start..end)
-                .ok_or(crate::Error::InvalidSize(end))?;
-            slot.copy_from_slice(p.data);
-        }
-    }
+    blit_inline_planes(&mut t, &planes, format, &grid, dtype)?;
 
     t.set_colorimetry(colorimetry_from(&strings));
     if h.quant_axis != -2 {
@@ -1257,6 +1140,184 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
         }
     }
     Ok(t)
+}
+
+fn validate_import_planes(planes: &[BlobPlane<'_>], inline: bool) -> crate::Result<()> {
+    if planes.iter().any(|p| p.is_inline() != inline) {
+        return Err(crate::Error::InvalidArgument(
+            "blob mixes inline and referenced planes; a tensor has one transport mode".into(),
+        ));
+    }
+    for p in planes {
+        if p.is_inline() {
+            // The schemas validator's own rules, enforced on the way in too.
+            if p.size as usize != p.data.len() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "inline plane declares size {} but carries {} bytes",
+                    p.size,
+                    p.data.len()
+                )));
+            }
+            if p.modifier != 0 || !p.handle_bytes.is_empty() {
+                return Err(crate::Error::InvalidArgument(
+                    "inline plane must have modifier 0 and no handle_bytes".into(),
+                ));
+            }
+        } else if !p.data.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "referenced plane must not also carry inline bytes".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn alloc_shape_from_grid(
+    format: Option<crate::PixelFormat>,
+    grid: &[usize],
+) -> crate::Result<Vec<usize>> {
+    match format {
+        Some(f) => {
+            let (w, h_px) = dims_from_grid(f, grid)?;
+            f.allocation_shape(w, h_px)
+                .ok_or_else(|| crate::Error::InvalidShape(format!("no allocation shape for {f:?}")))
+        }
+        None => Ok(grid.to_vec()),
+    }
+}
+
+#[cfg(unix)]
+fn import_referenced_blob(
+    v: &BlobView<'_>,
+    h: &BlobHeader,
+    planes: &[BlobPlane<'_>],
+    fds: &[BlobFd],
+    format: Option<crate::PixelFormat>,
+    strings: &BlobStrings<'_>,
+    dtype: crate::DType,
+) -> crate::Result<crate::TensorDyn> {
+    // Reference mode. Every plane's `handle` is an index into `fds`, and
+    // the index is bounded before use: it arrived from an untrusted blob,
+    // and an out-of-range read here would hand an arbitrary descriptor to
+    // `dup`.
+    let first = planes
+        .first()
+        .ok_or_else(|| crate::Error::InvalidArgument("referenced blob carries no planes".into()))?;
+    let idx = usize::try_from(first.handle).map_err(|_| {
+        crate::Error::InvalidArgument(format!("plane handle {} is not an index", first.handle))
+    })?;
+    let raw = *fds.get(idx).ok_or_else(|| {
+        crate::Error::InvalidArgument(format!(
+            "plane handle indexes fd {idx} but only {} were provided",
+            fds.len()
+        ))
+    })?;
+    for p in planes {
+        let i = usize::try_from(p.handle).unwrap_or(usize::MAX);
+        if i >= fds.len() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "plane handle indexes fd {i} but only {} were provided",
+                fds.len()
+            )));
+        }
+    }
+
+    let grid: Vec<usize> = v.shape().iter().map(|d| *d as usize).collect();
+    let alloc_shape = alloc_shape_from_grid(format, &grid)?;
+    let mut t = open_referenced_tensor(h.storage_kind, raw, &alloc_shape, dtype)?;
+    if let Some(f) = format {
+        t.set_format(f)?;
+    }
+    if first.stride > 0 {
+        // The producer's pitch, which the shape alone cannot express.
+        let _ = t.set_row_stride(first.stride as usize);
+    }
+    t.set_colorimetry(colorimetry_from(strings));
+    Ok(t)
+}
+
+#[cfg(unix)]
+fn open_referenced_tensor(
+    storage_kind: u32,
+    raw: BlobFd,
+    alloc_shape: &[usize],
+    dtype: crate::DType,
+) -> crate::Result<crate::TensorDyn> {
+    // The table entry is a PLATFORM handle, not universally a file
+    // descriptor: on Linux it is a dma-buf fd, on macOS an IOSurface ID.
+    // Dispatching on `storage_kind` rather than assuming an fd is required
+    // -- treating an IOSurface ID as an fd yields EBADF, which is how this
+    // gap was found.
+    match crate::TensorMemory::from_code(storage_kind) {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        Some(crate::TensorMemory::DmaBuf) | Some(crate::TensorMemory::IoSurface) => {
+            let id = u32::try_from(raw).map_err(|_| {
+                crate::Error::InvalidArgument(format!("{raw} is not an IOSurface id"))
+            })?;
+            crate::TensorDyn::from_iosurface_id(id, alloc_shape, dtype, None)
+        }
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+        Some(crate::TensorMemory::DmaBuf) | Some(crate::TensorMemory::Shm) => {
+            use std::os::fd::{BorrowedFd, OwnedFd};
+            // Import dups: the result is independent and the producer may
+            // die immediately, which is what removes the keepalive protocol.
+            // SAFETY: `raw` is live for this call -- the caller owns it and
+            // has not yet closed its own copy. Borrow, never adopt.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+            let owned: OwnedFd = borrowed
+                .try_clone_to_owned()
+                .map_err(crate::Error::IoError)?;
+            crate::TensorDyn::from_fd(owned, alloc_shape, dtype, None)
+        }
+        other => Err(crate::Error::NotImplemented(format!(
+            "reference-mode import for {other:?} on this platform"
+        ))),
+    }
+}
+
+fn blit_inline_planes(
+    t: &mut crate::TensorDyn,
+    planes: &[BlobPlane<'_>],
+    format: Option<crate::PixelFormat>,
+    grid: &[usize],
+    dtype: crate::DType,
+) -> crate::Result<()> {
+    let pin = t.pin_host(crate::CpuAccess::Write)?;
+    let dst = unsafe { std::slice::from_raw_parts_mut(pin.as_mut_ptr(), pin.len()) };
+    let geoms: Vec<crate::PlaneGeometry> = match format {
+        Some(f) => {
+            let (w, h_px) = dims_from_grid(f, grid)?;
+            let rs = t
+                .effective_row_stride()
+                .unwrap_or(w * f.channels() * dtype.size());
+            f.plane_table(w, h_px, rs)
+                .ok_or_else(|| crate::Error::InvalidShape(format!("no plane table for {f:?}")))?
+        }
+        None => vec![crate::PlaneGeometry {
+            offset: 0,
+            stride: dst.len() as u64,
+            size: dst.len() as u64,
+        }],
+    };
+    if geoms.len() != planes.len() {
+        return Err(crate::Error::InvalidArgument(format!(
+            "blob carries {} planes but {:?} has {}",
+            planes.len(),
+            format,
+            geoms.len()
+        )));
+    }
+    for (g, p) in geoms.iter().zip(planes) {
+        let start = g.offset as usize;
+        let end = start
+            .checked_add(p.data.len())
+            .ok_or(crate::Error::InvalidSize(p.data.len()))?;
+        let slot = dst
+            .get_mut(start..end)
+            .ok_or(crate::Error::InvalidSize(end))?;
+        slot.copy_from_slice(p.data);
+    }
+    Ok(())
 }
 
 /// Rebuild `Colorimetry` from the carried strings. An unrecognised value is

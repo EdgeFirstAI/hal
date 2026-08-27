@@ -21,6 +21,7 @@ import sys
 
 import pytest
 from edgefirst.tensor import PixelFormat, Tensor
+
 from tests.gpu_policy import skip_unless_gpu_backed
 
 
@@ -326,7 +327,8 @@ def test_decoder_accepts_foreign_tensor():
     t.from_numpy(raw)
 
     boxes, scores, _classes, _masks = dec.decode([t])
-    assert len(boxes) == 1 and float(np.asarray(scores)[0]) == pytest.approx(0.9)
+    assert len(boxes) == 1
+    assert float(np.asarray(scores)[0]) == pytest.approx(0.9)
 
 
 def test_decoder_decode_proto_accepts_foreign_tensor():
@@ -380,7 +382,8 @@ def test_decoder_decode_proto_accepts_foreign_tensor():
 
     boxes, scores, _classes, proto_data = dec.decode_proto([t_combined, t_protos])
     assert proto_data is not None
-    assert len(boxes) == 1 and float(np.asarray(scores)[0]) == pytest.approx(0.9)
+    assert len(boxes) == 1
+    assert float(np.asarray(scores)[0]) == pytest.approx(0.9)
 
 
 # --- Task 7: Decoder and ProtoData across packages ------------------------

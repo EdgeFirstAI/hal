@@ -130,13 +130,7 @@ SIBLING_C_LIBS = (
 
 def _wheel_extension(leaf: str) -> Path:
     name = f"edgefirst.{leaf}._{leaf}"
-    try:
-        mod = importlib.import_module(name)
-    except ImportError as exc:
-        pytest.fail(
-            f"{name} is not installed; packaging tests measure the built "
-            f"wheels, not `cargo tree -p edgefirst-python-*`: {exc}"
-        )
+    mod = importlib.import_module(name)
     path = Path(mod.__file__)
     if not path.is_file():
         pytest.fail(f"{name}.__file__ is not a file: {path}")

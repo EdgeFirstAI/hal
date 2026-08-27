@@ -13,7 +13,8 @@ mkdir -p "$(dirname "$OUT")"
 py() { command -v python3 >/dev/null && python3 "$@"; }
 
 deflate() {  # compressed size, i.e. what a user downloads
-    python3 -c "import sys,zlib;print(len(zlib.compress(open(sys.argv[1],'rb').read(),9)))" "$1"
+    local file="$1"
+    python3 -c "import sys,zlib;print(len(zlib.compress(open(sys.argv[1],'rb').read(),9)))" "$file"
 }
 
 printf '{\n  "artifacts": {\n' > "$OUT"
@@ -25,8 +26,8 @@ for f in \
     target/release/libedgefirst_decoder.so target/release/libedgefirst_decoder.dylib \
     target/release/libedgefirst_tracker.so target/release/libedgefirst_tracker.dylib
 do
-    [ -f "$f" ] || continue
-    [ $first -eq 1 ] || printf ',\n' >> "$OUT"
+    [[ -f "$f" ]] || continue
+    [[ $first -eq 1 ]] || printf ',\n' >> "$OUT"
     first=0
     printf '    "%s": {"raw": %s, "deflate": %s}' \
         "$(basename "$f")" \
@@ -35,8 +36,8 @@ done
 printf '\n  },\n  "wheels": {\n' >> "$OUT"
 first=1
 for w in target/wheels/*.whl; do
-    [ -e "$w" ] || continue
-    [ $first -eq 1 ] || printf ',\n' >> "$OUT"
+    [[ -e "$w" ]] || continue
+    [[ $first -eq 1 ]] || printf ',\n' >> "$OUT"
     first=0
     printf '    "%s": {"on_disk": %s, "uncompressed_so": %s}' \
         "$(basename "$w")" "$(wc -c < "$w" | tr -d ' ')" \

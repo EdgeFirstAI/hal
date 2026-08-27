@@ -1323,7 +1323,7 @@ fn downsample_uv_row_2x2(cb0: &[u8], cb1: &[u8], cr0: &[u8], cr1: &[u8], dst: &m
         // SAFETY: bounds asserted above; the loop reads 16 input bytes and
         // writes 16 output bytes per 8 pairs.
         unsafe {
-            use core::arch::aarch64::*;
+            use core::arch::aarch64::*; // NOSONAR
             while i + 8 <= n {
                 let s = i * 2;
                 // Pairwise-add within each row (u8→u16), add rows, then a
@@ -1378,7 +1378,7 @@ fn downsample_uv_row_v2(cb0: &[u8], cb1: &[u8], cr0: &[u8], cr1: &[u8], dst: &mu
     {
         // SAFETY: bounds asserted above.
         unsafe {
-            use core::arch::aarch64::*;
+            use core::arch::aarch64::*; // NOSONAR
             while i + 16 <= n {
                 // vhaddq: truncating halving add — matches (a+b)/2.
                 let b = vhaddq_u8(vld1q_u8(cb0.as_ptr().add(i)), vld1q_u8(cb1.as_ptr().add(i)));
@@ -1612,9 +1612,9 @@ unsafe fn interleave_uv_row_neon(cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize)
 #[target_feature(enable = "sse2")]
 unsafe fn interleave_uv_row_sse2(cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize) {
     #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
+    use core::arch::x86::*; // NOSONAR
     #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
+    use core::arch::x86_64::*; // NOSONAR
     let mut i = 0usize;
     while i + 16 <= n {
         let b = _mm_loadu_si128(cb.as_ptr().add(i) as *const __m128i);

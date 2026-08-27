@@ -32,7 +32,7 @@ fn artifact_is_fresh(artifact: &std::path::Path) -> bool {
     };
     let src_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
     let newest_src = std::fs::read_dir(src_dir).ok().and_then(|rd| {
-        rd.filter_map(|e| e.ok())
+        rd.filter_map(Result::ok)
             .filter_map(|e| e.metadata().ok())
             .filter_map(|m| m.modified().ok())
             .max()

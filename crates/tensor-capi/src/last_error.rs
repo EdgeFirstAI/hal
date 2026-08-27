@@ -162,7 +162,7 @@ pub unsafe extern "C" fn ef_tensor_last_error_message() -> *const c_char {
 /// rest of this ABI.
 #[no_mangle]
 pub unsafe extern "C" fn ef_tensor_last_error_class() -> u32 {
-    LAST_CLASS.with(|c| c.get()) as u32
+    LAST_CLASS.with(std::cell::Cell::get) as u32 // NOSONAR: C ABI is uint32_t; EfErrorClass is #[repr(u32)]
 }
 
 /// Runs the lazy hook install exactly once per process, on the first

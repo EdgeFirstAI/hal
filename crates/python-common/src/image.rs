@@ -927,7 +927,7 @@ impl PyImageProcessor {
         let mut _config = ImageProcessorConfig::default();
         #[cfg(target_os = "linux")]
         {
-            _config.egl_display = egl_display.map(|k| k.into());
+            _config.egl_display = egl_display.map(Into::into);
         }
         #[cfg(not(target_os = "linux"))]
         let _ = egl_display;

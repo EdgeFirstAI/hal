@@ -1775,6 +1775,11 @@ impl TensorDyn {
     /// Wrap a live `IOSurfaceRef` (macOS/iOS). Looks up the surface's
     /// `IOSurfaceID` and drives [`Self::from_iosurface_id`]: the C ABI
     /// does not take a raw ref, so the id is the portable handle.
+    ///
+    /// # Safety
+    ///
+    /// `surface_ref` must be a valid live `IOSurfaceRef`. `shape` must
+    /// match the IOSurface's pixel dimensions and chosen element type.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub unsafe fn from_iosurface(
         surface_ref: *mut std::ffi::c_void,

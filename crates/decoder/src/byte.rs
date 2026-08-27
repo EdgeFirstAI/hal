@@ -47,7 +47,7 @@ unsafe fn column_max_update_neon(
     signed: bool,
 ) {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
 
         let class_vec = vdupq_n_u8(class_idx);
         let chunks = n / 16;
@@ -128,7 +128,7 @@ unsafe fn column_max_update_neon_prefetch(
     signed: bool,
 ) {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
 
         const PREFETCH_AHEAD: usize = 128; // 2 cache lines on A55 (64B each)
 

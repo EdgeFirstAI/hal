@@ -585,7 +585,7 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
 /// on non-aarch64 targets or when the slice is too short to benefit from NEON.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn arg_max_i8(scores: &[i8]) -> (i8, usize) {
-    use std::arch::aarch64::*;
+    use std::arch::aarch64::*; // NOSONAR
 
     let n = scores.len();
     if n < 16 {

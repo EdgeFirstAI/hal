@@ -5,5 +5,5 @@ Part of the PEP 420 `edgefirst.*` namespace. No package in the set ships an
 every sibling.
 """
 
-from ._tracker import *  # noqa: F403
+from ._tracker import *
 from ._tracker import __doc__  # noqa: F401

@@ -9,7 +9,7 @@ from typing import Protocol, Tuple
 
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 
-from ._decoder import *  # noqa: F403
+from ._decoder import *
 from ._decoder import __doc__  # noqa: F401
 
 

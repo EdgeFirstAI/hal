@@ -8033,19 +8033,14 @@ mod gl_tests {
             (stride, dst.as_u8().unwrap().map().unwrap().to_vec())
         };
         // Stride-aware delta over a pixel region [r0..r0+rh) × [c0..c0+cw) (RGB).
-        let region = |a: &[u8],
-                      sa: usize,
-                      b: &[u8],
-                      sb: usize,
-                      c0: usize,
-                      r0: usize,
-                      cw: usize,
-                      rh: usize|
+        let region = |a: (&[u8], usize),
+                      b: (&[u8], usize),
+                      (c0, r0, cw, rh): (usize, usize, usize, usize)|
          -> (u32, f64) {
             let (mut mx, mut sum) = (0u32, 0u64);
             for r in r0..r0 + rh {
                 for c in (c0 * 3)..((c0 + cw) * 3) {
-                    let d = (a[r * sa + c] as i32 - b[r * sb + c] as i32).unsigned_abs();
+                    let d = (a.0[r * a.1 + c] as i32 - b.0[r * b.1 + c] as i32).unsigned_abs();
                     mx = mx.max(d);
                     sum += d as u64;
                 }
@@ -8056,7 +8051,7 @@ mod gl_tests {
         // same-size baseline (no resize)
         let cpu0 = cpu_packed(Crop::no_crop(), sw, sh);
         if let Some(g) = gl_packed("shader", Crop::no_crop(), sw, sh) {
-            let (mx, mean) = region(&g.1, g.0, &cpu0.1, cpu0.0, 0, 0, sw, sh);
+            let (mx, mean) = region((&g.1, g.0), (&cpu0.1, cpu0.0), (0, 0, sw, sh));
             eprintln!("PROBE2[same-size]   ShaderR8 vs CPU: max={mx} mean={mean:.2}");
         }
 
@@ -8084,9 +8079,12 @@ mod gl_tests {
         }
         for env in ["shader", "sampler"] {
             if let Some(g) = gl_packed(env, letterbox(), model, model) {
-                let (fmx, fmean) = region(&g.1, g.0, &cpu1.1, cpu1.0, 0, 0, model, model);
-                let (cmx, cmean) =
-                    region(&g.1, g.0, &cpu1.1, cpu1.0, pad_x, pad_y, scaled_w, scaled_h);
+                let (fmx, fmean) = region((&g.1, g.0), (&cpu1.1, cpu1.0), (0, 0, model, model));
+                let (cmx, cmean) = region(
+                    (&g.1, g.0),
+                    (&cpu1.1, cpu1.0),
+                    (pad_x, pad_y, scaled_w, scaled_h),
+                );
                 eprintln!(
                     "PROBE2[lb-full/{env:8}] vs CPU: max={fmx} mean={fmean:.2}   \
                      lb-content: max={cmx} mean={cmean:.2}"

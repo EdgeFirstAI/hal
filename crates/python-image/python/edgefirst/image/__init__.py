@@ -9,7 +9,7 @@ from typing import Protocol
 
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 
-from ._image import *  # noqa: F403
+from ._image import *
 from ._image import __doc__  # noqa: F401
 
 

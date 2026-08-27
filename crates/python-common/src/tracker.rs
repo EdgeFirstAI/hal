@@ -183,12 +183,18 @@ type AssociatedDetections = (
 
 impl Tracker<TrackBox> for PyByteTrack {
     fn update(&mut self, boxes: &[TrackBox], timestamp_ns: u64) -> Vec<Option<TrackInfo>> {
-        let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tracker = self
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.update(boxes, timestamp_ns)
     }
 
     fn get_active_tracks(&self) -> Vec<ActiveTrackInfo<TrackBox>> {
-        let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let tracker = self
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.get_active_tracks()
     }
 }
@@ -232,7 +238,9 @@ impl PyByteTrack {
                 .zip(labels)
                 .map(|((bbox, score), label)| TrackBox { bbox, score, label })
                 .collect();
-            let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tracker = tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let live = tracker.update(&detections, timestamp_ns);
             let mut out_boxes = Vec::new();
             let mut out_scores = Vec::new();
@@ -284,7 +292,9 @@ impl PyByteTrack {
                     label: *label,
                 })
                 .collect();
-            let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tracker = tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tracker
                 .update(&boxes, timestamp_ns)
                 .into_iter()
@@ -296,7 +306,9 @@ impl PyByteTrack {
     pub fn get_active_tracks(&self, py: Python<'_>) -> Vec<PyActiveTrackInfo> {
         let tracker = Arc::clone(&self.tracker);
         py.detach(move || {
-            let tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let tracker = tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tracker
                 .get_active_tracks()
                 .into_iter()

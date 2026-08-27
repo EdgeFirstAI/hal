@@ -538,7 +538,8 @@ impl<'py> AsMut<TensorDyn> for TensorArg<'py> {
 // exists for).
 #[cfg(feature = "decoder")]
 mod decoder_interop {
-    use super::*;
+    use super::{Bound, Py, PyAny, PyAnyMethods, PyCapsule, PyRef, PyResult, PyTypeMethods};
+    use pyo3::types::PyCapsuleMethods;
 
     /// Payload of the `edgefirst_decoder_v1` capsule.
     ///
@@ -713,8 +714,12 @@ mod decoder_interop {
 
 #[cfg(any(feature = "image", feature = "decoder"))]
 mod proto_interop {
-    use super::*;
+    use super::{
+        Bound, HostPin, IntoPyObject, Py, PyAny, PyAnyMethods, PyCapsule, PyRef, PyResult,
+        PyTypeMethods, TensorCapsulePayload, TensorDyn,
+    };
     use edgefirst_tensor::ProtoData;
+    use pyo3::types::PyCapsuleMethods;
 
     /// A `ProtoData` argument resolved from an arbitrary Python object.
     ///

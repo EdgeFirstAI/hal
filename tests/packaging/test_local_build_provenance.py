@@ -46,13 +46,7 @@ WORKSPACE_PACKAGES = (
 
 
 def distribution(name: str) -> md.Distribution:
-    try:
-        return md.distribution(name)
-    except md.PackageNotFoundError:
-        pytest.fail(
-            f"{name} is not installed, so its provenance cannot be checked and "
-            f"the suite is not exercising it. Run `make test-python`."
-        )
+    return md.distribution(name)
 
 
 def origin_url(dist: md.Distribution) -> str | None:

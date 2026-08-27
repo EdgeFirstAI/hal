@@ -65,9 +65,6 @@ env.sh
 # folded into the main code or deleted once the experiment concludes.
 /spikes/
 
-# C API build artifacts
-crates/capi/build/
-
 # Large binary model artifacts kept outside the repo. Tracked fixtures
 # (testdata/decoder/*.safetensors) survive because gitignore only
 # affects untracked files; new vetted fixtures need `git add -f`.

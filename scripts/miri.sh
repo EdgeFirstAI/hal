@@ -86,6 +86,7 @@ run_model() {
     echo "  FAIL  ${label}"
     fails=$((fails + 1))
   fi
+  return 0
 }
 
 run_model "Stacked Borrows (default)" \
@@ -125,20 +126,20 @@ diag_line_b=$(grep -n '^        let b = &mut \*(raw as \*mut TensorDyn);' "${sce
 diag_line_read=$(grep -n '^        let _ = a\.dtype();' "${scenarios_rs}" | head -1 | cut -d: -f1)
 diag_log="${TMPDIR:-/tmp}/miri-sh-diagnostic.$$.log"
 echo "== Miri (Stacked Borrows): the diagnostic itself (--ignored) =="
-if [ -z "${diag_line_a}" ] || [ -z "${diag_line_b}" ] || [ -z "${diag_line_read}" ]; then
+if [[ -z "${diag_line_a}" ]] || [[ -z "${diag_line_b}" ]] || [[ -z "${diag_line_read}" ]]; then
   echo "  FAIL  could not locate the diagnostic's three anchor lines in ${scenarios_rs} -- has it been rewritten? update this script's anchors"
   fails=$((fails + 1))
 else
 cargo "+${NIGHTLY}" miri test -p edgefirst-tensor --test scenarios \
   -- --ignored unwrap_then_use_aliases_the_same_tensor >"${diag_log}" 2>&1
 diag_rc=$?
-if [ "${diag_rc}" -ne 0 ] \
+if [[ "${diag_rc}" -ne 0 ]] \
   && grep -q 'trying to retag from' "${diag_log}" \
   && grep -q "scenarios.rs:${diag_line_a}" "${diag_log}" \
   && grep -q "scenarios.rs:${diag_line_b}" "${diag_log}" \
   && grep -q "scenarios.rs:${diag_line_read}" "${diag_log}"; then
   echo "  PASS  diagnostic still demonstrates the retag-invalidation hazard"
-elif [ "${diag_rc}" -ne 0 ]; then
+elif [[ "${diag_rc}" -ne 0 ]]; then
   # Failed, but not with the signature this diagnostic exists to produce --
   # could be a genuinely different bug, a Miri internal error, a build
   # failure, or a resource death (Miri is slow and memory-hungry; an OOM
@@ -165,7 +166,7 @@ rm -f "${diag_log}"
 fi
 
 echo
-if [ "${fails}" -eq 0 ]; then
+if [[ "${fails}" -eq 0 ]]; then
   echo "G7 PASS: scenarios.rs is clean under both aliasing models, and the diagnostic still demonstrates the hazard it exists to record"
   exit 0
 fi

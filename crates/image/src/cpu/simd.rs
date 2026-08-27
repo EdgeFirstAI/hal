@@ -142,7 +142,7 @@ pub(super) fn widen_u8_to_f32_norm(src: &[u8], dst: &mut [f32]) {
 #[target_feature(enable = "neon")]
 unsafe fn widen_u8_to_f32_norm_neon(src: &[u8], dst: &mut [f32]) {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
 
         let n = src.len();
         let sp = src.as_ptr();
@@ -228,7 +228,7 @@ pub(super) fn widen_u8_to_f16_norm(src: &[u8], dst: &mut [half::f16]) {
 #[target_feature(enable = "neon")]
 unsafe fn widen_u8_to_f16_norm_fp16(src: &[u8], dst: &mut [half::f16]) {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
 
         let n = src.len();
         let sp = src.as_ptr();
@@ -298,7 +298,7 @@ unsafe fn deinterleave_row_neon(
     src_ch: usize,
 ) {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
 
         let sp = src.as_ptr();
         let rp = r.as_mut_ptr();

@@ -28,7 +28,7 @@
 #![allow(dead_code)] // Wired into dispatch in subsequent N-* tasks.
 
 use crate::Quantization;
-use std::arch::aarch64::*;
+use std::arch::aarch64::*; // NOSONAR
 
 // ────────────────────────────────────────────────────────────────────────
 // Affine dequant: out[i] = (in[i] - zp) * scale

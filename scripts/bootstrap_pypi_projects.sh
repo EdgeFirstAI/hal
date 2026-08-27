@@ -17,29 +17,29 @@
 set -euo pipefail
 
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
+[[ "${1:-}" = "--dry-run" ]] && DRY=1
 
 if ! command -v twine >/dev/null && ! python3 -c "import twine" 2>/dev/null; then
-    echo "ERROR: pip install twine"; [ "$DRY" -eq 0 ] && exit 1
+    echo "ERROR: pip install twine" >&2; [[ "$DRY" -eq 0 ]] && exit 1
 fi
-if [ "$DRY" -eq 0 ] && [ -z "${TWINE_PASSWORD:-}" ]; then
-    echo "ERROR: TWINE_PASSWORD is unset. Use an ACCOUNT-scoped token —"
-    echo "       a project-scoped one cannot create a project that does not exist."
+if [[ "$DRY" -eq 0 ]] && [[ -z "${TWINE_PASSWORD:-}" ]]; then
+    echo "ERROR: TWINE_PASSWORD is unset. Use an ACCOUNT-scoped token —" >&2
+    echo "       a project-scoped one cannot create a project that does not exist." >&2
     exit 1
 fi
 
-[ -d target/wheels ] || { echo "ERROR: no target/wheels; run 'make wheel' first"; exit 1; }
+[[ -d target/wheels ]] || { echo "ERROR: no target/wheels; run 'make wheel' first" >&2; exit 1; }
 
 # Dependency order, same as the release workflow: the core first, since every
 # sibling declares a ~= dependency on it.
 for pkg in tensor codec image decoder tracker; do
     files=(target/wheels/edgefirst_${pkg}-*)
-    if [ ! -e "${files[0]}" ]; then
-        echo "ERROR: no artifacts for edgefirst-${pkg}"; exit 1
+    if [[ ! -e "${files[0]}" ]]; then
+        echo "ERROR: no artifacts for edgefirst-${pkg}" >&2; exit 1
     fi
     echo "==> edgefirst-${pkg}"
     printf '    %s\n' "${files[@]##*/}"
-    if [ "$DRY" -eq 1 ]; then
+    if [[ "$DRY" -eq 1 ]]; then
         echo "    (dry run — not uploading)"
     else
         twine upload --non-interactive --skip-existing "${files[@]}"

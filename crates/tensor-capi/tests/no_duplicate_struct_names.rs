@@ -68,7 +68,7 @@ fn struct_owners() -> BTreeMap<String, Vec<String>> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return owners;
     };
-    for e in entries.filter_map(|e| e.ok()) {
+    for e in entries.filter_map(Result::ok) {
         let crate_name = e.file_name().to_string_lossy().to_string();
         if !crate_name.ends_with("-capi") {
             continue;
@@ -77,8 +77,8 @@ fn struct_owners() -> BTreeMap<String, Vec<String>> {
         let Ok(files) = std::fs::read_dir(&src) else {
             continue;
         };
-        for f in files.filter_map(|f| f.ok()) {
-            if f.path().extension().and_then(|s| s.to_str()) != Some("rs") {
+        for f in files.filter_map(Result::ok) {
+            if f.path().extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(f.path()) else {

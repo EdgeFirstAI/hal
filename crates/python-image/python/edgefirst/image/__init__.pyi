@@ -7,14 +7,6 @@ mirrors the pymodule registrations in crates/python-image/src/lib.rs.
 import enum
 import sys
 
-import numpy as np
-import numpy.typing as npt
-
-# Image-only: no decoder or tracker dependency. Drawing takes boxes+masks+
-# proto data via the capsule protocol; fused decode+draw lives on
-# ``Decoder.draw_onto``.
-from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
-
 # Public re-exports from `edgefirst.tensor`, a hard dependency of this package
 # (see pyproject.toml). The redundant `as` form is what marks a name a public
 # re-export to type checkers. TensorMemory/Colorimetry and the colour axis
@@ -24,6 +16,8 @@ from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExporta
 # imports.
 from typing import Protocol
 
+import numpy as np
+import numpy.typing as npt
 from edgefirst.tensor import ColorEncoding as ColorEncoding
 from edgefirst.tensor import Colorimetry as Colorimetry
 from edgefirst.tensor import ColorRange as ColorRange
@@ -32,6 +26,11 @@ from edgefirst.tensor import ColorTransfer as ColorTransfer
 
 # DType is a type alias, not a runtime class — nothing to re-export.
 from edgefirst.tensor import DType
+
+# Image-only: no decoder or tracker dependency. Drawing takes boxes+masks+
+# proto data via the capsule protocol; fused decode+draw lives on
+# ``Decoder.draw_onto``.
+from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 from edgefirst.tensor import PixelFormat as PixelFormat
 from edgefirst.tensor import Region as Region
 from edgefirst.tensor import Tensor as Tensor

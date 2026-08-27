@@ -295,7 +295,10 @@ def test_colorimetry_has_no_equality_at_all_left_untouched():
     from edgefirst.tensor import Colorimetry, ColorSpace
 
     assert Colorimetry.__eq__ is object.__eq__
-    assert Colorimetry(space=ColorSpace.Bt709) != Colorimetry(space=ColorSpace.Bt709)
+    left = Colorimetry(space=ColorSpace.Bt709)
+    right = Colorimetry(space=ColorSpace.Bt709)
+    assert left is not right
+    assert left != right
 
 
 # --- __hash__: equal objects must hash equal --------------------------------
@@ -392,7 +395,10 @@ def test_colorimetry_hash_is_still_objects_identity_default():
     from edgefirst.tensor import Colorimetry
 
     assert Colorimetry.__hash__ is object.__hash__
-    assert hash(Colorimetry()) != hash(Colorimetry())
+    left = Colorimetry()
+    right = Colorimetry()
+    assert left is not right
+    assert hash(left) != hash(right)
 
 
 @pytest.mark.parametrize(
@@ -422,7 +428,10 @@ def test_single_package_eq_int_enum_hashable(mod, name, members):
     a = getattr(cls, members[0])
     b = getattr(cls, members[1])
 
-    assert {a: "x", b: "y"} == {a: "x", b: "y"}
+    keyed = {a: "x", b: "y"}
+    assert keyed[a] == "x"
+    assert keyed[b] == "y"
+    assert len(keyed) == 2
     assert len({a, b, a}) == 2
     assert hash(a) != hash(b)
 
@@ -471,8 +480,9 @@ def test_unrelated_enum_rejected_in_argument_position():
     from edgefirst.image import ImageProcessor
     from edgefirst.tensor import TensorMemory
 
+    proc = ImageProcessor()
     with pytest.raises(TypeError):
-        ImageProcessor().create_image(8, 8, TensorMemory.SHM, "uint8", "readwrite")
+        proc.create_image(8, 8, TensorMemory.SHM, "uint8", "readwrite")
 
 
 def test_bare_int_no_longer_accepted_in_argument_position():
@@ -482,8 +492,9 @@ def test_bare_int_no_longer_accepted_in_argument_position():
     test_enum_still_compares_equal_to_its_bare_int_discriminant)."""
     from edgefirst.image import ImageProcessor
 
+    proc = ImageProcessor()
     with pytest.raises(TypeError):
-        ImageProcessor().create_image(8, 8, 1, "uint8", "readwrite")
+        proc.create_image(8, 8, 1, "uint8", "readwrite")
 
 
 def test_cross_package_equality_and_hashing_still_work_after_the_fix():
@@ -520,14 +531,15 @@ def test_region_rejects_duck_typed_unrelated_object():
 
     from edgefirst.image import ImageProcessor, PixelFormat, Tensor
 
+    proc = ImageProcessor()
     src = Tensor.image(64, 64, PixelFormat.Rgb, access="readwrite")
-    dst = ImageProcessor().create_image(32, 32, PixelFormat.Rgb, access="readwrite")
+    dst = proc.create_image(32, 32, PixelFormat.Rgb, access="readwrite")
     # Setup lives outside the `raises` block deliberately: if Tensor.image()
     # or create_image() ever raised TypeError for an unrelated reason, this
     # test would pass while never exercising the type-confusion gate it
     # exists to guard -- only the call under test belongs inside `raises`.
     with pytest.raises(TypeError):
-        ImageProcessor().convert(src, dst, source=fake)
+        proc.convert(src, dst, source=fake)
 
 
 def test_region_cross_package_still_works_after_the_fix():

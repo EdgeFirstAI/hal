@@ -148,6 +148,59 @@ fn is_state_line(t: &str) -> bool {
     declared_static_name(t).is_some() || t.starts_with("thread_local!")
 }
 
+/// Scan one source file for process-wide state declarations, skipping
+/// `#[cfg(test)] mod ...` blocks (test-only state never ships).
+fn scan_file_for_global_state(path: &Path, text: &str, offenders: &mut Vec<String>) {
+    let lines: Vec<&str> = text.lines().collect();
+
+    // Test-only state (mock structs' Atomic fields, locals inside test
+    // functions) never ships in a linked artifact, so `#[cfg(test)] mod
+    // ...` blocks are out of scope. Track brace depth from the `mod`
+    // line to find where the block ends.
+    let mut pending_test_cfg = false;
+    let mut skip_depth: i32 = 0;
+
+    for (n, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+
+        if skip_depth > 0 {
+            skip_depth += line.matches('{').count() as i32;
+            skip_depth -= line.matches('}').count() as i32;
+            continue;
+        }
+
+        if t == "#[cfg(test)]" {
+            pending_test_cfg = true;
+            continue;
+        }
+        if pending_test_cfg {
+            pending_test_cfg = false;
+            if t.starts_with("mod ") {
+                let depth = line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                if depth > 0 {
+                    skip_depth = depth;
+                    continue;
+                }
+            }
+        }
+
+        if !is_state_line(t) {
+            continue;
+        }
+        // Exact identifier match, never `contains`: allowlisting `TABLE`
+        // by substring also silently permits `INTERN_TABLE`, which is
+        // close to the exact type this invariant exists to keep deleted.
+        let declared = declared_static_name(t);
+        if ALLOWED
+            .iter()
+            .any(|(name, _)| declared == Some(*name) || (declared.is_none() && line.contains(name)))
+        {
+            continue;
+        }
+        offenders.push(format!("{}:{}: {}", path.display(), n + 1, t));
+    }
+}
+
 #[test]
 fn edgefirst_tensor_declares_no_new_global_state() {
     // Resolved at compile time, so the scan works regardless of the runner's
@@ -176,53 +229,7 @@ fn edgefirst_tensor_declares_no_new_global_state() {
     let mut offenders = Vec::new();
     for entry in files {
         let text = std::fs::read_to_string(&entry).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-
-        // Test-only state (mock structs' Atomic fields, locals inside test
-        // functions) never ships in a linked artifact, so `#[cfg(test)] mod
-        // ...` blocks are out of scope. Track brace depth from the `mod`
-        // line to find where the block ends.
-        let mut pending_test_cfg = false;
-        let mut skip_depth: i32 = 0;
-
-        for (n, line) in lines.iter().enumerate() {
-            let t = line.trim_start();
-
-            if skip_depth > 0 {
-                skip_depth += line.matches('{').count() as i32;
-                skip_depth -= line.matches('}').count() as i32;
-                continue;
-            }
-
-            if t == "#[cfg(test)]" {
-                pending_test_cfg = true;
-                continue;
-            }
-            if pending_test_cfg {
-                pending_test_cfg = false;
-                if t.starts_with("mod ") {
-                    let depth = line.matches('{').count() as i32 - line.matches('}').count() as i32;
-                    if depth > 0 {
-                        skip_depth = depth;
-                        continue;
-                    }
-                }
-            }
-
-            if !is_state_line(t) {
-                continue;
-            }
-            // Exact identifier match, never `contains`: allowlisting `TABLE`
-            // by substring also silently permits `INTERN_TABLE`, which is
-            // close to the exact type this invariant exists to keep deleted.
-            let declared = declared_static_name(t);
-            if ALLOWED.iter().any(|(name, _)| {
-                declared == Some(*name) || (declared.is_none() && line.contains(name))
-            }) {
-                continue;
-            }
-            offenders.push(format!("{}:{}: {}", entry.display(), n + 1, t));
-        }
+        scan_file_for_global_state(&entry, &text, &mut offenders);
     }
     assert!(
         offenders.is_empty(),

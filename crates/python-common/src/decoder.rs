@@ -714,7 +714,7 @@ impl PyDecoder {
         nms: Option<PyNms>,
         input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
-        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
+        let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -780,7 +780,7 @@ impl PyDecoder {
         decoder_version: Option<PyDecoderVersion>,
         input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
-        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
+        let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -821,7 +821,7 @@ impl PyDecoder {
         nms: Option<PyNms>,
         input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
-        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
+        let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -857,7 +857,7 @@ impl PyDecoder {
         nms: Option<PyNms>,
         input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
-        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
+        let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)

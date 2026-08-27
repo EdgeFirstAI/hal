@@ -515,7 +515,7 @@ pub fn jaccard_batch4(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [b
 #[target_feature(enable = "neon")]
 unsafe fn jaccard_batch4_neon(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [bool; 4] {
     unsafe {
-        use std::arch::aarch64::*;
+        use std::arch::aarch64::*; // NOSONAR
 
         let zero = vdupq_n_f32(0.0);
         let iou_v = vdupq_n_f32(iou);

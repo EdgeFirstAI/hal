@@ -7,5 +7,5 @@ every sibling.
 
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 
-from ._codec import *  # noqa: F403
+from ._codec import *
 from ._codec import __doc__  # noqa: F401

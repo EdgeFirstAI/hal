@@ -101,7 +101,7 @@ pub(crate) unsafe fn nchw_to_nhwc_u8_neon(
     dst: &mut [u8],
 ) {
     unsafe {
-        use core::arch::aarch64::*;
+        use core::arch::aarch64::*; // NOSONAR
         let hw = h * w;
         debug_assert_eq!(src.len(), hw * c);
         debug_assert_eq!(dst.len(), hw * c);

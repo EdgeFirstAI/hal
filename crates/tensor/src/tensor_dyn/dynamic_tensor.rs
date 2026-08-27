@@ -483,6 +483,26 @@ impl<T: Element> Tensor<T> {
         self.inner.iosurface_ref()
     }
 
+    /// Wrap a live `IOSurfaceRef` as a typed tensor (macOS/iOS).
+    ///
+    /// Same signature as `static`'s `Tensor::from_iosurface` so identity
+    /// wrap tests compile against both backends.
+    ///
+    /// # Safety
+    ///
+    /// `surface_ref` must be a valid live `IOSurfaceRef`. `shape` must
+    /// match the IOSurface's pixel dimensions and chosen element type.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub unsafe fn from_iosurface(
+        surface_ref: *mut std::ffi::c_void,
+        shape: &[usize],
+        name: Option<&str>,
+    ) -> Result<Self> {
+        // SAFETY: caller guarantees `surface_ref` is a live IOSurfaceRef.
+        unsafe { TensorDyn::from_iosurface(surface_ref, shape, T::DTYPE, name) }
+            .map(Self::from_inner)
+    }
+
     /// Physical IOSurface dimensions in texels. `None` when not IOSurface-backed.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {

@@ -258,14 +258,14 @@ unsafe fn read_str(p: *const c_char, len: usize) -> Option<String> {
             return None;
         }
         if len == 0 {
-            CStr::from_ptr(p).to_str().ok().map(|s| s.to_string())
+            CStr::from_ptr(p).to_str().ok().map(str::to_string)
         } else {
             // c_char is i8 on macOS and u8 on aarch64-linux, so this cast is
             // load-bearing on one target and a no-op on the other. Neither can be
             // written without the other's lint firing.
             #[allow(clippy::unnecessary_cast)]
             let bytes = std::slice::from_raw_parts(p as *const u8, len);
-            std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+            std::str::from_utf8(bytes).ok().map(str::to_string)
         }
     }
 }

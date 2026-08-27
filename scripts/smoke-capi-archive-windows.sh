@@ -65,7 +65,8 @@ fi
 echo "using compiler: ${CC}"
 
 winpath() {
-  cygpath -w "$1" 2>/dev/null || printf '%s' "$1"
+  local path="$1"
+  cygpath -w "${path}" 2>/dev/null || printf '%s' "${path}"
 }
 
 find_implib() {
@@ -115,6 +116,7 @@ for leaf in tensor image codec decoder tracker; do
         exit 1
       fi
       ;;
+    *) echo "FAIL: unsupported compiler ${CC}" >&2; exit 1 ;;
   esac
   # Running requires the DLL next to the exe (no SONAME / rpath on Windows).
   dll="${BIN}/edgefirst_${leaf}.dll"

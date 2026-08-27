@@ -59,7 +59,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "${ROOT}"
 # -- this is what lets `PROFILE=nonexistent ./scripts/check-single-home.sh`
 # exercise every gate's cannot-measure path at once for verification.
 PROFILE="${PROFILE:-}"
-if [ -n "${PROFILE}" ]; then
+if [[ -n "${PROFILE}" ]]; then
   DEBUG_LIBDIR="target/${PROFILE}"
   RELEASE_LIBDIR="target/${PROFILE}"
 else
@@ -91,22 +91,28 @@ PY_EXTS="tensor image codec decoder tracker"
 # moves whenever *anything* does -- including the debug info this measure
 # deliberately ignores.
 g6_code_hash() { # g6_code_hash <shared object> -> sha256 of its loadable content
+  local so="$1"
   local tmp
   tmp=$(mktemp) || return 1
-  if objcopy --strip-debug --remove-section=.note.gnu.build-id "$1" "${tmp}" 2>/dev/null; then
+  if objcopy --strip-debug --remove-section=.note.gnu.build-id "${so}" "${tmp}" 2>/dev/null; then
     sha256sum <"${tmp}"
   fi
   rm -f "${tmp}"
 }
 fails=0
 gate() { # gate <id> <description> <0|1 pass>
-  if [ "$3" -eq 0 ]; then printf '  %-4s PASS  %s\n' "$1" "$2"
-  else printf '  %-4s FAIL  %s\n' "$1" "$2"; fails=$((fails+1)); fi
+  local id="$1" desc="$2" status="$3"
+  if [[ "${status}" -eq 0 ]]; then printf '  %-4s PASS  %s\n' "${id}" "${desc}"
+  else printf '  %-4s FAIL  %s\n' "${id}" "${desc}"; fails=$((fails+1)); fi
+  return 0
 }
 cannot_measure() { # cannot_measure <gate> <reason>
-  printf '  %-4s FAIL  cannot verify: %s\n' "$1" "$2"; fails=$((fails+1))
+  local id="$1" reason="$2"
+  printf '  %-4s FAIL  cannot verify: %s\n' "${id}" "${reason}"; fails=$((fails+1))
+  return 0
 }
 header_decls() { # header_decls <header>: print the ef_* function names it declares
+  local header="$1"
   # Drop doc-comment lines (a `@brief`/prose line may legitimately mention
   # another function by name, e.g. tensor.h's own header comment cites
   # ef_image_processor_create_image()) and typedef lines (struct/enum type
@@ -121,11 +127,12 @@ header_decls() { # header_decls <header>: print the ef_* function names it decla
   # Shared by G9 (as its liveness signal) and G11 (as the set it checks
   # against the library's exports) so the two can never disagree about what
   # counts as a declaration.
-  grep -vE '^\s*(\*|/\*|//)' "$1" \
+  grep -vE '^\s*(\*|/\*|//)' "${header}" \
     | grep -v '^typedef' \
     | grep -oE 'ef_[a-z0-9_]+\(' \
     | grep -oE 'ef_[a-z0-9_]+' \
     | sort -u
+  return 0
 }
 
 # --drift: G6, the drift test. Off by default -- unlike every other gate
@@ -162,10 +169,11 @@ for _arg in "$@"; do
     --drift-only) DRIFT_MODE=1; DRIFT_ONLY=1 ;;
     --differential) DIFFERENTIAL_MODE=1 ;;
     --differential-only) DIFFERENTIAL_MODE=1; DIFFERENTIAL_ONLY=1 ;;
+    *) echo "FAIL: unknown argument ${_arg}" >&2; exit 1 ;;
   esac
 done
 
-if [ "${DRIFT_MODE}" -eq 1 ]; then
+if [[ "${DRIFT_MODE}" -eq 1 ]]; then
   echo "== G6: siblings do not drift when edgefirst-tensor's own layout changes =="
   g6_lib_rs="crates/tensor/src/lib.rs"
   g6_patched=0
@@ -174,7 +182,7 @@ if [ "${DRIFT_MODE}" -eq 1 ]; then
   # round-trips cleanly), not a line number -- lines move; this text does
   # not, short of someone editing these exact fields.
   g6_revert() {
-    if [ "${g6_patched}" -eq 1 ]; then
+    if [[ "${g6_patched}" -eq 1 ]]; then
       # Check python3's own exit status before declaring the probe gone --
       # an interrupted or failed revert must not be reported as complete.
       # This is the one gate that mutates source, so a false "reverted" here
@@ -266,12 +274,13 @@ PY
         echo "  G6   WARN  revert of ${g6_lib_rs} failed -- inspect it by hand for a leftover _drift_probe field before committing anything" >&2
       fi
     fi
+    return 0
   }
   # Revert on ANY exit from this point on -- a failed build, an interrupted
   # run, or a bug in this script must not leave the probe field behind.
   trap g6_revert EXIT
 
-  if [ ! -s "${g6_lib_rs}" ] || [ ! -r "${g6_lib_rs}" ]; then
+  if [[ ! -s "${g6_lib_rs}" ]] || [[ ! -r "${g6_lib_rs}" ]]; then
     cannot_measure "G6" "${g6_lib_rs} is missing, empty, or unreadable"
   elif command -v git >/dev/null 2>&1 && ! git diff --quiet -- "${g6_lib_rs}" 2>/dev/null; then
     # Refuses to patch (and later revert) a file that already has someone
@@ -279,9 +288,9 @@ PY
     # agent's work inside another's commit earlier on this branch. Silently
     # reverting over a real edit would be worse than refusing to run.
     cannot_measure "G6" "${g6_lib_rs} already has uncommitted changes -- refusing to patch and revert over them"
-  elif [ ! -s "${DEBUG_LIBDIR}/libedgefirst_image.so" ]; then
+  elif [[ ! -s "${DEBUG_LIBDIR}/libedgefirst_image.so" ]]; then
     cannot_measure "G6" "${DEBUG_LIBDIR}/libedgefirst_image.so is missing -- run \`make capi-libs\` first"
-  elif [ ! -s "${DEBUG_LIBDIR}/lib_tensor.so" ]; then
+  elif [[ ! -s "${DEBUG_LIBDIR}/lib_tensor.so" ]]; then
     cannot_measure "G6" "${DEBUG_LIBDIR}/lib_tensor.so is missing -- run \`cargo build -p edgefirst-python-tensor -p edgefirst-python-image -p edgefirst-python-codec -p edgefirst-python-decoder\` first"
   else
     # Hash edgefirst-tensor's own library too, not just the four siblings --
@@ -366,7 +375,7 @@ src = src.replace(
 with open(path, "w") as f:
     f.write(src)
 PY
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
       cannot_measure "G6" "could not locate Tensor<T>'s struct/constructors in ${g6_lib_rs} to patch (anchors moved -- update this script)"
     else
       g6_patched=1
@@ -408,7 +417,7 @@ PY
       # Skipped when the baseline never produced one: a second
       # `cannot_measure` for the same cause is noise, and the last line a
       # gate prints is the one that gets quoted.
-      elif [ -z "${g6_py_before}" ]; then
+      elif [[ -z "${g6_py_before}" ]]; then
         : # the baseline already reported why
       elif ! cargo build $(for l in $PY_EXTS; do printf -- "-p edgefirst-python-%s " "$l"; done) \
              >>"${g6_build_log}" 2>&1; then
@@ -424,9 +433,9 @@ PY
         # libedgefirst_tensor.so itself MUST differ across this rebuild;
         # if it didn't, the rebuild that just ran is not evidence of
         # anything and this is `cannot_measure`, not a silent PASS.
-        if [ "${g6_tensor_before}" = "${g6_tensor_after}" ]; then
+        if [[ "${g6_tensor_before}" = "${g6_tensor_after}" ]]; then
           cannot_measure "G6" "libedgefirst_tensor.so did not change after the rebuild -- the probe never took effect, so byte-identical siblings would prove nothing (see ${g6_build_log})"
-        elif [ "${g6_before}" != "${g6_after}" ]; then
+        elif [[ "${g6_before}" != "${g6_after}" ]]; then
           gate "G6" "a sibling's bytes CHANGED when only edgefirst-tensor's private layout changed -- see ${g6_build_log}" 1
         # The Python half needs its own liveness signal, and byte-identity
         # cannot be it: an extension that was never recompiled is also
@@ -435,9 +444,9 @@ PY
         # hash-moved check above exists for the C half.
         elif ! grep -q "Compiling edgefirst-tensor " "${g6_build_log}"; then
           cannot_measure "G6" "the Python extension rebuild did not recompile edgefirst-tensor, so byte-identical extensions would prove nothing (see ${g6_build_log})"
-        elif [ -z "${g6_py_before}" ] || [ -z "${g6_py_after}" ]; then
+        elif [[ -z "${g6_py_before}" ]] || [[ -z "${g6_py_after}" ]]; then
           cannot_measure "G6" "could not hash the Python extensions' loadable content (is objcopy available?)"
-        elif [ "${g6_py_before}" != "${g6_py_after}" ]; then
+        elif [[ "${g6_py_before}" != "${g6_py_after}" ]]; then
           gate "G6" "a Python extension's LOADABLE CONTENT changed when only edgefirst-tensor's private layout changed -- something is still being baked in (see ${g6_build_log})" 1
         else
           gate "G6" "libedgefirst_tensor.so changed (rebuild confirmed); the four C siblings are byte-identical and the four Python extensions' loadable content is identical ACROSS A REAL RECOMPILE of edgefirst-tensor" 0
@@ -451,13 +460,13 @@ PY
     # failure) -- otherwise a failed revert here would go both unwarned-of
     # a second time AND unretried, since the trap that would have caught it
     # on exit is gone.
-    if [ "${g6_patched}" -eq 0 ]; then
+    if [[ "${g6_patched}" -eq 0 ]]; then
       trap - EXIT
     fi
   fi
   echo
-  if [ "${DRIFT_ONLY}" -eq 1 ]; then
-    if [ "${fails}" -eq 0 ]; then echo "ALL GATES GREEN"; exit 0; fi
+  if [[ "${DRIFT_ONLY}" -eq 1 ]]; then
+    if [[ "${fails}" -eq 0 ]]; then echo "ALL GATES GREEN"; exit 0; fi
     echo "${fails} GATE(S) RED"; exit 1
   fi
 fi
@@ -473,7 +482,7 @@ fi
 # The guarded body below is deliberately NOT re-indented. Bash does not care,
 # and a two-line diff is reviewable where a 600-line whitespace change is
 # not. The matching `fi` is immediately before the G13 block.
-if [ "${DIFFERENTIAL_ONLY}" -eq 0 ]; then
+if [[ "${DIFFERENTIAL_ONLY}" -eq 0 ]]; then
 
 echo "== G1: no sibling embeds edgefirst-tensor's implementation =="
 # Plain `nm`, not `nm -D`: the embedded symbols this gate looks for are
@@ -536,18 +545,18 @@ echo "== G1: no sibling embeds edgefirst-tensor's implementation =="
 # want 0, PASS".
 for l in $SIBS; do
   so="${DEBUG_LIBDIR}/libedgefirst_${l}.so"
-  if [ ! -s "${so}" ] || [ ! -r "${so}" ]; then
+  if [[ ! -s "${so}" ]] || [[ ! -r "${so}" ]]; then
     cannot_measure "G1" "${so} is missing, empty, or unreadable"
     continue
   fi
   syms=$(nm "${so}" 2>/dev/null)
-  if [ -z "${syms}" ]; then
+  if [[ -z "${syms}" ]]; then
     cannot_measure "G1" "${so} has no symbol table (stripped, or unreadable)"
     continue
   fi
   n=$(printf '%s\n' "${syms}" | grep -c 'static_backend' || true)
   gate "G1" "libedgefirst_${l}.so carries ${n} static_backend (embedded implementation) symbols (want 0)" \
-       "$([ "${n}" -eq 0 ] && echo 0 || echo 1)"
+       "$([[ "${n}" -eq 0 ]] && echo 0 || echo 1)"
 done
 
 echo "== G1b: cuda.rs's ungated dlopen surface (accepted exception, measured not hidden) =="
@@ -605,12 +614,12 @@ echo "== G1b: cuda.rs's ungated dlopen surface (accepted exception, measured not
 CUDA_MARKER='^[0-9a-f]+ +[0-9a-f]+ +[a-zA-Z] +<?edgefirst_tensor\[[0-9a-f]+\]::cuda::(load(::\{closure#0\})?|is_cuda_available|memcpy_device_to_host|stream_create|stream_destroy|stream_synchronize|gl_map_resource|gl_register_buffer|gl_unmap_resource|gl_unregister_resource|import_dma_fd|table|TABLE|CudaHandle(>::(new_gl|new_external|map)| as core\[[0-9a-f]+\]::(ops::drop::Drop>::drop|fmt::Debug>::fmt))|CudaMap(>::(device_ptr|len|is_empty)| as core\[[0-9a-f]+\]::ops::drop::Drop>::drop))$'
 for l in tensor $SIBS; do
   so="${DEBUG_LIBDIR}/libedgefirst_${l}.so"
-  if [ ! -s "${so}" ] || [ ! -r "${so}" ]; then
+  if [[ ! -s "${so}" ]] || [[ ! -r "${so}" ]]; then
     cannot_measure "G1b" "${so} is missing, empty, or unreadable"
     continue
   fi
   syms=$(nm -S "${so}" 2>/dev/null | c++filt 2>/dev/null)
-  if [ -z "${syms}" ]; then
+  if [[ -z "${syms}" ]]; then
     cannot_measure "G1b" "${so} has no symbol table (stripped, or unreadable)"
     continue
   fi
@@ -645,21 +654,21 @@ echo "== G2: each sibling really links libedgefirst_tensor.so =="
 # link at all, which is a different fact than "did not need to".
 for l in $SIBS; do
   so="${DEBUG_LIBDIR}/libedgefirst_${l}.so"
-  if [ ! -s "${so}" ] || [ ! -r "${so}" ]; then
+  if [[ ! -s "${so}" ]] || [[ ! -r "${so}" ]]; then
     cannot_measure "G2" "${so} is missing, empty, or unreadable"
     continue
   fi
   syms=$(nm "${so}" 2>/dev/null)
-  if [ -z "${syms}" ]; then
+  if [[ -z "${syms}" ]]; then
     cannot_measure "G2" "${so} has no symbol table (stripped, or unreadable)"
     continue
   fi
   embeds_static=$(printf '%s\n' "${syms}" | grep -c 'static_backend' || true)
   need=$(readelf -d "${so}" 2>/dev/null | grep -c 'libedgefirst_tensor.so' || true)
   und=$(nm -D -u "${so}" 2>/dev/null | grep -c ' ef_tensor_' || true)
-  if [ "${need}" -ge 1 ] && [ "${und}" -ge 1 ]; then
+  if [[ "${need}" -ge 1 ]] && [[ "${und}" -ge 1 ]]; then
     gate "G2" "libedgefirst_${l}.so: DT_NEEDED=${need} undefined ef_tensor_*=${und}" 0
-  elif [ "${embeds_static}" -eq 0 ] && [ "${need}" -eq 0 ] && [ "${und}" -eq 0 ]; then
+  elif [[ "${embeds_static}" -eq 0 ]] && [[ "${need}" -eq 0 ]] && [[ "${und}" -eq 0 ]]; then
     gate "G2" "libedgefirst_${l}.so: no embedded implementation (static_backend=0) and no ef_tensor_* reference -- this leaf needs no tensor primitive" 0
   else
     gate "G2" "libedgefirst_${l}.so: DT_NEEDED=${need} undefined ef_tensor_*=${und}, static_backend=${embeds_static}" 1
@@ -694,7 +703,7 @@ echo "== G4: the transition vtable is gone =="
 # 0.
 src_file_count=$(find . -path ./target -prune -o -path ./.git -prune -o \
   -type f -name '*.rs' -print 2>/dev/null | wc -l)
-if [ "${src_file_count}" -eq 0 ]; then
+if [[ "${src_file_count}" -eq 0 ]]; then
   cannot_measure "G4" "repo-wide search found no .rs files"
 else
   v=$(find . -path ./target -prune -o -path ./.git -prune -o \
@@ -702,7 +711,7 @@ else
     | grep -v '^\./crates/tensor/src/pbo\.rs$' \
     | xargs -r grep -l 'EfTensorVtable\|is_own_mint' 2>/dev/null | wc -l)
   gate "G4" "${v} files repo-wide (excluding crates/tensor/src/pbo.rs's unrelated PboOpsVtable) still reference EfTensorVtable/is_own_mint (want 0)" \
-       "$([ "${v}" -eq 0 ] && echo 0 || echo 1)"
+       "$([[ "${v}" -eq 0 ]] && echo 0 || echo 1)"
 fi
 
 echo "== G5: footprint =="
@@ -807,7 +816,7 @@ CEILING_BYTES=23200000
 # its name implies, and a gate that trusts the name is measuring history.
 g5_unmeasurable=""
 g5_provenance=""
-if [ -n "${PROFILE}" ]; then
+if [[ -n "${PROFILE}" ]]; then
   # PROFILE redirects RELEASE_LIBDIR to target/<PROFILE>, but this gate can
   # only build `--release`. Measuring target/<PROFILE> while building
   # target/release is precisely G6's original defect, so refuse rather than
@@ -830,13 +839,13 @@ else
       break
     fi
   done
-  [ -z "${g5_unmeasurable}" ] && rm -f "${g5_build_log}"
+  [[ -z "${g5_unmeasurable}" ]] && rm -f "${g5_build_log}"
   g5_provenance="built at HEAD"
 fi
 
 g5_sizes=""
 tot=0
-if [ -z "${g5_unmeasurable}" ]; then
+if [[ -z "${g5_unmeasurable}" ]]; then
   for l in tensor $SIBS; do
     f="${RELEASE_LIBDIR}/libedgefirst_${l}.so"
     # `[ -f ]` alone is not enough: a 0-byte `.so` (a truncated or interrupted
@@ -848,12 +857,12 @@ if [ -z "${g5_unmeasurable}" ]; then
     # succeeded: a build can succeed and write an artifact elsewhere (a
     # different --target-dir, a renamed cdylib), which would leave a stale or
     # absent file here with nothing having failed.
-    if [ ! -s "${f}" ]; then
+    if [[ ! -s "${f}" ]]; then
       g5_unmeasurable="${f} is missing or empty even though crates/${l}-capi built successfully -- artifact path mismatch, not a build failure"
       break
     fi
     s=$(stat -c%s "${f}" 2>/dev/null)
-    if [ -z "${s}" ]; then
+    if [[ -z "${s}" ]]; then
       g5_unmeasurable="${f} size could not be read"
       break
     fi
@@ -862,7 +871,7 @@ if [ -z "${g5_unmeasurable}" ]; then
   done
 fi
 
-if [ -n "${g5_unmeasurable}" ]; then
+if [[ -n "${g5_unmeasurable}" ]]; then
   # This is the case a missing (or empty) target/release directory used to
   # hit: every `stat` fell back to 0 or a 0-byte file measured as 0, `tot`
   # stayed 0, and a total of 0 sits comfortably under any ceiling -- five
@@ -875,7 +884,7 @@ else
   # day reporting numbers for a tree that never existed. Anyone reading a G5
   # line should be able to tell, from the line alone, whether a build happened.
   gate "G5" "five-library total ${tot} B (${g5_provenance}; ceiling ${CEILING_BYTES} B). De-duplication is G1's measure, not this gate's." \
-       "$([ "${tot}" -le "${CEILING_BYTES}" ] && echo 0 || echo 1)"
+       "$([[ "${tot}" -le "${CEILING_BYTES}" ]] && echo 0 || echo 1)"
 fi
 
 echo "== G7: dynamic backend aliasing shapes are clean under Miri (both models) =="
@@ -890,17 +899,17 @@ echo "== G7: dynamic backend aliasing shapes are clean under Miri (both models) 
 # Toolchain absence is `cannot_measure`, not a silent pass: `miri.sh` exits
 # 2 specifically when the nightly Miri component isn't installed, distinct
 # from exit 1 (a real aliasing failure) and exit 0 (both models clean).
-if [ ! -x scripts/miri.sh ]; then
+if [[ ! -x scripts/miri.sh ]]; then
   cannot_measure "G7" "scripts/miri.sh is missing or not executable"
 else
   g7_log="${TMPDIR:-/tmp}/check-single-home-g7.$$.log"
   ./scripts/miri.sh >"${g7_log}" 2>&1
   miri_rc=$?
-  if [ "${miri_rc}" -eq 2 ]; then
+  if [[ "${miri_rc}" -eq 2 ]]; then
     cannot_measure "G7" "Miri toolchain unavailable -- $(tail -n1 "${g7_log}")"
   else
     gate "G7" "scripts/miri.sh: both aliasing models (rc=${miri_rc}; re-run ./scripts/miri.sh for detail)" \
-         "$([ "${miri_rc}" -eq 0 ] && echo 0 || echo 1)"
+         "$([[ "${miri_rc}" -eq 0 ]] && echo 0 || echo 1)"
   fi
   rm -f "${g7_log}"
 fi
@@ -922,20 +931,20 @@ g9_unmeasurable=""
 # ef_* declarations tensor.h yields, which a real tensor.h always makes >= 1
 # no matter how many of them mention detections. Same signal G11 uses, same
 # helper, checked separately from `h`.
-if [ ! -s "${tensor_so}" ] || [ ! -r "${tensor_so}" ]; then
+if [[ ! -s "${tensor_so}" ]] || [[ ! -r "${tensor_so}" ]]; then
   g9_unmeasurable="${tensor_so} is missing, empty, or unreadable"
-elif [ -z "$(nm -D --defined-only "${tensor_so}" 2>/dev/null)" ]; then
+elif [[ -z "$(nm -D --defined-only "${tensor_so}" 2>/dev/null)" ]]; then
   g9_unmeasurable="${tensor_so} exports no dynamic symbols at all"
-elif [ ! -s "${decoder_so}" ] || [ ! -r "${decoder_so}" ]; then
+elif [[ ! -s "${decoder_so}" ]] || [[ ! -r "${decoder_so}" ]]; then
   g9_unmeasurable="${decoder_so} is missing, empty, or unreadable"
-elif [ -z "$(nm -D --defined-only "${decoder_so}" 2>/dev/null)" ]; then
+elif [[ -z "$(nm -D --defined-only "${decoder_so}" 2>/dev/null)" ]]; then
   g9_unmeasurable="${decoder_so} exports no dynamic symbols at all"
-elif [ ! -s "${tensor_hdr}" ] || [ ! -r "${tensor_hdr}" ]; then
+elif [[ ! -s "${tensor_hdr}" ]] || [[ ! -r "${tensor_hdr}" ]]; then
   g9_unmeasurable="${tensor_hdr} is missing, empty, or unreadable"
-elif [ "$(header_decls "${tensor_hdr}" | wc -l)" -eq 0 ]; then
+elif [[ "$(header_decls "${tensor_hdr}" | wc -l)" -eq 0 ]]; then
   g9_unmeasurable="${tensor_hdr}: extraction found 0 declarations (expected >= 1)"
 fi
-if [ -n "${g9_unmeasurable}" ]; then
+if [[ -n "${g9_unmeasurable}" ]]; then
   cannot_measure "G9" "${g9_unmeasurable}"
 else
   t=$(nm -D --defined-only "${tensor_so}" 2>/dev/null | grep -c 'ef_detect_box_list' || true)
@@ -946,18 +955,18 @@ else
   # exact moment G9's header requirement is finally met if `-e` were ever added.
   h=$(grep -c 'ef_detect_box' "${tensor_hdr}" || true)
   gate "G9" "tensor.so exports ${t} (want 0), decoder.so exports ${d} (want 6), tensor.h mentions ${h} (want 0)" \
-       "$([ "${t}" -eq 0 ] && [ "${d}" -eq 6 ] && [ "${h}" -eq 0 ] && echo 0 || echo 1)"
+       "$([[ "${t}" -eq 0 ]] && [[ "${d}" -eq 6 ]] && [[ "${h}" -eq 0 ]] && echo 0 || echo 1)"
 fi
 
 echo "== G11: header/library alignment =="
 for l in tensor image codec decoder tracker; do
   hdr="crates/${l}-capi/include/edgefirst/${l}.h"
   so="${DEBUG_LIBDIR}/libedgefirst_${l}.so"
-  if [ ! -s "${hdr}" ] || [ ! -r "${hdr}" ]; then
+  if [[ ! -s "${hdr}" ]] || [[ ! -r "${hdr}" ]]; then
     cannot_measure "G11" "${hdr} is missing, empty, or unreadable"
     continue
   fi
-  if [ ! -s "${so}" ] || [ ! -r "${so}" ]; then
+  if [[ ! -s "${so}" ]] || [[ ! -r "${so}" ]]; then
     cannot_measure "G11" "${so} is missing, empty, or unreadable"
     continue
   fi
@@ -965,7 +974,7 @@ for l in tensor image codec decoder tracker; do
   decl_count=0
   exports=$(nm -D --defined-only "${so}" 2>/dev/null)
   while read -r fn; do
-    [ -z "${fn}" ] && continue
+    [[ -z "${fn}" ]] && continue
     decl_count=$((decl_count+1))
     printf '%s\n' "${exports}" | grep -q " ${fn}\$" || bad=$((bad+1))
   done < <(header_decls "${hdr}")
@@ -978,12 +987,12 @@ for l in tensor image codec decoder tracker; do
   # independent of match outcome, and every one of these five headers
   # genuinely declares functions -- 0 extracted can only mean the header
   # was empty, unreadable, or not the file the extraction rule expects.
-  if [ "${decl_count}" -eq 0 ]; then
+  if [[ "${decl_count}" -eq 0 ]]; then
     cannot_measure "G11" "${hdr}: extraction found 0 declarations (expected >= 1)"
     continue
   fi
   gate "G11" "${l}.h declares ${bad} function(s) libedgefirst_${l}.so does not export (want 0)" \
-       "$([ "${bad}" -eq 0 ] && echo 0 || echo 1)"
+       "$([[ "${bad}" -eq 0 ]] && echo 0 || echo 1)"
 done
 
 echo "== G12: Python extensions really link libedgefirst_tensor.so =="
@@ -1011,7 +1020,7 @@ echo "== G12: Python extensions really link libedgefirst_tensor.so =="
 # The venv, never a global/system Python -- these are the actually
 # installed, actually shipped extensions, not a fresh build.
 PY_VENV="${PY_VENV:-venv}"
-if [ ! -x "${PY_VENV}/bin/python" ]; then
+if [[ ! -x "${PY_VENV}/bin/python" ]]; then
   cannot_measure "G12" "${PY_VENV}/bin/python not found -- build/install the Python extensions into the venv first (never a system Python)"
 else
   # Same technique the Makefile's own `build-python`/`test-python` targets
@@ -1019,7 +1028,7 @@ else
   # hardcoding a `python3.NN` version that will silently go stale.
   py_tag=$("${PY_VENV}/bin/python" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
   py_site="${PY_VENV}/lib/${py_tag}/site-packages"
-  if [ -z "${py_tag}" ] || [ ! -d "${py_site}" ]; then
+  if [[ -z "${py_tag}" ]] || [[ ! -d "${py_site}" ]]; then
     cannot_measure "G12" "could not resolve ${PY_VENV}'s site-packages directory (expected ${PY_VENV}/lib/python3.X/site-packages)"
   else
     # SCOPE: the four modular extensions, deliberately, and stated here
@@ -1068,7 +1077,7 @@ else
     # importable, it predates `013a59c9`, and it carries its own embedded
     # copy of the tensor implementation. Silence about it would be the same
     # mistake in the other direction, so it is reported and does not fail.
-    if [ -d "${py_site}/edgefirst_hal" ]; then
+    if [[ -d "${py_site}/edgefirst_hal" ]]; then
       printf '  %-4s WARN  %s\n' "G12" "${py_site}/edgefirst_hal is a stale install of the Python monolith removed at 013a59c9 -- nothing on this branch builds it; \`pip uninstall edgefirst-hal\` in this venv"
     fi
     for label in ${py_targets}; do
@@ -1076,33 +1085,33 @@ else
       # shellcheck disable=SC2206
       cpython=(${py_site}/edgefirst/${label}/_${label}.cpython-*.so)
       matches=()
-      if [ -e "${abi3}" ]; then
+      if [[ -e "${abi3}" ]]; then
         matches+=("${abi3}")
       fi
-      if [ -e "${cpython[0]}" ]; then
+      if [[ -e "${cpython[0]}" ]]; then
         matches+=("${cpython[@]}")
       fi
-      if [ "${#matches[@]}" -eq 0 ]; then
+      if [[ "${#matches[@]}" -eq 0 ]]; then
         cannot_measure "G12" "no installed extension matching ${py_site}/edgefirst/${label}/_${label}.abi3.so or _${label}.cpython-*.so -- build/install it into the venv first"
         continue
       fi
-      if [ "${#matches[@]}" -gt 1 ]; then
+      if [[ "${#matches[@]}" -gt 1 ]]; then
         cannot_measure "G12" "${#matches[@]} files matched edgefirst/${label}/_${label}.{abi3,cpython-*}.so, expected exactly one -- stale build in the venv?"
         continue
       fi
       so="${matches[0]}"
-      if [ ! -s "${so}" ] || [ ! -r "${so}" ]; then
+      if [[ ! -s "${so}" ]] || [[ ! -r "${so}" ]]; then
         cannot_measure "G12" "${so} is missing, empty, or unreadable"
         continue
       fi
       need=$(readelf -d "${so}" 2>/dev/null | grep -c 'libedgefirst_tensor.so' || true)
       und=$(nm -D -u "${so}" 2>/dev/null | grep -c ' ef_tensor_' || true)
-      if [ "${label}" = "tracker" ]; then
+      if [[ "${label}" = "tracker" ]]; then
         gate "G12" "${label} (${so#"${py_site}"/}): DT_NEEDED=${need} undefined ef_tensor_*=${und} (tracker must not link tensor)" \
-             "$([ "${need}" -eq 0 ] && [ "${und}" -eq 0 ] && echo 0 || echo 1)"
+             "$([[ "${need}" -eq 0 ]] && [[ "${und}" -eq 0 ]] && echo 0 || echo 1)"
       else
         gate "G12" "${label} (${so#"${py_site}"/}): DT_NEEDED=${need} undefined ef_tensor_*=${und}" \
-             "$([ "${need}" -ge 1 ] && [ "${und}" -ge 1 ] && echo 0 || echo 1)"
+             "$([[ "${need}" -ge 1 ]] && [[ "${und}" -ge 1 ]] && echo 0 || echo 1)"
       fi
     done
   fi
@@ -1149,7 +1158,7 @@ fi
 # cannot fail" this branch has produced seven of.
 fi # end of the --differential-only skip that began before G1
 
-if [ "${DIFFERENTIAL_MODE}" -eq 1 ]; then
+if [[ "${DIFFERENTIAL_MODE}" -eq 1 ]]; then
   echo "== G13: static and dynamic backends agree, test for test =="
   g13_static="${PY_STATIC_VENV:-venv}"
   g13_dynamic="${PY_DYNAMIC_VENV:-}"
@@ -1165,14 +1174,16 @@ if [ "${DIFFERENTIAL_MODE}" -eq 1 ]; then
   # XML keys every outcome the same way. `junitxml` is built into pytest,
   # so this still needs nothing extra installed in either venv.
   g13_run() { # g13_run <venv> <outfile>
+    local venv="$1"
+    local outfile="$2"
     # pytest's exit code is the ONLY signal that separates "ran the suite and
     # everything passed" from "collected nothing" (5) or "usage error, e.g. the
     # path does not exist" (4). Both of the latter still write a VALID junitxml
     # with tests="0", so the XML cannot tell them apart. Discarding this with
     # `|| true` is what let a nonexistent PY_TEST_PATHS report a clean pass.
-    if "$1/bin/python" -m pytest "${g13_tests}" --tb=no -q -p no:cacheprovider \
-      --junitxml="$2.xml" >"$2.raw" 2>&1; then echo 0 >"$2.rc"; else echo "$?" >"$2.rc"; fi
-    "$1/bin/python" - "$2.xml" >"$2" <<'G13_PARSE' || true
+    if "${venv}/bin/python" -m pytest "${g13_tests}" --tb=no -q -p no:cacheprovider \
+      --junitxml="${outfile}.xml" >"${outfile}.raw" 2>&1; then echo 0 >"${outfile}.rc"; else echo "$?" >"${outfile}.rc"; fi
+    "${venv}/bin/python" - "${outfile}.xml" >"${outfile}" <<'G13_PARSE' || true
 import sys, xml.etree.ElementTree as ET
 try:
     root = ET.parse(sys.argv[1]).getroot()
@@ -1204,19 +1215,22 @@ if rows:
 with open(sys.argv[1] + ".missing", "w") as fh:
     fh.write("\n".join(sorted(missing)))
 G13_PARSE
+    return 0
   }
 
   g13_check_venv() { # g13_check_venv <label> <path>
-    if [ -z "$2" ]; then
-      cannot_measure "G13" "$1 venv not supplied -- set PY_DYNAMIC_VENV to a venv with dynamic-linked extensions installed (never a system Python)"
+    local label="$1"
+    local path="$2"
+    if [[ -z "${path}" ]]; then
+      cannot_measure "G13" "${label} venv not supplied -- set PY_DYNAMIC_VENV to a venv with dynamic-linked extensions installed (never a system Python)"
       return 1
     fi
-    if [ ! -x "$2/bin/python" ]; then
-      cannot_measure "G13" "$1 venv $2/bin/python not found -- build/install the extensions into it first"
+    if [[ ! -x "${path}/bin/python" ]]; then
+      cannot_measure "G13" "${label} venv ${path}/bin/python not found -- build/install the extensions into it first"
       return 1
     fi
-    if ! "$2/bin/python" -c 'import pytest' >/dev/null 2>&1; then
-      cannot_measure "G13" "$1 venv $2 has no pytest installed"
+    if ! "${path}/bin/python" -c 'import pytest' >/dev/null 2>&1; then
+      cannot_measure "G13" "${label} venv ${path} has no pytest installed"
       return 1
     fi
     return 0
@@ -1237,16 +1251,17 @@ G13_PARSE
   # vendored an ARM `libedgefirst_tensor.so.0` inside an x86_64 wheel.
   # G12 already walks all four; this reuses the same set.
   g13_links_tensor_so() { # g13_links_tensor_so <venv> -> static|dynamic|missing|mixed(...)
+    local venv="$1"
     local site tag ext kinds pattern label
-    tag=$("$1/bin/python" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
-    site="$1/lib/${tag}/site-packages"
+    tag=$("${venv}/bin/python" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+    site="${venv}/lib/${tag}/site-packages"
     kinds=""
     for label in tensor image codec decoder; do
       pattern="${site}/edgefirst/${label}/_${label}.cpython-*.so"
       # shellcheck disable=SC2206
       local matches=(${pattern})
       ext="${matches[0]}"
-      if [ ! -s "${ext}" ]; then echo "missing(${label})"; return; fi
+      if [[ ! -s "${ext}" ]]; then echo "missing(${label})"; return; fi
       if readelf -d "${ext}" 2>/dev/null | grep -q 'libedgefirst_tensor.so'; then
         kinds="${kinds}${label}=dynamic "
       else
@@ -1260,6 +1275,7 @@ G13_PARSE
       "tensor=static image=static codec=static decoder=static ") echo "static" ;;
       *) echo "mixed(${kinds%% })" ;;
     esac
+    return 0
   }
 
   # Both venvs must have been built from the CURRENT source, not merely be one
@@ -1272,26 +1288,28 @@ G13_PARSE
   # crates/, and nothing said so. A differential gate whose two sides differ in
   # more than the one variable under test is measuring something it cannot name.
   g13_ext_mtime() { # g13_ext_mtime <venv> -> epoch seconds, or empty
+    local venv="$1"
     local tag site matches
-    tag=$("$1/bin/python" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
-    site="$1/lib/${tag}/site-packages"
+    tag=$("${venv}/bin/python" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+    site="${venv}/lib/${tag}/site-packages"
     # shellcheck disable=SC2206
     matches=(${site}/edgefirst/tensor/_tensor.cpython-*.so)
-    [ -s "${matches[0]}" ] && stat -c %Y "${matches[0]}" 2>/dev/null
+    [[ -s "${matches[0]}" ]] && stat -c %Y "${matches[0]}" 2>/dev/null
+    return 0
   }
 
   if g13_check_venv "static" "${g13_static}" && g13_check_venv "dynamic" "${g13_dynamic}"; then
     g13_kind_static=$(g13_links_tensor_so "${g13_static}")
     g13_kind_dynamic=$(g13_links_tensor_so "${g13_dynamic}")
-    if [ "${g13_kind_static}" != "static" ] || [ "${g13_kind_dynamic}" != "dynamic" ]; then
+    if [[ "${g13_kind_static}" != "static" ]] || [[ "${g13_kind_dynamic}" != "dynamic" ]]; then
       cannot_measure "G13" "the two venvs are not one of each backend (${g13_static}=${g13_kind_static}, ${g13_dynamic}=${g13_kind_dynamic}) -- comparing a venv with itself would pass having measured nothing"
-    elif [ -n "${g13_src_epoch:=$(git log -1 --format=%ct -- crates/ 2>/dev/null)}" ] \
+    elif [[ -n "${g13_src_epoch:=$(git log -1 --format=%ct -- crates/ 2>/dev/null)}" ]] \
       && { g13_stale=""; \
            for g13_v in "${g13_static}" "${g13_dynamic}"; do \
              g13_m=$(g13_ext_mtime "${g13_v}"); \
-             [ -n "${g13_m}" ] && [ "${g13_m}" -lt "${g13_src_epoch}" ] \
+             [[ -n "${g13_m}" ]] && [[ "${g13_m}" -lt "${g13_src_epoch}" ]] \
                && g13_stale="${g13_stale}${g13_v} ($(date -d "@${g13_m}" '+%b %d %H:%M')) "; \
-           done; [ -n "${g13_stale}" ]; }; then
+           done; [[ -n "${g13_stale}" ]]; }; then
       cannot_measure "G13" "venv(s) built before the current source: ${g13_stale}-- newest commit touching crates/ is $(date -d "@${g13_src_epoch}" '+%b %d %H:%M'). Rebuild and reinstall both, or the comparison carries a second variable (elapsed source changes) alongside the backend it means to test"
     else
       # `mktemp -d` failing (a full /tmp -- this host runs against a quota
@@ -1299,7 +1317,7 @@ G13_PARSE
       # empty string. `[ "" -eq 0 ]` does not evaluate false -- it ERRORS with
       # "integer expression expected" and returns 2, so the liveness `if` was
       # false and the comparison ran anyway, printing a pass "over  tests".
-      if ! g13_tmp=$(mktemp -d) || [ ! -d "${g13_tmp}" ]; then
+      if ! g13_tmp=$(mktemp -d) || [[ ! -d "${g13_tmp}" ]]; then
         cannot_measure "G13" "mktemp -d failed -- cannot stage the two runs (is TMPDIR full?)"
       else
       g13_run "${g13_static}" "${g13_tmp}/static"
@@ -1312,9 +1330,9 @@ G13_PARSE
       # 2 interrupted, 3 internal error, 4 usage error, 5 nothing collected --
       # none of those is a measurement, and all of them still leave a parseable
       # junitxml behind.
-      if [ "${g13_rc_static}" != "0" ] && [ "${g13_rc_static}" != "1" ]; then
+      if [[ "${g13_rc_static}" != "0" ]] && [[ "${g13_rc_static}" != "1" ]]; then
         cannot_measure "G13" "static run did not execute the suite (pytest exit ${g13_rc_static:-unknown}; 4=usage error/bad path, 5=nothing collected) -- see ${g13_tmp}/static.raw"
-      elif [ "${g13_rc_dynamic}" != "0" ] && [ "${g13_rc_dynamic}" != "1" ]; then
+      elif [[ "${g13_rc_dynamic}" != "0" ]] && [[ "${g13_rc_dynamic}" != "1" ]]; then
         cannot_measure "G13" "dynamic run did not execute the suite (pytest exit ${g13_rc_dynamic:-unknown}; 4=usage error/bad path, 5=nothing collected) -- see ${g13_tmp}/dynamic.raw"
       # Validate as NUMBERS before comparing as numbers. An empty or non-numeric
       # count must not reach `[ -eq ]`, which errors rather than returning false.
@@ -1326,7 +1344,7 @@ G13_PARSE
       # ERROR rows, which compare equal and report a confident zero. The
       # missing-package guard cannot see that: it keys on pytest's *skip*
       # message, which a hard collection ImportError never emits.
-      elif [ "${g13_n_static}" -lt "${G13_MIN_TESTS:-200}" ] || [ "${g13_n_dynamic}" -lt "${G13_MIN_TESTS:-200}" ]; then
+      elif [[ "${g13_n_static}" -lt "${G13_MIN_TESTS:-200}" ]] || [[ "${g13_n_dynamic}" -lt "${G13_MIN_TESTS:-200}" ]]; then
         cannot_measure "G13" "only ${g13_n_static}/${g13_n_dynamic} outcomes, below the floor of ${G13_MIN_TESTS:-200} -- a collection error collapses the suite into a few per-file ERROR rows that compare equal. Set G13_MIN_TESTS to run a deliberate subset. See ${g13_tmp}/*.raw"
       else
         # One line per DIVERGING TEST, not two (a `comm` of the two outcome
@@ -1357,7 +1375,7 @@ G13_PARSE
         # the number that gets quoted is the last one, and it said the
         # opposite of the verdict. Fourth instance on this gate of a figure
         # outliving the caveat that qualified it.
-        if [ -n "${g13_missing}" ]; then
+        if [[ -n "${g13_missing}" ]]; then
           cannot_measure "G13" "the two venvs have different optional packages installed (${g13_missing}) -- install them in both, or the import-skips they cause will read as backend divergences"
         else
         # CONFIRM a divergence before reporting it. Timing-sensitive tests --
@@ -1369,7 +1387,7 @@ G13_PARSE
         # is green, which is the same as not having it. Only divergences that
         # survive a second full pass on BOTH sides are real; the rest are
         # reported as flakes so they are visible without being fatal.
-        if [ "${g13_ndiff}" -ne 0 ]; then
+        if [[ "${g13_ndiff}" -ne 0 ]]; then
           echo "         ${g13_ndiff} candidate divergence(s); confirming with a second pass"
           g13_run "${g13_static}" "${g13_tmp}/static2"
           g13_run "${g13_dynamic}" "${g13_tmp}/dynamic2"
@@ -1381,14 +1399,14 @@ G13_PARSE
                             <(printf '%s\n' "${g13_diff}" | LC_ALL=C sort) \
                             <(printf '%s\n' "${g13_diff2}" | LC_ALL=C sort) | grep -v '^$' || true)
           g13_flaky=$((g13_ndiff - $(printf '%s' "${g13_confirmed}" | grep -c . || true)))
-          [ "${g13_flaky}" -gt 0 ] && echo "         ${g13_flaky} did not reproduce (flaky under load, not a backend difference)"
+          [[ "${g13_flaky}" -gt 0 ]] && echo "         ${g13_flaky} did not reproduce (flaky under load, not a backend difference)"
           g13_diff="${g13_confirmed}"
           g13_ndiff=$(printf '%s' "${g13_diff}" | grep -c . || true)
         fi
-        if [ "${g13_ndiff}" -ne 0 ]; then
+        if [[ "${g13_ndiff}" -ne 0 ]]; then
           g13_ok=0
           printf '%s\n' "${g13_diff}" | head -40 | sed 's/^/         /'
-          [ "${g13_ndiff}" -gt 40 ] && echo "         ... and $((g13_ndiff - 40)) more"
+          [[ "${g13_ndiff}" -gt 40 ]] && echo "         ... and $((g13_ndiff - 40)) more"
         fi
         # The venvs are built from the WORKING TREE, not from HEAD. With
         # uncommitted changes under crates/ the resulting number belongs to no
@@ -1399,9 +1417,9 @@ G13_PARSE
         # number it qualifies, and it is the number that gets quoted.
         g13_dirty=$(git status --porcelain -- crates/ 2>/dev/null | grep -c . || true)
         g13_note=""
-        [ "${g13_dirty}" -gt 0 ] && g13_note="  [${g13_dirty} uncommitted file(s) under crates/ -- this number belongs to no commit]"
+        [[ "${g13_dirty}" -gt 0 ]] && g13_note="  [${g13_dirty} uncommitted file(s) under crates/ -- this number belongs to no commit]"
         gate "G13" "${g13_ndiff} outcome(s) differ between backends over ${g13_n_static} tests (want 0)${g13_note}" \
-             "$([ "${g13_ok}" -eq 1 ] && echo 0 || echo 1)"
+             "$([[ "${g13_ok}" -eq 1 ]] && echo 0 || echo 1)"
         echo "         raw logs: ${g13_tmp}/{static,dynamic}.raw"
         fi # end of the package-mismatch short-circuit
       fi
@@ -1409,13 +1427,13 @@ G13_PARSE
     fi
   fi
 
-  if [ "${DIFFERENTIAL_ONLY}" -eq 1 ]; then
+  if [[ "${DIFFERENTIAL_ONLY}" -eq 1 ]]; then
     echo
-    if [ "${fails}" -eq 0 ]; then echo "ALL GATES GREEN"; exit 0; fi
+    if [[ "${fails}" -eq 0 ]]; then echo "ALL GATES GREEN"; exit 0; fi
     echo "${fails} GATE(S) RED"; exit 1
   fi
 fi
 
 echo
-if [ "${fails}" -eq 0 ]; then echo "ALL GATES GREEN"; exit 0; fi
+if [[ "${fails}" -eq 0 ]]; then echo "ALL GATES GREEN"; exit 0; fi
 echo "${fails} GATE(S) RED"; exit 1
