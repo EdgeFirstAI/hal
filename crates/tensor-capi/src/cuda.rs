@@ -101,3 +101,50 @@ pub unsafe extern "C" fn ef_tensor_cuda_unmap(map: *mut c_void) {
         }));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handle::{ef_tensor_free, ef_tensor_ndim, ef_tensor_new, ef_tensor_retain};
+
+    #[test]
+    fn cuda_map_keeps_the_tensor_alive_after_the_caller_frees() {
+        // Copilot review of this file: transmute-to-'static is only sound if
+        // the map retains `t`. `ef_tensor_cuda_map` already does that; this
+        // test is the contract, including the common NULL-map (no CUDA) path
+        // which must *not* take a retain.
+        let dims = [4u64];
+        let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
+        assert!(!t.is_null());
+        // Extra owner so we can observe liveness after dropping the mint.
+        assert_eq!(unsafe { ef_tensor_retain(t) }, 0);
+
+        let map = unsafe { ef_tensor_cuda_map(t) };
+        if map.is_null() {
+            unsafe { ef_tensor_free(t) };
+            assert_eq!(
+                unsafe { ef_tensor_ndim(t) },
+                1,
+                "a NULL cuda map must not consume a retain"
+            );
+            unsafe { ef_tensor_free(t) };
+            return;
+        }
+
+        unsafe { ef_tensor_free(t) };
+        unsafe { ef_tensor_free(t) };
+        let mut size = 0usize;
+        let _ptr = unsafe { ef_tensor_cuda_device_ptr(map, &mut size) };
+        assert_eq!(
+            unsafe { ef_tensor_ndim(t) },
+            1,
+            "the map's retain must keep the handle alive after the caller frees"
+        );
+        unsafe { ef_tensor_cuda_unmap(map) };
+    }
+
+    #[test]
+    fn cuda_unmap_of_null_is_a_noop() {
+        unsafe { ef_tensor_cuda_unmap(std::ptr::null_mut()) };
+    }
+}
