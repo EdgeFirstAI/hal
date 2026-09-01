@@ -78,6 +78,37 @@ typedef struct ef_decoder_tracker ef_decoder_tracker;
 
 /** @brief Track list from `ef_decoder_decode_tracked`. */
 typedef struct ef_decoder_track_list ef_decoder_track_list;
+
+/**
+ * @name EF_INFER_DTYPE_*
+ * @brief Numeric dtype codes for `ef_infer_signals_add_input`/
+ * `ef_infer_signals_add_output`.
+ *
+ * Mirrors `edgefirst_decoder::schema::DType`'s declaration order. This is a
+ * distinct vocabulary from `edgefirst/tensor.h`'s `EF_DTYPE_*` (a wider,
+ * differently-ordered enum for physical tensor storage) -- schema dtype is
+ * the narrower quantized/float set a model's logical I/O carries. As with
+ * `EF_DTYPE_*`, the functions that take one keep a plain `uint32_t`
+ * parameter rather than this enum: an out-of-range code is rejected with
+ * `EINVAL` rather than transmuted into a Rust enum, which would be
+ * undefined behaviour for a value no variant names.
+ *
+ * The codes start at `0x100` so the two vocabularies cannot overlap. Both
+ * cross as bare `uint32_t`, so had these numbered from `0` every value
+ * would have been a valid code in BOTH enums meaning something different
+ * -- `7` is FLOAT32 here and `EF_DTYPE_I64` there, and `0`/`1` invert
+ * signedness. A caller passing the tensor dtype code it already holds
+ * would have been silently misread rather than rejected. Disjoint ranges
+ * make that mistake an `EINVAL`.
+ */
+#define EF_INFER_DTYPE_INT8 0x100
+#define EF_INFER_DTYPE_UINT8 0x101
+#define EF_INFER_DTYPE_INT16 0x102
+#define EF_INFER_DTYPE_UINT16 0x103
+#define EF_INFER_DTYPE_INT32 0x104
+#define EF_INFER_DTYPE_UINT32 0x105
+#define EF_INFER_DTYPE_FLOAT16 0x106
+#define EF_INFER_DTYPE_FLOAT32 0x107
 """
 
 trailer = """
@@ -113,6 +144,8 @@ exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderP
 "EfDecoderTracker" = "ef_decoder_tracker"
 "EfDecoderTrackList" = "ef_decoder_track_list"
 "EfDecoderTrack" = "ef_decoder_track"
+"EfInferSignals" = "ef_infer_signals"
+"EfInferredSchema" = "ef_inferred_schema"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

@@ -55,6 +55,37 @@ typedef struct ef_decoder_tracker ef_decoder_tracker;
 /** @brief Track list from `ef_decoder_decode_tracked`. */
 typedef struct ef_decoder_track_list ef_decoder_track_list;
 
+/**
+ * @name EF_INFER_DTYPE_*
+ * @brief Numeric dtype codes for `ef_infer_signals_add_input`/
+ * `ef_infer_signals_add_output`.
+ *
+ * Mirrors `edgefirst_decoder::schema::DType`'s declaration order. This is a
+ * distinct vocabulary from `edgefirst/tensor.h`'s `EF_DTYPE_*` (a wider,
+ * differently-ordered enum for physical tensor storage) -- schema dtype is
+ * the narrower quantized/float set a model's logical I/O carries. As with
+ * `EF_DTYPE_*`, the functions that take one keep a plain `uint32_t`
+ * parameter rather than this enum: an out-of-range code is rejected with
+ * `EINVAL` rather than transmuted into a Rust enum, which would be
+ * undefined behaviour for a value no variant names.
+ *
+ * The codes start at `0x100` so the two vocabularies cannot overlap. Both
+ * cross as bare `uint32_t`, so had these numbered from `0` every value
+ * would have been a valid code in BOTH enums meaning something different
+ * -- `7` is FLOAT32 here and `EF_DTYPE_I64` there, and `0`/`1` invert
+ * signedness. A caller passing the tensor dtype code it already holds
+ * would have been silently misread rather than rejected. Disjoint ranges
+ * make that mistake an `EINVAL`.
+ */
+#define EF_INFER_DTYPE_INT8 0x100
+#define EF_INFER_DTYPE_UINT8 0x101
+#define EF_INFER_DTYPE_INT16 0x102
+#define EF_INFER_DTYPE_UINT16 0x103
+#define EF_INFER_DTYPE_INT32 0x104
+#define EF_INFER_DTYPE_UINT32 0x105
+#define EF_INFER_DTYPE_FLOAT16 0x106
+#define EF_INFER_DTYPE_FLOAT32 0x107
+
 
 /* Generated with cbindgen:0.29.4 */
 
@@ -75,6 +106,17 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
  * without linking this library.
  */
 typedef struct ef_detect_box_list ef_detect_box_list;
+
+/**
+ * Raw model I/O signals, accumulated field by field.
+ */
+typedef struct ef_infer_signals ef_infer_signals;
+
+/**
+ * An inferred Ultralytics schema. Its JSON views are rendered on demand by
+ * [`ef_inferred_schema_json`]/[`ef_inferred_schema_labels_json`].
+ */
+typedef struct ef_inferred_schema ef_inferred_schema;
 
 /**
  * Accumulates detections from every tile of one frame.
@@ -544,6 +586,143 @@ int ef_decoder_decode_tracked(const ef_decoder *d,
  * `l` must be `NULL` or have come from this library.
  */
 void ef_segmentation_list_free(ef_segmentation_list *l);
+
+/**
+ * Create empty signals for a model read from `source` (`0` onnx, `1`
+ * tflite, `2` other). `NULL` for an unrecognized source or allocation
+ * failure.
+ */
+struct ef_infer_signals *ef_infer_signals_new(uint32_t source);
+
+/**
+ * Free signals. Freeing `NULL` is a no-op.
+ *
+ * # Safety
+ * `s` must be `NULL` or have come from this library.
+ */
+void ef_infer_signals_free(struct ef_infer_signals *s);
+
+/**
+ * Append an input tensor. `dtype` is an `EF_INFER_DTYPE_*` code.
+ *
+ * @return 0 on success, `EINVAL` for a null/invalid argument.
+ *
+ * # Safety
+ * `name` must be NUL-terminated; `shape` must point to `rank` sizes.
+ */
+int ef_infer_signals_add_input(struct ef_infer_signals *s,
+                               const char *name,
+                               const uintptr_t *shape,
+                               uintptr_t rank,
+                               uint32_t dtype);
+
+/**
+ * Append an output tensor, with optional quantization.
+ *
+ * `quant_len` is `0` for an unquantized tensor or `1` for per-tensor
+ * quantization; `scale` and `zero_point` (when non-NULL) each carry
+ * `quant_len` entries. `zero_point` may be `NULL` for symmetric
+ * quantization.
+ *
+ * A `quant_len` above `1` describes per-channel quantization, which this
+ * setter accepts but [`ef_infer_ultralytics_schema`] then refuses: the
+ * decoder consumes per-tensor quantization only, so such a schema would
+ * build a decoder that fails. The refusal is deferred to inference so the
+ * error arrives on the call that reports errors, with a message naming
+ * the offending tensor.
+ *
+ * @return 0 on success, `EINVAL` for a null/invalid argument (including a
+ *         nonzero `quant_len` with a `NULL` `scale`).
+ *
+ * # Safety
+ * `name` must be NUL-terminated; `shape` must point to `rank` sizes;
+ * `scale`/`zero_point` must point to `quant_len` elements when non-NULL.
+ */
+int ef_infer_signals_add_output(struct ef_infer_signals *s,
+                                const char *name,
+                                const uintptr_t *shape,
+                                uintptr_t rank,
+                                uint32_t dtype,
+                                const float *scale,
+                                const int32_t *zero_point,
+                                uintptr_t quant_len);
+
+/**
+ * Insert a metadata key/value pair, as captured verbatim from the model's
+ * container format (ONNX `metadata_props`, TFLite `metadata.json`).
+ *
+ * @return 0 on success, `EINVAL` for a null handle or unreadable string.
+ *
+ * # Safety
+ * `key` and `value` must be NUL-terminated.
+ */
+int ef_infer_signals_add_metadata(struct ef_infer_signals *s, const char *key, const char *value);
+
+/**
+ * Infer an Ultralytics schema from accumulated signals.
+ *
+ * `NULL` on failure. When `err_out` is non-NULL, `*err_out` is set to a
+ * message the caller frees with `ef_decoder_string_free`.
+ *
+ * **Initialize your `char *` to `NULL` before calling.** `*err_out` is
+ * left untouched on success, and while every failure path writes a
+ * message, the write itself can still fail (a message carrying an
+ * embedded NUL, or the allocation behind it). Detect failure from the
+ * returned handle, and test `*err_out` separately before reading it:
+ *
+ * ```c
+ * char *err = NULL;
+ * ef_inferred_schema *r = ef_infer_ultralytics_schema(s, &err);
+ * if (!r) {
+ *     fprintf(stderr, "%s\n", err ? err : "(no message)");
+ *     ef_decoder_string_free(err); // freeing NULL is a no-op
+ * }
+ * ```
+ *
+ * # Safety
+ * `s` must be `NULL` or a live handle from this library; `err_out` must be
+ * `NULL` or writable.
+ */
+struct ef_inferred_schema *ef_infer_ultralytics_schema(const struct ef_infer_signals *s,
+                                                       char **err_out);
+
+/**
+ * The inferred schema as `edgefirst.json` schema v2 JSON. The caller frees
+ * the result with `ef_decoder_string_free`. `NULL` for a `NULL` handle or
+ * on serialization failure.
+ *
+ * # Safety
+ * `r` must be `NULL` or a live handle from this library.
+ */
+char *ef_inferred_schema_json(const struct ef_inferred_schema *r);
+
+/**
+ * The inferred class labels as a JSON array of strings, in index order.
+ * The caller frees the result with `ef_decoder_string_free`. `NULL` for a
+ * `NULL` handle or on serialization failure.
+ *
+ * # Safety
+ * `r` must be `NULL` or a live handle from this library.
+ */
+char *ef_inferred_schema_labels_json(const struct ef_inferred_schema *r);
+
+/**
+ * A human-readable summary, e.g. "Ultralytics YOLO26 segment, 80 classes".
+ * The caller frees the result with `ef_decoder_string_free`. `NULL` for a
+ * `NULL` handle.
+ *
+ * # Safety
+ * `r` must be `NULL` or a live handle from this library.
+ */
+char *ef_inferred_schema_description(const struct ef_inferred_schema *r);
+
+/**
+ * Free an inferred schema. Freeing `NULL` is a no-op.
+ *
+ * # Safety
+ * `r` must be `NULL` or have come from this library.
+ */
+void ef_inferred_schema_free(struct ef_inferred_schema *r);
 
 /**
  * Fill `out` with the library's default merge configuration.

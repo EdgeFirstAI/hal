@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Ultralytics schema inference.** Vanilla Ultralytics YOLOv8/YOLO11/YOLO26 ONNX and TFLite exports can now be decoded without an embedded `edgefirst.json`: the new schema-inference API reads the model's own metadata and tensor shapes to configure the decoder, including YOLO26's NMS-free outputs. Available from Rust (`edgefirst_decoder::infer_ultralytics_schema`), C (`ef_infer_*`), and Python (`edgefirst.decoder.infer_ultralytics_schema`). The inferred schema pins the NMS mode to class-aware for pre-NMS heads, matching Ultralytics' own `agnostic=False`; ambiguities it cannot measure — an uncharacterized container's box convention, per-channel quantization the decoder cannot consume — are typed errors rather than defaults.
+
 ## [0.29.0] - 2026-08-25
 
 ### Added

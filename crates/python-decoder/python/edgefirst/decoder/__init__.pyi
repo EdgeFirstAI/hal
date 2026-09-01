@@ -5,7 +5,7 @@ mirrors the pymodule registrations in crates/python-decoder/src/lib.rs.
 """
 
 import enum
-from typing import Protocol
+from typing import Any, NamedTuple, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -774,3 +774,80 @@ def merge_tiled_detections(
     classes: npt.NDArray[np.uintp],
     cfg: MergeConfig,
 ) -> DetectionOutput: ...
+
+class InferredSchema(NamedTuple):
+    """What :func:`infer_ultralytics_schema` derived from a model's signals.
+
+    A ``NamedTuple``, so it unpacks positionally like a plain tuple while
+    giving the three fields names.
+    """
+
+    schema: dict[str, Any]
+    labels: list[str]
+    description: str
+
+def infer_ultralytics_schema(
+    source: str,
+    inputs: list[
+        tuple[str, list[int | str], str]
+        | tuple[str, list[int | str], str, tuple[list[float], list[int]] | None]
+    ],
+    outputs: list[
+        tuple[str, list[int | str], str]
+        | tuple[str, list[int | str], str, tuple[list[float], list[int]] | None]
+    ],
+    metadata: dict[str, str],
+) -> InferredSchema:
+    """Infer an Ultralytics YOLO schema from raw model I/O signals.
+
+    Detection and segmentation are both supported, for Ultralytics v8/v11
+    pre-NMS heads and YOLO26 end-to-end heads alike. This lets a caller build
+    a decoder for an Ultralytics export straight from the shapes/dtypes/
+    metadata its inference runtime reports, without a hand-written
+    ``edgefirst.json``.
+
+    Args:
+        source: Container format the signals were read from: ``"onnx"`` or
+            ``"tflite"``. ``"other"`` is accepted but rejected by inference:
+            whether boxes are pixel-space or ``[0, 1]`` follows the exporter
+            and is not derivable from shapes, so an uncharacterized
+            container is refused rather than guessed at.
+        inputs: Input tensors as ``(name, shape, dtype)``, or with a 4th
+            ``quantization`` element -- an input's quantization is accepted
+            for symmetry with ``outputs`` and ignored.
+        outputs: Output tensors as ``(name, shape, dtype)`` for an
+            unquantized tensor, or ``(name, shape, dtype, quantization)``
+            where ``quantization`` is ``(scales, zero_points)`` or ``None``.
+            Only per-tensor quantization (one scale, one zero point) is
+            usable -- the decoder consumes per-tensor only, so more than one
+            scale is rejected rather than turned into a schema that cannot
+            build.
+        metadata: Raw model metadata key/values, passed through verbatim
+            (ONNX ``metadata_props``, or the TFLite ``metadata.json``
+            envelope under whichever key it was captured).
+
+    Note:
+        Supported dtype strings are ``"int8"``, ``"uint8"``, ``"int16"``,
+        ``"uint16"``, ``"int32"``, ``"uint32"``, ``"float16"`` and
+        ``"float32"``.
+
+        Shapes must be concrete. A model exported with ``dynamic=True``
+        reports a symbolic dimension (``'batch'`` from ONNX, ``-1`` from
+        TFLite); those are accepted as arguments and refused with a
+        ``ValueError`` naming the tensor and axis, since the layout rules
+        need real sizes.
+
+    Returns:
+        An :class:`InferredSchema` of ``(schema, labels, description)``: the
+        inferred ``edgefirst.json`` schema v2 document as a dict ready for
+        ``Decoder(schema)``, class names in index order, and a
+        human-readable summary (e.g. ``"Ultralytics YOLOv8/11 detect, 80
+        classes"``). It unpacks positionally as well.
+
+    Raises:
+        ValueError: the signals carry no recognizable Ultralytics schema
+            (bad/missing metadata, an unsupported task, a class-count
+            mismatch, an unrecognized output layout, or per-channel
+            quantization), or a dtype/source string isn't one of the values
+            listed above.
+    """

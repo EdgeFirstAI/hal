@@ -72,6 +72,11 @@ env.sh
 *.onnx
 /benchmarks/docker/coco-smoke/
 
+# Locally exported .pt/.onnx/.tflite models used by the schema-inference
+# fixture capture script and its on-demand integration test. Developers
+# produce these with their own tooling; nothing here is committed.
+/.ultralytics-exports/
+
 # maturin develop drops built extensions into the package source tree
 crates/python-*/python/edgefirst/*/_*.so
 crates/python-*/python/edgefirst/*/_*.pyd

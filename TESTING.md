@@ -326,6 +326,66 @@ C API: `make test-capi-modular` and `make test-capi-link` cover the five
 libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`). Headers
 live in each leaf's `include/edgefirst/*.h`.
 
+### On-demand Ultralytics discovery test
+
+`tests/decoder/test_ultralytics_discovery.py` runs the Ultralytics
+schema-inference API (`edgefirst.decoder.infer_ultralytics_schema`) against
+real exports, plus a few unsupported task exports (pose, classify, OBB) to
+confirm those fail gracefully with a typed error rather than a crash or a
+wrong schema. It is the only test in the suite that exercises the
+exporter's actual output conventions instead of captured fixtures.
+
+This repository ships no Ultralytics code and no script that installs it.
+The decoder is an independent Rust implementation that reads the *models*
+those tools export — nothing upstream is vendored, linked, or
+redistributed here. To run this test, export the models yourself with your
+own Ultralytics installation and point the test at them:
+
+```bash
+# In your own environment, not a project one:
+yolo export model=yolov8n.pt format=onnx imgsz=640
+yolo export model=yolov8n.pt format=tflite imgsz=640            # -> yolov8n.tflite
+yolo export model=yolov8n.pt format=tflite imgsz=640 int8=True data=coco8.yaml
+# ...and the same for yolo11n / yolo26n, plus the -seg variants.
+```
+
+Name the plain TFLite export `<model>_float32.tflite` (the exporter only
+adds a suffix for `int8=True`), put everything in one directory, and set
+`EF_ULTRALYTICS_EXPORTS` to it — it defaults to `.ultralytics-exports/`,
+which is git-ignored. Any model the test cannot find is skipped, not
+failed, so a partial set is fine.
+
+The matrix below is what the committed fixtures were captured from, which
+is not every combination the API supports:
+
+| Family | ONNX det | ONNX seg | TFLite det (f32/int8) | TFLite seg (f32/int8) |
+|---|---|---|---|---|
+| YOLOv8 | ✅ | ✅ | ✅ / ✅ | ✅ / ✅ |
+| YOLO11 | ✅ | ✅ | — | — |
+| YOLO26 | ✅ | ✅ | ✅ / — | — |
+
+The gaps are deliberate rather than unnoticed: YOLO11 shares YOLOv8's
+pre-NMS head and export conventions exactly (both infer as
+`decoder_version: yolov8`), so its TFLite exports would re-cover the
+YOLOv8 TFLite path. The one genuinely uncovered combination is **YOLO26
+segmentation on TFLite** — end-to-end plus prototypes plus `[0,1]` box
+normalization — which no export in this matrix exercises together. Every
+combination in the table is also covered offline by a captured fixture
+(`crates/decoder/testdata/infer/`), asserted field by field.
+
+```bash
+source venv/bin/activate && maturin develop -m crates/python-decoder/Cargo.toml && \
+  EF_ULTRALYTICS_EXPORTS=/path/to/exports \
+  pytest tests/decoder/test_ultralytics_discovery.py -m ultralytics -v
+```
+
+It is excluded from CI by default (`addopts = "-m 'not benchmark and not
+ultralytics'"` in `pyproject.toml`): it needs exported model files that
+only a developer with their own Ultralytics installation can produce, which
+is not something CI should carry. Run it locally after touching `infer.rs`,
+or when the export conventions change upstream. Everything it covers is
+also covered offline by the captured fixtures, which CI does run.
+
 ### Disabling hardware backends
 
 Use environment variables to isolate tests to specific backends:
