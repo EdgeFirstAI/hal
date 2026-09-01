@@ -194,6 +194,67 @@ coverage pass 1 (unsigned binaries) skips and pass 2 (signed) enforces.
 
 ---
 
+## Windows Setup
+
+Windows runs the same OpenGL ES engine on ANGLE over Direct3D 11 with PBO
+transfers (README § Windows GPU Acceleration). The GL tests need ANGLE's
+`libEGL.dll` + `libGLESv2.dll` reachable; without them every GL test
+self-skips (and `HAL_TEST_REQUIRE_GL=1` makes that a failure).
+
+### 1. Install ANGLE
+
+From Git Bash (the `--windows` flag is implied on a Windows host):
+
+```bash
+bash scripts/fetch-angle.sh            # → target/angle/windows-x64/bin/{libEGL,libGLESv2}.dll
+```
+
+### 2. Run the tests
+
+From a **Developer PowerShell for VS** (cargo must find MSVC `link.exe`;
+Git Bash's `/usr/bin/link.exe` shadows it):
+
+```powershell
+pwsh scripts/test-windows.ps1 -RequireGl                       # real GPU: all crates, -j 1
+pwsh scripts/test-windows.ps1 -RequireGl -p edgefirst-image    # image crate only
+pwsh scripts/test-windows.ps1 -Warp -RequireGl -p edgefirst-image   # no GPU: D3D11 WARP
+```
+
+The script defaults `EDGEFIRST_ANGLE_PATH` to the fetched directory, `-Warp`
+sets `EDGEFIRST_ANGLE_ADAPTER=warp` + `EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and
+`-RequireGl` sets `HAL_TEST_REQUIRE_GL=1`; everything after the switches is
+passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
+serialization policy.
+
+### 3. Verify the GPU backend is active
+
+```powershell
+$env:EDGEFIRST_ANGLE_PATH = "$PWD\target\angle\windows-x64\bin"
+$env:RUST_LOG = 'edgefirst_image=debug'
+cargo run --release -p edgefirst-image --example pipeline_demo
+```
+
+Expect `image.gl_init{platform="windows", backend="pbo"}`, an
+`ANGLE D3D11 adapter: <your GPU>` line, `ANGLE (<vendor>, <GPU> ...
+Direct3D11 ...)` as the renderer, and `GLConverter created (transfer=Pbo)`.
+`EDGEFIRST_ANGLE_ADAPTER` picks the adapter on multi-GPU machines (README §
+Environment Variables). Under a Remote Desktop session the hardware adapter
+is normally still used; check the adapter line if in doubt.
+
+### 4. Python GPU tests
+
+```powershell
+$env:HAL_TEST_REQUIRE_GL = '1'
+venv\Scripts\python -m pytest tests/ -m gpu -v --tb=short
+```
+
+`tests/gpu_policy.py` skips the gpu-marked tests on Windows unless
+`HAL_TEST_REQUIRE_GL=1`, and then requires a PBO-backed destination. The
+Windows `edgefirst-image` wheel bundles ANGLE when built with
+`EDGEFIRST_ANGLE_PATH` set, so an installed wheel needs no env var.
+
+---
+
 ## Rust Unit Tests
 
 Rust tests are co-located with source code in `#[cfg(test)]` modules:
@@ -985,7 +1046,7 @@ Tests run across multiple runner types:
 | Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | Paravirtual Metal GPU (ANGLE; Full GL serialization policy) |
 | Build & Link (iOS) | `macos-latest` | arm64 | No runtime tests — build + link closure only |
 | Build & Link (Android) | `ubuntu-22.04` | x86_64 host | No runtime tests — see Device Farm section below |
-| Build Check (Windows) | `windows-latest` | x86_64 | `cargo check` only |
+| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating); image-crate GL tests, C-API leaf tests and gpu pytest on ANGLE Direct3D 11 WARP (software; best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl` |
 | Software-GL Coverage (llvmpipe) | `ubuntu-22.04-xlarge` | x86_64 | Mesa llvmpipe (software GL) |
 | Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
 | Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |

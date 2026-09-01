@@ -88,18 +88,33 @@ returns early if it returns `false`. This keeps the suite green on developer
 machines without GPU hardware while still exercising the full hardware path
 on target boards and CI runners.
 
-The module runs on **both Linux and macOS/ANGLE** in three tiers, selected
-by per-item `cfg` gates:
+The module runs on **Linux, macOS/ANGLE and Windows/ANGLE** in four tiers,
+selected by per-item `cfg` gates:
 
 | Tier | Gate | Contents |
 |------|------|----------|
 | Portable | none | mask/segmentation/box render, proto suite, src_rect crops, decision tables, F16 zero-copy roundtrip |
-| Zero-copy | `feature = "dma_test_formats"` | `@Dma` fixtures that allocate on both platforms (RGBA/BGRA/GREY/NV*/YUYV — DMA-BUF on Linux, IOSurface on macOS): pool/recycle/steady-state, NV12/YUYV references, subview no-aliasing, NV16/NV24 Path-B oracles, odd-geometry `g01–g06`/grey/64×64 GPU-vs-CPU oracles |
-| Linux-only | `cfg(target_os = "linux")` (± the feature) | display probing, PBO/CUDA destinations, packed-RGB `@Dma` incl. the int8 odd-geometry oracles (no IOSurface FourCC for 3-byte RGB), DMA stride guards, multi-plane fd imports, Neutron scenarios, NV path-selection asserts and divergence probes |
+| Zero-copy | `feature = "dma_test_formats"` | `@Dma` fixtures that allocate on both platforms (RGBA/BGRA/GREY/NV*/YUYV — DMA-BUF on Linux, IOSurface on macOS): pool/recycle/steady-state, NV12/YUYV references, subview no-aliasing, NV16/NV24 Path-B oracles, odd-geometry `g01–g06`/grey/64×64 GPU-vs-CPU oracles. Self-skips on Windows (no zero-copy allocation) |
+| PBO destinations | `cfg(any(target_os = "linux", target_os = "windows"))` | PBO u8/i8/float destinations, cross-handle PBO map exclusion, `float_pbo_eligible` |
+| Linux-only | `cfg(target_os = "linux")` (± the feature) | display probing, CUDA destinations, packed-RGB `@Dma` incl. the int8 odd-geometry oracles (no IOSurface FourCC for 3-byte RGB), DMA stride guards, multi-plane fd imports, Neutron scenarios, NV path-selection asserts and divergence probes |
+
+On Windows the GL tests need ANGLE reachable (`EDGEFIRST_ANGLE_PATH` or the
+DLLs next to the test binary); `scripts/test-windows.ps1` sets that up and
+`-Warp` selects the D3D11 software adapter for GPU-less hosts — see the root
+`TESTING.md` § Windows Setup.
 
 The zero-copy tier probes `is_gpu_image_buffer_available()`
 (`edgefirst_tensor::is_gpu_buffer_available`) instead of the Linux-flavored
 `is_dma_available()`.
+
+The `test_opengl_*` integration tests in `src/lib.rs` (resize, grey,
+src/dst crop, the rotation × flip × backing matrix, 10-thread bring-up,
+the YUYV/VYUY zero-copy imports and the F16 GL/CPU parity check) follow the
+same rules: they are gated on every GL platform (Linux, macOS, iOS,
+Android, Windows), self-skip when `GLProcessorThreaded::new` fails, build
+their tensor-backing lists from `is_shm_available()` /
+`is_gpu_buffer_available()` rather than hard-coding `Shm`/`DmaBuf`, and the
+YUV imports skip where no zero-copy backing exists (Windows today).
 
 **Android** deliberately has no `#[cfg(target_os = "android")]` test tier
 in this module: no CI runner can execute Android GL, so on-device

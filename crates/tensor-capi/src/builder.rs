@@ -741,10 +741,24 @@ mod tests {
         if !edgefirst_tensor::is_shm_available() {
             return -1;
         }
-        let t = edgefirst_tensor::TensorDyn::new(&[len], DType::U8, Some(TensorMemory::Shm), None)
+        #[cfg(unix)]
+        {
+            let t = edgefirst_tensor::TensorDyn::new(
+                &[len],
+                DType::U8,
+                Some(TensorMemory::Shm),
+                None,
+            )
             .expect("shm backing allocation");
-        use std::os::fd::IntoRawFd;
-        t.clone_fd().expect("clone fd").into_raw_fd() as i64
+            use std::os::fd::IntoRawFd;
+            t.clone_fd().expect("clone fd").into_raw_fd() as i64
+        }
+        #[cfg(not(unix))]
+        {
+            // No fds on Windows (`is_shm_available()` is false there anyway).
+            let _ = len;
+            -1
+        }
     }
 
     #[test]

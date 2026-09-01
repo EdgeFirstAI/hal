@@ -18,6 +18,8 @@
 //! ./tensor_benchmark --bench
 //! ```
 
+// Only the Unix (Shm / DMA-BUF / IOSurface) sections below consult it.
+#[cfg(unix)]
 use edgefirst_tensor::is_gpu_buffer_available;
 use edgefirst_tensor::{Tensor, TensorMapTrait as _, TensorMemory, TensorTrait as _};
 use num_traits::Num;

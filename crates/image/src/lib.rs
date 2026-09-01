@@ -326,7 +326,10 @@ pub use edgefirst_codec as codec;
 use edgefirst_tensor::ProtoLayout;
 #[doc(inline)]
 pub use edgefirst_tensor::Region;
-#[cfg(any(test, all(target_os = "linux", feature = "opengl")))]
+#[cfg(any(
+    test,
+    all(any(target_os = "linux", target_os = "windows"), feature = "opengl")
+))]
 use edgefirst_tensor::Tensor;
 use edgefirst_tensor::{
     DType, PixelFormat, PixelLayout, TensorDyn, TensorMemory, TensorTrait as _,
@@ -341,7 +344,8 @@ pub use g2d::G2DProcessor;
         target_os = "linux",
         target_os = "macos",
         target_os = "ios",
-        target_os = "android"
+        target_os = "android",
+        target_os = "windows"
     ),
     feature = "opengl"
 ))]
@@ -351,7 +355,8 @@ pub use opengl_headless::EglDisplayKind;
         target_os = "linux",
         target_os = "macos",
         target_os = "ios",
-        target_os = "android"
+        target_os = "android",
+        target_os = "windows"
     ),
     feature = "opengl"
 ))]
@@ -361,7 +366,8 @@ pub use opengl_headless::GLProcessorThreaded;
         target_os = "linux",
         target_os = "macos",
         target_os = "ios",
-        target_os = "android"
+        target_os = "android",
+        target_os = "windows"
     ),
     feature = "opengl"
 ))]
@@ -377,7 +383,8 @@ pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
         target_os = "linux",
         target_os = "macos",
         target_os = "ios",
-        target_os = "android"
+        target_os = "android",
+        target_os = "windows"
     ),
     feature = "opengl"
 ))]
@@ -1065,15 +1072,17 @@ pub struct ImageProcessorConfig {
     /// PlatformDevice, Default. Use [`probe_egl_displays`] to discover
     /// which displays are available on the current system.
     ///
-    /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set, and on macOS
-    /// (ANGLE/Metal is the only display there; a `Some` value logs a
-    /// debug note and is otherwise ignored).
+    /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set, and on macOS and
+    /// Windows (ANGLE is the only display there — Metal and Direct3D 11
+    /// respectively; a `Some` value logs a debug note and is otherwise
+    /// ignored).
     #[cfg(all(
         any(
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         ),
         feature = "opengl"
     ))]
@@ -1254,14 +1263,14 @@ pub struct RenderDtypeSupport {
 /// `support` is set. U8/I8 and all other dtypes return `false` — they are
 /// handled by the existing `dtype.size() == 1` PBO gate.
 ///
-/// Linux-only: the float PBO readback path is the Linux GL backend's
-/// mechanism; macOS routes F16 through the RGBA16F-packed IOSurface
-/// instead and never calls this. The sole runtime caller in
-/// `create_image` is `cfg(all(target_os = "linux", feature = "opengl"))`,
-/// so leaving this ungated makes it dead code on macOS under
+/// Linux + Windows only: the float PBO readback path belongs to the
+/// PBO-transfer GL backends (native EGL on Linux, ANGLE/D3D11 on Windows);
+/// macOS routes F16 through the RGBA16F-packed IOSurface instead and
+/// never calls this. The sole runtime caller in `create_image` carries the
+/// same gate, so leaving this ungated makes it dead code on macOS under
 /// `-D warnings`. Its unit test (`float_pbo_eligibility`) carries the
 /// matching gate.
-#[cfg(all(target_os = "linux", feature = "opengl"))]
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "opengl"))]
 pub(crate) fn float_pbo_eligible(dtype: DType, support: RenderDtypeSupport) -> bool {
     match dtype {
         DType::F16 => support.f16,
@@ -1289,14 +1298,21 @@ pub struct ImageProcessor {
     /// if the EDGEFIRST_DISABLE_GL environment variable is not set and OpenGL
     /// ES is available.
     pub opengl: Option<GLProcessorThreaded>,
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     /// OpenGL-based image converter — the same unified
     /// `GLProcessorThreaded` engine as Linux (its worker owns a
     /// per-processor context). macOS/iOS run it via ANGLE + IOSurface
     /// (available when ANGLE's libEGL.dylib can be loaded — see
     /// README.md § macOS GPU Acceleration); Android runs it via the
-    /// native EGL driver + AHardwareBuffer.
+    /// native EGL driver + AHardwareBuffer; Windows runs it via ANGLE +
+    /// Direct3D 11 with PBO transfers (available when ANGLE's libEGL.dll
+    /// can be loaded — see README.md § Windows GPU Acceleration).
     pub opengl: Option<GLProcessorThreaded>,
 
     /// When set, only the specified backend is used — no fallback chain.
@@ -1392,7 +1408,8 @@ impl ImageProcessor {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         ))]
         #[cfg(feature = "opengl")]
         {
@@ -1437,7 +1454,12 @@ impl ImageProcessor {
     /// [`create_image`]: Self::create_image
     pub fn supported_render_dtypes(&self) -> RenderDtypeSupport {
         #[cfg(all(
-            any(target_os = "macos", target_os = "ios", target_os = "android"),
+            any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ),
             feature = "opengl"
         ))]
         if let Some(gl) = self.opengl.as_ref() {
@@ -1476,7 +1498,12 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
-                    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+                    #[cfg(any(
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android",
+                        target_os = "windows"
+                    ))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
@@ -1508,7 +1535,12 @@ impl ImageProcessor {
                     log::warn!("G2D requested but not available on this platform, using CPU");
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
-                        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+                        #[cfg(any(
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "android",
+                            target_os = "windows"
+                        ))]
                         #[cfg(feature = "opengl")]
                         opengl: None,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
@@ -1593,11 +1625,40 @@ impl ImageProcessor {
                     }
                     .apply_colorimetry_mode(config.colorimetry));
                 }
+                #[cfg(target_os = "windows")]
+                {
+                    #[cfg(feature = "opengl")]
+                    let opengl = match GLProcessorThreaded::with_cache_capacity(
+                        config.egl_display,
+                        config.egl_cache_capacity,
+                    ) {
+                        Ok(gl) => Some(gl),
+                        Err(e) => {
+                            log::warn!(
+                                "OpenGL requested on Windows but ANGLE/D3D11 init failed: {e:?} \
+                                 (fetch ANGLE with `scripts/fetch-angle.sh` and set \
+                                 EDGEFIRST_ANGLE_PATH to the directory containing libEGL.dll + \
+                                 libGLESv2.dll, or place the two DLLs next to the executable — \
+                                 see README.md § Windows GPU Acceleration). Falling back to CPU."
+                            );
+                            None
+                        }
+                    };
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        #[cfg(feature = "opengl")]
+                        opengl,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        forced_backend: None,
+                    }
+                    .apply_colorimetry_mode(config.colorimetry));
+                }
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "macos",
                     target_os = "ios",
-                    target_os = "android"
+                    target_os = "android",
+                    target_os = "windows"
                 )))]
                 {
                     log::warn!("OpenGL requested but not available on this platform, using CPU");
@@ -1638,7 +1699,12 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
-                    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+                    #[cfg(any(
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android",
+                        target_os = "windows"
+                    ))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
@@ -1730,19 +1796,40 @@ impl ImageProcessor {
                         }
                         .apply_colorimetry_mode(config.colorimetry))
                     }
+                    #[cfg(target_os = "windows")]
+                    #[cfg(feature = "opengl")]
+                    {
+                        let opengl = GLProcessorThreaded::with_cache_capacity(
+                            config.egl_display,
+                            config.egl_cache_capacity,
+                        )
+                        .map_err(|e| {
+                            Error::ForcedBackendUnavailable(format!(
+                                "opengl forced on Windows but ANGLE/D3D11 init failed: {e:?}"
+                            ))
+                        })?;
+                        Ok(Self {
+                            cpu: None,
+                            opengl: Some(opengl),
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            forced_backend: Some(ForcedBackend::OpenGl),
+                        }
+                        .apply_colorimetry_mode(config.colorimetry))
+                    }
                     #[cfg(not(all(
                         any(
                             target_os = "linux",
                             target_os = "macos",
                             target_os = "ios",
-                            target_os = "android"
+                            target_os = "android",
+                            target_os = "windows"
                         ),
                         feature = "opengl"
                     )))]
                     {
                         Err(Error::ForcedBackendUnavailable(
-                            "opengl backend requires Linux or macOS with the 'opengl' feature \
-                             enabled"
+                            "opengl backend requires Linux, macOS, Android or Windows with the \
+                             'opengl' feature enabled"
                                 .into(),
                         ))
                     }
@@ -1789,7 +1876,12 @@ impl ImageProcessor {
             }
         };
 
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         #[cfg(feature = "opengl")]
         let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
             .map(|x| x != "0" && x.to_lowercase() != "false")
@@ -1829,7 +1921,12 @@ impl ImageProcessor {
             #[cfg(target_os = "linux")]
             #[cfg(feature = "opengl")]
             opengl,
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ))]
             #[cfg(feature = "opengl")]
             opengl,
             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
@@ -1847,7 +1944,8 @@ impl ImageProcessor {
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ),
             feature = "opengl"
         ))]
@@ -1863,7 +1961,8 @@ impl ImageProcessor {
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ),
             feature = "opengl"
         )))]
@@ -1882,7 +1981,8 @@ impl ImageProcessor {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         ),
         feature = "opengl"
     ))]
@@ -1900,7 +2000,8 @@ impl ImageProcessor {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         ),
         feature = "opengl"
     ))]
@@ -2132,6 +2233,8 @@ impl ImageProcessor {
         // mapping now ERROR under explicit Dma (the explicit-Dma
         // contract), so auto-select catches that error here and falls
         // back to host storage — loudly, via the debug log below.
+        // Windows is deliberately absent: no zero-copy backing exists there
+        // yet, so create_image goes straight to the PBO arms below.
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {
@@ -2179,7 +2282,7 @@ impl ImageProcessor {
         // Try PBO (if GL available).
         // PBO buffers are u8-sized; the int8 shader emulates i8 output via
         // XOR 0x80 on the same underlying buffer, so both U8 and I8 work.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         #[cfg(feature = "opengl")]
         if dtype.size() == 1 {
             if let Some(gl) = &self.opengl {
@@ -2209,7 +2312,7 @@ impl ImageProcessor {
 
         // Try float PBO when the GPU backend reports support for this dtype.
         // Falls through to Mem on error (same policy as u8 PBO above).
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         #[cfg(feature = "opengl")]
         if float_pbo_eligible(dtype, self.supported_render_dtypes()) {
             if let Some(gl) = &self.opengl {
@@ -2652,7 +2755,8 @@ impl ImageProcessorTrait for ImageProcessor {
                         target_os = "linux",
                         target_os = "macos",
                         target_os = "ios",
-                        target_os = "android"
+                        target_os = "android",
+                        target_os = "windows"
                     ))]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
@@ -2674,7 +2778,8 @@ impl ImageProcessorTrait for ImageProcessor {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
@@ -2775,7 +2880,8 @@ impl ImageProcessorTrait for ImageProcessor {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         ))]
         #[cfg(feature = "opengl")]
         {
@@ -2807,7 +2913,8 @@ impl ImageProcessorTrait for ImageProcessor {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
@@ -4213,7 +4320,7 @@ mod image_tests {
             unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") };
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         #[cfg(feature = "opengl")]
         {
             unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
@@ -4349,7 +4456,7 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn test_new_image_converter() {
         let dst_width = 640;
         let dst_height = 360;
@@ -4401,7 +4508,7 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn test_create_image_dtype_i8() {
         let mut converter = ImageProcessor::new().unwrap();
 
@@ -4566,23 +4673,32 @@ mod image_tests {
         *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
     }
 
-    #[cfg(target_os = "linux")]
+    // Every GL platform: Linux EGL, ANGLE/Metal (macOS, iOS), Android EGL,
+    // ANGLE/D3D11 (Windows). `GLProcessorThreaded::new` fails cleanly where
+    // the driver or ANGLE is missing, so the `test_opengl_*` callers below
+    // self-skip there (and `HAL_TEST_REQUIRE_GL=1` lanes catch that via
+    // `gl_backend_available_canary`).
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     // Helper function to check if OpenGL is available
     fn is_opengl_available() -> bool {
-        #[cfg(all(target_os = "linux", feature = "opengl"))]
-        {
-            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
-        }
-
-        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
-        {
-            false
-        }
+        *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
     }
 
     /// CI canary: fails the lane when the GL backend cannot initialize.
@@ -5168,7 +5284,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_resize() {
         if !is_opengl_available() {
@@ -5230,7 +5352,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_10_threads() {
         if !is_opengl_available() {
@@ -5254,7 +5382,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_grey() {
         if !is_opengl_available() {
@@ -5545,7 +5679,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_src_crop() {
         if !is_opengl_available() {
@@ -5603,7 +5743,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_dst_crop() {
         if !is_opengl_available() {
@@ -5661,7 +5807,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_all_rgba() {
         if !is_opengl_available() {
@@ -5677,8 +5829,14 @@ mod image_tests {
 
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
-        let mut mem = vec![None, Some(TensorMemory::Mem), Some(TensorMemory::Shm)];
-        if is_dma_available() {
+        // Every backing this host can allocate: Shm is Unix-only, and the
+        // zero-copy slot is DMA-BUF on Linux / IOSurface on macOS (nothing on
+        // Windows yet).
+        let mut mem = vec![None, Some(TensorMemory::Mem)];
+        if edgefirst_tensor::is_shm_available() {
+            mem.push(Some(TensorMemory::Shm));
+        }
+        if edgefirst_tensor::is_gpu_buffer_available() {
             mem.push(Some(TensorMemory::DmaBuf));
         }
         let crop = Crop::new().with_source(Some(Region::new(50, 120, 1024, 576)));
@@ -5848,7 +6006,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_rotate() {
         if !is_opengl_available() {
@@ -5857,9 +6021,12 @@ mod image_tests {
         }
 
         let size = (1280, 720);
-        let mut mem = vec![None, Some(TensorMemory::Shm), Some(TensorMemory::Mem)];
-
-        if is_dma_available() {
+        // Same backing list as `test_opengl_all_rgba`.
+        let mut mem = vec![None, Some(TensorMemory::Mem)];
+        if edgefirst_tensor::is_shm_available() {
+            mem.push(Some(TensorMemory::Shm));
+        }
+        if edgefirst_tensor::is_gpu_buffer_available() {
             mem.push(Some(TensorMemory::DmaBuf));
         }
         for m in mem {
@@ -5873,7 +6040,13 @@ mod image_tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_opengl_rotate_(
         size: (usize, usize),
@@ -6103,7 +6276,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     #[ignore = "opengl doesn't support rendering to PixelFormat::Yuyv texture"]
     fn test_rgba_to_yuyv_resize_opengl() {
@@ -6112,9 +6291,9 @@ mod image_tests {
             return;
         }
 
-        if !is_dma_available() {
+        if !edgefirst_tensor::is_gpu_buffer_available() {
             eprintln!(
-                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
             );
             return;
@@ -6468,16 +6647,24 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
             return;
         }
-        if !is_dma_available() {
+        // Zero-copy YUYV source: DMA-BUF on Linux, IOSurface on macOS; skips
+        // where no such backing exists (Windows today).
+        if !edgefirst_tensor::is_gpu_buffer_available() {
             eprintln!(
-                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
             );
             return;
@@ -8311,7 +8498,13 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_crop_flip_opengl() {
         if !is_opengl_available() {
@@ -8319,9 +8512,9 @@ mod image_tests {
             return;
         }
 
-        if !is_dma_available() {
+        if !edgefirst_tensor::is_gpu_buffer_available() {
             eprintln!(
-                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
             );
             return;
@@ -8681,16 +8874,22 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     fn test_vyuy_to_rgba_opengl() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
             return;
         }
-        if !is_dma_available() {
+        if !edgefirst_tensor::is_gpu_buffer_available() {
             eprintln!(
-                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
             );
             return;
@@ -11214,7 +11413,16 @@ mod image_tests {
     /// 2^-8 (two F16 ULPs at 0.5). Skipped when OpenGL or F16 render is
     /// unavailable.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ),
+        feature = "opengl"
+    ))]
     fn convert_f16_gl_cpu_parity_identity() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: convert_f16_gl_cpu_parity_identity - OpenGL not available");
@@ -11342,10 +11550,11 @@ mod image_tests {
     // GAP-1: supported_render_dtypes() Linux smoke test
     // =========================================================================
 
-    /// Exercises the real Linux GL path that reads `gl.supported_render_dtypes()`.
-    /// Skipped when no GL backend is available (CI/host without a GPU).
+    /// Exercises the real Linux/Windows GL path that reads
+    /// `gl.supported_render_dtypes()`. Skipped when no GL backend is
+    /// available (CI/host without a GPU).
     #[test]
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "opengl"))]
     fn supported_render_dtypes_linux_smoke() {
         let proc = match ImageProcessor::new() {
             Ok(p) => p,

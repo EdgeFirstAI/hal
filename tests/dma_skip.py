@@ -7,9 +7,16 @@ The C API wraps ``PermissionDenied`` as ``IoError(Custom { kind: Other })``,
 so the Python message is ``image_alloc: … Permission denied`` rather than a
 bare ``PermissionDenied`` kind. Matching only ``errno`` / ``e.kind()``
 misses that wrap. Other I/O errors must still fail the test.
+
+Windows has no ``TensorMemory::DmaBuf`` backing at all (the GPU path there
+is PBO via ANGLE), so the allocator reports ``NotImplemented`` rather than a
+permission problem; that is the same "this host cannot allocate DMA" fact
+and skips too.
 """
 
 from __future__ import annotations
+
+import sys
 
 import pytest
 from edgefirst.tensor import Tensor, TensorMemory
@@ -17,6 +24,10 @@ from edgefirst.tensor import Tensor, TensorMemory
 
 def dma_unavailable(exc: BaseException) -> bool:
     msg = str(exc)
+    if sys.platform == "win32" and (
+        "NotImplemented" in msg or "only available on" in msg
+    ):
+        return True
     return (
         "Permission denied" in msg
         or "PermissionDenied" in msg

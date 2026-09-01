@@ -9,5 +9,5 @@ even when a leaf test file is collected in isolation.
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "gpu: GPU-backed tests (skipped on Linux/Windows CI; required on macOS)",
+        "gpu: GPU-backed tests (skipped on Linux CI; required on macOS, and on Windows when ANGLE is configured)",
     )

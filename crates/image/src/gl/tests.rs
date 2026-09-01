@@ -2855,7 +2855,7 @@ mod gl_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn test_gl_pbo_destination_smoke() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -2889,7 +2889,7 @@ mod gl_tests {
     /// deadlock returned. A successful return proves the round-trip
     /// completed.
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn test_gl_convert_any_to_pbo_no_deadlock() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -2959,7 +2959,7 @@ mod gl_tests {
     /// underlying defect as `convert_any_to_pbo`; both sites were patched
     /// in commit c494fae and both need explicit coverage.
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn test_gl_convert_pbo_to_pbo_no_deadlock() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -5830,11 +5830,12 @@ mod gl_tests {
     }
 
     // ── float_pbo_eligible unit tests ────────────────────────────────────────
-    // Pure-logic predicate; no GPU required. Linux-only: `float_pbo_eligible`
-    // is gated to the Linux GL backend (macOS uses IOSurface, not float PBO),
-    // so the symbol does not exist on macOS builds.
+    // Pure-logic predicate; no GPU required. Linux + Windows only:
+    // `float_pbo_eligible` is gated to the PBO-transfer GL backends (macOS
+    // uses IOSurface, not float PBO), so the symbol does not exist on macOS
+    // builds.
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn float_pbo_eligibility() {
         use crate::{float_pbo_eligible, RenderDtypeSupport};
@@ -6021,7 +6022,7 @@ mod gl_tests {
     /// Runs only where image allocation resolves to PBO (Orin / PBO-transfer
     /// targets); skipped elsewhere.
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn pbo_int8_letterbox_matches_mem_oracle() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -6140,7 +6141,7 @@ mod gl_tests {
     /// genuinely exercises `convert_float_to_pbo`. Uses an identity crop so
     /// the expected values are exact: `dst[y,x,c] == src[y,x,c] / 255`.
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f32_nhwc_pbo_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -6256,7 +6257,7 @@ mod gl_tests {
     /// distinct from NEAREST (which would land on a single integer texel,
     /// `2*dx * 16`), so the test discriminates bilinear vs NEAREST sampling.
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f32_nhwc_pbo_resize_bilinear() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -6366,7 +6367,7 @@ mod gl_tests {
     /// crop so `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
     /// (`2^-8`).
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f16_nchw_pbo_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
         use half::f16;
@@ -6624,7 +6625,7 @@ mod gl_tests {
     ///   content (exact normalization is GPU-dependent; we just need non-zero
     ///   and in-range)
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f32_pbo_letterbox_pad_color() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 

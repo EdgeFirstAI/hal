@@ -35,10 +35,10 @@
 //! buffers through the `GlPlatform` trait, implemented for macOS/iOS by
 //! `AngleClientBuffer` in the sibling `angle` module.
 //!
-//! A future `WindowsPlatform` (ANGLE + D3D11 shared textures) would slot
-//! in the same way: implement these two bring-up functions plus a
-//! `GlPlatform` import type (a `d3d11_import.rs` companion), and the
-//! shared engine runs unchanged.
+//! `WindowsPlatform` (`platform/windows.rs`, ANGLE over Direct3D 11) slots
+//! in the same way: the same two bring-up functions plus a `GlPlatform`
+//! leaf, and the shared engine runs unchanged (with PBO transfers until a
+//! D3D11 shared-texture import lands).
 
 use super::super::Egl;
 use crate::Error;

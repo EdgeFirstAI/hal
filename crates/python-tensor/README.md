@@ -29,7 +29,7 @@ pip install edgefirst-tensor
 
 Requires Python 3.8 or newer and NumPy. Wheels are published for Linux (x86_64, aarch64), macOS (arm64), and Windows (x86_64).
 
-The `_codec`, `_image`, `_decoder` and `_tracker` extensions locate `libedgefirst_tensor.so` via `DT_RUNPATH=$ORIGIN/../tensor`. That assumes every `edgefirst.*` package lands in the same `site-packages` tree, which `pip` normally guarantees. A split layout (`pip install --target`, some vendored trees) will fail at import with `libedgefirst_tensor.so.0: cannot open shared object file`.
+The `_codec`, `_image`, `_decoder` and `_tracker` extensions locate `libedgefirst_tensor.so` via `DT_RUNPATH=$ORIGIN/../tensor`. That assumes every `edgefirst.*` package lands in the same `site-packages` tree, which `pip` normally guarantees. A split layout (`pip install --target`, some vendored trees) will fail at import with `libedgefirst_tensor.so.0: cannot open shared object file`. On Windows the library is `edgefirst_tensor.dll` in that same `edgefirst/tensor/` directory and there is no rpath: each sibling package's `__init__.py` registers the directory with `os.add_dll_directory()` before loading its extension, because Python 3.8+ does not consult `PATH` for extension-module DLLs.
 
 Packages install under the [PEP 420](https://peps.python.org/pep-0420/) `edgefirst.*` namespace, so imports are `edgefirst.tensor`, `edgefirst.codec`, and so on. No package ships an `edgefirst/__init__.py` — a single one would shadow the namespace and hide its siblings.
 
