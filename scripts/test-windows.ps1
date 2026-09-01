@@ -58,8 +58,11 @@ if ($Warp) {
     $env:EDGEFIRST_ALLOW_SOFTWARE_GL = '1'
 }
 if ($RequireGl) { $env:HAL_TEST_REQUIRE_GL = '1' }
-if (-not (Get-Command cargo-nextest -ErrorAction Ignore) -and -not (Get-Command cargo -ErrorAction Ignore)) {
+if (-not (Get-Command cargo -ErrorAction Ignore)) {
     throw 'cargo not found on PATH'
+}
+if (-not (Get-Command cargo-nextest -ErrorAction Ignore)) {
+    throw 'cargo-nextest not found on PATH (cargo install cargo-nextest --locked)'
 }
 
 # Same exclusions as the macOS lane: gpu-probe is Linux-only (gbm/nix);
