@@ -207,10 +207,17 @@ $CYCLONEDX merge \
 echo "✓ Generated sbom.json (merged: dependencies + source)"
 echo
 
-# Check license policy
+# Check license policy.
+#
+# `|| POLICY_EXIT=$?` is required, not stylistic: `set -e` is on, so a bare
+# call would abort the script the moment the policy check reported a
+# violation -- before the assignment below, before NOTICE is generated, and
+# before the summary. The job still failed, but it failed without producing
+# the attribution file, and the deferred `exit $POLICY_EXIT` at the end was
+# unreachable. Suppressing the exit here is what makes that deferral real.
 echo "Checking license policy compliance..."
-python3 .github/scripts/check_license_policy.py sbom.json
-POLICY_EXIT=$?
+POLICY_EXIT=0
+python3 .github/scripts/check_license_policy.py sbom.json || POLICY_EXIT=$?
 echo
 
 # Generate NOTICE file
@@ -220,7 +227,7 @@ echo "✓ Generated NOTICE (third-party attributions)"
 echo
 
 # Cleanup temporary files
-rm -f source-sbom.json edgefirst_hal.cdx.json
+rm -f source-sbom.json
 
 echo "=================================================="
 echo "SBOM Generation Complete"

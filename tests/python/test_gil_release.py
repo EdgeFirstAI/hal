@@ -55,7 +55,9 @@ def _python_throughput(duration_s, run_alongside=None):
     return counted[0]
 
 
-def _assert_releases_gil(op_name, run_alongside, duration_s=0.4, threshold=0.7):
+def _assert_releases_gil(
+    op_name, run_alongside, duration_s=0.4, threshold=0.7, attempts=3
+):
     """Shared assertion for the throughput formulation: an unrelated Python
     thread must keep making most of its normal progress while `run_alongside`
     (some long-running HAL call) runs continuously. See
@@ -73,14 +75,33 @@ def _assert_releases_gil(op_name, run_alongside, duration_s=0.4, threshold=0.7):
     noise alone -- exactly the "erroring on symptoms of something else"
     flakiness the H4b brief warned against, just inverted (a false pass
     instead of a false fail).
+
+    Each attempt takes the baseline and the concurrent sample sequentially,
+    so anything that slows the machine between the two -- another job on a
+    shared CI runner, a scheduler hiccup -- depresses the ratio without
+    telling us anything about the GIL. Rather than widen the threshold
+    (which would erode the very gap that makes this test meaningful), a
+    failing attempt is retried: a real regression measures 38%-49% every
+    time and still fails every attempt, while a one-off load spike does
+    not. A passing run costs exactly one attempt, so the common case is no
+    slower than a single measurement.
     """
-    baseline = _python_throughput(duration_s)
-    concurrent = _python_throughput(duration_s, run_alongside=run_alongside)
-    ratio = concurrent / baseline
-    assert ratio > threshold, (
-        f"an unrelated Python thread only made {ratio:.2%} of its normal progress "
+    observed = []
+    for _ in range(attempts):
+        baseline = _python_throughput(duration_s)
+        concurrent = _python_throughput(duration_s, run_alongside=run_alongside)
+        ratio = concurrent / baseline
+        observed.append((ratio, baseline, concurrent))
+        if ratio > threshold:
+            return
+
+    best, baseline, concurrent = max(observed)
+    assert best > threshold, (
+        f"an unrelated Python thread only made {best:.2%} of its normal progress "
         f"while {op_name} was running -- {op_name} appears to hold the GIL "
-        f"(baseline={baseline}, concurrent={concurrent})"
+        f"(baseline={baseline}, concurrent={concurrent}; "
+        f"best of {attempts} attempts, all of "
+        f"{', '.join(f'{r:.2%}' for r, _, _ in observed)})"
     )
 
 

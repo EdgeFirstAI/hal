@@ -23,6 +23,7 @@ based on the output tensor layout.
 | [`modelpack.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/modelpack.rs) | local | Au-Zone ModelPack format kernels |
 | [`per_scale/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/) | local | Per-scale split-tensor decoder framework (NEON-optimized hot path) |
 | [`schema.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/schema.rs) | local | `SchemaV2` parser — model metadata document used by EdgeFirst Studio |
+| [`infer.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/infer.rs) | local | `infer_ultralytics_schema` — synthesizes a `SchemaV2` for vanilla Ultralytics YOLOv8/11/26 ONNX/TFLite exports from raw `ModelSignals` (tensor shapes/dtypes + the model's own metadata), with no `edgefirst.json` required |
 | [`float.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/float.rs) / [`byte.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/byte.rs) | local | NMS implementations (float and byte-quantized); `float.rs` also holds the IoU/IoS metric helpers reused by tiled merge |
 | [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/tiling.rs) | local | SAHI output side: shared `TilePlacement` contract, `MatchMetric`/`MergeConfig`, `lift_tile_boxes`, GREEDYNMM `merge_tiled_detections`, and the streaming `TiledFrameAccumulator` (fan-in fence) |
 | [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/error.rs) | local | `DecoderError`, `DecoderResult` |
@@ -154,6 +155,80 @@ class, ...)`.
 
 For non-end-to-end YOLO26 exports (`end2end=false`), use
 `decoder_version: "yolov8"` with an explicit `nms` configuration.
+
+### Ultralytics schema inference
+
+The [`infer`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/infer.rs)
+module derives a `SchemaV2` for a vanilla Ultralytics export directly from
+`ModelSignals` (the runtime-reported tensor shapes/dtypes and the model's
+own embedded metadata), so a hand-authored `edgefirst.json` is no longer
+required for standard YOLOv8/11/26 detection and segmentation exports.
+Identity and labels come from metadata (`names`, `task`, `end2end`); the exact
+tensor layout — combined pre-NMS, detection+proto segmentation, or YOLO26
+end-to-end — comes from the output shapes, cross-checked against the
+metadata rather than either signal being trusted alone. Input geometry comes
+from the input tensor, never from the metadata `imgsz` field: the tensor is
+what the runtime will actually be fed, and the two can disagree. The
+inferred schema
+always sets `decoder_version` explicitly (`yolov8` or `yolo26`), even though
+it could often be re-derived later from output shape alone: leaving it unset
+would let the decoder builder's own shape-based end-to-end inference run
+against layouts it wasn't designed to disambiguate (e.g. an anchors-first
+pre-NMS export whose dims coincidentally resemble an end-to-end row width),
+so `infer` settles the question once, from the model's own `end2end`
+metadata flag when present, and never leaves it for the builder to guess.
+
+```mermaid
+flowchart TD
+    Sig[ModelSignals<br/>inputs, outputs, metadata]
+    Meta[UltralyticsMeta::from_metadata<br/>names, task, end2end]
+    Sig --> Meta
+    Meta -->|no signature| ErrMeta[NotUltralytics / BadNames /<br/>UnsupportedTask]
+    Meta --> Cross{task vs proto tensor}
+    Cross -->|segment task, no proto| ErrA[UnsupportedLayout]
+    Cross -->|detect task, proto present| ErrB[UnsupportedLayout]
+    Cross -->|consistent| Layout[classify_input_layout<br/>H, W, expected_anchors]
+    Layout --> IsSeg{segmentation?}
+    IsSeg -->|yes| Proto[classify_proto<br/>k proto channels]
+    IsSeg -->|no| K0[k = 0]
+    Proto --> Feat[feat = 4 + nc + k<br/>e2e_feat = 6 + k]
+    K0 --> Feat
+    Feat --> E2E{end2end metadata}
+    E2E -->|Some true| FindE2E[find_e2e_candidate<br/>YOLO26 end-to-end]
+    E2E -->|Some false| PreNMS[classify_pre_nms<br/>YOLOv8/11 pre-NMS]
+    E2E -->|None| Fallback[classify_pre_nms,<br/>else find_e2e_candidate]
+    FindE2E --> Assemble[SchemaV2 + labels + description]
+    PreNMS --> Assemble
+    Fallback --> Assemble
+
+    style Sig fill:#e1f5ff
+    style Assemble fill:#e8f5e9
+    style ErrMeta fill:#ffcccc
+    style ErrA fill:#ffcccc
+    style ErrB fill:#ffcccc
+```
+
+Where the detection budget lives differs by head, and the inference rules
+follow that. An end-to-end head has `max_det` **baked into the graph**:
+Ultralytics' `Detect.postprocess` runs a TopK with `k = min(max_det,
+anchors)`, so the output is `[1, N, 6 (+k)]` with `N` fixed at export time
+and no padding. The exporter clamps it — `m.max_det = min(args.max_det,
+available)`, where `available` is the anchor count summed over strides —
+which is the same quantity this module computes as `expected_anchors`. So
+`N <= expected_anchors` is upstream's own guarantee rather than a
+heuristic, `N == expected_anchors` is a legitimate shape (any `max_det >=
+anchors` produces it), and inference accepts any `N` in that range. A
+pre-NMS head bakes in nothing: it emits every anchor, and the detection
+budget is the decoder's `max_det`, chosen per call. The inferred schema
+therefore names an NMS *mode* and never a count.
+
+The `end2end` flag is the primary signal because it is present on every
+real export; the shape-only fallback exists for stripped metadata, and it
+tries the pre-NMS layout first so an anchor-count match is never re-read as
+an end-to-end row count. A `ClassCountMismatch` raised while trying pre-NMS
+propagates instead of falling through — a dim that matches the anchor count
+unambiguously signals pre-NMS intent, so a feature-width mismatch there is
+a class-count problem, not a reason to try the other layout.
 
 ### Output tensor physical-order contract
 

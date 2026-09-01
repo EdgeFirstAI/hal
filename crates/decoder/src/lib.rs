@@ -72,11 +72,16 @@ use num_traits::{AsPrimitive, Float, PrimInt};
 pub mod byte;
 pub mod error;
 pub mod float;
+pub mod infer;
 pub mod modelpack;
 pub mod per_scale;
 pub mod schema;
 pub mod tiling;
 pub mod yolo;
+
+pub use infer::{
+    infer_ultralytics_schema, InferError, InferredSchema, ModelSignals, ModelSource, TensorInfo,
+};
 
 mod decoder;
 pub use decoder::*;
