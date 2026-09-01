@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -58,6 +58,8 @@ fn main() {
 /// load time via RPATH `$ORIGIN/../tensor`, reaching across the shared
 /// `edgefirst/` namespace package the way the four C leaves' `.so` files
 /// reach `libedgefirst_tensor.so` in the same directory as themselves.
+/// (Windows: the library is `edgefirst_tensor.dll` and there is no rpath;
+/// the cross-directory step happens at import time instead -- see below.)
 fn link_tensor(target_os: &str) {
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let tensor_capi_manifest = crate_dir.join("../tensor-capi/Cargo.toml");
@@ -106,7 +108,7 @@ fn link_tensor(target_os: &str) {
         .unwrap_or_else(|e| panic!("failed to spawn `cargo build` for tensor-capi: {e}"));
     if !status.success() {
         panic!(
-            "`cargo build --manifest-path {}` failed (status {status}) -- libedgefirst_tensor.so could not be built",
+            "`cargo build --manifest-path {}` failed (status {status}) -- the shared tensor library could not be built",
             tensor_capi_manifest.display()
         );
     }
@@ -118,7 +120,24 @@ fn link_tensor(target_os: &str) {
     let built_dir = built_dir.join(&profile);
 
     println!("cargo:rustc-link-search=native={}", built_dir.display());
-    println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    if target_os == "windows" {
+        // MSVC: a plain `dylib=edgefirst_tensor` resolves
+        // `edgefirst_tensor.lib`, the Rust STATICLIB cargo writes next to
+        // the DLL, and linking that into this cdylib duplicates rust std
+        // (LNK2005). The DLL's import library is `edgefirst_tensor.dll.lib`,
+        // so name that file verbatim -- same pattern as
+        // crates/python-tensor/build.rs and crates/image-capi/build.rs.
+        let import_lib_dir = windows_import_lib_dir(&built_dir);
+        if import_lib_dir != built_dir {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                import_lib_dir.display()
+            );
+        }
+        println!("cargo:rustc-link-lib=dylib:+verbatim=edgefirst_tensor.dll.lib");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    }
 
     // `$ORIGIN/../tensor` (Linux) / `@loader_path/../tensor` (macOS):
     // unlike the four C leaves (siblings in the same directory), this
@@ -130,9 +149,37 @@ fn link_tensor(target_os: &str) {
     // this extension needs its own rpath regardless of what
     // `edgefirst-python-common` (an rlib, no rpath of its own) or
     // anything else in the process might carry.
+    //
+    // Windows has no rpath. Python 3.8+ loads extension modules with
+    // `LoadLibraryExW(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR)`: the `.pyd`'s own directory plus
+    // whatever `os.add_dll_directory()` registered, never `PATH`. `_codec.pyd`
+    // lives in `edgefirst/codec/` while `edgefirst_tensor.dll` ships in
+    // `edgefirst/tensor/`, so the cross-directory step happens at import
+    // time instead: `python/edgefirst/codec/__init__.py` registers
+    // `edgefirst/tensor/` before importing `._codec`.
     if target_os == "macos" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,@loader_path/../tensor");
-    } else {
+    } else if target_os != "windows" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,$ORIGIN/../tensor");
     }
+}
+
+/// Directory holding `edgefirst_tensor.dll.lib`, the MSVC import library the
+/// nested tensor-capi build produced alongside `edgefirst_tensor.dll`. Cargo
+/// writes it in `deps/` and, depending on version, also uplifts a copy next
+/// to the DLL in `built_dir` itself; take whichever exists. Windows only.
+fn windows_import_lib_dir(built_dir: &Path) -> PathBuf {
+    let candidates = [built_dir.to_path_buf(), built_dir.join("deps")];
+    candidates
+        .iter()
+        .find(|dir| dir.join("edgefirst_tensor.dll.lib").is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected edgefirst_tensor.dll.lib in {} or {} after building tensor-capi, but it is in neither",
+                candidates[0].display(),
+                candidates[1].display()
+            )
+        })
 }

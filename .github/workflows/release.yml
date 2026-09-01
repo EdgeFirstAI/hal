@@ -148,8 +148,21 @@ jobs:
       - name: Install maturin
         run: pip install ${{ matrix.maturin-deps }}
 
+      - name: Fetch ANGLE (Windows x64)
+        # The Windows edgefirst-image wheel bundles ANGLE's libEGL.dll +
+        # libGLESv2.dll next to _image.pyd (python-image/build.rs reads
+        # EDGEFIRST_ANGLE_PATH), giving `pip install edgefirst-image` the
+        # Direct3D 11 GPU backend with no setup. Public release; no auth.
+        if: matrix.name == 'windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/fetch-angle.sh --windows
+
       - name: Build wheels (Python 3.11+ — zero-copy buffer protocol)
         shell: bash
+        env:
+          EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         run: |
           # Four self-contained distributions since 0.29. Order is irrelevant to
           # the build (no shared object); it matters only at publish time.
@@ -160,6 +173,8 @@ jobs:
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
         shell: bash
+        env:
+          EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         run: |
           # Strip --sdist from args (sdists already generated in the py311 pass)
           ARGS="${{ matrix.maturin-args }}"
@@ -314,8 +329,21 @@ jobs:
           esac
           echo "archive=edgefirst-hal-${VERSION}-${TARGET}.${EXT}" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch ANGLE (Windows x64)
+        # The Windows C archive bundles ANGLE's libEGL.dll + libGLESv2.dll in
+        # bin/ next to edgefirst_image.dll (package-capi.sh reads
+        # EDGEFIRST_ANGLE_PATH), so C consumers get the Direct3D 11 GPU
+        # backend with no setup. Public release; no auth.
+        if: ${{ endsWith(matrix.target, '-windows') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/fetch-angle.sh --windows
+
       - name: Package one archive
         shell: bash
+        env:
+          EDGEFIRST_ANGLE_PATH: ${{ endsWith(matrix.target, '-windows') && format('{0}/target/angle/windows-x64/bin', github.workspace) || '' }}
         run: |
           mkdir -p staged
           ./scripts/package-capi.sh \

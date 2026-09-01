@@ -480,6 +480,10 @@ impl GlPlatform for AndroidEgl {
         Ok(())
     }
 
+    fn begin_gpu_pass(_display: &AndroidGlContext) {
+        // Native EGL keeps per-context state; nothing to re-sync.
+    }
+
     fn end_gpu_pass(_display: &AndroidGlContext) {
         // EGLImage texture targets persist by design; nothing to release.
     }
@@ -490,7 +494,7 @@ impl GlPlatform for AndroidEgl {
 
     fn export_completion_fence(
         display: &AndroidGlContext,
-    ) -> crate::Result<Option<std::os::fd::OwnedFd>> {
+    ) -> crate::Result<Option<super::super::CompletionFence>> {
         if !display.shared.supports_native_fence {
             return Ok(None);
         }

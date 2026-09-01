@@ -5,7 +5,8 @@
     target_os = "linux",
     target_os = "macos",
     target_os = "ios",
-    target_os = "android"
+    target_os = "android",
+    target_os = "windows"
 ))]
 #![cfg(feature = "opengl")]
 // Several types defined at the `gl` module root (EglDisplayKind,
@@ -23,6 +24,7 @@
 //   - Linux-only:   `context`, `dma_import`, `fourcc`
 //   - macOS/iOS:    `iosurface_import`
 //   - Android-only: `ahardwarebuffer_import`
+//   - Windows:      `platform/windows.rs` (ANGLE/D3D11, PBO transfers only)
 // The engine (`processor`, `threaded`, `cache`, `resources`, `shaders`)
 // is portable and reaches platform buffers only through the `GlPlatform`
 // trait — see `crates/image/ARCHITECTURE.md`.
@@ -111,6 +113,17 @@ pub(super) type Egl = edgefirst_egl::Instance<
     edgefirst_egl::Dynamic<&'static libloading::Library, edgefirst_egl::EGL1_4>,
 >;
 
+/// Handle returned by `GlPlatform::export_completion_fence` (and surfaced
+/// by `convert_with_fence`): a sync_file fd on Unix
+/// (`EGL_ANDROID_native_fence_sync`), an NT handle on Windows — reserved
+/// for the D3D11 fence follow-on; no Windows platform exports one yet.
+/// Keeps the engine free of `cfg` branches (precedent: `BlobFd` in
+/// `crates/tensor/src/blob.rs`).
+#[cfg(unix)]
+pub(crate) type CompletionFence = std::os::fd::OwnedFd;
+#[cfg(windows)]
+pub(crate) type CompletionFence = std::os::windows::io::OwnedHandle;
+
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///
 /// The HAL creates a surfaceless GLES 3.0 context
@@ -196,7 +209,9 @@ pub(crate) enum TransferBackend {
     AHardwareBuffer,
 
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
-    /// but OpenGL is present. Data stays in GPU-accessible memory.
+    /// but OpenGL is present. Data stays in GPU-accessible memory. The only
+    /// transfer backend on Windows (ANGLE/D3D11): no zero-copy import kind
+    /// exists there yet.
     Pbo,
 
     /// Synchronous `glTexSubImage2D` upload + `glReadPixels` readback.

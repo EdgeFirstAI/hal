@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -47,6 +47,66 @@ fn main() {
     if env::var_os("CARGO_FEATURE_DYNAMIC").is_some() {
         link_tensor(&target_os);
     }
+
+    if target_os == "windows" {
+        bundle_angle(&PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()));
+    }
+}
+
+/// Windows: bundle ANGLE (GLES over Direct3D 11) into the wheel.
+///
+/// The HAL's Windows GL backend looks for `libEGL.dll` next to the module
+/// that loaded it (`_image.pyd`) before anything else, so copying ANGLE's two
+/// DLLs into `python/edgefirst/image/` -- which maturin's `python-source`
+/// packages verbatim -- gives `pip install edgefirst-image` the GPU backend
+/// with no environment setup. The DLLs come from `EDGEFIRST_ANGLE_PATH`, the
+/// directory `scripts/fetch-angle.sh --windows` produces
+/// (`target/angle/windows-x64/bin`); CI sets it for the Windows wheel rows.
+/// Unset: the wheel ships CPU-only and the loader falls back to
+/// `EDGEFIRST_ANGLE_PATH` / next-to-the-executable / the DLL search path at
+/// runtime, exactly as before. A stale bundled copy from an earlier build is
+/// removed in that case so the wheel content follows the environment.
+fn bundle_angle(crate_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=EDGEFIRST_ANGLE_PATH");
+    let dest_dir = crate_dir.join("python/edgefirst/image");
+    const DLLS: [&str; 2] = ["libEGL.dll", "libGLESv2.dll"];
+    let src_dir = env::var_os("EDGEFIRST_ANGLE_PATH")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    match src_dir {
+        Some(src_dir) if DLLS.iter().all(|d| src_dir.join(d).is_file()) => {
+            for dll in DLLS {
+                let src = src_dir.join(dll);
+                println!("cargo:rerun-if-changed={}", src.display());
+                let dest = dest_dir.join(dll);
+                std::fs::copy(&src, &dest).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to copy {} to {}: {e}",
+                        src.display(),
+                        dest.display()
+                    )
+                });
+            }
+            println!(
+                "cargo:warning=bundling ANGLE (libEGL.dll, libGLESv2.dll) from {} into the edgefirst-image wheel",
+                src_dir.display()
+            );
+        }
+        Some(src_dir) => {
+            println!(
+                "cargo:warning=EDGEFIRST_ANGLE_PATH={} does not contain libEGL.dll + libGLESv2.dll; the wheel ships without ANGLE",
+                src_dir.display()
+            );
+            for dll in DLLS {
+                let _ = std::fs::remove_file(dest_dir.join(dll));
+            }
+        }
+        None => {
+            for dll in DLLS {
+                let _ = std::fs::remove_file(dest_dir.join(dll));
+            }
+        }
+    }
 }
 
 /// Single-tensor-home, Python side (task P2): `_image` links
@@ -58,6 +118,8 @@ fn main() {
 /// load time via RPATH `$ORIGIN/../tensor`, reaching across the shared
 /// `edgefirst/` namespace package the way the four C leaves' `.so` files
 /// reach `libedgefirst_tensor.so` in the same directory as themselves.
+/// (Windows: the library is `edgefirst_tensor.dll` and there is no rpath;
+/// the cross-directory step happens at import time instead -- see below.)
 fn link_tensor(target_os: &str) {
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let tensor_capi_manifest = crate_dir.join("../tensor-capi/Cargo.toml");
@@ -106,7 +168,7 @@ fn link_tensor(target_os: &str) {
         .unwrap_or_else(|e| panic!("failed to spawn `cargo build` for tensor-capi: {e}"));
     if !status.success() {
         panic!(
-            "`cargo build --manifest-path {}` failed (status {status}) -- libedgefirst_tensor.so could not be built",
+            "`cargo build --manifest-path {}` failed (status {status}) -- the shared tensor library could not be built",
             tensor_capi_manifest.display()
         );
     }
@@ -118,7 +180,24 @@ fn link_tensor(target_os: &str) {
     let built_dir = built_dir.join(&profile);
 
     println!("cargo:rustc-link-search=native={}", built_dir.display());
-    println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    if target_os == "windows" {
+        // MSVC: a plain `dylib=edgefirst_tensor` resolves
+        // `edgefirst_tensor.lib`, the Rust STATICLIB cargo writes next to
+        // the DLL, and linking that into this cdylib duplicates rust std
+        // (LNK2005). The DLL's import library is `edgefirst_tensor.dll.lib`,
+        // so name that file verbatim -- same pattern as
+        // crates/python-tensor/build.rs and crates/image-capi/build.rs.
+        let import_lib_dir = windows_import_lib_dir(&built_dir);
+        if import_lib_dir != built_dir {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                import_lib_dir.display()
+            );
+        }
+        println!("cargo:rustc-link-lib=dylib:+verbatim=edgefirst_tensor.dll.lib");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    }
 
     // `$ORIGIN/../tensor` (Linux) / `@loader_path/../tensor` (macOS):
     // unlike the four C leaves (siblings in the same directory), this
@@ -130,9 +209,37 @@ fn link_tensor(target_os: &str) {
     // transitive, so this extension needs its own rpath regardless of
     // what `edgefirst-python-common` (an rlib, no rpath of its own) or
     // anything else in the process might carry.
+    //
+    // Windows has no rpath. Python 3.8+ loads extension modules with
+    // `LoadLibraryExW(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR)`: the `.pyd`'s own directory plus
+    // whatever `os.add_dll_directory()` registered, never `PATH`. `_image.pyd`
+    // lives in `edgefirst/image/` while `edgefirst_tensor.dll` ships in
+    // `edgefirst/tensor/`, so the cross-directory step happens at import
+    // time instead: `python/edgefirst/image/__init__.py` registers
+    // `edgefirst/tensor/` before importing `._image`.
     if target_os == "macos" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,@loader_path/../tensor");
-    } else {
+    } else if target_os != "windows" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,$ORIGIN/../tensor");
     }
+}
+
+/// Directory holding `edgefirst_tensor.dll.lib`, the MSVC import library the
+/// nested tensor-capi build produced alongside `edgefirst_tensor.dll`. Cargo
+/// writes it in `deps/` and, depending on version, also uplifts a copy next
+/// to the DLL in `built_dir` itself; take whichever exists. Windows only.
+fn windows_import_lib_dir(built_dir: &Path) -> PathBuf {
+    let candidates = [built_dir.to_path_buf(), built_dir.join("deps")];
+    candidates
+        .iter()
+        .find(|dir| dir.join("edgefirst_tensor.dll.lib").is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected edgefirst_tensor.dll.lib in {} or {} after building tensor-capi, but it is in neither",
+                candidates[0].display(),
+                candidates[1].display()
+            )
+        })
 }

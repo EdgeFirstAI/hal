@@ -767,13 +767,13 @@ they are built for the wider PyPI audience rather than for our targets.
 | Feature | Linux (i.MX) | Linux (other) | macOS | iOS | Android | Windows |
 |---------|--------------|---------------|-------|-----|---------|---------|
 | DMA tensors | Yes | Yes | No | No | No | No |
-| PBO tensors (GPU) | Yes | Yes | No | No | No | No |
+| PBO tensors (GPU) | Yes | Yes | No | No | No | Yes (with ANGLE) |
 | IOSurface tensors (zero-copy) | No | No | Yes (with ANGLE) | Yes (with ANGLE) | No | No |
 | AHardwareBuffer tensors (zero-copy) | No | No | No | No | Yes | No |
 | Shared memory tensors | Yes | Yes | Yes | Yes | Import-only¹ | No |
 | Heap tensors | Yes | Yes | Yes | Yes | Yes | Yes |
 | G2D acceleration | Yes | No | No | No | No | No |
-| OpenGL acceleration | Yes (optional) | Yes (optional) | Yes (with ANGLE) | Yes (with ANGLE) | Yes (native EGL) | No |
+| OpenGL acceleration | Yes (optional) | Yes (optional) | Yes (with ANGLE) | Yes (with ANGLE) | Yes (native EGL) | Yes (with ANGLE, Direct3D 11) |
 | CPU fallback | Yes | Yes | Yes | Yes | Yes | Yes |
 
 ¹ Android's bionic libc has no POSIX `shm_open`, so shared-memory tensor
@@ -786,7 +786,9 @@ for setup. If ANGLE is not present the HAL falls back to the CPU backend.
 On iOS the OpenGL backend uses the same ANGLE-over-Metal path — see
 [iOS](#ios) below. On Android the OpenGL backend uses the platform's
 native GLES driver directly (no translation layer) — see
-[Android](#android) below.
+[Android](#android) below. On Windows the OpenGL backend runs the same
+engine on ANGLE over Direct3D 11 with PBO transfers — see
+[Windows GPU Acceleration](#windows-gpu-acceleration) below.
 
 ## macOS GPU Acceleration
 
@@ -904,15 +906,96 @@ and no env var is needed.
 
 ### When you don't need this setup
 
-- **`pip install edgefirst-image`** (or any of the five wheels) — the macOS
-  wheel ships ANGLE bundled alongside the Python extension; no separate
-  install required.
 - **EdgeFirst-signed binary distribution** — official binary releases
   bundle ANGLE re-signed under the EdgeFirst Apple Developer ID. Install
   and run with no additional setup.
+- **Windows wheels and C archives** bundle ANGLE (see
+  [Windows GPU Acceleration](#windows-gpu-acceleration)); the macOS wheels
+  do not yet — set `EDGEFIRST_ANGLE_PATH` there as above.
 
 These channels exist precisely so end users do not need to deal with the
 Homebrew install or re-signing step.
+
+## Windows GPU Acceleration
+
+On Windows the HAL runs the same OpenGL ES engine on
+[Google's ANGLE](https://github.com/google/angle) translating to
+**Direct3D 11**. There is no zero-copy buffer kind on Windows yet, so GPU
+destinations are **PBO tensors** (`TensorMemory::Pbo`, the same path desktop
+Linux uses on NVIDIA where DMA-BUF import is unavailable): `Mem` sources are
+uploaded by GL and results are read back through `GL_PIXEL_PACK_BUFFER`
+and `map()`ped on the GL thread. D3D11 shared-texture tensors (and CUDA via
+D3D11 interop) are a planned follow-on. If ANGLE cannot be loaded the HAL
+logs a warning and falls back to the CPU backend.
+
+### Installing ANGLE (Windows)
+
+Pre-built `libEGL.dll` + `libGLESv2.dll` (Direct3D 11 backend, static CRT,
+no VC++ redistributable needed) are published from the same public
+[`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
+release tag as the Apple xcframeworks, as `angle-windows-x64-<tag>.zip`.
+Fetch, sha256-verify and extract them with the same helper, from Git Bash
+(the `--windows` flag is implied on a Windows host):
+
+```bash
+bash scripts/fetch-angle.sh                # → target/angle/windows-x64/{bin,lib,include}
+```
+
+The HAL looks for `libEGL.dll` in this order, loading it by absolute path
+with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` so ANGLE's `libEGL.dll` can find its
+sibling `libGLESv2.dll` (the two must stay in the same directory):
+
+1. `%EDGEFIRST_ANGLE_PATH%\libEGL.dll`
+2. next to the module that contains the HAL (`edgefirst_image.dll` from the
+   C archive, or `_image.pyd` from the wheel) — this is how the bundled
+   distributions work with no configuration;
+3. next to the executable;
+4. `libEGL.dll` on the default DLL search path.
+
+Everything else (`d3d11.dll`, `dxgi.dll`, `d3dcompiler_47.dll`) comes from
+System32 on Windows 10/11.
+
+```powershell
+$env:EDGEFIRST_ANGLE_PATH = "$PWD\target\angle\windows-x64\bin"
+$env:RUST_LOG = 'edgefirst_image=debug'
+cargo run --release -p edgefirst-image --example pipeline_demo
+```
+
+Look for `ANGLE D3D11 adapter: NVIDIA GeForce RTX 3070 ...` and
+`ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 ... Direct3D11 ...)` in the bring-up
+log, and `GLConverter created (transfer=Pbo)`. `create_image()` then returns
+`TensorMemory::Pbo` destinations.
+
+### Choosing the adapter
+
+`EDGEFIRST_ANGLE_ADAPTER` selects the Direct3D 11 adapter ANGLE creates its
+device on (the process-global display is created once, so set it before the
+first `ImageProcessor`):
+
+| Value | Meaning |
+|-------|---------|
+| unset / `hardware` | ANGLE's default hardware adapter (DXGI adapter 0) |
+| `warp` | Microsoft Basic Render Driver — software. Classified as a software renderer, so it also needs `EDGEFIRST_ALLOW_SOFTWARE_GL=1` (CI, machines without a GPU) |
+| `discrete` | the hardware adapter with the most dedicated video memory (hybrid laptops) |
+| `<high>:<low>` | an explicit adapter LUID (decimal or `0x` hex) |
+| any other text | case-insensitive substring of the adapter description, e.g. `RTX 3070` or `Intel` |
+
+`RUST_LOG=edgefirst_image=debug` lists every DXGI adapter with its LUID.
+Under a Remote Desktop session the hardware adapter is normally still
+enumerated; if only the Basic Render Driver is, the HAL warns up front and
+falls back to CPU unless `EDGEFIRST_ALLOW_SOFTWARE_GL=1`.
+
+### When you don't need this setup (Windows)
+
+- **`pip install edgefirst-image`** — the Windows wheel bundles `libEGL.dll`
+  + `libGLESv2.dll` next to the extension module.
+- **The Windows C archive** (`edgefirst-hal-<version>-x86_64-windows.zip`)
+  ships them in `bin/` next to `edgefirst_image.dll`, with ANGLE's BSD
+  licence under `share/licenses/angle/`.
+
+Both are built by CI with `EDGEFIRST_ANGLE_PATH` set at build time; a local
+`maturin build` / `scripts/package-capi.sh` bundles ANGLE the same way when
+the variable is set, and produces a CPU-only artifact when it is not.
 
 ## iOS
 
@@ -1218,7 +1301,8 @@ and the sibling `*-capi` READMEs.
 | `EDGEFIRST_PROTO_COMPUTE` | `1` enables GLES 3.1 compute shader for HWC→CHW proto repack |
 | `EDGEFIRST_DISABLE_V4L2` | `1` forces the software JPEG decoder, bypassing the V4L2 hardware JPEG backend (Linux) |
 | `EDGEFIRST_CODEC_V4L2_DEVICE` | Probe a specific V4L2 device node for hardware JPEG decode instead of auto-discovery |
-| `EDGEFIRST_ANGLE_PATH` | macOS only: directory containing `libEGL.dylib` / `libGLESv2.dylib`. Overrides the default search (Homebrew → `@loader_path` → `@executable_path` → `libEGL.dylib` on dyld). Set this when deploying a bundled or custom-signed ANGLE alongside the binary. |
+| `EDGEFIRST_ANGLE_PATH` | macOS and Windows: directory containing `libEGL.dylib` / `libGLESv2.dylib` (macOS) or `libEGL.dll` / `libGLESv2.dll` (Windows). Overrides the default search (macOS: Homebrew → `@loader_path` → `@executable_path` → `libEGL.dylib` on dyld; Windows: next to the loading module → next to the executable → the default DLL search path). Set this when deploying a bundled or custom-signed ANGLE alongside the binary. |
+| `EDGEFIRST_ANGLE_ADAPTER` | Windows only: which Direct3D 11 adapter ANGLE uses — `hardware` (default), `warp` (software; needs `EDGEFIRST_ALLOW_SOFTWARE_GL=1`), `discrete`, an adapter LUID `<high>:<low>`, or a substring of the adapter description (see [Windows GPU Acceleration](#windows-gpu-acceleration)) |
 | `EDGEFIRST_TESTDATA_DIR` | Override testdata location (used by benches and CI) |
 | `RUST_LOG` | Standard `env_logger` filter — `RUST_LOG=edgefirst_image=debug` for backend dispatch + cache stats |
 

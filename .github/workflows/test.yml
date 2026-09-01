@@ -791,25 +791,61 @@ jobs:
             -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 
   # ===========================================================================
-  # Build Check on Windows (verify Windows compilation before release)
+  # Build & Test on Windows (x86_64-pc-windows-msvc)
   #
-  # Catches cfg-gate mismatches between Linux/macOS-only modules (e.g.
-  # opengl_headless) and feature-only #[cfg] guards that compile fine on
-  # Linux but break on Windows. gpu-probe depends on EGL/GBM which are
-  # Linux-only; all other workspace crates must compile on Windows.
+  # Windows is a GPU platform: crates/image's GL engine runs on ANGLE over
+  # Direct3D 11 with PBO transfers (crates/image/src/gl/platform/windows.rs).
+  # This lane:
+  #   1. lints the workspace and the five C-API leaves (gating);
+  #   2. runs the Rust tests WITHOUT ANGLE on the search path (gating) — the
+  #      GL tests self-skip deterministically, everything else must pass;
+  #   3. runs the image crate's GL tests on ANGLE's D3D11 WARP software
+  #      adapter with HAL_TEST_REQUIRE_GL=1 (best-effort, like the Linux
+  #      software-gl-coverage lane: hosted Windows runners have no GPU);
+  #   4. builds, packages and smokes the C archive with ANGLE bundled (gating);
+  #   5. builds the five wheels with ANGLE bundled, checks the layout,
+  #      installs them, and runs the gpu-marked pytest on WARP (build +
+  #      layout gating; the WARP pytest best-effort).
+  # Real-GPU validation is a local run on an NVIDIA box:
+  #   pwsh scripts/test-windows.ps1 -RequireGl   (see TESTING.md § Windows).
+  # gpu-probe depends on EGL/GBM which are Linux-only; the python-* crates
+  # cannot join --workspace (edgefirst-tensor's static/dynamic exclusion).
   # ===========================================================================
-  build-windows:
-    name: Build Check (Windows)
+  build-and-test-windows:
+    name: Build & Test (Windows)
     runs-on: windows-latest
+    needs: checkout-lfs
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    env:
+      # scripts/fetch-angle.sh --windows downloads angle-windows-x64-<tag>.zip
+      # from the public EdgeFirstAI/angle-package release (no auth needed;
+      # GH_TOKEN only raises the API rate limit).
+      GH_TOKEN: ${{ github.token }}
+      # The HAL's Windows ANGLE loader reads this first; libEGL.dll and
+      # libGLESv2.dll must be flat siblings (libEGL loads libGLESv2 from its
+      # own directory) — see crates/image/src/gl/platform/windows.rs.
+      EDGEFIRST_ANGLE_PATH: ${{ github.workspace }}\target\angle\windows-x64\bin
 
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          lfs: false  # LFS files downloaded separately
+
+      - name: Download LFS testdata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: testdata-lfs
+          path: testdata/
 
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
+          components: clippy, rustfmt
 
       - name: Set up MSVC Developer Command Prompt
         # Prepends the Visual Studio PATH so MSVC `link.exe` wins. Not
@@ -823,28 +859,60 @@ jobs:
         with:
           shared-key: rust-windows
           cache-on-failure: true
+          cache-bin: false  # Prevent overwriting rustup cargo shim with stale cached binary
 
-      - name: Check workspace compiles on Windows
-        # --exclude the four python-* crates: same feature-unification failure
-        # as the other --workspace lanes in this file (edgefirst-tensor's
-        # `static`/`dynamic` mutual exclusion). Confirmed by reproducing this
-        # exact command locally: 11 errors (`Tensor`/`TensorDyn` defined
-        # multiple times, recursive types with infinite size) before the fix.
+      - name: Install cargo tools
+        uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
+        with:
+          tool: cargo-nextest
+
+      - name: Fetch ANGLE (Windows x64, release v2.1.28252)
+        # Download + sha256-verify + extract angle-windows-x64-<tag>.zip into
+        # target/angle/windows-x64/ (EDGEFIRST_ANGLE_PATH above points at its
+        # bin/). Same pinned ANGLE commit as the macOS xcframeworks.
+        shell: bash
+        run: bash scripts/fetch-angle.sh --windows
+
+      - name: Run Clippy
+        # Same exclusions as the macOS lane: gpu-probe/edgefirst-bench are
+        # Linux-only; the python-* crates cannot join --workspace.
         # pwsh: Git bash's `/usr/bin/link.exe` shadows MSVC `link.exe`.
         shell: pwsh
-        run: cargo check --workspace --exclude gpu-probe --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common
+        run: cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
 
-      - name: Check modular C-API leaves compile on Windows
+      - name: Run Clippy (modular C-API leaves)
         # The five modular C-API leaves are standalone packages excluded from
         # --workspace above. No Makefile is invoked here (this job's style is
-        # raw cargo, matching the step above), so this loop mirrors the
-        # Makefile's check-capi-modular recipe shape by hand.
+        # raw cargo), so this loop mirrors `make lint-capi-modular` by hand.
         shell: pwsh
         run: |
           foreach ($c in @('tensor-capi','image-capi','codec-capi','decoder-capi','tracker-capi')) {
-            cargo check --manifest-path "crates/$c/Cargo.toml" --target-dir target
+            cargo clippy --manifest-path "crates/$c/Cargo.toml" --all-targets --target-dir target -- -D warnings
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+
+      - name: Run Rust tests (no ANGLE on the search path)
+        # The gating pass: with EDGEFIRST_ANGLE_PATH empty the GL backend
+        # cannot come up, so every GL test self-skips deterministically and
+        # the rest of the suite must pass. -j 1 is the same single-threaded
+        # rule the other lanes apply (TESTING.md § Single-Threaded Execution).
+        shell: pwsh
+        env:
+          EDGEFIRST_ANGLE_PATH: ''
+        run: |
+          cargo nextest run --workspace --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1 2>&1 | Tee-Object -FilePath target/test-metrics-rust-windows.txt
+          exit $LASTEXITCODE
+
+      - name: Run GL tests on ANGLE D3D11 WARP (best-effort)
+        # Exercises the real GL engine on the runner's software D3D11
+        # adapter (EDGEFIRST_ANGLE_ADAPTER=warp + EDGEFIRST_ALLOW_SOFTWARE_GL=1).
+        # HAL_TEST_REQUIRE_GL=1 turns "ANGLE failed to come up" into a
+        # failure (gl_backend_available_canary) rather than a silent skip.
+        # continue-on-error like software-gl-coverage: WARP is a software
+        # renderer, not a supported production target; promote once stable.
+        shell: pwsh
+        continue-on-error: true
+        run: pwsh -NoProfile -File scripts/test-windows.ps1 -Warp -RequireGl -p edgefirst-image
 
       - name: Build modular C-API leaves (Windows, release)
         # Isolated from the bash packaging step so cargo uses MSVC link.exe.
@@ -856,7 +924,8 @@ jobs:
           }
 
       - name: Package and smoke the C archive (Windows)
-        # PR gate for the Windows packaging path (DLL + import-lib selection).
+        # PR gate for the Windows packaging path (DLL + import-lib selection,
+        # ANGLE bundled into bin/ because EDGEFIRST_ANGLE_PATH is set).
         # release.yml's build-capi Windows row would otherwise be the first
         # time that branch of package-capi.sh ever ran — after a tag.
         shell: bash
@@ -864,6 +933,77 @@ jobs:
           mkdir -p dist
           ./scripts/package-capi.sh --target x86_64-windows --libdir target/release --outdir dist
           ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.zip
+
+      - name: Run modular C-API tests (best-effort)
+        # `make test-capi-modular` is bash/Makefile-shaped; this mirrors its
+        # recipe by hand. First time these leaf tests run on Windows, so it
+        # starts non-gating; promote once green.
+        shell: pwsh
+        continue-on-error: true
+        env:
+          EF_REQUIRE_FRESH_ARTIFACTS: '1'
+        run: |
+          foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
+            cargo test --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build, check and install the Python wheels
+        # EDGEFIRST_ANGLE_PATH is set on the job, so python-image's build.rs
+        # bundles libEGL.dll + libGLESv2.dll next to _image.pyd. The layout
+        # check enforces the single-tensor-home rule (edgefirst_tensor.dll
+        # ships once, in the tensor wheel).
+        shell: pwsh
+        run: |
+          python -m venv venv
+          venv\Scripts\python.exe -m pip install --upgrade pip
+          venv\Scripts\pip.exe install maturin pytest numpy pillow
+          foreach ($pkg in @('tensor','codec','image','decoder','tracker')) {
+            venv\Scripts\maturin.exe build --manifest-path "crates/python-$pkg/Cargo.toml" --out target/wheels --release --features abi3-py311 --auditwheel skip
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          venv\Scripts\python.exe scripts/check_wheel_layout.py target/wheels
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          venv\Scripts\pip.exe install --no-deps --force-reinstall (Get-ChildItem target/wheels/*.whl)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          venv\Scripts\python.exe -c "import edgefirst.tensor, edgefirst.codec, edgefirst.image, edgefirst.decoder, edgefirst.tracker; print('wheels import ok')"
+
+      - name: Run GPU Python tests on WARP (best-effort)
+        # tests/gpu_policy.py: on Windows the gpu-marked tests skip unless
+        # HAL_TEST_REQUIRE_GL=1, and then REQUIRE a PBO-backed destination.
+        shell: pwsh
+        continue-on-error: true
+        env:
+          HAL_TEST_REQUIRE_GL: '1'
+          EDGEFIRST_ANGLE_ADAPTER: warp
+          EDGEFIRST_ALLOW_SOFTWARE_GL: '1'
+        run: venv\Scripts\python.exe -m pytest tests/ -m gpu -v --tb=short
+
+      - name: Upload test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: test-results-windows
+          path: |
+            target/nextest/default/test-results.xml
+            target/test-metrics-*-windows.txt
+          retention-days: 30
+
+      - name: Publish test results
+        # The `/windows` sub-action is the composite (Python) variant — the
+        # root action is docker-based and Linux-only. Same pinned hash.
+        uses: EnricoMi/publish-unit-test-result-action/windows@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2.23.0
+        if: always()
+        with:
+          files: target/nextest/default/test-results.xml
+          check_name: Test Results (Windows)
+          comment_mode: always
+          ignore_runs: true
 
   # ===========================================================================
   # Software-GL coverage (Mesa llvmpipe)
