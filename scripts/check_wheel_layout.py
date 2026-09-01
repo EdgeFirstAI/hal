@@ -54,9 +54,11 @@ def _check_tensor_home(wheel_name: str, pkg: str, names: list[str]) -> list[str]
     if pkg == "tensor":
         if not tensor_lib:
             return [
-                f"{wheel_name} is the tensor wheel but does not ship the shared "
-                "tensor library (libedgefirst_tensor.so.<major>, "
-                "libedgefirst_tensor.<major>.dylib or edgefirst_tensor.dll)"
+                (
+                    f"{wheel_name} is the tensor wheel but does not ship the shared "
+                    "tensor library (libedgefirst_tensor.so.<major>, "
+                    "libedgefirst_tensor.<major>.dylib or edgefirst_tensor.dll)"
+                )
             ]
         if len(tensor_lib) > 1:
             return [

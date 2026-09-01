@@ -15,11 +15,14 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
     # directories registered via os.add_dll_directory() are searched, PATH is
     # not. _image.pyd lives here but edgefirst_tensor.dll ships in the sibling
     # edgefirst/tensor/ directory, so register that directory before the
-    # import below loads the extension. The returned handle is dropped on
-    # purpose: the registration lasts for the process, only close() undoes it.
+    # import below loads the extension. The handle stays bound for the life
+    # of the process (CPython's handle has no __del__, so dropping it would
+    # not undo the registration, but holding it keeps the lifetime explicit
+    # and remove_dll_directory() possible); the leading underscore keeps it
+    # out of the public surface checked by tests/packaging.
     import edgefirst.tensor as _tensor_pkg
 
-    os.add_dll_directory(os.path.dirname(_tensor_pkg.__file__))
+    _tensor_dll_dir = os.add_dll_directory(os.path.dirname(_tensor_pkg.__file__))
     del _tensor_pkg
 
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
