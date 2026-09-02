@@ -2785,9 +2785,8 @@ impl GLProcessorST {
                         // D3D11) rejects a direct RGB/RED read into the PBO with
                         // GL_INVALID_OPERATION. Same fallback as the Mem path:
                         // RGBA into the scratch buffer, then repack the leading
-                        // channels into the mapped PBO. A CPU round trip, but
-                        // correct — and the RGBA destination fast path above is
-                        // unaffected.
+                        // channels into the mapped PBO. This adds a CPU copy;
+                        // the RGBA destination path above is unaffected.
                         read_pixels_into(
                             dst_w,
                             read_h,
@@ -7169,7 +7168,7 @@ mod tests {
              D3D11-32.0.16.1656)",
         );
         assert!(t.angle && !t.software && !t.virtual_gpu && !t.vivante);
-        // Windows: ANGLE over D3D11 WARP (GPU-less CI runner) — ANGLE AND software.
+        // Windows: ANGLE over D3D11 WARP (GPU-less CI runner) — ANGLE and software.
         let t = classify_renderer(
             "ANGLE (Microsoft, Microsoft Basic Render Driver Direct3D11 vs_5_0 ps_5_0, \
              D3D11-10.0.26100.1)",

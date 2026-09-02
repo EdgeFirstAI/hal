@@ -253,11 +253,11 @@ void main() {
 
 #[cfg(test)]
 mod nv_shader_golden {
-    /// The golden as checked out. `.gitattributes` pins `*.glsl` to LF, but a
-    /// checkout with `core.autocrlf=true` (Git for Windows' default) made
-    /// `include_str!` see CRLF while rustc normalizes the literal to LF, so
-    /// the two could never match on such a host. Line endings are not what
-    /// the goldens freeze; the GLSL bytes are.
+    /// The golden with CRLF normalized to LF. A checkout made with
+    /// `core.autocrlf=true` (the Git for Windows default) gives
+    /// `include_str!` CRLF line endings while rustc normalizes the string
+    /// literal to LF. `.gitattributes` pins `*.glsl` to LF; this covers
+    /// checkouts made before that attribute existed.
     fn golden(src: &str) -> String {
         src.replace("\r\n", "\n")
     }

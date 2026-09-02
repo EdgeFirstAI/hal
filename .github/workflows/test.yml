@@ -797,7 +797,7 @@ jobs:
   # Direct3D 11 with PBO transfers (crates/image/src/gl/platform/windows.rs).
   # This lane:
   #   1. lints the workspace and the five C-API leaves (gating);
-  #   2. runs the Rust tests WITHOUT ANGLE on the search path (gating) — the
+  #   2. runs the Rust tests without ANGLE on the search path (gating) — the
   #      GL tests self-skip deterministically, everything else must pass.
   #      Under cargo-llvm-cov like every other test lane (--no-report, so
   #      the profraw accumulates);
@@ -965,9 +965,9 @@ jobs:
           ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.zip
 
       - name: Run modular C-API tests (best-effort)
-        # `make test-capi-modular` is bash/Makefile-shaped; this mirrors its
-        # recipe by hand. First time these leaf tests run on Windows, so it
-        # starts non-gating; promote once green.
+        # `make test-capi-modular` needs bash and make; this repeats its
+        # recipe. Non-gating until the leaf tests have a run history on
+        # Windows; promote once green.
         shell: pwsh
         continue-on-error: true
         env:
@@ -1005,7 +1005,7 @@ jobs:
 
       - name: Run GPU Python tests on WARP (best-effort)
         # tests/gpu_policy.py: on Windows the gpu-marked tests skip unless
-        # HAL_TEST_REQUIRE_GL=1, and then REQUIRE a PBO-backed destination.
+        # HAL_TEST_REQUIRE_GL=1, and then require a PBO-backed destination.
         shell: pwsh
         continue-on-error: true
         env:
@@ -1015,9 +1015,9 @@ jobs:
         run: venv\Scripts\python.exe -m pytest tests/ -m gpu -v --tb=short
 
       - name: Coverage summary (Windows)
-        # Same tool-free per-lane visibility as the macOS lane: overall
-        # lines plus the GL-engine slice, straight from the lcov into the
-        # job's step summary.
+        # Per-lane coverage summary in the job's step summary (overall
+        # lines and the GL engine), computed from the lcov as the macOS lane
+        # does.
         if: always()
         shell: bash
         run: |
@@ -1880,7 +1880,7 @@ jobs:
           # so every lane resolves identically, on any runner layout.
           # The Windows lane (D:\a\hal\hal\..., backslashes) is already
           # normalized by scripts/normalize-lcov-paths.ps1; the backslash
-          # and drive-letter cases here are the safety net for it.
+          # and drive-letter cases here also cover a report that was not.
           for lcov in $(find coverage/ -name "*.lcov" -type f); do
             sed -i -E '/^SF:/{s|\\|/|g; s|^SF:.*/work/hal/hal/|SF:|; s|^SF:[A-Za-z]:/a/hal/hal/|SF:|}' "$lcov"
           done

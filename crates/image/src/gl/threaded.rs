@@ -395,12 +395,12 @@ fn run_gl_worker(
     // thread-safe. Neither needs the Linux lifecycle lock.
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
     let init_result = GLProcessorST::new(kind, capacity);
-    // Windows: ANGLE's D3D11 backend drives ONE immediate device context
+    // Windows: ANGLE's D3D11 backend drives one immediate device context
     // (and one state manager) per display from every GL context and is not
-    // safe to use from two threads at once — a processor bringing up its
+    // safe to use from two threads at once: a processor bringing up its
     // context (shader compiles, texture allocation) while another converted
-    // died with an access violation. Lifecycle and messages therefore share
-    // NON_LINUX_GL_MUTEX there; per-message locking is the ANGLE Full
+    // crashed with an access violation. Lifecycle and messages therefore
+    // share NON_LINUX_GL_MUTEX there; per-message locking is the ANGLE Full
     // policy anyway.
     #[cfg(target_os = "windows")]
     let init_result = {

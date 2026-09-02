@@ -122,7 +122,7 @@ fn link_tensor(target_os: &str) {
     println!("cargo:rustc-link-search=native={}", built_dir.display());
     if target_os == "windows" {
         // MSVC: a plain `dylib=edgefirst_tensor` resolves
-        // `edgefirst_tensor.lib`, the Rust STATICLIB cargo writes next to
+        // `edgefirst_tensor.lib`, the Rust staticlib cargo writes next to
         // the DLL, and linking that into this cdylib duplicates rust std
         // (LNK2005). The DLL's import library is `edgefirst_tensor.dll.lib`,
         // so name that file verbatim -- same pattern as

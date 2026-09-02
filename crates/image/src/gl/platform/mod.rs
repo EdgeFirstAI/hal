@@ -240,14 +240,15 @@ pub(super) trait GlPlatform {
         handle: Self::ImportHandle,
     ) -> crate::Result<()>;
 
-    /// Called by the dispatch wrapper on the worker thread before EVERY
-    /// message is handled (after the serialization lock is taken). No-op
-    /// on Linux, ANGLE/Metal and Android. On ANGLE/D3D11 it re-makes this
-    /// processor's context current when another processor's context issued
-    /// the previous GL commands: that backend keeps ONE state manager per
-    /// display and only re-syncs per-context state on `eglMakeCurrent`, so
-    /// alternating contexts on different threads — even fully serialized —
-    /// would otherwise render with the previous context's state.
+    /// Called by the dispatch wrapper on the worker thread before each
+    /// message is handled, after the serialization lock is taken. No-op
+    /// on Linux, ANGLE/Metal and Android. ANGLE/D3D11 keeps one state
+    /// manager per display and re-syncs per-context state only on
+    /// `eglMakeCurrent`, so its implementation re-makes this processor's
+    /// context current when another processor's context issued the
+    /// previous GL commands; otherwise contexts alternating between
+    /// threads, even fully serialized, render with the previous context's
+    /// state.
     fn begin_gpu_pass(display: &Self::Display);
 
     /// Release every texture attachment recorded since the last call.
