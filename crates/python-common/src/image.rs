@@ -1572,7 +1572,8 @@ impl PyImageProcessor {
         target_os = "linux",
         target_os = "macos",
         target_os = "ios",
-        target_os = "android"
+        target_os = "android",
+        target_os = "windows"
     ))]
     #[pyo3(signature = (mode))]
     pub fn set_int8_interpolation(&mut self, mode: &str) -> Result<()> {

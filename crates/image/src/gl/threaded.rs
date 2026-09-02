@@ -33,7 +33,7 @@ enum GLProcessorMessage {
         Rotation,
         Flip,
         Crop,
-        tokio::sync::oneshot::Sender<Result<Option<std::os::fd::OwnedFd>, Error>>,
+        tokio::sync::oneshot::Sender<Result<Option<super::CompletionFence>, Error>>,
     ),
     /// Complete any deferred batch render with a single GPU sync.
     Flush(tokio::sync::oneshot::Sender<Result<(), Error>>),
@@ -390,11 +390,23 @@ fn run_gl_worker(
             .unwrap_or_else(|e| e.into_inner());
         GLProcessorST::new(kind, capacity)
     };
-    // macOS: ANGLE serializes internally. Android: the system EGL
-    // is specification-conformant thread-safe. Neither needs the
-    // Linux lifecycle lock.
+    // macOS: ANGLE/Metal serializes display-level entry points
+    // internally. Android: the system EGL is specification-conformant
+    // thread-safe. Neither needs the Linux lifecycle lock.
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
     let init_result = GLProcessorST::new(kind, capacity);
+    // Windows: ANGLE's D3D11 backend drives one immediate device context
+    // (and one state manager) per display from every GL context and is not
+    // safe to use from two threads at once: a processor bringing up its
+    // context (shader compiles, texture allocation) while another converted
+    // crashed with an access violation. Lifecycle and messages therefore
+    // share NON_LINUX_GL_MUTEX there; per-message locking is the ANGLE Full
+    // policy anyway.
+    #[cfg(target_os = "windows")]
+    let init_result = {
+        let _guard = NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        GLProcessorST::new(kind, capacity)
+    };
     let mut gl_converter = match init_result {
         Ok(gl) => gl,
         Err(e) => {
@@ -462,11 +474,14 @@ fn run_gl_worker(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
         });
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
-        let _guard = serialize_per_msg.then(|| {
-            static MSG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            MSG_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
-        });
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
+        let _guard =
+            serialize_per_msg.then(|| NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner()));
 
         // After a panic, the GL context is in an undefined state. Reject
         // all subsequent messages with an error rather than risking wrong
@@ -477,6 +492,10 @@ fn run_gl_worker(
             continue;
         }
 
+        // Platform pre-message hook (ANGLE/D3D11 re-syncs this context's
+        // state when another processor's context issued the last commands;
+        // a no-op elsewhere). Runs under the lock taken above.
+        gl_converter.begin_gpu_pass();
         handle_gl_message(
             msg,
             &mut gl_converter,
@@ -489,13 +508,22 @@ fn run_gl_worker(
         gl_converter.end_gpu_pass_if_synced();
     }
     // Explicitly drop under the mutex so EGL teardown is serialized
-    // (Linux; ANGLE teardown is display-internal on macOS).
+    // (Linux, and Windows for the D3D11 reason above; ANGLE teardown is
+    // display-internal on macOS).
     #[cfg(target_os = "linux")]
     let _guard = super::context::GL_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_os = "windows")]
+    let _guard = NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     drop(gl_converter);
 }
+
+/// Per-message serialization lock for the platforms without a Linux-style
+/// `GL_MUTEX` (macOS/iOS, Android, Windows) — taken per message under the
+/// Full policy, and on Windows also around processor bring-up/teardown.
+#[cfg(not(target_os = "linux"))]
+static NON_LINUX_GL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn handle_gl_message(
     msg: GLProcessorMessage,
@@ -663,7 +691,7 @@ fn handle_image_convert_fenced(
     src: SendablePtr<TensorDyn>,
     mut dst: SendablePtr<TensorDyn>,
     geom: (Rotation, Flip, Crop),
-    resp: tokio::sync::oneshot::Sender<Result<Option<std::os::fd::OwnedFd>, Error>>,
+    resp: tokio::sync::oneshot::Sender<Result<Option<super::CompletionFence>, Error>>,
     gl_converter: &mut GLProcessorST,
     poisoned: &mut bool,
 ) {
@@ -1162,7 +1190,7 @@ impl GLProcessorThreaded {
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
-    ) -> Result<Option<std::os::fd::OwnedFd>, Error> {
+    ) -> Result<Option<super::CompletionFence>, Error> {
         use crate::ImageProcessorTrait as _;
         if !self.caps.native_fence_sync {
             // No fence on this display: the plain blocking convert IS the
@@ -1422,7 +1450,7 @@ mod tests {
     /// refusal is a real, releasable reservation rather than a permanently
     /// stuck `buffer_id`.
     #[test]
-    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn concurrent_maps_from_two_independent_handles_on_one_buffer_do_not_corrupt_gl_state() {
         let gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,

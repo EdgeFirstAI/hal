@@ -53,19 +53,19 @@ with different acceleration primitives per tier. The `TensorMemory`
 enum is shared across all tiers (same discriminants over the C ABI);
 the underlying storage and the GL transfer backend differ.
 
-| Capability | Embedded Linux (i.MX, RPi5, Jetson) | Desktop Linux (x86_64) | macOS (Apple Silicon) | Android (API 26+) |
-|------------|--------------------------------------|------------------------|------------------------|--------------------|
-| `TensorMemory::Mem` | Heap | Heap | Heap | Heap |
-| `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | Import-only — bionic has no `shm_open`, so allocation reports `NotImplemented`; `from_fd` works |
-| `TensorMemory::DmaBuf` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) |
-| `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) |
-| GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) |
-| GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal | Native EGL → driver (Adreno/Mali/PowerVR/Xclipse) |
-| Hardware 2D blitter | G2D on NXP i.MX | — | — | — |
-| Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` | `EGL_ANDROID_image_native_buffer` |
-| Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) | `AHardwareBuffer` (Binder / `sendHandleToUnixSocket`) |
-| Probe function | `is_dma_available()` | Same | `is_iosurface_available()` | `is_ahardwarebuffer_available()` |
-| Portable probe | `is_gpu_buffer_available()` — works on all four | | | |
+| Capability | Embedded Linux (i.MX, RPi5, Jetson) | Desktop Linux (x86_64) | macOS (Apple Silicon) | Android (API 26+) | Windows (x86_64) |
+|------------|--------------------------------------|------------------------|------------------------|--------------------|-------------------|
+| `TensorMemory::Mem` | Heap | Heap | Heap | Heap | Heap |
+| `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | Import-only — bionic has no `shm_open`, so allocation reports `NotImplemented`; `from_fd` works | — |
+| `TensorMemory::DmaBuf` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) | — (D3D11 shared textures are a planned follow-on) |
+| `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) | GLES PBO (the GPU destination kind) |
+| GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) | `Pbo` via ANGLE |
+| GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal | Native EGL → driver (Adreno/Mali/PowerVR/Xclipse) | ANGLE EGL → Direct3D 11 |
+| Hardware 2D blitter | G2D on NXP i.MX | — | — | — | — |
+| Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` | `EGL_ANDROID_image_native_buffer` | — (`EGL_ANGLE_d3d_texture_client_buffer` reserved for the follow-on) |
+| Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) | `AHardwareBuffer` (Binder / `sendHandleToUnixSocket`) | — |
+| Probe function | `is_dma_available()` | Same | `is_iosurface_available()` | `is_ahardwarebuffer_available()` | — (`false`; ask `ImageProcessor` whether GL is live) |
+| Portable probe | `is_gpu_buffer_available()` — works on all four zero-copy tiers; `false` on Windows | | | | |
 
 The portable `is_gpu_buffer_available()` is the recommended cross-platform
 gate when the question is "can I ask for `TensorMemory::DmaBuf` and expect a
@@ -73,6 +73,14 @@ zero-copy GPU-importable buffer?" The platform-specific probes
 (`is_dma_available`, `is_iosurface_available`) remain when callers need
 to know *which* primitive is in use — e.g. to decide whether to call
 `ef_tensor_clone_fd` (Linux) vs `ef_tensor_from_iosurface_id` / `ef_tensor_iosurface_ref` (macOS).
+
+**Windows (x86_64)** runs the same GL engine on ANGLE's Direct3D 11 backend
+(`crates/image/src/gl/platform/windows.rs`). No zero-copy buffer kind exists
+there yet, so it behaves like desktop Linux on an NVIDIA discrete GPU: `Mem`
+sources, `Pbo` destinations, `GL_PIXEL_PACK_BUFFER` readback. The adapter is
+chosen with `EDGEFIRST_ANGLE_ADAPTER` (hardware / WARP / LUID / name match);
+WARP is classified as a software renderer. D3D11 shared-texture tensors and
+CUDA-via-D3D11 interop are a separate follow-on.
 
 **iOS (16+)** shares the macOS column's architecture — ANGLE (EGL→Metal)
 via the prebuilt xcframeworks and IOSurface-backed `TensorMemory::DmaBuf`
@@ -108,6 +116,7 @@ dtype to request; `convert()` always succeeds (GPU or CPU fallback).
 | Vivante GC7000UL (i.MX 8M Plus) | **Disabled → CPU fallback** (float readback 170–320 ms) | **Disabled → CPU fallback** |
 | Tegra Orin / NVIDIA (orin-nano) | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** — `cuda_map()` registers the PBO with CUDA on the GL worker thread; the device pointer is usable from any thread via the per-device CUDA primary context |
 | macOS ANGLE (RGBA16F IOSurface) | F16 `PlanarRgb` zero-copy IOSurface | Not supported (ANGLE rejects `(GL_FLOAT, *)`) |
+| Windows ANGLE / Direct3D 11 | PBO readback (gated on `GL_EXT_color_buffer_half_float`, probed at display init) | PBO readback (gated on `GL_EXT_color_buffer_float`) |
 | CPU fallback | Always present — never errors | Always present — never errors |
 
 **Data layout produced by the GPU paths**

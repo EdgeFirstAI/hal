@@ -253,15 +253,25 @@ void main() {
 
 #[cfg(test)]
 mod nv_shader_golden {
+    /// The golden with CRLF normalized to LF. A checkout made with
+    /// `core.autocrlf=true` (the Git for Windows default) gives
+    /// `include_str!` CRLF line endings while rustc normalizes the string
+    /// literal to LF. `.gitattributes` pins `*.glsl` to LF; this covers
+    /// checkouts made before that attribute existed.
+    fn golden(src: &str) -> String {
+        src.replace("\r\n", "\n")
+    }
+
     /// The NV->RGBA shader source is validated on-target (V3D/Mali/Vivante/Tegra);
     /// its bytes must not drift. `golden/nv_rgba_linux.glsl` is the frozen
     /// reference. This test runs on every platform (the module is uncfg'd), so
-    /// byte-identity is enforced on the macOS host too, not just the Linux lane.
+    /// byte-identity is enforced on the macOS and Windows hosts too, not just
+    /// the Linux lane.
     #[test]
     fn nv_fragment_byte_identical() {
         assert_eq!(
             super::NV_RGBA_FRAGMENT,
-            include_str!("golden/nv_rgba_linux.glsl"),
+            golden(include_str!("golden/nv_rgba_linux.glsl")).as_str(),
             "NV->RGBA shader bytes drifted from the on-target-validated golden"
         );
     }
@@ -270,7 +280,7 @@ mod nv_shader_golden {
     fn vertex_byte_identical() {
         assert_eq!(
             super::VERTEX_SHADER,
-            include_str!("golden/vertex.glsl"),
+            golden(include_str!("golden/vertex.glsl")).as_str(),
             "vertex shader bytes drifted from the on-target-validated golden"
         );
     }

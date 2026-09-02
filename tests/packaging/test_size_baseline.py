@@ -9,6 +9,7 @@ import json
 import pathlib
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -18,6 +19,11 @@ BASELINE = pathlib.Path("docs/baselines/2026-08-15-phase1-baseline.json")
 @pytest.mark.skipif(
     shutil.which("git") is None or shutil.which("rustc") is None,
     reason="size_baseline.sh records git and rustc; hardware runners have neither",
+)
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="size_baseline.sh measures the Unix artifact layout (lib*.so / .dylib, "
+    "du, stat); Windows has no size baseline yet",
 )
 def test_baseline_script_emits_required_keys(tmp_path):
     out = tmp_path / "b.json"

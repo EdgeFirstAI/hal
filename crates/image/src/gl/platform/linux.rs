@@ -116,6 +116,11 @@ impl GlPlatform for LinuxEgl {
         Ok(())
     }
 
+    fn begin_gpu_pass(_display: &GlContext) {
+        // Each processor's context is current on its own thread and the
+        // driver keeps per-context state; nothing to re-sync.
+    }
+
     fn end_gpu_pass(_display: &GlContext) {
         // EGLImage texture targets persist by design; nothing to release.
     }
@@ -128,7 +133,7 @@ impl GlPlatform for LinuxEgl {
 
     fn export_completion_fence(
         _display: &GlContext,
-    ) -> crate::Result<Option<std::os::fd::OwnedFd>> {
+    ) -> crate::Result<Option<super::super::CompletionFence>> {
         Ok(None)
     }
 

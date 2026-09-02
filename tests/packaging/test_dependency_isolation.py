@@ -137,25 +137,80 @@ def _wheel_extension(leaf: str) -> Path:
     return path
 
 
+def _pe_imports(path: Path) -> list[str]:
+    """DLL names in a PE image's import directory (the DT_NEEDED analogue).
+
+    Pure Python so the check does not need dumpbin / a VS developer shell.
+    """
+    import struct
+
+    data = path.read_bytes()
+    (e_lfanew,) = struct.unpack_from("<I", data, 0x3C)
+    if data[e_lfanew : e_lfanew + 4] != b"PE\0\0":
+        raise ValueError(f"{path} is not a PE image")
+    coff = e_lfanew + 4
+    n_sections, opt_size = struct.unpack_from("<H", data, coff + 2)[0], struct.unpack_from("<H", data, coff + 16)[0]
+    opt = coff + 20
+    (magic,) = struct.unpack_from("<H", data, opt)
+    dir_off = opt + (112 if magic == 0x20B else 96)  # PE32+ vs PE32
+    import_rva, import_size = struct.unpack_from("<II", data, dir_off + 8)  # directory 1
+    if import_rva == 0 or import_size == 0:
+        return []
+    sections = []
+    sec = opt + opt_size
+    for i in range(n_sections):
+        off = sec + i * 40
+        vsize, vaddr, rsize, raddr = struct.unpack_from("<IIII", data, off + 8)
+        sections.append((vaddr, max(vsize, rsize), raddr))
+
+    def rva_to_off(rva: int) -> int:
+        for vaddr, size, raddr in sections:
+            if vaddr <= rva < vaddr + size:
+                return rva - vaddr + raddr
+        raise ValueError(f"RVA {rva:#x} outside every section of {path}")
+
+    names = []
+    desc = rva_to_off(import_rva)
+    while True:
+        _oft, _ts, _fwd, name_rva, first_thunk = struct.unpack_from("<IIIII", data, desc)
+        if name_rva == 0 and first_thunk == 0:
+            break
+        if name_rva:
+            off = rva_to_off(name_rva)
+            end = data.index(b"\0", off)
+            names.append(data[off:end].decode("ascii", "replace"))
+        desc += 20
+    return names
+
+
 def _needed_text(so: Path) -> str:
     if sys.platform == "darwin":
         r = subprocess.run(
             ["otool", "-L", str(so)], capture_output=True, text=True, check=True
         )
         return r.stdout
+    if sys.platform == "win32":
+        # `.pyd` extension modules are PE DLLs; their import directory names
+        # `edgefirst_tensor.dll` (no `lib` prefix on Windows).
+        return "\n".join(_pe_imports(so))
     r = subprocess.run(
         ["readelf", "-d", str(so)], capture_output=True, text=True, check=True
     )
     return r.stdout
 
 
+def _library_named(text: str, lib: str) -> bool:
+    # Linux/macOS: `libedgefirst_tensor.so.0` / `.dylib`; Windows: `edgefirst_tensor.dll`.
+    return lib in text or lib.removeprefix("lib") in text.lower()
+
+
 def _links_libedgefirst_tensor(so: Path) -> bool:
-    return "libedgefirst_tensor" in _needed_text(so)
+    return _library_named(_needed_text(so), "libedgefirst_tensor")
 
 
 def _embedded_sibling_c_libs(so: Path) -> list[str]:
     text = _needed_text(so)
-    return [lib for lib in SIBLING_C_LIBS if lib in text]
+    return [lib for lib in SIBLING_C_LIBS if _library_named(text, lib)]
 
 
 @pytest.mark.parametrize("leaf", ["tensor", "codec", "image", "decoder"])

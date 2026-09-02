@@ -404,8 +404,13 @@ impl GlPlatform for AngleClientBuffer {
 
     fn export_completion_fence(
         _display: &AngleDisplay,
-    ) -> crate::Result<Option<std::os::fd::OwnedFd>> {
+    ) -> crate::Result<Option<super::super::CompletionFence>> {
         Ok(None)
+    }
+
+    fn begin_gpu_pass(_display: &AngleDisplay) {
+        // ANGLE/Metal keeps per-context command state; contexts current on
+        // different threads do not need re-syncing (the D3D11 leaf does).
     }
 
     fn end_gpu_pass(display: &AngleDisplay) {

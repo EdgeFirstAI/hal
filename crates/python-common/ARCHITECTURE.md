@@ -33,7 +33,10 @@ implementation lives in that one shared library; the other wheels do not
 embed a second copy. `edgefirst-tensor`'s wheel ships the `.so` (and the
 `.so.0` soname symlink); codec/image/decoder set `DT_NEEDED` +
 `RUNPATH=$ORIGIN/../tensor`. Tracker does not link tensor: it consumes
-plain detection values.
+plain detection values. On Windows the same library is `edgefirst_tensor.dll`
+(no `lib` prefix, no SONAME) and there is no rpath: codec/image/decoder's
+`__init__.py` call `os.add_dll_directory()` on `edgefirst/tensor/` before
+importing their `.pyd`.
 
 A JPEG-only user installs `edgefirst-codec` + `edgefirst-tensor`. An
 image-only user installs `edgefirst-image` + `edgefirst-tensor` and does

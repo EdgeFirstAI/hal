@@ -21,8 +21,22 @@ fi
 WORKDIR="${TMPDIR:-/tmp}/smoke-capi-win.$$"
 mkdir -p "${WORKDIR}"
 trap 'rm -rf "${WORKDIR}"' EXIT
+# `python3` first (GitHub runners); Git Bash on a Windows dev box usually has
+# only `python`, and `python3` may be the Microsoft Store stub (exit 49,
+# "Python was not found") — probe by running it, as package-capi.sh does.
+PY=""
+for cand in python3 python; do
+  if command -v "${cand}" >/dev/null 2>&1 && "${cand}" -c 'pass' >/dev/null 2>&1; then
+    PY="${cand}"
+    break
+  fi
+done
+if [[ -z "${PY}" ]]; then
+  echo "FAIL: no working python3/python on PATH" >&2
+  exit 1
+fi
 case "${ARCHIVE}" in
-  *.zip) python3 -m zipfile -e "${ARCHIVE}" "${WORKDIR}" ;;
+  *.zip) "${PY}" -m zipfile -e "${ARCHIVE}" "${WORKDIR}" ;;
   *) echo "FAIL: unknown archive type ${ARCHIVE} (want .zip)" >&2; exit 1 ;;
 esac
 PREFIX="$(find "${WORKDIR}" -mindepth 1 -maxdepth 1 -type d | head -1)"
@@ -94,8 +108,10 @@ for leaf in tensor image codec decoder tracker; do
       # Git bash converts `/nologo` into `C:/Program Files/Git/nologo`.
       # MSYS_NO_PATHCONV keeps MSVC's slash flags intact. File arguments
       # must still be Windows paths: `/tmp/foo.c` is a cl option, not a source.
+      # /Fo keeps the .obj in the work dir; without it cl writes leaf.obj
+      # into the current directory (the repo root when run from there).
       if ! MSYS_NO_PATHCONV=1 cl /nologo /W3 /WX /TC "$(winpath "${src}")" \
-          /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" \
+          /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" /Fo"$(winpath "${WORKDIR}")\\" \
           /link /LIBPATH:"$(winpath "${LIBDIR}")" "$(winpath "${implib}")"; then
         echo "FAIL: compile ${leaf} (cl)" >&2
         exit 1
@@ -103,7 +119,7 @@ for leaf in tensor image codec decoder tracker; do
       ;;
     clang-cl)
       if ! MSYS_NO_PATHCONV=1 clang-cl /nologo /W3 /WX /TC "$(winpath "${src}")" \
-          /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" \
+          /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" /Fo"$(winpath "${WORKDIR}")\\" \
           /link /LIBPATH:"$(winpath "${LIBDIR}")" "$(winpath "${implib}")"; then
         echo "FAIL: compile ${leaf} (clang-cl)" >&2
         exit 1
@@ -129,6 +145,14 @@ for leaf in tensor image codec decoder tracker; do
   if [[ -f "${BIN}/edgefirst_tensor.dll" ]]; then
     cp "${BIN}/edgefirst_tensor.dll" "$(dirname "${exe}")/"
   fi
+  # ANGLE (GLES over Direct3D 11) is bundled when the archive was packaged
+  # with EDGEFIRST_ANGLE_PATH set; edgefirst_image.dll loads it lazily from
+  # its own directory, so keep the DLLs next to the exe as a consumer would.
+  for angle_dll in libEGL.dll libGLESv2.dll; do
+    if [[ -f "${BIN}/${angle_dll}" ]]; then
+      cp "${BIN}/${angle_dll}" "$(dirname "${exe}")/"
+    fi
+  done
   if ! "${exe}"; then
     echo "FAIL: run ${leaf} (compile succeeded, load/execute failed)" >&2
     exit 1
@@ -140,5 +164,10 @@ done
 if [[ "${ran}" -ne 5 ]]; then
   echo "FAIL: only ${ran}/5 libraries smoked" >&2
   exit 1
+fi
+if [[ -f "${BIN}/libEGL.dll" && -f "${BIN}/libGLESv2.dll" ]]; then
+  echo "ANGLE bundled: bin/libEGL.dll + bin/libGLESv2.dll (Direct3D 11 GPU backend available to consumers)"
+else
+  echo "ANGLE not bundled: archive is CPU-only unless EDGEFIRST_ANGLE_PATH is set at run time"
 fi
 echo "ALL PACKAGED WINDOWS HEADERS COMPILE AND ALL LIBRARIES RUN"
