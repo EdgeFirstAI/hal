@@ -208,6 +208,57 @@ disambiguation rules, the 2-way split format used by TFLite INT8
 segmentation models, and the `nc=28` edge case are documented in
 [ARCHITECTURE.md § Model-type selection](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md#model-type-selection).
 
+## Schema Inference for Ultralytics Exports
+
+This crate decodes the *output tensors* of YOLO-family models. It contains
+no upstream model code: the decoders, NMS and mask kernels here are an
+independent Rust implementation, and nothing from any model-training
+project is vendored, linked or redistributed. Exporting a model is
+something you do with your own tooling; this crate reads what came out.
+
+A vanilla Ultralytics YOLOv8/YOLO11/YOLO26 export (ONNX or TFLite, detection
+or segmentation) carries no `edgefirst.json`, but its own metadata and tensor
+shapes are enough to derive one. `infer_ultralytics_schema` reads the
+model's `names`/`task`/`end2end` metadata plus its I/O tensor shapes and
+dtypes, and returns a `SchemaV2` ready to hand to `DecoderBuilder`, along
+with the ordered class labels. Metadata and shapes are cross-checked, never
+guessed past — a mismatch (e.g. a class count that doesn't fit the output
+width) is a typed `InferError`, not a silent best-effort classification.
+
+```rust,ignore
+use edgefirst_decoder::{infer_ultralytics_schema, DecoderBuilder};
+
+// `signals: ModelSignals` comes from the runtime that loaded the model.
+let inferred = infer_ultralytics_schema(&signals)?;
+let decoder = DecoderBuilder::new().with_schema(inferred.schema).build()?;
+// `inferred.labels` are the class names in index order.
+```
+
+Rust callers hand the `SchemaV2` straight to `with_schema`; there is no
+reason to serialize it. Nor does Python: its binding returns the schema as
+a dict, which `Decoder(schema)` takes directly. The JSON rendering exists
+for the C API alone, which has no dict to hand across the boundary.
+
+The inferred schema pins the NMS *mode* but not the thresholds. Ultralytics
+runs NMS class-aware (`agnostic=False`), and leaving the field unset is not
+neutral — the builder's `Nms::Auto` default resolves an unset config to
+class-agnostic, which suppresses a box against an overlapping box of a
+different class. `with_nms` still overrides. YOLO26 end-to-end exports
+perform NMS in-graph and carry no mode.
+
+Box normalization follows the export format, not a fixed convention:
+Ultralytics ONNX exports report pixel-space boxes (`normalized: false`),
+while TFLite exports report boxes normalized to `[0, 1]` (`normalized:
+true`) — the inferred schema always matches the tensors the model actually
+produces. Those two conventions are the measured ones;
+`ModelSource::Other` is refused rather than defaulted, because this is the
+one field no tensor shape reveals and picking wrong scales every box by the
+input size. The schema's `decoder_version` (`yolov8` or `yolo26`) is always
+set explicitly rather than left for the builder to infer from output shape,
+because shape-based inference of end-to-end vs. pre-NMS layout is
+ambiguous in the general case; inference here settles it once, from the
+model's own `end2end` metadata flag when present.
+
 ## Tiled Inference (SAHI)
 
 When a frame is preprocessed into an overlapping tile grid (see

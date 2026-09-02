@@ -20,6 +20,8 @@ pub mod decoder;
 pub mod detect_boxes;
 #[cfg(feature = "image")]
 pub mod image;
+#[cfg(feature = "decoder")]
+pub mod infer;
 #[cfg(feature = "tensor")]
 pub mod interop;
 #[cfg(feature = "tensor")]

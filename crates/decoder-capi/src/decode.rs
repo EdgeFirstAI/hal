@@ -252,7 +252,7 @@ pub unsafe extern "C" fn ef_decoder_params_set_nms(p: *mut EfDecoderParams, nms:
 }
 
 /// Read a C string of `len` bytes, or NUL-terminated when `len` is 0.
-unsafe fn read_str(p: *const c_char, len: usize) -> Option<String> {
+pub(crate) unsafe fn read_str(p: *const c_char, len: usize) -> Option<String> {
     unsafe {
         if p.is_null() {
             return None;

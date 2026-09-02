@@ -3,7 +3,7 @@
 
 //! `edgefirst.decoder` — YOLO/ModelPack output decoding, NMS and tracking.
 
-use edgefirst_python_common::{colorimetry, decoder, tensor, tiling_merge};
+use edgefirst_python_common::{colorimetry, decoder, infer, tensor, tiling_merge};
 use pyo3::prelude::*;
 
 #[pymodule]
@@ -35,6 +35,8 @@ fn _decoder(m: &Bound<'_, PyModule>) -> PyResult<()> {
         tiling_merge::py_merge_tiled_detections,
         m
     )?)?;
+
+    m.add_function(wrap_pyfunction!(infer::py_infer_ultralytics_schema, m)?)?;
 
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())

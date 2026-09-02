@@ -88,6 +88,71 @@ boxes, scores, classes, masks, tracks = decoder.decode_tracked(
 )
 ```
 
+## Schema inference for Ultralytics exports
+
+A vanilla Ultralytics YOLOv8/11/26 export carries no `edgefirst.json`, but its
+own metadata and tensor shapes are enough to derive one.
+`infer_ultralytics_schema` reads what your runtime reports and returns a
+schema you can hand straight to `Decoder()`:
+
+```python
+import onnxruntime as ort
+from edgefirst.decoder import Decoder, infer_ultralytics_schema
+
+sess = ort.InferenceSession("yolov8n.onnx", providers=["CPUExecutionProvider"])
+
+# Ultralytics ONNX exports are float32 throughout and unquantized. A TFLite
+# interpreter reports dtype and quantization per tensor instead; pass those as
+# a 4th element on each output: (name, shape, dtype, (scales, zero_points)).
+inputs = [(t.name, list(t.shape), "float32") for t in sess.get_inputs()]
+outputs = [(t.name, list(t.shape), "float32") for t in sess.get_outputs()]
+metadata = dict(sess.get_modelmeta().custom_metadata_map)
+
+inferred = infer_ultralytics_schema("onnx", inputs, outputs, metadata)
+print(inferred.description)  # "Ultralytics YOLOv8/11 detect, 80 classes"
+
+decoder = Decoder(inferred.schema, score_threshold=0.25, iou_threshold=0.45)
+
+boxes, scores, classes, masks = decoder.decode(model_outputs)
+print(inferred.labels[classes[0]])  # class name for the first detection
+```
+
+The result is a named tuple, so `schema, labels, description = inferred`
+works too — but two of the three fields are strings, and naming them is
+cheaper than remembering the order.
+
+`source` decides the box convention: Ultralytics ONNX exports report
+pixel-space coordinates, TFLite exports report `[0, 1]`. `"other"` is
+accepted but refused by inference rather than defaulted — that convention
+follows the exporter, is not derivable from shapes, and guessing it scales
+every box by the input size. Supported dtype strings are `"int8"`,
+`"uint8"`, `"int16"`, `"uint16"`, `"int32"`, `"uint32"`, `"float16"` and
+`"float32"`.
+
+`schema` is a plain dict, ready for `Decoder(schema)` — there is no JSON
+string to parse back. `labels` is the class names in index order, which is
+what maps `decode()`'s class indices back to names.
+
+Shapes must be concrete. A model exported with `dynamic=True` reports a
+symbolic axis (`'batch'` from ONNX, `-1` from TFLite); those are refused
+with a `ValueError` naming the tensor and axis, because the layout rules
+need real sizes.
+
+The schema pins the NMS *mode* and leaves the *thresholds* to you.
+Ultralytics runs NMS class-aware (`agnostic=False`), so an inferred pre-NMS
+schema says so rather than inheriting `Decoder`'s class-agnostic default,
+which would suppress a box against an overlapping box of a different class.
+Passing `nms=` still overrides. Thresholds are not inferable, and
+`Decoder`'s defaults (`score_threshold=0.1`, `iou_threshold=0.7`) are not
+Ultralytics' (`0.25`/`0.45`) — pass them as shown above. YOLO26 end-to-end
+exports apply NMS in-graph and carry no mode at all.
+
+`ValueError` is raised for anything that is not a recognizable Ultralytics
+export — missing or unparsable metadata, an unsupported task (only `detect`
+and `segment`; pose, OBB and classify are refused), or a class count that does
+not fit the output width. Metadata and shapes are cross-checked against each
+other, so a disagreement is reported rather than resolved by preference.
+
 ## What this package provides
 
 | API | Purpose |
@@ -95,6 +160,8 @@ boxes, scores, classes, masks, tracks = decoder.decode_tracked(
 | `Decoder` | Model output decoding to boxes, scores, classes and masks |
 | `Decoder.new_from_outputs()` | Programmatic configuration from `Output` descriptions |
 | `Decoder.new_from_json_str()` / `new_from_yaml_str()` | Configuration from JSON or YAML |
+| `infer_ultralytics_schema()` | Schema derived from a vanilla Ultralytics export's own metadata and shapes |
+| `InferredSchema` | Named tuple returned by `infer_ultralytics_schema()` |
 | `Output`, `DimName` | Output shape and semantics description |
 | `Nms`, `DecoderType`, `DecoderVersion` | NMS mode and model family selection |
 | `ProtoData` | Mask prototypes and coefficients |
