@@ -26,6 +26,14 @@
   run (the `gl_backend_available_canary` test) instead of silently skipping.
 .PARAMETER Release
   Build tests with --release.
+.PARAMETER Coverage
+  Run under cargo-llvm-cov (`cargo llvm-cov nextest --no-report`) so the
+  instrumented run leaves its profraw under target\llvm-cov-target. Several
+  passes accumulate (the CI lane runs the no-ANGLE gating pass and the WARP
+  GL pass this way), then `cargo llvm-cov report --lcov` merges them and
+  scripts/normalize-lcov-paths.ps1 makes the SF: paths repo-relative for
+  SonarCloud. Needs `rustup component add llvm-tools-preview` and
+  `cargo install cargo-llvm-cov --locked`.
 .NOTES
   Everything after the three switches is passed to `cargo nextest run`
   (e.g. `-p edgefirst-image -E 'test(~pbo)'`) via the automatic `$args`.
@@ -36,11 +44,13 @@
 .EXAMPLE
   pwsh scripts/test-windows.ps1 -RequireGl                 # real GPU
   pwsh scripts/test-windows.ps1 -Warp -RequireGl -p edgefirst-image
+  pwsh scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci
 #>
 param(
     [switch]$Warp,
     [switch]$RequireGl,
-    [switch]$Release
+    [switch]$Release,
+    [switch]$Coverage
 )
 $NextestArgs = @($args)
 
@@ -64,6 +74,9 @@ if (-not (Get-Command cargo -ErrorAction Ignore)) {
 if (-not (Get-Command cargo-nextest -ErrorAction Ignore)) {
     throw 'cargo-nextest not found on PATH (cargo install cargo-nextest --locked)'
 }
+if ($Coverage -and -not (Get-Command cargo-llvm-cov -ErrorAction Ignore)) {
+    throw 'cargo-llvm-cov not found on PATH (cargo install cargo-llvm-cov --locked; rustup component add llvm-tools-preview)'
+}
 
 # Same exclusions as the macOS lane: gpu-probe is Linux-only (gbm/nix);
 # the python-* crates cannot join a --workspace build (edgefirst-tensor's
@@ -84,7 +97,15 @@ $profile = @(); if ($Release) { $profile = @('--release') }
 $scope = @('--workspace') + $exclude
 if ($NextestArgs -match '^(-p|--package)(=.*)?$') { $scope = @() }
 
-Write-Host "[test-windows] EDGEFIRST_ANGLE_PATH=$env:EDGEFIRST_ANGLE_PATH adapter=$($env:EDGEFIRST_ANGLE_ADAPTER ?? 'default') require_gl=$([bool]$RequireGl)"
+Write-Host "[test-windows] EDGEFIRST_ANGLE_PATH=$env:EDGEFIRST_ANGLE_PATH adapter=$($env:EDGEFIRST_ANGLE_ADAPTER ?? 'default') require_gl=$([bool]$RequireGl) coverage=$([bool]$Coverage)"
 Set-Location $root
-& cargo nextest run @scope @profile -j 1 @NextestArgs
+if ($Coverage) {
+    # --no-report leaves the profraw under target\llvm-cov-target so several
+    # passes merge into one later `cargo llvm-cov report` (the CI lane's
+    # shape: no-ANGLE gating pass + WARP GL pass -> one LCOV). Everything
+    # after --no-report is forwarded to nextest, `--profile <name>` included.
+    & cargo llvm-cov nextest --no-report @scope @profile -j 1 @NextestArgs
+} else {
+    & cargo nextest run @scope @profile -j 1 @NextestArgs
+}
 exit $LASTEXITCODE
