@@ -35,7 +35,7 @@ This directory contains the CI/CD workflows for EdgeFirst HAL.
 | `build-and-test-macos` | macos-latest | ANGLE/IOSurface GL path, C API, coverage |
 | `build-ios` | macos-latest | Clippy + build the native Rust API (device and simulator) |
 | `build-android` | ubuntu-22.04 | Clippy + build the native Rust API (arm64 and x86_64) |
-| `build-windows` | windows-latest | `cargo check` only |
+| `build-and-test-windows` | windows-latest | ANGLE/Direct3D 11 GL path (WARP in CI), C API, wheels, coverage |
 | `software-gl-coverage` | ubuntu-22.04-xlarge | GL tests under Mesa llvmpipe, for coverage of the GL paths no hardware runner reaches |
 | `build-arm` | ubuntu-22.04-arm-xlarge | Cross-build aarch64 test binaries (also feeds the hardware runner) |
 | `test-arm` | ubuntu-22.04-arm | Run the aarch64 binaries, collect coverage |
@@ -131,17 +131,18 @@ Each pin carries a trailing `# vX.Y.Z` comment naming the tag it corresponds to.
 | `ubuntu-22.04-arm` | aarch64 | Test and post-processing |
 | `ubuntu-22.04-arm-xlarge` | aarch64 | Cross-compilation |
 | `macos-latest` | arm64 | Apple Silicon; ANGLE → Metal |
-| `windows-latest` | x86_64 | Compile check only |
+| `windows-latest` | x86_64 | ANGLE → Direct3D 11 (WARP software adapter; no GPU) |
 | `nxp-imx8mp-latest` | aarch64 | Self-hosted board: G2D, DMA-heap, Vivante GL |
 
 ## Coverage Strategy
 
-Five jobs upload coverage artifacts, and `sonarcloud` merges them:
+Six jobs upload coverage artifacts, and `sonarcloud` merges them:
 
 | Artifact | Source | Covers |
 |----------|--------|--------|
 | `coverage-x86_64` | `build-and-test-x86` | Rust + Python + C API on x86_64 |
 | `coverage-macos` | `build-and-test-macos` | ANGLE/IOSurface GL paths |
+| `coverage-windows` | `build-and-test-windows` | ANGLE/Direct3D 11 leaf and PBO paths under WARP |
 | `coverage-software-gl` | `software-gl-coverage` | GL paths under Mesa llvmpipe |
 | `coverage-aarch64` | `test-arm` | Rust + Python on aarch64 |
 | `coverage-imx8mp-processed` | `process-hardware-coverage` | DMA-heap, G2D, Vivante GL |

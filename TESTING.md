@@ -226,6 +226,22 @@ sets `EDGEFIRST_ANGLE_ADAPTER=warp` + `EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and
 passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
 serialization policy.
 
+`-Coverage` runs the same command under `cargo llvm-cov nextest --no-report`
+(needs `rustup component add llvm-tools-preview` and
+`cargo install cargo-llvm-cov --locked`). Passes accumulate until the report
+is generated:
+
+```powershell
+pwsh scripts/test-windows.ps1 -Coverage                                   # pass 1: whole workspace
+pwsh scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci   # pass 2: GL on WARP
+cargo llvm-cov report --lcov --output-path target/coverage_rust.lcov
+pwsh scripts/normalize-lcov-paths.ps1 target/coverage_rust.lcov          # repo-relative SF: paths for SonarCloud
+```
+
+This is the CI lane's shape (its pass 1 runs with `EDGEFIRST_ANGLE_PATH`
+empty so the GL tests self-skip); `--profile ci` keeps the second pass's
+junit in its own nextest store instead of overwriting the first.
+
 ### 3. Verify the GPU backend is active
 
 ```powershell
@@ -1046,7 +1062,7 @@ Tests run across multiple runner types:
 | Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | Paravirtual Metal GPU (ANGLE; Full GL serialization policy) |
 | Build & Link (iOS) | `macos-latest` | arm64 | No runtime tests — build + link closure only |
 | Build & Link (Android) | `ubuntu-22.04` | x86_64 host | No runtime tests — see Device Farm section below |
-| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating); image-crate GL tests, C-API leaf tests and gpu pytest on ANGLE Direct3D 11 WARP (software; best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl` |
+| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating) and image-crate GL tests on ANGLE Direct3D 11 WARP (software; best-effort), both under cargo-llvm-cov into one LCOV (`coverage-windows` → SonarCloud); C-API leaf tests and gpu pytest on WARP (best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl` |
 | Software-GL Coverage (llvmpipe) | `ubuntu-22.04-xlarge` | x86_64 | Mesa llvmpipe (software GL) |
 | Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
 | Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |
