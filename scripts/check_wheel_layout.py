@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Assert the A3 wheel layout.
 
-Single-tensor-home (task P2): `libedgefirst_tensor.so` lives in exactly the
-`tensor` wheel -- every other wheel links to it via RPATH instead of
-embedding or vendoring a copy. Older revisions of this check predated that
+Single-tensor-home (task P2): the shared tensor library
+(`libedgefirst_tensor.so.<major>` on Linux, `libedgefirst_tensor.<major>.dylib`
+on macOS, `edgefirst_tensor.dll` on Windows) lives in exactly the `tensor`
+wheel -- every other wheel links to it via RPATH (or, on Windows, an
+`os.add_dll_directory()` call in its `__init__.py`) instead of embedding or
+vendoring a copy. Older revisions of this check predated that
 architecture and required every wheel to be fully self-contained, which is
 now exactly backwards for the `tensor` wheel: it is SUPPOSED to carry the
 shared core, precisely because nothing else should have to. Also checks for
@@ -25,34 +28,53 @@ def _pkg_from_wheel_name(name: str) -> str:
     return name.split("-")[0].replace("edgefirst_", "")
 
 
+def _is_tensor_library(name: str) -> bool:
+    """Whether a wheel entry is the shared tensor library itself.
+
+    Linux ships ``libedgefirst_tensor.so.<major>``, macOS
+    ``libedgefirst_tensor.<major>.dylib``, Windows ``edgefirst_tensor.dll``
+    (no ``lib`` prefix and no SONAME/version suffix: a DLL is always named by
+    its bare file name).
+    """
+    base = name.rsplit("/", 1)[-1]
+    return base.startswith("libedgefirst_tensor") or base == "edgefirst_tensor.dll"
+
+
 def _check_tensor_home(wheel_name: str, pkg: str, names: list[str]) -> list[str]:
-    # A3: single-tensor-home. libedgefirst_tensor.so lives in exactly the
+    # A3: single-tensor-home. The shared tensor library lives in exactly the
     # tensor wheel -- its own home -- and every other wheel links to it
-    # (RPATH $ORIGIN/../tensor) rather than vendoring a copy. A copy
-    # anywhere else is exactly the duplication this architecture
-    # removes, reintroduced invisibly: auditwheel/delocate vendor
-    # external shared libraries by default, which is precisely how this
-    # was found missing here (task P2's report, and again from a
-    # differential run afterward).
-    tensor_so = [n for n in names if "libedgefirst_tensor" in n]
+    # (RPATH $ORIGIN/../tensor on Linux/macOS; os.add_dll_directory() on
+    # edgefirst/tensor/ at import time on Windows) rather than vendoring a
+    # copy. A copy anywhere else is exactly the duplication this
+    # architecture removes, reintroduced invisibly: auditwheel/delocate/
+    # delvewheel vendor external shared libraries by default, which is
+    # precisely how this was found missing here (task P2's report, and
+    # again from a differential run afterward).
+    tensor_lib = [n for n in names if _is_tensor_library(n)]
     if pkg == "tensor":
-        if not tensor_so:
-            return [
-                f"{wheel_name} is the tensor wheel but does not ship libedgefirst_tensor.so"
-            ]
-        if len(tensor_so) > 1:
+        if not tensor_lib:
             return [
                 (
-                    f"{wheel_name} ships libedgefirst_tensor.so {len(tensor_so)} times "
-                    f"({tensor_so}); should be exactly one (the .so.<major> SONAME file)"
+                    f"{wheel_name} is the tensor wheel but does not ship the shared "
+                    "tensor library (libedgefirst_tensor.so.<major>, "
+                    "libedgefirst_tensor.<major>.dylib or edgefirst_tensor.dll)"
+                )
+            ]
+        if len(tensor_lib) > 1:
+            return [
+                (
+                    f"{wheel_name} ships the shared tensor library {len(tensor_lib)} "
+                    f"times ({tensor_lib}); should be exactly one (the SONAME/"
+                    "install-name file on Linux/macOS, edgefirst_tensor.dll on "
+                    "Windows)"
                 )
             ]
         return []
-    if tensor_so:
+    if tensor_lib:
         return [
             (
-                f"{wheel_name} vendors a shared core ({tensor_so}); "
-                "it must link, not vendor, libedgefirst_tensor.so"
+                f"{wheel_name} vendors a shared core ({tensor_lib}); "
+                "it must link, not vendor, the shared tensor library"
             )
         ]
     return []
@@ -145,7 +167,10 @@ def main(wheel_dir: str = "target/wheels") -> int:
     for error in errors:
         print(f"ERROR: {error}")
     if not errors:
-        print(f"✓ {len(wheels)} wheels: single tensor home, typed, namespace intact")
+        # ASCII on purpose: a Windows subprocess pipe is cp1252, where a
+        # U+2713 check mark raises UnicodeEncodeError and turns a passing
+        # check into exit status 1 (tests/packaging/test_wheel_layout.py).
+        print(f"OK: {len(wheels)} wheels: single tensor home, typed, namespace intact")
     return 1 if errors else 0
 
 

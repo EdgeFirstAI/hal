@@ -39,8 +39,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# `python3` first (Linux/macOS, GitHub runners); Git Bash on a Windows dev box
+# usually has only `python`, and `python3` may resolve to the Microsoft Store
+# stub, which exits 49 with "Python was not found" — so probe by running it.
+PY=""
+for cand in python3 python; do
+  if command -v "${cand}" >/dev/null 2>&1 && "${cand}" -c 'pass' >/dev/null 2>&1; then
+    PY="${cand}"
+    break
+  fi
+done
+if [[ -z "${PY}" ]]; then
+  echo "FAIL: no working python3/python on PATH" >&2
+  exit 1
+fi
+
 if [[ -z "${VERSION}" ]]; then
-  VERSION="$(python3 -c '
+  VERSION="$("${PY}" -c '
 import re, pathlib
 text = pathlib.Path("Cargo.toml").read_text()
 in_ws = False
@@ -153,6 +168,29 @@ for leaf in ${LEAVES}; do
   fi
 done
 
+# Windows: bundle ANGLE (GLES over Direct3D 11) next to edgefirst_image.dll
+# when EDGEFIRST_ANGLE_PATH points at the fetched DLLs (scripts/fetch-angle.sh),
+# so a consumer gets the GPU backend with zero configuration — the runtime
+# loader looks next to the loading module before anything else. ANGLE is
+# BSD-3-Clause; its licence ships alongside. Without EDGEFIRST_ANGLE_PATH the
+# archive is CPU-only, exactly as before.
+if [[ "${TARGET}" == *-windows ]]; then
+  if [[ -n "${EDGEFIRST_ANGLE_PATH:-}" && -f "${EDGEFIRST_ANGLE_PATH}/libEGL.dll" && -f "${EDGEFIRST_ANGLE_PATH}/libGLESv2.dll" ]]; then
+    cp "${EDGEFIRST_ANGLE_PATH}/libEGL.dll" "${EDGEFIRST_ANGLE_PATH}/libGLESv2.dll" "${STAGE}/bin/"
+    mkdir -p "${STAGE}/share/licenses/angle"
+    angle_root="$(cd "${EDGEFIRST_ANGLE_PATH}/.." && pwd)"
+    if [[ -f "${angle_root}/LICENSE" ]]; then
+      cp "${angle_root}/LICENSE" "${STAGE}/share/licenses/angle/LICENSE"
+    else
+      echo "WARN: ${angle_root}/LICENSE not found; shipping ANGLE DLLs without their licence file" >&2
+    fi
+    [[ -f "${angle_root}/BUILD_INFO.txt" ]] && cp "${angle_root}/BUILD_INFO.txt" "${STAGE}/share/licenses/angle/ANGLE_BUILD_INFO.txt"
+    echo "package-capi: bundled ANGLE (libEGL.dll, libGLESv2.dll) from ${EDGEFIRST_ANGLE_PATH}" >&2
+  else
+    echo "package-capi: EDGEFIRST_ANGLE_PATH unset or incomplete — Windows archive ships without ANGLE (CPU-only GPU fallback)" >&2
+  fi
+fi
+
 for leaf in ${LEAVES}; do
   sed "s/@VERSION@/${VERSION}/" \
     "crates/${leaf}-capi/edgefirst-${leaf}.pc.in" \
@@ -190,7 +228,7 @@ if [[ "${TARGET}" == *-linux ]]; then
   tar -C "${OUTDIR}" -czf "${ARCHIVE}" "${PKG_NAME}"
 else
   ARCHIVE="${OUTDIR}/${PKG_NAME}.zip"
-  python3 - "${OUTDIR}" "${PKG_NAME}" <<'PY'
+  "${PY}" - "${OUTDIR}" "${PKG_NAME}" <<'PY'
 import os, sys, zipfile
 
 outdir, pkg_name = sys.argv[1], sys.argv[2]

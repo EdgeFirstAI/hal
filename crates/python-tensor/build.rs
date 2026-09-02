@@ -3,7 +3,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -54,18 +54,19 @@ fn main() {
         // Proven necessary, not assumed: a static build run in a tree
         // that previously built dynamic (same working directory, e.g.
         // switching --features locally) silently bundled the STALE
-        // libedgefirst_tensor.so* left behind by that earlier run into
-        // the "static" wheel -- maturin's python-source packaging picks
-        // up whatever is sitting in this directory, stale or not, same
-        // failure shape as the aarch64-in-an-x86_64-wheel bug this task
-        // is also chasing. Must actively remove, not just skip writing.
+        // libedgefirst_tensor.so* (edgefirst_tensor.dll on Windows) left
+        // behind by that earlier run into the "static" wheel -- maturin's
+        // python-source packaging picks up whatever is sitting in this
+        // directory, stale or not, same failure shape as the
+        // aarch64-in-an-x86_64-wheel bug this task is also chasing. Must
+        // actively remove, not just skip writing.
         let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let py_tensor_dir = crate_dir.join("python/edgefirst/tensor");
         if let Ok(entries) = fs::read_dir(&py_tensor_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with("libedgefirst_tensor.") {
+                if name.starts_with("libedgefirst_tensor.") || name == "edgefirst_tensor.dll" {
                     let _ = fs::remove_file(entry.path());
                 }
             }
@@ -74,9 +75,11 @@ fn main() {
 }
 
 /// Single-tensor-home, Python side (task P2): `_tensor` links
-/// `libedgefirst_tensor.so` instead of embedding `edgefirst-tensor`'s
-/// implementation, and ships a copy of it in the wheel so the extension has
-/// something to resolve at load time. `crates/tensor-capi` is the crate that
+/// `libedgefirst_tensor.so` (`libedgefirst_tensor.dylib` on macOS,
+/// `edgefirst_tensor.dll` on Windows) instead of embedding
+/// `edgefirst-tensor`'s implementation, and ships a copy of it in the wheel
+/// so the extension has something to resolve at load time.
+/// `crates/tensor-capi` is the crate that
 /// produces that library; it is deliberately workspace-excluded (see the
 /// root `Cargo.toml`'s `[workspace.exclude]` comment -- the static/dynamic
 /// feature switch is mutually exclusive and cargo unifies features across
@@ -149,7 +152,7 @@ fn link_and_bundle_tensor(target_os: &str) {
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn `cargo build` for tensor-capi: {e}"));
     if !status.success() {
-        panic!("`cargo build --manifest-path {}` failed (status {status}) -- libedgefirst_tensor.so could not be built", tensor_capi_manifest.display());
+        panic!("`cargo build --manifest-path {}` failed (status {status}) -- the shared tensor library could not be built", tensor_capi_manifest.display());
     }
 
     let mut built_dir = nested_target_dir.clone();
@@ -158,7 +161,21 @@ fn link_and_bundle_tensor(target_os: &str) {
     }
     let built_dir = built_dir.join(&profile);
 
-    let (built_name, versioned_name) = if target_os == "macos" {
+    // Three naming schemes for the same artifact. Linux/macOS: cargo writes
+    // the bare `libedgefirst_tensor.{so,dylib}` and the wheel ships it under
+    // its SONAME/install_name, `libedgefirst_tensor.so.<major>` /
+    // `libedgefirst_tensor.<major>.dylib` (the bundling comment below says
+    // why only that name). Windows: cargo writes `edgefirst_tensor.dll` --
+    // no `lib` prefix -- and there is no SONAME concept at all: the import
+    // library and every dependent's import table name the DLL by its bare
+    // file name, so the shipped copy keeps that exact name and carries no
+    // version suffix.
+    let (built_name, shipped_name) = if target_os == "windows" {
+        (
+            "edgefirst_tensor.dll".to_string(),
+            "edgefirst_tensor.dll".to_string(),
+        )
+    } else if target_os == "macos" {
         (
             "libedgefirst_tensor.dylib".to_string(),
             format!("libedgefirst_tensor.{}.dylib", tensor_lib_version_major()),
@@ -169,11 +186,11 @@ fn link_and_bundle_tensor(target_os: &str) {
             format!("libedgefirst_tensor.so.{}", tensor_lib_version_major()),
         )
     };
-    let built_so = built_dir.join(&built_name);
-    if !built_so.is_file() {
+    let built_lib = built_dir.join(&built_name);
+    if !built_lib.is_file() {
         panic!(
             "expected {} after building tensor-capi, but it is not there",
-            built_so.display()
+            built_lib.display()
         );
     }
 
@@ -182,7 +199,28 @@ fn link_and_bundle_tensor(target_os: &str) {
     // crates/codec-capi/build.rs) -- `-L` the directory it landed in, `-l`
     // it by name.
     println!("cargo:rustc-link-search=native={}", built_dir.display());
-    println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    if target_os == "windows" {
+        // MSVC: a plain `dylib=edgefirst_tensor` resolves
+        // `edgefirst_tensor.lib`, which is the Rust staticlib cargo writes
+        // next to the DLL (tensor-capi's crate-type is `["staticlib",
+        // "cdylib"]`), and linking that into this cdylib duplicates rust
+        // std (LNK2005: `rust_panic`, alloc hooks, ...). The DLL's import
+        // library is `edgefirst_tensor.dll.lib`, so name that file
+        // verbatim -- the same pattern crates/image-capi/build.rs's
+        // `link_tensor_cdylib` uses. Cargo writes the import library in
+        // `deps/` and may also uplift it beside the DLL; whichever is
+        // present gets the `-L`.
+        let import_lib_dir = windows_import_lib_dir(&built_dir);
+        if import_lib_dir != built_dir {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                import_lib_dir.display()
+            );
+        }
+        println!("cargo:rustc-link-lib=dylib:+verbatim=edgefirst_tensor.dll.lib");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    }
 
     // Same non-transitivity reasoning as the C leaves: RUNPATH is not
     // transitive, so whatever eventually loads `_tensor.cpython-*.so` (the
@@ -192,9 +230,20 @@ fn link_and_bundle_tensor(target_os: &str) {
     // directory `_tensor.cpython-*.so` itself is loaded from) is correct
     // because the library this function bundles below ships as its sibling
     // in the same wheel, in the same `edgefirst/tensor/` directory.
+    //
+    // Windows has no rpath, and needs none here: Python 3.8+ loads
+    // extension modules with `LoadLibraryExW(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+    // | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR)`, so `_tensor.pyd`'s import-table
+    // entry for `edgefirst_tensor.dll` resolves from `_tensor.pyd`'s own
+    // directory, where the copy bundled below lands. `PATH` is not searched
+    // under those flags. The sibling extensions in other `edgefirst/*`
+    // directories do not get that resolution; their `__init__.py` registers
+    // `edgefirst/tensor/` via `os.add_dll_directory()` before importing
+    // their `.pyd` (see e.g.
+    // crates/python-image/python/edgefirst/image/__init__.py).
     if target_os == "macos" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,@loader_path");
-    } else {
+    } else if target_os != "windows" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,$ORIGIN");
     }
 
@@ -228,15 +277,42 @@ fn link_and_bundle_tensor(target_os: &str) {
     // still needed at LINK time (`-ledgefirst_tensor` above), but that
     // reads from `built_dir` (this crate's own build directory), never
     // from this bundled copy.
+    //
+    // Windows: the shipped name is the built name, `edgefirst_tensor.dll`
+    // (no SONAME, no version suffix), and, as above, only the DLL: the
+    // `edgefirst_tensor.dll.lib` import library and the
+    // `edgefirst_tensor.lib` staticlib cargo writes next to it are
+    // link-time inputs read from `built_dir`, never opened at load time,
+    // so bundling either would add nothing.
     let py_tensor_dir = crate_dir.join("python/edgefirst/tensor");
-    let dest_versioned = py_tensor_dir.join(&versioned_name);
-    fs::copy(&built_so, &dest_versioned).unwrap_or_else(|e| {
+    let dest_shipped = py_tensor_dir.join(&shipped_name);
+    fs::copy(&built_lib, &dest_shipped).unwrap_or_else(|e| {
         panic!(
             "failed to copy {} to {}: {e}",
-            built_so.display(),
-            dest_versioned.display()
+            built_lib.display(),
+            dest_shipped.display()
         )
     });
+}
+
+/// Directory holding `edgefirst_tensor.dll.lib`, the MSVC import library the
+/// nested tensor-capi build produced alongside `edgefirst_tensor.dll`. Cargo
+/// writes it in `deps/` and, depending on version, also uplifts a copy next
+/// to the DLL in `built_dir` itself; either location is fine for `-L`, so
+/// take whichever exists rather than hardcoding one. Windows only.
+fn windows_import_lib_dir(built_dir: &Path) -> PathBuf {
+    let candidates = [built_dir.to_path_buf(), built_dir.join("deps")];
+    candidates
+        .iter()
+        .find(|dir| dir.join("edgefirst_tensor.dll.lib").is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected edgefirst_tensor.dll.lib in {} or {} after building tensor-capi, but it is in neither",
+                candidates[0].display(),
+                candidates[1].display()
+            )
+        })
 }
 
 /// `edgefirst-tensor`'s own major version, read from the workspace root's

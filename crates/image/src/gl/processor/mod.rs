@@ -943,21 +943,36 @@ struct GlSupport {
 /// (`GLProcessorST::readback_scratch`) — grown on demand and kept at its
 /// high-water mark, so the fallback path costs no per-call allocation
 /// after the first read of a given size.
+/// Whether `glReadPixels(format, UNSIGNED_BYTE)` is accepted on the bound
+/// read framebuffer: `RGBA` always is; anything else only when it is the
+/// implementation-defined pair (ES 3.0 § 4.3.2). Shared by the Mem and PBO
+/// readback paths.
+///
+/// # Safety
+/// Must run on the GL thread with a complete read framebuffer bound.
+unsafe fn direct_read_supported(format: u32) -> bool {
+    if format == edgefirst_gl::gl::RGBA {
+        return true;
+    }
+    let mut impl_fmt = 0i32;
+    let mut impl_type = 0i32;
+    // SAFETY: two GetIntegerv queries on a current context.
+    unsafe {
+        edgefirst_gl::gl::GetIntegerv(
+            edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_FORMAT,
+            &mut impl_fmt,
+        );
+        edgefirst_gl::gl::GetIntegerv(
+            edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_TYPE,
+            &mut impl_type,
+        );
+    }
+    impl_fmt as u32 == format && impl_type as u32 == edgefirst_gl::gl::UNSIGNED_BYTE
+}
+
 unsafe fn read_pixels_into(w: usize, h: usize, format: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
     unsafe {
-        let direct = format == edgefirst_gl::gl::RGBA || {
-            let mut impl_fmt = 0i32;
-            let mut impl_type = 0i32;
-            edgefirst_gl::gl::GetIntegerv(
-                edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_FORMAT,
-                &mut impl_fmt,
-            );
-            edgefirst_gl::gl::GetIntegerv(
-                edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_TYPE,
-                &mut impl_type,
-            );
-            impl_fmt as u32 == format && impl_type as u32 == edgefirst_gl::gl::UNSIGNED_BYTE
-        };
+        let direct = direct_read_supported(format);
         if direct {
             edgefirst_gl::gl::ReadPixels(
                 0,
@@ -1007,7 +1022,9 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
         software: lower.contains("llvmpipe")
             || lower.contains("softpipe")
             || lower.contains("swrast")
-            || lower.contains("software rasterizer"),
+            || lower.contains("software rasterizer")
+            // D3D11 WARP (ANGLE on Windows without a GPU, e.g. CI runners).
+            || lower.contains("basic render driver"),
         virtual_gpu: lower.contains("paravirtual") || lower.contains("virtio"),
         angle: lower.contains("angle"),
     }
@@ -1042,9 +1059,10 @@ impl GLProcessorST {
         kind: Option<EglDisplayKind>,
         capacity: Option<usize>,
     ) -> Result<GLProcessorST, crate::Error> {
-        // Display bring-up goes through the platform seam — the contract a
-        // future platform (Windows/ANGLE) implements instead of forking this
-        // engine. On Linux this delegates straight to `GlContext::new`.
+        // Display bring-up goes through the platform seam — the contract
+        // each platform leaf (Linux EGL, ANGLE/Metal, Android EGL,
+        // ANGLE/D3D11) implements instead of forking this engine. On Linux
+        // this delegates straight to `GlContext::new`.
         let gl_context = Platform::init_display(kind)?;
         // Load the GL function pointers exactly once per process — `edgefirst_gl`
         // bindings are gl_generator `static mut` function-pointer tables, so
@@ -1636,7 +1654,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
-    ) -> Result<Option<std::os::fd::OwnedFd>, crate::Error> {
+    ) -> Result<Option<super::CompletionFence>, crate::Error> {
         use crate::ImageProcessorTrait as _;
         self.defer_finish = true;
         let result = self.convert(src, dst, rotation, flip, crop);
@@ -2744,19 +2762,80 @@ impl GLProcessorST {
             },
             Some(buffer_id) => {
                 unsafe {
-                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
                     edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
-                    edgefirst_gl::gl::ReadPixels(
-                        0,
-                        0,
-                        dst_w as i32,
-                        read_h as i32,
-                        dest_format,
-                        edgefirst_gl::gl::UNSIGNED_BYTE,
-                        std::ptr::null_mut(),
-                    );
-                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
-                    edgefirst_gl::gl::Finish();
+                    if direct_read_supported(dest_format) {
+                        edgefirst_gl::gl::BindBuffer(
+                            edgefirst_gl::gl::PIXEL_PACK_BUFFER,
+                            buffer_id,
+                        );
+                        edgefirst_gl::gl::ReadPixels(
+                            0,
+                            0,
+                            dst_w as i32,
+                            read_h as i32,
+                            dest_format,
+                            edgefirst_gl::gl::UNSIGNED_BYTE,
+                            std::ptr::null_mut(),
+                        );
+                        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
+                        edgefirst_gl::gl::Finish();
+                    } else {
+                        // The ES 3 guarantee covers only RGBA/UNSIGNED_BYTE plus
+                        // one implementation-defined pair; ANGLE (Metal and
+                        // D3D11) rejects a direct RGB/RED read into the PBO with
+                        // GL_INVALID_OPERATION. Same fallback as the Mem path:
+                        // RGBA into the scratch buffer, then repack the leading
+                        // channels into the mapped PBO. This adds a CPU copy;
+                        // the RGBA destination path above is unaffected.
+                        read_pixels_into(
+                            dst_w,
+                            read_h,
+                            dest_format,
+                            &mut self.readback_scratch,
+                            &mut [],
+                        );
+                        let channels = match dest_format {
+                            edgefirst_gl::gl::RGB => 3,
+                            edgefirst_gl::gl::RED => 1,
+                            _ => 4,
+                        };
+                        let packed_len = dst_w * read_h * channels;
+                        if len < packed_len {
+                            return Err(crate::Error::OpenGl(format!(
+                                "PBO destination is {len} B but the readback needs {packed_len} B"
+                            )));
+                        }
+                        edgefirst_gl::gl::BindBuffer(
+                            edgefirst_gl::gl::PIXEL_PACK_BUFFER,
+                            buffer_id,
+                        );
+                        let ptr = edgefirst_gl::gl::MapBufferRange(
+                            edgefirst_gl::gl::PIXEL_PACK_BUFFER,
+                            0,
+                            packed_len as isize,
+                            edgefirst_gl::gl::MAP_WRITE_BIT
+                                | edgefirst_gl::gl::MAP_INVALIDATE_RANGE_BIT,
+                        );
+                        if ptr.is_null() {
+                            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
+                            return Err(crate::Error::OpenGl(
+                                "glMapBufferRange returned null for the PBO readback repack"
+                                    .to_string(),
+                            ));
+                        }
+                        let out = std::slice::from_raw_parts_mut(ptr as *mut u8, packed_len);
+                        for (px, dst_px) in self
+                            .readback_scratch
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .zip(out.chunks_exact_mut(channels))
+                        {
+                            dst_px.copy_from_slice(&px[..channels]);
+                        }
+                        edgefirst_gl::gl::UnmapBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER);
+                        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
+                    }
                 }
                 // BGRA R↔B swap must map the PBO on the GL thread. Int8 XOR 0x80
                 // is handled in the fragment shader — no CPU map needed.
@@ -6956,6 +7035,14 @@ impl GLProcessorST {
         }
     }
 
+    /// Platform hook run by the dispatch wrapper before every message —
+    /// see [`super::platform::GlPlatform::begin_gpu_pass`]. A no-op
+    /// everywhere except ANGLE/D3D11, which must be told this context is
+    /// the one about to issue commands.
+    pub(super) fn begin_gpu_pass(&self) {
+        Platform::begin_gpu_pass(&self.gl_context);
+    }
+
     /// Assemble the immutable capability surface for this processor.
     /// Captured ONCE by the dispatch wrapper at worker startup (before its
     /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
@@ -7075,6 +7162,18 @@ mod tests {
         // Mesa software rasterizer (CI coverage lane)
         let t = classify_renderer("llvmpipe (LLVM 15.0.7, 256 bits)");
         assert!(t.software && !t.vivante && !t.virtual_gpu && !t.angle);
+        // Windows: ANGLE over Direct3D 11 on a real GPU — ANGLE, not software.
+        let t = classify_renderer(
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 vs_5_0 ps_5_0, \
+             D3D11-32.0.16.1656)",
+        );
+        assert!(t.angle && !t.software && !t.virtual_gpu && !t.vivante);
+        // Windows: ANGLE over D3D11 WARP (GPU-less CI runner) — ANGLE and software.
+        let t = classify_renderer(
+            "ANGLE (Microsoft, Microsoft Basic Render Driver Direct3D11 vs_5_0 ps_5_0, \
+             D3D11-10.0.26100.1)",
+        );
+        assert!(t.angle && t.software && !t.virtual_gpu && !t.vivante);
         // GitHub macOS runner: virtualized Metal — concurrent GL across
         // contexts mis-renders there; must select the Full policy.
         let t = classify_renderer(
@@ -7109,6 +7208,11 @@ mod tests {
         assert!(policy(
             "ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, \
              Version 15.7.7 (Build 24G720))"
+        ));
+        // Serialized: ANGLE over Direct3D 11 (Windows) — same ANGLE rule.
+        assert!(policy(
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 vs_5_0 ps_5_0, \
+             D3D11-32.0.16.1656)"
         ));
     }
 }

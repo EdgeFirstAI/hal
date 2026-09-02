@@ -2,24 +2,35 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Download and verify the pre-built ANGLE xcframeworks from the
-# EdgeFirstAI/angle-package GitHub release, then extract them to a local
-# directory. Used by the macOS and iOS builders so they share one
-# notarized, signed ANGLE artifact instead of each rebuilding from source
-# (or, on macOS, relying on the Homebrew tap + re-sign dance).
+# Download and verify a pre-built ANGLE package from the
+# EdgeFirstAI/angle-package GitHub release, then extract it to a local
+# directory. Used by the macOS, iOS and Windows builders so they share one
+# signed ANGLE artifact instead of each rebuilding from source (or, on
+# macOS, the Homebrew tap plus a re-sign step).
 #
-# The release ships:
-#   angle-xcframeworks-<tag>.zip          — EGL.xcframework + GLESv2.xcframework
+# The release ships, per tag (both built from the same pinned ANGLE commit):
+#   angle-xcframeworks-<tag>.zip          — EGL.xcframework + GLESv2.xcframework (macOS/iOS)
 #   angle-xcframeworks-<tag>.zip.sha256   — checksum
+#   angle-windows-x64-<tag>.zip           — bin/libEGL.dll + libGLESv2.dll, lib/*.lib,
+#                                           include/, LICENSE, BUILD_INFO.txt (Windows)
+#   angle-windows-x64-<tag>.zip.sha256    — checksum
 #
 # Output layout (extracted):
-#   <dest>/EGL.xcframework/{ios-arm64,ios-arm64-simulator,macos-arm64}/...
-#   <dest>/GLESv2.xcframework/{ios-arm64,ios-arm64-simulator,macos-arm64}/...
-#   <dest>/BUILD_INFO.txt
+#   macOS/iOS:
+#     <dest>/EGL.xcframework/{ios-arm64,ios-arm64-simulator,macos-arm64}/...
+#     <dest>/GLESv2.xcframework/{ios-arm64,ios-arm64-simulator,macos-arm64}/...
+#     <dest>/macos-flat-lib/{libEGL,libGLESv2}.dylib   (EDGEFIRST_ANGLE_PATH for macOS)
+#     <dest>/BUILD_INFO.txt
+#   Windows:
+#     <dest>/windows-x64/bin/{libEGL,libGLESv2}.dll     (EDGEFIRST_ANGLE_PATH for Windows)
+#     <dest>/windows-x64/{lib,include}/, LICENSE, BUILD_INFO.txt
 #
 # Usage:
-#   scripts/fetch-angle.sh [dest-dir] [tag]
+#   scripts/fetch-angle.sh [--windows|--macos] [dest-dir] [tag]
 #
+#   --windows / --macos  which package to fetch. Default: from the host
+#                        (`uname -s` MINGW*/MSYS*/CYGWIN* → windows, else macos);
+#                        FETCH_ANGLE_PLATFORM=windows|macos overrides.
 #   dest-dir  defaults to target/angle  (a cached download location)
 #   tag       defaults to v2.1.28252  (matches the ANGLE GL_VERSION string)
 #
@@ -36,10 +47,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HAL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+PLATFORM="${FETCH_ANGLE_PLATFORM:-}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --windows) PLATFORM=windows; shift ;;
+        --macos)   PLATFORM=macos; shift ;;
+        -h|--help) sed -n '5,44p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *) break ;;
+    esac
+done
+if [[ -z "${PLATFORM}" ]]; then
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*|Windows_NT) PLATFORM=windows ;;
+        *) PLATFORM=macos ;;
+    esac
+fi
+case "${PLATFORM}" in windows|macos) ;; *) echo "fetch-angle: unknown platform '${PLATFORM}' (windows|macos)" >&2; exit 1 ;; esac
+
 DEST="${1:-${HAL_ROOT}/target/angle}"
 TAG="${2:-v2.1.28252}"
 REPO="EdgeFirstAI/angle-package"
-ZIP_NAME="angle-xcframeworks-${TAG}.zip"
+if [[ "${PLATFORM}" == windows ]]; then
+    ZIP_NAME="angle-windows-x64-${TAG}.zip"
+else
+    ZIP_NAME="angle-xcframeworks-${TAG}.zip"
+fi
 SHA_NAME="${ZIP_NAME}.sha256"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ZIP_NAME}"
 SHA_URL="https://github.com/${REPO}/releases/download/${TAG}/${SHA_NAME}"
@@ -110,7 +142,19 @@ if [[ ${sha_download_ok} -eq 0 || ! -s "${SHA_PATH}" ]]; then
 else
     # First whitespace-delimited token = the hash (bare or "hash  filename").
     EXPECTED="$(awk '{print $1; exit}' "${SHA_PATH}")"
-    ACTUAL="$(shasum -a 256 "${ZIP_PATH}" | awk '{print $1}')"
+    # macOS ships shasum, Git Bash ships sha256sum, and plain Windows has certutil.
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL="$(sha256sum "${ZIP_PATH}" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        ACTUAL="$(shasum -a 256 "${ZIP_PATH}" | awk '{print $1}')"
+    elif command -v certutil >/dev/null 2>&1; then
+        ACTUAL="$(certutil -hashfile "$(cygpath -w "${ZIP_PATH}" 2>/dev/null || echo "${ZIP_PATH}")" SHA256 | sed -n '2p' | tr -d ' \r')"
+    else
+        echo "fetch-angle: ERROR — no sha256 tool found (need sha256sum, shasum, or certutil)" >&2
+        exit 1
+    fi
+    ACTUAL="$(echo "${ACTUAL}" | tr 'A-F' 'a-f')"
+    EXPECTED="$(echo "${EXPECTED}" | tr 'A-F' 'a-f')"
     if [[ "${EXPECTED}" != "${ACTUAL}" ]]; then
         echo "fetch-angle: CHECKSUM MISMATCH" >&2
         echo "  expected: ${EXPECTED}" >&2
@@ -123,14 +167,64 @@ fi
 
 # --- Extract -----------------------------------------------------------------
 
+# Portable unzip: Git Bash has unzip; Windows 10+ tar reads zips; PowerShell
+# Expand-Archive is the last resort.
+extract_zip() {
+    local zip="$1" dest="$2"
+    mkdir -p "${dest}"
+    if command -v unzip >/dev/null 2>&1; then
+        # -x "*/._*" skips macOS AppleDouble metadata files (harmless but noisy).
+        unzip -q -o "${zip}" -d "${dest}" -x "*/._*" "*/.DS_Store"
+    elif command -v tar >/dev/null 2>&1 && tar -tf "${zip}" >/dev/null 2>&1; then
+        tar -xf "${zip}" -C "${dest}"
+    elif command -v powershell.exe >/dev/null 2>&1; then
+        powershell.exe -NoProfile -Command \
+            "Expand-Archive -LiteralPath '$(cygpath -w "${zip}")' -DestinationPath '$(cygpath -w "${dest}")' -Force"
+    else
+        echo "fetch-angle: ERROR — no unzip/tar/Expand-Archive available to extract ${zip}" >&2
+        exit 1
+    fi
+}
+
+if [[ "${PLATFORM}" == windows ]]; then
+    WIN_DIR="${DEST}/windows-x64"
+    if [[ -f "${WIN_DIR}/bin/libEGL.dll" && -f "${WIN_DIR}/bin/libGLESv2.dll" ]]; then
+        echo "fetch-angle: already extracted at ${WIN_DIR}"
+    else
+        echo "fetch-angle: extracting to ${WIN_DIR}"
+        rm -rf "${WIN_DIR}"
+        extract_zip "${ZIP_PATH}" "${WIN_DIR}"
+        # The Windows zip is flat (bin/ lib/ include/ at the root); tolerate a
+        # top-level dir defensively, as the macOS branch does for dist/.
+        if [[ ! -f "${WIN_DIR}/bin/libEGL.dll" ]]; then
+            for sub in "${WIN_DIR}"/*/; do
+                if [[ -f "${sub}bin/libEGL.dll" ]]; then
+                    mv "${sub}"* "${WIN_DIR}/" 2>/dev/null || true
+                    rmdir "${sub}" 2>/dev/null || true
+                    break
+                fi
+            done
+        fi
+        [[ -f "${WIN_DIR}/bin/libEGL.dll" && -f "${WIN_DIR}/bin/libGLESv2.dll" ]] || {
+            echo "fetch-angle: ERROR — ${ZIP_NAME} did not contain bin/libEGL.dll + bin/libGLESv2.dll" >&2
+            exit 1
+        }
+    fi
+    echo "fetch-angle: ready at ${WIN_DIR}"
+    echo "  DLLs:    ${WIN_DIR}/bin  (set EDGEFIRST_ANGLE_PATH here; libEGL.dll and libGLESv2.dll must stay siblings)"
+    echo "  headers: ${WIN_DIR}/include   import libs: ${WIN_DIR}/lib"
+    if command -v cygpath >/dev/null 2>&1; then
+        echo "  PowerShell: \$env:EDGEFIRST_ANGLE_PATH = '$(cygpath -w "${WIN_DIR}/bin")'"
+    fi
+    exit 0
+fi
+
 # Re-extract only if the destination is missing the EGL framework marker.
 if [[ -f "${DEST}/EGL.xcframework/macos-arm64/libEGL.framework/libEGL" ]]; then
     echo "fetch-angle: already extracted at ${DEST}"
 else
     echo "fetch-angle: extracting to ${DEST}"
-    mkdir -p "${DEST}"
-    # -x "*/._*" skips macOS AppleDouble metadata files (harmless but noisy).
-    unzip -q -o "${ZIP_PATH}" -d "${DEST}" -x "*/._*" "*/.DS_Store"
+    extract_zip "${ZIP_PATH}" "${DEST}"
     # The zip's top level is "dist/"; move its contents up so ${DEST} IS the
     # dist dir (consumers expect ${DEST}/EGL.xcframework directly).
     if [[ -d "${DEST}/dist" ]]; then

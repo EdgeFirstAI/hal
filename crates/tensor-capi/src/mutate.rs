@@ -448,7 +448,7 @@ pub unsafe extern "C" fn ef_tensor_clone_fd(t: *const EfTensor) -> c_int {
             {
                 let _ = inner;
                 set_last_error("clone_fd: not supported on this platform");
-                return -libc::ENOTSUP;
+                -libc::ENOTSUP
             }
             #[cfg(unix)]
             match inner.clone_fd() {

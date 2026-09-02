@@ -89,3 +89,11 @@ crates/python-*/python/edgefirst/*/_*.dylib
 # the leading underscore this one crate's shared library carries.
 crates/python-tensor/python/edgefirst/tensor/libedgefirst_tensor.so*
 crates/python-tensor/python/edgefirst/tensor/libedgefirst_tensor.*.dylib
+# Windows counterpart of the two lines above: cargo names the DLL without
+# the `lib` prefix and there is no SONAME/version suffix.
+crates/python-tensor/python/edgefirst/tensor/edgefirst_tensor.dll
+# python-image's Windows wheel bundles the ANGLE runtime DLLs beside
+# _image.pyd the same way (libEGL/libGLESv2 plus the D3D shader compiler).
+crates/python-image/python/edgefirst/image/libEGL.dll
+crates/python-image/python/edgefirst/image/libGLESv2.dll
+crates/python-image/python/edgefirst/image/d3dcompiler_47.dll

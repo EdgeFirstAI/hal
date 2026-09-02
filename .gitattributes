@@ -18,3 +18,11 @@ testdata/camera4k.* filter=lfs diff=lfs merge=lfs -text
 testdata/*.safetensors filter=lfs diff=lfs merge=lfs -text
 testdata/decoder/*.safetensors filter=lfs diff=lfs merge=lfs -text
 testdata/mask_decode_scaled.safetensors filter=lfs diff=lfs merge=lfs -text
+
+# Line endings. Git for Windows defaults to core.autocrlf=true, so the
+# Windows CI runner checks text files out with CRLF. The shader goldens are
+# compared byte-for-byte against string literals (which rustc normalizes to
+# LF), and the shell scripts are parsed by bash there; keep both LF on every
+# checkout so the lane sees the same bytes as Linux and macOS.
+*.glsl text eol=lf
+*.sh text eol=lf

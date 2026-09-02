@@ -73,7 +73,7 @@ save_jpeg(&dst, "output.jpg", 90)?;
 | Backend | Platform | Hardware | Notes |
 |---------|----------|----------|-------|
 | G2D | Linux (NXP i.MX 8M Plus / 8M Mini) | 2D blit engine | Fastest for NXP platforms; no mask rendering |
-| OpenGL | Linux, macOS/iOS, Android | GPU | One engine everywhere behind the `GlPlatform` seam: EGL/GBM + DMA-BUF on Linux, ANGLE→Metal + IOSurface on Apple, native EGL + AHardwareBuffer on Android |
+| OpenGL | Linux, macOS/iOS, Android, Windows | GPU | One engine everywhere behind the `GlPlatform` seam: EGL/GBM + DMA-BUF on Linux, ANGLE→Metal + IOSurface on Apple, native EGL + AHardwareBuffer on Android, ANGLE→Direct3D 11 + PBO transfers on Windows (`EDGEFIRST_ANGLE_PATH` / `EDGEFIRST_ANGLE_ADAPTER`, see the root README § Windows GPU Acceleration) |
 | CPU | All | SIMD (NEON / AVX2, rayon) | Portable fallback, always available |
 
 ## Supported Formats

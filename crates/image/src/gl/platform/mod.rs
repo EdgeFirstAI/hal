@@ -15,8 +15,9 @@
 //! (static dispatch — no vtable on the per-frame path, no type-parameter
 //! infection of the processor or dispatch wrapper). The portable engine
 //! reaches platform buffers only through this trait; a new platform
-//! (e.g. Windows/ANGLE-D3D11) implements the trait or does not compile —
-//! it cannot fork convert logic.
+//! implements the trait or does not compile — it cannot fork convert
+//! logic. Windows (ANGLE over Direct3D 11, `windows.rs`) landed exactly
+//! that way: a leaf with PBO transfers and no zero-copy import yet.
 //!
 //! The trait grows with the convergence steps: today it covers display
 //! bring-up; the buffer-import methods land when the portable engine's
@@ -39,6 +40,8 @@ pub(super) mod angle;
 pub(super) mod linux;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) mod macos;
+#[cfg(target_os = "windows")]
+pub(super) mod windows;
 
 use super::EglDisplayKind;
 use edgefirst_tensor::{PixelFormat, Tensor};
@@ -237,6 +240,17 @@ pub(super) trait GlPlatform {
         handle: Self::ImportHandle,
     ) -> crate::Result<()>;
 
+    /// Called by the dispatch wrapper on the worker thread before each
+    /// message is handled, after the serialization lock is taken. No-op
+    /// on Linux, ANGLE/Metal and Android. ANGLE/D3D11 keeps one state
+    /// manager per display and re-syncs per-context state only on
+    /// `eglMakeCurrent`, so its implementation re-makes this processor's
+    /// context current when another processor's context issued the
+    /// previous GL commands; otherwise contexts alternating between
+    /// threads, even fully serialized, render with the previous context's
+    /// state.
+    fn begin_gpu_pass(display: &Self::Display);
+
     /// Release every texture attachment recorded since the last call.
     /// MUST be called only after the GPU work consuming those
     /// attachments has been synced (`glFinish`/fence) — the engine's
@@ -255,9 +269,11 @@ pub(super) trait GlPlatform {
     /// waits on the fd instead of the CPU blocking in `glFinish`).
     /// `Ok(None)` where native fence sync does not exist; the caller then
     /// falls back to the blocking sync. Must run on the GL worker thread.
+    /// The handle type is the platform-neutral [`super::CompletionFence`]
+    /// (an fd on Unix, an NT handle on Windows).
     fn export_completion_fence(
         display: &Self::Display,
-    ) -> crate::Result<Option<std::os::fd::OwnedFd>>;
+    ) -> crate::Result<Option<super::CompletionFence>>;
 }
 
 /// The one platform implementation for this build.
@@ -267,6 +283,8 @@ pub(super) type Platform = linux::LinuxEgl;
 pub(super) type Platform = angle::AngleClientBuffer;
 #[cfg(target_os = "android")]
 pub(super) type Platform = android::AndroidEgl;
+#[cfg(target_os = "windows")]
+pub(super) type Platform = windows::AngleD3d11;
 
 // Compile-time check that the selected platform implements the contract —
 // a partial port fails here, not at a call site deep in the engine.

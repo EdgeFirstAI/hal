@@ -31,7 +31,7 @@ target-version = "py38"
 testpaths = ["tests"]
 markers = [
     "benchmark: marks tests as benchmarks (deselect with '-m \"not benchmark\"')",
-    "gpu: GPU-backed tests (skipped on Linux/Windows CI; required on macOS)",
+    "gpu: GPU-backed tests (skipped on Linux CI; required on macOS, and on Windows when ANGLE is configured)",
     "ultralytics: on-demand Ultralytics export discovery tests (needs internet + venv; run with -m ultralytics)",
 ]
 addopts = "-m 'not benchmark and not ultralytics'"
