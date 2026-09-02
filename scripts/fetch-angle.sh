@@ -6,7 +6,7 @@
 # EdgeFirstAI/angle-package GitHub release, then extract it to a local
 # directory. Used by the macOS, iOS and Windows builders so they share one
 # signed ANGLE artifact instead of each rebuilding from source (or, on
-# macOS, relying on the Homebrew tap + re-sign dance).
+# macOS, the Homebrew tap plus a re-sign step).
 #
 # The release ships, per tag (both built from the same pinned ANGLE commit):
 #   angle-xcframeworks-<tag>.zip          — EGL.xcframework + GLESv2.xcframework (macOS/iOS)

@@ -165,7 +165,7 @@ fn link_and_bundle_tensor(target_os: &str) {
     // the bare `libedgefirst_tensor.{so,dylib}` and the wheel ships it under
     // its SONAME/install_name, `libedgefirst_tensor.so.<major>` /
     // `libedgefirst_tensor.<major>.dylib` (the bundling comment below says
-    // why ONLY that name). Windows: cargo writes `edgefirst_tensor.dll` --
+    // why only that name). Windows: cargo writes `edgefirst_tensor.dll` --
     // no `lib` prefix -- and there is no SONAME concept at all: the import
     // library and every dependent's import table name the DLL by its bare
     // file name, so the shipped copy keeps that exact name and carries no
@@ -201,7 +201,7 @@ fn link_and_bundle_tensor(target_os: &str) {
     println!("cargo:rustc-link-search=native={}", built_dir.display());
     if target_os == "windows" {
         // MSVC: a plain `dylib=edgefirst_tensor` resolves
-        // `edgefirst_tensor.lib`, which is the Rust STATICLIB cargo writes
+        // `edgefirst_tensor.lib`, which is the Rust staticlib cargo writes
         // next to the DLL (tensor-capi's crate-type is `["staticlib",
         // "cdylib"]`), and linking that into this cdylib duplicates rust
         // std (LNK2005: `rust_panic`, alloc hooks, ...). The DLL's import
@@ -231,15 +231,15 @@ fn link_and_bundle_tensor(target_os: &str) {
     // because the library this function bundles below ships as its sibling
     // in the same wheel, in the same `edgefirst/tensor/` directory.
     //
-    // Windows has no rpath, and needs none HERE: Python 3.8+ loads
+    // Windows has no rpath, and needs none here: Python 3.8+ loads
     // extension modules with `LoadLibraryExW(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
     // | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR)`, so `_tensor.pyd`'s import-table
-    // entry for `edgefirst_tensor.dll` resolves from `_tensor.pyd`'s OWN
-    // directory -- exactly where the copy bundled below lands. `PATH` is
-    // deliberately NOT searched under those flags. The sibling extensions
-    // in OTHER `edgefirst/*` directories cannot lean on that rule; their
-    // `__init__.py` registers `edgefirst/tensor/` via
-    // `os.add_dll_directory()` before importing their `.pyd` (see e.g.
+    // entry for `edgefirst_tensor.dll` resolves from `_tensor.pyd`'s own
+    // directory, where the copy bundled below lands. `PATH` is not searched
+    // under those flags. The sibling extensions in other `edgefirst/*`
+    // directories do not get that resolution; their `__init__.py` registers
+    // `edgefirst/tensor/` via `os.add_dll_directory()` before importing
+    // their `.pyd` (see e.g.
     // crates/python-image/python/edgefirst/image/__init__.py).
     if target_os == "macos" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,@loader_path");
@@ -278,12 +278,12 @@ fn link_and_bundle_tensor(target_os: &str) {
     // reads from `built_dir` (this crate's own build directory), never
     // from this bundled copy.
     //
-    // Windows: the shipped name IS the built name, `edgefirst_tensor.dll`
-    // -- no SONAME, no version suffix -- and, as above, ONLY the DLL: the
+    // Windows: the shipped name is the built name, `edgefirst_tensor.dll`
+    // (no SONAME, no version suffix), and, as above, only the DLL: the
     // `edgefirst_tensor.dll.lib` import library and the
     // `edgefirst_tensor.lib` staticlib cargo writes next to it are
     // link-time inputs read from `built_dir`, never opened at load time,
-    // and bundling either would only ship dead weight.
+    // so bundling either would add nothing.
     let py_tensor_dir = crate_dir.join("python/edgefirst/tensor");
     let dest_shipped = py_tensor_dir.join(&shipped_name);
     fs::copy(&built_lib, &dest_shipped).unwrap_or_else(|e| {

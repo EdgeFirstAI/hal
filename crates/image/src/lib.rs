@@ -2233,8 +2233,8 @@ impl ImageProcessor {
         // mapping now ERROR under explicit Dma (the explicit-Dma
         // contract), so auto-select catches that error here and falls
         // back to host storage — loudly, via the debug log below.
-        // Windows is deliberately absent: no zero-copy backing exists there
-        // yet, so create_image goes straight to the PBO arms below.
+        // Windows is not listed: no zero-copy backing exists there yet, so
+        // create_image goes straight to the PBO arms below.
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {

@@ -14,7 +14,7 @@
   crates/image/ARCHITECTURE.md § GL Concurrency Model).
 
   Run from a "Developer PowerShell for VS" (or any shell where cargo can
-  find MSVC link.exe); do NOT run cargo from Git Bash, whose
+  find MSVC link.exe); do not run cargo from Git Bash, whose
   /usr/bin/link.exe shadows the MSVC linker.
 
 .PARAMETER Warp
@@ -37,9 +37,9 @@
 .NOTES
   Everything after the three switches is passed to `cargo nextest run`
   (e.g. `-p edgefirst-image -E 'test(~pbo)'`) via the automatic `$args`.
-  Deliberately NOT an advanced script (no [CmdletBinding()] and no
-  [Parameter()] attributes, either of which would add PowerShell's common
-  parameters and make `-p` ambiguous with -ProgressAction/-PipelineVariable).
+  Not an advanced script (no [CmdletBinding()] and no [Parameter()]
+  attributes): either would add PowerShell's common parameters and make
+  `-p` ambiguous with -ProgressAction/-PipelineVariable.
 
 .EXAMPLE
   pwsh scripts/test-windows.ps1 -RequireGl                 # real GPU
@@ -101,8 +101,8 @@ Write-Host "[test-windows] EDGEFIRST_ANGLE_PATH=$env:EDGEFIRST_ANGLE_PATH adapte
 Set-Location $root
 if ($Coverage) {
     # --no-report leaves the profraw under target\llvm-cov-target so several
-    # passes merge into one later `cargo llvm-cov report` (the CI lane's
-    # shape: no-ANGLE gating pass + WARP GL pass -> one LCOV). Everything
+    # passes merge into one later `cargo llvm-cov report` (as the CI lane
+    # does: no-ANGLE gating pass + WARP GL pass -> one LCOV). Everything
     # after --no-report is forwarded to nextest, `--profile <name>` included.
     & cargo llvm-cov nextest --no-report @scope @profile -j 1 @NextestArgs
 } else {

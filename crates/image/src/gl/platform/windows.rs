@@ -28,9 +28,9 @@
 //!    three `import_*` methods return `NotSupported` and are unreachable
 //!    because no tensor on Windows is zero-copy-backed.
 //!
-//! The shared-display / per-processor-context shape is deliberately laid
-//! out function-for-function like `angle.rs` (the Android leaf did the
-//! same) so a later `angle_common` extraction is a pure move.
+//! The shared-display / per-processor-context code is laid out
+//! function-for-function like `angle.rs` (as the Android leaf is) so a
+//! later `angle_common` extraction is a move rather than a rewrite.
 //!
 //! No `windows-sys` dependency: the two kernel32 calls are declared here
 //! and the DXGI enumeration uses hand-written COM vtable slots over a
@@ -120,7 +120,7 @@ impl WindowsPlatform {
     }
 
     /// Directory of the module (DLL / `.pyd` / executable) that contains
-    /// this code — the `@loader_path` analogue. `None` if the OS refuses.
+    /// this code — the `@loader_path` analogue. `None` if either call fails.
     fn module_dir() -> Option<PathBuf> {
         use std::os::windows::ffi::OsStringExt as _;
         let anchor = Self::module_dir as *const () as *const u16;
@@ -193,9 +193,9 @@ impl WindowsPlatform {
                 continue;
             }
             // SAFETY: LoadLibrary runs the DLL's initializers; ANGLE's
-            // libEGL is well-behaved. DLL_LOAD_DIR lets it find its sibling
-            // libGLESv2.dll; DEFAULT_DIRS covers System32 (d3d11, dxgi,
-            // d3dcompiler_47).
+            // libEGL has no initializer side effects of concern.
+            // DLL_LOAD_DIR lets it find its sibling libGLESv2.dll;
+            // DEFAULT_DIRS covers System32 (d3d11, dxgi, d3dcompiler_47).
             match unsafe {
                 WinLibrary::load_with_flags(
                     &path,
@@ -281,7 +281,7 @@ impl WindowsPlatform {
                 EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE,
                 *low as i32,
             ]),
-            // Resolved to Luid/Hardware by `resolve_adapter` before we get here.
+            // Resolved to Luid/Hardware by `resolve_adapter` before this point.
             AdapterSelection::Discrete | AdapterSelection::Match(_) => attribs.extend([
                 EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
                 EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE,
@@ -673,7 +673,7 @@ pub(in crate::opengl_headless) struct SharedD3d11Display {
     pub(in crate::opengl_headless) config: egl::Config,
     /// Probe context + pbuffer used once at init to load GL and read the
     /// extension / version strings. Kept alive (never made current again)
-    /// so the display's D3D device is never idle-torn-down.
+    /// so the display's D3D device is not torn down while idle.
     probe_context: egl::Context,
     probe_pbuffer: egl::Surface,
     /// The probe context came up as GLES 3.1 (compute shaders available).
@@ -695,8 +695,8 @@ unsafe impl Sync for SharedD3d11Display {}
 static SHARED_DISPLAY: OnceLock<std::result::Result<SharedD3d11Display, String>> = OnceLock::new();
 
 /// Acquire the process-global ANGLE D3D11 display, initialising it on the
-/// first call. The error case is cached too — once ANGLE fails to load we
-/// don't keep retrying (and re-warning) per processor.
+/// first call. The error is cached too, so a failed ANGLE load is not
+/// retried (and re-logged) for every processor.
 pub(in crate::opengl_headless) fn shared_display() -> Result<&'static SharedD3d11Display> {
     SHARED_DISPLAY
         .get_or_init(|| init_shared_display().map_err(|e| e.to_string()))
@@ -777,7 +777,7 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
             Error::NotSupported("no EGL config with GLES3 + PBUFFER on the D3D11 display".into())
         })?;
 
-    // 4. Probe context (3.1 preferred) + a tiny pbuffer so it can be current.
+    // 4. Probe context (3.1 preferred) + a 16×16 pbuffer so it can be current.
     let (probe_context, has_compute) = create_es_context(&egl, display, config, true)?;
     let dummy_attribs = [egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE];
     let probe_pbuffer = egl
@@ -835,10 +835,10 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
 // Per-processor display: a private context on the shared D3D11 display.
 // ---------------------------------------------------------------------------
 
-/// One processor's GL bring-up state: a PRIVATE EGL context (plus dummy
+/// One processor's GL bring-up state: a private EGL context (plus dummy
 /// pbuffer) on the process-global shared ANGLE display. Created on the
 /// processor's worker thread, made current there once, and held for the
-/// thread's life. NOT `Send`: dropped on the creating thread (the dispatch
+/// thread's life. Not `Send`: dropped on the creating thread (the dispatch
 /// wrapper guarantees both).
 pub(in crate::opengl_headless) struct D3d11Display {
     pub(in crate::opengl_headless) shared: &'static SharedD3d11Display,
@@ -900,8 +900,8 @@ impl GlPlatform for AngleD3d11 {
     type Import = D3dTexturePbuffer;
     type ImportHandle = egl::Surface;
 
-    // eglBindTexImage attachments are released at end_gpu_pass — the
-    // engine's binding-skip cache must stay cold, as on macOS.
+    // eglBindTexImage attachments are released at end_gpu_pass, so the
+    // engine must not skip re-binding across passes (as on macOS).
     const PERSISTENT_TEX_BINDINGS: bool = false;
     const EXTERNAL_OES: bool = false;
 
@@ -932,7 +932,7 @@ impl GlPlatform for AngleD3d11 {
                     "eglCreatePbufferSurface (per-processor dummy): {e:?}"
                 )))
             })?;
-        // Made current ONCE on the calling (worker) thread and held for the
+        // Made current once on the calling (worker) thread and held for the
         // thread's life.
         if let Err(e) = shared.egl.make_current(
             shared.display,
@@ -1034,16 +1034,15 @@ impl GlPlatform for AngleD3d11 {
     }
 
     fn begin_gpu_pass(display: &D3d11Display) {
-        // ANGLE's D3D11 backend keeps ONE `StateManager11` per display and
+        // ANGLE's D3D11 backend keeps one `StateManager11` per display and
         // re-syncs a context's GL state onto the shared D3D device only from
         // `eglMakeCurrent` (`Context11::onMakeCurrent`). With every
         // processor's context permanently current on its own thread,
-        // alternating processors — even fully serialized by the dispatch
-        // wrapper — rendered with the PREVIOUS context's applied state
-        // (viewport, bindings, uniforms): the parallel-processor tests
-        // diverged on ~55 % of their bytes. So whenever a different context
+        // alternating processors, even fully serialized by the dispatch
+        // wrapper, render with the previous context's applied state
+        // (viewport, bindings, uniforms). So whenever a different context
         // issued the last commands, release and re-make this one current on
-        // this thread, which makes ANGLE mark everything dirty. Free when
+        // this thread, which makes ANGLE mark all state dirty. No cost when
         // consecutive messages come from the same processor.
         let ctx = display.context.as_ptr();
         if LAST_ACTIVE_CONTEXT.swap(ctx, Ordering::AcqRel) == ctx {
@@ -1072,9 +1071,10 @@ impl GlPlatform for AngleD3d11 {
     }
 
     fn native_fence_sync(_display: &D3d11Display) -> bool {
-        // No EGL_ANDROID_native_fence_sync on ANGLE/D3D11; consumers rely on
-        // convert() returning ⇒ GPU done. A D3D11 fence handle is the
-        // follow-on's job (the `CompletionFence` alias is an OwnedHandle here).
+        // No EGL_ANDROID_native_fence_sync on ANGLE/D3D11: convert()
+        // returning means the GPU work is complete. Exporting a D3D11 fence
+        // handle is left to the D3D11 texture follow-on (the
+        // `CompletionFence` alias is an OwnedHandle here).
         false
     }
 
@@ -1184,7 +1184,7 @@ mod tests {
 
     /// DXGI enumeration is a system facility; on a host where dxgi.dll is
     /// missing (Server Core) the function errors and the caller degrades,
-    /// so this only asserts the happy path when it applies.
+    /// so the assertions apply only when enumeration succeeds.
     #[test]
     fn dxgi_enumeration_lists_adapters_or_skips() {
         match enumerate_dxgi_adapters() {

@@ -20,8 +20,8 @@
 //! ```
 //!
 //! The fork / pipe / alarm machinery is POSIX-only, so the whole bench is
-//! Unix-only; on Windows the binary just says so (the crate's benches are
-//! compiled by `--all-targets` there).
+//! Unix-only; on Windows the binary prints a message and exits (the crate's
+//! benches are compiled by `--all-targets` there).
 
 #[cfg(unix)]
 mod common;
