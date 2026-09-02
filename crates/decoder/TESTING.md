@@ -20,13 +20,19 @@ crates/decoder/
 │   │       ├── sigmoid.rs / softmax.rs # Activation kernels
 │   │       └── level_box.rs / level_score.rs / level_mc.rs
 │   ├── tiling.rs                       # SAHI lift/merge unit + doc-tests
-│   └── schema.rs                       # SchemaV2 round-trip + fixture tests
+│   ├── schema.rs                       # SchemaV2 round-trip + fixture tests
+│   └── infer.rs                        # Ultralytics schema inference:
+│                                       #   metadata parsing, layout rules,
+│                                       #   and per-fixture expectations over
+│                                       #   testdata/infer/*.signals.json
 ├── tests/                              # Cross-cutting integration suites
 │   ├── decoder_capacity.rs
 │   ├── decoder_decode_vs_proto_parity.rs
 │   ├── decoder_from_edgefirst_json.rs
 │   ├── decoder_modelpack_multitask.rs
 │   ├── decoder_normalized_flag.rs
+│   ├── infer_builder.rs                # Inferred schemas round-trip through
+│                                       #   DecoderBuilder
 │   ├── modelpack_coffeecup_parity.rs
 │   ├── modelpack_decoder_schemas.rs
 │   ├── per_scale_parity.rs
