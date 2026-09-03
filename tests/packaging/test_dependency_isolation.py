@@ -149,11 +149,16 @@ def _pe_imports(path: Path) -> list[str]:
     if data[e_lfanew : e_lfanew + 4] != b"PE\0\0":
         raise ValueError(f"{path} is not a PE image")
     coff = e_lfanew + 4
-    n_sections, opt_size = struct.unpack_from("<H", data, coff + 2)[0], struct.unpack_from("<H", data, coff + 16)[0]
+    n_sections, opt_size = (
+        struct.unpack_from("<H", data, coff + 2)[0],
+        struct.unpack_from("<H", data, coff + 16)[0],
+    )
     opt = coff + 20
     (magic,) = struct.unpack_from("<H", data, opt)
     dir_off = opt + (112 if magic == 0x20B else 96)  # PE32+ vs PE32
-    import_rva, import_size = struct.unpack_from("<II", data, dir_off + 8)  # directory 1
+    import_rva, import_size = struct.unpack_from(
+        "<II", data, dir_off + 8
+    )  # directory 1
     if import_rva == 0 or import_size == 0:
         return []
     sections = []
@@ -172,7 +177,9 @@ def _pe_imports(path: Path) -> list[str]:
     names = []
     desc = rva_to_off(import_rva)
     while True:
-        _oft, _ts, _fwd, name_rva, first_thunk = struct.unpack_from("<IIIII", data, desc)
+        _oft, _ts, _fwd, name_rva, first_thunk = struct.unpack_from(
+            "<IIIII", data, desc
+        )
         if name_rva == 0 and first_thunk == 0:
             break
         if name_rva:

@@ -743,13 +743,9 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            let t = edgefirst_tensor::TensorDyn::new(
-                &[len],
-                DType::U8,
-                Some(TensorMemory::Shm),
-                None,
-            )
-            .expect("shm backing allocation");
+            let t =
+                edgefirst_tensor::TensorDyn::new(&[len], DType::U8, Some(TensorMemory::Shm), None)
+                    .expect("shm backing allocation");
             use std::os::fd::IntoRawFd;
             t.clone_fd().expect("clone fd").into_raw_fd() as i64
         }
