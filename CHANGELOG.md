@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.3] - 2026-09-04
+
+### Fixed
+
+- **Python 3.8–3.10 wheels (`abi3-py38`) failed to compile.** `TensorMapT::element_size()` (`crates/python-common/src/tensor.rs`) was gated `#[cfg(any(not(Py_LIMITED_API), Py_3_11))]`, but its caller in the abi3-py38 build of `HostPin::numpy()` is gated with the exact logical opposite (`#[cfg(all(Py_LIMITED_API, not(Py_3_11)))]`) — the method was compiled out precisely in the one configuration that calls it. `element_size()` is now unconditional (pure `size_of` arithmetic, no PyO3 dependency), matching its sibling accessors on the same type. Introduced alongside the modular Python wheels in 0.29.0; never previously visible because every release attempt since (0.29.0, 0.29.1, 0.29.2) failed earlier in the pipeline before reaching this build step, so no published wheel was ever affected.
+- **Release pipeline.** The `v0.29.2` tag push was the first to get far enough to hit the bug above; nothing published under `v0.29.0`, `v0.29.1`, or `v0.29.2` (each failed before any publish job ran), so no compatibility break results from skipping straight to this release.
+- **CI never compiled the `abi3-py38` Python bindings.** Every `cargo clippy --workspace` invocation in `test.yml` excludes the five `python-*` crates entirely, and every `maturin build` anywhere in this repo's CI only ever passes `--features abi3-py311`. `abi3-py38` (the other of the two mutually exclusive ABI configs every wheel ships) was compiled by nothing short of release.yml's tag-triggered publish build — how the bug above reached three release attempts before anything caught it. Added `make lint-python-abi3-py38` (clippy, `-p` per crate to avoid `edgefirst-tensor`'s static/dynamic feature conflict, same pattern as `lint-tensor-dynamic`), wired into `make lint` and the x86_64 CI lane, so this ABI config is checked on every PR from now on. Along the way, fixed the pre-existing clippy findings this newly-run lint surfaced in `crates/python-common` (two feature-conditional unused imports, a manual `Option::map`, an over-complex pickle-tuple return type) — `python-common` had never been linted at all before, under either ABI.
+
 ## [0.29.2] - 2026-09-04
 
 ### Fixed
