@@ -232,6 +232,9 @@ impl PyTilePlacement {
 
     /// Constructor args as a single tuple so a decoder in another extension
     /// can extract placement without six cross-module ``getattr`` hops.
+    // The tuple IS the pickle constructor arg list `__new__` expects; a type
+    // alias would only rename it, not simplify it.
+    #[allow(clippy::type_complexity)]
     fn __getnewargs__(
         &self,
     ) -> (

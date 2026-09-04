@@ -72,13 +72,10 @@ fn extract_placement(obj: &Bound<'_, PyAny>) -> PyResult<TilePlacement> {
             });
         }
     }
-    let letterbox = match obj
+    let letterbox = obj
         .getattr("letterbox")?
         .extract::<Option<(f32, f32, f32, f32)>>()?
-    {
-        Some((a, b, c, d)) => Some([a, b, c, d]),
-        None => None,
-    };
+        .map(|(a, b, c, d)| [a, b, c, d]);
     Ok(TilePlacement {
         index: obj.getattr("index")?.extract()?,
         count: obj.getattr("count")?.extract()?,

@@ -774,7 +774,13 @@ impl TensorMapT {
         map_dispatch!(self, size)
     }
 
-    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    // Deliberately ungated: pure size_of arithmetic per variant, no
+    // PyO3/buffer-protocol dependency, and called from both `numpy()`
+    // branches below -- the `__getbuffer__`-based one (any(not(Py_LIMITED_API),
+    // Py_3_11)) and the abi3-py38 manual-memoryview one (the exact opposite
+    // condition). A cfg gate here previously matched only the first branch,
+    // compiling this out precisely in the one configuration (Py_LIMITED_API
+    // without Py_3_11) that calls it from the second.
     pub fn element_size(&self) -> usize {
         match self {
             TensorMapT::TensorU8(_) => std::mem::size_of::<u8>(),
