@@ -29,6 +29,23 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     ("TABLE", "CUDA dlopen table; dlopen refcounts, same library"),
     (
+        "CUDA_IMPORT_SIZE_PADDED",
+        "per-copy cache of an adapter property (the driver pads D3D11 allocations); every copy observes the same answer",
+    ),
+    (
+        "CUDA_DEVICE_SELECTED",
+        "per-copy cache of cudaSetDevice for the one process D3D11 adapter; \
+         every copy computes the same device ordinal, so copies agree",
+    ),
+    (
+        "IMPORTED",
+        "per-copy CUDA external-semaphore import of the one process D3D11 \
+         fence (cuda.rs `shared_semaphore`); every copy imports the same \
+         fence and gets an object with the same meaning, so N copies cost N \
+         imports and nothing else. The CUDA stream stays per handle, so no \
+         consumer waits behind another's work.",
+    ),
+    (
         "UNPLANNED_CPU_ACCESS",
         "diagnostic counter; a per-artifact undercount misleads nobody",
     ),
@@ -55,6 +72,23 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "SHM_AVAILABLE",
         "platform availability probe cache; same true/false answer in every process",
+    ),
+    (
+        "DEVICE",
+        "per-copy reference to the one process D3D11 device, its fence and \
+         its signal counter (d3d11/device.rs). Not inert, and deliberately \
+         so: every copy resolves the same device through the rendezvous \
+         mapping `Local\\edgefirst-d3d11-device-<pid>`, so N copies hold N \
+         references to one object and agree on its identity -- which is the \
+         invariant this guard exists to protect -- rather than each minting \
+         a device of its own and diverging.",
+    ),
+    (
+        "EXTERNAL",
+        "host-installed device slot of `use_external_device` \
+         (d3d11/device.rs); consumed on the first `device()` call and \
+         published through the same rendezvous, so N copies of the slot can \
+         never yield two devices",
     ),
     (
         "GUARD",

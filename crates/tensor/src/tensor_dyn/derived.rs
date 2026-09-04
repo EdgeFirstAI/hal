@@ -32,9 +32,16 @@ impl TensorDyn {
     /// function `dup`s the fd, so the imported tensor's fd stays valid even
     /// after the producer's tensor drops (closing its own copy); the
     /// underlying dma-buf allocation itself is still only alive as long as
-    /// *some* fd or GPU import references it. A consumer needing to survive
-    /// past the capsule for any other kind (`HOST`, `IOSURFACE`) must take
-    /// its own reference explicitly — this function does not.
+    /// *some* fd or GPU import references it. `D3D11_TEXTURE` behaves the
+    /// same way for the same reason: the import duplicates the texture and
+    /// fence NT handles it keeps, so the result outlives the producer's
+    /// tensor while the texture itself lives as long as some handle or view
+    /// references it. Both of the descriptor's handle values must be valid
+    /// **in this process** — the protocol duplicates, it does not reach into
+    /// another process's handle table (the blob transport does; see
+    /// [`crate::blob::import`]). A consumer needing to survive past the
+    /// capsule for any other kind (`HOST`, `IOSURFACE`) must take its own
+    /// reference explicitly — this function does not.
     ///
     /// # Errors
     ///
@@ -70,11 +77,6 @@ fn validate_descriptor(desc: &TensorDesc) -> Result<(DType, Vec<usize>)> {
         )));
     }
 
-    // A producer advertising a fence we cannot wait on is a correctness
-    // problem, not a compatibility nicety: importing anyway would alias
-    // memory whose contents are still being written by the producer's
-    // device, and the corruption would be timing-dependent. `sync` is
-    // reserved in this build, so the only honest answer is to refuse.
     if desc.ndim as usize > crate::TensorDesc::MAX_NDIM {
         return Err(crate::Error::NotImplemented(format!(
             "descriptor declares rank {}, but this build's descriptor \
@@ -84,11 +86,37 @@ fn validate_descriptor(desc: &TensorDesc) -> Result<(DType, Vec<usize>)> {
             crate::TensorDesc::MAX_NDIM
         )));
     }
-    if desc.flags & crate::protocol::flags::SYNC_PRESENT != 0 {
+    // A producer advertising a fence we cannot wait on is a correctness
+    // problem, not a compatibility nicety: importing anyway would alias
+    // memory whose contents are still being written by the producer's
+    // device, and the corruption would be timing-dependent.
+    //
+    // `D3D11_TEXTURE` is the one kind with a wait path: its descriptor names
+    // an `ID3D11Fence` plus a value, and `from_d3d11_shared_handle` issues
+    // the GPU-side wait before the import is usable. Every other kind still
+    // has nowhere to wait, so a producer advertising a fence is refused.
+    if desc.flags & crate::protocol::flags::SYNC_PRESENT != 0
+        && desc.kind != crate::protocol::kind::D3D11_TEXTURE
+    {
         return Err(crate::Error::NotImplemented(
             "descriptor advertises SYNC_PRESENT, but waiting on a \
              producer fence is not implemented in this build; importing \
              would alias memory with device work still in flight"
+                .to_owned(),
+        ));
+    }
+    // The same refusal for a `D3D11_TEXTURE` descriptor that advertises a
+    // fence value with no fence to read it on: `ptr` is where that kind
+    // carries the fence handle, so a null one leaves a completion nobody can
+    // wait on, which is the in-flight-write hazard again rather than a
+    // missing feature.
+    if desc.flags & crate::protocol::flags::SYNC_PRESENT != 0
+        && desc.kind == crate::protocol::kind::D3D11_TEXTURE
+        && desc.ptr.is_null()
+    {
+        return Err(crate::Error::InvalidArgument(
+            "D3D11_TEXTURE descriptor advertises SYNC_PRESENT but carries no \
+             fence handle in `ptr`; the completion it names cannot be waited on"
                 .to_owned(),
         ));
     }
@@ -135,7 +163,38 @@ fn restore_descriptor_metadata(
         Some(crate::Colorimetry::unpack(desc.colorimetry))
     });
 
+    restore_d3d11_logical_shape(t, desc, shape)?;
+
     Ok(())
+}
+
+/// Give a `kind::D3D11_TEXTURE` import the shape its producer had.
+///
+/// The import opens the texture at the format's *allocation* shape, because
+/// that is what `from_d3d11_shared_handle` builds from width and height. A
+/// producer that called `set_logical_shape` was carrying the *addressing*
+/// shape instead (`[h, w]` for a semi-planar image rather than
+/// `[combined_h, w]`), and the descriptor faithfully reported it; without
+/// this the consumer would see a shape its producer did not have. The
+/// import arm has already checked `shape` is one of those two spellings of
+/// the geometry the texture itself reports, so nothing untrusted reaches
+/// `set_logical_shape` here.
+///
+/// After the format restore, not before: `set_format` validates the shape it
+/// finds, and an addressing shape is not one it accepts for a semi-planar
+/// format (`[481, 640]` is an unreachable combined-plane height).
+///
+/// No other kind needs this. Every one of them is imported at exactly the
+/// shape the descriptor carries.
+fn restore_d3d11_logical_shape(
+    t: &mut TensorDyn,
+    desc: &TensorDesc,
+    shape: &[usize],
+) -> Result<()> {
+    if desc.kind != crate::protocol::kind::D3D11_TEXTURE || t.shape() == shape {
+        return Ok(());
+    }
+    t.set_logical_shape(shape)
 }
 
 /// Restore the producer's physical row pitch (the row dimension

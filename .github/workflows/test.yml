@@ -901,15 +901,40 @@ jobs:
           "Source files in coverage: $((Select-String -Path target/coverage_rust.lcov -Pattern '^SF:' | Measure-Object).Count)"
           Select-String -Path target/coverage_rust.lcov -Pattern '^SF:' | Select-Object -First 3 | ForEach-Object { $_.Line }
 
-      - name: Run modular C-API tests (best-effort)
+      - name: Run modular C-API tests
         # `make test-capi-modular` needs bash and make; this repeats its
-        # recipe. Non-gating until the leaf tests have a run history on
-        # Windows; promote once green.
+        # recipe, the `capi-libs` debug build included: the C link tests
+        # read target/debug/edgefirst_*.lib, which the release build in the
+        # package-capi-windows job does not produce, and skip when it is
+        # missing. The harness finds
+        # cl.exe through vswhere and VsDevCmd.bat itself, so no developer
+        # shell is needed here. EDGEFIRST_D3D11_ADAPTER=warp: hosted
+        # runners have no GPU, and the D3D11 C test would otherwise report
+        # no device and skip its Windows arm; EDGEFIRST_ALLOW_SOFTWARE_GL=1
+        # goes with it, as in the GPU pytest step below, because the GL
+        # engine refuses a software renderer without it and image-capi's
+        # cross-library C program then converts into a host destination
+        # that hands back no fence. --test-threads=1 serializes the D3D11
+        # tests over the one WARP device; the C harness no longer needs it
+        # (each process compiles into its own scratch directory).
+        # Gating, no longer best-effort: the defect that made
+        # test_cross_library.c fail about twice in twenty runs -- a texture
+        # convert whose destination came back blank -- was the dynamic
+        # backend deriving a texture handle's BufferIdentity from the
+        # handle's own recyclable address, so the image crate's EGLImage
+        # cache served a dropped texture's import. Fixed in
+        # TensorDyn::derive_identity; 40 consecutive runs of this step are
+        # green on the RTX 3070 and on WARP.
         shell: pwsh
-        continue-on-error: true
         env:
           EF_REQUIRE_FRESH_ARTIFACTS: '1'
+          EDGEFIRST_D3D11_ADAPTER: warp
+          EDGEFIRST_ALLOW_SOFTWARE_GL: '1'
         run: |
+          foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
+            cargo build --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
             cargo test --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -942,7 +967,8 @@ jobs:
 
       - name: Run GPU Python tests on WARP (best-effort)
         # tests/gpu_policy.py: on Windows the gpu-marked tests skip unless
-        # HAL_TEST_REQUIRE_GL=1, and then require a PBO-backed destination.
+        # HAL_TEST_REQUIRE_GL=1, and then require a GPU-backed destination
+        # (a DMA_BUF texture or a PBO).
         shell: pwsh
         continue-on-error: true
         env:

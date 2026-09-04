@@ -23,8 +23,28 @@
 //! planar dst view cannot be built at all. The planar writers take their pitch
 //! from `tensor_row_stride(dst)` already; `padded_planar_dst_honours_stride`
 //! guards that seam with an explicitly strided (not viewed) planar tensor.
+//!
+//! `gl_padded_dst_rows_land_at_the_declared_stride` makes the same claim of the
+//! GL engine, whose readback packs its rows tightly and so has to re-space them
+//! to the destination's pitch.
+//! `gl_padded_pbo_dst_rows_land_at_the_declared_stride` makes it of the PBO
+//! readback, which reaches its destination through `glReadPixels` into a PACK
+//! buffer and `glMapBufferRange` instead of the tensor's map.
 
-use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Region, Rotation};
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ),
+    feature = "opengl"
+))]
+use edgefirst_image::GLProcessorThreaded;
+use edgefirst_image::{
+    CPUProcessor, Crop, Flip, ImageProcessor, ImageProcessorTrait, Region, Rotation,
+};
 use edgefirst_tensor::{
     CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -88,7 +108,6 @@ fn assert_view_dst_matches_standalone(
     crop: Crop,
 ) {
     let mut cpu = CPUProcessor::new();
-
     // Reference: the same convert into a tensor sized exactly to the view.
     let mut reference = mem_image(region.width, region.height, dst_fmt);
     fill(&mut reference, POISON);
@@ -531,4 +550,358 @@ fn padded_planar_dst_honours_stride() {
             assert_eq!(g, w, "planar plane {plane} row {row} mismatch");
         }
     }
+}
+
+/// The GL engine's readback has to land each output row at the destination's
+/// own pitch, exactly as the CPU writers above do.
+///
+/// `glReadPixels` packs its rows at `width * channels` whatever pitch the
+/// destination has, and the Mem readback wrote that block straight into the
+/// map — so a destination carrying a `row_stride` (a D3D11 staging texture on
+/// Windows, an IOSurface, any padded allocation) got a tight frame in a padded
+/// window and every row after the first landed short. It reproduces on any
+/// platform through a declared stride; on a discrete NVIDIA adapter it is what
+/// `tests/pin_convert.rs` caught, because the D3D11 staging pitch there is
+/// 128-byte aligned while the software adapter's is tight.
+///
+/// `Rgba` covers the direct `glReadPixels` branch and `Rgb`/`Grey` the
+/// RGBA-scratch repack ANGLE forces, because the two write the destination by
+/// different routes.
+#[test]
+fn gl_padded_dst_rows_land_at_the_declared_stride() {
+    let src = make_src(SRC_W, SRC_H, PixelFormat::Rgba);
+    let mut gl = ImageProcessor::new().expect("create ImageProcessor");
+
+    for dst_fmt in [PixelFormat::Rgba, PixelFormat::Rgb, PixelFormat::Grey] {
+        let bpp = dst_fmt.channels();
+        // Same construction as `padded_planar_dst_honours_stride`: allocate at
+        // the padded width, then re-declare the logical geometry and the pitch.
+        let stride = PARENT_W * bpp;
+        let mut padded = mem_image(PARENT_W, SRC_H, dst_fmt);
+        fill(&mut padded, POISON);
+        padded
+            .configure_image(SRC_W, SRC_H, dst_fmt)
+            .expect("shrink logical geometry");
+        padded.set_row_stride(stride).expect("declare padded pitch");
+        gl.convert(
+            &src,
+            &mut padded,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap_or_else(|e| panic!("{dst_fmt:?}: padded convert failed: {e}"));
+
+        let mut reference = mem_image(SRC_W, SRC_H, dst_fmt);
+        fill(&mut reference, POISON);
+        gl.convert(
+            &src,
+            &mut reference,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap_or_else(|e| panic!("{dst_fmt:?}: reference convert failed: {e}"));
+        let ref_stride = reference.effective_row_stride().expect("reference stride");
+        assert_eq!(
+            ref_stride,
+            SRC_W * bpp,
+            "{dst_fmt:?}: the reference destination must be tight"
+        );
+
+        let got = bytes(&padded);
+        let want = bytes(&reference);
+        let row_bytes = SRC_W * bpp;
+        for row in 0..SRC_H {
+            assert_eq!(
+                &got[row * stride..row * stride + row_bytes],
+                &want[row * ref_stride..row * ref_stride + row_bytes],
+                "{dst_fmt:?}: row {row} did not land at the {stride} B pitch"
+            );
+        }
+
+        // A CPU fallback would exercise the stride-aware CPU writers and pass
+        // without the GL readback ever running. `Rgba` is the first format, so
+        // the count here covers only its two converts. Asserted where the lane
+        // declares a GL backend must come up -- the same `HAL_TEST_REQUIRE_GL`
+        // flag `gl_backend_available_canary` gates on -- so a host with no GL
+        // stack still runs the assertions above rather than failing on their
+        // absence, with the count reported below.
+        if dst_fmt == PixelFormat::Rgba
+            && std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+        {
+            assert_eq!(
+                gl.convert_fallback_count(),
+                0,
+                "the Rgba convert fell back to the CPU backend, so the GL \
+                 readback under test never ran"
+            );
+        }
+    }
+
+    // A vacuous pass is visible in the log rather than silent: a non-zero count
+    // means the convert fell back to the CPU backend, which has its own
+    // stride-aware writers and never exercises the GL readback.
+    use std::io::Write;
+    let _ = writeln!(
+        &mut std::io::stderr(),
+        "NOTE: gl_padded_dst_rows_land_at_the_declared_stride: gl_fallbacks={}",
+        gl.convert_fallback_count()
+    );
+}
+
+/// Report a skip so it survives to the log: libtest discards captured output
+/// for a passing test, so a skip that only `eprintln!`s is indistinguishable
+/// from a run that did the work.
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ),
+    feature = "opengl"
+))]
+fn skip(why: &str) {
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
+}
+
+/// The PBO readback has to land each output row at the destination's pitch
+/// too, and it reaches the destination by routes of its own: `glReadPixels`
+/// into the PBO's PACK binding for the RGBA pair, and the RGBA-scratch repack
+/// ANGLE forces for `Rgb`/`Grey`, each writing through `glMapBufferRange` on
+/// the GL thread rather than through the tensor's map.
+///
+/// `PARENT_W * bpp` is a whole number of pixels for every format, the kind of
+/// pitch `GL_PACK_ROW_LENGTH` can express; `PARENT_W * bpp + 1` is not for the
+/// RGBA pair, so those rows have to be read tight and moved afterwards, as the
+/// Mem readback moves them. `Bgra` adds the R/B swap on top of each route.
+///
+/// A `GLProcessorThreaded` is driven directly: `ImageProcessor::create_image`
+/// prefers a D3D11 texture on Windows, and only the GL processor can allocate
+/// a PBO, so this is the one way to put a PBO destination in front of the
+/// readback. There is no CPU fallback that could pass in its place.
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ),
+    feature = "opengl"
+))]
+#[test]
+fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
+    let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+    let src = make_src(SRC_W, SRC_H, PixelFormat::Rgba);
+    let mut gl = match GLProcessorThreaded::new(None) {
+        Ok(gl) => gl,
+        Err(e) => {
+            assert!(
+                !require_gl,
+                "HAL_TEST_REQUIRE_GL=1 but the GL backend failed to come up: {e}"
+            );
+            skip(&format!(
+                "gl_padded_pbo_dst_rows_land_at_the_declared_stride: no GL backend: {e}"
+            ));
+            return;
+        }
+    };
+
+    // (destination format, bytes of pitch beyond the wide allocation's row)
+    let cases = [
+        (PixelFormat::Rgba, 0usize),
+        (PixelFormat::Rgba, 1),
+        (PixelFormat::Bgra, 0),
+        (PixelFormat::Bgra, 1),
+        (PixelFormat::Rgb, 0),
+        (PixelFormat::Grey, 0),
+    ];
+    for (dst_fmt, extra) in cases {
+        let bpp = dst_fmt.channels();
+        let stride = PARENT_W * bpp + extra;
+        let label = format!("{dst_fmt:?} at a {stride} B pitch");
+
+        // Allocate wide and one row tall of spare, then re-declare the logical
+        // geometry and the pitch, as the Mem test does. The spare row is for
+        // the tensor's own map, which spans `stride * rows` and the odd pitch
+        // pushes past a `PARENT_W x SRC_H` allocation.
+        let mut padded = match gl.create_pbo_image(PARENT_W, SRC_H + 1, dst_fmt) {
+            Ok(t) => t,
+            Err(e) => {
+                assert!(
+                    !require_gl,
+                    "HAL_TEST_REQUIRE_GL=1 but a PBO image could not be created: {e}"
+                );
+                skip(&format!(
+                    "gl_padded_pbo_dst_rows_land_at_the_declared_stride: no PBO images: {e}"
+                ));
+                return;
+            }
+        };
+        padded
+            .configure_image(SRC_W, SRC_H, dst_fmt)
+            .expect("shrink logical geometry");
+        padded.set_row_stride(stride).expect("declare padded pitch");
+        let mut padded = TensorDyn::from(padded);
+        fill(&mut padded, POISON);
+        gl.convert(
+            &src,
+            &mut padded,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap_or_else(|e| panic!("{label}: padded convert failed: {e}"));
+
+        // A tight PBO of the same render is the row oracle, and the Mem
+        // readback of the same render checks that the tight PBO route itself
+        // still lands the frame where it always did.
+        let mut reference = TensorDyn::from(
+            gl.create_pbo_image(SRC_W, SRC_H, dst_fmt)
+                .unwrap_or_else(|e| panic!("{label}: tight PBO: {e}")),
+        );
+        fill(&mut reference, POISON);
+        gl.convert(
+            &src,
+            &mut reference,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap_or_else(|e| panic!("{label}: reference convert failed: {e}"));
+        let row_bytes = SRC_W * bpp;
+        assert_eq!(
+            reference.effective_row_stride(),
+            Some(row_bytes),
+            "{label}: the reference destination must be tight"
+        );
+        let mut mem_reference = mem_image(SRC_W, SRC_H, dst_fmt);
+        fill(&mut mem_reference, POISON);
+        gl.convert(
+            &src,
+            &mut mem_reference,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap_or_else(|e| panic!("{label}: Mem reference convert failed: {e}"));
+        let want = bytes(&reference);
+        assert_eq!(
+            want,
+            bytes(&mem_reference),
+            "{label}: the tight PBO readback diverged from the Mem readback"
+        );
+
+        let got = bytes(&padded);
+        for row in 0..SRC_H {
+            assert_eq!(
+                &got[row * stride..row * stride + row_bytes],
+                &want[row * row_bytes..row * row_bytes + row_bytes],
+                "{label}: row {row} did not land at the {stride} B pitch"
+            );
+            // The bytes past a row's pixels are not the readback's to write.
+            // `extra == 0` is a whole number of pixels on every platform, so
+            // the rows land through `GL_PACK_ROW_LENGTH` or through the
+            // repack, and neither touches the pad. `extra == 1` is the
+            // read-tight-and-spread route, which leaves the tight read's
+            // leftovers there, as the Mem readback does. The last row's pad
+            // lies past the mapping.
+            if extra == 0 && row + 1 < SRC_H {
+                assert!(
+                    got[row * stride + row_bytes..(row + 1) * stride]
+                        .iter()
+                        .all(|&b| b == POISON),
+                    "{label}: row {row}: the pad past the pixels was written"
+                );
+            }
+        }
+    }
+}
+
+/// A PBO destination that is a `view()` of a wider parent is refused, not
+/// filled from the top of the parent's buffer.
+///
+/// The PBO readback writes at buffer offset 0 and bounds itself on the whole
+/// allocation, so a sub-region destination would land as a full-width band at
+/// the head of the parent -- the same corruption the CPU cases in this file
+/// exist to prevent, with no error to show for it. `convert` declines view
+/// destinations in `convert_inner`; the overlay `render` paths decline them
+/// in `check_draw_dst_placement`, which covers the zero-copy arm as well as
+/// this one, and the readback keeps its own guard (`plan_pbo_readback`) at
+/// the place that actually holds the offset-0 assumption. This test comes in
+/// through an overlay.
+///
+/// `draw_decoded_masks` with no detections still writes the destination (the
+/// cleared frame), which is exactly the write that must not happen here.
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ),
+    feature = "opengl"
+))]
+#[test]
+fn gl_pbo_view_dst_is_refused_rather_than_written_at_offset_zero() {
+    let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+    let mut gl = match GLProcessorThreaded::new(None) {
+        Ok(gl) => gl,
+        Err(e) => {
+            assert!(
+                !require_gl,
+                "HAL_TEST_REQUIRE_GL=1 but the GL backend failed to come up: {e}"
+            );
+            skip(&format!(
+                "gl_pbo_view_dst_is_refused_rather_than_written_at_offset_zero: no GL backend: {e}"
+            ));
+            return;
+        }
+    };
+    let parent = match gl.create_pbo_image(PARENT_W, PARENT_H, PixelFormat::Rgba) {
+        Ok(t) => t,
+        Err(e) => {
+            assert!(
+                !require_gl,
+                "HAL_TEST_REQUIRE_GL=1 but a PBO image could not be created: {e}"
+            );
+            skip(&format!(
+                "gl_pbo_view_dst_is_refused_rather_than_written_at_offset_zero: no PBO images: {e}"
+            ));
+            return;
+        }
+    };
+    let mut parent = TensorDyn::from(parent);
+    fill(&mut parent, POISON);
+    let before = bytes(&parent);
+
+    let view = parent
+        .as_u8()
+        .expect("u8 parent")
+        .view(Region::new(0, 0, SRC_W, SRC_H))
+        .expect("view of a PBO parent");
+    assert!(
+        view.view_origin().is_some(),
+        "the destination must report itself as a sub-region"
+    );
+    let mut view = TensorDyn::from(view);
+
+    let err = gl
+        .draw_decoded_masks(&mut view, &[], &[], Default::default())
+        .expect_err("an overlay into a PBO view must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("offset 0"),
+        "the refusal must name the offset-0 write it is declining, got: {msg}"
+    );
+    assert_eq!(
+        bytes(&parent),
+        before,
+        "the refused overlay wrote into the parent buffer anyway"
+    );
 }

@@ -257,13 +257,13 @@ path, no type parameters leaking into the engine):
 
 | Contract item | Linux (`platform/linux.rs`) | macOS (`platform/angle.rs`) | Android (`platform/android.rs`) | Windows (`platform/windows.rs`) |
 |---|---|---|---|---|
-| `Display` | `GlContext` (GBM/PlatformDevice/Default EGL + surfaceless context) | `AngleDisplay` (private per-processor context on the shared ANGLE/Metal display) | `AndroidGlContext` (private per-processor context on the shared native default display) | `D3d11Display` (private per-processor context on the shared ANGLE/Direct3D 11 display; adapter chosen by `EDGEFIRST_ANGLE_ADAPTER`) |
-| `Import` / `ImportHandle` | `EglImage` / `egl::Image` (DMA-BUF) | `IoSurfacePbuffer` / `egl::Surface` | `AndroidEglImage` / `egl::Image` (AHardwareBuffer) | `D3dTexturePbuffer` / `egl::Surface` (never constructed yet — no zero-copy tensor on Windows) |
-| `import_buffer` / `import_buffer_nv_r8` / `import_buffer_packed` | `eglCreateImageKHR` attribute assembly (`dma_import.rs`, 64-byte stride invariant, multi-plane NV12) | `eglCreatePbufferFromClientBuffer` (`iosurface_import.rs` layouts) | `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` (`ahardwarebuffer_import.rs`; self-describing buffer, no attribute assembly; NV R8 needs the API-29 `R8_UNORM` format and errors today) | `NotSupported` (the D3D11 shared-texture follow-on fills these via `EGL_ANGLE_d3d_texture_client_buffer`) |
-| `attach_tex_image_2d` (+`_external`, `_renderbuffer`) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies) | `eglBindTexImage`, recorded and released by `end_gpu_pass` after the engine's sync point | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies, like Linux) | `eglBindTexImage` / `end_gpu_pass`, same shape as macOS |
-| `PERSISTENT_TEX_BINDINGS` / `EXTERNAL_OES` | `true` / `true` | `false` / `false` (no `samplerExternalOES` on ANGLE — those four programs are not even built) | `true` / `false` (the driver exposes external-OES, but the YUV sampling flip awaits on-device camera validation) | `false` / `false` (ANGLE) |
+| `Display` | `GlContext` (GBM/PlatformDevice/Default EGL + surfaceless context) | `AngleDisplay` (private per-processor context on the shared ANGLE/Metal display) | `AndroidGlContext` (private per-processor context on the shared native default display) | `D3d11Display` (private per-processor context on the shared ANGLE/Direct3D 11 display, built on the tensor crate's device with `eglCreateDeviceANGLE`; the adapter is that crate's choice) |
+| `Import` / `ImportHandle` | `EglImage` / `egl::Image` (DMA-BUF) | `IoSurfacePbuffer` / `egl::Surface` | `AndroidEglImage` / `egl::Image` (AHardwareBuffer) | `D3d11EglImage` / `egl::Image` (`EGL_ANGLE_image_d3d11_texture`) |
+| `import_buffer` / `import_buffer_nv_r8` / `import_buffer_packed` | `eglCreateImageKHR` attribute assembly (`dma_import.rs`, 64-byte stride invariant, multi-plane NV12) | `eglCreatePbufferFromClientBuffer` (`iosurface_import.rs` layouts) | `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` (`ahardwarebuffer_import.rs`; self-describing buffer, no attribute assembly; NV R8 needs the API-29 `R8_UNORM` format and errors today) | EGLImage over the tensor's `ID3D11Texture2D` (`d3d11_import.rs` attributes) |
+| `attach_tex_image_2d` (+`_external`, `_renderbuffer`) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies) | `eglBindTexImage`, recorded and released by `end_gpu_pass` after the engine's sync point | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies, like Linux) | `glEGLImageTargetTexture2DOES`, re-issued per use (`end_gpu_pass` has nothing to release) |
+| `PERSISTENT_TEX_BINDINGS` / `EXTERNAL_OES` | `true` / `true` | `false` / `false` (no `samplerExternalOES` on ANGLE — those four programs are not even built) | `true` / `false` (the driver exposes external-OES, but the YUV sampling flip awaits on-device camera validation) | `false` / `false` (ANGLE has no `samplerExternalOES`; persistent bindings are off because ANGLE does not observe writes made to the texture outside GL and a kept binding samples stale content) |
 | `load_gl_once` | once-per-process via this display's `eglGetProcAddress` | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) |
-| Transfer backend | `DmaBuf` → `Pbo` on the NVIDIA verify-failure downgrade | `IOSurface` | `AHardwareBuffer` | `Pbo` (the only backend; sources upload, destinations read back) |
+| Transfer backend | `DmaBuf` → `Pbo` on the NVIDIA verify-failure downgrade | `IOSurface` | `AHardwareBuffer` | `D3d11Texture` |
 
 `PlatformCaps` (transfer backend, float render support, `serialize_gl`,
 `external_oes`, `native_fence_sync`) is captured ONCE per processor at worker startup and
@@ -293,20 +293,29 @@ different context issued the last commands (a process-global
 Windows also takes the non-Linux message mutex around processor bring-up
 and teardown, because the D3D11 immediate context is not safe to drive
 from two threads at once (concurrent bring-up crashed with an access
-violation).
+violation). Every context creation and destruction clears the marker as
+well: a new context on a recycled address would otherwise be mistaken for
+the one that issued the last commands, and skip the re-sync it needs.
 
 **Porting checklist (how Windows/ANGLE-D3D11 landed as a leaf, not a
 fork):** implement the trait (`init_display` over a shared ANGLE display
-+ per-processor context, the three import methods — `NotSupported` until
-a zero-copy buffer kind exists — the attach calls, `load_gl_once`), add
-the `Platform` alias arm — `rustc` rejects a partial port via the trait
-+ const assert, and the engine cannot be forked because it reaches
-buffers only through `Platform::*`. The Windows leaf additionally owns
-the DLL loader (`EDGEFIRST_ANGLE_PATH` → next to the loading module →
-next to the executable → default search path) and DXGI adapter selection
-(`EDGEFIRST_ANGLE_ADAPTER`); its `D3dTexturePbuffer` import type is the
-seam the D3D11 shared-texture follow-on fills via
-`EGL_ANGLE_d3d_texture_client_buffer`.
++ per-processor context, the three import methods, the attach calls,
+`load_gl_once`), add the `Platform` alias arm — `rustc` rejects a partial
+port via the trait + const assert, and the engine cannot be forked because
+it reaches buffers only through `Platform::*`. The Windows leaf
+additionally owns the DLL loader (`EDGEFIRST_ANGLE_PATH` → next to the
+loading module → next to the executable → default search path). It does
+**not** own the device or the adapter: the tensor crate creates the one
+process `ID3D11Device` and selects its adapter
+(`EDGEFIRST_D3D11_ADAPTER`, alias `EDGEFIRST_ANGLE_ADAPTER`), and this
+leaf builds its display on that device with `eglCreateDeviceANGLE` — ANGLE
+imports textures only from its own device, and every texture tensor lives
+on the tensor crate's. The completion fence is the other half of that
+split: `export_completion_fence` flushes GL and asks the tensor crate's
+device to signal, and `record_completion` stamps the signalled value onto the
+destination (`Tensor::set_gpu_write`) after every convert, deferred ones
+included, so a D3D12 or CUDA consumer waits on the fence instead of a
+blocking sync.
 
 The platform-independent pieces live in modules compiled on every OS:
 `gl::shaders_common` (the GLSL sources, including the NV→RGBA and

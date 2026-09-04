@@ -18,8 +18,8 @@
 use std::ffi::{c_char, c_int};
 
 pub use edgefirst_tensor_abi::{
-    EfCompression, EfCpuAccess, EfDtype, EfErrorClass, EfImageDescView, EfQuantizationInfo,
-    EfStorageKind, EfTensorPlane, EfTensorView, EfViewOrigin,
+    EfCompression, EfCpuAccess, EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView,
+    EfQuantizationInfo, EfStorageKind, EfTensorPlane, EfTensorView, EfViewOrigin,
 };
 
 /// Opaque tensor handle (never dereferenced, sized, or copied).
@@ -166,6 +166,7 @@ declare_abi! {
     pub fn ef_tensor_last_error_message() -> *const c_char;
     pub fn ef_tensor_last_error_class() -> u32;
     pub fn ef_tensor_map(t: *mut EfTensor, access: u32, out: *mut EfTensorView) -> c_int;
+    pub fn ef_tensor_try_map(t: *mut EfTensor, access: u32, out: *mut EfTensorView) -> c_int;
     pub fn ef_tensor_unmap(t: *mut EfTensor) -> c_int;
     pub fn ef_tensor_sync_for_cpu(t: *const EfTensor, access: u32) -> c_int;
     pub fn ef_tensor_sync_for_device(t: *const EfTensor, access: u32) -> c_int;
@@ -259,6 +260,7 @@ declare_abi! {
     pub fn ef_unplanned_cpu_access_count() -> u64;
 
     pub fn ef_tensor_cuda_map(t: *const EfTensor) -> *mut std::ffi::c_void;
+    pub fn ef_tensor_cuda_map_mut(t: *const EfTensor) -> *mut std::ffi::c_void;
     pub fn ef_tensor_cuda_device_ptr(
         map: *const std::ffi::c_void,
         out_size: *mut usize,
@@ -279,6 +281,40 @@ declare_abi! {
         height: *mut usize,
     ) -> c_int;
     pub fn ef_tensor_iosurface_ref(t: *const EfTensor) -> *mut std::ffi::c_void;
+
+    pub fn ef_d3d11_device() -> *mut std::ffi::c_void;
+    pub fn ef_d3d11_use_external_device(device: *mut std::ffi::c_void) -> c_int;
+    pub fn ef_tensor_d3d11_texture(t: *const EfTensor) -> *mut std::ffi::c_void;
+    pub fn ef_tensor_d3d11_layout(t: *const EfTensor, out: *mut EfD3d11Layout) -> c_int;
+    pub fn ef_tensor_d3d11_shared_handle(t: *const EfTensor) -> *mut std::ffi::c_void;
+    pub fn ef_tensor_gpu_completion(
+        t: *const EfTensor,
+        fence: *mut *mut std::ffi::c_void,
+        value: *mut u64,
+    ) -> c_int;
+    pub fn ef_tensor_gpu_write_value(t: *const EfTensor) -> u64;
+    pub fn ef_tensor_set_gpu_write(t: *mut EfTensor, value: u64) -> c_int;
+    pub fn ef_tensor_from_d3d11_texture(
+        texture: *mut std::ffi::c_void,
+        dtype: u32,
+        dims: *const u64,
+        ndim: u32,
+        format: *const c_char,
+        access: u32,
+        name: *const c_char,
+    ) -> *mut EfTensor;
+    pub fn ef_tensor_from_d3d11_shared_handle(
+        handle: *mut std::ffi::c_void,
+        dtype: u32,
+        dims: *const u64,
+        ndim: u32,
+        format: *const c_char,
+        access: u32,
+        fence: *mut std::ffi::c_void,
+        fence_value: u64,
+        name: *const c_char,
+    ) -> *mut EfTensor;
+
     pub fn ef_tensor_name(t: *const EfTensor) -> *mut c_char;
 
     pub fn ef_start_tracing(path: *const c_char) -> c_int;
@@ -433,7 +469,32 @@ mod tests {
     /// **Now 90** after the leftover monolith ports: capability probes,
     /// CUDA map, AHardwareBuffer/IOSurface, tracing, logging, and
     /// `ef_tensor_name`.
-    const HEADER_DECLARATION_COUNT: usize = 90;
+    /// **Now 100** with the Windows D3D11 texture family and the
+    /// non-blocking map it needs: `ef_d3d11_device`,
+    /// `ef_d3d11_use_external_device`, `ef_tensor_d3d11_texture`,
+    /// `_d3d11_layout`, `_d3d11_shared_handle`, `ef_tensor_gpu_completion`,
+    /// `ef_tensor_set_gpu_write`, `ef_tensor_from_d3d11_texture`,
+    /// `_from_d3d11_shared_handle`, and `ef_tensor_try_map`. Declared on
+    /// every platform and refused at run time off Windows, the rule
+    /// `ef_tensor_from_iosurface_id` already follows, so this library's
+    /// symbol set does not vary by target. `ef_tensor_try_map` is not
+    /// Windows-only in the same sense: it is the general non-blocking map,
+    /// but the D3D11 texture's staging refresh is the only backing that can
+    /// answer `EAGAIN` today, so it lands with this family.
+    /// **Now 101** with `ef_tensor_cuda_map_mut` (task C3), the writable
+    /// counterpart of `ef_tensor_cuda_map`. It is a distinct entry point
+    /// rather than a flag on the existing one because the two differ in what
+    /// `ef_tensor_cuda_unmap` then does: a D3D11 texture's CUDA mapping is a
+    /// linear copy of an opaque array, so only the writable map's release
+    /// copies the device buffer back into the texture. Every other backing
+    /// aliases its device memory and the two are the same mapping.
+    /// **Now 102** with `ef_tensor_gpu_write_value`: the recorded fence
+    /// value alone. `ef_tensor_gpu_completion` duplicates the fence handle
+    /// on every call, and the two callers that only forward the value -- the
+    /// Python bindings after each convert, and the dynamic backend's
+    /// descriptor export -- paid a `DuplicateHandle` and a `CloseHandle`
+    /// for a number they already had a fence for.
+    const HEADER_DECLARATION_COUNT: usize = 102;
 
     #[test]
     fn declared_matches_the_header_derived_count() {

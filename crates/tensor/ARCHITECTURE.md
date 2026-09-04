@@ -526,9 +526,10 @@ which is exactly what `Compression: None` (the default) produces.
 
 ## Zero-copy CUDA Tensor Mapping
 
-The CUDA surface maps the float PBO produced by `ImageProcessor::convert()`
-directly to a CUDA device pointer, enabling zero-copy inference with TensorRT
-and other CUDA consumers. The cross-crate data-flow story lives in
+The CUDA surface maps the destination `ImageProcessor::convert()` writes —
+a float PBO, a DMA-BUF tensor, or a D3D11 texture on Windows — to a CUDA
+device pointer, enabling zero-copy inference with TensorRT and other CUDA
+consumers. The cross-crate data-flow story lives in
 [`ARCHITECTURE.md § Zero-copy CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping);
 this section covers the tensor-crate implementation detail.
 
@@ -543,14 +544,15 @@ link-time dependency and no compile-time feature gate.
 `is_cuda_available() -> bool` returns `true` only if the symbol table was
 populated successfully.
 
-### `CudaHandle` — two backing variants
+### `CudaHandle` — three backing variants
 
 | Variant | Source | Device pointer lifetime |
 |---------|--------|------------------------|
 | `GlBuffer` | `cudaGraphicsGLRegisterBuffer` on a PBO | Per-map: valid between `cudaGraphicsMapResources` and `cudaGraphicsUnmapResources` |
 | `ExternalMem` | `cudaImportExternalMemory(OpaqueFd)` on a DMA-BUF fd | Persistent: valid for the lifetime of the `CudaHandle` |
+| `D3d11` (Windows) | `cudaImportExternalMemory(D3D11Resource)` on a texture's shared NT handle | Per-map refresh into a linear buffer owned by the handle |
 
-Both variants expose the same `device_ptr() -> *mut c_void` / `len() -> usize`
+All three expose the same `device_ptr() -> *mut c_void` / `len() -> usize`
 interface to callers via `CudaMap`.
 
 ### `CudaMap` — RAII guard
@@ -590,6 +592,32 @@ The DMA-BUF fd is `dup`'d before being handed to CUDA; CUDA takes
 ownership of the dup'd fd on success (closing it when the
 `CudaExternalMemory` handle is destroyed). This path is independent of
 the GL thread.
+
+### D3D11 texture import (`D3d11` path, Windows)
+
+A `TensorMemory::DmaBuf` tensor on Windows is an `ID3D11Texture2D`, and CUDA
+reads it through `cudaImportExternalMemory` with
+`cudaExternalMemoryHandleTypeD3D11Resource` over the texture's shared NT
+handle, plus the process device's fence imported as an external semaphore.
+Like the DMA-BUF path this needs no GL thread. Unlike it, a texture is not
+linear: the imported memory is a mipmapped array, so each map waits on the
+recorded fence value and then copies level 0 into a linear device buffer the
+handle owns.
+
+That copy is what fixes the layout every consumer sees. The buffer is **tight
+rows** of `width * bytes_per_texel` and `CudaMap::len()` is their sum;
+`row_stride()` reports the D3D11 staging pitch a CPU map sees and does not
+apply to the device pointer. `cuda_map_mut()` returns the same buffer for
+writing and copies it back into the texture when the guard is released,
+synchronizing before the release returns — the D3D11 arm is the only backing
+where the two maps differ, because it is the only one whose buffer does not
+alias the tensor. `cudaSetDevice` is set again before every copy and before
+the release: it is per-thread state, and a consumer thread that last touched
+another GPU would otherwise allocate on it.
+
+The import is best-effort (`try_init_d3d11_cuda`): the WARP adapter has no
+CUDA device at all, and a texture whose import fails is still a valid tensor
+whose `cuda_map()` answers `None`.
 
 ### Drop order
 
@@ -699,7 +727,7 @@ in the project ARCHITECTURE.md for the full two-layer story.
 | macOS / iOS | Yes (IOSurface) | Yes | Yes | No — the GL path renders into IOSurfaces |
 | Android | Yes (AHardwareBuffer) | Yes | Yes | No — the GL path renders into AHardwareBuffers |
 | Other Unix | No | Yes | Yes | No |
-| Windows | No | No | Yes | No |
+| Windows | Yes (D3D11 texture) | No | Yes | Yes (with OpenGL feature) |
 
 ### Every `TensorMemory` variant exists on every platform
 
@@ -707,7 +735,7 @@ in the project ARCHITECTURE.md for the full two-layer story.
 
 What *is* platform-dependent is availability, and that is a runtime question — `/dev/dma_heap` can exist while this process lacks permission on it — so it lives in `TensorMemory::is_available()` rather than in a `cfg`. Requesting a backing this build cannot serve returns a "not supported by this build" error, never a panic.
 
-The enum is `#[non_exhaustive]`, like `DType`, `Compression` and `PixelFormat`: match it with a wildcard arm. The variant list is expected to keep growing — this change added two, and Windows backings and a real CUDA device backing are on the way — and the attribute is what keeps a consumer outside this repo compiling across those additions. It protects downstream, not the HAL: inside `edgefirst-tensor` the matches stay exhaustive and compile-enforced, so a new variant is still a build error here. Outside it (the C mapping, the Python mapping) the substitute is an `all()`-driven test that fails the day a variant is added without a decision made there.
+The enum is `#[non_exhaustive]`, like `DType`, `Compression` and `PixelFormat`: match it with a wildcard arm. The variant list is expected to keep growing — this change added two, and a real CUDA device backing is still on the way — and the attribute is what keeps a consumer outside this repo compiling across those additions. It protects downstream, not the HAL: inside `edgefirst-tensor` the matches stay exhaustive and compile-enforced, so a new variant is still a build error here. Outside it (the C mapping, the Python mapping) the substitute is an `all()`-driven test that fails the day a variant is added without a decision made there.
 
 `IoSurface` and `Cuda` are defined as codes but no backend produces or accepts them yet: macOS/iOS allocate and report `DmaBuf`, as before. The C ABI's `ef_storage_kind` matches the Rust discriminants (`EF_STORAGE_KIND_MEM=0`, `SHM=1`, `DMA_BUF=2`, `IO_SURFACE=3`, `PBO=4`, `CUDA=5`) — it is no longer a remapped outlier. A backend that starts reporting `IoSurface` is visible to compiled C callers as `EF_STORAGE_KIND_IO_SURFACE`.
 
@@ -723,8 +751,10 @@ storage type differs:
   from `/dev/dma_heap/*`.
 - **macOS**: `TensorStorage::Dma(IoSurfaceTensor<T>)` backed by an
   `IOSurfaceRef` from the IOSurface framework.
+- **Windows**: `TensorStorage::Dma(D3d11TextureTensor<T>)` backed by an
+  `ID3D11Texture2D` on the process device (see below).
 
-Match arms work identically on both platforms because the
+Match arms work identically on every platform because the
 `TensorTrait` impl is the same shape (`new`, `map`, `name`, `memory`,
 `buffer_identity`) regardless of which inner type is in play. The only
 methods that genuinely differ are the platform-specific *export*
@@ -777,6 +807,38 @@ floor). It mirrors the IOSurface story with Android-specific rules:
   NNAPI/LiteRT/QNN registration; the GL backend imports via
   `EGL_ANDROID_get_native_client_buffer` + EGLImage.
 
+### D3D11 texture (Windows)
+
+Windows' `TensorMemory::DmaBuf` is
+`TensorStorage::Dma(D3d11TextureTensor<T>)`, backed by an `ID3D11Texture2D`
+on one process-wide D3D11 device. The module is `src/d3d11/`:
+
+- `d3d11/adapter.rs` enumerates DXGI and resolves `EDGEFIRST_D3D11_ADAPTER`
+  (alias `EDGEFIRST_ANGLE_ADAPTER`; the D3D11 name wins when both are set and
+  differ, logged once). `d3d11/device.rs` creates the device and its shared
+  `ID3D11Fence`, and rendezvouses with any other copy of this crate in the
+  process so two independently linked packages share one device.
+  `d3d11::use_external_device` installs a host's device instead, before
+  anything creates the HAL's.
+- `d3d11_layout.rs` holds the pure `(format, dtype, width, height) ->
+  D3d11ImageLayout` table — the DXGI format, the texel grid and the GL
+  internal format the image crate imports it as. A format with no entry has
+  no texture layout and falls to PBO or `Mem` in the allocation chain.
+- `d3d11/texture.rs` allocates, validates externally created textures, and
+  owns the staging texture a CPU map goes through. Its pitch becomes the
+  tensor's `row_stride`. Semi-planar layouts are widened to that pitch at
+  allocation so the plane's row stride and the sampled texture's width are
+  one number.
+- `d3d11/geometry.rs` inverts a texture description back to `(width, height)`
+  for the descriptor and blob import paths.
+
+Export is the texture pointer (`d3d11_texture()`, borrowed) or a duplicated
+shared NT handle (`d3d11_shared_handle()`, owned by the caller);
+`gpu_completion()` reports the fence handle and the value a GPU consumer waits
+on, `gpu_write_value()` the value alone with no handle duplicated, and
+`set_gpu_write()` records a consumer's own completion. CUDA reads the same
+texture through the `D3d11` `CudaHandle` backing above.
+
 ### Cross-platform availability probes
 
 | Probe | Returns true when |
@@ -784,7 +846,7 @@ floor). It mirrors the IOSurface story with Android-specific rules:
 | `is_dma_available()` | Linux DMA-BUF heap is mountable. False on every other OS. |
 | `is_iosurface_available()` | macOS/iOS IOSurface framework is present. False on every other OS. |
 | `is_ahardwarebuffer_available()` | Android AHardwareBuffer allocation succeeds. False on every other OS. |
-| `is_gpu_buffer_available()` | Whichever of the three above applies to this target. The portable probe — prefer it when you only care whether `TensorMemory::DmaBuf` will succeed, not which mechanism backs it. |
+| `is_gpu_buffer_available()` | Whichever of the three above applies to this target, and on Windows whether the process D3D11 device can be created — which it does by creating it, since the only honest answer is to try. The portable probe — prefer it when you only care whether `TensorMemory::DmaBuf` will succeed, not which mechanism backs it. |
 | `is_shm_available()` | `shm_open` works. True on Linux and macOS, false on Windows. |
 | `TensorMemory::is_available()` | Dispatches to the probe for that variant, so a caller holding a `TensorMemory` value can ask directly instead of picking a probe by hand. `IoSurface`, `Pbo` and `Cuda` answer `false` for now — the first two have no code of their own yet (macOS reports `DmaBuf`; PBOs come from `ImageProcessor::create_image`, whose GL context this crate cannot see), and the third has no backing at all. |
 

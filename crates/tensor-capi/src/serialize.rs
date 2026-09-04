@@ -29,6 +29,13 @@ use crate::handle::EfTensor;
 /// that large. `blob_len` and `fds_len` are always written when non-`NULL`, so
 /// a caller learns the requirement even from a failed call.
 ///
+/// A `NULL` `fds_out` is a zero-capacity handle table, not an error: it is
+/// refused only when the export actually produced handles. An export that
+/// produces none — every inline export, and every export on a platform that
+/// shares by handle value inside the blob rather than out of band, which is
+/// all of them on Windows — therefore succeeds with `fds_out, fds_cap` of
+/// `NULL, 0` and reports `*fds_len == 0`.
+///
 /// The transport mode is chosen from the tensor's storage: a backing with a
 /// shareable handle is exported by reference, and one without — `mem`, `pbo` —
 /// is inlined, because there is nothing to refer to. A caller that needs bytes
@@ -37,8 +44,10 @@ use crate::handle::EfTensor;
 /// variant can be appended later without breaking this signature.
 ///
 /// @return 0 on success, `ENOSPC` when a buffer is too small (with the
-///         required lengths written), `EINVAL` on a null tensor or null
-///         out-parameter, `EIO` if the tensor cannot be serialized.
+///         required lengths written) -- a `NULL` `fds_out` on an export that
+///         produced handles is that case, not a pointer refusal -- `EINVAL`
+///         on a null tensor, a null `blob_len` or a null `fds_len`, `EIO` if
+///         the tensor cannot be serialized.
 ///
 /// # Safety
 /// `blob` must be writable for `blob_cap` bytes and `fds` for `fds_cap` ints.
@@ -76,11 +85,11 @@ pub unsafe extern "C" fn ef_tensor_export(
             *blob_len = bytes.len();
             *fds_len = fds.len();
 
-            if blob_out.is_null()
-                || fds_out.is_null()
-                || blob_cap < bytes.len()
-                || fds_cap < fds.len()
-            {
+            // A null handle table is zero capacity rather than a separate
+            // refusal, so an export with no handles is served by the one
+            // `fds_cap < fds.len()` check instead of failing on the pointer.
+            let fds_cap = if fds_out.is_null() { 0 } else { fds_cap };
+            if blob_out.is_null() || blob_cap < bytes.len() || fds_cap < fds.len() {
                 return libc::ENOSPC;
             }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), blob_out, bytes.len());
@@ -202,6 +211,44 @@ mod tests {
             let got = ef_tensor_import(buf.as_ptr(), bl, fds.as_ptr(), fl);
             assert!(!got.is_null(), "a blob this library just wrote must import");
             assert_eq!(crate::handle::ef_tensor_ndim(got), 2);
+            crate::handle::ef_tensor_free(got);
+            crate::handle::ef_tensor_free(t);
+        }
+    }
+
+    #[test]
+    fn an_export_with_no_handles_accepts_a_null_handle_table() {
+        // An inline export produces no handles, and neither does any export
+        // on Windows, where the shareable handle travels inside the blob.
+        // `NULL, 0` for the table is the ordinary call in that case and must
+        // not be refused for a table there was nothing to write into.
+        let t = mem_tensor();
+        let (mut bl, mut fl) = (0usize, 0usize);
+        unsafe {
+            ef_tensor_export(
+                t,
+                std::ptr::null_mut(),
+                0,
+                &mut bl,
+                std::ptr::null_mut(),
+                0,
+                &mut fl,
+            );
+            let mut buf = vec![0u8; bl];
+            let rc = ef_tensor_export(
+                t,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut bl,
+                std::ptr::null_mut(),
+                0,
+                &mut fl,
+            );
+            assert_eq!(rc, 0, "a handleless export must accept a null fds_out");
+            assert_eq!(fl, 0, "an inline export carries no handles");
+
+            let got = ef_tensor_import(buf.as_ptr(), bl, std::ptr::null(), 0);
+            assert!(!got.is_null(), "the blob that export wrote must import");
             crate::handle::ef_tensor_free(got);
             crate::handle::ef_tensor_free(t);
         }

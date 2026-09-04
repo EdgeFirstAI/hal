@@ -5,8 +5,10 @@
 
 Linux CI skips (no real GPU; software GL is opted out). Windows skips unless
 ``HAL_TEST_REQUIRE_GL=1`` opts in (ANGLE configured via
-``EDGEFIRST_ANGLE_PATH``), in which case it must run and pass like macOS.
-macOS must run and pass via ANGLE.
+``EDGEFIRST_ANGLE_PATH``), in which case it must run and pass like macOS; the
+destination is normally ``DMA_BUF`` (a D3D11 texture), falling back to PBO
+for dtypes the display cannot render into. macOS must run and pass via
+ANGLE.
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ def skip_unless_gpu_backed(dst) -> None:
     """Enforce the GPU test policy on a ``create_image()`` result.
 
     - Windows: skip unless ``HAL_TEST_REQUIRE_GL=1`` (ANGLE configured via
-      ``EDGEFIRST_ANGLE_PATH``); once opted in, require a GPU-backed (PBO)
-      tensor exactly as on macOS. A vacuous skip there is a product bug.
+      ``EDGEFIRST_ANGLE_PATH``); once opted in, require a GPU-backed tensor
+      exactly as on macOS -- normally ``DMA_BUF`` (a D3D11 texture), or PBO
+      for dtypes the display cannot render into. A vacuous skip there is a
+      product bug.
     - Linux: skip when the destination is host memory (GitHub-hosted
       runners have no real GPU; software GL is opted out).
     - macOS: require a GPU-backed tensor. A vacuous skip is a product bug.
@@ -37,8 +41,8 @@ def skip_unless_gpu_backed(dst) -> None:
             )
         assert not host, (
             f"create_image() yielded {dst.memory!r} on Windows with "
-            "HAL_TEST_REQUIRE_GL=1; GPU-backed (PBO) is required when ANGLE is "
-            "configured"
+            "HAL_TEST_REQUIRE_GL=1; GPU-backed (DMA_BUF texture or PBO) is "
+            "required when ANGLE is configured"
         )
         return
     if sys.platform.startswith("linux"):

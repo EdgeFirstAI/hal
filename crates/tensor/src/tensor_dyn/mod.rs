@@ -35,6 +35,10 @@ pub use dynamic_backend::{Raw, TensorDyn};
 // constructors already do.
 #[cfg(feature = "dynamic")]
 pub(crate) use dynamic_backend::ffi_last_error;
+// `crate::d3d11`'s backend-routed module functions rebuild their `Error` the
+// same way every other `ef_*` call in this backend does.
+#[cfg(all(feature = "dynamic", target_os = "windows"))]
+pub(crate) use dynamic_backend::ffi_error;
 
 // `dynamic`'s `Tensor<T>` -- the typed lens with no storage of its own.
 // `static`'s `Tensor<T>` lives directly in `lib.rs` (it predates this

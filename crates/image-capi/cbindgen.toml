@@ -42,6 +42,13 @@ header = """
  * A tensor from here is an ordinary `ef_tensor`. There is one tensor
  * header, `edgefirst/tensor.h`. Detection primitives used when drawing
  * masks live in header-only `edgefirst/detect.h`.
+ *
+ * Platform-specific entry points. Both are declared on every platform and
+ * refuse at run time off their platform, so linking never depends on the
+ * host. The tie is stated per function with a "Platforms:" line:
+ *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence
+ *     (sync-fence fd)
+ *   - Windows: ef_image_processor_convert_fence_handle (event handle)
  */
 
 #include <stdarg.h>
