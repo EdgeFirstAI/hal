@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-09-04
+
+### Fixed
+
+- **Release pipeline.** `release.yml`'s `v0.29.0` tag push failed after publishing partway through; this release re-runs the same pipeline with the underlying build gaps closed:
+  - The Python wheel build's `--sdist` flag was applied to every package, including `edgefirst-tensor`, `edgefirst-codec`, `edgefirst-image`, and `edgefirst-decoder` — maturin builds a `--sdist` wheel from the freshly generated sdist rather than the live tree, and their sdists cannot see `python-tensor`'s `build.rs` invocation of the workspace-excluded `crates/tensor-capi` (only reachable via a build-script subprocess, not a real Cargo dependency). Scoped `--sdist` to `edgefirst-tracker`, the one package that doesn't need it.
+  - The aarch64-linux modular C API build failed to link (`cannot find 'ld'`): `ubuntu-22.04-arm` runners don't ship `lld`, which is rustc's default linker on Linux. Installs it explicitly, matching the existing `test.yml` aarch64 lane.
+  - `.github/scripts/verify_version.py` read repo files with the platform's default encoding, which is `cp1252` on Windows runners; `CHANGELOG.md`'s em dashes raised `UnicodeDecodeError`. Reads are now explicitly UTF-8.
+  - `scripts/smoke-capi-archive.sh` compiled the cross-built `x86_64-macos` archive's smoke test for the host's default architecture; on Apple Silicon `macos-latest` runners that silently links an arm64 stub against an x86_64 `.dylib` and fails hard at the INSTALL.txt example. The script now picks `-arch` from the archive's target triple and skips execution (compile+link only) when cross-arch.
+- **`test-differential` (G13).** The nightly differential-testing gate always failed:
+  - `python-tracker` lacked the `tracing`/`static`/`dynamic` no-op stub features the Makefile's `--features` loop passes uniformly across `PYTHON_CRATES`, so the `venv-static` build hard-errored.
+  - `test_python_wheel_dt_needed_libedgefirst_tensor` assumed a dynamic tensor backend; it now branches on the backend actually installed in the venv under test.
+
 ## [0.29.0] - 2026-09-02
 
 ### Added
