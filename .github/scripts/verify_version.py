@@ -167,7 +167,6 @@ def check_pyproject_toml(version: str) -> list[str]:
     """
     errors = []
     packages = ["tensor", "codec", "image", "decoder", "tracker"]
-    major_minor = ".".join(version.split(".")[:2])
 
     for pkg in packages:
         pyproject = Path(f"crates/python-{pkg}/pyproject.toml")
@@ -186,10 +185,16 @@ def check_pyproject_toml(version: str) -> list[str]:
         pin = re.search(r'edgefirst-tensor\s*~=\s*([0-9][0-9.]*)', content)
         if pin:
             pinned = pin.group(1)
-            if not pinned.startswith(major_minor):
+            # Exact match, not just major.minor: a PR review caught a stale
+            # `~= 0.29.0` pin surviving two patch releases (0.29.1, 0.29.2)
+            # because this used to only check the major.minor prefix, which
+            # a `~=` pin always satisfies for any patch in the same series --
+            # that's the whole point of the operator, so it can never catch
+            # the release procedure's real requirement (the exact version).
+            if pinned != version:
                 errors.append(
                     f"{pyproject}: pins edgefirst-tensor ~= {pinned}, "
-                    f"but the workspace is at {version}"
+                    f"expected ~= {version}"
                 )
         elif pkg not in ("tensor", "tracker"):
             errors.append(f"{pyproject}: no edgefirst-tensor pin found")
