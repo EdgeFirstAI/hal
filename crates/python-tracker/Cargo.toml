@@ -18,6 +18,18 @@ crate-type = ["cdylib"]
 default = []
 abi3-py38 = ["pyo3/abi3-py38", "edgefirst-python-common/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311", "edgefirst-python-common/abi3-py311"]
+# No-op stubs, unlike the real forwards on edgefirst-tracker/-image/-decoder/
+# -codec and python-common: this crate's `tracker` feature on
+# edgefirst-python-common never enables edgefirst-tensor (tracker consumes
+# plain boxes, so `_tracker.so` carries no DT_NEEDED on libedgefirst_tensor),
+# so there is no static/dynamic backend or tensor tracing to forward to.
+# Declared anyway so the Makefile's `venv-static`/`venv-dynamic` (G13, the
+# differential gate) and `wheel`/`build-python` loops, which pass the same
+# `--features` uniformly across every crate in PYTHON_CRATES, don't hard-error
+# with "does not contain these features" on this one.
+tracing = []
+static = []
+dynamic = []
 
 [dependencies]
 edgefirst-python-common = { path = "../python-common", default-features = false, features = ["tracker"] }
