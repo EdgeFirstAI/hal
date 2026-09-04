@@ -566,6 +566,16 @@ jobs:
             return 1
           }
           # Leaves first so dependents can resolve the new version on crates.io.
+          # `cargo publish` (even --no-verify) resolves the FULL dependency
+          # graph while packaging -- every `edgefirst-*` entry in Cargo.toml,
+          # optional or not, must already be on crates.io at this exact
+          # version. edgefirst-image optionally depends on both
+          # edgefirst-decoder and edgefirst-tracker (crates/image/Cargo.toml),
+          # so it must publish after both, not before either -- v0.29.3's
+          # tag push had image third-from-last but decoder and tracker after
+          # it, and failed packaging image with "failed to select a version
+          # for the requirement `edgefirst-decoder = \"^0.29.3\"`" before
+          # either had been published.
           for crate in \
             edgefirst-decoder-abi \
             edgefirst-tensor-abi \
@@ -574,9 +584,9 @@ jobs:
             edgefirst-gl \
             edgefirst-tensor \
             edgefirst-codec \
-            edgefirst-image \
+            edgefirst-tracker \
             edgefirst-decoder \
-            edgefirst-tracker
+            edgefirst-image
           do
             publish_one "${crate}"
             sleep 15
