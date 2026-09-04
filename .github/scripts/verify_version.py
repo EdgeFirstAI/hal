@@ -66,7 +66,7 @@ STANDALONE_LEAF_CRATES = [
 
 
 def read_file(path: str) -> str:
-    return Path(path).read_text()
+    return Path(path).read_text(encoding="utf-8")
 
 
 def extract_workspace_version(cargo_toml: str) -> str | None:
@@ -175,7 +175,7 @@ def check_pyproject_toml(version: str) -> list[str]:
             errors.append(f"{pyproject}: file not found")
             continue
 
-        content = pyproject.read_text()
+        content = pyproject.read_text(encoding="utf-8")
 
         if 'dynamic = ["version"]' not in content:
             errors.append(
@@ -205,7 +205,7 @@ def check_changelog(version: str) -> list[str]:
         errors.append("CHANGELOG.md: file not found")
         return errors
 
-    content = changelog.read_text()
+    content = changelog.read_text(encoding="utf-8")
 
     # Look for ## [X.Y.Z] heading
     pattern = rf"## \[{re.escape(version)}\]"
@@ -234,7 +234,7 @@ def check_notice(version: str) -> list[str]:
         errors.append("NOTICE: file not found")
         return errors
 
-    content = notice.read_text()
+    content = notice.read_text(encoding="utf-8")
     lines = content.splitlines()
 
     # Check internal crate versions
@@ -306,7 +306,7 @@ def check_crate_cargo_tomls(version: str) -> list[str]:
         if not cargo_toml.exists():
             continue
 
-        content = cargo_toml.read_text()
+        content = cargo_toml.read_text(encoding="utf-8")
         crate_name = None
         for line in content.splitlines():
             m = re.match(r'^name\s*=\s*"([^"]+)"', line)
