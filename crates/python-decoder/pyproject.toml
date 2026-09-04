@@ -25,7 +25,7 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-dependencies = ["numpy", "edgefirst-tensor ~= 0.29.0"]
+dependencies = ["numpy", "edgefirst-tensor ~= 0.29.2"]
 
 [project.urls]
 Homepage = "https://edgefirst.ai"

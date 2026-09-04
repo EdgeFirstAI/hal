@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-09-04
+
+### Fixed
+
+- **Release pipeline.** The `v0.29.1` tag push failed release.yml again: PR #151/#154 fixed the missing-`lld` link failure on the `build-capi` job's `aarch64-linux` runner, but the `build-wheels` job's `aarch64-linux` entry runs on the same `ubuntu-22.04-arm` runner and hits the identical `collect2: fatal error: cannot find 'ld'` through `python-tensor`'s `build.rs`, which nested-builds the workspace-excluded `edgefirst-tensor-capi` crate. Installs `lld` there too. Nothing published under `v0.29.1` (the other `build-wheels` matrix entries were cancelled and every publish job was skipped), so no compatibility break results from this release.
+
 ## [0.29.1] - 2026-09-04
 
 ### Fixed

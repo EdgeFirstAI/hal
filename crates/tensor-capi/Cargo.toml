@@ -4,7 +4,7 @@
 [package]
 name = "edgefirst-tensor-capi"
 description = "C API for the EdgeFirst tensor: opaque handle, builder, and (blob, fds) serialization"
-version = "0.29.1"
+version = "0.29.2"
 edition = "2021"
 rust-version = "1.94.0"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]
@@ -29,7 +29,7 @@ tracing = ["edgefirst-tensor/tracing"]
 # Deliberately narrow: this library is usable on its own, so a consumer
 # wanting only tensor IPC never links image, codec or decoder.
 [dependencies]
-edgefirst-tensor = { version = "0.29.1", path = "../tensor" }
+edgefirst-tensor = { version = "0.29.2", path = "../tensor" }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
 errno = "0.3"
 libc = "0.2.186"
