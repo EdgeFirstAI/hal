@@ -4,7 +4,7 @@
 [package]
 name = "edgefirst-codec-capi"
 description = "C API for EdgeFirst image decode and encode"
-version = "0.29.2"
+version = "0.29.3"
 edition = "2021"
 rust-version = "1.94.0"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]
@@ -32,12 +32,12 @@ tracing = ["edgefirst-tensor/tracing"]
 # `default-features = false` drops codec's own `static` default so it does
 # not collide with `edgefirst-tensor/dynamic`. v4l2/nvjpeg/png are codec's
 # former defaults, spelled out explicitly.
-edgefirst-codec = { version = "0.29.2", path = "../codec", default-features = false, features = [
+edgefirst-codec = { version = "0.29.3", path = "../codec", default-features = false, features = [
     "v4l2",
     "nvjpeg",
     "png",
 ] }
-edgefirst-tensor = { version = "0.29.2", path = "../tensor", default-features = false, features = [
+edgefirst-tensor = { version = "0.29.3", path = "../tensor", default-features = false, features = [
     "dynamic",
 ] }
 edgefirst-tensor-abi = { path = "../tensor-abi" }

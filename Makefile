@@ -141,7 +141,7 @@ format-capi-modular:
 # ===========================================================================
 
 .PHONY: lint
-lint: lint-rust lint-tensor-dynamic lint-python lint-capi-modular
+lint: lint-rust lint-tensor-dynamic lint-python lint-python-abi3-py38 lint-capi-modular
 	@echo "✓ All linting complete"
 
 .PHONY: lint-rust
@@ -151,6 +151,26 @@ lint-rust:
 		$(foreach c,$(PYTHON_CRATE_NAMES),--exclude $(c)) \
 		-- -D warnings
 	@echo "✓ Clippy passed"
+
+# The `--exclude`s above and the coverage build in test.yml only ever compile
+# the Python bindings under `abi3-py311` (the ABI our own CI Python happens
+# to be); `abi3-py38` -- the OTHER of the two mutually exclusive ABI configs
+# every one of the five wheels ships -- was compiled by nothing short of
+# release.yml's actual `--features abi3-py38` maturin build, on a tag push,
+# after the version bump PR had already merged. That gap let a
+# `#[cfg(...)]` mismatch in crates/python-common/src/tensor.rs (a method
+# compiled out in the exact one ABI config that called it) reach three
+# release attempts (0.29.0-0.29.2) before anything caught it. `-p` per crate,
+# not `--workspace`, for the same reason lint-tensor-dynamic below is: only
+# the one package's own dependency edge should pull in `dynamic`, not every
+# workspace member's default `static` unified alongside it.
+.PHONY: lint-python-abi3-py38
+lint-python-abi3-py38:
+	@echo "Running clippy on the Python bindings under abi3-py38 (the ABI regular CI otherwise never compiles)..."
+	@for pkg in $(PYTHON_PACKAGES); do \
+		cargo clippy -p edgefirst-python-$$pkg --features abi3-py38 --all-targets -- -D warnings || exit 1; \
+	done
+	@echo "✓ abi3-py38 Python-bindings clippy passed"
 
 .PHONY: lint-python
 lint-python:

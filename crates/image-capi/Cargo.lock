@@ -391,11 +391,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.29.2"
+version = "0.29.3"
 
 [[package]]
 name = "edgefirst-egl"
-version = "0.29.2"
+version = "0.29.3"
 dependencies = [
  "libc",
  "libloading",
@@ -426,14 +426,14 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gl"
-version = "0.29.2"
+version = "0.29.3"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "edgefirst-image"
-version = "0.29.2"
+version = "0.29.3"
 dependencies = [
  "dma-heap",
  "drm-fourcc",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-image-capi"
-version = "0.29.2"
+version = "0.29.3"
 dependencies = [
  "cbindgen",
  "edgefirst-decoder-abi",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.29.2"
+version = "0.29.3"
 dependencies = [
  "dma-heap",
  "edgefirst-tensor-ffi",
@@ -497,11 +497,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.29.2"
+version = "0.29.3"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.29.2"
+version = "0.29.3"
 dependencies = [
  "edgefirst-tensor-abi",
 ]

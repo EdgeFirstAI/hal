@@ -267,6 +267,19 @@ jobs:
         # backend was linted by nobody.
         run: make lint-tensor-dynamic
 
+      - name: Run Clippy (Python bindings, abi3-py38)
+        # The --workspace clippy above --excludes every python-* crate
+        # entirely (see its own comment), and every maturin build anywhere
+        # in this repo's CI -- including this job's own coverage build a
+        # few steps down -- only ever passes --features abi3-py311. That
+        # left abi3-py38 (the OTHER of the two mutually exclusive ABI
+        # configs every one of the five wheels ships) compiled by nothing
+        # short of release.yml's actual tag-triggered publish build. A
+        # `#[cfg(...)]` mismatch that only broke that one ABI config
+        # reached three release attempts (0.29.0-0.29.2) before anything
+        # caught it, each after its version-bump PR had already merged.
+        run: make lint-python-abi3-py38
+
       - name: Package and smoke the C archive
         # A PR that breaks header packaging, a .pc file, or the SONAME chain
         # must fail here — not on a tag, after PyPI has already published.
