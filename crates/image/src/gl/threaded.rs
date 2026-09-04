@@ -448,7 +448,17 @@ fn run_gl_worker(
     // drivers; lifecycle = force-parallel).
     let serialize_per_msg = match std::env::var("EDGEFIRST_GL_SERIALIZE").as_deref() {
         Ok("full") => true,
-        Ok("lifecycle") => false,
+        Ok("lifecycle") => {
+            // The per-message lock is what makes ANGLE's per-display state
+            // manager safe here: `LAST_ACTIVE_CONTEXT` and the per-message
+            // context re-sync it drives are documented as touched only under
+            // it, and concurrent GL on this backend has crashed this box.
+            #[cfg(target_os = "windows")]
+            log::warn!(
+                "EDGEFIRST_GL_SERIALIZE=lifecycle drops the per-message lock the ANGLE/D3D11 context re-sync relies on; concurrent GL across processors is not supported on this backend"
+            );
+            false
+        }
         _ => caps.serialize_gl,
     };
     log::debug!(
@@ -524,6 +534,21 @@ fn run_gl_worker(
 /// Full policy, and on Windows also around processor bring-up/teardown.
 #[cfg(not(target_os = "linux"))]
 static NON_LINUX_GL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`NON_LINUX_GL_MUTEX`] on behalf of a caller outside the GL worker
+/// threads. Poison-tolerant, like every other user of it.
+///
+/// Windows leaf tests MUST hold this guard for their whole body: any test
+/// that brings up an ANGLE display or a GL context does so on the test's own
+/// thread, and the lib test binary runs other tests whose GL workers are
+/// alive at the same time. ANGLE's D3D11 backend drives one immediate device
+/// context per display from every GL context and is not safe to use from two
+/// threads at once — the access-violation pattern documented on
+/// [`run_gl_worker`], which takes the same lock around bring-up and teardown.
+#[cfg(target_os = "windows")]
+pub(super) fn lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
+    NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn handle_gl_message(
     msg: GLProcessorMessage,
@@ -1386,6 +1411,11 @@ impl GLProcessorThreaded {
 
 impl Drop for GLProcessorThreaded {
     fn drop(&mut self) {
+        // Closing the channel ends the worker loop, which drops the
+        // `GLProcessorST` it owns; that `Drop` pays any device submission an
+        // open batch still owes. The join is what makes it ordered before this
+        // returns -- and it has to happen on the worker, which is the thread
+        // holding the context.
         drop(self.sender.take());
         let _ = self.handle.take().and_then(|h| h.join().ok());
     }

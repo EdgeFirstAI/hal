@@ -288,10 +288,18 @@ class ImageProcessor:
             image into ``dst`` before calling this function, you must now pass
             that image via ``background=`` instead.
 
+        On Windows the destination's ``gpu_completion()`` reflects this draw
+        afterwards, as it does after ``convert``.
+
+        A ``BGRA`` ``background=`` onto a GPU-backed destination raises: the
+        OpenGL base-layer draw has no ``BGRA`` arm and the CPU backend renders
+        only ``RGBA``/``RGB``. It previously returned without writing ``dst``.
+
         Args:
             dst: Output image tensor (always fully written by this call). Must
                 be ``RGBA`` or ``RGB`` for the CPU backend, or
-                ``RGBA``/``BGRA``/``RGB`` for OpenGL.
+                ``RGBA``/``BGRA``/``RGB`` for OpenGL -- ``BGRA`` without a
+                ``background=``, per the note above.
             bbox: ``(N, 4)`` float32 array of normalized bounding boxes in
                 ``[x1, y1, x2, y2]`` format with values in ``[0, 1]``.
             scores: ``(N,)`` float32 array of confidence scores.
@@ -397,6 +405,10 @@ class ImageProcessor:
         """Draw prototype masks onto ``dst`` without materialising per-instance
         mask arrays in Python. ``proto_data`` may come from another
         ``edgefirst.*`` package via the ``__edgefirst_protodata__`` capsule.
+
+        On Windows the destination's ``gpu_completion()`` reflects this draw
+        afterwards, as it does after ``convert``. The same ``BGRA``
+        ``background=`` restriction as :meth:`draw_decoded_masks` applies.
         """
 
     def create_image(
@@ -445,6 +457,97 @@ class ImageProcessor:
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.
+        """
+
+    def convert(
+        self,
+        src: EdgeFirstTensorExportable,
+        dst: EdgeFirstTensorExportable,
+        rotation: Rotation = Rotation.Rotate0,
+        flip: Flip = Flip.NoFlip,
+        source: Region | None = None,
+        letterbox: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        """Convert ``src`` into ``dst``, scaling, converting colour, rotating
+        and flipping as needed, and wait for the GPU before returning.
+
+        Args:
+            src: Source image, from this or any other ``edgefirst.*``
+                package (see ``crates/python-common/INTEROP.md``).
+            dst: Destination image, written in place.
+            rotation: Applied to the converted image.
+            flip: Applied to the converted image.
+            source: Sub-region of ``src`` to read, in source pixels.
+                ``None`` reads the whole image.
+            letterbox: ``(r, g, b, a)`` pad colour. Given, the source is
+                fitted into the destination preserving aspect ratio and the
+                remainder is padded; ``None`` stretches.
+
+        On Windows the destination's ``gpu_completion()`` reflects this
+        convert afterwards.
+        """
+
+    def convert_deferred(
+        self,
+        src: EdgeFirstTensorExportable,
+        dst: EdgeFirstTensorExportable,
+        rotation: Rotation = Rotation.Rotate0,
+        flip: Flip = Flip.NoFlip,
+        source: Region | None = None,
+        letterbox: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        """Convert without waiting for the GPU — the batch-preprocessing
+        primitive.
+
+        Same arguments as :meth:`convert`, but the OpenGL backend skips the
+        per-call ``glFinish()``. Render N model inputs by looping this over
+        ``dst.batch(n)`` / ``dst.view(region)`` row-bands of one batched
+        destination, then call :meth:`flush` once: the backend imports the
+        destination a single time and renders each tile as a viewport band,
+        syncing once at flush. A deferred destination is not safe to read
+        (or ``cuda_map``) until :meth:`flush` returns. Non-GL backends
+        complete synchronously and :meth:`flush` is a no-op.
+
+        On Windows the destination's ``gpu_completion()`` reflects this
+        convert afterwards — the value covers the queued render, so a device
+        consumer waits on that fence rather than on :meth:`flush`.
+        """
+
+    def flush(self) -> None:
+        """Complete all deferred converts since the last flush with a single
+        GPU sync.
+
+        After this returns, every destination written by
+        :meth:`convert_deferred` is finished and safe to read back or
+        ``cuda_map``. Non-GL backends return immediately.
+        """
+
+    def convert_with_fence(
+        self,
+        src: EdgeFirstTensorExportable,
+        dst: EdgeFirstTensorExportable,
+        rotation: Rotation = Rotation.Rotate0,
+        flip: Flip = Flip.NoFlip,
+        source: Region | None = None,
+        letterbox: tuple[int, int, int, int] | None = None,
+    ) -> int | None:
+        """Convert without blocking on the GPU; returns a completion handle.
+
+        Same ``src``/``dst``/``rotation``/``flip``/``source``/``letterbox``
+        arguments as an ordinary convert; this call differs only in what it
+        returns. The handle is the GL to NPU handoff primitive: hand it to a
+        consumer, or wait on it, instead of paying a blocking GPU sync.
+
+        Returns:
+            A sync-file descriptor on Linux and Android, an event handle
+            (as an integer) on Windows, or ``None`` when the convert
+            completed synchronously (no native fence on this display). The
+            caller owns the handle -- close it (``os.close`` for the fd,
+            ``ctypes.windll.kernel32.CloseHandle`` for the Windows handle).
+
+        On Windows the destination's ``gpu_completion()`` reflects this
+        convert afterwards, so a device consumer can be handed the fence
+        value instead of this event.
         """
 
     def alloc_tile_batch(
@@ -587,6 +690,20 @@ class ImageProcessor:
                     the format layout is unsupported, NV12 height is odd, the
                     fd dup syscall fails, or stride is smaller than the minimum.
             """
+
+    def set_class_colors(self, colors: list[tuple[int, int, int, int]]) -> None:
+        """Set the colours used to render segmentation masks by class label.
+
+        The palette holds 20 entries and a class index wraps around it. Only
+        the leading entries this call supplies are replaced; the rest keep
+        the defaults, and anything past the twentieth is ignored.
+
+        Args:
+            colors: ``(r, g, b, a)`` tuples, indexed by class label.
+
+        Raises:
+            RuntimeError: If the backend rejects the palette.
+        """
 
     def set_int8_interpolation(self, mode: str) -> None:
         """Sets the interpolation mode for int8 proto textures.

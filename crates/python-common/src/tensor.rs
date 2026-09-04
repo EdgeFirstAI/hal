@@ -892,20 +892,40 @@ impl TensorMapT {
     }
 }
 
+/// Which of the two mapping calls [`map_tensor_dyn`] dispatches to.
+#[derive(Clone, Copy)]
+enum MapWait {
+    /// `map_with`: wait for a GPU copy the map depends on to finish.
+    Block,
+    /// `try_map_with`: `WouldBlock` instead of that wait.
+    Fail,
+}
+
 /// Map a `TensorDyn` to a `TensorMapT`.
-fn map_tensor_dyn(t: &TensorDyn, access: tensor::CpuAccess) -> tensor::Result<TensorMapT> {
+fn map_tensor_dyn(
+    t: &TensorDyn,
+    access: tensor::CpuAccess,
+    wait: MapWait,
+) -> tensor::Result<TensorMapT> {
     // `map_with`, not `map()`: `map()` is `map_with(ReadWrite)`, and on a
     // non-coherent backing a ReadWrite bracket pays a full-buffer cache
     // writeback on unmap even when the caller only read. Routing the
     // direction through means a reader skips it (and on macOS takes the
     // read-only IOSurface lock, which skips the unlock flush).
+    //
+    // `wait` picks that same call's non-blocking form for `Tensor.try_map`.
+    // The two differ only on the Windows D3D11 texture, where
+    // `try_map_with` reports `WouldBlock` while the staging copy the map
+    // depends on is still in flight.
     macro_rules! lens {
-        ($ty:ty, $variant:ident) => {
-            t.as_typed::<$ty>()
-                .expect("dtype checked")
-                .map_with(access)
-                .map(TensorMapT::$variant)
-        };
+        ($ty:ty, $variant:ident) => {{
+            let typed = t.as_typed::<$ty>().expect("dtype checked");
+            match wait {
+                MapWait::Block => typed.map_with(access),
+                MapWait::Fail => typed.try_map_with(access),
+            }
+            .map(TensorMapT::$variant)
+        }};
     }
     match t.dtype() {
         tensor::DType::U8 => lens!(u8, TensorU8),
@@ -923,6 +943,59 @@ fn map_tensor_dyn(t: &TensorDyn, access: tensor::CpuAccess) -> tensor::Result<Te
             "unsupported dtype for tensor mapping".to_string(),
         )),
     }
+}
+
+/// Translate a failed `MapWait::Fail` mapping into the exception Python
+/// expects from a non-blocking call.
+///
+/// A `WouldBlock` is `BlockingIOError` -- the standard exception for "this
+/// would have blocked, ask again" -- rather than the blanket `RuntimeError`
+/// every other tensor error keeps, so `try_map` can be retried in a loop
+/// without matching on a message.
+fn would_block_err(err: tensor::Error) -> PyErr {
+    match &err {
+        tensor::Error::IoError(io) if io.kind() == std::io::ErrorKind::WouldBlock => {
+            pyo3::exceptions::PyBlockingIOError::new_err(format!("try_map: {io}"))
+        }
+        _ => Error::from(err).into(),
+    }
+}
+
+/// Check a texture-import `shape` against the geometry read off the texture.
+///
+/// The dimensions come from the texture's own description, never from the
+/// shape: a semi-planar allocation shape and an addressing shape are both
+/// rank 2 and nothing in the numbers tells them apart, so a shape-derived
+/// reading would silently pick one. Here the texture decides and the shape is
+/// only checked against it.
+///
+/// Either shape it gives those dimensions is accepted -- the allocation shape
+/// every allocating caller uses, and the addressing shape a descriptor or a
+/// blob reports. Both are honest answers to "what shape is this", and
+/// refusing one would make the constructor unusable from whichever surface
+/// reports the other. This is the same rule `ef_tensor_from_d3d11_texture`
+/// applies, so the two bindings accept the same arguments.
+#[cfg(target_os = "windows")]
+fn check_d3d11_shape(
+    geometry: tensor::Result<(usize, usize)>,
+    format: PixelFormat,
+    shape: &[usize],
+    what: &str,
+) -> PyResult<(usize, usize)> {
+    let (width, height) = geometry.map_err(Error::from)?;
+    let allocation = format.allocation_shape(width, height);
+    let addressing = format.addressing_shape(width, height);
+    if [&allocation, &addressing]
+        .into_iter()
+        .flatten()
+        .any(|s| s.as_slice() == shape)
+    {
+        return Ok((width, height));
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(format!(
+        "{what}: shape {shape:?} describes neither the allocation shape {allocation:?} nor \
+         the addressing shape {addressing:?} of this {width}x{height} {format:?} texture"
+    )))
 }
 
 // ─── numpy → tensor copy ────────────────────────────────────────────────────
@@ -1374,6 +1447,9 @@ impl PyTensor {
 
     /// Import an existing buffer as a tensor, without copying.
     ///
+    /// Platforms:
+    ///     Linux, macOS.
+    ///
     /// The buffer type is detected, not chosen. On Linux a `dma_buf` fd
     /// imports as `TensorMemory.DMABUF` and a tmpfs fd (`/dev/shm` or `memfd`)
     /// as `TensorMemory.SHM`, decided by filesystem magic; any other
@@ -1404,7 +1480,10 @@ impl PyTensor {
         Ok(PyTensor(tensor))
     }
 
-    /// Wrap an externally-allocated IOSurface as a Tensor (macOS only).
+    /// Wrap an externally-allocated IOSurface as a Tensor.
+    ///
+    /// Platforms:
+    ///     macOS.
     ///
     /// `surface_ref` is an `IOSurfaceRef` cast to `int` — typically
     /// obtained via `ctypes` from a CoreVideo / AVFoundation /
@@ -1476,6 +1555,12 @@ impl PyTensor {
         self.0.shape().to_vec()
     }
 
+    /// A duplicate of the file descriptor backing the tensor's memory.
+    ///
+    /// Platforms:
+    ///     Linux, macOS.
+    ///
+    /// The caller owns the returned descriptor and must close it.
     #[cfg(unix)]
     #[getter]
     fn fd(&self) -> Result<RawFd> {
@@ -1558,6 +1643,9 @@ impl PyTensor {
 
     /// Clone the DMA-BUF file descriptor backing this tensor.
     ///
+    /// Platforms:
+    ///     Linux.
+    ///
     /// Returns a new file descriptor that the caller must close.
     ///
     /// Raises RuntimeError if the tensor is not DMA-backed or if the
@@ -1568,7 +1656,10 @@ impl PyTensor {
         Ok(owned.into_raw_fd())
     }
 
-    /// IOSurfaceID for cross-process surface sharing (macOS only).
+    /// IOSurfaceID for cross-process surface sharing.
+    ///
+    /// Platforms:
+    ///     macOS.
     ///
     /// Returns None when the tensor is not IOSurface-backed. The ID is
     /// a 32-bit handle stable for the lifetime of the IOSurface; it
@@ -1580,7 +1671,10 @@ impl PyTensor {
         self.0.iosurface_id()
     }
 
-    /// Borrowed `IOSurfaceRef` as an integer (macOS only).
+    /// Borrowed `IOSurfaceRef` as an integer.
+    ///
+    /// Platforms:
+    ///     macOS.
     ///
     /// Use this to hand the surface off to native macOS APIs that take
     /// an IOSurfaceRef directly (CIImage, AVSampleBufferDisplayLayer,
@@ -1593,6 +1687,216 @@ impl PyTensor {
     #[getter]
     fn iosurface_ref(&self) -> Option<usize> {
         self.0.iosurface_ref().map(|p| p as usize)
+    }
+
+    /// Borrowed ``ID3D11Texture2D*`` as an integer.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// Wrap with ``ctypes.c_void_p`` for native callers; the pointer lives
+    /// as long as this tensor. ``None`` when the tensor is not a texture.
+    #[cfg(target_os = "windows")]
+    fn d3d11_texture(&self) -> Option<usize> {
+        self.0.d3d11_texture().map(|p| p as usize)
+    }
+
+    /// The texture's DXGI format and geometry.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// ``None`` when the tensor is not a texture.
+    #[cfg(target_os = "windows")]
+    fn d3d11_layout(&self) -> Option<PyD3d11Layout> {
+        self.0.d3d11_layout().map(PyD3d11Layout::from)
+    }
+
+    /// Duplicate the NT handle of the D3D11 texture backing this tensor.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// Returns:
+    ///     An NT handle the caller owns and must close with ``CloseHandle``.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the tensor is not a D3D11 texture, or the handle
+    ///         could not be duplicated.
+    #[cfg(target_os = "windows")]
+    fn d3d11_shared_handle(&self) -> Result<usize> {
+        use std::os::windows::io::IntoRawHandle;
+        Ok(self.0.d3d11_shared_handle()?.into_raw_handle() as usize)
+    }
+
+    /// Fence handle and value a GPU consumer waits on before reading.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// Returns:
+    ///     ``(fence_handle, value)``, the handle owned by the caller and
+    ///     closed with ``CloseHandle``; ``None`` when no GPU write has been
+    ///     recorded.
+    #[cfg(target_os = "windows")]
+    fn gpu_completion(&self) -> Result<Option<(usize, u64)>> {
+        use std::os::windows::io::IntoRawHandle;
+        Ok(self
+            .0
+            .gpu_completion()?
+            .map(|c| (c.fence.into_raw_handle() as usize, c.value)))
+    }
+
+    /// The fence value of the newest recorded GPU write, or 0.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// The same number :meth:`gpu_completion` returns as ``value``, with no
+    /// fence handle to close: for a consumer that already holds the process
+    /// fence and needs only the value to wait for. 0 when no write has been
+    /// recorded, or when the tensor is not a texture.
+    #[cfg(target_os = "windows")]
+    #[getter]
+    fn gpu_write_value(&self) -> u64 {
+        self.0.gpu_write_value()
+    }
+
+    /// Record that GPU work writing this texture completes at ``value``.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// The recorded value is a maximum, so a producer may record on a tensor
+    /// its consumers already hold.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the tensor is not a D3D11 texture.
+    #[cfg(target_os = "windows")]
+    fn set_gpu_write(&self, value: u64) -> Result<()> {
+        Ok(self.0.set_gpu_write(value)?)
+    }
+
+    /// Wrap a texture created on the HAL device.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// The width and height are read from the texture's own description, so
+    /// ``shape`` describes it rather than defining it: it must be either the
+    /// allocation shape or the addressing shape ``format`` gives those
+    /// dimensions.
+    ///
+    /// A semi-planar texture (``Nv12``, ``Nv16``, ``Nv24``) carries the
+    /// image's row stride as its width, so it is accepted only when that
+    /// width is even and equal to the staging row pitch the driver gives a
+    /// texture of that width. Allocate through the HAL, or match the pitch.
+    ///
+    /// Raises:
+    ///     ValueError: If ``shape`` is neither shape of this texture; the
+    ///         message names both.
+    ///     RuntimeError: If ``texture`` is not a live texture on the HAL
+    ///         device holding a ``format`` image.
+    #[cfg(target_os = "windows")]
+    #[staticmethod]
+    #[pyo3(signature = (texture, shape, dtype, format, access = "none", name = None))]
+    fn from_d3d11_texture(
+        texture: usize,
+        shape: Vec<usize>,
+        dtype: &str,
+        format: PyPixelFormat,
+        access: &str,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
+        let fmt: PixelFormat = format.into();
+        let texture = texture as *mut c_void;
+        // SAFETY: the caller contracts a live `ID3D11Texture2D*`; the helper
+        // takes and drops its own reference and keeps no pointer.
+        // ``shape`` goes in as well as out: a semi-planar texture is as wide
+        // as its row pitch, so the image width comes from the shape.
+        let geometry =
+            unsafe { edgefirst_tensor::d3d11_texture_geometry(texture, fmt, Some(&shape)) };
+        let (width, height) = check_d3d11_shape(geometry, fmt, &shape, "from_d3d11_texture")?;
+        // SAFETY: as above -- the geometry read just proved the pointer is a
+        // live texture holding this image; the constructor takes its own
+        // reference.
+        let tensor = unsafe {
+            TensorDyn::from_d3d11_texture(
+                texture,
+                width,
+                height,
+                fmt,
+                parse_dtype(dtype)?,
+                parse_cpu_access(access)?,
+                name,
+            )
+        }
+        .map_err(Error::from)?;
+        Ok(PyTensor(tensor))
+    }
+
+    /// Open a shared texture on the HAL device, waiting on ``completion``
+    /// first.
+    ///
+    /// Platforms:
+    ///     Windows.
+    ///
+    /// ``handle`` and ``completion``'s fence handle stay the caller's: this
+    /// duplicates what it keeps. The width and height are read from the
+    /// opened texture's own description, so ``shape`` describes it rather
+    /// than defining it: it must be either the allocation shape or the
+    /// addressing shape ``format`` gives those dimensions. The semi-planar
+    /// width rule of :meth:`from_d3d11_texture` applies here too.
+    ///
+    /// Args:
+    ///     completion: ``(fence_handle, value)`` from
+    ///         :meth:`gpu_completion` on the producing side, waited on
+    ///         before the texture is read.
+    ///
+    /// Raises:
+    ///     ValueError: If ``shape`` is neither shape of this texture; the
+    ///         message names both.
+    ///     RuntimeError: If ``handle`` does not open a texture holding a
+    ///         ``format`` image, or the fence wait fails.
+    #[cfg(target_os = "windows")]
+    #[staticmethod]
+    #[pyo3(signature = (handle, shape, dtype, format, access = "none", completion = None, name = None))]
+    fn from_d3d11_shared_handle(
+        handle: usize,
+        shape: Vec<usize>,
+        dtype: &str,
+        format: PyPixelFormat,
+        access: &str,
+        completion: Option<(usize, u64)>,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
+        let fmt: PixelFormat = format.into();
+        let handle = handle as *mut c_void;
+        // SAFETY: the caller contracts an NT shared handle of a D3D11 texture
+        // valid in this process; the helper opens a texture from it and drops
+        // that texture before returning.
+        // As above: the shape carries the semi-planar image width.
+        let geometry =
+            unsafe { edgefirst_tensor::d3d11_shared_handle_geometry(handle, fmt, Some(&shape)) };
+        let (width, height) = check_d3d11_shape(geometry, fmt, &shape, "from_d3d11_shared_handle")?;
+        let completion = completion.map(|(fence, value)| (fence as *mut c_void, value));
+        // SAFETY: as above for `handle`; the caller contracts that
+        // `completion`'s handle is a shared fence handle. The constructor
+        // duplicates what it keeps.
+        let tensor = unsafe {
+            TensorDyn::from_d3d11_shared_handle(
+                handle,
+                width,
+                height,
+                fmt,
+                parse_dtype(dtype)?,
+                parse_cpu_access(access)?,
+                completion,
+                name,
+            )
+        }
+        .map_err(Error::from)?;
+        Ok(PyTensor(tensor))
     }
 
     /// Producer half of the cross-package tensor protocol.
@@ -1751,10 +2055,45 @@ impl PyTensor {
         // DMA tensor's plane-0 stride is the whole allocation, and treating
         // that as strides[0] makes numpy `.fill` walk off the mapping.
         let row_stride = self.0.format().and(self.0.effective_row_stride());
-        let mapped = map_tensor_dyn(&self.0, access)?;
+        let mapped = map_tensor_dyn(&self.0, access, MapWait::Block)?;
         Ok(PyTensorMap {
             // Derived from the mapping, not from `access`: see
             // `TensorMapT::is_writable`.
+            readonly: !mapped.is_writable(),
+            mapped: Some(mapped),
+            row_stride,
+        })
+    }
+
+    /// Non-blocking :meth:`map`.
+    ///
+    /// Raises ``BlockingIOError`` while a GPU copy the map depends on is in
+    /// flight; identical to :meth:`map` on backings without such a copy.
+    ///
+    /// A caller that retries after ``BlockingIOError`` must yield or sleep
+    /// between attempts: on the WARP software adapter the CPU threads are
+    /// the GPU, so a tight retry loop starves the copy it is waiting for.
+    ///
+    /// Args:
+    ///     access: as :meth:`map`.
+    ///
+    /// Raises:
+    ///     BlockingIOError: While a GPU copy the map depends on is in
+    ///         flight.
+    #[pyo3(signature = (access = None))]
+    fn try_map(&self, access: Option<&str>) -> PyResult<PyTensorMap> {
+        let access = parse_cpu_access(access.unwrap_or("readwrite"))?;
+        if access == tensor::CpuAccess::None {
+            return Err(Error::Format(
+                "try_map: access=\"none\" is not a mapping; a mapped view is CPU \
+                 access by definition. Use \"read\", \"write\" or \"readwrite\""
+                    .to_owned(),
+            )
+            .into());
+        }
+        let row_stride = self.0.format().and(self.0.effective_row_stride());
+        let mapped = map_tensor_dyn(&self.0, access, MapWait::Fail).map_err(would_block_err)?;
+        Ok(PyTensorMap {
             readonly: !mapped.is_writable(),
             mapped: Some(mapped),
             row_stride,
@@ -1778,6 +2117,16 @@ impl PyTensor {
     ///     else:
     ///         with tensor.map() as host:
     ///             run_cpu_path(host)                    # fallback
+    ///
+    /// On Windows the mapping of a D3D11 texture tensor is tight rows of
+    /// ``width * bytes_per_texel``, and ``size`` is their sum, whatever
+    /// :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
+    /// map sees, a larger number on a padded backing. A consumer must not
+    /// stride the device pointer by :attr:`row_stride`.
+    ///
+    /// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
+    /// so there the mapping is :attr:`row_stride` times the combined height
+    /// and striding by it is correct.
     fn cuda_map(slf: Bound<'_, Self>) -> Option<PyCudaMap> {
         let owner: Py<PyTensor> = slf.clone().unbind();
         // SAFETY: The CudaMap borrows into the tensor's storage. We extend
@@ -1787,6 +2136,38 @@ impl PyTensor {
         // must not reshape the tensor while a CudaMap is live.
         let borrowed = slf.borrow();
         let map = borrowed.0.cuda_map()?;
+        let map_static: edgefirst_tensor::CudaMap<'static> = unsafe { std::mem::transmute(map) };
+        Some(PyCudaMap {
+            map: Some(map_static),
+            _owner: owner,
+        })
+    }
+
+    /// Writable counterpart of :meth:`cuda_map`.
+    ///
+    /// Changes are written back to the tensor when the mapping is released.
+    /// The same object as :meth:`cuda_map` where the mapping aliases the
+    /// tensor's memory, and ``None`` on the same terms. A Windows D3D11
+    /// texture is the backing that does not alias: its release copies the
+    /// device buffer back into the texture.
+    ///
+    /// On Windows the mapping of a D3D11 texture tensor is tight rows of
+    /// ``width * bytes_per_texel``, and ``size`` is their sum, whatever
+    /// :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
+    /// map sees, a larger number on a padded backing. A consumer must not
+    /// stride the device pointer by :attr:`row_stride`; writing at that
+    /// pitch scrambles the image rather than failing.
+    ///
+    /// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
+    /// so there the mapping is :attr:`row_stride` times the combined height
+    /// and striding by it is correct.
+    fn cuda_map_mut(slf: Bound<'_, Self>) -> Option<PyCudaMap> {
+        let owner: Py<PyTensor> = slf.clone().unbind();
+        // SAFETY: as `cuda_map` -- the borrow into the tensor's storage is
+        // extended to 'static and the PyTensor is kept alive by `_owner`,
+        // which `PyCudaMap`'s field order drops after the mapping.
+        let borrowed = slf.borrow();
+        let map = borrowed.0.cuda_map_mut()?;
         let map_static: edgefirst_tensor::CudaMap<'static> = unsafe { std::mem::transmute(map) };
         Some(PyCudaMap {
             map: Some(map_static),
@@ -2208,6 +2589,66 @@ impl PyQuantization {
     #[getter]
     fn is_symmetric(&self) -> bool {
         self.0.is_symmetric()
+    }
+}
+
+/// DXGI format and texture geometry behind a texture tensor.
+///
+/// Platforms:
+///     Windows.
+///
+/// The dimensions are the texture's, not the image's: a packed row folds
+/// several pixels or several planes into one texel.
+#[cfg(target_os = "windows")]
+#[pyclass(
+    name = "D3d11Layout",
+    frozen,
+    get_all,
+    skip_from_py_object,
+    module = "edgefirst.tensor"
+)]
+#[derive(Debug, Clone, Copy)]
+pub struct PyD3d11Layout {
+    /// The texture's `DXGI_FORMAT` as an integer.
+    pub dxgi_format: u32,
+    /// Texture width in texels.
+    pub texture_width: u32,
+    /// Texture height in rows.
+    pub texture_height: u32,
+    /// Bytes in one texel.
+    pub bytes_per_texel: u32,
+    /// The GL internal format ANGLE accepts for this texture.
+    pub gl_internal_format: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl From<edgefirst_tensor::d3d11_layout::D3d11ImageLayout> for PyD3d11Layout {
+    fn from(layout: edgefirst_tensor::d3d11_layout::D3d11ImageLayout) -> Self {
+        PyD3d11Layout {
+            dxgi_format: layout.dxgi_format,
+            // Texture dimensions are bounded by D3D11's 16384-texel limit,
+            // so the narrowing is exact.
+            texture_width: layout.texture_width as u32,
+            texture_height: layout.texture_height as u32,
+            bytes_per_texel: layout.bytes_per_texel as u32,
+            gl_internal_format: layout.gl_internal_format,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[pymethods]
+impl PyD3d11Layout {
+    fn __repr__(&self) -> String {
+        format!(
+            "D3d11Layout(dxgi_format={}, texture_width={}, texture_height={}, \
+             bytes_per_texel={}, gl_internal_format={})",
+            self.dxgi_format,
+            self.texture_width,
+            self.texture_height,
+            self.bytes_per_texel,
+            self.gl_internal_format
+        )
     }
 }
 

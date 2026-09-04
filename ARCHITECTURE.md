@@ -57,15 +57,17 @@ the underlying storage and the GL transfer backend differ.
 |------------|--------------------------------------|------------------------|------------------------|--------------------|-------------------|
 | `TensorMemory::Mem` | Heap | Heap | Heap | Heap | Heap |
 | `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | Import-only — bionic has no `shm_open`, so allocation reports `NotImplemented`; `from_fd` works | — |
-| `TensorMemory::DmaBuf` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) | — (D3D11 shared textures are a planned follow-on) |
-| `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) | GLES PBO (the GPU destination kind) |
-| GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) | `Pbo` via ANGLE |
+| `TensorMemory::DmaBuf` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) | D3D11 texture (`ID3D11Texture2D`, shared NT handle) |
+| `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) | GLES PBO (still allocatable; textures are the default GPU destination) |
+| GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) | `D3d11Texture` via ANGLE |
 | GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal | Native EGL → driver (Adreno/Mali/PowerVR/Xclipse) | ANGLE EGL → Direct3D 11 |
 | Hardware 2D blitter | G2D on NXP i.MX | — | — | — | — |
-| Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` | `EGL_ANDROID_image_native_buffer` | — (`EGL_ANGLE_d3d_texture_client_buffer` reserved for the follow-on) |
-| Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) | `AHardwareBuffer` (Binder / `sendHandleToUnixSocket`) | — |
-| Probe function | `is_dma_available()` | Same | `is_iosurface_available()` | `is_ahardwarebuffer_available()` | — (`false`; ask `ImageProcessor` whether GL is live) |
-| Portable probe | `is_gpu_buffer_available()` — works on all four zero-copy tiers; `false` on Windows | | | | |
+| Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` | `EGL_ANDROID_image_native_buffer` | `EGL_ANGLE_image_d3d11_texture` |
+| Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) | `AHardwareBuffer` (Binder / `sendHandleToUnixSocket`) | Shared NT handle (duplicated into the peer with `DuplicateHandle`) |
+| Zero-copy CUDA | PBO registration; DMA-BUF import (`cudaImportExternalMemory(OpaqueFd)`) | Same | — | — | CUDA external memory over the texture's shared handle |
+| GPU completion fence | — (blocking sync) | — (blocking sync) | — (blocking sync) | Sync-file fd (`EGL_ANDROID_native_fence_sync`) | D3D11 fence (event handle, plus a fence value on the tensor) |
+| Probe function | `is_dma_available()` | Same | `is_iosurface_available()` | `is_ahardwarebuffer_available()` | — (no Windows-specific probe; `is_gpu_buffer_available()` answers for the texture kind) |
+| Portable probe | `is_gpu_buffer_available()` — works on all five zero-copy tiers | | | | |
 
 The portable `is_gpu_buffer_available()` is the recommended cross-platform
 gate when the question is "can I ask for `TensorMemory::DmaBuf` and expect a
@@ -74,13 +76,56 @@ zero-copy GPU-importable buffer?" The platform-specific probes
 to know *which* primitive is in use — e.g. to decide whether to call
 `ef_tensor_clone_fd` (Linux) vs `ef_tensor_from_iosurface_id` / `ef_tensor_iosurface_ref` (macOS).
 
+**How a platform-tied API says so.** Every platform-tied entry point states
+its tie in its own docs, and the two surfaces count differently, deliberately:
+
+- A C export's `Platforms:` line (first doc line, rendered into
+  `edgefirst/tensor.h` and `image.h`) lists **every platform the export
+  works on**. Every symbol is declared everywhere and refuses at run time
+  off its platform, so linking never depends on the host and the line is
+  the only place the tie is written.
+- A Python method's `Platforms:` docstring section lists **the platforms
+  the wheels ship for on which the method exists** — Linux, macOS and
+  Windows.
+
+That is why `Tensor.from_fd` and `Tensor.fd` read `Linux, macOS.` while
+`ef_tensor_clone_fd` reads `Linux, macOS, iOS, Android.`: the export works
+on all four, and wheels are published for three of them, one of which has
+no file descriptors.
+
 **Windows (x86_64)** runs the same GL engine on ANGLE's Direct3D 11 backend
-(`crates/image/src/gl/platform/windows.rs`). No zero-copy buffer kind exists
-there yet, so it behaves like desktop Linux on an NVIDIA discrete GPU: `Mem`
-sources, `Pbo` destinations, `GL_PIXEL_PACK_BUFFER` readback. The adapter is
-chosen with `EDGEFIRST_ANGLE_ADAPTER` (hardware / WARP / LUID / name match);
-WARP is classified as a software renderer. D3D11 shared-texture tensors and
-CUDA-via-D3D11 interop are a separate follow-on.
+(`crates/image/src/gl/platform/windows.rs`), and its zero-copy kind is a
+D3D11 texture. The tensor crate owns the device: it enumerates DXGI,
+creates one `ID3D11Device` for the process (`crates/tensor/src/d3d11/`,
+design record § 4.1 -- an internal document, cited here and below for the
+reasoning behind a decision rather than as something to open) and hands it
+to ANGLE, which builds its display on
+that device through `eglCreateDeviceANGLE` rather than creating a second
+one. ANGLE imports a texture only from its own device, so the two must be
+the same device; a host that already has one installs it with
+`d3d11::use_external_device` before anything creates the HAL's. Copies of
+the tensor crate linked into one process rendezvous on that device and its
+fence, so two independently linked packages share one device.
+
+`TensorMemory::DmaBuf` on Windows is therefore an `ID3D11Texture2D`
+(design record § 4.3): `ImageProcessor::create_image` allocates one,
+the GL engine imports it as an EGLImage through
+`EGL_ANGLE_image_d3d11_texture` (design record § 5), and `map()` reaches
+the pixels through a staging texture whose pitch becomes the tensor's row
+stride. Every convert records a fence value on the destination
+(design record § 5.3, § 6), which a D3D12, CUDA or Media Foundation
+consumer waits on instead of a blocking GPU sync. CUDA reads the same
+texture as external memory (design record § 4.5). Textures cross process
+boundaries as shared NT handles and cross package boundaries through the
+`D3D11_TEXTURE` protocol kind (design record § 7.4).
+
+The adapter is chosen with `EDGEFIRST_D3D11_ADAPTER`, or with the older
+`EDGEFIRST_ANGLE_ADAPTER` (both names are read, hardware / WARP / LUID /
+name match); when both are set and differ the D3D11 name wins and the
+disagreement is logged once. WARP is classified as a software renderer. Note the ordering
+consequence of the device being a process singleton: `is_gpu_buffer_available()`
+creates it, because the only honest answer to "can this host allocate one"
+is to try.
 
 **iOS (16+)** shares the macOS column's architecture — ANGLE (EGL→Metal)
 via the prebuilt xcframeworks and IOSurface-backed `TensorMemory::DmaBuf`
@@ -116,7 +161,7 @@ dtype to request; `convert()` always succeeds (GPU or CPU fallback).
 | Vivante GC7000UL (i.MX 8M Plus) | **Disabled → CPU fallback** (float readback 170–320 ms) | **Disabled → CPU fallback** |
 | Tegra Orin / NVIDIA (orin-nano) | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** — `cuda_map()` registers the PBO with CUDA on the GL worker thread; the device pointer is usable from any thread via the per-device CUDA primary context |
 | macOS ANGLE (RGBA16F IOSurface) | F16 `PlanarRgb` zero-copy IOSurface | Not supported (ANGLE rejects `(GL_FLOAT, *)`) |
-| Windows ANGLE / Direct3D 11 | PBO readback (gated on `GL_EXT_color_buffer_half_float`, probed at display init) | PBO readback (gated on `GL_EXT_color_buffer_float`) |
+| Windows ANGLE / Direct3D 11 | Zero-copy D3D11 texture for `PlanarRgb`, `PlanarRgba`, `Rgb` and `Rgba` destinations; PBO readback for `TensorMemory::Pbo` ones, `Rgba` to `PlanarRgb` only (gated on `GL_EXT_color_buffer_half_float`, probed at display init) | The same four zero-copy destinations (gated on `GL_EXT_color_buffer_float`); the PBO route here is `Rgba` to `Rgb` only |
 | CPU fallback | Always present — never errors | Always present — never errors |
 
 **Data layout produced by the GPU paths**
@@ -403,10 +448,10 @@ reason the probe check has to be real rather than emergent.
 
 ## Zero-copy CUDA Tensor Mapping
 
-This section describes the cross-crate mechanism that lets the float PBO
-produced by `ImageProcessor::convert()` reach a CUDA/TensorRT consumer
-with no host round-trip. The per-crate detail (type model, handle lifetimes,
-drop order) lives in
+This section describes the cross-crate mechanism that lets the destination
+`ImageProcessor::convert()` writes — a float PBO, or a D3D11 texture on
+Windows — reach a CUDA/TensorRT consumer with no host round-trip. The
+per-crate detail (type model, handle lifetimes, drop order) lives in
 [`crates/tensor/ARCHITECTURE.md § Zero-copy CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping);
 this section covers the cross-crate data flow and the platform constraints.
 
@@ -469,6 +514,24 @@ takes ownership of the dup'd fd on success), and the resulting
 `CudaExternalMemory` handle yields a persistent device pointer without
 a per-map round-trip.
 
+### D3D11 texture import path (Windows)
+
+A `TensorMemory::DmaBuf` tensor on Windows is an `ID3D11Texture2D`, and CUDA
+reads it as external memory: the texture's shared NT handle is imported with
+`cudaImportExternalMemory(D3D11Resource)` and the process device's fence as an
+external semaphore, so the mapping is ordered after whatever GPU write the
+producer recorded (design record § 4.5). Like the DMA-BUF path this needs no
+GL thread; unlike it, a texture is not linear, so each `cuda_map()` copies the
+texture into a linear device buffer on the CUDA side. The copy is per map, not
+per tensor.
+
+The mapping's layout is tight rows of `width * bytes_per_texel`, and the length
+`CudaMap::len()` reports is their sum. `row_stride()` is the D3D11 staging pitch
+a CPU map sees, a larger number on a padded backing, and striding the device
+pointer by it reads past the end of the mapping. `cuda_map_mut()` is the
+writable counterpart: because the buffer does not alias the texture, releasing
+the guard copies it back and synchronizes before returning.
+
 ### Runtime loading (dlopen)
 
 CUDA support is loaded at runtime via `dlopen("libcudart.so")` using a
@@ -491,9 +554,9 @@ driver and is prevented by the ownership structure in
 
 | Language | Probe | Map | Handle |
 |----------|-------|-----|--------|
-| Rust | `is_cuda_available() -> bool` | `Tensor::cuda_map() -> Option<CudaMap>` | `CudaMap` — `device_ptr()`, `len()` |
-| C | `ef_is_cuda_available()` | `ef_tensor_cuda_map()` → `ef_tensor_cuda_device_ptr()` → `ef_tensor_cuda_unmap()` | opaque handle |
-| Python | `edgefirst.tensor.is_cuda_available()` | `Tensor.cuda_map() -> CudaMap | None` | context manager — `.device_ptr`, `.size` |
+| Rust | `is_cuda_available() -> bool` | `Tensor::cuda_map()` / `cuda_map_mut() -> Option<CudaMap>` | `CudaMap` — `device_ptr()`, `len()` |
+| C | `ef_is_cuda_available()` | `ef_tensor_cuda_map()` / `ef_tensor_cuda_map_mut()` → `ef_tensor_cuda_device_ptr()` → `ef_tensor_cuda_unmap()` | opaque handle |
+| Python | `edgefirst.tensor.is_cuda_available()` | `Tensor.cuda_map()` / `cuda_map_mut() -> CudaMap \| None` | context manager — `.device_ptr`, `.size` |
 
 See [`crates/tensor/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/README.md#cuda-tensor-mapping)
 for usage snippets and

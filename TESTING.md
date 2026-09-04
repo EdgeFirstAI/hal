@@ -196,10 +196,29 @@ coverage pass 1 (unsigned binaries) skips and pass 2 (signed) enforces.
 
 ## Windows Setup
 
-Windows runs the same OpenGL ES engine on ANGLE over Direct3D 11 with PBO
-transfers (README § Windows GPU Acceleration). The GL tests need ANGLE's
-`libEGL.dll` + `libGLESv2.dll` reachable; without them every GL test
-self-skips (and `HAL_TEST_REQUIRE_GL=1` makes that a failure).
+Windows runs the same OpenGL ES engine on ANGLE over Direct3D 11, rendering
+zero-copy into D3D11 texture tensors (README § Windows GPU Acceleration). The
+GL tests need ANGLE's `libEGL.dll` + `libGLESv2.dll` reachable; without them
+every GL test self-skips (and `HAL_TEST_REQUIRE_GL=1` makes that a failure).
+
+Almost everything runs on the WARP software adapter, so a box with no GPU
+still covers the tier: texture allocation, EGLImage import and the zero-copy
+convert paths, the float destination matrix (F16 and F32 × planar,
+interleaved and RGBA), staging `map()` / `try_map()`, the completion fence
+(`convert_with_fence`, `gpu_completion`, `gpu_write_value`), the blob's
+reference transport, and the cross-process import (a child process re-runs the
+test binary with `EF_D3D11_CHILD` set). WARP is slower than the GPU but not
+different in kind; `try_map` retry loops must yield between attempts there,
+because its CPU threads *are* the GPU.
+
+The exception is CUDA. WARP has no CUDA device — `cudaD3D11GetDevice` fails,
+the tensor simply has no CUDA handle, and `cuda_map()` answers `None` — so the
+CUDA tests need the RTX 3070 (or another CUDA-capable adapter). The runtime is
+loaded by name, newest first: `cudart64_13.dll`, `cudart64_12.dll`,
+`cudart64_110.dll`, then the same three under `%CUDA_PATH%\bin` (where the
+installer puts the one that is not on `PATH`).
+`edgefirst_tensor::cuda_runtime_path()` reports which file actually opened,
+and the loader test prints it.
 
 ### 1. Install ANGLE
 
@@ -225,6 +244,37 @@ sets `EDGEFIRST_ANGLE_ADAPTER=warp` + `EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and
 `-RequireGl` sets `HAL_TEST_REQUIRE_GL=1`; everything after the switches is
 passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
 serialization policy.
+
+One variable picks the adapter for both the device and ANGLE's display, since
+ANGLE builds its display on the HAL's device: `EDGEFIRST_D3D11_ADAPTER` is the
+current name and `EDGEFIRST_ANGLE_ADAPTER` its alias, which is why the script
+still sets the older one. Setting both to different values is not a way to
+drive them apart — the D3D11 name wins and the HAL logs the disagreement once
+— so clear a leftover `EDGEFIRST_ANGLE_ADAPTER` from the shell before reading
+too much into an adapter line.
+
+Running a GL test from a bare shell rather than through the script needs the
+same two variables the script sets: `EDGEFIRST_ANGLE_PATH` pointing at the
+ANGLE DLLs (`cargo nextest run -p edgefirst-image fence` fails without it),
+and, on WARP, `EDGEFIRST_ALLOW_SOFTWARE_GL=1` beside the adapter variable.
+
+The C leaf harness does not execute C tests on Windows on this branch: it
+wants a POSIX `cc` and a `.a`. The D3D11 C tests were verified by an MSVC
+syntax check of both branches and by linking the test against the built DLLs
+(`edgefirst_tensor.dll.lib` and the image leaf's `.lib` beside it) from a VS
+developer shell, once on the RTX and once on WARP. Teaching the harness to do
+that is a follow-up.
+
+After an ANGLE upgrade or a graphics-driver update, re-run the interop probe
+before trusting the tier: the extension inventory, the import routes and the
+fence behaviour it measures are what the implementation is built on.
+
+```powershell
+pwsh crates/gpu-probe/windows/build.ps1 -Run          # hardware adapter
+pwsh crates/gpu-probe/windows/build.ps1 -Run -Warp    # WARP
+```
+
+Both runs must report 0 FAIL.
 
 `-Coverage` runs the same command under `cargo llvm-cov nextest --no-report`
 (needs `rustup component add llvm-tools-preview` and
@@ -261,13 +311,23 @@ is normally still used; check the adapter line if in doubt.
 
 ```powershell
 $env:HAL_TEST_REQUIRE_GL = '1'
-venv\Scripts\python -m pytest tests/ -m gpu -v --tb=short
+venv\Scripts\python.exe -m pytest tests/ -m gpu -v --tb=short
 ```
 
+Use the repo's `venv\Scripts\python.exe` explicitly. The `python` on `PATH`
+is a system interpreter, and a `pip install` through it puts the wheels
+somewhere the suite never looks.
+
 `tests/gpu_policy.py` skips the gpu-marked tests on Windows unless
-`HAL_TEST_REQUIRE_GL=1`, and then requires a PBO-backed destination. The
+`HAL_TEST_REQUIRE_GL=1`, and then requires a GPU-backed destination. The
 Windows `edgefirst-image` wheel bundles ANGLE when built with
 `EDGEFIRST_ANGLE_PATH` set, so an installed wheel needs no env var.
+
+One asymmetry to know when writing a test: after a Python `convert`,
+`convert_deferred` or `convert_with_fence`, the destination's
+`gpu_completion()` reflects that convert, because the binding writes the
+recorded value back onto the object the caller passed. The C API records it on
+the tensor directly and needs no such step.
 
 ---
 
@@ -402,6 +462,52 @@ for the `maturin develop` + `pytest` + `slipcover` workflow.
 C API: `make test-capi-modular` and `make test-capi-link` cover the five
 libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`). Headers
 live in each leaf's `include/edgefirst/*.h`.
+
+On Windows the leaf tests compile, link and run the C programs under
+`tests/c/` with MSVC. The harness finds `cl.exe` through vswhere and
+`VsDevCmd.bat` itself, so any shell works — a plain PowerShell, Git
+bash, or a Visual Studio developer shell, whose environment it uses
+directly when one is already open. Discovery runs once per test
+process and ends with a trivial program compiled and linked, so the
+programs are built at the default test parallelism; each process
+compiles into its own directory under `%TEMP%`.
+
+It links the `target/debug/edgefirst_*.lib` a debug `cargo build` of
+each leaf produces (the same `capi-libs` prerequisite
+`make test-capi-modular` has). The build and the test run may use
+different target directories: the harness looks in the one this test
+binary was built into, then `CARGO_TARGET_DIR`, the workspace
+`target/`, and the leaf's own `target/`.
+
+```powershell
+cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
+cargo test  --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
+```
+
+Every skip names what was not compiled and why — the command that
+failed and what the compiler printed, the directories a missing
+library was looked for in, or the artifact that is older than `src/`.
+A stale library in one candidate directory is passed over for a fresh
+one in another, and reported only when no directory holds a fresh copy.
+A host with no MSVC skips; a compile, link or run failure with a
+working MSVC fails the test with the compiler's own diagnostic. So does
+an aborting `assert()`, rather than a Windows Error Reporting dialog
+the harness would then wait on: it sets `SEM_FAILCRITICALERRORS |
+SEM_NOGPFAULTERRORBOX`, which the programs inherit.
+
+Each test process compiles into `%TEMP%\edgefirst-capi-c-<pid>`, left
+behind so a failing program can be re-run by hand from the path its
+diagnostic names; the next run removes the directories of processes
+that have exited.
+
+`tests/c/test_d3d11.c` allocates a Direct3D 11 texture tensor on the
+default adapter; set `EDGEFIRST_D3D11_ADAPTER=warp` on a host without
+a GPU, as CI does, and `EDGEFIRST_ALLOW_SOFTWARE_GL=1` with it, or the
+GL engine refuses the software renderer and image-capi's
+`test_cross_library.c` converts into a host destination that hands
+back no fence. `--test-threads=1` is what CI uses to serialize the
+D3D11 tests over one WARP device; the C harness itself does not need
+it.
 
 ### On-demand Ultralytics discovery test
 
@@ -947,7 +1053,7 @@ PBO allocation is unavailable, so they are *not* part of `make test`.
 |------------------------|--------|
 | `gl::tests::convert_f32_pbo_cuda_map_{roundtrip,numeric}` | RGBA→Rgb F32 PBO → device ptr; 256-byte alignment; numeric match |
 | `gl::tests::jpeg_{nv12,nv16,nv24,grey}_convert_cuda_devptr` | full Jetson flow per native format: JPEG decode → NVxx/GREY → convert → PBO → `cuda_map` (colorimetry-correct) |
-| C-API CUDA map (`crates/tensor-capi`) | `ef_tensor_cuda_map` → `ef_tensor_cuda_device_ptr` → `ef_tensor_cuda_unmap` |
+| C-API CUDA map (`crates/tensor-capi`) | `ef_tensor_cuda_map` and `ef_tensor_cuda_map_mut` → `ef_tensor_cuda_device_ptr` → `ef_tensor_cuda_unmap` (the writable map's unmap writes back) |
 
 A **dev PC** typically has only the NVIDIA driver (no CUDA toolkit). Install the
 runtime into the local venv and run via the Makefile, which points the HAL's

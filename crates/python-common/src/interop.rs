@@ -332,6 +332,13 @@ impl<'py> TensorArg<'py> {
 /// caller obligation, not a compiler-visible aliasing violation. `Foreign`
 /// was never affected: it already owns a `Box<TensorDyn>` built exactly
 /// this way, never a pointer into shared `PyClass` memory.
+///
+/// One consequence the callers have to close: a backend that records state
+/// onto the destination it renders into -- the fence value a D3D11 texture
+/// carries for its last GPU write -- records it on the reconstructed tensor,
+/// which is dropped at the end of the call. [`publish_gpu_write`] copies
+/// such a value back onto the caller's own object once the GIL is held
+/// again, so `gpu_completion()` on the destination reflects the render.
 pub struct RawTensorAccess {
     repr: RawTensorRepr,
 }
@@ -377,6 +384,10 @@ impl<'py> TensorArg<'py> {
     /// import -- can fail: an unrecognised descriptor kind, or a pin the
     /// backend refuses. The foreign path never fails here: it was already
     /// holding an owned, `Send`, independently-built `TensorDyn`.
+    ///
+    /// The reconstructed tensor is what the compute writes into, so a caller
+    /// that renders into it must hand it to [`publish_gpu_write`] afterwards
+    /// for any completion the backend recorded to reach the caller's object.
     pub fn into_raw_access(self) -> PyResult<RawTensorAccess> {
         use edgefirst_tensor::CpuAccess;
 
@@ -455,6 +466,81 @@ pub(crate) fn reconstruct(
         ))
     })?;
     Ok((imported, pin))
+}
+
+/// The fence value a render recorded on the tensor it actually wrote.
+///
+/// A convert renders into the reconstructed `TensorDyn`, never the caller's
+/// (see [`RawTensorAccess`]), so the value the backend records lands on that
+/// short-lived tensor. Read it before the tensor -- and, on the GIL-held
+/// path, the Python borrow it was resolved from -- goes away, then hand it
+/// to [`publish_gpu_write`].
+///
+/// `None` whenever there is nothing to publish: a backing that is not a
+/// D3D11 texture, or a texture no render has recorded a write on.
+// Only the image bindings publish completions; the tensor, codec and
+// decoder extensions build this crate without them.
+#[cfg(feature = "image")]
+pub(crate) fn recorded_gpu_write(rendered: &TensorDyn) -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        // Checked before asking for the value: only a texture can carry a
+        // recorded write, so this saves the FFI round trip on every other
+        // backing, once per convert. This is the same condition the GL leaf
+        // gates `record_completion` on.
+        if rendered.memory() != edgefirst_tensor::TensorMemory::DmaBuf {
+            return None;
+        }
+        // The value alone: `gpu_completion` would duplicate the fence handle
+        // and this would close it again, once per convert.
+        Some(rendered.gpu_write_value()).filter(|v| *v != 0)
+    }
+    // Only D3D11 textures record completions, and they exist only on
+    // Windows; every other platform's tensors have nothing to publish.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = rendered;
+        None
+    }
+}
+
+/// Record a render's completion on the object the caller passed as the
+/// destination.
+///
+/// `value` comes from [`recorded_gpu_write`] on the tensor the render wrote.
+/// This copies it onto the caller's own object by calling that object's
+/// `set_gpu_write`, looked up by name rather than by type so a tensor from
+/// another package's copy of these bindings is served by the same code --
+/// the method is public on every `Tensor`.
+///
+/// **Call this only once every borrow of the destination has been dropped.**
+/// A native destination is resolved through a `PyRefMut`, and
+/// `set_gpu_write` takes `&self`: with that borrow still alive pyo3 refuses
+/// the call with "Already borrowed" and the publish is silently lost.
+///
+/// `set_gpu_write` records a monotonic maximum, so a value the caller's
+/// tensor already carries changes nothing -- which is what the GIL-held path
+/// publishes, having rendered onto the caller's tensor directly.
+///
+/// Nothing here can fail the convert, which has already succeeded. A
+/// destination with nothing to publish, one whose producer has no
+/// `set_gpu_write`, and a call that raises are all debug-logged at most.
+// Only the image bindings publish completions; the tensor, codec and
+// decoder extensions build this crate without them.
+#[cfg(feature = "image")]
+pub(crate) fn publish_gpu_write(dst: &Bound<'_, PyAny>, value: Option<u64>) {
+    let Some(value) = value else {
+        return;
+    };
+    let Ok(method) = dst.getattr("set_gpu_write") else {
+        return;
+    };
+    if !method.is_callable() {
+        return;
+    }
+    if let Err(e) = method.call1((value,)) {
+        log::debug!("publishing a render completion onto the destination: {e}");
+    }
 }
 
 /// Whether [`reconstruct`] can succeed for `tensor`'s backing memory --

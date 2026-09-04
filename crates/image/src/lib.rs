@@ -339,6 +339,19 @@ use enum_dispatch::enum_dispatch;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
+/// Handle returned by `convert_with_fence`: a sync_file fd on Unix, an
+/// event handle on Windows that is set when the GPU work completes.
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ),
+    feature = "opengl"
+))]
+pub use opengl_headless::CompletionFence;
 #[cfg(all(
     any(
         target_os = "linux",
@@ -965,6 +978,12 @@ pub trait ImageProcessorTrait {
     /// `overlay` controls compositing: `background` is the compositing source
     /// (must match `dst` in size and format); `opacity` scales mask alpha.
     ///
+    /// A `Bgra` background onto a zero-copy destination (a D3D11 texture, an
+    /// IOSurface, a dma-buf) returns [`Error::NotSupported`]: the GL
+    /// base-layer draw has no `Bgra` arm and the CPU backend renders only
+    /// `Rgba`/`Rgb`. It previously returned `Ok` with `dst` unwritten. A
+    /// `Bgra` destination with no background is unaffected.
+    ///
     /// # Buffer aliasing
     ///
     /// `dst` and `overlay.background` must reference **distinct underlying
@@ -1019,6 +1038,11 @@ pub trait ImageProcessorTrait {
 
     /// Sets the colors used for rendering segmentation masks. Up to 20 colors
     /// can be set.
+    ///
+    /// On [`ImageProcessor`] with no forced backend this reaches every
+    /// available backend rather than the first that accepts, because a
+    /// later draw may land on any of them. A forced backend receives the
+    /// colors alone.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
 
     /// Like [`convert`](Self::convert), but does not wait for the GPU to finish.
@@ -1239,6 +1263,10 @@ pub(crate) enum ForcedBackend {
 /// combination with `EGL_BAD_ATTRIBUTE`, so there is no F32 IOSurface
 /// path.
 ///
+/// **Windows (ANGLE/D3D11):** `f16` enables the RGBA16F texture paths and
+/// `f32` the RGBA32F ones for every float layout (`float_dispatch.rs`) —
+/// `PlanarRgb` and `PlanarRgba` NCHW, interleaved `Rgb`, and `Rgba`.
+///
 /// Regardless of these flags, [`ImageProcessor::convert`] never returns
 /// an error due to float capability — it falls back to CPU when the GPU
 /// path is unavailable.
@@ -1248,12 +1276,16 @@ pub struct RenderDtypeSupport {
     ///
     /// On Linux, `true` enables F32 `Rgb` NHWC PBO readback. On macOS
     /// this flag is informational only — no F32 IOSurface path exists.
+    /// On Windows, `true` enables the RGBA32F zero-copy texture render
+    /// for every F32 layout.
     pub f32: bool,
     /// `GL_EXT_color_buffer_half_float` is available on the current GPU.
     ///
     /// On Linux, `true` enables F16 `PlanarRgb` NCHW PBO readback and,
     /// on V3D/Mali, zero-copy DMA-BUF render. On macOS, `true` enables
-    /// F16 `PlanarRgb` via RGBA16F-packed IOSurface (zero-copy).
+    /// F16 `PlanarRgb` via RGBA16F-packed IOSurface (zero-copy). On
+    /// Windows, `true` enables the RGBA16F zero-copy texture render for
+    /// every F16 layout.
     pub f16: bool,
 }
 
@@ -1263,14 +1295,24 @@ pub struct RenderDtypeSupport {
 /// `support` is set. U8/I8 and all other dtypes return `false` — they are
 /// handled by the existing `dtype.size() == 1` PBO gate.
 ///
-/// Linux + Windows only: the float PBO readback path belongs to the
-/// PBO-transfer GL backends (native EGL on Linux, ANGLE/D3D11 on Windows);
-/// macOS routes F16 through the RGBA16F-packed IOSurface instead and
-/// never calls this. The sole runtime caller in `create_image` carries the
-/// same gate, so leaving this ungated makes it dead code on macOS under
-/// `-D warnings`. Its unit test (`float_pbo_eligibility`) carries the
-/// matching gate.
-#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "opengl"))]
+/// The same question `create_image` asks before trying a zero-copy float
+/// destination, which is why that gate calls this rather than restating it:
+/// a float image is only worth allocating on the GPU where the display can
+/// render into that dtype at all.
+///
+/// Compiled on every platform with a GL backend -- the name is historical
+/// (it began as the float *PBO* gate) and both callers are live everywhere
+/// the `opengl` feature builds a backend.
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
+    feature = "opengl"
+))]
 pub(crate) fn float_pbo_eligible(dtype: DType, support: RenderDtypeSupport) -> bool {
     match dtype {
         DType::F16 => support.f16,
@@ -1382,20 +1424,28 @@ impl ImageProcessor {
         edgefirst_tensor::compression_fallback_count()
     }
 
-    /// Convert and return a native sync-fence fd that signals when the
-    /// GPU work completes, instead of blocking the CPU — the GL→NPU
-    /// handoff (`EGL_ANDROID_native_fence_sync` on Android).
+    /// Convert and return a native fence that signals when the GPU work
+    /// completes, instead of blocking the CPU — the GL→NPU handoff
+    /// (`EGL_ANDROID_native_fence_sync` on Android). On Windows the handle
+    /// is a manual-reset event set when the GPU work completes; wait on it
+    /// with `WaitForSingleObject`.
     ///
-    /// `Ok(Some(fd))`: the destination buffer is still in flight; hand
-    /// the fd to the consumer (e.g.
-    /// `ANeuralNetworksExecution_startComputeWithDependencies`) or
-    /// `poll()` it before reading. `Ok(None)`: the convert completed with
-    /// the normal blocking contract (no native fence on this platform, or
-    /// a non-GL backend handled the frame) — the destination is already
-    /// safe. Semantics are otherwise identical to
-    /// [`convert`](ImageProcessorTrait::convert), including the
-    /// GL→G2D→CPU fallback chain.
-    #[cfg(unix)]
+    /// `Ok(Some(fence))`: the destination buffer is still in flight; hand
+    /// the fence to the consumer (e.g.
+    /// `ANeuralNetworksExecution_startComputeWithDependencies` on Android,
+    /// or `WaitForSingleObject` on Windows) or poll it before reading.
+    /// `Ok(None)`: the convert completed with the normal blocking contract
+    /// (no native fence on this platform, or a non-GL backend handled the
+    /// frame) — the destination is already safe. Semantics are otherwise
+    /// identical to [`convert`](ImageProcessorTrait::convert), including
+    /// the GL→G2D→CPU fallback chain.
+    ///
+    /// On Windows, **for a texture destination**, the event and the
+    /// destination's own `Tensor::gpu_completion` name the same fence value:
+    /// one flush and one signal cover the convert, and the value recorded on
+    /// `dst` is the one this event waits for, so a consumer may use either.
+    /// A destination that is not a texture records nothing, and the event
+    /// then carries a value of its own that only it can be waited on for.
     pub fn convert_with_fence(
         &mut self,
         src: &TensorDyn,
@@ -1403,7 +1453,7 @@ impl ImageProcessor {
         rotation: Rotation,
         flip: Flip,
         crop: Crop,
-    ) -> Result<Option<std::os::fd::OwnedFd>> {
+    ) -> Result<Option<CompletionFence>> {
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
@@ -2227,35 +2277,47 @@ impl ImageProcessor {
             None => {}
         }
 
-        // macOS: when the GL backend is active with the IOSurface
-        // transfer path, prefer Dma (IOSurface on Apple, AHardwareBuffer
-        // on Android) for zero-copy import. Formats without a zero-copy
+        // macOS/Android/Windows: when the GL backend is active, prefer Dma
+        // (IOSurface on Apple, AHardwareBuffer on Android, a D3D11 texture
+        // on Windows) for zero-copy import. Formats without a zero-copy
         // mapping now ERROR under explicit Dma (the explicit-Dma
         // contract), so auto-select catches that error here and falls
         // back to host storage — loudly, via the debug log below.
-        // Windows is not listed: no zero-copy backing exists there yet, so
-        // create_image goes straight to the PBO arms below.
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {
-            let _ = gl; // probe_transfer_backend lives behind the platform trait
-            match TensorDyn::image(
-                width,
-                height,
-                format,
-                dtype,
-                Some(edgefirst_tensor::TensorMemory::DmaBuf),
-                access,
-            ) {
-                Ok(img) => return Ok(img),
-                Err(e) => {
-                    // Falling back to a non-zero-copy destination is a real
-                    // perf cliff — never do it silently (on-device triage
-                    // starts from this line).
-                    log::debug!(
-                        "create_image: zero-copy Dma allocation declined \
-                         ({format:?}/{dtype:?} {width}x{height}): {e:?}; using fallback storage"
-                    );
+            let _ = gl;
+            // Float textures only where the display can render into them;
+            // otherwise the float PBO step below applies. The same question
+            // that step asks, asked through the same helper so the two
+            // cannot answer differently.
+            let support = self.supported_render_dtypes();
+            let dtype_ok =
+                !matches!(dtype, DType::F16 | DType::F32) || float_pbo_eligible(dtype, support);
+            if dtype_ok {
+                match TensorDyn::image(
+                    width,
+                    height,
+                    format,
+                    dtype,
+                    Some(edgefirst_tensor::TensorMemory::DmaBuf),
+                    access,
+                ) {
+                    Ok(img) => return Ok(img),
+                    Err(e) => {
+                        // Falling back to a non-zero-copy destination is a real
+                        // perf cliff — never do it silently (on-device triage
+                        // starts from this line).
+                        log::debug!(
+                            "create_image: zero-copy Dma allocation declined \
+                             ({format:?}/{dtype:?} {width}x{height}): {e:?}; using fallback storage"
+                        );
+                    }
                 }
             }
         }
@@ -3000,7 +3062,13 @@ impl ImageProcessorTrait for ImageProcessor {
                 ForcedBackend::OpenGl => {
                     // GL handles background natively via GPU blit, and now
                     // actively clears when there is no background.
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android",
+                        target_os = "windows"
+                    ))]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
                         return opengl.draw_decoded_masks(dst, detect, segmentation, overlay);
@@ -3034,7 +3102,13 @@ impl ImageProcessorTrait for ImageProcessor {
         // Populated frames (or G2D unavailable): GL first, CPU fallback.
         // Both backends now own their own base-layer handling (bg blit
         // or clear), so we hand the overlay through untouched.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             log::trace!(
@@ -3120,7 +3194,13 @@ impl ImageProcessorTrait for ImageProcessor {
                     Err(Error::ForcedBackendUnavailable("g2d".into()))
                 }
                 ForcedBackend::OpenGl => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android",
+                        target_os = "windows"
+                    ))]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
                         return opengl.draw_proto_masks(dst, render_detect, proto_data, overlay);
@@ -3156,7 +3236,13 @@ impl ImageProcessorTrait for ImageProcessor {
         // CPU materialize needs `&mut` for its MaskScratch buffers; GL also
         // needs `&mut`. The CPU borrow is scoped to its block so the
         // subsequent GL borrow is free to take over `self`.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         #[cfg(feature = "opengl")]
         if let (Some(_), Some(_)) = (self.cpu.as_ref(), self.opengl.as_ref()) {
             let segmentation = match self.cpu.as_mut() {
@@ -3212,7 +3298,13 @@ impl ImageProcessorTrait for ImageProcessor {
                     "g2d does not support set_class_colors".into(),
                 )),
                 ForcedBackend::OpenGl => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android",
+                        target_os = "windows"
+                    ))]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
                         return opengl.set_class_colors(colors);
@@ -3224,34 +3316,50 @@ impl ImageProcessorTrait for ImageProcessor {
 
         // skip G2D as it doesn't support rendering to image
 
-        #[cfg(target_os = "linux")]
+        // Every available backend, not the first that accepts. A palette is
+        // state a later draw reads, and which backend that draw lands on is
+        // not known here: GL declines a `view()` destination, an unsupported
+        // format or an import failure, and the CPU backend takes over. A
+        // backend that never received the colours would render
+        // `DEFAULT_COLORS_U8` with nothing to show the caller why.
+        let mut backends = 0usize;
+        let mut first_err = None;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("image started with opengl in {:?}", start.elapsed());
+            backends += 1;
             match opengl.set_class_colors(colors) {
-                Ok(_) => {
-                    log::trace!("colors set with opengl in {:?}", start.elapsed());
-                    return Ok(());
-                }
+                Ok(()) => log::trace!("colors set with opengl in {:?}", start.elapsed()),
                 Err(e) => {
-                    log::trace!("colors didn't set with opengl: {e:?}")
+                    log::trace!("colors didn't set with opengl: {e:?}");
+                    first_err.get_or_insert(e);
                 }
             }
         }
-        log::trace!("image started with cpu in {:?}", start.elapsed());
         if let Some(cpu) = self.cpu.as_mut() {
+            backends += 1;
             match cpu.set_class_colors(colors) {
-                Ok(_) => {
-                    log::trace!("colors set with cpu in {:?}", start.elapsed());
-                    return Ok(());
-                }
+                Ok(()) => log::trace!("colors set with cpu in {:?}", start.elapsed()),
                 Err(e) => {
                     log::trace!("colors didn't set with cpu: {e:?}");
-                    return Err(e);
+                    first_err.get_or_insert(e);
                 }
             }
         }
-        Err(Error::NoConverter)
+        // The first error, so a GL failure is not hidden by the CPU backend
+        // accepting afterwards; the colours the other backends took are kept
+        // either way, since a partial palette beats a stale one.
+        match first_err {
+            Some(e) => Err(e),
+            None if backends > 0 => Ok(()),
+            None => Err(Error::NoConverter),
+        }
     }
 }
 
@@ -5805,6 +5913,1110 @@ mod image_tests {
 
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
+    /// A deterministic RGBA8 `Mem` source: `R = x`, `G = y`, `B = x + y`,
+    /// `A = 255`, each `& 255`. Written at the tensor's own row stride so a
+    /// padded allocation still gets the pattern at the right columns.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn synthetic_rgba(w: usize, h: usize) -> TensorDyn {
+        let t = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill_synthetic_rgba(&t);
+        t
+    }
+
+    /// Every pixel of `actual` equals `expected`, compared through the
+    /// tensors' own row compaction so a padded texture and a tight `Mem`
+    /// image compare as images. `compare_images` scores similarity and
+    /// accepts anything at a 0.0 threshold; this is the exact check.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn assert_pixels_identical(actual: &TensorDyn, expected: &TensorDyn, name: &str) {
+        assert_eq!(actual.shape(), expected.shape(), "{name}: shapes differ");
+        let flat = |t: &TensorDyn| {
+            let typed = t.as_typed::<u8>().expect("u8 image");
+            let mut out = vec![0u8; t.shape().iter().product::<usize>()];
+            typed.copy_to_flat(&mut out).expect("compact the rows");
+            out
+        };
+        let (a, e) = (flat(actual), flat(expected));
+        let mismatches = a.iter().zip(&e).filter(|(x, y)| x != y).count();
+        assert_eq!(
+            mismatches,
+            0,
+            "{name}: {mismatches} of {} bytes differ (first rows: {:?} vs {:?})",
+            a.len(),
+            &a[..16.min(a.len())],
+            &e[..16.min(e.len())]
+        );
+    }
+
+    /// Write the `synthetic_rgba` pattern into any writable RGBA8 tensor,
+    /// a texture included, at its own row stride.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn fill_synthetic_rgba(t: &TensorDyn) {
+        let w = t.width().unwrap();
+        let h = t.height().unwrap();
+        let bound = t.as_typed::<u8>().unwrap();
+        let stride = bound.effective_row_stride().unwrap_or(w * 4);
+        let mut m = bound.map().unwrap();
+        let px = m.as_mut_slice();
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * stride + x * 4;
+                px[o] = x as u8;
+                px[o + 1] = y as u8;
+                px[o + 2] = (x + y) as u8;
+                px[o + 3] = 255;
+            }
+        }
+    }
+
+    /// Element-wise comparison of two float images of the same format and
+    /// dtype.
+    ///
+    /// Both sides are read through `copy_to_flat`, the tensor's own row
+    /// compaction, for the reason `compare_images` does: a Windows texture
+    /// destination pads its rows, so reading the head of the mapping as a
+    /// tight image would read padding as values. F16 values are widened with
+    /// `half::f16::to_f64` before the comparison.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn compare_float_images(a: &TensorDyn, b: &TensorDyn, tol: f64, what: &str) {
+        assert_eq!(a.format(), b.format(), "{what}: pixel formats differ");
+        assert_eq!(a.dtype(), b.dtype(), "{what}: dtypes differ");
+        assert_eq!(a.shape(), b.shape(), "{what}: shapes differ");
+        let values = |t: &TensorDyn| -> Vec<f64> {
+            let elems: usize = t.shape().iter().product();
+            match t.dtype() {
+                DType::F32 => {
+                    let typed = t.as_typed::<f32>().expect("F32 image");
+                    let mut bytes = vec![0u8; elems * 4];
+                    typed
+                        .copy_to_flat(&mut bytes)
+                        .expect("compact the padded rows");
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c) as f64)
+                        .collect()
+                }
+                DType::F16 => {
+                    let typed = t.as_typed::<half::f16>().expect("F16 image");
+                    let mut bytes = vec![0u8; elems * 2];
+                    typed
+                        .copy_to_flat(&mut bytes)
+                        .expect("compact the padded rows");
+                    bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| half::f16::from_le_bytes(*c).to_f64())
+                        .collect()
+                }
+                other => panic!("{what}: {other:?} is not a float dtype"),
+            }
+        };
+        let (av, bv) = (values(a), values(b));
+        assert_eq!(av.len(), bv.len(), "{what}: element counts differ");
+        for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+            assert!(
+                (x - y).abs() <= tol,
+                "{what}: element {i} differs by {} (gpu {x}, cpu {y}, tol {tol})",
+                (x - y).abs()
+            );
+        }
+    }
+
+    /// The float PBO readback has to land each destination row at the
+    /// destination's own pitch, exactly as the u8 PBO readback does.
+    ///
+    /// The packed render target's rows ARE the destination's rows -- `(W/4,
+    /// 3H)` RGBA16F texels, one plane row per surface row, for
+    /// `PlanarRgb`/F16; `(W*3, H)` R32F texels, one image row per surface
+    /// row, for `Rgb`/F32 -- and the read was tight whatever pitch the
+    /// destination declared. A pool tensor narrowed with `configure_image`
+    /// that keeps the pool's pitch is exactly that destination, so every row
+    /// after the first landed short.
+    ///
+    /// Both routes the pitch can take are covered. `POOL_W`'s pitch is a
+    /// whole number of texels for both formats, which `GL_PACK_ROW_LENGTH`
+    /// expresses; the F16 case adds a 4-byte pad, which an 8-byte texel does
+    /// not divide, so those rows are read tight and spread afterwards. The
+    /// tight stride is the control: it must still take the read it always
+    /// did.
+    ///
+    /// The oracle is the same convert into a tight PBO of the same geometry.
+    /// `compare_float_images` reads both sides through `copy_to_flat`, the
+    /// tensor's own row compaction, so it compares logical elements and not
+    /// mapping offsets.
+    #[test]
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn windows_padded_float_pbo_rows_land_at_the_declared_stride() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        const W: usize = 64;
+        const H: usize = 32;
+        const POOL_W: usize = 96;
+
+        let mut gpu = ImageProcessor::new().unwrap();
+        let support = gpu.supported_render_dtypes();
+        let src = synthetic_rgba(W, H);
+
+        // (format, dtype, supported, the pitches to declare)
+        let cases: [(PixelFormat, DType, bool, &[usize]); 2] = [
+            (
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                support.f16,
+                // Tight plane row, the pool's pitch (a whole texel count),
+                // and a 4-byte pad that no 8-byte texel divides.
+                &[W * 2, POOL_W * 2, W * 2 + 4],
+            ),
+            (
+                PixelFormat::Rgb,
+                DType::F32,
+                support.f32,
+                &[W * 3 * 4, POOL_W * 3 * 4],
+            ),
+        ];
+
+        for (fmt, dtype, supported, strides) in cases {
+            if !supported {
+                eprintln!("SKIPPED: {} - {fmt:?}/{dtype:?} not reported", function!());
+                continue;
+            }
+            let Some(gl) = gpu.opengl.as_ref() else {
+                eprintln!("SKIPPED: {} - no GL processor", function!());
+                return;
+            };
+            // The oracle: a tight PBO of the target geometry, same route.
+            let mut reference = match gl.create_pbo_image_dtype(W, H, fmt, dtype) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("SKIPPED: {} - no float PBO images: {e:?}", function!());
+                    return;
+                }
+            };
+            assert_eq!(
+                reference.memory(),
+                TensorMemory::Pbo,
+                "{fmt:?}/{dtype:?}: the destination must be a PBO to reach this readback"
+            );
+            gpu.convert(
+                &src,
+                &mut reference,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .unwrap_or_else(|e| panic!("{fmt:?}/{dtype:?}: tight convert failed: {e}"));
+
+            for &stride in strides {
+                let label = format!("{fmt:?}/{dtype:?} at a {stride} B pitch");
+                // Allocate at the pool width, then narrow the geometry and
+                // declare the pitch, as the u8 stride tests do.
+                let mut padded = gpu
+                    .opengl
+                    .as_ref()
+                    .expect("GL processor")
+                    .create_pbo_image_dtype(POOL_W, H, fmt, dtype)
+                    .unwrap_or_else(|e| panic!("{label}: pool PBO: {e:?}"));
+                padded
+                    .configure_image(W, H, fmt)
+                    .unwrap_or_else(|e| panic!("{label}: narrow the pool tensor: {e}"));
+                padded
+                    .set_row_stride(stride)
+                    .unwrap_or_else(|e| panic!("{label}: declare the pitch: {e}"));
+                assert_eq!(padded.effective_row_stride(), Some(stride), "{label}");
+
+                let before = gpu.convert_fallback_count();
+                gpu.convert(
+                    &src,
+                    &mut padded,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                )
+                .unwrap_or_else(|e| panic!("{label}: padded convert failed: {e}"));
+                // A CPU fallback writes the destination with the stride-aware
+                // CPU writers and would pass without the GL readback running.
+                assert_eq!(
+                    gpu.convert_fallback_count(),
+                    before,
+                    "{label}: fell back to the CPU backend, so the float PBO readback under test never ran"
+                );
+
+                let tol = if dtype == DType::F16 {
+                    1.0 / 1024.0
+                } else {
+                    1e-6
+                };
+                compare_float_images(&padded, &reference, tol, &label);
+            }
+        }
+    }
+
+    /// Every float destination layout the GL backend reports it can render
+    /// must render zero-copy into the texture and match the CPU converter
+    /// element for element: F16 and F32 planar (three and four planes),
+    /// interleaved float RGB, and float RGBA.
+    ///
+    /// The destination memory is requested explicitly so each layout is
+    /// exercised as a texture whatever `create_image`'s own allocation
+    /// policy would pick for it; the policy itself is covered by
+    /// `windows_create_image_prefers_textures_and_convert_with_fence_returns_a_set_event`.
+    #[test]
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn windows_float_destinations_match_the_cpu_converter_for_every_layout() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let mut gpu = ImageProcessor::new().unwrap();
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let support = gpu.supported_render_dtypes();
+        eprintln!("{}: supported_render_dtypes = {support:?}", function!());
+        let src = synthetic_rgba(640, 480);
+        for (fmt, dtype, need) in [
+            (PixelFormat::PlanarRgb, DType::F16, support.f16),
+            (PixelFormat::PlanarRgb, DType::F32, support.f32),
+            (PixelFormat::PlanarRgba, DType::F16, support.f16),
+            (PixelFormat::PlanarRgba, DType::F32, support.f32),
+            (PixelFormat::Rgb, DType::F16, support.f16),
+            (PixelFormat::Rgb, DType::F32, support.f32),
+            (PixelFormat::Rgba, DType::F16, support.f16),
+            (PixelFormat::Rgba, DType::F32, support.f32),
+        ] {
+            if !need {
+                eprintln!("{}: {fmt:?}/{dtype:?} not reported", function!());
+                continue;
+            }
+            let mut dst_gpu = gpu
+                .create_image(
+                    640,
+                    480,
+                    fmt,
+                    dtype,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
+            assert_eq!(
+                dst_gpu.memory(),
+                TensorMemory::DmaBuf,
+                "{fmt:?}/{dtype:?} must be a texture"
+            );
+            let mut dst_cpu = TensorDyn::image(
+                640,
+                480,
+                fmt,
+                dtype,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let before = gpu.convert_fallback_count();
+            gpu.convert(
+                &src,
+                &mut dst_gpu,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .unwrap();
+            cpu.convert(
+                &src,
+                &mut dst_cpu,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                gpu.convert_fallback_count(),
+                before,
+                "{fmt:?}/{dtype:?} fell back to CPU"
+            );
+            let tol = if dtype == DType::F16 {
+                1.0 / 1024.0
+            } else {
+                1e-6
+            };
+            compare_float_images(&dst_gpu, &dst_cpu, tol, &format!("{fmt:?}/{dtype:?}"));
+        }
+    }
+
+    // The tests below wait on a Windows completion fence directly, so they
+    // need the raw wait call — no crate in this workspace wraps it.
+    #[cfg(target_os = "windows")]
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    }
+
+    /// A batch of deferred converts records one distinct fence value per
+    /// tile and submits once, at `flush`.
+    ///
+    /// The values are what a GPU consumer waits on, so they have to stay
+    /// per-destination and strictly increasing; the submission is what
+    /// batching exists to spare, so there must be exactly one of it. The
+    /// destinations are compared against the same convert done standalone,
+    /// which is what proves the deferred submission did not lose a tile.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_deferred_batch_records_one_value_per_tile_and_submits_once() {
+        use edgefirst_tensor::CpuAccess;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let mut p = match ImageProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} - ImageProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+        let (w, h, tiles) = (640usize, 480usize, 4usize);
+        let src = synthetic_rgba(w, h);
+        let mut dsts: Vec<TensorDyn> = (0..tiles)
+            .map(|_| {
+                p.create_image(w, h, PixelFormat::Rgba, DType::U8, None, CpuAccess::Read)
+                    .unwrap()
+            })
+            .collect();
+        if dsts[0].memory() != TensorMemory::DmaBuf {
+            eprintln!("SKIPPED: {} - destinations are not textures", function!());
+            return;
+        }
+        for dst in &mut dsts {
+            p.convert_deferred(&src, dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+        }
+        let values: Vec<u64> = dsts
+            .iter()
+            .map(|d| {
+                d.gpu_completion()
+                    .unwrap()
+                    .expect("each deferred convert records its own completion")
+                    .value
+            })
+            .collect();
+        for pair in values.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "the batch allocated {values:?}, which is not one increasing value per tile"
+            );
+        }
+        p.flush().unwrap();
+        // The one submission the batch owed has happened, so every recorded
+        // value is reachable.
+        let dev = edgefirst_tensor::d3d11::device().unwrap();
+        let last = *values.last().unwrap();
+        let ev = dev.event_for(last).unwrap();
+        // SAFETY: `ev` owns a live Win32 event handle for the duration of
+        // this call.
+        assert_eq!(
+            unsafe {
+                WaitForSingleObject(
+                    std::os::windows::io::AsRawHandle::as_raw_handle(&ev) as _,
+                    5000,
+                )
+            },
+            0,
+            "the batch's newest value {last} never arrived after flush"
+        );
+
+        let mut solo = p
+            .create_image(w, h, PixelFormat::Rgba, DType::U8, None, CpuAccess::Read)
+            .unwrap();
+        p.convert(&src, &mut solo, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        // Read through the tensor's own compaction: a Windows texture's
+        // staging rows are pitch-padded, so a flat read of the mapping would
+        // compare padding as pixels.
+        let flat = |img: &TensorDyn| -> Vec<u8> {
+            let t = img.as_typed::<u8>().expect("u8 image");
+            let mut out = vec![0u8; t.shape().iter().product::<usize>()];
+            t.copy_to_flat(&mut out).expect("compact the padded rows");
+            out
+        };
+        let want = flat(&solo);
+        for (i, dst) in dsts.iter().enumerate() {
+            assert_eq!(
+                flat(dst),
+                want,
+                "tile {i} does not match a standalone convert"
+            );
+        }
+    }
+
+    /// A processor dropped with a batch still open submits what that batch
+    /// recorded.
+    ///
+    /// The values are already published on destinations that outlive the
+    /// processor, so a consumer may be waiting on one; a deferred signal that
+    /// is never submitted is a wait nothing can satisfy. `flush` is what
+    /// normally pays it, and the whole point here is that the caller never
+    /// calls it.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_dropping_a_processor_submits_an_open_batch() {
+        use edgefirst_tensor::CpuAccess;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let src = synthetic_rgba(320, 240);
+        let recorded = {
+            let mut p = match ImageProcessor::new() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("SKIPPED: {} - init failed ({e:?})", function!());
+                    return;
+                }
+            };
+            let mut dst = p
+                .create_image(
+                    320,
+                    240,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    None,
+                    CpuAccess::Read,
+                )
+                .unwrap();
+            if dst.memory() != TensorMemory::DmaBuf {
+                eprintln!("SKIPPED: {} - destination is not a texture", function!());
+                return;
+            }
+            p.convert_deferred(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            // No `flush`: the drop below is what has to settle the batch.
+            dst.gpu_completion()
+                .unwrap()
+                .expect("the deferred convert recorded a completion")
+                .value
+        };
+
+        let dev = edgefirst_tensor::d3d11::device().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dev.completed_value() < recorded {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped processor never submitted its batch: fence at {}, recorded {recorded}",
+                dev.completed_value()
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// After Task B5, `create_image(.., None, ..)` reaches the Windows
+    /// Dma-first arm (a D3D11 texture, not a PBO or `Mem` tensor), and
+    /// `convert_with_fence` is available on every platform: on Windows it
+    /// returns a manual-reset event set when the GPU work completes.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_create_image_prefers_textures_and_convert_with_fence_returns_a_set_event() {
+        use edgefirst_tensor::CpuAccess;
+        use std::os::windows::io::AsRawHandle;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let mut p = ImageProcessor::new().unwrap();
+        let src = synthetic_rgba(320, 240);
+        let mut dst = p
+            .create_image(
+                320,
+                240,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::Read,
+            )
+            .unwrap();
+        // Without a GL backend (CI's no-ANGLE coverage pass) `create_image`
+        // answers host memory and there is no fence to wait on; the lanes
+        // that set HAL_TEST_REQUIRE_GL=1 still hold the texture-first claim.
+        if dst.memory() != TensorMemory::DmaBuf
+            && !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+        {
+            eprintln!(
+                "SKIPPED: {} - create_image gave {:?}, not a texture (no GL backend)",
+                function!(),
+                dst.memory()
+            );
+            return;
+        }
+        assert_eq!(
+            dst.memory(),
+            TensorMemory::DmaBuf,
+            "create_image(None) must prefer a texture on Windows"
+        );
+        // Read before the wait: the recorded value must be the one the fence
+        // names, not an older point the destination happened to carry.
+        let before = dst.gpu_completion().unwrap().map(|c| c.value);
+        let fence = p
+            .convert_with_fence(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap()
+            .expect("Windows exports a fence");
+        let recorded = dst
+            .gpu_completion()
+            .unwrap()
+            .expect("the convert recorded a completion")
+            .value;
+        assert!(
+            before.is_none_or(|b| recorded > b),
+            "the fenced convert recorded a newer value than {before:?}"
+        );
+        // One flush and one signal for the whole call: the value the
+        // destination carries is the newest the device has allocated, so
+        // nothing was signalled after `record_completion`. Two signals (the
+        // shape this replaced) would leave `last_signalled` one past it.
+        assert_eq!(
+            edgefirst_tensor::d3d11::device().unwrap().last_signalled(),
+            recorded,
+            "a fenced convert must signal exactly once"
+        );
+        // SAFETY: `fence` owns a live Win32 event handle returned by
+        // `convert_with_fence`; WaitForSingleObject only reads the handle,
+        // which stays valid for the duration of this call because `fence`
+        // is not dropped until after it.
+        assert_eq!(
+            unsafe { WaitForSingleObject(fence.as_raw_handle() as _, 5000) },
+            0,
+            "fence was not set within 5 seconds"
+        );
+        // The event and the destination's own completion name the same
+        // value, so a consumer may wait on either: the event fired, and the
+        // device's completed value has reached the value `dst` reports.
+        assert!(
+            edgefirst_tensor::d3d11::device().unwrap().completed_value() >= recorded,
+            "the event fired, so the recorded value {recorded} is complete"
+        );
+        assert_eq!(
+            dst.gpu_completion().unwrap().map(|c| c.value),
+            Some(recorded),
+            "the destination still reports the value the event waited on"
+        );
+        let mut expected = TensorDyn::image(
+            320,
+            240,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        cpu.convert(
+            &src,
+            &mut expected,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap();
+        compare_images(&dst, &expected, 0.0, "fenced convert");
+    }
+
+    /// A Windows GL test's destination must be a texture; without a GL backend
+    /// (CI's no-ANGLE coverage pass) `create_image` answers host memory and the
+    /// test skips, unless the lane set HAL_TEST_REQUIRE_GL=1, which keeps the
+    /// texture-first claim a hard assertion.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn texture_or_skip(t: &TensorDyn, test: &str) -> bool {
+        if t.memory() == TensorMemory::DmaBuf {
+            return true;
+        }
+        if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1") {
+            panic!(
+                "{test}: create_image(None) must prefer a texture on Windows, got {:?}",
+                t.memory()
+            );
+        }
+        eprintln!(
+            "SKIPPED: {test} - create_image gave {:?}, not a texture (no GL backend)",
+            t.memory()
+        );
+        false
+    }
+
+    /// A draw into a texture destination records a completion on it the way
+    /// a convert does, so a device consumer can wait on the drawn frame. The
+    /// destination is `CpuAccess::Read`: only the GL backend can write it,
+    /// so a CPU fallback fails the draw outright instead of leaving the
+    /// completion empty.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_draw_decoded_masks_into_a_texture_records_a_completion() {
+        use edgefirst_tensor::{CpuAccess, Segmentation};
+        use ndarray::Array3;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let mut p = ImageProcessor::new().unwrap();
+        let mut dst = p
+            .create_image(64, 64, PixelFormat::Rgba, DType::U8, None, CpuAccess::Read)
+            .unwrap();
+        if !texture_or_skip(&dst, function!()) {
+            return;
+        }
+        assert!(
+            dst.gpu_completion().unwrap().is_none(),
+            "nothing has written this texture yet"
+        );
+
+        let detect = DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.99,
+            label: 0,
+        };
+        let seg_arr = Array3::from_shape_fn((4, 4, 1), |_| 255u8);
+        let seg = Segmentation {
+            segmentation: edgefirst_tensor::Tensor::from_arrayview3(seg_arr.view())
+                .unwrap()
+                .into(),
+            xmin: 0.25,
+            ymin: 0.25,
+            xmax: 0.75,
+            ymax: 0.75,
+        };
+        p.draw_decoded_masks(&mut dst, &[detect], &[seg], MaskOverlay::default())
+            .expect("draw into a read-only texture");
+
+        let completion = dst
+            .gpu_completion()
+            .unwrap()
+            .expect("the draw recorded no completion on dst");
+        assert!(completion.value > 0, "completion value must be non-zero");
+
+        // The drawn frame is read back through the texture's staging copy;
+        // `copy_to_flat` compacts its padded rows into tight RGBA pixels and
+        // needs only a read mapping, which the read-only texture allows.
+        // The corner is cleared and the box centre carries the mask colour.
+        let mut flat = vec![0u8; 64 * 64 * 4];
+        dst.as_typed::<u8>()
+            .unwrap()
+            .copy_to_flat(&mut flat)
+            .expect("read the drawn texture");
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * 64 + x) * 4;
+            [flat[o], flat[o + 1], flat[o + 2], flat[o + 3]]
+        };
+        assert_eq!(px(2, 2), [0, 0, 0, 0], "corner (2,2) was not cleared");
+        assert_ne!(px(32, 32), [0, 0, 0, 0], "centre (32,32) was not coloured");
+    }
+
+    /// The full-GPU proto draw (forced GL, no CPU materialize) records a
+    /// completion on a texture destination too.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_draw_proto_masks_into_a_texture_records_a_completion() {
+        use edgefirst_tensor::{CpuAccess, Tensor};
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        // Forcing OpenGL fails outright without a GL backend (CI's no-ANGLE
+        // coverage pass); that is the same skip the texture guard below gives,
+        // unless the lane set HAL_TEST_REQUIRE_GL=1.
+        let mut p = match with_force_backend(Some("opengl"), ImageProcessor::new) {
+            Ok(p) => p,
+            Err(e) if !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1") => {
+                eprintln!("SKIPPED: {} - no OpenGL backend: {e}", function!());
+                return;
+            }
+            Err(e) => panic!("forced OpenGL backend unavailable: {e}"),
+        };
+        let mut dst = p
+            .create_image(64, 64, PixelFormat::Rgba, DType::U8, None, CpuAccess::Read)
+            .unwrap();
+        if !texture_or_skip(&dst, function!()) {
+            return;
+        }
+
+        let detect = DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.99,
+            label: 0,
+        };
+        // One prototype channel of ones and a positive coefficient: every
+        // pixel of the box is foreground.
+        let proto = ProtoData {
+            mask_coefficients: TensorDyn::F32(
+                Tensor::<f32>::from_slice(&[1.0_f32], &[1, 1]).unwrap(),
+            ),
+            protos: TensorDyn::F32(
+                Tensor::<f32>::from_slice(&vec![1.0_f32; 8 * 8], &[8, 8, 1]).unwrap(),
+            ),
+            layout: ProtoLayout::Nhwc,
+        };
+        p.draw_proto_masks(&mut dst, &[detect], &proto, MaskOverlay::default())
+            .expect("forced-GL proto draw into a read-only texture");
+
+        let completion = dst
+            .gpu_completion()
+            .unwrap()
+            .expect("the proto draw recorded no completion on dst");
+        assert!(completion.value > 0, "completion value must be non-zero");
+    }
+
+    /// An empty draw with a host-memory background onto a texture
+    /// destination leaves the background in the texture, rows in order.
+    /// The gradient pattern makes a missing or vertically flipped base
+    /// layer differ from the expected image.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_draw_decoded_masks_composites_a_host_background_onto_a_texture() {
+        use edgefirst_tensor::CpuAccess;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let mut p = ImageProcessor::new().unwrap();
+        let bg = synthetic_rgba(64, 48);
+        let mut dst = p
+            .create_image(64, 48, PixelFormat::Rgba, DType::U8, None, CpuAccess::Read)
+            .unwrap();
+        if !texture_or_skip(&dst, function!()) {
+            return;
+        }
+        p.draw_decoded_masks(&mut dst, &[], &[], MaskOverlay::new().with_background(&bg))
+            .expect("empty draw with a host background onto a texture");
+        assert_pixels_identical(&dst, &bg, "host background onto a texture");
+        assert!(dst.gpu_completion().unwrap().is_some());
+    }
+
+    /// The same draw with the background in a texture of its own: the
+    /// base layer is sampled from the background texture directly.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_draw_decoded_masks_composites_a_texture_background_onto_a_texture() {
+        use edgefirst_tensor::CpuAccess;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let mut p = ImageProcessor::new().unwrap();
+        let expected = synthetic_rgba(64, 48);
+        let bg = p
+            .create_image(
+                64,
+                48,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::ReadWrite,
+            )
+            .unwrap();
+        if !texture_or_skip(&bg, function!()) {
+            return;
+        }
+        fill_synthetic_rgba(&bg);
+        let mut dst = p
+            .create_image(64, 48, PixelFormat::Rgba, DType::U8, None, CpuAccess::Read)
+            .unwrap();
+        assert_eq!(dst.memory(), TensorMemory::DmaBuf);
+        p.draw_decoded_masks(&mut dst, &[], &[], MaskOverlay::new().with_background(&bg))
+            .expect("empty draw with a texture background onto a texture");
+        assert_pixels_identical(&dst, &expected, "texture background onto a texture");
+        assert!(dst.gpu_completion().unwrap().is_some());
+    }
+
+    /// A draw into a `view()` of a texture fills that band and leaves its
+    /// sibling alone. The GL draw declines a sub-region destination
+    /// (`check_draw_dst_placement`) and the CPU backend, which offsets into
+    /// the parent, takes it; the zero-copy arm would otherwise have cleared
+    /// the parent's first rows instead of the view's.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_draw_decoded_masks_into_a_texture_view_fills_only_its_band() {
+        use edgefirst_tensor::CpuAccess;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let (w, h) = (32usize, 64usize);
+        let mut p = ImageProcessor::new().unwrap();
+        let parent = p
+            .create_image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::ReadWrite,
+            )
+            .unwrap();
+        if !texture_or_skip(&parent, function!()) {
+            return;
+        }
+        fill_synthetic_rgba(&parent);
+
+        // The lower band only. An empty draw with no background clears its
+        // destination, so a write at the parent's origin would show up as
+        // cleared pixels in the upper band.
+        let mut band = parent
+            .view(edgefirst_tensor::Region::new(0, h / 2, w, h / 2))
+            .unwrap();
+        p.draw_decoded_masks(&mut band, &[], &[], MaskOverlay::default())
+            .expect("empty draw into a texture view");
+        drop(band);
+
+        let mut flat = vec![0u8; w * h * 4];
+        parent
+            .as_typed::<u8>()
+            .unwrap()
+            .copy_to_flat(&mut flat)
+            .expect("read the parent texture");
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 4;
+                let got = [flat[o], flat[o + 1], flat[o + 2], flat[o + 3]];
+                let want = if y < h / 2 {
+                    [x as u8, y as u8, (x + y) as u8, 255]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(got, want, "pixel ({x},{y})");
+            }
+        }
+
+        // The GL decline is what sent the draw above to the CPU: with GL
+        // forced there is no CPU arm to fall through to, so it surfaces.
+        let mut forced = with_force_backend(Some("opengl"), ImageProcessor::new).unwrap();
+        let mut band = parent
+            .view(edgefirst_tensor::Region::new(0, h / 2, w, h / 2))
+            .unwrap();
+        let err = forced
+            .draw_decoded_masks(&mut band, &[], &[], MaskOverlay::default())
+            .expect_err("forced GL must decline a view destination");
+        assert!(
+            matches!(err, Error::NotSupported(_)),
+            "expected NotSupported, got {err:?}"
+        );
+    }
+
+    /// `set_class_colors` reaches the CPU backend even when GL accepts it, so
+    /// a draw GL declines still renders the caller's palette. The view
+    /// destination is the reachable decline: `check_draw_dst_placement`
+    /// refuses it and the CPU backend draws the mask.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn windows_class_colors_reach_the_cpu_backend_behind_a_declined_gl_draw() {
+        use edgefirst_tensor::{CpuAccess, Segmentation};
+        use ndarray::Array3;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        const CUSTOM: [u8; 4] = [7, 200, 13, 255];
+        assert_ne!(
+            CUSTOM[..3],
+            DEFAULT_COLORS_U8[0][..3],
+            "the custom colour must differ from the default palette's, or \
+             this test cannot tell them apart"
+        );
+
+        let (w, h) = (32usize, 64usize);
+        let mut p = ImageProcessor::new().unwrap();
+        let parent = p
+            .create_image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::ReadWrite,
+            )
+            .unwrap();
+        // Without a GL backend (CI's no-ANGLE coverage pass) `create_image`
+        // answers host memory and nothing declines the draw; the test needs
+        // the texture-backed parent so the view is the reachable decline. The
+        // lanes that set HAL_TEST_REQUIRE_GL=1 still require the texture.
+        if parent.memory() != TensorMemory::DmaBuf
+            && !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+        {
+            eprintln!(
+                "SKIPPED: {} - create_image gave {:?}, not a texture (no GL backend)",
+                function!(),
+                parent.memory()
+            );
+            return;
+        }
+        p.set_class_colors(&[CUSTOM]).unwrap();
+
+        let detect = DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.99,
+            label: 0,
+        };
+        let seg_arr = Array3::from_shape_fn((4, 4, 1), |_| 255u8);
+        let seg = Segmentation {
+            segmentation: edgefirst_tensor::Tensor::from_arrayview3(seg_arr.view())
+                .unwrap()
+                .into(),
+            xmin: 0.25,
+            ymin: 0.25,
+            xmax: 0.75,
+            ymax: 0.75,
+        };
+        let mut band = parent
+            .view(edgefirst_tensor::Region::new(0, h / 2, w, h / 2))
+            .unwrap();
+        p.draw_decoded_masks(&mut band, &[detect], &[seg], MaskOverlay::default())
+            .expect("draw into a texture view");
+        drop(band);
+
+        let mut flat = vec![0u8; w * h * 4];
+        parent
+            .as_typed::<u8>()
+            .unwrap()
+            .copy_to_flat(&mut flat)
+            .expect("read the parent texture");
+        // The band's centre, inside the box. The mask blend writes RGB only;
+        // alpha is whatever the base layer left, which is the clear.
+        let o = ((h / 2 + h / 4) * w + w / 2) * 4;
+        assert_eq!(
+            &flat[o..o + 3],
+            &CUSTOM[..3],
+            "the CPU backend drew the default palette, so it never received \
+             set_class_colors"
+        );
+    }
+
+    /// Two independently-created `ImageProcessor`s, each converting into its
+    /// own texture destination in lockstep, must not bleed GL state into
+    /// each other across 200 iterations (the destination created by
+    /// `create_image(None)` is the texture arm this task adds).
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    #[test]
+    fn two_processors_alternate_on_texture_destinations_without_state_bleed() {
+        use edgefirst_tensor::CpuAccess;
+
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            return;
+        }
+        let mut a = ImageProcessor::new().unwrap();
+        let mut b = ImageProcessor::new().unwrap();
+        let src_a = synthetic_rgba(512, 512);
+        let src_b = synthetic_rgba(256, 256);
+        let mut dst_a = a
+            .create_image(
+                512,
+                512,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::Read,
+            )
+            .unwrap();
+        let mut dst_b = b
+            .create_image(
+                256,
+                256,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::Read,
+            )
+            .unwrap();
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ref_a = TensorDyn::image(
+            512,
+            512,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut ref_b = TensorDyn::image(
+            256,
+            256,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        cpu.convert(
+            &src_a,
+            &mut ref_a,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap();
+        cpu.convert(
+            &src_b,
+            &mut ref_b,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap();
+        for _ in 0..200 {
+            a.convert(
+                &src_a,
+                &mut dst_a,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .unwrap();
+            b.convert(
+                &src_b,
+                &mut dst_b,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .unwrap();
+            compare_images(&dst_a, &ref_a, 0.0, "processor A");
+            compare_images(&dst_b, &ref_b, 0.0, "processor B");
+        }
+    }
 
     #[test]
     #[cfg(any(
@@ -6660,8 +7872,8 @@ mod image_tests {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
             return;
         }
-        // Zero-copy YUYV source: DMA-BUF on Linux, IOSurface on macOS; skips
-        // where no such backing exists (Windows today).
+        // Zero-copy YUYV source: DMA-BUF on Linux, IOSurface on macOS, a
+        // D3D11 texture on Windows; skips where no such backing exists.
         if !edgefirst_tensor::is_gpu_buffer_available() {
             eprintln!(
                 "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
@@ -9502,31 +10714,44 @@ mod image_tests {
             "format must be Rgb or Rgba for comparison"
         );
 
+        // A pitch-padded destination -- the D3D11 staging texture behind a
+        // Windows `TensorMemory::DmaBuf` tensor pads an RGBA row to 128 bytes
+        // -- spaces its rows at `effective_row_stride()`, so reading the head
+        // of the mapping as a tight image would read padding as pixels.
+        // `copy_to_flat` is the tensor's own compaction and degenerates to one
+        // memcpy when the tensor is tight.
+        fn flat(img: &TensorDyn) -> Vec<u8> {
+            let t = img.as_typed::<u8>().expect("u8 image");
+            let mut out = vec![0u8; t.shape().iter().product::<usize>()];
+            t.copy_to_flat(&mut out).expect("compact the padded rows");
+            out
+        }
+
         let image1 = match img1.format().unwrap() {
             PixelFormat::Rgb => image::RgbImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap(),
             PixelFormat::Rgba => image::RgbaImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap()
             .convert(),
             PixelFormat::Grey => image::GrayImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap()
             .convert(),
             PixelFormat::PlanarRgb => image::GrayImage::from_vec(
                 img1.width().unwrap() as u32,
                 (img1.height().unwrap() * 3) as u32,
-                img1.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap()
             .convert(),
@@ -9537,27 +10762,27 @@ mod image_tests {
             PixelFormat::Rgb => image::RgbImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap(),
             PixelFormat::Rgba => image::RgbaImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap()
             .convert(),
             PixelFormat::Grey => image::GrayImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap()
             .convert(),
             PixelFormat::PlanarRgb => image::GrayImage::from_vec(
                 img2.width().unwrap() as u32,
                 (img2.height().unwrap() * 3) as u32,
-                img2.as_typed::<u8>().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap()
             .convert(),
@@ -10569,7 +11794,13 @@ mod image_tests {
         run_all_scenarios(None, "auto", false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     #[cfg(feature = "opengl")]
     #[test]
     fn test_draw_masks_4_scenarios_opengl() {

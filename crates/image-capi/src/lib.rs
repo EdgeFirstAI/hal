@@ -51,6 +51,17 @@ pub extern "C" fn ef_image_abi_version() -> u32 {
     1
 }
 
+// Test-support modules that live in the tensor leaf. They are included here,
+// relative to `src/`, rather than inside `mod tests`: a `#[path]` inside an
+// inline module resolves relative to `src/tests/`, and Linux and macOS refuse
+// to walk `..` through a directory that does not exist.
+#[cfg(test)]
+#[path = "../../tensor-capi/tests/support/artifacts.rs"]
+mod artifacts;
+#[cfg(all(test, windows))]
+#[path = "../../tensor-capi/tests/support/msvc.rs"]
+mod msvc;
+
 #[cfg(test)]
 mod tests {
     /// The shipped header text.
@@ -72,6 +83,7 @@ mod tests {
     ///
     /// Returns `None` when no C compiler is available, so the check skips with
     /// a printed reason rather than passing silently on a host without one.
+    #[cfg(not(windows))]
     fn cc_syntax_check(src: &str) -> Option<std::process::Output> {
         let include = concat!(env!("CARGO_MANIFEST_DIR"), "/include");
         // The shared tensor ABI header lives in tensor-capi; detect.h lives
@@ -107,125 +119,106 @@ mod tests {
         }
     }
 
+    // Artifact discovery, freshness and symbol reading, shared with the
+    // other modular C-API leaves; included at the crate root (see the
+    // `#[path]` above `mod tests`) because a path relative to this inline
+    // module would traverse `src/tests/`, a directory that does not exist,
+    // which Linux and macOS refuse to resolve.
+    use crate::artifacts;
+    use artifacts::skip;
+
+    /// This leaf's sources, and the tensor leaf's, which the artifacts read
+    /// here are checked against. Each library is checked against ITS OWN
+    /// crate's sources: comparing libedgefirst_tensor against image-capi/src
+    /// would report staleness every time this crate is edited, which is
+    /// noise, not a signal.
+    const SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    const TENSOR_SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tensor-capi/src");
+
+    /// The staticlib this platform builds and the prefix every artifact of
+    /// this library shares.
+    ///
+    /// MSVC drops the `lib` prefix and names the staticlib `.lib`, so these
+    /// are the platform's spellings, not POSIX's: looking for the POSIX
+    /// names on Windows found nothing and skipped every run.
+    #[cfg(not(windows))]
+    const ARTIFACT_PREFIX: &str = "libedgefirst_image";
+    #[cfg(windows)]
+    const ARTIFACT_PREFIX: &str = "edgefirst_image";
+    #[cfg(not(windows))]
+    const STATICLIB: &str = "libedgefirst_image.a";
+    #[cfg(windows)]
+    const STATICLIB: &str = "edgefirst_image.lib";
+
+    /// A built artifact of this leaf, fresh, or the reason there is none.
+    fn find_artifact(name: &str) -> Result<std::path::PathBuf, String> {
+        artifacts::find_artifact(name, std::path::Path::new(SRC_DIR))
+    }
+
+    /// Runs a built C program, reporting a spawn failure rather than
+    /// swallowing it.
+    ///
+    /// A program that cannot even start is not a skip: the harness compiled
+    /// and linked it a moment ago, so the reason is a missing DLL or a
+    /// broken image, and `None` alone would leave the test reporting ok.
+    fn run_program(
+        exe: &std::path::Path,
+        mut cmd: std::process::Command,
+    ) -> Option<std::process::Output> {
+        match cmd.output() {
+            Ok(out) => Some(out),
+            Err(e) => {
+                skip(&format!(
+                    "{} was built but could not be run ({cmd:?}): {e}",
+                    exe.display()
+                ));
+                None
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_artifact_is_libedgefirst_image_not_capi() {
         // REQUIRED: consumers link `-ledgefirst-image`. The `-capi` suffix
         // names the source crate only, mirroring the `python-*` siblings, and
         // must never reach a filename. A `[lib] name` typo here would ship
         // libedgefirst_image_capi.so and break every consumer's link line.
-        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        dir.pop();
-        dir.pop();
-        dir.push("target");
-        dir.push("debug");
-        let found: Vec<String> = std::fs::read_dir(&dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|n| n.starts_with("libedgefirst_image"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if found.is_empty() {
-            eprintln!(
-                "SKIP: nothing built in {}; artifact name not checked",
-                dir.display()
-            );
+        //
+        // The staticlib has to exist for the check to mean anything, and
+        // finding it is what says the leaf was built at all.
+        if let Err(reason) = find_artifact(STATICLIB) {
+            skip(&format!("artifact name not checked: {reason}"));
             return;
         }
+        // Every candidate directory, not just the one that held the fresh
+        // staticlib: a `_capi` file left in a target directory this run did
+        // not build into is exactly the one an install or link step can
+        // still pick up.
+        let found = artifacts::artifacts_named(ARTIFACT_PREFIX);
+        let wrong: Vec<&String> = found.iter().filter(|n| n.contains("_capi")).collect();
         assert!(
-            !found.iter().any(|n| n.contains("_capi")),
-            "the C library must ship as libedgefirst_image.*, never \
-             libedgefirst_image_capi.*; found {found:?}.\n\
+            wrong.is_empty(),
+            "the C library must ship as {ARTIFACT_PREFIX}.*, never \
+             {ARTIFACT_PREFIX}_capi.*; found {wrong:?} among {found:?} in {dirs:?}.\n\
              If `[lib] name` is already correct, these are STALE artifacts from \
              a previous name -- cargo does not remove them on rename, and an \
              install or link step can still pick the wrong file up. \
-             Delete target/debug/libedgefirst_image_capi.* or `cargo clean`."
-        );
-        assert!(
-            found.iter().any(|n| n == "libedgefirst_image.a"),
-            "expected libedgefirst_image.a among {found:?}"
+             Delete them or `cargo clean`.",
+            dirs = artifacts::artifact_dirs()
         );
     }
 
-    /// Is this build artifact newer than the crate's sources?
-    ///
-    /// Every test here that reads a compiled artifact needs this check, because
-    /// neither `cargo test` nor `cargo test --all-targets` builds the
-    /// `staticlib`/`cdylib` targets — only `cargo build` does. A test that skips
-    /// it silently validates a library built *before* the change under test,
-    /// which is exactly how the "no accessor is exported" check was found to be
-    /// vacuous.
-    ///
-    /// Default is a **loud skip**, not a panic: panicking would make plain
-    /// `cargo test` fail for everyone after any edit, and a clearly-reported
-    /// skip does not carry the failure mode being guarded — nobody reads
-    /// "NOT CHECKED" as a pass. Set `EF_REQUIRE_FRESH_ARTIFACTS=1` where build
-    /// order is guaranteed (the Makefile's C-library target, CI) to turn the
-    /// skip into a hard failure.
-    fn artifact_is_fresh_vs(artifact: &std::path::Path, src_dir: &std::path::Path) -> bool {
-        let art = match std::fs::metadata(artifact).and_then(|m| m.modified()) {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-        let newest_src = std::fs::read_dir(src_dir).ok().and_then(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter_map(|e| e.metadata().ok())
-                .filter_map(|m| m.modified().ok())
-                .max()
-        });
-        let Some(newest_src) = newest_src else {
-            return false;
-        };
-        if art >= newest_src {
-            return true;
-        }
-        let msg = format!(
-            "{} is older than src/ -- this check did NOT run. \
-             `cargo test` does not build staticlib/cdylib targets; run \
-             `cargo build` the owning crate first.",
-            artifact.display()
-        );
-        if std::env::var("EF_REQUIRE_FRESH_ARTIFACTS").is_ok() {
-            panic!("{msg}");
-        }
-        // Straight to stderr: libtest swallows `eprintln!` for passing tests,
-        // and a skip nobody sees is indistinguishable from a pass.
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "SKIP: {msg}");
-        false
-    }
-
-    /// `ef_*` symbols a built library exports.
-    fn ef_symbols_of(lib: &std::path::Path, src_dir: &std::path::Path) -> Option<Vec<String>> {
-        // Each library is checked against ITS OWN crate's sources. Comparing
-        // libedgefirst_tensor against image-capi/src would report staleness
-        // every time this crate is edited, which is noise, not a signal.
-        if !lib.exists() || !artifact_is_fresh_vs(lib, src_dir) {
-            return None;
-        }
-        let args: &[&str] = if cfg!(target_os = "macos") {
-            &["-gU"]
-        } else {
-            &["-D", "--defined-only"]
-        };
-        let out = std::process::Command::new("nm")
-            .args(args)
-            .arg(lib)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.split_whitespace().last())
-            .map(|s| s.trim_start_matches('_').to_string())
+    /// `ef_*` symbols the built shared library `stem` exports, checked
+    /// against `src_dir` for freshness.
+    fn ef_symbols_of(stem: &str, src_dir: &str) -> Result<Vec<String>, String> {
+        let lib = artifacts::find_cdylib(stem, std::path::Path::new(src_dir))?;
+        let mut v: Vec<String> = artifacts::symbols_of(&lib)?
+            .into_iter()
             .filter(|s| s.starts_with("ef_"))
             .collect();
         v.sort();
         v.dedup();
-        Some(v)
+        Ok(v)
     }
 
     #[test]
@@ -236,32 +229,21 @@ mod tests {
         // would be freed by the wrong implementation. One library alone
         // could never demonstrate this -- it takes both linked into one
         // binary to prove there is nothing left for the linker to interpose.
-        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        dir.pop();
-        dir.pop();
-        dir.push("target");
-        dir.push("debug");
-        let ext = if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        };
-        let (Some(img), Some(tsr)) = (
-            ef_symbols_of(
-                &dir.join(format!("libedgefirst_image.{ext}")),
-                std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
-            ),
-            ef_symbols_of(
-                &dir.join(format!("libedgefirst_tensor.{ext}")),
-                std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../tensor-capi/src")),
-            ),
-        ) else {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIP: both libraries must be built and current; \
-                 run `cargo build -p edgefirst-tensor-capi -p edgefirst-image-capi`"
-            );
+        let img = ef_symbols_of("edgefirst_image", SRC_DIR);
+        let tsr = ef_symbols_of("edgefirst_tensor", TENSOR_SRC_DIR);
+        let (Ok(img), Ok(tsr)) = (&img, &tsr) else {
+            // Which library, and why: the old message blamed the build for
+            // every cause, including a Windows host where it looked for
+            // libedgefirst_*.so that MSVC never produces.
+            let reason = [img.as_ref().err(), tsr.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            skip(&format!(
+                "the two libraries' exports not compared: {reason}"
+            ));
             return;
         };
         assert!(
@@ -293,27 +275,27 @@ mod tests {
     ///
     /// Linking matters: a syntax-only pass cannot compare a size Rust computed
     /// against one C computed, and it would not notice a missing symbol either.
+    #[cfg(not(windows))]
     fn cc_build_and_run(src: &str, bin_name: &str) -> Option<std::process::Output> {
         let include = concat!(env!("CARGO_MANIFEST_DIR"), "/include");
-        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        dir.pop();
-        dir.pop();
-        dir.push("target");
-        dir.push("debug");
-        let lib = dir.join("libedgefirst_image.a");
-        let tensor_lib = dir.join("libedgefirst_tensor.a");
-        if !lib.exists() {
-            eprintln!("SKIP: {} not built yet; C link test not run", lib.display());
-            return None;
-        }
-        // The staticlib has the same staleness exposure as the cdylib: linking
-        // C against a stale .a validates the previous build's symbols.
-        if !artifact_is_fresh_vs(
-            &lib,
-            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        let (lib, tensor_lib) = match (
+            find_artifact(STATICLIB),
+            artifacts::find_artifact(
+                "libedgefirst_tensor.a",
+                std::path::Path::new(TENSOR_SRC_DIR),
+            ),
         ) {
-            return None;
-        }
+            (Ok(lib), Ok(tensor_lib)) => (lib, tensor_lib),
+            (image, tensor) => {
+                let reason = [image.err(), tensor.err()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                skip(&format!("{src} not linked: {reason}"));
+                return None;
+            }
+        };
         let out_bin = std::env::temp_dir().join(bin_name);
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
         let mut cmd = std::process::Command::new(&cc);
@@ -345,11 +327,7 @@ mod tests {
         // not hypothetical: dropping `#[no_mangle]` from `ef_tensor_free` left
         // this test PASSING, reported as a toolchain problem.
         if !toolchain_works(&cc) {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIP: no working C toolchain ({cc}); C link test not run"
-            );
+            skip(&format!("{src} not linked: no working C toolchain ({cc})"));
             return None;
         }
         match cmd.output() {
@@ -360,7 +338,7 @@ mod tests {
                  known good, so this is a real defect):\n{}",
                 String::from_utf8_lossy(&o.stderr)
             ),
-            Ok(_) => std::process::Command::new(&out_bin).output().ok(),
+            Ok(_) => run_program(&out_bin, std::process::Command::new(&out_bin)),
             Err(e) => panic!("failed to run {cc} after it probed OK: {e}"),
         }
     }
@@ -369,9 +347,13 @@ mod tests {
     ///
     /// Separates "no toolchain here" from "our library is broken", which the
     /// C tests otherwise cannot tell apart.
+    #[cfg(not(windows))]
     fn toolchain_works(cc: &str) -> bool {
-        let probe = std::env::temp_dir().join("ef_cc_probe.c");
-        let out = std::env::temp_dir().join("ef_cc_probe.bin");
+        // Per-process names: two leaves' test binaries, or two `cargo test`
+        // runs, would otherwise compile over each other's probe.
+        let pid = std::process::id();
+        let probe = std::env::temp_dir().join(format!("ef_cc_probe-{pid}.c"));
+        let out = std::env::temp_dir().join(format!("ef_cc_probe-{pid}.bin"));
         if std::fs::write(&probe, b"int main(void){return 0;}\n").is_err() {
             return false;
         }
@@ -382,6 +364,86 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    // MSVC discovery, shared with tensor-capi where it lives; included at the
+    // crate root for the same reason as `artifacts`.
+    #[cfg(windows)]
+    use crate::msvc;
+
+    /// The three include directories the POSIX helpers pass with `-I`.
+    #[cfg(windows)]
+    const INCLUDES: [&str; 3] = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/include"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../tensor-capi/include"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../decoder-abi/include"),
+    ];
+
+    /// The Windows twin of `cc_syntax_check`: `cl.exe /Zs` parses without
+    /// generating code, and `/W4 /WX` stands in for `-Wall -Werror`.
+    #[cfg(windows)]
+    fn cc_syntax_check(src: &str) -> Option<std::process::Output> {
+        Some(msvc::require(src)?.syntax_check(&INCLUDES, &[], src))
+    }
+
+    /// The Windows twin of `cc_build_and_run`.
+    ///
+    /// Links `edgefirst_image.lib` with the tensor DLL's import library and
+    /// never the tensor staticlib, as `build.rs` does for this library
+    /// itself: a second copy of the Rust runtime fails the link with
+    /// duplicate symbols. The binary therefore loads `edgefirst_tensor.dll`
+    /// at start, so `target/debug` is put on its PATH.
+    #[cfg(windows)]
+    fn cc_build_and_run(src: &str, bin_name: &str) -> Option<std::process::Output> {
+        let (lib, tensor_import_lib) = match (
+            find_artifact(STATICLIB),
+            artifacts::find_artifact(
+                "edgefirst_tensor.dll.lib",
+                std::path::Path::new(TENSOR_SRC_DIR),
+            ),
+        ) {
+            (Ok(lib), Ok(tensor_import_lib)) => (lib, tensor_import_lib),
+            (image, tensor) => {
+                let reason = [image.err(), tensor.err()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                skip(&format!("{src} not linked: {reason}"));
+                return None;
+            }
+        };
+        // Same split as the POSIX branch: a toolchain that cannot build a
+        // trivial program is a skip naming what failed; any failure after
+        // that is our defect.
+        let toolchain = msvc::require(src)?;
+        // Under the toolchain's own scratch directory, one per process: the
+        // libtest threads driving these programs would otherwise write one
+        // another's object files.
+        let exe = toolchain.scratch().join(format!("{bin_name}.exe"));
+        let libs = [lib.as_os_str(), tensor_import_lib.as_os_str()];
+        let out = toolchain.build(&INCLUDES, src, &exe, &libs);
+        // The command line and cl's own stdout diagnostics are folded into
+        // stderr by the harness, so this message carries both.
+        assert!(
+            out.status.success(),
+            "C link against edgefirst_image.lib FAILED (the toolchain is \
+             known good, so this is a real defect):\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // edgefirst_tensor.dll sits beside the import library the binary was
+        // linked against, so the loader finds it there.
+        let dll_dir = tensor_import_lib
+            .parent()
+            .expect("find_artifact returns a path under a directory")
+            .to_path_buf();
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let path =
+            std::env::join_paths(std::iter::once(dll_dir).chain(std::env::split_paths(&inherited)))
+                .expect("PATH entries split on the separator contain none");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.env("PATH", path);
+        run_program(&exe, cmd)
     }
 
     #[test]

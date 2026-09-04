@@ -94,7 +94,7 @@ selected by per-item `cfg` gates:
 | Tier | Gate | Contents |
 |------|------|----------|
 | Portable | none | mask/segmentation/box render, proto suite, src_rect crops, decision tables, F16 zero-copy roundtrip |
-| Zero-copy | `feature = "dma_test_formats"` | `@Dma` fixtures that allocate on both platforms (RGBA/BGRA/GREY/NV*/YUYV — DMA-BUF on Linux, IOSurface on macOS): pool/recycle/steady-state, NV12/YUYV references, subview no-aliasing, NV16/NV24 Path-B oracles, odd-geometry `g01–g06`/grey/64×64 GPU-vs-CPU oracles. Self-skips on Windows (no zero-copy allocation) |
+| Zero-copy | `feature = "dma_test_formats"` | `@Dma` fixtures that allocate on all three platforms (RGBA/BGRA/GREY/NV*/YUYV — DMA-BUF on Linux, IOSurface on macOS, D3D11 textures on Windows): pool/recycle/steady-state, NV12/YUYV references, subview no-aliasing, NV16/NV24 Path-B oracles, odd-geometry `g01–g06`/grey/64×64 GPU-vs-CPU oracles. Runs wherever `is_gpu_buffer_available()` is true, Windows included: every format the tier uses has a D3D11 texture layout |
 | PBO destinations | `cfg(any(target_os = "linux", target_os = "windows"))` | PBO u8/i8/float destinations, cross-handle PBO map exclusion, `float_pbo_eligible` |
 | Linux-only | `cfg(target_os = "linux")` (± the feature) | display probing, CUDA destinations, packed-RGB `@Dma` incl. the int8 odd-geometry oracles (no IOSurface FourCC for 3-byte RGB), DMA stride guards, multi-plane fd imports, Neutron scenarios, NV path-selection asserts and divergence probes |
 
@@ -114,7 +114,11 @@ same rules: they are gated on every GL platform (Linux, macOS, iOS,
 Android, Windows), self-skip when `GLProcessorThreaded::new` fails, build
 their tensor-backing lists from `is_shm_available()` /
 `is_gpu_buffer_available()` rather than hard-coding `Shm`/`DmaBuf`, and the
-YUV imports skip where no zero-copy backing exists (Windows today).
+YUV imports skip where no zero-copy backing exists for that format.
+`is_gpu_buffer_available()` is true on Windows, so the zero-copy backings are
+exercised there; `test_yuyv_to_rgba_opengl` runs, because YUYV has a D3D11
+texture layout (`R8G8_UNORM`), while the VYUY import still self-skips — VYUY
+has no entry in `crates/tensor/src/d3d11_layout.rs`.
 
 **Android** deliberately has no `#[cfg(target_os = "android")]` test tier
 in this module: no CI runner can execute Android GL, so on-device

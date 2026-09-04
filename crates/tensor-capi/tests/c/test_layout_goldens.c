@@ -43,6 +43,14 @@ _Static_assert(offsetof(EfViewOrigin, x) == 24, "");
 _Static_assert(offsetof(EfViewOrigin, y) == 32, "");
 _Static_assert(offsetof(EfViewOrigin, has_origin) == 40, "");
 
+/* Five u32s, no wider field to force alignment: 20 bytes at align 4. */
+_Static_assert(sizeof(ef_d3d11_layout) == 20, "d3d11 layout frozen at 20");
+_Static_assert(offsetof(ef_d3d11_layout, dxgi_format) == 0, "");
+_Static_assert(offsetof(ef_d3d11_layout, texture_width) == 4, "");
+_Static_assert(offsetof(ef_d3d11_layout, texture_height) == 8, "");
+_Static_assert(offsetof(ef_d3d11_layout, bytes_per_texel) == 12, "");
+_Static_assert(offsetof(ef_d3d11_layout, gl_internal_format) == 16, "");
+
 _Static_assert(sizeof(ef_quantization_info) == 12, "quantization info frozen at 12");
 _Static_assert(offsetof(ef_quantization_info, axis) == 0, "");
 _Static_assert(offsetof(ef_quantization_info, count) == 4, "");

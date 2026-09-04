@@ -752,8 +752,23 @@ echo "== G5: footprint =="
 # when only one of them can measure it is how a wrong number acquires a
 # second, agreeing witness. G5's remaining job is narrower and honest: notice
 # if the five libraries get big.
-CEILING_BYTES=23200000
+CEILING_BYTES=23420000
 # CEILING HISTORY -- a number with an arithmetic derivation, not a feeling.
+#
+# v3 (2026-09-05): re-measured at HEAD by this gate in CI (ubuntu-22.04,
+# x86_64) on the Windows zero-copy tensor round (hal#152), which the v2
+# ceiling tripped by 15,656 B:
+#   tensor 1,422,088 + image 9,721,704 + codec 1,208,336 + decoder 10,456,288
+#   + tracker 407,240 = 23,215,656 B.
+# Delta over v2 is 215,512 B: tensor +34,400 (try_map, cuda_map_mut,
+# gpu_write_value, the D3D11_TEXTURE descriptor kind and the reference-mode
+# blob record, all of which exist on every platform; the D3D11 device and
+# texture code itself is cfg'd out of these builds), decoder +240,248 and
+# codec +20,696 (main's 0.29.x releases between v2 and this measurement),
+# image -87,088 (the stride-honouring readbacks replaced three open-coded
+# copies with one), tracker +7,256. G1 still reports 0 sibling embeds.
+# Headroom above the measurement: 204,344 B (0.88%), the same role as v1
+# and v2 (build-to-build variance, not a de-duplication budget).
 #
 # v2 (2026-08-26): re-measured at HEAD after the modular C/Python split and
 # the 0.29.0 release-readiness work (ordered crates.io publish, one C archive,

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! The map window: `ef_tensor_map` / `ef_tensor_unmap` / `ef_tensor_copy_to`.
+//! The map window: `ef_tensor_map` / `ef_tensor_try_map` /
+//! `ef_tensor_unmap` / `ef_tensor_copy_to`.
 //!
 //! One CPU-access window per tensor at a time, held for the caller between
 //! `ef_tensor_map` and `ef_tensor_unmap` -- the C counterpart to
@@ -99,6 +100,12 @@ pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
         Error::InsufficientCapacity { .. } => libc::ERANGE,
         Error::NotImplemented(_) => libc::ENOTSUP,
         Error::PboDisconnected | Error::PboMapped => libc::EBUSY,
+        // `WouldBlock` is not a failure: it is `ef_tensor_try_map` reporting
+        // that the GPU copy the map depends on has not finished and the
+        // caller should come back. `EAGAIN` is the POSIX spelling of exactly
+        // that, and keeping it out of the `EIO` arm below is what lets a
+        // caller tell "retry me" from "this map is broken".
+        Error::IoError(e) if e.kind() == std::io::ErrorKind::WouldBlock => libc::EAGAIN,
         Error::IoError(_) => libc::EIO,
         #[cfg(unix)]
         Error::NixError(_) => libc::EIO,
@@ -153,18 +160,73 @@ pub unsafe extern "C" fn ef_tensor_map(
     access: u32,
     out: *mut EfTensorView,
 ) -> c_int {
+    // SAFETY: `t` and `out` carry this function's own contract unchanged.
+    unsafe { map_window(t, access, out, false) }
+}
+
+/// Non-blocking [`ef_tensor_map`]: identical in every way except that a
+/// backing whose map has to wait for a GPU copy answers `EAGAIN` instead of
+/// stalling until that copy lands.
+///
+/// Only the Windows D3D11 texture has such a copy today (its staging
+/// refresh). Every other backing -- host memory, shared memory, dma-buf,
+/// IOSurface, AHardwareBuffer, PBO -- reaches exactly the code
+/// `ef_tensor_map` reaches and can never answer `EAGAIN`, so a caller can
+/// use this unconditionally and only ever actually retry where the wait is
+/// real.
+///
+/// `EAGAIN` takes nothing: no map is left outstanding, `out` is untouched,
+/// and a later call (this one or `ef_tensor_map`) makes progress. Yield or
+/// sleep between attempts: on the WARP software adapter the CPU threads are
+/// the GPU, so a tight retry loop starves the copy it is waiting for.
+///
+/// @return the codes [`ef_tensor_map`] returns, plus `EAGAIN` when the map
+///         would have had to wait for a GPU copy.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle; `out` must be writable for one
+/// `ef_tensor_view`.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_try_map(
+    t: *mut EfTensor,
+    access: u32,
+    out: *mut EfTensorView,
+) -> c_int {
+    // SAFETY: `t` and `out` carry this function's own contract unchanged.
+    unsafe { map_window(t, access, out, true) }
+}
+
+/// The shared body of [`ef_tensor_map`] and [`ef_tensor_try_map`].
+///
+/// Written once rather than twice: the two differ only in which `TensorDyn`
+/// mapping call they make at the end, and every gate before it -- the null
+/// checks, the access decode, the write-access refusal, the exclusive-write
+/// refcount gate, the outstanding-map check -- is a contract both must
+/// enforce identically. Two hand-written copies is exactly how one of those
+/// gates ends up applying to only one of them.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle; `out` must be writable for one
+/// `ef_tensor_view`.
+unsafe fn map_window(
+    t: *mut EfTensor,
+    access: u32,
+    out: *mut EfTensorView,
+    non_blocking: bool,
+) -> c_int {
+    let what = if non_blocking { "try_map" } else { "map" };
     unsafe {
         shield_int(|| {
             if t.is_null() || out.is_null() {
-                set_last_error("map: null tensor or out");
+                set_last_error(&format!("{what}: null tensor or out"));
                 return libc::EINVAL;
             }
             let Some(access) = crate::codes::cpu_access_from_code(access) else {
-                set_last_error(&format!("map: unknown access code {access}"));
+                set_last_error(&format!("{what}: unknown access code {access}"));
                 return libc::EINVAL;
             };
             let Some(imp) = impl_of(t) else {
-                set_last_error("map: could not resolve handle");
+                set_last_error(&format!("{what}: could not resolve handle"));
                 return libc::EINVAL;
             };
             // Narrow, write-only gate: a read request against a not-writable
@@ -175,7 +237,9 @@ pub unsafe extern "C" fn ef_tensor_map(
             // does not permit writes is refused, at this boundary, before ever
             // reaching the backend.
             if access.writes() && !imp.inner.cpu_access().writes() {
-                set_last_error("map: write access requested on a non-writable tensor");
+                set_last_error(&format!(
+                    "{what}: write access requested on a non-writable tensor"
+                ));
                 return libc::EACCES;
             }
             // A poisoned lock means a shielded panic unwound while the lock was
@@ -197,21 +261,28 @@ pub unsafe extern "C" fn ef_tensor_map(
                 let refs = imp.refs.load(std::sync::atomic::Ordering::Acquire);
                 if refs > 1 {
                     set_last_error(&format!(
-                        "map: write map refused: tensor handle is shared (refcount \
+                        "{what}: write map refused: tensor handle is shared (refcount \
                      {refs}); write access requires a unique handle"
                     ));
                     return libc::EBUSY;
                 }
             }
             if slot.is_some() {
-                set_last_error("map: a map is already outstanding on this tensor");
+                set_last_error(&format!(
+                    "{what}: a map is already outstanding on this tensor"
+                ));
                 return libc::EBUSY;
             }
-            let mut view = match imp.inner.map_bytes(access) {
+            let mapped = if non_blocking {
+                imp.inner.try_map_bytes(access)
+            } else {
+                imp.inner.map_bytes(access)
+            };
+            let mut view = match mapped {
                 Ok(v) => v,
                 Err(e) => {
                     let errno = errno_for(&e);
-                    set_last_error(&format!("map: {e}"));
+                    set_last_error(&format!("{what}: {e}"));
                     return errno;
                 }
             };

@@ -19,35 +19,95 @@ def version() -> str:
 def is_dma_available() -> bool:
     """True when Linux DMA-BUF heap allocation is available.
 
-    macOS callers should use :func:`is_iosurface_available` or the
-    portable :func:`is_gpu_buffer_available` instead.
+    Declared and answered on every platform; ``True`` only on Linux. Use
+    :func:`is_gpu_buffer_available` for the portable question.
     """
 
 def is_iosurface_available() -> bool:
     """True when macOS IOSurface allocation is available.
 
-    Always returns ``False`` on non-macOS platforms.
+    Declared and answered on every platform; ``True`` only on macOS and iOS.
+    Use :func:`is_gpu_buffer_available` for the portable question.
     """
 
 def is_gpu_buffer_available() -> bool:
     """True when a platform-native GPU-coherent buffer kind is available.
 
-    Dispatches to :func:`is_dma_available` on Linux and
-    :func:`is_iosurface_available` on macOS. Use this when you only care
-    whether ``TensorMemory.DMABUF`` will succeed without caring which
-    primitive backs it.
+    A DMA-BUF on Linux, an IOSurface on macOS and iOS, an AHardwareBuffer on
+    Android, a D3D11 texture on Windows. Declared and answered on every
+    platform. Use this when you only care whether ``TensorMemory.DMABUF``
+    will succeed without caring which primitive backs it.
     """
 
 def is_shm_available() -> bool:
-    """True when POSIX shared memory allocation is available (Linux and macOS)."""
+    """True when POSIX shared memory allocation is available.
+
+    Declared and answered on every platform; ``True`` only where ``/dev/shm``
+    is writable, so not on Windows.
+    """
 
 def is_cuda_available() -> bool:
     """True when libcudart is loaded and all CUDA interop symbols resolved.
 
-    Checks whether zero-copy CUDA tensor mapping is available on this system.
-    Use this to gate CUDA-specific code paths before calling
-    :meth:`Tensor.cuda_map`. The result is cached after the first call.
+    Declared and answered on every platform; ``True`` only where a CUDA
+    runtime loaded.
     """
+
+if sys.platform == "win32":
+    def d3d11_device() -> int:
+        """Borrowed ``ID3D11Device*`` of the process device, as an integer.
+
+        Platforms:
+            Windows.
+
+        The device is created on the first call. Wrap with
+        ``ctypes.c_void_p`` for native callers; no reference is
+        transferred, so never ``Release`` this pointer.
+
+        This is the device the tensors this wheel allocates live on, which
+        is the one inside ``libedgefirst_tensor`` -- not a second one in the
+        wheel's own linked copy.
+
+        Raises:
+            RuntimeError: If no device could be created.
+        """
+
+    def d3d11_use_external_device(ptr: int) -> None:
+        """Install a host-owned D3D11 device before the HAL's first use.
+
+        Platforms:
+            Windows.
+
+        Tensors the HAL allocates then live on the caller's device instead
+        of a second one. The reference stays the caller's. Must run before
+        anything that creates the device as a side effect:
+        :func:`d3d11_device`, :func:`is_gpu_buffer_available`, or any
+        texture allocation.
+
+        The pointer is installed into ``libedgefirst_tensor``, which is
+        where the allocations happen, so it takes effect with no intervening
+        call.
+
+        Raises:
+            RuntimeError: If the device is already initialized, or ``ptr``
+                is not a live ``ID3D11Device``.
+        """
+
+    class D3d11Layout:
+        """DXGI format and texture geometry behind a texture tensor.
+
+        Platforms:
+            Windows.
+
+        The dimensions are the texture's, not the image's: a packed row
+        folds several pixels or several planes into one texel.
+        """
+
+        dxgi_format: int
+        texture_width: int
+        texture_height: int
+        bytes_per_texel: int
+        gl_internal_format: int
 
 class Quantization:
     """Quantization parameters for an integer tensor.
@@ -188,6 +248,9 @@ class Tensor:
             """Import an existing buffer as a tensor, without copying. If no
             name is given, a random name will be generated.
 
+            Platforms:
+                Linux, macOS.
+
             The buffer type is **detected, not chosen**. On Linux it is
             determined by the file descriptor's filesystem magic:
 
@@ -230,6 +293,9 @@ class Tensor:
         @property
         def fd(self) -> int:
             """A duplicate of the file descriptor backing the tensor's memory.
+
+            Platforms:
+                Linux, macOS.
 
             The caller owns the returned descriptor and must close it.
             """
@@ -339,6 +405,9 @@ class Tensor:
         def dmabuf_clone(self) -> int:
             """Clone the DMA-BUF file descriptor backing this tensor.
 
+            Platforms:
+                Linux.
+
             Returns a new file descriptor that the caller must close.
 
             Returns:
@@ -356,7 +425,10 @@ class Tensor:
             dtype: DType = "uint8",
             name: None | str = None,
         ) -> Tensor:
-            """Wrap an externally-allocated IOSurface as a Tensor (macOS only).
+            """Wrap an externally-allocated IOSurface as a Tensor.
+
+            Platforms:
+                macOS.
 
             ``surface_ref`` is an ``IOSurfaceRef`` cast to ``int`` — typically
             obtained via ``ctypes`` from a CoreVideo / AVFoundation /
@@ -386,7 +458,10 @@ class Tensor:
 
         @property
         def iosurface_id(self) -> int | None:
-            """``IOSurfaceID`` for cross-process surface sharing (macOS only).
+            """``IOSurfaceID`` for cross-process surface sharing.
+
+            Platforms:
+                macOS.
 
             Returns ``None`` when the tensor is not IOSurface-backed. The ID
             is a 32-bit handle stable for the lifetime of the IOSurface; it
@@ -396,7 +471,10 @@ class Tensor:
 
         @property
         def iosurface_ref(self) -> int | None:
-            """Borrowed ``IOSurfaceRef`` as an ``int`` (macOS only).
+            """Borrowed ``IOSurfaceRef`` as an ``int``.
+
+            Platforms:
+                macOS.
 
             Hand this off to native macOS APIs that take an ``IOSurfaceRef``
             directly (``CIImage``, ``AVSampleBufferDisplayLayer``,
@@ -431,6 +509,147 @@ class Tensor:
                 # bound via ctypes; the IOSurface stays valid while `t`
                 # is alive.
                 # ci_image_with_iosurface(surf_ptr)
+            """
+
+    if sys.platform == "win32":
+        def d3d11_texture(self) -> int | None:
+            """Borrowed ``ID3D11Texture2D*`` as an integer.
+
+            Platforms:
+                Windows.
+
+            Wrap with ``ctypes.c_void_p`` for native callers; the pointer
+            lives as long as this tensor. ``None`` when the tensor is not a
+            texture.
+            """
+
+        def d3d11_layout(self) -> D3d11Layout | None:
+            """The texture's DXGI format and geometry.
+
+            Platforms:
+                Windows.
+
+            ``None`` when the tensor is not a texture.
+            """
+
+        def d3d11_shared_handle(self) -> int:
+            """Duplicate the NT handle of the D3D11 texture backing this tensor.
+
+            Platforms:
+                Windows.
+
+            Returns:
+                An NT handle the caller owns and must close with
+                ``CloseHandle``.
+
+            Raises:
+                RuntimeError: If the tensor is not a D3D11 texture, or the
+                    handle could not be duplicated.
+            """
+
+        def gpu_completion(self) -> tuple[int, int] | None:
+            """Fence handle and value a GPU consumer waits on before reading.
+
+            Platforms:
+                Windows.
+
+            Returns:
+                ``(fence_handle, value)``, the handle owned by the caller
+                and closed with ``CloseHandle``; ``None`` when no GPU write
+                has been recorded.
+            """
+
+        @property
+        def gpu_write_value(self) -> int:
+            """The fence value of the newest recorded GPU write, or 0.
+
+            Platforms:
+                Windows.
+
+            The same number :meth:`gpu_completion` returns as ``value``,
+            with no fence handle to close: for a consumer that already holds
+            the process fence and needs only the value to wait for. 0 when
+            no write has been recorded, or when the tensor is not a texture.
+            """
+
+        def set_gpu_write(self, value: int) -> None:
+            """Record that GPU work writing this texture completes at ``value``.
+
+            Platforms:
+                Windows.
+
+            The recorded value is a maximum, so a producer may record on a
+            tensor its consumers already hold.
+
+            Raises:
+                RuntimeError: If the tensor is not a D3D11 texture.
+            """
+
+        @staticmethod
+        def from_d3d11_texture(
+            texture: int,
+            shape: list[int],
+            dtype: DType,
+            format: PixelFormat,
+            access: str = "none",
+            name: str | None = None,
+        ) -> Tensor:
+            """Wrap a texture created on the HAL device.
+
+            Platforms:
+                Windows.
+
+            The width and height are read from the texture's own
+            description, so ``shape`` describes it rather than defining it:
+            it must be either the allocation shape or the addressing shape
+            ``format`` gives those dimensions.
+
+            A semi-planar texture (``Nv12``, ``Nv16``, ``Nv24``) carries the
+            image's row stride as its width, so it is accepted only when
+            that width is even and equal to the staging row pitch the driver
+            gives a texture of that width. Allocate through the HAL, or
+            match the pitch.
+
+            Raises:
+                ValueError: If ``shape`` is neither shape of this texture;
+                    the message names both.
+                RuntimeError: If ``texture`` is not a live texture on the
+                    HAL device holding a ``format`` image.
+            """
+
+        @staticmethod
+        def from_d3d11_shared_handle(
+            handle: int,
+            shape: list[int],
+            dtype: DType,
+            format: PixelFormat,
+            access: str = "none",
+            completion: tuple[int, int] | None = None,
+            name: str | None = None,
+        ) -> Tensor:
+            """Open a shared texture on the HAL device, waiting on ``completion`` first.
+
+            Platforms:
+                Windows.
+
+            ``handle`` and ``completion``'s fence handle stay the caller's:
+            this duplicates what it keeps. The width and height are read
+            from the opened texture's own description, so ``shape``
+            describes it rather than defining it: it must be either the
+            allocation shape or the addressing shape ``format`` gives those
+            dimensions. The semi-planar width rule of
+            :meth:`from_d3d11_texture` applies here too.
+
+            Args:
+                completion: ``(fence_handle, value)`` from
+                    :meth:`gpu_completion` on the producing side, waited on
+                    before the texture is read.
+
+            Raises:
+                ValueError: If ``shape`` is neither shape of this texture;
+                    the message names both.
+                RuntimeError: If ``handle`` does not open a texture holding
+                    a ``format`` image, or the fence wait fails.
             """
 
     def map(
@@ -488,6 +707,26 @@ class Tensor:
             BufferError: If the tensor is already mapped or has been unmapped.
         """
 
+    def try_map(
+        self, access: Literal["read", "write", "readwrite"] | None = None
+    ) -> HostView:
+        """Non-blocking :meth:`map`.
+
+        Raises ``BlockingIOError`` while a GPU copy the map depends on is in
+        flight; identical to :meth:`map` on backings without such a copy.
+
+        A caller that retries after ``BlockingIOError`` must yield or sleep
+        between attempts: on the WARP software adapter the CPU threads are
+        the GPU, so a tight retry loop starves the copy it is waiting for.
+
+        Args:
+            access: as :meth:`map`.
+
+        Raises:
+            BlockingIOError: While a GPU copy the map depends on is in
+                flight.
+        """
+
     def cuda_map(self) -> CudaMap | None:
         """Attempt a zero-copy CUDA device-pointer mapping.
 
@@ -507,8 +746,39 @@ class Tensor:
                 with tensor.map() as host:
                     run_cpu_path(host)                    # CPU fallback
 
+        On Windows the mapping of a D3D11 texture tensor is tight rows of
+        ``width * bytes_per_texel``, and ``size`` is their sum, whatever
+        :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
+        map sees, a larger number on a padded backing. A consumer must not
+        stride the device pointer by :attr:`row_stride`.
+
+        A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
+        so there the mapping is :attr:`row_stride` times the combined height
+        and striding by it is correct.
+
         Returns:
             A :class:`CudaMap` context manager, or ``None``.
+        """
+
+    def cuda_map_mut(self) -> CudaMap | None:
+        """Writable counterpart of :meth:`cuda_map`.
+
+        Changes are written back to the tensor when the mapping is released.
+        The same object as :meth:`cuda_map` where the mapping aliases the
+        tensor's memory, and ``None`` on the same terms. A Windows D3D11
+        texture is the backing that does not alias: its release copies the
+        device buffer back into the texture.
+
+        On Windows the mapping of a D3D11 texture tensor is tight rows of
+        ``width * bytes_per_texel``, and ``size`` is their sum, whatever
+        :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
+        map sees, a larger number on a padded backing. A consumer must not
+        stride the device pointer by :attr:`row_stride`; writing at that
+        pitch scrambles the image rather than failing.
+
+        A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
+        so there the mapping is :attr:`row_stride` times the combined height
+        and striding by it is correct.
         """
 
     @staticmethod

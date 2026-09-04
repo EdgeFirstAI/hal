@@ -92,6 +92,18 @@ pub(crate) fn set_last_error_classified(class: EfErrorClass, msg: &str) {
     LAST_CLASS.with(|c| c.set(class));
 }
 
+/// Set the calling thread's `errno`, for the entry points whose only
+/// failure channel is a `NULL` return.
+///
+/// Lives beside [`set_last_error`] because the two are written together on
+/// every such path: the errno is what the caller programs against, the
+/// message is the advisory detail. `hardware.rs` had a private copy of this
+/// before `d3d11.rs` needed the same thing; one definition rather than two
+/// that could drift on which crate sets errno at all.
+pub(crate) fn set_errno(code: c_int) {
+    errno::set_errno(errno::Errno(code));
+}
+
 /// Map a backend error onto the wire class.
 ///
 /// A deliberate many-to-one: the vocabulary names the distinctions a caller

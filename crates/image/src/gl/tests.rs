@@ -233,7 +233,6 @@ mod gl_tests {
     /// fixtures allocate on both platforms (RGBA/BGRA/GREY/NV*/YUYV);
     /// packed-RGB `@Dma` has no IOSurface FourCC, so tests with RGB DMA
     /// destinations stay Linux-gated.
-    #[cfg(feature = "dma_test_formats")]
     fn is_gpu_image_buffer_available() -> bool {
         edgefirst_tensor::is_gpu_buffer_available()
     }
@@ -268,31 +267,44 @@ mod gl_tests {
             "format must be Rgb or Rgba for comparison"
         );
 
+        // A pitch-padded destination -- the D3D11 staging texture behind a
+        // Windows `TensorMemory::DmaBuf` tensor pads an RGBA row to 128 bytes
+        // -- spaces its rows at `effective_row_stride()`, so reading the head
+        // of the mapping as a tight image would read padding as pixels.
+        // `copy_to_flat` is the tensor's own compaction and degenerates to one
+        // memcpy when the tensor is tight.
+        fn flat(img: &TensorDyn) -> Vec<u8> {
+            let t = img.as_u8().expect("u8 image");
+            let mut out = vec![0u8; t.shape().iter().product::<usize>()];
+            t.copy_to_flat(&mut out).expect("compact the padded rows");
+            out
+        }
+
         let image1 = match img1.format().unwrap() {
             PixelFormat::Rgb => image::RgbImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap(),
             PixelFormat::Rgba => image::RgbaImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap()
             .convert(),
             PixelFormat::Grey => image::GrayImage::from_vec(
                 img1.width().unwrap() as u32,
                 img1.height().unwrap() as u32,
-                img1.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap()
             .convert(),
             PixelFormat::PlanarRgb => image::GrayImage::from_vec(
                 img1.width().unwrap() as u32,
                 (img1.height().unwrap() * 3) as u32,
-                img1.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img1),
             )
             .unwrap()
             .convert(),
@@ -303,27 +315,27 @@ mod gl_tests {
             PixelFormat::Rgb => image::RgbImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap(),
             PixelFormat::Rgba => image::RgbaImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap()
             .convert(),
             PixelFormat::Grey => image::GrayImage::from_vec(
                 img2.width().unwrap() as u32,
                 img2.height().unwrap() as u32,
-                img2.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap()
             .convert(),
             PixelFormat::PlanarRgb => image::GrayImage::from_vec(
                 img2.width().unwrap() as u32,
                 (img2.height().unwrap() * 3) as u32,
-                img2.as_u8().unwrap().map().unwrap().to_vec(),
+                flat(img2),
             )
             .unwrap()
             .convert(),
@@ -357,6 +369,8 @@ mod gl_tests {
     // references
     // =========================================================================
 
+    /// An image tensor of `format` holding `bytes`, a *tight* buffer laid into
+    /// it at the destination's own row pitch by [`write_tight_rows`].
     #[cfg(feature = "dma_test_formats")]
     fn load_raw_image(
         width: usize,
@@ -373,9 +387,70 @@ mod gl_tests {
             memory,
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        let mut map = img.as_u8().unwrap().map()?;
-        map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        write_tight_rows(&img, bytes)?;
         Ok(img)
+    }
+
+    /// Copy a *tight* image buffer -- rows packed at the image's own row
+    /// length, with no padding -- into `t`, re-spacing the rows to the
+    /// destination's own pitch.
+    ///
+    /// A backing can carry a physical pitch wider than the image: an
+    /// IOSurface's `bytesPerRow`, and on Windows a D3D11 texture allocated as
+    /// wide as the driver's staging pitch (128 bytes on this NVIDIA adapter, so
+    /// a 64-wide NV16 source is a 128-wide texture). `effective_row_stride()`
+    /// is the spacing every consumer of that tensor uses, the Path B shader
+    /// included, so a block `copy_from_slice` of the whole buffer puts row `r`
+    /// at `r * tight` where the texture and the shader look at `r * stride`,
+    /// and every pixel past the first row is wrong.
+    ///
+    /// A semi-planar buffer is re-spaced by *line*, not by row: its combined
+    /// plane is `height` luma lines of `width` bytes followed by chroma lines
+    /// of `2 * chroma_w` bytes, and the chroma lines sit
+    /// `ChromaLayout::uv_rows_per_luma` destination rows apart -- two, for
+    /// NV24, whose `2W`-byte line is wider than one image row. That is the
+    /// layout `fill_patterned_nv` writes and the layout the shader decodes.
+    #[cfg(feature = "dma_test_formats")]
+    fn write_tight_rows(t: &TensorDyn, bytes: &[u8]) -> Result<(), crate::Error> {
+        let format = t.format().unwrap();
+        let width = t.width().unwrap();
+        let height = t.height().unwrap();
+        // `bytes` and the map are byte slices, but the rows they hold are
+        // samples: a row is as many bytes as the element type is wide. Every
+        // caller today is `DType::U8`, where this is a multiplication by one;
+        // taking it from the tensor means a float caller addresses its rows
+        // rather than a quarter of them.
+        let elem = t.dtype().size();
+        let bound = t.as_u8().unwrap();
+        let stride = bound.effective_row_stride().unwrap();
+        let mut map = bound.map()?;
+        let dst = map.as_mut_slice();
+        match format.chroma_layout() {
+            Some(chroma) => {
+                let luma = width * elem;
+                let chroma_h = height.div_ceil(1 << chroma.shift_y);
+                let line = width.div_ceil(1 << chroma.shift_x) * 2 * elem;
+                for r in 0..height {
+                    dst[r * stride..r * stride + luma]
+                        .copy_from_slice(&bytes[r * luma..(r + 1) * luma]);
+                }
+                let uv = &bytes[luma * height..];
+                for i in 0..chroma_h {
+                    let at = (height + i * chroma.uv_rows_per_luma) * stride;
+                    dst[at..at + line].copy_from_slice(&uv[i * line..(i + 1) * line]);
+                }
+            }
+            None => {
+                let tight = match format.layout() {
+                    edgefirst_tensor::PixelLayout::Packed => width * format.channels() * elem,
+                    _ => width * elem,
+                };
+                for (r, row) in bytes.chunks(tight).enumerate() {
+                    dst[r * stride..r * stride + row.len()].copy_from_slice(row);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Steady-state import gate: an N-frame convert loop over a fixed pool of
@@ -469,6 +544,16 @@ mod gl_tests {
     /// tensors must derive the SAME identity from the buffer's system key
     /// (so the key matches at all), and the entry must OUTLIVE the tensor it
     /// was built from (so there is still an entry to match).
+    ///
+    /// The first of those cannot hold on Windows. A D3D11 handle import keys
+    /// on the `ID3D11Texture2D` the open produced (see
+    /// `IdentityKind::D3d11Texture`), and `OpenSharedResource1` mints a fresh
+    /// object per open. Keying on a handle value instead would be stable
+    /// here and unsound: Windows recycles a closed handle value at once --
+    /// measured at 49 of 50 frames on this box -- so a cache entry outliving
+    /// its tensor would be served to an unrelated later import of a different
+    /// texture. The Windows arm below therefore asserts what is true and
+    /// load-bearing instead.
     #[test]
     #[cfg(feature = "dma_test_formats")]
     fn reimported_buffer_hits_the_cache() {
@@ -534,21 +619,45 @@ mod gl_tests {
         }
         let steady = renderer.egl_cache_stats().unwrap();
 
-        assert_eq!(
-            warm.total_misses(),
-            steady.total_misses(),
-            "re-imported buffer was re-imported into GL every frame: \
-             warm={warm:?} steady={steady:?}"
-        );
-        let hits = |s: &crate::opengl_headless::cache::GlCacheStats| {
-            s.src.hits + s.dst.hits + s.nv_r8.hits
-        };
-        let gained = hits(&steady) - hits(&warm);
-        assert!(
-            gained >= FRAMES as u64,
-            "expected at least {FRAMES} cache hits over the loop, got {gained} \
-             (warm={warm:?} steady={steady:?})"
-        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(
+                warm.total_misses(),
+                steady.total_misses(),
+                "re-imported buffer was re-imported into GL every frame: \
+                 warm={warm:?} steady={steady:?}"
+            );
+            let hits = |s: &crate::opengl_headless::cache::GlCacheStats| {
+                s.src.hits + s.dst.hits + s.nv_r8.hits
+            };
+            let gained = hits(&steady) - hits(&warm);
+            assert!(
+                gained >= FRAMES as u64,
+                "expected at least {FRAMES} cache hits over the loop, got {gained} \
+                 (warm={warm:?} steady={steady:?})"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // See the doc comment: a fresh identity per handle import is the
+            // price of an identity that cannot be recycled under a live cache
+            // entry. What still holds, and is what the cache is for, is that
+            // the long-lived destination never re-imports and the per-frame
+            // source churn is bounded by the loop rather than unbounded.
+            assert_eq!(
+                steady.dst.misses, warm.dst.misses,
+                "the destination lives across the loop, so it must not re-import: \
+                 warm={warm:?} steady={steady:?}"
+            );
+            assert!(
+                steady.dst.hits - warm.dst.hits >= FRAMES as u64,
+                "the destination must hit every frame: warm={warm:?} steady={steady:?}"
+            );
+            assert!(
+                steady.total_misses() - warm.total_misses() <= FRAMES as u64,
+                "source imports must be bounded by the loop: warm={warm:?} steady={steady:?}"
+            );
+        }
     }
 
     /// RGBA gradient bytes (w*h*4) with distinct R/G/B functions and a salt —
@@ -567,12 +676,14 @@ mod gl_tests {
         v
     }
 
-    /// Portable contract of the GL→NPU fence entry point on platforms
-    /// WITHOUT `EGL_ANDROID_native_fence_sync` (Linux/macOS): it must
-    /// behave exactly like `convert` — same output, `Ok(None)` (the
-    /// blocking contract), destination immediately readable. The
-    /// fence-returning arm is device-verified on Android
-    /// (`verify_fence_handoff` in the Device Farm harness).
+    /// Portable contract of the GL→NPU fence entry point: whether or not the
+    /// display exports a fence, the converted output must equal the blocking
+    /// convert's. On platforms with no device fence (Linux/macOS) the call
+    /// also returns `Ok(None)` — the blocking contract, destination
+    /// immediately readable. Android exports an
+    /// `EGL_ANDROID_native_fence_sync` fd and Windows an event on the D3D11
+    /// device fence, so those two may return a handle; the Android arm is
+    /// device-verified by `verify_fence_handoff` in the Device Farm harness.
     // dma_test_formats only for the fixture helpers (`rgba_gradient`,
     // `load_raw_image`) — the tensors here are plain Mem.
     #[test]
@@ -620,7 +731,7 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .expect("convert_with_fence");
-        if cfg!(not(target_os = "android")) {
+        if cfg!(not(any(target_os = "android", target_os = "windows"))) {
             assert!(
                 fence.is_none(),
                 "no platform in this test tier has native fence sync"
@@ -1436,10 +1547,14 @@ mod gl_tests {
 
     /// Overwrite an existing tensor's bytes in place (re-map → copy → drop →
     /// DMA_BUF_IOCTL_SYNC(END)), simulating a pool recycle of one buffer.
+    ///
+    /// Through [`write_tight_rows`], like the fresh-source half of the same
+    /// tests: the recycled buffer and the oracle must be laid out identically,
+    /// or the comparison measures the two writers' disagreement instead of the
+    /// stale read it is looking for.
     #[cfg(feature = "dma_test_formats")]
     fn overwrite_in_place(t: &TensorDyn, bytes: &[u8]) {
-        let mut map = t.as_u8().unwrap().map().unwrap();
-        map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        write_tight_rows(t, bytes).unwrap();
     }
 
     /// Write image A into a DMA source, convert, then overwrite the SAME source
@@ -5830,12 +5945,10 @@ mod gl_tests {
     }
 
     // ── float_pbo_eligible unit tests ────────────────────────────────────────
-    // Pure-logic predicate; no GPU required. Linux + Windows only:
-    // `float_pbo_eligible` is gated to the PBO-transfer GL backends (macOS
-    // uses IOSurface, not float PBO), so the symbol does not exist on macOS
-    // builds.
+    // Pure-logic predicate; no GPU required. Compiled wherever the helper is,
+    // which is every platform with a GL backend: `create_image`'s zero-copy
+    // float gate calls it too, so it is no longer PBO-only.
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn float_pbo_eligibility() {
         use crate::{float_pbo_eligible, RenderDtypeSupport};
@@ -5886,7 +5999,18 @@ mod gl_tests {
     }
 
     // ── classify_float_render unit tests ────────────────────────────────────
-    // Pure-logic classifier; no GPU required.
+    // Pure-logic classifier; no GPU required. The zero-copy float set is the
+    // one this build's leaf reports, so these read as "what this platform
+    // dispatches"; `float_dispatch`'s own tests pin both sets.
+    //
+    // A test here may only assert a fixed path when that path is the same
+    // under both sets -- the two PBO routes, which no set touches, and the
+    // planar F16 zero-copy render, which both sets carry. Anything else
+    // derives its expectation from the const below, or it fails on whichever
+    // leaf it was not written for.
+    use super::super::platform::{GlPlatform, Platform};
+    const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
+        <Platform as GlPlatform>::ZERO_COPY_FLOAT;
 
     #[test]
     fn dispatch_hailo_f32_pbo() {
@@ -5902,7 +6026,8 @@ mod gl_tests {
                 PixelFormat::Rgb,
                 DType::F32,
                 TensorMemory::Pbo,
-                s
+                s,
+                ZERO_COPY_FLOAT,
             ),
             FloatRenderPath::PboF32Nhwc
         );
@@ -5922,7 +6047,8 @@ mod gl_tests {
                 PixelFormat::PlanarRgb,
                 DType::F16,
                 TensorMemory::Pbo,
-                s
+                s,
+                ZERO_COPY_FLOAT,
             ),
             FloatRenderPath::PboF16Nchw
         );
@@ -5942,19 +6068,32 @@ mod gl_tests {
                 PixelFormat::PlanarRgb,
                 DType::F16,
                 TensorMemory::DmaBuf,
-                s
+                s,
+                ZERO_COPY_FLOAT,
             ),
             FloatRenderPath::ZeroCopyF16Nchw
         );
     }
 
+    // Was `dispatch_f32_dma_is_none` before Task B2: Rgba->Rgb F32 into a
+    // DmaBuf destination had no classified path anywhere. It is now the
+    // interleaved zero-copy render on a leaf that reports the full set
+    // (Windows) and still `None` on the leaves that report `PlanarF16`, so the
+    // expectation is derived from the leaf's own const rather than fixed --
+    // fixing it would fail this test on every non-Windows leaf.
+    // `float_dispatch`'s own tests pin both sets directly.
     #[test]
-    fn dispatch_f32_dma_is_none() {
+    fn dispatch_f32_dma_follows_this_leafs_zero_copy_set() {
+        use super::super::float_dispatch::ZeroCopyFloatSet;
         use super::super::processor::{classify_float_render, FloatRenderPath};
         use crate::RenderDtypeSupport;
         let s = RenderDtypeSupport {
             f32: true,
             f16: true,
+        };
+        let expected = match ZERO_COPY_FLOAT {
+            ZeroCopyFloatSet::All => FloatRenderPath::ZeroCopyFloatNhwc,
+            ZeroCopyFloatSet::PlanarF16 => FloatRenderPath::None,
         };
         assert_eq!(
             classify_float_render(
@@ -5962,9 +6101,10 @@ mod gl_tests {
                 PixelFormat::Rgb,
                 DType::F32,
                 TensorMemory::DmaBuf,
-                s
+                s,
+                ZERO_COPY_FLOAT,
             ),
-            FloatRenderPath::None
+            expected
         );
     }
 
@@ -5982,35 +6122,44 @@ mod gl_tests {
                 PixelFormat::Rgb,
                 DType::F32,
                 TensorMemory::Pbo,
-                s
+                s,
+                ZERO_COPY_FLOAT,
             ),
             FloatRenderPath::None
         );
     }
 
-    // ── dma_f16_packed_layout unit tests ────────────────────────────────────
+    // ── packed_planar_layout unit tests ─────────────────────────────────────
     // Pure geometry helper; no GPU required.
 
     #[test]
-    fn dma_f16_layout_640x640() {
-        use super::super::processor::dma_f16_packed_layout;
-        // Logical [3,640,640] f16 → packed RGBA16F surface (160, 1920),
-        // pitch (640/4)*8 = 1280 bytes.
-        assert_eq!(dma_f16_packed_layout(640, 640), Some((160, 1920, 1280)));
+    fn packed_planar_layout_640x640() {
+        use super::super::processor::packed_planar_layout;
+        // Logical [3,640,640] → packed surface (640/4, 3*640).
+        assert_eq!(packed_planar_layout(640, 640, 3), Some((160, 1920)));
     }
 
     #[test]
-    fn dma_f16_layout_non_multiple_of_4_rejected() {
-        use super::super::processor::dma_f16_packed_layout;
-        // W not divisible by 4 cannot be packed into whole RGBA16F texels.
-        assert_eq!(dma_f16_packed_layout(642, 640), None);
+    fn packed_planar_layout_non_multiple_of_4_rejected() {
+        use super::super::processor::packed_planar_layout;
+        // W not divisible by 4 cannot be packed into whole four-element texels.
+        assert_eq!(packed_planar_layout(642, 640, 3), None);
     }
 
     #[test]
-    fn dma_f16_layout_rectangular() {
-        use super::super::processor::dma_f16_packed_layout;
-        // Non-square, W divisible by 4: surface (320/4, 3*240), pitch (80)*8.
-        assert_eq!(dma_f16_packed_layout(320, 240), Some((80, 720, 640)));
+    fn packed_planar_layout_rectangular() {
+        use super::super::processor::packed_planar_layout;
+        // Non-square, W divisible by 4: surface (320/4, 3*240).
+        assert_eq!(packed_planar_layout(320, 240, 3), Some((80, 720)));
+    }
+
+    #[test]
+    fn packed_planar_layout_four_planes() {
+        use super::super::processor::packed_planar_layout;
+        // A PlanarRgba destination stacks a fourth plane onto the surface,
+        // which is what gives its shader a plane index of 3.
+        assert_eq!(packed_planar_layout(640, 480, 4), Some((160, 1920)));
+        assert_eq!(packed_planar_layout(640, 480, 3), Some((160, 1440)));
     }
 
     /// The int8 letterbox clear colour must be pre-biased (XOR 0x80) on EVERY
@@ -9724,5 +9873,714 @@ mod gl_tests {
             max_diff <= 4,
             "even NV24 64×64 regression: max_diff={max_diff} > 4; first bad at {first_fail:?}"
         );
+    }
+
+    /// Fill a YUYV tensor at its real row stride: two bytes per pixel, Y in
+    /// the even byte and alternating Cb/Cr in the odd one.
+    #[cfg(feature = "dma_test_formats")]
+    fn fill_yuyv_pattern(t: &TensorDyn, w: usize, h: usize, salt: u8) {
+        let stride = t.effective_row_stride().unwrap_or(w * 2);
+        let bound = t.as_u8().unwrap();
+        let mut m = bound.map().unwrap();
+        let buf = m.as_mut_slice();
+        for r in 0..h {
+            for c in 0..w {
+                let i = r * stride + c * 2;
+                buf[i] = ((r * 7 + c * 3) as u8).wrapping_add(salt);
+                buf[i + 1] = ((r * 5 + c * 11) as u8).wrapping_add(salt);
+            }
+        }
+    }
+
+    /// Fill an RGBA tensor at its real row stride.
+    #[cfg(feature = "dma_test_formats")]
+    fn fill_rgba_pattern(t: &TensorDyn, w: usize, h: usize, salt: u8) {
+        let stride = t.effective_row_stride().unwrap_or(w * 4);
+        let bound = t.as_u8().unwrap();
+        let mut m = bound.map().unwrap();
+        let buf = m.as_mut_slice();
+        for r in 0..h {
+            for c in 0..w {
+                let i = r * stride + c * 4;
+                buf[i] = ((r * 3 + c * 7) as u8).wrapping_add(salt);
+                buf[i + 1] = ((r * 11 + c * 5) as u8).wrapping_add(salt);
+                buf[i + 2] = ((r + c) as u8).wrapping_add(salt);
+                buf[i + 3] = 255;
+            }
+        }
+    }
+
+    /// Worst absolute channel difference between two packed outputs.
+    #[cfg(feature = "dma_test_formats")]
+    fn worst_channel_diff(expected: &[u8], actual: &[u8]) -> u8 {
+        assert_eq!(expected.len(), actual.len(), "Buffer size mismatch");
+        expected
+            .iter()
+            .zip(actual)
+            .map(|(&e, &a)| (e as i16 - a as i16).unsigned_abs() as u8)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Bytes that differ between two `w x h` packed outputs on the last row
+    /// or the last column.
+    #[cfg(feature = "dma_test_formats")]
+    fn edge_mismatches(
+        expected: &[u8],
+        actual: &[u8],
+        w: usize,
+        h: usize,
+        channels: usize,
+    ) -> usize {
+        assert_eq!(expected.len(), actual.len(), "Buffer size mismatch");
+        // A degenerate output has no last row or column; the index math
+        // below would underflow on it.
+        if w == 0 || h == 0 {
+            return 0;
+        }
+        let row = w * channels;
+        let last_row = (h - 1) * row..h * row;
+        let last_col = (0..h - 1).flat_map(|r| {
+            let start = r * row + (w - 1) * channels;
+            start..start + channels
+        });
+        last_row
+            .chain(last_col)
+            .filter(|&i| expected[i] != actual[i])
+            .count()
+    }
+
+    /// A *destination* pool tensor narrowed by `configure_image` renders into
+    /// the region its logical dimensions name, not a stretched copy of the
+    /// whole texture.
+    ///
+    /// The mirror of the narrowed-source cases below, and the one the import
+    /// seam makes non-obvious on Windows: a texture import has no sub-extent
+    /// attribute there, so the destination's own image is the whole texture
+    /// and the band is viewport state. A fresh destination of the narrowed
+    /// size is the oracle -- the same convert with no recycling in it.
+    #[test]
+    fn recycled_narrowed_destination_matches_a_fresh_one() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
+            return;
+        }
+        let src = match crate::load_image_test_helper(
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
+            Some(PixelFormat::Rgba),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - source decode failed ({e:?})", function!());
+                return;
+            }
+        };
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let rgba_dst = |w: usize, h: usize| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+        };
+        let Ok(mut pool) = rgba_dst(256, 192) else {
+            eprintln!(
+                "SKIPPED: {} - texture destination alloc failed",
+                function!()
+            );
+            return;
+        };
+        // Seed the whole texture, so anything the narrowed convert fails to
+        // cover reads as this rather than as the converted image.
+        {
+            let mut m = pool.as_u8().unwrap().map().unwrap();
+            m.as_mut_slice().fill(0x5A);
+        }
+        for (w, h) in [(160usize, 120usize), (64, 48)] {
+            pool.configure_image(w, h, PixelFormat::Rgba).unwrap();
+            gl.convert(&src, &mut pool, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            let mut fresh = rgba_dst(w, h).unwrap();
+            gl.convert(
+                &src,
+                &mut fresh,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            let (got, want) = (flat_bytes(&pool), flat_bytes(&fresh));
+            assert_eq!(got.len(), want.len(), "{w}x{h}: output size mismatch");
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            // The two converts resample through differently sized textures,
+            // so the last bit can round differently; a mis-mapped viewport is
+            // off by tens or hundreds.
+            assert!(
+                worst <= 1,
+                "{w}x{h}: narrowed destination differs from a fresh one by up to {worst}"
+            );
+        }
+    }
+
+    /// Compact a destination's rows into a tight buffer.
+    ///
+    /// A Windows `TensorMemory::DmaBuf` destination is a D3D11 texture whose
+    /// staging rows are padded to the driver's pitch (128 bytes on this
+    /// NVIDIA adapter), so reading the head of the mapping as a tight image
+    /// reads padding as pixels and shifts every row after the first.
+    /// `copy_to_flat` is the tensor's own compaction and degenerates to one
+    /// memcpy on a tight backing.
+    fn flat_bytes(img: &TensorDyn) -> Vec<u8> {
+        let t = img.as_u8().expect("u8 image");
+        let mut out = vec![0u8; t.shape().iter().product::<usize>()];
+        t.copy_to_flat(&mut out).expect("compact the padded rows");
+        out
+    }
+
+    /// The 128x128 Grey pool the narrowed-source tests recycle, seeded over
+    /// its whole extent so anything sampled from outside a later narrowed
+    /// image is unmistakable.
+    #[cfg(feature = "dma_test_formats")]
+    fn seeded_grey_pool() -> TensorDyn {
+        let pool = TensorDyn::image(
+            128,
+            128,
+            PixelFormat::Grey,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill_grey_pattern(&pool, 128, 128, 200);
+        pool
+    }
+
+    /// Convert a `sw x sh` Grey image to `dw x dh` RGBA twice: recycled
+    /// through `pool` (narrowed by `configure_image`) and from a fresh buffer
+    /// of exactly its size. Returns `(fresh, recycled)` output bytes.
+    #[cfg(feature = "dma_test_formats")]
+    fn convert_narrowed_and_fresh_grey(
+        gl: &mut GLProcessorThreaded,
+        pool: &mut TensorDyn,
+        (sw, sh): (usize, usize),
+        (dw, dh): (usize, usize),
+        salt: u8,
+    ) -> (Vec<u8>, Vec<u8>) {
+        convert_narrowed_and_fresh_grey_as(
+            gl,
+            pool,
+            (sw, sh),
+            (dw, dh),
+            salt,
+            Rotation::None,
+            Crop::no_crop(),
+        )
+    }
+
+    /// [`convert_narrowed_and_fresh_grey`] with an explicit rotation and crop,
+    /// so a case can put the sampling rectangle's far edge on the logical edge
+    /// by a route other than a whole-source stretch.
+    #[cfg(feature = "dma_test_formats")]
+    fn convert_narrowed_and_fresh_grey_as(
+        gl: &mut GLProcessorThreaded,
+        pool: &mut TensorDyn,
+        (sw, sh): (usize, usize),
+        (dw, dh): (usize, usize),
+        salt: u8,
+        rotation: Rotation,
+        crop: Crop,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, rotation, Flip::None, crop).unwrap();
+        };
+        let rgba_dst = || {
+            TensorDyn::image(
+                dw,
+                dh,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        pool.configure_image(sw, sh, PixelFormat::Grey).unwrap();
+        fill_grey_pattern(pool, sw, sh, salt);
+        let mut recycled = rgba_dst();
+        convert(gl, pool, &mut recycled);
+        let recycled_bytes = flat_bytes(&recycled);
+
+        let fresh = TensorDyn::image(
+            sw,
+            sh,
+            PixelFormat::Grey,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill_grey_pattern(&fresh, sw, sh, salt);
+        let mut oracle = rgba_dst();
+        convert(gl, &fresh, &mut oracle);
+        let oracle_bytes = flat_bytes(&oracle);
+
+        assert_eq!(
+            recycled_bytes.len(),
+            oracle_bytes.len(),
+            "{sw}x{sh} -> {dw}x{dh}: output size mismatch"
+        );
+        (oracle_bytes, recycled_bytes)
+    }
+
+    /// A pool buffer narrowed by `configure_image` imports its whole texture on
+    /// platforms whose import has no sub-extent attribute (Windows), so the
+    /// engine maps the source rectangle onto that extent. Resizing is what
+    /// makes a mis-mapping obvious — every sample moves, not just the edge —
+    /// so each case must equal a fresh-buffer convert of the same geometry.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn dma_recycle_narrowed_source_resized_matches_fresh() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
+            return;
+        }
+        let mut pool = seeded_grey_pool();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // (src w, src h, dst w, dst h).
+        let cases: [(usize, usize, usize, usize); 4] = [
+            (128, 96, 128, 96),
+            (128, 96, 64, 48),
+            (128, 96, 192, 144),
+            (96, 128, 192, 256),
+        ];
+        for (i, &(sw, sh, dw, dh)) in cases.iter().enumerate() {
+            let (oracle_bytes, recycled_bytes) = convert_narrowed_and_fresh_grey(
+                &mut gl,
+                &mut pool,
+                (sw, sh),
+                (dw, dh),
+                i as u8 * 10,
+            );
+            // Tolerance 1: the two converts resample through differently sized
+            // textures, and a software rasteriser rounds the last bit
+            // differently. A mis-mapped source is off by tens or hundreds.
+            let worst = worst_channel_diff(&oracle_bytes, &recycled_bytes);
+            assert!(
+                worst <= 1,
+                "case {i} ({sw}x{sh} -> {dw}x{dh}): narrowed source differs by up to {worst}"
+            );
+        }
+    }
+
+    /// An upscale of a narrowed pool source samples within half a texel of
+    /// the logical edge on its last row or column. A texture that is exactly
+    /// the logical image clamps to its edge texel there; one that merely
+    /// contains it holds the pool's previous content beyond that edge, which
+    /// the `LINEAR` kernel would blend in. The shaders clamp every sample to
+    /// the logical image's half-texel-inset rectangle (`src_extent`), so both
+    /// edges must equal the fresh-buffer oracle exactly.
+    ///
+    /// The narrowed axis is half the pool in every case: the scaled texture
+    /// coordinates are then exact in float, both converts filter the same
+    /// texel positions, and the edge clamp is the only thing left to differ.
+    /// The interior keeps the sibling test's tolerance of 1.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn dma_recycle_narrowed_source_upscaled_edges_match_fresh() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
+            return;
+        }
+        let mut pool = seeded_grey_pool();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // (src w, src h, dst w, dst h): height narrowed, width narrowed, both,
+        // and a non-integer upscale.
+        let cases: [(usize, usize, usize, usize); 4] = [
+            (128, 64, 256, 128),
+            (64, 128, 128, 256),
+            (64, 64, 128, 128),
+            (128, 64, 192, 96),
+        ];
+        for (i, &(sw, sh, dw, dh)) in cases.iter().enumerate() {
+            let (oracle_bytes, recycled_bytes) = convert_narrowed_and_fresh_grey(
+                &mut gl,
+                &mut pool,
+                (sw, sh),
+                (dw, dh),
+                i as u8 * 10,
+            );
+            let edges = edge_mismatches(&oracle_bytes, &recycled_bytes, dw, dh, 4);
+            assert_eq!(
+                edges, 0,
+                "case {i} ({sw}x{sh} -> {dw}x{dh}): {edges} bytes differ from a fresh buffer \
+                 on the last row or column of the upscaled narrowed source"
+            );
+            let worst = worst_channel_diff(&oracle_bytes, &recycled_bytes);
+            assert!(
+                worst <= 1,
+                "case {i} ({sw}x{sh} -> {dw}x{dh}): narrowed source differs by up to {worst}"
+            );
+        }
+    }
+
+    /// The clamp has to hold when the sampling rectangle reaches the logical
+    /// edge by a route other than a whole-source stretch.
+    ///
+    /// Case 0 crops the source to its bottom-right quadrant, whose far edge is
+    /// exactly the logical edge, and upscales it 4x: the crop rect is scaled
+    /// onto the import by the same `logical / extent` factor, so its far edge
+    /// still lands half a texel short of the stale row. Case 1 rotates 90
+    /// degrees, which permutes which quad corner carries which texcoord — the
+    /// clamp is per axis in texture space and must be unaffected.
+    ///
+    /// Both narrow an axis to half the pool, so the scaled coordinates are
+    /// exact and the edges must match the fresh-buffer oracle byte for byte.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn dma_recycle_narrowed_source_cropped_and_rotated_edges_match_fresh() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
+            return;
+        }
+        let mut pool = seeded_grey_pool();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // (src w, src h, dst w, dst h, rotation, crop).
+        let cases: [(usize, usize, usize, usize, Rotation, Crop); 2] = [
+            (
+                128,
+                64,
+                256,
+                128,
+                Rotation::None,
+                Crop::no_crop().with_source(Some(crate::Region::new(64, 32, 64, 32))),
+            ),
+            (64, 128, 256, 128, Rotation::Clockwise90, Crop::no_crop()),
+        ];
+        for (i, &(sw, sh, dw, dh, rotation, crop)) in cases.iter().enumerate() {
+            let (oracle_bytes, recycled_bytes) = convert_narrowed_and_fresh_grey_as(
+                &mut gl,
+                &mut pool,
+                (sw, sh),
+                (dw, dh),
+                i as u8 * 10,
+                rotation,
+                crop,
+            );
+            let edges = edge_mismatches(&oracle_bytes, &recycled_bytes, dw, dh, 4);
+            assert_eq!(
+                edges, 0,
+                "case {i} ({sw}x{sh} -> {dw}x{dh}, {rotation:?}, crop {:?}): {edges} bytes \
+                 differ from a fresh buffer on the last row or column",
+                crop.source
+            );
+            let worst = worst_channel_diff(&oracle_bytes, &recycled_bytes);
+            assert!(
+                worst <= 1,
+                "case {i} ({sw}x{sh} -> {dw}x{dh}, {rotation:?}): narrowed source differs \
+                 by up to {worst}"
+            );
+        }
+    }
+
+    /// The YUYV source program rebuilds texel coordinates from a `src_size`
+    /// uniform, so a narrowed pool buffer needs the texture's grid there, not
+    /// the logical image's: otherwise `floor(tc * src_size)` lands on the wrong
+    /// column and the chroma pair comes from the wrong pixel.
+    ///
+    /// The last two frames upscale, which is where the u8 blit paths blend the
+    /// texel past a narrowed edge. This shader cannot: `floor` snaps every
+    /// sample to a texel centre, so it reads one texel rather than filtering
+    /// two, and its `src_extent` clamp only bounds that index. Both edges
+    /// therefore equal the fresh-buffer oracle exactly, with or without the
+    /// clamp — the frames pin that down rather than reproducing a bleed.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn dma_recycle_narrowed_yuyv_source_matches_fresh() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
+            return;
+        }
+        let mut pool = TensorDyn::image(
+            128,
+            128,
+            PixelFormat::Yuyv,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill_yuyv_pattern(&pool, 128, 128, 200);
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        };
+
+        let rgba_dst = |w: usize, h: usize| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        // (src w, src h, dst w, dst h, salt). Even widths only: YUYV pairs two
+        // columns per chroma sample.
+        let frames: [(usize, usize, usize, usize, u8); 5] = [
+            (128, 96, 128, 96, 0),
+            (96, 128, 96, 128, 40),
+            (64, 100, 64, 100, 80),
+            (128, 64, 256, 128, 120),
+            (64, 128, 128, 256, 160),
+        ];
+        for (i, &(w, h, dw, dh, salt)) in frames.iter().enumerate() {
+            pool.configure_image(w, h, PixelFormat::Yuyv).unwrap();
+            fill_yuyv_pattern(&pool, w, h, salt);
+            let mut recycled = rgba_dst(dw, dh);
+            convert(&mut gl, &pool, &mut recycled);
+            let recycled_bytes = flat_bytes(&recycled);
+
+            let fresh = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Yuyv,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            fill_yuyv_pattern(&fresh, w, h, salt);
+            let mut oracle = rgba_dst(dw, dh);
+            convert(&mut gl, &fresh, &mut oracle);
+            let oracle_bytes = flat_bytes(&oracle);
+
+            assert_eq!(
+                recycled_bytes.len(),
+                oracle_bytes.len(),
+                "frame {i} ({w}x{h} -> {dw}x{dh}): output size mismatch"
+            );
+            let edges = edge_mismatches(&oracle_bytes, &recycled_bytes, dw, dh, 4);
+            assert_eq!(
+                edges, 0,
+                "frame {i} ({w}x{h} -> {dw}x{dh}): {edges} bytes differ from a fresh buffer \
+                 on the last row or column"
+            );
+            assert_pixels_match(&oracle_bytes, &recycled_bytes, 0);
+        }
+    }
+
+    /// The float paths feed their source through the same zero-copy import, so
+    /// a narrowed pool buffer must be mapped onto its import extent there too:
+    /// `feed_float_src`'s import arm, whose uv comes from `float_crop_uniforms`
+    /// over the logical dims. Without that mapping the narrowed source renders
+    /// stretched and this differs from the fresh-buffer oracle by ~0.99 of
+    /// full scale.
+    ///
+    /// Each frame drives both float destination kinds: an F32 `Rgb` PBO (the
+    /// readback float path) and a zero-copy F32 `PlanarRgb` texture, which
+    /// the packed float path renders into directly. They share the uv
+    /// builder, so the mapping has to hold on both. The last frame upscales,
+    /// which reaches the sample clamp (`src_extent`) on the narrowed axis;
+    /// that axis is half the pool so the scaled coordinates are exact and the
+    /// clamp is the only difference from the fresh buffer.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn dma_recycle_narrowed_source_into_float_dst_matches_fresh() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
+            return;
+        }
+        // Force the GL backend so a declined float path is a hard error rather
+        // than a CPU fallback that would make this test vacuous.
+        let mut proc = match crate::ImageProcessor::with_config(crate::ImageProcessorConfig {
+            backend: crate::ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            return;
+        }
+        let mut pool = TensorDyn::image(
+            128,
+            128,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill_rgba_pattern(&pool, 128, 128, 200);
+
+        // (src w, src h, dst w, dst h, salt).
+        let frames: [(usize, usize, usize, usize, u8); 3] = [
+            (128, 96, 128, 96, 0),
+            (96, 128, 96, 128, 60),
+            (128, 64, 256, 128, 120),
+        ];
+        for (i, &(w, h, dw, dh, salt)) in frames.iter().enumerate() {
+            pool.configure_image(w, h, PixelFormat::Rgba).unwrap();
+            fill_rgba_pattern(&pool, w, h, salt);
+            // An F32 destination through the PBO float render path, allocated
+            // on the processor's GL context: `create_image` picks a zero-copy
+            // texture first where the platform has one, and a PBO tensor can
+            // only come from the GL worker.
+            let float_dst = |p: &crate::ImageProcessor| {
+                p.opengl
+                    .as_ref()
+                    .expect("OpenGl backend")
+                    .create_pbo_image_dtype(dw, dh, PixelFormat::Rgb, DType::F32)
+            };
+            let Ok(mut recycled) = float_dst(&proc) else {
+                eprintln!("SKIPPED: {} - no F32 PBO destination", function!());
+                return;
+            };
+            proc.convert(
+                &pool,
+                &mut recycled,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            let recycled_bytes = recycled.as_f32().unwrap().map().unwrap().to_vec();
+
+            let fresh = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            fill_rgba_pattern(&fresh, w, h, salt);
+            let mut oracle = float_dst(&proc).unwrap();
+            proc.convert(
+                &fresh,
+                &mut oracle,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            let oracle_bytes = oracle.as_f32().unwrap().map().unwrap().to_vec();
+
+            assert_eq!(
+                recycled_bytes.len(),
+                oracle_bytes.len(),
+                "frame {i} ({w}x{h} -> {dw}x{dh}): output size mismatch"
+            );
+            let worst = recycled_bytes
+                .iter()
+                .zip(oracle_bytes.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst == 0.0,
+                "frame {i} ({w}x{h} -> {dw}x{dh}): narrowed float source differs from a \
+                 fresh buffer by up to {worst}"
+            );
+
+            // ── The same source into a zero-copy float destination: an F32
+            // PlanarRgb texture, rendered straight into by the packed float
+            // path rather than read back through a PBO. The extent mapping
+            // lives in the shared uv builder, so both destinations must show
+            // it; this one is the path that exists only where the platform
+            // renders float zero-copy.
+            let planar_dst = || {
+                TensorDyn::image(
+                    dw,
+                    dh,
+                    PixelFormat::PlanarRgb,
+                    DType::F32,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+            };
+            let (Ok(mut zc_recycled), Ok(mut zc_oracle)) = (planar_dst(), planar_dst()) else {
+                eprintln!(
+                    "SKIPPED (zero-copy float dst): {} - no F32 PlanarRgb texture",
+                    function!()
+                );
+                continue;
+            };
+            if zc_recycled.memory() != TensorMemory::DmaBuf {
+                eprintln!(
+                    "SKIPPED (zero-copy float dst): {} - F32 PlanarRgb dst is not zero-copy",
+                    function!()
+                );
+                continue;
+            }
+            // Both sides are read through `copy_to_flat`: a Windows texture
+            // destination spaces its rows at a padded pitch, whose bytes are
+            // not written by the render.
+            let flat_f32 = |t: &TensorDyn| -> Vec<u8> {
+                let typed = t.as_typed::<f32>().expect("F32 image");
+                let mut out = vec![0u8; typed.shape().iter().product::<usize>() * 4];
+                typed.copy_to_flat(&mut out).expect("compact padded rows");
+                out
+            };
+            proc.convert(
+                &pool,
+                &mut zc_recycled,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            proc.convert(
+                &fresh,
+                &mut zc_oracle,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            assert_eq!(
+                flat_f32(&zc_recycled),
+                flat_f32(&zc_oracle),
+                "frame {i} ({w}x{h} -> {dw}x{dh}): narrowed source into a zero-copy F32 \
+                 PlanarRgb destination differs from a fresh buffer"
+            );
+        }
     }
 }
