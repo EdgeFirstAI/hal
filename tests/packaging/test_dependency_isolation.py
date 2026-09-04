@@ -220,15 +220,37 @@ def _embedded_sibling_c_libs(so: Path) -> list[str]:
     return [lib for lib in SIBLING_C_LIBS if _library_named(text, lib)]
 
 
+def _tensor_backend_is_dynamic() -> bool:
+    """Whether the installed edgefirst-tensor wheel links libedgefirst_tensor
+    (the `dynamic` backend) rather than embedding the implementation
+    (`static`) -- measured off the actual installed wheel, not assumed.
+
+    Every real release ships `dynamic` (each python-* crate's own default),
+    but G13 (the differential gate, `make test-differential`) deliberately
+    installs a genuine `static` build in one of its two comparison venvs, so
+    this test cannot assume the backend it is running against.
+    """
+    return _links_libedgefirst_tensor(_wheel_extension("tensor"))
+
+
 @pytest.mark.parametrize("leaf", ["tensor", "codec", "image", "decoder"])
 def test_python_wheel_dt_needed_libedgefirst_tensor(leaf):
-    """Four wheels dynamically link libedgefirst_tensor; they must not
-    embed a sibling C library (G12).
+    """Under a `dynamic` tensor backend, these four wheels link
+    libedgefirst_tensor; under `static` none of them do (the implementation
+    is embedded instead). Either way they must not embed a sibling C
+    library (G12).
     """
     so = _wheel_extension(leaf)
-    assert _links_libedgefirst_tensor(so), (
-        f"{so} has no DT_NEEDED/otool entry for libedgefirst_tensor"
-    )
+    dynamic = _tensor_backend_is_dynamic()
+    if dynamic:
+        assert _links_libedgefirst_tensor(so), (
+            f"{so} has no DT_NEEDED/otool entry for libedgefirst_tensor"
+        )
+    else:
+        assert not _links_libedgefirst_tensor(so), (
+            f"{so} links libedgefirst_tensor under a static tensor backend; "
+            "a static build must embed the implementation, not DT_NEEDED it"
+        )
     siblings = _embedded_sibling_c_libs(so)
     assert not siblings, (
         f"{so} dynamically links sibling C libraries {siblings}; "
