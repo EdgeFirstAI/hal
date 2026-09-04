@@ -715,9 +715,14 @@ mod decoder_interop {
 #[cfg(any(feature = "image", feature = "decoder"))]
 mod proto_interop {
     use super::{
-        Bound, HostPin, IntoPyObject, Py, PyAny, PyAnyMethods, PyCapsule, PyRef, PyResult,
-        PyTypeMethods, TensorCapsulePayload, TensorDyn,
+        Bound, HostPin, Py, PyAny, PyAnyMethods, PyCapsule, PyResult, PyTypeMethods,
+        TensorCapsulePayload, TensorDyn,
     };
+    // Only the `Native` variant below and its `into_raw_access` arm
+    // (both feature = "decoder") name PyRef / call `into_pyobject`; an
+    // "image"-only build (no "decoder") never reaches either.
+    #[cfg(feature = "decoder")]
+    use super::{IntoPyObject, PyRef};
     use edgefirst_tensor::ProtoData;
     use pyo3::types::PyCapsuleMethods;
 
