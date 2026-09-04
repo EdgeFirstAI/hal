@@ -139,6 +139,14 @@ typedef struct ef_decoder_track {
 
 /**
  * ABI version of this library's C surface.
+ *
+ * Bumped to 2 for the tiled merge: `ef_merge_config` gained a `mode` field
+ * in its old tail pad and the default merge became keep-best, so
+ * `ef_merge_tiled_detections` and `ef_tiled_frame_accumulator_new` return
+ * different box geometry than version 1 did. The struct layout is
+ * unchanged, which is exactly why the probe has to carry the signal: a
+ * caller that drops in this library gets no link error and no size
+ * mismatch, only different boxes.
  */
 uint32_t ef_decoder_abi_version(void);
 
@@ -727,13 +735,22 @@ void ef_inferred_schema_free(struct ef_inferred_schema *r);
 /**
  * Fill `out` with the library's default merge configuration.
  *
+ * The default `mode` is `0` (keep-best): the highest-scoring box of each
+ * matched group is kept and the boxes it matched are dropped. Set `mode = 1`
+ * for the enclosing-union merge, which measured about 0.05 AP50 worse on
+ * every frame of the Ocean Cleanup ADIS 4K validation (TOP2-836).
+ *
  * # Safety
  * `out` must be writable.
  */
 int ef_merge_config_default(ef_merge_config *out);
 
 /**
- * Create an accumulator for a frame of `tiles_total` tiles.
+ * Create an accumulator for a frame of `tiles_total` tiles, merging as
+ * `cfg` says — including its `mode`.
+ *
+ * @return the accumulator, or `NULL` for a null `cfg`, zero tiles, or a
+ *         `metric`/`mode` value this library does not know.
  *
  * # Safety
  * `cfg` must be valid.
@@ -823,9 +840,12 @@ struct ef_detect_box_list *ef_lift_tile_boxes(const ef_detect_box *boxes,
                                               const ef_tile_placement *placement);
 
 /**
- * Merge overlapping detections that already share one coordinate space.
+ * Merge overlapping detections that already share one coordinate space,
+ * merging as `cfg` says — including its `mode`.
  *
- * @return a list the caller frees with `ef_detect_box_list_free`, or `NULL`.
+ * @return a list the caller frees with `ef_detect_box_list_free`, or `NULL`
+ *         for a null `cfg`, a null `boxes` with a non-zero `count`, or a
+ *         `metric`/`mode` value this library does not know.
  *
  * # Safety
  * `boxes` must point to `count` elements; `cfg` must be valid.

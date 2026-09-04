@@ -166,7 +166,7 @@ other, so a disagreement is reported rather than resolved by preference.
 | `Nms`, `DecoderType`, `DecoderVersion` | NMS mode and model family selection |
 | `ProtoData` | Mask prototypes and coefficients |
 | `Decoder.draw_onto` | Fused decode + draw onto an `ImageProcessor` |
-| `MatchMetric`, `MergeConfig`, `TiledFrameAccumulator` | SAHI tile-merge |
+| `MatchMetric`, `MergeMode`, `MergeConfig`, `TiledFrameAccumulator` | SAHI tile-merge (keep-best by default; `MergeMode.Union` for the enclosing union) |
 
 ## Interoperability
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `MergeMode` for the tiled-detection merge: `KeepBest` (suppression) or `Union` (enclosing union). Rust `edgefirst_decoder::tiling::MergeMode` / `MergeConfig::mode`, Python `edgefirst.decoder.MergeMode` / `MergeConfig(mode=...)`, and C `ef_merge_config.mode`.
+
+### Changed
+
+- **Tiled merge default is keep-best suppression; the enclosing union is opt-in (`MergeMode::Union`).** `merge_tiled_detections` and `TiledFrameAccumulator` used to replace every group of same-class boxes matched at IoS ≥ 0.5 with the group's enclosing union carrying the max score. On the Ocean Cleanup ADIS 4K validation set (5823 frames, one evaluator; TOP2-836) that union cost about 0.05 AP50 on every frame, tiled or not: whole frame with plain NMS 0.491 AP50, the same predictions after the union merge 0.437, the same IoS-0.5 class-aware matching keeping the highest-scoring box unchanged 0.490; a 28-tile pipeline 0.500 with keep-best at a 0.001 floor versus 0.442 with the union. Only ~5 % of boxes are touched, but a union inflates true positives past IoU 0.5 and swallows small low-score true positives lying mostly inside a larger same-class box; the seam-split case the union was built for is negligible next to that. The default now keeps the best box of each group unchanged -- never grown or rescored -- and drops the rest; ordering, class-aware matching against the original base box, `score_threshold` and `max_det` are unchanged, and `Union` stays bit-exact with the previous behaviour. **Rust:** `MergeConfig` gains a public `mode` field, so a downstream crate that builds it with an exhaustive struct literal must add `mode` or switch to `..MergeConfig::default()`; the struct is deliberately left constructible (not `#[non_exhaustive]`) so functional-update syntax keeps working. **C:** `ef_merge_config` gains a `mode` field in the 4-byte tail pad it already had, so the struct is still 32 bytes and no other field's offset moved; `ef_merge_config_default` fills it with keep-best, and `mode = 1` restores the union. **This is a minor-version ABI break and must ship in 0.30.0, not a 0.29 patch:** `ef_merge_config` shipped without `mode` in every 0.29 release (0.29.0 through 0.29.4), and a caller built against that header never initialised the tail pad this release reads. **`ef_decoder_abi_version` is now 2.** No symbol or struct layout changed — which is exactly why the probe had to move: `ef_merge_tiled_detections` and `ef_tiled_frame_accumulator_new` return different box geometry than version 1 did, and a caller that drops in this library gets no link error and no size mismatch to warn them.
+
 ## [0.29.4] - 2026-09-04
 
 ### Fixed

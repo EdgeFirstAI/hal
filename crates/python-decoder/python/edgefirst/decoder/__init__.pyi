@@ -722,6 +722,19 @@ class MatchMetric(enum.Enum):
     Iou: MatchMetric
     Ios: MatchMetric
 
+class MergeMode(enum.Enum):
+    """What the tiled-detection merge emits for a group of overlapping boxes.
+
+    ``KeepBest`` (default) keeps the group's highest-scoring box exactly as
+    decoded and drops the boxes it matched. ``Union`` replaces the group with
+    its enclosing union carrying the max score -- the original GREEDYNMM
+    merge, opt-in because it measured about 0.05 AP50 worse on every frame
+    of the Ocean Cleanup ADIS 4K validation (TOP2-836).
+    """
+
+    KeepBest: MergeMode
+    Union: MergeMode
+
 class MergeConfig:
     def __init__(
         self,
@@ -730,6 +743,7 @@ class MergeConfig:
         class_agnostic: bool = False,
         max_det: int = 300,
         score_threshold: float = 0.0,
+        mode: MergeMode = ...,
     ) -> None: ...
     @property
     def metric(self) -> MatchMetric: ...
@@ -741,6 +755,8 @@ class MergeConfig:
     def max_det(self) -> int: ...
     @property
     def score_threshold(self) -> float: ...
+    @property
+    def mode(self) -> MergeMode: ...
 
 class TiledFrameAccumulator:
     def __init__(

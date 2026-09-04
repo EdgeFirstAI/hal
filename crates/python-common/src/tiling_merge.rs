@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Output-side tiled-detection merge: lift, GREEDYNMM, streaming accumulator.
+//! Output-side tiled-detection merge: lift, greedy merge, streaming accumulator.
 //! Registered on `edgefirst.decoder`. TilePlacement is accepted by attribute
 //! so an `edgefirst.image.TilePlacement` works without sharing a PyO3 type.
 
 use crate::detect_boxes::{convert_detect_box, numpy_to_detect_boxes, PyDetOutput};
 use edgefirst_decoder::tiling::{
-    lift_tile_boxes, merge_tiled_detections, MatchMetric, MergeConfig, TiledFrameAccumulator,
+    lift_tile_boxes, merge_tiled_detections, MatchMetric, MergeConfig, MergeMode,
+    TiledFrameAccumulator,
 };
 use edgefirst_decoder_abi::TilePlacement;
 use edgefirst_tensor::{BoundingBox, DetectBox};
@@ -59,6 +60,54 @@ impl From<MatchMetric> for PyMatchMetric {
     }
 }
 
+/// What the tiled-detection merge emits for a group of overlapping boxes.
+///
+/// - ``KeepBest`` (default) — keep the group's highest-scoring box exactly
+///   as decoded, coordinates and score, and drop the boxes it matched.
+/// - ``Union`` — replace the group with its enclosing union carrying the
+///   max score (the original GREEDYNMM merge). Opt-in: it measured about
+///   0.05 AP50 worse on every frame of the Ocean Cleanup ADIS 4K validation
+///   (whole frame 0.491 AP50 with plain NMS, 0.437 after the union, 0.490
+///   with keep-best; TOP2-836).
+#[pyclass(
+    name = "MergeMode",
+    eq,
+    eq_int,
+    from_py_object,
+    module = "edgefirst.decoder"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PyMergeMode {
+    #[default]
+    KeepBest,
+    Union,
+}
+
+#[pymethods]
+impl PyMergeMode {
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
+impl From<PyMergeMode> for MergeMode {
+    fn from(val: PyMergeMode) -> Self {
+        match val {
+            PyMergeMode::KeepBest => MergeMode::KeepBest,
+            PyMergeMode::Union => MergeMode::Union,
+        }
+    }
+}
+
+impl From<MergeMode> for PyMergeMode {
+    fn from(val: MergeMode) -> Self {
+        match val {
+            MergeMode::KeepBest => PyMergeMode::KeepBest,
+            MergeMode::Union => PyMergeMode::Union,
+        }
+    }
+}
+
 fn extract_placement(obj: &Bound<'_, PyAny>) -> PyResult<TilePlacement> {
     if let Ok(packed) = obj.call_method0("__getnewargs__") {
         if let Ok((index, count, origin, crop_size, frame_dims, letterbox)) = packed.extract() {
@@ -102,7 +151,11 @@ fn flat_to_detect_boxes(bbox: &[f32], scores: &[f32], classes: &[usize]) -> Vec<
         .collect()
 }
 
-/// Configuration for the tiled-detection merge (GREEDYNMM).
+/// Configuration for the tiled-detection merge.
+///
+/// Defaults: ``MatchMetric.Ios`` at ``threshold`` 0.5, class-aware,
+/// ``max_det`` 300, no ``score_threshold``, and ``MergeMode.KeepBest`` --
+/// suppression rather than the enclosing union, see :class:`MergeMode`.
 #[pyclass(name = "MergeConfig", from_py_object, module = "edgefirst.decoder")]
 #[derive(Debug, Clone, Copy)]
 pub struct PyMergeConfig(pub(crate) MergeConfig);
@@ -110,13 +163,14 @@ pub struct PyMergeConfig(pub(crate) MergeConfig);
 #[pymethods]
 impl PyMergeConfig {
     #[new]
-    #[pyo3(signature = (metric = PyMatchMetric::Ios, threshold = 0.5, class_agnostic = false, max_det = 300, score_threshold = 0.0))]
+    #[pyo3(signature = (metric = PyMatchMetric::Ios, threshold = 0.5, class_agnostic = false, max_det = 300, score_threshold = 0.0, mode = PyMergeMode::KeepBest))]
     pub fn new(
         metric: PyMatchMetric,
         threshold: f32,
         class_agnostic: bool,
         max_det: usize,
         score_threshold: f32,
+        mode: PyMergeMode,
     ) -> Self {
         PyMergeConfig(MergeConfig {
             metric: metric.into(),
@@ -124,6 +178,7 @@ impl PyMergeConfig {
             class_agnostic,
             max_det,
             score_threshold,
+            mode: mode.into(),
         })
     }
 
@@ -152,10 +207,15 @@ impl PyMergeConfig {
         self.0.score_threshold
     }
 
+    #[getter]
+    fn mode(&self) -> PyMergeMode {
+        self.0.mode.into()
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "MergeConfig(metric={:?}, threshold={}, class_agnostic={}, max_det={}, score_threshold={})",
-            self.0.metric, self.0.threshold, self.0.class_agnostic, self.0.max_det, self.0.score_threshold,
+            "MergeConfig(metric={:?}, threshold={}, class_agnostic={}, max_det={}, score_threshold={}, mode={:?})",
+            self.0.metric, self.0.threshold, self.0.class_agnostic, self.0.max_det, self.0.score_threshold, self.0.mode,
         )
     }
 }
@@ -278,7 +338,8 @@ pub fn py_lift_tile_boxes<'py>(
     Ok(convert_detect_box(py, &lift_tile_boxes(dets, &placement)))
 }
 
-/// Greedy Non-Max **Merge** of lifted full-frame detections (GREEDYNMM).
+/// Greedy merge of lifted full-frame detections: keep-best suppression by
+/// default, or the enclosing union with ``MergeMode.Union``.
 #[pyfunction]
 #[pyo3(name = "merge_tiled_detections")]
 pub fn py_merge_tiled_detections<'py>(
