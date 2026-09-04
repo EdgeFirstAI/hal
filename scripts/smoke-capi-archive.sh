@@ -16,6 +16,38 @@ set -euo pipefail
 ARCHIVE="${1:?usage: $0 <archive.tar.gz|archive.zip>}"
 CC="${CC:-cc}"
 
+# macos-latest is an Apple Silicon (arm64) runner, but this script also
+# smokes the x86_64-macos archive (cross-compiled via `--target
+# x86_64-apple-darwin`, a genuine x86_64 .dylib). Left to its host default,
+# `cc` compiles the smoke test itself for arm64, and linking an arm64 stub
+# against an x86_64 .dylib silently "ignores" it (a warning, not an error --
+# the trivial per-leaf stubs below call nothing, so nothing forces a real
+# link) right up until the INSTALL.txt example, which calls real functions
+# and fails hard with "Undefined symbols for architecture arm64". The
+# archive name carries the target triple, so pick the matching `-arch`
+# rather than trusting the host default.
+CC_ARCH_FLAGS=()
+CROSS_ARCH=0
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  host_arch="$(uname -m)"
+  case "${ARCHIVE}" in
+    *x86_64-macos*) CC_ARCH_FLAGS=(-arch x86_64); [[ "${host_arch}" != "x86_64" ]] && CROSS_ARCH=1 ;;
+    *aarch64-macos*) CC_ARCH_FLAGS=(-arch arm64); [[ "${host_arch}" != "arm64" ]] && CROSS_ARCH=1 ;;
+  esac
+fi
+# When cross-arch, only compile+link (still proves the header/.pc/SONAME
+# contract this script exists to check) -- do not assume Rosetta (or an
+# aarch64 emulator) is installed on the runner to actually EXECUTE a
+# foreign-arch binary; that risks trading this failure for an unrelated
+# "Bad CPU type in executable" one.
+run_bin() {
+  if [[ "${CROSS_ARCH}" -eq 1 ]]; then
+    echo "  (skipping execution: ${CC_ARCH_FLAGS[*]} binary, host is $(uname -m) -- compiled+linked only)"
+    return 0
+  fi
+  "$1"
+}
+
 if [[ ! -f "${ARCHIVE}" ]]; then
   echo "FAIL: ${ARCHIVE} not found" >&2
   exit 1
@@ -54,12 +86,12 @@ for leaf in tensor image codec decoder tracker; do
   bin="${WORKDIR}/${leaf}.bin"
   printf '#include <edgefirst/%s.h>\nint main(void){return 0;}\n' "${leaf}" > "${src}"
   # shellcheck disable=SC2046
-  if ! "${CC}" -std=c11 -Wall -Wextra -Werror -o "${bin}" "${src}" \
+  if ! "${CC}" -std=c11 -Wall -Wextra -Werror "${CC_ARCH_FLAGS[@]}" -o "${bin}" "${src}" \
       $(pkg-config --cflags --libs "edgefirst-${leaf}"); then
     echo "FAIL: compile ${leaf} via pkg-config" >&2
     exit 1
   fi
-  if ! "${bin}"; then
+  if ! run_bin "${bin}"; then
     echo "FAIL: run ${leaf} (compile succeeded, load/execute failed)" >&2
     exit 1
   fi
@@ -98,7 +130,7 @@ if ! grep -q 'ef_tensor_image_alloc' "${example_c}"; then
 fi
 example_bin="${WORKDIR}/install_example.bin"
 # shellcheck disable=SC2046
-if ! "${CC}" -std=c11 -Wall -Wextra -Werror -o "${example_bin}" "${example_c}" \
+if ! "${CC}" -std=c11 -Wall -Wextra -Werror "${CC_ARCH_FLAGS[@]}" -o "${example_bin}" "${example_c}" \
     $(pkg-config --cflags --libs edgefirst-codec); then
   echo "FAIL: INSTALL.txt example does not compile" >&2
   exit 1

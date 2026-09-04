@@ -166,9 +166,22 @@ jobs:
         run: |
           # Four self-contained distributions since 0.29. Order is irrelevant to
           # the build (no shared object); it matters only at publish time.
+          #
+          # --sdist only for tracker. tensor/codec/image/decoder's build.rs
+          # nested-builds the workspace-excluded edgefirst-tensor-capi via a
+          # `../tensor-capi` relative path (dynamic backend); maturin builds
+          # the wheel FROM the generated sdist whenever --sdist is passed,
+          # and its sdist can never include a sibling outside the crate
+          # directory (`include`/`exclude` patterns reject any `..`), so
+          # `--sdist` against those four always fails with "manifest path
+          # .../tensor-capi/Cargo.toml does not exist". tracker has no such
+          # nested build and is the only one of the five safe to sdist.
+          ARGS="${{ matrix.maturin-args }}"
           for pkg in tensor codec image decoder tracker; do
+            pkg_args="$ARGS"
+            [ "$pkg" != "tracker" ] && pkg_args="${pkg_args//--sdist/}"
             maturin build --release --auditwheel skip -m "crates/python-$pkg/Cargo.toml" \
-              --features abi3-py311 ${{ matrix.maturin-args }}
+              --features abi3-py311 $pkg_args
           done
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
@@ -290,6 +303,17 @@ jobs:
       - name: Add cross-compile target
         if: matrix.rust_target != ''
         run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Install lld (aarch64 runner)
+        # ubuntu-22.04-arm does not ship lld by default, unlike ubuntu-latest
+        # (x86_64) -- recent stable rustc defaults to -fuse-ld=lld on Linux,
+        # so a bare build here fails at link time with "collect2: fatal
+        # error: cannot find 'ld'". test.yml's aarch64 runners already
+        # install it for the same reason (`Install build dependencies`).
+        if: matrix.target == 'aarch64-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld
 
       - name: Build the five modular C API libraries
         shell: bash
