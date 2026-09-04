@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-09-02
+
 ### Added
 
 - **Ultralytics schema inference.** Vanilla Ultralytics YOLOv8/YOLO11/YOLO26 ONNX and TFLite exports can now be decoded without an embedded `edgefirst.json`: the new schema-inference API reads the model's own metadata and tensor shapes to configure the decoder, including YOLO26's NMS-free outputs. Available from Rust (`edgefirst_decoder::infer_ultralytics_schema`), C (`ef_infer_*`), and Python (`edgefirst.decoder.infer_ultralytics_schema`). The inferred schema pins the NMS mode to class-aware for pre-NMS heads, matching Ultralytics' own `agnostic=False`; ambiguities it cannot measure — an uncharacterized container's box convention, per-channel quantization the decoder cannot consume — are typed errors rather than defaults.
@@ -14,24 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/fetch-angle.sh --windows` fetches `angle-windows-x64-<tag>.zip` (`bin/libEGL.dll` + `libGLESv2.dll`, import libs, headers) from the same `EdgeFirstAI/angle-package` release tag as the xcframeworks; `scripts/test-windows.ps1` runs the Rust suite with ANGLE reachable (`-Warp`, `-RequireGl`).
 - The Windows `edgefirst-image` wheel and the Windows C archive bundle ANGLE next to `_image.pyd` / `edgefirst_image.dll` when built with `EDGEFIRST_ANGLE_PATH` set (CI does), so `pip install edgefirst-image` and the C zip get the GPU backend with no setup. The C archive carries ANGLE's licence under `share/licenses/angle/`.
 - CI: the Windows lane now runs clippy, the Rust test suite (GL self-skipping), the image crate's GL tests on ANGLE D3D11 WARP (best-effort), the modular C-API tests (best-effort), the C archive smoke, the wheel build + layout check, and the gpu-marked pytest on WARP (best-effort), replacing the previous `cargo check`-only job. Both Rust passes run under cargo-llvm-cov and the merged LCOV (`coverage-windows`, made repo-relative by `scripts/normalize-lcov-paths.ps1`) feeds the SonarCloud job like the other platforms. Release builds fetch ANGLE for the Windows wheel and C archive rows.
-
-### Changed
-
-- `GlPlatform::export_completion_fence` and the `convert_with_fence` plumbing carry a platform-neutral `CompletionFence` handle (`OwnedFd` on Unix, `OwnedHandle` on Windows). `ImageProcessor::convert_with_fence` remains Unix-only public API.
-- `GlPlatform` gains a `begin_gpu_pass` hook run before every message. ANGLE/D3D11 uses it to re-make a processor's context current when another processor's context issued the previous commands (that backend keeps one state manager per display and re-syncs only on `eglMakeCurrent`); Linux, ANGLE/Metal and Android implement it as a no-op. Windows also serializes processor bring-up/teardown with the per-message mutex.
-- The PBO readback path honours the ES 3.0 read-format guarantee: when `RGB`/`RED` is not the implementation-defined pair (ANGLE), it reads RGBA into the scratch buffer and repacks into the mapped PBO instead of failing with `GL_INVALID_OPERATION`.
-- `tests/gpu_policy.py`: on Windows the gpu-marked tests skip unless `HAL_TEST_REQUIRE_GL=1`, and then require a PBO-backed `create_image()` destination.
-- The `test_opengl_*` integration tests in `crates/image/src/lib.rs` (resize, grey, crops, rotation × flip × backing matrix, 10-thread bring-up, YUYV/VYUY zero-copy imports, F16 GL/CPU parity) were gated `target_os = "linux"` since before the platform seam; they now compile and run on macOS (ANGLE/Metal, IOSurface in the zero-copy slot), iOS, Android and Windows (ANGLE/D3D11, PBO). The backing lists are built from `is_shm_available()` / `is_gpu_buffer_available()` instead of hard-coding `Shm` and `DmaBuf`, so the zero-copy YUV imports self-skip on Windows until D3D11 texture tensors land.
-
-### Fixed
-
-- Windows wheels: `crates/python-tensor/build.rs` and the codec/image/decoder build scripts hard-coded Unix library names (`libedgefirst_tensor.so`/`.dylib`) and `-Wl,-rpath` link args and could not build on MSVC; they now link `edgefirst_tensor.dll.lib` verbatim (never the Rust staticlib) and bundle `edgefirst_tensor.dll`. The codec/image/decoder packages register the tensor package directory with `os.add_dll_directory` on Windows (Python 3.8+ does not search `PATH` for extension-module dependencies). `scripts/check_wheel_layout.py` accepts the Windows library name.
-- README no longer claims the macOS wheels bundle ANGLE (no code does; set `EDGEFIRST_ANGLE_PATH` there).
-
-## [0.29.0] - 2026-08-25
-
-### Added
-
 - **Modular C API.** Five independently installable libraries: `libedgefirst_tensor.so` (`edgefirst/tensor.h`), `libedgefirst_codec.so`, `libedgefirst_image.so`, `libedgefirst_decoder.so`, `libedgefirst_tracker.so`. Siblings link `libedgefirst_tensor.so` at load time instead of embedding a second tensor copy. A JPEG-only C consumer ships tensor + codec only. Tracker takes detections as a plain `ef_detect_box` array and links neither tensor nor decoder.
 - **Modular Python wheels.** `edgefirst-tensor`, `edgefirst-codec`, `edgefirst-image`, `edgefirst-decoder`, and `edgefirst-tracker` under the `edgefirst.` namespace. Extensions link one shared `libedgefirst_tensor.so`; they do not embed it. A JPEG-only user installs `edgefirst-codec` + `edgefirst-tensor`.
 - **`static` / `dynamic` backend on `edgefirst-tensor`.** Mutually exclusive. `static` (default) is the real implementation for Rust consumers. `dynamic` wraps the opaque C handle so a cdylib can call `ef_tensor_*` instead of compiling a private copy. `--all-features` does not build this crate.
@@ -42,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `GlPlatform::export_completion_fence` and the `convert_with_fence` plumbing carry a platform-neutral `CompletionFence` handle (`OwnedFd` on Unix, `OwnedHandle` on Windows). `ImageProcessor::convert_with_fence` remains Unix-only public API.
+- `GlPlatform` gains a `begin_gpu_pass` hook run before every message. ANGLE/D3D11 uses it to re-make a processor's context current when another processor's context issued the previous commands (that backend keeps one state manager per display and re-syncs only on `eglMakeCurrent`); Linux, ANGLE/Metal and Android implement it as a no-op. Windows also serializes processor bring-up/teardown with the per-message mutex.
+- The PBO readback path honours the ES 3.0 read-format guarantee: when `RGB`/`RED` is not the implementation-defined pair (ANGLE), it reads RGBA into the scratch buffer and repacks into the mapped PBO instead of failing with `GL_INVALID_OPERATION`.
+- `tests/gpu_policy.py`: on Windows the gpu-marked tests skip unless `HAL_TEST_REQUIRE_GL=1`, and then require a PBO-backed `create_image()` destination.
+- The `test_opengl_*` integration tests in `crates/image/src/lib.rs` (resize, grey, crops, rotation × flip × backing matrix, 10-thread bring-up, YUYV/VYUY zero-copy imports, F16 GL/CPU parity) were gated `target_os = "linux"` since before the platform seam; they now compile and run on macOS (ANGLE/Metal, IOSurface in the zero-copy slot), iOS, Android and Windows (ANGLE/D3D11, PBO). The backing lists are built from `is_shm_available()` / `is_gpu_buffer_available()` instead of hard-coding `Shm` and `DmaBuf`, so the zero-copy YUV imports self-skip on Windows until D3D11 texture tensors land.
 - **BREAKING (C):** the monolithic `libedgefirst_hal` / `edgefirst/hal.h` is removed. Include the per-library header (`edgefirst/tensor.h`, `codec.h`, `image.h`, `decoder.h`, `tracker.h`, `detect.h`) and link the matching `.so`.
 - **BREAKING:** `edgefirst-tensor` requires exactly one of `static` or `dynamic`. `--no-default-features` alone is a `compile_error!`.
 - **BREAKING (C):** `ef_tensor_builder_wrap` rejects plane fields it cannot represent (`offset` is carried; `used != size` is `EBADMSG`; non-zero `modifier` is `EDOM`; a second unrepresentable plane is `ENOTSUP`) instead of silently dropping them.
@@ -53,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows wheels: `crates/python-tensor/build.rs` and the codec/image/decoder build scripts hard-coded Unix library names (`libedgefirst_tensor.so`/`.dylib`) and `-Wl,-rpath` link args and could not build on MSVC; they now link `edgefirst_tensor.dll.lib` verbatim (never the Rust staticlib) and bundle `edgefirst_tensor.dll`. The codec/image/decoder packages register the tensor package directory with `os.add_dll_directory` on Windows (Python 3.8+ does not search `PATH` for extension-module dependencies). `scripts/check_wheel_layout.py` accepts the Windows library name.
+- README no longer claims the macOS wheels bundle ANGLE (no code does; set `EDGEFIRST_ANGLE_PATH` there).
 - `HostView.numpy()` (and other tensor→numpy conversions) honour DMA row padding, matching `memoryview`.
 - Dynamic-backend gaps that returned a wrong answer or silently skipped DMA import (`as_dma()`, `create_image(dtype="int8")`, batch-NULL mapping).
 - pkg-config files derive `prefix` from `${pcfiledir}` so an archive extracted outside `/usr` still compiles.
