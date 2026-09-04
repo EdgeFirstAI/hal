@@ -438,7 +438,7 @@ typedef void (*EfLogCallback)(ef_log_level level,
 /**
  * A mapped CPU window over a tensor's bytes.
  *
- * By-value and frozen forever (no version field, no reserved tail): its size
+ * By-value with no version field and no reserved tail, so its size
  * is baked into consumer call sites, so it evolves by a suffixed successor
  * (`ef_tensor_view2` + new entry points), never in place. The pointer is
  * valid from `ef_tensor_map` until the matching `ef_tensor_unmap`; writing
