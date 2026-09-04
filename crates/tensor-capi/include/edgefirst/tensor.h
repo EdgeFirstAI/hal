@@ -23,6 +23,18 @@
  *   - A builder, for construction, with sticky errors.
  *   - A (blob, fds) pair, for IPC. Fds travel out of band; a struct with an
  *     fd field is meaningless across a process boundary.
+ *
+ * Platform-specific entry points. Every function is declared on every
+ * platform and refuses at run time off its platform, so linking never
+ * depends on the host. The tie is stated per function with a
+ * "Platforms:" line:
+ *   - Linux:   dma-buf fds (the DMA_BUF export kind); ef_tensor_clone_fd
+ *              duplicates the fd of any Unix backing that has one
+ *   - macOS, iOS: IOSurface (ef_tensor_iosurface_ref, ef_tensor_from_iosurface_id)
+ *   - Android: AHardwareBuffer (ef_tensor_from_hardware_buffer, ef_tensor_hardware_buffer_*)
+ *   - Windows: D3D11 textures (ef_d3d11_*, ef_tensor_d3d11_*, ef_tensor_gpu_completion,
+ *              ef_tensor_gpu_write_value, ef_tensor_set_gpu_write, ef_tensor_from_d3d11_*)
+ *   - any host with a CUDA driver: ef_tensor_cuda_*
  */
 
 #include <stdarg.h>
@@ -294,6 +306,57 @@ typedef uint32_t ef_error_class;
  * An image request, built up field by field.
  */
 typedef struct ef_tensor_image_desc ef_tensor_image_desc;
+
+/**
+ * The D3D11 texture behind a Windows texture tensor.
+ *
+ * The scalar block `ef_tensor_d3d11_layout` fills, the same shape as
+ * `ef_tensor_plane` and `ef_tensor_view_origin` -- one library reading a
+ * tensor it did not mint. Mirrors `edgefirst_tensor::d3d11_layout::
+ * D3d11ImageLayout`.
+ *
+ * The dimensions are the texture's, in texels and rows, not the image's in
+ * pixels: a semi-planar image is one texture whose row count covers both
+ * planes, and a YUYV image is one texel per two pixels, so
+ * `texture_width`/`texture_height` do not match `ef_tensor_shape` for
+ * either. Read the image's own dimensions from the shape.
+ *
+ * For a semi-planar format (`nv12`, `nv16`, `nv24`) `texture_width` is the
+ * driver's row pitch -- at least `even(width)`, and on a discrete adapter
+ * commonly more (128 bytes on NVIDIA, so a 64-wide NV12 image is a 128-wide
+ * texture). It is the pitch the combined plane's rows are spaced by and the
+ * width a sampler must address the texture at. Never derive it from the
+ * image width: read this field, or `ef_tensor_row_stride`, which carries the
+ * same number.
+ *
+ * By-value and frozen forever: a consumer bakes this size and these offsets
+ * into its call sites, so the struct evolves by a suffixed successor, never
+ * by an in-place edit. `d3d11_layout_is_pinned` and the C golden in
+ * `tensor-capi/tests/c/test_layout_goldens.c` hold both sides to it.
+ */
+typedef struct ef_d3d11_layout {
+  /**
+   * `DXGI_FORMAT` the texture was created with.
+   */
+  uint32_t dxgi_format;
+  /**
+   * Texture width in texels.
+   */
+  uint32_t texture_width;
+  /**
+   * Texture height in rows.
+   */
+  uint32_t texture_height;
+  /**
+   * Bytes per texel of `dxgi_format`.
+   */
+  uint32_t bytes_per_texel;
+  /**
+   * The GL internal format an importer binds this texture as; 0 when the
+   * format has no GL equivalent.
+   */
+  uint32_t gl_internal_format;
+} ef_d3d11_layout;
 
 /**
  * Flattened, `#[repr(C)]` view of an image-request descriptor's fields.
@@ -713,11 +776,23 @@ ef_tensor *ef_tensor_builder_alloc(ef_tensor_builder *b);
 ef_tensor *ef_tensor_builder_wrap(ef_tensor_builder *b);
 
 /**
+ * Platforms: any host with a CUDA driver.
+ *
  * Map `t` for CUDA use. Returns an opaque map, or NULL if CUDA is unavailable.
  *
  * The map retains `t`. The caller may `ef_tensor_free` their own handle
  * while the map is outstanding; [`ef_tensor_cuda_unmap`] releases that
  * retain.
+ *
+ * On Windows the mapping of a D3D11 texture tensor is tight rows of
+ * `width * bytes_per_texel`, and the size [`ef_tensor_cuda_device_ptr`]
+ * reports is their sum, whatever `ef_tensor_row_stride` says -- that is the
+ * D3D11 staging pitch a CPU map sees, a larger number on a padded backing.
+ * A consumer must not stride the device pointer by `ef_tensor_row_stride`.
+ *
+ * A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
+ * there the mapping is `ef_tensor_row_stride` times the combined height and
+ * striding by it is correct.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -725,7 +800,45 @@ ef_tensor *ef_tensor_builder_wrap(ef_tensor_builder *b);
 void *ef_tensor_cuda_map(const ef_tensor *t);
 
 /**
- * Device pointer from a map returned by [`ef_tensor_cuda_map`].
+ * Platforms: any host with a CUDA driver.
+ *
+ * Writable mapping; `ef_tensor_cuda_unmap` writes the device buffer back
+ * into the tensor on backings that do not alias (Windows D3D11 textures).
+ *
+ * On Windows the mapping of a D3D11 texture tensor is tight rows of
+ * `width * bytes_per_texel`, and the size [`ef_tensor_cuda_device_ptr`]
+ * reports is their sum, whatever `ef_tensor_row_stride` says -- that is the
+ * D3D11 staging pitch a CPU map sees, a larger number on a padded backing.
+ * A consumer must not stride the device pointer by `ef_tensor_row_stride`;
+ * writing at that pitch scrambles the image rather than failing.
+ *
+ * A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
+ * there the mapping is `ef_tensor_row_stride` times the combined height and
+ * striding by it is correct.
+ *
+ * Retains `t` and returns NULL when CUDA is unavailable, exactly as
+ * [`ef_tensor_cuda_map`].
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+void *ef_tensor_cuda_map_mut(const ef_tensor *t);
+
+/**
+ * Platforms: any host with a CUDA driver.
+ *
+ * Device pointer from a map returned by [`ef_tensor_cuda_map`] or
+ * [`ef_tensor_cuda_map_mut`].
+ *
+ * `*out_size` is the mapping's length in bytes. On Windows that is the
+ * D3D11 texture's tight rows of `width * bytes_per_texel` summed over the
+ * rows, not `ef_tensor_row_stride` times the row count -- the stride is the
+ * staging pitch a CPU map sees, and striding this pointer by it walks off
+ * the end of the mapping.
+ *
+ * A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
+ * there the mapping is `ef_tensor_row_stride` times the combined height and
+ * striding by it is correct.
  *
  * # Safety
  * `map` must be `NULL` or a live map. `out_size` may be NULL.
@@ -733,14 +846,272 @@ void *ef_tensor_cuda_map(const ef_tensor *t);
 void *ef_tensor_cuda_device_ptr(const void *map, uintptr_t *out_size);
 
 /**
- * Release a map from [`ef_tensor_cuda_map`]. NULL is a no-op.
+ * Platforms: any host with a CUDA driver.
  *
- * Drops the CUDA mapping first, then releases the retain taken at map.
+ * Release a map from [`ef_tensor_cuda_map`] or [`ef_tensor_cuda_map_mut`].
+ * NULL is a no-op.
+ *
+ * Drops the CUDA mapping first, then releases the retain taken at map. A
+ * writable map's drop is where the write-back happens: the device buffer is
+ * copied into the tensor and the copy is synchronized before this returns.
  *
  * # Safety
- * `map` must be `NULL` or have come from [`ef_tensor_cuda_map`].
+ * `map` must be `NULL` or have come from [`ef_tensor_cuda_map`] or
+ * [`ef_tensor_cuda_map_mut`].
  */
 void ef_tensor_cuda_unmap(void *map);
+
+/**
+ * Platforms: Windows.
+ *
+ * The process `ID3D11Device*`, created on first call. **Borrowed**: no
+ * reference is transferred, so a caller that keeps the pointer past this
+ * tensor library's lifetime must `AddRef` it, and must never `Release` the
+ * one handed back here.
+ *
+ * Every texture tensor this library allocates lives on this device, so a
+ * consumer that wants to render into one creates its own resources on the
+ * same device rather than opening a shared handle.
+ *
+ * @retval `NULL` with `errno` set: `EIO` when no device could be created
+ *         (no adapter, or `D3D11CreateDevice` failed --
+ *         `ef_tensor_last_error_message` carries the reason), `ENOTSUP`
+ *         off Windows.
+ */
+void *ef_d3d11_device(void);
+
+/**
+ * Platforms: Windows.
+ *
+ * Adopt a host-owned `ID3D11Device*` as the process device, so tensors this
+ * library allocates share the caller's device instead of creating a second
+ * one. The reference stays the caller's; this library takes its own when it
+ * first uses the device.
+ *
+ * Must be called before anything that creates the device as a side effect
+ * -- `ef_d3d11_device`, `ef_is_gpu_buffer_available`, or any texture
+ * allocation. Once the device exists it cannot be replaced.
+ *
+ * @return 0 on success, `EINVAL` for `NULL` or a pointer that is not a live
+ *         `ID3D11Device`, `EBUSY` when the device is already initialized,
+ *         `ENOTSUP` off Windows.
+ *
+ * # Safety
+ * `device` must be `NULL` or a live `ID3D11Device *`.
+ */
+int ef_d3d11_use_external_device(void *device);
+
+/**
+ * Platforms: Windows.
+ *
+ * The `ID3D11Texture2D*` backing this tensor. **Borrowed**: valid while the
+ * tensor lives, and never `Release`d by the caller. Bind it, copy from it,
+ * or `QueryInterface` it; to hand it to another device or process use
+ * [`ef_tensor_d3d11_shared_handle`] instead.
+ *
+ * @retval `NULL` with `errno` set: `EINVAL` for a `NULL` tensor, `ENOTSUP`
+ *         for a tensor that is not a D3D11 texture and off Windows.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+void *ef_tensor_d3d11_texture(const ef_tensor *t);
+
+/**
+ * Platforms: Windows.
+ *
+ * The texture geometry the HAL chose for this image: DXGI format, texel
+ * dimensions, bytes per texel, and the matching GL internal format. The
+ * dimensions are the *texture's*, not the image's -- see `ef_d3d11_layout`
+ * for why the two differ for semi-planar and packed-YUV formats.
+ *
+ * `out` is written only on success.
+ *
+ * @return 0 on success, `EINVAL` for a `NULL` tensor or `out`, `ENOTSUP`
+ *         for a tensor that is not a D3D11 texture and off Windows.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle; `out` must be writable for one
+ * `ef_d3d11_layout`.
+ */
+int ef_tensor_d3d11_layout(const ef_tensor *t, struct ef_d3d11_layout *out);
+
+/**
+ * Platforms: Windows.
+ *
+ * An **owned** duplicate of the texture's NT shared handle; close it with
+ * `CloseHandle`. Open it on a D3D12 device, another D3D11 device, in CUDA,
+ * or duplicate it into another process. Closing it does not affect the
+ * tensor, and the tensor's own handle outlives this duplicate.
+ *
+ * @retval `NULL` with `errno` set: `EINVAL` for a `NULL` tensor, `ENOTSUP`
+ *         for a tensor that is not a D3D11 texture and off Windows, or
+ *         another errno translated from the backend's error -- a
+ *         duplication that failed for its own reason keeps that reason.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+void *ef_tensor_d3d11_shared_handle(const ef_tensor *t);
+
+/**
+ * Platforms: Windows.
+ *
+ * The fence a GPU consumer waits on before reading this texture, and the
+ * timeline value to wait for.
+ *
+ * `*fence` and `*value` are cleared to `NULL`/0 before anything else, so
+ * whatever the caller had in those variables can never be mistaken for an
+ * answer: "no write has been recorded" is return 0 with `*fence == NULL`,
+ * and every failure path leaves them cleared too.
+ *
+ * When a write *is* recorded, `*fence` is an **owned** duplicate of the
+ * shared fence's NT handle; close it with `CloseHandle`. Open it with
+ * `ID3D12Device::OpenSharedHandle`, `ID3D11Device5::OpenSharedFence`, or
+ * `cudaImportExternalSemaphore`, and wait for `*value`.
+ *
+ * @return 0 on success, whether or not a write is recorded; `EINVAL` for a
+ *         `NULL` tensor, `fence` or `value`; `ENOTSUP` for a tensor that is
+ *         not a D3D11 texture and off Windows; or another errno translated
+ *         from the backend's error.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle; `fence` and `value` must be writable.
+ */
+int ef_tensor_gpu_completion(const ef_tensor *t, void **fence, uint64_t *value);
+
+/**
+ * Platforms: Windows.
+ *
+ * The fence value of the newest GPU write recorded on this tensor, or 0 when
+ * there is none: the `*value` [`ef_tensor_gpu_completion`] reports, without
+ * the duplicated fence handle. For a consumer that already holds the process
+ * fence -- one an earlier `ef_tensor_gpu_completion` handed it -- and needs
+ * only the value to wait for, so a query costs no `DuplicateHandle` and no
+ * `CloseHandle`.
+ *
+ * @return the recorded value, or 0 with `errno` set: `EINVAL` for a `NULL`
+ *         tensor, `ENOTSUP` for a tensor that is not a D3D11 texture and
+ *         off Windows. A texture with no recorded write answers 0 and
+ *         leaves `errno` alone.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+uint64_t ef_tensor_gpu_write_value(const ef_tensor *t);
+
+/**
+ * Platforms: Windows.
+ *
+ * Record that the GPU work writing this texture completes at `value` of the
+ * process device's shared fence -- the value a later
+ * [`ef_tensor_gpu_completion`] hands a consumer. Monotonic: an older value
+ * never displaces a newer one.
+ *
+ * The value is a monotonic maximum, recorded into an atomic: it is safe to
+ * call while consumers hold the same handle and are reading the tensor,
+ * which is the situation it exists for -- a producer that has just queued
+ * work publishes the fence value on a tensor it has already shared. Unlike
+ * the geometry setters, this needs no exclusive access. `ef_tensor *` rather
+ * than `const ef_tensor *` only because it changes what the tensor reports.
+ *
+ * @return 0 on success, `EINVAL` for a `NULL` tensor, `ENOTSUP` for a
+ *         tensor that is not a D3D11 texture and off Windows, or another
+ *         errno translated from the backend's error.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+int ef_tensor_set_gpu_write(ef_tensor *t, uint64_t value);
+
+/**
+ * Platforms: Windows.
+ *
+ * Wrap an existing `ID3D11Texture2D` as a tensor. The texture must live on
+ * the process device ([`ef_d3d11_device`]) and match the layout the HAL
+ * would have chosen for `format` at the texture's own dimensions.
+ * Ownership stays with the caller: this takes its own reference, and the
+ * tensor releases it when freed.
+ *
+ * `dims`/`ndim` describe the tensor's grid: the allocation shape --
+ * `[height, width, channels]` packed, `[channels, height, width]` planar,
+ * `[combined_height, width]` semi-planar -- or the (smaller) addressing
+ * shape, which names the same texture. The width and height are read off
+ * the texture description, never derived from `dims`; `dims` is then
+ * checked against them and anything else is `EINVAL`, so a shape cannot
+ * silently reinterpret the texture. The tensor that comes back always
+ * carries the allocation shape, so `ef_tensor_shape` echoes `dims` back
+ * only for that spelling.
+ *
+ * `format` is the wire descriptor (`"NV12"`, `"rgba8"`), the same
+ * vocabulary every other entry point takes; `dtype` is an `EF_DTYPE_*`
+ * code; `access` is an `EF_CPU_ACCESS_*` code, and decides whether a CPU
+ * staging texture is created alongside -- `EF_CPU_ACCESS_NONE` included,
+ * which is what a caller that will only touch the texture from the GPU
+ * asks for and costs no staging texture at all. `name` may be `NULL`.
+ *
+ * A semi-planar texture (`"NV12"`, `"NV16"`, `"NV24"`) carries the image's
+ * row stride as its width, so it is accepted only when that width is even
+ * and equal to the staging row pitch the driver gives a texture of that
+ * width; anything else is `EINVAL` with both numbers in the message. The
+ * HAL allocates its own that way. A D3D12 or CUDA producer that needs one
+ * should allocate through the HAL, or match the pitch.
+ *
+ * @retval a new tensor the caller must free with `ef_tensor_free`.
+ * @retval `NULL` with `errno` set: `EINVAL` for a `NULL`/unshaped argument,
+ *         an unknown format/dtype/access code, or a `dims` the texture does
+ *         not have; the errno the backend's own failure maps to when the
+ *         import itself fails; `ENOTSUP` off Windows.
+ *         `ef_tensor_last_error_message` carries the reason.
+ *
+ * # Safety
+ * `texture` must be a live `ID3D11Texture2D *` created on the process
+ * device; `dims` must point to `ndim` readable `uint64_t`; `format` and
+ * `name` must be `NULL` or NUL-terminated.
+ */
+ef_tensor *ef_tensor_from_d3d11_texture(void *texture,
+                                        uint32_t dtype,
+                                        const uint64_t *dims,
+                                        uint32_t ndim,
+                                        const char *format,
+                                        uint32_t access,
+                                        const char *name);
+
+/**
+ * Platforms: Windows.
+ *
+ * Open a shared D3D11 texture by its NT handle on the process device --
+ * the consumer half of [`ef_tensor_d3d11_shared_handle`], and the route by
+ * which a texture crosses a process boundary.
+ *
+ * `handle` stays owned by the caller: this opens its own texture from it,
+ * so the caller still closes the handle with `CloseHandle`. `fence` is the
+ * same: when non-`NULL` it names a shared fence whose value `fence_value`
+ * is waited for on the process device's immediate context, so a same-device
+ * reader needs no further ordering; the handle is duplicated, never
+ * consumed. Pass `NULL`/0 when there is nothing to wait for.
+ *
+ * `dims`, `format`, `dtype`, `access` and `name` follow
+ * [`ef_tensor_from_d3d11_texture`] exactly, geometry check included.
+ *
+ * @retval a new tensor the caller must free with `ef_tensor_free`.
+ * @retval `NULL` with `errno` set, as [`ef_tensor_from_d3d11_texture`].
+ *
+ * # Safety
+ * `handle` must be an NT shared handle of a D3D11 texture, valid in this
+ * process, and `fence` `NULL` or a shared-fence NT handle; `dims` must
+ * point to `ndim` readable `uint64_t`; `format` and `name` must be `NULL`
+ * or NUL-terminated.
+ */
+ef_tensor *ef_tensor_from_d3d11_shared_handle(void *handle,
+                                              uint32_t dtype,
+                                              const uint64_t *dims,
+                                              uint32_t ndim,
+                                              const char *format,
+                                              uint32_t access,
+                                              void *fence,
+                                              uint64_t fence_value,
+                                              const char *name);
 
 /**
  * Create a request for a `width`×`height` image.
@@ -1055,9 +1426,10 @@ ef_tensor *ef_tensor_wrap_host(uint8_t *ptr,
                                uint32_t ndim);
 
 /**
+ * Platforms: macOS, iOS.
+ *
  * Wrap a live IOSurface, named by its cross-process `IOSurfaceID`, as a
- * tensor (macOS/iOS only) -- the consumer half of the capsule protocol's
- * `IOSURFACE` kind.
+ * tensor -- the consumer half of the capsule protocol's `IOSURFACE` kind.
  *
  * Declared on every platform and refused at runtime off Apple, rather than
  * existing only in an Apple build: this library's ABI surface is the same
@@ -1132,6 +1504,8 @@ int ef_tensor_retain(ef_tensor *t);
 int ef_tensor_set_colorimetry(ef_tensor *t, uint32_t packed);
 
 /**
+ * Platforms: Android.
+ *
  * Wrap an AHardwareBuffer. `NULL` / `ENOTSUP` off Android.
  *
  * # Safety
@@ -1144,6 +1518,8 @@ ef_tensor *ef_tensor_from_hardware_buffer(uint32_t dtype,
                                           const char *name);
 
 /**
+ * Platforms: Android.
+ *
  * Borrowed AHardwareBuffer pointer, or NULL / `ENOTSUP`.
  *
  * # Safety
@@ -1152,6 +1528,8 @@ ef_tensor *ef_tensor_from_hardware_buffer(uint32_t dtype,
 void *ef_tensor_hardware_buffer_ptr(const ef_tensor *t);
 
 /**
+ * Platforms: Android.
+ *
  * Physical AHardwareBuffer dimensions in texels.
  *
  * # Safety
@@ -1162,6 +1540,8 @@ int ef_tensor_hardware_buffer_physical_dims(const ef_tensor *t,
                                             uintptr_t *height);
 
 /**
+ * Platforms: macOS, iOS.
+ *
  * Borrowed IOSurfaceRef, or NULL / `ENOTSUP` off Apple.
  *
  * # Safety
@@ -1400,6 +1780,32 @@ int ef_log_init_callback(EfLogCallback cb, void *userdata, uint32_t max_level);
  * `ef_tensor_view`.
  */
 int ef_tensor_map(ef_tensor *t, uint32_t access, struct ef_tensor_view *out);
+
+/**
+ * Non-blocking [`ef_tensor_map`]: identical in every way except that a
+ * backing whose map has to wait for a GPU copy answers `EAGAIN` instead of
+ * stalling until that copy lands.
+ *
+ * Only the Windows D3D11 texture has such a copy today (its staging
+ * refresh). Every other backing -- host memory, shared memory, dma-buf,
+ * IOSurface, AHardwareBuffer, PBO -- reaches exactly the code
+ * `ef_tensor_map` reaches and can never answer `EAGAIN`, so a caller can
+ * use this unconditionally and only ever actually retry where the wait is
+ * real.
+ *
+ * `EAGAIN` takes nothing: no map is left outstanding, `out` is untouched,
+ * and a later call (this one or `ef_tensor_map`) makes progress. Yield or
+ * sleep between attempts: on the WARP software adapter the CPU threads are
+ * the GPU, so a tight retry loop starves the copy it is waiting for.
+ *
+ * @return the codes [`ef_tensor_map`] returns, plus `EAGAIN` when the map
+ *         would have had to wait for a GPU copy.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle; `out` must be writable for one
+ * `ef_tensor_view`.
+ */
+int ef_tensor_try_map(ef_tensor *t, uint32_t access, struct ef_tensor_view *out);
 
 /**
  * Release the outstanding map taken by `ef_tensor_map`.
@@ -1655,8 +2061,11 @@ int ef_tensor_reshape(ef_tensor *t, const uint64_t *dims, uint32_t ndim);
 int ef_tensor_set_logical_shape(ef_tensor *t, const uint64_t *dims, uint32_t ndim);
 
 /**
+ * Platforms: Linux, macOS, iOS, Android.
+ *
  * Duplicate the file descriptor backing this tensor, for any storage kind
- * that has one.
+ * that has one: a dma-buf fd on Linux, a shared-memory fd wherever `Shm`
+ * allocates.
  *
  * Deliberately **not** derivable from `ef_tensor_plane_at`: that reports a
  * plane's *native handle*, which is a dma-buf fd on Linux and an IOSurface
@@ -1726,27 +2135,36 @@ int ef_tensor_set_dtype(ef_tensor *t, uint32_t dtype);
 int ef_tensor_configure_image(ef_tensor *t, uintptr_t width, uintptr_t height, const char *format);
 
 /**
- * Whether CUDA interop symbols resolved.
+ * Whether CUDA interop symbols resolved. Declared and answered on every
+ * platform; `1` only where a CUDA runtime loaded.
  */
 int ef_is_cuda_available(void);
 
 /**
- * Whether Linux DMA-BUF allocation is available.
+ * Whether Linux DMA-BUF allocation is available. Declared and answered on
+ * every platform; `1` only on Linux. `ef_is_gpu_buffer_available` is the
+ * portable question.
  */
 int ef_is_dma_available(void);
 
 /**
- * Whether a platform GPU-coherent buffer kind can be allocated.
+ * Whether a platform GPU-coherent buffer kind can be allocated: a DMA-BUF on
+ * Linux, an IOSurface on macOS and iOS, an AHardwareBuffer on Android, a
+ * D3D11 texture on Windows. Declared and answered on every platform.
  */
 int ef_is_gpu_buffer_available(void);
 
 /**
- * Whether IOSurface allocation is available.
+ * Whether IOSurface allocation is available. Declared and answered on every
+ * platform; `1` only on macOS and iOS. `ef_is_gpu_buffer_available` is the
+ * portable question.
  */
 int ef_is_iosurface_available(void);
 
 /**
- * Whether POSIX shared memory allocation is available.
+ * Whether POSIX shared memory allocation is available. Declared and answered
+ * on every platform; `1` only where `/dev/shm` is writable, so not on
+ * Windows.
  */
 int ef_is_shm_available(void);
 
@@ -1854,6 +2272,13 @@ int ef_tensor_quantization_clear(ef_tensor *t);
  * that large. `blob_len` and `fds_len` are always written when non-`NULL`, so
  * a caller learns the requirement even from a failed call.
  *
+ * A `NULL` `fds_out` is a zero-capacity handle table, not an error: it is
+ * refused only when the export actually produced handles. An export that
+ * produces none — every inline export, and every export on a platform that
+ * shares by handle value inside the blob rather than out of band, which is
+ * all of them on Windows — therefore succeeds with `fds_out, fds_cap` of
+ * `NULL, 0` and reports `*fds_len == 0`.
+ *
  * The transport mode is chosen from the tensor's storage: a backing with a
  * shareable handle is exported by reference, and one without — `mem`, `pbo` —
  * is inlined, because there is nothing to refer to. A caller that needs bytes
@@ -1862,8 +2287,10 @@ int ef_tensor_quantization_clear(ef_tensor *t);
  * variant can be appended later without breaking this signature.
  *
  * @return 0 on success, `ENOSPC` when a buffer is too small (with the
- *         required lengths written), `EINVAL` on a null tensor or null
- *         out-parameter, `EIO` if the tensor cannot be serialized.
+ *         required lengths written) -- a `NULL` `fds_out` on an export that
+ *         produced handles is that case, not a pointer refusal -- `EINVAL`
+ *         on a null tensor, a null `blob_len` or a null `fds_len`, `EIO` if
+ *         the tensor cannot be serialized.
  *
  * # Safety
  * `blob` must be writable for `blob_cap` bytes and `fds` for `fds_cap` ints.

@@ -186,15 +186,15 @@ pub(super) unsafe fn check_framebuffer_complete() -> Result<(), u32> {
 /// Computes `(src_rect_uv, dst_rect_px, pad_color)` from `crop` after running
 /// [`Crop::check_crop_dims`] (the dimension validation must happen first, as it
 /// can error). `src_rect_uv` is normalized to source dims; `dst_rect_px` is in
-/// single-plane pixel coords; `pad_color` is normalized `[0,1]`. When a rect is
-/// `None` the whole image is sampled/painted (identity transform).
+/// single-plane pixel coords; `pad_color` is normalized `[0,1]` RGBA. When a
+/// rect is `None` the whole image is sampled/painted (identity transform).
 pub(super) fn float_crop_uniforms(
     crop: &ResolvedCrop,
     src_w: usize,
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
-) -> crate::Result<([f32; 4], [f32; 4], [f32; 3])> {
+) -> crate::Result<([f32; 4], [f32; 4], [f32; 4])> {
     crop.check_crop_dims(src_w, src_h, dst_w, dst_h)?;
     let src_rect_uv = match crop.src_rect {
         Some(r) => [
@@ -209,9 +209,19 @@ pub(super) fn float_crop_uniforms(
         Some(r) => [r.left as f32, r.top as f32, r.width as f32, r.height as f32],
         None => [0.0, 0.0, dst_w as f32, dst_h as f32],
     };
+    // Four components: a `PlanarRgba` or `Rgba` float destination pads its
+    // alpha plane too, with the same value the CPU reference writes there.
+    // A crop with no pad colour also has no destination rect, so the whole
+    // destination is content and the value below is never sampled; opaque
+    // black is the sane default for it.
     let pad_color = match crop.dst_color {
-        Some([r, g, b, _]) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
-        None => [0.0, 0.0, 0.0],
+        Some([r, g, b, a]) => [
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+            a as f32 / 255.0,
+        ],
+        None => [0.0, 0.0, 0.0, 1.0],
     };
     Ok((src_rect_uv, dst_rect_px, pad_color))
 }
@@ -228,7 +238,7 @@ mod tests {
             float_crop_uniforms(&ResolvedCrop::no_crop(), 640, 480, 320, 240).unwrap();
         assert_eq!(src_uv, [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(dst_px, [0.0, 0.0, 320.0, 240.0]);
-        assert_eq!(pad, [0.0, 0.0, 0.0]);
+        assert_eq!(pad, [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -250,7 +260,7 @@ mod tests {
         };
         let (_, dst_px, pad) = float_crop_uniforms(&crop, 640, 480, 320, 240).unwrap();
         assert_eq!(dst_px, [10.0, 20.0, 100.0, 50.0]);
-        assert_eq!(pad, [1.0, 128.0 / 255.0, 0.0]);
+        assert_eq!(pad, [1.0, 128.0 / 255.0, 0.0, 1.0]);
     }
 
     #[test]

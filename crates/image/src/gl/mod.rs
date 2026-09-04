@@ -72,6 +72,10 @@ mod render;
 // `shaders.rs` and the format code no longer pull in `gbm`.
 #[cfg(target_os = "android")]
 mod ahardwarebuffer_import;
+// `EGL_ANGLE_image_d3d11_texture` attribute assembly (pure); consumed by the
+// Windows leaf (`platform/windows.rs`) to build the EGLImage import target.
+#[cfg(target_os = "windows")]
+pub(super) mod d3d11_import;
 #[cfg(target_os = "linux")]
 mod fourcc;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -115,14 +119,14 @@ pub(super) type Egl = edgefirst_egl::Instance<
 
 /// Handle returned by `GlPlatform::export_completion_fence` (and surfaced
 /// by `convert_with_fence`): a sync_file fd on Unix
-/// (`EGL_ANDROID_native_fence_sync`), an NT handle on Windows — reserved
-/// for the D3D11 fence follow-on; no Windows platform exports one yet.
+/// (`EGL_ANDROID_native_fence_sync`), an event NT handle on Windows, set
+/// when the D3D11 device fence reaches the value the convert queued.
 /// Keeps the engine free of `cfg` branches (precedent: `BlobFd` in
 /// `crates/tensor/src/blob.rs`).
 #[cfg(unix)]
-pub(crate) type CompletionFence = std::os::fd::OwnedFd;
+pub type CompletionFence = std::os::fd::OwnedFd;
 #[cfg(windows)]
-pub(crate) type CompletionFence = std::os::windows::io::OwnedHandle;
+pub type CompletionFence = std::os::windows::io::OwnedHandle;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///
@@ -208,10 +212,19 @@ pub(crate) enum TransferBackend {
     #[cfg(target_os = "android")]
     AHardwareBuffer,
 
+    /// Zero-copy via `EGL_ANGLE_image_d3d11_texture` (Windows): the tensor's
+    /// `ID3D11Texture2D` wrapped as an EGLImage and bound with
+    /// `glEGLImageTargetTexture2DOES`. Unlike Linux and Android the binding
+    /// is re-issued per use, because ANGLE does not observe writes made to
+    /// the texture outside GL (see `AngleD3d11::PERSISTENT_TEX_BINDINGS`).
+    #[cfg(target_os = "windows")]
+    D3d11Texture,
+
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
-    /// but OpenGL is present. Data stays in GPU-accessible memory. The only
-    /// transfer backend on Windows (ANGLE/D3D11): no zero-copy import kind
-    /// exists there yet.
+    /// but OpenGL is present. Data stays in GPU-accessible memory. Windows
+    /// took this path until the D3D11 texture import landed and now reports
+    /// [`TransferBackend::D3d11Texture`]; PBO destinations still exist there
+    /// as `TensorMemory::Pbo` tensors.
     Pbo,
 
     /// Synchronous `glTexSubImage2D` upload + `glReadPixels` readback.
@@ -239,6 +252,10 @@ impl TransferBackend {
         }
         #[cfg(target_os = "android")]
         if self == TransferBackend::AHardwareBuffer {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if self == TransferBackend::D3d11Texture {
             return true;
         }
         self == TransferBackend::DmaBuf
@@ -286,5 +303,16 @@ impl RegionOfInterest {
             right: ((crop.left + crop.width) as f32 / tex_w as f32 - half_x).clamp(0.0, 1.0),
             bottom: (crop.top as f32 / tex_h as f32 + half_y).clamp(0.0, 1.0),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod d3d11_backend_tests {
+    use super::TransferBackend;
+
+    #[test]
+    fn d3d11_texture_is_zero_copy_and_not_dma() {
+        assert!(TransferBackend::D3d11Texture.is_zero_copy());
+        assert!(!TransferBackend::D3d11Texture.is_dma());
     }
 }

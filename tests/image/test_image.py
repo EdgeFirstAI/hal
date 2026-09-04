@@ -21,6 +21,8 @@ from edgefirst.image import (
 from edgefirst.tensor import ColorEncoding, Colorimetry, ColorRange, TensorMemory
 from PIL import Image
 
+from tests.gpu_policy import skip_unless_gpu_backed
+
 
 def load_image(image, format="RGBA", resize=None):
     im = Image.open(image).convert(format)
@@ -347,6 +349,25 @@ def test_is_v4l2_available_returns_bool():
 # ---------------------------------------------------------------------------
 
 
+def _skip_unless_pitch_is_padded_and_aligned(t, tight_row_bytes):
+    """Skip unless this adapter gave the tensor a 64-byte-aligned padded row.
+
+    The padded-pitch tests exist to prove the strided buffer protocol, which
+    needs a pitch wider than the tight row to prove anything. Whether one is
+    produced is the adapter's choice, not the HAL's: at 595 columns the RTX
+    3070 pads rgba8 to 2432 and mono8 to 640, while WARP hands back 2380
+    (tight) and 596 (even-rounded, not 64-aligned). Neither is a defect, so
+    an adapter that does not pad to a 64-byte multiple skips rather than
+    fails; the padded path is exercised on adapters that pad.
+    """
+    if t.row_stride == tight_row_bytes or t.row_stride % 64 != 0:
+        pytest.skip(
+            f"this adapter returns a {t.row_stride}-byte pitch for a "
+            f"{tight_row_bytes}-byte row; the padded path is exercised on "
+            "adapters that pad to a 64-byte multiple"
+        )
+
+
 def _dma_image_or_skip(w, h, fmt):
     """Allocate a DMA-backed image tensor, or skip when DMA is unavailable."""
     try:
@@ -378,8 +399,7 @@ def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
     """
     w, h = 595, 438  # odd width → width*channels is not 64-aligned → padded
     t = _dma_image_or_skip(w, h, fmt)
-    assert t.row_stride > w * channels, "expected a padded pitch for this width"
-    assert t.row_stride % 64 == 0, "DMA pitch must be 64-byte aligned"
+    _skip_unless_pitch_is_padded_and_aligned(t, w * channels)
 
     ref = (np.arange(h * w * channels, dtype=np.uint8) % 251).reshape(h, w, channels)
     t.from_numpy(ref)
@@ -419,7 +439,8 @@ def test_dma_semiplanar_buffer_protocol_strided(fmt):
     zero-copy (the chroma rows share the same padded pitch as luma)."""
     w, h = 595, 438
     t = _dma_image_or_skip(w, h, fmt)
-    assert t.row_stride > w and t.row_stride % 64 == 0
+    # The combined Y+UV plane is one byte per column, so the tight row is `w`.
+    _skip_unless_pitch_is_padded_and_aligned(t, w)
 
     with t.map() as m:
         mv = memoryview(m)
@@ -1105,3 +1126,77 @@ def test_convert_honors_tagged_colorimetry(monkeypatch):
     # difference; require a clearly visible mean delta.
     mean_diff = np.abs(bt601_full.astype(int) - bt709_limited.astype(int)).mean()
     assert mean_diff > 1.0, f"mean pixel delta {mean_diff:.3f} too small to be real"
+
+
+@pytest.mark.gpu
+def test_convert_with_fence_returns_a_waitable_or_none():
+    """convert_with_fence() must hand back a completion handle the caller
+    can wait on and close, or None when the convert already completed
+    synchronously (no native fence on this platform/backend).
+
+    skip_unless_gpu_backed enforces the GPU test policy (tests/gpu_policy.py):
+    on Windows this requires HAL_TEST_REQUIRE_GL=1, at which point
+    create_image(access="read") (memory unspecified) prefers a D3D11 texture
+    destination and convert_with_fence hands back a set-on-completion event
+    for it -- so `fence is None` here is only reachable on a platform/backend
+    combination with no native fence at all.
+    """
+    p = ImageProcessor()
+    src = Tensor.image(64, 48, PixelFormat.Rgba, None, "readwrite")
+    dst = p.create_image(64, 48, PixelFormat.Rgb, "uint8", "read")
+    skip_unless_gpu_backed(dst)
+
+    fence = p.convert_with_fence(src, dst, Rotation.Rotate0, Flip.NoFlip)
+    if fence is None:
+        return  # platform without a native fence: the convert already completed
+
+    if sys.platform == "win32":
+        import ctypes
+
+        # Closed in a `finally`, as a plain call: a failing assert there
+        # would replace the real failure with its own.
+        try:
+            waited = ctypes.windll.kernel32.WaitForSingleObject(
+                ctypes.c_void_p(fence), 5000
+            )
+        finally:
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(fence))
+        assert waited == 0, "the fence was not set within 5 seconds"
+    else:
+        os.close(fence)
+
+
+@pytest.mark.gpu
+def test_convert_publishes_its_completion_on_the_destination():
+    """A convert records a fence value on the destination it rendered into,
+    and the caller's own tensor reports it afterwards.
+
+    The engine writes onto a `TensorDyn` the binding reconstructs from the
+    destination's descriptor (that is what lets the convert release the
+    GIL), never onto the caller's tensor, so without the publish step
+    `gpu_completion()` answers None for work that has in fact been queued
+    and a CUDA or D3D12 consumer has no fence value to wait on. This is the
+    same-package case: destination and processor both come from
+    `edgefirst.image`.
+    """
+    if sys.platform != "win32":
+        pytest.skip("only D3D11 textures record completions")
+    import ctypes
+
+    p = ImageProcessor()
+    src = Tensor.image(64, 48, PixelFormat.Rgba, None, "readwrite")
+    dst = p.create_image(64, 48, PixelFormat.Rgb, "uint8", "read")
+    skip_unless_gpu_backed(dst)
+    assert dst.gpu_completion() is None, "nothing has written this texture yet"
+
+    p.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
+
+    completion = dst.gpu_completion()
+    assert completion is not None, "the convert published no completion"
+    fence, value = completion
+    try:
+        assert value > 0
+    finally:
+        # A plain call, not an assertion: a failing assert here would
+        # replace the real failure above with this one.
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(fence))

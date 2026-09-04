@@ -159,6 +159,15 @@ fn draw_err(e: &edgefirst_image::Error) -> c_int {
 
 /// Draw boxes and decoded masks onto `dst`.
 ///
+/// On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
+/// afterwards, as it does after a convert, so another device can wait on the
+/// drawn frame instead of the CPU.
+///
+/// A `BGRA` background onto a zero-copy destination (a D3D11 texture, an
+/// IOSurface, a dma-buf) returns `EIO`: the GL base-layer draw has no `BGRA`
+/// arm and the CPU backend renders only `RGBA`/`RGB`. It previously returned
+/// 0 with the destination unwritten.
+///
 /// # Safety
 /// Pointers must be live or NULL as documented.
 #[no_mangle]
@@ -198,6 +207,12 @@ pub unsafe extern "C" fn ef_image_processor_draw_decoded_masks(
 }
 
 /// Draw proto masks onto `dst`. `protos` and `coeffs` are borrowed, not taken.
+///
+/// On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
+/// afterwards, as it does after a convert.
+///
+/// The same `BGRA` background restriction as
+/// `ef_image_processor_draw_decoded_masks`.
 ///
 /// # Safety
 /// Tensor handles must stay live for the call.

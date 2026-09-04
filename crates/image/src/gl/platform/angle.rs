@@ -34,7 +34,7 @@ use super::macos::ApplePlatform;
 use super::GlPlatform;
 use crate::{Error, Result};
 use edgefirst_egl as egl;
-use edgefirst_tensor::{DType, PixelFormat, Tensor};
+use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn};
 use log::debug;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -353,6 +353,12 @@ impl GlPlatform for AngleClientBuffer {
     // eglBindTexImage attachments are released at end_gpu_pass — the
     // engine's binding-skip cache must stay cold on macOS.
     const PERSISTENT_TEX_BINDINGS: bool = false;
+
+    /// As Linux and Android: the planar F16 zero-copy render only. The
+    /// packed-surface import here reconstructs a three-plane stack, so the
+    /// wider set would need its own on-target run before it is claimed.
+    const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
+        super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = false;
 
     fn load_gl_once(_display: &AngleDisplay) {
@@ -362,6 +368,12 @@ impl GlPlatform for AngleClientBuffer {
 
     fn import_handle(import: &IoSurfacePbuffer) -> egl::Surface {
         import.surface
+    }
+
+    fn import_extent(_import: &IoSurfacePbuffer) -> Option<(u32, u32)> {
+        // The pbuffer is created with explicit EGL_WIDTH/EGL_HEIGHT, so it is
+        // the tensor's logical image however large the IOSurface is.
+        None
     }
 
     unsafe fn attach_tex_image_2d(display: &AngleDisplay, handle: egl::Surface) -> Result<()> {
@@ -404,8 +416,23 @@ impl GlPlatform for AngleClientBuffer {
 
     fn export_completion_fence(
         _display: &AngleDisplay,
+        _recorded: Option<u64>,
     ) -> crate::Result<Option<super::super::CompletionFence>> {
         Ok(None)
+    }
+
+    fn record_completion(
+        _display: &AngleDisplay,
+        _dst: &mut TensorDyn,
+        _submit: bool,
+    ) -> Option<u64> {
+        // No device fence on ANGLE/Metal — convert() returning means the
+        // GPU work is complete.
+        None
+    }
+
+    fn submit_recorded(_display: &AngleDisplay) {
+        // Nothing is ever queued unsubmitted: there is no device fence.
     }
 
     fn begin_gpu_pass(_display: &AngleDisplay) {
@@ -453,6 +480,11 @@ impl GlPlatform for AngleClientBuffer {
                     )));
                 }
                 (PixelFormat::PlanarRgb, DType::F16, width * 4, height / 3)
+            }
+            super::PackedImportFormat::Rgba32323232F => {
+                return Err(Error::NotSupported(
+                    "RGBA32F zero-copy import has no buffer format on this platform".into(),
+                ))
             }
         };
         let shared = display.shared;

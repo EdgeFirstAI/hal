@@ -18,6 +18,13 @@
  * A tensor from here is an ordinary `ef_tensor`. There is one tensor
  * header, `edgefirst/tensor.h`. Detection primitives used when drawing
  * masks live in header-only `edgefirst/detect.h`.
+ *
+ * Platform-specific entry points. Both are declared on every platform and
+ * refuse at run time off their platform, so linking never depends on the
+ * host. The tie is stated per function with a "Platforms:" line:
+ *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence
+ *     (sync-fence fd)
+ *   - Windows: ef_image_processor_convert_fence_handle (event handle)
  */
 
 #include <stdarg.h>
@@ -119,6 +126,15 @@ uint32_t ef_image_abi_version(void);
 /**
  * Draw boxes and decoded masks onto `dst`.
  *
+ * On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
+ * afterwards, as it does after a convert, so another device can wait on the
+ * drawn frame instead of the CPU.
+ *
+ * A `BGRA` background onto a zero-copy destination (a D3D11 texture, an
+ * IOSurface, a dma-buf) returns `EIO`: the GL base-layer draw has no `BGRA`
+ * arm and the CPU backend renders only `RGBA`/`RGB`. It previously returned
+ * 0 with the destination unwritten.
+ *
  * # Safety
  * Pointers must be live or NULL as documented.
  */
@@ -135,6 +151,12 @@ int ef_image_processor_draw_decoded_masks(ef_image_processor *p,
 
 /**
  * Draw proto masks onto `dst`. `protos` and `coeffs` are borrowed, not taken.
+ *
+ * On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
+ * afterwards, as it does after a convert.
+ *
+ * The same `BGRA` background restriction as
+ * `ef_image_processor_draw_decoded_masks`.
  *
  * # Safety
  * Tensor handles must stay live for the call.
@@ -330,6 +352,8 @@ int ef_image_processor_set_class_colors(ef_image_processor *p,
 int ef_image_processor_flush(ef_image_processor *p);
 
 /**
+ * Platforms: Linux, macOS, iOS, Android.
+ *
  * Convert, returning a sync-fence fd instead of blocking on the GPU.
  *
  * The GL to NPU handoff. `*fence_fd` receives a descriptor the caller owns and
@@ -337,7 +361,7 @@ int ef_image_processor_flush(ef_image_processor *p);
  * therefore completed synchronously — in which case the destination is already
  * safe to read.
  *
- * @return 0 on success, otherwise an errno.
+ * @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
  *
  * # Safety
  * `p`, `src`, `dst` must be live handles; `fence_fd` must be writable.
@@ -349,6 +373,27 @@ int ef_image_processor_convert_fence(ef_image_processor *p,
                                      uint32_t flip,
                                      const struct ef_crop *crop,
                                      int *fence_fd);
+
+/**
+ * Platforms: Windows.
+ *
+ * Convert, returning an event handle instead of blocking on the GPU. The
+ * event is set when the destination is complete; the caller owns it and
+ * closes it with `CloseHandle`. `*fence` is `NULL` when the convert
+ * completed synchronously (no fence on this display).
+ *
+ * @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
+ *
+ * # Safety
+ * `p`, `src`, `dst` must be live handles; `fence` must be writable.
+ */
+int ef_image_processor_convert_fence_handle(ef_image_processor *p,
+                                            const ef_tensor *src,
+                                            ef_tensor *dst,
+                                            uint32_t rotation,
+                                            uint32_t flip,
+                                            const struct ef_crop *crop,
+                                            void **fence);
 
 /**
  * Deploy defaults: overlap 0.2, stretch, pad `[114,114,114,255]`.

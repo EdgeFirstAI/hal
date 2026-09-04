@@ -129,6 +129,27 @@ pub struct TensorDyn {
     /// type-erased via `Any` like `pbo`: `CudaHandle` itself carries no
     /// element type to erase.
     pub(crate) cuda: Option<Box<crate::cuda::CudaHandle>>,
+    /// The texture NT handle [`Self::descriptor_pinned`] puts in a
+    /// [`crate::protocol::kind::D3D11_TEXTURE`] descriptor, kept here for as
+    /// long as this value lives.
+    ///
+    /// The static backend borrows the tensor's own handle
+    /// (`d3d11_shared_handle_value`); across the C ABI there is no such
+    /// accessor -- `ef_tensor_d3d11_shared_handle` transfers ownership of a
+    /// *duplicate*, which a descriptor cannot own (it is `Copy` and has no
+    /// drop). Writing the duplicate's value into the descriptor and dropping
+    /// it leaves the descriptor naming a closed handle; leaking it leaks one
+    /// handle per descriptor, and a per-frame producer builds one every
+    /// frame. Holding it here gives it the same lifetime the static
+    /// backend's borrowed handle has -- the producing tensor's, which the
+    /// capsule keepalive already holds for the descriptor's whole life --
+    /// and closes it exactly once, when this tensor drops.
+    ///
+    /// `OnceLock` for the reason [`Self::quantization_cache`] documents:
+    /// `descriptor_pinned` takes `&self`, and `get_or_init` serializes
+    /// concurrent initializers without ever materializing a `&mut`.
+    #[cfg(target_os = "windows")]
+    descriptor_texture_handle: std::sync::OnceLock<Option<std::os::windows::io::OwnedHandle>>,
 }
 
 // SAFETY: `TensorTrait<T>: Send + Sync` is a supertrait bound every consumer
@@ -178,10 +199,17 @@ impl TensorDyn {
             multiplane_chroma: None,
             pbo: None,
             cuda: None,
+            #[cfg(target_os = "windows")]
+            descriptor_texture_handle: std::sync::OnceLock::new(),
         }
     }
 
     /// Derive this handle's [`BufferIdentity`].
+    ///
+    /// On Windows, a texture-backed handle uses the `ID3D11Texture2D*` behind
+    /// `ef_tensor_d3d11_texture`, the same key the static backend's
+    /// `d3d11::texture::tex_key` derives, so one texture has one identity
+    /// whichever backend names it.
     ///
     /// For a DMA-BUF-backed handle, uses the native fd's `(st_dev, st_ino)`
     /// -- survives `dup`, and is the same value for every independent
@@ -209,12 +237,36 @@ impl TensorDyn {
     /// error, no crash -- an ABA hazard the design a `IdentityKind` doc
     /// comment (`lib.rs`) explicitly says a process-local kind must not be
     /// exposed to a cache like this without exactly this kind of stable,
-    /// unrecyclable-while-live key. Falls back to `HostPtr` (this handle's
-    /// own address) for every other storage kind, or if the fd cannot be
-    /// `fstat`-ed -- no `ef_tensor_*` primitive exposes a system-level
-    /// identity key for those, so a process-local one is the best answer
-    /// available, same as the static backend's own `Mem`/`Pbo` tensors.
+    /// unrecyclable-while-live key. The D3D11 branch is the same argument on
+    /// Windows: an `ID3D11Texture2D*` is process-local like a handle address,
+    /// but ANGLE's EGLImage holds a reference to the texture, so the address
+    /// cannot be recycled while a cache entry keyed on it can be found --
+    /// which a handle address, held by nothing, can. Falls back to `HostPtr`
+    /// (this handle's own address) for every other storage kind, or if the fd
+    /// cannot be `fstat`-ed -- no `ef_tensor_*` primitive exposes a
+    /// system-level identity key for those, so a process-local one is the best
+    /// answer available, same as the static backend's own `Mem`/`Pbo` tensors,
+    /// neither of which any GPU import path accepts.
     fn derive_identity(handle: NonNull<EfTensor>) -> BufferIdentity {
+        // Gated on the storage kind first, as the Unix branch is, so a `Mem`
+        // or PBO handle does not pay an `ENOTSUP` that overwrites the ABI's
+        // last-error slot on every construction.
+        #[cfg(target_os = "windows")]
+        {
+            // SAFETY: `handle` is live for the duration of this call.
+            let code = unsafe { edgefirst_tensor_ffi::ef_tensor_storage_kind(handle.as_ptr()) };
+            if TensorMemory::from_code(code) == Some(TensorMemory::DmaBuf) {
+                // SAFETY: `handle` is live for the duration of this call; the
+                // pointer is borrowed and carries no reference of its own.
+                let tex = unsafe { edgefirst_tensor_ffi::ef_tensor_d3d11_texture(handle.as_ptr()) };
+                if !tex.is_null() {
+                    return BufferIdentity::derived(
+                        IdentityKind::D3d11Texture,
+                        tex as usize as u64,
+                    );
+                }
+            }
+        }
         #[cfg(unix)]
         {
             // SAFETY: `handle` is live for the duration of this call.
@@ -597,6 +649,20 @@ impl TensorDyn {
     /// why this is not `pub(self)` -- it is shared plumbing within the
     /// crate, not a second public byte-mapping entry point.
     pub(crate) fn map_pin(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'static>> {
+        self.map_pin_with(access, false)
+    }
+
+    /// [`map_pin`](Self::map_pin), with the choice of `ef_tensor_map` or
+    /// `ef_tensor_try_map`.
+    ///
+    /// One body rather than two: the PBO detour, the retain that makes the
+    /// pin `'static`, and the unmap-on-retain-failure unwind are identical
+    /// for both, and the ABI call is the only line that differs.
+    pub(crate) fn map_pin_with(
+        &self,
+        access: CpuAccess,
+        non_blocking: bool,
+    ) -> Result<crate::pin::HostPin<'static>> {
         // A PBO-backed handle's real (GPU-resident) bytes live in the GL
         // buffer `pbo` addresses, not in this companion `ef_tensor_*`
         // handle's own host allocation (real and full-sized, not
@@ -627,11 +693,31 @@ impl TensorDyn {
             len: 0,
         };
         // SAFETY: `self.handle` is live; `view` is a valid local out-param.
-        let rc =
-            unsafe { edgefirst_tensor_ffi::ef_tensor_map(self.handle.as_ptr(), code, &mut view) };
+        let rc = unsafe {
+            if non_blocking {
+                edgefirst_tensor_ffi::ef_tensor_try_map(self.handle.as_ptr(), code, &mut view)
+            } else {
+                edgefirst_tensor_ffi::ef_tensor_map(self.handle.as_ptr(), code, &mut view)
+            }
+        };
+        if rc == libc::EAGAIN && non_blocking {
+            // Not a failure: the GPU copy this map depends on is still in
+            // flight and a retry makes progress. Rebuilt as the exact error
+            // the static backend raises, so `try_map_with` means one thing
+            // on both backends.
+            return Err(Error::IoError(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                ffi_last_error(),
+            )));
+        }
         if rc != 0 {
+            let what = if non_blocking {
+                "ef_tensor_try_map"
+            } else {
+                "ef_tensor_map"
+            };
             return Err(Error::InvalidOperation(format!(
-                "ef_tensor_map failed: errno {rc}"
+                "{what} failed: errno {rc}"
             )));
         }
         // Retain so the pin can genuinely outlive `self` -- released by
@@ -733,6 +819,20 @@ impl TensorDyn {
     /// backend's own `map_bytes`.
     pub fn map_bytes(&self, access: CpuAccess) -> Result<crate::view::HostView<'static, u8>> {
         let pin = self.map_pin(access)?;
+        let len = pin.len();
+        Ok(crate::view::HostView::new(pin, vec![len], None, access))
+    }
+
+    /// Non-blocking [`map_bytes`](Self::map_bytes), same contract as the
+    /// static backend's own `try_map_bytes`.
+    ///
+    /// Drives `ef_tensor_try_map`, whose `EAGAIN` becomes
+    /// `Error::IoError(WouldBlock)` -- the same error the static backend
+    /// raises for the same reason, so a caller sees one contract on both.
+    /// Only the Windows D3D11 texture can actually answer it; every other
+    /// backing reaches the identical code `ef_tensor_map` does.
+    pub fn try_map_bytes(&self, access: CpuAccess) -> Result<crate::view::HostView<'static, u8>> {
+        let pin = self.map_pin_with(access, true)?;
         let len = pin.len();
         Ok(crate::view::HostView::new(pin, vec![len], None, access))
     }
@@ -1683,22 +1783,202 @@ impl TensorDyn {
         unsafe { Some((IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface))) }
     }
 
-    /// The CUDA registration for this tensor, if any.
+    /// The borrowed `ID3D11Texture2D*` backing this tensor (Windows only).
+    /// `None` when the tensor is not texture-backed.
+    ///
+    /// Drives `ef_tensor_d3d11_texture`. Same contract as the static
+    /// backend's own `TensorDyn::d3d11_texture`: the pointer is valid while
+    /// the tensor lives and carries no reference of its own.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_texture(&self) -> Option<*mut std::ffi::c_void> {
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        let p = unsafe { edgefirst_tensor_ffi::ef_tensor_d3d11_texture(self.handle.as_ptr()) };
+        (!p.is_null()).then_some(p)
+    }
+
+    /// The texture geometry the HAL chose for this image (Windows only).
+    /// `None` when the tensor is not texture-backed.
+    ///
+    /// Drives `ef_tensor_d3d11_layout`, whose `ef_d3d11_layout` is the wire
+    /// form of the same five fields `D3d11ImageLayout` carries -- widened
+    /// back to `usize` here, since the ABI struct pins them at `uint32_t`.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_layout(&self) -> Option<crate::d3d11_layout::D3d11ImageLayout> {
+        let mut out = edgefirst_tensor_ffi::EfD3d11Layout::default();
+        // SAFETY: `self.handle` is live; `out` is a valid local out-param.
+        let rc =
+            unsafe { edgefirst_tensor_ffi::ef_tensor_d3d11_layout(self.handle.as_ptr(), &mut out) };
+        (rc == 0).then_some(crate::d3d11_layout::D3d11ImageLayout {
+            dxgi_format: out.dxgi_format,
+            texture_width: out.texture_width as usize,
+            texture_height: out.texture_height as usize,
+            bytes_per_texel: out.bytes_per_texel as usize,
+            gl_internal_format: out.gl_internal_format,
+        })
+    }
+
+    /// A duplicated NT handle the caller owns (Windows only).
+    ///
+    /// Drives `ef_tensor_d3d11_shared_handle`, which is documented to
+    /// transfer ownership of the duplicate -- so wrapping it in an
+    /// `OwnedHandle` is what closes it, exactly once, when this value is
+    /// dropped.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_shared_handle(&self) -> Result<std::os::windows::io::OwnedHandle> {
+        use std::os::windows::io::FromRawHandle;
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        let h =
+            unsafe { edgefirst_tensor_ffi::ef_tensor_d3d11_shared_handle(self.handle.as_ptr()) };
+        if h.is_null() {
+            return Err(ffi_error(Error::NotImplemented));
+        }
+        // SAFETY: the export transferred ownership of a live NT handle.
+        Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h) })
+    }
+
+    /// The fence handle plus value a GPU consumer waits on before reading
+    /// this texture (Windows only), or `None` when no GPU write has been
+    /// recorded.
+    ///
+    /// Drives `ef_tensor_gpu_completion`, which writes `NULL`/0 before doing
+    /// anything else -- so a returned `NULL` fence with rc 0 is genuinely
+    /// "nothing recorded", not a stale local. The fence handle it hands back
+    /// is an owned duplicate, wrapped here for the same reason
+    /// [`d3d11_shared_handle`](Self::d3d11_shared_handle) wraps its own.
+    #[cfg(target_os = "windows")]
+    pub fn gpu_completion(&self) -> Result<Option<crate::d3d11::GpuCompletion>> {
+        use std::os::windows::io::FromRawHandle;
+        let mut fence = std::ptr::null_mut();
+        let mut value = 0u64;
+        // SAFETY: `self.handle` is live; both out-params are valid locals.
+        let rc = unsafe {
+            edgefirst_tensor_ffi::ef_tensor_gpu_completion(
+                self.handle.as_ptr(),
+                &mut fence,
+                &mut value,
+            )
+        };
+        if rc != 0 {
+            return Err(ffi_error(Error::NotImplemented));
+        }
+        if fence.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: the export transferred ownership of a live NT handle.
+        let fence = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(fence) };
+        Ok(Some(crate::d3d11::GpuCompletion { fence, value }))
+    }
+
+    /// The fence value of the newest GPU write recorded on this tensor, or 0
+    /// when there is none; every platform, 0 off Windows. See
+    /// [`Tensor::gpu_write_value`](crate::Tensor::gpu_write_value).
+    ///
+    /// Drives `ef_tensor_gpu_write_value`, declared on every platform. Only a
+    /// texture can carry a recorded write, so any other backing is answered
+    /// here: the export would cost an FFI round trip and leave a refusal in
+    /// the thread-local last error that no caller of this reads.
+    pub fn gpu_write_value(&self) -> u64 {
+        if self.memory() != TensorMemory::DmaBuf {
+            return 0;
+        }
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        unsafe { edgefirst_tensor_ffi::ef_tensor_gpu_write_value(self.handle.as_ptr()) }
+    }
+
+    /// Record that GPU work writing this texture completes at `value` of the
+    /// process device's fence (Windows only).
+    ///
+    /// Drives `ef_tensor_set_gpu_write`. Takes `&self`, matching the static
+    /// backend: the export records a monotonic maximum into an atomic and
+    /// needs no exclusive access, so a producer can record a write on a
+    /// tensor its consumers are reading.
+    #[cfg(target_os = "windows")]
+    pub fn set_gpu_write(&self, value: u64) -> Result<()> {
+        // SAFETY: `self.handle` is live; the export records a monotonic
+        // maximum into an atomic, so a shared borrow is all it needs.
+        let rc =
+            unsafe { edgefirst_tensor_ffi::ef_tensor_set_gpu_write(self.handle.as_ptr(), value) };
+        if rc != 0 {
+            return Err(ffi_error(Error::NotImplemented));
+        }
+        Ok(())
+    }
+
+    /// The CUDA registration this wrapper holds, if any.
     ///
     /// Reads [`Self::cuda`], with no `ef_tensor_*` entry: `CudaHandle` is
     /// already backend-agnostic in-process Rust state (see `crate::cuda`'s
     /// module doc and [`crate::Tensor::cuda`], which task 18 added for the
     /// typed lens) -- there is nothing about it to send across the
     /// boundary.
+    ///
+    /// It is not the whole answer to "is this tensor registered with CUDA":
+    /// a tensor the C library allocated carries its registration there, out
+    /// of this field's reach. [`Self::cuda_map`] covers both.
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
         self.cuda.as_deref()
+    }
+
+    /// The C library's own mapping of this tensor, for a registration that
+    /// lives inside it rather than in [`Self::cuda`]: `Tensor::image` and the
+    /// D3D11 constructors attach a `CudaHandle` to the `Tensor` *they*
+    /// allocate, which is the C handle this struct wraps and not this struct,
+    /// so [`Self::cuda`] cannot see it. `mk` is `ef_tensor_cuda_map` or
+    /// `ef_tensor_cuda_map_mut`; both return an opaque map that retains the
+    /// tensor and is released by `ef_tensor_cuda_unmap`.
+    fn ffi_cuda_map(
+        &self,
+        mk: unsafe extern "C" fn(*const EfTensor) -> *mut std::ffi::c_void,
+    ) -> Option<crate::cuda::CudaMap<'_>> {
+        // SAFETY: `self.handle` is this tensor's live C handle.
+        let map = unsafe { mk(self.handle.as_ptr()) };
+        if map.is_null() {
+            return None;
+        }
+        // SAFETY: `map` is the live, non-NULL map `mk` just returned, with no
+        // other owner, so the guard may release it exactly once.
+        unsafe { crate::cuda::CudaMap::from_ffi(map) }
     }
 
     /// Fast-fail CUDA map: `None` when no handle is attached; else a scoped
     /// device-pointer guard. Same contract as [`crate::Tensor::cuda_map`]
     /// and as the static backend's own `TensorDyn::cuda_map`.
+    ///
+    /// A locally-attached handle ([`Self::set_cuda_handle`]'s PBO and nvJPEG
+    /// registrations) is mapped in process; anything else falls through to
+    /// [`Self::ffi_cuda_map`], because a tensor allocated by the C library
+    /// keeps its registration there. Without that fall-through this backend
+    /// answers `None` for every D3D11 texture tensor while the static one
+    /// maps it, which is the divergence the three-backend rule forbids.
+    ///
+    /// The fall-through is skipped for the backings that can never carry a
+    /// library registration: `Mem` and `Shm` are host allocations the C
+    /// library imports nothing into, so it has nothing to answer for them and
+    /// they report `None` without asking it.
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
-        self.cuda()?.map()
+        match self.cuda() {
+            Some(h) => h.map(),
+            None if !self.can_carry_library_registration() => None,
+            None => self.ffi_cuda_map(edgefirst_tensor_ffi::ef_tensor_cuda_map),
+        }
+    }
+
+    /// Whether a tensor of this backing could hold a CUDA registration inside
+    /// the C library. Host memory never does; every device backing may.
+    fn can_carry_library_registration(&self) -> bool {
+        !matches!(self.memory(), TensorMemory::Mem | TensorMemory::Shm)
+    }
+
+    /// Writable counterpart of [`cuda_map`](Self::cuda_map). See
+    /// [`CudaHandle::map_mut`](crate::cuda::CudaHandle::map_mut) for which
+    /// backings distinguish the two, and [`cuda_map`](Self::cuda_map) for why
+    /// the fall-through exists.
+    pub fn cuda_map_mut(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        match self.cuda() {
+            Some(h) => h.map_mut(),
+            None if !self.can_carry_library_registration() => None,
+            None => self.ffi_cuda_map(edgefirst_tensor_ffi::ef_tensor_cuda_map_mut),
+        }
     }
 
     /// GL buffer ID for this PBO; `None` when the tensor is not PBO-backed.
@@ -1847,6 +2127,103 @@ impl TensorDyn {
         }
     }
 
+    /// Wrap an existing `ID3D11Texture2D` as a type-erased tensor (Windows
+    /// only). See
+    /// [`Tensor::from_d3d11_texture`](crate::Tensor::from_d3d11_texture).
+    ///
+    /// Drives `ef_tensor_from_d3d11_texture`. Same signature as the static
+    /// backend's, so a caller compiles against either; the C constructor
+    /// takes the tensor's *shape* rather than `width`/`height`, so those are
+    /// turned into the allocation shape here and validated back against the
+    /// texture description on the far side.
+    ///
+    /// # Safety
+    ///
+    /// `texture` must be null or a live `ID3D11Texture2D` created on the HAL
+    /// device ([`crate::d3d11::device()`]).
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    pub unsafe fn from_d3d11_texture(
+        texture: *mut std::ffi::c_void,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        access: CpuAccess,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let dims = allocation_dims(format, width, height, "from_d3d11_texture")?;
+        let format = format_cstring(format)?;
+        let name = name_cstring(name)?;
+        // SAFETY: the caller guarantees `texture`; `dims`, `format` and
+        // `name` are live locals for the call's duration.
+        let handle = unsafe {
+            edgefirst_tensor_ffi::ef_tensor_from_d3d11_texture(
+                texture,
+                dtype.code(),
+                dims.as_ptr(),
+                dims.len() as u32,
+                format.as_ptr(),
+                access_code(access),
+                name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
+            )
+        };
+        match NonNull::new(handle) {
+            Some(h) => Ok(Self::from_handle(h)),
+            None => Err(ffi_error(Error::InvalidArgument)),
+        }
+    }
+
+    /// Open a shared texture by its NT handle as a type-erased tensor
+    /// (Windows only). See
+    /// [`Tensor::from_d3d11_shared_handle`](crate::Tensor::from_d3d11_shared_handle).
+    ///
+    /// Drives `ef_tensor_from_d3d11_shared_handle`, with the same
+    /// dimensions-to-shape conversion
+    /// [`from_d3d11_texture`](Self::from_d3d11_texture) documents. Both
+    /// handles stay the caller's: the export duplicates what it keeps.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be an NT shared handle of a D3D11 texture, valid in
+    /// this process, and `completion`'s handle a shared fence handle.
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    pub unsafe fn from_d3d11_shared_handle(
+        handle: std::os::windows::io::RawHandle,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        access: CpuAccess,
+        completion: Option<(std::os::windows::io::RawHandle, u64)>,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let dims = allocation_dims(format, width, height, "from_d3d11_shared_handle")?;
+        let format = format_cstring(format)?;
+        let name = name_cstring(name)?;
+        let (fence, fence_value) = completion.unwrap_or((std::ptr::null_mut(), 0));
+        // SAFETY: the caller guarantees both handles; `dims`, `format` and
+        // `name` are live locals for the call's duration.
+        let tensor = unsafe {
+            edgefirst_tensor_ffi::ef_tensor_from_d3d11_shared_handle(
+                handle,
+                dtype.code(),
+                dims.as_ptr(),
+                dims.len() as u32,
+                format.as_ptr(),
+                access_code(access),
+                fence,
+                fence_value,
+                name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
+            )
+        };
+        match NonNull::new(tensor) {
+            Some(h) => Ok(Self::from_handle(h)),
+            None => Err(ffi_error(Error::InvalidArgument)),
+        }
+    }
+
     /// Rebuild a type-erased PBO tensor from a cross-cdylib `ops` (see
     /// [`crate::pbo::import_pbo_ops`]) plus the geometry a
     /// [`crate::TensorDesc`] under [`crate::protocol::kind::PBO`] carries.
@@ -1948,6 +2325,34 @@ impl TensorDyn {
                 let ops = unsafe { crate::pbo::import_pbo_ops(desc.ptr.0 as *const _)? };
                 Self::from_pbo_import(buffer_id, desc.capacity as usize, shape, dtype, ops)
             }
+            #[cfg(target_os = "windows")]
+            crate::protocol::kind::D3D11_TEXTURE => {
+                let (tex, completion) = crate::protocol::descriptor_d3d11_handles(desc)?;
+                // SAFETY: the caller guarantees the producer's keepalive
+                // outlives the returned tensor -- the capsule contract
+                // `import_descriptor` documents -- so both handles are the
+                // producer's own and live for this call. `ReadWrite` is the
+                // widest access an import can ask for; the descriptor
+                // carries no access of its own.
+                unsafe {
+                    let (format, width, height) =
+                        crate::protocol::descriptor_d3d11_geometry(desc, tex, shape)?;
+                    Self::from_d3d11_shared_handle(
+                        tex,
+                        width,
+                        height,
+                        format,
+                        dtype,
+                        CpuAccess::ReadWrite,
+                        completion,
+                        None,
+                    )
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            crate::protocol::kind::D3D11_TEXTURE => Err(Error::NotImplemented(
+                "D3D11 texture import off Windows".into(),
+            )),
             k => Err(Error::NotImplemented(format!(
                 "tensor interop kind {k} cannot be imported by this build"
             ))),
@@ -1980,8 +2385,33 @@ impl TensorDyn {
             // `pbo` and never in the backing `ef_tensor_*` handle -- plane 0
             // would report `-1` here.
             TensorMemory::Pbo => self.pbo_id().map(|id| id as i64).unwrap_or(-1),
+            // A D3D11 texture's plane 0 reports `-1`: an NT handle is not a
+            // value `ef_tensor_plane_at` carries. The handle comes from
+            // `ef_tensor_d3d11_shared_handle`, and this tensor keeps it --
+            // see `descriptor_texture_handle`.
+            #[cfg(target_os = "windows")]
+            TensorMemory::DmaBuf => self.descriptor_texture_handle_value(),
             _ => self.plane0().map(|p| p.handle).unwrap_or(-1),
         };
+        // The fence is the process device's, shared with the library that
+        // owns this handle through the rendezvous, so its handle value is
+        // borrowed rather than duplicated -- the device outlives the
+        // descriptor, and a copy whose own fence is private exports no handle
+        // at all rather than pairing two timelines. Only the value comes from
+        // the library, through `ef_tensor_gpu_write_value`, which duplicates
+        // no fence handle for a number the descriptor only forwards.
+        #[cfg(target_os = "windows")]
+        let (fence_handle, sync) = match memory {
+            TensorMemory::DmaBuf => (
+                crate::d3d11::device()
+                    .map(|d| d.exported_fence_handle_value())
+                    .unwrap_or(0),
+                Some(self.gpu_write_value()).filter(|v| *v != 0),
+            ),
+            _ => (0, None),
+        };
+        #[cfg(not(target_os = "windows"))]
+        let (fence_handle, sync) = (0, None);
         crate::protocol::from_parts(crate::protocol::DescParts {
             dims: self.shape(),
             memory,
@@ -1994,7 +2424,22 @@ impl TensorDyn {
             capacity: self.capacity_bytes() as u64,
             pin,
             pbo_vtable_ptr: self.pbo_vtable_ptr(),
+            fence_handle,
+            sync,
         })
+    }
+
+    /// The value of the texture handle this tensor keeps for its
+    /// descriptors, duplicating it on first use; `-1` when this tensor has
+    /// no D3D11 texture behind it.
+    #[cfg(target_os = "windows")]
+    fn descriptor_texture_handle_value(&self) -> i64 {
+        use std::os::windows::io::AsRawHandle;
+        self.descriptor_texture_handle
+            .get_or_init(|| self.d3d11_shared_handle().ok())
+            .as_ref()
+            .map(|h| h.as_raw_handle() as usize as i64)
+            .unwrap_or(-1)
     }
 }
 
@@ -2227,6 +2672,50 @@ fn identity_from_stat(stat: &nix::sys::stat::FileStat) -> BufferIdentity {
 fn format_cstring(format: PixelFormat) -> Result<std::ffi::CString> {
     std::ffi::CString::new(format.as_str())
         .map_err(|e| Error::InvalidArgument(format!("pixel format string contains a NUL: {e}")))
+}
+
+/// `NUL`-terminate an optional debug name for a C call.
+///
+/// Unlike [`format_cstring`]'s input, this string comes from the caller and
+/// really can contain a NUL, so the refusal is a reachable path rather than
+/// a defensive one. `None` stays `None`, which is the ABI's own "no name"
+/// spelling.
+#[cfg(target_os = "windows")]
+fn name_cstring(name: Option<&str>) -> Result<Option<std::ffi::CString>> {
+    name.map(std::ffi::CString::new)
+        .transpose()
+        .map_err(|e| Error::InvalidArgument(format!("name contains a NUL: {e}")))
+}
+
+/// `width`x`height` as the `uint64_t[]` shape a D3D11 constructor takes.
+///
+/// The C constructors are given the tensor's shape, not its pixel
+/// dimensions, so that `ef_tensor_shape` reports back exactly what was
+/// passed in and the far side can check it against the texture. The static
+/// backend's constructors take `width`/`height` and derive the same shape
+/// internally, so converting here is what keeps the two signatures
+/// identical.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] for a `width`/`height` the format has no
+/// allocation shape for (a zero dimension, or an odd one for a subsampled
+/// format).
+#[cfg(target_os = "windows")]
+fn allocation_dims(
+    format: PixelFormat,
+    width: usize,
+    height: usize,
+    what: &str,
+) -> Result<Vec<u64>> {
+    format
+        .allocation_shape(width, height)
+        .map(|s| s.iter().map(|&d| d as u64).collect())
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "{what}: invalid dimensions {width}x{height} for format {format:?}"
+            ))
+        })
 }
 
 /// Encode `Option<TensorMemory>` as the `(has_memory, memory)` pair every

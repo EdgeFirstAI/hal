@@ -6,8 +6,8 @@
 use crate::colorimetry::effective_colorimetry;
 use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Result, Rotation};
 use edgefirst_tensor::{
-    ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait,
-    TensorMemory, TensorTrait,
+    ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMemory,
+    TensorTrait,
 };
 use four_char_code::FourCharCode;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
@@ -345,17 +345,21 @@ impl G2DProcessor {
             }
         }
 
-        // Apply XOR 0x80 for int8 output (u8→i8 bias conversion).
-        // map() issues DMA_BUF_IOCTL_SYNC(START) on the dst fd; for self-allocated
-        // CMA buffers this performs cache invalidation via the DrmAttachment.
-        // For foreign fds (e.g. the Neutron NPU DMA-BUF imported via from_fd()),
-        // the DrmAttachment is None and the sync ioctl is handled by the NPU driver.
-        // The map drop issues DMA_BUF_IOCTL_SYNC(END) so the NPU DMA engine sees
-        // the CPU-written XOR'd data on the next Invoke().
+        // Apply XOR 0x80 for int8 output (u8→i8 bias conversion), confined to
+        // each row's pixel bytes: the destination's pitch may exceed its pixels
+        // (a padded allocation, or a `view()` tile whose trailing bytes are the
+        // parent's neighbouring pixels), and a flat walk of the mapping would
+        // bias those bytes too.
+        // The helper's map issues DMA_BUF_IOCTL_SYNC(START) on the dst fd; for
+        // self-allocated CMA buffers this performs cache invalidation via the
+        // DrmAttachment. For foreign fds (e.g. the Neutron NPU DMA-BUF imported
+        // via from_fd()), the DrmAttachment is None and the sync ioctl is
+        // handled by the NPU driver. The map drop issues DMA_BUF_IOCTL_SYNC(END)
+        // so the NPU DMA engine sees the CPU-written XOR'd data on the next
+        // Invoke().
         if is_int8_dst {
             let start = Instant::now();
-            let mut map = dst.map()?;
-            crate::cpu::apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
+            crate::cpu::apply_int8_xor_bias_rows(dst, dst_fmt)?;
             log::trace!("g2d int8 XOR 0x80 post-pass takes {:?}", start.elapsed());
         }
 
@@ -2117,5 +2121,180 @@ mod g2d_tests {
             max_diff <= 35,
             "D-03: gross NV12 odd-both G2D vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
         );
+    }
+    /// An `I8` destination gets its bias from a CPU post-pass after the blit,
+    /// and that pass must stay inside each row's pixels: the bytes between one
+    /// row's pixels and the next are an allocation pad or a `view()` parent's
+    /// neighbouring tile, and a flat walk of the mapping biased both.
+    ///
+    /// The oracle is the same blit into a `U8` destination at the same pitch,
+    /// G2D being deterministic for an identical blit: every pixel byte of the
+    /// `I8` result must be that byte XOR 0x80 (alpha excepted), and both
+    /// destinations' pads must still hold the poison they were filled with.
+    /// The `U8` pad is asserted first, so a DPU that writes the pad is not
+    /// misread as a bias-pass regression.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn g2d_int8_dst_biases_only_the_pixel_bytes_at_the_declared_stride() {
+        // Direct stderr, not eprintln!: libtest replays captured output only
+        // for failing tests, so a skip printed through the capture is
+        // indistinguishable from a run that did the work (TESTING.md).
+        let skip = |why: &str| {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: g2d_int8_dst_biases_only_the_pixel_bytes_at_the_declared_stride - {why}"
+            );
+        };
+        if !is_dma_available() {
+            skip("DMA not available");
+            return;
+        }
+        if !is_g2d_available() {
+            skip("G2D not available");
+            return;
+        }
+        const W: usize = 64;
+        const H: usize = 16;
+        const POISON: u8 = 0xAB;
+        let fmt = PixelFormat::Rgba;
+        let bpp = fmt.channels();
+        let row_bytes = W * bpp;
+        // 64 bytes of pad past the pixels keeps the pitch 64-aligned for G2D.
+        let stride = row_bytes + 64;
+
+        let src = TensorDyn::image(
+            W,
+            H,
+            fmt,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("DMA source");
+        {
+            let t = src.as_typed::<u8>().unwrap();
+            let s = t.effective_row_stride().unwrap();
+            let mut m = t.map().unwrap();
+            let buf = m.as_mut_slice();
+            for y in 0..H {
+                for i in 0..row_bytes {
+                    buf[y * s + i] = (y * 31 + i * 7) as u8;
+                }
+            }
+        }
+
+        let mut u8_dst = TensorDyn::image_with_stride(
+            W,
+            H,
+            fmt,
+            DType::U8,
+            stride,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("padded U8 destination");
+        let mut i8_dst = TensorDyn::image_with_stride(
+            W,
+            H,
+            fmt,
+            DType::I8,
+            stride,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("padded I8 destination");
+        assert_eq!(i8_dst.effective_row_stride(), Some(stride));
+        // Both destinations are poisoned: the `U8` pad is what says whether
+        // G2D itself wrote past the pixels, and without it a DPU that does
+        // would look like the bias pass over-reaching.
+        u8_dst
+            .as_typed::<u8>()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(POISON);
+        i8_dst
+            .as_typed::<i8>()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(POISON as i8);
+
+        let mut g2d = G2DProcessor::new().unwrap();
+        g2d.convert(
+            &src,
+            &mut u8_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("U8 blit");
+        g2d.convert(
+            &src,
+            &mut i8_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("I8 blit");
+
+        let u8_stride = u8_dst.effective_row_stride().unwrap();
+        let want = u8_dst
+            .as_typed::<u8>()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_slice()
+            .to_vec();
+        let got: Vec<u8> = i8_dst
+            .as_typed::<i8>()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|&v| v as u8)
+            .collect();
+        // Both mappings are indexed to the end of the last row's pad below;
+        // say so here rather than failing on an index panic that names no
+        // stride.
+        assert!(
+            got.len() >= H * stride && want.len() >= H * u8_stride,
+            "a {stride} B pitch over {H} rows needs {} B, mapped {} (I8) and {} (U8)",
+            H * stride,
+            got.len(),
+            want.len()
+        );
+        // The blit's own pad first: everything below reads the `U8`
+        // destination as the oracle, so a G2D write past the pixels has to be
+        // named as G2D's rather than surface as a bias-pass failure.
+        for y in 0..H {
+            assert!(
+                want[y * u8_stride + row_bytes..(y + 1) * u8_stride]
+                    .iter()
+                    .all(|&b| b == POISON),
+                "row {y}: the G2D blit itself wrote past the pixels; the I8 \
+                 assertions below cannot separate that from the bias pass"
+            );
+        }
+        for y in 0..H {
+            for x in 0..W {
+                for c in 0..bpp {
+                    let g = got[y * stride + x * bpp + c];
+                    let w = want[y * u8_stride + x * bpp + c];
+                    let expect = if c == bpp - 1 { w } else { w ^ 0x80 };
+                    assert_eq!(g, expect, "pixel ({x},{y}) channel {c}");
+                }
+            }
+            assert!(
+                got[y * stride + row_bytes..(y + 1) * stride]
+                    .iter()
+                    .all(|&b| b == POISON),
+                "row {y}: the padding past the pixels was biased"
+            );
+        }
     }
 }

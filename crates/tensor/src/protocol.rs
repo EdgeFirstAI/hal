@@ -133,6 +133,11 @@ pub mod flags {
     /// legal handle somewhere: `0` is a valid `GLsync`-adjacent value and a
     /// valid fd number is never negative, so `-1` and `0` cannot both be
     /// spare across the kinds this field spans.
+    ///
+    /// Under [`kind::D3D11_TEXTURE`] `sync` is not a handle at all: it is a
+    /// value on the timeline of the fence whose NT handle
+    /// [`TensorDesc::ptr`] carries, so a producer that sets this flag must
+    /// also fill in `ptr`.
     pub const SYNC_PRESENT: u32 = 1 << 0;
 }
 
@@ -148,6 +153,12 @@ pub mod kind {
     pub const PBO: u32 = 3;
     /// CUDA device memory. `ptr` is a device pointer, not host-addressable.
     pub const CUDA_DEVICE: u32 = 4;
+    /// Windows D3D11 texture. `handle` is the texture's NT shared handle and
+    /// `ptr` the device fence's NT shared handle, both valid in the producing
+    /// process (other modules of the same process included); `sync` is the
+    /// fence value of the last recorded GPU write when `SYNC_PRESENT` is set.
+    /// The `ptr` reuse follows `PBO`'s vtable precedent.
+    pub const D3D11_TEXTURE: u32 = 5;
 }
 
 /// A raw pointer that may cross a `PyCapsule`.
@@ -185,11 +196,15 @@ pub struct TensorDesc {
     pub version: u32,
     /// One of the [`kind`] constants.
     pub kind: u32,
-    /// dma-buf fd, IOSurface id or GL buffer id; `-1` when unused.
+    /// dma-buf fd, IOSurface id, GL buffer id or D3D11 texture NT handle
+    /// value; `-1` when unused.
     pub handle: i64,
     /// Host pointer when addressable, else null -- **except under
     /// [`kind::PBO`]**, where it instead carries a `*const
-    /// crate::pbo::PboOpsVtable`, or null if the producer attached none.
+    /// crate::pbo::PboOpsVtable`, or null if the producer attached none,
+    /// **and under [`kind::D3D11_TEXTURE`]**, where it carries the process
+    /// device fence's NT handle value, or null when [`Self::sync`] carries
+    /// nothing to wait on.
     /// Interpretation is keyed by [`Self::kind`], the same established
     /// pattern [`Self::sync`]'s own doc comment already documents for that
     /// field: a PBO tensor never takes a `HostPin` (`PboTensor` refuses
@@ -250,10 +265,11 @@ pub struct TensorDesc {
     /// Completion handle for work still in flight against this tensor, or 0
     /// when [`flags::SYNC_PRESENT`] is clear.
     ///
-    /// **Reserved: producers in this build always leave it clear.** It is
-    /// declared now because the field has to exist before the first release
-    /// or adding it later costs a capsule-name bump, and it is the one gap
-    /// the synchronous-at-the-boundary contract cannot close: a *foreign*
+    /// Filled in by [`kind::D3D11_TEXTURE`] producers, and left clear by
+    /// every other kind in this build. It was declared before any producer
+    /// set it because the field has to exist before the first release or
+    /// adding it later costs a capsule-name bump, and it is the one gap the
+    /// synchronous-at-the-boundary contract cannot close: a *foreign*
     /// producer with queued GPU work has no other way to say "wait on this
     /// first".
     ///
@@ -267,6 +283,9 @@ pub struct TensorDesc {
     /// * [`kind::PBO`] -- a `GLsync` from `glFenceSync`, valid only in the
     ///   producer's share group.
     /// * [`kind::CUDA_DEVICE`] -- a `cudaEvent_t`.
+    /// * [`kind::D3D11_TEXTURE`] -- a value on the timeline of the
+    ///   `ID3D11Fence` [`Self::ptr`] names, not a handle of its own: the
+    ///   handle and the value together are what a consumer waits on.
     /// * [`kind::HOST`], [`kind::IOSURFACE`] -- no fence flavour defined;
     ///   `SYNC_PRESENT` must be clear.
     pub sync: u64,
@@ -325,7 +344,14 @@ pub(crate) fn kind_of(memory: TensorMemory) -> u32 {
             {
                 kind::IOSURFACE
             }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            // Windows has no dma-buf: the shared `DmaBuf` discriminant is a
+            // D3D11 texture there, whose handle field means something else
+            // again (an NT handle, not an fd).
+            #[cfg(target_os = "windows")]
+            {
+                kind::D3D11_TEXTURE
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
             {
                 kind::DMABUF
             }
@@ -454,6 +480,124 @@ pub(crate) fn descriptor_pbo_buffer_id(desc: &TensorDesc) -> crate::Result<u32> 
     Ok(buffer_id)
 }
 
+/// Read a `kind::D3D11_TEXTURE` descriptor's texture handle and, when the
+/// producer recorded a GPU write, the fence handle plus value an import
+/// waits on before reading.
+///
+/// Both checks together, like [`descriptor_pbo_buffer_id`]'s, because this
+/// kind also spends two of the descriptor's fields on one backing:
+/// `handle` names the texture and `ptr` the fence that orders access to it.
+/// The completion is optional -- a producer that has queued no GPU work
+/// leaves `SYNC_PRESENT` clear, and there is then nothing to wait for.
+///
+/// Both handles stay the producer's: they are its own, not duplicates, and
+/// are valid only while the capsule keepalive holds the producing tensor
+/// alive. `from_d3d11_shared_handle` duplicates what it keeps.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidArgument`] when the descriptor carries no texture
+/// handle.
+#[cfg(target_os = "windows")]
+pub(crate) fn descriptor_d3d11_handles(
+    desc: &TensorDesc,
+) -> crate::Result<(
+    std::os::windows::io::RawHandle,
+    Option<(std::os::windows::io::RawHandle, u64)>,
+)> {
+    if desc.handle <= 0 {
+        return Err(crate::Error::InvalidArgument(
+            "D3D11_TEXTURE descriptor without a texture handle".into(),
+        ));
+    }
+    let tex = desc.handle as usize as std::os::windows::io::RawHandle;
+    let completion = (desc.flags & flags::SYNC_PRESENT != 0 && !desc.ptr.is_null())
+        .then_some((desc.ptr.0 as std::os::windows::io::RawHandle, desc.sync));
+    Ok((tex, completion))
+}
+
+/// The pixel format and image dimensions a `kind::D3D11_TEXTURE` import is
+/// built at, with the descriptor's shape checked against them.
+///
+/// The dimensions come from the texture, not from `shape`: a shape cannot
+/// tell an allocation grid from an addressing grid, and a producer may
+/// legitimately send either (`descriptor_pinned` emits `shape()`, which is
+/// the allocation shape until someone calls `set_logical_shape`). The one
+/// thing the texture cannot supply is a semi-planar image's width -- such a
+/// texture is as wide as the driver's row pitch -- which is why `shape` is
+/// passed down to [`crate::d3d11_shared_handle_geometry`] rather than only
+/// checked here.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidArgument`] when the descriptor names no pixel
+/// format, or when its shape is neither spelling of the geometry the
+/// texture reports. Propagates whatever opening and describing the texture
+/// reports.
+///
+/// # Safety
+///
+/// `texture` must be an NT shared handle of a D3D11 texture, valid in this
+/// process. It stays owned by the caller.
+#[cfg(target_os = "windows")]
+pub(crate) unsafe fn descriptor_d3d11_geometry(
+    desc: &TensorDesc,
+    texture: std::os::windows::io::RawHandle,
+    shape: &[usize],
+) -> crate::Result<(crate::PixelFormat, usize, usize)> {
+    let format = crate::PixelFormat::from_code(desc.format).ok_or_else(|| {
+        crate::Error::InvalidArgument(
+            "D3D11_TEXTURE descriptor without a pixel format: the texture's own \
+             description cannot say which format it was allocated for"
+                .into(),
+        )
+    })?;
+    // SAFETY: the caller guarantees `texture` is a shared NT handle valid in
+    // this process.
+    let (width, height) = unsafe { d3d11_geometry_checked(format, texture, shape) }?;
+    Ok((format, width, height))
+}
+
+/// The image dimensions a shared D3D11 texture reports, with `shape` checked
+/// against them.
+///
+/// Split out of [`descriptor_d3d11_geometry`] so the blob's reference-mode
+/// import ([`crate::blob::import`]) makes the same refusal rather than a
+/// second copy of it: the two transports differ in how they name the format,
+/// not in which shapes describe a given texture.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidArgument`] when `shape` is neither spelling of the
+/// geometry the texture reports. Propagates whatever opening and describing
+/// the texture reports.
+///
+/// # Safety
+///
+/// `texture` must be an NT shared handle of a D3D11 texture, valid in this
+/// process. It stays owned by the caller.
+#[cfg(target_os = "windows")]
+pub(crate) unsafe fn d3d11_geometry_checked(
+    format: crate::PixelFormat,
+    texture: std::os::windows::io::RawHandle,
+    shape: &[usize],
+) -> crate::Result<(usize, usize)> {
+    // SAFETY: the caller guarantees `texture` is a shared NT handle valid in
+    // this process; the helper opens its own texture and drops it on return.
+    let (width, height) =
+        unsafe { crate::d3d11_shared_handle_geometry(texture, format, Some(shape)) }?;
+    let allocation = format.allocation_shape(width, height);
+    let addressing = format.addressing_shape(width, height);
+    if allocation.as_deref() != Some(shape) && addressing.as_deref() != Some(shape) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "D3D11 texture shape {shape:?} is neither the {format:?} allocation \
+             shape {allocation:?} nor the addressing shape {addressing:?} of the \
+             {width}x{height} texture it names"
+        )));
+    }
+    Ok((width, height))
+}
+
 /// Inputs to [`from_parts`], grouped into one named-field struct rather than
 /// a positional argument list.
 ///
@@ -487,6 +631,15 @@ pub(crate) struct DescParts<'a, 'p> {
     /// other kind (mutually exclusive with `pin`: a PBO tensor never has
     /// one, since `PboTensor` refuses `pin_host`).
     pub pbo_vtable_ptr: Option<*const std::ffi::c_void>,
+    /// The process device fence's NT handle value, for [`TensorDesc::ptr`]
+    /// under [`kind::D3D11_TEXTURE`] — the third meaning that one field
+    /// carries, keyed by kind exactly as the PBO vtable is. `0` for every
+    /// other kind and for a device with no fence.
+    pub fence_handle: usize,
+    /// The fence value of the producer's last recorded GPU write, for
+    /// [`TensorDesc::sync`] under [`kind::D3D11_TEXTURE`]. `None` for every
+    /// other kind and when nothing has been recorded.
+    pub sync: Option<u64>,
 }
 
 /// Build a descriptor from its parts.
@@ -548,7 +701,17 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         capacity,
         pin,
         pbo_vtable_ptr,
+        fence_handle,
+        sync,
     } = parts;
+    let desc_kind = kind_of(memory);
+    // Both fields are meaningful only under `D3D11_TEXTURE`, and only when
+    // the device has a fence to name: a value with no handle behind it would
+    // set `SYNC_PRESENT` on a descriptor no consumer can wait on.
+    let completion = (desc_kind == kind::D3D11_TEXTURE && fence_handle != 0)
+        .then_some(sync)
+        .flatten()
+        .map(|value| (fence_handle, value));
     // `ndim` carries the TRUE rank even when it exceeds the eight slots the
     // descriptor can hold, so a consumer can detect the case and refuse.
     // Reporting the clamped value instead would ship a descriptor whose
@@ -603,16 +766,26 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
     }
     TensorDesc {
         version: ABI_VERSION,
-        kind: kind_of(memory),
+        kind: desc_kind,
         handle,
-        // `pin` and `pbo_vtable_ptr` are mutually exclusive by construction
-        // (see `DescParts::pbo_vtable_ptr`'s own doc comment) -- `pin`
-        // takes precedence purely because it is the older, more general
-        // case; a real caller only ever supplies one.
-        ptr: pin
-            .map(|p| SendPtr(p.as_mut_ptr()))
-            .or_else(|| pbo_vtable_ptr.map(|p| SendPtr(p as *mut u8)))
-            .unwrap_or_else(SendPtr::null),
+        // Keyed by kind, because that is what this field's meaning is keyed
+        // by. Under `D3D11_TEXTURE` it is the fence handle or nothing, even
+        // when the producer also pinned a host address -- a Python capsule
+        // asked for `access="read"` does pin a texture tensor, and writing
+        // that address here would hand the consumer a host pointer to open
+        // as a fence. The pin stays the producer's own keepalive; a D3D11
+        // import reopens the texture and takes its own CPU mapping, so it
+        // never wanted the address. Otherwise `pin` and `pbo_vtable_ptr`
+        // are mutually exclusive by construction (see
+        // `DescParts::pbo_vtable_ptr`'s own doc comment) and `pin` takes
+        // precedence purely because it is the older, more general case.
+        ptr: if desc_kind == kind::D3D11_TEXTURE {
+            completion.map_or_else(SendPtr::null, |(h, _)| SendPtr(h as *mut u8))
+        } else {
+            pin.map(|p| SendPtr(p.as_mut_ptr()))
+                .or_else(|| pbo_vtable_ptr.map(|p| SendPtr(p as *mut u8)))
+                .unwrap_or_else(SendPtr::null)
+        },
         ndim: ndim as u32,
         dtype: dtype_of(dtype),
         shape,
@@ -620,9 +793,14 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         fourcc,
         format: format.map(format_of).unwrap_or(format::NONE),
         colorimetry,
-        // Reserved; no producer in this build sets either. See the field docs.
-        flags: 0,
+        // `D3D11_TEXTURE` is the one kind that fills these in; every other
+        // producer in this build leaves them clear. See the field docs.
+        flags: if completion.is_some() {
+            flags::SYNC_PRESENT
+        } else {
+            0
+        },
         capacity,
-        sync: 0,
+        sync: completion.map_or(0, |(_, value)| value),
     }
 }

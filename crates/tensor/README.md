@@ -132,12 +132,15 @@ imx8mp.
 | macOS / iOS | Yes (IOSurface) | Yes | Yes | No |
 | Android | Yes (AHardwareBuffer) | Yes | Yes | No |
 | Other Unix | No | Yes | Yes | No |
-| Windows | No | No | Yes | No |
+| Windows | Yes (D3D11 texture) | No | Yes | Yes (with OpenGL) |
 
 On macOS and Android the GL backend renders into the platform GPU buffer
-directly, so it has no need of PBOs. Probe with `is_gpu_buffer_available()`
-rather than the per-platform probes when all you need to know is whether
-`TensorMemory::DmaBuf` will work.
+directly, so it has no need of PBOs. On Windows the DMA column is a
+`TensorMemory::DmaBuf` tensor backed by an `ID3D11Texture2D` on the HAL's
+D3D11 device (`src/d3d11/`); PBO tensors still allocate there and are the
+fallback when a format has no texture layout. Probe with
+`is_gpu_buffer_available()` rather than the per-platform probes when all you
+need to know is whether `TensorMemory::DmaBuf` will work.
 
 ## Feature Flags
 
