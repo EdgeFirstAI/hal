@@ -148,6 +148,20 @@ jobs:
       - name: Install maturin
         run: pip install ${{ matrix.maturin-deps }}
 
+      - name: Install lld (aarch64 runner)
+        # ubuntu-22.04-arm does not ship lld by default, unlike ubuntu-latest
+        # (x86_64) -- recent stable rustc defaults to -fuse-ld=lld on Linux.
+        # tensor/codec/image/decoder's build.rs nested-builds the
+        # workspace-excluded edgefirst-tensor-capi via a plain `cargo build`
+        # (not routed through maturin's --zig cross-compiler), so it links
+        # natively and hits the same "collect2: fatal error: cannot find
+        # 'ld'" the build-capi job's aarch64 runner hit -- see that job's
+        # identically-named step, and test.yml's aarch64 lane.
+        if: matrix.name == 'aarch64-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld
+
       - name: Fetch ANGLE (Windows x64)
         # The Windows edgefirst-image wheel bundles ANGLE's libEGL.dll +
         # libGLESv2.dll next to _image.pyd (python-image/build.rs reads
