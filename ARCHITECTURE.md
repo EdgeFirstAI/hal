@@ -189,52 +189,70 @@ it is done safely in the sense defined below.
 
 Because the libraries ship and upgrade independently, a deployment can end up
 with a `libedgefirst_tensor.so` and a `libedgefirst_image.so` built from
-different releases. The rule:
+different releases. Which pairs are compatible depends on the era, because
+what a minor bump is permitted to do differs between them.
 
-- **Same minor, any patch** — fully compatible. Must work with no
-  degradation and no diagnostic.
-- **Different minor** — not compatible, and must not be silently
-  mis-executed.
+**Pre-1.0**, a minor may break ABI, so the incompatible boundary is the minor:
 
-**What enforces the second rule, and when.** Post-1.0 the enforcement is
-structural rather than a runtime check: a layout or signature change costs a
-major bump, the SONAME carries the major, and the dynamic loader refuses to
-bind a consumer built against `libedgefirst_X.so.1` to `libedgefirst_X.so.2`.
-Nothing needs to be verified at call time because the mismatched pair never
-links in the first place.
+- *Same minor, any patch* — fully compatible. Must work with no degradation
+  and no diagnostic.
+- *Different minor* — not compatible, and must not be silently mis-executed.
+
+**Post-1.0**, a minor is additive only, so the boundary moves to the major:
+
+- *Same major, any minor or patch* — compatible. A 1.2 consumer against a 1.3
+  library is fine by construction: everything 1.3 added is new surface the 1.2
+  consumer never calls, and nothing it does call has moved.
+- *Different major* — not compatible.
+
+**What enforces it.** Post-1.0 the enforcement is structural rather than a
+runtime check, and it lands exactly on the boundary the post-1.0 rule draws: a
+breaking change costs a major bump, the SONAME carries the major, and the
+dynamic loader refuses to bind a consumer built against
+`libedgefirst_X.so.1` to `libedgefirst_X.so.2`. Nothing needs to be verified
+at call time because the mismatched pair never links. Note that the SONAME
+deliberately does *not* separate a 1.2 library from a 1.3 one — post-1.0 that
+pair is compatible, so there is nothing to reject.
 
 Pre-1.0 there is no such enforcement, and this document states that plainly
 rather than implying a guarantee the code does not provide. Every library's
 SONAME is `libedgefirst_X.so.0`, so the loader binds any 0.x to any other
-0.x, and the `ef_*_abi_version()` probes below are consulted by nothing.
+0.x — including the 0.N/0.N+1 pair the pre-1.0 rule above calls incompatible
+— and the `ef_*_abi_version()` probes below are consulted by nothing.
 **Across a pre-1.0 minor the rule is therefore an obligation on whoever
 deploys, not a runtime promise the libraries make**: ship and deploy the five
 libraries as one set from one release, and pin the minor. That is what
 "pin the archive version you built against" in `packaging/c/README.md` is
-asking for, and it is the whole of the mitigation until the probes are
-wired.
+asking for, and it is the whole of the mitigation until the probes are wired.
 
-**SONAME carries the major only.** Each `build.rs` emits
+**Why the SONAME carries the major only.** Each `build.rs` emits
 `-Wl,-soname,libedgefirst_X.so.{major}`, matching the glibc/OpenSSL/zlib
 convention: the SONAME is copied verbatim into every dependent's `DT_NEEDED`,
-so embedding a minor or patch would force downstream relinks on every
-release. Post-1.0 this makes the dynamic loader itself refuse a major
-mismatch. **Pre-1.0 it does not help at all** — every library's SONAME is
-`libedgefirst_X.so.0`, so the loader will bind a 0.29 build against a 0.30
-build without complaint, which is precisely the case the table above says is
-incompatible.
+so embedding a minor or patch would force a downstream relink on every
+release. That is why the loader can only ever police the major boundary —
+which is the right boundary post-1.0 and the wrong one before it, as above.
 
 **The `ef_*_abi_version()` probes are how that gap is meant to be closed.**
 Every C library exports one (`ef_tensor_abi_version`, `ef_image_abi_version`,
 `ef_codec_abi_version`, `ef_decoder_abi_version`, `ef_tracker_abi_version`).
 It returns a monotonic ABI generation for that library, hand-maintained and
 independent of the package version, and it **must be bumped whenever that
-library's C surface changes in a way a consumer could observe — layout or
-semantics.** A semantics-only change is the case most easily missed and the
-one that most needs the signal: if a call keeps its name, its signature and
-its struct layouts but computes something different, the consumer gets no
-link error, no size mismatch and no loader diagnostic. The probe is the only
-thing left that can tell them.
+library's C surface changes in a way that is not backward compatible** — a
+layout change, a removed or re-signatured symbol, or a change to *documented*
+semantics that an existing caller would experience as a different contract.
+The semantics-only case is the one most easily missed and the one that most
+needs the signal: if a call keeps its name, its signature and its struct
+layouts but computes something different, the consumer gets no link error, no
+size mismatch and no loader diagnostic. The probe is the only thing left that
+can tell them.
+
+**A bug fix is not a probe bump**, even though a caller can observe it.
+Bringing behaviour into line with the documented contract is what a patch
+release is for, and it stays inside the patch row of the table above.
+Advancing the generation for it would be actively harmful: a consumer doing
+an exact-equality probe check would start rejecting patch releases it should
+accept, which is the opposite of what the probe is for. The test is whether
+the *documented* contract changed, not whether any observable byte did.
 
 > **Not yet enforced.** Nothing in this tree compares a probe to anything.
 > All five are defined, declared in their headers, and called only by the
@@ -368,7 +386,11 @@ patch guarantee would have forbidden it outright, which is why none of 0.29.2,
 and what tells a consumer not to mix. `ef_decoder_abi_version` went to `2` as
 well, even though no layout changed, because the default tiled merge changed
 from the enclosing union to keep-best suppression — the semantics-only case
-above, where the probe is the consumer's only signal.
+above, where the probe is the consumer's only signal. Note which side of the
+bug-fix line that falls on: the union was the *documented* behaviour, so
+replacing it changes the contract rather than correcting a deviation from it.
+Had the union merely been a bug against a keep-best specification, the fix
+would have been a patch with no probe bump.
 
 Note what the mismatch does *not* do: `mode_from()` rejects any value that is
 not `0` or `1`, so a garbage pad usually yields a refused call. "Usually" is
