@@ -56,7 +56,7 @@ pkg-config, runtime search path, and a JPEG→tensor example. Link
 `libedgefirst_tensor` plus any of codec / image / decoder / tracker. Headers
 live under `include/edgefirst/` (`tensor.h`, `codec.h`, `image.h`, `decoder.h`,
 `tracker.h`, `detect.h`). Windows ships `bin/*.dll` and `lib/*.lib` import
-libraries. **Before 1.0 the C ABI is stable across patch releases but may break across minors** — any `0.N.z` is drop-in for any other `0.N.z`, and `0.N` to `0.N+1` may not be. Mix the five libraries only within one minor. See [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
+libraries. **Before 1.0 the C ABI is stable across patch releases but may break across minors** — any `0.N.z` is drop-in for any other `0.N.z`, and `0.N` to `0.N+1` may not be. While pre-1.0, mix the five libraries only within one minor; from 1.0 the boundary becomes the major. See [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
 
 ### Basic usage
 
