@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.4] - 2026-09-04
+
+### Fixed
+
+- **Release pipeline: crates.io publish order.** The `v0.29.3` tag push was the first to reach the crates.io publish job — every wheel (PyPI) and GitHub Release step succeeded — but that job's hardcoded dependency-order list published `edgefirst-image` before `edgefirst-decoder` and `edgefirst-tracker`, which `edgefirst-image` optionally depends on (`crates/image/Cargo.toml`). `cargo publish` resolves the full dependency graph while packaging, even with `--no-verify` and even for non-default optional dependencies, so it failed selecting a version for `edgefirst-decoder = "^0.29.3"` before that crate had been published. Reordered so `edgefirst-image` publishes last. Note for posterity: `edgefirst-decoder-abi`, `edgefirst-tensor-abi`, `edgefirst-tensor-ffi`, `edgefirst-egl`, `edgefirst-gl`, `edgefirst-tensor`, and `edgefirst-codec` are permanently published on crates.io at `0.29.3` (crates.io never allows removing/replacing a version); `edgefirst-decoder`, `edgefirst-tracker`, and `edgefirst-image` never published at that version, so no partial or broken crate exists at `0.29.3` — just an incomplete version set, superseded by this release.
+
 ## [0.29.3] - 2026-09-04
 
 ### Fixed

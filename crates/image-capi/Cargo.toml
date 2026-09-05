@@ -4,7 +4,7 @@
 [package]
 name = "edgefirst-image-capi"
 description = "C API for EdgeFirst image processing"
-version = "0.29.3"
+version = "0.29.4"
 edition = "2021"
 rust-version = "1.94.0"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]
@@ -30,10 +30,10 @@ tracing = ["edgefirst-tensor/tracing"]
 # library mints tensors via libedgefirst_tensor.so instead of embedding a
 # private copy. `edgefirst-tensor-ffi` is declarations-only.
 [dependencies]
-edgefirst-image = { version = "0.29.3", path = "../image", default-features = false, features = [
+edgefirst-image = { version = "0.29.4", path = "../image", default-features = false, features = [
     "opengl",
 ] }
-edgefirst-tensor = { version = "0.29.3", path = "../tensor", default-features = false, features = [
+edgefirst-tensor = { version = "0.29.4", path = "../tensor", default-features = false, features = [
     "dynamic",
 ] }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
