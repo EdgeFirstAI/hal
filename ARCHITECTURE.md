@@ -31,7 +31,7 @@ Each sub-crate has a single responsibility in the inference pipeline:
 - [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with interchangeable backends — the `TensorMemory::DmaBuf` zero-copy slot maps to DMA-BUF on Linux, IOSurface on macOS/iOS, and AHardwareBuffer on Android, alongside SHM / Mem / PBO — plus multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key (interned on `AHardwareBuffer_getId` on Android), the required `CpuAccess` declaration and tile-compression metadata on image tensors, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
 - [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) — Image decoding (JPEG, PNG) into pre-allocated tensor buffers with support for u8, u16, i8, i16, and f32 pixel types. Supports strided output for GPU pitch-aligned DMA-BUF/PBO tensors. Designed for the allocate-once, decode-in-loop pattern.
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface, Android uses native EGL + AHardwareBuffer EGLImage import (iOS builds ride the ANGLE platform) — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch. Also owns the input half of SAHI tiling (`tiling.rs`) — `TilingConfig`, `plan_tiles`, `alloc_tile_batch`, `tile_into`, `tile_one` — which rides that same batch engine to render an overlapping tile grid with one import and one flush.
-- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time. Owns the output half of SAHI tiling (`tiling` module) — `TilePlacement` (the record shared with `edgefirst-image`), `lift_tile_boxes`, GREEDYNMM `merge_tiled_detections`, and the streaming `TiledFrameAccumulator`.
+- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time. Owns the output half of SAHI tiling (`tiling` module) — `TilePlacement` (the record shared with `edgefirst-image`), `lift_tile_boxes`, greedy `merge_tiled_detections` (keep-best suppression by default, enclosing union opt-in via `MergeMode`), and the streaming `TiledFrameAccumulator`.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
 - [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) — C ABI for tensors (`libedgefirst_tensor`, `edgefirst/tensor.h`). Sibling leaves cover codec, image, decoder, and tracker. Detection layouts are header-only in `edgefirst/detect.h`.
 - [`crates/python-common`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/) — the shared PyO3 binding rlib, plus four thin `cdylib` crates (`python-tensor`, `python-codec`, `python-image`, `python-decoder`) published as the independent `edgefirst-tensor` / `edgefirst-codec` / `edgefirst-image` / `edgefirst-decoder` wheels under the `edgefirst.` PEP 420 namespace. Contains the three-path numpy copy dispatcher.
@@ -153,6 +153,251 @@ let mut dst = proc.create_image(
 # Ok(())
 # }
 ```
+
+---
+
+## C ABI Stability and Versioning
+
+The five C libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`)
+are independently versioned artifacts that a consumer links, ships and
+upgrades separately. This section is the contract that governs them: what a
+version number promises, what mixing versions is allowed to do, and which
+mechanisms enforce it. It applies to every `-capi` crate; per-library detail
+lives in each one's `ARCHITECTURE.md`.
+
+### What a version number promises
+
+| Change to a library's C surface | Pre-1.0 (`0.N.z`) | Post-1.0 (`X.Y.Z`) |
+|---|---|---|
+| **Breaking** — a struct layout moves, a symbol is removed or changes signature, or an existing call changes what it computes | minor `N` | major `X` |
+| **Additive** — new symbols, or a struct extended safely (below) | minor `N` | minor `Y` |
+| **No ABI impact** — bug fixes, performance work, internal refactors | patch `z` | patch `Z` |
+
+**The patch guarantee holds in both eras.** ABI is stable across `z`: any
+`0.29.z` is drop-in for any other `0.29.z`. A `0` major buys the right to
+break across *minors*, not the right to break arbitrarily — so "pin the
+version you built against", the advice in
+[README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md) and
+`packaging/c/README.md`, means pin the minor and take patches freely.
+
+**Post-1.0 the majors do the work.** A break costs a major bump, so a
+consumer that pins `1.x` is safe against every release that carries the `1`.
+Extending a struct is explicitly a *minor* — it is not forbidden — provided
+it is done safely in the sense defined below.
+
+### Mixing versions across the five libraries
+
+Because the libraries ship and upgrade independently, a deployment can end up
+with a `libedgefirst_tensor.so` and a `libedgefirst_image.so` built from
+different releases. Which pairs are compatible depends on the era, because
+what a minor bump is permitted to do differs between them.
+
+**Pre-1.0**, a minor may break ABI, so the incompatible boundary is the minor:
+
+- *Same minor, any patch* — fully compatible. Must work with no degradation
+  and no diagnostic.
+- *Different minor* — not compatible, and must not be silently mis-executed.
+
+**Post-1.0**, a minor is additive only, so the boundary moves to the major:
+
+- *Same major, any minor or patch* — compatible. A 1.2 consumer against a 1.3
+  library is fine by construction: everything 1.3 added is new surface the 1.2
+  consumer never calls, and nothing it does call has moved.
+- *Different major* — not compatible.
+
+**What enforces it.** Post-1.0 the enforcement is structural rather than a
+runtime check, and it lands exactly on the boundary the post-1.0 rule draws: a
+breaking change costs a major bump, the SONAME carries the major, and the
+dynamic loader refuses to bind a consumer built against
+`libedgefirst_X.so.1` to `libedgefirst_X.so.2`. Nothing needs to be verified
+at call time because the mismatched pair never links. Note that the SONAME
+deliberately does *not* separate a 1.2 library from a 1.3 one — post-1.0 that
+pair is compatible, so there is nothing to reject.
+
+Pre-1.0 there is no such enforcement, and this document states that plainly
+rather than implying a guarantee the code does not provide. Every library's
+SONAME is `libedgefirst_X.so.0`, so the loader binds any 0.x to any other
+0.x — including the 0.N/0.N+1 pair the pre-1.0 rule above calls incompatible
+— and the `ef_*_abi_version()` probes below are consulted by nothing.
+**Across a pre-1.0 minor the rule is therefore an obligation on whoever
+deploys, not a runtime promise the libraries make**: ship and deploy the five
+libraries as one set from one release, and pin the minor. That is what
+"pin the archive version you built against" in `packaging/c/README.md` is
+asking for, and it is the whole of the mitigation until the probes are wired.
+
+**Why the SONAME carries the major only.** Each `build.rs` emits
+`-Wl,-soname,libedgefirst_X.so.{major}`, matching the glibc/OpenSSL/zlib
+convention: the SONAME is copied verbatim into every dependent's `DT_NEEDED`,
+so embedding a minor or patch would force a downstream relink on every
+release. That is why the loader can only ever police the major boundary —
+which is the right boundary post-1.0 and the wrong one before it, as above.
+
+**The `ef_*_abi_version()` probes are how that gap is meant to be closed.**
+Every C library exports one (`ef_tensor_abi_version`, `ef_image_abi_version`,
+`ef_codec_abi_version`, `ef_decoder_abi_version`, `ef_tracker_abi_version`).
+It returns a monotonic ABI generation for that library, hand-maintained and
+independent of the package version, and it **must be bumped whenever that
+library's C surface changes in a way that is not backward compatible** — a
+layout change, a removed or re-signatured symbol, or a change to *documented*
+semantics that an existing caller would experience as a different contract.
+The semantics-only case is the one most easily missed and the one that most
+needs the signal: if a call keeps its name, its signature and its struct
+layouts but computes something different, the consumer gets no link error, no
+size mismatch and no loader diagnostic. The probe is the only thing left that
+can tell them.
+
+**A bug fix is not a probe bump**, even though a caller can observe it.
+Bringing behaviour into line with the documented contract is what a patch
+release is for, and it stays inside the patch row of the table above.
+Advancing the generation for it would be actively harmful: a consumer doing
+an exact-equality probe check would start rejecting patch releases it should
+accept, which is the opposite of what the probe is for. The test is whether
+the *documented* contract changed, not whether any observable byte did.
+
+> **Not yet enforced.** Nothing in this tree compares a probe to anything.
+> All five are defined, declared in their headers, and called only by the
+> per-crate `test_double_include.c` link smoke tests. The "detect and report"
+> half of the mixed-version rule above is therefore **unimplemented**: today
+> a minor-skewed pair links cleanly and misbehaves silently. See the comment
+> on `TensorDyn::compression` in
+> [`crates/tensor/src/tensor_dyn/dynamic_backend.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/tensor_dyn/dynamic_backend.rs),
+> which documents the same gap from the consumer side — an unrecognised wire
+> value is logged rather than refused, because "there is no ABI-version
+> negotiation to refuse it first". Closing this means each library checking
+> its dependencies' probes once at initialization and failing loudly on a
+> mismatch. It must be closed before 1.0, when the probes become the
+> contract rather than a convention.
+
+### Evolving a by-value struct
+
+By-value structs (`ef_merge_config`, `ef_tensor_view`, `ef_tile_placement`,
+`ef_detect_box`, …) are the hard case: unlike an opaque handle, their size
+and field offsets are baked into every consumer's call site the moment it
+compiles. Two independent properties decide whether a field can be added in
+place.
+
+**Size-safety.** A caller allocates the struct and the library reads it, so
+the library must never read past what the caller allocated. Adding a field
+that fits in *existing tail padding* keeps `sizeof` and every earlier offset
+unchanged, so an old caller's allocation is still exactly the right size.
+Adding a field that grows `sizeof` is not size-safe and cannot be done in
+place.
+
+**Value-safety.** Size-safety is not sufficient. C guarantees nothing about
+the contents of padding bytes: a caller that filled the struct field by field
+never initialized the tail pad, so a library that starts reading it reads
+garbage. A field added into padding is therefore only safe when the consumer
+is *known* to have been built against the newer definition. Post-1.0 a major
+bump establishes that through the SONAME, and the loader enforces it. Pre-1.0
+nothing establishes it, so the requirement is waived rather than met — see
+the rule below.
+
+This yields the rule:
+
+- **Pre-1.0, in place is a minor bump.** A field may be added in place when
+  it is size-safe. Value-safety is not achieved — an older caller's padding is
+  still unwritten — it is *waived*, because a pre-1.0 minor is permitted to
+  break and consumers are required to move as a set. Bump
+  `ef_*_abi_version()` so a consumer that does check has a signal, and say in
+  the CHANGELOG that the release is not drop-in, rather than letting the
+  unchanged `sizeof` imply that it is.
+- **Post-1.0, in place is a major bump.** Padding reuse cannot deliver
+  value-safety, so the change is breaking, and breaking costs a major. That
+  is not a hardship — it is the mechanism: the major moves the SONAME, the
+  loader refuses every stale consumer, and the mismatch is caught before a
+  single field is read.
+- **Post-1.0, to extend without a major, add a suffixed successor type**
+  (`ef_tensor_view2`) plus the entry points that take it, and leave the
+  original untouched. Nothing existing moves, so every current consumer keeps
+  working unmodified — which is precisely what makes the change additive and
+  therefore a minor. The cost is real and permanent: each successor doubles
+  the entry points that take that struct. Weigh that against a major bump
+  rather than reaching for it reflexively.
+
+**Why there is no `struct_size` handshake.** A first-member
+`uint32_t struct_size` that the caller sets — Linux's `copy_struct_from_user`
+convention (`clone_args`, `sched_attr`), Win32's `cbSize` — is the one
+mechanism that would let a struct grow *in place* within a minor post-1.0.
+It was considered for this codebase and **declined**, because it only works
+as a convention and this vocabulary cannot adopt it as one. Of the fourteen
+by-value structs across the five libraries, only three are caller-filled
+configuration where the handshake means anything:
+
+| Class | Structs | Verdict |
+|---|---|---|
+| Caller-filled config | `ef_merge_config`, `ef_tiling_config`, `ef_crop` | the handshake would work |
+| Library-filled `*out` | `ef_tensor_view`, `ef_tensor_plane`, `ef_image_desc_view`, `EfViewOrigin`, `ef_quantization_info`, `ef_tile_spec`, `ef_decoder_track`, `ef_track_info` | inverts the contract — the caller would be declaring its buffer size, paid per call on hot accessors |
+| Arrayed elements | `ef_detect_box`, `ef_segmentation`, `ef_tile_placement` | actively harmful |
+
+The third class settles it. These travel as contiguous blocks —
+`ef_detect_box_list_data()` hands back a packed array a consumer can `memcpy`
+or wrap zero-copy — so a per-element size field would add four identical
+redundant bytes per element (about 1.2 KB on a 300-box frame) and break that
+contract outright. A convention that cannot cover the vocabulary is not a
+convention, and applying it to `ef_merge_config` alone would leave
+`ef_tiling_config` — same shape, same hazard, same library family — without
+it. That asymmetry is the kind that produced a successor struct in the first
+place.
+
+`ef_crop` is the sharpest single argument: it documents a zeroed struct as
+meaning "the whole source, same as passing `NULL`". A mandatory size field
+would turn `{0}` from a useful default into an error.
+
+So by-value structs here evolve by major bump or by successor type, and the
+SONAME is the handshake. Revisit this only if the config structs ever
+outnumber the data structs, and revisit it for all three at once.
+
+**Layout goldens pin all of this — where they exist.** A
+`tests/c/test_layout_goldens.c` is a set of `_Static_assert`s on `sizeof` and
+`offsetof` for a library's by-value structs, compiled by a Rust test, backed
+by matching `offset_of!` assertions on the Rust side in the `-abi` crate. A
+failure means a layout moved; the fix is to decide whether that was intended
+and, if so, to carry the version bumps this section requires. Coverage is
+currently partial:
+
+| Library | By-value structs in its header | Layout goldens |
+|---|---|---|
+| `tensor` | `ef_tensor_view`, `ef_tensor_plane`, `ef_image_desc_view`, `ef_quantization_info`, … | yes |
+| `decoder` | `ef_detect_box`, `ef_segmentation`, `ef_merge_config`, `ef_tile_placement` (via `detect.h`) | yes |
+| `image` | `ef_crop`, `ef_tiling_config`, `ef_tile_spec` | **none — gap** |
+| `tracker` | `ef_track_info` | **none — gap** |
+| `codec` | none (opaque handles only) | not needed |
+
+The two gaps are the same drift class the goldens exist to catch, in headers
+that have it: `image` and `tracker` should gain goldens before 1.0, when a
+layout move stops being a permitted minor-bump event and becomes a major one.
+`crates/tensor-capi/tests/check_abi.rs` covers the complementary drift class
+— the exported `ef_*` symbol set, the `DECLARED` list in `tensor-ffi`, and
+the header declarations must agree exactly.
+
+**Worked example.** `ef_merge_config` shipped without a `mode` field in every
+0.29 release. 0.29.0 through 0.29.4 each held its layout and its
+`ef_decoder_abi_version` unchanged, exactly as the patch guarantee requires,
+so the compatibility boundary is 0.29.4 → 0.30.0 and not any boundary inside
+the 0.29 series. The field then went into the 4-byte tail pad the struct
+already had: `sizeof` stayed 32 and no earlier offset moved, so the change is
+size-safe — a caller built against any 0.29 header still allocates exactly the
+right number of bytes. It is *not* value-safe: that caller never wrote the
+pad, so a 0.30 library reading `mode` from it reads whatever was on the stack.
+
+Both facts together are why the change takes a **minor** bump to 0.30.0. The
+patch guarantee would have forbidden it outright, which is why none of 0.29.2,
+0.29.3 or 0.29.4 could have carried it; the minor is what licenses the break
+and what tells a consumer not to mix. `ef_decoder_abi_version` went to `2` as
+well, even though no layout changed, because the default tiled merge changed
+from the enclosing union to keep-best suppression — the semantics-only case
+above, where the probe is the consumer's only signal. Note which side of the
+bug-fix line that falls on: the union was the *documented* behaviour, so
+replacing it changes the contract rather than correcting a deviation from it.
+Had the union merely been a bug against a keep-best specification, the fix
+would have been a patch with no probe bump.
+
+Note what the mismatch does *not* do: `mode_from()` rejects any value that is
+not `0` or `1`, so a garbage pad usually yields a refused call. "Usually" is
+the problem — fresh stack and `calloc` memory reads as `0`, which is a
+*valid* mode, so the same mismatch silently selects keep-best on one run and
+refuses on another. That is the mixed-version gap above in miniature, and the
+reason the probe check has to be real rather than emergent.
 
 ---
 

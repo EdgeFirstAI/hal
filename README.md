@@ -56,7 +56,7 @@ pkg-config, runtime search path, and a JPEG→tensor example. Link
 `libedgefirst_tensor` plus any of codec / image / decoder / tracker. Headers
 live under `include/edgefirst/` (`tensor.h`, `codec.h`, `image.h`, `decoder.h`,
 `tracker.h`, `detect.h`). Windows ships `bin/*.dll` and `lib/*.lib` import
-libraries. **No ABI stability is offered before 1.0.**
+libraries. **Before 1.0 the C ABI is stable across patch releases but may break across minors** — any `0.N.z` is drop-in for any other `0.N.z`, and `0.N` to `0.N+1` may not be. While pre-1.0, mix the five libraries only within one minor; from 1.0 the boundary becomes the major. See [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
 
 ### Basic usage
 
@@ -232,9 +232,11 @@ together. HAL covers both halves: `edgefirst-image` cuts and renders the grid,
 
 The input side renders every tile into one tall packed batch tensor with a
 single GL import and a single flush, so N tiles cost roughly one GPU sync
-rather than N. The output side merges with **GREEDYNMM** using the **IoS**
-(intersection-over-smaller) metric, because an object split across a tile seam
-has low IoU with its own fragments but high IoS. A `TilePlacement` produced by
+rather than N. The output side merges with a greedy, class-aware pass under the
+**IoS** (intersection-over-smaller) metric, because an object split across a
+tile seam has low IoU with its own fragments but high IoS; by default it keeps
+the highest-scoring box of each matched group unchanged
+(`MergeMode::KeepBest`). A `TilePlacement` produced by
 `plan_tiles` / `tile_into` is the shared record of how each tile was cut, and it
 is what the merge uses to lift boxes back to full-frame coordinates.
 
@@ -272,7 +274,7 @@ let decoder = DecoderBuilder::new()
 let mut acc = TiledFrameAccumulator::new(
     (src_w as f32, src_h as f32),
     placements.len(),       // tiles_total — the fan-in fence
-    MergeConfig::default(), // Ios metric, 0.5 threshold, max_det 300
+    MergeConfig::default(), // Ios metric, 0.5 threshold, keep-best, max_det 300
     16,                     // estimated detections per tile (capacity hint)
 );
 
@@ -320,15 +322,21 @@ through inference into a caller-owned slot, and `is_complete()` / `remaining()`
 fence the frame.
 
 `MergeConfig` tunes the metric (`Ios` by default, or `Iou`), the match
-`threshold` (0.5), `class_agnostic` (false), `max_det` (300), and a final
-`score_threshold` (0.0). That last default is deliberate: per-tile decoding is
-the real flood control, and the merged score gate belongs after fragments have
-been joined.
+`threshold` (0.5), `class_agnostic` (false), `max_det` (300), a final
+`score_threshold` (0.0), and the `mode` (`KeepBest` by default, or `Union`).
+The `score_threshold` default is deliberate: per-tile decoding is the real
+flood control, and the merged score gate belongs after fragments have been
+joined.
 
 > [!NOTE]
-> An IoS merge reconstructs the enclosing union of fragments, so it cannot
-> recover an object larger than a single tile. For mixed-scale datasets, add a
-> full-frame downscaled pass as one more `push_tile` at `origin=(0, 0)`,
+> `MergeMode::KeepBest` suppresses: the best box of each matched group comes
+> back unchanged, never grown, so an object larger than a single tile is reported
+> as its best fragment. `MergeMode::Union` (the original GREEDYNMM behaviour)
+> grows that box to the group's enclosing union instead, but it measured about
+> 0.05 AP50 worse on every frame of the Ocean Cleanup ADIS 4K validation
+> (whole frame: 0.491 AP50 with plain NMS, 0.437 after the union, 0.490 with
+> keep-best), so it is opt-in. For mixed-scale datasets, add a full-frame
+> downscaled pass as one more `push_tile` at `origin=(0, 0)`,
 > `crop_size=frame_dims`.
 
 The C API mirrors the same split (`ef_image_processor_plan_tiles` /

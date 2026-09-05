@@ -266,7 +266,10 @@ When a frame is preprocessed into an overlapping tile grid (see
 its detections are lifted back to full-frame coordinates and merged. A single
 object split across a tile seam has low IoU but high **IoS**
 (intersection-over-smaller), so the default merge metric is `Ios` with a `0.5`
-threshold via a GREEDYNMM pass — canonical SAHI postprocessing.
+threshold. The merge is a greedy, class-aware pass that by default keeps the
+highest-scoring box of each matched group unchanged
+(`MergeMode::KeepBest`); the enclosing-union merge of the original GREEDYNMM
+reference is `MergeMode::Union`, opt-in.
 
 The input and output sides share one `TilePlacement` (produced by
 `ImageProcessor::plan_tiles`/`tile_into`) describing how each tile was cut.
@@ -315,17 +318,24 @@ tiles through inference, and `is_complete()`/`remaining()` fence the frame.
 The free functions `lift_tile_boxes` and `merge_tiled_detections` expose the two
 stages directly if you need to merge without the accumulator. `MergeConfig` tunes
 the metric (`Ios`, default, or `Iou`), the match `threshold` (0.5),
-`class_agnostic` (false), `max_det` (300), and a final `score_threshold`. That
-last one defaults to `0.0` on purpose: per-tile decode is the real flood
-control, and this is where you put the score gate once fragments have been
-joined. The same machinery supports standard SAHI with Ultralytics YOLO models.
-Merged boxes can be fed straight to the tracker (next section), which expects
-normalized coordinates, hence `finalize_normalized`.
+`class_agnostic` (false), `max_det` (300), a final `score_threshold`, and the
+`mode` (`KeepBest`, default, or `Union`). `score_threshold` defaults to `0.0`
+on purpose: per-tile decode is the real flood control, and this is where you
+put the score gate once fragments have been joined. The same machinery supports
+standard SAHI with Ultralytics YOLO models. Merged boxes can be fed straight to
+the tracker (next section), which expects normalized coordinates, hence
+`finalize_normalized`.
 
-> **Note:** IoS merge reconstructs the *enclosing union* of fragments and cannot
-> recover an object larger than a single tile; add an optional full-frame
-> downscaled pass (another `push_tile` at `origin=(0,0)`, `crop_size=frame_dims`)
-> for mixed-scale datasets.
+> **Note:** `MergeMode::KeepBest` suppresses — the best box of each matched
+> group comes back unchanged, never grown — so an object larger than a single tile
+> is reported as its best fragment. `MergeMode::Union` grows that box to the
+> group's *enclosing union* instead, but on the Ocean Cleanup ADIS 4K
+> validation (TOP2-836) the union cost about 0.05 AP50 on every frame, tiled
+> or not (whole frame: 0.491 AP50 with plain NMS, 0.437 after the union, 0.490
+> with keep-best; 28-tile pipeline: 0.500 keep-best vs 0.442 union), which is
+> why keep-best is the default. Add an optional full-frame downscaled pass
+> (another `push_tile` at `origin=(0,0)`, `crop_size=frame_dims`) for
+> mixed-scale datasets.
 
 ## Tracked Decoding
 

@@ -28,6 +28,7 @@ fn _decoder(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<decoder::PyOutput>()?;
 
     m.add_class::<tiling_merge::PyMatchMetric>()?;
+    m.add_class::<tiling_merge::PyMergeMode>()?;
     m.add_class::<tiling_merge::PyMergeConfig>()?;
     m.add_class::<tiling_merge::PyTiledFrameAccumulator>()?;
     m.add_function(wrap_pyfunction!(tiling_merge::py_lift_tile_boxes, m)?)?;

@@ -56,6 +56,17 @@ typedef struct ef_segmentation {
  * How overlapping detections from neighbouring tiles are merged.
  *
  * metric: 0 = IoU, 1 = Intersection-over-Smaller (default for seam splits).
+ * mode:   0 = keep-best (default): the highest-scoring box of each matched
+ *         group is kept and the boxes it matched are dropped.
+ *         1 = union: the group becomes its enclosing union carrying the max
+ *         score (the original GREEDYNMM merge; about 0.05 AP50 worse on
+ *         every frame of the Ocean Cleanup ADIS 4K validation, TOP2-836).
+ *
+ * A zero-initialised struct is NOT the library default: only `mode`'s
+ * default is 0. `metric` defaults to 1 (IoS), so an all-zero struct selects
+ * IoU -- the metric that leaves a seam-split object as two detections, which
+ * is the one thing tiled merging exists to avoid. Always fill the struct with
+ * `ef_merge_config_default` and then override what you need.
  */
 typedef struct ef_merge_config {
     uint32_t metric;
@@ -63,6 +74,7 @@ typedef struct ef_merge_config {
     int class_agnostic;
     uintptr_t max_det;
     float score_threshold;
+    uint32_t mode;
 } ef_merge_config;
 
 /**

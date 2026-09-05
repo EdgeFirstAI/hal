@@ -74,6 +74,24 @@ The default merge metric is Intersection-over-Smaller, not IoU. An object split
 across a tile seam has *low* IoU with its own fragment, so an IoU default would
 keep both halves as separate detections.
 
+The default merge **mode** is keep-best: the highest-scoring box of each matched
+group is kept and the rest are dropped. The enclosing-union merge measured about
+0.05 AP50 worse on every frame of the Ocean Cleanup ADIS 4K validation
+(TOP2-836), so it is opt-in: fill an `ef_merge_config` with
+`ef_merge_config_default`, set `mode = 1`, and pass it to
+`ef_tiled_frame_accumulator_new` or `ef_merge_tiled_detections`.
+
+`mode` was added to `ef_merge_config` in the 4-byte tail pad it already had, so
+the struct is still 32 bytes and no other field moved. `ef_decoder_abi_version`
+is `2`: the layout did not change, but the default merge did, so the same call
+with the same struct returns different box geometry than version 1 -- gate on
+the probe rather than on a link succeeding.
+
+**This is a minor-version ABI break.** `ef_merge_config` shipped without `mode`
+in 0.29.x, and a caller built against that header never initialised the tail
+pad this release now reads. Rebuild against the 0.30 header; do not mix a 0.29
+consumer with a 0.30 `libedgefirst_decoder`.
+
 `finalize` is destructive and returns `NULL` on a second call, rather than an
 empty list that would be indistinguishable from a frame which genuinely found
 nothing.

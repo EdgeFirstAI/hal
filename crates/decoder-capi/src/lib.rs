@@ -13,9 +13,17 @@ pub mod infer;
 pub mod tiling;
 
 /// ABI version of this library's C surface.
+///
+/// Bumped to 2 for the tiled merge: `ef_merge_config` gained a `mode` field
+/// in its old tail pad and the default merge became keep-best, so
+/// `ef_merge_tiled_detections` and `ef_tiled_frame_accumulator_new` return
+/// different box geometry than version 1 did. The struct layout is
+/// unchanged, which is exactly why the probe has to carry the signal: a
+/// caller that drops in this library gets no link error and no size
+/// mismatch, only different boxes.
 #[no_mangle]
 pub extern "C" fn ef_decoder_abi_version() -> u32 {
-    1
+    2
 }
 
 #[cfg(test)]
@@ -135,9 +143,9 @@ mod tests {
     #[test]
     fn the_layout_goldens_hold() {
         // By-value structs in `detect.h` (`ef_detect_box`, `ef_segmentation`,
-        // `ef_merge_config`, `ef_tile_placement`) are the drift class no
-        // name-level check can see, and are identical on every LP64 target
-        // this header ships for.
+        // `ef_merge_config`, `ef_tile_placement`) are the
+        // drift class no name-level check can see, and are identical on
+        // every LP64 target this header ships for.
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/test_layout_goldens.c");
         let Some(out) = cc_syntax_check_c11(src) else {
             return;

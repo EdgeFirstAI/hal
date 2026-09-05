@@ -13,6 +13,7 @@ import pytest
 from edgefirst.decoder import (
     MatchMetric,
     MergeConfig,
+    MergeMode,
     TiledFrameAccumulator,
     lift_tile_boxes,
     merge_tiled_detections,
@@ -80,14 +81,41 @@ def test_merge_respects_class_unless_agnostic():
 
 
 def test_merge_enclosing_union_for_partial_overlap():
-    # Two boxes overlapping exactly IoS == 0.5 merge to their enclosing union.
+    # Legacy ``MergeMode.Union``: two boxes overlapping exactly IoS == 0.5
+    # merge to their enclosing union.
     bbox, sc, cl = _triple([[0, 0, 100, 100], [50, 0, 150, 100]], [0.9, 0.8], [0, 0])
     b, s, _ = merge_tiled_detections(
-        bbox, sc, cl, MergeConfig(metric=MatchMetric.Ios, threshold=0.5)
+        bbox,
+        sc,
+        cl,
+        MergeConfig(metric=MatchMetric.Ios, threshold=0.5, mode=MergeMode.Union),
     )
     assert b.shape == (1, 4)
     np.testing.assert_allclose(b[0], [0, 0, 150, 100])
     assert s[0] == pytest.approx(0.9)
+
+
+def test_keep_best_keeps_the_base_box_for_partial_overlap():
+    # Same geometry, default mode: the lower-scoring box is suppressed and the
+    # base box comes back with its coordinates and score untouched.
+    bbox, sc, cl = _triple([[0, 0, 100, 100], [50, 0, 150, 100]], [0.9, 0.8], [0, 0])
+    for cfg in (MergeConfig(), MergeConfig(mode=MergeMode.KeepBest)):
+        b, s, c = merge_tiled_detections(bbox, sc, cl, cfg)
+        assert b.shape == (1, 4)
+        np.testing.assert_allclose(b[0], [0, 0, 100, 100])
+        assert s[0] == pytest.approx(0.9)
+        assert c[0] == 0
+
+
+def test_default_merge_mode_is_keep_best():
+    # TOP2-836: the enclosing union measured about -0.05 AP50 on every frame
+    # of the Ocean Cleanup ADIS 4K validation, so suppression is the default.
+    assert MergeConfig().mode == MergeMode.KeepBest
+    assert MergeConfig(mode=MergeMode.Union).mode == MergeMode.Union
+    # ``mode`` is the last keyword so positional callers keep working.
+    positional = MergeConfig(MatchMetric.Ios, 0.5, False, 300, 0.0, MergeMode.Union)
+    assert positional.mode == MergeMode.Union
+    assert "mode=Union" in repr(positional)
 
 
 def test_merge_empty_is_empty():
