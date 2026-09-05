@@ -557,49 +557,6 @@ jobs:
       - name: Two-library C user
         run: make test-two-library-user
 
-      - name: Package and smoke the C archive (macOS)
-        # PR gate for the macOS zip path (dylib names inside a .zip).
-        # release.yml's build-capi macOS rows would otherwise be the first
-        # time that branch of package-capi.sh ever ran — after a tag.
-        run: |
-          if ! command -v pkg-config >/dev/null 2>&1; then
-            brew install pkgconf
-          fi
-          make package
-          ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.zip
-
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Run GPU Python tests
-        # Linux pytest skips @pytest.mark.gpu (no real GPU; software GL is
-        # opted out). macOS must run and pass via ANGLE. Codesign the venv
-        # interpreter with disable-library-validation so dlopen of ANGLE
-        # does not SIGKILL the process (same entitlement as test-macos.sh).
-        # --auditwheel skip matches the x86/aarch64 lanes: on macOS it
-        # skips delocate, which cannot locate @rpath/libedgefirst_tensor.N.dylib
-        # (the copy is bundled via python-source, not on the dyld search path).
-        env:
-          HAL_TEST_REQUIRE_GL: "1"
-        run: |
-          python3 -m venv venv
-          venv/bin/pip install --upgrade pip
-          venv/bin/pip install maturin pytest numpy pillow
-          for pkg in tensor codec image decoder tracker; do
-            venv/bin/maturin build \
-              --manifest-path "crates/python-$pkg/Cargo.toml" \
-              --out target/wheels \
-              --release \
-              --features abi3-py311 \
-              --auditwheel skip
-          done
-          venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
-          PY=$(python3 -c "import os; print(os.path.realpath('venv/bin/python3'))")
-          codesign --force --sign - --entitlements entitlements.plist "$PY"
-          venv/bin/python -m pytest tests/ -m gpu -v --tb=short
-
       - name: Coverage summary (macOS)
         # Tool-free per-lane visibility: overall lines plus the GL-engine
         # slice (the number the GL-tests-on-ANGLE port moves), straight
@@ -915,8 +872,10 @@ jobs:
         # The gating pass: with EDGEFIRST_ANGLE_PATH empty the GL backend
         # cannot come up, so every GL test self-skips deterministically and
         # the rest of the suite must pass. Runs under cargo-llvm-cov like the
-        # other lanes; --no-report leaves the profraw in place so the WARP
-        # pass below adds the GL engine's and one report step merges both.
+        # other lanes; --no-report keeps the report generation in its own
+        # step below. The WARP GL pass that used to accumulate into this
+        # profraw is now the test-windows-warp job, which publishes its own
+        # lcov -- the sonarcloud job globs both into reportPaths.
         # -j 1 is the same single-threaded rule the other lanes apply
         # (TESTING.md § Single-Threaded Execution).
         shell: pwsh
@@ -927,23 +886,8 @@ jobs:
           cargo llvm-cov nextest --no-report --workspace --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1 2>&1 | Tee-Object -FilePath target/test-metrics-rust-windows.txt
           exit $LASTEXITCODE
 
-      - name: Run GL tests on ANGLE D3D11 WARP with coverage (best-effort)
-        # Exercises the real GL engine on the runner's software D3D11
-        # adapter (EDGEFIRST_ANGLE_ADAPTER=warp + EDGEFIRST_ALLOW_SOFTWARE_GL=1).
-        # HAL_TEST_REQUIRE_GL=1 turns "ANGLE failed to come up" into a
-        # failure (gl_backend_available_canary) rather than a silent skip.
-        # continue-on-error like software-gl-coverage: WARP is a software
-        # renderer, not a supported production target; promote once stable.
-        # -Coverage accumulates into the gating pass's profraw. `--profile ci`
-        # keeps this pass's junit in its own nextest store
-        # (llvm-cov-target/nextest/ci/) so it does not overwrite the full
-        # workspace results published below.
-        shell: pwsh
-        continue-on-error: true
-        run: pwsh -NoProfile -File scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci
-
       - name: Generate LCOV report (Windows)
-        # Merges the profraw from both nextest passes above. cargo-llvm-cov
+        # Reports the gating pass's profraw. cargo-llvm-cov
         # writes absolute SF: records with backslashes (D:\a\hal\hal\...);
         # SonarCloud resolves SF: against the Linux scanner's checkout, so
         # the paths are made repo-relative POSIX here (the sonarcloud job's
@@ -956,26 +900,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "Source files in coverage: $((Select-String -Path target/coverage_rust.lcov -Pattern '^SF:' | Measure-Object).Count)"
           Select-String -Path target/coverage_rust.lcov -Pattern '^SF:' | Select-Object -First 3 | ForEach-Object { $_.Line }
-
-      - name: Build modular C-API leaves (Windows, release)
-        # Isolated from the bash packaging step so cargo uses MSVC link.exe.
-        shell: pwsh
-        run: |
-          foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
-            cargo build --release --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-
-      - name: Package and smoke the C archive (Windows)
-        # PR gate for the Windows packaging path (DLL + import-lib selection,
-        # ANGLE bundled into bin/ because EDGEFIRST_ANGLE_PATH is set).
-        # release.yml's build-capi Windows row would otherwise be the first
-        # time that branch of package-capi.sh ever ran — after a tag.
-        shell: bash
-        run: |
-          mkdir -p dist
-          ./scripts/package-capi.sh --target x86_64-windows --libdir target/release --outdir dist
-          ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.zip
 
       - name: Run modular C-API tests (best-effort)
         # `make test-capi-modular` needs bash and make; this repeats its
@@ -1056,7 +980,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
-          # default/ is the full-workspace gating pass, ci/ the WARP GL pass.
+          # default/ is the full-workspace gating pass (the WARP GL pass and
+          # its ci/ store are now the test-windows-warp job).
           # Both nextest store roots are listed: under cargo-llvm-cov the
           # store can land in target/llvm-cov-target or stay in target/
           # depending on how the target dir was resolved (a local run with
@@ -1064,9 +989,7 @@ jobs:
           name: test-results-windows
           path: |
             target/nextest/default/test-results.xml
-            target/nextest/ci/test-results.xml
             target/llvm-cov-target/nextest/default/test-results.xml
-            target/llvm-cov-target/nextest/ci/test-results.xml
             target/test-metrics-*-windows.txt
           retention-days: 30
 
@@ -1102,6 +1025,294 @@ jobs:
   # job still succeeds and uploads whatever coverage it collected. The x86 /
   # macOS / hardware lanes remain the authoritative test gates.
   # ===========================================================================
+
+  # Split out of build-and-test-windows: WARP is a *software* D3D11
+  # rasterizer, so this was the most CPU-bound step on the lane with the
+  # fewest cores, serialized behind the full-workspace gating pass. It is
+  # scoped to -p edgefirst-image, so it builds a fraction of the workspace.
+  # It publishes its own LCOV rather than accumulating into the gating
+  # pass's profraw (which is what kept it in-job): the sonarcloud job globs
+  # every coverage-*/**.lcov into -Dsonar.rust.lcov.reportPaths, so two
+  # reports merge exactly as one did.
+  test-windows-warp:
+    name: GL Tests (Windows, ANGLE D3D11 WARP)
+    runs-on: windows-latest
+    needs: checkout-lfs
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EDGEFIRST_ANGLE_PATH: ${{ github.workspace }}\target\angle\windows-x64\bin
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          lfs: false  # LFS files downloaded separately
+
+      - name: Download LFS testdata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: testdata-lfs
+          path: testdata/
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # llvm-tools-preview supplies the profdata/cov tooling cargo-llvm-cov
+          # needs to turn the instrumented run into an LCOV report.
+          components: clippy, rustfmt, llvm-tools-preview
+
+      - name: Set up MSVC Developer Command Prompt
+        # Prepends the Visual Studio PATH so MSVC `link.exe` wins. Not
+        # sufficient on this job's default Git bash: `/usr/bin/link.exe`
+        # (coreutils `link`) still shadows MSVC. Cargo steps below use
+        # pwsh so the MSVC directory is actually first.
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-windows-warp
+          cache-on-failure: true
+          cache-bin: false  # Prevent overwriting rustup cargo shim with stale cached binary
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
+        with:
+          tool: cargo-nextest,cargo-llvm-cov@0.6.16
+
+      - name: Fetch ANGLE (Windows x64, release v2.1.28252)
+        # Download + sha256-verify + extract angle-windows-x64-<tag>.zip into
+        # target/angle/windows-x64/ (EDGEFIRST_ANGLE_PATH above points at its
+        # bin/). Same pinned ANGLE commit as the macOS xcframeworks.
+        shell: bash
+        run: bash scripts/fetch-angle.sh --windows
+
+      - name: Reset coverage counters
+        # The gating pass in build-and-test-windows used to run
+        # `cargo llvm-cov clean` before this pass accumulated into its
+        # profraw. Standalone, this job must clear stale counters itself so a
+        # restored target/ cache cannot contribute to the report below.
+        shell: pwsh
+        run: |
+          cargo llvm-cov clean --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run GL tests on ANGLE D3D11 WARP with coverage (best-effort)
+        # Exercises the real GL engine on the runner's software D3D11
+        # adapter (EDGEFIRST_ANGLE_ADAPTER=warp + EDGEFIRST_ALLOW_SOFTWARE_GL=1).
+        # HAL_TEST_REQUIRE_GL=1 turns "ANGLE failed to come up" into a
+        # failure (gl_backend_available_canary) rather than a silent skip.
+        # continue-on-error like software-gl-coverage: WARP is a software
+        # renderer, not a supported production target; promote once stable.
+        # -Coverage accumulates into the gating pass's profraw. `--profile ci`
+        # keeps this pass's junit in its own nextest store
+        # (llvm-cov-target/nextest/ci/) so it does not overwrite the full
+        # workspace results published below.
+        shell: pwsh
+        continue-on-error: true
+        run: pwsh -NoProfile -File scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci
+
+
+      - name: Generate LCOV report (WARP GL pass)
+        shell: pwsh
+        run: |
+          cargo llvm-cov report --lcov --output-path target/coverage_rust_warp.lcov --ignore-filename-regex '(\.cargo|[\\/]rustc[\\/]|[\\/]target[\\/])'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File scripts/normalize-lcov-paths.ps1 target/coverage_rust_warp.lcov
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "Source files in WARP coverage: $((Select-String -Path target/coverage_rust_warp.lcov -Pattern '^SF:' | Measure-Object).Count)"
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          # Globbed by the sonarcloud job alongside coverage-windows.
+          name: coverage-windows-warp
+          path: |
+            target/coverage_rust_warp.lcov
+          retention-days: 30
+
+  # Split out of build-and-test-windows: the release C-API build shares no
+  # artifacts with the coverage steps it used to sit behind (different cargo
+  # profile), so ~8m of it was serialized for no reason.
+
+      - name: Upload test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          # The WARP pass's junit, which used to ride test-results-windows
+          # from the ci/ nextest store. Never published as a check (the
+          # publish step globs default/ only) -- uploaded for parity.
+          name: test-results-windows-warp
+          path: |
+            target/nextest/ci/test-results.xml
+            target/llvm-cov-target/nextest/ci/test-results.xml
+          retention-days: 30
+
+  package-windows-capi:
+    name: Package C Archive (Windows)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EDGEFIRST_ANGLE_PATH: ${{ github.workspace }}\target\angle\windows-x64\bin
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          lfs: false  # LFS files downloaded separately
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # llvm-tools-preview supplies the profdata/cov tooling cargo-llvm-cov
+          # needs to turn the instrumented run into an LCOV report.
+          components: clippy, rustfmt, llvm-tools-preview
+
+      - name: Set up MSVC Developer Command Prompt
+        # Prepends the Visual Studio PATH so MSVC `link.exe` wins. Not
+        # sufficient on this job's default Git bash: `/usr/bin/link.exe`
+        # (coreutils `link`) still shadows MSVC. Cargo steps below use
+        # pwsh so the MSVC directory is actually first.
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-windows-capi
+          cache-on-failure: true
+          cache-bin: false  # Prevent overwriting rustup cargo shim with stale cached binary
+
+      - name: Fetch ANGLE (Windows x64, release v2.1.28252)
+        # Download + sha256-verify + extract angle-windows-x64-<tag>.zip into
+        # target/angle/windows-x64/ (EDGEFIRST_ANGLE_PATH above points at its
+        # bin/). Same pinned ANGLE commit as the macOS xcframeworks.
+        shell: bash
+        run: bash scripts/fetch-angle.sh --windows
+
+      - name: Build modular C-API leaves (Windows, release)
+        # Isolated from the bash packaging step so cargo uses MSVC link.exe.
+        shell: pwsh
+        run: |
+          foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
+            cargo build --release --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Package and smoke the C archive (Windows)
+        # PR gate for the Windows packaging path (DLL + import-lib selection,
+        # ANGLE bundled into bin/ because EDGEFIRST_ANGLE_PATH is set).
+        # release.yml's build-capi Windows row would otherwise be the first
+        # time that branch of package-capi.sh ever ran — after a tag.
+        shell: bash
+        run: |
+          mkdir -p dist
+          ./scripts/package-capi.sh --target x86_64-windows --libdir target/release --outdir dist
+          ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.zip
+
+
+  # Split out of build-and-test-macos: both steps are release-profile work
+  # independent of the debug/coverage run they used to follow. macos-latest
+  # is the smallest runner in the matrix, so serialization costs most here.
+  package-macos-capi-gpu:
+    name: Package C Archive & GPU Tests (macOS)
+    runs-on: macos-latest
+    needs: checkout-lfs
+    permissions:
+      contents: read
+    env:
+      # Same job-level env as build-and-test-macos, which this job's steps
+      # were split out of. EDGEFIRST_ANGLE_PATH is what lets python-image
+      # find ANGLE: without it create_image() falls back to TensorMemory.MEM
+      # and the gpu-marked tests fail rather than silently skipping.
+      GH_TOKEN: ${{ github.token }}
+      EDGEFIRST_ANGLE_PATH: ${{ github.workspace }}/target/angle/macos-flat-lib
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          lfs: false  # LFS files downloaded separately
+
+      - name: Download LFS testdata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: testdata-lfs
+          path: testdata/
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # llvm-tools-preview supplies the profdata/cov tooling cargo-llvm-cov
+          # needs to turn the instrumented run into an LCOV report.
+          components: clippy, rustfmt, llvm-tools-preview
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-macos-package
+          cache-on-failure: true
+          cache-bin: false  # Prevent overwriting rustup cargo shim with stale cached binary
+
+      - name: Fetch ANGLE xcframeworks (release v2.1.28252)
+        # Download + sha256-verify + extract the signed, notarized ANGLE
+        # xcframeworks from the EdgeFirstAI/angle-package release. Replaces
+        # the old Homebrew tap (`brew install startergo/angle/angle`) + the
+        # re-sign dance (the release is already Developer-ID-signed +
+        # notarized, so it dlopens cleanly without re-signing — unlike
+        # Homebrew's install_name_tool-mangled dylibs). EDGEFIRST_ANGLE_PATH
+        # (set on the job) points the HAL loader at the macOS slice.
+        run: bash scripts/fetch-angle.sh
+
+      - name: Package and smoke the C archive (macOS)
+        # PR gate for the macOS zip path (dylib names inside a .zip).
+        # release.yml's build-capi macOS rows would otherwise be the first
+        # time that branch of package-capi.sh ever ran — after a tag.
+        run: |
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkgconf
+          fi
+          make package
+          ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.zip
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run GPU Python tests
+        # Linux pytest skips @pytest.mark.gpu (no real GPU; software GL is
+        # opted out). macOS must run and pass via ANGLE. Codesign the venv
+        # interpreter with disable-library-validation so dlopen of ANGLE
+        # does not SIGKILL the process (same entitlement as test-macos.sh).
+        # --auditwheel skip matches the x86/aarch64 lanes: on macOS it
+        # skips delocate, which cannot locate @rpath/libedgefirst_tensor.N.dylib
+        # (the copy is bundled via python-source, not on the dyld search path).
+        env:
+          HAL_TEST_REQUIRE_GL: "1"
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install maturin pytest numpy pillow
+          for pkg in tensor codec image decoder tracker; do
+            venv/bin/maturin build \
+              --manifest-path "crates/python-$pkg/Cargo.toml" \
+              --out target/wheels \
+              --release \
+              --features abi3-py311 \
+              --auditwheel skip
+          done
+          venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
+          PY=$(python3 -c "import os; print(os.path.realpath('venv/bin/python3'))")
+          codesign --force --sign - --entitlements entitlements.plist "$PY"
+          venv/bin/python -m pytest tests/ -m gpu -v --tb=short
+
   software-gl-coverage:
     name: Software-GL Coverage (llvmpipe)
     runs-on: ubuntu-22.04-xlarge
@@ -1851,7 +2062,7 @@ jobs:
   # ===========================================================================
   sonarcloud:
     name: SonarCloud Analysis
-    needs: [doc-tests, build-and-test-x86, build-and-test-macos, build-and-test-windows, software-gl-coverage, test-arm, process-hardware-coverage]
+    needs: [doc-tests, build-and-test-x86, build-and-test-macos, build-and-test-windows, test-windows-warp, software-gl-coverage, test-arm, process-hardware-coverage]
     runs-on: ubuntu-22.04
     # !cancelled() keeps analysis running even when a needed lane fails or
     # skips — otherwise a single macOS/ANGLE failure silently skips SonarCloud
