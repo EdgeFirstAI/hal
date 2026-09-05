@@ -17,12 +17,22 @@ pin-observable backend (e.g. a PBO, which needs a live GL context) that
 is out of scope here.
 """
 
+import ctypes
 import sys
 
 import pytest
-from edgefirst.tensor import PixelFormat, Tensor
+from edgefirst.tensor import PixelFormat, Tensor, is_gpu_buffer_available
 
 from tests.gpu_policy import skip_unless_gpu_backed
+
+
+def _close(handle: int) -> None:
+    """Close a Windows handle a completion or fence call handed back.
+
+    A plain call, never an assertion: these run in `finally` blocks, where a
+    failing assert would replace the real failure with this one.
+    """
+    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 def test_capsule_defaults_to_no_pin():
@@ -76,7 +86,10 @@ def test_codec_tensor_converts_via_image(tmp_path):
     proc.convert(src, dst, letterbox=[114, 114, 114, 255])  # <-- crosses packages
 
     with dst.map() as m:
-        out = np.frombuffer(m, dtype=np.uint8).reshape(64, 64, 3)
+        # np.asarray(memoryview(m)) honours the mapping's own row_stride
+        # (a padded pitch on a D3D11 texture destination) instead of
+        # assuming a tight buffer the way frombuffer().reshape() does.
+        out = np.asarray(memoryview(m))
         assert out[32, 32].tolist() != [0, 0, 0], "converted image is blank"
 
 
@@ -123,8 +136,10 @@ def test_draw_decoded_masks_background_from_different_package():
     w, h = 16, 16
     background = TTensor.image(w, h, TFmt.Rgba, None, "readwrite")  # different package
     with background.map() as m:
-        buf = np.frombuffer(m, dtype=np.uint8).reshape(h, w, 4)
-        buf[:] = (30, 60, 90, 255)
+        # np.asarray(memoryview(m)) honours the mapping's own row_stride
+        # instead of assuming a tight buffer the way frombuffer().reshape()
+        # does.
+        np.asarray(memoryview(m))[:] = (30, 60, 90, 255)
 
     proc = ImageProcessor()
     dst = proc.create_image(w, h, ImgFmt.Rgba, "uint8", "readwrite")
@@ -137,9 +152,146 @@ def test_draw_decoded_masks_background_from_different_package():
     )
 
     with dst.map() as m:
-        out = np.frombuffer(m, dtype=np.uint8).reshape(h, w, 4)
+        out = np.asarray(memoryview(m))
         assert out[8, 8].tolist() != [0, 0, 0, 0], (
             "background did not composite -- dst is blank"
+        )
+
+
+@pytest.mark.gpu
+def test_draw_decoded_masks_publishes_its_completion_on_a_foreign_texture():
+    """A D3D11 texture allocated read-only by `edgefirst.tensor` and drawn
+    into by `edgefirst.image` reports the draw's completion afterwards.
+
+    Only the GL engine can write a read-only texture: the CPU backend maps
+    it for writing and fails (`ef_tensor_map failed: errno 13`), which is
+    what every draw on Windows did while the GL draw arms were Linux-only.
+    The GL draw records a fence value on the tensor it renders into -- the
+    one reconstructed from the descriptor, not the caller's -- and the
+    binding publishes it back the way `convert` does, so a device consumer
+    can wait on the drawn frame instead of the CPU.
+    """
+    if sys.platform != "win32" or not is_gpu_buffer_available():
+        pytest.skip("needs Windows with a D3D11 device")
+
+    import numpy as np
+    from edgefirst.image import ImageProcessor
+    from edgefirst.tensor import TensorMemory
+
+    proc = ImageProcessor()
+    # Allocated by edgefirst.tensor, drawn into by edgefirst.image's GL engine.
+    dst = Tensor.image(64, 64, PixelFormat.Rgba, TensorMemory.DMABUF, "read")
+    skip_unless_gpu_backed(dst)
+    assert dst.memory == TensorMemory.DMABUF, (
+        f"destination is {dst.memory!r}, not a texture -- this test is "
+        "vacuous unless the draw lands in a real GPU allocation"
+    )
+    assert dst.gpu_completion() is None, "nothing has written this texture yet"
+
+    proc.draw_decoded_masks(
+        dst,  # <-- crosses packages
+        bbox=np.array([[0.25, 0.25, 0.75, 0.75]], dtype=np.float32),
+        scores=np.array([0.99], dtype=np.float32),
+        classes=np.array([0], dtype=np.uintp),
+        seg=[np.full((4, 4, 1), 255, dtype=np.uint8)],
+    )
+
+    completion = dst.gpu_completion()
+    assert completion is not None, "the draw published no completion on dst"
+    fence, value = completion
+    try:
+        assert value > 0
+    finally:
+        # An owned duplicate under the dynamic backend the wheels link.
+        _close(fence)
+
+    with dst.map("read") as m:
+        # np.asarray(memoryview(m)) honours the texture's staging pitch.
+        out = np.asarray(memoryview(m))
+        assert out[2, 2].tolist() == [0, 0, 0, 0], "corner (2,2) was not cleared"
+        assert out[32, 32].tolist() != [0, 0, 0, 0], (
+            "box centre (32,32) was not coloured"
+        )
+
+
+@pytest.mark.gpu
+def test_draw_proto_masks_publishes_its_completion_on_a_foreign_texture():
+    """The proto draw publishes its completion the way the decoded-mask
+    draw does: a read-only texture from `edgefirst.tensor`, prototype data
+    from `edgefirst.decoder`, rendered by `edgefirst.image`.
+
+    Same reasoning as the decoded-mask test above. The proto data crosses
+    packages through `__edgefirst_protodata__`, built the way
+    `test_materialize_masks_accepts_foreign_proto_data` builds it.
+    """
+    if sys.platform != "win32" or not is_gpu_buffer_available():
+        pytest.skip("needs Windows with a D3D11 device")
+
+    import numpy as np
+    from edgefirst.decoder import Decoder
+    from edgefirst.decoder import Tensor as DTensor
+    from edgefirst.image import ImageProcessor
+    from edgefirst.tensor import TensorMemory
+
+    nc, nm, n_anchors, proto_h, proto_w = 1, 1, 1, 4, 4
+    metadata = {
+        "decoder_version": "yolov8",
+        "nms": "class_agnostic",
+        "outputs": [
+            {
+                "type": "detection",
+                "decoder": "ultralytics",
+                "shape": [1, 4 + nc + nm, n_anchors],
+                "score_format": "per_class",
+                "quantization": [1.0, 0],
+            },
+            {
+                "type": "protos",
+                "decoder": "ultralytics",
+                "shape": [1, nm, proto_h, proto_w],
+                "dshape": [
+                    {"batch": 1},
+                    {"num_protos": nm},
+                    {"height": proto_h},
+                    {"width": proto_w},
+                ],
+                "quantization": [1.0, 0],
+            },
+        ],
+    }
+    dec = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
+    combined = np.zeros((1, 4 + nc + nm, n_anchors), dtype=np.float32)
+    combined[0, 0:4, 0] = [0.5, 0.5, 0.5, 0.5]  # centred half-frame box
+    combined[0, 4, 0] = 0.9  # class score
+    combined[0, 5, 0] = 4.0  # positive coefficient: foreground everywhere
+    protos = np.ones((1, nm, proto_h, proto_w), dtype=np.float32)
+    t_combined = DTensor(list(combined.shape), dtype="float32")
+    t_combined.from_numpy(combined)
+    t_protos = DTensor(list(protos.shape), dtype="float32")
+    t_protos.from_numpy(protos)
+    boxes, scores, classes, proto_data = dec.decode_proto([t_combined, t_protos])
+    assert len(boxes) == 1
+
+    proc = ImageProcessor()
+    dst = Tensor.image(64, 64, PixelFormat.Rgba, TensorMemory.DMABUF, "read")
+    skip_unless_gpu_backed(dst)
+    assert dst.gpu_completion() is None, "nothing has written this texture yet"
+
+    proc.draw_proto_masks(dst, boxes, scores, classes, proto_data)  # <-- crosses
+
+    completion = dst.gpu_completion()
+    assert completion is not None, "the proto draw published no completion on dst"
+    fence, value = completion
+    try:
+        assert value > 0
+    finally:
+        _close(fence)
+
+    with dst.map("read") as m:
+        out = np.asarray(memoryview(m))
+        assert out[2, 2].tolist() == [0, 0, 0, 0], "corner (2,2) was not cleared"
+        assert out[32, 32].tolist() != [0, 0, 0, 0], (
+            "box centre (32,32) was not coloured"
         )
 
 
@@ -273,8 +425,125 @@ def test_decode_into_gpu_backed_tensor_from_another_package():
     dst = proc.create_image(640, 640, ImgFmt.Rgb, "uint8", "readwrite")
     proc.convert(src, dst, letterbox=[114, 114, 114, 255])
     with dst.map() as m:
-        out = np.frombuffer(m, dtype=np.uint8).reshape(640, 640, 3)
+        # np.asarray(memoryview(m)) honours the mapping's own row_stride. A
+        # `create_image()` destination is a D3D11 texture on Windows, whose
+        # staging pitch need not equal the tight 1920-byte row
+        # frombuffer().reshape() assumes.
+        out = np.asarray(memoryview(m))
         assert out[320, 320].tolist() != [0, 0, 0], "converted image is blank"
+
+
+@pytest.mark.gpu
+def test_d3d11_texture_crosses_packages_through_the_capsule():
+    """A D3D11 texture allocated by `edgefirst.tensor` and rendered into by
+    `edgefirst.image`, through the capsule and nothing else.
+
+    Every `edgefirst.*` wheel links its own copy of the tensor crate, so
+    before the device rendezvous each copy created its own `ID3D11Device`
+    and a texture from one was unreachable from the other -- the convert
+    either failed to import the destination or rendered into a texture the
+    consumer's device could not open. It also needs the `D3D11_TEXTURE`
+    descriptor kind: without it the destination arrives as a HOST
+    descriptor with no address and the convert falls back to (or fails on)
+    host memory, which is not the zero-copy path this exists for.
+
+    The completion crosses back two ways, and both are checked here. A
+    convert renders into a `TensorDyn` the binding reconstructs from the
+    descriptor -- that is what lets it release the GIL -- so the fence value
+    `edgefirst.image`'s GL engine records lands on that short-lived tensor;
+    the binding publishes it onto the caller's object through
+    `set_gpu_write` before returning, which is what `dst.gpu_completion()`
+    reads back. `convert_with_fence` carries the same completion the other
+    way, as an event the caller waits on and owns.
+    """
+    if sys.platform != "win32" or not is_gpu_buffer_available():
+        pytest.skip("needs Windows with a D3D11 device")
+
+    import numpy as np
+    from edgefirst.image import Flip, ImageProcessor, Rotation
+    from edgefirst.tensor import TensorMemory
+
+    p = ImageProcessor()
+    src = Tensor.image(64, 48, PixelFormat.Rgba, None, "readwrite")
+    with src.map() as m:
+        np.asarray(memoryview(m))[:] = (200, 100, 50, 255)
+
+    # Allocated by edgefirst.tensor, written by edgefirst.image's GL engine.
+    dst = Tensor.image(64, 48, PixelFormat.Rgb, TensorMemory.DMABUF, "read")
+    # The same GPU policy the other tests here follow: Windows runs this only
+    # with HAL_TEST_REQUIRE_GL=1 and ANGLE configured, because a CPU-backend
+    # convert has no device fence to hand back.
+    skip_unless_gpu_backed(dst)
+    assert dst.memory == TensorMemory.DMABUF, (
+        f"destination is {dst.memory!r}, not a texture -- this test is "
+        "vacuous unless the convert crosses a real GPU allocation"
+    )
+
+    assert dst.gpu_completion() is None, "nothing has written this texture yet"
+
+    p.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)  # <-- crosses packages
+
+    with dst.map("read") as m:
+        # np.asarray(memoryview(m)) honours the texture's staging pitch,
+        # which is not the tight 192-byte row of a 64-pixel rgb8 image.
+        assert np.asarray(memoryview(m))[0, 0].tolist() == [200, 100, 50]
+
+    completion = dst.gpu_completion()
+    assert completion is not None, "the convert published no completion on dst"
+    fence, value = completion
+    try:
+        assert value > 0
+    finally:
+        # An owned duplicate under the dynamic backend the wheels link.
+        _close(fence)
+
+    # The same completion the other way round: the event a fenced convert
+    # hands back, which a caller waits on instead of the fence value.
+    event = p.convert_with_fence(src, dst, Rotation.Rotate0, Flip.NoFlip)
+    assert event is not None, (
+        "a D3D11 display signals its device fence, so a fenced convert into "
+        "a texture from another package must hand back an event"
+    )
+    try:
+        # WAIT_OBJECT_0. A fence the consumer's device could not signal
+        # would time out here (WAIT_TIMEOUT, 0x102).
+        waited = ctypes.windll.kernel32.WaitForSingleObject(
+            ctypes.c_void_p(event), 5000
+        )
+    finally:
+        # The caller owns the event, as it owns the handle `gpu_completion`
+        # returns: both are duplicates under the dynamic backend the wheels
+        # link.
+        _close(event)
+    assert waited == 0
+
+    # The second convert published a value of its own. Strictly greater, not
+    # merely not-smaller: each recorded completion signals the shared device
+    # fence at a new, higher value, so an equal reading would mean the fenced
+    # convert published nothing and this is still the first convert's value
+    # sitting in a monotonic slot.
+    later = dst.gpu_completion()
+    assert later is not None
+    later_fence, later_value = later
+    try:
+        assert later_value > value
+    finally:
+        _close(later_fence)
+
+    # `convert_deferred` publishes too, and its value covers the queued
+    # render. Read before the `flush`, deliberately: that is the whole point
+    # of the deferred path -- a device consumer waits on this fence instead
+    # of paying the flush. The flush then completes the render this test
+    # queued rather than leaving it outstanding.
+    p.convert_deferred(src, dst, Rotation.Rotate0, Flip.NoFlip)
+    deferred = dst.gpu_completion()
+    p.flush()
+    assert deferred is not None, "convert_deferred published no completion"
+    deferred_fence, deferred_value = deferred
+    try:
+        assert deferred_value > later_value
+    finally:
+        _close(deferred_fence)
 
 
 def test_decode_into_mem_backed_destination_from_another_package():

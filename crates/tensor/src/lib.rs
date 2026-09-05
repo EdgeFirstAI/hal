@@ -101,6 +101,13 @@ mod dma;
 mod dmabuf;
 mod error;
 mod format;
+// Layout table is backend-agnostic (pure DXGI-format math), same reasoning
+// as `iosurface_layout` below: compiled on every platform so it is
+// unit-tested on every CI lane. The allocator that consumes it
+// (`crate::d3d11`) is Windows-only.
+#[cfg(target_os = "windows")]
+pub mod d3d11;
+pub mod d3d11_layout;
 // Layout table is backend-agnostic (pure FourCC math). Storage
 // (`IoSurfaceTensor`) is `static`-only; `dynamic` reads IOSurface handles
 // through `ef_tensor_*`.
@@ -159,6 +166,12 @@ pub(crate) use crate::ahardwarebuffer::AHardwareBufferTensor;
 pub(crate) use crate::dma::DmaTensor;
 #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "static"))]
 pub(crate) use crate::iosurface::IoSurfaceTensor;
+// The two geometry helpers are compiled for both backends: three of the four
+// surfaces that read a raw texture's geometry (the Python bindings, and the
+// protocol and blob imports) link `dynamic`, and only the C ABI links
+// `static`. See `crate::d3d11::geometry`.
+#[cfg(target_os = "windows")]
+pub use crate::d3d11::geometry::{d3d11_shared_handle_geometry, d3d11_texture_geometry};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use crate::iosurface_layout::image_iosurface_layout;
 #[cfg(feature = "static")]
@@ -168,7 +181,8 @@ pub use crate::pbo::{PboMapping, PboOps, PboTensor};
 pub(crate) use crate::shm::ShmTensor;
 pub use cuda::{
     gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
-    is_cuda_available, memcpy_device_to_host, stream_create, stream_destroy, stream_synchronize,
+    is_cuda_available, memcpy_device_to_host, memcpy_host_to_device,
+    runtime_path as cuda_runtime_path, stream_create, stream_destroy, stream_synchronize,
     CudaGlOps, CudaHandle, CudaMap, CudaStream,
 };
 pub use detect::{unletter_norm, BoundingBox, DetectBox, ProtoData, ProtoLayout, Segmentation};
@@ -384,6 +398,99 @@ pub struct PackedRgb888Layout {
     pub bytes_per_texel: usize,
     /// Row pitch in bytes (`surface_w * 4` = `width * 3`).
     pub pitch: usize,
+}
+
+/// The logical `(width, height)` an **allocation** shape describes for
+/// `format` -- the inverse of [`PixelFormat::allocation_shape`].
+///
+/// Used wherever a tensor arrives carrying a shape and a format but not its
+/// dimensions: the C constructors, the Python bindings and the cross-package
+/// protocol import.
+///
+/// # The input is the allocation shape, not the addressing shape
+///
+/// [`PixelFormat::allocation_shape`] is what [`Tensor::image`] allocates from
+/// and what `descriptor_pinned` emits from `shape()`, so that is what this
+/// inverts. [`PixelFormat::addressing_shape`] is a different, smaller grid,
+/// and for a semi-planar format the two collide: NV12's addressing shape is
+/// `[h, w]` and its allocation shape is `[combined_h, w]`, both rank 2. Handed
+/// an addressing shape this cannot tell -- NV12 `[480, 640]` reads as a
+/// combined height of 480 and answers `(640, 320)`, silently. Nothing in the
+/// shape distinguishes them, so callers must pass the allocation shape.
+///
+/// A D3D11 import is the one place this cannot bite: the constructors check
+/// the derived size against the texture description, so a mismatch fails with
+/// [`Error::InvalidArgument`] naming both. On Windows, prefer
+/// `d3d11_texture_geometry` and `d3d11_shared_handle_geometry`, which read the
+/// dimensions off the texture itself and leave the shape as a consistency
+/// check -- except for a semi-planar texture, whose width is its row stride
+/// rather than the image width, so those helpers take the width from the shape
+/// they are given and refuse to answer without one.
+///
+/// The rank is part of the format's contract, so a shape of the wrong rank is
+/// an error rather than an interpretation of whatever dimensions are present:
+///
+/// | Layout | Shape | Result |
+/// |--------|-------|--------|
+/// | Packed | `[h, w, c]` | `(shape[1], shape[0])` |
+/// | Planar | `[c, h, w]` | `(shape[2], shape[1])` |
+/// | SemiPlanar | `[combined_h, w]` | `(shape[1], image height)` |
+///
+/// A semi-planar shape carries the *combined* plane height, so the logical
+/// height is recovered through
+/// [`PixelFormat::image_height_from_combined`], which rejects a combined
+/// height no image height produces (721 for NV12, say) instead of rounding to
+/// a nearby one.
+///
+/// # Errors
+///
+/// [`Error::InvalidShape`] for a shape of the wrong rank, or a semi-planar
+/// combined height with no image height behind it.
+///
+/// # Example
+///
+/// ```
+/// use edgefirst_tensor::{image_dims_from_shape, PixelFormat};
+/// assert_eq!(image_dims_from_shape(PixelFormat::Rgba, &[480, 640, 4]).unwrap(), (640, 480));
+/// assert_eq!(image_dims_from_shape(PixelFormat::PlanarRgb, &[3, 480, 640]).unwrap(), (640, 480));
+/// assert_eq!(image_dims_from_shape(PixelFormat::Nv12, &[722, 640]).unwrap(), (640, 481));
+/// assert!(image_dims_from_shape(PixelFormat::Nv12, &[721, 640]).is_err());
+/// ```
+pub fn image_dims_from_shape(format: PixelFormat, shape: &[usize]) -> Result<(usize, usize)> {
+    let wrong_rank = |expected: usize| {
+        Error::InvalidShape(format!(
+            "image_dims_from_shape: {format:?} describes a rank-{expected} allocation \
+             shape, got rank {} ({shape:?})",
+            shape.len()
+        ))
+    };
+    match format.layout() {
+        PixelLayout::Packed => {
+            if shape.len() != 3 {
+                return Err(wrong_rank(3));
+            }
+            Ok((shape[1], shape[0]))
+        }
+        PixelLayout::Planar => {
+            if shape.len() != 3 {
+                return Err(wrong_rank(3));
+            }
+            Ok((shape[2], shape[1]))
+        }
+        PixelLayout::SemiPlanar => {
+            if shape.len() != 2 {
+                return Err(wrong_rank(2));
+            }
+            let height = format.image_height_from_combined(shape[0]).ok_or_else(|| {
+                Error::InvalidShape(format!(
+                    "image_dims_from_shape: no {format:?} image height has combined plane \
+                     height {} (shape {shape:?})",
+                    shape[0]
+                ))
+            })?;
+            Ok((shape[1], height))
+        }
+    }
 }
 
 /// Per-plane DMA-BUF descriptor for external buffer import.
@@ -1382,11 +1489,21 @@ impl ImageDesc {
 ///
 /// That is safe rather than tolerated: an identity exists to answer "are
 /// these the same bytes?", and buffers with no bytes have nothing to alias.
-/// Nor can they reach an import cache — both GPU import paths require a
-/// dma-buf fd or an IOSurface ref and reject anything else, so a `HostPtr`
-/// identity is never a cache key. Do not "fix" this by minting a distinct id
-/// per empty tensor: that reintroduces a counter, which is the state this
-/// whole design exists to remove.
+/// Nor can they reach an import cache. There are four GPU import paths —
+/// a dma-buf fd on Linux, an IOSurface ref on macOS, an `AHardwareBuffer` on
+/// Android, and an `ID3D11Texture2D` on Windows — and each takes only its own
+/// object, so a tensor with no allocation reaches none of them. The Windows
+/// path additionally keys on the texture the import itself holds a reference
+/// to, and `edgefirst-image` **refuses** any texture whose identity is not
+/// `D3d11Texture` over that same pointer — in every build, and on every
+/// import including one served from its cache
+/// (`GlPlatform::validate_import_identity`). That refusal exists because the
+/// rule was once only written
+/// down: the dynamic backend handed the image crate `HostPtr` identities over
+/// recyclable handle addresses, and converts silently rendered into dropped
+/// textures. Do not "fix" the zero-element case by minting a distinct id per
+/// empty tensor: that reintroduces a counter, which is the state this whole
+/// design exists to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityKind {
     /// `(st_dev, st_ino)` of a dma-buf or memfd. Survives `dup`, and is the
@@ -1400,6 +1517,42 @@ pub enum IdentityKind {
     /// The `AHardwareBuffer*` pointer, pre-API-31 where no id exists.
     /// Process-local: unique among live buffers here, meaningless elsewhere.
     AHardwareBufferPtr,
+    /// An `ID3D11Texture2D*`. Process-local, like `AHardwareBufferPtr`, and
+    /// the same pointer for every kind of texture tensor: one the HAL
+    /// allocated, one wrapped from a caller's pointer, and one opened from a
+    /// shared NT handle all key on the texture object they hold.
+    ///
+    /// **Both backends derive it from the same pointer, so their ids are
+    /// equal byte for byte.** The static backend reads the `ComPtr` it owns
+    /// (`d3d11::texture::tex_key`); the dynamic backend reads the same
+    /// pointer back across the ABI with `ef_tensor_d3d11_texture`
+    /// (`TensorDyn::derive_identity`). That equality is the point, not a
+    /// coincidence: [`BufferIdentity::derived`] exists so two independently
+    /// linked copies of this crate name one buffer identically, and
+    /// `edgefirst-image` links the dynamic backend inside every `-capi` leaf
+    /// while its own tests link the static one.
+    ///
+    /// **An `ef_tensor` handle's address must never be the key.** It is not a
+    /// buffer at all, nothing the cache holds keeps it alive, and this
+    /// library's allocator hands a freed handle's address to the very next
+    /// one it mints — measured at 400 texture handles over 4 distinct
+    /// addresses. The dynamic backend did exactly that on Windows until
+    /// 2026-09-04, and a convert whose destination key collided rendered into
+    /// the dropped texture while returning success.
+    ///
+    /// A handle import therefore does **not** compare equal to the tensor it
+    /// was exported from, nor to a second import of the same handle:
+    /// `OpenSharedResource1` mints a fresh `ID3D11Texture2D` per open. Keying
+    /// on a handle value would make those compare equal, and would be unsound:
+    /// Windows recycles a closed handle value straight into the next
+    /// `DuplicateHandle`, so a consumer that caches on this id past the
+    /// producing tensor's lifetime -- as the image crate's EGLImage cache
+    /// does -- could serve one texture's entry for a later, unrelated import.
+    /// A COM object's address cannot be recycled that way: a cache that holds
+    /// a reference to the texture keeps the address taken for as long as its
+    /// entry can be found. The cost is a cache miss per re-import instead of
+    /// a wrong image.
+    D3d11Texture,
     /// A host mapping address. Process-local.
     HostPtr,
     /// A GL buffer name. Valid only in the context that created it.
@@ -1660,6 +1813,19 @@ where
     /// allocation lives rather than borrowing the tensor: the returned view
     /// shares ownership through the pin's keepalive, so a map can coexist with
     /// a `&mut` on the same tensor.
+    ///
+    /// # Windows D3D11 textures: no write-only map of a partial window
+    ///
+    /// A [`CpuAccess::Write`] map is not refreshed from the texture and
+    /// publishes the whole texture when it unmaps, so the bytes the caller
+    /// leaves untouched are undefined. That is a contract a whole-tensor map
+    /// can meet and a sub-view cannot: the window spans its own rows only.
+    /// A write-only map of a tensor whose window is shorter than its backing
+    /// -- a [`view`](Tensor::view), or a shape narrowed with
+    /// `set_logical_shape` -- is therefore refused with
+    /// [`Error::InvalidArgument`] naming [`CpuAccess::ReadWrite`], which is
+    /// the same window with the refresh that makes the untouched rows
+    /// well-defined.
     fn map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a;
@@ -1701,6 +1867,38 @@ where
         T: 'a,
     {
         self.map_with(CpuAccess::ReadWrite)
+    }
+
+    /// Non-blocking [`map_with`](Self::map_with): returns
+    /// `Err(Error::IoError(WouldBlock))` while a GPU copy the map depends on
+    /// is still in flight, and makes progress on a retry.
+    ///
+    /// Backings with no such copy (host memory, shared memory, dma-buf,
+    /// IOSurface, AHardwareBuffer, PBO) alias `map_with`, so a caller can use
+    /// this unconditionally and only ever see `WouldBlock` where the wait is
+    /// real -- today the Windows D3D11 texture's staging refresh.
+    ///
+    /// A retry loop must yield or sleep between attempts. On the WARP
+    /// software adapter the CPU threads are the GPU, so a tight loop starves
+    /// the very copy it is waiting for.
+    ///
+    /// [`CpuAccess::Write`] is refused on a Windows D3D11 texture tensor whose
+    /// window is shorter than its backing, exactly as it is for
+    /// [`map_with`](Self::map_with); see that method.
+    fn try_map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.map_with(access)
+    }
+
+    /// Non-blocking [`map`](Self::map): read-write, and `WouldBlock` rather
+    /// than a stall. See [`try_map_with`](Self::try_map_with).
+    fn try_map<'a>(&self) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.try_map_with(CpuAccess::ReadWrite)
     }
 
     /// Get the buffer identity for cache keying and liveness tracking.
@@ -1872,6 +2070,14 @@ crate::ef_vocabulary! {
         /// `EGL_ANGLE_iosurface_client_buffer`). CPU access via `map()`
         /// incurs cache-coherency overhead on Linux DMA-BUF and is similar
         /// in cost on IOSurface; SHM/Mem are cheaper for CPU-only workloads.
+        ///
+        /// On Windows it is an `ID3D11Texture2D` on the process D3D11 device
+        /// (`crates/tensor/src/d3d11/`), allocated only through
+        /// [`Tensor::image`](crate::Tensor::image); CPU access goes through a
+        /// staging copy. The first such allocation creates the process
+        /// device, so a host supplying its own device must call
+        /// `d3d11::use_external_device` before it -- and before
+        /// [`crate::is_gpu_buffer_available`], which creates the device too.
         DmaBuf = 2, "dmabuf", DMABUF,
         /// Apple IOSurface, named specifically rather than through the
         /// portable `DmaBuf` spelling.
@@ -1929,6 +2135,13 @@ impl TensorMemory {
     /// * `Cuda` -- there is no CUDA backing in this crate at all. Probing
     ///   for `libcuda` would answer `true` on a Jetson while every
     ///   allocation still failed, which is worse than answering `false`.
+    ///
+    /// One variant answers `true` for a narrower constructor than the rest:
+    /// on Windows `DmaBuf` is an `ID3D11Texture2D`, which is image-formatted,
+    /// so `true` there means [`Tensor::image`] can serve it and
+    /// [`Tensor::new`] with `Some(DmaBuf)` still answers `NotImplemented`.
+    /// [`is_gpu_buffer_available`](crate::is_gpu_buffer_available), which this
+    /// forwards to, states the same split.
     pub fn is_available(self) -> bool {
         match self {
             // Always: the fallback every constructor chain ends on. If this
@@ -1965,7 +2178,8 @@ impl TensorMemory {
             TensorMemory::Shm => "POSIX shared memory is unix-only",
             TensorMemory::DmaBuf => {
                 "this target has no platform GPU-buffer allocator (DMA-BUF is Linux, \
-                 IOSurface macOS/iOS, AHardwareBuffer Android)"
+                 IOSurface macOS/iOS, AHardwareBuffer Android, D3D11 textures on \
+                 Windows)"
             }
             TensorMemory::IoSurface => {
                 "no backend produces or accepts IOSurface under its own code yet -- \
@@ -2036,6 +2250,8 @@ where
     Dma(IoSurfaceTensor<T>),
     #[cfg(target_os = "android")]
     Dma(AHardwareBufferTensor<T>),
+    #[cfg(target_os = "windows")]
+    Dma(crate::d3d11::texture::D3d11TextureTensor<T>),
     #[cfg(unix)]
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
@@ -2067,6 +2283,13 @@ where
             // image-formatted buffers (height > 1) carry a real row pitch.
             #[cfg(target_os = "android")]
             TensorStorage::Dma(t) => t.image_backing_row_stride(),
+            // Windows D3D11: the driver's staging row pitch. `None` when the
+            // tensor has no staging (write-only or hardware-only), whose host
+            // buffer has tight rows -- except for a semi-planar tensor, whose
+            // texture is allocated as wide as that pitch for every access, so
+            // it always has one to report.
+            #[cfg(target_os = "windows")]
+            TensorStorage::Dma(t) => t.image_backing_row_stride(),
             _ => None,
         }
     }
@@ -2089,15 +2312,26 @@ where
             Some(TensorMemory::DmaBuf) => {
                 AHardwareBufferTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
+            // Windows has a DmaBuf backing, but it is a D3D11 texture: an image
+            // layout, not a byte bag, so a shape alone cannot describe one.
+            // Name the constructor that can, rather than quietly handing back
+            // host memory the caller did not ask for.
+            #[cfg(target_os = "windows")]
+            Some(TensorMemory::DmaBuf) => Err(crate::error::Error::NotImplemented(
+                "D3D11 texture tensors are image-formatted; use Tensor::image with \
+                 TensorMemory::DmaBuf"
+                    .to_owned(),
+            )),
             #[cfg(not(any(
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             )))]
             Some(TensorMemory::DmaBuf) => Err(crate::error::Error::NotImplemented(
                 "TensorMemory::DmaBuf is only available on Linux (DMA-BUF), macOS/iOS (IOSurface), \
-                 and Android (AHardwareBuffer)"
+                 Android (AHardwareBuffer), and Windows (D3D11 textures, via Tensor::image)"
                     .to_owned(),
             )),
             #[cfg(unix)]
@@ -2271,6 +2505,29 @@ where
             .map(TensorStorage::Dma)
     }
 
+    /// Allocate an image-formatted D3D11 texture storage (Windows).
+    ///
+    /// Used by `Tensor::image()` when the caller requests
+    /// `TensorMemory::DmaBuf`. Unlike the IOSurface and AHardwareBuffer
+    /// constructors there is no byte-bag fallback: a format with no texture
+    /// layout is an error, because a texture is the only thing this backing
+    /// can be.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn new_image_d3d11(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        shape: &[usize],
+        name: Option<&str>,
+        access: CpuAccess,
+    ) -> Result<Self> {
+        crate::d3d11::texture::D3d11TextureTensor::<T>::new_image(
+            width, height, format, dtype, shape, name, access,
+        )
+        .map(TensorStorage::Dma)
+    }
+
     /// Create a new tensor storage using the given file descriptor, shape,
     /// and optional name.
     #[cfg(unix)]
@@ -2368,7 +2625,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(_) => TensorMemory::DmaBuf,
             #[cfg(unix)]
@@ -2384,7 +2642,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.name(),
             #[cfg(unix)]
@@ -2400,7 +2659,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.shape(),
             #[cfg(unix)]
@@ -2416,7 +2676,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.reshape(shape),
             #[cfg(unix)]
@@ -2432,7 +2693,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.capacity_bytes(),
             #[cfg(unix)]
@@ -2448,7 +2710,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.set_logical_shape(shape),
             #[cfg(unix)]
@@ -2467,7 +2730,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.map_with(access),
             #[cfg(unix)]
@@ -2477,13 +2741,34 @@ where
         }
     }
 
+    fn try_map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        match self {
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ))]
+            TensorStorage::Dma(t) => t.try_map_with(access),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.try_map_with(access),
+            TensorStorage::Mem(t) => t.try_map_with(access),
+            TensorStorage::Pbo(t) => t.try_map_with(access),
+        }
+    }
+
     fn buffer_identity(&self) -> &BufferIdentity {
         match self {
             #[cfg(any(
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.buffer_identity(),
             #[cfg(unix)]
@@ -2505,7 +2790,8 @@ where
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
-                target_os = "android"
+                target_os = "android",
+                target_os = "windows"
             ))]
             TensorStorage::Dma(t) => t.view(offset_bytes, shape).map(TensorStorage::Dma),
             #[cfg(unix)]
@@ -2752,8 +3038,13 @@ where
     ///   together, and there is no `GL_MAP_PERSISTENT_BIT` in GLES) and an
     ///   AHardwareBuffer (`AHardwareBuffer_lock` is what yields the address at
     ///   all, so there is no address outside the lock). Both name
-    ///   `map()`/`map_with()` as the alternative. `Mem`, `Shm`, DMA-BUF and
-    ///   IOSurface all pin.
+    ///   `map()`/`map_with()` as the alternative. `Mem`, `Shm`, DMA-BUF,
+    ///   IOSurface and the Windows D3D11 texture all pin — the texture through
+    ///   a persistent host buffer the storage owns, which
+    ///   [`sync_for_cpu`](Self::sync_for_cpu) and
+    ///   [`sync_for_device`](Self::sync_for_device) move bytes between and the
+    ///   texture, rather than through the staging mapping (a pin outlives every
+    ///   map guard, so holding the staging texture mapped would freeze it).
     pub fn pin_host<'a>(&self, access: CpuAccess) -> Result<HostPin<'a>>
     where
         T: 'a,
@@ -2777,6 +3068,13 @@ where
             TensorStorage::Dma(d) => d.host_pin(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(s) => s.host_pin(),
+            // Windows D3D11: the pin is the storage's own persistent host
+            // buffer, not the staging mapping -- see `D3d11TextureTensor::host_pin`.
+            // The direction goes with it: a writable pin is what tells
+            // `sync_for_device` the host buffer, not the staging copy, carries
+            // the caller's writes.
+            #[cfg(target_os = "windows")]
+            TensorStorage::Dma(t) => t.host_pin(access),
             // AHardwareBuffer cannot support a pin at all, and that is a
             // platform contract rather than missing work: the NDK exposes no
             // way to obtain a CPU address outside AHardwareBuffer_lock, so a
@@ -2832,6 +3130,7 @@ where
     /// | `Dma` (Linux DMA-BUF) | one `DMA_BUF_IOCTL_SYNC`, direction-tagged |
     /// | `Dma` (macOS/iOS IOSurface) | `IOSurfaceLock` / `IOSurfaceUnlock`, options matched to `access` |
     /// | `Dma` (Android AHardwareBuffer) | [`Error::NotImplemented`] — no sync independent of the lock |
+    /// | `Dma` (Windows D3D11 texture) | refreshes the pinned host buffer from the texture through the staging copy, or uploads it back; a no-op until something pins |
     /// | `Pbo` | [`Error::NotImplemented`] — no coherency window independent of the map |
     ///
     /// Only the first row is a no-op, so "bracket unconditionally and pay
@@ -2850,7 +3149,9 @@ where
     /// # Cost
     ///
     /// `Mem`/`Shm`: nothing. `Dma` on Linux: one ioctl. IOSurface: one
-    /// lock/unlock pair.
+    /// lock/unlock pair. Windows D3D11 texture: one `CopyResource` plus a
+    /// staging map per direction, and nothing at all on a tensor no one has
+    /// pinned.
     ///
     /// # Errors
     ///
@@ -2873,6 +3174,10 @@ where
             }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(s) => s.sync_for_cpu(access),
+            // Windows D3D11: refreshes the pinned host buffer from the texture
+            // through the staging copy.
+            #[cfg(target_os = "windows")]
+            TensorStorage::Dma(t) => t.sync_for_cpu(access),
             #[cfg(target_os = "android")]
             TensorStorage::Dma(_) => Err(Error::NotImplemented(
                 "sync_for_cpu: AHardwareBuffer has no sync independent of its \
@@ -2908,6 +3213,9 @@ where
             }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(s) => s.sync_for_device(access),
+            // Windows D3D11: uploads the pinned host buffer to the texture.
+            #[cfg(target_os = "windows")]
+            TensorStorage::Dma(t) => t.sync_for_device(access),
             #[cfg(target_os = "android")]
             TensorStorage::Dma(_) => Err(Error::NotImplemented(
                 "sync_for_device: AHardwareBuffer has no sync independent of \
@@ -3479,6 +3787,37 @@ where
                 }
             }
             t.cpu_access = access;
+            return Ok(t);
+        }
+
+        // Windows Dma path: allocate an `ID3D11Texture2D` on the process
+        // device so the GL backend can bind it through ANGLE's D3D11 texture
+        // import and a D3D12/CUDA consumer can open its shared NT handle.
+        //
+        // Explicit-Dma contract, as on macOS and Android: the caller asked for
+        // a texture, so a format with no texture layout is an error here
+        // rather than a silent fall-through to the host-memory arms below,
+        // which would only surface much later as a failed GPU import.
+        #[cfg(target_os = "windows")]
+        if matches!(memory, Some(TensorMemory::DmaBuf)) {
+            let dtype = dtype_of::<T>().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "Tensor::image: element type {} has no DType, so no D3D11 texture \
+                     layout exists. Pass memory=None or Some(TensorMemory::Mem) for a \
+                     CPU tensor.",
+                    std::any::type_name::<T>()
+                ))
+            })?;
+            let storage = TensorStorage::<T>::new_image_d3d11(
+                width, height, format, dtype, &shape, None, access,
+            )?;
+            let mut t = Self::wrap(storage);
+            t.format = Some(format);
+            record_d3d11_row_stride(&mut t, format, "Tensor::image");
+            t.cpu_access = access;
+            // Best-effort CUDA import, as the Linux DMA arms do: a texture a
+            // CUDA consumer can map is worth the one import at allocation.
+            t.try_init_d3d11_cuda();
             return Ok(t);
         }
 
@@ -4128,7 +4467,10 @@ where
                 self.shape()
             )));
         }
-        let map = self.map()?;
+        // Read-only: this helper never writes back into the tensor, so a
+        // read map suffices — and is required on backends (D3D11) that
+        // reject a writable map on a tensor allocated CpuAccess::Read.
+        let map = self.map_read()?;
         // SAFETY: T is a plain numeric type (crate-wide bound); viewing the
         // mapped elements as bytes is sound.
         let src: &[u8] = unsafe {
@@ -4729,8 +5071,34 @@ where
     /// }
     /// # }
     /// ```
+    ///
+    /// # D3D11 texture tensors: the mapping is tight rows
+    ///
+    /// On Windows the mapping is a linear copy of the texture laid out at
+    /// `width * bytes_per_texel`, and `len()` is that times the row count --
+    /// *not* [`row_stride`](Self::row_stride), which reports the D3D11 staging
+    /// pitch a CPU map sees and is the larger number on a padded backing. A
+    /// consumer that strides the device pointer by `row_stride()` reads past
+    /// the end of the mapping.
+    ///
+    /// Semi-planar formats (NV12, NV16, NV24) are the exception: their texture
+    /// is allocated as wide as its own row pitch, so the tight row *is* the
+    /// pitch and the mapping equals `row_stride() x combined_height` bytes.
+    /// Striding the device pointer by `row_stride()` is exactly right there.
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
         self.cuda.as_ref()?.map()
+    }
+
+    /// Writable counterpart of [`cuda_map`](Self::cuda_map). See
+    /// [`CudaHandle::map_mut`](crate::cuda::CudaHandle::map_mut) for which
+    /// backings distinguish the two.
+    ///
+    /// The D3D11 arm is the one that does: the guard's release copies the
+    /// buffer back into the texture. Its layout is [`cuda_map`](Self::cuda_map)'s
+    /// -- tight rows of `width * bytes_per_texel`, not `row_stride()` -- and
+    /// writing it at the wrong pitch scrambles the image rather than failing.
+    pub fn cuda_map_mut(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        self.cuda.as_ref()?.map_mut()
     }
 
     /// Attempt to attach a CUDA `ExternalMemory` handle for DMA-backed tensors.
@@ -4763,6 +5131,278 @@ where
         if let Some((ext, dptr)) = crate::cuda::import_dma_fd(raw_fd, buf_size) {
             self.cuda = Some(crate::cuda::CudaHandle::new_external(ext, dptr, buf_size));
         }
+    }
+
+    /// Attempt to attach a CUDA external-memory handle for D3D11 texture
+    /// tensors — the Windows counterpart of
+    /// [`try_init_dma_cuda`](Self::try_init_dma_cuda).
+    ///
+    /// Imports the texture's shared NT handle via
+    /// `cudaImportExternalMemory(D3D11Resource)` and the process device's
+    /// fence as an external semaphore, so [`cuda_map`](Self::cuda_map) hands
+    /// out a linear device buffer whose refresh is ordered after the D3D11
+    /// work a producer recorded with [`set_gpu_write`](Self::set_gpu_write).
+    ///
+    /// No-op when a handle is already attached or the tensor is not
+    /// texture-backed. Import failure is silently ignored: the WARP adapter
+    /// has no CUDA device at all, and a texture whose import fails is still a
+    /// valid tensor whose `cuda_map()` is `None`.
+    #[cfg(target_os = "windows")]
+    pub fn try_init_d3d11_cuda(&mut self) {
+        if self.cuda.is_some() {
+            return;
+        }
+        let TensorStorage::Dma(tex) = &self.storage else {
+            return;
+        };
+        if let Some(h) = tex.try_init_cuda() {
+            self.cuda = Some(h);
+        }
+    }
+}
+
+/// Windows D3D11 texture accessors. No `'static` bound: none of these needs
+/// `dtype_of::<T>()`.
+#[cfg(all(feature = "static", target_os = "windows"))]
+impl<T> Tensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// The borrowed `ID3D11Texture2D*` backing this tensor, valid while the
+    /// tensor lives. `None` when the tensor is not texture-backed.
+    pub fn d3d11_texture(&self) -> Option<*mut std::ffi::c_void> {
+        match &self.storage {
+            TensorStorage::Dma(t) => Some(t.texture_ptr()),
+            _ => None,
+        }
+    }
+
+    /// The texture geometry the HAL chose for this image: DXGI format, texel
+    /// dimensions and the matching GL internal format. `None` when the tensor
+    /// is not texture-backed.
+    pub fn d3d11_layout(&self) -> Option<crate::d3d11_layout::D3d11ImageLayout> {
+        match &self.storage {
+            TensorStorage::Dma(t) => Some(t.layout()),
+            _ => None,
+        }
+    }
+
+    /// A duplicated NT handle the caller owns: open it on a D3D12 device,
+    /// another D3D11 device, or CUDA, or duplicate it into another process.
+    /// Closing it does not affect this tensor.
+    pub fn d3d11_shared_handle(&self) -> Result<std::os::windows::io::OwnedHandle> {
+        match &self.storage {
+            TensorStorage::Dma(t) => t.shared_handle(),
+            _ => Err(Error::NotImplemented(
+                "not a D3D11 texture tensor".to_owned(),
+            )),
+        }
+    }
+
+    /// The fence handle plus value a GPU consumer waits on before reading this
+    /// texture, or `None` when no GPU write has been recorded on it.
+    pub fn gpu_completion(&self) -> Result<Option<crate::d3d11::GpuCompletion>> {
+        match &self.storage {
+            TensorStorage::Dma(t) => t.gpu_completion(),
+            _ => Err(Error::NotImplemented(
+                "not a D3D11 texture tensor".to_owned(),
+            )),
+        }
+    }
+
+    /// Record that GPU work writing this texture completes at `value` of the
+    /// process device's fence. Monotonic: an older value never displaces a
+    /// newer one, so recording out of order is safe rather than merely
+    /// tolerated.
+    ///
+    /// Takes `&self`, not `&mut self`: the fence slot is an `AtomicU64` and
+    /// this is a `fetch_max` on it. A producer records a write on the very
+    /// tensor its consumers already hold and are reading, so demanding
+    /// exclusive access here would forbid the one call this exists for.
+    pub fn set_gpu_write(&self, value: u64) -> Result<()> {
+        match &self.storage {
+            TensorStorage::Dma(t) => {
+                t.set_gpu_write(value);
+                Ok(())
+            }
+            _ => Err(Error::NotImplemented(
+                "not a D3D11 texture tensor".to_owned(),
+            )),
+        }
+    }
+
+    /// The tensor's own NT handle value -- not a duplicate -- for descriptors
+    /// whose consumer keeps the producing tensor alive.
+    ///
+    /// Borrowed rather than duplicated because the C exports (task A6) hand
+    /// out owned duplicates, which a `Copy` descriptor cannot close; the
+    /// cross-package protocol's `kind::D3D11_TEXTURE` reads this instead.
+    pub(crate) fn d3d11_shared_handle_value(&self) -> Option<usize> {
+        match &self.storage {
+            TensorStorage::Dma(t) => Some(t.shared_handle_value()),
+            _ => None,
+        }
+    }
+}
+
+/// The recorded GPU write value, on every platform: the descriptor path and
+/// the Python bindings forward it without a `cfg` of their own, and only
+/// Windows can record one.
+#[cfg(feature = "static")]
+impl<T> Tensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// The fence value of the newest GPU write recorded on this tensor, or 0
+    /// when there is none: the `value` of `gpu_completion` without the
+    /// duplicated fence handle, for a consumer that already holds the process
+    /// fence. 0 for a tensor that is not a D3D11 texture, and on every
+    /// platform other than Windows.
+    pub fn gpu_write_value(&self) -> u64 {
+        #[cfg(target_os = "windows")]
+        {
+            if let TensorStorage::Dma(t) = &self.storage {
+                return t.last_gpu_write();
+            }
+        }
+        0
+    }
+}
+
+/// Records the D3D11 backing's row pitch on `t` when it exceeds the natural
+/// stride for its format and width.
+///
+/// The staging pitch is the row stride CPU consumers see, and for a
+/// semi-planar tensor it is also the texture's own width, which the GL
+/// backend's Path B shader takes as its `tex_width`. Three constructors need
+/// it identically -- `Tensor::image`'s Windows arm and the two wrap
+/// constructors below -- and a wrapped texture is the case that makes it
+/// load-bearing: without it such a tensor reports the natural `even(width)`
+/// stride while its texture is the driver's pitch wide, and the shader samples
+/// a padded texture at the image width.
+///
+/// `t.format` must already be set: the natural stride comes from it.
+#[cfg(all(feature = "static", target_os = "windows"))]
+fn record_d3d11_row_stride<T>(t: &mut Tensor<T>, format: PixelFormat, what: &str)
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    let pitch = match &t.storage {
+        TensorStorage::Dma(tex) => tex.image_backing_row_stride(),
+        _ => None,
+    };
+    let (Some(pitch), Some(natural)) = (pitch, t.effective_row_stride()) else {
+        return;
+    };
+    if pitch > natural {
+        log::debug!(
+            "{what}: the D3D11 backing pitch for the {format:?} texture is {pitch} bytes \
+             (natural {natural}); recording row stride"
+        );
+        t.set_row_stride_unchecked(pitch);
+    }
+}
+
+/// The two texture-importing constructors. Separate from the accessors above
+/// because `dtype_of::<T>()` needs `T: 'static`.
+#[cfg(all(feature = "static", target_os = "windows"))]
+impl<T> Tensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync + 'static,
+{
+    /// Wrap an existing `ID3D11Texture2D` as a tensor. The texture is checked
+    /// against the layout the HAL would have chosen for `format`/`width`/
+    /// `height` and must live on the HAL's process device; ownership stays
+    /// with the caller, since this takes its own reference.
+    ///
+    /// The backing's row pitch is recorded as the tensor's
+    /// [`row_stride`](Self::row_stride) when it exceeds the natural stride, so
+    /// a wrapped semi-planar texture -- whose width *is* the pitch -- reports
+    /// the geometry its consumers address it by.
+    ///
+    /// # Safety
+    ///
+    /// `texture` must be null or a live `ID3D11Texture2D` created on the HAL
+    /// device ([`crate::d3d11::device()`]).
+    pub unsafe fn from_d3d11_texture(
+        texture: *mut std::ffi::c_void,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        access: CpuAccess,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let dtype = dtype_of::<T>().ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "from_d3d11_texture: element type {} has no DType",
+                std::any::type_name::<T>()
+            ))
+        })?;
+        let shape = format.allocation_shape(width, height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "invalid dimensions {width}x{height} for format {format:?}"
+            ))
+        })?;
+        // SAFETY: the caller guarantees `texture` is null or a live
+        // `ID3D11Texture2D`; the storage takes its own reference.
+        let storage = unsafe {
+            crate::d3d11::texture::D3d11TextureTensor::<T>::from_d3d11_texture(
+                texture, width, height, format, dtype, &shape, access, name,
+            )
+        }?;
+        let mut t = Self::wrap(TensorStorage::Dma(storage));
+        t.format = Some(format);
+        record_d3d11_row_stride(&mut t, format, "from_d3d11_texture");
+        t.cpu_access = access;
+        t.try_init_d3d11_cuda();
+        Ok(t)
+    }
+
+    /// Open a shared texture by its NT handle on the HAL's device. When
+    /// `completion` is given, its fence value is waited for on the immediate
+    /// context, so a same-device reader needs no further ordering. Both
+    /// handles stay owned by the caller: this duplicates what it keeps.
+    ///
+    /// Records the backing's row pitch as
+    /// [`row_stride`](Self::row_stride) on the same rule as
+    /// [`from_d3d11_texture`](Self::from_d3d11_texture).
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be an NT shared handle of a D3D11 texture, valid in this
+    /// process, and `completion`'s handle a shared fence handle.
+    pub unsafe fn from_d3d11_shared_handle(
+        handle: std::os::windows::io::RawHandle,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        access: CpuAccess,
+        completion: Option<(std::os::windows::io::RawHandle, u64)>,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let dtype = dtype_of::<T>().ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "from_d3d11_shared_handle: element type {} has no DType",
+                std::any::type_name::<T>()
+            ))
+        })?;
+        let shape = format.allocation_shape(width, height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "invalid dimensions {width}x{height} for format {format:?}"
+            ))
+        })?;
+        // SAFETY: the caller guarantees the handles are valid in this process.
+        let storage = unsafe {
+            crate::d3d11::texture::D3d11TextureTensor::<T>::from_d3d11_shared_handle(
+                handle, width, height, format, dtype, &shape, access, completion, name,
+            )
+        }?;
+        let mut t = Self::wrap(TensorStorage::Dma(storage));
+        t.format = Some(format);
+        record_d3d11_row_stride(&mut t, format, "from_d3d11_shared_handle");
+        t.cpu_access = access;
+        t.try_init_d3d11_cuda();
+        Ok(t)
     }
 }
 
@@ -4809,6 +5449,7 @@ fn map_strided_host_view<'a, T>(
     tensor: &Tensor<T>,
     stride: usize,
     access: CpuAccess,
+    non_blocking: bool,
 ) -> Result<crate::view::HostView<'a, T>>
 where
     T: Num + Clone + fmt::Debug + Send + Sync + 'a,
@@ -4827,7 +5468,7 @@ where
             "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
         ))
     })?;
-    map_strided_storage(tensor, stride, rows, total_bytes, access)
+    map_strided_storage(tensor, stride, rows, total_bytes, access, non_blocking)
 }
 
 #[cfg(feature = "static")]
@@ -4865,6 +5506,7 @@ fn map_strided_storage<'a, T>(
     _rows: usize,
     total_bytes: usize,
     access: CpuAccess,
+    _non_blocking: bool,
 ) -> Result<crate::view::HostView<'a, T>>
 where
     T: Num + Clone + fmt::Debug + Send + Sync + 'a,
@@ -4951,6 +5593,21 @@ where
             }
             ahb.map_with_byte_size(total_bytes, access)
         }
+        // Windows: `TensorStorage::Dma` is the D3D11 texture, whose CPU side
+        // is the staging copy at the driver's pitch -- the very pitch
+        // `Tensor::image` recorded as this tensor's row stride. Its
+        // `map_with_byte_size` bounds-checks the span against this tensor's
+        // own window, as the IOSurface arm above does. This is also the only
+        // backing with a real non-blocking map, so it is the only arm that
+        // reads `_non_blocking`.
+        #[cfg(target_os = "windows")]
+        TensorStorage::Dma(tex) => {
+            if _non_blocking {
+                tex.try_map_with_byte_size(total_bytes, access)
+            } else {
+                tex.map_with_byte_size(total_bytes, access)
+            }
+        }
         TensorStorage::Pbo(pbo) => {
             // PBO: the GPU-side allocation may have a padded row stride
             // (e.g. 64-byte aligned). Expose the full padded buffer so a
@@ -4980,9 +5637,141 @@ where
         _ => Err(Error::InvalidOperation(
             "CPU mapping of strided tensors is supported only for HAL-allocated \
              Mem/Shm (any platform), DMA (Linux, self-allocated or imported), \
-             IOSurface (macOS), and PBO"
+             IOSurface (macOS), AHardwareBuffer (Android), D3D11 textures \
+             (Windows), and PBO"
                 .into(),
         )),
+    }
+}
+
+#[cfg(feature = "static")]
+impl<T> Tensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// The shared body of [`TensorTrait::map_with`] and
+    /// [`TensorTrait::try_map_with`]: the direction check, the
+    /// declared-vs-requested telemetry, the strided and plane-offset routing,
+    /// and finally the backing's own map. `non_blocking` chooses which of the
+    /// backing's two maps that last step takes; everything before it is the
+    /// same either way.
+    fn map_impl<'a>(
+        &self,
+        access: CpuAccess,
+        non_blocking: bool,
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        let _span = tracing::trace_span!(
+            "tensor.map",
+            memory = ?self.storage.memory(),
+            ?access,
+            non_blocking,
+        )
+        .entered();
+        if access == CpuAccess::None {
+            return Err(Error::InvalidArgument(
+                "map_with(CpuAccess::None) is not a mappable direction — use \
+                 map_read()/map_write()/map_mut()"
+                    .into(),
+            ));
+        }
+        // Declared-vs-requested telemetry (all platforms): mapping beyond
+        // the allocation-time declaration is best-effort — tolerated where
+        // the backing is CPU-mappable regardless (Mem/Shm/dma-buf/
+        // IOSurface), refused by the Android backend for CpuAccess::None
+        // buffers — but always loud and counted, never silent.
+        if !self.cpu_access.covers(access) {
+            note_unplanned_cpu_access(
+                self.buffer_identity().id(),
+                &format!("{:?}", self.storage.memory()),
+                "map access exceeds the declared CpuAccess",
+            );
+        }
+        // CPU mapping of a strided tensor exposes the full padded buffer
+        // (`row_stride × rows`) so callers can iterate rows via
+        // `effective_row_stride()` without running past the slice. This is sound
+        // only when the HAL owns and can size-check the allocation:
+        //
+        //   * Self-allocated Mem / Shm tensors (any platform) — the backing
+        //     `Vec` / shm segment is sized by `capacity_bytes()`, checked here.
+        //   * Self-allocated DMA tensors (Linux) — pitch padding from
+        //     `image_with_stride()`; checked against the DMA-BUF `buf_size`.
+        //
+        //   * Self-allocated PBO tensors (any platform with GL) — the GL buffer
+        //     is sized by `capacity_bytes()` and may carry 64-byte row padding;
+        //     the JPEG decoder mmaps it and convert() reads it, both iterating
+        //     by `row_stride`. Checked against the PBO capacity below.
+        //
+        // A strided **imported** DMA-BUF is accepted here too (Task 10b): the
+        // `stride × rows <= buf_size` check just below is exactly what a
+        // self-allocated Dma tensor relies on for its own soundness, and
+        // `buf_size` for an imported fd is `fstat`-derived when the kernel
+        // reports a usable size (`stat.st_size > 0` and at least the
+        // declared shape's logical size; `DmaTensor::from_fd`) -- kernel
+        // truth, not a caller's claim, in that case. The rare fallback (a
+        // kernel that reports `st_size <= 0` for a DMA-BUF fd) uses the
+        // declared logical size instead; that is not a hole here either, since
+        // an out-of-range mmap against the real dma-buf is still rejected by
+        // the kernel regardless of what this crate believed `buf_size` was.
+        // So the check is equally load-bearing regardless of who allocated
+        // the buffer. What
+        // changed is only *which* callers can now reach this path: the
+        // cross-package capsule protocol reconstructs an imported alias of a
+        // HAL-owned Dma tensor and then calls `configure_image`, which
+        // computes its stride with the exact same alignment rule a
+        // self-allocated `Tensor::image()` used — so the value being
+        // bounds-checked here is HAL-computed and format/width-derived, not
+        // read from an external driver. Rejecting it unconditionally used to
+        // make every foreign-imported GPU-backed destination fail any CPU
+        // write path (the JPEG decoder's MCU writer among them) even when the
+        // write was provably in-bounds. `set_row_stride()` was already
+        // "trust the caller, bounds-check the map" for every *other* backing
+        // (Mem/Shm/self-allocated Dma/PBO) — singling out imported Dma out
+        // for a stricter standard was the inconsistency, not the trust model
+        // itself. IOSurface keeps its own always-allowed strided path
+        // unconditionally (see its arm below): a live `IOSurfaceRef` reports
+        // its real `bytesPerRow` from the OS regardless of who allocated it,
+        // so there was never anything to distrust there.
+        if let Some(stride) = self.row_stride {
+            return map_strided_host_view(self, stride, access, non_blocking);
+        }
+        // Offset tensors are supported for storages that apply the offset
+        // inside their own `map()`: DMA (`DmaMap`/IOSurface adjust the mapped
+        // base), Mem (`MemMap` adjusts the slice base), Shm (`ShmMap` adjusts
+        // the slice base), and PBO (the staged copy starts at the offset). Every
+        // self-allocated backing now carries a sub-region concept via `view`, so
+        // a non-zero offset is honoured rather than rejected.
+        if self.plane_offset.is_some_and(|o| o > 0) {
+            let supported = matches!(self.storage, TensorStorage::Mem(_) | TensorStorage::Pbo(_));
+            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF; Android
+            // `Dma` is the AHardwareBuffer, Windows `Dma` is the D3D11 texture
+            // (whose pin and map both add the storage's own `view_offset`, the
+            // same way IOSurface does) — all apply the offset in their map.
+            // (`Dma` is the same variant name on each, hence one `cfg(any(...))`
+            // arm rather than four.)
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ))]
+            let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
+            #[cfg(unix)]
+            let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
+            if !supported {
+                return Err(Error::InvalidOperation(
+                    "plane offset only supported for DMA, Mem, Shm, and PBO tensors".into(),
+                ));
+            }
+        }
+        if non_blocking {
+            self.storage.try_map_with(access)
+        } else {
+            self.storage.map_with(access)
+        }
     }
 }
 
@@ -5082,107 +5871,14 @@ where
     where
         T: 'a,
     {
-        let _span = tracing::trace_span!(
-            "tensor.map",
-            memory = ?self.storage.memory(),
-            ?access,
-        )
-        .entered();
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(
-                "map_with(CpuAccess::None) is not a mappable direction — use \
-                 map_read()/map_write()/map_mut()"
-                    .into(),
-            ));
-        }
-        // Declared-vs-requested telemetry (all platforms): mapping beyond
-        // the allocation-time declaration is best-effort — tolerated where
-        // the backing is CPU-mappable regardless (Mem/Shm/dma-buf/
-        // IOSurface), refused by the Android backend for CpuAccess::None
-        // buffers — but always loud and counted, never silent.
-        if !self.cpu_access.covers(access) {
-            note_unplanned_cpu_access(
-                self.buffer_identity().id(),
-                &format!("{:?}", self.storage.memory()),
-                "map access exceeds the declared CpuAccess",
-            );
-        }
-        // CPU mapping of a strided tensor exposes the full padded buffer
-        // (`row_stride × rows`) so callers can iterate rows via
-        // `effective_row_stride()` without running past the slice. This is sound
-        // only when the HAL owns and can size-check the allocation:
-        //
-        //   * Self-allocated Mem / Shm tensors (any platform) — the backing
-        //     `Vec` / shm segment is sized by `capacity_bytes()`, checked here.
-        //   * Self-allocated DMA tensors (Linux) — pitch padding from
-        //     `image_with_stride()`; checked against the DMA-BUF `buf_size`.
-        //
-        //   * Self-allocated PBO tensors (any platform with GL) — the GL buffer
-        //     is sized by `capacity_bytes()` and may carry 64-byte row padding;
-        //     the JPEG decoder mmaps it and convert() reads it, both iterating
-        //     by `row_stride`. Checked against the PBO capacity below.
-        //
-        // A strided **imported** DMA-BUF is accepted here too (Task 10b): the
-        // `stride × rows <= buf_size` check just below is exactly what a
-        // self-allocated Dma tensor relies on for its own soundness, and
-        // `buf_size` for an imported fd is `fstat`-derived when the kernel
-        // reports a usable size (`stat.st_size > 0` and at least the
-        // declared shape's logical size; `DmaTensor::from_fd`) -- kernel
-        // truth, not a caller's claim, in that case. The rare fallback (a
-        // kernel that reports `st_size <= 0` for a DMA-BUF fd) uses the
-        // declared logical size instead; that is not a hole here either, since
-        // an out-of-range mmap against the real dma-buf is still rejected by
-        // the kernel regardless of what this crate believed `buf_size` was.
-        // So the check is equally load-bearing regardless of who allocated
-        // the buffer. What
-        // changed is only *which* callers can now reach this path: the
-        // cross-package capsule protocol reconstructs an imported alias of a
-        // HAL-owned Dma tensor and then calls `configure_image`, which
-        // computes its stride with the exact same alignment rule a
-        // self-allocated `Tensor::image()` used — so the value being
-        // bounds-checked here is HAL-computed and format/width-derived, not
-        // read from an external driver. Rejecting it unconditionally used to
-        // make every foreign-imported GPU-backed destination fail any CPU
-        // write path (the JPEG decoder's MCU writer among them) even when the
-        // write was provably in-bounds. `set_row_stride()` was already
-        // "trust the caller, bounds-check the map" for every *other* backing
-        // (Mem/Shm/self-allocated Dma/PBO) — singling out imported Dma out
-        // for a stricter standard was the inconsistency, not the trust model
-        // itself. IOSurface keeps its own always-allowed strided path
-        // unconditionally (see its arm below): a live `IOSurfaceRef` reports
-        // its real `bytesPerRow` from the OS regardless of who allocated it,
-        // so there was never anything to distrust there.
-        if let Some(stride) = self.row_stride {
-            return map_strided_host_view(self, stride, access);
-        }
-        // Offset tensors are supported for storages that apply the offset
-        // inside their own `map()`: DMA (`DmaMap`/IOSurface adjust the mapped
-        // base), Mem (`MemMap` adjusts the slice base), Shm (`ShmMap` adjusts
-        // the slice base), and PBO (the staged copy starts at the offset). Every
-        // self-allocated backing now carries a sub-region concept via `view`, so
-        // a non-zero offset is honoured rather than rejected.
-        if self.plane_offset.is_some_and(|o| o > 0) {
-            let supported = matches!(self.storage, TensorStorage::Mem(_) | TensorStorage::Pbo(_));
-            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF; Android
-            // `Dma` is the AHardwareBuffer — all apply the offset in their map.
-            // (`Dma` is the same variant name on each, hence one `cfg(any(...))`
-            // arm rather than three.)
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "android"
-            ))]
-            let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
-            #[cfg(unix)]
-            let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
-            if !supported {
-                return Err(Error::InvalidOperation(
-                    "plane offset only supported for DMA, Mem, Shm, and PBO tensors".into(),
-                ));
-            }
-        }
-        self.storage.map_with(access)
+        self.map_impl(access, false)
+    }
+
+    fn try_map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.map_impl(access, true)
     }
 
     fn buffer_identity(&self) -> &BufferIdentity {
@@ -5268,12 +5964,22 @@ pub fn is_ahardwarebuffer_available() -> bool {
     false
 }
 
-/// Portable probe for the platform's native zero-copy GPU buffer
-/// allocator (DMA-BUF on Linux, IOSurface on macOS/iOS, AHardwareBuffer on
-/// Android). Returns `false` on
-/// Windows and other platforms with no equivalent. Use this when writing
-/// cross-platform code that cares whether the `Dma` tensor variant will
-/// work, not which underlying mechanism is used.
+/// Portable probe for the platform's native zero-copy GPU buffer allocator
+/// (DMA-BUF on Linux, IOSurface on macOS/iOS, AHardwareBuffer on Android,
+/// D3D11 textures on Windows). Returns `false` on platforms with no
+/// equivalent. Use this when writing cross-platform code that cares whether
+/// the `Dma` tensor variant will work, not which underlying mechanism is used.
+///
+/// On Windows the `Dma` variant is image-formatted: `true` here means
+/// [`Tensor::image`] can serve `TensorMemory::DmaBuf`, not [`Tensor::new`].
+///
+/// # Ordering on Windows
+///
+/// This probe **creates the process D3D11 device**, because the only honest
+/// answer to "can this host allocate one" is to try. A host that must supply
+/// its own device calls `d3d11::use_external_device` **before** this probe or
+/// any allocation: the device is cached on first creation and installing one
+/// afterwards is refused.
 pub fn is_gpu_buffer_available() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -5287,11 +5993,18 @@ pub fn is_gpu_buffer_available() -> bool {
     {
         is_ahardwarebuffer_available()
     }
+    // No cached probe: `d3d11::device()` is itself a `OnceLock` over the
+    // process device, so asking twice costs one atomic load.
+    #[cfg(target_os = "windows")]
+    {
+        crate::d3d11::device().is_ok()
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
         target_os = "ios",
-        target_os = "android"
+        target_os = "android",
+        target_os = "windows"
     )))]
     {
         false
@@ -5360,6 +6073,54 @@ mod dtype_tests {
 #[cfg(test)]
 mod image_tests {
     use super::*;
+
+    #[test]
+    fn image_dims_from_shape_inverts_allocation_shape() {
+        for (format, w, h) in [
+            (PixelFormat::Rgba, 640usize, 480usize),
+            (PixelFormat::Rgb, 641, 3),
+            (PixelFormat::Grey, 32, 32),
+            (PixelFormat::PlanarRgb, 640, 480),
+            (PixelFormat::PlanarRgba, 8, 5),
+            (PixelFormat::Nv12, 640, 481),
+            (PixelFormat::Nv16, 33, 17),
+            (PixelFormat::Nv24, 16, 9),
+        ] {
+            let shape = format.allocation_shape(w, h).unwrap();
+            assert_eq!(
+                image_dims_from_shape(format, &shape).unwrap(),
+                (w, h),
+                "{format:?} {w}x{h} via {shape:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_dims_from_shape_rejects_the_wrong_rank() {
+        // Packed and planar want rank 3, semi-planar rank 2.
+        for (format, shape) in [
+            (PixelFormat::Rgba, vec![480usize, 640usize]),
+            (PixelFormat::PlanarRgb, vec![3, 480]),
+            (PixelFormat::Nv12, vec![720, 640, 1]),
+        ] {
+            let err = image_dims_from_shape(format, &shape).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidShape(ref m) if m.contains("rank")),
+                "{format:?} {shape:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_dims_from_shape_rejects_an_unproduced_combined_height() {
+        // NV12 maps 480 -> 720 and 481 -> 722; nothing maps to 721, so the
+        // shape is rejected rather than rounded to 480.
+        let err = image_dims_from_shape(PixelFormat::Nv12, &[721, 640]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidShape(ref m) if m.contains("combined plane height")),
+            "{err}"
+        );
+    }
 
     #[test]
     fn allocation_shape_per_layout() {
@@ -6549,16 +7310,16 @@ mod tests {
         let _lock = crate::tests::fd_lock_shared();
         // u8 has align 1, so every byte offset is valid for the alignment check;
         // this isolates the identity-sharing contract from alignment concerns.
-        let assert_shares = |memory: TensorMemory, label: &str| {
-            let parent = Tensor::<u8>::new(&[64], Some(memory), None)
-                .unwrap_or_else(|e| panic!("{label}: parent alloc failed: {e:?}"));
+        // `window` is the view shape; a formatted parent validates it against
+        // its own format, so an image parent needs an image-shaped window.
+        let assert_parent_shares = |parent: Tensor<u8>, window: &[usize], label: &str| {
             let parent_id = parent.buffer_identity().id();
             // Two offset-distinct windows must both carry the parent's identity.
             let v0 = parent
-                .subview(0, &[16])
+                .subview(0, window)
                 .unwrap_or_else(|e| panic!("{label}: subview(0) failed: {e:?}"));
             let v1 = parent
-                .subview(16, &[16])
+                .subview(16, window)
                 .unwrap_or_else(|e| panic!("{label}: subview(16) failed: {e:?}"));
             assert_eq!(
                 v0.buffer_identity().id(),
@@ -6571,6 +7332,11 @@ mod tests {
                 "{label}: subview(16) minted a fresh BufferIdentity"
             );
         };
+        let assert_shares = |memory: TensorMemory, label: &str| {
+            let parent = Tensor::<u8>::new(&[64], Some(memory), None)
+                .unwrap_or_else(|e| panic!("{label}: parent alloc failed: {e:?}"));
+            assert_parent_shares(parent, &[16], label);
+        };
 
         assert_shares(TensorMemory::Mem, "Mem");
 
@@ -6579,10 +7345,61 @@ mod tests {
             assert_shares(TensorMemory::Shm, "Shm");
         }
 
-        // Dma == DMA-BUF on Linux, IOSurface on macOS; same public variant.
+        // Dma == DMA-BUF on Linux, IOSurface on macOS, AHardwareBuffer on
+        // Android; same public variant.
+        #[cfg(not(target_os = "windows"))]
         if crate::is_gpu_buffer_available() {
             assert_shares(TensorMemory::DmaBuf, "Dma");
         }
+        // Windows' Dma is an image-formatted D3D11 texture, which
+        // `Tensor::new` deliberately refuses -- allocate it the only way it
+        // can be allocated and hold it to the same contract.
+        #[cfg(target_os = "windows")]
+        if crate::is_gpu_buffer_available() {
+            let parent = Tensor::<u8>::image(
+                64,
+                1,
+                PixelFormat::Grey,
+                Some(TensorMemory::DmaBuf),
+                CpuAccess::ReadWrite,
+            )
+            .expect("D3D11 texture alloc failed");
+            assert_parent_shares(parent, &[1, 16, 1], "Dma");
+        }
+    }
+
+    /// A sub-view records a plane offset, and on Windows the D3D11 storage
+    /// already applied that offset itself when the view was made -- so the
+    /// map's plane-offset gate must accept it, exactly as it does for the
+    /// other zero-copy backings. It used to refuse, with a message that named
+    /// every backend but this one.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn subview_of_a_texture_tensor_maps_at_its_offset() {
+        if !crate::is_gpu_buffer_available() {
+            return;
+        }
+        let t = Tensor::<u8>::image(
+            32,
+            8,
+            PixelFormat::Rgba,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        // For a texture tensor this is the backing pitch either way: the
+        // allocation records the staging pitch when it exceeds the tight row,
+        // and the two are equal when it does not.
+        let stride = t.effective_row_stride().unwrap();
+        let v = t.subview(stride * 2, &[2, 32, 4]).unwrap();
+        assert!(
+            v.plane_offset().is_some_and(|o| o > 0),
+            "a sub-view at a row offset must carry one"
+        );
+        let m = v
+            .map_read()
+            .expect("a sub-view of a texture tensor must map");
+        assert_eq!(m.as_slice().len(), 2 * stride, "two rows of the window");
     }
 
     #[test]

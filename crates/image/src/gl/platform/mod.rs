@@ -44,7 +44,7 @@ pub(super) mod macos;
 pub(super) mod windows;
 
 use super::EglDisplayKind;
-use edgefirst_tensor::{PixelFormat, Tensor};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn};
 
 /// Capability surface a platform reports for one initialized display +
 /// context. Captured once at processor/worker construction (see
@@ -91,6 +91,8 @@ pub(crate) enum PackedImportFormat {
     Rgba8888,
     /// 8 bytes/pixel RGBA16F (Linux `DrmFourcc::Abgr16161616f`).
     Rgba16161616F,
+    /// 16 bytes/pixel RGBA32F (Windows `R32G32B32A32_FLOAT`).
+    Rgba32323232F,
 }
 
 impl PackedImportFormat {
@@ -99,6 +101,7 @@ impl PackedImportFormat {
         match self {
             PackedImportFormat::Rgba8888 => 4,
             PackedImportFormat::Rgba16161616F => 8,
+            PackedImportFormat::Rgba32323232F => 16,
         }
     }
 }
@@ -130,8 +133,26 @@ pub(super) trait GlPlatform {
     /// (enabling the binding-skip cache keyed by `BufferImportKey`);
     /// macOS `eglBindTexImage` bindings are released at the end of each
     /// synced pass ([`Self::end_gpu_pass`]) per the EGL pbuffer contract,
-    /// so the skip cache must stay cold there.
+    /// so the skip cache must stay cold there. Windows/ANGLE is a third
+    /// `false` for a third reason: ANGLE does not observe writes made to
+    /// the D3D11 texture outside GL, so a persisted binding would serve a
+    /// stale frame.
     const PERSISTENT_TEX_BINDINGS: bool;
+
+    /// Which zero-copy float render paths this platform is known to serve.
+    ///
+    /// The classifier ([`super::float_dispatch::classify_float_render`])
+    /// stays pure and takes this as an input rather than reading a `cfg`.
+    /// Only [`ZeroCopyFloatSet::PlanarF16`] has ever run on Linux, macOS and
+    /// Android, so those leaves report it and nothing more; the Windows leaf
+    /// reports [`ZeroCopyFloatSet::All`], which is the set this branch
+    /// validated on an RTX 3070 and on WARP. Widening a leaf is a decision
+    /// backed by an on-target run, which is why it is a value here and not a
+    /// property of the classifier.
+    ///
+    /// [`ZeroCopyFloatSet::PlanarF16`]: super::float_dispatch::ZeroCopyFloatSet::PlanarF16
+    /// [`ZeroCopyFloatSet::All`]: super::float_dispatch::ZeroCopyFloatSet::All
+    const ZERO_COPY_FLOAT: super::float_dispatch::ZeroCopyFloatSet;
 
     /// Whether `GL_TEXTURE_EXTERNAL_OES` sampling of imports exists on
     /// this platform (Linux: yes — the NV "Path A" and the legacy packed
@@ -170,6 +191,33 @@ pub(super) trait GlPlatform {
         for_dst: bool,
     ) -> crate::Result<Self::Import>;
 
+    /// Confirm this tensor's [`BufferIdentity`] still names the object the
+    /// platform would import, before the import cache is consulted.
+    ///
+    /// Called on **every** import, hits included, which is the whole point:
+    /// [`import_buffer`](Self::import_buffer) and friends run only on a miss,
+    /// so a check made there cannot see a cached entry being served for a
+    /// tensor whose identity has stopped matching its buffer. The cache keys
+    /// on the identity and outlives the tensor that produced it, so an
+    /// identity that names the wrong object is served a stale import with no
+    /// error and no crash — wrong pixels, which is exactly the failure this
+    /// exists to turn into a refusal.
+    ///
+    /// Default `Ok(())`: a platform whose identity is an OS-level key the
+    /// kernel cannot recycle while the import holds it (a dma-buf inode, an
+    /// `IOSurfaceID`) has nothing to re-check. Windows overrides it, because
+    /// its identity is a raw `ID3D11Texture2D` address that the tensor crate
+    /// derives independently in each of its two backends.
+    ///
+    /// An error refuses the zero-copy path and falls the frame back to the
+    /// CPU converter, so a regression costs throughput instead of output.
+    fn validate_import_identity<T>(_img: &Tensor<T>, _what: &str) -> crate::Result<()>
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        Ok(())
+    }
+
     /// Import an NV12/NV16/NV24 tensor's combined semi-planar plane as ONE
     /// R8 buffer (luma + interleaved chroma addressed by the shader — the
     /// "Path B" NV sampling strategy). On Linux a single-plane R8 EGLImage
@@ -198,6 +246,30 @@ pub(super) trait GlPlatform {
 
     /// The `Copy` handle for a cached import.
     fn import_handle(import: &Self::Import) -> Self::ImportHandle;
+
+    /// The texel size of the texture an import covers, when that can be
+    /// larger than the tensor's logical image; `None` when the import is
+    /// always exactly the logical image.
+    ///
+    /// Linux creates the DMA-BUF `EGLImage` at the logical size (the physical
+    /// pitch is a separate attribute) and macOS gives the pbuffer explicit
+    /// dimensions, so on both the import *is* the logical image.
+    /// `EGL_ANGLE_image_d3d11_texture` has no sub-extent attribute: a pool
+    /// buffer narrowed by `configure_image` keeps its texture and imports all
+    /// of it, so Windows reports the texture's texel size and the engine
+    /// scales the source rectangle by `logical / extent`
+    /// ([`super::render::scale_roi_to_import`]) and clamps every sample to the
+    /// logical image ([`super::render::sample_clamp_rect`]). A leaf that
+    /// returns `None` reaches both as the identity.
+    ///
+    /// Not every sampling site clamps: the two `GL_TEXTURE_EXTERNAL_OES`
+    /// camera programs (`draw_camera_texture_to_rgb_planar`,
+    /// `draw_camera_texture_eglimage`) scale their source rectangle and stop
+    /// there. They exist only where [`Self::EXTERNAL_OES`] is true, which
+    /// today is only the leaf that returns `None` here, so a narrowed import
+    /// cannot reach them. A leaf that returns `Some` and has external-OES
+    /// programs must add the clamp to both.
+    fn import_extent(import: &Self::Import) -> Option<(u32, u32)>;
 
     /// Attach the import as the image of the CURRENTLY BOUND
     /// `GL_TEXTURE_2D` texture object. Linux:
@@ -271,9 +343,41 @@ pub(super) trait GlPlatform {
     /// falls back to the blocking sync. Must run on the GL worker thread.
     /// The handle type is the platform-neutral [`super::CompletionFence`]
     /// (an fd on Unix, an NT handle on Windows).
+    ///
+    /// `recorded` is the value [`Self::record_completion`] just recorded on
+    /// the destination for this same convert, when the caller has one. A leaf
+    /// whose completion fence *is* the device fence turns that value into the
+    /// event instead of signalling a second one, so the returned event and
+    /// `Tensor::gpu_completion` name the same point. A leaf whose fence is a
+    /// GL native fence ignores it.
     fn export_completion_fence(
         display: &Self::Display,
+        recorded: Option<u64>,
     ) -> crate::Result<Option<super::CompletionFence>>;
+
+    /// Called by the engine after a convert or a mask draw into `dst` has
+    /// been issued and, for the blocking path, completed. Platforms with a
+    /// device fence record the value covering that work on the destination so
+    /// GPU consumers can wait on it (`Tensor::gpu_completion`), and return it.
+    /// No-op elsewhere, which answers `None`. Called after every convert,
+    /// including deferred (batched) ones, and after every successful draw — a
+    /// leaf that needs the GL work submitted flushes GL first, whatever
+    /// `submit` says.
+    ///
+    /// `submit` is `false` while a deferred batch is open. The value is
+    /// still allocated and its signal queued in order, but the device's
+    /// command buffer is submitted once from [`Self::submit_recorded`] at the
+    /// batch's flush rather than once per tile — N tiles would otherwise cost
+    /// N submissions, which is exactly what batching exists to avoid. Every
+    /// writer of the engine's `defer_finish` flag sets it inside a convert,
+    /// so a draw never runs under one and always passes `true`.
+    fn record_completion(display: &Self::Display, dst: &mut TensorDyn, submit: bool)
+        -> Option<u64>;
+
+    /// Submit the signals [`Self::record_completion`] queued with
+    /// `submit == false`. Called once when a deferred batch flushes. No-op on
+    /// a leaf that submits as it goes.
+    fn submit_recorded(display: &Self::Display);
 }
 
 /// The one platform implementation for this build.
@@ -292,3 +396,13 @@ const _: fn() = || {
     fn assert_platform<P: GlPlatform>() {}
     assert_platform::<Platform>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::PackedImportFormat;
+
+    #[test]
+    fn rgba32323232f_is_16_bytes_per_pixel() {
+        assert_eq!(PackedImportFormat::Rgba32323232F.bytes_per_pixel(), 16);
+    }
+}

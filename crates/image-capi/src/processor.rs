@@ -8,7 +8,7 @@
 //! caller might allocate — `mem`, `shm`, `dmabuf` — is available from
 //! `libedgefirst-tensor` alone.
 
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_image::ImageProcessor;
@@ -504,6 +504,8 @@ pub unsafe extern "C" fn ef_image_processor_flush(p: *mut EfImageProcessor) -> c
     }
 }
 
+/// Platforms: Linux, macOS, iOS, Android.
+///
 /// Convert, returning a sync-fence fd instead of blocking on the GPU.
 ///
 /// The GL to NPU handoff. `*fence_fd` receives a descriptor the caller owns and
@@ -511,11 +513,10 @@ pub unsafe extern "C" fn ef_image_processor_flush(p: *mut EfImageProcessor) -> c
 /// therefore completed synchronously — in which case the destination is already
 /// safe to read.
 ///
-/// @return 0 on success, otherwise an errno.
+/// @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
 ///
 /// # Safety
 /// `p`, `src`, `dst` must be live handles; `fence_fd` must be writable.
-#[cfg(unix)]
 #[no_mangle]
 pub unsafe extern "C" fn ef_image_processor_convert_fence(
     p: *mut EfImageProcessor,
@@ -531,16 +532,18 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
             if p.is_null() || fence_fd.is_null() {
                 return libc::EINVAL;
             }
+            // Written before any early return, so a caller never reads an
+            // uninitialised descriptor after a failure -- a bad rotation or
+            // flip code included, which is where this used to leave `*fence_fd`
+            // untouched while the handle sibling below cleared it.
+            *fence_fd = -1;
             let (Some(rot), Some(fl)) = (rotation_from(rotation), flip_from(flip)) else {
                 return libc::EINVAL;
             };
-            // Written before any early return, so a caller never reads an
-            // uninitialised descriptor after a failure.
-            *fence_fd = -1;
             #[cfg(not(unix))]
             {
                 let _ = (p, src, dst, rot, fl, crop);
-                return libc::ENOTSUP;
+                libc::ENOTSUP
             }
             #[cfg(unix)]
             {
@@ -558,6 +561,72 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
                     }
                     // No native fence here: the convert already completed, which the
                     // -1 reports. Not an error.
+                    Ok(Ok(Ok(None))) => 0,
+                    Ok(Ok(Err(_))) => libc::EIO,
+                    Ok(Err(e)) | Err(e) => e,
+                }
+            }
+        }))
+        .unwrap_or(libc::EINVAL)
+    }
+}
+
+/// Platforms: Windows.
+///
+/// Convert, returning an event handle instead of blocking on the GPU. The
+/// event is set when the destination is complete; the caller owns it and
+/// closes it with `CloseHandle`. `*fence` is `NULL` when the convert
+/// completed synchronously (no fence on this display).
+///
+/// @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
+///
+/// # Safety
+/// `p`, `src`, `dst` must be live handles; `fence` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
+    p: *mut EfImageProcessor,
+    src: *const EfTensor,
+    dst: *mut EfTensor,
+    rotation: u32,
+    flip: u32,
+    crop: *const EfCrop,
+    fence: *mut *mut c_void,
+) -> c_int {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            if p.is_null() || fence.is_null() {
+                return libc::EINVAL;
+            }
+            // Written before the rotation/flip check below, as the fd
+            // sibling above does, so a caller reading `*fence` after any
+            // failure -- a bad code included -- never sees an uninitialised
+            // pointer.
+            *fence = std::ptr::null_mut();
+            let (Some(rot), Some(fl)) = (rotation_from(rotation), flip_from(flip)) else {
+                return libc::EINVAL;
+            };
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (src, dst, rot, fl, crop);
+                libc::ENOTSUP
+            }
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::io::IntoRawHandle;
+                let result = with_tensor(src, |s| {
+                    with_tensor_mut(dst, |d| {
+                        (*p).inner
+                            .convert_with_fence(s, d, rot, fl, crop_from(crop))
+                    })
+                });
+                match result {
+                    Ok(Ok(Ok(Some(owned)))) => {
+                        *fence = owned.into_raw_handle();
+                        0
+                    }
+                    // No fence on this display: the convert already
+                    // completed, which the NULL `*fence` reports. Not an
+                    // error.
                     Ok(Ok(Ok(None))) => 0,
                     Ok(Ok(Err(_))) => libc::EIO,
                     Ok(Err(e)) | Err(e) => e,
@@ -841,5 +910,142 @@ mod tests {
         let mut v = full_view();
         v.compression = 2;
         assert!(image_desc_from_view(&v).is_none());
+    }
+
+    /// `p`/`fence` are checked before any platform arm runs, so a `NULL`
+    /// here is `EINVAL` on every platform this family is declared on --
+    /// unlike a bad `src`/`dst`, whose errno differs by platform (see the
+    /// Windows-only round trip below).
+    #[test]
+    fn convert_fence_handle_refuses_a_null_processor_or_fence() {
+        let mut fence: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                ef_image_processor_convert_fence_handle(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    &mut fence,
+                ),
+                libc::EINVAL
+            );
+            let p = processor();
+            assert_eq!(
+                ef_image_processor_convert_fence_handle(
+                    p,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                ),
+                libc::EINVAL,
+                "a null fence out-param must be refused before it is written"
+            );
+            ef_image_processor_free(p);
+        }
+    }
+
+    /// The Windows path end to end, on the real GPU: mint a texture-backed
+    /// src/dst through this same library, convert without blocking, and wait
+    /// on the returned event.
+    ///
+    /// The C leaf harness does not execute C tests on Windows (POSIX `cc`
+    /// and a `.a` -- see `lib.rs`'s `cc_build_and_run`), so this is the one
+    /// place in this crate that actually drives
+    /// `ef_image_processor_convert_fence_handle` on real hardware, the same
+    /// role `a_texture_tensor_round_trips_through_the_exports` plays for the
+    /// tensor leaf's D3D11 family (`tensor-capi/src/d3d11.rs`).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn convert_fence_handle_returns_an_owned_event_set_on_completion() {
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIP: no D3D11 device on this host");
+            return;
+        }
+        let p = processor();
+        let rgba = std::ffi::CString::new("rgba8").unwrap();
+        let rgb = std::ffi::CString::new("rgb8").unwrap();
+        // `storage` has no dedicated "auto" enumerator (see
+        // `TensorMemory::from_code`): any code outside the 0-5 vocabulary
+        // maps to `None`, which is what lets `create_image` reach its
+        // Dma-first arm and hand back a D3D11 texture. Code 0 is `Mem` --
+        // a real, valid request, not "unspecified" -- so it would allocate
+        // a host tensor here and make this test vacuous.
+        const AUTO: u32 = u32::MAX;
+        unsafe {
+            let src = ef_image_processor_create_image(p, 64, 48, rgba.as_ptr(), 0, AUTO, 3);
+            let dst = ef_image_processor_create_image(p, 64, 48, rgb.as_ptr(), 0, AUTO, 3);
+            assert!(!src.is_null() && !dst.is_null());
+
+            let mut fence: *mut c_void = std::ptr::dangling_mut();
+            let rc = ef_image_processor_convert_fence_handle(
+                p,
+                src,
+                dst,
+                0,
+                0,
+                std::ptr::null(),
+                &mut fence,
+            );
+            assert_eq!(rc, 0, "a same-library fenced convert must succeed");
+            assert!(
+                !fence.is_null(),
+                "a texture destination on Windows must hand back a fence"
+            );
+            assert_eq!(
+                wait_for_single_object(fence, 5000),
+                0,
+                "fence was not set within 5 seconds"
+            );
+            close_handle(fence);
+
+            // The event and the destination's own completion name one value:
+            // a fenced convert into a texture flushes and signals once, and
+            // records that value on `dst`. A consumer may wait on either.
+            let mut dvalue: u64 = 0;
+            let mut dfence: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                edgefirst_tensor_ffi::ef_tensor_gpu_completion(dst, &mut dfence, &mut dvalue),
+                0
+            );
+            assert_ne!(dvalue, 0, "the fenced convert recorded a completion");
+            if !dfence.is_null() {
+                close_handle(dfence);
+            }
+
+            edgefirst_tensor_ffi::ef_tensor_free(src);
+            edgefirst_tensor_ffi::ef_tensor_free(dst);
+            ef_image_processor_free(p);
+        }
+    }
+
+    /// `WaitForSingleObject`/`CloseHandle` without pulling the `windows`
+    /// crate into this leaf: the handle crossing this ABI is a plain
+    /// `void *`, and the test needs exactly two Win32 calls to wait on and
+    /// give back the owned one. Mirrors `tensor-capi/src/d3d11.rs`'s
+    /// `close_handle` test helper.
+    #[cfg(target_os = "windows")]
+    fn wait_for_single_object(h: *mut c_void, millis: u32) -> u32 {
+        extern "system" {
+            fn WaitForSingleObject(h: *mut c_void, millis: u32) -> u32;
+        }
+        // SAFETY: `h` is a live NT event handle this test received from an
+        // export documented to transfer ownership.
+        unsafe { WaitForSingleObject(h, millis) }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn close_handle(h: *mut c_void) {
+        extern "system" {
+            fn CloseHandle(h: *mut c_void) -> i32;
+        }
+        // SAFETY: `h` is an owned NT handle this test received from an
+        // export documented to transfer ownership.
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
     }
 }

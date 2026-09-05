@@ -29,7 +29,7 @@ Requires Python 3.8 or newer; `edgefirst-tensor` and NumPy are installed automat
 
 Packages install under the [PEP 420](https://peps.python.org/pep-0420/) `edgefirst.*` namespace, so the import is `edgefirst.image`.
 
-A single OpenGL ES engine backs this package on every platform — Linux via native EGL and DMA-BUF, macOS and iOS via ANGLE over Metal and IOSurface, Android via native EGL and AHardwareBuffer, Windows via ANGLE over Direct3D 11 with PBO transfers — alongside NXP G2D on i.MX and a portable CPU fallback everywhere else. Backend selection is automatic; no code changes are needed to move between them. The Windows wheel bundles ANGLE's `libEGL.dll` and `libGLESv2.dll` next to the extension module, so no setup is required there; `EDGEFIRST_ANGLE_ADAPTER` picks the GPU on multi-adapter machines.
+A single OpenGL ES engine backs this package on every platform — Linux via native EGL and DMA-BUF, macOS and iOS via ANGLE over Metal and IOSurface, Android via native EGL and AHardwareBuffer, Windows via ANGLE over Direct3D 11 and D3D11 textures (PBO remains the fallback where a format has no texture layout) — alongside NXP G2D on i.MX and a portable CPU fallback everywhere else. Backend selection is automatic; no code changes are needed to move between them. The Windows wheel bundles ANGLE's `libEGL.dll` and `libGLESv2.dll` next to the extension module, so no setup is required there; `EDGEFIRST_D3D11_ADAPTER` (alias `EDGEFIRST_ANGLE_ADAPTER`, and the D3D11 name wins if both are set and differ) picks the GPU on multi-adapter machines.
 
 ## Quick start
 

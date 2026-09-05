@@ -114,6 +114,61 @@ path when producer and consumer are the same package), and if that fails,
 call the protocol method rather than rejecting the object. Write your own
 producers and consumers the same way.
 
+## Backing-store kinds
+
+The descriptor's `kind` says what backs the tensor, and it is what decides how
+to read `handle`, `ptr` and `sync`. A consumer that does not recognize a kind
+must refuse the tensor rather than guess.
+
+`sync` is meaningful only when the `SYNC_PRESENT` flag is set, and its
+flavour is keyed by kind as well.
+
+| `kind` | Backing | `handle` | `ptr` | `sync` flavour |
+|---|---|---|---|---|
+| `HOST` (0) | `Mem` or `Shm` | `-1` | host address when pinned, else null | none defined; `SYNC_PRESENT` must be clear |
+| `DMABUF` (1) | Linux dma-buf | the fd | host address when pinned, else null | a `sync_file` fd the consumer closes |
+| `IOSURFACE` (2) | Apple IOSurface | the surface id | host address when pinned, else null | none defined; `SYNC_PRESENT` must be clear |
+| `PBO` (3) | OpenGL pixel buffer object | the buffer id | `*const PboOpsVtable`, or null | a `GLsync`, valid only in the producer's share group |
+| `CUDA_DEVICE` (4) | CUDA device memory | `-1` | device pointer, not host-addressable | a `cudaEvent_t` |
+| `D3D11_TEXTURE` (5) | Windows `ID3D11Texture2D` | the texture's NT shared handle | the device fence's NT shared handle, or null | a fence value, the last recorded GPU write |
+
+`D3D11_TEXTURE` is the first kind anything actually produces `sync` for, and it
+produces a **value on a timeline** rather than a handle: the fence it names is
+the one whose NT handle `ptr` carries, so a producer that sets `SYNC_PRESENT`
+must fill in `ptr` as well. A descriptor that sets the flag with a null `ptr`
+is refused — it advertises a completion nobody can wait on. Both handle values
+are valid in the producing process, other modules of the same process included,
+and the import duplicates whatever it keeps, exactly as the `DMABUF` kind does
+with its fd.
+
+One consequence worth stating: an `access="read"` capsule over a texture tensor
+still pins host memory, but no consumer can reach the pixels through that
+address, because the pixels live in the texture. The pin is a keepalive and
+nothing more. A consumer that wants the bytes imports the descriptor and maps
+the imported tensor.
+
+### Carrying a texture between processes
+
+The descriptor protocol is an in-process contract: its handle values mean
+nothing in another process. The blob (`edgefirst_tensor::blob`,
+`ef_tensor_export` / `ef_tensor_import`) is what crosses that boundary, and on
+Windows it does so without any file descriptors — the `fds` array is empty and
+`fds_out` may be null.
+
+A reference-mode blob carries the producer's `pid` at byte 28 of the fixed
+header, and each D3D11 plane carries 24 bytes of `handle_bytes`: three
+little-endian `u64`s, the texture NT handle value, the fence NT handle value
+and the fence value of the last recorded GPU write. The importer opens the
+producer with `OpenProcess(PROCESS_DUP_HANDLE, ...)` and calls
+`DuplicateHandle` for each handle into its own process. Two things follow from
+that, and each fails distinctly rather than silently producing a handle-less
+tensor: a producer that has already exited gives `NotFound` ("exporting process
+`<pid>` is gone"), and a producer this process is not allowed to open for
+`PROCESS_DUP_HANDLE` — on Windows, a different user, or one whose token does
+not grant it — gives a permission error naming the pid.
+
+Inline mode copies the pixels instead and has neither requirement.
+
 ## Lifetime and ownership
 
 The tensor descriptor **borrows**. It is only valid while the capsule that
@@ -121,14 +176,16 @@ carries it is alive:
 
 - `access=None` requests no pin. The descriptor still carries shape, dtype,
   backing-store kind and the native handle (dma-buf fd, IOSurface id, PBO
-  id, CUDA device pointer) — everything a zero-copy GPU/DMA consumer needs —
-  but `ptr` is null and no host address is guaranteed.
+  id, CUDA device pointer, D3D11 texture NT handle) — everything a zero-copy
+  GPU/DMA consumer needs — but no host address is guaranteed, and `ptr` is
+  null except where the table above gives that field another meaning.
 - `"read"` / `"write"` / `"readwrite"` pins host memory for that access and
   fills in `ptr`. The pin is owned by the capsule: dropping the capsule
   releases it. A consumer that needs the address to outlive the capsule
   (rather than just the call it was extracted for) must not just hold onto
-  `ptr` — it must dup the underlying fd (`Tensor.dmabuf_clone()`) or retain
-  the surface itself.
+  `ptr` — it must dup the underlying fd (`Tensor.dmabuf_clone()`), duplicate
+  the texture handle (`Tensor.d3d11_shared_handle()`), or retain the surface
+  itself.
 
 A consumer **may call the producer method more than once per operation** —
 for example, `TensorArg::extract` retries with `access="read"` when an

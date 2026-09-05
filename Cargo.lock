@@ -724,6 +724,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "uuid",
+ "windows",
 ]
 
 [[package]]

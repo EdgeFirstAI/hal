@@ -258,6 +258,114 @@ pub(super) fn plan_batch(n_tiles: usize, rows_per_tile: usize, max_rows: usize) 
     }
 }
 
+/// How one axis of a logical image maps onto the texture an import covers:
+/// `(scale, limit)` — the factor that places the logical image over its share
+/// of the texture, and the normalized coordinate of its far edge. An axis that
+/// is not narrowed (and a degenerate or contradictory extent) maps as the
+/// identity.
+///
+/// The far edge is not pulled half a physical texel inside here. These
+/// coordinates are the endpoints of the quad's texcoord attribute, so moving
+/// one rescales the whole affine dst-to-source mapping rather than excluding
+/// an edge: measured on a narrowed 128x96 source, the inset left the identity
+/// convert differing from a fresh buffer in 34380 of 49152 bytes.
+///
+/// The inset belongs on the sample instead, and that is where it now is: every
+/// shader that samples through this mapping clamps each sample coordinate to
+/// [`sample_clamp_rect`], so a `LINEAR` kernel centred within half a texel of
+/// the logical edge cannot blend the stale texel beyond it. Measured on the
+/// RTX 3070 and on WARP, the last row and column of an upscaled narrowed
+/// source then match a fresh buffer of the same geometry byte for byte
+/// (492-762 bytes differed by up to 48 without the clamp).
+fn axis_map(logical: usize, extent: u32) -> (f32, f32) {
+    if extent == 0 || logical == 0 || logical as u64 >= extent as u64 {
+        return (1.0, 1.0);
+    }
+    let scale = logical as f32 / extent as f32;
+    (scale, scale)
+}
+
+/// Map a source rectangle from the tensor's logical image onto the larger
+/// texture its import covers.
+///
+/// `roi` is normalized over the logical image; `extent` is
+/// `GlPlatform::import_extent`. The logical image occupies the texture's own
+/// texels from its origin, so mapping one onto the other is one multiply per
+/// axis — the half-texel inset the crop math already applied scales with it —
+/// held inside the logical edge by [`axis_map`]. `None` and an extent no
+/// larger than the logical image leave `roi` untouched.
+pub(super) fn scale_roi_to_import(
+    roi: super::RegionOfInterest,
+    logical: (usize, usize),
+    extent: Option<(u32, u32)>,
+) -> super::RegionOfInterest {
+    let Some((pw, ph)) = extent else {
+        return roi;
+    };
+    let (sx, lx) = axis_map(logical.0, pw);
+    let (sy, ly) = axis_map(logical.1, ph);
+    super::RegionOfInterest {
+        left: (roi.left * sx).min(lx),
+        top: (roi.top * sy).min(ly),
+        right: (roi.right * sx).min(lx),
+        bottom: (roi.bottom * sy).min(ly),
+    }
+}
+
+/// [`scale_roi_to_import`] for the float paths' `src_rect_uv`, which is an
+/// origin and a size rather than two corners: the origin scales, and the size
+/// is trimmed to keep the far edge inside the same limit.
+pub(super) fn scale_uv_rect_to_import(
+    rect: [f32; 4],
+    logical: (usize, usize),
+    extent: Option<(u32, u32)>,
+) -> [f32; 4] {
+    let Some((pw, ph)) = extent else {
+        return rect;
+    };
+    let (sx, lx) = axis_map(logical.0, pw);
+    let (sy, ly) = axis_map(logical.1, ph);
+    let left = (rect[0] * sx).min(lx);
+    let top = (rect[1] * sy).min(ly);
+    [
+        left,
+        top,
+        (rect[2] * sx).min(lx - left).max(0.0),
+        (rect[3] * sy).min(ly - top).max(0.0),
+    ]
+}
+
+/// The rectangle a source sample may reach, as the `src_extent` uniform of
+/// the source-sampling shaders: `[u_min, v_min, u_max, v_max]`, the logical
+/// image's share of the texture in normalized coordinates, inset by half a
+/// physical texel on each side.
+///
+/// A `LINEAR` sample at those bounds is centred on the logical image's edge
+/// texel, so the kernel cannot reach the texel beyond it. On a texture that
+/// is exactly the logical image (`extent` is `None`, or no larger than
+/// `logical`) that texel does not exist and `CLAMP_TO_EDGE` already returns
+/// the edge value, so the clamp changes nothing there. On an import that
+/// covers more of the texture than the logical image the texel beyond the
+/// edge holds the pool buffer's previous content, which an upscale would
+/// otherwise blend into the last row or column.
+///
+/// A degenerate logical size yields the whole texture, `[0, 0, 1, 1]`.
+pub(super) fn sample_clamp_rect(logical: (usize, usize), extent: Option<(u32, u32)>) -> [f32; 4] {
+    fn axis(logical: usize, extent: Option<u32>) -> (f32, f32) {
+        if logical == 0 {
+            return (0.0, 1.0);
+        }
+        let texture = match extent {
+            Some(e) if e as u64 > logical as u64 => e as f32,
+            _ => logical as f32,
+        };
+        (0.5 / texture, (logical as f32 - 0.5) / texture)
+    }
+    let (u_min, u_max) = axis(logical.0, extent.map(|e| e.0));
+    let (v_min, v_max) = axis(logical.1, extent.map(|e| e.1));
+    [u_min, v_min, u_max, v_max]
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -487,5 +595,137 @@ mod tests {
         assert_eq!(lower_dst(false, Pbo), DstLowering::TexturePbo);
         assert_eq!(lower_dst(false, Mem), DstLowering::TextureMem);
         assert_eq!(lower_dst(false, Shm), DstLowering::TextureMem);
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod import_extent_tests {
+    use super::*;
+
+    fn roi() -> super::super::RegionOfInterest {
+        super::super::RegionOfInterest {
+            left: 0.0,
+            top: 1.0,
+            right: 1.0,
+            bottom: 0.0,
+        }
+    }
+
+    /// 128x96 written into a 128x128 pool texture: u is untouched (that axis
+    /// is not narrowed), v is scaled to the logical image's share.
+    #[test]
+    fn a_narrowed_logical_image_scales_by_its_share_of_the_texture() {
+        let r = scale_roi_to_import(roi(), (128, 96), Some((128, 128)));
+        assert_eq!(r.left, 0.0);
+        assert_eq!(r.right, 1.0);
+        assert_eq!(r.top, 0.75);
+        assert_eq!(r.bottom, 0.0);
+    }
+
+    #[test]
+    fn both_axes_scale_and_an_interior_rectangle_is_unchanged_in_shape() {
+        let src = super::super::RegionOfInterest {
+            left: 0.25,
+            top: 0.75,
+            right: 0.5,
+            bottom: 0.25,
+        };
+        let r = scale_roi_to_import(src, (64, 100), Some((128, 200)));
+        assert_eq!((r.left, r.right), (0.125, 0.25));
+        assert_eq!((r.top, r.bottom), (0.375, 0.125));
+    }
+
+    #[test]
+    fn equal_extents_and_no_extent_leave_the_rectangle_alone() {
+        let r = scale_roi_to_import(roi(), (128, 96), Some((128, 96)));
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
+        let r = scale_roi_to_import(roi(), (128, 96), None);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
+    }
+
+    /// A logical image larger than the reported extent is a contradiction; the
+    /// rectangle is left alone rather than magnified past the texture.
+    #[test]
+    fn a_logical_image_larger_than_the_extent_is_not_magnified() {
+        let r = scale_roi_to_import(roi(), (256, 256), Some((128, 128)));
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn a_degenerate_extent_leaves_the_rectangle_alone() {
+        let r = scale_roi_to_import(roi(), (128, 96), Some((0, 0)));
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
+    }
+
+    /// The float paths' origin+size rectangle: the origin scales and the size
+    /// is trimmed so the far edge lands where a corner would.
+    #[test]
+    fn a_uv_rect_scales_its_origin_and_trims_its_size() {
+        let r = scale_uv_rect_to_import([0.0, 0.0, 1.0, 1.0], (128, 96), Some((128, 128)));
+        assert_eq!([r[0], r[1]], [0.0, 0.0]);
+        assert_eq!(r[2], 1.0);
+        assert_eq!(r[3], 0.75);
+    }
+
+    #[test]
+    fn a_uv_rect_keeps_an_interior_crop_and_passes_no_extent_through() {
+        // Half the width starting a quarter in, on an axis narrowed to 3/4:
+        // both scale, and the far edge (0.25 + 0.5) * 0.75 stays interior.
+        let r = scale_uv_rect_to_import([0.25, 0.25, 0.5, 0.5], (96, 96), Some((128, 128)));
+        assert_eq!([r[0], r[1]], [0.1875, 0.1875]);
+        assert_eq!([r[2], r[3]], [0.375, 0.375]);
+        let r = scale_uv_rect_to_import([0.25, 0.25, 0.5, 0.5], (96, 96), None);
+        assert_eq!(r, [0.25, 0.25, 0.5, 0.5]);
+    }
+
+    /// 128x96 in a 128x128 texture: u spans the whole texture inset by half
+    /// a texel, v stops half a texel short of row 96.
+    #[test]
+    fn a_narrowed_image_clamps_samples_half_a_texel_inside_its_edge() {
+        let r = sample_clamp_rect((128, 96), Some((128, 128)));
+        assert_eq!(r, [0.5 / 128.0, 0.5 / 128.0, 127.5 / 128.0, 95.5 / 128.0]);
+    }
+
+    /// Without an extent the texture is the logical image, and the clamp is
+    /// the half-texel inset of the whole texture on both axes.
+    #[test]
+    fn no_extent_clamps_to_the_textures_own_edge_texels() {
+        let r = sample_clamp_rect((128, 96), None);
+        assert_eq!(r, [0.5 / 128.0, 0.5 / 96.0, 127.5 / 128.0, 95.5 / 96.0]);
+        assert_eq!(sample_clamp_rect((128, 96), Some((128, 96))), r);
+    }
+
+    /// An extent smaller than the logical image is a contradiction; the
+    /// texture is taken to be the logical image, as in `scale_roi_to_import`.
+    #[test]
+    fn an_extent_smaller_than_the_image_is_ignored() {
+        assert_eq!(
+            sample_clamp_rect((256, 256), Some((128, 128))),
+            sample_clamp_rect((256, 256), None)
+        );
+    }
+
+    #[test]
+    fn a_degenerate_logical_size_leaves_the_whole_texture_reachable() {
+        assert_eq!(
+            sample_clamp_rect((0, 0), Some((128, 128))),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            sample_clamp_rect((0, 96), None),
+            [0.0, 0.5 / 96.0, 1.0, 95.5 / 96.0]
+        );
+    }
+
+    /// One logical texel in a larger texture: min and max meet at that
+    /// texel's centre. The only input where the bound could invert.
+    #[test]
+    fn a_one_texel_image_clamps_to_its_single_texel_centre() {
+        assert_eq!(
+            sample_clamp_rect((1, 1), Some((128, 128))),
+            [0.5 / 128.0; 4]
+        );
+        assert_eq!(sample_clamp_rect((1, 1), None), [0.5; 4]);
     }
 }

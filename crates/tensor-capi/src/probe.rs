@@ -8,31 +8,40 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_tensor::{DType, PixelFormat};
 
-/// Whether CUDA interop symbols resolved.
+/// Whether CUDA interop symbols resolved. Declared and answered on every
+/// platform; `1` only where a CUDA runtime loaded.
 #[no_mangle]
 pub extern "C" fn ef_is_cuda_available() -> c_int {
     catch_unwind(|| i32::from(edgefirst_tensor::is_cuda_available())).unwrap_or(0)
 }
 
-/// Whether Linux DMA-BUF allocation is available.
+/// Whether Linux DMA-BUF allocation is available. Declared and answered on
+/// every platform; `1` only on Linux. `ef_is_gpu_buffer_available` is the
+/// portable question.
 #[no_mangle]
 pub extern "C" fn ef_is_dma_available() -> c_int {
     catch_unwind(|| i32::from(edgefirst_tensor::is_dma_available())).unwrap_or(0)
 }
 
-/// Whether a platform GPU-coherent buffer kind can be allocated.
+/// Whether a platform GPU-coherent buffer kind can be allocated: a DMA-BUF on
+/// Linux, an IOSurface on macOS and iOS, an AHardwareBuffer on Android, a
+/// D3D11 texture on Windows. Declared and answered on every platform.
 #[no_mangle]
 pub extern "C" fn ef_is_gpu_buffer_available() -> c_int {
     catch_unwind(|| i32::from(edgefirst_tensor::is_gpu_buffer_available())).unwrap_or(0)
 }
 
-/// Whether IOSurface allocation is available.
+/// Whether IOSurface allocation is available. Declared and answered on every
+/// platform; `1` only on macOS and iOS. `ef_is_gpu_buffer_available` is the
+/// portable question.
 #[no_mangle]
 pub extern "C" fn ef_is_iosurface_available() -> c_int {
     catch_unwind(|| i32::from(edgefirst_tensor::is_iosurface_available())).unwrap_or(0)
 }
 
-/// Whether POSIX shared memory allocation is available.
+/// Whether POSIX shared memory allocation is available. Declared and answered
+/// on every platform; `1` only where `/dev/shm` is writable, so not on
+/// Windows.
 #[no_mangle]
 pub extern "C" fn ef_is_shm_available() -> c_int {
     catch_unwind(|| i32::from(edgefirst_tensor::is_shm_available())).unwrap_or(0)

@@ -255,6 +255,54 @@ impl TensorDyn {
         }
     }
 
+    /// Non-blocking [`map_bytes`](Self::map_bytes): returns
+    /// `Err(Error::IoError(WouldBlock))` while a GPU copy the map depends on
+    /// is still in flight, and makes progress on a retry. Dispatches to each
+    /// typed tensor's
+    /// [`TensorTrait::try_map_with`](crate::TensorTrait::try_map_with), which
+    /// aliases `map_with` for every backing but the Windows D3D11 texture.
+    pub fn try_map_bytes(
+        &self,
+        access: crate::CpuAccess,
+    ) -> crate::Result<crate::view::HostView<'static, u8>> {
+        use crate::TensorTrait;
+        match self {
+            Self::U8(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::I8(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::U16(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::I16(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::U32(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::I32(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::U64(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::I64(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::F16(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::F32(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+            Self::F64(t) => t
+                .try_map_with(access)
+                .map(crate::view::HostView::into_bytes),
+        }
+    }
+
     /// See [`Tensor::sync_for_cpu`](crate::Tensor::sync_for_cpu).
     pub fn sync_for_cpu(&self, access: crate::CpuAccess) -> crate::Result<()> {
         dispatch!(self, sync_for_cpu, access)
@@ -289,9 +337,35 @@ impl TensorDyn {
             }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMemory::DmaBuf => self.iosurface_id().map(|id| id as i64).unwrap_or(-1),
+            // The tensor's own handle, not a duplicate: the consumer's own
+            // keepalive holds this tensor alive for the descriptor's whole
+            // life, and a duplicate made here would have nowhere to be
+            // closed.
+            #[cfg(target_os = "windows")]
+            TensorMemory::DmaBuf => self
+                .d3d11_shared_handle_value()
+                .map(|h| h as i64)
+                .unwrap_or(-1),
             TensorMemory::Pbo => self.pbo_id().map(|id| id as i64).unwrap_or(-1),
             _ => -1,
         };
+        // The fence is the process device's, shared by every module of this
+        // process through the rendezvous, so its handle is borrowed the same
+        // way the texture's is -- the device outlives the descriptor. A copy
+        // that fell back to a fence of its own exports none, because the value
+        // beside it may come from a copy on the shared one.
+        #[cfg(target_os = "windows")]
+        let (fence_handle, sync) = match self.memory() {
+            TensorMemory::DmaBuf => (
+                crate::d3d11::device()
+                    .map(|d| d.exported_fence_handle_value())
+                    .unwrap_or(0),
+                Some(self.gpu_write_value()).filter(|v| *v != 0),
+            ),
+            _ => (0, None),
+        };
+        #[cfg(not(target_os = "windows"))]
+        let (fence_handle, sync) = (0, None);
         crate::protocol::from_parts(crate::protocol::DescParts {
             dims: self.shape(),
             memory: self.memory(),
@@ -304,6 +378,8 @@ impl TensorDyn {
             capacity: self.capacity_bytes() as u64,
             pin,
             pbo_vtable_ptr: self.pbo_vtable_ptr(),
+            fence_handle,
+            sync,
         })
     }
 
@@ -583,6 +659,13 @@ impl TensorDyn {
     /// ```
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
         dispatch!(self, cuda_map)
+    }
+
+    /// Writable counterpart of [`cuda_map`](Self::cuda_map). See
+    /// [`CudaHandle::map_mut`](crate::cuda::CudaHandle::map_mut) for which
+    /// backings distinguish the two.
+    pub fn cuda_map_mut(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        dispatch!(self, cuda_map_mut)
     }
 
     /// Quantization metadata. Returns `None` for float variants (F16, F32,
@@ -997,6 +1080,34 @@ impl TensorDyn {
                 let ops = unsafe { crate::pbo::import_pbo_ops(desc.ptr.0 as *const _)? };
                 Self::from_pbo_import(buffer_id, desc.capacity as usize, shape, dtype, ops)
             }
+            #[cfg(target_os = "windows")]
+            crate::protocol::kind::D3D11_TEXTURE => {
+                let (tex, completion) = crate::protocol::descriptor_d3d11_handles(desc)?;
+                // SAFETY: the caller guarantees the producer's keepalive
+                // outlives the returned tensor -- the capsule contract
+                // `import_descriptor` documents -- so both handles are the
+                // producer's own and live for this call. `ReadWrite` is the
+                // widest access an import can ask for; the descriptor
+                // carries no access of its own.
+                unsafe {
+                    let (format, width, height) =
+                        crate::protocol::descriptor_d3d11_geometry(desc, tex, shape)?;
+                    Self::from_d3d11_shared_handle(
+                        tex,
+                        width,
+                        height,
+                        format,
+                        dtype,
+                        crate::CpuAccess::ReadWrite,
+                        completion,
+                        None,
+                    )
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            crate::protocol::kind::D3D11_TEXTURE => Err(crate::Error::NotImplemented(
+                "D3D11 texture import off Windows".into(),
+            )),
             k => Err(crate::Error::NotImplemented(format!(
                 "tensor interop kind {k} cannot be imported by this build"
             ))),
@@ -1247,6 +1358,198 @@ impl TensorDyn {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
         dispatch!(self, iosurface_physical_dims)
+    }
+
+    /// The borrowed `ID3D11Texture2D*` backing this tensor (Windows only).
+    /// `None` when the tensor is not texture-backed.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_texture(&self) -> Option<*mut std::ffi::c_void> {
+        dispatch!(self, d3d11_texture)
+    }
+
+    /// The texture geometry the HAL chose for this image (Windows only).
+    /// `None` when the tensor is not texture-backed.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_layout(&self) -> Option<crate::d3d11_layout::D3d11ImageLayout> {
+        dispatch!(self, d3d11_layout)
+    }
+
+    /// A duplicated NT handle the caller owns (Windows only). See
+    /// [`Tensor::d3d11_shared_handle`](crate::Tensor::d3d11_shared_handle).
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_shared_handle(&self) -> crate::Result<std::os::windows::io::OwnedHandle> {
+        dispatch!(self, d3d11_shared_handle)
+    }
+
+    /// The fence handle plus value a GPU consumer waits on before reading this
+    /// texture (Windows only), or `None` when no GPU write has been recorded.
+    #[cfg(target_os = "windows")]
+    pub fn gpu_completion(&self) -> crate::Result<Option<crate::d3d11::GpuCompletion>> {
+        dispatch!(self, gpu_completion)
+    }
+
+    /// The fence value of the newest GPU write recorded on this tensor, or 0
+    /// when there is none; every platform, 0 off Windows. See
+    /// [`Tensor::gpu_write_value`](crate::Tensor::gpu_write_value).
+    pub fn gpu_write_value(&self) -> u64 {
+        dispatch!(self, gpu_write_value)
+    }
+
+    /// Record that GPU work writing this texture completes at `value` of the
+    /// process device's fence (Windows only). Takes `&self` -- see
+    /// [`Tensor::set_gpu_write`](crate::Tensor::set_gpu_write).
+    #[cfg(target_os = "windows")]
+    pub fn set_gpu_write(&self, value: u64) -> crate::Result<()> {
+        dispatch!(self, set_gpu_write, value)
+    }
+
+    /// The tensor's own NT handle value -- not a duplicate -- for descriptors
+    /// whose consumer keeps the producing tensor alive (Windows only).
+    #[cfg(target_os = "windows")]
+    pub(crate) fn d3d11_shared_handle_value(&self) -> Option<usize> {
+        dispatch!(self, d3d11_shared_handle_value)
+    }
+
+    /// Wrap an existing `ID3D11Texture2D` as a type-erased tensor (Windows
+    /// only). See [`Tensor::from_d3d11_texture`](crate::Tensor::from_d3d11_texture).
+    ///
+    /// # Safety
+    ///
+    /// `texture` must be null or a live `ID3D11Texture2D` created on the HAL
+    /// device ([`crate::d3d11::device()`]).
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    pub unsafe fn from_d3d11_texture(
+        texture: *mut std::ffi::c_void,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        access: crate::CpuAccess,
+        name: Option<&str>,
+    ) -> crate::Result<Self> {
+        // SAFETY: the caller guarantees `texture` is null or a live texture on
+        // the HAL device; the typed constructor takes its own reference.
+        unsafe {
+            match dtype {
+                DType::U8 => {
+                    Tensor::<u8>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::U8)
+                }
+                DType::I8 => {
+                    Tensor::<i8>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::I8)
+                }
+                DType::U16 => {
+                    Tensor::<u16>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::U16)
+                }
+                DType::I16 => {
+                    Tensor::<i16>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::I16)
+                }
+                DType::U32 => {
+                    Tensor::<u32>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::U32)
+                }
+                DType::I32 => {
+                    Tensor::<i32>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::I32)
+                }
+                DType::U64 => {
+                    Tensor::<u64>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::U64)
+                }
+                DType::I64 => {
+                    Tensor::<i64>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::I64)
+                }
+                DType::F16 => {
+                    Tensor::<f16>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::F16)
+                }
+                DType::F32 => {
+                    Tensor::<f32>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::F32)
+                }
+                DType::F64 => {
+                    Tensor::<f64>::from_d3d11_texture(texture, width, height, format, access, name)
+                        .map(Self::F64)
+                }
+            }
+        }
+    }
+
+    /// Open a shared texture by its NT handle as a type-erased tensor (Windows
+    /// only). See
+    /// [`Tensor::from_d3d11_shared_handle`](crate::Tensor::from_d3d11_shared_handle).
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be an NT shared handle of a D3D11 texture, valid in this
+    /// process, and `completion`'s handle a shared fence handle.
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    pub unsafe fn from_d3d11_shared_handle(
+        handle: std::os::windows::io::RawHandle,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        access: crate::CpuAccess,
+        completion: Option<(std::os::windows::io::RawHandle, u64)>,
+        name: Option<&str>,
+    ) -> crate::Result<Self> {
+        // SAFETY: the caller guarantees the handles are valid in this process;
+        // the typed constructor duplicates what it keeps.
+        unsafe {
+            match dtype {
+                DType::U8 => Tensor::<u8>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::U8),
+                DType::I8 => Tensor::<i8>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::I8),
+                DType::U16 => Tensor::<u16>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::U16),
+                DType::I16 => Tensor::<i16>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::I16),
+                DType::U32 => Tensor::<u32>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::U32),
+                DType::I32 => Tensor::<i32>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::I32),
+                DType::U64 => Tensor::<u64>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::U64),
+                DType::I64 => Tensor::<i64>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::I64),
+                DType::F16 => Tensor::<f16>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::F16),
+                DType::F32 => Tensor::<f32>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::F32),
+                DType::F64 => Tensor::<f64>::from_d3d11_shared_handle(
+                    handle, width, height, format, access, completion, name,
+                )
+                .map(Self::F64),
+            }
+        }
     }
 
     /// Wrap an externally-allocated AHardwareBuffer as a type-erased
@@ -2089,6 +2392,18 @@ mod tests {
                 t.row_stride().is_none() || t.row_stride() >= Some(300),
                 "AHardwareBuffer pitch must be absent or at least the tight row"
             );
+            return;
+        }
+        // Windows' TensorMemory::DmaBuf is a D3D11 texture, whose pitch is the
+        // driver's staging row pitch (384 on the RTX 3070 for this 300-byte
+        // row) and is recorded only when it exceeds the tight row -- so, as on
+        // Android, 320 is the wrong platform's invariant.
+        if cfg!(target_os = "windows") {
+            assert!(
+                t.row_stride().is_none() || t.row_stride() >= Some(300),
+                "D3D11 staging pitch must be absent or at least the tight row"
+            );
+            assert!(t.effective_row_stride() >= Some(300));
             return;
         }
         assert_eq!(t.row_stride(), Some(320));

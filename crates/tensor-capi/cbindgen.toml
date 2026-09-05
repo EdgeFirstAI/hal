@@ -56,6 +56,18 @@ header = """
  *   - A builder, for construction, with sticky errors.
  *   - A (blob, fds) pair, for IPC. Fds travel out of band; a struct with an
  *     fd field is meaningless across a process boundary.
+ *
+ * Platform-specific entry points. Every function is declared on every
+ * platform and refuses at run time off its platform, so linking never
+ * depends on the host. The tie is stated per function with a
+ * "Platforms:" line:
+ *   - Linux:   dma-buf fds (the DMA_BUF export kind); ef_tensor_clone_fd
+ *              duplicates the fd of any Unix backing that has one
+ *   - macOS, iOS: IOSurface (ef_tensor_iosurface_ref, ef_tensor_from_iosurface_id)
+ *   - Android: AHardwareBuffer (ef_tensor_from_hardware_buffer, ef_tensor_hardware_buffer_*)
+ *   - Windows: D3D11 textures (ef_d3d11_*, ef_tensor_d3d11_*, ef_tensor_gpu_completion,
+ *              ef_tensor_gpu_write_value, ef_tensor_set_gpu_write, ef_tensor_from_d3d11_*)
+ *   - any host with a CUDA driver: ef_tensor_cuda_*
  */
 
 #include <stdarg.h>
@@ -129,6 +141,7 @@ include = [
 "EfCompression" = "ef_compression"
 "EfErrorClass" = "ef_error_class"
 "EfLogLevel" = "ef_log_level"
+"EfD3d11Layout" = "ef_d3d11_layout"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

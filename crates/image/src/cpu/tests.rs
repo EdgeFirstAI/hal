@@ -5473,4 +5473,67 @@ mod cpu_tests {
             CROP.3
         );
     }
+    /// The row-confined int8 bias -- the `I8` post-pass the G2D backend shares
+    /// with the CPU convert -- biases only the pixel bytes of each logical row.
+    /// On a pitch-padded destination the bytes between one row's pixels and the
+    /// next belong to nobody (an allocation pad) or to somebody else (a
+    /// `view()` parent's neighbouring tile), and a flat walk of the mapping
+    /// would bias them too. A tight destination is the flat walk exactly.
+    #[test]
+    fn int8_bias_rows_touches_only_the_pixel_bytes_at_the_declared_stride() {
+        use crate::cpu::{apply_int8_xor_bias, apply_int8_xor_bias_rows};
+        use edgefirst_tensor::{CpuAccess, PixelFormat, Tensor, TensorMapTrait, TensorMemory};
+
+        const W: usize = 16;
+        const H: usize = 4;
+        const POISON: u8 = 0xAB;
+        for fmt in [PixelFormat::Rgba, PixelFormat::Rgb, PixelFormat::Grey] {
+            for wide in [W, W + 8] {
+                let bpp = fmt.channels();
+                let row_bytes = W * bpp;
+                let stride = wide * bpp;
+                // Allocate at the padded width, then re-declare the logical
+                // geometry and the pitch.
+                let mut t = Tensor::<u8>::image(
+                    wide,
+                    H,
+                    fmt,
+                    Some(TensorMemory::Mem),
+                    CpuAccess::ReadWrite,
+                )
+                .unwrap();
+                t.configure_image(W, H, fmt).unwrap();
+                t.set_row_stride(stride).unwrap();
+                // A distinct byte per pixel offset, poison in the padding.
+                let mut before = vec![POISON; stride * H];
+                for y in 0..H {
+                    for i in 0..row_bytes {
+                        before[y * stride + i] = (y * 31 + i * 7) as u8;
+                    }
+                }
+                t.map_mut().unwrap().as_mut_slice().copy_from_slice(&before);
+
+                apply_int8_xor_bias_rows(&mut t, fmt).unwrap();
+
+                let after = t.map_read().unwrap().as_slice().to_vec();
+                for y in 0..H {
+                    // The flat helper on one row is the per-row oracle, alpha
+                    // skip included.
+                    let mut want = before[y * stride..y * stride + row_bytes].to_vec();
+                    apply_int8_xor_bias(&mut want, fmt);
+                    assert_eq!(
+                        &after[y * stride..y * stride + row_bytes],
+                        &want[..],
+                        "{fmt:?} at a {stride} B pitch: row {y} pixels"
+                    );
+                    assert!(
+                        after[y * stride + row_bytes..(y + 1) * stride]
+                            .iter()
+                            .all(|&b| b == POISON),
+                        "{fmt:?} at a {stride} B pitch: row {y} padding was biased"
+                    );
+                }
+            }
+        }
+    }
 }

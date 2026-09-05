@@ -68,6 +68,22 @@ pub const PLANE_RECORD_LEN: usize = 56;
 /// from us that we cannot provide, and we must refuse.
 pub const SUPPORTED_REQUIRED_MASK: u64 = 0;
 
+/// Byte offset of [`BlobHeader::pid`] inside the fixed header, as the table
+/// in the module docs assigns it. Named so nothing re-derives the layout by
+/// hand; `pid_offset_matches_the_writer` pins it to what
+/// [`BlobHeader::write_to`] actually emits.
+pub const HEADER_PID_OFFSET: usize = 28;
+
+/// Bytes a Windows D3D11 reference plane carries in
+/// [`BlobPlane::handle_bytes`]: three little-endian `u64`s, in order the
+/// texture NT handle value, the fence NT handle value and the fence value of
+/// the last recorded GPU write.
+///
+/// Not a `required_mask` bit: a plane's `handle_bytes` length is already part
+/// of its record, and a consumer that does not understand a D3D11 reference
+/// refuses it on the storage kind rather than on the byte count.
+pub const D3D11_HANDLE_BYTES: usize = 24;
+
 /// File-descriptor slot in the blob's accompanying table.
 ///
 /// `std::os::fd` exists only on Unix. Windows still type-checks `export` /
@@ -150,8 +166,18 @@ pub struct BlobHeader {
     pub planes_bytes: u64,
     /// Backing store for the whole tensor; the shared `TensorMemory` code.
     pub storage_kind: u32,
-    /// Producer pid, for `pidfd_open`/`pidfd_getfd`. Zero when all planes are
-    /// inlined, where there is no handle to reopen.
+    /// Producer pid, for `pidfd_open`/`pidfd_getfd` and, on Windows, for
+    /// `OpenProcess(PROCESS_DUP_HANDLE)`. Zero when all planes are inlined,
+    /// where there is no handle to reopen.
+    ///
+    /// **Trust boundary.** This value and the handle values beside it come
+    /// out of the blob, so a hostile one makes an importer probe a pid it
+    /// chose and a handle slot in that process. That is the whole of what it
+    /// buys: the import asks for `PROCESS_DUP_HANDLE` alone, and hands the
+    /// duplicate only to `OpenSharedResource1` / `OpenSharedFence`, which
+    /// refuse anything that is not a shareable D3D11 object. Nothing here
+    /// makes a blob safe to accept from an untrusted peer -- import blobs
+    /// from peers you would already hand a texture to.
     pub pid: u32,
     /// Acquire fence, or `-1` for none. Per-tensor, never per-plane.
     pub fence_fd: i32,
@@ -563,6 +589,13 @@ pub struct BlobPlane<'a> {
     /// Indices also let planes share a descriptor: NV12's luma and chroma
     /// commonly live in one dma-buf at different offsets, and both planes then
     /// carry index 0 while the table holds a single fd.
+    ///
+    /// Windows has no fd table: a D3D11 texture is shared by NT handle, which
+    /// is a value in the *exporting process's* handle table rather than a
+    /// descriptor an out-of-band table can carry. Such a plane carries index
+    /// `0` over an empty table — non-negative, so the record is still a
+    /// reference and not an inline one — and its handles live in
+    /// [`Self::handle_bytes`].
     pub handle: i64,
     /// Byte offset of this plane within the handle; ignored when inline.
     pub offset: u64,
@@ -576,7 +609,16 @@ pub struct BlobPlane<'a> {
     /// non-zero value must refuse, not read the plane as linear.
     pub modifier: u64,
     /// Opaque handle for backends whose handle is not an integer (a
-    /// `cudaIpcMemHandle_t` is 64 bytes). Empty for every storage kind today.
+    /// `cudaIpcMemHandle_t` is 64 bytes), or whose handle does not travel in
+    /// the fd table at all.
+    ///
+    /// Windows D3D11 textures are the one storage kind that fills this in
+    /// today: [`D3D11_HANDLE_BYTES`] bytes holding the texture's NT handle
+    /// value, the process device fence's NT handle value and the fence value
+    /// of the producer's last recorded GPU write, each a little-endian `u64`.
+    /// All three are values in the exporting process's handle table, which is
+    /// why the header's [`BlobHeader::pid`] is what makes them reachable --
+    /// and why that field documents the trust boundary they share.
     pub handle_bytes: &'a [u8],
     /// Inlined plane bytes; non-empty only when `handle == -1`.
     pub data: &'a [u8],
@@ -763,6 +805,12 @@ impl<'a> BlobView<'a> {
 /// the fds in the table are the source tensor's own, valid only while it lives;
 /// `dup` happens on import, never here. That is what makes export cheap and
 /// removes any keepalive protocol between producer and consumer.
+///
+/// On Windows the table is empty and each plane carries
+/// [`D3D11_HANDLE_BYTES`] instead: the texture's NT handle value, the process
+/// device fence's, and the last recorded GPU write. Those are borrowed on the
+/// same terms -- they are handle-table entries of *this* process, which the
+/// header's [`pid`](BlobHeader::pid) is what lets an importer reach.
 pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u8>, Vec<BlobFd>)> {
     let fmt = t.format();
     // The addressing grid, not the allocation: for a subsampled format these
@@ -808,21 +856,38 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
     // The fd table. Planes sharing one descriptor (NV12 luma + chroma in a
     // single dma-buf) must share one entry, or the receiver would dup the same
     // buffer twice and the offsets would no longer refer to one allocation.
-    let mut fds: Vec<BlobFd> = Vec::new();
-    let handle: i64 = match mode {
-        TransportMode::Inline => -1,
+    let (handle, handle_bytes, fds): (i64, Vec<u8>, Vec<BlobFd>) = match mode {
+        TransportMode::Inline => (-1, Vec::new(), Vec::new()),
         TransportMode::Reference => {
             let raw = reference_handle(t)?;
-            let raw = i32::try_from(raw).map_err(|_| {
-                crate::Error::InvalidOperation("handle is not representable as an fd".into())
-            })?;
-            fds.push(raw);
-            0 // index into `fds`, never the fd itself
+            #[cfg(target_os = "windows")]
+            {
+                // The table stays empty: an NT handle is not a file
+                // descriptor and does not travel out of band, so the handle
+                // values ride in the record and the importer duplicates them
+                // out of the pid the header carries.
+                (0, reference_handle_bytes(t, raw), Vec::new())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let raw = i32::try_from(raw).map_err(|_| {
+                    crate::Error::InvalidOperation("handle is not representable as an fd".into())
+                })?;
+                // `handle` is an index into `fds`, never the fd itself.
+                (0, Vec::new(), vec![raw])
+            }
         }
     };
 
     let mut planes_buf = Vec::new();
-    write_export_planes(&geoms, mode, handle, all_bytes, &mut planes_buf)?;
+    write_export_planes(
+        &geoms,
+        mode,
+        handle,
+        &handle_bytes,
+        all_bytes,
+        &mut planes_buf,
+    )?;
 
     let strings_bytes = strings_encoded_len(&strings);
     let header = BlobHeader {
@@ -937,6 +1002,7 @@ fn write_export_planes(
     geoms: &[crate::PlaneGeometry],
     mode: TransportMode,
     handle: i64,
+    handle_bytes: &[u8],
     all_bytes: &[u8],
     planes_buf: &mut Vec<u8>,
 ) -> crate::Result<()> {
@@ -976,7 +1042,11 @@ fn write_export_planes(
                     g.size
                 },
                 modifier: 0,
-                handle_bytes: &[],
+                // Every plane carries the same bytes, for the same reason
+                // every plane carries the same fd index: they name one
+                // allocation, and the plane table already says where each
+                // one starts inside it.
+                handle_bytes,
                 data,
             },
             planes_buf,
@@ -1039,12 +1109,70 @@ fn reference_handle(t: &crate::TensorDyn) -> crate::Result<i64> {
             .iosurface_id()
             .map(|id| id as i64)
             .ok_or_else(|| crate::Error::InvalidOperation("IOSurface tensor has no id".into())),
+        // The tensor's own NT handle value, not a duplicate: export borrows,
+        // so the value is valid exactly as long as the source tensor is, and
+        // a duplicate made here would have nowhere to be closed. The importer
+        // duplicates instead -- out of this process, by pid.
+        #[cfg(target_os = "windows")]
+        crate::TensorMemory::DmaBuf => {
+            t.d3d11_shared_handle_value()
+                .map(|h| h as i64)
+                .ok_or_else(|| {
+                    crate::Error::InvalidOperation(
+                        "D3D11 texture tensor has no shared handle".into(),
+                    )
+                })
+        }
         // `mem` and `pbo` have no shareable handle at all. Refusing beats
         // silently inlining: the caller asked for a reference and would
         // otherwise receive a copy without being told.
         other => Err(crate::Error::InvalidOperation(format!(
             "{other:?} has no shareable handle; export it with TransportMode::Inline"
         ))),
+    }
+}
+
+/// The [`D3D11_HANDLE_BYTES`] a Windows reference plane carries: the
+/// texture's NT handle value (`raw`), the process device fence's, and the
+/// fence value of the last recorded GPU write.
+///
+/// A device with no fence -- or one whose fence is private to this copy
+/// rather than the process-shared one, whose values another copy's recorded
+/// write is not comparable with -- contributes a zero handle **and a zero
+/// value**, so the import builds no completion. That is the same answer a
+/// tensor with no recorded write gives: nothing to wait on.
+///
+/// The value has to go with the handle. `import` refuses a value with no
+/// fence beside it -- a completion nobody can wait on -- so exporting the
+/// recorded value on its own would make a degraded copy's blobs unimportable
+/// rather than completion-less.
+#[cfg(target_os = "windows")]
+fn reference_handle_bytes(t: &crate::TensorDyn, raw: i64) -> Vec<u8> {
+    let fence = crate::d3d11::device()
+        .map(|d| d.exported_fence_handle_value())
+        .unwrap_or(0);
+    let (fence, value) = reference_completion(fence, t.gpu_write_value());
+    let mut out = Vec::with_capacity(D3D11_HANDLE_BYTES);
+    out.extend_from_slice(&(raw as u64).to_le_bytes());
+    out.extend_from_slice(&fence.to_le_bytes());
+    out.extend_from_slice(&value.to_le_bytes());
+    out
+}
+
+/// The `(fence handle, fence value)` pair a reference plane carries, given
+/// what the device is willing to export and what the tensor recorded.
+///
+/// One rule, in one place, because the importer enforces its other half: a
+/// value with no fence beside it is refused outright (a completion nobody can
+/// wait on), so a copy that exports no handle -- no fence at all, or a private
+/// one whose values no other copy can compare with -- must drop the value with
+/// it. A handle with a zero value is fine and means "nothing recorded yet".
+#[cfg(target_os = "windows")]
+fn reference_completion(fence: usize, recorded: u64) -> (u64, u64) {
+    if fence == 0 {
+        (0, 0)
+    } else {
+        (fence as u64, recorded)
     }
 }
 
@@ -1055,7 +1183,15 @@ fn reference_handle(t: &crate::TensorDyn) -> crate::Result<i64> {
 /// allocation holding a copy of the carried bytes.
 ///
 /// `fds` is the table that travelled beside the blob; a reference-mode plane's
-/// `handle` indexes into it. Pass an empty slice for an inline blob.
+/// `handle` indexes into it. Pass an empty slice for an inline blob, and on
+/// Windows for a reference-mode one too: a D3D11 texture is named by the NT
+/// handle values in the plane's [`BlobPlane::handle_bytes`], and this
+/// duplicates them out of the exporting process (the header's
+/// [`pid`](BlobHeader::pid)) with `OpenProcess(PROCESS_DUP_HANDLE)` when that
+/// is not this process. The duplication is what makes the import independent
+/// there, exactly as `dup` does on Unix. Both the pid and the handle values
+/// are blob fields, so a hostile blob can steer that probe -- see
+/// [`BlobHeader::pid`] for what it can and cannot reach.
 ///
 /// `blob` is untrusted: it may come from another wheel, another process, or a
 /// network. Every length has already been bounded by [`BlobView::parse`]; this
@@ -1090,10 +1226,14 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
     };
 
     if !inline {
-        #[cfg(not(unix))]
+        #[cfg(target_os = "windows")]
+        {
+            return import_referenced_d3d11_blob(&v, &h, &planes, format, &strings, dtype);
+        }
+        #[cfg(not(any(unix, target_os = "windows")))]
         {
             return Err(crate::Error::NotImplemented(
-                "reference-mode blob import is Unix-only".into(),
+                "reference-mode blob import is not available on this platform".into(),
             ));
         }
         #[cfg(unix)]
@@ -1275,6 +1415,271 @@ fn open_referenced_tensor(
     }
 }
 
+/// The Windows sibling of [`import_referenced_blob`]: a D3D11 texture named by
+/// the NT handle values in the first plane's
+/// [`handle_bytes`](BlobPlane::handle_bytes), reachable through the header's
+/// pid.
+///
+/// No fd table is consulted -- there is none on Windows -- so the plane
+/// `handle` is only ever read as "this record is a reference", which
+/// [`BlobPlane::is_inline`] has already decided.
+#[cfg(target_os = "windows")]
+fn import_referenced_d3d11_blob(
+    v: &BlobView<'_>,
+    h: &BlobHeader,
+    planes: &[BlobPlane<'_>],
+    format: Option<crate::PixelFormat>,
+    strings: &BlobStrings<'_>,
+    dtype: crate::DType,
+) -> crate::Result<crate::TensorDyn> {
+    let first = planes
+        .first()
+        .ok_or_else(|| crate::Error::InvalidArgument("referenced blob carries no planes".into()))?;
+    // Every plane must name the same texture, exactly as every Unix plane
+    // must index the same fd: the planes describe one allocation and the
+    // plane table already says where each starts inside it, so a blob whose
+    // planes disagree about which object that is has no coherent reading.
+    // Checked over all of them, not just the one the open uses, because the
+    // disagreement is the corruption.
+    for p in planes {
+        if p.handle != 0 || p.handle_bytes != first.handle_bytes {
+            return Err(crate::Error::InvalidArgument(
+                "D3D11 reference blob planes must all carry handle 0 and identical \
+                 handle bytes; they name one texture"
+                    .into(),
+            ));
+        }
+    }
+    // The blob's own grid, not an allocation shape derived from it: this is
+    // the shape hint the geometry check wants, and a semi-planar texture's
+    // image width can only come from a shape (the texture is as wide as the
+    // driver's row pitch).
+    let grid: Vec<usize> = v.shape().iter().map(|d| *d as usize).collect();
+    let mut t = open_referenced_texture(h.storage_kind, first, h.pid, &grid, dtype, format)?;
+    // The producer's `stride` is deliberately not restored. A texture import
+    // has a pitch of its own -- `from_d3d11_shared_handle` records the one
+    // this device's staging copy reports -- and the producer's is a fact
+    // about the producer's driver, not about the texture as this process
+    // sees it. The descriptor path makes the same exclusion for the same
+    // reason (`restore_imported_row_stride` is `HOST | DMABUF` only).
+    t.set_colorimetry(colorimetry_from(strings));
+    Ok(t)
+}
+
+/// Open the D3D11 texture a reference-mode plane names, duplicating both NT
+/// handles out of the exporting process when that is not this one.
+///
+/// The handle values are the exporting process's, so in the same process (a
+/// second module of one wheel, or the export-then-import round trip a test
+/// makes) they are usable as they stand -- one handle table. Across processes
+/// they are duplicated through a `PROCESS_DUP_HANDLE` handle on the exporter,
+/// which is what the header's pid is carried for.
+///
+/// The tensor lands on the format's *allocation* shape, exactly as the Unix
+/// arm does: [`export`] writes the addressing shape for every image, so the
+/// producer's own `shape()` is not recoverable from the blob and picking the
+/// addressing spelling here would make one blob import at two different
+/// shapes depending on the platform.
+#[cfg(target_os = "windows")]
+fn open_referenced_texture(
+    storage_kind: u32,
+    first: &BlobPlane<'_>,
+    pid: u32,
+    grid: &[usize],
+    dtype: crate::DType,
+    format: Option<crate::PixelFormat>,
+) -> crate::Result<crate::TensorDyn> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_DUP_HANDLE};
+
+    if storage_kind != crate::TensorMemory::DmaBuf.code() {
+        return Err(crate::Error::InvalidArgument(format!(
+            "storage kind {storage_kind} is not referenceable on Windows"
+        )));
+    }
+    if first.handle_bytes.len() != D3D11_HANDLE_BYTES {
+        return Err(crate::Error::InvalidArgument(format!(
+            "D3D11 reference plane needs {D3D11_HANDLE_BYTES} handle bytes, not {}",
+            first.handle_bytes.len()
+        )));
+    }
+    let format = format.ok_or_else(|| {
+        crate::Error::InvalidArgument("D3D11 reference blob without a pixel format".into())
+    })?;
+    let word = |i: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&first.handle_bytes[i * 8..(i + 1) * 8]);
+        u64::from_le_bytes(b)
+    };
+    let handle_at = |i: usize| HANDLE(word(i) as usize as *mut std::ffi::c_void);
+    let (mut tex, mut fence, value) = (handle_at(0), handle_at(1), word(2));
+    if tex.is_invalid() {
+        return Err(crate::Error::InvalidArgument(
+            "D3D11 reference plane carries no texture handle".into(),
+        ));
+    }
+    // The same refusal the descriptor path makes: a fence value with no fence
+    // to read it on names a completion nobody can wait on, and importing
+    // anyway would alias a texture the producer's device may still be writing.
+    // The other way round is not an error -- a zero value means nothing was
+    // recorded, so a fence handle beside it is simply unused.
+    if fence.is_invalid() && value != 0 {
+        return Err(crate::Error::InvalidArgument(format!(
+            "D3D11 reference plane names fence value {value} with no fence handle; \
+             the completion it names cannot be waited on"
+        )));
+    }
+
+    // Duplicates this import owns, closed by `OwnedHandle` on every path --
+    // including a panic between the duplication and the constructor. Empty in
+    // the same process, where the values are already this process's own.
+    let mut duplicates: Vec<OwnedHandle> = Vec::new();
+    if std::process::id() != pid {
+        // SAFETY: documented call. `pid` came out of the blob, so it may name
+        // a process this token cannot reach or one that no longer exists;
+        // both fail rather than returning a handle.
+        let src = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
+            .map_err(|e| open_process_error(pid, &e))?;
+        // SAFETY: `OpenProcess` returned a live handle this scope owns; the
+        // wrapper is what closes it.
+        let src = unsafe { OwnedHandle::from_raw_handle(src.0) };
+        for (h, which) in [(&mut tex, "texture"), (&mut fence, "fence")] {
+            if h.is_invalid() {
+                continue;
+            }
+            let dup = duplicate_out_of(&src, *h, pid, which)?;
+            *h = HANDLE(dup.as_raw_handle());
+            duplicates.push(dup);
+        }
+    }
+
+    // SAFETY: `tex` is a shared NT texture handle valid in this process --
+    // the exporter's own value in the same process, a duplicate otherwise.
+    // The helper opens its own texture and drops it on return.
+    let geometry = unsafe { crate::protocol::d3d11_geometry_checked(format, tex.0, grid) };
+    // A fence value of 0 is "nothing recorded", so there is nothing to wait on
+    // even when the device published a fence handle.
+    let completion = (value != 0).then_some((fence.0, value));
+    let opened = match geometry {
+        // SAFETY: both handles are valid in this process, as above, and the
+        // constructor duplicates what it keeps rather than adopting them.
+        Ok((width, height)) => unsafe {
+            crate::TensorDyn::from_d3d11_shared_handle(
+                tex.0,
+                width,
+                height,
+                format,
+                dtype,
+                crate::CpuAccess::ReadWrite,
+                completion,
+                None,
+            )
+        },
+        Err(e) => Err(e),
+    };
+    // The constructor duplicated what it keeps, so whatever was duplicated
+    // here is a temporary; this is where it closes.
+    drop(duplicates);
+    opened
+}
+
+/// The `ErrorKind` a Win32 failure maps to, by the code the call itself
+/// reported rather than a re-read of the thread's last error that any cleanup
+/// call in between can overwrite.
+///
+/// Spec section 8 names `EACCES` for the cross-process import, and both halves
+/// of it can be denied: the `OpenProcess` that reaches the exporting process,
+/// and the `DuplicateHandle` that takes a handle out of it.
+/// `PermissionDenied` is what the C ABI turns into that errno.
+#[cfg(target_os = "windows")]
+fn win32_error_kind(e: &windows::core::Error) -> std::io::ErrorKind {
+    use std::io::ErrorKind;
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+    let code = e.code();
+    if code == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        ErrorKind::PermissionDenied
+    } else if code == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) {
+        // What Windows answers for a pid no process holds: the blob outlived
+        // its producer, or never named a real one. A handle value the named
+        // process does not have answers `ERROR_INVALID_HANDLE` instead, which
+        // falls to `Other` below -- the message carries the code either way.
+        ErrorKind::NotFound
+    } else {
+        ErrorKind::Other
+    }
+}
+
+/// Map an `OpenProcess` failure onto the crate error.
+#[cfg(target_os = "windows")]
+fn open_process_error(pid: u32, e: &windows::core::Error) -> crate::Error {
+    use std::io::ErrorKind;
+
+    let kind = win32_error_kind(e);
+    let what = match kind {
+        ErrorKind::PermissionDenied => {
+            format!("cannot open exporting process {pid} to duplicate its handles: access denied")
+        }
+        ErrorKind::NotFound => format!("exporting process {pid} is gone"),
+        _ => format!(
+            "cannot open exporting process {pid} to duplicate its handles: {} \
+             (HRESULT 0x{:08X})",
+            e.message(),
+            e.code().0 as u32
+        ),
+    };
+    crate::Error::IoError(std::io::Error::new(kind, what))
+}
+
+/// One `DuplicateHandle` out of `src`, as an owned handle. `which` names the
+/// handle in the error: a blob carries two, and they fail for different
+/// reasons.
+#[cfg(target_os = "windows")]
+fn duplicate_out_of(
+    src: &std::os::windows::io::OwnedHandle,
+    handle: windows::Win32::Foundation::HANDLE,
+    pid: u32,
+    which: &str,
+) -> crate::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut out = HANDLE(std::ptr::null_mut());
+    // SAFETY: `src` is a live process handle opened for PROCESS_DUP_HANDLE,
+    // `handle` is a value in that process, and `out` is a valid local.
+    unsafe {
+        DuplicateHandle(
+            HANDLE(src.as_raw_handle()),
+            handle,
+            GetCurrentProcess(),
+            &mut out,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .map_err(|e| {
+        // The same mapping `open_process_error` uses: this is the other half
+        // of one operation, and a denied duplication is as much the `EACCES`
+        // case spec section 8 names as a denied `OpenProcess` is.
+        crate::Error::IoError(std::io::Error::new(
+            win32_error_kind(&e),
+            format!(
+                "cannot duplicate the {which} handle out of exporting process {pid}: {} \
+                 (HRESULT 0x{:08X})",
+                e.message(),
+                e.code().0 as u32
+            ),
+        ))
+    })?;
+    // SAFETY: `DuplicateHandle` succeeded, so `out` is a live handle this
+    // process owns.
+    Ok(unsafe { OwnedHandle::from_raw_handle(out.0) })
+}
+
 fn blit_inline_planes(
     t: &mut crate::TensorDyn,
     planes: &[BlobPlane<'_>],
@@ -1376,6 +1781,21 @@ fn dims_from_grid(f: crate::PixelFormat, grid: &[usize]) -> crate::Result<(usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The half of the completion contract the exporter owns: a copy that
+    /// exports no fence handle must export no value either, because `import`
+    /// refuses that pair outright -- a degraded copy's blobs would be
+    /// unimportable rather than merely completion-less.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_reference_plane_drops_the_value_with_the_fence() {
+        assert_eq!(super::reference_completion(0, 42), (0, 0));
+        assert_eq!(super::reference_completion(0, 0), (0, 0));
+        // A handle with nothing recorded is a legitimate pair: the importer
+        // reads a zero value as "nothing to wait on".
+        assert_eq!(super::reference_completion(0x1234, 0), (0x1234, 0));
+        assert_eq!(super::reference_completion(0x1234, 42), (0x1234, 42));
+    }
 
     #[test]
     fn every_region_offset_is_constant_time_arithmetic() {
@@ -1485,22 +1905,39 @@ mod tests {
 
     /// Fill a tensor's bytes with a recognisable ramp so a content comparison
     /// can actually fail. An all-zero buffer round-trips through almost any bug.
+    ///
+    /// Bracketed with the coherency pair, which is free on `Mem` and one ioctl
+    /// on a dma-buf but load-bearing for a D3D11 texture: the pin is a host
+    /// shadow buffer there, so nothing written through it reaches the texture
+    /// until the upload.
     fn fill_ramp(t: &TensorDyn) {
         let pin = t.pin_host(CpuAccess::ReadWrite).expect("pin");
+        t.sync_for_cpu(CpuAccess::ReadWrite).expect("sync for cpu");
+        // SAFETY: the pin holds `pin.len()` writable bytes live for its own
+        // lifetime, and this test is their only holder -- no map guard is
+        // open and no device work is in flight across the two syncs.
         let s = unsafe { std::slice::from_raw_parts_mut(pin.as_mut_ptr(), pin.len()) };
         for (i, b) in s.iter_mut().enumerate() {
             *b = (i % 251) as u8;
         }
+        t.sync_for_device(CpuAccess::ReadWrite)
+            .expect("sync for device");
     }
 
     fn bytes_of(t: &TensorDyn) -> Vec<u8> {
         let pin = t.pin_host(CpuAccess::Read).expect("pin");
-        unsafe { std::slice::from_raw_parts(pin.as_mut_ptr(), pin.len()) }.to_vec()
+        t.sync_for_cpu(CpuAccess::Read).expect("sync for cpu");
+        // SAFETY: as in `fill_ramp`; the pin holds `pin.len()` readable bytes
+        // live and `sync_for_cpu` has just refreshed them.
+        let bytes = unsafe { std::slice::from_raw_parts(pin.as_mut_ptr(), pin.len()) }.to_vec();
+        t.sync_for_device(CpuAccess::Read).expect("sync for device");
+        bytes
     }
 
     /// A reference-capable tensor, or `None` on a host that has no shareable
     /// backing (no dma-heap, or one this user cannot open).
     fn reference_capable(w: usize, h: usize) -> Option<TensorDyn> {
+        use std::io::Write;
         match Tensor::<u8>::image(
             w,
             h,
@@ -1510,7 +1947,6 @@ mod tests {
         ) {
             Ok(t) => Some(TensorDyn::from(t)),
             Err(e) => {
-                use std::io::Write;
                 let _ = writeln!(
                     std::io::stderr(),
                     "SKIP: no shareable backing on this host ({e:?}); \
@@ -1529,20 +1965,33 @@ mod tests {
         let (blob, fds) = export(&src, TransportMode::Reference).unwrap();
         let v = BlobView::parse(&blob).unwrap();
         let planes = v.planes().unwrap();
-        assert!(!fds.is_empty(), "reference mode must carry an fd table");
         for p in &planes {
             assert!(!p.is_inline());
-            assert!(
-                (p.handle as usize) < fds.len(),
-                "handle {} must index the {}-entry fd table, not be a raw fd",
-                p.handle,
-                fds.len()
-            );
         }
-        // NV12's two planes share one allocation, so they share one table entry
-        // -- duplicating it would make the receiver dup the same buffer twice
-        // and the offsets would stop referring to one buffer.
-        assert_eq!(fds.len(), 1, "planes sharing a buffer share a table entry");
+        if cfg!(target_os = "windows") {
+            // A D3D11 texture is shared by NT handle, a value in this
+            // process's handle table rather than a descriptor an out-of-band
+            // table can carry, so the table is empty and every plane carries
+            // the same handle bytes.
+            assert!(fds.is_empty(), "an NT handle does not travel out of band");
+            assert!(planes
+                .iter()
+                .all(|p| p.handle_bytes.len() == D3D11_HANDLE_BYTES));
+        } else {
+            assert!(!fds.is_empty(), "reference mode must carry an fd table");
+            for p in &planes {
+                assert!(
+                    (p.handle as usize) < fds.len(),
+                    "handle {} must index the {}-entry fd table, not be a raw fd",
+                    p.handle,
+                    fds.len()
+                );
+            }
+            // NV12's two planes share one allocation, so they share one table
+            // entry -- duplicating it would make the receiver dup the same
+            // buffer twice and the offsets would stop referring to one buffer.
+            assert_eq!(fds.len(), 1, "planes sharing a buffer share a table entry");
+        }
         assert!(planes.iter().all(|p| p.handle == 0));
     }
 
@@ -1562,11 +2011,21 @@ mod tests {
         // preserves the underlying object, so derived identity survives the
         // round trip -- which is also what lets the GL import cache hit on a
         // tensor that arrived from another process.
-        assert_eq!(
-            got.buffer_identity().id(),
-            src_id,
-            "reference mode must share the buffer, not copy it"
-        );
+        //
+        // Windows shares the same buffer but cannot say so through the
+        // identity: every texture tensor keys on its own `ID3D11Texture2D*`,
+        // and `OpenSharedResource1` mints a fresh object per open, so an
+        // import never compares equal to what it was exported from
+        // (`IdentityKind::D3d11Texture` says why a handle value would be the
+        // unsound alternative). The byte comparison below is what carries the
+        // property there.
+        if !cfg!(target_os = "windows") {
+            assert_eq!(
+                got.buffer_identity().id(),
+                src_id,
+                "reference mode must share the buffer, not copy it"
+            );
+        }
 
         // Import dups, so dropping the producer must not invalidate the import.
         drop(src);
@@ -1586,17 +2045,141 @@ mod tests {
             return;
         };
         let (blob, fds) = export(&src, TransportMode::Reference).unwrap();
+        if cfg!(target_os = "windows") {
+            // There is no fd table to index there. What arrives untrusted
+            // instead is the pid and the two handle values, and neither may
+            // be taken on faith: one names a process whose handle table this
+            // import reaches into, the other is opened as a texture.
+            let err = import(&patch_handle_word(&blob, 0, 0), &[])
+                .expect_err("a null texture handle must be refused, not opened");
+            assert!(
+                matches!(err, crate::Error::InvalidArgument(_)),
+                "expected InvalidArgument, got {err:?}"
+            );
+
+            // A fence value with no fence handle to read it on: the same
+            // refusal the descriptor path makes for a completion nobody can
+            // wait on. Both words are patched, since an exported tensor with
+            // no recorded write carries value 0, where a missing fence handle
+            // is simply unused.
+            let named = patch_handle_word(&patch_handle_word(&blob, 1, 0), 2, 7);
+            let err = import(&named, &[])
+                .expect_err("a fence value with no fence handle must be refused");
+            let msg = format!("{err}");
+            assert!(
+                matches!(err, crate::Error::InvalidArgument(_))
+                    && msg.contains("cannot be waited on"),
+                "expected the unwaitable-completion refusal, got {err:?}"
+            );
+
+            // A pid that does not exist: the import must fail to open it
+            // rather than falling back on this process's handle table.
+            let mut tampered = blob.clone();
+            tampered[HEADER_PID_OFFSET..HEADER_PID_OFFSET + 4]
+                .copy_from_slice(&u32::MAX.to_le_bytes());
+            let err =
+                import(&tampered, &[]).expect_err("a pid that does not exist must be refused");
+            match &err {
+                crate::Error::IoError(e) => assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "a pid no process holds is reported as gone, got {e:?}"
+                ),
+                other => panic!("expected IoError, got {other:?}"),
+            }
+            return;
+        }
+        let r = region_offsets(&BlobView::parse(&blob).unwrap().header()).unwrap();
         assert!(
             import(&blob, &[]).is_err(),
             "an empty table cannot satisfy an index"
         );
         let mut tampered = blob.clone();
-        let r = region_offsets(&BlobView::parse(&blob).unwrap().header()).unwrap();
         tampered[r.planes..r.planes + 8].copy_from_slice(&99i64.to_le_bytes());
         assert!(
             import(&tampered, &fds).is_err(),
             "an out-of-range index must be refused, not read"
         );
+    }
+
+    /// A copy of `blob` with one of the three handle words rewritten in
+    /// *every* plane, so the tampering under test is the refusal that fires
+    /// rather than the planes-disagree one.
+    ///
+    /// Every reference plane record is the same length -- the scalar block
+    /// plus [`D3D11_HANDLE_BYTES`], padded to 8 -- which is what makes the
+    /// stride computable without re-parsing.
+    ///
+    /// Compiled everywhere, because the Windows branch that calls it is a
+    /// `cfg!` arm rather than a `#[cfg]` one.
+    fn patch_handle_word(blob: &[u8], word: usize, value: u64) -> Vec<u8> {
+        let v = BlobView::parse(blob).unwrap();
+        let r = region_offsets(&v.header()).unwrap();
+        let stride = (PLANE_RECORD_LEN + D3D11_HANDLE_BYTES).next_multiple_of(8);
+        let mut out = blob.to_vec();
+        for i in 0..v.header().plane_count as usize {
+            let at = r.planes + i * stride + PLANE_RECORD_LEN + word * 8;
+            out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    /// A handle value that is neither null nor a shared texture. The
+    /// constructor must refuse it: the blob is untrusted input, and the one
+    /// thing this import may not do is hand an arbitrary handle to the driver
+    /// and carry on.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_garbage_texture_handle_is_refused_by_the_constructor() {
+        let Some(src) = reference_capable(64, 48) else {
+            return;
+        };
+        let (blob, _) = export(&src, TransportMode::Reference).unwrap();
+        let err = import(&patch_handle_word(&blob, 0, 0x1234), &[])
+            .expect_err("a handle that is not a shared texture must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("OpenSharedResource"),
+            "the refusal must come from opening the handle, got: {msg}"
+        );
+    }
+
+    /// The planes of one reference blob name one texture. A blob whose planes
+    /// disagree is refused rather than read through the first of them.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn planes_that_disagree_about_the_texture_are_refused() {
+        let Some(src) = reference_capable(64, 48) else {
+            return;
+        };
+        let (blob, _) = export(&src, TransportMode::Reference).unwrap();
+        let v = BlobView::parse(&blob).unwrap();
+        let r = region_offsets(&v.header()).unwrap();
+        assert_eq!(v.planes().unwrap().len(), 2, "NV12 exports two planes");
+        // The second record starts one padded record after the first.
+        let second = r.planes + (PLANE_RECORD_LEN + D3D11_HANDLE_BYTES).next_multiple_of(8);
+        let mut tampered = blob.clone();
+        tampered[second + PLANE_RECORD_LEN..second + PLANE_RECORD_LEN + 8]
+            .copy_from_slice(&0xBEEFu64.to_le_bytes());
+        let err = import(&tampered, &[]).expect_err("planes naming two textures must be refused");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, crate::Error::InvalidArgument(_)) && msg.contains("one texture"),
+            "expected the one-texture refusal, got {err:?}"
+        );
+    }
+
+    /// The pid offset the tamper test writes at is the one the writer emits.
+    #[test]
+    fn pid_offset_matches_the_writer() {
+        let h = BlobHeader {
+            size: HEADER_LEN as u64,
+            pid: 0x0BAD_F00D,
+            ..BlobHeader::empty()
+        };
+        let mut buf = vec![0u8; HEADER_LEN];
+        h.write_to(&mut buf);
+        assert_eq!(rd_u32(&buf, HEADER_PID_OFFSET), h.pid);
     }
 
     #[test]

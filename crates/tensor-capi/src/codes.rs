@@ -17,15 +17,34 @@
 use edgefirst_tensor::{CompressionScheme, DType, TensorMemory};
 pub use edgefirst_tensor_abi::{EfCompression, EfCpuAccess, EfDtype, EfStorageKind};
 
-/// Wire code -> validated Rust access. `None` (0) and unknown codes are not
-/// mappable directions: the wire rule says validate the integer, never
+/// Wire code -> validated *map direction*. `None` (0) and unknown codes are
+/// not mappable directions: the wire rule says validate the integer, never
 /// materialize an enum from it.
+///
+/// For the constructors, which take `access` as a *declaration* of what CPU
+/// access to provision rather than as a direction to map in, use
+/// [`declared_cpu_access_from_code`]: `EF_CPU_ACCESS_NONE` is a legitimate
+/// answer there and a nonsensical one here.
 pub fn cpu_access_from_code(code: u32) -> Option<edgefirst_tensor::CpuAccess> {
     match code {
         1 => Some(edgefirst_tensor::CpuAccess::Read),
         2 => Some(edgefirst_tensor::CpuAccess::Write),
         3 => Some(edgefirst_tensor::CpuAccess::ReadWrite),
         _ => None,
+    }
+}
+
+/// Wire code -> validated Rust access, for an allocation or wrap request.
+///
+/// The same mapping `ef_tensor_image_desc_set_access` uses, `None` (0)
+/// included: "no CPU access at all" is what a caller wrapping a texture it
+/// will only ever touch from the GPU asks for, and it is what the Python
+/// constructors default to. Refusing it would cost that caller a staging
+/// texture it never reads.
+pub fn declared_cpu_access_from_code(code: u32) -> Option<edgefirst_tensor::CpuAccess> {
+    match code {
+        0 => Some(edgefirst_tensor::CpuAccess::None),
+        _ => cpu_access_from_code(code),
     }
 }
 

@@ -228,6 +228,47 @@ pub struct EfViewOrigin {
     pub has_origin: u32,
 }
 
+/// The D3D11 texture behind a Windows texture tensor.
+///
+/// The scalar block `ef_tensor_d3d11_layout` fills, the same shape as
+/// `ef_tensor_plane` and `ef_tensor_view_origin` -- one library reading a
+/// tensor it did not mint. Mirrors `edgefirst_tensor::d3d11_layout::
+/// D3d11ImageLayout`.
+///
+/// The dimensions are the texture's, in texels and rows, not the image's in
+/// pixels: a semi-planar image is one texture whose row count covers both
+/// planes, and a YUYV image is one texel per two pixels, so
+/// `texture_width`/`texture_height` do not match `ef_tensor_shape` for
+/// either. Read the image's own dimensions from the shape.
+///
+/// For a semi-planar format (`nv12`, `nv16`, `nv24`) `texture_width` is the
+/// driver's row pitch -- at least `even(width)`, and on a discrete adapter
+/// commonly more (128 bytes on NVIDIA, so a 64-wide NV12 image is a 128-wide
+/// texture). It is the pitch the combined plane's rows are spaced by and the
+/// width a sampler must address the texture at. Never derive it from the
+/// image width: read this field, or `ef_tensor_row_stride`, which carries the
+/// same number.
+///
+/// By-value and frozen forever: a consumer bakes this size and these offsets
+/// into its call sites, so the struct evolves by a suffixed successor, never
+/// by an in-place edit. `d3d11_layout_is_pinned` and the C golden in
+/// `tensor-capi/tests/c/test_layout_goldens.c` hold both sides to it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EfD3d11Layout {
+    /// `DXGI_FORMAT` the texture was created with.
+    pub dxgi_format: u32,
+    /// Texture width in texels.
+    pub texture_width: u32,
+    /// Texture height in rows.
+    pub texture_height: u32,
+    /// Bytes per texel of `dxgi_format`.
+    pub bytes_per_texel: u32,
+    /// The GL internal format an importer binds this texture as; 0 when the
+    /// format has no GL equivalent.
+    pub gl_internal_format: u32,
+}
+
 /// Presence/shape summary of a tensor's quantization metadata.
 ///
 /// The first half of the two-call idiom `ef_tensor_quantization_info` /
@@ -334,6 +375,15 @@ mod tests {
     #[test]
     fn cpu_access_is_u32() {
         assert_eq!(std::mem::size_of::<EfCpuAccess>(), 4);
+    }
+
+    #[test]
+    fn d3d11_layout_is_pinned() {
+        // Five 4-byte fields, no `u64` to force wider alignment -- 20 bytes,
+        // 4-byte aligned, and the field order the C golden asserts offsets
+        // for. A widened field or a reorder is a new suffixed struct.
+        assert_eq!(std::mem::size_of::<EfD3d11Layout>(), 20);
+        assert_eq!(std::mem::align_of::<EfD3d11Layout>(), 4);
     }
 
     #[test]

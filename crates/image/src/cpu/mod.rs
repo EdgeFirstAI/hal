@@ -195,16 +195,13 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
             }
             let bg_u8 = bg.as_typed::<u8>().ok_or(Error::NotAnImage)?;
             let dst_u8 = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
-            let bg_map = bg_u8.map_read()?;
-            let mut dst_map = dst_u8.map_mut()?;
-            let bg_slice = bg_map.as_slice();
-            let dst_slice = dst_map.as_mut_slice();
-            if bg_slice.len() != dst_slice.len() {
-                return Err(Error::InvalidShape(
-                    "background buffer size does not match dst".into(),
-                ));
-            }
-            dst_slice.copy_from_slice(bg_slice);
+            // Row-wise, not a flat copy_from_slice: `bg` and `dst` can each
+            // carry their own row_stride (a padded D3D11/GPU-pitch destination
+            // composited from a tight background, or vice versa), so a single
+            // equal-length check is wrong even when the logical shapes match.
+            // `CPUProcessor::copy_image` already walks both sides at their
+            // own pitch via `logical_surface`/`packed_row_pairs`.
+            CPUProcessor::copy_image(bg_u8, dst_u8)?;
         }
         None => {
             let dst_u8 = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
@@ -406,8 +403,9 @@ pub(crate) fn apply_int8_xor_bias(data: &mut [u8], fmt: PixelFormat) {
 /// Row-confined [`apply_int8_xor_bias`] for a destination whose row pitch may
 /// exceed its pixel bytes — an allocation-padded tensor, or a `Tensor::view()`
 /// whose pitch is the parent's and whose trailing bytes are the parent's
-/// neighbouring pixels.
-fn apply_int8_xor_bias_rows(tensor: &mut Tensor<u8>, fmt: PixelFormat) -> Result<()> {
+/// neighbouring pixels. The `I8` post-pass of the CPU convert and of the G2D
+/// blit alike.
+pub(crate) fn apply_int8_xor_bias_rows(tensor: &mut Tensor<u8>, fmt: PixelFormat) -> Result<()> {
     use edgefirst_tensor::PixelLayout;
     let (rows, row_bytes) = logical_surface(tensor)?;
     let stride = tensor_row_stride(tensor);

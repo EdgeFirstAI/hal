@@ -17,7 +17,7 @@ use super::super::dma_import::DmaImportAttrs;
 use super::super::EglDisplayKind;
 use super::GlPlatform;
 use edgefirst_egl as egl;
-use edgefirst_tensor::{PixelFormat, Tensor};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn};
 use std::rc::Rc;
 
 /// An owned EGLImage import over a DMA-BUF. Dropping destroys the
@@ -60,6 +60,11 @@ impl GlPlatform for LinuxEgl {
     // EGLImage targets persist on the texture object — the engine's
     // binding-skip cache (BufferImportKey on Texture) applies.
     const PERSISTENT_TEX_BINDINGS: bool = true;
+
+    /// The planar F16 zero-copy render only -- the one float path this leaf
+    /// has ever executed. The rest were written and measured on Windows.
+    const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
+        super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = true;
 
     fn init_display(kind: Option<EglDisplayKind>) -> crate::Result<GlContext> {
@@ -80,6 +85,12 @@ impl GlPlatform for LinuxEgl {
 
     fn import_handle(import: &EglImage) -> egl::Image {
         import.egl_image
+    }
+
+    fn import_extent(_import: &EglImage) -> Option<(u32, u32)> {
+        // The DMA-BUF EGLImage is created at the tensor's logical size; the
+        // buffer's physical pitch is a separate import attribute.
+        None
     }
 
     unsafe fn attach_tex_image_2d(_display: &GlContext, handle: egl::Image) -> crate::Result<()> {
@@ -133,8 +144,19 @@ impl GlPlatform for LinuxEgl {
 
     fn export_completion_fence(
         _display: &GlContext,
+        _recorded: Option<u64>,
     ) -> crate::Result<Option<super::super::CompletionFence>> {
         Ok(None)
+    }
+
+    fn record_completion(_display: &GlContext, _dst: &mut TensorDyn, _submit: bool) -> Option<u64> {
+        // No device fence on Linux — convert() returning means the GPU
+        // work is complete.
+        None
+    }
+
+    fn submit_recorded(_display: &GlContext) {
+        // Nothing is ever queued unsubmitted: there is no device fence.
     }
 
     fn import_buffer_packed<T>(
@@ -151,6 +173,11 @@ impl GlPlatform for LinuxEgl {
         let drm_format = match fmt {
             super::PackedImportFormat::Rgba8888 => drm_fourcc::DrmFourcc::Abgr8888,
             super::PackedImportFormat::Rgba16161616F => drm_fourcc::DrmFourcc::Abgr16161616f,
+            super::PackedImportFormat::Rgba32323232F => {
+                return Err(crate::Error::NotSupported(
+                    "RGBA32F zero-copy import has no buffer format on this platform".into(),
+                ))
+            }
         };
         let bpp = fmt.bytes_per_pixel();
         // `dmabuf()`, not `as_dma().fd` -- see `gl/dma_import.rs`'s own

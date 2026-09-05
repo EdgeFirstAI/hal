@@ -38,10 +38,39 @@ pub(super) enum CacheKind {
 /// Storing only the raw handle (`Platform::import_handle`) would keep the
 /// key-matching behaviour and silently lose the anchor.
 ///
-/// Only DMA-BUF/IOSurface-backed tensors ever reach here — both
-/// `Platform::import_buffer*` implementations reject anything else — so the
-/// process-local identity kinds that genuinely could be recycled
-/// (`IdentityKind::HostPtr`, `Pbo`) are never cached.
+/// **The rule a cached key must satisfy, and where each platform enforces
+/// it.** A key is safe here only when the import this entry owns keeps the
+/// keyed object alive, because that is what stops the key being recycled onto
+/// a different buffer while the entry is still findable. Each
+/// `Platform::import_buffer*` implementation reaches its platform's object
+/// through an accessor no other backing answers — `dmabuf_fd` on Linux,
+/// `iosurface_ref` on macOS, the `AHardwareBuffer*` on Android, and
+/// `d3d11_texture` on Windows — so a `Mem` or PBO tensor cannot reach any of
+/// them and `IdentityKind::HostPtr` and `Pbo` are never cached.
+///
+/// Two cached kinds are raw pointers, recyclable in principle:
+/// `IdentityKind::D3d11Texture` (an `ID3D11Texture2D*`) and
+/// `AHardwareBufferPtr`. The anchor above is what rules a stale key out for
+/// them, since the EGLImage holds its own reference to the object, which
+/// therefore cannot be freed and its address reused while the entry lives.
+///
+/// Reaching the right accessor is *not* on its own proof that the identity
+/// names that object, and on Windows the two came apart: the dynamic tensor
+/// backend answered `d3d11_texture` correctly while identifying the tensor by
+/// its recyclable `ef_tensor` handle address, and converts rendered into
+/// dropped textures. So the Windows path checks rather than assumes, through
+/// [`GlPlatform::validate_import_identity`], which refuses in every build any
+/// texture whose identity is not `D3d11Texture` over that same pointer.
+///
+/// That check runs on **every** import, cache hits included, and that is why
+/// it is a separate hook rather than a line in `Platform::import_buffer*`:
+/// those run only on a miss, so a check made there could not see this cache
+/// serving an entry for a tensor whose identity had stopped matching its
+/// buffer — the one case that produces wrong pixels rather than none. The
+/// other three platforms take the default `Ok(())`: their identities are
+/// OS-level keys the kernel cannot recycle while the import holds the object.
+///
+/// [`GlPlatform::validate_import_identity`]: super::platform::GlPlatform::validate_import_identity
 pub(super) struct CachedImport<I> {
     pub(super) import: I,
     /// Optional GL renderbuffer backed by this import (used by direct RGB path).

@@ -934,6 +934,24 @@ impl PyImageProcessor {
         let converter = image::ImageProcessor::with_config(_config)?;
         Ok(PyImageProcessor(Mutex::new(converter)))
     }
+
+    /// Convert ``src`` into ``dst``, scaling, converting colour, rotating
+    /// and flipping as needed, and wait for the GPU before returning.
+    ///
+    /// Args:
+    ///     src: Source image, from this or any other ``edgefirst.*``
+    ///         package (see ``crates/python-common/INTEROP.md``).
+    ///     dst: Destination image, written in place.
+    ///     rotation: Applied to the converted image.
+    ///     flip: Applied to the converted image.
+    ///     source: Sub-region of ``src`` to read, in source pixels.
+    ///         ``None`` reads the whole image.
+    ///     letterbox: ``(r, g, b, a)`` pad colour. Given, the source is
+    ///         fitted into the destination preserving aspect ratio and the
+    ///         remainder is padded; ``None`` stretches.
+    ///
+    /// On Windows the destination's ``gpu_completion()`` reflects this
+    /// convert afterwards.
     // `&self`, not `&mut self`: `PyImageProcessor` is a bare `Mutex` whose
     // whole point is to let multiple callers coordinate through the lock
     // rather than through Rust-level exclusive access. `&mut self` would
@@ -964,7 +982,7 @@ impl PyImageProcessor {
         // host pin -- the descriptor's native handle is all a zero-copy
         // consumer needs.
         let src = crate::interop::TensorArg::extract(src, None)?;
-        let dst = crate::interop::TensorArg::extract_mut(dst, None)?;
+        let dst_arg = crate::interop::TensorArg::extract_mut(dst, None)?;
         let rotation = rotation.into();
         let flip = flip.into();
         // Destination placement is the destination tensor (use `tensor.view`/
@@ -977,47 +995,169 @@ impl PyImageProcessor {
                 None => Fit::Stretch,
             },
         };
-        if src.can_detach() && dst.can_detach() {
+        if src.can_detach() && dst_arg.can_detach() {
             // Every Python guard is released by `into_raw_access` before
-            // this point -- `src`/`dst` are now plain `Send` data, so the
-            // actual convert (GPU or CPU, and rayon-parallel on the CPU
-            // path) can run with the GIL released.
+            // this point -- `src` and the reconstructed destination are now
+            // plain `Send` data, so the actual convert (GPU or CPU, and
+            // rayon-parallel on the CPU path) can run with the GIL released.
             let src = src.into_raw_access()?;
-            let mut dst = dst.into_raw_access()?;
+            let mut rendered = dst_arg.into_raw_access()?;
+            // Borrowed into the detached region rather than moved, so the
+            // completion the backend recorded on it can be published back
+            // onto the caller's object once the GIL is held again.
+            let target = &mut rendered;
             py.detach(move || -> Result<()> {
                 let mut l = self
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                l.convert(src.as_ref(), dst.as_mut(), rotation, flip, crop)?;
+                l.convert(src.as_ref(), target.as_mut(), rotation, flip, crop)?;
                 Ok(())
             })?;
+            // Read before the reconstructed tensor is dropped, published
+            // after: `publish_gpu_write` calls into Python, which must not
+            // happen while a borrow of the destination is alive.
+            let recorded = crate::interop::recorded_gpu_write(rendered.as_ref());
+            drop(rendered);
+            crate::interop::publish_gpu_write(dst, recorded);
         } else {
             // A GL-PBO-backed argument: `TensorArg::can_detach` -- see its
             // docs -- cannot reconstruct an independent `TensorDyn` for it,
             // so this call keeps the GIL held for its whole duration,
             // exactly this crate's behaviour before GIL release existed
             // for tensors at all.
-            let mut dst = dst;
-            let mut l = self
-                .0
-                .lock()
-                .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-            l.convert(src.as_ref(), dst.as_mut(), rotation, flip, crop)?;
+            let mut dst_arg = dst_arg;
+            {
+                let mut l = self
+                    .0
+                    .lock()
+                    .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+                l.convert(src.as_ref(), dst_arg.as_mut(), rotation, flip, crop)?;
+            }
+            // `dst_arg` holds a `PyRefMut` of a native destination, and
+            // `set_gpu_write` takes `&self`: the borrow has to end before
+            // the publish or pyo3 refuses the call as "Already borrowed".
+            let recorded = crate::interop::recorded_gpu_write(dst_arg.as_ref());
+            drop(dst_arg);
+            crate::interop::publish_gpu_write(dst, recorded);
         }
         Ok(())
     }
 
+    /// Convert without blocking on the GPU; returns a completion handle.
+    ///
+    /// Same ``src``/``dst``/``rotation``/``flip``/``source``/``letterbox``
+    /// arguments as an ordinary convert; this call differs only in what it
+    /// returns. The handle is the GL to NPU handoff primitive: hand it to a
+    /// consumer, or wait on it, instead of paying a blocking GPU sync.
+    ///
+    /// Returns:
+    ///     A sync-file descriptor on Linux and Android, an event handle
+    ///     (as an integer) on Windows, or ``None`` when the convert
+    ///     completed synchronously (no native fence on this display). The
+    ///     caller owns the handle -- close it (``os.close`` for the fd,
+    ///     ``ctypes.windll.kernel32.CloseHandle`` for the Windows handle).
+    ///
+    /// On Windows the destination's ``gpu_completion()`` reflects this
+    /// convert afterwards, so a device consumer can be handed the fence
+    /// value instead of this event.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
+    pub fn convert_with_fence<'py>(
+        &self,
+        py: Python<'py>,
+        src: &Bound<'py, PyAny>,
+        dst: &Bound<'py, PyAny>,
+        rotation: PyRotation,
+        flip: PyFlip,
+        source: Option<PyRegion>,
+        letterbox: Option<[u8; 4]>,
+    ) -> Result<Option<usize>> {
+        let _span = tracing::trace_span!("python.convert_with_fence").entered();
+        // See `convert`: GPU/DMA path, no host pin forced.
+        let src = crate::interop::TensorArg::extract(src, None)?;
+        let dst_arg = crate::interop::TensorArg::extract_mut(dst, None)?;
+        let rotation = rotation.into();
+        let flip = flip.into();
+        let crop = Crop {
+            source: source.map(|x| x.into()),
+            fit: match letterbox {
+                Some(pad) => Fit::Letterbox { pad },
+                None => Fit::Stretch,
+            },
+        };
+        // Assigned in both arms below: the publish has to run inside each
+        // arm, where the tensor the convert wrote is still in scope.
+        let fence;
+        if src.can_detach() && dst_arg.can_detach() {
+            // See `convert`: every Python guard is released by this point,
+            // so the actual convert can run with the GIL released.
+            let src = src.into_raw_access()?;
+            let mut rendered = dst_arg.into_raw_access()?;
+            // See `convert`: borrowed rather than moved, so the recorded
+            // completion can be published afterwards.
+            let target = &mut rendered;
+            fence = py.detach(move || -> Result<Option<image::CompletionFence>> {
+                let mut l = self
+                    .0
+                    .lock()
+                    .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+                Ok(l.convert_with_fence(src.as_ref(), target.as_mut(), rotation, flip, crop)?)
+            })?;
+            // Read before the reconstructed tensor is dropped, published
+            // after: `publish_gpu_write` calls into Python, which must not
+            // happen while a borrow of the destination is alive.
+            let recorded = crate::interop::recorded_gpu_write(rendered.as_ref());
+            drop(rendered);
+            crate::interop::publish_gpu_write(dst, recorded);
+        } else {
+            // See `convert`: a GL-PBO-backed argument keeps the GIL held.
+            let mut dst_arg = dst_arg;
+            {
+                let mut l = self
+                    .0
+                    .lock()
+                    .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+                fence =
+                    l.convert_with_fence(src.as_ref(), dst_arg.as_mut(), rotation, flip, crop)?;
+            }
+            // `dst_arg` holds a `PyRefMut` of a native destination, and
+            // `set_gpu_write` takes `&self`: the borrow has to end before
+            // the publish or pyo3 refuses the call as "Already borrowed".
+            let recorded = crate::interop::recorded_gpu_write(dst_arg.as_ref());
+            drop(dst_arg);
+            crate::interop::publish_gpu_write(dst, recorded);
+        }
+        // The caller now owns the handle: it crosses into a bare Python int,
+        // so ownership can no longer be tracked by a Rust drop.
+        Ok(fence.map(|f| {
+            #[cfg(unix)]
+            {
+                use std::os::fd::IntoRawFd;
+                f.into_raw_fd() as usize
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::IntoRawHandle;
+                f.into_raw_handle() as usize
+            }
+        }))
+    }
+
     /// Convert without waiting for the GPU — the batch-preprocessing primitive.
     ///
-    /// Same as [`convert`](Self::convert) but the OpenGL backend skips the
-    /// per-call `glFinish()`. Render N model inputs by looping this over
-    /// `dst.batch(n)` / `dst.view(region)` row-bands of one batched destination,
-    /// then call [`flush`](Self::flush) once: the backend imports the destination
-    /// a single time and renders each tile as a `glViewport` band, syncing once
-    /// at flush. A deferred destination is not safe to read (or `cuda_map`) until
-    /// `flush` returns. Non-GL backends complete synchronously and `flush` is a
-    /// no-op.
+    /// Same arguments as :meth:`convert`, but the OpenGL backend skips the
+    /// per-call ``glFinish()``. Render N model inputs by looping this over
+    /// ``dst.batch(n)`` / ``dst.view(region)`` row-bands of one batched
+    /// destination, then call :meth:`flush` once: the backend imports the
+    /// destination a single time and renders each tile as a viewport band,
+    /// syncing once at flush. A deferred destination is not safe to read
+    /// (or ``cuda_map``) until :meth:`flush` returns. Non-GL backends
+    /// complete synchronously and :meth:`flush` is a no-op.
+    ///
+    /// On Windows the destination's ``gpu_completion()`` reflects this
+    /// convert afterwards — the value covers the queued render, so a device
+    /// consumer waits on that fence rather than on :meth:`flush`.
     // `&self`: see `convert`'s comment on the same choice.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
@@ -1034,7 +1174,7 @@ impl PyImageProcessor {
         let _span = tracing::trace_span!("python.convert_deferred").entered();
         // See `convert`: GPU/DMA path, no host pin forced.
         let src = crate::interop::TensorArg::extract(src, None)?;
-        let dst = crate::interop::TensorArg::extract_mut(dst, None)?;
+        let dst_arg = crate::interop::TensorArg::extract_mut(dst, None)?;
         let rotation = rotation.into();
         let flip = flip.into();
         let crop = Crop {
@@ -1044,26 +1184,45 @@ impl PyImageProcessor {
                 None => Fit::Stretch,
             },
         };
-        if src.can_detach() && dst.can_detach() {
+        if src.can_detach() && dst_arg.can_detach() {
             // See `convert`: every Python guard is gone by this point.
             let src = src.into_raw_access()?;
-            let mut dst = dst.into_raw_access()?;
+            let mut rendered = dst_arg.into_raw_access()?;
+            // See `convert`: borrowed rather than moved, so the recorded
+            // completion can be published afterwards. The value covers the
+            // queued render even though nothing has waited on the GPU yet,
+            // which is what a device consumer waits on instead of `flush`.
+            let target = &mut rendered;
             py.detach(move || -> Result<()> {
                 let mut l = self
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                l.convert_deferred(src.as_ref(), dst.as_mut(), rotation, flip, crop)?;
+                l.convert_deferred(src.as_ref(), target.as_mut(), rotation, flip, crop)?;
                 Ok(())
             })?;
+            // Read before the reconstructed tensor is dropped, published
+            // after: `publish_gpu_write` calls into Python, which must not
+            // happen while a borrow of the destination is alive.
+            let recorded = crate::interop::recorded_gpu_write(rendered.as_ref());
+            drop(rendered);
+            crate::interop::publish_gpu_write(dst, recorded);
         } else {
             // See `convert`: a GL-PBO-backed argument keeps the GIL held.
-            let mut dst = dst;
-            let mut l = self
-                .0
-                .lock()
-                .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-            l.convert_deferred(src.as_ref(), dst.as_mut(), rotation, flip, crop)?;
+            let mut dst_arg = dst_arg;
+            {
+                let mut l = self
+                    .0
+                    .lock()
+                    .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+                l.convert_deferred(src.as_ref(), dst_arg.as_mut(), rotation, flip, crop)?;
+            }
+            // `dst_arg` holds a `PyRefMut` of a native destination, and
+            // `set_gpu_write` takes `&self`: the borrow has to end before
+            // the publish or pyo3 refuses the call as "Already borrowed".
+            let recorded = crate::interop::recorded_gpu_write(dst_arg.as_ref());
+            drop(dst_arg);
+            crate::interop::publish_gpu_write(dst, recorded);
         }
         Ok(())
     }
@@ -1086,6 +1245,18 @@ impl PyImageProcessor {
         Ok(())
     }
 
+    /// Draw detection boxes and optional segmentation masks onto ``dst``.
+    ///
+    /// ``dst`` is always fully overwritten: ``background`` plus the masks
+    /// when a background is given, otherwise cleared to transparent and
+    /// drawn on. See the stub for the full argument list.
+    ///
+    /// On Windows the destination's ``gpu_completion()`` reflects this draw
+    /// afterwards, as it does after ``convert``.
+    ///
+    /// A ``BGRA`` ``background=`` onto a GPU-backed destination raises: the
+    /// OpenGL base-layer draw has no ``BGRA`` arm and the CPU backend renders
+    /// only ``RGBA``/``RGB``. It previously returned without writing ``dst``.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0, letterbox=None, color_mode=PyColorMode::Class))]
     pub fn draw_decoded_masks<'py>(
@@ -1101,7 +1272,11 @@ impl PyImageProcessor {
         color_mode: PyColorMode,
     ) -> Result<()> {
         // GPU render target, same as `convert`'s dst: no host pin forced.
-        let mut dst = crate::interop::TensorArg::extract_mut(dst, None)?;
+        // The caller's object is kept under its own name: the extraction
+        // shadows `dst`, and the completion publish below needs the object,
+        // not the resolved tensor.
+        let dst_obj = dst;
+        let mut dst = crate::interop::TensorArg::extract_mut(dst_obj, None)?;
         // Read-only compositing input.
         let background = background
             .map(|b| crate::interop::TensorArg::extract(b, None))
@@ -1163,6 +1338,15 @@ impl PyImageProcessor {
             color_mode: color_mode.into(),
         };
         l.draw_decoded_masks(dst.as_mut(), &detect, &seg, overlay)?;
+        drop(l);
+        // Same as the convert variants: a draw writes the tensor resolved
+        // from the destination's descriptor, not the caller's, so the
+        // completion the GL backend recorded on it (a D3D11 texture on
+        // Windows) has to be published back. Read before the borrow ends,
+        // published after, as in `convert`.
+        let recorded = crate::interop::recorded_gpu_write(dst.as_ref());
+        drop(dst);
+        crate::interop::publish_gpu_write(dst_obj, recorded);
         Ok(())
     }
 
@@ -1259,6 +1443,10 @@ impl PyImageProcessor {
     /// Draw prototype masks onto ``dst`` without materialising per-instance
     /// mask arrays in Python. ``proto_data`` may come from another
     /// ``edgefirst.*`` package via the ``__edgefirst_protodata__`` capsule.
+    ///
+    /// On Windows the destination's ``gpu_completion()`` reflects this draw
+    /// afterwards, as it does after ``convert``. The same ``BGRA``
+    /// ``background=`` restriction as :meth:`draw_decoded_masks` applies.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (dst, bbox, scores, classes, proto_data, background=None, opacity=1.0, letterbox=None, color_mode=PyColorMode::Class))]
     pub fn draw_proto_masks<'py>(
@@ -1273,7 +1461,11 @@ impl PyImageProcessor {
         letterbox: Option<[f32; 4]>,
         color_mode: PyColorMode,
     ) -> Result<()> {
-        let mut dst = crate::interop::TensorArg::extract_mut(dst, None)?;
+        // The caller's object is kept under its own name: the extraction
+        // shadows `dst`, and the completion publish below needs the object,
+        // not the resolved tensor.
+        let dst_obj = dst;
+        let mut dst = crate::interop::TensorArg::extract_mut(dst_obj, None)?;
         let background = background
             .map(|b| crate::interop::TensorArg::extract(b, None))
             .transpose()?;
@@ -1290,6 +1482,15 @@ impl PyImageProcessor {
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
         l.draw_proto_masks(dst.as_mut(), &detect, proto_data.as_ref(), overlay)?;
+        drop(l);
+        // As `draw_decoded_masks`: a draw writes the tensor resolved from the
+        // destination's descriptor, not the caller's, so the completion the
+        // GL backend recorded on it (a D3D11 texture on Windows) has to be
+        // published back. Read before the borrow ends, published after, as in
+        // `convert`.
+        let recorded = crate::interop::recorded_gpu_write(dst.as_ref());
+        drop(dst);
+        crate::interop::publish_gpu_write(dst_obj, recorded);
         Ok(())
     }
 
@@ -1531,6 +1732,17 @@ impl PyImageProcessor {
         Ok(PyTensor(dyn_tensor))
     }
 
+    /// Set the colours used to render segmentation masks by class label.
+    ///
+    /// The palette holds 20 entries and a class index wraps around it. Only
+    /// the leading entries this call supplies are replaced; the rest keep the
+    /// defaults, and anything past the twentieth is ignored.
+    ///
+    /// Args:
+    ///     colors: ``(r, g, b, a)`` tuples, indexed by class label.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the backend rejects the palette.
     pub fn set_class_colors(&mut self, colors: Vec<[u8; 4]>) -> Result<()> {
         self.0
             .lock()

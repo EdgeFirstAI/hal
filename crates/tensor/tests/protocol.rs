@@ -218,8 +218,10 @@ fn kind_codes_are_abi() {
             tensor_kind::DMABUF,
             tensor_kind::IOSURFACE,
             tensor_kind::PBO,
+            tensor_kind::CUDA_DEVICE,
+            tensor_kind::D3D11_TEXTURE,
         ],
-        [0, 1, 2, 3]
+        [0, 1, 2, 3, 4, 5]
     );
 }
 

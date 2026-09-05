@@ -58,6 +58,7 @@ fn bare_u8(shape: &[usize]) -> Tensor<u8> {
 /// error in `io::ErrorKind::Other` (`builder_alloc: IoError(Os { kind:
 /// PermissionDenied, ... })`), so matching only `e.kind()` misses the
 /// GitHub-hosted runner case and panics as "unexpected".
+#[cfg(unix)]
 fn platform_resource_absent(err: &Error) -> bool {
     match err {
         Error::IoError(e) => {
@@ -421,6 +422,129 @@ fn dma_buffer_identity_is_derived_from_the_inode_not_the_handle_address() {
         edgefirst_tensor::IdentityKind::DmaBuf,
         "a DMA-BUF handle's identity must be inode-derived, not the process-local HostPtr \
          fallback -- see TensorDyn::derive_identity's doc comment"
+    );
+}
+
+/// The Windows half of the same rule, and a regression guard for a defect the
+/// C harness found: a texture-to-texture convert through the image C API
+/// returned 0 and left the destination blank about one process in ten.
+///
+/// The DMA branch above never ran on Windows, so every `dynamic` handle here
+/// -- D3D11 texture tensors included -- fell through to `IdentityKind::HostPtr`
+/// over the handle's own address. `edgefirst-image`'s EGLImage cache keys on
+/// that id plus geometry and deliberately outlives the tensor it imported, and
+/// this library's C-side allocator hands a freed `EfTensorImpl`'s address
+/// straight to the next handle it mints. A recycled address arriving with
+/// matching geometry therefore hit the cache and served the *previous*
+/// texture's EGLImage: the convert rendered into a texture nobody read, and
+/// the freshly created destination stayed blank.
+///
+/// What is asserted, on each of 200 create-and-drop cycles of a pair at the
+/// geometry the C program used: the identity's kind is `D3d11Texture` and its
+/// id is byte-for-byte the key the *static* backend's `d3d11::texture::tex_key`
+/// derives from the same texture. One texture then has one identity whichever
+/// backend names it, which is what makes the cache's retention argument hold --
+/// ANGLE's EGLImage holds a reference to the texture, so that address cannot be
+/// recycled while an entry keyed on it can still be found, whereas a handle
+/// address, held by nothing, can and does.
+///
+/// The churn is the point of the loop rather than the assertion: it is what
+/// drove the allocator to hand a freed handle's address back out, and the
+/// stderr line reports how much recycling actually happened, so a future
+/// reader can see the run was not vacuous. Before the fix every one of the 400
+/// tensors fails the first assertion (`HostPtr`).
+#[cfg(target_os = "windows")]
+#[test]
+fn a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_address() {
+    use std::collections::HashSet;
+
+    const ITERATIONS: usize = 200;
+
+    // `Some(DmaBuf)` is the Windows texture request, and the same one
+    // `edgefirst-image`'s `create_image` makes on its Dma-first arm -- the
+    // path the C harness reached this defect through.
+    //
+    // Both formats are probed, not just the first: `Rgb` has its own layout
+    // (packed three bytes into an RGBA8 texel, so the texture is a quarter
+    // width) and a host that cannot allocate it must skip rather than panic
+    // inside the loop on a `None` texture.
+    for format in [PixelFormat::Rgba, PixelFormat::Rgb] {
+        match Tensor::<u8>::image(
+            64,
+            48,
+            format,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        ) {
+            Ok(t) if t.d3d11_texture().is_some() => drop(t),
+            other => {
+                eprintln!(
+                    "SKIPPED: \
+                     a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_address \
+                     - no D3D11 {format:?} texture tensors on this host ({:?})",
+                    other.map(|t| t.memory())
+                );
+                return;
+            }
+        }
+    }
+
+    // The id `BufferIdentity::derived` builds: the kind's discriminant in the
+    // high bits, the key below it. Recomputed here rather than imported so the
+    // test pins the value the image crate's cache actually sees.
+    let expected_id =
+        |tex: usize| ((edgefirst_tensor::IdentityKind::D3d11Texture as u64) << 56) ^ (tex as u64);
+
+    let mut ids = HashSet::new();
+    let mut recycled = 0usize;
+    for i in 0..ITERATIONS {
+        // One pair per iteration at the geometry the C program used, both
+        // dropped at the end of it: the churn that recycles addresses.
+        let mut pair = Vec::new();
+        for format in [PixelFormat::Rgba, PixelFormat::Rgb] {
+            let t = Tensor::<u8>::image(
+                64,
+                48,
+                format,
+                Some(TensorMemory::DmaBuf),
+                CpuAccess::ReadWrite,
+            )
+            .expect("image allocation");
+            let tex = t.d3d11_texture().expect("a texture-backed handle") as usize;
+            let identity = t.buffer_identity();
+            assert_eq!(
+                identity.kind(),
+                edgefirst_tensor::IdentityKind::D3d11Texture,
+                "iteration {i} {format:?}: a texture handle's identity must name its \
+                 ID3D11Texture2D, not the process-local HostPtr fallback over the handle's \
+                 own address -- an EGLImage cache keyed on that address serves the previous \
+                 texture's image and the convert leaves the destination blank"
+            );
+            assert_eq!(
+                identity.id(),
+                expected_id(tex),
+                "iteration {i} {format:?}: the identity must be the texture pointer keyed as \
+                 D3d11Texture, the same value the static backend's tex_key derives, so one \
+                 texture has one identity whichever backend names it"
+            );
+            if !ids.insert(identity.id()) {
+                recycled += 1;
+            }
+            pair.push(t);
+        }
+        // Both are alive here, which is the one relationship the id vocabulary
+        // guarantees outright: distinct live buffers, distinct identities.
+        assert_ne!(
+            pair[0].buffer_identity().id(),
+            pair[1].buffer_identity().id(),
+            "iteration {i}: two simultaneously live textures must not share an identity"
+        );
+    }
+    eprintln!(
+        "{ITERATIONS} texture pairs: {} distinct identities over {} tensors, \
+         {recycled} landed on an address a dropped texture had used",
+        ids.len(),
+        ITERATIONS * 2
     );
 }
 
@@ -1305,6 +1429,12 @@ fn reshape_changes_the_shape_and_the_cache_follows() {
 /// dma-buf fd on Linux and `-1` for every other backing -- so SHM-backed
 /// tensors were refused with "this tensor has no native fd (not
 /// DMA-backed)", while the static backend clones theirs without complaint.
+///
+/// Unix only: `clone_fd`/`from_fd` are the fd-based primitives, and neither
+/// exists on Windows -- without this gate the whole target fails to compile
+/// there, which is what kept every other test in this file from running on
+/// Windows at all.
+#[cfg(unix)]
 #[test]
 fn clone_fd_works_for_shm_not_only_dma() {
     const SHAPE: [usize; 2] = [64, 64];

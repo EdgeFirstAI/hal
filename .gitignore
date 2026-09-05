@@ -97,3 +97,9 @@ crates/python-tensor/python/edgefirst/tensor/edgefirst_tensor.dll
 crates/python-image/python/edgefirst/image/libEGL.dll
 crates/python-image/python/edgefirst/image/libGLESv2.dll
 crates/python-image/python/edgefirst/image/d3dcompiler_47.dll
+
+# Subagent-driven-development scratch (ledgers, briefs, review packages).
+/.superpowers/
+
+# maturin develop drops the extension's PDB beside the .pyd on Windows
+crates/python-*/python/edgefirst/*/*.pdb

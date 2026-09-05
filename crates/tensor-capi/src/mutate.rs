@@ -414,8 +414,11 @@ unsafe fn reshape_impl(t: *mut EfTensor, dims: *const u64, ndim: u32, by_capacit
     }
 }
 
+/// Platforms: Linux, macOS, iOS, Android.
+///
 /// Duplicate the file descriptor backing this tensor, for any storage kind
-/// that has one.
+/// that has one: a dma-buf fd on Linux, a shared-memory fd wherever `Shm`
+/// allocates.
 ///
 /// Deliberately **not** derivable from `ef_tensor_plane_at`: that reports a
 /// plane's *native handle*, which is a dma-buf fd on Linux and an IOSurface
