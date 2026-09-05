@@ -13,24 +13,52 @@ use std::ffi::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_decoder::tiling::{
-    lift_tile_boxes, merge_tiled_detections, MatchMetric, MergeConfig, TiledFrameAccumulator,
+    lift_tile_boxes, merge_tiled_detections, MatchMetric, MergeConfig, MergeMode,
+    TiledFrameAccumulator,
 };
 use edgefirst_decoder_abi::{EfMergeConfig, EfTilePlacement, TilePlacement};
 use edgefirst_tensor::{BoundingBox, DetectBox};
 
-use crate::decode::EfDetectBox;
+use crate::decode::{EfDetectBox, EfDetectBoxList};
+
+fn metric_from(v: u32) -> Option<MatchMetric> {
+    match v {
+        0 => Some(MatchMetric::Iou),
+        1 => Some(MatchMetric::Ios),
+        _ => None,
+    }
+}
+
+fn metric_to(m: MatchMetric) -> u32 {
+    match m {
+        MatchMetric::Iou => 0,
+        MatchMetric::Ios => 1,
+    }
+}
+
+fn mode_from(v: u32) -> Option<MergeMode> {
+    match v {
+        0 => Some(MergeMode::KeepBest),
+        1 => Some(MergeMode::Union),
+        _ => None,
+    }
+}
+
+fn mode_to(m: MergeMode) -> u32 {
+    match m {
+        MergeMode::KeepBest => 0,
+        MergeMode::Union => 1,
+    }
+}
 
 fn merge_config_from(c: &EfMergeConfig) -> Option<MergeConfig> {
     Some(MergeConfig {
-        metric: match c.metric {
-            0 => MatchMetric::Iou,
-            1 => MatchMetric::Ios,
-            _ => return None,
-        },
+        metric: metric_from(c.metric)?,
         threshold: c.threshold,
         class_agnostic: c.class_agnostic != 0,
         max_det: c.max_det,
         score_threshold: c.score_threshold,
+        mode: mode_from(c.mode)?,
     })
 }
 
@@ -60,6 +88,11 @@ fn to_c(d: &DetectBox) -> EfDetectBox {
 
 /// Fill `out` with the library's default merge configuration.
 ///
+/// The default `mode` is `0` (keep-best): the highest-scoring box of each
+/// matched group is kept and the boxes it matched are dropped. Set `mode = 1`
+/// for the enclosing-union merge, which measured about 0.05 AP50 worse on
+/// every frame of the Ocean Cleanup ADIS 4K validation (TOP2-836).
+///
 /// # Safety
 /// `out` must be writable.
 #[no_mangle]
@@ -71,14 +104,12 @@ pub unsafe extern "C" fn ef_merge_config_default(out: *mut EfMergeConfig) -> c_i
         catch_unwind(AssertUnwindSafe(|| {
             let d = MergeConfig::default();
             *out = EfMergeConfig {
-                metric: match d.metric {
-                    MatchMetric::Iou => 0,
-                    MatchMetric::Ios => 1,
-                },
+                metric: metric_to(d.metric),
                 threshold: d.threshold,
                 class_agnostic: i32::from(d.class_agnostic),
                 max_det: d.max_det,
                 score_threshold: d.score_threshold,
+                mode: mode_to(d.mode),
             };
             0
         }))
@@ -91,7 +122,11 @@ pub struct EfTiledFrameAccumulator {
     inner: Option<TiledFrameAccumulator>,
 }
 
-/// Create an accumulator for a frame of `tiles_total` tiles.
+/// Create an accumulator for a frame of `tiles_total` tiles, merging as
+/// `cfg` says — including its `mode`.
+///
+/// @return the accumulator, or `NULL` for a null `cfg`, zero tiles, or a
+///         `metric`/`mode` value this library does not know.
 ///
 /// # Safety
 /// `cfg` must be valid.
@@ -296,9 +331,12 @@ pub unsafe extern "C" fn ef_lift_tile_boxes(
     }
 }
 
-/// Merge overlapping detections that already share one coordinate space.
+/// Merge overlapping detections that already share one coordinate space,
+/// merging as `cfg` says — including its `mode`.
 ///
-/// @return a list the caller frees with `ef_detect_box_list_free`, or `NULL`.
+/// @return a list the caller frees with `ef_detect_box_list_free`, or `NULL`
+///         for a null `cfg`, a null `boxes` with a non-zero `count`, or a
+///         `metric`/`mode` value this library does not know.
 ///
 /// # Safety
 /// `boxes` must point to `count` elements; `cfg` must be valid.
@@ -307,7 +345,7 @@ pub unsafe extern "C" fn ef_merge_tiled_detections(
     boxes: *const EfDetectBox,
     count: usize,
     cfg: *const EfMergeConfig,
-) -> *mut crate::decode::EfDetectBoxList {
+) -> *mut EfDetectBoxList {
     unsafe {
         catch_unwind(AssertUnwindSafe(|| {
             if cfg.is_null() || (boxes.is_null() && count != 0) {
@@ -335,8 +373,12 @@ pub unsafe extern "C" fn ef_merge_tiled_detections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::{ef_detect_box_list_free, ef_detect_box_list_len};
+    use crate::decode::{ef_detect_box_list_free, ef_detect_box_list_get, ef_detect_box_list_len};
 
+    /// The library default, seeded from a struct whose every field is wrong
+    /// (`mode: 99` is not a value this library knows) so a `default()` that
+    /// skipped a field would fail the assertions below rather than pass by
+    /// accident.
     fn cfg() -> EfMergeConfig {
         let mut c = EfMergeConfig {
             metric: 0,
@@ -344,9 +386,48 @@ mod tests {
             class_agnostic: 0,
             max_det: 0,
             score_threshold: 0.0,
+            mode: 99,
         };
         unsafe { ef_merge_config_default(&mut c) };
         c
+    }
+
+    fn ebox(b: [f32; 4], score: f32, label: u32) -> EfDetectBox {
+        EfDetectBox {
+            xmin: b[0],
+            ymin: b[1],
+            xmax: b[2],
+            ymax: b[3],
+            score,
+            label,
+        }
+    }
+
+    /// Copy the boxes out of a list (and free it) so a test can assert on
+    /// coordinates without holding a borrowed pointer.
+    unsafe fn drain(l: *mut crate::decode::EfDetectBoxList) -> Vec<EfDetectBox> {
+        unsafe {
+            assert!(!l.is_null(), "merge returned NULL");
+            let n = ef_detect_box_list_len(l);
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut b = EfDetectBox::default();
+                assert_eq!(ef_detect_box_list_get(l, i, &mut b), 0);
+                out.push(b);
+            }
+            ef_detect_box_list_free(l);
+            out
+        }
+    }
+
+    /// The partial-overlap pair the merge-mode tests share: `b` matches `a`
+    /// at IoS exactly 0.5 and extends past it, so the two modes give
+    /// visibly different boxes.
+    fn overlapping_pair() -> [EfDetectBox; 2] {
+        [
+            ebox([0.0, 0.0, 100.0, 100.0], 0.9, 0),
+            ebox([50.0, 0.0, 150.0, 100.0], 0.8, 0),
+        ]
     }
 
     fn placement(index: usize, count: usize) -> EfTilePlacement {
@@ -370,7 +451,131 @@ mod tests {
         // its own fragment, so an IoU default would keep both halves.
         let c = cfg();
         assert_eq!(c.metric, 1, "default must be IoS, not IoU");
+    }
+
+    #[test]
+    fn the_default_merge_mode_is_keep_best() {
+        // The Ocean Cleanup ADIS 4K study (TOP2-836) put the enclosing union
+        // at about -0.05 AP50 on every frame; keep-best is the default and
+        // `0`, though a zero-initialised struct still is not the library
+        // default -- `metric` would be IoU rather than the IoS default.
+        let c = cfg();
+        assert_eq!(c.mode, 0, "default must be keep-best (0), not union (1)");
+        assert_eq!(c.metric, 1, "IoS stays the default metric");
+        assert_eq!(c.threshold, 0.5);
+        assert_eq!(c.max_det, 300);
         assert!(unsafe { ef_merge_config_default(std::ptr::null_mut()) } == libc::EINVAL);
+    }
+
+    #[test]
+    fn keep_best_keeps_the_base_box_and_union_encloses_it() {
+        unsafe {
+            let boxes = overlapping_pair();
+
+            let mut keep = cfg();
+            keep.mode = 0;
+            let out = drain(ef_merge_tiled_detections(boxes.as_ptr(), 2, &keep));
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                [out[0].xmin, out[0].ymin, out[0].xmax, out[0].ymax],
+                [0.0, 0.0, 100.0, 100.0],
+                "keep-best must leave the base box exactly as decoded"
+            );
+            assert_eq!(out[0].score, 0.9);
+
+            let mut union = cfg();
+            union.mode = 1;
+            let out = drain(ef_merge_tiled_detections(boxes.as_ptr(), 2, &union));
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                [out[0].xmin, out[0].ymin, out[0].xmax, out[0].ymax],
+                [0.0, 0.0, 150.0, 100.0],
+                "union must grow the base box to the group's enclosing union"
+            );
+            assert_eq!(out[0].score, 0.9);
+        }
+    }
+
+    #[test]
+    fn a_default_config_merges_keep_best_through_both_entry_points() {
+        // The standalone merge and the accumulator must agree: a config
+        // straight from `ef_merge_config_default` keeps the base box rather
+        // than growing it to the union these inputs used to produce.
+        unsafe {
+            let boxes = overlapping_pair();
+            let c = cfg();
+            let out = drain(ef_merge_tiled_detections(boxes.as_ptr(), 2, &c));
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                [out[0].xmin, out[0].ymin, out[0].xmax, out[0].ymax],
+                [0.0, 0.0, 100.0, 100.0]
+            );
+
+            let a = ef_tiled_frame_accumulator_new(640.0, 480.0, 1, &c, 4);
+            assert!(!a.is_null());
+            let p = placement(0, 1);
+            // Whole-frame placement with a unit crop: boxes lift unchanged.
+            assert_eq!(
+                ef_tiled_frame_accumulator_push_tile(a, boxes.as_ptr(), 2, &p),
+                1
+            );
+            let out = drain(ef_tiled_frame_accumulator_finalize(a, 0));
+            ef_tiled_frame_accumulator_free(a);
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                [out[0].xmin, out[0].ymin, out[0].xmax, out[0].ymax],
+                [0.0, 0.0, 100.0, 100.0]
+            );
+        }
+    }
+
+    #[test]
+    fn an_accumulator_honours_an_explicit_union_mode() {
+        unsafe {
+            let boxes = overlapping_pair();
+            let p = placement(0, 1);
+
+            let mut union = cfg();
+            union.mode = 1;
+            let a = ef_tiled_frame_accumulator_new(640.0, 480.0, 1, &union, 4);
+            assert!(!a.is_null());
+            assert_eq!(ef_tiled_frame_accumulator_remaining(a), 1);
+            assert_eq!(
+                ef_tiled_frame_accumulator_push_tile(a, boxes.as_ptr(), 2, &p),
+                1
+            );
+            assert_eq!(ef_tiled_frame_accumulator_is_complete(a), 1);
+            let out = drain(ef_tiled_frame_accumulator_finalize(a, 0));
+            ef_tiled_frame_accumulator_free(a);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].xmax, 150.0, "union mode reaches the accumulator");
+
+            assert!(ef_tiled_frame_accumulator_new(640.0, 480.0, 0, &union, 4).is_null());
+            assert!(ef_tiled_frame_accumulator_new(640.0, 480.0, 1, std::ptr::null(), 4).is_null());
+        }
+    }
+
+    #[test]
+    fn an_unknown_mode_is_refused() {
+        unsafe {
+            let mut c = cfg();
+            c.mode = 99;
+            assert!(ef_tiled_frame_accumulator_new(640.0, 480.0, 1, &c, 1).is_null());
+            assert!(ef_merge_tiled_detections(std::ptr::null(), 0, &c).is_null());
+
+            let mut c = cfg();
+            c.metric = 99;
+            assert!(ef_tiled_frame_accumulator_new(640.0, 480.0, 1, &c, 1).is_null());
+            assert!(ef_merge_tiled_detections(std::ptr::null(), 0, &c).is_null());
+
+            let c = cfg();
+            assert!(ef_merge_tiled_detections(std::ptr::null(), 0, std::ptr::null()).is_null());
+            assert!(ef_merge_tiled_detections(std::ptr::null(), 3, &c).is_null());
+            let empty = ef_merge_tiled_detections(std::ptr::null(), 0, &c);
+            assert!(!empty.is_null());
+            assert_eq!(ef_detect_box_list_len(empty), 0);
+            ef_detect_box_list_free(empty);
+        }
     }
 
     #[test]

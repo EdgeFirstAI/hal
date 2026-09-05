@@ -17,7 +17,7 @@ Five independently linkable libraries from the [EdgeFirst Hardware Abstraction L
 
 Detection boxes live in header-only `edgefirst/detect.h`. See `INSTALL.txt` for extract, pkg-config, runtime search path, and a JPEG→tensor example.
 
-**No ABI stability is offered before 1.0.** SONAME is `.so.0` (major 0); pin the archive version you built against.
+**Before 1.0 the C ABI is stable across patch releases but may break across minors.** Any `0.N.z` is drop-in for any other `0.N.z`; `0.N` to `0.N+1` may not be. SONAME is `.so.0` (major 0), so the loader will bind libraries from different minors without complaint — it enforces the major only. Pin the archive *minor* you built against, and do not mix libraries from different minors. From 1.0, a break costs a major bump. See [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
 
 The archive is the C ABI only: headers plus shared libraries. Linux ships a `.tar.gz`; Windows and macOS ship a `.zip`. Linux and macOS put the `.so` / `.dylib` in `lib/`. Windows ships `bin/edgefirst_*.dll` and `lib/edgefirst_*.lib` import libraries (never cargo's `*.dll.lib`, never the Rust staticlib). See `INSTALL.txt`.
 

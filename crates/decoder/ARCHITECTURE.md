@@ -25,7 +25,7 @@ based on the output tensor layout.
 | [`schema.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/schema.rs) | local | `SchemaV2` parser — model metadata document used by EdgeFirst Studio |
 | [`infer.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/infer.rs) | local | `infer_ultralytics_schema` — synthesizes a `SchemaV2` for vanilla Ultralytics YOLOv8/11/26 ONNX/TFLite exports from raw `ModelSignals` (tensor shapes/dtypes + the model's own metadata), with no `edgefirst.json` required |
 | [`float.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/float.rs) / [`byte.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/byte.rs) | local | NMS implementations (float and byte-quantized); `float.rs` also holds the IoU/IoS metric helpers reused by tiled merge |
-| [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/tiling.rs) | local | SAHI output side: shared `TilePlacement` contract, `MatchMetric`/`MergeConfig`, `lift_tile_boxes`, GREEDYNMM `merge_tiled_detections`, and the streaming `TiledFrameAccumulator` (fan-in fence) |
+| [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/tiling.rs) | local | SAHI output side: shared `TilePlacement` contract, `MatchMetric`/`MergeMode`/`MergeConfig`, `lift_tile_boxes`, greedy `merge_tiled_detections` (keep-best by default, enclosing union opt-in), and the streaming `TiledFrameAccumulator` (fan-in fence) |
 | [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/error.rs) | local | `DecoderError`, `DecoderResult` |
 
 ## Key Types and Traits
@@ -485,7 +485,7 @@ fields: tiles, boxes_in, boxes_out
 | `decoder.nms_get_boxes.suppress`                | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. |
 | `decoder.nms_get_boxes.dequant_boxes`           | (quant path only)                                       | Int8 → f32 dequant applied only to survivors of NMS — avoids dequantising filtered candidates. |
 | `decoder.tiled.lift`                            | `metrics/tiled.py::lift_tile_boxes` (partial)            | Per-tile-decoded normalized boxes → full-frame pixel xyxy (optional letterbox inversion). Called once per tile, either directly or via `TiledFrameAccumulator::push_tile`. The `boxes` field is the per-call detection count — sum across tiles to get total lift cost for a frame. |
-| `decoder.tiled.merge`                           | `metrics/tiled.py::merge_tiled_detections`                | GREEDYNMM/IOS merge of one frame's accumulated lifted detections, called from `TiledFrameAccumulator::finalize`/`finalize_normalized`. `tiles` is the frame's total tile count (the fan-in fence), `boxes_in` the pre-merge detection count, `boxes_out` the post-merge count — the ratio is the seam-duplicate collapse rate. |
+| `decoder.tiled.merge`                           | `metrics/tiled.py::merge_tiled_detections`                | Greedy IOS merge (keep-best by default, `MergeMode::Union` for GREEDYNMM) of one frame's accumulated lifted detections, called from `TiledFrameAccumulator::finalize`/`finalize_normalized`. `tiles` is the frame's total tile count (the fan-in fence), `boxes_in` the pre-merge detection count, `boxes_out` the post-merge count — the ratio is the seam-duplicate collapse rate. |
 
 [`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
 

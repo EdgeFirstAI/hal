@@ -70,6 +70,19 @@ pub struct EfMergeConfig {
     pub class_agnostic: c_int,
     pub max_det: usize,
     pub score_threshold: f32,
+    /// 0 = keep-best (default): the highest-scoring box of each matched
+    /// group is kept and the boxes it matched are dropped. 1 = union: the
+    /// group becomes its enclosing union carrying the max score.
+    ///
+    /// Keep-best is `0`, but note that a zero-initialised struct is still
+    /// not the library default: `metric` defaults to `1` (IoS), so an
+    /// all-zero struct selects IoU. Fill with `ef_merge_config_default`.
+    /// The union measured about 0.05 AP50 worse on every frame of the Ocean
+    /// Cleanup ADIS 4K validation (TOP2-836), which is why it is opt-in.
+    ///
+    /// Occupies what was this struct's 4-byte tail pad, so adding it left
+    /// every other field's offset and the 32-byte size unchanged.
+    pub mode: u32,
 }
 
 /// One tile's placement within a frame grid.
@@ -199,9 +212,16 @@ mod tests {
     #[test]
     fn merge_config_layout_is_pinned() {
         // `max_det: usize` forces 8-byte alignment and 4 bytes of pad after
-        // `class_agnostic`; the trailing `f32` pads 28 -> 32.
+        // `class_agnostic`; `mode` fills what was the tail pad at 28, so the
+        // struct is 32 bytes with or without it. Matches `detect.h`.
         assert_eq!(std::mem::size_of::<EfMergeConfig>(), 32);
         assert_eq!(std::mem::align_of::<EfMergeConfig>(), 8);
+        assert_eq!(std::mem::offset_of!(EfMergeConfig, metric), 0);
+        assert_eq!(std::mem::offset_of!(EfMergeConfig, threshold), 4);
+        assert_eq!(std::mem::offset_of!(EfMergeConfig, class_agnostic), 8);
+        assert_eq!(std::mem::offset_of!(EfMergeConfig, max_det), 16);
+        assert_eq!(std::mem::offset_of!(EfMergeConfig, score_threshold), 24);
+        assert_eq!(std::mem::offset_of!(EfMergeConfig, mode), 28);
     }
 
     #[test]

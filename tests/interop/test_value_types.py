@@ -45,7 +45,8 @@ equal too -- required by Python's data model, and doubly so now that
 equality is structural rather than identity-based. The single-package
 `eq_int` enums the equality sweep also turned up (`Nms`, `DecoderType`,
 `DecoderVersion`, `DimName`, `Normalization`, `EglDisplayKind`, `Rotation`,
-`Flip`, `ColorMode`, `Fit`, `MatchMetric`) get the same discriminant-hash
+`Flip`, `ColorMode`, `Fit`, `MatchMetric`, `MergeMode`) get the same
+discriminant-hash
 treatment for the same reason, even though they have no cross-package
 equality problem to fix (single-package -- no sibling copy is reachable).
 `Colorimetry` is untouched here too: its hash is still `object`'s
@@ -415,6 +416,7 @@ def test_colorimetry_hash_is_still_objects_identity_default():
         ("image", "ColorMode", ("Class", "Instance")),
         ("image", "Fit", ("Stretch", "Letterbox")),
         ("decoder", "MatchMetric", ("Iou", "Ios")),
+        ("decoder", "MergeMode", ("KeepBest", "Union")),
     ],
 )
 def test_single_package_eq_int_enum_hashable(mod, name, members):
