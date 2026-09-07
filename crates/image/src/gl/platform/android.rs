@@ -44,7 +44,7 @@ use super::super::{ahardwarebuffer_import, native_fence, Egl};
 use super::GlPlatform;
 use crate::{Error, Result};
 use edgefirst_egl as egl;
-use edgefirst_tensor::{PixelFormat, Tensor};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn};
 use log::{debug, warn};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -382,6 +382,13 @@ impl GlPlatform for AndroidEgl {
     // binding-skip cache (BufferImportKey on Texture) applies, exactly
     // like Linux DMA-BUF.
     const PERSISTENT_TEX_BINDINGS: bool = true;
+
+    /// What this leaf has run: the planar F16 zero-copy render and nothing
+    /// else. The float shaders this branch added were validated on Windows
+    /// only, and every other tuple still falls through to the CPU converter
+    /// that produces this platform's reference output.
+    const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
+        super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     // Only the RGBA8/RGBA16F → TEXTURE_2D import was probe-validated;
     // the external-OES YUV sampler flip is a planned on-device follow-up.
     const EXTERNAL_OES: bool = false;
@@ -444,6 +451,12 @@ impl GlPlatform for AndroidEgl {
         import.image
     }
 
+    fn import_extent(_import: &AndroidEglImage) -> Option<(u32, u32)> {
+        // `eglGetNativeClientBufferANDROID` carries the AHardwareBuffer's own
+        // description, and a HAL tensor's buffer is its logical image.
+        None
+    }
+
     unsafe fn attach_tex_image_2d(_display: &AndroidGlContext, handle: egl::Image) -> Result<()> {
         unsafe {
             edgefirst_gl::gl::EGLImageTargetTexture2DOES(
@@ -494,11 +507,26 @@ impl GlPlatform for AndroidEgl {
 
     fn export_completion_fence(
         display: &AndroidGlContext,
+        _recorded: Option<u64>,
     ) -> crate::Result<Option<super::super::CompletionFence>> {
         if !display.shared.supports_native_fence {
             return Ok(None);
         }
         native_fence::export_native_fence_fd(&display.shared.egl, display.shared.display).map(Some)
+    }
+
+    fn record_completion(
+        _display: &AndroidGlContext,
+        _dst: &mut TensorDyn,
+        _submit: bool,
+    ) -> Option<u64> {
+        // No device fence on Android — convert() returning (or the
+        // exported native fence signaling) means the GPU work is complete.
+        None
+    }
+
+    fn submit_recorded(_display: &AndroidGlContext) {
+        // Nothing is ever queued unsubmitted: there is no device fence.
     }
 
     fn import_buffer(
@@ -558,11 +586,16 @@ impl GlPlatform for AndroidEgl {
         img: &Tensor<T>,
         width: usize,
         height: usize,
-        _fmt: super::PackedImportFormat,
+        fmt: super::PackedImportFormat,
     ) -> Result<AndroidEglImage>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
+        if fmt == super::PackedImportFormat::Rgba32323232F {
+            return Err(Error::NotSupported(
+                "RGBA32F zero-copy import has no buffer format on this platform".into(),
+            ));
+        }
         let ptr = tensor_ahb_ptr(img)?;
         // The AHardwareBuffer is self-describing — the import cannot
         // reinterpret it at different dimensions the way the Linux DMA-BUF

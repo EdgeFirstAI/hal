@@ -69,19 +69,31 @@ pub(super) fn generate_vertex_shader() -> &'static str {
     super::shaders_common::VERTEX_SHADER
 }
 
+/// `sampler2D` source blit. `src_extent` is the rectangle a sample may reach
+/// (`render::sample_clamp_rect`): the logical image's share of the texture,
+/// inset by half a texel, so a `LINEAR` kernel at the edge of an import that
+/// covers more than the logical image does not blend the texel beyond it.
+///
+/// `src_extent` is `highp` although this shader's default is `mediump`: a
+/// `mediump` bound rounds to a multiple of 2^-11 near 1.0, which on a texture
+/// wider than 1024 lands inside the true half-texel inset and would pull the
+/// last column's sample in by up to half a texel. At `highp` the bound is
+/// exact, so clamping to it reproduces `CLAMP_TO_EDGE` wherever the texture
+/// is the logical image.
 pub(super) fn generate_texture_fragment_shader() -> &'static str {
     "\
 #version 300 es
 
 precision mediump float;
 uniform sampler2D tex;
+uniform highp vec4 src_extent;
 in vec3 fragPos;
 in vec2 tc;
 
 out vec4 color;
 
 void main(){
-    color = texture(tex, tc);
+    color = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
 }
 "
 }
@@ -136,6 +148,7 @@ pub(super) fn generate_texture_int8_shader() -> &'static str {
 #version 300 es
 precision highp float;
 uniform sampler2D tex;
+uniform vec4 src_extent;
 in vec3 fragPos;
 in vec2 tc;
 
@@ -149,7 +162,7 @@ vec3 int8_bias(vec3 v) {
 }
 
 void main(){
-    vec4 c = texture(tex, tc);
+    vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
     color = vec4(int8_bias(c.rgb), c.a);
 }
 "
@@ -577,8 +590,9 @@ precision highp float;
 precision highp int;
 uniform sampler2D u_tex;        // RGBA8 source, normalized fetch -> [0,1]
 uniform vec4 src_rect_uv;       // (origin_u, origin_v, size_u, size_v)
+uniform vec4 src_extent;        // (u_min, v_min, u_max, v_max) a sample may reach
 uniform vec4 dst_rect_px;       // (origin_x, origin_y, w, h) in pixel space
-uniform vec3 pad_color;         // per-channel normalized pad value
+uniform vec4 pad_color;         // per-channel normalized pad value (RGBA)
 out float frag_value;
 void main() {
     int ox = int(gl_FragCoord.x);
@@ -597,7 +611,8 @@ void main() {
     }
     float u = (float(px) + 0.5 - dst_rect_px.x) / dst_rect_px.z;
     float v = (float(py) + 0.5 - dst_rect_px.y) / dst_rect_px.w;
-    vec2 src_uv = src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw;
+    vec2 src_uv = clamp(src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw,
+                        src_extent.xy, src_extent.zw);
     vec4 rgba = texture(u_tex, src_uv);
     frag_value = (channel == 0) ? rgba.r
                : (channel == 1) ? rgba.g : rgba.b;
@@ -605,23 +620,45 @@ void main() {
 "
 }
 
-/// RGBA8 → packed RGBA16F PlanarRgb F16 fragment shader.
+/// RGBA8 → packed planar-float fragment shader (`PlanarRgb` / `PlanarRgba`,
+/// F16 or F32).
 ///
-/// The render target is a single `RGBA16F` texture sized `(W/4, 3*H)`.
-/// Each output texel packs 4 half-float channel samples into its four
-/// components, so a linear readout of the rendered texture produces a
-/// tightly-packed `[3, H, W]` F16 buffer (CHW / PlanarRgb order, one plane
-/// per row-band).  Width `W` must be a multiple of 4.
+/// The render target is a single `RGBA16F` (F16) or `RGBA32F` (F32) texture
+/// sized `(W/4, C*H)`. Each output texel packs 4 float channel samples into
+/// its four components, so a linear readout of the rendered texture produces
+/// a tightly-packed `[C, H, W]` buffer (CHW order, one plane per row-band).
+/// Width `W` must be a multiple of 4.
 ///
 /// Normalization from RGBA8 → `[0, 1]` is performed for free by the hardware
 /// texture fetch (`sampler2D` normalized fetch).  Letterboxing is applied via
 /// `dst_rect_px`; pixels outside that rectangle are filled with `pad_color`.
 ///
 /// Single source of truth lives in [`super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT`],
-/// shared with the macOS IOSurface path (`macos_processor.rs`).
-// Consumed by `GLProcessorST` for the F16 NCHW PBO and DMA-BUF render paths.
+/// shared with the macOS IOSurface and Windows D3D11 texture paths.
+// Consumed by `GLProcessorST` for the F16 NCHW PBO path and the F16/F32 NCHW
+// zero-copy render paths.
 pub(super) fn generate_planar_rgb_f16_packed_shader() -> &'static str {
     super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT
+}
+
+/// RGBA8 → packed interleaved-float fragment shader (`Rgb`, F16 or F32) for
+/// the `(W*3/4, H)` zero-copy render surface.
+///
+/// Single source of truth lives in
+/// [`super::shaders_common::FLOAT_NHWC_PACKED_FRAGMENT`].
+// Consumed by `GLProcessorST` for the interleaved float zero-copy render path.
+pub(super) fn generate_float_nhwc_packed_shader() -> &'static str {
+    super::shaders_common::FLOAT_NHWC_PACKED_FRAGMENT
+}
+
+/// RGBA8 → float `Rgba` fragment shader for the `(W, H)` zero-copy render
+/// surface (one texel per pixel, no packing).
+///
+/// Single source of truth lives in
+/// [`super::shaders_common::FLOAT_RGBA_FRAGMENT`].
+// Consumed by `GLProcessorST` for the float RGBA zero-copy render path.
+pub(super) fn generate_float_rgba_shader() -> &'static str {
+    super::shaders_common::FLOAT_RGBA_FRAGMENT
 }
 
 pub(super) fn generate_color_shader() -> &'static str {

@@ -349,6 +349,29 @@ impl PixelFormat {
         }
     }
 
+    /// The image height whose combined plane height is `combined`, or `None`
+    /// when no image height produces it (721 for NV12, say) and for every
+    /// non-semi-planar format.
+    ///
+    /// The inverse of [`combined_plane_height`](Self::combined_plane_height),
+    /// and verified against it before returning: the forward map is not
+    /// surjective, so a shape carrying a combined height nothing produced must
+    /// be rejected rather than rounded to a nearby image height.
+    ///
+    /// [`crate::image_dims_from_shape`] uses it to recover the logical height
+    /// from a semi-planar allocation shape.
+    pub fn image_height_from_combined(&self, combined: usize) -> Option<usize> {
+        let candidate = match self {
+            // Checked: a garbled combined height read off a descriptor must
+            // not wrap into a plausible-looking image height.
+            PixelFormat::Nv12 => combined.checked_mul(2)? / 3,
+            PixelFormat::Nv16 => combined / 2,
+            PixelFormat::Nv24 => combined / 3,
+            _ => return None,
+        };
+        (self.combined_plane_height(candidate) == Some(combined)).then_some(candidate)
+    }
+
     /// Per-format semi-planar chroma addressing parameters, shared by the codec
     /// writer ([`uv_rows_per_luma`](ChromaLayout::uv_rows_per_luma)), the CPU
     /// readers, and both GL shaders so the combined-plane chroma geometry has a
@@ -713,6 +736,43 @@ mod tests {
                 Some(fmt),
                 "roundtrip failed for {fmt:?}"
             );
+        }
+    }
+
+    #[test]
+    fn combined_plane_height_inverts_for_every_semi_planar_height() {
+        for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+            for h in 1..=64usize {
+                let combined = fmt.combined_plane_height(h).unwrap();
+                assert_eq!(
+                    fmt.image_height_from_combined(combined),
+                    Some(h),
+                    "{fmt:?} height {h} -> combined {combined}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_height_from_combined_rejects_unproduced_heights() {
+        // NV12 maps 480 -> 720 and 481 -> 722; nothing maps to 721.
+        assert_eq!(PixelFormat::Nv12.image_height_from_combined(721), None);
+        // NV16 doubles, so every odd combined height is unreachable.
+        assert_eq!(PixelFormat::Nv16.image_height_from_combined(7), None);
+        // NV24 triples.
+        assert_eq!(PixelFormat::Nv24.image_height_from_combined(8), None);
+    }
+
+    #[test]
+    fn image_height_from_combined_is_none_for_non_semi_planar() {
+        for fmt in [
+            PixelFormat::Rgba,
+            PixelFormat::Rgb,
+            PixelFormat::Grey,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ] {
+            assert_eq!(fmt.image_height_from_combined(12), None, "{fmt:?}");
         }
     }
 

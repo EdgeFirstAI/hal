@@ -509,6 +509,124 @@ impl<T: Element> Tensor<T> {
         self.inner.iosurface_physical_dims()
     }
 
+    /// The borrowed `ID3D11Texture2D*` backing this tensor, valid while the
+    /// tensor lives. `None` when the tensor is not texture-backed.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_texture(&self) -> Option<*mut std::ffi::c_void> {
+        self.inner.d3d11_texture()
+    }
+
+    /// The texture geometry the HAL chose for this image: DXGI format, texel
+    /// dimensions and the matching GL internal format. `None` when the tensor
+    /// is not texture-backed.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_layout(&self) -> Option<crate::d3d11_layout::D3d11ImageLayout> {
+        self.inner.d3d11_layout()
+    }
+
+    /// A duplicated NT handle the caller owns: open it on a D3D12 device,
+    /// another D3D11 device, or CUDA, or duplicate it into another process.
+    /// Closing it does not affect this tensor.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_shared_handle(&self) -> Result<std::os::windows::io::OwnedHandle> {
+        self.inner.d3d11_shared_handle()
+    }
+
+    /// The fence handle plus value a GPU consumer waits on before reading this
+    /// texture, or `None` when no GPU write has been recorded on it.
+    #[cfg(target_os = "windows")]
+    pub fn gpu_completion(&self) -> Result<Option<crate::d3d11::GpuCompletion>> {
+        self.inner.gpu_completion()
+    }
+
+    /// The fence value of the newest GPU write recorded on this tensor, or 0
+    /// when there is none: the `value` of `gpu_completion` without the
+    /// duplicated fence handle. 0 for a tensor that is not a D3D11 texture,
+    /// and on every platform other than Windows.
+    pub fn gpu_write_value(&self) -> u64 {
+        self.inner.gpu_write_value()
+    }
+
+    /// Record that GPU work writing this texture completes at `value` of the
+    /// process device's fence. Monotonic: an older value never displaces a
+    /// newer one, so recording out of order is safe rather than merely
+    /// tolerated.
+    ///
+    /// Takes `&self` for the reason `static`'s own `Tensor::set_gpu_write`
+    /// does: the fence slot is an atomic, and a producer records a write on
+    /// a tensor its consumers already hold.
+    #[cfg(target_os = "windows")]
+    pub fn set_gpu_write(&self, value: u64) -> Result<()> {
+        self.inner.set_gpu_write(value)
+    }
+
+    /// Wrap an existing `ID3D11Texture2D` as a tensor. The texture is checked
+    /// against the layout the HAL would have chosen for `format`/`width`/
+    /// `height` and must live on the HAL's process device; ownership stays
+    /// with the caller, since this takes its own reference.
+    ///
+    /// Same signature as `static`'s `Tensor::from_d3d11_texture`, so a
+    /// caller compiles against either backend.
+    ///
+    /// # Safety
+    ///
+    /// `texture` must be null or a live `ID3D11Texture2D` created on the HAL
+    /// device ([`crate::d3d11::device()`]).
+    #[cfg(target_os = "windows")]
+    pub unsafe fn from_d3d11_texture(
+        texture: *mut std::ffi::c_void,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        access: CpuAccess,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        // SAFETY: caller guarantees `texture` is null or a live texture on
+        // the HAL device.
+        unsafe {
+            TensorDyn::from_d3d11_texture(texture, width, height, format, T::DTYPE, access, name)
+        }
+        .map(Self::from_inner)
+    }
+
+    /// Open a shared texture by its NT handle on the HAL's device. When
+    /// `completion` is given, its fence value is waited for on the immediate
+    /// context, so a same-device reader needs no further ordering. Both
+    /// handles stay owned by the caller: this duplicates what it keeps.
+    ///
+    /// Same signature as `static`'s `Tensor::from_d3d11_shared_handle`, for
+    /// the reason [`from_d3d11_texture`](Self::from_d3d11_texture) gives.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be an NT shared handle of a D3D11 texture, valid in this
+    /// process, and `completion`'s handle a shared fence handle.
+    #[cfg(target_os = "windows")]
+    pub unsafe fn from_d3d11_shared_handle(
+        handle: std::os::windows::io::RawHandle,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        access: CpuAccess,
+        completion: Option<(std::os::windows::io::RawHandle, u64)>,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        // SAFETY: caller guarantees the handles are valid in this process.
+        unsafe {
+            TensorDyn::from_d3d11_shared_handle(
+                handle,
+                width,
+                height,
+                format,
+                T::DTYPE,
+                access,
+                completion,
+                name,
+            )
+        }
+        .map(Self::from_inner)
+    }
+
     /// CUDA registration for this tensor, if any (set at creation via
     /// [`Self::set_cuda_handle`]).
     ///
@@ -524,14 +642,30 @@ impl<T: Element> Tensor<T> {
     /// decoder (`jpeg/nvjpeg/mod.rs`, this getter) -- which, before this
     /// existed, unconditionally took the non-CUDA fallback path on
     /// `dynamic` even for a genuinely CUDA-registered PBO destination.
+    ///
+    /// It answers only for a handle attached here. A registration the C
+    /// library made on the tensor it owns -- every D3D11 texture tensor --
+    /// is out of this field's reach, and is reachable through
+    /// [`Self::cuda_map`] / [`Self::cuda_map_mut`] instead. Gate on the map,
+    /// not on this, when the question is whether CUDA can read this tensor.
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
         self.inner.cuda.as_deref()
     }
 
-    /// See [`Self::cuda`]. `None` when no handle is attached, same as
-    /// `static`'s own `Tensor::cuda_map`.
+    /// See [`Self::cuda`]. `None` when the tensor carries no registration on
+    /// either side of the ABI, same as `static`'s own `Tensor::cuda_map`.
+    ///
+    /// Delegates to `TensorDyn::cuda_map` rather than reading [`Self::cuda`],
+    /// so a tensor whose registration lives inside the C library -- every
+    /// D3D11 texture tensor -- maps here too.
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
-        self.cuda()?.map()
+        self.inner.cuda_map()
+    }
+
+    /// See [`Self::cuda_map`]. Writable counterpart, same as `static`'s own
+    /// `Tensor::cuda_map_mut`.
+    pub fn cuda_map_mut(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        self.inner.cuda_map_mut()
     }
 
     /// Attach a CUDA handle (called by `ImageProcessor::create_image` after
@@ -1013,6 +1147,30 @@ impl<T: Element> TensorTrait<T> for Tensor<T> {
         T: 'a,
     {
         let pin = self.inner.map_pin(access)?;
+        let byte_len = pin.len();
+        Ok(crate::view::HostView::new(
+            pin,
+            self.inner.shape().to_vec(),
+            Some(byte_len),
+            access,
+        ))
+    }
+
+    /// The non-blocking counterpart of [`map_with`](Self::map_with), routed
+    /// through `ef_tensor_try_map` rather than left on `TensorTrait`'s
+    /// `map_with` default.
+    ///
+    /// The default would be wrong here, not merely imprecise: it would stall
+    /// on the Windows D3D11 texture's staging refresh under a name whose
+    /// whole contract is that it does not, so a caller polling this would
+    /// block instead of making progress elsewhere. Same body as `map_with`
+    /// otherwise -- including the `byte_size_override`, for the padded-row
+    /// reason that method's own doc comment gives.
+    fn try_map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        let pin = self.inner.map_pin_with(access, true)?;
         let byte_len = pin.len();
         Ok(crate::view::HostView::new(
             pin,
