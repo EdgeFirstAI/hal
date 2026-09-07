@@ -130,12 +130,19 @@ not have their own instrumentation.
 
 ## Inter-Crate Interfaces
 
-The tracker crate has no compile-time dependency on any other `edgefirst-*`
-crate. It is consumed as an optional feature by:
+The tracker crate's only `edgefirst-*` dependency is an optional
+[`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/),
+pulled in by the default `static` and `tensor-boxes` features — the latter is
+the orphan-rule home for `impl DetectionBox for DetectBox`. Both are off in
+the C leaf, so `libedgefirst_tracker` links no tensor at all. Nothing here
+depends on the model decoder.
+
+It is consumed by:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) — exposes `decode_tracked()` which accepts any `Tracker<DetectBox>` implementation.
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) — adds `draw_masks_tracked()` for rendering masks for tracked detections and returning track info. `ColorMode::Track` is the planned per-UUID palette mode, but currently aliases `ColorMode::Instance` (detection-order colouring) until the per-track palette lands.
-- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) (feature `tracker`) — re-exports as `edgefirst_hal::tracker`.
+- [`edgefirst-tracker-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/) — `libedgefirst_tracker`, which takes plain `ef_detect_box` values (`--no-default-features`, so neither tensor nor decoder is linked).
+- [`crates/python-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-tracker/) — the standalone `edgefirst-tracker` wheel, the one of the five that links no `libedgefirst_tensor.so`.
 
 The boundary type is the [`DetectionBox`](https://docs.rs/edgefirst-tracker/latest/edgefirst_tracker/trait.DetectionBox.html)
 trait; the decoder's `DetectBox` implements it, but any third-party detection
