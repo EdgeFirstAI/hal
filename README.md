@@ -1572,7 +1572,7 @@ graph TD
     Decoder --> DetectAbi
     Decoder -.->|tracker feature| Tracker
     Codec --> Tensor
-    Tracker -.->|tensor-boxes feature| Tensor
+    Tracker -.->|static or tensor-boxes feature| Tensor
 
     Python[edgefirst.{tensor,codec,image,decoder,tracker}<br/>PyO3]
     TensorC[libedgefirst_tensor]
