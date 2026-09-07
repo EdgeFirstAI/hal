@@ -10,8 +10,10 @@ makes correct code fail to type-check and incorrect code pass.
 
 Two directions, because each catches a different rot:
 
-* **coverage** — every public runtime name has a stub declaration. Catches new
-  API that nobody stubbed.
+* **coverage** — every public runtime name has a stub declaration, module-level
+  names and class members alike. Catches new API that nobody stubbed:
+  `ImageProcessor.convert`, `convert_deferred` and `flush` went unstubbed for a
+  release because the module-level pass sees only the class.
 * **ghosts** — every unconditionally-stubbed class and method exists at
   runtime. Catches API that was removed or moved to another package.
 
@@ -25,6 +27,7 @@ from __future__ import annotations
 import ast
 import importlib
 import pathlib
+import types
 
 import pytest
 
@@ -50,6 +53,93 @@ def _bound_names(nodes) -> set[str]:
     return names
 
 
+def _class_members(node: ast.ClassDef) -> set[str]:
+    """Names a stub class declares, including those inside a platform `if`."""
+    names: set[str] = set()
+
+    def walk(body):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(n.name)
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+                names.add(n.target.id)
+            elif isinstance(n, ast.Assign):
+                names.update(t.id for t in n.targets if isinstance(t, ast.Name))
+            elif isinstance(n, ast.If):
+                walk(n.body)
+                walk(n.orelse)
+
+    walk(node.body)
+    return names
+
+
+def _imported_bases(tree: ast.Module) -> dict[str, tuple[str, str]]:
+    """Imported name -> (module, original name), `if` bodies included.
+
+    `from edgefirst.tensor import Tensor as _BaseTensor` maps `_BaseTensor` to
+    `("edgefirst.tensor", "Tensor")`, which is enough to open that stub.
+    """
+    bases: dict[str, tuple[str, str]] = {}
+
+    def walk(body):
+        for n in body:
+            if isinstance(n, ast.ImportFrom) and n.module:
+                for a in n.names:
+                    bases[a.asname or a.name] = (n.module, a.name)
+            elif isinstance(n, ast.If):
+                walk(n.body)
+                walk(n.orelse)
+
+    walk(tree.body)
+    return bases
+
+
+def _stub_class_members(module: str, name: str) -> set[str]:
+    """Members `class <name>` declares in the stub of `module`, if it is one
+    of ours.
+
+    A base from `typing` or `enum` has no stub here, so it contributes nothing:
+    `vars()` on the runtime class does not see those members either.
+    """
+    prefix = "edgefirst."
+    if not module.startswith(prefix) or module[len(prefix) :] not in PACKAGES:
+        return set()
+    tree = ast.parse(stub_path(module[len(prefix) :]).read_text())
+    conditional = [
+        c for n in tree.body if isinstance(n, ast.If) for c in (*n.body, *n.orelse)
+    ]
+    for node in (*tree.body, *conditional):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return _class_members(node)
+    return set()
+
+
+def _runtime_members(cls) -> set[str]:
+    """Public, non-dunder callables and properties the class itself defines.
+
+    `vars`, not `dir`: an inherited `object` member is not this class's API and
+    no stub is expected to redeclare it.
+    """
+    kinds = (
+        property,
+        staticmethod,
+        classmethod,
+        types.FunctionType,
+        types.BuiltinFunctionType,
+        types.MethodDescriptorType,
+        types.GetSetDescriptorType,
+        types.MemberDescriptorType,
+        types.WrapperDescriptorType,
+    )
+    out: set[str] = set()
+    for name, value in vars(cls).items():
+        if name.startswith("_"):
+            continue
+        if isinstance(value, kinds) or callable(value):
+            out.add(name)
+    return out
+
+
 @pytest.mark.parametrize("pkg", PACKAGES)
 def test_every_runtime_name_is_stubbed(pkg: str):
     tree = ast.parse(stub_path(pkg).read_text())
@@ -67,6 +157,66 @@ def test_every_runtime_name_is_stubbed(pkg: str):
     assert not missing, (
         f"edgefirst.{pkg} exports {missing} but {stub_path(pkg)} does not "
         f"declare them; a user's type checker will reject correct code"
+    )
+
+
+@pytest.mark.parametrize("pkg", PACKAGES)
+def test_every_runtime_class_member_is_stubbed(pkg: str):
+    """The module-level pass above sees a class, never its methods.
+
+    A method missing from a stubbed class is invisible to both older
+    directions: coverage stops at the class name, and the ghost pass only
+    walks the other way.
+    """
+    tree = ast.parse(stub_path(pkg).read_text())
+    conditional = [
+        c for n in tree.body if isinstance(n, ast.If) for c in (*n.body, *n.orelse)
+    ]
+    classes = {
+        n.name: n for n in (*tree.body, *conditional) if isinstance(n, ast.ClassDef)
+    }
+    imported = _imported_bases(tree)
+
+    mod = importlib.import_module(f"edgefirst.{pkg}")
+
+    missing: list[str] = []
+    absent: list[str] = []
+    for name, node in classes.items():
+        runtime_cls = getattr(mod, name, None)
+        if not isinstance(runtime_cls, type):
+            continue  # a ghost, or a re-exported alias; the other test owns it
+        declared = {m for m in _class_members(node) if not m.startswith("_")}
+        bases = [
+            imported[b.id]
+            for b in node.bases
+            if isinstance(b, ast.Name) and b.id in imported
+        ]
+        if bases:
+            # The class inherits part of its surface from a stub this file does
+            # not contain (`edgefirst.codec`'s Tensor extends
+            # `edgefirst.tensor`'s). The additions this stub class makes on
+            # its own must exist on the runtime class.
+            absent += [
+                f"{name}.{m}" for m in sorted(declared) if not hasattr(runtime_cls, m)
+            ]
+        # The runtime class is not a Python subclass of the base (each
+        # extension registers its own `Tensor`, with the shared methods
+        # repeated on it), so `vars()` holds the base's members too. Those
+        # are the base stub's to declare; what is left must be declared here.
+        inherited: set[str] = set()
+        for module, base_name in bases:
+            inherited |= _stub_class_members(module, base_name)
+        for member in sorted(_runtime_members(runtime_cls) - declared - inherited):
+            missing.append(f"{name}.{member}")
+
+    assert not missing, (
+        f"edgefirst.{pkg} exposes {missing} but {stub_path(pkg)} does not "
+        f"declare them on the class; a user's type checker will reject "
+        f"correct code"
+    )
+    assert not absent, (
+        f"{stub_path(pkg)} declares {absent} on a class that inherits an "
+        f"imported base, but edgefirst.{pkg} has no such members at runtime"
     )
 
 

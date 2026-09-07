@@ -775,6 +775,7 @@ they are built for the wider PyPI audience rather than for our targets.
 | Feature | Linux (i.MX) | Linux (other) | macOS | iOS | Android | Windows |
 |---------|--------------|---------------|-------|-----|---------|---------|
 | DMA tensors | Yes | Yes | No | No | No | No |
+| D3D11 texture tensors (zero-copy) | No | No | No | No | No | Yes (ANGLE only for GL rendering) |
 | PBO tensors (GPU) | Yes | Yes | No | No | No | Yes (with ANGLE) |
 | IOSurface tensors (zero-copy) | No | No | Yes (with ANGLE) | Yes (with ANGLE) | No | No |
 | AHardwareBuffer tensors (zero-copy) | No | No | No | No | Yes | No |
@@ -795,8 +796,8 @@ On iOS the OpenGL backend uses the same ANGLE-over-Metal path — see
 [iOS](#ios) below. On Android the OpenGL backend uses the platform's
 native GLES driver directly (no translation layer) — see
 [Android](#android) below. On Windows the OpenGL backend runs the same
-engine on ANGLE over Direct3D 11 with PBO transfers — see
-[Windows GPU Acceleration](#windows-gpu-acceleration) below.
+engine on ANGLE over Direct3D 11, rendering zero-copy into D3D11 texture
+tensors — see [Windows GPU Acceleration](#windows-gpu-acceleration) below.
 
 ## macOS GPU Acceleration
 
@@ -928,13 +929,30 @@ Homebrew install or re-signing step.
 
 On Windows the HAL runs the same OpenGL ES engine on
 [Google's ANGLE](https://github.com/google/angle) translating to
-**Direct3D 11**. There is no zero-copy buffer kind on Windows yet, so GPU
-destinations are **PBO tensors** (`TensorMemory::Pbo`, the same path desktop
-Linux uses on NVIDIA where DMA-BUF import is unavailable): `Mem` sources are
-uploaded by GL and results are read back through `GL_PIXEL_PACK_BUFFER`
-and `map()`ped on the GL thread. D3D11 shared-texture tensors (and CUDA via
-D3D11 interop) are a planned follow-on. If ANGLE cannot be loaded the HAL
-logs a warning and falls back to the CPU backend.
+**Direct3D 11**. The zero-copy buffer kind there is a **D3D11 texture**:
+`TensorMemory::DmaBuf` is an `ID3D11Texture2D` on a HAL-owned D3D11 device
+that ANGLE renders straight into. If ANGLE cannot be loaded the HAL logs a
+warning and falls back to the CPU backend.
+
+`ImageProcessor::create_image()` allocates a texture first, then a PBO, then
+heap memory, so a GPU destination reports `TensorMemory.DMABUF` on Windows
+the way it does on Linux and macOS. Sources are uploaded by GL as before.
+`map()` on a texture goes through a staging copy whose pitch becomes the
+tensor's `row_stride()`, so a padded destination must be read row by row (or
+through the buffer protocol) rather than as one flat run. `try_map()` returns
+`WouldBlock` while that copy is still in flight instead of stalling; a retry
+loop must yield or sleep between attempts, because on the WARP software
+adapter the CPU threads *are* the GPU and a tight loop starves the copy it is
+waiting for.
+
+Semi-planar textures (NV12, NV16, NV24) are allocated as wide as the driver's
+staging row pitch, always an even width, and that width is the tensor's
+`row_stride()`. An external semi-planar texture handed to
+`from_d3d11_texture` / `from_d3d11_shared_handle` (or the C and Python
+constructors) is accepted only when its width is even and equal to its own
+staging pitch; anything else is refused with an error naming both numbers.
+A D3D12 or CUDA producer that needs one should allocate through the HAL, or
+match that pitch.
 
 ### Installing ANGLE (Windows)
 
@@ -971,14 +989,19 @@ cargo run --release -p edgefirst-image --example pipeline_demo
 
 Look for `ANGLE D3D11 adapter: NVIDIA GeForce RTX 3070 ...` and
 `ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 ... Direct3D11 ...)` in the bring-up
-log, and `GLConverter created (transfer=Pbo)`. `create_image()` then returns
-`TensorMemory::Pbo` destinations.
+log, and `GLConverter created (transfer=D3d11Texture)`. `create_image()` then
+returns `TensorMemory::DmaBuf` destinations.
 
 ### Choosing the adapter
 
-`EDGEFIRST_ANGLE_ADAPTER` selects the Direct3D 11 adapter ANGLE creates its
-device on (the process-global display is created once, so set it before the
-first `ImageProcessor`):
+`EDGEFIRST_D3D11_ADAPTER` selects the Direct3D 11 adapter the device is
+created on. `EDGEFIRST_ANGLE_ADAPTER` is read as an alias and both names stay
+valid; one variable drives both the device and ANGLE's display, because ANGLE
+builds its display on the HAL's device instead of creating a second one. When
+both are set and they differ, `EDGEFIRST_D3D11_ADAPTER` wins and the HAL logs
+the disagreement once, so a stale deployment variable cannot quietly pick the
+adapter. The device and the display are each created once per process, so set
+the variable before the first allocation or the first `ImageProcessor`:
 
 | Value | Meaning |
 |-------|---------|
@@ -992,6 +1015,62 @@ first `ImageProcessor`):
 Under a Remote Desktop session the hardware adapter is normally still
 enumerated; if only the Basic Render Driver is, the HAL warns up front and
 falls back to CPU unless `EDGEFIRST_ALLOW_SOFTWARE_GL=1`.
+
+### CUDA consumers (Windows)
+
+`Tensor::cuda_map()` / `cuda_map_mut()` (`ef_tensor_cuda_map`,
+`ef_tensor_cuda_map_mut`, `Tensor.cuda_map()` in Python) import the texture's
+shared handle as CUDA external memory and hand back a linear device pointer.
+A texture is not linear, so **each map costs one device copy**, ordered behind
+the fence value the last GPU write recorded. The mapping is **tight rows** of
+`width * bytes_per_texel` and its `len()` is their sum — *not* `row_stride()`,
+which is the D3D11 staging pitch a CPU map sees and is the larger number on a
+padded texture. Striding the device pointer by `row_stride()` reads past the
+end of the mapping and, on a write, scrambles the image rather than failing.
+Releasing a writable map copies the buffer back into the texture and
+synchronizes before it returns.
+
+### D3D12 and DirectML consumers (Windows)
+
+DirectML runs on D3D12, so a DirectML consumer is a D3D12 consumer:
+`Tensor::d3d11_shared_handle()` (`ef_tensor_d3d11_shared_handle`,
+`Tensor.d3d11_shared_handle()`) duplicates the texture's shared NT handle for
+`ID3D12Device::OpenSharedHandle` or any other device that opens D3D11 shared
+resources. The caller owns the handle and closes it with `CloseHandle`.
+`Tensor::gpu_completion()` (`ef_tensor_gpu_completion`,
+`Tensor.gpu_completion()`) reports the fence handle and the value to wait for
+before reading, which is cheaper than blocking the GL thread.
+`Tensor::gpu_write_value()` (`ef_tensor_gpu_write_value`,
+`Tensor.gpu_write_value`) is the value alone, with no handle to close and no
+`DuplicateHandle` behind it, for a consumer that already holds the process
+fence and only needs the number to wait for. A consumer that writes the
+texture itself records its own completion with `Tensor::set_gpu_write()`
+(`ef_tensor_set_gpu_write`, `Tensor.set_gpu_write()`); the recorded value is a
+maximum, so recording one a consumer already holds is safe. In Python a
+destination's `gpu_completion()` reflects the convert that just wrote it — the
+binding writes the recorded value back onto the object the caller passed. The
+C API needs no such step.
+
+### Other processes and other packages (Windows)
+
+`ef_tensor_export` / `ef_tensor_import` (`edgefirst_tensor::blob`) carry a
+texture across a process boundary: the blob names the producer's pid and the
+importer duplicates the handles out of that process, so the producer must
+still be alive and the importer must be able to open it with
+`PROCESS_DUP_HANDLE`. No file descriptors travel on Windows, so the `fds`
+arrays stay empty. Independently linked packages inside one process exchange
+textures through the `D3D11_TEXTURE` kind of the tensor descriptor protocol
+([`crates/python-common/INTEROP.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/INTEROP.md)).
+
+### Hosts that own the device (Windows)
+
+A host that already has an `ID3D11Device` — a Media Foundation pipeline, a
+game engine, a D3D12 application with an interop device — installs it with
+`edgefirst_tensor::d3d11::use_external_device` (`ef_d3d11_use_external_device`,
+`edgefirst.tensor.d3d11_use_external_device`) so HAL tensors are allocated on
+it and ANGLE renders on it. The reference stays the host's. This must run
+before anything that creates the device as a side effect: the first
+allocation, `d3d11_device()`, or `is_gpu_buffer_available()`.
 
 ### When you don't need this setup (Windows)
 
@@ -1310,7 +1389,8 @@ and the sibling `*-capi` READMEs.
 | `EDGEFIRST_DISABLE_V4L2` | `1` forces the software JPEG decoder, bypassing the V4L2 hardware JPEG backend (Linux) |
 | `EDGEFIRST_CODEC_V4L2_DEVICE` | Probe a specific V4L2 device node for hardware JPEG decode instead of auto-discovery |
 | `EDGEFIRST_ANGLE_PATH` | macOS and Windows: directory containing `libEGL.dylib` / `libGLESv2.dylib` (macOS) or `libEGL.dll` / `libGLESv2.dll` (Windows). Overrides the default search (macOS: Homebrew → `@loader_path` → `@executable_path` → `libEGL.dylib` on dyld; Windows: next to the loading module → next to the executable → the default DLL search path). Set this when deploying a bundled or custom-signed ANGLE alongside the binary. |
-| `EDGEFIRST_ANGLE_ADAPTER` | Windows only: which Direct3D 11 adapter ANGLE uses — `hardware` (default), `warp` (software; needs `EDGEFIRST_ALLOW_SOFTWARE_GL=1`), `discrete`, an adapter LUID `<high>:<low>`, or a substring of the adapter description (see [Windows GPU Acceleration](#windows-gpu-acceleration)) |
+| `EDGEFIRST_D3D11_ADAPTER` | Windows only: which Direct3D 11 adapter the HAL creates its device on, and therefore the one ANGLE renders with — `hardware` (default), `warp` (software; needs `EDGEFIRST_ALLOW_SOFTWARE_GL=1`), `discrete`, an adapter LUID `<high>:<low>`, or a substring of the adapter description (see [Windows GPU Acceleration](#windows-gpu-acceleration)) |
+| `EDGEFIRST_ANGLE_ADAPTER` | Windows only: alias of `EDGEFIRST_D3D11_ADAPTER`, kept from before the device moved into the tensor crate. Both names are read; if both are set and differ, `EDGEFIRST_D3D11_ADAPTER` wins and the disagreement is logged once |
 | `EDGEFIRST_TESTDATA_DIR` | Override testdata location (used by benches and CI) |
 | `RUST_LOG` | Standard `env_logger` filter — `RUST_LOG=edgefirst_image=debug` for backend dispatch + cache stats |
 

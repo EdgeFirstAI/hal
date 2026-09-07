@@ -16,11 +16,10 @@ use edgefirst_tensor::{DType, TensorDyn};
 use std::ffi::CStr;
 
 use crate::handle::EfTensor;
+use crate::last_error::set_errno;
 
-fn set_errno(code: i32) {
-    errno::set_errno(errno::Errno(code));
-}
-
+/// Platforms: Android.
+///
 /// Wrap an AHardwareBuffer. `NULL` / `ENOTSUP` off Android.
 ///
 /// # Safety
@@ -71,6 +70,8 @@ pub unsafe extern "C" fn ef_tensor_from_hardware_buffer(
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// Platforms: Android.
+///
 /// Borrowed AHardwareBuffer pointer, or NULL / `ENOTSUP`.
 ///
 /// # Safety
@@ -102,6 +103,8 @@ pub unsafe extern "C" fn ef_tensor_hardware_buffer_ptr(t: *const EfTensor) -> *m
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// Platforms: Android.
+///
 /// Physical AHardwareBuffer dimensions in texels.
 ///
 /// # Safety
@@ -145,6 +148,8 @@ pub unsafe extern "C" fn ef_tensor_hardware_buffer_physical_dims(
     .unwrap_or(libc::EINVAL)
 }
 
+/// Platforms: macOS, iOS.
+///
 /// Borrowed IOSurfaceRef, or NULL / `ENOTSUP` off Apple.
 ///
 /// # Safety

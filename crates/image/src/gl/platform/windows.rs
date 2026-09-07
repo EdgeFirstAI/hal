@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Windows implementation of [`GlPlatform`]: ANGLE (GLES → Direct3D 11)
-//! display bring-up with PBO transfers.
+//! Windows implementation of [`GlPlatform`]: ANGLE (GLES → Direct3D 11) on
+//! the tensor crate's D3D11 device, with zero-copy texture transfers.
 //!
 //! Structurally this is the macOS leaf (`platform/macos.rs` loader +
 //! `platform/angle.rs` display) with three differences:
@@ -14,36 +14,36 @@
 //!    to the executable, then the default DLL search path. Absolute
 //!    candidates load with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` so ANGLE's
 //!    `libEGL.dll` resolves its sibling `libGLESv2.dll`.
-//! 2. **Display** — `eglGetPlatformDisplayEXT` selects the D3D11 backend
-//!    and, via `EDGEFIRST_ANGLE_ADAPTER`, the adapter: ANGLE's default
-//!    hardware adapter, WARP (software, for CI), or a specific adapter by
-//!    LUID / description substring resolved through DXGI enumeration.
-//! 3. **Transfer** — there is no zero-copy buffer kind on Windows yet, so
-//!    the display reports [`TransferBackend::Pbo`]: `Mem` sources upload
-//!    through `glTexImage2D` and destinations are PBO tensors read back
-//!    through `GL_PIXEL_PACK_BUFFER` — the same path desktop Linux takes on
-//!    NVIDIA where DMA-BUF import is unavailable. The `Import` type
-//!    ([`D3dTexturePbuffer`]) is the shape the D3D11 shared-texture
-//!    follow-on fills via `EGL_ANGLE_d3d_texture_client_buffer`; today the
-//!    three `import_*` methods return `NotSupported` and are unreachable
-//!    because no tensor on Windows is zero-copy-backed.
+//! 2. **Display** — the display is built on the device the tensor crate
+//!    already created: `eglCreateDeviceANGLE` wraps that `ID3D11Device` as
+//!    an `EGLDeviceEXT` and `eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT)`
+//!    turns it into the display. ANGLE imports textures only from its own
+//!    device, and every texture tensor lives on the tensor crate's, so the
+//!    two must be one device. Which adapter that is belongs to the tensor
+//!    crate (`EDGEFIRST_D3D11_ADAPTER`, alias `EDGEFIRST_ANGLE_ADAPTER`);
+//!    this leaf selects nothing.
+//! 3. **Transfer** — the display reports [`TransferBackend::D3d11Texture`]:
+//!    a tensor's `ID3D11Texture2D` is imported as an EGLImage through
+//!    `EGL_ANGLE_image_d3d11_texture` and bound with
+//!    `glEGLImageTargetTexture2DOES`. The attachment outlives the pass, so
+//!    `end_gpu_pass` has nothing to release, but it is re-issued on every
+//!    use (`PERSISTENT_TEX_BINDINGS = false`) because ANGLE does not see
+//!    writes made to the texture outside GL — see the constant's comment.
 //!
 //! The shared-display / per-processor-context code is laid out
 //! function-for-function like `angle.rs` (as the Android leaf is) so a
 //! later `angle_common` extraction is a move rather than a rewrite.
 //!
-//! No `windows-sys` dependency: the two kernel32 calls are declared here
-//! and the DXGI enumeration uses hand-written COM vtable slots over a
-//! `dxgi.dll` loaded with `libloading` — the HAL's dlopen convention for
-//! optional platform libraries.
+//! No `windows` / `windows-sys` dependency: the three kernel32 calls are
+//! declared here, and the D3D11 device and textures arrive as raw
+//! `*mut c_void` from the tensor crate's accessors.
 
 use super::super::{CompletionFence, Egl, EglDisplayKind, TransferBackend};
 use super::GlPlatform;
 use crate::{Error, Result};
 use edgefirst_egl as egl;
-use edgefirst_tensor::{PixelFormat, Tensor};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn};
 use log::{debug, info, warn};
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -54,6 +54,33 @@ use std::sync::OnceLock;
 /// the dispatch wrapper's process-wide message lock (ANGLE takes the Full
 /// serialization policy), so a plain atomic is enough.
 static LAST_ACTIVE_CONTEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Forget which context issued the last GL commands, so the next message on
+/// ANY processor re-makes its own context current
+/// ([`GlPlatform::begin_gpu_pass`]).
+///
+/// Every context creation and destruction on the shared display calls this;
+/// destruction goes through [`destroy_context`] so the bring-up failure arms
+/// cannot forget. ANGLE's D3D11 backend keeps one state manager per display,
+/// and bringing a context up or tearing one down disturbs it: without the
+/// invalidation a processor whose context was already the last active one
+/// skips its re-sync and draws through state the lifecycle event invalidated,
+/// which faults inside `glDrawArrays` (`0xC0000005`, reproduced in ~6% of
+/// four-processor convert-then-teardown runs). Clearing it also stops a
+/// successor context allocated at a destroyed one's address from being
+/// mistaken for it.
+fn invalidate_active_context() {
+    LAST_ACTIVE_CONTEXT.store(std::ptr::null_mut(), Ordering::Release);
+}
+
+/// `eglDestroyContext` plus the invalidation every context destruction on the
+/// shared display owes. The one place the leaf destroys a context, including
+/// the bring-up failure arms, so [`invalidate_active_context`]'s contract
+/// cannot drift away from the call sites.
+fn destroy_context(egl: &Egl, display: egl::Display, context: egl::Context) {
+    invalidate_active_context();
+    let _ = egl.destroy_context(display, context);
+}
 
 // ---------------------------------------------------------------------------
 // EGL constants (EGL/egl.h + EGL/eglext_angle.h; edgefirst_egl does not
@@ -68,23 +95,13 @@ const EGL_RED_SIZE: i32 = 0x3024;
 const EGL_GREEN_SIZE: i32 = 0x3023;
 const EGL_BLUE_SIZE: i32 = 0x3022;
 const EGL_ALPHA_SIZE: i32 = 0x3021;
-const EGL_BACK_BUFFER: i32 = 0x3084;
 
-/// `EGL_ANGLE_platform_angle`.
-const EGL_PLATFORM_ANGLE_ANGLE: u32 = 0x3202;
-const EGL_PLATFORM_ANGLE_TYPE_ANGLE: i32 = 0x3203;
-/// `EGL_ANGLE_platform_angle_d3d`.
-const EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE: i32 = 0x3208;
-const EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE: i32 = 0x3209;
-const EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE: i32 = 0x320A;
-const EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE: i32 = 0x320B;
-/// `EGL_ANGLE_platform_angle_d3d_luid`.
-const EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE: i32 = 0x34A0;
-const EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE: i32 = 0x34A1;
-
-/// Environment variable selecting the D3D11 adapter (see
-/// [`AdapterSelection`]).
-pub(crate) const ADAPTER_ENV: &str = "EDGEFIRST_ANGLE_ADAPTER";
+/// `EGL_ANGLE_device_d3d`: the `ID3D11Device*` an `EGLDeviceEXT` wraps.
+const EGL_D3D11_DEVICE_ANGLE: i32 = 0x33A1;
+/// `EGL_EXT_platform_device`: a display over an `EGLDeviceEXT`.
+const EGL_PLATFORM_DEVICE_EXT: u32 = 0x313F;
+/// `EGL_EXT_device_query`: the `EGLDeviceEXT` behind a display.
+const EGL_DEVICE_EXT: i32 = 0x322C;
 
 // ---------------------------------------------------------------------------
 // Loader: locate and load ANGLE's libEGL.dll.
@@ -99,6 +116,7 @@ static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 unsafe extern "system" {
     fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void) -> i32;
     fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
 }
 const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
@@ -236,385 +254,138 @@ impl WindowsPlatform {
         ))))
     }
 
-    /// Bring up an ANGLE Direct3D 11 display on the selected adapter.
+    /// Hands the tensor crate's device to ANGLE. Every texture tensor lives
+    /// on that device, and ANGLE imports textures only from its own device.
     ///
-    /// `egl` must wrap a libEGL handle from [`Self::load_egl_lib`]: the call
-    /// goes through ANGLE's `EGL_EXT_platform_base` client extension
-    /// (`eglGetPlatformDisplayEXT`), which Windows has no system EGL for.
+    /// Returns the display and the `EGLDeviceEXT` it was built from. The
+    /// device is deliberately never released once a display exists: the
+    /// shared display itself is leaked for the process's life, and ANGLE
+    /// tears both down at exit.
+    ///
+    /// `egl` must wrap a libEGL handle from [`Self::load_egl_lib`]: both
+    /// calls go through ANGLE client extensions, which Windows has no
+    /// system EGL for.
     pub(in super::super) fn create_display(
         egl: &Egl,
-        sel: &AdapterSelection,
-    ) -> Result<egl::Display> {
+        device: &edgefirst_tensor::d3d11::D3d11Device,
+    ) -> Result<(egl::Display, *mut c_void)> {
+        type FnCreateDeviceANGLE = unsafe extern "C" fn(
+            device_type: i32,
+            native: *mut c_void,
+            attribs: *const isize,
+        ) -> *mut c_void;
         type FnGetPlatformDisplayEXT = unsafe extern "C" fn(
             platform: u32,
             native: *mut c_void,
             attribs: *const i32,
         ) -> egl::EGLDisplay;
 
-        let ptr = egl
+        let create_device = egl
+            .get_proc_address("eglCreateDeviceANGLE")
+            .ok_or_else(|| {
+                Error::Io(std::io::Error::other(
+                    "eglCreateDeviceANGLE not exported by ANGLE libEGL",
+                ))
+            })?;
+        let get_platform_display = egl
             .get_proc_address("eglGetPlatformDisplayEXT")
             .ok_or_else(|| {
                 Error::Io(std::io::Error::other(
                     "eglGetPlatformDisplayEXT not exported by ANGLE libEGL",
                 ))
             })?;
-        // SAFETY: the pointer comes from EGL's own dispatch table and
-        // matches the documented C signature.
-        let get_platform_display: FnGetPlatformDisplayEXT = unsafe { std::mem::transmute(ptr) };
+        // SAFETY: both pointers were resolved by name from libEGL and have
+        // the extension's documented signatures.
+        let create_device: FnCreateDeviceANGLE = unsafe { std::mem::transmute(create_device) };
+        // SAFETY: as above.
+        let get_platform_display: FnGetPlatformDisplayEXT =
+            unsafe { std::mem::transmute(get_platform_display) };
 
-        let mut attribs = vec![
-            EGL_PLATFORM_ANGLE_TYPE_ANGLE,
-            EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
-        ];
-        match sel {
-            AdapterSelection::Hardware => attribs.extend([
-                EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
-                EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE,
-            ]),
-            AdapterSelection::Warp => attribs.extend([
-                EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
-                EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE,
-            ]),
-            AdapterSelection::Luid { high, low } => attribs.extend([
-                EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE,
-                *high,
-                EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE,
-                *low as i32,
-            ]),
-            // Resolved to Luid/Hardware by `resolve_adapter` before this point.
-            AdapterSelection::Discrete | AdapterSelection::Match(_) => attribs.extend([
-                EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
-                EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE,
-            ]),
+        // SAFETY: `device.raw()` is the live process device; ANGLE AddRefs it.
+        let egl_device =
+            unsafe { create_device(EGL_D3D11_DEVICE_ANGLE, device.raw(), std::ptr::null()) };
+        if egl_device.is_null() {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "eglCreateDeviceANGLE failed: {}",
+                egl_error_name(egl)
+            ))));
         }
-        attribs.push(egl::NONE);
-
-        // SAFETY: well-formed attrib list passed to a documented EGL
-        // extension entry point.
-        let raw = unsafe {
-            get_platform_display(
-                EGL_PLATFORM_ANGLE_ANGLE,
-                std::ptr::null_mut(),
-                attribs.as_ptr(),
-            )
-        };
+        // SAFETY: `egl_device` is the EGLDeviceEXT just created; no attributes.
+        let raw =
+            unsafe { get_platform_display(EGL_PLATFORM_DEVICE_EXT, egl_device, std::ptr::null()) };
         if raw.is_null() {
-            return Err(Error::Io(std::io::Error::other(
-                "eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, D3D11) returned NO_DISPLAY",
-            )));
+            let why = egl_error_name(egl);
+            release_egl_device(egl, egl_device);
+            return Err(Error::Io(std::io::Error::other(format!(
+                "eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT) returned NO_DISPLAY: {why}"
+            ))));
         }
         // SAFETY: `raw` is a valid EGLDisplay per the spec.
-        Ok(unsafe { egl::Display::from_ptr(raw) })
+        Ok((unsafe { egl::Display::from_ptr(raw) }, egl_device))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Adapter selection (EDGEFIRST_ANGLE_ADAPTER) + DXGI enumeration.
-// ---------------------------------------------------------------------------
-
-/// Which D3D11 adapter ANGLE should create its device on.
-///
-/// Parsed from `EDGEFIRST_ANGLE_ADAPTER`:
-///
-/// | Value | Meaning |
-/// |---|---|
-/// | unset / `hardware` | ANGLE's default hardware adapter (DXGI adapter 0) |
-/// | `warp` | Microsoft Basic Render Driver (software; classified as a software renderer, so it also needs `EDGEFIRST_ALLOW_SOFTWARE_GL=1`) |
-/// | `discrete` | the non-software adapter with the most dedicated video memory |
-/// | `<high>:<low>` | an explicit adapter LUID (decimal or `0x` hex) |
-/// | anything else | case-insensitive substring of the adapter description (e.g. `RTX 3070`) |
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AdapterSelection {
-    Hardware,
-    Warp,
-    Discrete,
-    Luid { high: i32, low: u32 },
-    Match(String),
-}
-
-fn parse_int(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        i64::from_str_radix(hex, 16).ok()
-    } else {
-        s.parse().ok()
-    }
-}
-
-/// Parse an `EDGEFIRST_ANGLE_ADAPTER` value. Pure.
-pub(crate) fn parse_adapter_selection(raw: Option<&str>) -> AdapterSelection {
-    let raw = raw.map(str::trim).unwrap_or("");
-    match raw.to_ascii_lowercase().as_str() {
-        "" | "hardware" | "hw" | "default" => AdapterSelection::Hardware,
-        "warp" | "software" => AdapterSelection::Warp,
-        "discrete" | "dgpu" => AdapterSelection::Discrete,
-        _ => {
-            if let Some((h, l)) = raw.split_once(':') {
-                if let (Some(high), Some(low)) = (parse_int(h), parse_int(l)) {
-                    if let (Ok(high), Ok(low)) = (i32::try_from(high), u32::try_from(low)) {
-                        return AdapterSelection::Luid { high, low };
-                    }
-                }
-            }
-            AdapterSelection::Match(raw.to_string())
-        }
-    }
-}
-
-/// One DXGI adapter as enumerated by `IDXGIFactory1::EnumAdapters1`.
-#[derive(Debug, Clone)]
-pub(crate) struct DxgiAdapter {
-    pub(crate) index: u32,
-    pub(crate) description: String,
-    pub(crate) luid_high: i32,
-    pub(crate) luid_low: u32,
-    pub(crate) software: bool,
-    pub(crate) dedicated_video_memory: u64,
-}
-
-// Minimal hand-written COM surface: the DXGI vtables are ABI-stable and we
-// need three slots, which is not worth a `windows-sys` dependency.
-type ComPtr = *mut c_void;
-type HResult = i32;
-#[repr(C)]
-struct Guid {
-    data1: u32,
-    data2: u16,
-    data3: u16,
-    data4: [u8; 8],
-}
-/// `IID_IDXGIFactory1` = {770aae78-f26f-4dba-a829-253c83d1b387}.
-const IID_IDXGI_FACTORY1: Guid = Guid {
-    data1: 0x770a_ae78,
-    data2: 0xf26f,
-    data3: 0x4dba,
-    data4: [0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87],
-};
-#[repr(C)]
-struct Luid {
-    low: u32,
-    high: i32,
-}
-/// `DXGI_ADAPTER_DESC1`.
-#[repr(C)]
-struct DxgiAdapterDesc1 {
-    description: [u16; 128],
-    vendor_id: u32,
-    device_id: u32,
-    subsys_id: u32,
-    revision: u32,
-    dedicated_video_memory: usize,
-    dedicated_system_memory: usize,
-    shared_system_memory: usize,
-    adapter_luid: Luid,
-    flags: u32,
-}
-const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2;
-const DXGI_ERROR_NOT_FOUND: HResult = 0x887A_0002_u32 as i32;
-/// Vtable slots: IUnknown (0-2), IDXGIObject (3-6), IDXGIFactory (7-11),
-/// IDXGIFactory1 (12-13); IDXGIAdapter (7-9), IDXGIAdapter1 (10).
-const SLOT_RELEASE: usize = 2;
-const SLOT_FACTORY1_ENUM_ADAPTERS1: usize = 12;
-const SLOT_ADAPTER1_GET_DESC1: usize = 10;
-type FnCreateDxgiFactory1 =
-    unsafe extern "system" fn(riid: *const Guid, out: *mut ComPtr) -> HResult;
-type FnRelease = unsafe extern "system" fn(this: ComPtr) -> u32;
-type FnEnumAdapters1 =
-    unsafe extern "system" fn(this: ComPtr, index: u32, out: *mut ComPtr) -> HResult;
-type FnGetDesc1 = unsafe extern "system" fn(this: ComPtr, desc: *mut DxgiAdapterDesc1) -> HResult;
-
-/// Read vtable slot `index` of a live COM object.
-///
-/// # Safety
-/// `this` must be a live COM object pointer whose vtable has at least
-/// `index + 1` entries.
-unsafe fn com_slot(this: ComPtr, index: usize) -> *const c_void {
-    // SAFETY: per the contract, `this` points at an object whose first
-    // field is the vtable pointer, an array of function pointers.
-    unsafe {
-        let vtbl = *(this as *const *const *const c_void);
-        *vtbl.add(index)
-    }
-}
-
-/// Enumerate the DXGI adapters (hardware and software) on this host.
-/// Errors when `dxgi.dll` or the factory is unavailable (Server Core, a
-/// sandbox); callers degrade to ANGLE's default adapter.
-pub(crate) fn enumerate_dxgi_adapters() -> Result<Vec<DxgiAdapter>> {
-    let io = |m: String| Error::Io(std::io::Error::other(m));
-    // SAFETY: dxgi.dll is a Windows system library with no initializer
-    // side effects of concern.
-    let dxgi = unsafe { libloading::Library::new("dxgi.dll") }
-        .map_err(|e| io(format!("dxgi.dll: {e}")))?;
-    // SAFETY: the symbol has the documented `CreateDXGIFactory1` signature.
-    let create: libloading::Symbol<FnCreateDxgiFactory1> =
-        unsafe { dxgi.get(b"CreateDXGIFactory1\0") }
-            .map_err(|e| io(format!("CreateDXGIFactory1: {e}")))?;
-    let mut factory: ComPtr = std::ptr::null_mut();
-    // SAFETY: valid IID and out-pointer.
-    let hr = unsafe { create(&IID_IDXGI_FACTORY1, &mut factory) };
-    if hr < 0 || factory.is_null() {
-        return Err(io(format!("CreateDXGIFactory1 failed: HRESULT {hr:#010x}")));
-    }
-    // SAFETY: `factory` is a live IDXGIFactory1; slot indices per the
-    // interface layout documented on the constants.
-    let (factory_release, enum_adapters1): (FnRelease, FnEnumAdapters1) = unsafe {
-        (
-            std::mem::transmute::<*const c_void, FnRelease>(com_slot(factory, SLOT_RELEASE)),
-            std::mem::transmute::<*const c_void, FnEnumAdapters1>(com_slot(
-                factory,
-                SLOT_FACTORY1_ENUM_ADAPTERS1,
-            )),
-        )
+/// Drop an `EGLDeviceEXT` created by `eglCreateDeviceANGLE`. Only used when
+/// display creation fails afterwards: a display that came up owns its device
+/// for the process's life (see [`SharedD3d11Display::egl_device`]).
+fn release_egl_device(egl: &Egl, egl_device: *mut c_void) {
+    type FnReleaseDeviceANGLE = unsafe extern "C" fn(device: *mut c_void) -> u32;
+    let Some(release) = egl.get_proc_address("eglReleaseDeviceANGLE") else {
+        return;
     };
-    let mut adapters = Vec::new();
-    let mut index = 0u32;
-    loop {
-        let mut adapter: ComPtr = std::ptr::null_mut();
-        // SAFETY: live factory, valid out-pointer.
-        let hr = unsafe { enum_adapters1(factory, index, &mut adapter) };
-        if hr == DXGI_ERROR_NOT_FOUND || hr < 0 || adapter.is_null() {
-            break;
-        }
-        // SAFETY: `adapter` is a live IDXGIAdapter1.
-        let (adapter_release, get_desc1): (FnRelease, FnGetDesc1) = unsafe {
-            (
-                std::mem::transmute::<*const c_void, FnRelease>(com_slot(adapter, SLOT_RELEASE)),
-                std::mem::transmute::<*const c_void, FnGetDesc1>(com_slot(
-                    adapter,
-                    SLOT_ADAPTER1_GET_DESC1,
-                )),
-            )
-        };
-        let mut desc = std::mem::MaybeUninit::<DxgiAdapterDesc1>::zeroed();
-        // SAFETY: live adapter, valid out-pointer to a correctly laid-out struct.
-        let hr = unsafe { get_desc1(adapter, desc.as_mut_ptr()) };
-        if hr >= 0 {
-            // SAFETY: GetDesc1 succeeded and filled the struct.
-            let desc = unsafe { desc.assume_init() };
-            let end = desc
-                .description
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(desc.description.len());
-            adapters.push(DxgiAdapter {
-                index,
-                description: String::from_utf16_lossy(&desc.description[..end]),
-                luid_high: desc.adapter_luid.high,
-                luid_low: desc.adapter_luid.low,
-                software: desc.flags & DXGI_ADAPTER_FLAG_SOFTWARE != 0,
-                dedicated_video_memory: desc.dedicated_video_memory as u64,
-            });
-        }
-        // SAFETY: balances the reference EnumAdapters1 handed out.
-        unsafe { adapter_release(adapter) };
-        index += 1;
-    }
-    // SAFETY: balances CreateDXGIFactory1's reference.
-    unsafe { factory_release(factory) };
-    Ok(adapters)
+    // SAFETY: the pointer was resolved by name from libEGL and has the
+    // extension's documented signature.
+    let release: FnReleaseDeviceANGLE = unsafe { std::mem::transmute(release) };
+    // SAFETY: `egl_device` came from `eglCreateDeviceANGLE` and no display
+    // was built on it, so nothing else references it. The boolean result is
+    // ignored: this already runs on a failure path.
+    let _ = unsafe { release(egl_device) };
 }
 
-/// Turn `Discrete` / `Match` into a concrete LUID (or `Hardware` when
-/// nothing matches, with a warning). Pure over the adapter list.
-pub(crate) fn resolve_adapter(sel: AdapterSelection, adapters: &[DxgiAdapter]) -> AdapterSelection {
-    let luid = |a: &DxgiAdapter| AdapterSelection::Luid {
-        high: a.luid_high,
-        low: a.luid_low,
-    };
-    match sel {
-        AdapterSelection::Discrete => match adapters
-            .iter()
-            .filter(|a| !a.software)
-            .max_by_key(|a| a.dedicated_video_memory)
-        {
-            Some(a) => luid(a),
-            None => {
-                warn!("{ADAPTER_ENV}=discrete: no hardware adapter enumerated; using ANGLE's default adapter");
-                AdapterSelection::Hardware
-            }
-        },
-        AdapterSelection::Match(needle) => {
-            let n = needle.to_ascii_lowercase();
-            match adapters
-                .iter()
-                .find(|a| a.description.to_ascii_lowercase().contains(&n))
-            {
-                Some(a) => luid(a),
-                None => {
-                    warn!(
-                        "{ADAPTER_ENV}={needle:?} matches no DXGI adapter description \
-                         ({:?}); using ANGLE's default adapter",
-                        adapters
-                            .iter()
-                            .map(|a| a.description.as_str())
-                            .collect::<Vec<_>>()
-                    );
-                    AdapterSelection::Hardware
-                }
-            }
-        }
-        other => other,
+/// The EGL error left by the last call, for a message. `get_error` also
+/// clears it, so call this once per failure.
+fn egl_error_name(egl: &Egl) -> String {
+    match egl.get_error() {
+        Some(e) => format!("{e:?}"),
+        None => "no EGL error reported".to_string(),
     }
 }
 
-/// Read `EDGEFIRST_ANGLE_ADAPTER`, enumerate DXGI, log the adapters, and
-/// return the selection to hand to [`WindowsPlatform::create_display`]
-/// plus a human-readable name of the chosen adapter.
-fn select_adapter() -> (AdapterSelection, String) {
-    let raw = std::env::var(ADAPTER_ENV).ok();
-    let sel = parse_adapter_selection(raw.as_deref());
-    let adapters = match enumerate_dxgi_adapters() {
-        Ok(a) => a,
-        Err(e) => {
-            debug!("DXGI adapter enumeration unavailable ({e}); using ANGLE's default adapter");
-            Vec::new()
-        }
+/// The `ID3D11Device*` ANGLE reports for `display`, through
+/// `EGL_EXT_device_query` + `EGL_ANGLE_device_d3d`. Null when either
+/// extension is missing or either query fails — the caller compares it
+/// against the device it injected, so null reads as "not the same device".
+fn query_angle_d3d11_device(egl: &Egl, display: egl::Display) -> *mut c_void {
+    type FnQueryDisplayAttribEXT =
+        unsafe extern "C" fn(display: egl::EGLDisplay, attribute: i32, value: *mut isize) -> u32;
+    type FnQueryDeviceAttribEXT =
+        unsafe extern "C" fn(device: *mut c_void, attribute: i32, value: *mut isize) -> u32;
+
+    let (Some(query_display), Some(query_device)) = (
+        egl.get_proc_address("eglQueryDisplayAttribEXT"),
+        egl.get_proc_address("eglQueryDeviceAttribEXT"),
+    ) else {
+        return std::ptr::null_mut();
     };
-    for a in &adapters {
-        debug!(
-            "dxgi adapter #{}: {:?} luid={:#x}:{:#x} vram={} MiB software={}",
-            a.index,
-            a.description,
-            a.luid_high,
-            a.luid_low,
-            a.dedicated_video_memory >> 20,
-            a.software
-        );
+    // SAFETY: both pointers were resolved by name from libEGL and have the
+    // extension's documented signatures.
+    let query_display: FnQueryDisplayAttribEXT = unsafe { std::mem::transmute(query_display) };
+    // SAFETY: as above.
+    let query_device: FnQueryDeviceAttribEXT = unsafe { std::mem::transmute(query_device) };
+
+    let mut device: isize = 0;
+    // SAFETY: `display` is an initialized EGLDisplay and `device` a valid
+    // out-parameter for the one attribute asked for.
+    if unsafe { query_display(display.as_ptr(), EGL_DEVICE_EXT, &mut device) } == 0 {
+        return std::ptr::null_mut();
     }
-    let resolved = resolve_adapter(sel, &adapters);
-    let name = match &resolved {
-        AdapterSelection::Warp => "WARP (Microsoft Basic Render Driver)".to_string(),
-        AdapterSelection::Luid { high, low } => adapters
-            .iter()
-            .find(|a| a.luid_high == *high && a.luid_low == *low)
-            .map(|a| a.description.clone())
-            .unwrap_or_else(|| format!("LUID {high:#x}:{low:#x}")),
-        _ => adapters
-            .iter()
-            .find(|a| !a.software)
-            .map(|a| format!("{} (ANGLE default)", a.description))
-            .unwrap_or_else(|| "ANGLE default adapter".to_string()),
-    };
-    if matches!(resolved, AdapterSelection::Hardware)
-        && !adapters.is_empty()
-        && adapters.iter().all(|a| a.software)
-    {
-        warn!(
-            "no hardware D3D11 adapter is enumerated (only {:?}); ANGLE will run on \
-             the software renderer, which the GL backend rejects unless \
-             EDGEFIRST_ALLOW_SOFTWARE_GL=1",
-            adapters
-                .iter()
-                .map(|a| a.description.as_str())
-                .collect::<Vec<_>>()
-        );
+    let mut d3d11: isize = 0;
+    // SAFETY: `device` is the EGLDeviceEXT the display just reported, and
+    // `d3d11` a valid out-parameter.
+    if unsafe { query_device(device as *mut c_void, EGL_D3D11_DEVICE_ANGLE, &mut d3d11) } == 0 {
+        return std::ptr::null_mut();
     }
-    info!(
-        "ANGLE D3D11 adapter: {name} ({ADAPTER_ENV}={})",
-        raw.as_deref().unwrap_or("unset")
-    );
-    (resolved, name)
+    d3d11 as *mut c_void
 }
 
 // ---------------------------------------------------------------------------
@@ -682,13 +453,22 @@ pub(in crate::opengl_headless) struct SharedD3d11Display {
     pub(in crate::opengl_headless) supports_f32_color: bool,
     /// `GL_EXT_color_buffer_half_float` — gates F16 PBO destinations.
     pub(in crate::opengl_headless) supports_f16_color: bool,
-    /// Human-readable name of the adapter ANGLE was pointed at.
+    /// The tensor crate's process device, which this display renders on and
+    /// whose fence carries convert completions.
+    pub(in crate::opengl_headless) device: &'static edgefirst_tensor::d3d11::D3d11Device,
+    /// The `EGLDeviceEXT` wrapping [`Self::device`]. Never released: this
+    /// display is process-global and leaked, so the device it was built on
+    /// must outlive it. Kept here so the pairing is inspectable.
+    #[allow(dead_code)]
+    egl_device: *mut c_void,
+    /// Human-readable name of the adapter the tensor crate chose.
     pub(in crate::opengl_headless) adapter: String,
 }
 
 // SAFETY: every member is either a leaked static, an EGL handle (ANGLE
-// synchronizes display-level entry points internally), or plain data.
-// The probe context is never made current after init.
+// synchronizes display-level entry points internally), the process device
+// (itself `Send + Sync`), or plain data. The `EGLDeviceEXT` is only ever
+// read. The probe context is never made current after init.
 unsafe impl Send for SharedD3d11Display {}
 unsafe impl Sync for SharedD3d11Display {}
 
@@ -721,10 +501,12 @@ fn gl_string(name: u32) -> String {
 
 fn init_shared_display() -> Result<SharedD3d11Display> {
     let _span =
-        tracing::info_span!("image.gl_init", platform = "windows", backend = "pbo").entered();
+        tracing::info_span!("image.gl_init", platform = "windows", backend = "d3d11").entered();
 
-    // 1. Adapter selection (env + DXGI enumeration), then ANGLE libEGL.
-    let (selection, adapter) = select_adapter();
+    // 1. The tensor crate's device (it owns adapter selection), then ANGLE
+    //    libEGL.
+    let device = edgefirst_tensor::d3d11::device()
+        .map_err(|e| Error::Io(std::io::Error::other(format!("D3D11 device: {e}"))))?;
     let egl_lib = WindowsPlatform::load_egl_lib()
         .map_err(|e| Error::Io(std::io::Error::other(format!("ANGLE libEGL: {e}"))))?;
     // SAFETY: `egl_lib` is a live, leaked library handle; the loader
@@ -737,8 +519,8 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
     .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;
     debug!("EGL dynamic instance loaded, version = {:?}", egl.version());
 
-    // 2. D3D11 display on the selected adapter.
-    let display = WindowsPlatform::create_display(&egl, &selection)?;
+    // 2. D3D11 display on that device.
+    let (display, egl_device) = WindowsPlatform::create_display(&egl, device)?;
     let (maj, min) = egl
         .initialize(display)
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglInitialize: {e:?}"))))?;
@@ -747,14 +529,28 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     debug!("ANGLE EGL {maj}.{min} initialised (process-global shared display): {egl_version}");
+    // The two pointers must be the same object: a mismatch means ANGLE built
+    // the display on a device of its own, and no texture tensor could ever be
+    // imported into it. Fail here rather than at the first convert.
+    let reported = query_angle_d3d11_device(&egl, display);
+    debug!(
+        "D3D11 device injected: {:?}, reported back by ANGLE: {reported:?}",
+        device.raw()
+    );
+    if reported != device.raw() {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "ANGLE did not adopt the injected D3D11 device: injected {:?}, display \
+             reports {reported:?} (EGL_EXT_device_query / EGL_ANGLE_device_d3d)",
+            device.raw()
+        ))));
+    }
 
     egl.bind_api(egl::OPENGL_ES_API)
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindAPI: {e:?}"))))?;
 
-    // 3. GLES3 + pbuffer config. No EGL_BIND_TO_TEXTURE_TARGET_ANGLE here —
-    //    that attribute belongs to the IOSurface extension and D3D11
-    //    rejects it. The D3D11 client-buffer follow-on will add
-    //    EGL_BIND_TO_TEXTURE_RGBA when pbuffer imports arrive.
+    // 3. GLES3 + pbuffer config. No bind-to-texture attribute: imports are
+    //    EGLImages, and the pbuffer here only exists so a context can be
+    //    made current.
     let cfg_attribs = [
         EGL_RENDERABLE_TYPE,
         EGL_OPENGL_ES3_BIT,
@@ -783,7 +579,7 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
     let probe_pbuffer = egl
         .create_pbuffer_surface(display, config, &dummy_attribs)
         .map_err(|e| {
-            let _ = egl.destroy_context(display, probe_context);
+            destroy_context(&egl, display, probe_context);
             Error::Io(std::io::Error::other(format!(
                 "eglCreatePbufferSurface(probe): {e:?}"
             )))
@@ -795,7 +591,7 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
         Some(probe_context),
     ) {
         let _ = egl.destroy_surface(display, probe_pbuffer);
-        let _ = egl.destroy_context(display, probe_context);
+        destroy_context(&egl, display, probe_context);
         return Err(Error::Io(std::io::Error::other(format!(
             "eglMakeCurrent(probe): {e:?}"
         ))));
@@ -813,8 +609,9 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
     let gl_version = gl_string(edgefirst_gl::gl::VERSION);
     let gl_renderer = gl_string(edgefirst_gl::gl::RENDERER);
     info!(
-        "ANGLE D3D11 display ready: {gl_renderer} — {gl_version} \
-         (compute={has_compute}, f32_color={supports_f32_color}, f16_color={supports_f16_color})"
+        "ANGLE D3D11 display ready on {}: {gl_renderer} — {gl_version} \
+         (compute={has_compute}, f32_color={supports_f32_color}, f16_color={supports_f16_color})",
+        device.adapter_label()
     );
     let _ = egl.make_current(display, None, None, None);
 
@@ -827,7 +624,9 @@ fn init_shared_display() -> Result<SharedD3d11Display> {
         has_compute,
         supports_f32_color,
         supports_f16_color,
-        adapter,
+        device,
+        egl_device,
+        adapter: device.adapter_label().to_owned(),
     })
 }
 
@@ -845,51 +644,213 @@ pub(in crate::opengl_headless) struct D3d11Display {
     context: egl::Context,
     dummy_pbuffer: egl::Surface,
     /// Duck-typed counterparts of the `GlContext` members the portable
-    /// engine reads. PBO is the only transfer backend on Windows.
+    /// engine reads. D3D11 textures are the transfer backend on Windows.
     pub(in crate::opengl_headless) transfer_backend: TransferBackend,
     pub(in crate::opengl_headless) has_compute: bool,
-    /// Texture attachments made via `eglBindTexImage` since the last
-    /// `GlPlatform::end_gpu_pass` (released there, after the engine's sync
-    /// point). Unused until the D3D11 client-buffer follow-on; kept so the
-    /// leaf already has the pbuffer-binding shape.
-    active_binds: RefCell<Vec<egl::Surface>>,
+}
+
+impl D3d11Display {
+    /// This context's raw pointer, the value `begin_gpu_pass` records in
+    /// `LAST_ACTIVE_CONTEXT`. Only the leaf's own tests read it.
+    #[cfg(test)]
+    fn context_ptr(&self) -> *mut c_void {
+        self.context.as_ptr()
+    }
 }
 
 impl Drop for D3d11Display {
     fn drop(&mut self) {
-        // Runs on the owning worker thread: release, then destroy. Forget
-        // this context as the last active one so a successor allocated at
-        // the same address is not mistaken for it.
+        // Runs on the owning worker thread: release, then destroy.
         let d = self.shared;
-        let ctx = self.context.as_ptr();
-        let _ = LAST_ACTIVE_CONTEXT.compare_exchange(
-            ctx,
-            std::ptr::null_mut(),
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
         let _ = d.egl.make_current(d.display, None, None, None);
         let _ = d.egl.destroy_surface(d.display, self.dummy_pbuffer);
-        let _ = d.egl.destroy_context(d.display, self.context);
+        destroy_context(&d.egl, d.display, self.context);
     }
 }
 
-/// An owned D3D11-texture→EGL-pbuffer import. Dropping destroys the
-/// pbuffer. Never constructed today (no zero-copy tensor exists on
-/// Windows); the D3D11 shared-texture follow-on creates these via
-/// `eglCreatePbufferFromClientBuffer(EGL_D3D_TEXTURE_ANGLE, ...)`.
-pub(in crate::opengl_headless) struct D3dTexturePbuffer {
+/// An owned EGLImage over a tensor's `ID3D11Texture2D`. A binding made from
+/// it needs no release at the end of a pass (unlike the macOS pbuffer
+/// route), but is re-issued per use — see `PERSISTENT_TEX_BINDINGS`.
+/// Dropping destroys the image; the texture stays the tensor's.
+pub(in crate::opengl_headless) struct D3d11EglImage {
     shared: &'static SharedD3d11Display,
-    pub(in crate::opengl_headless) surface: egl::Surface,
+    pub(in crate::opengl_headless) image: egl::Image,
+    /// The imported texture's own geometry, which a tensor narrowed by
+    /// `configure_image` no longer fills — reported as the import extent so
+    /// the engine samples the logical image rather than the whole texture.
+    extent: (u32, u32),
 }
 
-impl Drop for D3dTexturePbuffer {
+impl Drop for D3d11EglImage {
     fn drop(&mut self) {
-        let _ = self
-            .shared
-            .egl
-            .destroy_surface(self.shared.display, self.surface);
+        // The image was created through the EGL 1.5 entry points, so the
+        // upcast that made it is available again here.
+        let Some(egl15) = self.shared.egl.upcast::<egl::EGL1_5>() else {
+            log::error!("eglDestroyImage(D3D11 texture): EGL 1.5 no longer available");
+            return;
+        };
+        if let Err(e) = egl15.destroy_image(self.shared.display, self.image) {
+            log::error!("eglDestroyImage(D3D11 texture): {e:?}");
+        }
     }
+}
+
+/// Wrap `texture` as an EGLImage on the shared display. `what` names the
+/// role in the error message.
+fn import_texture(
+    display: &D3d11Display,
+    texture: *mut c_void,
+    layout: &edgefirst_tensor::d3d11_layout::D3d11ImageLayout,
+    what: &str,
+) -> Result<D3d11EglImage> {
+    let _span =
+        tracing::trace_span!("image.convert.gl.egl_import", target = "d3d11_texture").entered();
+    let shared = display.shared;
+    let egl15 = shared.egl.upcast::<egl::EGL1_5>().ok_or_else(|| {
+        Error::NotSupported(
+            "ANGLE libEGL does not expose EGL 1.5 (eglCreateImage), which the D3D11 \
+             texture import needs"
+                .into(),
+        )
+    })?;
+    let attribs = super::super::d3d11_import::d3d11_image_attribs(layout.gl_internal_format, None);
+    // The image ANGLE returns holds its own reference to `texture`: that is
+    // what makes a cached import outliving its tensor sound, and what the
+    // pool-recycle tier tests exercise every run.
+    let image = egl15
+        .create_image(
+            shared.display,
+            // SAFETY: EGL_NO_CONTEXT is the context a client-buffer image
+            // target takes; the image is not tied to any GL context.
+            unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
+            super::super::d3d11_import::EGL_D3D11_TEXTURE_ANGLE,
+            // SAFETY: `texture` is the tensor's live `ID3D11Texture2D`. It
+            // is live for the call, and ANGLE takes its own reference to it
+            // for the image's life, so the import stays valid even after the
+            // tensor drops -- which the cache relies on, since an entry
+            // deliberately outlives the tensor it was built from
+            // (`cache.rs`).
+            unsafe { egl::ClientBuffer::from_ptr(texture) },
+            &attribs,
+        )
+        .map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "eglCreateImage(EGL_D3D11_TEXTURE_ANGLE) for {what}: {e:?}"
+            )))
+        })?;
+    Ok(D3d11EglImage {
+        shared,
+        image,
+        extent: (layout.texture_width as u32, layout.texture_height as u32),
+    })
+}
+
+/// The tensor's texture and the geometry the HAL gave it, or an error
+/// naming the role that is not texture-backed.
+fn texture_of<T>(
+    img: &Tensor<T>,
+    what: &str,
+) -> Result<(
+    *mut c_void,
+    edgefirst_tensor::d3d11_layout::D3d11ImageLayout,
+)>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match (img.d3d11_texture(), img.d3d11_layout()) {
+        (Some(t), Some(l)) => {
+            check_identity_names_texture(
+                edgefirst_tensor::TensorTrait::buffer_identity(img).kind(),
+                edgefirst_tensor::TensorTrait::buffer_identity(img).id(),
+                t,
+                what,
+            )?;
+            Ok((t, l))
+        }
+        _ => Err(Error::NotSupported(format!(
+            "GL convert: {what} is not a D3D11 texture tensor"
+        ))),
+    }
+}
+
+/// The key `IdentityKind::D3d11Texture` must carry for `texture`: the
+/// discriminant in the high bits, the texture's own address below it. Exactly
+/// what `BufferIdentity::derived` builds and what both tensor backends derive
+/// (`d3d11::texture::tex_key` in the static one, `ef_tensor_d3d11_texture` in
+/// the dynamic one).
+fn d3d11_identity_key(texture: *mut c_void) -> u64 {
+    ((edgefirst_tensor::IdentityKind::D3d11Texture as u64) << 56) ^ (texture as usize as u64)
+}
+
+/// Refuse an identity that does not name `texture`.
+///
+/// The import cache keys on the identity and outlives the tensor that produced
+/// it, so the identity has to name something the cached EGLImage itself keeps
+/// alive -- otherwise a later, unrelated buffer arrives under the same key and
+/// is served the old import. Only `D3d11Texture` over this texture's own
+/// address qualifies: ANGLE's EGLImage holds a reference to the texture, so
+/// that address stays taken while the entry lives. An `ef_tensor` handle
+/// address does not qualify, and keying on one rendered into the previous
+/// texture and left the new one blank.
+///
+/// Refused in every build rather than asserted in debug: the failure this
+/// catches is silent wrong pixels. One enum compare and one XOR, and the error
+/// falls the frame back to the CPU converter -- right instead of fast.
+///
+/// Split out from its two callers ([`texture_of`], which runs on a cache miss,
+/// and [`GlPlatform::validate_import_identity`], which runs on every import)
+/// so the rule has one home, and so the decision is testable without a tensor
+/// whose identity disagrees with its texture -- which is not constructible
+/// through any public API.
+fn check_identity_names_texture(
+    kind: edgefirst_tensor::IdentityKind,
+    id: u64,
+    texture: *mut c_void,
+    what: &str,
+) -> Result<()> {
+    let expected = d3d11_identity_key(texture);
+    if kind != edgefirst_tensor::IdentityKind::D3d11Texture || id != expected {
+        return Err(Error::NotSupported(format!(
+            "GL convert: {what} is a D3D11 texture but its buffer identity is {kind:?} \
+             ({id:#x}), not this texture's own address ({expected:#x}); the EGLImage cache \
+             outlives the tensor and cannot key on anything the import does not keep alive \
+             -- see TensorDyn::derive_identity"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a texture whose DXGI format is not the one the HAL's layout table
+/// picks for `fmt` — the engine samples the import as `fmt`, so a texture of
+/// another format would be read with the wrong channel layout. Dimensions are
+/// deliberately not compared: a view's own width and height are smaller than
+/// the parent texture it imports. The check is skipped when the table has no
+/// entry for `fmt` at these dimensions (a packed-RGB view whose width breaks
+/// the 4-byte texel packing), which says nothing about the texture.
+fn check_dxgi_format<T>(
+    layout: &edgefirst_tensor::d3d11_layout::D3d11ImageLayout,
+    img: &Tensor<T>,
+    fmt: PixelFormat,
+) -> Result<()>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    let (Some(w), Some(h)) = (img.width(), img.height()) else {
+        return Ok(());
+    };
+    let Some(expected) =
+        edgefirst_tensor::d3d11_layout::image_d3d11_layout(fmt, edgefirst_tensor::DType::U8, w, h)
+    else {
+        log::debug!("GL convert: no D3D11 layout for {fmt:?} at {w}x{h}; format check skipped");
+        return Ok(());
+    };
+    if layout.dxgi_format != expected.dxgi_format {
+        return Err(Error::NotSupported(format!(
+            "GL convert: texture is DXGI format {} but {fmt:?} needs {}",
+            layout.dxgi_format, expected.dxgi_format
+        )));
+    }
+    Ok(())
 }
 
 /// Marker type: Windows ANGLE + Direct3D 11 platform.
@@ -897,12 +858,27 @@ pub(crate) struct AngleD3d11;
 
 impl GlPlatform for AngleD3d11 {
     type Display = D3d11Display;
-    type Import = D3dTexturePbuffer;
-    type ImportHandle = egl::Surface;
+    type Import = D3d11EglImage;
+    type ImportHandle = egl::Image;
 
-    // eglBindTexImage attachments are released at end_gpu_pass, so the
-    // engine must not skip re-binding across passes (as on macOS).
+    // The attachment survives the pass (there is nothing for
+    // `end_gpu_pass` to release), but the engine must still re-attach on
+    // every use: ANGLE's D3D11 texture storage keeps its own view of the
+    // image and does not observe writes made to the underlying
+    // `ID3D11Texture2D` outside GL, which is how a CPU producer refreshes a
+    // recycled source (staging `CopyResource`). Skipping the re-attach then
+    // samples the previous frame — `dma_recycle_grey_stale_read` fails on
+    // WARP with the skip enabled and passes without it. The cost is one
+    // `glEGLImageTargetTexture2DOES` per draw; the EGLImage import cache
+    // itself is unaffected.
     const PERSISTENT_TEX_BINDINGS: bool = false;
+
+    /// Every zero-copy float destination: planar F16 and F32, interleaved
+    /// `Rgb`, and `Rgba`. Each is covered by
+    /// `windows_float_destinations_match_the_cpu_converter_for_every_layout`
+    /// on both adapters.
+    const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
+        super::super::float_dispatch::ZeroCopyFloatSet::All;
     const EXTERNAL_OES: bool = false;
 
     fn load_gl_once(_display: &D3d11Display) {
@@ -927,7 +903,7 @@ impl GlPlatform for AngleD3d11 {
             .egl
             .create_pbuffer_surface(shared.display, shared.config, &dummy_attribs)
             .map_err(|e| {
-                let _ = shared.egl.destroy_context(shared.display, context);
+                destroy_context(&shared.egl, shared.display, context);
                 Error::Io(std::io::Error::other(format!(
                     "eglCreatePbufferSurface (per-processor dummy): {e:?}"
                 )))
@@ -941,13 +917,16 @@ impl GlPlatform for AngleD3d11 {
             Some(context),
         ) {
             let _ = shared.egl.destroy_surface(shared.display, dummy_pbuffer);
-            let _ = shared.egl.destroy_context(shared.display, context);
+            destroy_context(&shared.egl, shared.display, context);
             return Err(Error::Io(std::io::Error::other(format!(
                 "eglMakeCurrent (per-processor): {e:?}"
             ))));
         }
+        // This context is now current on this thread, which disturbs the
+        // display's shared state manager the same way a teardown does.
+        invalidate_active_context();
         debug!(
-            "Windows GL context up on {} (GLES {}, transfer=Pbo)",
+            "Windows GL context up on {} (GLES {}, transfer=D3d11Texture)",
             shared.adapter,
             if has_compute { "3.1" } else { "3.0" }
         );
@@ -955,82 +934,166 @@ impl GlPlatform for AngleD3d11 {
             shared,
             context,
             dummy_pbuffer,
-            transfer_backend: TransferBackend::Pbo,
+            transfer_backend: TransferBackend::D3d11Texture,
             has_compute,
-            active_binds: RefCell::new(Vec::new()),
         })
     }
 
-    fn import_buffer(
-        _display: &D3d11Display,
-        _img: &Tensor<u8>,
-        _fmt: PixelFormat,
-        _for_dst: bool,
-    ) -> Result<D3dTexturePbuffer> {
-        Err(Error::NotSupported(
-            "Windows GL backend has no zero-copy buffer import yet (D3D11 shared-texture \
-             import is a follow-on); sources are Mem tensors and destinations PBO tensors"
-                .into(),
-        ))
-    }
-
-    fn import_buffer_nv_r8(
-        _display: &D3d11Display,
-        _img: &Tensor<u8>,
-        _fmt: PixelFormat,
-    ) -> Result<D3dTexturePbuffer> {
-        Err(Error::NotSupported(
-            "Windows GL backend has no zero-copy NV import yet (D3D11 shared-texture import is a follow-on)".into(),
-        ))
-    }
-
-    fn import_buffer_packed<T>(
-        _display: &D3d11Display,
-        _img: &Tensor<T>,
-        _width: usize,
-        _height: usize,
-        _fmt: super::PackedImportFormat,
-    ) -> Result<D3dTexturePbuffer>
+    /// Windows keys its imports on a raw `ID3D11Texture2D` address that the
+    /// tensor crate derives independently in each of its two backends, so the
+    /// identity and the texture can disagree without anything else noticing.
+    /// They did: the dynamic backend identified texture tensors by their
+    /// recyclable `ef_tensor` handle address, and converts rendered into
+    /// dropped textures. Checked here, before the cache lookup, so a cache
+    /// **hit** cannot serve a stale image either -- `import_buffer` runs only
+    /// on a miss and would never see it.
+    ///
+    /// A tensor with no texture is not this check's business: the import
+    /// functions refuse it by name, with a message about what it is instead.
+    fn validate_import_identity<T>(img: &Tensor<T>, what: &str) -> Result<()>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
-        Err(Error::NotSupported(
-            "Windows GL backend has no zero-copy packed import yet (D3D11 shared-texture import is a follow-on)".into(),
-        ))
+        let Some(texture) = img.d3d11_texture() else {
+            return Ok(());
+        };
+        let identity = edgefirst_tensor::TensorTrait::buffer_identity(img);
+        check_identity_names_texture(identity.kind(), identity.id(), texture, what)
     }
 
-    fn import_handle(import: &D3dTexturePbuffer) -> egl::Surface {
-        import.surface
+    fn import_buffer(
+        display: &D3d11Display,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+        _for_dst: bool,
+    ) -> Result<D3d11EglImage> {
+        // `EGL_ANGLE_image_d3d11_texture` has no sub-extent attribute, so
+        // the image always covers the whole texture. That is what a
+        // destination view wants (the tile offset is viewport state) and
+        // what `d3d11_texture()` returns for a view either way, so there is
+        // no branch here. A source whose logical image is smaller than its
+        // texture -- a pool buffer narrowed by `configure_image` -- is
+        // sampled through the extent reported by `import_extent`, which the
+        // engine folds into the source rectangle.
+        //
+        // `for_dst` is unused for the same reason there is no bind-flag
+        // refusal here: the tensor crate's layout ABI is frozen and carries
+        // no bind flags, so this leaf cannot ask whether an externally
+        // wrapped texture was created with `D3D11_BIND_RENDER_TARGET`. Such
+        // a texture is imported and attached, and rejected at
+        // `CheckFramebufferStatus`, which falls the frame back to the CPU
+        // converter -- correct, at the cost of one `eglCreateImage` and one
+        // FBO probe per frame. Textures the HAL allocates always carry the
+        // flag.
+        let (texture, layout) = texture_of(img, "source/destination")?;
+        check_dxgi_format(&layout, img, fmt)?;
+        import_texture(display, texture, &layout, "image")
     }
 
-    unsafe fn attach_tex_image_2d(display: &D3d11Display, handle: egl::Surface) -> Result<()> {
-        display
-            .shared
-            .egl
-            .bind_tex_image(display.shared.display, handle, EGL_BACK_BUFFER)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindTexImage: {e:?}"))))?;
-        display.active_binds.borrow_mut().push(handle);
+    fn import_buffer_nv_r8(
+        display: &D3d11Display,
+        img: &Tensor<u8>,
+        _fmt: PixelFormat,
+    ) -> Result<D3d11EglImage> {
+        let (texture, layout) = texture_of(img, "NV source")?;
+        // The HAL's own semi-planar allocations are always R8, and so is any
+        // externally wrapped one the tensor crate accepted. That acceptance
+        // is a contract this whole path rests on: `d3d11/texture.rs`'s
+        // `validate_external` refuses a semi-planar texture whose width is
+        // not its own staging row pitch, which is what makes the combined
+        // plane's rows and the texel grid one number here. Checking the
+        // format anyway costs nothing and makes the leaf self-defending.
+        if layout.dxgi_format != edgefirst_tensor::d3d11_layout::DXGI_FORMAT_R8_UNORM {
+            return Err(Error::UnsupportedFormat(format!(
+                "NV source texture is DXGI format {}, but the combined-plane path needs R8_UNORM ({})",
+                layout.dxgi_format,
+                edgefirst_tensor::d3d11_layout::DXGI_FORMAT_R8_UNORM
+            )));
+        }
+        import_texture(display, texture, &layout, "NV combined plane")
+    }
+
+    fn import_buffer_packed<T>(
+        display: &D3d11Display,
+        img: &Tensor<T>,
+        width: usize,
+        height: usize,
+        fmt: super::PackedImportFormat,
+    ) -> Result<D3d11EglImage>
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        let (texture, layout) = texture_of(img, "packed destination")?;
+        let expected = match fmt {
+            super::PackedImportFormat::Rgba8888 => {
+                edgefirst_tensor::d3d11_layout::DXGI_FORMAT_R8G8B8A8_UNORM
+            }
+            super::PackedImportFormat::Rgba16161616F => {
+                edgefirst_tensor::d3d11_layout::DXGI_FORMAT_R16G16B16A16_FLOAT
+            }
+            super::PackedImportFormat::Rgba32323232F => {
+                edgefirst_tensor::d3d11_layout::DXGI_FORMAT_R32G32B32A32_FLOAT
+            }
+        };
+        if layout.dxgi_format != expected
+            || layout.texture_width != width
+            || layout.texture_height != height
+        {
+            return Err(Error::NotSupported(format!(
+                "GL convert: texture layout {layout:?} does not match the packed render \
+                 surface {width}x{height} {fmt:?}"
+            )));
+        }
+        import_texture(display, texture, &layout, "packed surface")
+    }
+
+    fn import_handle(import: &D3d11EglImage) -> egl::Image {
+        import.image
+    }
+
+    fn import_extent(import: &D3d11EglImage) -> Option<(u32, u32)> {
+        // Always `Some`: the image covers the whole `ID3D11Texture2D`, which
+        // is larger than the logical image whenever `configure_image` narrowed
+        // a pool tensor.
+        Some(import.extent)
+    }
+
+    unsafe fn attach_tex_image_2d(_display: &D3d11Display, handle: egl::Image) -> Result<()> {
+        // SAFETY: the caller has the intended texture bound on the active
+        // unit and keeps the import alive for this call.
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                edgefirst_gl::gl::TEXTURE_2D,
+                handle.as_ptr(),
+            );
+        }
         Ok(())
     }
 
     unsafe fn attach_tex_image_external(
         _display: &D3d11Display,
-        _handle: egl::Surface,
+        _handle: egl::Image,
     ) -> Result<()> {
+        // Unreachable in practice: `EXTERNAL_OES` is false, so path
+        // selection never picks the external sampler.
         Err(Error::NotSupported(
-            "GL_TEXTURE_EXTERNAL_OES is not available on ANGLE/D3D11".into(),
+            "GL_TEXTURE_EXTERNAL_OES sampling is not used on ANGLE/D3D11".into(),
         ))
     }
 
     unsafe fn attach_renderbuffer_storage(
         _display: &D3d11Display,
-        _handle: egl::Surface,
+        handle: egl::Image,
     ) -> Result<()> {
-        Err(Error::NotSupported(
-            "renderbuffer import targets are not available on ANGLE/D3D11 \
-             (EDGEFIRST_OPENGL_RENDERSURFACE has no effect on Windows)"
-                .into(),
-        ))
+        // SAFETY: the caller has the intended renderbuffer bound and keeps
+        // the import alive for this call.
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+                edgefirst_gl::gl::RENDERBUFFER,
+                handle.as_ptr(),
+            );
+        }
+        Ok(())
     }
 
     fn begin_gpu_pass(display: &D3d11Display) {
@@ -1057,29 +1120,88 @@ impl GlPlatform for AngleD3d11 {
             Some(display.context),
         ) {
             warn!("eglMakeCurrent (per-message context re-sync) failed: {e:?}");
+            // The swap above already recorded this context as active, but it
+            // is not: leaving the marker would make the next message skip its
+            // own re-sync, which is the exact state this invalidation exists
+            // to prevent.
+            invalidate_active_context();
         }
     }
 
-    fn end_gpu_pass(display: &D3d11Display) {
-        for surface in display.active_binds.borrow_mut().drain(..) {
-            let _ = display.shared.egl.release_tex_image(
-                display.shared.display,
-                surface,
-                EGL_BACK_BUFFER,
-            );
+    fn end_gpu_pass(_display: &D3d11Display) {
+        // EGLImage texture targets persist by design; nothing to release.
+    }
+
+    fn native_fence_sync(display: &D3d11Display) -> bool {
+        display.shared.device.signal_supported()
+    }
+
+    /// A manual-reset event set when the device fence reaches the value
+    /// covering this convert.
+    ///
+    /// `recorded` is that value when `record_completion` has already taken
+    /// it for the same convert, which is the fenced path: the event and
+    /// `dst.gpu_completion()` then name one value, at the cost of one flush
+    /// and one signal for the whole call rather than two of each. Without
+    /// one -- a caller exporting a fence over work no destination recorded --
+    /// this submits and signals itself.
+    fn export_completion_fence(
+        display: &D3d11Display,
+        recorded: Option<u64>,
+    ) -> Result<Option<CompletionFence>> {
+        let dev = display.shared.device;
+        if !dev.signal_supported() {
+            return Ok(None);
         }
+        let value = match recorded {
+            Some(v) => v,
+            None => {
+                // SAFETY: a GL context is current on this thread (the worker
+                // holds it for its life); glFlush takes no arguments.
+                unsafe { edgefirst_gl::gl::Flush() };
+                let Some(v) = dev.signal() else {
+                    return Ok(None);
+                };
+                v
+            }
+        };
+        dev.event_for(value).map(Some).map_err(Error::Io)
     }
 
-    fn native_fence_sync(_display: &D3d11Display) -> bool {
-        // No EGL_ANDROID_native_fence_sync on ANGLE/D3D11: convert()
-        // returning means the GPU work is complete. Exporting a D3D11 fence
-        // handle is left to the D3D11 texture follow-on (the
-        // `CompletionFence` alias is an OwnedHandle here).
-        false
+    /// Queues a fence signal behind the render -- a convert or a mask draw --
+    /// and records its value on the destination so CUDA, D3D12 and
+    /// other-device consumers can wait on it. The `glFlush` first: the value
+    /// must cover this render's GL work even when the terminal `glFinish` is
+    /// deferred to `flush`.
+    ///
+    /// `submit == false` keeps the D3D11 command buffer unsubmitted, so a
+    /// batch of deferred converts costs one submission at its flush instead
+    /// of one per tile. The values are still allocated under the device lock,
+    /// so they order the tiles among themselves; what they do not carry until
+    /// `submit_recorded` runs is the promise that a waiter sees them arrive.
+    fn record_completion(display: &D3d11Display, dst: &mut TensorDyn, submit: bool) -> Option<u64> {
+        if dst.memory() != edgefirst_tensor::TensorMemory::DmaBuf
+            || !display.shared.device.signal_supported()
+        {
+            return None;
+        }
+        // SAFETY: as in `export_completion_fence` — a context is current on
+        // this thread.
+        unsafe { edgefirst_gl::gl::Flush() };
+        let dev = display.shared.device;
+        let value = if submit {
+            dev.signal()
+        } else {
+            dev.signal_deferred()
+        }?;
+        if let Err(e) = dst.set_gpu_write(value) {
+            log::debug!("record_completion: {e}");
+        }
+        Some(value)
     }
 
-    fn export_completion_fence(_display: &D3d11Display) -> Result<Option<CompletionFence>> {
-        Ok(None)
+    fn submit_recorded(display: &D3d11Display) {
+        display.shared.device.flush();
     }
 }
 
@@ -1087,114 +1209,65 @@ impl GlPlatform for AngleD3d11 {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+    use std::os::windows::io::AsRawHandle as _;
 
+    /// The import-identity rule, decided directly.
+    ///
+    /// There is no honest end-to-end test for the failure it catches: a tensor
+    /// whose `BufferIdentity` disagrees with its own `d3d11_texture()` is not
+    /// constructible through any public API — both tensor backends derive the
+    /// identity from the texture at construction and neither exposes a way to
+    /// swap one without the other. That is the property the fix established,
+    /// so the only way to exercise the refusal is to hand the decision the
+    /// disagreement it is meant to reject. Hence the split: the rule lives in
+    /// a function over `(kind, id, texture)` that both callers share.
     #[test]
-    fn adapter_selection_parses_env_values() {
-        assert_eq!(parse_adapter_selection(None), AdapterSelection::Hardware);
-        assert_eq!(
-            parse_adapter_selection(Some("")),
-            AdapterSelection::Hardware
-        );
-        assert_eq!(
-            parse_adapter_selection(Some(" Hardware ")),
-            AdapterSelection::Hardware
-        );
-        assert_eq!(
-            parse_adapter_selection(Some("WARP")),
-            AdapterSelection::Warp
-        );
-        assert_eq!(
-            parse_adapter_selection(Some("discrete")),
-            AdapterSelection::Discrete
-        );
-        assert_eq!(
-            parse_adapter_selection(Some("0x1234:0xabcd")),
-            AdapterSelection::Luid {
-                high: 0x1234,
-                low: 0xabcd
-            }
-        );
-        assert_eq!(
-            parse_adapter_selection(Some("0:74901")),
-            AdapterSelection::Luid {
-                high: 0,
-                low: 74901
-            }
-        );
-        assert_eq!(
-            parse_adapter_selection(Some("RTX 3070")),
-            AdapterSelection::Match("RTX 3070".into())
-        );
-        // A colon that is not a LUID stays a substring match.
-        assert_eq!(
-            parse_adapter_selection(Some("Intel: Arc")),
-            AdapterSelection::Match("Intel: Arc".into())
-        );
-    }
+    fn an_identity_that_does_not_name_the_texture_is_refused() {
+        use edgefirst_tensor::IdentityKind;
 
-    #[test]
-    fn resolve_adapter_prefers_largest_hardware_adapter_and_matches_substrings() {
-        let adapters = vec![
-            DxgiAdapter {
-                index: 0,
-                description: "Intel(R) UHD Graphics 630".into(),
-                luid_high: 0,
-                luid_low: 1,
-                software: false,
-                dedicated_video_memory: 128 << 20,
-            },
-            DxgiAdapter {
-                index: 1,
-                description: "NVIDIA GeForce RTX 3070".into(),
-                luid_high: 0,
-                luid_low: 2,
-                software: false,
-                dedicated_video_memory: 8 << 30,
-            },
-            DxgiAdapter {
-                index: 2,
-                description: "Microsoft Basic Render Driver".into(),
-                luid_high: 0,
-                luid_low: 3,
-                software: true,
-                dedicated_video_memory: 0,
-            },
-        ];
-        assert_eq!(
-            resolve_adapter(AdapterSelection::Discrete, &adapters),
-            AdapterSelection::Luid { high: 0, low: 2 }
-        );
-        assert_eq!(
-            resolve_adapter(AdapterSelection::Match("intel".into()), &adapters),
-            AdapterSelection::Luid { high: 0, low: 1 }
-        );
-        assert_eq!(
-            resolve_adapter(AdapterSelection::Match("no such gpu".into()), &adapters),
-            AdapterSelection::Hardware
-        );
-        assert_eq!(
-            resolve_adapter(AdapterSelection::Warp, &adapters),
-            AdapterSelection::Warp
-        );
-        assert_eq!(
-            resolve_adapter(AdapterSelection::Discrete, &adapters[2..]),
-            AdapterSelection::Hardware
-        );
-    }
+        // A plausible texture address; never dereferenced.
+        let texture = 0x2000_usize as *mut c_void;
+        let good = d3d11_identity_key(texture);
 
-    /// DXGI enumeration is a system facility; on a host where dxgi.dll is
-    /// missing (Server Core) the function errors and the caller degrades,
-    /// so the assertions apply only when enumeration succeeds.
-    #[test]
-    fn dxgi_enumeration_lists_adapters_or_skips() {
-        match enumerate_dxgi_adapters() {
-            Ok(adapters) => {
-                assert!(!adapters.is_empty(), "DXGI enumerated zero adapters");
-                for a in &adapters {
-                    assert!(!a.description.is_empty());
-                }
-            }
-            Err(e) => eprintln!("DXGI enumeration unavailable — skipping: {e}"),
+        assert!(
+            check_identity_names_texture(IdentityKind::D3d11Texture, good, texture, "dst").is_ok(),
+            "the key both tensor backends derive for this texture must be accepted"
+        );
+
+        // The defect: right kind is not enough if the key names another
+        // object. This is what a cache HIT would have served a stale image
+        // for, since the miss path never runs.
+        let other = d3d11_identity_key(0x3000_usize as *mut c_void);
+        let err = check_identity_names_texture(IdentityKind::D3d11Texture, other, texture, "dst")
+            .expect_err("a D3d11Texture key naming a different texture must be refused");
+        assert!(
+            matches!(err, Error::NotSupported(_)),
+            "a refusal falls the frame back to the CPU converter: {err:?}"
+        );
+
+        // The shipped defect's actual shape: the dynamic backend's `HostPtr`
+        // over a recyclable `ef_tensor` handle address.
+        assert!(
+            check_identity_names_texture(IdentityKind::HostPtr, 0x2000, texture, "src").is_err(),
+            "a HostPtr identity must be refused even when its numeric key \
+             happens to equal the texture address"
+        );
+
+        // Every other kind is equally wrong here, including the ones that are
+        // legitimate cache keys on their own platforms.
+        for kind in [
+            IdentityKind::DmaBuf,
+            IdentityKind::Shm,
+            IdentityKind::IoSurface,
+            IdentityKind::AHardwareBufferId,
+            IdentityKind::AHardwareBufferPtr,
+            IdentityKind::Pbo,
+        ] {
+            assert!(
+                check_identity_names_texture(kind, good, texture, "src").is_err(),
+                "{kind:?} is not a D3D11 texture identity"
+            );
         }
     }
 
@@ -1215,6 +1288,144 @@ mod tests {
             .expect("ANGLE libEGL.dll should load from EDGEFIRST_ANGLE_PATH");
     }
 
+    /// A context teardown must forget the last-active context for EVERY
+    /// processor, not just its own: ANGLE's per-display state manager is
+    /// disturbed by the destruction, so a processor that was already the last
+    /// active one must still re-sync on its next message. Skipping that
+    /// re-sync faulted inside `glDrawArrays` in about one four-processor
+    /// convert-then-teardown run in fifteen.
+    #[test]
+    fn destroying_a_context_forgets_another_processors_last_active_context() {
+        // Serializes this display/context work with the GL workers of
+        // other tests in this binary; see `lifecycle_guard`.
+        let _lifecycle = super::super::super::threaded::lifecycle_guard();
+        let Ok(keeper) = AngleD3d11::init_display(None) else {
+            eprintln!("SKIP: no ANGLE");
+            return;
+        };
+        let Ok(doomed) = AngleD3d11::init_display(None) else {
+            eprintln!("SKIP: no ANGLE");
+            return;
+        };
+        // `keeper` issues the last commands, so it is the context the
+        // per-message re-sync would skip.
+        AngleD3d11::begin_gpu_pass(&keeper);
+        assert_eq!(
+            LAST_ACTIVE_CONTEXT.load(Ordering::Acquire),
+            keeper.context_ptr()
+        );
+        drop(doomed);
+        assert!(
+            LAST_ACTIVE_CONTEXT.load(Ordering::Acquire).is_null(),
+            "another context's teardown must invalidate the re-sync cache"
+        );
+        // And the invalidation makes `keeper`'s next pass re-make it current.
+        AngleD3d11::begin_gpu_pass(&keeper);
+        assert_eq!(
+            LAST_ACTIVE_CONTEXT.load(Ordering::Acquire),
+            keeper.context_ptr()
+        );
+    }
+
+    /// The display ANGLE brings up is the tensor crate's device, both as the
+    /// leaf recorded it and as ANGLE reports it back through
+    /// `EGL_ANGLE_device_d3d`.
+    #[test]
+    fn shared_display_runs_on_the_tensor_crates_device() {
+        // Serializes this display/context work with the GL workers of
+        // other tests in this binary; see `lifecycle_guard`.
+        let _lifecycle = super::super::super::threaded::lifecycle_guard();
+        let Ok(shared) = shared_display() else {
+            eprintln!("SKIP: no ANGLE");
+            return;
+        };
+        let dev = edgefirst_tensor::d3d11::device().expect("device");
+        assert_eq!(shared.device.raw(), dev.raw());
+        assert_eq!(
+            query_angle_d3d11_device(&shared.egl, shared.display),
+            dev.raw()
+        );
+    }
+
+    /// A texture tensor imported as an EGLImage, attached to a GL texture
+    /// and rendered into, carries the rendered pixels back to the CPU map:
+    /// the zero-copy round trip the whole leaf exists for.
+    #[test]
+    fn rgba8_texture_imports_renders_and_reads_back() {
+        // Serializes this display/context work with the GL workers of
+        // other tests in this binary; see `lifecycle_guard`.
+        let _lifecycle = super::super::super::threaded::lifecycle_guard();
+        let Ok(display) = AngleD3d11::init_display(None) else {
+            eprintln!("SKIP: no ANGLE");
+            return;
+        };
+        let t = edgefirst_tensor::Tensor::<u8>::image(
+            64,
+            32,
+            PixelFormat::Rgba,
+            Some(edgefirst_tensor::TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::Read,
+        )
+        .unwrap();
+        let import = AngleD3d11::import_buffer(&display, &t, PixelFormat::Rgba, true).unwrap();
+        let handle = AngleD3d11::import_handle(&import);
+        let mut tex = 0;
+        let mut fbo = 0;
+        // SAFETY: `init_display` left a context current on this thread, and
+        // every GL name below was generated in this block. The import is
+        // alive for the whole block.
+        unsafe {
+            edgefirst_gl::gl::GenTextures(1, &mut tex);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+            AngleD3d11::attach_tex_image_2d(&display, handle).unwrap();
+            edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
+                tex,
+                0,
+            );
+            assert_eq!(
+                edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER),
+                edgefirst_gl::gl::FRAMEBUFFER_COMPLETE
+            );
+            edgefirst_gl::gl::ClearColor(1.0, 0.5, 0.0, 1.0);
+            edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+            edgefirst_gl::gl::Finish();
+        }
+        let m = t.map_read().unwrap();
+        let px = &m.as_slice()[..4];
+        assert_eq!(px[0], 255, "red {px:?}");
+        // 0.5 lands on 127 or 128 depending on the driver's rounding.
+        assert!(px[1] == 128 || px[1] == 127, "green {px:?}");
+        assert_eq!(px[2], 0, "blue {px:?}");
+        assert_eq!(px[3], 255, "alpha {px:?}");
+    }
+
+    /// The exported completion fence is an event on the tensor crate's
+    /// device fence; after a `glFinish` the value it waits for is reached.
+    #[test]
+    fn export_completion_fence_yields_a_set_event_after_finish() {
+        // Serializes this display/context work with the GL workers of
+        // other tests in this binary; see `lifecycle_guard`.
+        let _lifecycle = super::super::super::threaded::lifecycle_guard();
+        let Ok(display) = AngleD3d11::init_display(None) else {
+            eprintln!("SKIP: no ANGLE");
+            return;
+        };
+        assert!(AngleD3d11::native_fence_sync(&display));
+        let fence = AngleD3d11::export_completion_fence(&display, None)
+            .unwrap()
+            .expect("fence");
+        // SAFETY: `fence` owns a live manual-reset event handle.
+        assert_eq!(
+            unsafe { WaitForSingleObject(fence.as_raw_handle() as _, 5000) },
+            0
+        );
+    }
+
     /// Per-processor context bring-up latency (budget <50 ms each, as on
     /// macOS). Ignored: needs ANGLE + a D3D11 device; run on demand:
     /// `cargo test -p edgefirst-image --release --lib windows::tests -- --ignored --nocapture`
@@ -1222,6 +1433,9 @@ mod tests {
     #[ignore = "needs ANGLE + a D3D11 device; run on demand"]
     fn per_processor_context_bring_up_latency() {
         use std::time::Instant;
+        // Serializes this display/context work with the GL workers of
+        // other tests in this binary; see `lifecycle_guard`.
+        let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let t0 = Instant::now();
         let first = AngleD3d11::init_display(None).expect("first display");
         let first_ms = t0.elapsed().as_secs_f64() * 1e3;

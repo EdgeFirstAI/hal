@@ -603,3 +603,40 @@ fn import_refuses_a_descriptor_advertising_an_unwaitable_fence() {
         "the error must name what it refused, got: {msg}"
     );
 }
+
+/// `D3D11_TEXTURE` is the one kind allowed to set `SYNC_PRESENT`, and it
+/// carries the fence's NT handle in `ptr`. A descriptor that advertises a
+/// fence value with a null `ptr` therefore names a completion nobody can wait
+/// on, which is the same in-flight-write hazard rather than a missing
+/// feature. Refused on every platform: the check is in the shared validation,
+/// not in the Windows construction arm, so a non-Windows consumer refuses it
+/// too instead of reporting the kind as unimplemented.
+#[test]
+fn import_refuses_a_d3d11_completion_with_no_fence_handle() {
+    let t = Tensor::<u8>::image(
+        16,
+        8,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        CpuAccess::ReadWrite,
+    )
+    .expect("alloc");
+    let pin = t.pin_host(CpuAccess::ReadWrite).unwrap();
+    let dyn_t = TensorDyn::from(t);
+    let mut desc = dyn_t.descriptor_pinned(Some(&pin));
+    desc.kind = edgefirst_tensor::protocol::kind::D3D11_TEXTURE;
+    desc.flags |= edgefirst_tensor::protocol::flags::SYNC_PRESENT;
+    desc.sync = 7;
+    desc.ptr = edgefirst_tensor::protocol::SendPtr(std::ptr::null_mut());
+    let err = TensorDyn::import_descriptor(&desc)
+        .expect_err("a completion with no fence to read it on must be refused");
+    let msg = format!("{err}");
+    assert!(
+        matches!(err, Error::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+    assert!(
+        msg.contains("fence handle"),
+        "the error must name what it refused, got: {msg}"
+    );
+}

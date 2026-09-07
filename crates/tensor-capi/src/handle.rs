@@ -767,9 +767,10 @@ pub unsafe extern "C" fn ef_tensor_wrap_host(
     }
 }
 
+/// Platforms: macOS, iOS.
+///
 /// Wrap a live IOSurface, named by its cross-process `IOSurfaceID`, as a
-/// tensor (macOS/iOS only) -- the consumer half of the capsule protocol's
-/// `IOSURFACE` kind.
+/// tensor -- the consumer half of the capsule protocol's `IOSURFACE` kind.
 ///
 /// Declared on every platform and refused at runtime off Apple, rather than
 /// existing only in an Apple build: this library's ABI surface is the same
@@ -840,13 +841,14 @@ pub unsafe extern "C" fn ef_tensor_from_iosurface_id(
 /// Read a `(dims, ndim)` pair into a shape, or set the last error and
 /// return `None`.
 ///
-/// Shared by the constructors above rather than repeated: the null/zero
-/// check and the `u64 -> usize` narrowing are exactly the places two
-/// hand-written copies drift into accepting different arguments.
+/// Shared by the constructors above, and by `d3d11.rs`'s two, rather than
+/// repeated: the null/zero check and the `u64 -> usize` narrowing are
+/// exactly the places two hand-written copies drift into accepting
+/// different arguments.
 ///
 /// # Safety
 /// `dims` must be `NULL` or point to `ndim` readable `uint64_t`.
-unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Option<Vec<usize>> {
+pub(crate) unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Option<Vec<usize>> {
     if dims.is_null() || ndim == 0 {
         crate::last_error::set_last_error(&format!("{what}: null dims or zero ndim"));
         return None;
