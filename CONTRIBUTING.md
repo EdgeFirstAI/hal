@@ -26,7 +26,7 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 **System Requirements:**
 - Rust stable. The workspace declares no MSRV; CI pins `1.94.0` (see `RUST_STABLE_VERSION` in `.github/workflows/test.yml`), so build against that or newer.
 - Python 3.8 or later (for Python bindings)
-- Linux, macOS, Windows, Android, or iOS. Linux and macOS run the full suite locally; Windows runs everything but the hardware-backend tests, on ANGLE over Direct3D 11 (see [TESTING.md § Windows Setup](TESTING.md#windows-setup)).
+- Linux, macOS, Windows, Android, or iOS. Linux is the reference host and runs every gate. macOS and Windows both run the Rust suite with the GPU backend on ANGLE — over Metal and over Direct3D 11 respectively — and Windows covers the D3D11 tier on the WARP software adapter, so a box with no GPU still exercises it. What no desktop host covers: CUDA (needs a CUDA-capable adapter) and the i.MX G2D / dma-heap paths (need the boards). See [TESTING.md § Windows Setup](TESTING.md#windows-setup).
 - Optional: NXP i.MX platform for G2D hardware acceleration testing
 
 **Development Tools:**
