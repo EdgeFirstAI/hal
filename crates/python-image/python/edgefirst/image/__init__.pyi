@@ -533,6 +533,12 @@ class ImageProcessor:
     ) -> int | None:
         """Convert without blocking on the GPU; returns a completion handle.
 
+        Platforms:
+            Linux, macOS, iOS, Android (sync-file descriptor) and Windows
+            (event handle). Declared and callable on every platform; the two
+            families return different handle kinds, so close each with the
+            matching call -- see Returns below.
+
         Same ``src``/``dst``/``rotation``/``flip``/``source``/``letterbox``
         arguments as an ordinary convert; this call differs only in what it
         returns. The handle is the GL to NPU handoff primitive: hand it to a

@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.29.4"
+version = "0.30.0"
 dependencies = [
  "dma-heap",
  "half",
@@ -197,11 +197,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.29.4"
+version = "0.30.0"
 
 [[package]]
 name = "edgefirst-tensor-capi"
-version = "0.29.4"
+version = "0.30.0"
 dependencies = [
  "cbindgen",
  "edgefirst-tensor",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.29.4"
+version = "0.30.0"
 dependencies = [
  "edgefirst-tensor-abi",
 ]

@@ -805,7 +805,7 @@ macOS, and Android.
 
 | Segment | Meaning | Examples |
 |---------|---------|----------|
-| `codec.` | Image decode | `codec.decode_jpeg`, `codec.decode_jpeg.mcu_loop`, `codec.decode_png.zune_decode` |
+| `codec.` | Image decode | `codec.decode_jpeg`, `codec.decode_jpeg.mcu_loop`, `codec.decode_jpeg.write_rgb` (and `write_grey` / `write_nv16` / `write_nv24` / `write_rgb_420`, the fused output stage), `codec.decode_png.zune_decode` |
 | `tensor.` | Tensor lifecycle | `tensor.alloc`, `tensor.map` |
 | `image.` | Image processing entry points | `image.convert`, `image.flush`, `image.gl_init`, `image.materialize_masks`, `image.draw_decoded_masks` |
 | `image.convert.<backend>` | Backend that serviced the convert | `image.convert.cpu`, `image.convert.gl`, `image.convert.g2d` |
@@ -815,7 +815,7 @@ macOS, and Android.
 | `decoder.<op>.<step>` | Sub-step within a decode phase | `decoder.nms_get_boxes.score_filter`, `decoder.nms_get_boxes.suppress`, `decoder.decode_proto.extract_proto_data` |
 | `decoder.tiled.` | SAHI tiling output side | `decoder.tiled.lift`, `decoder.tiled.merge` |
 | `tracker.` | ByteTrack association | `tracker.update`, `tracker.update.match_high_conf`, `tracker.update.predict` |
-| `python.` | Python binding entry point | `python.convert`, `python.decode`, `python.tile_into`, `python.materialize_masks` |
+| `python.` | Python binding entry point | `python.convert`, `python.convert_deferred`, `python.convert_with_fence`, `python.flush`, `python.decode`, `python.tile_into`, `python.tile_one`, `python.materialize_masks` |
 
 Every span site uses `tracing::trace_span!`, except `image.gl_init`, which
 uses `info_span!` so GL bring-up stays visible at a coarser filter level.
@@ -826,10 +826,11 @@ Field conventions:
 - `mode` — algorithm variant (float / quant, proto / scaled)
 - `*_fmt` — pixel format enum value
 - `*_memory` — tensor memory backend (`Dma` / `Shm` / `Mem`)
+- `memory` — on `tensor.map`, the concrete primitive being mapped: `"iosurface"`, `"ahardwarebuffer"`, `"d3d11_texture"` (the platform-native backends each map through their own site; DMA-BUF, SHM, PBO and heap share the generic one)
 - `layout` — data layout (`nhwc` / `nchw`)
 - `pass` — multi-pass identifier (`pre_resize` / `post_resize` / `direct`)
-- `platform` — `"linux"` / `"macos"` / `"ios"` / `"android"` — emitted by spans in the GL platform layer
-- `backend` — on `image.gl_init`, the chosen transfer backend (`"dmabuf"` / `"iosurface"` / `"ahardwarebuffer"` / `"pbo"` / `"sync"`)
+- `platform` — `"linux"` / `"macos"` / `"ios"` / `"android"` / `"windows"` — emitted by spans in the GL platform layer
+- `backend` — on `image.gl_init`, the chosen transfer backend (`"dmabuf"` / `"iosurface"` / `"ahardwarebuffer"` / `"d3d11"` / `"pbo"` / `"sync"`)
 - `tiles`, `index`, `count`, `overlap` — SAHI tiling geometry on the `image.*_tile*` and `decoder.tiled.*` spans
 
 Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
@@ -966,7 +967,10 @@ hal/
 │   ├── image/              # edgefirst-image
 │   ├── decoder/            # edgefirst-decoder
 │   ├── tracker/            # edgefirst-tracker
-│   ├── tensor-capi/        # libedgefirst_tensor (C ABI; workspace-excluded)
+│   ├── tensor-abi/         # edgefirst-tensor-abi (plain C value types shared by tensor and its FFI)
+│   ├── tensor-ffi/         # edgefirst-tensor-ffi (the `ef_tensor_*` declarations the dynamic backend calls)
+│   ├── decoder-abi/        # edgefirst-decoder-abi (header-only `edgefirst/detect.h` values: boxes, masks, tile placements)
+│   ├── tensor-capi/        # libedgefirst_tensor (C ABI; the five -capi leaves are workspace-excluded)
 │   ├── codec-capi/         # libedgefirst_codec
 │   ├── image-capi/         # libedgefirst_image
 │   ├── decoder-capi/       # libedgefirst_decoder
@@ -976,6 +980,7 @@ hal/
 │   ├── python-codec/       # -> edgefirst.codec    wheel
 │   ├── python-image/       # -> edgefirst.image    wheel
 │   ├── python-decoder/     # -> edgefirst.decoder  wheel
+│   ├── python-tracker/     # -> edgefirst.tracker  wheel
 │   ├── egl/                # edgefirst-egl (trimmed khronos-egl fork, dynamic load only)
 │   ├── gl/                 # edgefirst-gl (trimmed gls fork)
 │   ├── bench/              # edgefirst-bench (workspace dev-dep)

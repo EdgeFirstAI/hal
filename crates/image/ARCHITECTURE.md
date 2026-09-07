@@ -1587,11 +1587,12 @@ in the project README for the user-facing rules and validation patterns.
 | Direction | Crate | Interface |
 |-----------|-------|-----------|
 | Depends on | [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) | `TensorDyn`, `Tensor<T>`, `BufferIdentity`, `PboOps` impl |
-| Depends on (unconditional) | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `DetectBox`, `Segmentation`, proto data for `draw_*` |
+| Depends on (unconditional) | [`edgefirst-decoder-abi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-abi/) | `DetectBox`, `Segmentation` and the other plain values `draw_*` renders — the header-only value crate, not the model decoder |
+| Depends on (feature `codec`, on by default) | [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) | JPEG/PNG decode helpers for tests, benches and examples; off in `image-capi` and `python-image` |
+| Depends on (feature `decode`, off by default) | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | the decoder-taking convenience wrappers `draw_masks` / `draw_masks_tracked` only; the generic `draw_decoded_masks` / `draw_proto_masks` surface is unconditional |
 | Depends on (feature `tracker`) | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) | `Tracker<DetectBox>` for `draw_masks_tracked` |
-| Consumed by | [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | re-export as `edgefirst_hal::image` |
 | Consumed by | [`edgefirst-image-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/) | C bindings for `ImageProcessor` and rendering APIs (does **not** bridge to Python) |
-| Consumed by | [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) | PyO3 binding over the Rust umbrella crate (does not go through the C API) |
+| Consumed by | [`crates/python-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-image/) | the `edgefirst.image` wheel, via the shared `python-common` binding rlib (does not go through the C API) |
 
 ## Platform-Specific Notes
 
