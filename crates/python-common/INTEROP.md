@@ -79,24 +79,38 @@ The consumer applies it only to a **handle-based** import. Under
 `kind::HOST` the descriptor's `ptr` is the producer's pinned address for the
 view itself, so the offset is already in it and re-applying it would advance
 past the sub-region a second time. `DMABUF` (dup's the fd), `IOSURFACE`
-(looks the surface up by id) and `PBO` (by buffer id) all re-derive the base
-from a handle naming the whole parent buffer, so for those it must be put
-back. See `interop::apply_plane_offset`.
+(looks the surface up by id), `D3D11_TEXTURE` (opens the NT handle) and
+`PBO` (by buffer id) all re-derive the base from a handle naming the whole
+parent buffer, so for those it must be put back. See
+`interop::apply_plane_offset`.
 
-**Known gap: D3D11 still needs fixing.**
 `Tensor::set_plane_offset` syncs the storage-internal offset that `map()`
-adds for `Mem`, `Dma` under `cfg(target_os = "linux")` and `Dma` under
-`cfg(any(target_os = "macos", target_os = "ios"))`; every other backing hits
-its `_ => {}` arm. `D3d11TextureTensor::view_offset` (Windows) is set by its
-own `view()` and added by its own `map()`, but nothing writes it back on
-reconstruction, so a reconstructed view there addresses the parent's origin.
+adds for `Mem` and for `Dma` on Linux, macOS/iOS and Windows; every other
+backing hits its `_ => {}` arm.
 
-IOSurface (macOS/iOS) had the same defect and is fixed. It was easy to miss
+IOSurface (macOS/iOS) had the defect and is fixed. It was easy to miss
 because `IoSurfaceTensor::view` always set its own `view_offset` correctly,
 so a *freshly created* view was right and only a tensor rebuilt from a
 `TensorDesc` was wrong — and because `TensorStorage::Dma` is a
 cfg-multiplexed name rather than one type, so the Linux-gated arm did not
 fail to compile on macOS, it silently became a fall-through.
+
+D3D11 (Windows) is fixed too, and the bug had a different shape there. A
+view's descriptor was refused rather than rebuilt at the wrong origin: the
+import checks the shape against the texture's own geometry, and a window
+was neither spelling it accepted. It now accepts a packed window, opens the
+whole texture and narrows it, keeping the texture's pitch as the row
+stride; the storage offset is then written back by `set_plane_offset` and
+cleared by `set_format` and `reshape`. Two Windows-only details follow from
+the texture being the unit of import. The ANGLE image binds the whole
+texture from its origin and cannot express an offset, so the GL engine's
+Windows leaf refuses to attach a *source* carrying a plane offset and the
+engine uploads it through `map()` instead — without that refusal even a
+fresh `view()` converted the parent's origin. And a texture tensor measures
+its offset in the row pitch of a staging texture the *local* driver
+chooses, so when the descriptor's stride (the producer's pitch) differs from
+the consumer's, `apply_plane_offset` re-expresses the offset row by row
+before applying it.
 
 The other backings are not silently affected: `Mem`/`Shm` report
 `kind::HOST` and take the pinned-pointer path; Android reports

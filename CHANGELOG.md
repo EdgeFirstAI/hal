@@ -64,12 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past the sub-region a second time. Both directions are covered by
   `test_view_converts_its_own_sub_region_not_the_parents_origin`.
 
-  **Fixed on Linux DMA-BUF and on IOSurface (macOS/iOS); D3D11 (Windows)
-  still needs the same treatment.** `Tensor::set_plane_offset` now syncs the
-  storage-internal offset for `Mem`, Linux `Dma` and Apple `Dma`, so a
-  reconstructed IOSurface view addresses its own sub-region rather than the
-  parent surface's origin. `MEM`/`SHM` were never affected (they take the
-  pinned-pointer path), Android fails the import outright rather than
+  **Fixed on Linux DMA-BUF, on IOSurface (macOS/iOS) and on D3D11
+  (Windows).** `Tensor::set_plane_offset` now syncs the storage-internal
+  offset for `Mem`, Linux `Dma`, Apple `Dma` and Windows `Dma`, so a
+  reconstructed IOSurface or D3D11 view addresses its own sub-region rather
+  than the parent buffer's origin. `MEM`/`SHM` were never affected (they take
+  the pinned-pointer path), Android fails the import outright rather than
   reconstructing, and a PBO image's `view()` comes back as host memory so it
   never reaches the PBO arm. See `interop::apply_plane_offset`'s doc comment
   for the per-backing accounting.
@@ -95,6 +95,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set_format_clears_the_iosurface_map_window` for the clear — all on the
   macOS CI lane, which runs the Rust suite the Python interop tests cannot
   reach there.
+
+  The D3D11 half had a different shape, and needed three parts. A view's
+  descriptor was not reconstructed at the wrong origin, it was *refused*: the
+  `D3D11_TEXTURE` import checks the descriptor's shape against the texture's
+  own geometry, and a window is neither of the two spellings it accepted. The
+  import now takes a packed window as a third spelling, opens the whole
+  texture and narrows it to the window, with `Tensor::set_logical_shape`
+  keeping the texture's pitch as the row stride while it does. The storage
+  arms then follow the IOSurface pair — plus one at `reshape`'s clear site,
+  because `D3d11TextureTensor::reshape` does not zero its own offset — and
+  the pins refuse an offset past the backing rather than trusting a
+  descriptor's value. Last, and the part no `map()` test could see: the ANGLE
+  D3D11 import binds the whole texture from its origin and cannot express an
+  offset, so the GL engine sampled every offset *source* from the texture's
+  top-left — a *fresh* `view()` converted the parent's origin on Windows,
+  not only a reconstructed one. The Windows leaf now refuses to attach a
+  source carrying a plane offset and the engine uploads it through `map()`,
+  which honours the offset. Because a texture tensor's offset is measured in
+  a staging pitch the consumer's driver may not share, `apply_plane_offset`
+  re-expresses it row by row from the descriptor's stride to the local pitch.
+  Pinned by seven `d3d11` tests in `crates/tensor/tests/d3d11_tensor.rs` and
+  the Windows arm of `crates/image/tests/reconstructed_view_convert.rs`, on
+  the Windows CI lanes.
 
 ### Changed
 

@@ -832,3 +832,253 @@ fn child_imports_the_exported_blob(path: &str) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Plane offset on a reconstructed tensor -- issue #161, the Windows half.
+//
+// `TensorDesc` has no field for the plane offset, so a consumer rebuilding a
+// `view()` from a descriptor opens the whole texture and puts the offset back
+// with `Tensor::set_plane_offset`. That was a silent no-op on this backing:
+// the `Dma` arm was `cfg(target_os = "linux")` and `TensorStorage::Dma` is a
+// cfg-multiplexed *name* rather than one type, so Windows fell through to the
+// catch-all. And it could not even be reached: the import refused a window
+// shape outright. Each test below pins one piece of the fix and was seen to
+// fail without it.
+// ---------------------------------------------------------------------------
+
+/// A ramp so byte `i` holds `i & 0xff`: a window that lands at the wrong
+/// origin cannot coincidentally match the expected bytes.
+fn ramped_rgba(w: usize, h: usize) -> TensorDyn {
+    let t = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgba,
+        DType::U8,
+        Some(TensorMemory::DmaBuf),
+        CpuAccess::ReadWrite,
+    )
+    .expect("texture alloc");
+    assert_eq!(t.memory(), TensorMemory::DmaBuf);
+    let mut m = t.map_bytes(CpuAccess::Write).expect("map parent");
+    for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+        *b = (i & 0xff) as u8;
+    }
+    drop(m);
+    t
+}
+
+/// A view's descriptor imports at the window's shape, over the whole
+/// texture, keeping the texture's pitch as its row stride. Before the fix
+/// this import failed with "neither the allocation shape nor the addressing
+/// shape", which is the *loud* half of the Windows bug.
+#[test]
+fn d3d11_view_descriptor_imports_at_the_window_with_the_textures_pitch() {
+    let parent = ramped_rgba(64, 64);
+    let pitch = parent.effective_row_stride().expect("parent pitch");
+    let view = parent
+        .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+        .expect("view");
+    let desc = view.descriptor_pinned(None);
+    assert_eq!(desc.kind, edgefirst_tensor::protocol::kind::D3D11_TEXTURE);
+    assert_eq!(desc.shape(), &[16, 16, 4]);
+
+    let rebuilt = TensorDyn::import_descriptor(&desc).expect("a window is a valid shape");
+    assert_eq!(rebuilt.shape(), &[16, 16, 4], "narrowed to the window");
+    assert_eq!(
+        rebuilt.effective_row_stride(),
+        Some(pitch),
+        "rows are still the texture's rows"
+    );
+    assert_eq!(
+        rebuilt.plane_offset(),
+        None,
+        "the descriptor cannot carry the offset; the capsule restores it"
+    );
+    // Before the offset is put back, the window sits at the texture's
+    // origin -- the state `apply_plane_offset` corrects.
+    let m = rebuilt.map_bytes(CpuAccess::Read).expect("map rebuilt");
+    assert_eq!(m.as_slice()[0], 0);
+}
+
+/// A window is the only third spelling: a semi-planar sub-rectangle is not
+/// one (`Tensor::view` makes packed views only), nor a window with a
+/// different channel count, nor an empty one. Untrusted descriptor input
+/// keeps failing loudly.
+#[test]
+fn d3d11_window_descriptor_is_packed_and_non_empty_only() {
+    let nv12 = TensorDyn::image(
+        64,
+        64,
+        PixelFormat::Nv12,
+        DType::U8,
+        Some(TensorMemory::DmaBuf),
+        CpuAccess::ReadWrite,
+    )
+    .expect("nv12 alloc");
+    let mut desc = nv12.descriptor_pinned(None);
+    desc.ndim = 2;
+    desc.shape[0] = 32;
+    desc.shape[1] = 32;
+    let err = TensorDyn::import_descriptor(&desc).expect_err("semi-planar window");
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+
+    let rgba = ramped_rgba(64, 64);
+    for (label, shape) in [
+        ("wrong channels", [16usize, 16, 3]),
+        ("empty rows", [0, 16, 4]),
+        ("taller than the texture", [65, 16, 4]),
+    ] {
+        let mut desc = rgba.descriptor_pinned(None);
+        desc.shape[0] = shape[0] as u64;
+        desc.shape[1] = shape[1] as u64;
+        desc.shape[2] = shape[2] as u64;
+        let err = TensorDyn::import_descriptor(&desc).expect_err(label);
+        assert!(matches!(err, Error::InvalidArgument(_)), "{label}: {err}");
+    }
+}
+
+/// Restoring a plane offset onto a reconstructed texture tensor must move
+/// where `map()` starts. The Windows twin of
+/// `set_plane_offset_moves_the_iosurface_map_window`.
+#[test]
+fn set_plane_offset_moves_the_d3d11_map_window() {
+    let parent = ramped_rgba(64, 64);
+    let view = parent
+        .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+        .expect("view");
+    let offset = view.plane_offset().expect("a view carries its offset");
+    let mut rebuilt =
+        TensorDyn::import_descriptor(&view.descriptor_pinned(None)).expect("reconstruct");
+
+    // The restore under test: what `interop::apply_plane_offset` does.
+    rebuilt.set_plane_offset(offset);
+    assert_eq!(rebuilt.plane_offset(), Some(offset));
+
+    let m = rebuilt
+        .map_bytes(CpuAccess::Read)
+        .expect("map after the offset");
+    let s = m.as_slice();
+    assert_ne!(
+        s[0], 0,
+        "map() still starts at the texture's origin -- set_plane_offset was a \
+         no-op on D3D11 storage (issue #161)"
+    );
+    let pitch = rebuilt.effective_row_stride().expect("pitch");
+    for row in 0..16 {
+        for x in 0..16 * 4 {
+            let at = row * pitch + x;
+            assert_eq!(
+                s[at],
+                ((offset + at) & 0xff) as u8,
+                "window byte {at} must be parent[{}]",
+                offset + at
+            );
+        }
+    }
+}
+
+/// A nested `subview` must not compound its offset now that
+/// `set_plane_offset` writes through to the texture storage: `Tensor::subview`
+/// sets the offset twice by two routes (`D3d11TextureTensor::view` computes
+/// `view_offset + offset_bytes`, then `subview` writes `plane_offset +
+/// offset_bytes` back), which agree only while the wrapper and storage fields
+/// stay in sync. Two levels, because one level cannot tell an idempotent
+/// write from one that compounds from zero.
+#[test]
+fn nested_d3d11_subviews_do_not_compound_their_plane_offset() {
+    let parent = ramped_rgba(64, 64);
+    let pitch = parent.effective_row_stride().expect("pitch");
+    let outer = parent
+        .view(edgefirst_tensor::Region::new(8, 8, 32, 32))
+        .expect("outer view");
+    assert_eq!(outer.plane_offset(), Some(8 * pitch + 8 * 4));
+    let inner = outer
+        .view(edgefirst_tensor::Region::new(4, 4, 16, 16))
+        .expect("inner view");
+    let expected = 12 * pitch + 12 * 4;
+    assert_eq!(
+        inner.plane_offset(),
+        Some(expected),
+        "offsets add once, not twice"
+    );
+    let m = inner.map_bytes(CpuAccess::Read).expect("map nested view");
+    assert_eq!(
+        m.as_slice()[0],
+        (expected & 0xff) as u8,
+        "nested window byte 0 must be parent[{expected}], not a compounded offset"
+    );
+}
+
+/// `set_format` must clear the texture storage offset, not just the wrapper
+/// field, or `plane_offset()` reports `None` while `map()` still starts at
+/// the old offset -- a stale window instead of a lost one.
+#[test]
+fn set_format_clears_the_d3d11_map_window() {
+    let parent = ramped_rgba(64, 64);
+    let view = parent
+        .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+        .expect("view");
+    let mut t = TensorDyn::import_descriptor(&view.descriptor_pinned(None)).expect("reconstruct");
+    t.set_plane_offset(view.plane_offset().expect("offset"));
+    assert_ne!(
+        t.map_bytes(CpuAccess::Read).expect("map before").as_slice()[0],
+        0,
+        "precondition: the offset is live before the format change"
+    );
+
+    // A different packed format of the same channel count keeps the shape
+    // valid; changing it drops the offset it cannot vouch for.
+    t.set_format(PixelFormat::Bgra).expect("new format");
+    assert_eq!(t.plane_offset(), None, "the wrapper field is cleared");
+    assert_eq!(
+        t.map_bytes(CpuAccess::Read).expect("map after").as_slice()[0],
+        0,
+        "map() still starts at the old offset -- set_format cleared the wrapper \
+         field but not the D3D11 storage (issue #161)"
+    );
+}
+
+/// `reshape` is the other clear site, and unlike `IoSurfaceTensor::reshape`
+/// the D3D11 storage's own `reshape` leaves `view_offset` alone, so the
+/// wrapper's arm is what clears it.
+#[test]
+fn reshape_clears_the_d3d11_map_window() {
+    let parent = ramped_rgba(64, 64);
+    let view = parent
+        .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+        .expect("view");
+    let mut t = TensorDyn::import_descriptor(&view.descriptor_pinned(None)).expect("reconstruct");
+    t.set_plane_offset(view.plane_offset().expect("offset"));
+    assert_ne!(
+        t.map_bytes(CpuAccess::Read).expect("map before").as_slice()[0],
+        0
+    );
+
+    t.reshape(&[16 * 16 * 4]).expect("same element count");
+    assert_eq!(t.plane_offset(), None);
+    assert_eq!(
+        t.map_bytes(CpuAccess::Read).expect("map after").as_slice()[0],
+        0,
+        "map() still starts at the old offset after reshape (issue #161)"
+    );
+}
+
+/// `set_plane_offset` takes any value -- a descriptor's restored offset is
+/// untrusted -- so the pins bound it rather than offsetting a base pointer
+/// past the backing.
+#[test]
+fn d3d11_map_refuses_a_plane_offset_past_the_backing() {
+    let parent = ramped_rgba(64, 64);
+    let mut t = TensorDyn::import_descriptor(&parent.descriptor_pinned(None)).expect("reconstruct");
+    let backing = t.effective_row_stride().expect("pitch") * 64;
+    t.set_plane_offset(backing + 1);
+    let err = t
+        .map_bytes(CpuAccess::Read)
+        .expect_err("a window past the backing");
+    assert!(matches!(err, Error::InsufficientCapacity { .. }), "{err}");
+    // Exactly the backing is the one-past-the-end address: an empty window,
+    // not an error.
+    t.set_plane_offset(backing);
+    let m = t.map_bytes(CpuAccess::Read).expect("empty window");
+    assert!(m.as_slice().is_empty());
+}
