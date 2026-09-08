@@ -83,13 +83,20 @@ past the sub-region a second time. `DMABUF` (dup's the fd), `IOSURFACE`
 from a handle naming the whole parent buffer, so for those it must be put
 back. See `interop::apply_plane_offset`.
 
-**Known gap: IOSurface and D3D11 still need fixing.**
+**Known gap: D3D11 still needs fixing.**
 `Tensor::set_plane_offset` syncs the storage-internal offset that `map()`
-adds for `Mem` and (under `cfg(target_os = "linux")`) `Dma` only; every
-other backing hits its `_ => {}` arm. `IoSurfaceTensor::view_offset`
-(macOS/iOS) and `D3d11TextureTensor::view_offset` (Windows) are set by their
-own `view()` and added by their own `map()`, but nothing writes them back on
+adds for `Mem`, `Dma` under `cfg(target_os = "linux")` and `Dma` under
+`cfg(any(target_os = "macos", target_os = "ios"))`; every other backing hits
+its `_ => {}` arm. `D3d11TextureTensor::view_offset` (Windows) is set by its
+own `view()` and added by its own `map()`, but nothing writes it back on
 reconstruction, so a reconstructed view there addresses the parent's origin.
+
+IOSurface (macOS/iOS) had the same defect and is fixed. It was easy to miss
+because `IoSurfaceTensor::view` always set its own `view_offset` correctly,
+so a *freshly created* view was right and only a tensor rebuilt from a
+`TensorDesc` was wrong — and because `TensorStorage::Dma` is a
+cfg-multiplexed name rather than one type, so the Linux-gated arm did not
+fail to compile on macOS, it silently became a fall-through.
 
 The other backings are not silently affected: `Mem`/`Shm` report
 `kind::HOST` and take the pinned-pointer path; Android reports
@@ -97,8 +104,8 @@ The other backings are not silently affected: `Mem`/`Shm` report
 reconstructing; and a `view()` of a PBO-backed image comes back as host
 memory, so it never reaches the PBO arm. See
 `interop::apply_plane_offset`'s doc comment for the full per-backing
-accounting and why widening those `cfg`s needs per-platform tests rather
-than a one-liner.
+accounting, including the caller audit that showed no other
+`set_plane_offset` caller can reach either backing.
 
 `interop::reconstruct` — the same-module path, where no capsule is involved
 — carries the offset across the same way, because it reconstructs through

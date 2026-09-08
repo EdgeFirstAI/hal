@@ -4136,6 +4136,15 @@ where
                 TensorStorage::Mem(ref mut m) => m.set_offset(0),
                 #[cfg(target_os = "linux")]
                 TensorStorage::Dma(ref mut dma) => dma.mmap_offset = 0,
+                // Paired with the arm in `set_plane_offset`: a setter that
+                // takes effect on this backing needs a clear that does too,
+                // or the wrapper reports `None` while `map()` still starts at
+                // the old offset -- a stale window rather than a lost one.
+                // `reshape`'s clear site needs no such arm:
+                // `IoSurfaceTensor::reshape` zeroes `view_offset` itself
+                // before the match there runs.
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                TensorStorage::Dma(ref mut io) => io.view_offset = 0,
                 _ => {}
             }
         }
@@ -4631,29 +4640,42 @@ where
         self.plane_offset = Some(offset);
         // The offset consulted by `map()` lives inside the storage variant.
         // Keep it in sync with the wrapper field for every backing that
-        // honors it (DMA and Mem); see also the clear sites in `set_format`
-        // and `reshape`.
+        // honors it; see also the clear sites in `set_format` and `reshape`.
         //
-        // INCOMPLETE, knowingly: `IoSurfaceTensor`, `PboTensor`,
-        // `D3d11TextureTensor` and `AHardwareBufferTensor` each have a
+        // Note that `TensorStorage::Dma` is a cfg-multiplexed *name* rather
+        // than one type -- `DmaTensor` on Linux, `IoSurfaceTensor` on
+        // macOS/iOS, `AHardwareBufferTensor` on Android,
+        // `D3d11TextureTensor` on Windows -- so a `cfg`-gated `Dma` arm does
+        // not fail to compile on the other targets, it silently becomes a
+        // fall-through to `_ => {}`. That is how macOS went without one.
+        //
+        // STILL INCOMPLETE: `D3d11TextureTensor` (Windows),
+        // `AHardwareBufferTensor` (Android) and `PboTensor` each have a
         // `view_offset` that their own `map()` adds and their own `view()`
-        // sets -- but nothing writes it here, so they fall into `_ => {}`
-        // and a caller that sets the offset on them gets a map at the
-        // parent's origin.
-        //
-        // The two that this demonstrably breaks are `IoSurfaceTensor`
-        // (macOS/iOS) and `D3d11TextureTensor` (Windows): both are
+        // sets, but nothing writes it here, so they fall into `_ => {}` and
+        // a caller that sets the offset on them gets a map at the parent's
+        // origin. D3D11 is the one that demonstrably matters -- it is
         // reachable through `TensorDyn::import_descriptor`, so a
-        // reconstructed `view()` reads the wrong region there. See
-        // `edgefirst-python-common`'s `interop::apply_plane_offset`, which
-        // fixes the Linux DMA-BUF case, records the full per-backing
-        // accounting, and explains why the remaining two want a
-        // per-platform change with a test on each rather than two more arms
-        // added blind.
+        // reconstructed `view()` reads the wrong region there (issue #161).
+        // Android cannot be reconstructed at all (its `import_storage` arm
+        // is `cfg(target_os = "linux")`), and a PBO `view()` demotes to host
+        // memory before it gets here (issue #162). See
+        // `edgefirst-python-common`'s `interop::apply_plane_offset` for the
+        // full per-backing accounting.
         match self.storage {
             TensorStorage::Mem(ref mut m) => m.set_offset(offset),
             #[cfg(target_os = "linux")]
             TensorStorage::Dma(ref mut dma) => dma.mmap_offset = offset,
+            // The offset `IoSurfaceTensor::scoped_pin`/`map_inner` add to the
+            // locked base address. Writing it here is what makes a
+            // *reconstructed* view address its own sub-region instead of the
+            // parent surface's origin; `IoSurfaceTensor::view` already set it
+            // on the fresh-view path, which is why only the descriptor round
+            // trip was ever wrong. Idempotent against `subview`, which sets
+            // the same absolute value by both routes -- pinned by
+            // `nested_iosurface_subviews_do_not_compound_their_plane_offset`.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            TensorStorage::Dma(ref mut io) => io.view_offset = offset,
             _ => {}
         }
     }

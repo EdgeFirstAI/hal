@@ -1535,4 +1535,191 @@ mod tests {
             "write through view is visible in parent"
         );
     }
+
+    /// Restoring a plane offset onto a *reconstructed* IOSurface tensor must
+    /// move where `map()` starts. Regression test for issue #161.
+    ///
+    /// `TensorDesc` has no field for the plane offset, so every path that
+    /// rebuilds a tensor from a descriptor puts the offset back by calling
+    /// `Tensor::set_plane_offset` — `edgefirst-python-common`'s
+    /// `interop::apply_plane_offset` is the caller that matters. That call was
+    /// a silent no-op on this backing: `set_plane_offset`'s `Dma` arm was
+    /// `cfg(target_os = "linux")`, and because `TensorStorage::Dma` is a
+    /// cfg-multiplexed *name* rather than one type, macOS did not fail to
+    /// compile — it fell through to the catch-all. A reconstructed `view()`
+    /// therefore addressed the parent surface's origin, silently, with no
+    /// error to follow.
+    ///
+    /// Distinct from `subview_iosurface_shares_identity_and_offsets_map`
+    /// above, which covers the *fresh* view path: `IoSurfaceTensor::view` sets
+    /// its own `view_offset` and always did. Only restoring an offset onto an
+    /// already-built tensor was broken — which is exactly why a freshly
+    /// created view was correct on every platform and only the descriptor
+    /// round trip was wrong.
+    ///
+    /// The reconstruction is spelled with `TensorDyn::from_iosurface_id`
+    /// because that is the same `lookup_by_id` + `from_iosurface` pair that
+    /// `import_storage`'s `kind::IOSURFACE` arm runs, without needing the
+    /// Python capsule layer to reach it.
+    #[test]
+    fn set_plane_offset_moves_the_iosurface_map_window() {
+        use crate::{DType, Tensor, TensorDyn, TensorTrait};
+
+        const PARENT: usize = 256;
+        const OFFSET: usize = 64;
+        const WINDOW: usize = 64;
+
+        // Ramp the parent surface so byte i holds i: a window that lands at
+        // the wrong origin cannot coincidentally match the expected bytes.
+        let parent = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        assert_eq!(parent.memory(), TensorMemory::DmaBuf);
+        {
+            let mut m = parent.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+        let parent_dyn = TensorDyn::from(parent);
+        let id = parent_dyn
+            .iosurface_id()
+            .expect("parent is IOSurface-backed");
+
+        // Reopen the *whole* surface at the sub-region's shape, as an import
+        // does: the handle names the parent, so this lands at its origin.
+        let mut rebuilt = TensorDyn::from_iosurface_id(id, &[WINDOW], DType::U8, None)
+            .expect("reconstruct at the view's shape");
+        {
+            let m = rebuilt
+                .map_bytes(crate::CpuAccess::Read)
+                .expect("map rebuilt before the offset");
+            assert_eq!(
+                m.as_slice()[0],
+                0,
+                "precondition: a bare import starts at the parent's origin"
+            );
+        }
+
+        // The restore under test.
+        rebuilt.set_plane_offset(OFFSET);
+        assert_eq!(
+            rebuilt.plane_offset(),
+            Some(OFFSET),
+            "the wrapper field records the offset on every backing"
+        );
+
+        let m = rebuilt
+            .map_bytes(crate::CpuAccess::Read)
+            .expect("map rebuilt after the offset");
+        let s = m.as_slice();
+        assert_eq!(s.len(), WINDOW, "the window exposes its logical length");
+        assert_ne!(
+            s[0], 0,
+            "map() still starts at the parent's origin — set_plane_offset was \
+             a no-op on IOSurface storage (issue #161)"
+        );
+        for (i, b) in s.iter().enumerate() {
+            assert_eq!(
+                *b,
+                ((i + OFFSET) & 0xff) as u8,
+                "window byte {i} must be parent[{}]",
+                i + OFFSET
+            );
+        }
+    }
+
+    /// A nested `subview` must not compound its offset now that
+    /// `set_plane_offset` writes through to IOSurface storage.
+    ///
+    /// The double-apply guard for the fix above, and the reason it needed
+    /// checking rather than assuming: `Tensor::subview` sets the offset
+    /// *twice* by two different routes. `TensorStorage::view` computes
+    /// `view_offset + offset_bytes` inside `IoSurfaceTensor::view`, and then
+    /// `subview` calls `set_plane_offset(plane_offset + offset_bytes)` on the
+    /// result. Those are the same number only while the wrapper field and the
+    /// storage field stay in sync — which is what the new arm makes true, and
+    /// what an unguarded restore got wrong on `MEM` in the DMA-BUF half of
+    /// this fix (PR #160). Two levels, because a single level cannot tell an
+    /// idempotent write apart from one that compounds from zero.
+    #[test]
+    fn nested_iosurface_subviews_do_not_compound_their_plane_offset() {
+        use crate::{Tensor, TensorTrait};
+
+        let parent = Tensor::<u8>::new(&[256], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        {
+            let mut m = parent.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        let outer = parent.subview(64, &[128]).expect("outer subview");
+        assert_eq!(outer.plane_offset(), Some(64));
+        let inner = outer.subview(32, &[64]).expect("inner subview");
+        assert_eq!(
+            inner.plane_offset(),
+            Some(96),
+            "offsets add once, not twice (64 + 32)"
+        );
+
+        let m = inner.map().expect("map nested subview");
+        for (i, b) in m.as_slice().iter().enumerate() {
+            assert_eq!(
+                *b,
+                ((i + 96) & 0xff) as u8,
+                "nested window byte {i} must be parent[{}], not a compounded offset",
+                i + 96
+            );
+        }
+    }
+
+    /// `set_format` must clear the IOSurface storage offset, not just the
+    /// wrapper field.
+    ///
+    /// The mirror of `set_plane_offset_moves_the_iosurface_map_window`, and
+    /// the reason the fix for it is a set/clear pair rather than one arm:
+    /// `set_format` deliberately drops stride and offset when the format
+    /// changes, because neither is necessarily valid for the new one. It
+    /// dropped them with the same Linux-gated match the setter had, so
+    /// clearing on macOS left `plane_offset()` reporting `None` while
+    /// `map()` still started at the old offset -- a stale window instead of
+    /// a lost one, and the failure mode that making the setter take effect
+    /// would otherwise have introduced.
+    #[test]
+    fn set_format_clears_the_iosurface_map_window() {
+        use crate::{PixelFormat, Tensor, TensorTrait};
+
+        const PARENT: usize = 256;
+        const OFFSET: usize = 64;
+
+        let mut t = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        {
+            let mut m = t.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        // An 8x8 greyscale window carrying an offset, so there is something
+        // to clear. The surface is a 256-byte byte-bag, so the 64-byte window
+        // plus the offset still fits.
+        t.set_logical_shape(&[8, 8, 1]).expect("logical shape");
+        t.set_format(PixelFormat::Grey).expect("format");
+        t.set_plane_offset(OFFSET);
+        assert_eq!(
+            t.map().expect("map before").as_slice()[0],
+            OFFSET as u8,
+            "precondition: the offset is live before the format change"
+        );
+
+        // Changing the format drops the offset it cannot vouch for.
+        t.set_logical_shape(&[4, 8, 3]).expect("rgb logical shape");
+        t.set_format(PixelFormat::Rgb).expect("new format");
+        assert_eq!(t.plane_offset(), None, "the wrapper field is cleared");
+        assert_eq!(
+            t.map().expect("map after").as_slice()[0],
+            0,
+            "map() still starts at the old offset — set_format cleared the \
+             wrapper field but not the IOSurface storage (issue #161)"
+        );
+    }
 }

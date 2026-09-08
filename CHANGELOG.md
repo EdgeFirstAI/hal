@@ -64,15 +64,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past the sub-region a second time. Both directions are covered by
   `test_view_converts_its_own_sub_region_not_the_parents_origin`.
 
-  **Fixed on Linux DMA-BUF; IOSurface (macOS/iOS) and D3D11 (Windows) still
-  need the same treatment.** `Tensor::set_plane_offset` only syncs the
-  storage-internal offset for `Mem` and Linux `Dma`, so on those two a
-  reconstructed view still lands at the parent's origin. `MEM`/`SHM` were
-  never affected (they take the pinned-pointer path), Android fails the
-  import outright rather than reconstructing, and a PBO image's `view()`
-  comes back as host memory so it never reaches the PBO arm. See
-  `interop::apply_plane_offset`'s doc comment for the per-backing
-  accounting.
+  **Fixed on Linux DMA-BUF and on IOSurface (macOS/iOS); D3D11 (Windows)
+  still needs the same treatment.** `Tensor::set_plane_offset` now syncs the
+  storage-internal offset for `Mem`, Linux `Dma` and Apple `Dma`, so a
+  reconstructed IOSurface view addresses its own sub-region rather than the
+  parent surface's origin. `MEM`/`SHM` were never affected (they take the
+  pinned-pointer path), Android fails the import outright rather than
+  reconstructing, and a PBO image's `view()` comes back as host memory so it
+  never reaches the PBO arm. See `interop::apply_plane_offset`'s doc comment
+  for the per-backing accounting.
+
+  The IOSurface half was easy to miss because `IoSurfaceTensor::view` always
+  set its own `view_offset` correctly — a *freshly created* view was right on
+  every platform, and only restoring an offset onto a tensor rebuilt from a
+  `TensorDesc` was broken. `TensorStorage::Dma` compounds that: it is a
+  cfg-multiplexed *name* rather than one type, so the `cfg(target_os =
+  "linux")` arm did not fail to compile elsewhere, it silently became a
+  fall-through.
+
+  The fix is a set/clear pair, not a single arm: `set_format` drops the
+  offset when the format changes, through the same Linux-gated match, so
+  making only the setter take effect would have left `plane_offset()`
+  reporting `None` while `map()` still started at the old offset — trading a
+  lost window for a stale one. (`reshape`'s clear site needed nothing:
+  `IoSurfaceTensor::reshape` zeroes its own `view_offset`.) Three regression
+  tests in `edgefirst-tensor` pin it —
+  `set_plane_offset_moves_the_iosurface_map_window` for the restore,
+  `nested_iosurface_subviews_do_not_compound_their_plane_offset` for the
+  double-apply the restore risks, and
+  `set_format_clears_the_iosurface_map_window` for the clear — all on the
+  macOS CI lane, which runs the Rust suite the Python interop tests cannot
+  reach there.
 
 ### Changed
 
