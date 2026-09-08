@@ -220,14 +220,24 @@ const _: () = {
 ///
 /// The audit the IOSurface fix rested on applies unchanged to D3D11, and is
 /// recorded here so it need not be redone: `set_plane_offset`'s callers
-/// beyond this one cannot reach either backing. `image::import_image`
-/// rejects any tensor whose `memory()` is not `TensorMemory::DmaBuf` before
-/// it sets an offset, and `tensor-capi`'s builder only ever constructs
-/// storage through `TensorDyn::from_fd` under `cfg(unix)`. The one caller
-/// that does reach them, `Tensor::subview`, writes the same absolute value
-/// the storage's own `view()` already computed, so the write is idempotent
-/// rather than a double-apply -- the failure this protocol produced once on
-/// `MEM` (see the `HOST` arm above). What D3D11 still wants is the arm, a
+/// beyond this one cannot reach either backing.
+///
+/// * `image::import_image` -- the whole method is
+///   `#[cfg(target_os = "linux")]` (`crates/image/src/lib.rs`), so it does
+///   not exist on macOS or Windows. Note that its internal
+///   `memory() != TensorMemory::DmaBuf` rejection is **not** what excludes
+///   them: `TensorMemory::DmaBuf` is the portable spelling of "platform
+///   zero-copy buffer", so IOSurface and D3D11 both report it and would
+///   pass that check. The `cfg` is the gate.
+/// * `tensor-capi`'s builder (`builder.rs`, the `wrap` path) -- constructs
+///   storage only through `TensorDyn::from_fd`. Its
+///   `cfg(all(unix, not(target_os = "linux")))` arm always yields a
+///   `ShmTensor`, never an `IoSurfaceTensor`, and its `cfg(not(unix))` arm
+///   returns `ENOSYS`, so neither backing is reachable.
+/// * `Tensor::subview` -- does reach them, and writes the same absolute
+///   value the storage's own `view()` already computed, so the write is
+///   idempotent rather than a double-apply -- the failure this protocol
+///   produced once on `MEM` (see the `HOST` arm above). What D3D11 still wants is the arm, a
 /// `pub(crate)` setter for its private `view_offset`, a matching arm at
 /// `set_format`'s clear site -- a setter that takes effect needs a clear
 /// that does too, or the wrapper reports `None` while `map()` still starts
