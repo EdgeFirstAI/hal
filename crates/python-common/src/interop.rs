@@ -28,160 +28,16 @@
 use std::sync::Arc;
 
 use edgefirst_tensor::{HostPin, Quantization, TensorDesc, TensorDyn};
+
+/// The capsule's quantization descriptor. Defined in `edgefirst-tensor`'s
+/// `protocol` module -- the payload that embeds it lives here, but the type
+/// and its unsafe decode live where their round-trip tests can actually run
+/// (`make test-rust` excludes every `edgefirst-python-*` package, and this
+/// crate's test binary cannot link libpython anyway). Re-exported so the
+/// producers keep naming one path for it.
+pub use edgefirst_tensor::protocol::QuantDesc;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
-
-/// A `*const T` that may cross a `PyCapsule`.
-///
-/// The same obligation [`edgefirst_tensor::SendPtr`] discharges for
-/// [`TensorDesc::ptr`], for the two arrays [`QuantDesc`] points at: the
-/// producer keeps them alive for the capsule's lifetime, here via
-/// [`TensorCapsulePayload::quant_keepalive`].
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug)]
-pub struct SendConstPtr<T>(pub *const T);
-
-// SAFETY: the pointer is only dereferenced by a consumer that received it
-// through a capsule whose `quant_keepalive` owns the pointed-to arrays, so
-// the memory outlives every use. See `QuantDesc`.
-unsafe impl<T> Send for SendConstPtr<T> {}
-unsafe impl<T> Sync for SendConstPtr<T> {}
-
-impl<T> SendConstPtr<T> {
-    /// A null pointer, for a descriptor that carries no array.
-    pub const fn null() -> Self {
-        SendConstPtr(std::ptr::null())
-    }
-}
-
-/// Quantization metadata, in a form that can cross an `.so` boundary.
-///
-/// [`TensorDesc`] deliberately does not carry this: it is the *shared*
-/// descriptor, pinned by `ABI_VERSION` and consumed by the C API, where
-/// tensors travel as real `ef_tensor` handles into one shared
-/// `libedgefirst_tensor.so` and no reconstruction ever happens. The Python
-/// packages are the only consumers that rebuild a tensor from a descriptor,
-/// so this rides in the capsule payload rather than widening a C ABI that
-/// does not need it.
-///
-/// Variable-length by nature -- per-channel quantization carries one scale
-/// (and optionally one zero-point) per channel -- so the arrays are
-/// *borrowed*, not inlined: `scales`/`zero_points` point into the
-/// `Quantization` that [`TensorCapsulePayload::quant_keepalive`] owns, on
-/// exactly the terms [`TensorDesc::ptr`] borrows the producer's host
-/// address. A consumer copies the values out during import (see
-/// [`QuantDesc::to_quantization`]) while the capsule is still alive, and
-/// never retains the pointers.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct QuantDesc {
-    /// Number of entries in `scales` (and in `zero_points` when non-null).
-    /// **Zero means the tensor carries no quantization** -- the one field a
-    /// consumer must check before reading either pointer.
-    pub len: u64,
-    /// Channel axis for per-channel quantization, **plus one**; `0` means
-    /// per-tensor. Encoded this way so the whole struct zeroes to "absent"
-    /// rather than needing a separate presence flag for an `Option<usize>`.
-    pub axis_plus_one: u64,
-    /// `len` scale factors. Null iff `len == 0`.
-    pub scales: SendConstPtr<f32>,
-    /// `len` zero-points, or null for symmetric quantization.
-    pub zero_points: SendConstPtr<i32>,
-}
-
-impl QuantDesc {
-    /// The descriptor for a tensor with no quantization metadata.
-    pub const fn absent() -> Self {
-        Self {
-            len: 0,
-            axis_plus_one: 0,
-            scales: SendConstPtr::null(),
-            zero_points: SendConstPtr::null(),
-        }
-    }
-
-    /// Describe `quant`, borrowing its arrays.
-    ///
-    /// The caller must keep `quant` alive for as long as the descriptor is
-    /// readable -- in the capsule protocol, by storing the same `Arc` in
-    /// [`TensorCapsulePayload::quant_keepalive`].
-    pub fn borrowing(quant: &Quantization) -> Self {
-        Self {
-            len: quant.scale().len() as u64,
-            axis_plus_one: quant.axis().map_or(0, |a| a as u64 + 1),
-            scales: SendConstPtr(quant.scale().as_ptr()),
-            zero_points: quant
-                .zero_point()
-                .map_or(SendConstPtr::null(), |zp| SendConstPtr(zp.as_ptr())),
-        }
-    }
-
-    /// Copy the borrowed arrays into an owned [`Quantization`], or `None`
-    /// when the producer declared no quantization.
-    ///
-    /// `Ok(None)` means "the producer has none"; a descriptor that declares
-    /// quantization but cannot be read back as a valid [`Quantization`] is
-    /// an `Err`, not a second spelling of `None`. Conflating the two is
-    /// what made the bug this whole capsule version exists to fix so hard
-    /// to place: a tensor that quietly arrives unquantized surfaces much
-    /// later as the consumer's own "requires quantization metadata", which
-    /// names the symptom and not the cause.
-    ///
-    /// # Safety
-    ///
-    /// `self` must have come from a capsule that is still alive, so the
-    /// arrays `scales`/`zero_points` point at are still owned by the
-    /// producer's `quant_keepalive`.
-    pub unsafe fn to_quantization(&self) -> PyResult<Option<Quantization>> {
-        if self.len == 0 {
-            return Ok(None);
-        }
-        if self.scales.0.is_null() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "malformed tensor capsule: quantization declares {} scale(s) but \
-                 carries a null scale array",
-                self.len
-            )));
-        }
-        let len = self.len as usize;
-        // SAFETY: the caller's obligation, above: the producer's
-        // `quant_keepalive` owns these arrays and the capsule holding it is
-        // alive, and `len` came from the same producer as the pointers.
-        let scales = unsafe { std::slice::from_raw_parts(self.scales.0, len) }.to_vec();
-        let zero_points = if self.zero_points.0.is_null() {
-            None
-        } else {
-            Some(unsafe { std::slice::from_raw_parts(self.zero_points.0, len) }.to_vec())
-        };
-        // Rebuilt through the named constructors so an ill-formed
-        // descriptor cannot produce a `Quantization` that the type's own
-        // invariants say is impossible -- `Quantization::validate` rejects
-        // per-channel scales with no axis and a per-tensor scale that
-        // carries one, so those shapes cannot be forced into existence here
-        // either. A descriptor that names one of them is reported, not
-        // silently downgraded to "unquantized".
-        let axis = self.axis_plus_one.checked_sub(1).map(|a| a as usize);
-        let quant = match (axis, zero_points) {
-            (None, None) if len == 1 => Ok(Quantization::per_tensor_symmetric(scales[0])),
-            (None, Some(zp)) if len == 1 => Ok(Quantization::per_tensor(scales[0], zp[0])),
-            (Some(a), None) => Quantization::per_channel_symmetric(scales, a),
-            (Some(a), Some(zp)) => Quantization::per_channel(scales, zp, a),
-            // `len > 1` with no axis: per-channel scales that name no
-            // channel dimension. `Quantization` has no such shape.
-            (None, _) => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "malformed tensor capsule: {len} quantization scales but no \
-                     channel axis; per-channel quantization must name one"
-                )));
-            }
-        };
-        quant.map(Some).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "malformed tensor capsule: quantization metadata is not valid: {e}"
-            ))
-        })
-    }
-}
 
 /// Attach `quant` to `tensor`, if there is any.
 ///
@@ -256,7 +112,12 @@ unsafe fn read_capsule_parts(ptr: *const TensorCapsulePayload) -> PyResult<Capsu
         // SAFETY: `to_quantization` copies the borrowed scale arrays out
         // while the capsule -- which owns them through `quant_keepalive` --
         // is still alive, which the caller also guarantees.
-        quant: unsafe { quant_desc.to_quantization() }?,
+        //
+        // Its `Err` is `edgefirst-tensor`'s, because the decoder lives
+        // there now (so it can be unit-tested); this is the seam that turns
+        // it into the Python exception a binding must raise.
+        quant: unsafe { quant_desc.to_quantization() }
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
         plane_offset,
     })
 }
@@ -287,6 +148,16 @@ const _: () = {
     // which is not the mistake this is guarding against.
     assert!(size_of::<QuantDesc>() == 2 * size_of::<u64>() + 2 * size_of::<*const ()>());
     assert!(align_of::<QuantDesc>() == align_of::<u64>());
+    // Every field, not just the total size: `len` and `axis_plus_one` are
+    // both `u64` and `scales` and `zero_points` are both pointers, so
+    // swapping either pair leaves size and alignment untouched. Size alone
+    // would let a reordering -- which breaks every shipped `_v2` consumer
+    // exactly as an added field would -- pass this guard and ship without
+    // the rename.
+    assert!(offset_of!(QuantDesc, len) == 0);
+    assert!(offset_of!(QuantDesc, axis_plus_one) == size_of::<u64>());
+    assert!(offset_of!(QuantDesc, scales) == 2 * size_of::<u64>());
+    assert!(offset_of!(QuantDesc, zero_points) == 2 * size_of::<u64>() + size_of::<*const ()>());
     assert!(offset_of!(TensorCapsulePayload, desc) == 0);
     assert!(offset_of!(TensorCapsulePayload, quant) == size_of::<TensorDesc>());
     assert!(
@@ -309,6 +180,25 @@ const _: () = {
 /// a handle naming the whole parent buffer -- `DMABUF` dup's the fd,
 /// `IOSURFACE` looks the surface up by id, `PBO` by buffer id -- and so
 /// lands at the parent's origin unless the offset is put back.
+///
+/// **Known gap: this currently takes effect only on Linux DMA-BUF.**
+/// `Tensor::set_plane_offset` records the wrapper field for every backing,
+/// but only syncs the storage-internal offset that `map()` actually adds
+/// for `Mem` and, under `#[cfg(target_os = "linux")]`, `Dma` -- every other
+/// backing falls into its `_ => {}` arm. `IoSurfaceTensor::view_offset`,
+/// `PboTensor::view_offset`, `D3d11TextureTensor::view_offset` and
+/// `AHardwareBufferTensor::view_offset` all exist and are all honored by
+/// those backends' own `map()`, and each backend's own `view()` sets them
+/// -- they are simply not written back here. So on macOS/iOS, Windows,
+/// Android, and for PBO, a reconstructed view still addresses the parent's
+/// origin, exactly as it did before this fix.
+///
+/// Not fixed here deliberately: `set_plane_offset` has callers beyond this
+/// one (`image::import_image`'s multiplane path, `tensor-capi`'s builder),
+/// so widening those `cfg`s changes behaviour on three platforms that
+/// cannot be tested from this repo's CI, and double-applying an offset is a
+/// failure this protocol has already produced once (see the `HOST` arm
+/// above). It wants a platform-by-platform change with tests on each.
 fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u64) {
     if plane_offset == 0 || desc.kind == edgefirst_tensor::tensor_kind::HOST {
         return;
@@ -343,7 +233,9 @@ fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u
 ///
 /// Any change to this struct's layout -- including a change to *how* the
 /// layout is guaranteed, not only to the fields themselves -- moves the
-/// capsule name to `edgefirst_tensor_v2`, per INTEROP.md's Versioning rule.
+/// capsule name to `edgefirst_tensor_v3`, per INTEROP.md's Versioning rule.
+/// `_v2` is what this struct is *now*, so naming it here would read as
+/// "rename it to the name it already has", i.e. as no rename at all.
 #[repr(C)]
 pub struct TensorCapsulePayload {
     pub desc: TensorDesc,

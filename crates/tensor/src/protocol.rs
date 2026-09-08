@@ -806,3 +806,280 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         sync: completion.map_or(0, |(_, value)| value),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Quantization, as it crosses the capsule.
+//
+// This lives here rather than in `edgefirst-python-common` beside
+// `TensorCapsulePayload`, which is the only thing that embeds it, for one
+// reason: it is unsafe pointer/length decoding of a versioned wire format,
+// and `edgefirst-python-common` cannot host a test that runs. That crate
+// pins `pyo3/extension-module`, which suppresses linking libpython, so its
+// test binary cannot link at all -- and `make test-rust` excludes it by
+// name regardless. Here, the round trip is covered by `quant_desc_tests`
+// below, which `make test` runs.
+//
+// It does NOT go in `TensorDesc`: that descriptor is also the C ABI's, and
+// the C libraries pass real `ef_tensor` handles into one shared
+// `libedgefirst_tensor.so` and never rebuild a tensor from a descriptor, so
+// they never lose the metadata. See `python-common/INTEROP.md`.
+// ---------------------------------------------------------------------------
+
+/// A `*const T` that may cross a `PyCapsule`.
+///
+/// The same obligation [`crate::SendPtr`] discharges for
+/// [`crate::TensorDesc::ptr`], for the two arrays [`QuantDesc`] points at: the
+/// producer keeps them alive for the capsule's lifetime, here via
+/// `TensorCapsulePayload::quant_keepalive`.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct SendConstPtr<T>(pub *const T);
+
+// SAFETY: the pointer is only dereferenced by a consumer that received it
+// through a capsule whose `quant_keepalive` owns the pointed-to arrays, so
+// the memory outlives every use. See `QuantDesc`.
+unsafe impl<T> Send for SendConstPtr<T> {}
+unsafe impl<T> Sync for SendConstPtr<T> {}
+
+impl<T> SendConstPtr<T> {
+    /// A null pointer, for a descriptor that carries no array.
+    pub const fn null() -> Self {
+        SendConstPtr(std::ptr::null())
+    }
+}
+
+/// Quantization metadata, in a form that can cross an `.so` boundary.
+///
+/// [`crate::TensorDesc`] deliberately does not carry this: it is the *shared*
+/// descriptor, pinned by `ABI_VERSION` and consumed by the C API, where
+/// tensors travel as real `ef_tensor` handles into one shared
+/// `libedgefirst_tensor.so` and no reconstruction ever happens. The Python
+/// packages are the only consumers that rebuild a tensor from a descriptor,
+/// so this rides in the capsule payload rather than widening a C ABI that
+/// does not need it.
+///
+/// Variable-length by nature -- per-channel quantization carries one scale
+/// (and optionally one zero-point) per channel -- so the arrays are
+/// *borrowed*, not inlined: `scales`/`zero_points` point into the
+/// `Quantization` that `TensorCapsulePayload::quant_keepalive` owns, on
+/// exactly the terms [`crate::TensorDesc::ptr`] borrows the producer's host
+/// address. A consumer copies the values out during import (see
+/// [`QuantDesc::to_quantization`]) while the capsule is still alive, and
+/// never retains the pointers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QuantDesc {
+    /// Number of entries in `scales` (and in `zero_points` when non-null).
+    /// **Zero means the tensor carries no quantization** -- the one field a
+    /// consumer must check before reading either pointer.
+    pub len: u64,
+    /// Channel axis for per-channel quantization, **plus one**; `0` means
+    /// per-tensor. Encoded this way so the whole struct zeroes to "absent"
+    /// rather than needing a separate presence flag for an `Option<usize>`.
+    pub axis_plus_one: u64,
+    /// `len` scale factors. Null iff `len == 0`.
+    pub scales: SendConstPtr<f32>,
+    /// `len` zero-points, or null for symmetric quantization.
+    pub zero_points: SendConstPtr<i32>,
+}
+
+impl QuantDesc {
+    /// The descriptor for a tensor with no quantization metadata.
+    pub const fn absent() -> Self {
+        Self {
+            len: 0,
+            axis_plus_one: 0,
+            scales: SendConstPtr::null(),
+            zero_points: SendConstPtr::null(),
+        }
+    }
+
+    /// Describe `quant`, borrowing its arrays.
+    ///
+    /// The caller must keep `quant` alive for as long as the descriptor is
+    /// readable -- in the capsule protocol, by storing the same `Arc` in
+    /// `TensorCapsulePayload::quant_keepalive`.
+    pub fn borrowing(quant: &crate::Quantization) -> Self {
+        Self {
+            len: quant.scale().len() as u64,
+            axis_plus_one: quant.axis().map_or(0, |a| a as u64 + 1),
+            scales: SendConstPtr(quant.scale().as_ptr()),
+            zero_points: quant
+                .zero_point()
+                .map_or(SendConstPtr::null(), |zp| SendConstPtr(zp.as_ptr())),
+        }
+    }
+
+    /// Copy the borrowed arrays into an owned [`crate::Quantization`], or `None`
+    /// when the producer declared no quantization.
+    ///
+    /// `Ok(None)` means "the producer has none"; a descriptor that declares
+    /// quantization but cannot be read back as a valid [`crate::Quantization`] is
+    /// an `Err`, not a second spelling of `None`. Conflating the two is
+    /// what made the bug this whole capsule version exists to fix so hard
+    /// to place: a tensor that quietly arrives unquantized surfaces much
+    /// later as the consumer's own "requires quantization metadata", which
+    /// names the symptom and not the cause.
+    ///
+    /// # Safety
+    ///
+    /// `self` must have come from a capsule that is still alive, so the
+    /// arrays `scales`/`zero_points` point at are still owned by the
+    /// producer's `quant_keepalive`.
+    pub unsafe fn to_quantization(&self) -> crate::Result<Option<crate::Quantization>> {
+        if self.len == 0 {
+            return Ok(None);
+        }
+        if self.scales.0.is_null() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "malformed tensor capsule: quantization declares {} scale(s) but \
+                 carries a null scale array",
+                self.len
+            )));
+        }
+        let len = self.len as usize;
+        // SAFETY: the caller's obligation, above: the producer's
+        // `quant_keepalive` owns these arrays and the capsule holding it is
+        // alive, and `len` came from the same producer as the pointers.
+        let scales = unsafe { std::slice::from_raw_parts(self.scales.0, len) }.to_vec();
+        let zero_points = if self.zero_points.0.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(self.zero_points.0, len) }.to_vec())
+        };
+        // Rebuilt through the named constructors so an ill-formed
+        // descriptor cannot produce a `Quantization` that the type's own
+        // invariants say is impossible -- `crate::Quantization::validate` rejects
+        // per-channel scales with no axis and a per-tensor scale that
+        // carries one, so those shapes cannot be forced into existence here
+        // either. A descriptor that names one of them is reported, not
+        // silently downgraded to "unquantized".
+        let axis = self.axis_plus_one.checked_sub(1).map(|a| a as usize);
+        let quant = match (axis, zero_points) {
+            (None, None) if len == 1 => Ok(crate::Quantization::per_tensor_symmetric(scales[0])),
+            (None, Some(zp)) if len == 1 => Ok(crate::Quantization::per_tensor(scales[0], zp[0])),
+            (Some(a), None) => crate::Quantization::per_channel_symmetric(scales, a),
+            (Some(a), Some(zp)) => crate::Quantization::per_channel(scales, zp, a),
+            // `len > 1` with no axis: per-channel scales that name no
+            // channel dimension. `Quantization` has no such shape.
+            (None, _) => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "malformed tensor capsule: {len} quantization scales but no \
+                     channel axis; per-channel quantization must name one"
+                )));
+            }
+        };
+        quant.map(Some).map_err(|e| {
+            crate::Error::InvalidArgument(format!(
+                "malformed tensor capsule: quantization metadata is not valid: {e}"
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod quant_desc_tests {
+    use super::QuantDesc;
+    use crate::Quantization;
+
+    /// Borrow `q`, then copy back out of the descriptor while `q` is still
+    /// alive -- exactly the producer/consumer ordering the capsule enforces
+    /// via `TensorCapsulePayload::quant_keepalive`.
+    fn round_trip(q: &Quantization) -> Option<Quantization> {
+        let desc = QuantDesc::borrowing(q);
+        // SAFETY: `q` outlives `desc` here, which is the whole contract.
+        unsafe { desc.to_quantization() }.expect("a well-formed descriptor must import")
+    }
+
+    #[test]
+    fn absent_descriptor_is_none_not_an_error() {
+        // SAFETY: an all-zero descriptor names no arrays to read.
+        let imported = unsafe { QuantDesc::absent().to_quantization() };
+        assert!(imported
+            .expect("absent is well-formed, not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn per_tensor_round_trips() {
+        for q in [
+            Quantization::per_tensor_symmetric(0.5),
+            Quantization::per_tensor(0.125, -7),
+        ] {
+            assert_eq!(round_trip(&q).as_ref(), Some(&q));
+        }
+    }
+
+    /// The arms this type exists for. A per-tensor descriptor carries one
+    /// scale and no axis, so it would round-trip correctly even if the
+    /// length and the axis were both ignored -- only a per-channel case
+    /// exercises the borrowed variable-length arrays.
+    #[test]
+    fn per_channel_symmetric_round_trips_with_its_length_and_axis() {
+        let q = Quantization::per_channel_symmetric(vec![0.5, 0.25, 0.125], 0)
+            .expect("per-channel symmetric");
+        let imported = round_trip(&q).expect("per-channel must survive the descriptor");
+        assert_eq!(imported, q);
+        // Spelled out rather than left to `PartialEq`: dropping the axis or
+        // truncating the array to one entry is the specific failure the
+        // borrowed-array encoding risks, and both would still be a valid
+        // `Quantization`.
+        assert_eq!(imported.scale(), &[0.5, 0.25, 0.125]);
+        assert_eq!(imported.axis(), Some(0));
+        assert_eq!(imported.zero_point(), None);
+    }
+
+    #[test]
+    fn per_channel_asymmetric_round_trips_with_its_zero_points() {
+        let q = Quantization::per_channel(vec![0.5, 0.25, 0.125], vec![1, 2, 3], 2)
+            .expect("per-channel asymmetric");
+        let imported = round_trip(&q).expect("per-channel must survive the descriptor");
+        assert_eq!(imported, q);
+        assert_eq!(imported.scale().len(), 3);
+        assert_eq!(imported.axis(), Some(2));
+        assert_eq!(imported.zero_point(), Some(&[1, 2, 3][..]));
+    }
+
+    /// A non-zero axis must survive as itself, not be clamped to 0 -- the
+    /// `+1` encoding is the one place an off-by-one would hide.
+    #[test]
+    fn the_axis_plus_one_encoding_is_reversible() {
+        for axis in 0..4usize {
+            let q =
+                Quantization::per_channel_symmetric(vec![0.5, 0.25], axis).expect("per-channel");
+            assert_eq!(QuantDesc::borrowing(&q).axis_plus_one, axis as u64 + 1);
+            assert_eq!(round_trip(&q).and_then(|i| i.axis()), Some(axis));
+        }
+    }
+
+    /// A descriptor that survives the capsule-name check but disagrees with
+    /// itself is *reported*, not forced into a `Quantization` whose own
+    /// invariants say it cannot exist -- and not quietly downgraded to
+    /// "unquantized" either, which would resurface as the consumer's own
+    /// "requires quantization metadata" and name the symptom, not the cause.
+    #[test]
+    fn per_channel_without_an_axis_is_an_error_not_a_silent_none() {
+        let q = Quantization::per_channel_symmetric(vec![0.5, 0.25], 0).expect("per-channel");
+        let mut desc = QuantDesc::borrowing(&q);
+        desc.axis_plus_one = 0;
+        // SAFETY: `q` still owns the arrays `desc` points at.
+        let err = unsafe { desc.to_quantization() }
+            .expect_err("per-channel scales naming no axis is malformed");
+        assert!(
+            err.to_string().contains("no channel axis"),
+            "the error must say what is wrong with the descriptor, got: {err}"
+        );
+    }
+
+    /// The other malformed shape the length field admits: a non-zero count
+    /// with nothing to read it from. Checked before any dereference.
+    #[test]
+    fn a_null_scale_array_with_a_non_zero_length_is_an_error() {
+        let mut desc = QuantDesc::absent();
+        desc.len = 3;
+        // SAFETY: nothing is dereferenced -- the null check precedes it.
+        let err =
+            unsafe { desc.to_quantization() }.expect_err("a length with a null array is malformed");
+        assert!(err.to_string().contains("null scale array"), "got: {err}");
+    }
+}

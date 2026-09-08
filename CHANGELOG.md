@@ -59,11 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `TensorCapsulePayload` gains a `plane_offset`, and `interop::reconstruct`
   clones it across for the same-module path, which had the identical bug.
-  It is applied only to a handle-based import (`DMABUF`/`IOSURFACE`/`PBO`),
-  which re-derives its base from the whole parent buffer; applying it to a
-  `HOST` import would advance past the sub-region a second time. Both
-  directions are covered by
+  It is applied only to a handle-based import, which re-derives its base
+  from the whole parent buffer; applying it to a `HOST` import would advance
+  past the sub-region a second time. Both directions are covered by
   `test_view_converts_its_own_sub_region_not_the_parents_origin`.
+
+  **Fixed on Linux DMA-BUF (and unaffected for `MEM`/`SHM`), not yet on
+  IOSurface, PBO, D3D11 or AHardwareBuffer.** `Tensor::set_plane_offset`
+  only syncs the storage-internal offset for `Mem` and Linux `Dma`; the
+  other backings have a `view_offset` their `map()` honors but which nothing
+  writes back on reconstruction, so a view still lands at the parent's
+  origin there. See `interop::apply_plane_offset`'s doc comment.
 
 ### Changed
 

@@ -894,8 +894,9 @@ def test_tensor_capsule_is_v2_for_a_per_channel_producer():
     consumer half: no Python binding hands back the quantization of an
     *imported* tensor, so there is nothing here to compare against. The
     borrow-then-copy round trip is covered in Rust instead, by
-    `interop::quant_desc_tests` in `crates/python-common/src/interop.rs`
-    (which `make test` does not run -- see that module's own doc comment).
+    `protocol::quant_desc_tests` in `crates/tensor/src/protocol.rs` -- which
+    is where `QuantDesc` lives precisely so those tests run under
+    `make test`.
     """
     import numpy as np
     from edgefirst.decoder import Decoder  # noqa: F401  (forces a sibling .so in)
@@ -922,21 +923,29 @@ def test_tensor_capsule_is_v2_for_a_per_channel_producer():
 
 
 def _view_source_or_skip(cls, mem, shape, fmt):
-    """Allocate a whole image in `mem` or skip; DMA-BUF needs a usable heap.
+    """Allocate a whole image in `mem`, skipping only if DMA-BUF is absent.
 
     A skip rather than a fallback: silently converting a DMA request into a
     MEM allocation would run the parametrised case below twice against the
     same backing store and report the DMA half as passing without ever
     having imported through an fd.
+
+    The skip is scoped to `DMABUF` on purpose. `MEM` is the always-available
+    host constructor and is the half CI actually runs, so a failure there is
+    a real regression; swallowing it into a skip would quietly delete the
+    only coverage this test has on a machine with no DMA heap.
     """
     from edgefirst.tensor import TensorMemory
 
-    try:
+    if mem == TensorMemory.DMABUF:
+        try:
+            t = cls(shape, "uint8", mem)
+        except Exception as e:  # pragma: no cover - depends on the host's heaps
+            pytest.skip(f"DMA-BUF allocation unavailable here: {e}")
+        if t.memory != TensorMemory.DMABUF:
+            pytest.skip(f"DMA-BUF request fell back to {t.memory!r}")
+    else:
         t = cls(shape, "uint8", mem)
-    except Exception as e:  # pragma: no cover - depends on the host's heaps
-        pytest.skip(f"{mem!r} allocation unavailable here: {e}")
-    if mem == TensorMemory.DMABUF and t.memory != TensorMemory.DMABUF:
-        pytest.skip(f"DMA-BUF request fell back to {t.memory!r}")
     t.set_format(fmt)
     return t
 

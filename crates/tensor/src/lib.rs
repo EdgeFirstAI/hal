@@ -4633,6 +4633,18 @@ where
         // Keep it in sync with the wrapper field for every backing that
         // honors it (DMA and Mem); see also the clear sites in `set_format`
         // and `reshape`.
+        //
+        // INCOMPLETE, knowingly: `IoSurfaceTensor`, `PboTensor`,
+        // `D3d11TextureTensor` and `AHardwareBufferTensor` each have a
+        // `view_offset` that their own `map()` adds and their own `view()`
+        // sets -- but nothing writes it here, so they fall into `_ => {}`
+        // and a caller that sets the offset on them gets a map at the
+        // parent's origin. That is what makes a reconstructed `view()` read
+        // the wrong region on macOS/iOS, Windows, Android and PBO; see
+        // `edgefirst-python-common`'s `interop::apply_plane_offset`, which
+        // fixes the Linux DMA-BUF case and documents why the rest needs a
+        // per-platform change with tests rather than four more arms added
+        // blind.
         match self.storage {
             TensorStorage::Mem(ref mut m) => m.set_offset(offset),
             #[cfg(target_os = "linux")]

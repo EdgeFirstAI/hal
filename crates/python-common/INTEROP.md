@@ -83,6 +83,17 @@ past the sub-region a second time. `DMABUF` (dup's the fd), `IOSURFACE`
 from a handle naming the whole parent buffer, so for those it must be put
 back. See `interop::apply_plane_offset`.
 
+**Known gap.** Putting it back currently only *takes effect* on Linux
+DMA-BUF. `Tensor::set_plane_offset` syncs the storage-internal offset that
+`map()` adds for `Mem` and (under `cfg(target_os = "linux")`) `Dma` only;
+IOSurface, PBO, D3D11 and AHardwareBuffer each have a `view_offset` their
+own `map()` honors and their own `view()` sets, but `set_plane_offset` never
+writes it. A reconstructed view on macOS/iOS, Windows, Android, or PBO
+therefore still addresses the parent's origin. Tracked in
+`interop::apply_plane_offset`'s doc comment, which explains why widening
+those `cfg`s is a change that needs per-platform tests rather than a
+one-liner.
+
 `interop::reconstruct` — the same-module path, where no capsule is involved
 — carries the offset across the same way, because it reconstructs through
 the identical `TensorDesc` and lost it identically.
