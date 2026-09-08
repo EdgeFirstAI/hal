@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-09-08
+
+### Fixed
+
+- **BREAKING (Python interop): the tensor capsule now carries quantization,
+  and is renamed `edgefirst_tensor_v2`.** An int8 `ProtoData` produced by
+  `edgefirst.decoder` could not be used by `edgefirst.image` at all:
+  `materialize_masks` refused it with `I8 mask_coefficients require
+  quantization metadata`, and `draw_proto_masks` and the fused
+  `Decoder.draw_onto` failed identically. The `_v1` payload carried only a
+  `TensorDesc`, which has no quantization field, so `import_tensor_capsule`'s
+  `TensorDyn::import_descriptor` rebuilt the prototype tensors without the
+  scales the int8 fast path reads off them. Every NPU segmentation model is
+  quantized, so this was segmentation-from-Python entirely, not an edge case.
+
+  `TensorCapsulePayload` gains a `#[repr(C)] QuantDesc` — length, channel
+  axis, and pointers to the scale/zero-point arrays, borrowed from an
+  `Arc<Quantization>` the payload owns, since per-channel quantization is
+  variable-length and cannot be inlined. The consumer copies the values out
+  during import. Per INTEROP.md's Versioning rule a payload layout change
+  takes the capsule name with it, so `edgefirst_tensor_v1` becomes
+  `edgefirst_tensor_v2`: a 0.30.0 producer meeting a `_v2` consumer is
+  rejected at the name check, before any byte of the mismatched payload is
+  read, rather than misread.
+
+  Quantization deliberately does **not** go into `TensorDesc`. That
+  descriptor is also the C ABI's, and the modular C libraries pass real
+  `ef_tensor` handles into one shared `libedgefirst_tensor.so` — nothing
+  there rebuilds a tensor from a descriptor, so nothing there loses the
+  metadata. `ABI_VERSION` and the C headers are unchanged.
+
+- **`interop::reconstruct` dropped quantization on the same-module path
+  too.** `TensorArg::NativeRef` and `ProtoDataArg::into_raw_access`
+  reconstruct an independent `TensorDyn` from a descriptor — deliberately, so
+  a GIL-released region never aliases a live `PyTensor` — which lost the
+  same metadata even when producer and consumer were one package. It now
+  clones the quantization straight off the source tensor; no wire format is
+  involved on that path.
+
+- **A DMA-backed `Tensor.view()` converted the wrong pixels.** The same root
+  cause, found while fixing the above, with a worse symptom: silently wrong
+  data instead of a refusal. `TensorDesc` has no field for the plane offset,
+  so a tensor rebuilt from a descriptor came back addressing the *parent*
+  buffer's origin rather than the sub-region `view()` asked for.
+  `ImageProcessor.convert(t.view(region), dst)` returned the top-left tile
+  of the parent image, with no error. DMA-BUF is the preferred backing on
+  Linux, so this hit the embedded targets by default; `MEM`/`SHM` views were
+  unaffected, because a host import rebuilds from the producer's pinned
+  pointer, which already addresses the view.
+
+  `TensorCapsulePayload` gains a `plane_offset`, and `interop::reconstruct`
+  clones it across for the same-module path, which had the identical bug.
+  It is applied only to a handle-based import (`DMABUF`/`IOSURFACE`/`PBO`),
+  which re-derives its base from the whole parent buffer; applying it to a
+  `HOST` import would advance past the sub-region a second time. Both
+  directions are covered by
+  `test_view_converts_its_own_sub_region_not_the_parents_origin`.
+
+### Changed
+
+- A malformed quantization descriptor in a tensor capsule is now reported
+  rather than silently treated as "no quantization". Conflating the two is
+  what made the bug above hard to place: the failure resurfaced later as the
+  consumer's own "requires quantization metadata", which names the symptom
+  and not the cause.
+
+- The capsule name-mismatch error now names version skew as a likely cause.
+  After the first-ever capsule rename, a 0.30.0 `edgefirst.tensor` beside a
+  0.31.0 `edgefirst.image` is the most probable reason a consumer sees it,
+  and the old text told the user their object was unsupported instead.
+
 ## [0.30.0] - 2026-09-07
 
 ### Added

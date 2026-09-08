@@ -11,8 +11,10 @@
 //!
 //! So the contract between packages is a **descriptor**, not a type. A producer
 //! exposes `__edgefirst_tensor__()` returning a `PyCapsule` named
-//! `edgefirst_tensor_v1` wrapping [`TensorDesc`]; a consumer reads the
-//! descriptor and never performs an `isinstance` check. That duck typing is
+//! `edgefirst_tensor_v2` whose payload leads with [`TensorDesc`] (followed by
+//! the quantization metadata `TensorDesc` deliberately does not carry -- see
+//! `edgefirst-python-common`'s `QuantDesc`); a consumer reads the descriptor
+//! and never performs an `isinstance` check. That duck typing is
 //! what makes the protocol survive independent release cadences, and it is the
 //! same pattern numpy, pyarrow and DLPack use.
 //!
@@ -26,7 +28,7 @@
 /// This is the **second line of defense, not the gate**: it cannot catch a
 /// producer whose `TensorDesc` is a different *size*, since the
 /// out-of-bounds/misaligned read has already happened by the time this
-/// field could be inspected. The capsule name (`edgefirst_tensor_v1`, see
+/// field could be inspected. The capsule name (`edgefirst_tensor_v2`, see
 /// `INTEROP.md`'s Versioning section) is what actually gates that --
 /// checked by `PyCapsule::pointer_checked` before any byte of the payload
 /// is read. DLPack reached the same conclusion after shipping an

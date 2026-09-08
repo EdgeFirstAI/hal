@@ -67,8 +67,20 @@ fn descriptor_layout_is_pinned() {
     // IS the wire format.
     //
     // If it changes, the capsule name must move with it, in the same
-    // commit -- `edgefirst_tensor_v1` -> `_v2`, see INTEROP.md's Versioning
-    // section. NOT `ABI_VERSION`: that field is checked by
+    // commit -- `edgefirst_tensor_v2` -> `_v3`, see INTEROP.md's Versioning
+    // section.
+    //
+    // This assertion covers only half of the wire format. `_v1` -> `_v2`
+    // was a `QuantDesc` field added to `TensorCapsulePayload`, which left
+    // this struct's size alone: the rule binds on the *payload's* layout,
+    // of which `TensorDesc` is only the first field. The rest -- the size
+    // and alignment of `QuantDesc`, and the offsets of both `#[repr(C)]`
+    // fields -- is pinned by a `const` assertion next to the struct in
+    // `crates/python-common/src/interop.rs`, because `cargo test` never
+    // reaches that crate (`make test-rust` excludes every
+    // `edgefirst-python-*` package by name).
+    //
+    // NOT `ABI_VERSION`: that field is checked by
     // `TensorDyn::import_descriptor`, but only after the payload has been
     // copied out at this build's size, so it cannot gate a mismatch it is
     // itself read through. The capsule name is checked by

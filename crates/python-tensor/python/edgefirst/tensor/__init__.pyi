@@ -811,7 +811,7 @@ class Tensor:
     def __edgefirst_tensor__(self, access: str | None = None) -> object:
         """Producer half of the cross-package tensor protocol.
 
-        Returns a ``PyCapsule`` named ``edgefirst_tensor_v1``. Consumers in
+        Returns a ``PyCapsule`` named ``edgefirst_tensor_v2``. Consumers in
         other ``edgefirst.*`` packages read this instead of type-checking --
         see :class:`EdgeFirstTensorExportable` and
         ``crates/python-common/INTEROP.md``.

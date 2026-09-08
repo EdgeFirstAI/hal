@@ -406,7 +406,7 @@ class ProtoData:
         Composes the existing ``__edgefirst_tensor__`` capsule protocol
         rather than describing its own layout: returns the
         ``mask_coefficients`` and ``protos`` tensors as
-        ``edgefirst_tensor_v1`` capsules, plus the prototype layout as a
+        ``edgefirst_tensor_v2`` capsules, plus the prototype layout as a
         string (``"nhwc"`` or ``"nchw"``). See
         :class:`EdgeFirstProtoDataExportable` and
         ``crates/python-common/INTEROP.md``.

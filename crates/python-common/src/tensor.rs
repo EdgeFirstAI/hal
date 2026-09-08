@@ -1901,8 +1901,8 @@ impl PyTensor {
 
     /// Producer half of the cross-package tensor protocol.
     ///
-    /// Returns a ``PyCapsule`` named ``edgefirst_tensor_v1`` wrapping an
-    /// ``TensorDesc``. Consumers in *other* EdgeFirst packages read this
+    /// Returns a ``PyCapsule`` named ``edgefirst_tensor_v2`` wrapping an
+    /// ``TensorDesc`` and this tensor's quantization metadata. Consumers in *other* EdgeFirst packages read this
     /// rather than type-checking, because each extension module statically
     /// links its own copy of the bindings and therefore has its own PyO3 type
     /// objects — ``isinstance`` across packages would always fail.
@@ -1962,12 +1962,28 @@ impl PyTensor {
         // other kind, so this is unconditional rather than gated on
         // `desc.kind`. `TensorCapsulePayload` is `#[repr(C)]` because this
         // crosses an `.so` boundary -- see its doc comment in `interop.rs`.
+        // Quantization is cloned into an `Arc` the payload owns, and
+        // `quant` borrows that `Arc`'s arrays -- the consumer copies them
+        // out during import. Without it an integer tensor arrives on the
+        // far side looking unquantized, and every dequantizing consumer
+        // refuses it.
+        let quant_keepalive = self.0.quantization().cloned().map(std::sync::Arc::new);
         let payload = crate::interop::TensorCapsulePayload {
             desc,
+            quant: quant_keepalive
+                .as_deref()
+                .map_or_else(crate::interop::QuantDesc::absent, |q| {
+                    crate::interop::QuantDesc::borrowing(q)
+                }),
+            // A `view()`'s byte offset into the parent buffer. Carried for
+            // the same reason as the quantization above and lost the same
+            // way without it -- see `interop::apply_plane_offset`.
+            plane_offset: self.0.plane_offset().unwrap_or(0) as u64,
             pin,
             pbo_keepalive: self.0.pbo_keepalive(),
+            quant_keepalive,
         };
-        pyo3::types::PyCapsule::new_with_value(py, payload, c"edgefirst_tensor_v1")
+        pyo3::types::PyCapsule::new_with_value(py, payload, c"edgefirst_tensor_v2")
             .map_err(|e| Error::from(std::io::Error::other(e.to_string())).into())
     }
 

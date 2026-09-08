@@ -57,7 +57,8 @@ edgefirst.tensor.Tensor is edgefirst.image.Tensor   # False — by design
 Cross-package handoff is **duck-typed** through the
 `__edgefirst_tensor__` capsule protocol rather than an `isinstance` check.
 A producer exposes `__edgefirst_tensor__()` returning a `PyCapsule` named
-`edgefirst_tensor_v1` wrapping a `#[repr(C)] TensorDesc`; a consumer reads
+`edgefirst_tensor_v2` wrapping a `#[repr(C)] TensorDesc` and its
+quantization; a consumer reads
 the descriptor without ever naming the producer's type.
 
 The capsule owns both the descriptor **and** the producer's `HostPin`, so
