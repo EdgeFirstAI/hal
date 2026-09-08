@@ -26,7 +26,7 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 **System Requirements:**
 - Rust stable. The workspace declares no MSRV; CI pins `1.94.0` (see `RUST_STABLE_VERSION` in `.github/workflows/test.yml`), so build against that or newer.
 - Python 3.8 or later (for Python bindings)
-- Linux, macOS, Android, or iOS for the full feature set. Windows is compile-check only — CI runs `cargo check` there and nothing more.
+- Linux, macOS, Windows, Android, or iOS. Linux is the reference host and runs every gate. macOS and Windows both run the Rust suite with the GPU backend on ANGLE — over Metal and over Direct3D 11 respectively — and Windows covers the D3D11 tier on the WARP software adapter, so a box with no GPU still exercises it. What no desktop host covers: CUDA (needs a CUDA-capable adapter) and the i.MX G2D / dma-heap paths (need the boards). See [TESTING.md § Windows Setup](TESTING.md#windows-setup).
 - Optional: NXP i.MX platform for G2D hardware acceleration testing
 
 **Development Tools:**
@@ -37,11 +37,12 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 - `maturin` - For building Python bindings
 - `pytest` - For Python tests
 
-#### Platform-specific notes (macOS / iOS / ANGLE)
+#### Platform-specific notes (macOS / iOS / Windows / ANGLE)
 
 The HAL's CPU path builds and tests on Linux, macOS, and Windows with no
-extra setup. The **OpenGL (GPU) backend on Apple platforms needs ANGLE**
-(Google's GLES→Metal translator), which is *not* part of macOS/iOS.
+extra setup. The **OpenGL (GPU) backend on Apple platforms and on Windows
+needs ANGLE** (Google's GLES translator — to Metal on macOS/iOS, to
+Direct3D 11 on Windows), which ships with none of them.
 
 - ANGLE is an open-source Google project, and the EdgeFirst **pre-built,
   signed + notarized xcframeworks are published from the public
@@ -54,6 +55,11 @@ extra setup. The **OpenGL (GPU) backend on Apple platforms needs ANGLE**
   the dylibs — see README). On **iOS** there is no Homebrew equivalent, so
   use `scripts/fetch-angle.sh` (or build the CPU-only path:
   `cargo build --target aarch64-apple-ios --no-default-features --features static,ndarray,tracing`).
+- On **Windows** the same helper fetches the `angle-windows-x64-<tag>.zip`
+  DLLs from that release (`bash scripts/fetch-angle.sh` from Git Bash; the
+  `--windows` flag is implied on a Windows host). See
+  [README.md § Windows GPU Acceleration](README.md#windows-gpu-acceleration)
+  and [TESTING.md § Windows Setup](TESTING.md#windows-setup).
 - Either way, you can contribute to the Linux/CPU paths without any ANGLE
   at all — just disable the `opengl` feature
   (`--no-default-features --features static,ndarray,tracing`). `static` is
@@ -378,7 +384,16 @@ Runs on every push and PR to `main`, `develop`, or `release/**`:
   Local prerequisites:
   `rustup target add aarch64-linux-android x86_64-linux-android`,
   `cargo install cargo-ndk`, and an NDK (r26+) via `ANDROID_NDK_HOME`.
-- **Windows**: compile check (`cargo check`).
+- **Windows**: three parallel lanes on `windows-latest`, all under MSVC.
+  `build-and-test-windows` runs clippy (workspace + the five C-API leaves),
+  the Rust suite with coverage (deliberately with ANGLE off the search path,
+  so the GL tests self-skip), the modular C-API tests, the wheel build and
+  layout check, and the gpu-marked pytest on WARP (best-effort).
+  `test-windows-warp` runs the image crate's GL tests on ANGLE over Direct3D
+  11 WARP with its own coverage report — split out because WARP is a software
+  rasterizer and was the slowest step on the lane with the fewest cores.
+  `package-windows-capi` does the release C-API build plus archive package
+  and smoke. All three fetch ANGLE from the public `angle-package` release.
 - **Coverage collection**: Rust (cargo-llvm-cov) + Python (slipcover)
 - **SonarCloud analysis**: Static analysis and coverage aggregation
 

@@ -16,13 +16,13 @@ everywhere else.
 
 ## Features
 
-- **Zero-copy memory management** — DMA-BUF, IOSurface, AHardwareBuffer, POSIX shared memory, OpenGL PBO, and heap, with automatic backend selection
-- **Zero-copy CUDA tensor mapping** — `convert()` PBO output mapped directly to a CUDA device pointer for TensorRT and other CUDA consumers; no host round-trip on Jetson (Orin-series). See [Zero-copy CUDA (TensorRT) input](#zero-copy-cuda-tensorrt-input).
+- **Zero-copy memory management** — DMA-BUF, IOSurface, AHardwareBuffer, D3D11 texture, POSIX shared memory, OpenGL PBO, and heap, with automatic backend selection
+- **Zero-copy CUDA tensor mapping** — `convert()` output mapped directly to a CUDA device pointer for TensorRT and other CUDA consumers: a PBO with no host round-trip on Jetson (Orin-series), a D3D11 texture imported as CUDA external memory on Windows. See [Zero-copy CUDA (TensorRT) input](#zero-copy-cuda-tensorrt-input).
 - **Hardware-accelerated image processing** — OpenGL → G2D → CPU dispatch with shared cache infrastructure
 - **Tiled inference (SAHI)** — overlapping tile grid rendered in one GPU pass, with IoS-based merge of per-tile detections back to full-frame coordinates. See [Tiled inference (SAHI)](#tiled-inference-sahi).
 - **YOLO + ModelPack decoding** — YOLOv5 / v8 / v11 / v26 (incl. end-to-end) and ModelPack post-processing
 - **Multi-object tracking** — ByteTrack with Kalman filtering and stable per-track UUIDs
-- **Cross-platform** — Linux (i.MX 8M Plus / i.MX 95 / RPi 5 / Jetson / desktop), macOS, iOS, and Android, over CPU / GPU / zero-copy-buffer tiers
+- **Cross-platform** — Linux (i.MX 8M Plus / i.MX 95 / RPi 5 / Jetson / desktop), macOS, iOS, Android, and Windows, over CPU / GPU / zero-copy-buffer tiers
 
 ## Quick Start
 
@@ -387,7 +387,7 @@ graph TB
 
 | Crate | Role | Architecture | Testing |
 |-------|------|--------------|---------|
-| [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) | Zero-copy multi-dim buffers (DMA / SHM / Mem / PBO) | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md) |
+| [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) | Zero-copy multi-dim buffers (DMA-BUF / IOSurface / AHardwareBuffer / D3D11 texture / SHM / PBO / Mem) | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md) |
 | [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) | JPEG/PNG decode into pre-allocated tensors (strided, multi-dtype) | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/TESTING.md) |
 | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | OpenGL / G2D / CPU image processor + mask rendering | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md) |
 | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | YOLO + ModelPack post-processing, NMS, proto-mask APIs | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md) |
@@ -1555,20 +1555,24 @@ The tracing infrastructure complements the rules in the
 ```mermaid
 graph TD
     Tensor[edgefirst-tensor]
+    DetectAbi[edgefirst-decoder-abi<br/>header-only values]
     Codec[edgefirst-codec]
     Image[edgefirst-image]
     Decoder[edgefirst-decoder]
-    Tracker[edgefirst-tracker<br/>optional]
-    G2D[g2d-sys<br/>optional]
+    Tracker[edgefirst-tracker]
+    G2D[g2d-sys<br/>Linux only]
 
     Image --> Tensor
-    Image --> Decoder
-    Image --> Codec
-    Image -.optional.-> G2D
+    Image --> DetectAbi
+    Image -.->|codec feature, on by default| Codec
+    Image -.->|decode feature, off by default| Decoder
+    Image -.->|Linux target only| G2D
     Image -.->|tracker feature| Tracker
     Decoder --> Tensor
+    Decoder --> DetectAbi
     Decoder -.->|tracker feature| Tracker
     Codec --> Tensor
+    Tracker -.->|static or tensor-boxes feature| Tensor
 
     Python[edgefirst.{tensor,codec,image,decoder,tracker}<br/>PyO3]
     TensorC[libedgefirst_tensor]
@@ -1578,8 +1582,10 @@ graph TD
     TrackerC[libedgefirst_tracker]
 
     Python --> Tensor
+    Python --> Codec
     Python --> Image
     Python --> Decoder
+    Python --> Tracker
     TensorC --> Tensor
     ImageC --> Image
     CodecC --> Codec

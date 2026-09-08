@@ -805,17 +805,17 @@ macOS, and Android.
 
 | Segment | Meaning | Examples |
 |---------|---------|----------|
-| `codec.` | Image decode | `codec.decode_jpeg`, `codec.decode_jpeg.mcu_loop`, `codec.decode_png.zune_decode` |
+| `codec.` | Image decode | `codec.decode_jpeg`, `codec.decode_jpeg.mcu_loop`, `codec.decode_png.zune_decode`; the fused output stage is `codec.decode_jpeg.write_rgb`, `codec.decode_jpeg.write_rgb_420`, `codec.decode_jpeg.write_grey`, `codec.decode_jpeg.write_nv16`, `codec.decode_jpeg.write_nv24` |
 | `tensor.` | Tensor lifecycle | `tensor.alloc`, `tensor.map` |
 | `image.` | Image processing entry points | `image.convert`, `image.flush`, `image.gl_init`, `image.materialize_masks`, `image.draw_decoded_masks` |
-| `image.convert.<backend>` | Backend that serviced the convert | `image.convert.cpu`, `image.convert.gl`, `image.convert.g2d` |
+| `image.convert.<backend>` | Backend that serviced the convert | `image.convert.gl`, `image.convert.g2d`. The CPU backend opens no span at this level — a CPU-serviced convert is identified by its `image.convert.cpu.*` sub-steps under `image.convert` |
 | `image.convert.<backend>.<step>` | Sub-step within a backend | `image.convert.cpu.format_convert`, `image.convert.gl.egl_import`, `image.convert.gl.pack_rgb.pass1_rgba`, `image.convert.gl.pack_rgb.pass2_pack` |
 | `image.plan_tiles` / `image.tile_into` / `image.tile_one` | SAHI tiling input side | fields `tiles`, `overlap`, `index`, `count` |
 | `decoder.` | Model output post-processing | `decoder.decode`, `decoder.nms_get_boxes`, `decoder.decode_proto`, `decoder.per_scale_run` |
 | `decoder.<op>.<step>` | Sub-step within a decode phase | `decoder.nms_get_boxes.score_filter`, `decoder.nms_get_boxes.suppress`, `decoder.decode_proto.extract_proto_data` |
 | `decoder.tiled.` | SAHI tiling output side | `decoder.tiled.lift`, `decoder.tiled.merge` |
 | `tracker.` | ByteTrack association | `tracker.update`, `tracker.update.match_high_conf`, `tracker.update.predict` |
-| `python.` | Python binding entry point | `python.convert`, `python.decode`, `python.tile_into`, `python.materialize_masks` |
+| `python.` | Python binding entry point | `python.convert`, `python.convert_deferred`, `python.convert_with_fence`, `python.flush`, `python.decode`, `python.decode_proto`, `python.tile_into`, `python.tile_one`, `python.materialize_masks` |
 
 Every span site uses `tracing::trace_span!`, except `image.gl_init`, which
 uses `info_span!` so GL bring-up stays visible at a coarser filter level.
@@ -825,11 +825,12 @@ Field conventions:
 - `n` or `n_*` — counts (detections, candidates, tracks)
 - `mode` — algorithm variant (float / quant, proto / scaled)
 - `*_fmt` — pixel format enum value
-- `*_memory` — tensor memory backend (`Dma` / `Shm` / `Mem`)
+- `*_memory` — tensor memory backend, recorded as the `TensorMemory` variant: `Mem` / `Shm` / `DmaBuf` / `IoSurface` / `Pbo` / `Cuda`
+- `memory` — on `tensor.map`, recorded twice in two nested spans. The outer one is opened by the generic `Tensor::map_impl`, so **every** map has it, and carries the `TensorMemory` variant like the fields above. The platform-native backings then open their own inner `tensor.map` before touching the surface, where `memory` is instead a string naming the primitive — `"iosurface"`, `"ahardwarebuffer"`, `"d3d11_texture"`. A trace filtered to the string values sees only those three backings; filter on the enum to see all of them.
 - `layout` — data layout (`nhwc` / `nchw`)
 - `pass` — multi-pass identifier (`pre_resize` / `post_resize` / `direct`)
-- `platform` — `"linux"` / `"macos"` / `"ios"` / `"android"` — emitted by spans in the GL platform layer
-- `backend` — on `image.gl_init`, the chosen transfer backend (`"dmabuf"` / `"iosurface"` / `"ahardwarebuffer"` / `"pbo"` / `"sync"`)
+- `platform` — `"macos"` / `"ios"` / `"android"` / `"windows"`, recorded by the GL platform layer's shared-display bring-up. There is deliberately no Linux value: Linux brings its display up through `context.rs` and emits no `image.gl_init` at all (`crates/image/ARCHITECTURE.md` § What each span measures)
+- `backend` — on `image.gl_init`, the platform's zero-copy import mechanism, fixed per platform: `"iosurface"` (macOS/iOS), `"ahardwarebuffer"` (Android), `"d3d11"` (Windows). This is bring-up, not a per-convert choice — for how an individual convert fed its source, read `src_feed` on `image.convert.gl` (`import` / `pbo` / `upload`)
 - `tiles`, `index`, `count`, `overlap` — SAHI tiling geometry on the `image.*_tile*` and `decoder.tiled.*` spans
 
 Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
@@ -966,7 +967,10 @@ hal/
 │   ├── image/              # edgefirst-image
 │   ├── decoder/            # edgefirst-decoder
 │   ├── tracker/            # edgefirst-tracker
-│   ├── tensor-capi/        # libedgefirst_tensor (C ABI; workspace-excluded)
+│   ├── tensor-abi/         # edgefirst-tensor-abi (plain C value types shared by tensor and its FFI)
+│   ├── tensor-ffi/         # edgefirst-tensor-ffi (the `ef_tensor_*` declarations the dynamic backend calls)
+│   ├── decoder-abi/        # edgefirst-decoder-abi (header-only `edgefirst/detect.h` values: boxes, masks, tile placements)
+│   ├── tensor-capi/        # libedgefirst_tensor (C ABI; the five -capi leaves are workspace-excluded)
 │   ├── codec-capi/         # libedgefirst_codec
 │   ├── image-capi/         # libedgefirst_image
 │   ├── decoder-capi/       # libedgefirst_decoder
@@ -976,6 +980,7 @@ hal/
 │   ├── python-codec/       # -> edgefirst.codec    wheel
 │   ├── python-image/       # -> edgefirst.image    wheel
 │   ├── python-decoder/     # -> edgefirst.decoder  wheel
+│   ├── python-tracker/     # -> edgefirst.tracker  wheel
 │   ├── egl/                # edgefirst-egl (trimmed khronos-egl fork, dynamic load only)
 │   ├── gl/                 # edgefirst-gl (trimmed gls fork)
 │   ├── bench/              # edgefirst-bench (workspace dev-dep)
