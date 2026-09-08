@@ -64,12 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past the sub-region a second time. Both directions are covered by
   `test_view_converts_its_own_sub_region_not_the_parents_origin`.
 
-  **Fixed on Linux DMA-BUF (and unaffected for `MEM`/`SHM`), not yet on
-  IOSurface, PBO, D3D11 or AHardwareBuffer.** `Tensor::set_plane_offset`
-  only syncs the storage-internal offset for `Mem` and Linux `Dma`; the
-  other backings have a `view_offset` their `map()` honors but which nothing
-  writes back on reconstruction, so a view still lands at the parent's
-  origin there. See `interop::apply_plane_offset`'s doc comment.
+  **Fixed on Linux DMA-BUF; IOSurface (macOS/iOS) and D3D11 (Windows) still
+  need the same treatment.** `Tensor::set_plane_offset` only syncs the
+  storage-internal offset for `Mem` and Linux `Dma`, so on those two a
+  reconstructed view still lands at the parent's origin. `MEM`/`SHM` were
+  never affected (they take the pinned-pointer path), Android fails the
+  import outright rather than reconstructing, and a PBO image's `view()`
+  comes back as host memory so it never reaches the PBO arm. See
+  `interop::apply_plane_offset`'s doc comment for the per-backing
+  accounting.
 
 ### Changed
 

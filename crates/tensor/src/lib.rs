@@ -4639,12 +4639,17 @@ where
         // `view_offset` that their own `map()` adds and their own `view()`
         // sets -- but nothing writes it here, so they fall into `_ => {}`
         // and a caller that sets the offset on them gets a map at the
-        // parent's origin. That is what makes a reconstructed `view()` read
-        // the wrong region on macOS/iOS, Windows, Android and PBO; see
+        // parent's origin.
+        //
+        // The two that this demonstrably breaks are `IoSurfaceTensor`
+        // (macOS/iOS) and `D3d11TextureTensor` (Windows): both are
+        // reachable through `TensorDyn::import_descriptor`, so a
+        // reconstructed `view()` reads the wrong region there. See
         // `edgefirst-python-common`'s `interop::apply_plane_offset`, which
-        // fixes the Linux DMA-BUF case and documents why the rest needs a
-        // per-platform change with tests rather than four more arms added
-        // blind.
+        // fixes the Linux DMA-BUF case, records the full per-backing
+        // accounting, and explains why the remaining two want a
+        // per-platform change with a test on each rather than two more arms
+        // added blind.
         match self.storage {
             TensorStorage::Mem(ref mut m) => m.set_offset(offset),
             #[cfg(target_os = "linux")]

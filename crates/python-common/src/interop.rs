@@ -181,24 +181,38 @@ const _: () = {
 /// `IOSURFACE` looks the surface up by id, `PBO` by buffer id -- and so
 /// lands at the parent's origin unless the offset is put back.
 ///
-/// **Known gap: this currently takes effect only on Linux DMA-BUF.**
+/// **Known gap: putting it back only takes effect on Linux DMA-BUF.**
 /// `Tensor::set_plane_offset` records the wrapper field for every backing,
 /// but only syncs the storage-internal offset that `map()` actually adds
-/// for `Mem` and, under `#[cfg(target_os = "linux")]`, `Dma` -- every other
-/// backing falls into its `_ => {}` arm. `IoSurfaceTensor::view_offset`,
-/// `PboTensor::view_offset`, `D3d11TextureTensor::view_offset` and
-/// `AHardwareBufferTensor::view_offset` all exist and are all honored by
-/// those backends' own `map()`, and each backend's own `view()` sets them
-/// -- they are simply not written back here. So on macOS/iOS, Windows,
-/// Android, and for PBO, a reconstructed view still addresses the parent's
-/// origin, exactly as it did before this fix.
+/// for `Mem` and, under `#[cfg(target_os = "linux")]`, `Dma`; every other
+/// backing falls into its `_ => {}` arm. Backing by backing:
 ///
-/// Not fixed here deliberately: `set_plane_offset` has callers beyond this
-/// one (`image::import_image`'s multiplane path, `tensor-capi`'s builder),
-/// so widening those `cfg`s changes behaviour on three platforms that
-/// cannot be tested from this repo's CI, and double-applying an offset is a
-/// failure this protocol has already produced once (see the `HOST` arm
-/// above). It wants a platform-by-platform change with tests on each.
+/// * **Linux DMA-BUF** -- fixed, and verified end-to-end.
+/// * **`Mem`/`Shm`** -- never affected. Both report `kind::HOST`, so this
+///   function skips them and the pinned `desc.ptr` already addresses the
+///   view.
+/// * **IOSurface (macOS/iOS)** and **D3D11 (Windows)** -- **still wrong.**
+///   `IoSurfaceTensor::view_offset` and `D3d11TextureTensor::view_offset`
+///   are set by their own `view()` and added by their own `map()`, but
+///   nothing writes them back here, so a *reconstructed* view addresses the
+///   parent's origin. These are the two that still need fixing.
+/// * **Android** -- not silently wrong: it reports `kind::DMABUF`, and
+///   `import_storage`'s DMABUF arm is `cfg(target_os = "linux")`, so an
+///   import there fails with "dma-buf import off Linux" rather than
+///   reconstructing anything. A separate pre-existing limitation.
+/// * **PBO** -- not reached. `Tensor::view()` on a PBO-backed image comes
+///   back reporting `TensorMemory::Mem`, so it takes the `HOST` path above.
+///   (Why it demotes has not been traced, and such a view appears to be
+///   detached from the parent buffer entirely -- reproducible on `main`,
+///   so a pre-existing PBO-view issue independent of this one.)
+///
+/// So the outstanding work is IOSurface and D3D11. Not done here
+/// deliberately: `set_plane_offset` has callers beyond this one
+/// (`image::import_image`'s multiplane path, `tensor-capi`'s builder), so
+/// widening those `cfg`s changes behaviour on two platforms this repo's CI
+/// cannot exercise, and double-applying an offset is a failure this
+/// protocol has already produced once (see the `HOST` arm above). It wants
+/// a per-platform change with a test on each.
 fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u64) {
     if plane_offset == 0 || desc.kind == edgefirst_tensor::tensor_kind::HOST {
         return;

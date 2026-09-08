@@ -83,16 +83,22 @@ past the sub-region a second time. `DMABUF` (dup's the fd), `IOSURFACE`
 from a handle naming the whole parent buffer, so for those it must be put
 back. See `interop::apply_plane_offset`.
 
-**Known gap.** Putting it back currently only *takes effect* on Linux
-DMA-BUF. `Tensor::set_plane_offset` syncs the storage-internal offset that
-`map()` adds for `Mem` and (under `cfg(target_os = "linux")`) `Dma` only;
-IOSurface, PBO, D3D11 and AHardwareBuffer each have a `view_offset` their
-own `map()` honors and their own `view()` sets, but `set_plane_offset` never
-writes it. A reconstructed view on macOS/iOS, Windows, Android, or PBO
-therefore still addresses the parent's origin. Tracked in
-`interop::apply_plane_offset`'s doc comment, which explains why widening
-those `cfg`s is a change that needs per-platform tests rather than a
-one-liner.
+**Known gap: IOSurface and D3D11 still need fixing.**
+`Tensor::set_plane_offset` syncs the storage-internal offset that `map()`
+adds for `Mem` and (under `cfg(target_os = "linux")`) `Dma` only; every
+other backing hits its `_ => {}` arm. `IoSurfaceTensor::view_offset`
+(macOS/iOS) and `D3d11TextureTensor::view_offset` (Windows) are set by their
+own `view()` and added by their own `map()`, but nothing writes them back on
+reconstruction, so a reconstructed view there addresses the parent's origin.
+
+The other backings are not silently affected: `Mem`/`Shm` report
+`kind::HOST` and take the pinned-pointer path; Android reports
+`kind::DMABUF` whose import arm is Linux-only, so it fails loudly instead of
+reconstructing; and a `view()` of a PBO-backed image comes back as host
+memory, so it never reaches the PBO arm. See
+`interop::apply_plane_offset`'s doc comment for the full per-backing
+accounting and why widening those `cfg`s needs per-platform tests rather
+than a one-liner.
 
 `interop::reconstruct` — the same-module path, where no capsule is involved
 — carries the offset across the same way, because it reconstructs through
