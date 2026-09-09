@@ -237,14 +237,15 @@ const _: () = {
 /// * `Tensor::subview` -- does reach them, and writes the same absolute
 ///   value the storage's own `view()` already computed, so the write is
 ///   idempotent rather than a double-apply -- the failure this protocol
-///   produced once on `MEM` (see the `HOST` arm above). What D3D11 still wants is the arm, a
-/// `pub(crate)` setter for its private `view_offset`, a matching arm at
-/// `set_format`'s clear site -- a setter that takes effect needs a clear
-/// that does too, or the wrapper reports `None` while `map()` still starts
-/// at the old offset -- and the three tests above mirrored under
-/// `cfg(windows)`, where the Windows CI lane's WARP device runs them.
-/// (`reshape`'s clear site needed no IOSurface arm because
-/// `IoSurfaceTensor::reshape` zeroes its own `view_offset`; whether
+///   produced once on `MEM` (see the `HOST` arm above).
+///
+/// What D3D11 still wants is the arm, a `pub(crate)` setter for its private
+/// `view_offset`, a matching arm at `set_format`'s clear site -- a setter
+/// that takes effect needs a clear that does too, or the wrapper reports
+/// `None` while `map()` still starts at the old offset -- and the three
+/// tests above mirrored under `cfg(windows)`, where the Windows CI lane's
+/// WARP device runs them. (`reshape`'s clear site needed no IOSurface arm
+/// because `IoSurfaceTensor::reshape` zeroes its own `view_offset`; whether
 /// `D3d11TextureTensor::reshape` does the same wants checking rather than
 /// assuming.)
 fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u64) {
