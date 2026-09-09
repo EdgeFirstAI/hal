@@ -67,7 +67,10 @@ impl Texture {
     ) -> crate::Result<()> {
         if data.len() < required {
             return Err(crate::Error::NotSupported(format!(
-                "GL upload: {width}x{height} texture needs {required} B but the                  source maps only {} B -- a window that does not cover its own                  image (a restored plane offset past the buffer?); converting                  on the CPU instead",
+                "GL upload: {width}x{height} texture needs {required} B but the \
+                 source maps only {} B -- a window that does not cover its own \
+                 image (a restored plane offset past the buffer?); converting \
+                 on the CPU instead",
                 data.len()
             )));
         }

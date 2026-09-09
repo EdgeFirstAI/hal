@@ -1966,6 +1966,41 @@ impl GLProcessorST {
                 support,
                 <Platform as GlPlatform>::ZERO_COPY_FLOAT,
             );
+            // Sibling of the view_origin guard above, for the
+            // offset-without-view_origin case: none of the four zero-copy
+            // float destination imports (`convert_float_to_zero_copy`,
+            // `convert_nv_to_float_two_pass` -> `get_or_create_egl_image_rgb`
+            // -> `import_buffer_packed`) go through `bind_dst`'s placement
+            // gate, and on ANGLE they bind the whole buffer from its origin.
+            // A destination rebuilt from a descriptor has no `view_origin` to
+            // place it by, and there is no mapped-texture readback for a
+            // float DMA destination to lower to, so decline outright rather
+            // than render at the buffer's origin.
+            if matches!(
+                path,
+                FloatRenderPath::ZeroCopyF16Nchw
+                    | FloatRenderPath::ZeroCopyF32Nchw
+                    | FloatRenderPath::ZeroCopyFloatNhwc
+                    | FloatRenderPath::ZeroCopyFloatRgba
+            ) {
+                let places = match dst_dtype {
+                    edgefirst_tensor::DType::F16 => Platform::dst_import_places(
+                        dst.as_typed::<half::f16>().expect("dtype checked"),
+                    ),
+                    edgefirst_tensor::DType::F32 => {
+                        Platform::dst_import_places(dst.as_typed::<f32>().expect("dtype checked"))
+                    }
+                    _ => unreachable!("dst_dtype is F16 or F32 in this branch"),
+                };
+                if !places {
+                    return Err(Error::NotSupported(format!(
+                        "GL float destination at plane offset {} has no view origin \
+                         to place it by, and the zero-copy float import binds the \
+                         whole buffer from its origin; CPU fallback handles it",
+                        dst.plane_offset().unwrap_or(0)
+                    )));
+                }
+            }
             match path {
                 FloatRenderPath::ZeroCopyF16Nchw
                 | FloatRenderPath::ZeroCopyF32Nchw
@@ -2155,8 +2190,26 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
+        // Same gate as `bind_dst`, for the two destination imports that do
+        // not go through it: the packed-RGB two-pass plan's pass 2
+        // (`convert_to_packed_rgb` -> `get_or_create_egl_image_rgb`) and the
+        // planar two-pass plan, both zero-copy imports via
+        // `import_buffer_packed`, which on ANGLE binds the whole buffer from
+        // its origin. A destination rebuilt from a descriptor carries a
+        // plane offset but no `view_origin`, so without this it would still
+        // take `DstLowering::ZeroCopy` here and render at the buffer's
+        // origin.
+        let places = Platform::dst_import_places(dst);
+        if !places {
+            log::debug!(
+                "convert_via_engine: zero-copy destination at plane offset {} \
+                 has no view origin; rendering to a texture and reading back \
+                 through map()",
+                dst.plane_offset().unwrap_or(0)
+            );
+        }
         let lowering = super::render::lower_dst(
-            self.gl_context.transfer_backend.is_zero_copy(),
+            self.gl_context.transfer_backend.is_zero_copy() && places,
             dst.memory(),
         );
         let plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
@@ -5330,6 +5383,9 @@ impl GLProcessorST {
                 }
                 self.convert_stats.src_uploads += 1;
                 tracing::Span::current().record("src_feed", "upload");
+                // Map before touching pixel-store state: a `?` here must not
+                // leave `UNPACK_ROW_LENGTH` set for the next upload.
+                let pixels = src.map_read()?;
                 let row_len_px = src
                     .effective_row_stride()
                     .map(|s| s / src_bpp)
@@ -5359,13 +5415,12 @@ impl GLProcessorST {
                     src_h,
                     texture_format,
                     required,
-                    &src.map_read()?,
+                    &pixels,
                 );
-                if uploaded.is_err() {
-                    edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
-                }
-                uploaded?;
+                // Reset on both outcomes; nothing between the set and here
+                // can return early now.
                 edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
+                uploaded?;
             }
 
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);

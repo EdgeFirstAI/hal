@@ -96,35 +96,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macOS CI lane, which runs the Rust suite the Python interop tests cannot
   reach there.
 
+  Two more IOSurface gaps surfaced in review of that fix and are closed
+  here. `restore_imported_row_stride` was `HOST | DMABUF` only, so a real
+  capsule import of an IOSurface view kept the window's tight row over a
+  pitched surface; the merged test had hidden it by restoring the stride
+  by hand. An IOSurface's `bytesPerRow` is a property of the shared
+  surface — unlike a D3D11 staging pitch, which stays excluded — so the
+  producer's stride is now restored, bounded by the surface's capacity.
+  And ANGLE over IOSurface binds plane 0 from the surface origin with no
+  offset attribute, exactly as ANGLE over D3D11 does, so a *fresh* source
+  `view()` was sampled from the parent's origin on the zero-copy path; the
+  Apple leaf now shares Windows' `refuse_offset_source` and uploads such a
+  source through `map()`. The convert test allocates a real image surface
+  (its Apple source had been a one-row byte-bag ANGLE could not bind, so it
+  never reached the zero-copy import) and reconstructs through
+  `import_descriptor` on both platforms. The convert engine now asks
+  `dst_import_places` for two more destination imports: the packed-RGB
+  two-pass plan lowers one it cannot place to the mapped-texture path, whose
+  readback writes through `map()` at the offset, the same as `bind_dst`; the
+  float zero-copy path has no such texture to lower to, so it declines
+  outright and `ImageProcessor`'s CPU fallback handles it instead, pinned on
+  macOS by `reconstructed_planar_dst.rs`. The packed-RGB path has no
+  platform pin: no ANGLE leaf can allocate a zero-copy RGB destination to
+  test it against (IOSurface falls back to a byte-bag ANGLE cannot bind;
+  D3D11 has no 24-bit format), and Linux places the offset itself, so it is
+  verified by reasoning and by the Linux suite staying unchanged. And the NV
+  R8 upload no longer adds the plane offset on top of `map()`, which already
+  starts at the offset on every backing, pinned by
+  `offset_nv_source_upload.rs`.
+
   The D3D11 half had a different shape, and needed three parts. A view's
   descriptor was not reconstructed at the wrong origin, it was *refused*: the
   `D3D11_TEXTURE` import checks the descriptor's shape against the texture's
   own geometry, and a window is neither of the two spellings it accepted. The
   import now takes a packed window as a third spelling, opens the whole
   texture and narrows it to the window, with `Tensor::set_logical_shape`
-  keeping the texture's pitch as the row stride while it does. The storage
-  arms then follow the IOSurface pair — plus one at `reshape`'s clear site,
-  because `D3d11TextureTensor::reshape` does not zero its own offset — and
-  the pins refuse an offset past the backing rather than trusting a
-  descriptor's value. Last, and the part no `map()` test could see: the ANGLE
-  D3D11 import binds the whole texture from its origin and cannot express an
-  offset, so the GL engine sampled every offset *source* from the texture's
-  top-left — a *fresh* `view()` converted the parent's origin on Windows,
-  not only a reconstructed one. The Windows leaf now refuses to attach a
-  source carrying a plane offset and the engine uploads it through `map()`,
-  which honours the offset. A *destination* rebuilt from a descriptor has the
-  same problem from the other side: it carries the offset but not the
-  `view_origin` a `view()` would have given it, so the engine has no viewport
-  to place it by and the render would land at the texture's origin. The
-  engine now asks the platform whether a zero-copy destination import can
-  place the tensor (`GlPlatform::dst_import_places`), and lowers one it
-  cannot to the mapped texture path, whose readback writes through `map()`
-  at the offset. A single-row window keeps `view()`'s tight row stride when
-  a descriptor narrows it (`Tensor::set_logical_shape`), so it maps in the
-  texture's last row, and the offset is applied as the producer measured it:
-  the consumer opens the same texture on the same adapter, so its staging
-  pitch is the same, and the descriptor's stride is not a pitch to translate
-  it by. Pinned by eight `d3d11` tests in
+  keeping the texture's pitch as the row stride while it does.
+
+  That adoption is not D3D11-specific: `set_logical_shape` now keeps the
+  backing's own pitch for every backing that reports one — IOSurface and
+  Android `AHardwareBuffer` as well — matching what `configure_image`
+  already did, and reachable through `ef_tensor_set_logical_shape`. Same
+  rule, one place.
+
+  The storage arms then follow the IOSurface pair — plus one at
+  `reshape`'s clear site, because `D3d11TextureTensor::reshape` does not
+  zero its own offset — and the pins refuse an offset past the backing
+  rather than trusting a descriptor's value. Last, and the part no
+  `map()` test could see: the ANGLE D3D11 import binds the whole texture
+  from its origin and cannot express an offset, so the GL engine sampled
+  every offset *source* from the texture's top-left — a *fresh* `view()`
+  converted the parent's origin on Windows, not only a reconstructed one.
+  The engine's ANGLE leaves (D3D11 and IOSurface) refuse to attach a
+  source carrying a plane offset and the engine uploads it through
+  `map()`, which honours the offset. A *destination* rebuilt from a
+  descriptor has the same problem from the other side: it carries the
+  offset but not the `view_origin` a `view()` would have given it, so the
+  engine has no viewport to place it by and the render would land at the
+  texture's origin. The engine now asks the platform whether a zero-copy
+  destination import can place the tensor (`GlPlatform::dst_import_places`),
+  and lowers one it cannot to the mapped texture path, whose readback writes
+  through `map()` at the offset. A single-row window keeps `view()`'s tight
+  row stride when a descriptor narrows it (`Tensor::set_logical_shape`), so
+  it maps in the texture's last row, and the offset is applied as the
+  producer measured it: the consumer opens the same texture on the same
+  adapter, so its staging pitch is the same, and the descriptor's stride is
+  not a pitch to translate it by. Pinned by eight `d3d11` tests in
   `crates/tensor/tests/d3d11_tensor.rs` and the Windows arm of
   `crates/image/tests/reconstructed_view_convert.rs`, on the Windows CI
   lanes.

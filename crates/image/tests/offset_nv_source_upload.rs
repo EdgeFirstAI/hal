@@ -71,6 +71,13 @@ fn bytes(t: &TensorDyn) -> Vec<u8> {
 #[test]
 fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
     let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+    // The macOS coverage lane runs pass 1 with the ANGLE dlopen gate closed;
+    // the same guard `gl_backend_available_canary` carries.
+    #[cfg(target_os = "macos")]
+    if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+        skip("ANGLE dlopen gate closed (coverage pass 1)");
+        return;
+    }
     let mut gl = match GLProcessorThreaded::new(None) {
         Ok(gl) => gl,
         Err(e) => {
@@ -105,6 +112,17 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
     src.set_format(PixelFormat::Nv12).expect("nv12 format");
     src.set_plane_offset(elem);
     assert_eq!(src.plane_offset(), Some(elem), "precondition: frame 1");
+    // Tag BT.601 full-range so the new frame-1 assertion below can compare
+    // the reference's R byte directly to `LUMA`. Without a tag, the
+    // colorimetry heuristic resolves an untagged SD tensor to BT.601
+    // *limited*, which expands luma (e.g. 200 -> ~215) and would make that
+    // assertion misfire even on a correct read -- the same reason
+    // `odd_dim_cpu.rs`'s analytic reference tags full-range.
+    src.set_colorimetry(Some(
+        edgefirst_tensor::Colorimetry::default()
+            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+            .with_range(edgefirst_tensor::ColorRange::Full),
+    ));
 
     let mut reference = rgba_dst();
     CPUProcessor::new()
@@ -117,6 +135,16 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
         )
         .expect("CPU reference convert");
     let want = bytes(&reference);
+    // Both converters read through `map()`, so agreement alone cannot tell
+    // frame 1 from frame 0. The frames are 80 luma apart: the reference's
+    // first pixel must be near LUMA[1], not LUMA[0].
+    assert!(
+        want[0].abs_diff(LUMA[1]) <= 8,
+        "the CPU reference read frame {} (luma {}) instead of frame 1 (luma {})",
+        if want[0].abs_diff(LUMA[0]) <= 8 { 0 } else { 2 },
+        want[0],
+        LUMA[1]
+    );
 
     let mut dst = rgba_dst();
     gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
