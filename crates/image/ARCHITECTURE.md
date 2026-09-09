@@ -280,6 +280,22 @@ Adding a driver to the parallel set means running it through
 release because it was assumed to behave like the drivers that had been
 measured.
 
+`RendererTraits::mali` is a second GL_RENDERER-derived policy bit,
+independent of `is_vivante`: on i.MX 95 the EGL DMA-BUF import silently
+samples zeros from a source whose `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not
+64-byte aligned — no EGL error, and V3D/Tegra import every offset
+correctly (measured at offsets 32 and 2080 of a 256-byte pitch; #165).
+`mali_rejects_source_offset` declines a *source* import at such an offset
+in both `get_or_create_egl_image` and `get_or_create_nv_r8_egl_image`, and
+the caller uploads the window through `map()` instead; a destination is
+exempt because a view imports its parent at offset 0. Folding the pixel
+remainder into the sampling rectangle to keep the aligned case zero-copy —
+the same fold destinations already do for `import_extent` — is filed as
+#170. A source whose R8 import is refused this way, or by the ANGLE
+leaves' own offset refusal, now uploads the combined plane through the R8
+shader rather than falling to `draw_src_texture`, which has no NV arm and
+previously dropped the convert onto the CPU.
+
 ANGLE over Direct3D 11 (Windows) needs one step more than the Full
 policy. That backend keeps a single `StateManager11` per display and only
 re-syncs a context's GL state onto the shared D3D device from
