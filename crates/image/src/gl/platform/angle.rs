@@ -350,6 +350,26 @@ impl GlPlatform for AngleClientBuffer {
     type Import = IoSurfacePbuffer;
     type ImportHandle = egl::Surface;
 
+    /// `EGL_ANGLE_iosurface_client_buffer` binds the whole surface from its
+    /// origin: the pbuffer is described by plane, width and height, and there
+    /// is no byte-offset attribute. A destination that carries a plane offset
+    /// but no `view_origin` -- one rebuilt from a descriptor, since a
+    /// `TensorDesc` transports the offset and not the origin -- therefore has
+    /// nothing to place it by, and attaching it renders the tile at the
+    /// surface's top-left instead of the window that was asked for.
+    ///
+    /// Declining sends the engine down the mapped-texture path, whose
+    /// readback writes through `map()` at the offset. The same rule as
+    /// `AngleD3d11`, for the same reason, and pinned by case D of
+    /// `reconstructed_view_convert.rs`, which fails with the tile at the
+    /// canvas's origin without this.
+    fn dst_import_places<T>(img: &Tensor<T>) -> bool
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        super::unplaced_destination(img).is_none()
+    }
+
     // eglBindTexImage attachments are released at end_gpu_pass — the
     // engine's binding-skip cache must stay cold on macOS.
     const PERSISTENT_TEX_BINDINGS: bool = false;

@@ -851,25 +851,11 @@ where
     }
 }
 
-/// A destination whose bytes start at a plane offset the engine cannot lower
-/// to a viewport: one rebuilt from a descriptor, which carries the offset
-/// but not the `view_origin` a `view()` would have given it. Imported, it
-/// would be rendered at the texture's origin.
-fn unplaced_destination<T>(img: &Tensor<T>) -> Option<usize>
-where
-    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
-{
-    match (img.plane_offset(), img.view_origin()) {
-        (Some(offset), None) if offset != 0 => Some(offset),
-        _ => None,
-    }
-}
-
 fn refuse_unplaced_destination<T>(img: &Tensor<T>) -> Result<()>
 where
     T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
 {
-    match unplaced_destination(img) {
+    match super::unplaced_destination(img) {
         None => Ok(()),
         Some(offset) => Err(Error::NotSupported(format!(
             "GL convert: destination starts {offset} bytes into its D3D11 texture \
@@ -1010,7 +996,7 @@ impl GlPlatform for AngleD3d11 {
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
-        unplaced_destination(img).is_none()
+        super::unplaced_destination(img).is_none()
     }
 
     fn validate_import_identity<T>(img: &Tensor<T>, what: &str) -> Result<()>

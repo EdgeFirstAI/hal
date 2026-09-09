@@ -111,6 +111,30 @@ impl PackedImportFormat {
 /// One implementation per OS, selected by the [`Platform`] alias. Methods
 /// are associated functions (no `&self`) — the platform is stateless; all
 /// state lives in the `Display` it creates.
+/// A destination whose bytes start at a plane offset the engine cannot lower
+/// to a viewport: one rebuilt from a descriptor, which carries the offset but
+/// not the `view_origin` a `view()` would have given it.
+///
+/// Shared by the platforms whose import binds a whole buffer from its origin.
+/// ANGLE over a D3D11 texture and ANGLE over an IOSurface both do, and neither
+/// extension has a byte-offset attribute, so each one's `dst_import_places`
+/// asks the same question of the same two fields. Linux's DMA-BUF import can
+/// express the offset and keeps the default.
+///
+/// Gated to its callers' platforms: `angle` and `windows` are the only
+/// modules that use it, and both are `cfg`-gated, so on Linux and Android it
+/// would be dead code and fail those lanes under `-D warnings`.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+pub(super) fn unplaced_destination<T>(img: &Tensor<T>) -> Option<usize>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match (img.plane_offset(), img.view_origin()) {
+        (Some(offset), None) if offset != 0 => Some(offset),
+        _ => None,
+    }
+}
+
 pub(super) trait GlPlatform {
     /// Owning handle for the platform's GL/EGL bring-up state: display,
     /// context, capability probes. On Linux this is

@@ -379,6 +379,9 @@ where
                 "IOSurfaceGetBaseAddress returned null after lock",
             ))
         })?;
+        // SAFETY: the sole caller, `map_inner`, refuses `view_offset + exposed`
+        // past `buf_size` before it gets here, so this stays inside the
+        // surface's allocation.
         let data = unsafe { (base_ptr.as_ptr() as *mut u8).add(self.view_offset) };
         let len = self.buf_size.saturating_sub(self.view_offset);
         Ok(crate::pin::HostPin::new(keepalive, data, len))
@@ -1533,6 +1536,91 @@ mod tests {
             mp.as_slice()[64],
             0xAB,
             "write through view is visible in parent"
+        );
+    }
+
+    /// Pins the bound `map_inner` already enforces, which issue #161 made
+    /// load-bearing: before it, `view_offset` could only come from `view()`
+    /// under that function's own bounds check, and now `set_plane_offset`
+    /// writes a descriptor's restored offset -- untrusted cross-package input
+    /// -- straight into it.
+    ///
+    /// Nothing here is new behaviour; the point is that removing the
+    /// `view_offset + exposed <= buf_size` check in `map_inner` would now be
+    /// reachable from a descriptor rather than only from a bug in `view()`.
+    /// Two things would go wrong. `scoped_pin` offsets the locked base
+    /// address by `view_offset`, which leaves the allocation entirely -- and
+    /// forming that pointer is undefined behaviour before anything reads it.
+    /// And an offset merely *close* to the end yields a map shorter than the
+    /// image while the tensor still reports its full shape, which the GL
+    /// upload path reads `width x height` from through a raw pointer that
+    /// cannot see a slice's length.
+    ///
+    /// `D3d11TextureTensor` had no equivalent of this check; see
+    /// `d3d11_map_refuses_a_plane_offset_past_the_backing`, which this test's
+    /// bounds now match.
+    #[test]
+    fn iosurface_map_refuses_a_plane_offset_that_cannot_hold_the_image() {
+        use crate::{DType, Tensor, TensorDyn, TensorTrait};
+
+        const PARENT: usize = 256;
+        const WINDOW: usize = 64;
+
+        let parent = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        assert_eq!(parent.memory(), TensorMemory::DmaBuf);
+        let parent_dyn = TensorDyn::from(parent);
+        let id = parent_dyn
+            .iosurface_id()
+            .expect("parent is IOSurface-backed");
+        // The surface's own allocation, which IOSurface may round up past the
+        // 256 bytes asked for -- the bound is the real one, not the request.
+        let capacity = parent_dyn
+            .map_bytes(crate::CpuAccess::Read)
+            .expect("map parent")
+            .as_slice()
+            .len();
+
+        let mut rebuilt = TensorDyn::from_iosurface_id(id, &[WINDOW], DType::U8, None)
+            .expect("reconstruct at the view's shape");
+
+        // A window that still holds its whole 64 bytes is fine, including the
+        // one that ends exactly at the surface's end.
+        rebuilt.set_plane_offset(capacity - WINDOW);
+        assert_eq!(
+            rebuilt
+                .map_bytes(crate::CpuAccess::Read)
+                .expect("the last window that fits")
+                .as_slice()
+                .len(),
+            WINDOW,
+            "a window ending exactly at the surface's end must still map"
+        );
+
+        // One byte further and the image no longer fits. Refused, rather than
+        // handed back one byte short.
+        rebuilt.set_plane_offset(capacity - WINDOW + 1);
+        let err = rebuilt
+            .map_bytes(crate::CpuAccess::Read)
+            .expect_err("a window one byte short of its image");
+        assert!(
+            matches!(err, Error::InsufficientCapacity { .. }),
+            "expected InsufficientCapacity, got {err}"
+        );
+
+        // The degenerate one-past-the-end offset: a legal pointer, an empty
+        // window, and a tensor that still calls itself 64 bytes wide.
+        rebuilt.set_plane_offset(capacity);
+        assert!(
+            rebuilt.map_bytes(crate::CpuAccess::Read).is_err(),
+            "an empty window for a non-empty tensor must not map"
+        );
+
+        // Far past the surface, and a value chosen to overflow if the bound
+        // were computed with wrapping arithmetic.
+        rebuilt.set_plane_offset(usize::MAX);
+        assert!(
+            rebuilt.map_bytes(crate::CpuAccess::Read).is_err(),
+            "usize::MAX must not wrap into range"
         );
     }
 

@@ -1062,23 +1062,53 @@ where
         }
     }
 
-    /// Refuses a window that starts past the backing.
+    /// Bytes this tensor's image occupies from the start of its window.
+    ///
+    /// Every row but the last at the backing's pitch, plus the last row's own
+    /// bytes. The final row is followed by no padding, which is what lets a
+    /// view in the texture's last row fit its backing exactly --
+    /// [`pitched_extent`](Self::pitched_extent) counts a full pitch for that
+    /// row too, so bounding an offset by it would refuse
+    /// `one_row_d3d11_view_descriptor_maps_the_producers_texels`.
+    fn addressable_span(&self) -> usize {
+        let tight_row = self.image_row_bytes();
+        if tight_row == 0 {
+            return 0;
+        }
+        let tight = self.shape.iter().product::<usize>() * self.dtype.size();
+        let rows = tight.div_ceil(tight_row);
+        if rows == 0 {
+            return 0;
+        }
+        let last_row = tight - (rows - 1) * tight_row;
+        (rows - 1) * self.backing_pitch() + last_row
+    }
+
+    /// Refuses a window that cannot hold this tensor's own image.
     ///
     /// `view` computes `view_offset` under a bounds check, but
     /// `set_view_offset` takes whatever `Tensor::set_plane_offset` was handed
     /// -- a descriptor's restored offset, untrusted cross-package input -- so
-    /// every pin re-checks before it offsets a base pointer by it. An offset
-    /// equal to the backing is the one-past-the-end address, which is a
-    /// legal pointer and an empty window.
+    /// every pin re-checks before it offsets a base pointer by it.
+    ///
+    /// Bounding only the *start* is not enough. A pin's length is the backing
+    /// less the offset, so an offset near the end yields a map shorter than
+    /// the image while the tensor still reports its full width and height; a
+    /// consumer reading `width x height` through the pointer then runs past
+    /// the allocation, which the GL upload path did. An offset equal to the
+    /// backing is the extreme case: a legal one-past-the-end pointer and an
+    /// empty window for a non-empty tensor. Both are refused here, and
+    /// `checked_add` keeps a hostile offset from wrapping into range.
     fn check_view_offset(&self) -> Result<()> {
         let capacity = self.backing_bytes();
-        if self.view_offset <= capacity {
-            return Ok(());
+        let end = self.view_offset.checked_add(self.addressable_span());
+        match end {
+            Some(end) if end <= capacity => Ok(()),
+            _ => Err(Error::InsufficientCapacity {
+                needed: end.unwrap_or(usize::MAX),
+                capacity,
+            }),
         }
-        Err(Error::InsufficientCapacity {
-            needed: self.view_offset,
-            capacity,
-        })
     }
 
     /// Moves this tensor's window to `offset` bytes from the backing's

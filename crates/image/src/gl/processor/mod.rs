@@ -5339,13 +5339,32 @@ impl GLProcessorST {
                     edgefirst_gl::gl::UNPACK_ROW_LENGTH,
                     row_len_px as i32,
                 );
-                self.camera_normal_texture.update_texture(
+                // What GL will read: every row but the last at the stride
+                // `UNPACK_ROW_LENGTH` just set, plus the last row's own
+                // pixels. `UNPACK_ALIGNMENT` is 1, so no row is padded
+                // further.
+                let row_stride_b = if row_len_px == 0 {
+                    src_w * src_bpp
+                } else {
+                    row_len_px * src_bpp
+                };
+                let required = if src_h == 0 {
+                    0
+                } else {
+                    (src_h - 1) * row_stride_b + src_w * src_bpp
+                };
+                let uploaded = self.camera_normal_texture.update_texture(
                     texture_target,
                     src_w,
                     src_h,
                     texture_format,
+                    required,
                     &src.map_read()?,
                 );
+                if uploaded.is_err() {
+                    edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
+                }
+                uploaded?;
                 edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
             }
 

@@ -238,6 +238,70 @@ fn reconstructed_view_converts_its_own_sub_region_not_the_parents_origin() {
             "a whole image at a one-row offset must start at parent row 1, \
              not row 0 (issue #161)"
         );
+
+        // D -- the destination side, the mirror of B. A destination rebuilt
+        // from a descriptor carries the offset but not the `view_origin` a
+        // fresh `view()` would have given it, so the engine has no viewport
+        // to place it by. The ANGLE IOSurface import binds the whole surface
+        // from its origin and has no plane-offset attribute, so if such a
+        // destination were zero-copy attached the tile would land at the
+        // canvas's top-left. Windows refuses that import explicitly
+        // (`dst_import_places`); Apple has no override, so this pins the
+        // behaviour rather than assuming it.
+        const BLANK: u8 = 0x55;
+        let canvas = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )
+        .expect("canvas alloc");
+        {
+            let mut m = canvas.map_bytes(CpuAccess::Write).expect("map canvas");
+            m.as_mut_slice().fill(BLANK);
+        }
+        let canvas_pitch = canvas.effective_row_stride().unwrap_or(W * BPP);
+        let canvas_id = canvas.iosurface_id().expect("canvas is IOSurface-backed");
+        let mut rebuilt_dst =
+            TensorDyn::from_iosurface_id(canvas_id, &[SIDE, SIDE, BPP], DType::U8, None)
+                .expect("reconstruct the destination at the window's shape");
+        rebuilt_dst
+            .set_format(PixelFormat::Rgba)
+            .expect("rebuilt destination format");
+        rebuilt_dst
+            .set_row_stride(canvas_pitch)
+            .expect("rebuilt destination row stride");
+        rebuilt_dst.set_plane_offset(Y0 * canvas_pitch + X0 * BPP);
+
+        proc.convert(
+            &fresh,
+            &mut rebuilt_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .expect("convert into a reconstructed destination view");
+        let out = read_all(&canvas);
+        let px = |x: usize, y: usize| &out[y * canvas_pitch + x * BPP..][..BPP];
+        assert_eq!(
+            px(0, 0),
+            &[BLANK; BPP],
+            "a reconstructed destination view wrote the canvas's ORIGIN, i.e. \
+             the plane offset was lost (issue #161)"
+        );
+        assert_eq!(
+            px(X0 - 1, Y0),
+            &[BLANK; BPP],
+            "left of the window untouched"
+        );
+        assert_eq!(px(X0, Y0 - 1), &[BLANK; BPP], "above the window untouched");
+        for y in Y0..Y0 + SIDE {
+            for x in X0..X0 + SIDE {
+                assert_eq!(px(x, y), &want(x, y), "tile pixel ({x}, {y})");
+            }
+        }
     }
 
     // B and C on Windows, spelled through the descriptor itself: a D3D11

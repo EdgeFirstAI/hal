@@ -1066,6 +1066,13 @@ fn reshape_clears_the_d3d11_map_window() {
 /// `set_plane_offset` takes any value -- a descriptor's restored offset is
 /// untrusted -- so the pins bound it rather than offsetting a base pointer
 /// past the backing.
+///
+/// The bound is the whole image, not just its first byte. A pin's length is
+/// the backing less the offset, so an offset near the end leaves a map
+/// shorter than the image while the tensor still reports its full width and
+/// height, and a consumer reading `width x height` through the map's pointer
+/// runs past the allocation -- which the GL upload path does, since GL takes
+/// a raw pointer and cannot see a slice's length.
 #[test]
 fn d3d11_map_refuses_a_plane_offset_past_the_backing() {
     let parent = ramped_rgba(64, 64);
@@ -1076,11 +1083,27 @@ fn d3d11_map_refuses_a_plane_offset_past_the_backing() {
         .map_bytes(CpuAccess::Read)
         .expect_err("a window past the backing");
     assert!(matches!(err, Error::InsufficientCapacity { .. }), "{err}");
-    // Exactly the backing is the one-past-the-end address: an empty window,
-    // not an error.
+
+    // Exactly the backing is a legal one-past-the-end pointer, but it is an
+    // empty window for a tensor that still calls itself 64x64 -- the shape
+    // that fed a short map to `TexImage2D`. Refused, not handed back empty.
     t.set_plane_offset(backing);
-    let m = t.map_bytes(CpuAccess::Read).expect("empty window");
-    assert!(m.as_slice().is_empty());
+    let err = t
+        .map_bytes(CpuAccess::Read)
+        .expect_err("an empty window for a non-empty tensor");
+    assert!(matches!(err, Error::InsufficientCapacity { .. }), "{err}");
+
+    // One byte short of the whole image is refused for the same reason: the
+    // map would be a byte shy of what width x height reads.
+    t.set_plane_offset(1);
+    let err = t
+        .map_bytes(CpuAccess::Read)
+        .expect_err("a window one byte short of the image");
+    assert!(matches!(err, Error::InsufficientCapacity { .. }), "{err}");
+
+    // The whole image at its own origin still maps.
+    t.set_plane_offset(0);
+    assert!(!t.map_bytes(CpuAccess::Read).expect("origin").is_empty());
 }
 
 /// A single-row view records a tight row stride (`Tensor::view`) while its
