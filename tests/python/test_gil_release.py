@@ -166,14 +166,35 @@ def _assert_releases_gil(
     -- it plateaued at 43-50%, same order as the default -- because the
     counting thread accumulates most of its count *during* that same
     startup stall (fully uncontested, main thread blocked waiting), which
-    inflates both legs' counts roughly together. This lever does not work
-    with `_python_throughput`'s current per-call fresh-thread design, so
-    it was not kept; a fix would need a persistent counting thread reused
-    across sub-measurements, which is a larger change than this ticket's
-    scope. `n_rounds=6` (3 real + 3 control rounds, alternating) rather
-    than 2 gives each leg's median enough samples that one noisy round
-    can't dominate it; `attempts=3` retries a genuinely unlucky attempt
-    the same way the previous design did.
+    inflates both legs' counts roughly together.
+
+    A second, more targeted attempt scoped the raised interval to just
+    the `run_alongside()` loop inside `_python_throughput` -- restoring
+    it in a `finally` *before* `stop.set()`/`t.join()` -- specifically to
+    avoid racing `Thread.start()` or the teardown wait. In isolation this
+    worked as hoped about half the time (control ratio ~4-8%, matching
+    near-zero); the other half hit a same-family race at the *other*
+    boundary instead: if the waiting counting thread happens to acquire
+    the GIL right as the measurement loop ends (before the `finally` runs
+    and lowers the interval back), it becomes the new holder under the
+    *still-elevated* interval, and now it's the main thread's turn to
+    wait up to that same full interval to get the GIL back -- observed
+    directly as calls that should take ~0.067s instead taking ~0.5-1.0s
+    with the control's count inflated by 10-15x (ratios of 600%-1500%
+    against the ratio's own denominator). Restoring the interval requires
+    the GIL too, so there is no way to guarantee it happens before that
+    handoff without already holding the GIL, which is exactly what's in
+    contention. Across a full test run (many rounds x attempts x rows),
+    this ~50%-per-call race compounds: a run that normally takes ~7.4s
+    exceeded 120s and was killed rather than let finish. Neither variant
+    of this lever is usable with `_python_throughput`'s current per-call
+    fresh-thread design; a fix would need a persistent counting thread
+    reused across sub-measurements (avoiding repeated `Thread.start()`
+    entirely), which is a larger change than this ticket's scope, so
+    neither was kept. `n_rounds=6` (3 real + 3 control rounds,
+    alternating) rather than 2 gives each leg's median enough samples
+    that one noisy round can't dominate it; `attempts=3` retries a
+    genuinely unlucky attempt the same way the previous design did.
     """
     slice_s = duration_s / n_rounds
     control_op = _gil_holding_control(slice_s)
