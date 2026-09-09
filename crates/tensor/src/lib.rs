@@ -4145,6 +4145,11 @@ where
                 // before the match there runs.
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 TensorStorage::Dma(ref mut io) => io.view_offset = 0,
+                // The same pair for D3D11. Unlike `IoSurfaceTensor`,
+                // `D3d11TextureTensor::reshape` leaves `view_offset` alone, so
+                // `reshape`'s clear site carries this arm as well.
+                #[cfg(target_os = "windows")]
+                TensorStorage::Dma(ref mut tex) => tex.set_view_offset(0),
                 _ => {}
             }
         }
@@ -4649,17 +4654,14 @@ where
         // not fail to compile on the other targets, it silently becomes a
         // fall-through to `_ => {}`. That is how macOS went without one.
         //
-        // STILL INCOMPLETE: `D3d11TextureTensor` (Windows),
-        // `AHardwareBufferTensor` (Android) and `PboTensor` each have a
-        // `view_offset` that their own `map()` adds and their own `view()`
-        // sets, but nothing writes it here, so they fall into `_ => {}` and
-        // a caller that sets the offset on them gets a map at the parent's
-        // origin. D3D11 is the one that demonstrably matters -- it is
-        // reachable through `TensorDyn::import_descriptor`, so a
-        // reconstructed `view()` reads the wrong region there (issue #161).
-        // Android cannot be reconstructed at all (its `import_storage` arm
-        // is `cfg(target_os = "linux")`), and a PBO `view()` demotes to host
-        // memory before it gets here (issue #162). See
+        // STILL INCOMPLETE: `AHardwareBufferTensor` (Android) and
+        // `PboTensor` each have a `view_offset` that their own `map()` adds
+        // and their own `view()` sets, but nothing writes it here, so they
+        // fall into `_ => {}` and a caller that sets the offset on them gets
+        // a map at the parent's origin. Neither is reachable through
+        // `TensorDyn::import_descriptor` today: Android's `import_storage`
+        // arm is `cfg(target_os = "linux")`, and a PBO `view()` demotes to
+        // host memory before it gets here (issue #162). See
         // `edgefirst-python-common`'s `interop::apply_plane_offset` for the
         // full per-backing accounting.
         match self.storage {
@@ -4676,6 +4678,14 @@ where
             // `nested_iosurface_subviews_do_not_compound_their_plane_offset`.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(ref mut io) => io.view_offset = offset,
+            // The offset every `D3d11TextureTensor` pin adds to its host or
+            // staging base, in backing (pitched) space like `row_stride()`.
+            // `view()` bounds-checks the value it computes; this route does
+            // not, so the pins refuse an offset past the backing instead
+            // (`check_view_offset` in `d3d11/texture.rs`). Pinned by the
+            // `d3d11` plane-offset tests in `crates/tensor/tests`.
+            #[cfg(target_os = "windows")]
+            TensorStorage::Dma(ref mut tex) => tex.set_view_offset(offset),
             _ => {}
         }
     }
@@ -5881,6 +5891,11 @@ where
             TensorStorage::Mem(ref mut m) => m.set_offset(0),
             #[cfg(target_os = "linux")]
             TensorStorage::Dma(ref mut dma) => dma.mmap_offset = 0,
+            // `IoSurfaceTensor::reshape` zeroes its own `view_offset`;
+            // `D3d11TextureTensor::reshape` does not, so the clear that
+            // pairs with `set_plane_offset`'s D3D11 arm lives here.
+            #[cfg(target_os = "windows")]
+            TensorStorage::Dma(ref mut tex) => tex.set_view_offset(0),
             _ => {}
         }
         Ok(())
@@ -5902,8 +5917,49 @@ where
     /// reconfiguring it to a smaller image without reallocating -- and it
     /// worked precisely because it bypassed this method. This forwards the
     /// same way, so the two agree.
+    ///
+    /// A narrower image inside a pitched backing (an IOSurface, an
+    /// AHardwareBuffer, a D3D11 texture) still advances rows by the backing's
+    /// pitch, so that pitch is recorded as the row stride whenever it exceeds
+    /// the new shape's natural stride -- the same adoption `configure_image`
+    /// makes. Without it a texture narrowed from 64 to 16 texels wide reports
+    /// a 64-byte stride over rows that are 256 bytes apart. A single-row
+    /// shape records its own tight stride instead, by [`view`](Self::view)'s
+    /// rule: a strided `map()` spans `stride * rows`, and one pitched row
+    /// runs past the backing when the window sits in the last row.
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
-        self.storage.set_logical_shape(shape)
+        self.storage.set_logical_shape(shape)?;
+        // Only a backing with a pitch of its own, and only while the shape
+        // still has the rank the format's row is measured on: a caller may
+        // flatten an image to one dimension and leave the format behind.
+        let Some(pitch) = self.storage.backing_row_stride() else {
+            return Ok(());
+        };
+        let Some((rank, rows)) = self.format.map(|f| match f.layout() {
+            PixelLayout::Packed => (3, shape.first().copied()),
+            PixelLayout::Planar => (3, shape.get(1).copied()),
+            PixelLayout::SemiPlanar => (2, shape.first().copied()),
+        }) else {
+            return Ok(());
+        };
+        if rank != shape.len() {
+            return Ok(());
+        }
+        // The natural stride of the new shape, not of the stride recorded for
+        // the old one.
+        let prior = self.row_stride.take();
+        let Some(natural) = self.effective_row_stride() else {
+            self.row_stride = prior;
+            return Ok(());
+        };
+        if rows == Some(1) {
+            self.set_row_stride_unchecked(natural);
+        } else if pitch > natural {
+            self.set_row_stride_unchecked(pitch);
+        } else {
+            self.row_stride = prior;
+        }
+        Ok(())
     }
 
     fn map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>

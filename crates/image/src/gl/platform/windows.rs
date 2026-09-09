@@ -827,6 +827,59 @@ fn check_identity_names_texture(
 /// the parent texture it imports. The check is skipped when the table has no
 /// entry for `fmt` at these dimensions (a packed-RGB view whose width breaks
 /// the 4-byte texel packing), which says nothing about the texture.
+/// Refuses to import a source whose pixels do not start at the texture's
+/// origin.
+///
+/// The image ANGLE creates over an `ID3D11Texture2D` covers the whole
+/// texture and carries no offset, and the engine samples a source from the
+/// origin of its import. A `view()` (or a whole tensor at a foreign offset)
+/// attached that way would convert the parent's top-left tile in place of
+/// the region it names -- silently. Declining here sends the engine down its
+/// upload path, whose `map()` starts at the offset. Issue #161's Windows
+/// half at the convert level.
+fn refuse_offset_source<T>(img: &Tensor<T>, what: &str) -> Result<()>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match img.plane_offset() {
+        None | Some(0) => Ok(()),
+        Some(offset) => Err(Error::NotSupported(format!(
+            "GL convert: {what} starts {offset} bytes into its D3D11 texture, and \
+             EGL_ANGLE_image_d3d11_texture can only bind the whole texture from its \
+             origin; uploading the window instead"
+        ))),
+    }
+}
+
+/// A destination whose bytes start at a plane offset the engine cannot lower
+/// to a viewport: one rebuilt from a descriptor, which carries the offset
+/// but not the `view_origin` a `view()` would have given it. Imported, it
+/// would be rendered at the texture's origin.
+fn unplaced_destination<T>(img: &Tensor<T>) -> Option<usize>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match (img.plane_offset(), img.view_origin()) {
+        (Some(offset), None) if offset != 0 => Some(offset),
+        _ => None,
+    }
+}
+
+fn refuse_unplaced_destination<T>(img: &Tensor<T>) -> Result<()>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match unplaced_destination(img) {
+        None => Ok(()),
+        Some(offset) => Err(Error::NotSupported(format!(
+            "GL convert: destination starts {offset} bytes into its D3D11 texture \
+             with no view origin to place it by, and EGL_ANGLE_image_d3d11_texture \
+             can only bind the whole texture from its origin; rendering to a \
+             texture and reading back through map() instead"
+        ))),
+    }
+}
+
 fn check_dxgi_format<T>(
     layout: &edgefirst_tensor::d3d11_layout::D3d11ImageLayout,
     img: &Tensor<T>,
@@ -950,6 +1003,16 @@ impl GlPlatform for AngleD3d11 {
     ///
     /// A tensor with no texture is not this check's business: the import
     /// functions refuse it by name, with a message about what it is instead.
+    /// `EGL_ANGLE_image_d3d11_texture` binds the whole texture from its
+    /// origin, so a destination that starts elsewhere is placed only when
+    /// it carries a `view_origin` for the viewport.
+    fn dst_import_places<T>(img: &Tensor<T>) -> bool
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        unplaced_destination(img).is_none()
+    }
+
     fn validate_import_identity<T>(img: &Tensor<T>, what: &str) -> Result<()>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
@@ -965,7 +1028,7 @@ impl GlPlatform for AngleD3d11 {
         display: &D3d11Display,
         img: &Tensor<u8>,
         fmt: PixelFormat,
-        _for_dst: bool,
+        for_dst: bool,
     ) -> Result<D3d11EglImage> {
         // `EGL_ANGLE_image_d3d11_texture` has no sub-extent attribute, so
         // the image always covers the whole texture. That is what a
@@ -974,17 +1037,29 @@ impl GlPlatform for AngleD3d11 {
         // no branch here. A source whose logical image is smaller than its
         // texture -- a pool buffer narrowed by `configure_image` -- is
         // sampled through the extent reported by `import_extent`, which the
-        // engine folds into the source rectangle.
+        // engine folds into the source rectangle from the texture's origin.
+        // A source whose pixels start elsewhere -- a `view()`, or a tensor
+        // carrying a plane offset -- therefore cannot be attached at all, and
+        // is refused so the engine uploads it through `map()`, which honours
+        // the offset. A destination carrying an offset without the
+        // `view_origin` a `view()` would have given it -- one rebuilt from a
+        // descriptor -- has no viewport to place it either, and is refused
+        // for the same reason (`dst_import_places` keeps the engine from
+        // asking, so this is the second line).
         //
-        // `for_dst` is unused for the same reason there is no bind-flag
-        // refusal here: the tensor crate's layout ABI is frozen and carries
-        // no bind flags, so this leaf cannot ask whether an externally
-        // wrapped texture was created with `D3D11_BIND_RENDER_TARGET`. Such
-        // a texture is imported and attached, and rejected at
-        // `CheckFramebufferStatus`, which falls the frame back to the CPU
-        // converter -- correct, at the cost of one `eglCreateImage` and one
-        // FBO probe per frame. Textures the HAL allocates always carry the
-        // flag.
+        // There is no bind-flag refusal here: the tensor crate's layout ABI
+        // is frozen and carries no bind flags, so this leaf cannot ask
+        // whether an externally wrapped texture was created with
+        // `D3D11_BIND_RENDER_TARGET`. Such a texture is imported and
+        // attached, and rejected at `CheckFramebufferStatus`, which falls
+        // the frame back to the CPU converter -- correct, at the cost of one
+        // `eglCreateImage` and one FBO probe per frame. Textures the HAL
+        // allocates always carry the flag.
+        if for_dst {
+            refuse_unplaced_destination(img)?;
+        } else {
+            refuse_offset_source(img, "source")?;
+        }
         let (texture, layout) = texture_of(img, "source/destination")?;
         check_dxgi_format(&layout, img, fmt)?;
         import_texture(display, texture, &layout, "image")
@@ -995,6 +1070,7 @@ impl GlPlatform for AngleD3d11 {
         img: &Tensor<u8>,
         _fmt: PixelFormat,
     ) -> Result<D3d11EglImage> {
+        refuse_offset_source(img, "NV source")?;
         let (texture, layout) = texture_of(img, "NV source")?;
         // The HAL's own semi-planar allocations are always R8, and so is any
         // externally wrapped one the tensor crate accepted. That acceptance

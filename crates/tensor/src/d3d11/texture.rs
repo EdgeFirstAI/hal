@@ -1025,6 +1025,7 @@ where
     /// `sync_for_device` move bytes between it and the texture.
     pub(crate) fn host_pin<'a>(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'a>> {
         self.require_access(self.access)?;
+        self.check_view_offset()?;
         if access.writes() {
             // A pin outlives every guard, so there is no drop to notice the
             // write at: `sync_for_device` reads this to decide that the host
@@ -1032,8 +1033,8 @@ where
             self.wrote_host.store(true, Ordering::Release);
         }
         let (base, len) = self.host_buffer().span();
-        // SAFETY: `view` bounds-checks `view_offset` against `backing_bytes()`,
-        // which is the length this buffer was allocated at.
+        // SAFETY: `check_view_offset` above bounds `view_offset` by
+        // `backing_bytes()`, which is the length this buffer was allocated at.
         let at = unsafe { base.add(self.view_offset) };
         // The cell, not the buffer: holding it is what keeps the address live.
         let keepalive: Arc<dyn Send + Sync> = self.host.clone();
@@ -1053,11 +1054,44 @@ where
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'a>> {
         self.require_access(access)?;
+        self.check_view_offset()?;
         self.refuse_partial_write(access)?;
         match self.staging.as_ref() {
             Some(st) => self.staging_pin(st, access, non_blocking),
             None => self.buffer_pin(access),
         }
+    }
+
+    /// Refuses a window that starts past the backing.
+    ///
+    /// `view` computes `view_offset` under a bounds check, but
+    /// `set_view_offset` takes whatever `Tensor::set_plane_offset` was handed
+    /// -- a descriptor's restored offset, untrusted cross-package input -- so
+    /// every pin re-checks before it offsets a base pointer by it. An offset
+    /// equal to the backing is the one-past-the-end address, which is a
+    /// legal pointer and an empty window.
+    fn check_view_offset(&self) -> Result<()> {
+        let capacity = self.backing_bytes();
+        if self.view_offset <= capacity {
+            return Ok(());
+        }
+        Err(Error::InsufficientCapacity {
+            needed: self.view_offset,
+            capacity,
+        })
+    }
+
+    /// Moves this tensor's window to `offset` bytes from the backing's
+    /// origin, in the pitched space `view` measures in.
+    ///
+    /// The write-back half of `Tensor::set_plane_offset` (and the clear half
+    /// of `set_format`/`reshape`): a tensor rebuilt from a descriptor is
+    /// opened at the texture's origin, and this is how the sub-region it
+    /// described is put back. Unchecked here so the setter stays infallible;
+    /// `check_view_offset` refuses an offset past the backing when a pin is
+    /// taken.
+    pub(crate) fn set_view_offset(&mut self, offset: usize) {
+        self.view_offset = offset;
     }
 
     /// Refuses a write-only window that covers less than the whole backing.
@@ -1208,8 +1242,8 @@ where
         len: usize,
         guard: G,
     ) -> crate::pin::HostPin<'a> {
-        // SAFETY: `view` bounds-checks `view_offset` against `backing_bytes()`,
-        // which is the length of both backings.
+        // SAFETY: `pin_impl` ran `check_view_offset`, which bounds
+        // `view_offset` by `backing_bytes()`, the length of both backings.
         let at = unsafe { base.add(self.view_offset) };
         crate::pin::HostPin::new(Arc::new(guard), at, len.saturating_sub(self.view_offset))
     }
