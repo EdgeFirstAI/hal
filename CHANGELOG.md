@@ -129,6 +129,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crates/image/tests/reconstructed_view_convert.rs`, on the Windows CI
   lanes.
 
+- **CUDA tests passed without running.** `cuda.rs`'s runtime probe listed
+  `libcudart.so.12` and `.so.11.0` only, and current NVIDIA pip toolkits ship
+  `libcudart.so.13` with no unversioned symlink — so `is_cuda_available()`
+  returned false and all six CUDA tests reported `SKIP: no libcudart`
+  followed by `ok` on any CUDA 13 host. The soname is now probed, and
+  `HAL_TEST_REQUIRE_CUDA=1` (set by `make test-cuda` whenever it located a
+  runtime) makes such a skip a failure rather than a silent pass.
+
 ### Changed
 
 - A malformed quantization descriptor in a tensor capsule is now reported
