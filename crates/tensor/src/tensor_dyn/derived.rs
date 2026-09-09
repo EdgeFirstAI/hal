@@ -175,9 +175,16 @@ fn restore_descriptor_metadata(
 /// producer that called `set_logical_shape` was carrying the *addressing*
 /// shape instead (`[h, w]` for a semi-planar image rather than
 /// `[combined_h, w]`), and the descriptor faithfully reported it; without
-/// this the consumer would see a shape its producer did not have. The
-/// import arm has already checked `shape` is one of those two spellings of
-/// the geometry the texture itself reports, so nothing untrusted reaches
+/// this the consumer would see a shape its producer did not have. The same
+/// narrowing rebuilds a `view()`: its descriptor carries the window's shape,
+/// the import opens the whole texture, and this cuts it down to the window
+/// (`Tensor::set_logical_shape` keeps the texture's pitch as the row stride
+/// while it does, or `view()`'s tight stride for a single-row window, so
+/// the window maps in the texture's last row). Where the window sits is the
+/// plane offset, which the
+/// descriptor cannot carry and the capsule restores afterwards. The import
+/// arm has already checked `shape` is one of those three spellings of the
+/// geometry the texture itself reports, so nothing untrusted reaches
 /// `set_logical_shape` here.
 ///
 /// After the format restore, not before: `set_format` validates the shape it

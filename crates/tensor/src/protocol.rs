@@ -530,12 +530,20 @@ pub(crate) fn descriptor_d3d11_handles(
 /// passed down to [`crate::d3d11_shared_handle_geometry`] rather than only
 /// checked here.
 ///
+/// A third spelling is accepted here and nowhere else: a packed *window* of
+/// the texture, which is what a `view()` describes (`[h', w', c]` with `h'`
+/// and `w'` no larger than the texture's, and no smaller than one). The
+/// import still opens the whole texture; `restore_d3d11_logical_shape`
+/// narrows it to the window and the producer's plane offset places it. The
+/// blob transport does not take this spelling because nothing narrows on
+/// that path, so a window shape would be accepted and then ignored.
+///
 /// # Errors
 ///
 /// [`crate::Error::InvalidArgument`] when the descriptor names no pixel
-/// format, or when its shape is neither spelling of the geometry the
-/// texture reports. Propagates whatever opening and describing the texture
-/// reports.
+/// format, or when its shape is none of the three spellings of the geometry
+/// the texture reports. Propagates whatever opening and describing the
+/// texture reports.
 ///
 /// # Safety
 ///
@@ -556,8 +564,39 @@ pub(crate) unsafe fn descriptor_d3d11_geometry(
     })?;
     // SAFETY: the caller guarantees `texture` is a shared NT handle valid in
     // this process.
-    let (width, height) = unsafe { d3d11_geometry_checked(format, texture, shape) }?;
+    let (width, height) =
+        unsafe { d3d11_geometry_with_rule(format, texture, shape, ShapeRule::OrWindow) }?;
     Ok((format, width, height))
+}
+
+/// Which spellings of a texture's geometry a `shape` may take.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShapeRule {
+    /// The allocation shape or the addressing shape, exactly.
+    Exact,
+    /// `Exact`, or a packed window of the texture (a `view()`).
+    OrWindow,
+}
+
+/// Whether `shape` is a packed sub-rectangle of a `width` x `height` image
+/// in `format`: the allocation spelling with a smaller height or width. A
+/// window is never a semi-planar or planar image (`Tensor::view` makes
+/// packed views only) and never empty.
+#[cfg(target_os = "windows")]
+fn is_packed_window_of(
+    format: crate::PixelFormat,
+    shape: &[usize],
+    width: usize,
+    height: usize,
+) -> bool {
+    if format.layout() != crate::PixelLayout::Packed {
+        return false;
+    }
+    let [h, w, c] = shape else {
+        return false;
+    };
+    *c == format.channels() && (1..=height).contains(h) && (1..=width).contains(w)
 }
 
 /// The image dimensions a shared D3D11 texture reports, with `shape` checked
@@ -584,20 +623,38 @@ pub(crate) unsafe fn d3d11_geometry_checked(
     texture: std::os::windows::io::RawHandle,
     shape: &[usize],
 ) -> crate::Result<(usize, usize)> {
+    // SAFETY: forwarded unchanged.
+    unsafe { d3d11_geometry_with_rule(format, texture, shape, ShapeRule::Exact) }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn d3d11_geometry_with_rule(
+    format: crate::PixelFormat,
+    texture: std::os::windows::io::RawHandle,
+    shape: &[usize],
+    rule: ShapeRule,
+) -> crate::Result<(usize, usize)> {
     // SAFETY: the caller guarantees `texture` is a shared NT handle valid in
     // this process; the helper opens its own texture and drops it on return.
     let (width, height) =
         unsafe { crate::d3d11_shared_handle_geometry(texture, format, Some(shape)) }?;
     let allocation = format.allocation_shape(width, height);
     let addressing = format.addressing_shape(width, height);
-    if allocation.as_deref() != Some(shape) && addressing.as_deref() != Some(shape) {
-        return Err(crate::Error::InvalidArgument(format!(
-            "D3D11 texture shape {shape:?} is neither the {format:?} allocation \
-             shape {allocation:?} nor the addressing shape {addressing:?} of the \
-             {width}x{height} texture it names"
-        )));
+    if allocation.as_deref() == Some(shape) || addressing.as_deref() == Some(shape) {
+        return Ok((width, height));
     }
-    Ok((width, height))
+    if rule == ShapeRule::OrWindow && is_packed_window_of(format, shape, width, height) {
+        return Ok((width, height));
+    }
+    let window = match rule {
+        ShapeRule::OrWindow => " nor a packed window",
+        ShapeRule::Exact => "",
+    };
+    Err(crate::Error::InvalidArgument(format!(
+        "D3D11 texture shape {shape:?} is neither the {format:?} allocation \
+         shape {allocation:?} nor the addressing shape {addressing:?}{window} of the \
+         {width}x{height} texture it names"
+    )))
 }
 
 /// Inputs to [`from_parts`], grouped into one named-field struct rather than

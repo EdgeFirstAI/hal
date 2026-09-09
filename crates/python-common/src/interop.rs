@@ -178,24 +178,53 @@ const _: () = {
 /// offset is already baked into it and applying it again would advance past
 /// the sub-region a second time. Every other kind re-derives the base from
 /// a handle naming the whole parent buffer -- `DMABUF` dup's the fd,
-/// `IOSURFACE` looks the surface up by id, `PBO` by buffer id -- and so
-/// lands at the parent's origin unless the offset is put back.
+/// `IOSURFACE` looks the surface up by id, `D3D11_TEXTURE` opens the NT
+/// handle, `PBO` by buffer id -- and so lands at the parent's origin unless
+/// the offset is put back.
 ///
-/// **Known gap: putting it back only takes effect on Linux DMA-BUF.**
 /// `Tensor::set_plane_offset` records the wrapper field for every backing,
 /// but only syncs the storage-internal offset that `map()` actually adds
-/// for `Mem` and, under `#[cfg(target_os = "linux")]`, `Dma`; every other
-/// backing falls into its `_ => {}` arm. Backing by backing:
+/// for `Mem`, `Dma` under `#[cfg(target_os = "linux")]`, `Dma` under
+/// `#[cfg(any(target_os = "macos", target_os = "ios"))]` and `Dma` under
+/// `#[cfg(target_os = "windows")]`; every other backing falls into its
+/// `_ => {}` arm. Backing by backing:
 ///
 /// * **Linux DMA-BUF** -- fixed, and verified end-to-end.
+/// * **IOSurface (macOS/iOS)** -- fixed (issue #161).
+///   `IoSurfaceTensor::view_offset` is now written back by
+///   `set_plane_offset` *and* cleared by `set_format`, so a reconstructed
+///   view addresses its own sub-region and a later format change does not
+///   leave a stale window behind. Pinned by three tests in
+///   `edgefirst-tensor`'s `iosurface` module, which the macOS CI lane runs:
+///   `set_plane_offset_moves_the_iosurface_map_window`,
+///   `nested_iosurface_subviews_do_not_compound_their_plane_offset` and
+///   `set_format_clears_the_iosurface_map_window`.
+/// * **D3D11 (Windows)** -- fixed (issue #161), in three parts, because
+///   the bug had a different shape there. A view's descriptor was not
+///   reconstructed wrongly, it was *refused*: the `D3D11_TEXTURE` import
+///   checks the descriptor's shape against the texture's own geometry, and
+///   a window is neither of its two spellings. The import now accepts a
+///   packed window, narrows the whole-texture tensor to it and keeps the
+///   texture's pitch as the row stride. `D3d11TextureTensor::view_offset`
+///   is then written back by `set_plane_offset` and cleared by
+///   `set_format` and `reshape` (unlike `IoSurfaceTensor`, its own
+///   `reshape` leaves the offset alone). And because the ANGLE import binds
+///   the whole texture from its origin and cannot express an offset, the GL
+///   engine's Windows leaf refuses to attach a source carrying one and
+///   uploads it through `map()` instead -- without which even a *fresh*
+///   `view()` converted the parent's origin on the GL path. A rebuilt
+///   *destination* has the offset but not the `view_origin` the engine
+///   lowers a fresh view's tile to a viewport from, so the engine asks the
+///   platform whether a zero-copy destination can be placed
+///   (`GlPlatform::dst_import_places`) and lowers one that cannot to the
+///   mapped texture path, whose readback writes through `map()` at the
+///   offset. Pinned by the `d3d11` plane-offset tests in
+///   `crates/tensor/tests/d3d11_tensor.rs` and by
+///   `crates/image/tests/reconstructed_view_convert.rs`, which the Windows
+///   CI lanes run (the latter on WARP).
 /// * **`Mem`/`Shm`** -- never affected. Both report `kind::HOST`, so this
 ///   function skips them and the pinned `desc.ptr` already addresses the
 ///   view.
-/// * **IOSurface (macOS/iOS)** and **D3D11 (Windows)** -- **still wrong.**
-///   `IoSurfaceTensor::view_offset` and `D3d11TextureTensor::view_offset`
-///   are set by their own `view()` and added by their own `map()`, but
-///   nothing writes them back here, so a *reconstructed* view addresses the
-///   parent's origin. These are the two that still need fixing.
 /// * **Android** -- not silently wrong: it reports `kind::DMABUF`, and
 ///   `import_storage`'s DMABUF arm is `cfg(target_os = "linux")`, so an
 ///   import there fails with "dma-buf import off Linux" rather than
@@ -204,15 +233,44 @@ const _: () = {
 ///   back reporting `TensorMemory::Mem`, so it takes the `HOST` path above.
 ///   (Why it demotes has not been traced, and such a view appears to be
 ///   detached from the parent buffer entirely -- reproducible on `main`,
-///   so a pre-existing PBO-view issue independent of this one.)
+///   so a pre-existing PBO-view issue independent of this one. Issue #162.
+///   If that is fixed so views stay PBO-backed, `PboTensor` needs an arm in
+///   `set_plane_offset` too.)
 ///
-/// So the outstanding work is IOSurface and D3D11. Not done here
-/// deliberately: `set_plane_offset` has callers beyond this one
-/// (`image::import_image`'s multiplane path, `tensor-capi`'s builder), so
-/// widening those `cfg`s changes behaviour on two platforms this repo's CI
-/// cannot exercise, and double-applying an offset is a failure this
-/// protocol has already produced once (see the `HOST` arm above). It wants
-/// a per-platform change with a test on each.
+/// The audit the IOSurface fix rested on applied unchanged to D3D11, and is
+/// recorded here so it need not be redone: `set_plane_offset`'s callers
+/// beyond this one cannot reach either backing.
+///
+/// * `image::import_image` -- the whole method is
+///   `#[cfg(target_os = "linux")]` (`crates/image/src/lib.rs`), so it does
+///   not exist on macOS or Windows. Note that its internal
+///   `memory() != TensorMemory::DmaBuf` rejection is **not** what excludes
+///   them: `TensorMemory::DmaBuf` is the portable spelling of "platform
+///   zero-copy buffer", so IOSurface and D3D11 both report it and would
+///   pass that check. The `cfg` is the gate.
+/// * `tensor-capi`'s builder (`builder.rs`, the `wrap` path) -- constructs
+///   storage only through `TensorDyn::from_fd`. Its
+///   `cfg(all(unix, not(target_os = "linux")))` arm always yields a
+///   `ShmTensor`, never an `IoSurfaceTensor`, and its `cfg(not(unix))` arm
+///   returns `ENOSYS`, so neither backing is reachable.
+/// * `Tensor::subview` -- does reach them, and writes the same absolute
+///   value the storage's own `view()` already computed, so the write is
+///   idempotent rather than a double-apply -- the failure this protocol
+///   produced once on `MEM` (see the `HOST` arm above).
+///
+/// **D3D11 applies the offset verbatim, and the descriptor's stride is not
+/// a pitch to translate it by.** A texture tensor's `map()` goes through a
+/// staging texture whose row pitch the driver chooses, and `view()` measures
+/// its offset in that pitch (`y * pitch + x * bpp`). The consumer opens the
+/// same texture through its NT handle, which only the adapter that created
+/// it can open, so the staging texture it creates for its own `map()` gets
+/// the same pitch from the same driver, and the offset names the same texel
+/// without translation. Translating by `strides[0]` would be wrong in the
+/// one case it looks needed: a single-row `view()` records a *tight* row
+/// stride for its map span (`Tensor::view`), while its offset is still in
+/// the pitch, so dividing that offset by the descriptor's stride yields a
+/// different row. The offset is bounded on the consumer's side instead:
+/// `D3d11TextureTensor`'s pins refuse one past the backing.
 fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u64) {
     if plane_offset == 0 || desc.kind == edgefirst_tensor::tensor_kind::HOST {
         return;

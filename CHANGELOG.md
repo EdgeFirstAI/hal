@@ -64,15 +64,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past the sub-region a second time. Both directions are covered by
   `test_view_converts_its_own_sub_region_not_the_parents_origin`.
 
-  **Fixed on Linux DMA-BUF; IOSurface (macOS/iOS) and D3D11 (Windows) still
-  need the same treatment.** `Tensor::set_plane_offset` only syncs the
-  storage-internal offset for `Mem` and Linux `Dma`, so on those two a
-  reconstructed view still lands at the parent's origin. `MEM`/`SHM` were
-  never affected (they take the pinned-pointer path), Android fails the
-  import outright rather than reconstructing, and a PBO image's `view()`
-  comes back as host memory so it never reaches the PBO arm. See
-  `interop::apply_plane_offset`'s doc comment for the per-backing
-  accounting.
+  **Fixed on Linux DMA-BUF, on IOSurface (macOS/iOS) and on D3D11
+  (Windows).** `Tensor::set_plane_offset` now syncs the storage-internal
+  offset for `Mem`, Linux `Dma`, Apple `Dma` and Windows `Dma`, so a
+  reconstructed IOSurface or D3D11 view addresses its own sub-region rather
+  than the parent buffer's origin. `MEM`/`SHM` were never affected (they take
+  the pinned-pointer path), Android fails the import outright rather than
+  reconstructing, and a PBO image's `view()` comes back as host memory so it
+  never reaches the PBO arm. See `interop::apply_plane_offset`'s doc comment
+  for the per-backing accounting.
+
+  The IOSurface half was easy to miss because `IoSurfaceTensor::view` always
+  set its own `view_offset` correctly — a *freshly created* view was right on
+  every platform, and only restoring an offset onto a tensor rebuilt from a
+  `TensorDesc` was broken. `TensorStorage::Dma` compounds that: it is a
+  cfg-multiplexed *name* rather than one type, so the `cfg(target_os =
+  "linux")` arm did not fail to compile elsewhere, it silently became a
+  fall-through.
+
+  The fix is a set/clear pair, not a single arm: `set_format` drops the
+  offset when the format changes, through the same Linux-gated match, so
+  making only the setter take effect would have left `plane_offset()`
+  reporting `None` while `map()` still started at the old offset — trading a
+  lost window for a stale one. (`reshape`'s clear site needed nothing:
+  `IoSurfaceTensor::reshape` zeroes its own `view_offset`.) Three regression
+  tests in `edgefirst-tensor` pin it —
+  `set_plane_offset_moves_the_iosurface_map_window` for the restore,
+  `nested_iosurface_subviews_do_not_compound_their_plane_offset` for the
+  double-apply the restore risks, and
+  `set_format_clears_the_iosurface_map_window` for the clear — all on the
+  macOS CI lane, which runs the Rust suite the Python interop tests cannot
+  reach there.
+
+  The D3D11 half had a different shape, and needed three parts. A view's
+  descriptor was not reconstructed at the wrong origin, it was *refused*: the
+  `D3D11_TEXTURE` import checks the descriptor's shape against the texture's
+  own geometry, and a window is neither of the two spellings it accepted. The
+  import now takes a packed window as a third spelling, opens the whole
+  texture and narrows it to the window, with `Tensor::set_logical_shape`
+  keeping the texture's pitch as the row stride while it does. The storage
+  arms then follow the IOSurface pair — plus one at `reshape`'s clear site,
+  because `D3d11TextureTensor::reshape` does not zero its own offset — and
+  the pins refuse an offset past the backing rather than trusting a
+  descriptor's value. Last, and the part no `map()` test could see: the ANGLE
+  D3D11 import binds the whole texture from its origin and cannot express an
+  offset, so the GL engine sampled every offset *source* from the texture's
+  top-left — a *fresh* `view()` converted the parent's origin on Windows,
+  not only a reconstructed one. The Windows leaf now refuses to attach a
+  source carrying a plane offset and the engine uploads it through `map()`,
+  which honours the offset. A *destination* rebuilt from a descriptor has the
+  same problem from the other side: it carries the offset but not the
+  `view_origin` a `view()` would have given it, so the engine has no viewport
+  to place it by and the render would land at the texture's origin. The
+  engine now asks the platform whether a zero-copy destination import can
+  place the tensor (`GlPlatform::dst_import_places`), and lowers one it
+  cannot to the mapped texture path, whose readback writes through `map()`
+  at the offset. A single-row window keeps `view()`'s tight row stride when
+  a descriptor narrows it (`Tensor::set_logical_shape`), so it maps in the
+  texture's last row, and the offset is applied as the producer measured it:
+  the consumer opens the same texture on the same adapter, so its staging
+  pitch is the same, and the descriptor's stride is not a pitch to translate
+  it by. Pinned by eight `d3d11` tests in
+  `crates/tensor/tests/d3d11_tensor.rs` and the Windows arm of
+  `crates/image/tests/reconstructed_view_convert.rs`, on the Windows CI
+  lanes.
 
 ### Changed
 

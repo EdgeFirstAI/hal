@@ -455,13 +455,16 @@ impl GLProcessorST {
         self.convert_stats.src_uploads += 1;
         tracing::Span::current().record("src_feed", "upload");
         let pixels = src_u8.map_read()?;
+        // Tight RGBA rows: no `UNPACK_ROW_LENGTH` is set on this path, and
+        // `UNPACK_ALIGNMENT` is 1, so GL reads exactly the image.
         self.camera_normal_texture.update_texture(
             edgefirst_gl::gl::TEXTURE_2D,
             src_w,
             src_h,
             edgefirst_gl::gl::RGBA,
+            src_w * src_h * 4,
             &pixels,
-        );
+        )?;
         Ok(FloatSrcFeed::Upload)
     }
 
