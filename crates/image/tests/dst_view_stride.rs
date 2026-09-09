@@ -803,21 +803,15 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
                 &want[row * row_bytes..row * row_bytes + row_bytes],
                 "{label}: row {row} did not land at the {stride} B pitch"
             );
-            // The bytes past a row's pixels are not the readback's to write.
-            // `extra == 0` is a whole number of pixels on every platform, so
-            // the rows land through `GL_PACK_ROW_LENGTH` or through the
-            // repack, and neither touches the pad. `extra == 1` is the
-            // read-tight-and-spread route, which leaves the tight read's
-            // leftovers there, as the Mem readback does. The last row's pad
-            // lies past the mapping.
-            if extra == 0 && row + 1 < SRC_H {
-                assert!(
-                    got[row * stride + row_bytes..(row + 1) * stride]
-                        .iter()
-                        .all(|&b| b == POISON),
-                    "{label}: row {row}: the pad past the pixels was written"
-                );
-            }
+            // The bytes between this row's pixels and the next row are the
+            // destination's padding, and no route promises them: a driver
+            // packing rows at `GL_PACK_ROW_LENGTH` may write them (Vivante
+            // does, issue #167), and the read-tight-and-spread route leaves
+            // the tight read's leftovers there. What every route promises is
+            // the pixel bytes of every row at the declared pitch, asserted
+            // above, and that nothing lands past `needed` -- the spare row
+            // this test allocates keeps even a written last-row pad inside
+            // the buffer.
         }
     }
 }

@@ -28,6 +28,12 @@
 //! Every offset here is asserted, including the aligned ones, so a regression
 //! on the drivers that handle unaligned offsets natively (V3D, Vivante) is
 //! caught by the same file.
+//!
+//! The ANGLE leaves (`platform/angle.rs`, `platform/windows.rs`) refuse an
+//! offset source through the same `refuse_offset_source` import-failure arms
+//! this file pins, but this file is Linux-only, so an IOSurface or D3D11
+//! offset NV source is not built here -- that upload is covered separately
+//! by `offset_nv_source_upload.rs`, which drives `Mem`.
 
 #![cfg(all(target_os = "linux", feature = "opengl"))]
 

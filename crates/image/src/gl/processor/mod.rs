@@ -1277,6 +1277,12 @@ const MALI_DMA_IMPORT_OFFSET_ALIGN: usize = 64;
 
 /// Whether a Mali source import at `plane_offset` would sample zeros. Pure so
 /// the rule is unit-testable without a GL context, like [`classify_renderer`].
+///
+/// Only plane 0's offset is checked. For single-plane NV12 the chroma plane
+/// sits at `plane0_offset + pitch * height` (`dma_import.rs` ~`:225`), which
+/// is itself a multiple of 64 whenever `pitch` is -- and the HAL pads every
+/// DMA pitch to 64 -- so the chroma plane's alignment is not checked
+/// separately here.
 fn mali_rejects_source_offset(is_mali: bool, plane_offset: usize) -> bool {
     is_mali && !plane_offset.is_multiple_of(MALI_DMA_IMPORT_OFFSET_ALIGN)
 }
@@ -3216,6 +3222,10 @@ impl GLProcessorST {
             edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
             if direct_read_supported(format) {
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
+                // The bytes between rows at this pitch are the destination's
+                // padding; a driver may write them while packing (Vivante
+                // does, issue #167). `needed` keeps every written byte inside
+                // the buffer either way.
                 if let Some(pixels) = row_length {
                     edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, pixels);
                 }
@@ -4268,12 +4278,6 @@ impl GLProcessorST {
                     Err(e) => {
                         let src_w = src.width().unwrap_or(0);
                         let src_h = src.height().unwrap_or(0);
-                        // The R8 import declined (Mali's alignment rule, the
-                        // ANGLE leaves' offset refusal, or a driver that cannot
-                        // import the buffer at all). This is still a GPU
-                        // convert: the same shader runs on an R8 *upload* of the
-                        // combined plane, so record ShaderR8, not Cpu.
-                        self.last_nv_convert_path = NvConvertPath::ShaderR8;
                         self.convert_stats.zero_copy_declines += 1;
                         // Warn once per buffer — a steady-state video pipeline
                         // hits this every frame with the same buffers, and a
@@ -4318,6 +4322,13 @@ impl GLProcessorST {
                             flip,
                             is_int8,
                         )?;
+                        // The R8 import declined (Mali's alignment rule, the
+                        // ANGLE leaves' offset refusal, or a driver that cannot
+                        // import the buffer at all), but the upload just drawn
+                        // above succeeded: still a GPU convert, so record
+                        // ShaderR8, not Cpu -- only now that the draw has
+                        // actually returned `Ok`, not before it could fail.
+                        self.last_nv_convert_path = NvConvertPath::ShaderR8;
                         log::debug!("NV R8 upload takes {:?}", start.elapsed());
                     }
                 }
@@ -4359,12 +4370,8 @@ impl GLProcessorST {
                             src_fmt,
                             PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
                         ) && !src.is_multiplane();
-                        if src_fmt == PixelFormat::Nv12 {
-                            self.last_nv_convert_path = if nv_upload_capable {
-                                NvConvertPath::ShaderR8
-                            } else {
-                                NvConvertPath::Cpu
-                            };
+                        if src_fmt == PixelFormat::Nv12 && !nv_upload_capable {
+                            self.last_nv_convert_path = NvConvertPath::Cpu;
                         }
                         self.convert_stats.zero_copy_declines += 1;
                         // Warn once per buffer (see the ShaderR8 arm): repeats
@@ -4399,6 +4406,12 @@ impl GLProcessorST {
                                 flip,
                                 is_int8,
                             )?;
+                            // The upload just drawn above succeeded: still a
+                            // GPU convert, so record ShaderR8 now that it is
+                            // certain, not before the draw could fail.
+                            if src_fmt == PixelFormat::Nv12 {
+                                self.last_nv_convert_path = NvConvertPath::ShaderR8;
+                            }
                             log::debug!("NV R8 upload takes {:?}", start.elapsed());
                         } else {
                             self.draw_src_texture(
