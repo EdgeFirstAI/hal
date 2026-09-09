@@ -650,8 +650,8 @@ fn blob_export_import_shares_a_texture_in_process() {
 /// A texture import keeps the pitch its own device reports, not the producer's
 /// that the blob happens to carry: the two are facts about different drivers,
 /// and `from_d3d11_shared_handle` has already recorded the local one. The
-/// descriptor path makes the same exclusion (`restore_imported_row_stride` is
-/// `HOST | DMABUF` only), so a blob stride saying otherwise must not move it.
+/// descriptor path makes the same exclusion (`restore_imported_row_stride`
+/// skips `D3D11_TEXTURE`), so a blob stride saying otherwise must not move it.
 #[test]
 fn blob_import_keeps_the_local_pitch_not_the_blobs_stride() {
     let (w, h) = (37usize, 16usize);

@@ -1461,7 +1461,8 @@ fn import_referenced_d3d11_blob(
     // this device's staging copy reports -- and the producer's is a fact
     // about the producer's driver, not about the texture as this process
     // sees it. The descriptor path makes the same exclusion for the same
-    // reason (`restore_imported_row_stride` is `HOST | DMABUF` only).
+    // reason (`restore_imported_row_stride` excludes `D3D11_TEXTURE` for
+    // the same reason).
     t.set_colorimetry(colorimetry_from(strings));
     Ok(t)
 }

@@ -106,11 +106,6 @@ impl PackedImportFormat {
     }
 }
 
-/// The compile-time platform contract for the portable GL engine.
-///
-/// One implementation per OS, selected by the [`Platform`] alias. Methods
-/// are associated functions (no `&self`) — the platform is stateless; all
-/// state lives in the `Display` it creates.
 /// A destination whose bytes start at a plane offset the engine cannot lower
 /// to a viewport: one rebuilt from a descriptor, which carries the offset but
 /// not the `view_origin` a `view()` would have given it.
@@ -135,6 +130,51 @@ where
     }
 }
 
+/// Refuses to import a source whose pixels do not start at the buffer's
+/// origin.
+///
+/// Shared by the platforms whose import binds a whole buffer from its
+/// origin: ANGLE over a D3D11 texture (`EGL_ANGLE_image_d3d11_texture`) and
+/// ANGLE over an IOSurface (`EGL_ANGLE_iosurface_client_buffer`). Neither
+/// extension has a byte-offset attribute, and the engine samples a source
+/// from the origin of its import, so a `view()` -- or a whole tensor at a
+/// foreign offset -- attached that way converts the parent's top-left tile
+/// in place of the region it names, silently. Declining sends the source
+/// through `map()`, which starts at the offset: the engine's texture upload
+/// for a packed source into a packed destination, and otherwise
+/// `ImageProcessor::convert`'s CPU fallback -- a planar destination's GL
+/// lowering and the NV import's failure arm (`draw_src_texture` has no NV
+/// case) propagate the refusal instead of uploading, and a forced OpenGL
+/// backend returns it to the caller. Issue #161 at the convert level.
+/// Linux's DMA-BUF import expresses the offset itself
+/// (`EGL_DMA_BUF_PLANE0_OFFSET_EXT`) and does not need this.
+///
+/// `binding` names the extension in the message, so a log line says which
+/// leaf declined.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+pub(super) fn refuse_offset_source<T>(
+    img: &Tensor<T>,
+    what: &str,
+    binding: &str,
+) -> crate::Result<()>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match img.plane_offset() {
+        None | Some(0) => Ok(()),
+        Some(offset) => Err(crate::Error::NotSupported(format!(
+            "GL convert: {what} starts {offset} bytes into its buffer, and {binding} \
+             can only bind the whole buffer from its origin; uploading the window \
+             instead"
+        ))),
+    }
+}
+
+/// The compile-time platform contract for the portable GL engine.
+///
+/// One implementation per OS, selected by the [`Platform`] alias. Methods
+/// are associated functions (no `&self`) — the platform is stateless; all
+/// state lives in the `Display` it creates.
 pub(super) trait GlPlatform {
     /// Owning handle for the platform's GL/EGL bring-up state: display,
     /// context, capability probes. On Linux this is
@@ -449,5 +489,31 @@ mod tests {
     #[test]
     fn rgba32323232f_is_16_bytes_per_pixel() {
         assert_eq!(PackedImportFormat::Rgba32323232F.bytes_per_pixel(), 16);
+    }
+
+    /// The refusal is a pure function of `plane_offset`, so a host tensor
+    /// exercises it without a GL context.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn an_offset_source_is_refused_and_an_origin_source_is_not() {
+        use edgefirst_tensor::{Tensor, TensorMemory};
+
+        let mut t = Tensor::<u8>::new(&[4, 4, 4], Some(TensorMemory::Mem), None).expect("alloc");
+        assert!(
+            super::refuse_offset_source(&t, "source", "ext").is_ok(),
+            "no offset recorded: attachable"
+        );
+        t.set_plane_offset(0);
+        assert!(
+            super::refuse_offset_source(&t, "source", "ext").is_ok(),
+            "a zero offset is the origin: attachable"
+        );
+        t.set_plane_offset(16);
+        let err = super::refuse_offset_source(&t, "source", "ext")
+            .expect_err("a source 16 bytes in cannot be bound from the origin");
+        assert!(
+            matches!(err, crate::Error::NotSupported(_)),
+            "NotSupported is what sends the engine to the upload path; got {err}"
+        );
     }
 }

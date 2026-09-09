@@ -238,11 +238,22 @@ fn restore_d3d11_logical_shape(
 /// tighter one instead -- silent misalignment for any GPU
 /// consumer reading at the true (wider) physical pitch.
 ///
-/// `IOSURFACE` is not included: nothing has reported this gap for
-/// it, and unlike `DMABUF` its CPU-mapping was never restricted by
-/// `is_imported` in the first place, so there is no known-broken
-/// case pulling it in yet. The same argument would apply if one
-/// surfaces.
+/// `IOSURFACE` is included for the same reason `DMABUF` is, and with the
+/// same bound. An IOSurface's `bytesPerRow` is a property of the surface
+/// itself -- the same in every process that maps it -- so the producer's
+/// stride is the consumer's, and `IoSurfaceTensor::capacity_bytes` is the
+/// whole surface, so the `stride * rows <= capacity` check below bounds
+/// it the same way. Without it a view of a pitched surface, reopened at
+/// the window's shape, was read at the window's tight row over rows the
+/// surface stores a pitch apart (issue #161; pinned by
+/// `descriptor_import_restores_the_iosurface_pitch_onto_a_view`).
+///
+/// `D3D11_TEXTURE` is deliberately excluded: a texture import has a pitch
+/// of its own -- `from_d3d11_shared_handle` records the one this device's
+/// staging copy reports -- and the producer's is a fact about the
+/// producer's driver, not about the texture as this process sees it.
+/// `PBO` and `CUDA_DEVICE` are excluded because neither import
+/// reconstructs a strided image today.
 fn restore_imported_row_stride(
     t: &mut TensorDyn,
     desc: &TensorDesc,
@@ -251,7 +262,9 @@ fn restore_imported_row_stride(
 ) {
     if !matches!(
         desc.kind,
-        crate::protocol::kind::HOST | crate::protocol::kind::DMABUF
+        crate::protocol::kind::HOST
+            | crate::protocol::kind::DMABUF
+            | crate::protocol::kind::IOSURFACE
     ) {
         return;
     }

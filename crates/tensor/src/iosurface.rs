@@ -1810,4 +1810,67 @@ mod tests {
              wrapper field but not the IOSurface storage (issue #161)"
         );
     }
+
+    /// A descriptor round trip must restore the surface's pitch onto an
+    /// IOSurface view import. Regression test for the second half of issue
+    /// #161's IOSurface fix.
+    ///
+    /// `restore_imported_row_stride` was `HOST | DMABUF` only, on the
+    /// grounds that nothing had reported the gap for IOSurface. A view of a
+    /// pitched surface reports its parent's pitch in `strides[0]`; the import
+    /// reopened the whole surface at the window's shape and, dropping that
+    /// stride, read a 16-texel RGBA window at 64-byte rows over a surface
+    /// whose rows are 256 bytes apart -- every row but the first sheared.
+    /// The merged convert test hid it by calling `set_row_stride` by hand,
+    /// which a real capsule consumer never does.
+    ///
+    /// Unlike D3D11 (whose exclusion stands: a staging pitch is the local
+    /// driver's), an IOSurface's `bytesPerRow` is a property of the shared
+    /// surface, so the producer's stride is the consumer's.
+    #[test]
+    fn descriptor_import_restores_the_iosurface_pitch_onto_a_view() {
+        use crate::{Region, Tensor, TensorDyn, TensorTrait};
+
+        // Width 50 RGBA: a 200-byte natural row, which IOSurface pads to a
+        // 64-aligned 256-byte pitch. The two must differ or this test cannot
+        // tell a restored pitch from a dropped one.
+        let parent = Tensor::<u8>::image(
+            50,
+            8,
+            PixelFormat::Rgba,
+            Some(TensorMemory::DmaBuf),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("alloc a pitched RGBA surface");
+        assert_eq!(parent.memory(), TensorMemory::DmaBuf);
+        let pitch = parent.effective_row_stride().expect("surface pitch");
+        assert_ne!(pitch, 50 * 4, "precondition: the pitch is padded");
+
+        let view = parent.view(Region::new(4, 2, 16, 4)).expect("view");
+        assert_eq!(
+            view.effective_row_stride(),
+            Some(pitch),
+            "a multi-row view carries its parent's pitch"
+        );
+        let desc = TensorDyn::from(view).descriptor_pinned(None);
+        assert_eq!(
+            desc.strides()[0],
+            pitch as i64,
+            "the descriptor reports the pitch in bytes"
+        );
+
+        let rebuilt = TensorDyn::import_descriptor(&desc).expect("import the view's descriptor");
+        assert_eq!(
+            rebuilt.shape(),
+            &[4, 16, 4],
+            "imported at the window's shape"
+        );
+        assert_eq!(
+            rebuilt.effective_row_stride(),
+            Some(pitch),
+            "restore_imported_row_stride dropped the IOSurface pitch: a 16-wide \
+             window over a {pitch}-byte-pitched surface would be read at 64-byte \
+             rows (issue #161)"
+        );
+    }
 }

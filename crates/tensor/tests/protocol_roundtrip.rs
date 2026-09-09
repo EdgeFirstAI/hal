@@ -523,21 +523,22 @@ fn iosurface_roundtrip_sees_the_same_bytes() {
 
     let imported = TensorDyn::import_descriptor(&desc).unwrap();
     assert_eq!(imported.shape(), dyn_t.shape());
-    // The row-stride restoration `import_descriptor` applies for pool-reuse
-    // (`host_import_preserves_the_producers_row_stride_for_pool_reuse`) is
-    // scoped to `kind::HOST` -- applying it to a `Dma`-kind import broke
-    // Linux DMA-BUF's CPU mapping (an imported, non-self-allocated DMA-BUF
-    // is CPU-mappable only while `row_stride` stays `None`; see
-    // `tensor_dyn.rs`'s comment at the `HOST`-only gate). That regression
-    // has no macOS-native coverage since IOSurface tolerates a strided
-    // import either way -- this assertion is the closest a macOS run gets
-    // to guarding the same invariant the Linux-only
-    // `dmabuf_roundtrip_sees_the_same_bytes` test caught it with.
+    // `restore_imported_row_stride` lists the kinds whose pitch is a
+    // property of the shared buffer itself, and since issue #161 an
+    // IOSurface is one of them. This used to assert the opposite, guarding
+    // a Linux DMA-BUF CPU-map restriction that has since been lifted at the
+    // map site (`imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable`
+    // pins that). The stride must now survive the round trip, and the map
+    // below must still alias with it recorded. At 64 RGB texels the pitch
+    // equals the tight row, so this only proves the restore ran; the
+    // padded-pitch case is
+    // `descriptor_import_restores_the_iosurface_pitch_onto_a_view` in the
+    // `iosurface` module.
     assert_eq!(
         imported.row_stride(),
-        None,
-        "a non-HOST (Dma) import must not have row_stride set by the HOST-only \
-         restoration path"
+        Some(desc.strides()[0] as usize),
+        "an IOSurface import must carry the producer's pitch \
+         (restore_imported_row_stride)"
     );
     let m = imported.as_u8().unwrap().map_read().unwrap();
     assert_eq!(

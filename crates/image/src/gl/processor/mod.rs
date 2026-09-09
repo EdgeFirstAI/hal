@@ -5702,13 +5702,21 @@ impl GLProcessorST {
                             "draw_nv_texture_2d upload: {src_fmt:?} is not semi-planar"
                         ))
                     })?;
-                    let offset = src.plane_offset().unwrap_or(0);
                     let needed = tex_width as usize * combined_h;
+                    // `map()` already starts at the source's plane offset for
+                    // every backing that reaches here: `Mem` and each
+                    // platform's DMA variant write it through
+                    // `set_plane_offset`, and an Shm window only ever gets one
+                    // from its own `view()`. So the window is read from its
+                    // own start. Adding `plane_offset` on top of the map, as
+                    // this once did, read an offset frame at twice its offset
+                    // or refused it as too short -- pinned by
+                    // `offset_nv_source_upload.rs`.
                     let map = src.map_read()?;
                     let bytes = map.as_slice();
-                    if offset + needed > bytes.len() {
+                    if needed > bytes.len() {
                         return Err(Error::InvalidShape(format!(
-                            "NV R8 upload: need {needed} bytes at offset {offset} but buffer is {}",
+                            "NV R8 upload: need {needed} bytes but the source maps {}",
                             bytes.len()
                         )));
                     }
@@ -5726,7 +5734,7 @@ impl GLProcessorST {
                         0,
                         edgefirst_gl::gl::RED,
                         edgefirst_gl::gl::UNSIGNED_BYTE,
-                        bytes[offset..].as_ptr() as *const c_void,
+                        bytes.as_ptr() as *const c_void,
                     );
                     check_gl_error(function!(), line!())?;
                     // The texture now holds uploaded pixels, not an EGLImage —

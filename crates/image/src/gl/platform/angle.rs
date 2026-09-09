@@ -360,7 +360,7 @@ impl GlPlatform for AngleClientBuffer {
     ///
     /// Declining sends the engine down the mapped-texture path, whose
     /// readback writes through `map()` at the offset. The same rule as
-    /// `AngleD3d11`, for the same reason, and pinned by case D of
+    /// `AngleD3d11`, for the same reason, and pinned by case E of
     /// `reconstructed_view_convert.rs`, which fails with the tile at the
     /// canvas's origin without this.
     fn dst_import_places<T>(img: &Tensor<T>) -> bool
@@ -595,6 +595,19 @@ impl GlPlatform for AngleClientBuffer {
                 "ANGLE IOSurface import has no multi-plane NV binding — use the R8 path".into(),
             ));
         }
+        // `EGL_ANGLE_iosurface_client_buffer` binds plane 0 from the
+        // surface's origin: the pbuffer is described by width and height
+        // only, with no byte-offset attribute. A *source* whose pixels start
+        // elsewhere -- a `view()`, or a tensor carrying a plane offset --
+        // cannot be attached, and is refused so the engine uploads it through
+        // `map()`, which honours the offset. Without this a fresh `view()`
+        // converted the parent's origin on the zero-copy path, exactly as it
+        // did on Windows before #164. The destination side is handled by
+        // `dst_import_places`. Issue #161's Apple half at the convert
+        // level; pinned by case A of `reconstructed_view_convert.rs`.
+        if !for_dst {
+            super::refuse_offset_source(img, "source", "EGL_ANGLE_iosurface_client_buffer")?;
+        }
         // A destination view()/batch() tile imports its PARENT surface
         // (the per-tile offset is viewport state, mirroring the Linux
         // dst-view collapse in DmaImportAttrs/BufferImportKey).
@@ -630,6 +643,7 @@ impl GlPlatform for AngleClientBuffer {
         img: &Tensor<u8>,
         _fmt: PixelFormat,
     ) -> Result<IoSurfacePbuffer> {
+        super::refuse_offset_source(img, "NV source", "EGL_ANGLE_iosurface_client_buffer")?;
         let surface_ref = img.iosurface_ref().ok_or_else(|| {
             Error::NotSupported("GL convert: NV source is not IOSurface-backed".into())
         })?;
