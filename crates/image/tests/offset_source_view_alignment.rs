@@ -82,7 +82,14 @@ fn gl_or_skip() -> Option<GLProcessorThreaded> {
     }
 }
 
+/// A DMA-BUF image, or a skip. Under `HAL_TEST_REQUIRE_GL=1` a missing or
+/// downgraded DMA-BUF is a FAILURE, not a skip: the boards this file exists
+/// for all have a heap, so a heap that needs privileges (or an allocation that
+/// quietly lands on the heap allocator) would otherwise let the whole file
+/// pass without importing anything -- vacuously green on exactly the path
+/// under test. The GL bring-up above carries the same rule.
 fn dmabuf_image_or_skip(w: usize, h: usize, fmt: PixelFormat) -> Option<TensorDyn> {
+    let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
     match TensorDyn::image(
         w,
         h,
@@ -93,6 +100,11 @@ fn dmabuf_image_or_skip(w: usize, h: usize, fmt: PixelFormat) -> Option<TensorDy
     ) {
         Ok(t) if t.memory() == TensorMemory::DmaBuf => Some(t),
         Ok(t) => {
+            assert!(
+                !require_gl,
+                "HAL_TEST_REQUIRE_GL=1 but the {fmt:?} zero-copy request fell back to {:?}",
+                t.memory()
+            );
             skip(&format!(
                 "{fmt:?}: zero-copy request fell back to {:?}",
                 t.memory()
@@ -100,6 +112,10 @@ fn dmabuf_image_or_skip(w: usize, h: usize, fmt: PixelFormat) -> Option<TensorDy
             None
         }
         Err(e) => {
+            assert!(
+                !require_gl,
+                "HAL_TEST_REQUIRE_GL=1 but no DMA-BUF could be allocated for {fmt:?}: {e}"
+            );
             skip(&format!("{fmt:?}: no DMA-BUF here: {e}"));
             None
         }
@@ -297,6 +313,134 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
         references[0], references[1],
         "precondition: offsets {aligned} and {unaligned} name different windows"
     );
+    assert!(
+        failures.is_empty(),
+        "pitch {pitch}:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A DESTINATION at a plane offset Mali cannot *sample* from. Rendering into an
+/// unaligned base is a different operation from sampling one, and the
+/// destination exemption in `get_or_create_egl_image` claims it is safe, so it
+/// is measured here rather than assumed.
+///
+/// Measured: Mali (i.MX 95) and V3D render into offset 2080 correctly, so Mali
+/// destinations keep the zero-copy import. Vivante does NOT — `eglCreateImage`
+/// returns `EGL_BAD_ACCESS` at 2080 while 2048 renders — which this test found
+/// and `vivante_rejects_dst_import_offset` now lowers to the mapped-texture
+/// path. Both offsets are asserted on every driver, so either half regressing
+/// is caught here.
+///
+/// The destination is rebuilt from a `view()`'s descriptor, which is the only
+/// shape that reaches the import at a nonzero offset: a fresh `view()` collapses
+/// onto its parent's key at offset 0 (`cache.rs`'s `for_dst` arm), while a
+/// rebuilt one carries the offset and no `view_origin`, so on Linux
+/// `dst_import_places` keeps it zero-copy and the import base IS the offset.
+/// Same pattern as `reconstructed_view_convert.rs` case E, at both an aligned
+/// and an unaligned offset.
+#[test]
+fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() {
+    const BLANK: u8 = 0x55;
+    let Some(mut gl) = gl_or_skip() else { return };
+    let Some(canvas) = dmabuf_image_or_skip(W, H, PixelFormat::Rgba) else {
+        return;
+    };
+    let pitch = canvas.effective_row_stride().unwrap_or(W * BPP);
+
+    let mut failures = Vec::new();
+    // (0, 8) is 8 * pitch, aligned whenever the pitch is; (8, 8) adds
+    // 8 * BPP = 32, which is never 64-aligned. Same construction as the source
+    // test, so the two halves are measured at the same two offsets.
+    for (x0, y0) in [(0usize, 8usize), (8, 8)] {
+        let offset = y0 * pitch + x0 * BPP;
+        {
+            let mut m = canvas.map_bytes(CpuAccess::Write).expect("map canvas");
+            m.as_mut_slice().fill(BLANK);
+        }
+        let fresh = canvas
+            .view(Region::new(x0, y0, SIDE, SIDE))
+            .expect("fresh destination view");
+        assert_eq!(
+            fresh.plane_offset(),
+            Some(offset),
+            "precondition: the view's offset is the pitch arithmetic above"
+        );
+        let mut dst = TensorDyn::import_descriptor(&fresh.descriptor_pinned(None))
+            .expect("rebuild the destination view from its descriptor");
+        assert_eq!(
+            dst.effective_row_stride(),
+            Some(pitch),
+            "precondition: the rebuilt destination kept the canvas pitch"
+        );
+        dst.set_plane_offset(offset);
+        assert_eq!(
+            dst.view_origin(),
+            None,
+            "precondition: rebuilt, so no viewport to place it by"
+        );
+
+        // The source carries the tile's ABSOLUTE canvas colours, so a tile that
+        // lands at the wrong origin is wrong in value, not just in place.
+        let src = rgba_dst(SIDE, SIDE);
+        {
+            let mut m = src.map_bytes(CpuAccess::Write).expect("map src");
+            let s = m.as_mut_slice();
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    s[(y * SIDE + x) * BPP..][..BPP].copy_from_slice(&want(x0 + x, y0 + y));
+                }
+            }
+        }
+        if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
+            failures.push(format!("({x0},{y0}) offset {offset}: convert failed: {e}"));
+            continue;
+        }
+        let out = bytes(&canvas);
+        let px = |x: usize, y: usize| &out[y * pitch + x * BPP..][..BPP];
+        if px(0, 0) != [BLANK; BPP] {
+            failures.push(format!(
+                "({x0},{y0}) offset {offset}: the tile landed at the canvas ORIGIN, \
+                 i.e. the import ignored the offset; (0,0)={:?}",
+                px(0, 0)
+            ));
+            continue;
+        }
+        if y0 > 0 && px(x0, y0 - 1) != [BLANK; BPP] {
+            failures.push(format!(
+                "({x0},{y0}) offset {offset}: the row above the window was written: {:?}",
+                px(x0, y0 - 1)
+            ));
+        }
+        if x0 > 0 && px(x0 - 1, y0) != [BLANK; BPP] {
+            failures.push(format!(
+                "({x0},{y0}) offset {offset}: the column left of the window was written: {:?}",
+                px(x0 - 1, y0)
+            ));
+        }
+        let mut wrong = 0usize;
+        let mut first = None;
+        for y in y0..y0 + SIDE {
+            for x in x0..x0 + SIDE {
+                if px(x, y) != want(x, y) {
+                    wrong += 1;
+                    first.get_or_insert((x, y, px(x, y).to_vec(), want(x, y)));
+                }
+            }
+        }
+        if let Some((x, y, got, exp)) = first {
+            let flat = out.chunks(BPP).take(SIDE).all(|p| p == [0, 0, 0, 255]);
+            failures.push(format!(
+                "({x0},{y0}) offset {offset}: {wrong} tile pixels wrong{}; \
+                 ({x},{y}) got={got:?} expected={exp:?}",
+                if flat {
+                    " (ZEROS: the render target sampled/wrote nothing)"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
     assert!(
         failures.is_empty(),
         "pitch {pitch}:\n{}",

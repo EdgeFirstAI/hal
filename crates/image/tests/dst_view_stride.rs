@@ -807,11 +807,12 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
             // destination's padding, and no route promises them: a driver
             // packing rows at `GL_PACK_ROW_LENGTH` may write them (Vivante
             // does, issue #167), and the read-tight-and-spread route leaves
-            // the tight read's leftovers there. What every route promises is
-            // the pixel bytes of every row at the declared pitch, asserted
-            // above, and that nothing lands past `needed` -- the spare row
-            // this test allocates keeps even a written last-row pad inside
-            // the buffer.
+            // the tight read's leftovers there. So this test asserts one
+            // thing, the pixel bytes of every row at the declared pitch,
+            // above. That nothing lands past `needed` is `plan_pbo_readback`'s
+            // invariant, unit-tested there, NOT something asserted here; the
+            // spare row this test allocates is what keeps a written last-row
+            // pad inside the buffer either way.
         }
     }
 }

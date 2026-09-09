@@ -280,22 +280,6 @@ Adding a driver to the parallel set means running it through
 release because it was assumed to behave like the drivers that had been
 measured.
 
-`RendererTraits::mali` is a second GL_RENDERER-derived policy bit,
-independent of `is_vivante`: on i.MX 95 the EGL DMA-BUF import silently
-samples zeros from a source whose `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not
-64-byte aligned — no EGL error, and V3D/Tegra import every offset
-correctly (measured at offsets 32 and 2080 of a 256-byte pitch; #165).
-`mali_rejects_source_offset` declines a *source* import at such an offset
-in both `get_or_create_egl_image` and `get_or_create_nv_r8_egl_image`, and
-the caller uploads the window through `map()` instead; a destination is
-exempt because a view imports its parent at offset 0. Folding the pixel
-remainder into the sampling rectangle to keep the aligned case zero-copy —
-the same fold destinations already do for `import_extent` — is filed as
-#170. A source whose R8 import is refused this way, or by the ANGLE
-leaves' own offset refusal, now uploads the combined plane through the R8
-shader rather than falling to `draw_src_texture`, which has no NV arm and
-previously dropped the convert onto the CPU.
-
 ANGLE over Direct3D 11 (Windows) needs one step more than the Full
 policy. That backend keeps a single `StateManager11` per display and only
 re-syncs a context's GL state onto the shared D3D device from
@@ -312,6 +296,47 @@ from two threads at once (concurrent bring-up crashed with an access
 violation). Every context creation and destruction clears the marker as
 well: a new context on a recycled address would otherwise be mistaken for
 the one that issued the last commands, and skip the re-sync it needs.
+
+`RendererTraits::mali` is a second GL_RENDERER-derived policy bit,
+independent of `is_vivante`: on i.MX 95 the EGL DMA-BUF import silently
+samples zeros from a source whose `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not
+64-byte aligned — no EGL error at all (measured at offsets 32 and 2080 of a
+256-byte pitch, against 64/256/2048 which sample correctly; #165). V3D was
+measured on the same offsets and imports every one correctly; Tegra/Orin is
+unmeasured, having no DMA heap to build a DMA-BUF source on.
+`mali_rejects_import_offset` declines a *source* import at such an offset in
+both `get_or_create_egl_image` and `get_or_create_nv_r8_egl_image`, and the
+caller uploads the window through `map()` instead. Every plane offset the
+import passes to EGL is checked, not only plane 0: a contiguous two-plane
+NV12 import derives plane 1 as `plane0_offset + pitch * height`
+(`nv12_plane1_offset`), which a `from_fd`-adopted buffer's unpadded pitch can
+leave unaligned while plane 0 is fine — chroma alone sampling zeros is a
+colour shift rather than a black frame. The R8 entry point needs plane 0
+only, binding the combined plane as one R8 texture.
+
+Mali **destinations** keep the zero-copy import, and that is measured, not
+assumed: rendering into an unaligned base at the same offsets is correct on
+i.MX 95, so the defect is in sampling and not in the render target. The
+driver that does fail on the destination side is Vivante, and it fails
+loudly — `eglCreateImage` returns `EGL_BAD_ACCESS` for a destination at
+offset 2080 while offset 2048 renders — so
+`vivante_rejects_dst_import_offset` joins `Platform::dst_import_places` in
+the `places` term that `bind_dst`, `convert_via_engine` and the float
+dispatch share. An unaligned Vivante destination therefore lowers to the
+mapped-texture path, whose readback writes through `map()` at the offset,
+instead of letting the EGL error end the convert; the float paths, which
+have no mapped-texture readback to lower to, decline to the CPU converter.
+Only a destination whose import actually starts at the offset is affected: a
+fresh `view()` collapses onto its parent at offset 0, so this is about one
+rebuilt from a descriptor, or a whole tensor at a foreign offset.
+
+Folding the pixel remainder into the sampling rectangle to keep the aligned
+case zero-copy — the source-side counterpart of the viewport band a
+destination view already resolves to — is filed as #170. A source whose R8
+import is refused this way, or by the ANGLE leaves' own offset refusal, now
+uploads the combined plane through the R8 shader rather than falling to
+`draw_src_texture`, which has no NV arm and previously dropped the convert
+onto the CPU.
 
 **Porting checklist (how Windows/ANGLE-D3D11 landed as a leaf, not a
 fork):** implement the trait (`init_display` over a shared ANGLE display

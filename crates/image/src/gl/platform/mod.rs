@@ -141,11 +141,13 @@ where
 /// foreign offset -- attached that way converts the parent's top-left tile
 /// in place of the region it names, silently. Declining sends the source
 /// through `map()`, which starts at the offset: the engine's texture upload
-/// for a packed source into a packed destination, and otherwise
-/// `ImageProcessor::convert`'s CPU fallback -- a planar destination's GL
-/// lowering and the NV import's failure arm (`draw_src_texture` has no NV
-/// case) propagate the refusal instead of uploading, and a forced OpenGL
-/// backend returns it to the caller. Issue #161 at the convert level.
+/// for a packed source into a packed destination, and the R8 upload of the
+/// combined plane for a single-plane NV source, whose import failure arms took
+/// over from `draw_src_texture` (which has no NV case) in #166. What is left
+/// on `ImageProcessor::convert`'s CPU fallback is a planar destination's GL
+/// lowering and a true-multiplane NV12, which cannot be uploaded as one R8
+/// texture; a forced OpenGL backend returns the refusal to the caller.
+/// Issue #161 at the convert level.
 /// Linux's DMA-BUF import expresses the offset itself
 /// (`EGL_DMA_BUF_PLANE0_OFFSET_EXT`) and does not need this.
 ///
