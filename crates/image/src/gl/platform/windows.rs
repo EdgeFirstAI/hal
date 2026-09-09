@@ -851,6 +851,35 @@ where
     }
 }
 
+/// A destination whose bytes start at a plane offset the engine cannot lower
+/// to a viewport: one rebuilt from a descriptor, which carries the offset
+/// but not the `view_origin` a `view()` would have given it. Imported, it
+/// would be rendered at the texture's origin.
+fn unplaced_destination<T>(img: &Tensor<T>) -> Option<usize>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match (img.plane_offset(), img.view_origin()) {
+        (Some(offset), None) if offset != 0 => Some(offset),
+        _ => None,
+    }
+}
+
+fn refuse_unplaced_destination<T>(img: &Tensor<T>) -> Result<()>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match unplaced_destination(img) {
+        None => Ok(()),
+        Some(offset) => Err(Error::NotSupported(format!(
+            "GL convert: destination starts {offset} bytes into its D3D11 texture \
+             with no view origin to place it by, and EGL_ANGLE_image_d3d11_texture \
+             can only bind the whole texture from its origin; rendering to a \
+             texture and reading back through map() instead"
+        ))),
+    }
+}
+
 fn check_dxgi_format<T>(
     layout: &edgefirst_tensor::d3d11_layout::D3d11ImageLayout,
     img: &Tensor<T>,
@@ -974,6 +1003,16 @@ impl GlPlatform for AngleD3d11 {
     ///
     /// A tensor with no texture is not this check's business: the import
     /// functions refuse it by name, with a message about what it is instead.
+    /// `EGL_ANGLE_image_d3d11_texture` binds the whole texture from its
+    /// origin, so a destination that starts elsewhere is placed only when
+    /// it carries a `view_origin` for the viewport.
+    fn dst_import_places<T>(img: &Tensor<T>) -> bool
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        unplaced_destination(img).is_none()
+    }
+
     fn validate_import_identity<T>(img: &Tensor<T>, what: &str) -> Result<()>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
@@ -1002,7 +1041,11 @@ impl GlPlatform for AngleD3d11 {
         // A source whose pixels start elsewhere -- a `view()`, or a tensor
         // carrying a plane offset -- therefore cannot be attached at all, and
         // is refused so the engine uploads it through `map()`, which honours
-        // the offset.
+        // the offset. A destination carrying an offset without the
+        // `view_origin` a `view()` would have given it -- one rebuilt from a
+        // descriptor -- has no viewport to place it either, and is refused
+        // for the same reason (`dst_import_places` keeps the engine from
+        // asking, so this is the second line).
         //
         // There is no bind-flag refusal here: the tensor crate's layout ABI
         // is frozen and carries no bind flags, so this leaf cannot ask
@@ -1012,7 +1055,9 @@ impl GlPlatform for AngleD3d11 {
         // the frame back to the CPU converter -- correct, at the cost of one
         // `eglCreateImage` and one FBO probe per frame. Textures the HAL
         // allocates always carry the flag.
-        if !for_dst {
+        if for_dst {
+            refuse_unplaced_destination(img)?;
+        } else {
             refuse_offset_source(img, "source")?;
         }
         let (texture, layout) = texture_of(img, "source/destination")?;

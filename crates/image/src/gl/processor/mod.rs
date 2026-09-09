@@ -2773,8 +2773,20 @@ impl GLProcessorST {
         dst_fmt: PixelFormat,
         crop: ResolvedCrop,
     ) -> crate::Result<DstTarget> {
+        // A zero-copy destination the platform cannot place -- one carrying a
+        // plane offset with no `view_origin` to lower to a viewport -- takes
+        // the mapped texture path, whose readback writes through `map()` at
+        // the offset.
+        let places = Platform::dst_import_places(dst);
+        if !places {
+            log::debug!(
+                "bind_dst: zero-copy destination at plane offset {} has no view \
+                 origin; rendering to a texture and reading back through map()",
+                dst.plane_offset().unwrap_or(0)
+            );
+        }
         match super::render::lower_dst(
-            self.gl_context.transfer_backend.is_zero_copy(),
+            self.gl_context.transfer_backend.is_zero_copy() && places,
             dst.memory(),
         ) {
             super::render::DstLowering::ZeroCopy => {

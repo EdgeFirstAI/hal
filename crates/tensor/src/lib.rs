@@ -5923,24 +5923,41 @@ where
     /// pitch, so that pitch is recorded as the row stride whenever it exceeds
     /// the new shape's natural stride -- the same adoption `configure_image`
     /// makes. Without it a texture narrowed from 64 to 16 texels wide reports
-    /// a 64-byte stride over rows that are 256 bytes apart.
+    /// a 64-byte stride over rows that are 256 bytes apart. A single-row
+    /// shape records its own tight stride instead, by [`view`](Self::view)'s
+    /// rule: a strided `map()` spans `stride * rows`, and one pitched row
+    /// runs past the backing when the window sits in the last row.
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
         self.storage.set_logical_shape(shape)?;
         // Only a backing with a pitch of its own, and only while the shape
         // still has the rank the format's row is measured on: a caller may
         // flatten an image to one dimension and leave the format behind.
-        if let Some(pitch) = self.storage.backing_row_stride() {
-            let rank = self.format.map(|f| match f.layout() {
-                PixelLayout::Packed | PixelLayout::Planar => 3,
-                PixelLayout::SemiPlanar => 2,
-            });
-            if rank == Some(shape.len()) {
-                if let Some(natural) = self.effective_row_stride() {
-                    if pitch > natural {
-                        self.set_row_stride_unchecked(pitch);
-                    }
-                }
-            }
+        let Some(pitch) = self.storage.backing_row_stride() else {
+            return Ok(());
+        };
+        let Some((rank, rows)) = self.format.map(|f| match f.layout() {
+            PixelLayout::Packed => (3, shape.first().copied()),
+            PixelLayout::Planar => (3, shape.get(1).copied()),
+            PixelLayout::SemiPlanar => (2, shape.first().copied()),
+        }) else {
+            return Ok(());
+        };
+        if rank != shape.len() {
+            return Ok(());
+        }
+        // The natural stride of the new shape, not of the stride recorded for
+        // the old one.
+        let prior = self.row_stride.take();
+        let Some(natural) = self.effective_row_stride() else {
+            self.row_stride = prior;
+            return Ok(());
+        };
+        if rows == Some(1) {
+            self.set_row_stride_unchecked(natural);
+        } else if pitch > natural {
+            self.set_row_stride_unchecked(pitch);
+        } else {
+            self.row_stride = prior;
         }
         Ok(())
     }

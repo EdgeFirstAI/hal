@@ -112,12 +112,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   top-left — a *fresh* `view()` converted the parent's origin on Windows,
   not only a reconstructed one. The Windows leaf now refuses to attach a
   source carrying a plane offset and the engine uploads it through `map()`,
-  which honours the offset. Because a texture tensor's offset is measured in
-  a staging pitch the consumer's driver may not share, `apply_plane_offset`
-  re-expresses it row by row from the descriptor's stride to the local pitch.
-  Pinned by seven `d3d11` tests in `crates/tensor/tests/d3d11_tensor.rs` and
-  the Windows arm of `crates/image/tests/reconstructed_view_convert.rs`, on
-  the Windows CI lanes.
+  which honours the offset. A *destination* rebuilt from a descriptor has the
+  same problem from the other side: it carries the offset but not the
+  `view_origin` a `view()` would have given it, so the engine has no viewport
+  to place it by and the render would land at the texture's origin. The
+  engine now asks the platform whether a zero-copy destination import can
+  place the tensor (`GlPlatform::dst_import_places`), and lowers one it
+  cannot to the mapped texture path, whose readback writes through `map()`
+  at the offset. A single-row window keeps `view()`'s tight row stride when
+  a descriptor narrows it (`Tensor::set_logical_shape`), so it maps in the
+  texture's last row, and the offset is applied as the producer measured it:
+  the consumer opens the same texture on the same adapter, so its staging
+  pitch is the same, and the descriptor's stride is not a pitch to translate
+  it by. Pinned by eight `d3d11` tests in
+  `crates/tensor/tests/d3d11_tensor.rs` and the Windows arm of
+  `crates/image/tests/reconstructed_view_convert.rs`, on the Windows CI
+  lanes.
 
 ### Changed
 

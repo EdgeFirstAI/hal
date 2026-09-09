@@ -218,6 +218,27 @@ pub(super) trait GlPlatform {
         Ok(())
     }
 
+    /// Whether a zero-copy import of `img` as a destination can place the
+    /// render where the tensor's bytes start.
+    ///
+    /// A `view()` destination carries a `view_origin`, and the engine
+    /// imports its parent and lowers the tile to a viewport. A destination
+    /// reconstructed from a descriptor carries only a `plane_offset`: no
+    /// `view_origin` is transported, so the viewport is the surface's origin
+    /// and the import itself has to start at the offset. Linux's DMA-BUF
+    /// import does. A platform whose import always binds the whole buffer
+    /// from its origin returns `false` for such a tensor, and the engine
+    /// lowers it to the mapped texture path, whose readback writes through
+    /// `map()` at the offset.
+    ///
+    /// Default `true`: every import that can express an offset.
+    fn dst_import_places<T>(_img: &Tensor<T>) -> bool
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        true
+    }
+
     /// Import an NV12/NV16/NV24 tensor's combined semi-planar plane as ONE
     /// R8 buffer (luma + interleaved chroma addressed by the shader — the
     /// "Path B" NV sampling strategy). On Linux a single-plane R8 EGLImage

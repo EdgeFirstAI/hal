@@ -179,7 +179,9 @@ fn restore_descriptor_metadata(
 /// narrowing rebuilds a `view()`: its descriptor carries the window's shape,
 /// the import opens the whole texture, and this cuts it down to the window
 /// (`Tensor::set_logical_shape` keeps the texture's pitch as the row stride
-/// while it does). Where the window sits is the plane offset, which the
+/// while it does, or `view()`'s tight stride for a single-row window, so
+/// the window maps in the texture's last row). Where the window sits is the
+/// plane offset, which the
 /// descriptor cannot carry and the capsule restores afterwards. The import
 /// arm has already checked `shape` is one of those three spellings of the
 /// geometry the texture itself reports, so nothing untrusted reaches

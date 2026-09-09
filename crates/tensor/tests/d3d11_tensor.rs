@@ -1082,3 +1082,53 @@ fn d3d11_map_refuses_a_plane_offset_past_the_backing() {
     let m = t.map_bytes(CpuAccess::Read).expect("empty window");
     assert!(m.as_slice().is_empty());
 }
+
+/// A single-row view records a tight row stride (`Tensor::view`) while its
+/// offset is measured in the texture's pitch. The descriptor round trip
+/// keeps the two apart: the window imports at one row with the same tight
+/// stride, and the offset put back is the producer's own, so the rebuilt
+/// window maps the same texels -- including in the texture's last row,
+/// where one pitched row would run past the backing. Dividing the offset by
+/// the descriptor's stride, as a pitch translation once did, named row 32
+/// for a view of row 8.
+#[test]
+fn one_row_d3d11_view_descriptor_maps_the_producers_texels() {
+    let parent = ramped_rgba(64, 64);
+    let pitch = parent.effective_row_stride().expect("parent pitch");
+    for (x, y) in [(8usize, 8usize), (48, 63)] {
+        let view = parent
+            .view(edgefirst_tensor::Region::new(x, y, 16, 1))
+            .expect("one-row view");
+        assert_eq!(
+            view.effective_row_stride(),
+            Some(16 * 4),
+            "a one-row view is tight"
+        );
+        let offset = view.plane_offset().expect("a view carries its offset");
+        assert_eq!(offset, y * pitch + x * 4, "the offset is in the pitch");
+
+        let desc = view.descriptor_pinned(None);
+        let mut rebuilt = TensorDyn::import_descriptor(&desc).expect("a one-row window");
+        assert_eq!(rebuilt.shape(), &[1, 16, 4]);
+        assert_eq!(
+            rebuilt.effective_row_stride(),
+            Some(16 * 4),
+            "a narrowed one-row window keeps view()'s tight stride"
+        );
+        rebuilt.set_plane_offset(offset);
+
+        let expect: Vec<u8> = (offset..offset + 16 * 4)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        let m = rebuilt
+            .map_bytes(CpuAccess::Read)
+            .expect("the window maps, last row included");
+        assert_eq!(
+            m.as_slice(),
+            expect.as_slice(),
+            "rebuilt window at ({x}, {y})"
+        );
+        let v = view.map_bytes(CpuAccess::Read).expect("map the view");
+        assert_eq!(v.as_slice(), expect.as_slice(), "fresh view at ({x}, {y})");
+    }
+}

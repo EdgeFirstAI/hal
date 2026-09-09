@@ -106,11 +106,19 @@ the texture being the unit of import. The ANGLE image binds the whole
 texture from its origin and cannot express an offset, so the GL engine's
 Windows leaf refuses to attach a *source* carrying a plane offset and the
 engine uploads it through `map()` instead — without that refusal even a
-fresh `view()` converted the parent's origin. And a texture tensor measures
-its offset in the row pitch of a staging texture the *local* driver
-chooses, so when the descriptor's stride (the producer's pitch) differs from
-the consumer's, `apply_plane_offset` re-expresses the offset row by row
-before applying it.
+fresh `view()` converted the parent's origin. A *destination* rebuilt from a
+descriptor is the same problem from the other side — it has the offset but
+not the `view_origin` the engine lowers a fresh view's tile to a viewport
+from — so the engine asks the platform whether a zero-copy destination can
+be placed (`GlPlatform::dst_import_places`) and lowers one that cannot to
+the mapped texture path, whose readback writes through `map()` at the
+offset. The offset itself is applied as the producer measured it: a texture
+tensor measures it in the row pitch of its staging texture, and a consumer
+opens the same texture on the same adapter, so its own staging has the same
+pitch. The descriptor's stride is deliberately *not* used to translate it — a
+single-row `view()` records a tight stride for its map span while its offset
+is still in the pitch, so dividing by that stride would name a different
+row.
 
 The other backings are not silently affected: `Mem`/`Shm` report
 `kind::HOST` and take the pinned-pointer path; Android reports

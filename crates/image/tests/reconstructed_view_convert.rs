@@ -298,5 +298,88 @@ fn reconstructed_view_converts_its_own_sub_region_not_the_parents_origin() {
             "a whole image at a one-row offset must start at parent row 1, \
              not row 0 (issue #161)"
         );
+
+        // D -- a one-row view. Its descriptor carries the tight stride
+        // `view()` records for a single row, while its offset is measured in
+        // the texture's pitch; the round trip must not confuse the two.
+        let row = src
+            .view(Region::new(X0, Y0, SIDE, 1))
+            .expect("one-row view");
+        let mut rebuilt_row = TensorDyn::import_descriptor(&row.descriptor_pinned(None))
+            .expect("reconstruct the one-row view from its descriptor");
+        rebuilt_row.set_plane_offset(row.plane_offset().expect("a view carries its offset"));
+        let mut dst_d = TensorDyn::new(&[1, SIDE, BPP], DType::U8, Some(TensorMemory::Mem), None)
+            .expect("dst_d alloc")
+            .with_format(PixelFormat::Rgba)
+            .expect("dst_d format");
+        proc.convert(
+            &rebuilt_row,
+            &mut dst_d,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .expect("convert one-row reconstructed view");
+        let expected_row: Vec<u8> = (X0..X0 + SIDE).flat_map(|x| want(x, Y0)).collect();
+        assert_eq!(
+            read_all(&dst_d),
+            expected_row,
+            "a one-row reconstructed view must read parent row {Y0} from \
+             column {X0} (issue #161)"
+        );
+
+        // E -- the destination side. A destination window rebuilt from a
+        // descriptor has the offset but not the `view_origin` a fresh view()
+        // has, so the engine has no viewport to place it by; the ANGLE
+        // import binds the whole texture from its origin, and before the
+        // engine lowered such a destination to the mapped texture path the
+        // tile landed at the canvas's top-left.
+        const BLANK: u8 = 0x55;
+        let canvas = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )
+        .expect("canvas alloc");
+        {
+            let mut m = canvas.map_bytes(CpuAccess::Write).expect("map canvas");
+            m.as_mut_slice().fill(BLANK);
+        }
+        let fresh_dst = canvas
+            .view(Region::new(X0, Y0, SIDE, SIDE))
+            .expect("fresh destination view");
+        let mut rebuilt_dst = TensorDyn::import_descriptor(&fresh_dst.descriptor_pinned(None))
+            .expect("reconstruct the destination view from its descriptor");
+        rebuilt_dst.set_plane_offset(fresh_dst.plane_offset().expect("a view carries its offset"));
+        proc.convert(
+            &fresh,
+            &mut rebuilt_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .expect("convert into a reconstructed destination view");
+        let out = read_all(&canvas);
+        let px = |x: usize, y: usize| &out[y * pitch + x * BPP..][..BPP];
+        assert_eq!(
+            px(0, 0),
+            &[BLANK; BPP],
+            "a reconstructed destination view wrote the canvas's ORIGIN, i.e. \
+             the plane offset was lost (issue #161)"
+        );
+        assert_eq!(
+            px(X0 - 1, Y0),
+            &[BLANK; BPP],
+            "left of the window untouched"
+        );
+        assert_eq!(px(X0, Y0 - 1), &[BLANK; BPP], "above the window untouched");
+        for y in Y0..Y0 + SIDE {
+            for x in X0..X0 + SIDE {
+                assert_eq!(px(x, y), &want(x, y), "tile pixel ({x}, {y})");
+            }
+        }
     }
 }

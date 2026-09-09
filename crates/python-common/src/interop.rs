@@ -212,10 +212,16 @@ const _: () = {
 ///   the whole texture from its origin and cannot express an offset, the GL
 ///   engine's Windows leaf refuses to attach a source carrying one and
 ///   uploads it through `map()` instead -- without which even a *fresh*
-///   `view()` converted the parent's origin on the GL path. Pinned by the
-///   `d3d11` plane-offset tests in `crates/tensor/tests/d3d11_tensor.rs`
-///   and by `crates/image/tests/reconstructed_view_convert.rs`, which the
-///   Windows CI lanes run (the latter on WARP).
+///   `view()` converted the parent's origin on the GL path. A rebuilt
+///   *destination* has the offset but not the `view_origin` the engine
+///   lowers a fresh view's tile to a viewport from, so the engine asks the
+///   platform whether a zero-copy destination can be placed
+///   (`GlPlatform::dst_import_places`) and lowers one that cannot to the
+///   mapped texture path, whose readback writes through `map()` at the
+///   offset. Pinned by the `d3d11` plane-offset tests in
+///   `crates/tensor/tests/d3d11_tensor.rs` and by
+///   `crates/image/tests/reconstructed_view_convert.rs`, which the Windows
+///   CI lanes run (the latter on WARP).
 /// * **`Mem`/`Shm`** -- never affected. Both report `kind::HOST`, so this
 ///   function skips them and the pinned `desc.ptr` already addresses the
 ///   view.
@@ -252,64 +258,25 @@ const _: () = {
 ///   idempotent rather than a double-apply -- the failure this protocol
 ///   produced once on `MEM` (see the `HOST` arm above).
 ///
-/// **D3D11 measures the offset in a pitch the consumer may not share.** A
-/// texture tensor's `map()` goes through a staging texture whose row pitch
-/// the *local* driver chooses, and `view()` records its offset in that
-/// pitch (`y * pitch + x * bpp`). The descriptor carries the producer's
-/// pitch in `strides`, and the import records the consumer's own; when the
-/// two differ -- a producer on a padding driver handing a texture to a
-/// consumer on a tight one, or the reverse -- the offset is re-expressed
-/// row by row (`repitch_offset`) so it still names the same texel. Every
-/// other kind maps the producer's bytes as they are, so their offset needs
-/// no such translation.
+/// **D3D11 applies the offset verbatim, and the descriptor's stride is not
+/// a pitch to translate it by.** A texture tensor's `map()` goes through a
+/// staging texture whose row pitch the driver chooses, and `view()` measures
+/// its offset in that pitch (`y * pitch + x * bpp`). The consumer opens the
+/// same texture through its NT handle, which only the adapter that created
+/// it can open, so the staging texture it creates for its own `map()` gets
+/// the same pitch from the same driver, and the offset names the same texel
+/// without translation. Translating by `strides[0]` would be wrong in the
+/// one case it looks needed: a single-row `view()` records a *tight* row
+/// stride for its map span (`Tensor::view`), while its offset is still in
+/// the pitch, so dividing that offset by the descriptor's stride yields a
+/// different row. The offset is bounded on the consumer's side instead:
+/// `D3d11TextureTensor`'s pins refuse one past the backing.
 fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u64) {
     if plane_offset == 0 || desc.kind == edgefirst_tensor::tensor_kind::HOST {
         return;
     }
-    let mut offset = plane_offset as usize;
-    if desc.kind == edgefirst_tensor::tensor_kind::D3D11_TEXTURE {
-        let producer = desc
-            .strides()
-            .first()
-            .and_then(|s| usize::try_from(*s).ok())
-            .filter(|s| *s > 0);
-        offset = repitch_offset(offset, producer, tensor.effective_row_stride());
-    }
-    tensor.set_plane_offset(offset);
+    tensor.set_plane_offset(plane_offset as usize);
 }
-
-/// `offset`, a byte offset into rows `from` bytes apart, re-expressed for
-/// rows `to` bytes apart. The row and the byte within it are kept; only the
-/// row length changes. Unchanged when either pitch is unknown or the two
-/// agree, and saturating rather than wrapping when they do not: a wrapped
-/// offset would look small enough to pass a capacity check it should fail.
-const fn repitch_offset(offset: usize, from: Option<usize>, to: Option<usize>) -> usize {
-    match (from, to) {
-        (Some(from), Some(to)) if from != to && from > 0 => {
-            let row = offset / from;
-            let within = offset % from;
-            row.saturating_mul(to).saturating_add(within)
-        }
-        _ => offset,
-    }
-}
-
-/// `repitch_offset`'s contract, checked on every build for the same reason
-/// the capsule layout above is: nothing in this crate runs under
-/// `make test-rust`.
-const _: () = {
-    // Row 8, byte 32 within it: the same texel at a 256-byte and a 512-byte
-    // pitch.
-    assert!(repitch_offset(8 * 256 + 32, Some(256), Some(512)) == 8 * 512 + 32);
-    assert!(repitch_offset(8 * 512 + 32, Some(512), Some(256)) == 8 * 256 + 32);
-    // Agreeing or unknown pitches leave the offset alone.
-    assert!(repitch_offset(2080, Some(256), Some(256)) == 2080);
-    assert!(repitch_offset(2080, None, Some(512)) == 2080);
-    assert!(repitch_offset(2080, Some(256), None) == 2080);
-    assert!(repitch_offset(2080, Some(0), Some(512)) == 2080);
-    // Saturates rather than wrapping.
-    assert!(repitch_offset(usize::MAX, Some(1), Some(2)) == usize::MAX);
-};
 
 /// Payload of the `edgefirst_tensor_v2` capsule -- the cross-package tensor
 /// protocol's wire format.
