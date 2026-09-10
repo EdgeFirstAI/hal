@@ -1485,20 +1485,20 @@ mod tests {
         let gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: concurrent_maps_from_two_independent_handles... - \
+                crate::test_support::report_skip(&format!(
+                    "concurrent_maps_from_two_independent_handles... - \
                      OpenGL not available: {e:?}"
-                );
+                ));
                 return;
             }
         };
         let tensor_a = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: concurrent_maps_from_two_independent_handles... - \
+                crate::test_support::report_skip(&format!(
+                    "concurrent_maps_from_two_independent_handles... - \
                      PBO not supported: {e:?}"
-                );
+                ));
                 return;
             }
         };

@@ -689,6 +689,15 @@ Two details worth knowing:
   because the Vivante driver has an intermittent double-free that otherwise
   masquerades as a regression in whatever you just changed. The workaround
   keys off the hardware, so it applies to any Vivante board.
+- **Feature-gated tests need `FEATURES`.** The script builds the test crates
+  with their default features, so a test behind a cargo feature never runs on
+  a board unless you ask for it. `FEATURES=edgefirst-image/dma_test_formats`
+  reaches the DMA-BUF import suite, which CI's hardware lane builds and this
+  script did not; spell a feature that is not shared by every selected package
+  as `<pkg>/<feature>`, which is what cargo requires with more than one `-p`.
+  It applies to the test build only, not to the C-API leaves. `g2d_test_formats`
+  is imx8mp-only, so enabling it across a mixed set of boards lights up tests
+  the others cannot serve.
 
 ### What a given board can actually exercise
 
@@ -741,6 +750,29 @@ ssh imx95-frdm 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./<b
 
 The `python-*` crates are excluded from cross-builds — PyO3 requires a
 target Python installation.
+
+**Cross-compiling the `dynamic` backend's tests** (`dynamic_primitives`,
+`protocol_roundtrip`, and the rest of `make test-tensor-dynamic`'s
+`DYNAMIC_TEST_TARGETS`) needs one more step: these link against
+`libedgefirst_tensor.so`, cross-built from `crates/tensor-capi`, not the
+plain `edgefirst-tensor` rlib. `crates/tensor/build.rs`'s
+`dynamic-test-link` feature honours `EDGEFIRST_TENSOR_LIB_DIR` when set,
+otherwise it derives the search path from `OUT_DIR` (the
+`target/<target-triple>/<profile>` layout `cargo-zigbuild` itself produces)
+— so cross-building this lane no longer needs a hand-rolled `RUSTFLAGS`:
+
+```bash
+cargo-zigbuild build --target aarch64-unknown-linux-gnu.2.35 \
+  --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
+cargo-zigbuild test --target aarch64-unknown-linux-gnu.2.35 --no-run \
+  -p edgefirst-tensor --no-default-features --features dynamic,dynamic-test-link,ndarray \
+  --test dynamic_primitives
+```
+
+Set `EDGEFIRST_TENSOR_LIB_DIR` to the directory containing
+`libedgefirst_tensor.so` only when the producer build landed somewhere the
+derived path can't find on its own (a different `--target-dir`, or a `.so`
+fetched from elsewhere).
 
 CI automates this flow in
 [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).

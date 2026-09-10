@@ -10,8 +10,11 @@
 //! the import succeeds -- so a 16x16 view at (8, 8) of a 256-byte-pitched RGBA
 //! surface (offset 2080) came back all `[0, 0, 0, 255]` while (0, 8) (offset
 //! 2048) and (16, 0) (offset 64) were fine; V3D converts all of them. The
-//! engine now declines a Mali source import at an unaligned offset so the
-//! upload path, which reads through `map()`, takes it.
+//! engine imports such a source from the 64-byte-aligned base below its
+//! offset, widened by the remainder in pixels, and folds that shift into the
+//! sampling rectangle -- so the view stays zero-copy on Mali (issue #170).
+//! The NV12 case below still declines and uploads: its combined-plane R8
+//! import has no room to widen, its pitch being its width.
 //!
 //! The NV12 case also pins #166: a declined NV source must reach the R8
 //! *upload*, not the CPU converter -- `GLProcessorThreaded` is driven
@@ -152,6 +155,7 @@ fn rgba_source_views_convert_their_own_tile_at_every_origin() {
             }
         }
     }
+    let before = gl.convert_stats().expect("convert stats");
     let mut failures = Vec::new();
     for (x0, y0) in ORIGINS {
         let view = src.view(Region::new(x0, y0, SIDE, SIDE)).expect("view");
@@ -187,6 +191,175 @@ fn rgba_source_views_convert_their_own_tile_at_every_origin() {
     assert!(
         failures.is_empty(),
         "pitch {pitch}:\n{}",
+        failures.join("\n")
+    );
+
+    let after = gl.convert_stats().expect("convert stats");
+    let imports = after.src_imports - before.src_imports;
+    let uploads = after.src_uploads - before.src_uploads;
+    let pbo = after.src_pbo_uploads - before.src_pbo_uploads;
+    // A driver with no DMA-BUF import at all feeds every one of them by
+    // copy and there is no route to assert -- the desktop NVIDIA GPU is
+    // exactly that: it has a DMA heap, so the allocation above is a real
+    // DMA-BUF and the file does not skip, but its EGL has no working
+    // DMA-BUF import. The copy is a `map()` upload on some drivers and a
+    // PBO on others, so both count here; leaving PBO out let a PBO-fed
+    // desktop fall past this guard into the assertions below. The pixels
+    // above are the whole assertion on such a driver.
+    if imports == 0 && (uploads + pbo) as usize == ORIGINS.len() {
+        skip("this GL driver cannot import DMA-BUF at all; the pixels above are the assertion");
+        return;
+    }
+    // Issue #170: an unaligned source is no longer declined into an upload.
+    // It imports from a 64-byte-aligned base widened by the remainder in
+    // pixels, and the engine folds the shift into the sampling rectangle --
+    // so every one of these origins is a zero-copy import on every driver
+    // with a DMA-BUF import, Mali included, where offsets 32 and 2080 used
+    // to take the upload path.
+    //
+    // Asserted alongside the pixels, not instead of them: an engine that
+    // silently uploaded would still produce the right tile and pass the
+    // loop above, which is exactly how #170 could regress unnoticed.
+    assert_eq!(
+        uploads + pbo,
+        0,
+        "{uploads} of {} source views were uploaded and {pbo} went by PBO, \
+         not imported (issue #170: the aligned-base rebase must keep them \
+         zero-copy); imports={imports}",
+        ORIGINS.len()
+    );
+    assert_eq!(
+        imports as usize,
+        ORIGINS.len(),
+        "every origin must be fed by import; uploads={uploads} pbo={pbo}"
+    );
+    assert_eq!(
+        after.zero_copy_declines, before.zero_copy_declines,
+        "no source import may be declined at any of these origins"
+    );
+}
+
+/// A whole RGBA frame at a byte offset inside a bigger DMA-BUF -- the shape a
+/// pool slot or an `interop::apply_plane_offset` window arrives in -- on a
+/// surface whose pitch has no room to widen.
+///
+/// This is the case a Mali decline keyed on the FORMAT gets wrong. 64 RGBA
+/// pixels is a 256-byte row, already 64-byte aligned, so nothing is padded on
+/// and the pitch is tight; folding a 32-byte offset would need the import
+/// widened to 72 pixels (288 bytes), which runs past that pitch, so
+/// `from_tensor` keeps the frame's own unaligned offset and Mali must go on
+/// declining it into the upload. Exempt it because "RGBA is a format the fold
+/// covers" and it imports unaligned and comes back black (issue #170).
+///
+/// The pixels are the assertion that separates the drivers, and they have to
+/// be: nothing here can name the renderer. On Mali a wrongly-exempted import
+/// samples zeros and this fails; on V3D and Vivante the same import is read
+/// correctly and it passes, which is the behaviour those two must keep. The
+/// counters pin the other half -- exactly one source feed per convert, so a
+/// silent CPU fallback cannot pass either.
+#[test]
+fn rgba_offset_frames_convert_at_a_pitch_with_no_room_to_rebase() {
+    let Some(mut gl) = gl_or_skip() else { return };
+    // Three frames' worth of rows so a window can start past the first frame
+    // and still be fully backed, then re-tagged to one frame's geometry at an
+    // offset, which keeps the surface pitch -- as in the NV12 case below.
+    let Some(mut src) = dmabuf_image_or_skip(W, H * 3, PixelFormat::Rgba) else {
+        return;
+    };
+    let pitch = src.effective_row_stride().unwrap_or(W * BPP);
+    assert_eq!(
+        pitch,
+        W * BPP,
+        "precondition: {W} RGBA pixels is {} bytes, already 64-aligned, so the \
+         surface pitch is tight and the rebase has no room to widen into",
+        W * BPP
+    );
+    // A pattern whose period (31) is coprime with both the pitch and 64, so a
+    // window read at the wrong offset cannot coincide with the right one.
+    // Written BEFORE the re-tag, while the map still covers every row.
+    {
+        let mut m = src.map_bytes(CpuAccess::Write).expect("map src");
+        let s = m.as_mut_slice();
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = 112 + (i % 31) as u8;
+        }
+    }
+    src.set_logical_shape(&[H, W, BPP])
+        .expect("one frame's geometry");
+    assert_eq!(src.height(), Some(H), "precondition: one frame is {H} rows");
+    assert_eq!(
+        src.effective_row_stride(),
+        Some(pitch),
+        "precondition: the re-tag kept the surface pitch"
+    );
+
+    let frame = pitch * H;
+    let aligned = frame.next_multiple_of(MALI_ALIGN);
+    let unaligned = aligned + MALI_ALIGN / 2;
+    assert_ne!(
+        unaligned % MALI_ALIGN,
+        0,
+        "precondition: {unaligned} is not aligned"
+    );
+
+    let mut failures = Vec::new();
+    for offset in [aligned, unaligned] {
+        src.set_plane_offset(offset);
+        assert_eq!(
+            src.plane_offset(),
+            Some(offset),
+            "precondition: the offset stuck"
+        );
+        let mut reference = rgba_dst(W, H);
+        CPUProcessor::new()
+            .convert(
+                &src,
+                &mut reference,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .expect("CPU reference");
+        let want = bytes(&reference);
+
+        let before = gl.convert_stats().expect("convert stats");
+        let mut dst = rgba_dst(W, H);
+        let outcome = gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default());
+        let after = gl.convert_stats().expect("convert stats");
+        let imports = after.src_imports - before.src_imports;
+        let uploads = after.src_uploads - before.src_uploads;
+        let pbo = after.src_pbo_uploads - before.src_pbo_uploads;
+
+        match outcome {
+            Err(e) => failures.push(format!("offset {offset}: GL refused the source: {e}")),
+            Ok(()) => {
+                let got = bytes(&dst);
+                if got != want {
+                    let kind = if got.chunks(BPP).all(|p| p == [0, 0, 0, 255]) {
+                        "ZEROS (issue #170: an unrebased offset was imported anyway)"
+                    } else {
+                        "wrong pixels"
+                    };
+                    failures.push(format!(
+                        "offset {offset}: {kind}; first={:?} expected={:?} \
+                         (imports={imports} uploads={uploads} pbo={pbo})",
+                        &got[..BPP],
+                        &want[..BPP]
+                    ));
+                }
+            }
+        }
+        if imports + uploads + pbo != 1 {
+            failures.push(format!(
+                "offset {offset}: the source must be fed exactly once, not \
+                 imports={imports} uploads={uploads} pbo={pbo} -- a silent CPU \
+                 fallback would pass the pixels above"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "pitch {pitch}, aligned {aligned}, unaligned {unaligned}:\n{}",
         failures.join("\n")
     );
 }

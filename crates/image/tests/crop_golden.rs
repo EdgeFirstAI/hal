@@ -39,6 +39,17 @@ use serde::{Deserialize, Serialize};
 const SRC_W: usize = 640;
 const SRC_H: usize = 480;
 
+/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
+/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
+/// it -- see `edgefirst_image`'s (crate-internal) `test_support` module
+/// for the same mechanism in the library's own `#[cfg(test)]` code; this
+/// integration test binary is a separate compilation unit and cannot reach
+/// that `pub(crate)` helper, so it carries a local copy.
+fn report_skip(reason: &str) {
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+}
+
 /// One golden-fixture entry: the case parameters plus the CRC32 of the CPU
 /// backend's converted output bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,10 +176,10 @@ fn generate_cases() -> Vec<Case> {
                 for &(dst_w, dst_h) in &dst_sizes() {
                     let Some(crc32) = run_case(&mut proc_, &src, dst_fmt, crop_rect, dst_w, dst_h)
                     else {
-                        eprintln!(
-                            "crop_golden: skipping rejected case {src_fmt:?} -> {dst_fmt:?} \
+                        report_skip(&format!(
+                            "crop_golden: rejected case {src_fmt:?} -> {dst_fmt:?} \
                              crop={crop_rect:?} dst={dst_w}x{dst_h}"
-                        );
+                        ));
                         continue;
                     };
                     cases.push(Case {
@@ -234,12 +245,12 @@ fn generate_golden() {
 #[test]
 fn cropped_convert_matches_golden() {
     if !cpu_matches_fixture_kernel_path() {
-        eprintln!(
-            "crop_golden: SKIP — this CPU selects a different (equally correct) \
+        report_skip(
+            "crop_golden: this CPU selects a different (equally correct) \
              yuv-crate kernel path than the one the frozen fixtures were \
              generated under; byte comparison is unmatchable by construction. \
              Cropped-convert correctness here is covered by the oracle-based \
-             tests in the edgefirst-image lib suite."
+             tests in the edgefirst-image lib suite.",
         );
         return;
     }

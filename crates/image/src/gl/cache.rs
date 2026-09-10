@@ -126,6 +126,12 @@ pub struct ConvertStats {
 /// foreign/multi-plane byte offset (e.g. an externally-imported buffer whose data
 /// starts past the fd origin); those still key distinctly.
 ///
+/// A source rebased onto an aligned DMA-BUF base (issue #170) is keyed by its
+/// OWN `plane_offset`, not by the base it imports at, which is what keeps two
+/// views sharing one base but differing in remainder from aliasing: their
+/// imports are widened by different amounts. Keying on the base would collapse
+/// them onto one import and sample the wrong region for one of the two.
+///
 /// `width` / `height` / `row_stride` / `format` capture the geometry the
 /// EGLImage was imported with — the **parent's** for a view. A pooled buffer
 /// reused at a different size via `Tensor::configure_image` (e.g. a 128-wide pool
@@ -387,6 +393,28 @@ mod tests {
             row_stride,
             format,
         }
+    }
+
+    /// Two source views whose byte offsets share a 64-byte-aligned base but
+    /// differ in the remainder are DIFFERENT imports after issue #170 -- one
+    /// is widened by 8 texels and the other by 4 -- so their keys must not
+    /// collide. The key holds the tensor's own `plane_offset`, which is
+    /// finer than the base, so this holds by construction; it is asserted
+    /// because a future "key on the import base instead" would silently
+    /// alias two imports and sample one region for the other.
+    #[test]
+    fn source_keys_distinguish_offsets_that_share_an_aligned_base() {
+        let a = key(1, 2048, 16, 16, 256, PixelFormat::Rgba);
+        let b = key(1, 2064, 16, 16, 256, PixelFormat::Rgba);
+        let c = key(1, 2080, 16, 16, 256, PixelFormat::Rgba);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        let mut map: HashMap<BufferImportKey, u32> = HashMap::new();
+        map.insert(a, 1);
+        map.insert(b, 2);
+        map.insert(c, 3);
+        assert_eq!(map.len(), 3, "three remainders, three imports");
     }
 
     /// The two numbers Task 7 (capacity sizing) reads, and the LRU order they

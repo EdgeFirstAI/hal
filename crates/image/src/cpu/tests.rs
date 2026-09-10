@@ -5536,4 +5536,246 @@ mod cpu_tests {
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Super-white luma must never decode to black (the `Fast` kernel wrap)
+    // ---------------------------------------------------------------------
+
+    /// Decode a uniform limited-range BT.601 NV12 frame and return its first
+    /// RGBA pixel. 64x64 so the `yuv` kernels take their vectorized main loop
+    /// rather than only the scalar tail.
+    fn decode_uniform_nv12(y: u8, u: u8, v: u8) -> [u8; 4] {
+        use edgefirst_tensor::{
+            ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, TensorDyn, TensorMapTrait,
+            TensorTrait,
+        };
+        let (w, h) = (64usize, 64usize);
+        let mut src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let bound = src.as_typed::<u8>().unwrap();
+            let stride = bound.effective_row_stride().unwrap();
+            let mut m = bound.map().unwrap();
+            let buf = m.as_mut_slice();
+            for r in 0..h {
+                for c in 0..w {
+                    buf[r * stride + c] = y;
+                }
+            }
+            let uv = stride * h;
+            for r in 0..h / 2 {
+                for c in 0..w / 2 {
+                    buf[uv + r * stride + c * 2] = u;
+                    buf[uv + r * stride + c * 2 + 1] = v;
+                }
+            }
+        }
+        src.set_colorimetry(Some(
+            Colorimetry::default()
+                .with_encoding(ColorEncoding::Bt601)
+                .with_range(ColorRange::Limited),
+        ));
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        CPUProcessor::new()
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+        let bound = dst.as_typed::<u8>().unwrap();
+        let m = bound.map().unwrap();
+        let p = m.as_slice();
+        [p[0], p[1], p[2], p[3]]
+    }
+
+    /// Exact BT.601 limited-range YUV→RGB, unclamped.
+    fn exact_bt601_limited(y: f64, u: f64, v: f64) -> [f64; 3] {
+        let l = 1.164383 * (y - 16.0);
+        [
+            l + 1.596027 * (v - 128.0),
+            l - 0.391762 * (u - 128.0) - 0.812968 * (v - 128.0),
+            l + 2.017232 * (u - 128.0),
+        ]
+    }
+
+    /// Super-white luma (Y above the 235 limited-range white point) must decode
+    /// to a bright pixel, never to its opposite.
+    ///
+    /// The `yuv` crate's `Fast` NV12→RGB kernel accumulates each channel in a
+    /// non-saturating signed 16-bit lane, so `(Y-16)*75 + (Cb-128)*127` wraps
+    /// negative past `i16::MAX` and the final saturating narrow emits 0 — the
+    /// brightest blue in a frame rendered as black. `fast_path_luma` in
+    /// `cpu/convert.rs` caps luma at the white point to keep the accumulator in
+    /// range, which clips super-white instead of inverting it.
+    ///
+    /// Clipping is deliberate and bounded: for a channel that lands back in
+    /// range the result shifts by at most `(255-235) * 255/219 ≈ 23`, hence the
+    /// tolerance below. Channels whose exact value saturates get no slack — the
+    /// bug being pinned turned exactly those into 0.
+    ///
+    /// Platform note: `yuv_mode()` selects the `Fast` kernel only on aarch64
+    /// cores without the ARMv8.1 `rdm` feature (Cortex-A53/A35-class, e.g. the
+    /// i.MX8MP). Everywhere else — x86 desktops, Cortex-A55 and newer — the
+    /// exact kernel runs and this test passes with or without the guard. It is
+    /// red only on the hardware that carries the defect.
+    #[test]
+    fn super_white_luma_never_decodes_to_black() {
+        // Saturated chroma both ways: the first overflows blue, the second is
+        // the in-range-result case that the clamp shifts rather than saves.
+        for (y, u, v) in [(255u8, 255u8, 255u8), (255, 16, 16), (249, 253, 115)] {
+            let got = decode_uniform_nv12(y, u, v);
+            let exact = exact_bt601_limited(y as f64, u as f64, v as f64);
+            for (ch, name) in ["red", "green", "blue"].iter().enumerate() {
+                let want = exact[ch].clamp(0.0, 255.0);
+                let have = got[ch] as f64;
+                if exact[ch] >= 255.0 {
+                    assert!(
+                        have >= 230.0,
+                        "Y={y} U={u} V={v}: {name} saturates to 255 in exact math \
+                         but decoded to {have} (fast-kernel wrap)"
+                    );
+                }
+                assert!(
+                    (have - want).abs() <= 25.0,
+                    "Y={y} U={u} V={v}: {name} decoded {have}, exact {want} \
+                     (delta {:.1} > 25)",
+                    (have - want).abs()
+                );
+            }
+        }
+    }
+
+    /// `fast_path_luma` borrows unless the scanned rows really carry super-white
+    /// luma, and clips the WHOLE plane when they do — the plane's length must
+    /// not change, and a partial clip would leave wrapped pixels behind.
+    ///
+    /// Runs on every platform: it drives the helper directly rather than going
+    /// through the host-dependent kernel choice.
+    #[test]
+    fn fast_path_luma_borrows_unless_it_must_clip() {
+        use crate::cpu::convert::{fast_path_luma, FAST_PATH_MAX_LUMA};
+        use std::borrow::Cow;
+        let fast = yuv::YuvConversionMode::Fast;
+        let lim = yuv::YuvRange::Limited;
+
+        // In-range frame: borrowed, byte-identical.
+        let ok = vec![FAST_PATH_MAX_LUMA; 8192];
+        assert!(matches!(
+            fast_path_luma(&ok, 0..ok.len(), lim, fast),
+            Cow::Borrowed(_)
+        ));
+
+        // Super-white: clipped to the white point, everything else untouched.
+        // Longer than one scan chunk so the chunked reduction is exercised, and
+        // the hot byte sits in the second chunk so an early exit would miss it.
+        let mut hot = vec![100u8; 8192];
+        hot[5000] = 255;
+        hot[5001] = 236;
+        let got = fast_path_luma(&hot, 0..hot.len(), lim, fast);
+        assert!(matches!(got, Cow::Owned(_)));
+        assert_eq!(got.len(), hot.len(), "the plane length must not change");
+        assert_eq!(got[5000], FAST_PATH_MAX_LUMA);
+        assert_eq!(got[5001], FAST_PATH_MAX_LUMA);
+        assert_eq!(got[4999], 100);
+
+        // Super-white outside the scanned rows must not force a copy: a cropped
+        // decode never reads those bytes.
+        assert!(matches!(
+            fast_path_luma(&hot, 0..4096, lim, fast),
+            Cow::Borrowed(_)
+        ));
+        // But a hit inside the scanned rows still clips the WHOLE plane, so no
+        // wrapped byte survives anywhere the crate might chunk over.
+        let clipped = fast_path_luma(&hot, 4096..8192, lim, fast);
+        assert!(matches!(clipped, Cow::Owned(_)));
+        assert_eq!(clipped.len(), hot.len());
+        assert_eq!(clipped[5000], FAST_PATH_MAX_LUMA);
+
+        // Full range never overflows the kernel, so it is left alone.
+        assert!(matches!(
+            fast_path_luma(&hot, 0..hot.len(), yuv::YuvRange::Full, fast),
+            Cow::Borrowed(_)
+        ));
+        // Neither does the exact kernel.
+        assert!(matches!(
+            fast_path_luma(&hot, 0..hot.len(), lim, yuv::YuvConversionMode::Balanced),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// [`FAST_PATH_MAX_LUMA`] must sit below the luma at which the `yuv` crate's
+    /// `Fast` kernel wraps — pinned against the kernel itself, not against our
+    /// arithmetic about it.
+    ///
+    /// This drives `yuv_nv12_to_rgba` directly with an explicit
+    /// `YuvConversionMode::Fast`, so it does not depend on what `yuv_mode()`
+    /// would pick for the host: it is red on x86 and on every CI runner, not
+    /// only on the non-`rdm` cores that select `Fast` in production. The aarch64
+    /// NEON and x86 SSE fast rows share the overflow.
+    ///
+    /// Two halves, and both matter. An unclamped super-white plane must actually
+    /// wrap — otherwise the guard is guarding nothing and this test says so. The
+    /// same plane clamped to [`FAST_PATH_MAX_LUMA`] must decode bright. If a
+    /// future `yuv` widens the accumulator the first half fails, which is the
+    /// signal to re-measure and consider dropping the guard.
+    #[test]
+    fn fast_path_max_luma_is_below_the_kernel_wrap_point() {
+        use crate::cpu::convert::FAST_PATH_MAX_LUMA;
+        const W: usize = 64;
+        const H: usize = 64;
+
+        // Uniform Y with saturated chroma: Cb = Cr = 255 drives blue hardest.
+        let decode = |luma: u8| -> [u8; 4] {
+            let y = vec![luma; W * H];
+            let uv = vec![255u8; W * (H / 2)];
+            let img = yuv::YuvBiPlanarImage {
+                y_plane: &y,
+                y_stride: W as u32,
+                uv_plane: &uv,
+                uv_stride: W as u32,
+                width: W as u32,
+                height: H as u32,
+            };
+            let mut out = vec![0u8; W * H * 4];
+            yuv::yuv_nv12_to_rgba(
+                &img,
+                &mut out,
+                (W * 4) as u32,
+                yuv::YuvRange::Limited,
+                yuv::YuvStandardMatrix::Bt601,
+                yuv::YuvConversionMode::Fast,
+            )
+            .unwrap();
+            [out[0], out[1], out[2], out[3]]
+        };
+
+        // Exact math puts blue far past 255 at Y=255, Cb=255, so anything dark
+        // is the accumulator wrapping.
+        let unguarded = decode(255);
+        assert!(
+            unguarded[2] < 64,
+            "the `Fast` kernel no longer wraps super-white luma (blue {} at Y=255, Cb=255). The guard may be removable, but re-measure before changing FAST_PATH_MAX_LUMA.",
+            unguarded[2]
+        );
+
+        // Clamped to the constant the guard applies, the same pixel is bright.
+        let guarded = decode(FAST_PATH_MAX_LUMA);
+        assert!(
+            guarded[2] >= 230,
+            "clamping luma to {FAST_PATH_MAX_LUMA} still decodes blue {}: the constant is at or above the kernel's wrap point",
+            guarded[2]
+        );
+    }
 }

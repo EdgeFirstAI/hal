@@ -1907,15 +1907,15 @@ mod g2d_tests {
     ///   (b) G2D output matches CPU reference within ±4 on RGB channels.
     ///       (Alpha is hardware-defined and excluded from the comparison.)
     ///
-    /// If on-target validation shows the G2D hardware has wider tolerance for
-    /// odd widths, the tolerance may be relaxed to ±6 with a justification
-    /// comment — but only after observing an actual on-target failure, not
-    /// preemptively.
+    /// On-target validation has since run: the G2D-vs-CPU residual on an
+    /// i.MX8MP is 23–24 across widths 63–81, so the ±4 tolerance only warns and
+    /// the `max_diff <= 35` assertion is what actually fails. Do not relax
+    /// either without a new measurement on the board.
     #[test]
     #[cfg(target_os = "linux")]
     fn d01_nv12_odd_w_g2d_vs_cpu() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: d01_nv12_odd_w_g2d_vs_cpu - DMA not available");
+            crate::test_support::report_skip("d01_nv12_odd_w_g2d_vs_cpu - DMA not available");
             return;
         }
         let (w, h) = (65usize, 64usize);
@@ -1974,7 +1974,9 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}");
+                crate::test_support::report_skip(&format!(
+                    "d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}"
+                ));
                 return;
             }
         };
@@ -1995,12 +1997,23 @@ mod g2d_tests {
         let tol = 4u32;
         let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
         eprintln!("D-01 NV12 odd-W G2D vs CPU: max_diff={max_diff}");
-        // Post-WS1 both CPU and G2D resolve this untagged odd-W NV12 source to
+        // Both CPU and G2D resolve this untagged odd-W NV12 source to
         // limited-range BT.601 (G2D is limited-range matrix-only), so the
-        // YUV-matrix delta that previously forced the loose >64 bound has
-        // closed; the residual is G2D fixed-point rounding. Warn above the tight
-        // ±tol, fail on >35 (was 64) so a real geometry/stride regression — the
-        // odd-W stride handling this test guards — still trips.
+        // YUV-matrix delta that once forced the loose >64 bound has closed. What
+        // remains is G2D's own fixed-point rounding; its exact mechanism has not
+        // been characterised, only its magnitude, measured below.
+        //
+        // Measured on an i.MX8MP (the only G2D board): max_diff 23 at 63×64,
+        // 64×64, 65×64 and 65×63, and 24 at 80×64 and 81×64. The >35 bound has
+        // ~11 of headroom over that and still trips a real geometry/stride
+        // regression — the odd-W stride handling this test guards.
+        //
+        // History: this bound was tightened 64 → 35 without a hardware run (the
+        // imx8mp lane had stopped executing), and the first run that reached it
+        // read 255. That was NOT G2D: the pattern's `% 256` ramps synthesise
+        // super-white luma, which the CPU reference's fast kernel wrapped to
+        // black. See `fast_path_luma` in `cpu/convert.rs`. The full-range
+        // pattern is deliberate — it is what caught that bug — so keep it.
         if max_diff > tol {
             eprintln!(
                 "WARNING: D-01 NV12 odd-W G2D vs CPU max_diff={max_diff} > {tol} \
@@ -2028,7 +2041,7 @@ mod g2d_tests {
     #[cfg(target_os = "linux")]
     fn d03_nv12_odd_both_g2d_vs_cpu() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: d03_nv12_odd_both_g2d_vs_cpu - DMA not available");
+            crate::test_support::report_skip("d03_nv12_odd_both_g2d_vs_cpu - DMA not available");
             return;
         }
         let (w, h) = (65usize, 63usize);
@@ -2087,7 +2100,9 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}");
+                crate::test_support::report_skip(&format!(
+                    "d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}"
+                ));
                 return;
             }
         };
@@ -2108,9 +2123,10 @@ mod g2d_tests {
         let tol = 4u32;
         let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
         eprintln!("D-03 NV12 odd-both G2D vs CPU: max_diff={max_diff}");
-        // Post-WS1 the YUV-matrix delta has closed — see test_d01 above. Warn
-        // above ±tol on G2D fixed-point rounding, fail only on a gross >35
-        // geometry/stride regression (was 64).
+        // The YUV-matrix delta has closed — see d01 above for the measured
+        // per-width figures behind the >35 bound, and for why this pattern's
+        // super-white luma must stay. Warn above ±tol on G2D fixed-point
+        // rounding, fail only on a gross >35 geometry/stride regression.
         if max_diff > tol {
             eprintln!(
                 "WARNING: D-03 NV12 odd-both G2D vs CPU max_diff={max_diff} > {tol} \
