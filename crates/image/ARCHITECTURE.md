@@ -326,9 +326,22 @@ dispatch share. An unaligned Vivante destination therefore lowers to the
 mapped-texture path, whose readback writes through `map()` at the offset,
 instead of letting the EGL error end the convert; the float paths, which
 have no mapped-texture readback to lower to, decline to the CPU converter.
-Only a destination whose import actually starts at the offset is affected: a
-fresh `view()` collapses onto its parent at offset 0, so this is about one
-rebuilt from a descriptor, or a whole tensor at a foreign offset.
+
+Each site must ask the rule about the offset **its own** import bases at,
+and the two destination routes differ. `bind_dst` imports through
+`Platform::import_buffer(.., for_dst = true)`, which collapses a fresh
+`view()`/`batch()` onto its parent at offset 0 and places the tile by
+viewport, so that site asks `view_collapsed_dst_base` and a tile view is
+never gated however unaligned its own bytes are.
+`convert_via_engine`'s packed-RGB plan and the zero-copy float paths import
+through `import_buffer_packed`, which passes `plane_offset()` straight to
+EGL with no collapse, so those sites ask the raw offset and a view
+destination there IS gated. Asking the collapsed base everywhere would
+under-fire on the packed routes; asking the raw offset everywhere over-fires
+on `bind_dst`, and that is not merely a lost fast path — the mapped-texture
+readback returns wrong pixels for a view destination on Vivante, so the
+over-fire silently corrupted unaligned tile views until
+`a_fresh_unaligned_view_destination_keeps_the_zero_copy_import` caught it.
 
 Folding the pixel remainder into the sampling rectangle to keep the aligned
 case zero-copy — the source-side counterpart of the viewport band a

@@ -1316,32 +1316,43 @@ fn mali_rejects_import_offset(is_mali: bool, plane_offset: usize) -> bool {
 /// `map()` at the offset, instead of letting the EGL error end the convert.
 ///
 /// Takes the offset the import will actually start at, which is what
-/// [`dst_import_base`] computes — NOT the tensor's `plane_offset`, which for a
-/// fresh `view()` is its own byte offset while the import bases at 0.
+/// Takes the offset the import being guarded actually bases at, which differs
+/// by route: [`view_collapsed_dst_base`] for `bind_dst`'s import, the raw
+/// `plane_offset()` for the `import_buffer_packed` ones.
 fn vivante_rejects_dst_import_offset(is_vivante: bool, plane_offset: usize) -> bool {
     is_vivante && unaligned_import_offset(plane_offset)
 }
 
-/// The byte offset a DESTINATION import will actually base at.
+/// The byte offset a destination import bases at **on the route that collapses
+/// a view to its parent** — `bind_dst`'s `get_or_create_egl_image(Dst)`.
 ///
-/// A fresh `view()`/`batch()` destination imports its PARENT and places the
-/// tile with `glViewport`, so its import bases at 0 however far into the buffer
-/// its own bytes start — `DmaImportAttrs::from_tensor` with `for_dst = true`
-/// (`dma_import.rs` ~`:202`) and `BufferImportKey::from_tensor` (`cache.rs`
-/// ~`:167`) both collapse to 0 whenever `view_origin` is `Some`. Only a
-/// destination WITHOUT a `view_origin` — one rebuilt from a descriptor, or a
-/// whole tensor at a foreign offset — is imported at its own offset.
+/// The engine has two zero-copy destination import routes and they treat a
+/// `view()` differently, so a driver rule about the base offset has to know
+/// which one it guards:
 ///
-/// So a driver rule about the import's base offset must be asked of this, not
-/// of `plane_offset()`. Asking `plane_offset()` made
-/// [`vivante_rejects_dst_import_offset`] fire on every tile view whose byte
-/// offset happened to be unaligned (RGBA `x0` not a multiple of 16, say), which
-/// silently cost Vivante the zero-copy destination path for a case its driver
-/// handles perfectly — the import never saw that offset.
+/// * **`bind_dst` → `get_or_create_egl_image(CacheKind::Dst)` →
+///   `Platform::import_buffer(.., for_dst = true)`.** A fresh `view()`/`batch()`
+///   destination imports its PARENT and places the tile with `glViewport`, so
+///   the import bases at 0 however far into the buffer the view's own bytes
+///   start: `DmaImportAttrs::from_tensor` (`dma_import.rs` ~`:202`) and
+///   `BufferImportKey::from_tensor` (`cache.rs` ~`:167`) both collapse to 0
+///   whenever `view_origin` is `Some`. **This function.**
+/// * **`convert_via_engine`'s packed-RGB plan and the zero-copy float paths →
+///   `get_or_create_egl_image_rgb` → `Platform::import_buffer_packed`.** That
+///   one passes `plane_offset()` straight to `EGL_DMA_BUF_PLANE0_OFFSET_EXT`
+///   with no `view_origin` collapse (`platform/linux.rs` ~`:199`), so a
+///   destination there IS imported at its own offset. Those sites pass the raw
+///   `plane_offset()` and must NOT use this function.
+///
+/// Getting the first case wrong is not merely a lost fast path: asking
+/// `plane_offset()` there made [`vivante_rejects_dst_import_offset`] fire on
+/// every tile view whose byte offset happened to be unaligned (an RGBA `x0` of
+/// 8 is 32 bytes), and the mapped-texture readback it lowered to returns wrong
+/// pixels for a view destination on that driver.
 ///
 /// Pure, and takes the two field values rather than a tensor, so it serves both
 /// `Tensor<u8>` and `TensorDyn` call sites and is unit-testable without either.
-fn dst_import_base(
+fn view_collapsed_dst_base(
     view_origin: Option<edgefirst_tensor::ViewOrigin>,
     plane_offset: Option<usize>,
 ) -> usize {
@@ -2107,9 +2118,16 @@ impl GLProcessorST {
                 // mapped-texture readback for a float DMA destination to lower
                 // to, so this declines to the CPU converter rather than letting
                 // `EGL_BAD_ACCESS` escape.
+                // The RAW `plane_offset`, not the view-collapsed base: these
+                // four float paths import through `import_buffer_packed`,
+                // which passes `plane_offset()` straight to
+                // `EGL_DMA_BUF_PLANE0_OFFSET_EXT` with no `view_origin`
+                // collapse (`platform/linux.rs` ~`:199`). Only `bind_dst`'s
+                // `get_or_create_egl_image(Dst)` route collapses a view to 0 —
+                // see `view_collapsed_dst_base`.
                 && !vivante_rejects_dst_import_offset(
                     self.is_vivante,
-                    dst_import_base(dst.view_origin(), dst.plane_offset()),
+                    dst.plane_offset().unwrap_or(0),
                 );
                 if !places {
                     return Err(Error::NotSupported(format!(
@@ -2322,8 +2340,13 @@ impl GLProcessorST {
         // take `DstLowering::ZeroCopy` here and render at the buffer's
         // origin.
         // Vivante's driver-side half of the same question: an unaligned
-        // destination offset fails `eglCreateImage` (see `bind_dst`).
-        let dst_offset = dst_import_base(dst.view_origin(), dst.plane_offset());
+        // destination offset fails `eglCreateImage` (see `bind_dst`). The RAW
+        // `plane_offset` here, not the view-collapsed base: this plan imports
+        // through `import_buffer_packed`, which passes `plane_offset()` straight
+        // to EGL with no `view_origin` collapse (`platform/linux.rs` ~`:199`),
+        // so a view destination on this route really is imported at its own
+        // offset. See `view_collapsed_dst_base` for the route that differs.
+        let dst_offset = dst.plane_offset().unwrap_or(0);
         let places = Platform::dst_import_places(dst)
             && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
         if !places {
@@ -2968,7 +2991,7 @@ impl GLProcessorST {
         // and without this the EGL error ended the convert instead of lowering
         // it (measured on i.MX 8M Plus: offset 2048 renders, 2080 is
         // `EGL_BAD_ACCESS`).
-        let dst_offset = dst_import_base(dst.view_origin(), dst.plane_offset());
+        let dst_offset = view_collapsed_dst_base(dst.view_origin(), dst.plane_offset());
         let places = Platform::dst_import_places(dst)
             && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
         if !places {
@@ -4394,22 +4417,20 @@ impl GLProcessorST {
                         // Warn once per buffer — a steady-state video pipeline
                         // hits this every frame with the same buffers, and a
                         // per-frame warn floods the log. Repeats drop to debug.
+                        // `log`, not `tracing`: the workspace installs no
+                        // `tracing-log` bridge, so a `tracing::warn!` reaches no
+                        // ordinary board or field log at all -- and this is the
+                        // line that diagnoses #165 on a Mali box. The sibling
+                        // arm below already uses `log`. Same warn-once shape.
                         if self.nv_import_warned.insert(src.buffer_identity().id()) {
-                            tracing::warn!(
-                                src_fmt = ?src_fmt,
-                                src_w,
-                                src_h,
-                                error = %e,
+                            log::warn!(
                                 "Path B R8 EGLImage creation failed for {src_fmt} \
-                                 ({src_w}x{src_h}); uploading the combined plane instead"
+                                 ({src_w}x{src_h}); uploading the combined plane instead: {e}"
                             );
                         } else {
-                            tracing::debug!(
-                                src_fmt = ?src_fmt,
-                                src_w,
-                                src_h,
-                                error = %e,
-                                "Path B R8 EGLImage creation failed (repeat)"
+                            log::debug!(
+                                "Path B R8 EGLImage creation failed for {src_fmt} \
+                                 ({src_w}x{src_h}) (repeat): {e}"
                             );
                         }
                         // The same shader on an R8 *upload* of the combined
@@ -8355,12 +8376,17 @@ mod tests {
     }
 
     // The offset a destination import actually bases at, which is what the
-    // Vivante rule must be asked of. A fresh view() bases at 0 however far into
-    // the buffer its own bytes start, so asking `plane_offset()` instead made
-    // the rule fire on tile views the driver handles perfectly.
+    // Vivante rule must be asked of -- and which of the two routes is being
+    // guarded. `bind_dst`'s import collapses a fresh view() to 0 however far
+    // into the buffer its own bytes start, so asking `plane_offset()` there
+    // made the rule fire on tile views the driver handles perfectly. The
+    // `import_buffer_packed` routes do NOT collapse, so they must keep asking
+    // the raw offset; both shapes are asserted here.
     #[test]
     fn a_view_destination_imports_at_base_zero_and_escapes_the_offset_rule() {
-        use super::{dst_import_base as base, vivante_rejects_dst_import_offset as dst_rejects};
+        use super::{
+            view_collapsed_dst_base as base, vivante_rejects_dst_import_offset as dst_rejects,
+        };
         use edgefirst_tensor::ViewOrigin;
 
         // A fresh view: `view_origin` is Some, so the import bases at 0 -- even
@@ -8394,6 +8420,25 @@ mod tests {
 
         // Nothing here touches a non-Vivante driver.
         assert!(!dst_rejects(false, base(None, Some(2080))));
+
+        // THE OTHER ROUTE. `import_buffer_packed` passes `plane_offset()`
+        // straight to EGL with no collapse, so `convert_via_engine`'s packed
+        // plan and the float paths ask the RAW offset -- and a view destination
+        // there really is imported at its own offset, so the rule must fire on
+        // it. Collapsing at those sites would under-fire and hand Vivante the
+        // `EGL_BAD_ACCESS` this rule exists to avoid.
+        let raw = |plane_offset: Option<usize>| plane_offset.unwrap_or(0);
+        assert_eq!(raw(Some(2080)), 2080);
+        assert!(
+            dst_rejects(true, raw(Some(2080))),
+            "a view destination on the packed route imports at its own offset, \
+             so the rule must still fire there"
+        );
+        assert!(!dst_rejects(true, raw(Some(2048))));
+        assert!(!dst_rejects(true, raw(None)));
+        // The two routes genuinely disagree for the same tensor: that is the
+        // whole reason the helper is route-specific.
+        assert_ne!(base(vo, Some(2080)), raw(Some(2080)));
     }
 
     // The chroma-plane offset a contiguous NV12 import hands EGL, and whether

@@ -180,7 +180,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an NV12/16/24 source was declined — the ANGLE leaves' offset refusal, or
   the Mali rule above — the engine fell to `draw_src_texture`, which has no
   NV arm, so the convert left the GPU entirely. Both NV import-failure arms
-  now upload the combined plane through the same R8 shader. (#166)
+  now upload the combined plane through the same R8 shader. On i.MX 8M Plus
+  this is what a single-plane NV12 source at an unaligned plane offset now
+  takes: Vivante's `Auto` policy sends it to the external sampler, whose EGL
+  refuses the offset, and the convert stays on the GPU through the R8 shader
+  on an upload instead of dropping to the CPU. Vivante also refuses a
+  *destination* import at an unaligned offset outright, with
+  `EGL(BadAccess)`, which used to fail the convert; the engine now lowers
+  such a destination to the mapped-texture path, whose readback writes
+  through `map()` at the offset. (#166)
 - **A test asserted padding no readback promises.**
   `gl_padded_pbo_dst_rows_land_at_the_declared_stride` required the bytes
   between pitched rows to stay untouched; Vivante writes them while packing
