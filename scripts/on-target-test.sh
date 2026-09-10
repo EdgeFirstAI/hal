@@ -311,6 +311,25 @@ for i in "${!OK_HOSTS[@]}"; do
     echo "    syncing testdata"
     rsync -az --delete --info=none "${ROOT}/testdata/" "${target}:${REMOTE_DIR}/testdata/" || {
       echo "SKIP: testdata sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue; }
+
+    # Per-crate testdata (e.g. `crates/decoder/testdata/infer/`) merges into
+    # the SAME remote testdata/ tree above, not a separate location: every
+    # `EDGEFIRST_TESTDATA_DIR`-aware fixture loader resolves relative to one
+    # deploy root (see e.g. `infer.rs`'s `infer_fixture_dir()`), so a second
+    # root here would just be a place fixtures are never looked for. No
+    # `--delete`: each crate contributes a disjoint subtree of the merged
+    # tree, so a stale file left by a DIFFERENT crate's sync must not be
+    # pruned by this one.
+    crate_testdata_sync_failed=0
+    for crate_testdata in "${ROOT}"/crates/*/testdata; do
+      [[ -d "${crate_testdata}" ]] || continue
+      echo "    syncing $(basename "$(dirname "${crate_testdata}")")'s testdata"
+      rsync -az --info=none "${crate_testdata}/" "${target}:${REMOTE_DIR}/testdata/" || {
+        crate_testdata_sync_failed=1; break; }
+    done
+    if [[ "${crate_testdata_sync_failed}" == "1" ]]; then
+      echo "SKIP: per-crate testdata sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue
+    fi
   fi
 
   # Deploy the five C-API libraries + their `.so.0` symlinks + the G3

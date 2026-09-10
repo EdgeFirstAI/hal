@@ -1047,6 +1047,26 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
 mod tests {
     use super::*;
 
+    /// Root of the `testdata/infer` fixture directory.
+    ///
+    /// `EDGEFIRST_TESTDATA_DIR` wins when set -- `scripts/on-target-test.sh`
+    /// and CI both mirror `crates/decoder/testdata/infer` into
+    /// `$EDGEFIRST_TESTDATA_DIR/infer` (see `on-target-test.sh`'s testdata
+    /// sync and `.github/workflows/test.yml`'s "Upload testdata as
+    /// artifact" step). The manifest-relative fallback is baked in at
+    /// **compile** time, so a cross-compiled binary carries the build
+    /// host's absolute path and can never find fixtures on a different
+    /// target -- same reasoning as `decoder_from_edgefirst_json.rs`'s
+    /// `testdata_root()`.
+    fn infer_fixture_dir() -> std::path::PathBuf {
+        std::env::var("EDGEFIRST_TESTDATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata")
+            })
+            .join("infer")
+    }
+
     #[test]
     fn parse_names_python_dict_repr() {
         let s = "{0: 'person', 1: 'bicycle', 2: \"fire hydrant\"}";
@@ -1152,12 +1172,9 @@ mod tests {
     /// regardless of whether the source was ONNX (flat props) or TFLite
     /// (single `metadata.json` envelope entry).
     fn load_fixture_metadata(name: &str) -> BTreeMap<String, String> {
-        let path = format!(
-            "{}/testdata/infer/{name}.signals.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = infer_fixture_dir().join(format!("{name}.signals.json"));
         let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
+            .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
         let json: serde_json::Value =
             serde_json::from_str(&content).expect("fixture is valid JSON");
         json["metadata"]
@@ -1199,12 +1216,9 @@ mod tests {
     /// inference runtime would report it: tensor names/shapes/dtypes plus
     /// the raw metadata map.
     fn signals_from_fixture(name: &str) -> ModelSignals {
-        let path = format!(
-            "{}/testdata/infer/{name}.signals.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = infer_fixture_dir().join(format!("{name}.signals.json"));
         let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
+            .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
         let json: serde_json::Value =
             serde_json::from_str(&content).expect("fixture is valid JSON");
 
@@ -2162,9 +2176,9 @@ mod tests {
         // Without this, a fixture can be added (or renamed) and silently
         // never asserted on -- which is exactly how `yolo11n-seg` and
         // `yolov8n-seg_int8` ended up with no field-level coverage.
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/infer");
-        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
-            .expect("testdata/infer exists")
+        let dir = infer_fixture_dir();
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{} exists: {e}", dir.display()))
             .filter_map(|e| {
                 let name = e.ok()?.file_name().into_string().ok()?;
                 name.strip_suffix(".signals.json").map(str::to_string)

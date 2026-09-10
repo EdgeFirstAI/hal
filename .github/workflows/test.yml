@@ -93,6 +93,27 @@ jobs:
       - name: Checkout LFS objects
         run: git lfs checkout
 
+      - name: Merge per-crate testdata into the shared testdata/ tree
+        run: |
+          # Every `crates/<name>/testdata/` (currently only
+          # `crates/decoder/testdata/infer/`) merges into the top-level
+          # `testdata/` tree uploaded below, so every job that downloads the
+          # `testdata-lfs` artifact -- rather than doing its own full LFS
+          # checkout -- gets crate-local fixtures too, at the same relative
+          # path `EDGEFIRST_TESTDATA_DIR`-aware fixture loaders resolve
+          # against (see e.g. `infer.rs`'s `infer_fixture_dir()`, and
+          # `scripts/on-target-test.sh`'s testdata sync, which merges the
+          # same way). A second `path:` entry on the upload step below would
+          # do this too, but `upload-artifact` strips only the paths' least
+          # common ancestor, which for `testdata/` and
+          # `crates/decoder/testdata/` is the repo root -- every job that
+          # downloads this artifact expecting a bare `testdata/` layout
+          # would break.
+          for dir in crates/*/testdata; do
+            [ -d "${dir}" ] || continue
+            cp -a "${dir}/." testdata/
+          done
+
       - name: Upload testdata as artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
