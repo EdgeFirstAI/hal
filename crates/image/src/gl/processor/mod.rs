@@ -1315,12 +1315,41 @@ fn mali_rejects_import_offset(is_mali: bool, plane_offset: usize) -> bool {
 /// destination lowers to the mapped-texture path, whose readback writes through
 /// `map()` at the offset, instead of letting the EGL error end the convert.
 ///
-/// Only the offset the import actually starts at matters, so a fresh `view()`
-/// destination (which collapses onto its parent at offset 0) is unaffected;
-/// this is about a destination rebuilt from a descriptor, or a whole tensor at
-/// a foreign offset.
+/// Takes the offset the import will actually start at, which is what
+/// [`dst_import_base`] computes — NOT the tensor's `plane_offset`, which for a
+/// fresh `view()` is its own byte offset while the import bases at 0.
 fn vivante_rejects_dst_import_offset(is_vivante: bool, plane_offset: usize) -> bool {
     is_vivante && unaligned_import_offset(plane_offset)
+}
+
+/// The byte offset a DESTINATION import will actually base at.
+///
+/// A fresh `view()`/`batch()` destination imports its PARENT and places the
+/// tile with `glViewport`, so its import bases at 0 however far into the buffer
+/// its own bytes start — `DmaImportAttrs::from_tensor` with `for_dst = true`
+/// (`dma_import.rs` ~`:202`) and `BufferImportKey::from_tensor` (`cache.rs`
+/// ~`:167`) both collapse to 0 whenever `view_origin` is `Some`. Only a
+/// destination WITHOUT a `view_origin` — one rebuilt from a descriptor, or a
+/// whole tensor at a foreign offset — is imported at its own offset.
+///
+/// So a driver rule about the import's base offset must be asked of this, not
+/// of `plane_offset()`. Asking `plane_offset()` made
+/// [`vivante_rejects_dst_import_offset`] fire on every tile view whose byte
+/// offset happened to be unaligned (RGBA `x0` not a multiple of 16, say), which
+/// silently cost Vivante the zero-copy destination path for a case its driver
+/// handles perfectly — the import never saw that offset.
+///
+/// Pure, and takes the two field values rather than a tensor, so it serves both
+/// `Tensor<u8>` and `TensorDyn` call sites and is unit-testable without either.
+fn dst_import_base(
+    view_origin: Option<edgefirst_tensor::ViewOrigin>,
+    plane_offset: Option<usize>,
+) -> usize {
+    if view_origin.is_some() {
+        0
+    } else {
+        plane_offset.unwrap_or(0)
+    }
 }
 
 /// The plane-1 (interleaved CbCr) byte offset a *contiguous* NV12 import hands
@@ -2080,7 +2109,7 @@ impl GLProcessorST {
                 // `EGL_BAD_ACCESS` escape.
                 && !vivante_rejects_dst_import_offset(
                     self.is_vivante,
-                    dst.plane_offset().unwrap_or(0),
+                    dst_import_base(dst.view_origin(), dst.plane_offset()),
                 );
                 if !places {
                     return Err(Error::NotSupported(format!(
@@ -2294,12 +2323,12 @@ impl GLProcessorST {
         // origin.
         // Vivante's driver-side half of the same question: an unaligned
         // destination offset fails `eglCreateImage` (see `bind_dst`).
-        let dst_offset = dst.plane_offset().unwrap_or(0);
+        let dst_offset = dst_import_base(dst.view_origin(), dst.plane_offset());
         let places = Platform::dst_import_places(dst)
             && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
         if !places {
             log::debug!(
-                "convert_via_engine: zero-copy destination at plane offset \
+                "convert_via_engine: zero-copy destination importing at base offset \
                  {dst_offset} cannot be placed by this platform/driver; rendering \
                  to a texture and reading back through map()"
             );
@@ -2939,14 +2968,14 @@ impl GLProcessorST {
         // and without this the EGL error ended the convert instead of lowering
         // it (measured on i.MX 8M Plus: offset 2048 renders, 2080 is
         // `EGL_BAD_ACCESS`).
-        let dst_offset = dst.plane_offset().unwrap_or(0);
+        let dst_offset = dst_import_base(dst.view_origin(), dst.plane_offset());
         let places = Platform::dst_import_places(dst)
             && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
         if !places {
             log::debug!(
-                "bind_dst: zero-copy destination at plane offset {dst_offset} cannot be \
-                 placed by this platform/driver; rendering to a texture and reading \
-                 back through map()"
+                "bind_dst: zero-copy destination importing at base offset {dst_offset} \
+                 cannot be placed by this platform/driver; rendering to a texture and \
+                 reading back through map()"
             );
         }
         match super::render::lower_dst(
@@ -4552,10 +4581,12 @@ impl GLProcessorST {
             // replacing the old CPU fallback. Multiplane NV12 (separate Y/UV
             // buffers) cannot be uploaded as one R8 texture → CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
-            self.last_nv_convert_path = NvConvertPath::ShaderR8;
             self.convert_stats.src_uploads += 1;
             tracing::Span::current().record("src_feed", "upload");
-            self.draw_nv_texture_2d(
+            // Recorded from the draw's result, like the four DMA arms above: a
+            // failed upload records Cpu rather than leaving a ShaderR8 claim or
+            // the previous convert's value.
+            match self.draw_nv_texture_2d(
                 src,
                 src_fmt,
                 None,
@@ -4564,7 +4595,13 @@ impl GLProcessorST {
                 rotation_offset,
                 flip,
                 is_int8,
-            )?;
+            ) {
+                Ok(()) => self.last_nv_convert_path = NvConvertPath::ShaderR8,
+                Err(e) => {
+                    self.last_nv_convert_path = NvConvertPath::Cpu;
+                    return Err(e);
+                }
+            }
         } else {
             // Non-DMA source, non-NV (or multiplane NV): CPU texture-upload path.
             if matches!(
@@ -8315,6 +8352,48 @@ mod tests {
             mali_rejects_import_offset(true, 2080),
             "the Mali rule is the source rule, and 2080 is in it"
         );
+    }
+
+    // The offset a destination import actually bases at, which is what the
+    // Vivante rule must be asked of. A fresh view() bases at 0 however far into
+    // the buffer its own bytes start, so asking `plane_offset()` instead made
+    // the rule fire on tile views the driver handles perfectly.
+    #[test]
+    fn a_view_destination_imports_at_base_zero_and_escapes_the_offset_rule() {
+        use super::{dst_import_base as base, vivante_rejects_dst_import_offset as dst_rejects};
+        use edgefirst_tensor::ViewOrigin;
+
+        // A fresh view: `view_origin` is Some, so the import bases at 0 -- even
+        // at an unaligned byte offset like an RGBA x0 of 8 (2080 here).
+        let vo = Some(ViewOrigin {
+            parent_width: 64,
+            parent_height: 64,
+            parent_row_stride: 256,
+            x: 8,
+            y: 8,
+        });
+        assert_eq!(base(vo, Some(2080)), 0);
+        assert!(
+            !dst_rejects(true, base(vo, Some(2080))),
+            "a fresh view destination must KEEP zero-copy on Vivante"
+        );
+        // Still 0 at an aligned offset, and 0 even if the offset is absent.
+        assert_eq!(base(vo, Some(2048)), 0);
+        assert_eq!(base(vo, None), 0);
+
+        // No view_origin -- rebuilt from a descriptor, or a whole tensor at a
+        // foreign offset. Now the import really does base at the offset, and
+        // the rule applies.
+        assert_eq!(base(None, Some(2080)), 2080);
+        assert!(dst_rejects(true, base(None, Some(2080))));
+        assert_eq!(base(None, Some(2048)), 2048);
+        assert!(!dst_rejects(true, base(None, Some(2048))));
+        // A whole tensor with no offset at all is base 0.
+        assert_eq!(base(None, None), 0);
+        assert!(!dst_rejects(true, base(None, None)));
+
+        // Nothing here touches a non-Vivante driver.
+        assert!(!dst_rejects(false, base(None, Some(2080))));
     }
 
     // The chroma-plane offset a contiguous NV12 import hands EGL, and whether
