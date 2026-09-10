@@ -1315,9 +1315,8 @@ fn mali_rejects_import_offset(is_mali: bool, plane_offset: usize) -> bool {
 /// destination lowers to the mapped-texture path, whose readback writes through
 /// `map()` at the offset, instead of letting the EGL error end the convert.
 ///
-/// Takes the offset the import will actually start at, which is what
 /// Takes the offset the import being guarded actually bases at, which differs
-/// by route: [`view_collapsed_dst_base`] for `bind_dst`'s import, the raw
+/// by route: [`view_collapsed_dst_base`] for `bind_dst`'s import, and the raw
 /// `plane_offset()` for the `import_buffer_packed` ones.
 fn vivante_rejects_dst_import_offset(is_vivante: bool, plane_offset: usize) -> bool {
     is_vivante && unaligned_import_offset(plane_offset)
