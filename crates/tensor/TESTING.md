@@ -170,6 +170,29 @@ To exercise just the CUDA tests by name:
 cargo test -p edgefirst-tensor cuda -- --test-threads=1
 ```
 
+### Windows D3D11 CUDA interop tests
+
+`crates/tensor/tests/d3d11_tensor.rs` (Windows-only, `feature = "static"`)
+has three tests exercising CUDA's external-memory import of a D3D11 texture
+tensor (`cuda_map_matches_the_cpu_map_and_map_mut_writes_back`,
+`cuda_map_covers_a_texture_whose_allocation_the_driver_padded`,
+`cuda_map_reads_the_nv12_combined_plane`). Each self-skips on the WARP
+adapter (`cudaD3D11GetDevice` has no ordinal for it — that skip is correct by
+design), and then when `edgefirst_tensor::is_cuda_available()` is false. The
+order matters: the WARP skip is a property of the adapter that no runtime can
+satisfy, so checking it first keeps it a skip even under the gate below.
+
+`crates/tensor/tests/support/cuda_require.rs` is the guard, mirroring
+`crates/image/src/gl/cuda_policy.rs`: under `HAL_TEST_REQUIRE_CUDA=1` (set by
+`scripts/test-windows.ps1 -RequireCuda`, which also arms it from NVIDIA host
+detection unless WARP is the selected adapter) a "no CUDA runtime" skip fails
+instead of passing, naming the test and the reason. Its pure decision core,
+`decide`, is covered platform-generically — so on this box and every CI lane,
+not just Windows — by `crates/tensor/tests/cuda_require_policy.rs`, which is
+not Windows-gated and which `#[path]`-includes this same support module rather
+than copying it, so the tests pin the function `d3d11_tensor.rs` actually
+calls.
+
 ### On-target validation
 
 On-target tests require a CUDA-capable device with `libcudart.so` present.
