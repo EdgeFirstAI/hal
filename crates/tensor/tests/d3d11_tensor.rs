@@ -11,6 +11,31 @@ use edgefirst_tensor::{
 };
 use std::os::windows::io::AsRawHandle;
 
+#[path = "support/cuda_require.rs"]
+mod cuda_require;
+
+/// The WARP exclusion for the three CUDA interop tests, printing
+/// `SKIP {what}: ...` and returning `true` when the caller must return early.
+///
+/// `cudaD3D11GetDevice` has no ordinal for the WARP adapter, so no amount of
+/// working CUDA runtime can give a WARP device a CUDA import: the skip is a
+/// property of the adapter, not a missing precondition, and it is deliberately
+/// checked *before* `cuda_require::cuda_available_or_skip`. Ordered the other
+/// way, a WARP run with `HAL_TEST_REQUIRE_CUDA=1` (which
+/// `scripts/test-windows.ps1` can arm from host detection alone) would panic
+/// on the absent runtime before reaching this skip, contradicting the
+/// documented promise that the WARP path is unaffected by the gate.
+///
+/// A failure to create the device at all is not treated as WARP: that host has
+/// no D3D11 at all, and the CUDA gate below is the one that should speak.
+fn warp_has_no_cuda_device(what: &str) -> bool {
+    let warp = edgefirst_tensor::d3d11::device().is_ok_and(|d| d.is_warp());
+    if warp {
+        eprintln!("SKIP {what}: WARP adapter has no CUDA device");
+    }
+    warp
+}
+
 #[test]
 fn image_with_dmabuf_on_windows_is_a_texture_tensor() {
     if !edgefirst_tensor::is_gpu_buffer_available() {
@@ -431,17 +456,14 @@ fn copy_rows(dst: &mut [u8], src: &[u8], row_bytes: usize, dst_stride: usize) {
 /// into the texture when the guard drops.
 #[test]
 fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
-    if !edgefirst_tensor::is_cuda_available() {
-        eprintln!("SKIP: no CUDA runtime");
+    if warp_has_no_cuda_device("cuda_map_matches_the_cpu_map_and_map_mut_writes_back") {
+        return;
+    }
+    if !cuda_require::cuda_available_or_skip("cuda_map_matches_the_cpu_map_and_map_mut_writes_back")
+    {
         return;
     }
     let device = edgefirst_tensor::d3d11::device().unwrap();
-    if device.is_warp() {
-        // `cudaD3D11GetDevice` has no ordinal for the WARP adapter, so the
-        // import fails and the tensor is CUDA-less by design.
-        eprintln!("SKIP: WARP adapter has no CUDA device");
-        return;
-    }
     let t = Tensor::<u8>::image(
         256,
         128,
@@ -509,12 +531,12 @@ fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
 /// 256x128 is one it accepts, so only this test covers the fallback).
 #[test]
 fn cuda_map_covers_a_texture_whose_allocation_the_driver_padded() {
-    if !edgefirst_tensor::is_cuda_available() {
-        eprintln!("SKIP: no CUDA runtime");
+    if warp_has_no_cuda_device("cuda_map_covers_a_texture_whose_allocation_the_driver_padded") {
         return;
     }
-    if edgefirst_tensor::d3d11::device().unwrap().is_warp() {
-        eprintln!("SKIP: WARP adapter has no CUDA device");
+    if !cuda_require::cuda_available_or_skip(
+        "cuda_map_covers_a_texture_whose_allocation_the_driver_padded",
+    ) {
         return;
     }
     let (w, h) = (640usize, 480usize);
@@ -556,12 +578,10 @@ fn cuda_map_covers_a_texture_whose_allocation_the_driver_padded() {
 /// laid out identically and the whole plane round-trips byte for byte.
 #[test]
 fn cuda_map_reads_the_nv12_combined_plane() {
-    if !edgefirst_tensor::is_cuda_available() {
-        eprintln!("SKIP: no CUDA runtime");
+    if warp_has_no_cuda_device("cuda_map_reads_the_nv12_combined_plane") {
         return;
     }
-    if edgefirst_tensor::d3d11::device().unwrap().is_warp() {
-        eprintln!("SKIP: WARP adapter has no CUDA device");
+    if !cuda_require::cuda_available_or_skip("cuda_map_reads_the_nv12_combined_plane") {
         return;
     }
     let (w, h) = (640usize, 480usize);

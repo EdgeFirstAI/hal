@@ -114,7 +114,11 @@ opt-in every skip inside those tests — no runtime, no GL, no F32 render
 support, a destination that didn't land on a PBO, `cuda_map()` returning
 `None` — is a failure instead of a pass. `crates/image/src/gl/cuda_policy.rs`
 is the shared guard; a developer machine without CUDA still sees ordinary
-skips, since the opt-in is unset there.
+skips, since the opt-in is unset there. The Windows counterpart is
+`crates/tensor/tests/d3d11_tensor.rs`'s three D3D11 CUDA interop tests,
+gated the same way under `HAL_TEST_REQUIRE_CUDA=1` via
+`scripts/test-windows.ps1 -RequireCuda` — see
+[`crates/tensor/TESTING.md § Windows D3D11 CUDA interop tests`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md#windows-d3d11-cuda-interop-tests).
 
 The `test_opengl_*` integration tests in `src/lib.rs` (resize, grey,
 src/dst crop, the rotation × flip × backing matrix, 10-thread bring-up,

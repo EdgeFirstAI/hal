@@ -237,6 +237,7 @@ Git Bash's `/usr/bin/link.exe` shadows it):
 pwsh scripts/test-windows.ps1 -RequireGl                       # real GPU: all crates, -j 1
 pwsh scripts/test-windows.ps1 -RequireGl -p edgefirst-image    # image crate only
 pwsh scripts/test-windows.ps1 -Warp -RequireGl -p edgefirst-image   # no GPU: D3D11 WARP
+pwsh scripts/test-windows.ps1 -RequireGl -RequireCuda -p edgefirst-tensor   # real GPU + CUDA
 ```
 
 The script defaults `EDGEFIRST_ANGLE_PATH` to the fetched directory, `-Warp`
@@ -244,6 +245,28 @@ sets `EDGEFIRST_ANGLE_ADAPTER=warp` + `EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and
 `-RequireGl` sets `HAL_TEST_REQUIRE_GL=1`; everything after the switches is
 passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
 serialization policy.
+
+`-RequireCuda` sets `HAL_TEST_REQUIRE_CUDA=1`, turning a silent
+`SKIP: no CUDA runtime` in `crates/tensor/tests/d3d11_tensor.rs`'s three
+D3D11 CUDA interop tests into a failure naming the test and the reason. The
+WARP-adapter skip is unaffected — it is correct by design, and those tests
+check the adapter *before* the gate so an armed gate cannot convert it into a
+failure.
+
+The script arms the gate without the switch when the host looks like an NVIDIA
+box (`nvidia-smi` on PATH and exiting zero, or `CUDA_PATH` set), printing
+"NVIDIA driver or toolkit present: requiring CUDA coverage". Read that for what
+it is: evidence about the *host*, not about the adapter the D3D11 device is
+created on. That adapter comes from `EDGEFIRST_D3D11_ADAPTER` (or the
+`EDGEFIRST_ANGLE_ADAPTER` alias), and unset means DXGI adapter 0, which on a
+hybrid laptop can be the integrated GPU. Auto-detection is therefore suppressed
+when WARP is the selected adapter — via `-Warp` or either variable inherited
+from the shell — which prints "WARP adapter selected: not auto-requiring CUDA
+coverage". On a hybrid box whose adapter 0 is not the NVIDIA one, either name
+the NVIDIA adapter (`EDGEFIRST_D3D11_ADAPTER=discrete`, or a description
+substring such as `RTX 3070`) or pass `-NoRequireCuda`. `-RequireCuda` passed
+explicitly, and an inherited `HAL_TEST_REQUIRE_CUDA=1`, arm the gate whatever
+the adapter; `-NoRequireCuda` disarms it whatever the environment.
 
 One variable picks the adapter for both the device and ANGLE's display, since
 ANGLE builds its display on the HAL's device: `EDGEFIRST_D3D11_ADAPTER` is the
@@ -322,6 +345,16 @@ somewhere the suite never looks.
 `HAL_TEST_REQUIRE_GL=1`, and then requires a GPU-backed destination. The
 Windows `edgefirst-image` wheel bundles ANGLE when built with
 `EDGEFIRST_ANGLE_PATH` set, so an installed wheel needs no env var.
+
+Export `EDGEFIRST_ANGLE_PATH` for the `maturin build` step itself, the way
+`scripts/test-windows.ps1` sets it for the cargo runs — `crates/python-image/build.rs`
+reads it at build time and ships the wheel CPU-only when it is unset. A wheel
+built without it fails seven of the gpu-marked tests with
+`create_image() yielded TensorMemory.MEM on Windows with HAL_TEST_REQUIRE_GL=1`,
+since nothing in the wheel supplies ANGLE and the runtime fallback has no
+`EDGEFIRST_ANGLE_PATH` to fall back to. The build says which it did: look for
+the `bundling ANGLE (libEGL.dll, libGLESv2.dll)` cargo warning, or check the
+installed package for `edgefirst/image/libEGL.dll`.
 
 One asymmetry to know when writing a test: after a Python `convert`,
 `convert_deferred` or `convert_with_fence`, the destination's
@@ -1173,7 +1206,7 @@ Tests run across multiple runner types:
 | Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | Paravirtual Metal GPU (ANGLE; Full GL serialization policy) |
 | Build & Link (iOS) | `macos-latest` | arm64 | No runtime tests — build + link closure only |
 | Build & Link (Android) | `ubuntu-22.04` | x86_64 host | No runtime tests — see Device Farm section below |
-| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating) and image-crate GL tests on ANGLE Direct3D 11 WARP (software; best-effort), both under cargo-llvm-cov into one LCOV (`coverage-windows` → SonarCloud); C-API leaf tests and gpu pytest on WARP (best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl` |
+| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating) and image-crate GL tests on ANGLE Direct3D 11 WARP (software; best-effort), both under cargo-llvm-cov into one LCOV (`coverage-windows` → SonarCloud); C-API leaf tests and gpu pytest on WARP (best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl -RequireCuda` |
 | Software-GL Coverage (llvmpipe) | `ubuntu-22.04-xlarge` | x86_64 | Mesa llvmpipe (software GL) |
 | Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
 | Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |
