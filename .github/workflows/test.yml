@@ -1949,6 +1949,31 @@ jobs:
             fi
           }
 
+          run_unfiltered() {
+            # Same as run_filtered but without a substring filter: used for
+            # the crates/image/tests/*.rs integration binaries below, which
+            # are each a single dedicated whole-binary GL test rather than a
+            # multi-category lib test binary split by g2d/opengl/dma filter.
+            local test_bin="$1" label="$2"
+            local test_name
+            test_name=$(basename "$test_bin")
+            echo "=== Running $test_name ($label) ==="
+            EXIT_CODE=0
+            local logfile="build/rust-test-results/${test_name}-${label// /-}.txt"
+            "$test_bin" --test-threads=1 2>&1 | tee "$logfile" || EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+              # Check if all tests actually passed but process crashed on
+              # exit (Vivante GPU driver SIGABRT during library unload)
+              if grep -q 'test result: ok' "$logfile" && \
+                 ! grep -q 'FAILED' "$logfile"; then
+                echo "::warning::$test_name ($label) exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
+              else
+                echo "FAILED: $test_name ($label)"
+                TEST_FAILED=1
+              fi
+            fi
+          }
+
           for test_bin in hardware-test-binaries-stripped/*; do
             [[ -x "$test_bin" && -f "$test_bin" ]] || continue
             [[ "$test_bin" == *.so ]] && continue
@@ -1962,7 +1987,30 @@ jobs:
             elif [[ "$test_name" == edgefirst_tensor-* ]]; then
               # DMA-heap tensor tests only
               run_filtered "$test_bin" dma "DMA tests"
+            elif [[ "$test_name" == dst_view_stride-* || "$test_name" == offset_nv_source_upload-* || \
+                    "$test_name" == offset_source_view_alignment-* || "$test_name" == gl_concurrent_stress-* || \
+                    "$test_name" == reconstructed_view_convert-* || "$test_name" == reconstructed_view_draw-* || \
+                    "$test_name" == reconstructed_planar_dst-* || "$test_name" == pin_convert-* || \
+                    "$test_name" == crop_golden-* || "$test_name" == mask_golden-* || "$test_name" == odd_dim_cpu-* ]]; then
+              # crates/image/tests/*.rs GL integration binaries: whole-binary
+              # GPU/EGL tests, run unfiltered (no g2d/opengl/dma split).
+              run_unfiltered "$test_bin" "GL integration test"
             else
+              # CPU-only, covered by aarch64 runner: edgefirst-image benches
+              # (image_benchmark, pipeline_benchmark, nv_path_benchmark,
+              # mask_benchmark, parallel_processors_benchmark,
+              # mask_decode_benchmark, sanity_check, decode_pipeline_benchmark,
+              # nvjpeg_benchmark, convert_matrix_benchmark,
+              # cpu_preprocess_benchmark, batch_convert_benchmark,
+              # tiled_convert_benchmark, opencv_benchmark), and any decoder/
+              # tracker/capi binaries that end up in this artifact.
+              #
+              # NOTE: crates/tensor/tests/*.rs integration binaries also land
+              # here (d3d11_tensor, dynamic_primitives, identity,
+              # logical_shape, map_access, no_global_state, pin, protocol,
+              # protocol_roundtrip, scenarios, vocabulary). This is scoped
+              # out of the current fix -- see the task report for whether
+              # any of these need DMA-heap routing like edgefirst_tensor-*.
               echo "=== Skipping $test_name (CPU-only, covered by aarch64 runner) ==="
             fi
           done
