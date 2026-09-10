@@ -709,6 +709,29 @@ ssh imx95-frdm 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./<b
 The `python-*` crates are excluded from cross-builds — PyO3 requires a
 target Python installation.
 
+**Cross-compiling the `dynamic` backend's tests** (`dynamic_primitives`,
+`protocol_roundtrip`, and the rest of `make test-tensor-dynamic`'s
+`DYNAMIC_TEST_TARGETS`) needs one more step: these link against
+`libedgefirst_tensor.so`, cross-built from `crates/tensor-capi`, not the
+plain `edgefirst-tensor` rlib. `crates/tensor/build.rs`'s
+`dynamic-test-link` feature honours `EDGEFIRST_TENSOR_LIB_DIR` when set,
+otherwise it derives the search path from `OUT_DIR` (the
+`target/<target-triple>/<profile>` layout `cargo-zigbuild` itself produces)
+— so cross-building this lane no longer needs a hand-rolled `RUSTFLAGS`:
+
+```bash
+cargo-zigbuild build --target aarch64-unknown-linux-gnu.2.35 \
+  --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
+cargo-zigbuild test --target aarch64-unknown-linux-gnu.2.35 --no-run \
+  -p edgefirst-tensor --no-default-features --features dynamic,dynamic-test-link,ndarray \
+  --test dynamic_primitives
+```
+
+Set `EDGEFIRST_TENSOR_LIB_DIR` to the directory containing
+`libedgefirst_tensor.so` only when the producer build landed somewhere the
+derived path can't find on its own (a different `--target-dir`, or a `.so`
+fetched from elsewhere).
+
 CI automates this flow in
 [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).
 Binaries are stripped on the build host (split debuginfo preserved for
