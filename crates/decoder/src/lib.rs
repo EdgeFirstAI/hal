@@ -85,6 +85,8 @@ pub use infer::{
 
 mod decoder;
 pub use decoder::*;
+#[cfg(test)]
+mod test_support;
 
 // The detection vocabulary lives in edgefirst-tensor so edgefirst-image can
 // render from it without depending on this crate. Re-exported here so the

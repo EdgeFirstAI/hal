@@ -15,21 +15,35 @@ use edgefirst_decoder::schema::{DType, SchemaV2};
 use edgefirst_decoder::DecoderBuilder;
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 
-/// Loads a captured Task-0 fixture into `ModelSignals`, exactly as the
-/// inference runtime would report it: tensor names/shapes/dtypes plus the
-/// raw metadata map.
+/// Root of the `testdata/infer` fixture directory.
+///
+/// `EDGEFIRST_TESTDATA_DIR` wins when set -- `scripts/on-target-test.sh`
+/// and CI both mirror `crates/decoder/testdata/infer` into
+/// `$EDGEFIRST_TESTDATA_DIR/infer` (see `on-target-test.sh`'s testdata sync
+/// and `.github/workflows/test.yml`'s "Upload testdata as artifact" step).
+/// The manifest-relative fallback is baked in at **compile** time, so a
+/// cross-compiled binary carries the build host's absolute path and can
+/// never find fixtures on a different target -- same reasoning as
+/// `decoder_from_edgefirst_json.rs`'s `testdata_root()`.
 ///
 /// Copied from `infer.rs`'s unit-test module rather than shared: this is a
 /// separate integration-test crate, and reusing a `#[cfg(test)]`-only
 /// helper across crates would force a public (non-test) API just for test
 /// convenience.
+fn infer_fixture_dir() -> std::path::PathBuf {
+    std::env::var("EDGEFIRST_TESTDATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata"))
+        .join("infer")
+}
+
+/// Loads a captured Task-0 fixture into `ModelSignals`, exactly as the
+/// inference runtime would report it: tensor names/shapes/dtypes plus the
+/// raw metadata map.
 fn signals_from_fixture(name: &str) -> ModelSignals {
-    let path = format!(
-        "{}/testdata/infer/{name}.signals.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = infer_fixture_dir().join(format!("{name}.signals.json"));
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
+        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
     let json: serde_json::Value = serde_json::from_str(&content).expect("fixture is valid JSON");
 
     let source = match json["source"]

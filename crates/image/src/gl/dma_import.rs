@@ -15,6 +15,7 @@ use std::os::unix::io::RawFd;
 
 use super::context::egl_ext;
 use super::fourcc::pixel_format_to_drm;
+use super::processor::DMA_IMPORT_OFFSET_ALIGN;
 use crate::colorimetry::resolve_colorimetry;
 use crate::Error;
 
@@ -36,6 +37,13 @@ pub(super) struct DmaImportAttrs {
     pub plane0_fd: RawFd,
     pub plane0_pitch: usize,
     pub plane0_offset: usize,
+    /// Texels between this import's first column and the tensor's own first
+    /// pixel. Nonzero only for a SOURCE rebased onto an aligned base (issue
+    /// #170): `width` is widened by it and `plane0_offset` walked back by
+    /// `x_shift_px * bpp`, so the tensor's pixel `(x, y)` is import texel
+    /// `(x + x_shift_px, y)` at the same pitch. The engine folds it through
+    /// `GlPlatform::import_origin` into the sampling rectangle.
+    pub x_shift_px: u32,
     /// Second plane for NV12.
     pub plane1: Option<DmaPlane1Attrs>,
     pub is_yuv: bool,
@@ -53,6 +61,180 @@ pub(super) struct DmaPlane1Attrs {
     pub fd: RawFd,
     pub pitch: usize,
     pub offset: usize,
+}
+
+/// The largest byte offset at or below `offset` that is a multiple of
+/// `align` **and** a whole number of `bpp`-byte pixels away from `offset`,
+/// with that distance in pixels.
+///
+/// Mali's EGL DMA-BUF import silently samples zeros unless
+/// `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is 64-byte aligned (issue #165, measured
+/// on i.MX 95: offsets 32 and 2080 sample zeros, 0/64/256/2048 are correct).
+/// Rather than decline such a source into an upload, the import starts at
+/// this base and widens by the returned shift, so the tensor's first pixel
+/// lands on texel `x_shift_px` of the imported texture and the engine folds
+/// that shift into the sampling rectangle (issue #170).
+///
+/// The step is `lcm(align, bpp)`, not `align`: walking back by `align` alone
+/// lands mid-pixel whenever `bpp` does not divide `align` — for `Rgb`'s 3
+/// bytes a 64-byte floor of 2079 gives a 31-byte remainder, which is not a
+/// whole RGB pixel, while the 192-byte step gives 159 bytes = 53 pixels.
+///
+/// `None` when no such base exists — `offset` is not a whole number of
+/// pixels (a 128-byte padded pitch is not a multiple of 3, so an `Rgb` row
+/// offset can land mid-pixel), or a degenerate `bpp`/`align`. The caller
+/// declines the import and uploads, which is Stage F's behaviour.
+pub(super) fn aligned_source_base(offset: usize, bpp: usize, align: usize) -> Option<(usize, u32)> {
+    if bpp == 0 || align == 0 || !offset.is_multiple_of(bpp) {
+        return None;
+    }
+    // lcm(align, bpp), computed as `align / gcd * bpp` so the intermediate
+    // cannot overflow for any realistic pair.
+    let mut a = align;
+    let mut b = bpp;
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    let step = (align / a).checked_mul(bpp)?;
+    let base = offset - offset % step;
+    Some((base, u32::try_from((offset - base) / bpp).ok()?))
+}
+
+/// Whether a source rebased by `x_shift_px` pixels still fits the pitch it
+/// imports at: the widened row `(width_px + x_shift_px) * bpp` must not run
+/// past `plane0_pitch`.
+///
+/// A driver that derives a row from WIDTH and PITCH rejects an import whose
+/// row runs past its pitch, and the widened row is the only thing the rebase
+/// can make run past. `false` declines the rebase, and the caller imports at
+/// the original offset instead.
+///
+/// The room comes from the pitch padding. A view's `width_px` is its own
+/// while its pitch is the parent's, so a 64-padded parent pitch normally has
+/// room for every shift `aligned_source_base` can return. A pitch that is
+/// merely tight has none: a foreign DMA-BUF adopted through `from_fd` at the
+/// producer's unpadded stride, or a whole tensor at a `set_plane_offset`
+/// window whose row already fills its pitch. Overflow counts as not fitting.
+pub(super) fn rebase_fits_pitch(
+    width_px: usize,
+    x_shift_px: u32,
+    bpp: usize,
+    plane0_pitch: usize,
+) -> bool {
+    width_px
+        .checked_add(x_shift_px as usize)
+        .and_then(|w| w.checked_mul(bpp))
+        .is_some_and(|row| row <= plane0_pitch)
+}
+
+/// The bytes per pixel the aligned-base rebase uses for `src_fmt`, or `None`
+/// for the formats it does not cover.
+///
+/// Packed formats whose texel is exactly `channels()` bytes only: YUYV/VYUY
+/// carry a 2-pixel macropixel phase a texel shift would break, NV12's second
+/// plane has an offset of its own, and the R8 paths' pitch IS their width so
+/// they cannot widen at all.
+fn rebase_bpp(src_fmt: PixelFormat) -> Option<usize> {
+    matches!(
+        src_fmt,
+        PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb | PixelFormat::Grey
+    )
+    .then(|| src_fmt.channels())
+}
+
+/// The plane-0 channel count the **import** uses, which is not always
+/// `PixelFormat::channels()`: NV12's plane 0 is single-channel luma, and
+/// PlanarRgb's is one R8 plane three times as tall rather than three
+/// interleaved channels.
+///
+/// [`DmaImportAttrs::from_tensor`] derives the same number inside the branch
+/// that also resolves width, height and fourcc, and debug-asserts it against
+/// this function. [`resolved_source_plane0_offset`] calls this directly. The
+/// two must agree, because the tight pitch they fall back on when a tensor
+/// stores no row stride is what the gate and the import would otherwise
+/// disagree about.
+fn import_plane0_channels(src_fmt: PixelFormat) -> usize {
+    if src_fmt == PixelFormat::Nv12 || src_fmt.layout() == PixelLayout::Planar {
+        1
+    } else {
+        src_fmt.channels()
+    }
+}
+
+/// The tightly-packed plane-0 pitch a tensor with no stored row stride
+/// imports at.
+fn tight_plane0_pitch(src_fmt: PixelFormat, width_px: usize, channels: usize) -> usize {
+    if src_fmt == PixelFormat::Nv12 {
+        // Luma plane is 1 byte/pixel for NV12 semi-planar YUV.
+        width_px
+    } else {
+        width_px * channels
+    }
+}
+
+/// The plane-0 offset a SOURCE import of this shape presents to EGL, and the
+/// texel shift folded into the sampling rectangle to pay for it.
+///
+/// **The single source of truth for the source rebase (issue #170.)**
+/// [`DmaImportAttrs::from_tensor`] builds its import from this, and the Mali
+/// gate in `processor/mod.rs` asks it which offset EGL will actually be
+/// handed — see [`resolved_source_plane0_offset`]. Neither may
+/// reimplement the decision: the gate declines a source Mali would sample
+/// zeros from, and it can only be right about that if it is reading the very
+/// offset the import will carry.
+///
+/// Three outcomes, in order:
+///
+/// * A format the rebase does not cover, or an offset that is already
+///   64-byte aligned — returned unchanged with no shift. The aligned case
+///   is every ordinary import.
+/// * An unaligned offset the rebase can move — the aligned base below it,
+///   and the remainder in whole pixels. This is the zero-copy win.
+/// * An unaligned offset it cannot move — an offset that is not a whole
+///   number of pixels (`offset % bpp != 0`, which a 64-padded stride
+///   produces whenever `bpp` does not divide it), or a pitch with no room
+///   to widen into — returned
+///   unchanged, unaligned. The drivers that import such an offset correctly
+///   go on doing so; Mali declines it upstream and uploads instead, which is
+///   exactly what this function exists to let the gate see.
+pub(super) fn resolve_source_plane0(
+    src_fmt: PixelFormat,
+    width_px: usize,
+    plane0_pitch: usize,
+    plane_offset: usize,
+) -> (usize, u32) {
+    let Some(bpp) = rebase_bpp(src_fmt) else {
+        return (plane_offset, 0);
+    };
+    if plane_offset.is_multiple_of(DMA_IMPORT_OFFSET_ALIGN) {
+        return (plane_offset, 0);
+    }
+    aligned_source_base(plane_offset, bpp, DMA_IMPORT_OFFSET_ALIGN)
+        .filter(|&(_, shift)| rebase_fits_pitch(width_px, shift, bpp, plane0_pitch))
+        .unwrap_or((plane_offset, 0))
+}
+
+/// [`resolve_source_plane0`]'s offset for a whole tensor, resolving the
+/// width, pitch and offset the way [`DmaImportAttrs::from_tensor`] does for a
+/// source. This is what the Mali gate calls.
+///
+/// A source never collapses onto a parent import (`view_origin` is honored
+/// for destinations only), so its geometry is its own and these three
+/// accessors are the whole input. The tight-pitch fallback goes through
+/// [`import_plane0_channels`], the same rule the import applies, so the two
+/// cannot answer differently for a tensor that stores no row stride —
+/// `PixelFormat::channels()` would say three for PlanarRgb where the import
+/// says one. Unreachable while the rebase covers neither planar nor NV (the
+/// caller returns before the pitch is read), but the gate must not depend on
+/// that to be right.
+pub(super) fn resolved_source_plane0_offset(src: &Tensor<u8>, src_fmt: PixelFormat) -> usize {
+    let width = src.width().unwrap_or(0);
+    let pitch = src
+        .effective_row_stride()
+        .unwrap_or_else(|| tight_plane0_pitch(src_fmt, width, import_plane0_channels(src_fmt)));
+    resolve_source_plane0(src_fmt, width, pitch, src.plane_offset().unwrap_or(0)).0
 }
 
 impl DmaImportAttrs {
@@ -129,6 +311,12 @@ impl DmaImportAttrs {
             // tested platform (Mali G310, Vivante GC7000UL, V3D, Tegra),
             // so we keep the blanket width%4 check for those.
             //
+            // It is the TIGHT pitch this protects, and the aligned-base
+            // rebase (issue #170) never changes that pitch: the rebase
+            // widens the import and walks the offset back, both at the
+            // pitch the tensor already had, so a width that satisfies this
+            // check before the rebase still does after it.
+            //
             // 4-bpp packed formats (Rgba, Bgra) have a row pitch of
             // `width * 4` which is trivially 4-byte aligned at any width.
             // The DRM fourcc spec (ABGR8888 / ARGB8888) imposes no
@@ -149,6 +337,16 @@ impl DmaImportAttrs {
             }
             (src_w, src_h, pixel_format_to_drm(src_fmt)?, src_channels)
         };
+
+        // The branch above resolves `channels` alongside width, height and
+        // fourcc, so it cannot simply call `import_plane0_channels`; this
+        // pins the two together instead, because the gate reads the helper
+        // and both feed `tight_plane0_pitch`.
+        debug_assert_eq!(
+            channels,
+            import_plane0_channels(src_fmt),
+            "{src_fmt:?}: the import's plane-0 channel count and the gate's must agree"
+        );
 
         // `dmabuf()`, not `as_dma().fd`. Both reach the same file
         // descriptor and both are on `Tensor<T>` with the same signature on
@@ -187,14 +385,9 @@ impl DmaImportAttrs {
         // tightly-packed pitch.
         let plane0_pitch = match view_origin {
             Some(vo) => vo.parent_row_stride,
-            None => src.effective_row_stride().unwrap_or_else(|| {
-                if src_fmt == PixelFormat::Nv12 {
-                    // Luma plane is 1 byte/pixel for NV12 semi-planar YUV.
-                    width
-                } else {
-                    width * channels
-                }
-            }),
+            None => src
+                .effective_row_stride()
+                .unwrap_or_else(|| tight_plane0_pitch(src_fmt, width, channels)),
         };
 
         // A view imports its parent at offset 0 (its byte offset becomes the
@@ -204,6 +397,36 @@ impl DmaImportAttrs {
         } else {
             src.plane_offset().unwrap_or(0)
         };
+
+        // Mali's EGL DMA-BUF import silently samples zeros unless the plane
+        // offset is 64-byte aligned (issue #165: offsets 32 and 2080 on
+        // i.MX 95). Rather than decline such a SOURCE into an upload, import
+        // from an aligned base and widen by the remainder in pixels; the
+        // engine folds the shift into the sampling rectangle through
+        // `GlPlatform::import_origin` (issue #170). Applied on every driver,
+        // not only Mali: one code path, exercised wherever an unaligned
+        // source runs, rather than a Mali-only branch nothing else covers.
+        //
+        // Sources only. A destination view imports its parent at base 0 and
+        // places the tile by viewport, and the driver that does fail on an
+        // unaligned destination fails loudly (Vivante, EGL_BAD_ACCESS),
+        // which `Platform::dst_import_places` already lowers.
+        //
+        // `resolve_source_plane0` owns the whole decision, and the Mali gate
+        // in `processor/mod.rs` asks the same function what offset this
+        // import will present. That shared answer is what makes the gate
+        // safe to narrow: a source it exempts is one this call rebased onto
+        // an aligned base, never merely one whose format is usually
+        // rebasable. When the rebase cannot be applied -- an offset that is
+        // not a whole number of pixels, or a pitch with no room to widen --
+        // the import keeps its own unaligned offset, the drivers that read
+        // it correctly go on doing so, and Mali declines it upstream.
+        let (plane0_offset, x_shift_px) = if for_dst {
+            (plane0_offset, 0)
+        } else {
+            resolve_source_plane0(src_fmt, width, plane0_pitch, plane0_offset)
+        };
+        let width = width + x_shift_px as usize;
 
         // Semi-planar YUV (NV12) carries a second (interleaved CbCr) plane.
         // NV12 (4:2:0): H/2 rows, W bytes/row (W/2 CbCr pairs).
@@ -275,6 +498,7 @@ impl DmaImportAttrs {
             plane0_fd: fd,
             plane0_pitch,
             plane0_offset,
+            x_shift_px,
             plane1,
             is_yuv: src_fmt.is_yuv(),
             yuv_encoding,
@@ -363,6 +587,10 @@ impl DmaImportAttrs {
             plane0_fd: fd,
             plane0_pitch: tex_width,
             plane0_offset,
+            // The R8 import's pitch IS its width, so it cannot widen: an
+            // unaligned NV source keeps the Stage F decline and uploads
+            // (issue #170).
+            x_shift_px: 0,
             plane1: None,
             is_yuv: false, // R8 is not a multi-plane YUV fourcc; no driver hints
             // Path B applies the YUV→RGB matrix in-shader (per-tensor coeffs),
@@ -496,7 +724,7 @@ mod tests {
     #[cfg(feature = "dma_test_formats")]
     fn from_tensor_source_view_imports_own_region_dst_imports_parent() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: from_tensor_source_view... - DMA not available");
+            crate::test_support::report_skip("from_tensor_source_view... - DMA not available");
             return;
         }
         // 64x64 RGBA with a padded 320-byte stride (tight row = 64*4 = 256).
@@ -510,7 +738,7 @@ mod tests {
         ) {
             Ok(t) => t,
             Err(_) => {
-                eprintln!("SKIPPED: image_with_stride DMA unavailable");
+                crate::test_support::report_skip("image_with_stride DMA unavailable");
                 return;
             }
         };
@@ -518,17 +746,30 @@ mod tests {
             .view(edgefirst_tensor::Region::new(8, 8, 32, 16))
             .unwrap();
 
-        // SOURCE (for_dst = false): import the view's OWN region.
+        // SOURCE (for_dst = false): import the view's OWN region -- rebased
+        // onto an aligned base, because (8, 8) at a 320-byte pitch is byte
+        // 2592, which is not 64-byte aligned. The base is 2560 and the
+        // 32-byte remainder is 8 RGBA pixels of shift, so the import is 8
+        // texels wider than the view and starts it 8 texels in (issue #170).
+        // The region is deliberately left at an unaligned origin: the
+        // rebased numbers say more about what this test guards than an
+        // aligned origin that exercises nothing.
         let s = DmaImportAttrs::from_tensor(&view, PixelFormat::Rgba, false).unwrap();
         assert_eq!(
             (s.width, s.height),
-            (32, 16),
-            "source view imports its own dimensions"
+            (32 + 8, 16),
+            "source view imports its own dimensions, widened by the shift"
         );
+        assert_eq!(s.x_shift_px, 8, "32 bytes of remainder is 8 RGBA pixels");
         assert_eq!(
             s.plane0_offset,
+            8 * 320,
+            "source view imports at the aligned base below its own byte offset"
+        );
+        assert_eq!(
+            s.plane0_offset + s.x_shift_px as usize * 4,
             8 * 320 + 8 * 4,
-            "source view imports at its own byte offset"
+            "and the shift closes that base back to the view's own offset"
         );
         assert_eq!(s.plane0_pitch, 320, "source view keeps the parent pitch");
 
@@ -562,14 +803,18 @@ mod tests {
         let luma_buf = match alloc_dma(luma_bytes, "luma_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_true_multiplane_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_true_multiplane_attrs - DMA not available",
+                );
                 return;
             }
         };
         let chroma_buf = match alloc_dma(chroma_bytes, "chroma_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_true_multiplane_attrs - DMA alloc failed");
+                crate::test_support::report_skip(
+                    "test_nv12_true_multiplane_attrs - DMA alloc failed",
+                );
                 return;
             }
         };
@@ -625,7 +870,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "shared_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_same_fd_multiplane_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_same_fd_multiplane_attrs - DMA not available",
+                );
                 return;
             }
         };
@@ -680,7 +927,9 @@ mod tests {
         let buf = match alloc_dma(total, "nv12_even_w") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_even_width_relaxed_gate - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_even_width_relaxed_gate - DMA not available",
+                );
                 return;
             }
         };
@@ -723,7 +972,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "contiguous_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_contiguous_single_fd_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_contiguous_single_fd_attrs - DMA not available",
+                );
                 return;
             }
         };
@@ -772,7 +1023,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "padded_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_contiguous_padded_stride_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_contiguous_padded_stride_attrs - DMA not available",
+                );
                 return;
             }
         };
@@ -810,14 +1063,16 @@ mod tests {
         let luma_buf = match alloc_dma(luma_bytes, "luma_padded") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_multiplane_padded_strides_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_multiplane_padded_strides_attrs - DMA not available",
+                );
                 return;
             }
         };
         let chroma_buf = match alloc_dma(chroma_bytes, "chroma_padded") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: DMA alloc failed");
+                crate::test_support::report_skip("DMA alloc failed");
                 return;
             }
         };
@@ -862,7 +1117,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "offset_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_same_fd_nonzero_luma_offset - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_same_fd_nonzero_luma_offset - DMA not available",
+                );
                 return;
             }
         };
@@ -908,7 +1165,9 @@ mod tests {
         let y_buf = match alloc_dma(y_size, "y_only_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_chroma_offset_exceeds_buffer - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_chroma_offset_exceeds_buffer - DMA not available",
+                );
                 return;
             }
         };
@@ -956,6 +1215,7 @@ mod tests {
             plane0_fd: 10,
             plane0_pitch: 1920,
             plane0_offset: 0,
+            x_shift_px: 0,
             plane1: Some(DmaPlane1Attrs {
                 fd: 11, // different fd
                 pitch: 1920,
@@ -1018,6 +1278,7 @@ mod tests {
             plane0_fd: 10,
             plane0_pitch: 1920,
             plane0_offset: 0,
+            x_shift_px: 0,
             plane1: Some(DmaPlane1Attrs {
                 fd: 12, // different raw fd, same underlying buffer
                 pitch: 1920,
@@ -1053,6 +1314,7 @@ mod tests {
             plane0_fd: 10,
             plane0_pitch: pitch,
             plane0_offset: 0,
+            x_shift_px: 0,
             plane1: Some(DmaPlane1Attrs {
                 fd: 10, // SAME raw fd
                 pitch,
@@ -1088,6 +1350,7 @@ mod tests {
             plane0_fd: 10,
             plane0_pitch: 640 * 4,
             plane0_offset: 0,
+            x_shift_px: 0,
             plane1: None,
             is_yuv: false,
             yuv_encoding: ColorEncoding::Bt709,
@@ -1121,6 +1384,7 @@ mod tests {
             plane0_fd: 10,
             plane0_pitch: stride,
             plane0_offset: 0,
+            x_shift_px: 0,
             plane1: Some(DmaPlane1Attrs {
                 fd: 10,
                 pitch: stride,
@@ -1158,6 +1422,7 @@ mod tests {
             plane0_fd: 10,
             plane0_pitch: 1920,
             plane0_offset: 0,
+            x_shift_px: 0,
             plane1: Some(DmaPlane1Attrs {
                 fd: 10,
                 pitch: 1920,
@@ -1228,7 +1493,9 @@ mod tests {
     #[test]
     fn test_from_tensor_accepts_non_4_aligned_rgba() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_from_tensor_accepts_non_4_aligned_rgba — DMA not available");
+            crate::test_support::report_skip(
+                "test_from_tensor_accepts_non_4_aligned_rgba — DMA not available",
+            );
             return;
         }
         use crate::{align_pitch_bytes_to_gpu_alignment, primary_plane_bpp};
@@ -1245,7 +1512,9 @@ mod tests {
             ) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("SKIPPED: image_with_stride failed at width {w}: {e}");
+                    crate::test_support::report_skip(&format!(
+                        "image_with_stride failed at width {w}: {e}"
+                    ));
                     return;
                 }
             };
@@ -1267,7 +1536,9 @@ mod tests {
     #[test]
     fn test_from_tensor_accepts_non_4_aligned_bgra() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_from_tensor_accepts_non_4_aligned_bgra — DMA not available");
+            crate::test_support::report_skip(
+                "test_from_tensor_accepts_non_4_aligned_bgra — DMA not available",
+            );
             return;
         }
         use crate::{align_pitch_bytes_to_gpu_alignment, primary_plane_bpp};
@@ -1283,7 +1554,7 @@ mod tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: image_with_stride failed: {e}");
+                crate::test_support::report_skip(&format!("image_with_stride failed: {e}"));
                 return;
             }
         };
@@ -1331,5 +1602,501 @@ mod tests {
         let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Grey, false)
             .expect_err("Grey width 375 must still be rejected");
         assert!(matches!(err, crate::Error::NotSupported(_)));
+    }
+
+    // ─── aligned_source_base tests ───────────────────────────────────
+
+    /// The offsets the i.MX 95 probe classified (issue #165), at RGBA's
+    /// 4 bytes per pixel: 32 and 2080 sampled zeros, 0/64/256/2048 were fine.
+    /// `lcm(64, 4)` is 64, so the base is just the 64-byte floor and the
+    /// remainder is always a whole number of RGBA pixels.
+    #[test]
+    fn aligned_source_base_rgba_floors_to_64_and_shifts_whole_pixels() {
+        let f = |o| super::aligned_source_base(o, 4, 64);
+        // Aligned offsets are untouched: no rebase, no shift, so every
+        // driver sees exactly the import it sees today.
+        assert_eq!(f(0), Some((0, 0)));
+        assert_eq!(f(64), Some((64, 0)));
+        assert_eq!(f(256), Some((256, 0)));
+        assert_eq!(f(2048), Some((2048, 0)));
+        // The two that sampled zeros. 32 is 8 RGBA pixels past base 0;
+        // 2080 is 8 past base 2048 -- the (8, 0) and (8, 8) view origins.
+        assert_eq!(f(32), Some((0, 8)));
+        assert_eq!(f(2080), Some((2048, 8)));
+    }
+
+    /// Grey is 1 byte per pixel, so the remainder is whole by construction
+    /// and every byte of the 64-byte residue becomes a texel of shift.
+    #[test]
+    fn aligned_source_base_grey_shifts_every_residue_byte() {
+        let f = |o| super::aligned_source_base(o, 1, 64);
+        assert_eq!(f(0), Some((0, 0)));
+        assert_eq!(f(32), Some((0, 32)));
+        assert_eq!(f(2080), Some((2048, 32)));
+        assert_eq!(f(63), Some((0, 63)));
+    }
+
+    /// RGB is the case the `lcm` exists for: 3 does not divide 64, so the
+    /// step is `lcm(64, 3) = 192` and the base walks back to a multiple of
+    /// BOTH. A 64-byte floor alone would leave a fractional pixel.
+    #[test]
+    fn aligned_source_base_rgb_steps_by_lcm_192() {
+        let f = |o| super::aligned_source_base(o, 3, 64);
+        assert_eq!(f(0), Some((0, 0)));
+        assert_eq!(f(192), Some((192, 0)));
+        // 96 = 32 RGB pixels; base 0, because 96 is not a multiple of 192.
+        assert_eq!(f(96), Some((0, 32)));
+        // 2079 = 3 * 693. Base 1920 (= 10 * 192, and 1920 % 64 == 0),
+        // remainder 159 bytes = 53 whole RGB pixels.
+        assert_eq!(f(2079), Some((1920, 53)));
+        // A 64-byte floor would have given base 2048 and a 31-byte
+        // remainder, which is not a whole number of RGB pixels.
+        assert_ne!(f(2079).map(|(b, _)| b), Some(2048));
+    }
+
+    /// An offset that is not a whole number of pixels has no aligned base
+    /// with a whole-pixel remainder, and the import must decline rather
+    /// than fold half a pixel.
+    #[test]
+    fn aligned_source_base_refuses_a_fractional_pixel_offset() {
+        assert_eq!(super::aligned_source_base(2080, 3, 64), None);
+        assert_eq!(super::aligned_source_base(2081, 4, 64), None);
+        assert_eq!(super::aligned_source_base(1, 2, 64), None);
+        // Degenerate inputs are refusals, not panics or divisions by zero.
+        assert_eq!(super::aligned_source_base(64, 0, 64), None);
+        assert_eq!(super::aligned_source_base(64, 4, 0), None);
+    }
+
+    /// The two invariants every caller depends on, over a sweep rather than
+    /// a handful of points: the base is import-aligned, and the shift is an
+    /// exact whole-pixel distance from it back to the tensor's own offset.
+    #[test]
+    fn aligned_source_base_invariants_hold_across_a_sweep() {
+        for bpp in [1usize, 3, 4] {
+            for px in 0usize..4096 {
+                let offset = px * bpp;
+                let Some((base, shift)) = super::aligned_source_base(offset, bpp, 64) else {
+                    panic!("a whole-pixel offset {offset} at {bpp} bpp must have a base");
+                };
+                assert_eq!(base % 64, 0, "base {base} must be 64-byte aligned");
+                assert!(base <= offset, "base {base} must not pass offset {offset}");
+                assert_eq!(
+                    base + shift as usize * bpp,
+                    offset,
+                    "shift {shift} px at {bpp} bpp must close base {base} to {offset}"
+                );
+            }
+        }
+    }
+
+    // ─── source rebase onto an aligned base (issue #170) ─────────────
+
+    /// Allocate the DMA parent the rebase tests view into, or `None` when
+    /// this machine has no usable DMA heap (the heap is root-only on the
+    /// desk, so an unprivileged run skips) or cannot allocate this format.
+    #[cfg(feature = "dma_test_formats")]
+    fn dma_parent(width: usize, height: usize, fmt: PixelFormat) -> Option<Tensor<u8>> {
+        if !is_dma_available() {
+            return None;
+        }
+        match Tensor::<u8>::image(
+            width,
+            height,
+            fmt,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => Some(t),
+            _ => None,
+        }
+    }
+
+    /// A source at an unaligned RGBA offset imports from the 64-byte floor,
+    /// widened by the remainder in pixels, at the SAME pitch -- so the
+    /// tensor's first pixel is texel `x_shift_px` of row 0. This is the
+    /// import Mali samples correctly where the unrebased one sampled zeros
+    /// (issue #170).
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_rebases_an_unaligned_rgba_source_to_an_aligned_base() {
+        let Some(parent) = dma_parent(64, 64, PixelFormat::Rgba) else {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - DMA not available",
+                function!()
+            );
+            return;
+        };
+        let pitch = parent.effective_row_stride().unwrap_or(256);
+        // (8, 8) of a 256-byte-pitched RGBA surface: offset 2080, the origin
+        // that sampled zeros on i.MX 95.
+        let view = parent
+            .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+            .unwrap();
+        assert_eq!(view.plane_offset(), Some(8 * pitch + 32));
+        let s = DmaImportAttrs::from_tensor(&view, PixelFormat::Rgba, false).unwrap();
+        assert_eq!(s.plane0_offset % 64, 0, "the import base must be aligned");
+        assert_eq!(s.plane0_offset, 8 * pitch + 32 - 32);
+        assert_eq!(s.x_shift_px, 8, "32 bytes is 8 RGBA pixels");
+        assert_eq!(s.width, 16 + 8, "the import widens by the shift");
+        assert_eq!(
+            s.plane0_pitch, pitch,
+            "the pitch is the parent's, unchanged"
+        );
+    }
+
+    /// An ALIGNED source is untouched -- no rebase, no shift, no widening --
+    /// so every driver sees exactly the import it saw before issue #170.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_leaves_an_aligned_source_alone() {
+        let Some(parent) = dma_parent(64, 64, PixelFormat::Rgba) else {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - DMA not available",
+                function!()
+            );
+            return;
+        };
+        let pitch = parent.effective_row_stride().unwrap_or(256);
+        assert_eq!(pitch % 64, 0, "the premise: a 64-aligned parent pitch");
+        // (0, 8): offset 8 * pitch, aligned whenever the pitch is.
+        let view = parent
+            .view(edgefirst_tensor::Region::new(0, 8, 16, 16))
+            .unwrap();
+        let s = DmaImportAttrs::from_tensor(&view, PixelFormat::Rgba, false).unwrap();
+        assert_eq!(s.plane0_offset, 8 * pitch);
+        assert_eq!(s.x_shift_px, 0);
+        assert_eq!(s.width, 16);
+    }
+
+    /// A DESTINATION is never rebased: it imports its parent at base 0 and
+    /// places the tile by viewport, and the drivers that fail on the
+    /// destination side fail loudly rather than silently (Vivante,
+    /// EGL_BAD_ACCESS), which `dst_import_places` already lowers.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_never_rebases_a_destination() {
+        let Some(parent) = dma_parent(64, 64, PixelFormat::Rgba) else {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - DMA not available",
+                function!()
+            );
+            return;
+        };
+        let view = parent
+            .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+            .unwrap();
+        let d = DmaImportAttrs::from_tensor(&view, PixelFormat::Rgba, true).unwrap();
+        assert_eq!(d.plane0_offset, 0, "a dst view imports its parent");
+        assert_eq!(d.x_shift_px, 0, "and is never shifted");
+        assert_eq!(d.width, 64, "at the parent's own width");
+    }
+    // ─── rebase_fits_pitch ───────────────────────────────────────────
+
+    /// The pitch guard is about ROOM, and the room is the pitch padding.
+    /// A pitch that is merely tight -- a foreign DMA-BUF adopted at the
+    /// producer's own stride -- has none, and the rebase must be declined
+    /// rather than handed to EGL as a row that runs past its pitch.
+    #[test]
+    fn rebase_fits_pitch_declines_a_tight_foreign_pitch() {
+        let fits = super::rebase_fits_pitch;
+        // 100 RGBA pixels at the producer's tight 400-byte stride: the row
+        // already fills the pitch, so even one pixel of shift runs past it.
+        assert!(!fits(100, 1, 4, 400));
+        assert!(!fits(100, 8, 4, 400));
+        // No shift is the unrebased import, which always fits.
+        assert!(fits(100, 0, 4, 400));
+        // The same width at the 64-padded pitch a HAL allocation gives it
+        // (448) has room for a shift, but only up to the padding: 12 pixels
+        // is 448 bytes exactly, 13 is 452 and runs past.
+        assert!(fits(100, 12, 4, 448));
+        assert!(!fits(100, 13, 4, 448));
+        // The shape the pin test exercises: a 16-pixel view shifted 8
+        // pixels inside a 256-byte parent pitch, with room to spare.
+        assert!(fits(16, 8, 4, 256));
+        // Overflow is "does not fit", never a wrap or a panic.
+        assert!(!fits(usize::MAX, 1, 4, usize::MAX));
+    }
+
+    // ─── which formats rebase (issue #170) ───────────────────────────
+
+    /// `Rgb` is 3 bytes per pixel, so its step is `lcm(64, 3) = 192` rather
+    /// than 64 and the base walks back further than a 64-byte floor would.
+    /// Asserted against the offset the view actually reports, so a board
+    /// whose pitch padding differs is still pinned rather than skipped.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_rebases_an_unaligned_rgb_source_by_the_lcm_step() {
+        let Some(parent) = dma_parent(64, 64, PixelFormat::Rgb) else {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - DMA not available",
+                function!()
+            );
+            return;
+        };
+        let pitch = parent.effective_row_stride().unwrap_or(192);
+        let view = parent
+            .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+            .unwrap();
+        // (8, 8) of a 192-byte-pitched RGB surface is offset 1560: base
+        // 1536 (8 * 192), shift 8 pixels = 24 bytes.
+        let offset = view.plane_offset().unwrap_or(0);
+        assert_eq!(offset, 8 * pitch + 24);
+        let expect_base = offset - offset % 192;
+        let expect_shift = (offset - expect_base) / 3;
+        assert!(
+            expect_shift > 0,
+            "precondition: offset {offset} at pitch {pitch} must be unaligned"
+        );
+        let s = DmaImportAttrs::from_tensor(&view, PixelFormat::Rgb, false).unwrap();
+        assert_eq!(s.plane0_offset, expect_base, "base steps by lcm(64, 3)");
+        assert_eq!(s.plane0_offset % 64, 0, "and is still import-aligned");
+        assert_eq!(s.x_shift_px as usize, expect_shift);
+        assert_eq!(s.width, 16 + expect_shift, "the import widens by the shift");
+        assert_eq!(
+            s.plane0_pitch, pitch,
+            "the pitch is the parent's, unchanged"
+        );
+    }
+
+    /// `Grey` is 1 byte per pixel, so every residue byte is a texel of
+    /// shift and the step is just the 64-byte alignment.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_rebases_an_unaligned_grey_source_byte_for_texel() {
+        let Some(parent) = dma_parent(64, 64, PixelFormat::Grey) else {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - DMA not available",
+                function!()
+            );
+            return;
+        };
+        let pitch = parent.effective_row_stride().unwrap_or(64);
+        let view = parent
+            .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+            .unwrap();
+        // (8, 8) of a 64-byte-pitched Grey surface is offset 520: base 512,
+        // shift 8 bytes = 8 pixels.
+        let offset = view.plane_offset().unwrap_or(0);
+        assert_eq!(offset, 8 * pitch + 8);
+        let expect_base = offset - offset % 64;
+        let expect_shift = offset - expect_base;
+        assert!(
+            expect_shift > 0,
+            "precondition: offset {offset} at pitch {pitch} must be unaligned"
+        );
+        let s = DmaImportAttrs::from_tensor(&view, PixelFormat::Grey, false).unwrap();
+        assert_eq!(s.plane0_offset, expect_base);
+        assert_eq!(s.plane0_offset % 64, 0);
+        assert_eq!(
+            s.x_shift_px as usize, expect_shift,
+            "1 bpp: a byte is a texel"
+        );
+        assert_eq!(s.width, 16 + expect_shift);
+        assert_eq!(s.plane0_pitch, pitch);
+    }
+
+    // ─── the gate and the import read the same answer ────────────────
+
+    /// The four shapes the Mali gate has to tell apart, as a pure table.
+    /// Keyed on the RESOLVED offset, so a packed format is exempt only when
+    /// the fold actually moved it -- which is the whole point of issue
+    /// #170's fix round: a format-keyed exemption waves the last two
+    /// through into a black frame on Mali.
+    #[test]
+    fn the_resolved_offset_tells_the_four_shapes_apart() {
+        // The gate's question, in the production resolver's terms.
+        let aligned = |fmt, w, pitch, off| {
+            super::resolve_source_plane0(fmt, w, pitch, off)
+                .0
+                .is_multiple_of(DMA_IMPORT_OFFSET_ALIGN)
+        };
+
+        // Rebased: a 16-pixel view 8 pixels into a 256-byte-pitched RGBA
+        // parent, at the offset i.MX 95 sampled zeros from. Room to widen
+        // ((16 + 8) * 4 = 96 <= 256), so the base is 2048 and it is exempt.
+        assert!(aligned(PixelFormat::Rgba, 16, 256, 2080));
+        // Already aligned: exempt without being touched.
+        assert!(aligned(PixelFormat::Rgba, 64, 256, 2048));
+        // Tight pitch, no room: a whole 64-wide RGBA tensor at a
+        // `set_plane_offset(32)` window. Its stride is 256 because 256 is
+        // already 64-aligned and nothing was padded on, so the widened row
+        // would be (64 + 8) * 4 = 288 > 256. NOT exempt.
+        assert!(!aligned(PixelFormat::Rgba, 64, 256, 32));
+        // Stride not a whole pixel count: a 100-wide RGB surface pads to
+        // 320 bytes, which is not a multiple of 3, so row 1 column 1 is at
+        // 323 -- unaligned and not a whole number of pixels. NOT exempt.
+        assert!(!aligned(PixelFormat::Rgb, 16, 320, 323));
+    }
+
+    /// The anti-drift pin the gate's safety rests on: for every shape, the
+    /// offset `resolved_source_plane0_offset` reports (what the gate reads)
+    /// is byte-for-byte the `plane0_offset` `from_tensor` puts in the import
+    /// (what EGL is handed). If these two ever disagree the gate is deciding
+    /// about an import that does not exist -- declining a good one, or
+    /// waving through one that comes back black.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn the_gate_reads_the_offset_the_import_presents() {
+        if !is_dma_available() {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - DMA not available",
+                function!()
+            );
+            return;
+        }
+        // (format, parent w/h, view or whole-tensor offset)
+        let cases: [(PixelFormat, usize, usize, Option<usize>); 5] = [
+            // A rebased RGBA view: (8, 8) of 64x64, offset 2080.
+            (PixelFormat::Rgba, 64, 64, None),
+            // The tight-pitch whole tensor at a window offset.
+            (PixelFormat::Rgba, 64, 64, Some(32)),
+            // An aligned window offset, which must stay put.
+            (PixelFormat::Rgba, 64, 64, Some(64)),
+            // Rgb, whose 64-padded stride is not a multiple of 3.
+            (PixelFormat::Rgb, 100, 8, Some(323)),
+            // A format the fold never covers.
+            (PixelFormat::Nv12, 64, 64, Some(32)),
+        ];
+        // The whole test already returned above when there is no DMA heap,
+        // so on a host that reached here every case must be allocatable and
+        // every case must be compared. Counting and asserting the full total
+        // (rather than merely "more than none") is what stops this pin from
+        // going quietly vacuous if a format stops allocating.
+        let total = cases.len();
+        let mut compared = 0usize;
+        for (fmt, w, h, whole_offset) in cases {
+            let Some(mut parent) = dma_parent(w, h, fmt) else {
+                use std::io::Write;
+                let _ = writeln!(
+                    &mut std::io::stderr(),
+                    "SKIPPED: {} {fmt:?} - not allocatable here",
+                    function!()
+                );
+                continue;
+            };
+            if fmt == PixelFormat::Rgb {
+                // The premise of this row: a 100-wide RGB surface pads its
+                // 300-byte row to 320, which is not a multiple of 3, so byte
+                // 323 is row 1 column 1 and is NOT a whole number of pixels
+                // from the start. Asserted rather than assumed -- a board
+                // that padded differently would quietly turn this row into
+                // an ordinary aligned case.
+                let pitch = parent.effective_row_stride().unwrap_or(0);
+                assert_eq!(pitch, 320, "precondition: the padded Rgb stride");
+                let off = whole_offset.unwrap();
+                assert_eq!(off, pitch + 3, "precondition: row 1, column 1");
+                assert_ne!(off % 3, 0, "precondition: {off} is mid-pixel");
+                assert_ne!(off % 64, 0, "precondition: {off} is unaligned");
+            }
+            let attrs = match whole_offset {
+                Some(off) => {
+                    parent.set_plane_offset(off);
+                    DmaImportAttrs::from_tensor(&parent, fmt, false)
+                        .unwrap_or_else(|e| panic!("{fmt:?} at {off}: {e}"))
+                }
+                None => {
+                    let view = parent
+                        .view(edgefirst_tensor::Region::new(8, 8, 16, 16))
+                        .unwrap();
+                    let a = DmaImportAttrs::from_tensor(&view, fmt, false).unwrap();
+                    assert_eq!(
+                        super::resolved_source_plane0_offset(&view, fmt),
+                        a.plane0_offset,
+                        "{fmt:?} view: the gate and the import must agree"
+                    );
+                    compared += 1;
+                    continue;
+                }
+            };
+            assert_eq!(
+                super::resolved_source_plane0_offset(&parent, fmt),
+                attrs.plane0_offset,
+                "{fmt:?} at {whole_offset:?}: the gate and the import must agree"
+            );
+            compared += 1;
+        }
+        assert_eq!(
+            compared, total,
+            "a DMA heap is available, so every case must be comparable, but only \
+             {compared} of {total} were (see the SKIPPED lines above); \
+             the gate-versus-import equality went unpinned for the rest"
+        );
+    }
+
+    /// A whole 64-wide RGBA tensor at a `set_plane_offset` window is the
+    /// shape a format-keyed Mali exemption got wrong: its stride is tight at
+    /// 256 bytes (64 * 4 is already 64-aligned, so nothing was padded on),
+    /// leaving no room to widen, so the import keeps its own unaligned
+    /// offset and Mali must go on declining it.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_cannot_rebase_a_window_into_a_tight_pitch() {
+        let Some(mut t) = dma_parent(64, 64, PixelFormat::Rgba) else {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - DMA not available",
+                function!()
+            );
+            return;
+        };
+        let pitch = t.effective_row_stride().unwrap_or(256);
+        assert_eq!(pitch, 64 * 4, "precondition: the pitch is tight");
+        t.set_plane_offset(32);
+        let s = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgba, false).unwrap();
+        assert_eq!(s.plane0_offset, 32, "no room to widen, so no rebase");
+        assert_eq!(s.x_shift_px, 0);
+        assert_eq!(s.width, 64, "and no widening");
+        assert!(
+            !super::resolve_source_plane0(PixelFormat::Rgba, 64, pitch, 32)
+                .0
+                .is_multiple_of(DMA_IMPORT_OFFSET_ALIGN),
+            "so Mali must still decline it"
+        );
+    }
+
+    /// The formats the fold does NOT cover import at their own offset with
+    /// no shift, however unaligned that offset is: YUYV/VYUY carry a
+    /// 2-pixel macropixel phase a texel shift would break, NV12's second
+    /// plane has an offset of its own, and planar RGB stacks its planes by
+    /// row. The Mali gate in the processor must keep declining these, which
+    /// is only sound while they are not rebased here.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_never_rebases_the_formats_the_fold_misses() {
+        for fmt in [PixelFormat::Yuyv, PixelFormat::Nv12, PixelFormat::PlanarRgb] {
+            let Some(mut t) = dma_parent(64, 64, fmt) else {
+                use std::io::Write;
+                let _ = writeln!(
+                    &mut std::io::stderr(),
+                    "SKIPPED: {} {fmt:?} - not allocatable here",
+                    function!()
+                );
+                continue;
+            };
+            // 32 is one of the two offsets i.MX 95 sampled zeros from, and
+            // is unaligned for every one of these formats.
+            t.set_plane_offset(32);
+            let s = DmaImportAttrs::from_tensor(&t, fmt, false)
+                .unwrap_or_else(|e| panic!("{fmt:?} source import must resolve: {e}"));
+            assert_eq!(s.x_shift_px, 0, "{fmt:?} must not be rebased");
+            assert_eq!(
+                s.plane0_offset, 32,
+                "{fmt:?} keeps its own (unaligned) offset"
+            );
+            assert_eq!(s.width, 64, "{fmt:?} must not be widened");
+        }
     }
 }

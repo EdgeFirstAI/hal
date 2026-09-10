@@ -11,6 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bright highlights rendered as black on Cortex-A53 CPU conversion.** Any
+  NV12/NV16/NV24 → RGB(A) convert on a core without the ARMv8.1 `rdm` feature
+  — Cortex-A53/A35-class, which includes the i.MX8MP — takes the `yuv` crate's
+  `Fast` kernel, and that kernel accumulates each channel in a non-saturating
+  signed 16-bit lane. Super-white luma (above the limited-range white point
+  235) combined with strong chroma pushes the accumulator past `i16::MAX`; it
+  wraps negative and the final saturating narrow emits 0, so the brightest
+  pixel in a frame comes out black instead of clipping to white. Decoded video
+  reaches that range routinely — a specular highlight is enough.
+
+  `cpu/convert.rs` now caps luma at the white point before the fast kernel, on
+  that path only. The plane is scanned with a vectorized chunked max-reduction
+  and copied only when the frame really carries super-white luma, so an
+  in-range frame keeps byte-identical output and pays 8% (6.06 → 6.56
+  ns/pixel, 1920×1080 NV12 → RGBA on an i.MX8MP); a frame that would otherwise
+  be wrong pays 26%. Clipping super-white is an approximation bounded at ~23
+  levels, against the 255 the unguarded kernel got wrong, and 235 is
+  limited-range white so a conforming frame never reaches it. The exact
+  alternative, running the accurate kernel on these cores, costs ~2× on every
+  frame. Full range and the accurate kernel are untouched — neither can
+  overflow.
+
+  Exposed by the G2D odd-dimension tests (`d01_nv12_odd_w_g2d_vs_cpu`,
+  `d03_nv12_odd_both_g2d_vs_cpu`), which had never run in CI and failed at
+  `max_diff=255` on the imx8mp lane's first execution in four months. The
+  divergence was the CPU *reference*, not G2D: G2D was correct throughout, and
+  the residual against a correct reference is 23–24 across widths 63–81, well
+  inside the tests' existing bound. Upstream `yuv` 0.8.17 does not fix the
+  kernel.
+
 - **BREAKING (Python interop): the tensor capsule now carries quantization,
   and is renamed `edgefirst_tensor_v2`.** An int8 `ProtoData` produced by
   `edgefirst.decoder` could not be used by `edgefirst.image` at all:
@@ -174,8 +204,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import at such an offset, uploading the window through `map()` instead;
   destinations are unaffected (a view imports its parent at offset 0).
   Pinned by `offset_source_view_alignment.rs` on imx95, imx8mp and rpi5.
-  Zero-copy for those views (an aligned base with the remainder folded into
-  the sampling rectangle) is follow-up #170. (#165)
+  Those views are zero-copy again as of #170: the import starts at the
+  64-byte-aligned base below the offset, widened by the remainder in pixels,
+  and the engine folds that shift into the sampling rectangle. (#165, #170)
 - **A refused zero-copy NV source ended on the CPU.** When the R8 import of
   an NV12/16/24 source was declined — the ANGLE leaves' offset refusal, or
   the Mali rule above — the engine fell to `draw_src_texture`, which has no
@@ -264,6 +295,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and leaves the map window intact rather than accepting the call and
   reading the wrong bytes.
 
+- **The imx8mp hardware lane executed zero Rust tests, silently, since
+  2026-05-14 (`a87ae59c`).** The artifact-restoring `chmod +x` named
+  `hardware-test-binaries/`, a directory the artifact stopped shipping the
+  day that commit switched to `hardware-test-binaries-stripped/`; the glob
+  matched nothing, the error was swallowed by `2>/dev/null || true`, and
+  every binary then failed the loop's `[[ -x ]]` guard in complete silence
+  -- no `=== Running`, no `=== Skipping`, and the JUnit generator reported
+  `tests="0"` with nothing downstream asserting a floor. Four months of a
+  green-but-empty gate. Fixed by naming the directory the loop actually
+  iterates, dropping the error suppression so a real mismatch fails loudly
+  instead of vanishing, and adding a zero-tests guard plus a `--min-tests`
+  floor on the generated JUnit XML (also applied to the aarch64 runner's
+  identical step). The lane now also runs 15 integration binaries
+  (`crates/image/tests/*.rs`'s GL binaries and `crates/tensor/tests/*.rs`'s
+  DMA-BUF-touching ones) that previously fell into a CPU-only skip branch
+  unconditionally, and every crate's `testdata/` (not just the repository
+  root's) is shipped to the boards and to CI's own testdata artifact, so
+  fixtures under a crate-local `testdata/` directory reach on-target runs
+  the same way root-level fixtures already did. The JUnit generator now
+  counts executed tests from libtest's own `test result:` summary lines
+  rather than from a per-test regex that could not span a test's interleaved
+  log output: on the lane's first real run that regex named 574 of the 778
+  cases the summaries account for, so the floor moved with logging verbosity
+  as much as with test count. Both the reported count and the floor are now
+  the summary-line total (757 executed on that run), and the recovered cases
+  appear in the XML.
+- **A hardware-gated test that returned early after `eprintln!`-ing its
+  skip reason reported bare `ok`, indistinguishable from having actually
+  run.** libtest captures `println!`/`eprintln!` and replays it only for a
+  *failing* test, so the reason was silently discarded on every passing
+  skip -- both locally and on the boards. Every such site across
+  `edgefirst-image`, `edgefirst-tensor`, `edgefirst-codec`, and
+  `edgefirst-decoder` now writes `SKIPPED: <reason>` directly to stderr,
+  bypassing libtest's capture hook, so `scripts/on-target-test.sh`'s
+  per-board skip count (and a human reading captured CI logs) can actually
+  see it.
+- **Cross-building `edgefirst-tensor`'s `dynamic` backend test lane for a
+  board needed a hand-rolled `RUSTFLAGS`.** `crates/tensor/build.rs`'s
+  `dynamic-test-link` feature hardcoded a link-search path relative to this
+  crate's own manifest directory, which is wrong for any cross (`--target`)
+  build. It now honours `EDGEFIRST_TENSOR_LIB_DIR` when set and otherwise
+  derives the search path from `OUT_DIR`, matching whatever `target/
+  <profile>` or `target/<target-triple>/<profile>` layout the actual build
+  used.
+- **`test_merge_tiled_detections_releases_the_gil`'s 20% gap floor failed
+  on a two-vCPU hosted CI runner** that measured a real, repeatable ~17-19%
+  gap for a short CPU-bound op -- a headroom shortfall on that runner, not
+  a regression (a GIL-holding mutation still measures a gap near 0% under
+  the same harness). Lowered to 10%, which still discriminates a genuine
+  hold from a genuine release by roughly an order of magnitude.
+
 ### Changed
 
 - **`Tensor::as_pbo()` is removed** (Rust API; pre-1.0, so removed rather
@@ -283,6 +365,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned a capsule whose descriptor carried a host address in the field
   consumers read as the PBO op-vtable pointer. The `access=None` form, which
   is what `convert` uses, is unaffected.
+
+- **A packed DMA-BUF source at an unaligned plane offset is zero-copy again.**
+  Where 0.31.0 declined such a source on Mali and uploaded it through `map()`,
+  the GL engine now imports it from the largest 64-byte-aligned base a whole
+  number of pixels below the offset — `lcm(64, bpp)`, so RGB steps by 192 —
+  widens the import by the remainder in texels at the same pitch, and folds
+  the shift into the sampling rectangle through the new
+  `GlPlatform::import_origin`, beside the extent it already folded. Aligned
+  offsets are untouched. RGBA/BGRA/RGB/Grey sources only: NV's combined-plane
+  R8 import has no room to widen (its pitch is its width) and keeps the upload,
+  YUYV carries a two-pixel macropixel phase, and destinations are unchanged.
+  The two external-OES camera programs gained the sample clamp the `sampler2D`
+  ones already had. Pinned on imx95 (Mali), imx8mp (Vivante) and rpi5 (V3D) by
+  `offset_source_view_alignment.rs`, which now asserts the route was an import
+  and not an upload. (#170)
+
+- **The Mali offset gate asks about the offset the import will present.** A
+  gate keyed on the pixel format alone would exempt sources the rebase cannot
+  actually move — a 64-wide RGBA window into a tight 256-byte pitch, whose
+  widened row would run past the pitch, and a 100-wide RGB surface whose
+  64-byte-padded 320-byte stride puts a view at byte 323, which is not a whole
+  number of pixels — and both would then import unaligned on Mali and sample
+  zeros silently, where 0.31.0 declined and uploaded. `resolve_source_plane0`
+  is now the one place the decision lives: the import is built from it and the
+  gate reads the same function, held together by a test that asserts the two
+  agree over five real DMA shapes. (#170)
+
+- **A clamped sample coordinate is computed at `highp`.** The `tc` varying
+  defaulted to `mediump`, which was harmless while it only reached
+  `texture()`; routing it through the new `clamp()` put it on Mali's fp16 ALU,
+  quantizing the coordinate to about 0.625 texel at 1280 wide, which `LINEAR`
+  then smeared across the whole frame (max_diff 50 on i.MX 95, flat, not an
+  edge artifact). Every shader that computes on `tc` declares it `highp`,
+  including two that predate this change, pinned by name — not by count — in
+  `mod tc_precision`. The rule tracks the name `tc`; a sample coordinate under
+  another name needs its own recorded decision. (#170)
+
+- `scripts/on-target-test.sh` takes a `FEATURES` variable, applied to the test
+  build only. Feature-gated tests such as the `dma_test_formats` DMA-BUF import
+  suite otherwise never ran on a board, although CI's hardware lane builds
+  them; `FEATURES=edgefirst-image/dma_test_formats` is what verified this
+  change's gated tests on the three boards. See TESTING.md.
 
 - A malformed quantization descriptor in a tensor capsule is now reported
   rather than silently treated as "no quantization". Conflating the two is

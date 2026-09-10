@@ -303,7 +303,11 @@ pub struct GLProcessorST {
     /// Whether the GPU is an Arm Mali core (GL_RENDERER). Used to decline a
     /// source DMA-BUF import at a plane offset Mali would sample zeros from,
     /// so the upload path takes it instead — see `mali_rejects_import_offset`
-    /// and issue #165.
+    /// and issue #165. Its reach is now the imports the aligned-base rebase
+    /// does not move: a source it rebases presents an aligned base and stays
+    /// zero-copy, so what still declines is NV12's two-plane import, the
+    /// combined-plane R8 import, YUYV's macropixel phase, planar R8, and any
+    /// packed source the rebase could not apply to (#170).
     is_mali: bool,
     /// Whether the GPU is a virtualized/paravirtual device (GL_RENDERER).
     /// Concurrent GL across contexts mis-renders on paravirtual Metal
@@ -352,6 +356,11 @@ pub struct GLProcessorST {
     /// `draw_src_texture` and `draw_src_texture_from_pbo` select between;
     /// see [`Self::texture_src_extent_loc`].
     texture_src_extent_locs: [i32; 2],
+    /// Link-time `src_extent` locations for the four external-OES programs,
+    /// in the order `[yuv, yuv_int8, planar, planar_int8]`. `-1` on a
+    /// platform without external OES, where the programs are `None` and
+    /// `glUniform4f(-1, ..)` is a defined no-op.
+    external_src_extent_locs: [i32; 4],
     /// Shader: packed RGB -> RGBA8 packing (2D texture source, pass 2).
     packed_rgba8_program_2d: GlProgram,
     /// Shader: packed RGB int8 -> RGBA8 packing with XOR 0x80 (2D texture source, pass 2).
@@ -881,7 +890,11 @@ struct RendererTraits {
     /// Arm Mali (i.MX 95 G310 and kin). Its DMA-BUF import silently samples
     /// zeros when `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not 64-byte aligned —
     /// the import succeeds and no EGL error follows — so a source at such an
-    /// offset is declined and uploaded instead (issue #165).
+    /// offset is declined and uploaded instead (issue #165). The trait
+    /// remains; the offset it is asked about is now the one the import will
+    /// present, so a packed source folded onto an aligned base keeps the
+    /// zero copy and only what the fold could not move declines (issue
+    /// #170).
     mali: bool,
     /// Software rasterizer (llvmpipe/softpipe/swrast) — rejected unless the
     /// coverage-lane override is set.
@@ -1332,7 +1345,7 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
 /// Two data points bracket the Vivante rule rather than pin it — the true
 /// requirement is somewhere in `(32, 2048]` — so 64 is the tightest value
 /// consistent with both drivers rather than a documented driver constant.
-const DMA_IMPORT_OFFSET_ALIGN: usize = 64;
+pub(super) const DMA_IMPORT_OFFSET_ALIGN: usize = 64;
 
 /// Whether `plane_offset` is one of the offsets no measured embedded driver
 /// imports correctly. Pure, so the per-driver rules below are unit-testable
@@ -1347,8 +1360,39 @@ fn unaligned_import_offset(plane_offset: usize) -> bool {
 /// checked by its caller: a two-plane NV12 import hands EGL a plane-1 offset
 /// of its own, which can be unaligned while plane 0 is aligned — see
 /// [`nv12_plane1_offset`].
+///
+/// Asked of the offset the import will PRESENT, which for a source is
+/// [`source_import_plane0_offset`] rather than the tensor's own: a rebased
+/// source imports at an aligned base and is not declined, an unrebased one
+/// still carries its unaligned offset and is (issue #170).
 fn mali_rejects_import_offset(is_mali: bool, plane_offset: usize) -> bool {
     is_mali && unaligned_import_offset(plane_offset)
+}
+
+/// The plane-0 offset a SOURCE import of `img` will present to EGL.
+///
+/// Not `img.plane_offset()`: since issue #170 a source at an unaligned
+/// offset may import from the aligned base below it with the remainder
+/// folded into the sampling rectangle, and it is the base, not the tensor's
+/// own offset, that reaches `EGL_DMA_BUF_PLANE0_OFFSET_EXT`. Asking the
+/// tensor would decline a rebased source for nothing AND pass an unrebased
+/// one that comes back black, so the answer comes from the same function the
+/// import is built from — `dma_import::resolve_source_plane0`, the single
+/// source of truth.
+///
+/// Off Linux there is no DMA-BUF import to rebase, so the tensor's own
+/// offset is the answer; no non-Linux backend reports a Mali renderer
+/// anyway, which is the only thing that consults this.
+fn source_import_plane0_offset(img: &Tensor<u8>, img_fmt: PixelFormat) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        super::dma_import::resolved_source_plane0_offset(img, img_fmt)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = img_fmt;
+        img.plane_offset().unwrap_or(0)
+    }
 }
 
 /// Whether Vivante would fail to import a DESTINATION at `plane_offset`.
@@ -1637,6 +1681,24 @@ impl GLProcessorST {
             None
         };
 
+        // SAFETY: each program, when present, was linked above on this
+        // thread's current context; `GetUniformLocation` reads a linked
+        // program without needing it current, and the name is a `c"..."`
+        // literal.
+        let external_src_extent_locs = unsafe {
+            [
+                texture_program_yuv.as_ref(),
+                texture_int8_program_yuv.as_ref(),
+                texture_program_planar.as_ref(),
+                texture_program_planar_int8.as_ref(),
+            ]
+            .map(|p| {
+                p.map_or(-1, |p| {
+                    edgefirst_gl::gl::GetUniformLocation(p.id, c"src_extent".as_ptr())
+                })
+            })
+        };
+
         // Planar RGB shaders with sampler2D (for two-pass NV12→RGBA→PlanarRgb on Vivante)
         let texture_program_planar_2d =
             GlProgram::new(generate_vertex_shader(), generate_planar_rgb_shader_2d())?;
@@ -1766,6 +1828,7 @@ impl GLProcessorST {
             yuyv_program_2d,
             yuyv_2d_locs,
             texture_src_extent_locs,
+            external_src_extent_locs,
             packed_rgba8_program_2d,
             packed_rgba8_int8_program_2d,
             texture_program_planar_2d,
@@ -4022,7 +4085,8 @@ impl GLProcessorST {
             });
             // The uploaded texture is exactly the logical image, so the
             // sample clamp is the texture's own half-texel inset.
-            let [u0, v0, u1, v1] = super::render::sample_clamp_rect((src_w, src_h), None);
+            let [u0, v0, u1, v1] =
+                super::render::sample_clamp_rect((src_w, src_h), super::render::ImportMap::WHOLE);
             edgefirst_gl::gl::Uniform4f(self.texture_src_extent_loc(is_int8), u0, v0, u1, v1);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_normal_texture.id);
@@ -4874,13 +4938,17 @@ impl GLProcessorST {
         let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
         // As in `draw_src_texture`: the import may cover more of the texture
-        // than the logical image.
-        let src_roi = self.scale_src_roi(src_roi, src, src_fmt);
+        // than the logical image, and may start it partway in. One cache
+        // lookup feeds both the source rectangle and the sampling clamp.
+        let src_map = self.cached_src_import_map(src, src_fmt);
+        let src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), src_map);
+        let src_extent = super::render::sample_clamp_rect((src_w, src_h), src_map);
 
         self.draw_camera_texture_to_rgb_planar(
             src_key,
             src_egl,
             src_roi,
+            src_extent,
             dst_roi,
             rotation_offset,
             flip,
@@ -5294,6 +5362,10 @@ impl GLProcessorST {
         src_key: BufferImportKey,
         egl_img: PlatformHandle,
         src_roi: RegionOfInterest,
+        // The rectangle a sample may reach on the imported texture
+        // (`render::sample_clamp_rect`), computed at the call site from the
+        // same `ImportMap` that produced `src_roi`.
+        src_extent: [f32; 4],
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
@@ -5322,6 +5394,8 @@ impl GLProcessorST {
         .id;
         unsafe {
             edgefirst_gl::gl::UseProgram(program_id);
+            let [e0, e1, e2, e3] = src_extent;
+            edgefirst_gl::gl::Uniform4f(self.external_src_extent_loc(int8, true), e0, e1, e2, e3);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter(texture_target, edgefirst_gl::gl::LINEAR);
@@ -5622,20 +5696,21 @@ impl GLProcessorST {
             None
         };
         // An import can cover more of the texture than the logical image (a
-        // pool tensor narrowed by `configure_image`); sample only the logical
-        // part. `None` when the source is uploaded instead, and on every
-        // platform whose import is already the logical image.
-        let import_extent = zero_copy_attach
-            .is_some()
-            .then(|| self.cached_src_import_extent(src, src_fmt))
-            .flatten();
-        if import_extent.is_some() {
-            src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), import_extent);
-        }
-        // The shader clamps every sample to the logical image's half-texel-inset
-        // rectangle on the texture, so an upscale's last row or column cannot
-        // blend the texel beyond a narrowed image.
-        let [u0, v0, u1, v1] = super::render::sample_clamp_rect((src_w, src_h), import_extent);
+        // pool tensor narrowed by `configure_image`) and can start it partway
+        // in (a source rebased onto an aligned DMA-BUF base, issue #170);
+        // sample only the logical part. `WHOLE` when the source is uploaded
+        // instead, and on every platform whose import is already the logical
+        // image.
+        let import_map = if zero_copy_attach.is_some() {
+            self.cached_src_import_map(src, src_fmt)
+        } else {
+            super::render::ImportMap::WHOLE
+        };
+        src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), import_map);
+        // The shader clamps every sample to the logical image's
+        // half-texel-inset rectangle on the texture, so an upscale's last row
+        // or column cannot blend the texel beyond a narrowed or shifted image.
+        let [u0, v0, u1, v1] = super::render::sample_clamp_rect((src_w, src_h), import_map);
         let texture_format = match src_fmt {
             PixelFormat::Rgb => edgefirst_gl::gl::RGB,
             PixelFormat::Rgba => edgefirst_gl::gl::RGBA,
@@ -5681,8 +5756,16 @@ impl GLProcessorST {
                 // The shader rebuilds texel coordinates as `floor(tc * src_size)`,
                 // and `tc` was just scaled onto the imported texture, so this
                 // must be the texture's own texel grid — not the logical image's,
-                // which would land the pair lookup on the wrong column.
-                let (grid_w, grid_h) = import_extent
+                // which would land the pair lookup on the wrong column. A
+                // nonzero origin would break the Y/UV pair phase, so YUYV is
+                // never rebased (`DmaImportAttrs::from_tensor`).
+                debug_assert_eq!(
+                    import_map.origin,
+                    (0, 0),
+                    "YUYV must not be sampled through a shifted import"
+                );
+                let (grid_w, grid_h) = import_map
+                    .extent
                     .map_or((src_w as f32, src_h as f32), |(pw, ph)| {
                         (pw as f32, ph as f32)
                     });
@@ -5878,8 +5961,21 @@ impl GLProcessorST {
         let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
         // As in `draw_src_texture`: the import may cover more of the texture
-        // than the logical image.
+        // than the logical image, and may start it partway in.
         let src_roi = self.scale_src_roi(src_roi, src, src_fmt);
+        // The external-OES programs sample through the same mapping, so they
+        // clamp through it too: a rebased source (issue #170) has real texels
+        // in front of its first column and behind its last, and a LINEAR
+        // kernel at either edge would otherwise blend them.
+        let (src_w, src_h) = (
+            src.width().ok_or(Error::NotAnImage)?,
+            src.height().ok_or(Error::NotAnImage)?,
+        );
+        let [e0, e1, e2, e3] = super::render::sample_clamp_rect(
+            (src_w, src_h),
+            self.cached_src_import_map(src, src_fmt),
+        );
+        let extent_loc = self.external_src_extent_loc(is_int8, false);
 
         // Draw-time program selection (see draw_src_texture).
         let program_id = if is_int8 {
@@ -5895,6 +5991,7 @@ impl GLProcessorST {
         let texture_target = edgefirst_gl::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             edgefirst_gl::gl::UseProgram(program_id);
+            edgefirst_gl::gl::Uniform4f(extent_loc, e0, e1, e2, e3);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
@@ -6290,6 +6387,20 @@ impl GLProcessorST {
         // shader addresses the chroma bytes inside it by texel arithmetic, so
         // EGL is never handed a second plane offset. The two-plane import in
         // `get_or_create_egl_image` is the one that needs plane 1 checked too.
+        //
+        // The aligned-base rebase that keeps packed sources zero-copy (issue
+        // #170) does not apply here, and cannot: this import's pitch IS its
+        // width (`tex_width`), so widening it by the shift would overlap
+        // every row with the next, and the alternative -- a uniform shift
+        // with the width unchanged -- makes the shader address luma at
+        // `y * tex_width + x + shift`, which wraps rows and so needs a
+        // per-texel integer divide and modulo. That is exactly the
+        // arithmetic `nv_rgba_body_divfree` exists to avoid (3.3x on
+        // Vivante), and it would also leave the last `shift` bytes of the
+        // final chroma row outside the import, which for NV24 are pixels.
+        // So the NV path keeps the decline and uploads the combined plane,
+        // which issue #166's routing already sends to the R8 upload rather
+        // than the CPU.
         let offset = img.plane_offset().unwrap_or(0);
         if mali_rejects_import_offset(self.is_mali, offset) {
             return Err(crate::Error::NotSupported(format!(
@@ -6345,8 +6456,22 @@ impl GLProcessorST {
             },
         )?;
         // Mali samples zeros from a source imported at a plane offset that is
-        // not 64-byte aligned, with no EGL error to notice (issue #165). Refuse
-        // it so the caller's failure arm uploads the window through `map()`.
+        // not 64-byte aligned, with no EGL error to notice (issue #165). The
+        // question is asked of the offset the import will actually PRESENT,
+        // not of the tensor's own: since issue #170 a packed source at an
+        // unaligned offset imports from the aligned base below it with the
+        // remainder folded into the sampling rectangle, so it is exempt --
+        // but only when that rebase really applied. An offset that is not a
+        // whole number of pixels (`offset % bpp != 0`: a 64-padded RGB row
+        // stride of 320 is not a multiple of 3, so row 1 column 1 is byte
+        // 323) or a pitch with no room to widen (a whole 64-wide RGBA tensor
+        // at a `set_plane_offset` window has a tight 256-byte pitch) leaves
+        // the import unaligned, and keying the exemption on the FORMAT would
+        // wave exactly those through into a black frame. NV12's two-plane
+        // import, YUYV's macropixel phase and planar R8 are never rebased
+        // and so never exempt. The caller's failure arm uploads the window
+        // through `map()`.
+        //
         // Destinations are untouched: a destination view imports its parent at
         // offset 0 and is rendered into by viewport, never sampled at an
         // offset.
@@ -6362,7 +6487,12 @@ impl GLProcessorST {
             // would then sample zeros for chroma alone — silently
             // colour-shifted output rather than a black frame, which is harder
             // to notice than the luma case.
-            let offset = img.plane_offset().unwrap_or(0);
+            // The offset EGL will be handed, which is the tensor's own
+            // unless the rebase moved it.
+            let offset = source_import_plane0_offset(img, img_fmt);
+            // Plane 1 is derived from that same value, which for NV12 is
+            // the tensor's own offset unchanged: the rebase never covers a
+            // semi-planar format, so there is nothing for it to have moved.
             let chroma_offset = (img_fmt == PixelFormat::Nv12).then(|| {
                 if img.is_multiplane() {
                     // A separate chroma DMA-BUF imports at its own offset.
@@ -6463,24 +6593,50 @@ impl GLProcessorST {
         Ok(handle)
     }
 
-    /// The texel extent of the cached source import for `img`, when the
-    /// platform's import can cover more than the logical image
-    /// ([`GlPlatform::import_extent`]). Read after the import so the entry
-    /// exists; `None` on every platform whose import is the logical image, and
-    /// when the source was fed by upload instead.
-    fn cached_src_import_extent(&self, img: &Tensor<u8>, fmt: PixelFormat) -> Option<(u32, u32)> {
+    /// Where the cached source import puts `img`'s logical image on the
+    /// texture it covers ([`GlPlatform::import_extent`] +
+    /// [`GlPlatform::import_origin`]). ONE cache lookup for both, because
+    /// this runs on every convert. Read after the import so the entry
+    /// exists; [`ImportMap::WHOLE`](super::render::ImportMap::WHOLE) on every
+    /// platform whose import is the logical image, and when the source was
+    /// fed by upload instead.
+    fn cached_src_import_map(
+        &self,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> super::render::ImportMap {
         let id = BufferImportKey::from_tensor(img, fmt, false);
         self.src_egl_cache
             .entries
             .get(&id)
-            .and_then(|entry| Platform::import_extent(&entry.import))
+            .map(|entry| {
+                let map = super::render::ImportMap {
+                    extent: Platform::import_extent(&entry.import),
+                    origin: Platform::import_origin(&entry.import),
+                };
+                // The origin is only meaningful against an extent: every fold
+                // helper takes the map as the identity when `extent` is
+                // `None`, so a leaf that shifted the image without saying how
+                // big the texture is would drop the shift silently and show
+                // up as a black or torn frame on that board alone, with
+                // nothing to see locally. The two travel together.
+                debug_assert!(
+                    map.origin == (0, 0) || map.extent.is_some(),
+                    "an import origin {:?} without an extent is dropped by the fold",
+                    map.origin,
+                );
+                map
+            })
+            .unwrap_or(super::render::ImportMap::WHOLE)
     }
 
-    /// [`Self::cached_src_import_extent`] applied to a source rectangle: the
+    /// [`Self::cached_src_import_map`] applied to a source rectangle: the
     /// single site that turns logical-image coordinates into texture
     /// coordinates for the uv-sampling paths. The NV combined-plane path does
     /// not use it — its shader indexes texels absolutely from `img_size`, so a
-    /// narrowed plane already reads the right texels.
+    /// narrowed plane already reads the right texels, which is also why the NV
+    /// R8 import is never rebased to an aligned base (issue #170); it keeps
+    /// the Stage F decline.
     fn scale_src_roi(
         &self,
         roi: RegionOfInterest,
@@ -6490,7 +6646,7 @@ impl GLProcessorST {
         let (Some(w), Some(h)) = (img.width(), img.height()) else {
             return roi;
         };
-        super::render::scale_roi_to_import(roi, (w, h), self.cached_src_import_extent(img, fmt))
+        super::render::scale_roi_to_import(roi, (w, h), self.cached_src_import_map(img, fmt))
     }
 
     /// The `src_extent` location of the `sampler2D` source program
@@ -6502,6 +6658,18 @@ impl GLProcessorST {
             int8
         } else {
             plain
+        }
+    }
+
+    /// The `src_extent` location of the external-OES program the two camera
+    /// draws select for `is_int8` and `planar`.
+    fn external_src_extent_loc(&self, is_int8: bool, planar: bool) -> i32 {
+        let [yuv, yuv_int8, pl, pl_int8] = self.external_src_extent_locs;
+        match (planar, is_int8) {
+            (false, false) => yuv,
+            (false, true) => yuv_int8,
+            (true, false) => pl,
+            (true, true) => pl_int8,
         }
     }
 
@@ -6522,12 +6690,14 @@ impl GLProcessorST {
         src_w: usize,
         src_h: usize,
     ) -> ([f32; 4], [f32; 4]) {
-        let extent = (feed == float::FloatSrcFeed::Import)
-            .then(|| self.cached_src_import_extent(src_u8, PixelFormat::Rgba))
-            .flatten();
+        let map = if feed == float::FloatSrcFeed::Import {
+            self.cached_src_import_map(src_u8, PixelFormat::Rgba)
+        } else {
+            super::render::ImportMap::WHOLE
+        };
         (
-            super::render::scale_uv_rect_to_import(src_rect_uv, (src_w, src_h), extent),
-            super::render::sample_clamp_rect((src_w, src_h), extent),
+            super::render::scale_uv_rect_to_import(src_rect_uv, (src_w, src_h), map),
+            super::render::sample_clamp_rect((src_w, src_h), map),
         )
     }
 
@@ -8109,7 +8279,8 @@ impl GLProcessorST {
         let (src_rect_uv, dst_rect_px, pad_color) =
             super::core::float_crop_uniforms(&ResolvedCrop::no_crop(), dst_w, dst_h, dst_w, dst_h)?;
         // The intermediate texture is exactly the pass-1 destination.
-        let src_extent = super::render::sample_clamp_rect((dst_w, dst_h), None);
+        let src_extent =
+            super::render::sample_clamp_rect((dst_w, dst_h), super::render::ImportMap::WHOLE);
         self.render_float_to_zero_copy_tail(
             self.packed_rgb_intermediate_tex.id,
             src_rect_uv,
@@ -8469,6 +8640,9 @@ mod tests {
     // imported or uploaded. The offsets are the ones measured on i.MX 95
     // (issue #165): 32 and 2080 sampled zeros; 64, 256 and 2048 sampled
     // correctly, and offset 0 is the whole-image control, not a window.
+    // The offset rule itself is unchanged by issue #170: these are still the
+    // offsets Mali samples zeros from, and `mali_rejects_import_offset` is
+    // still the predicate. What changed is which formats are asked.
     #[test]
     fn mali_declines_only_unaligned_source_offsets() {
         use super::mali_rejects_import_offset as rejects;
@@ -8485,6 +8659,59 @@ mod tests {
         assert!(!rejects(false, 2080));
         // 256 was measured too, and is the RGBA test's `(0, 1)` origin.
         assert!(!rejects(true, 256));
+    }
+
+    // Which imports still reach that rule. A packed source the fold rebases
+    // presents an aligned base and must NOT be declined -- declining it is
+    // one regression this test exists to catch, because it costs the zero
+    // copy silently and every pixel still comes out right through the
+    // upload. Exempting one the fold could NOT move is the other, and that
+    // one comes back black, which is why the exemption is keyed on the
+    // resolved offset rather than on the format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mali_declines_the_imports_the_fold_could_not_move() {
+        use super::super::dma_import::resolve_source_plane0;
+        use super::{PixelFormat, DMA_IMPORT_OFFSET_ALIGN};
+
+        // Exactly the question the gate asks, through the same resolver
+        // the import is built from -- not a mirror of it.
+        let aligned = |fmt, w, pitch, off| {
+            resolve_source_plane0(fmt, w, pitch, off)
+                .0
+                .is_multiple_of(DMA_IMPORT_OFFSET_ALIGN)
+        };
+
+        // Rebased onto an aligned base: exempt. A 16-pixel view 8 pixels
+        // into a 256-byte-pitched RGBA parent, at the offset i.MX 95
+        // sampled zeros from.
+        assert!(aligned(PixelFormat::Rgba, 16, 256, 2080));
+        assert!(aligned(PixelFormat::Bgra, 16, 256, 32));
+        // Already aligned: exempt, and untouched.
+        assert!(aligned(PixelFormat::Rgba, 64, 256, 2048));
+        assert!(aligned(PixelFormat::Nv12, 64, 64, 0));
+        // Packed, but the fold cannot move it -- these are the two shapes
+        // that would come back black if the exemption were keyed on the
+        // format. A whole 64-wide RGBA tensor at a `set_plane_offset`
+        // window has a tight 256-byte pitch with no room to widen; a
+        // 100-wide RGB surface has a 64-padded 320-byte stride that is not
+        // a multiple of 3, so row 1 does not start on a whole pixel.
+        assert!(!aligned(PixelFormat::Rgba, 64, 256, 32));
+        assert!(!aligned(PixelFormat::Rgb, 16, 320, 323));
+        // Never rebased, so still declined at an unaligned offset: NV12's
+        // second plane carries an offset of its own and the R8 import's
+        // pitch is its width; YUYV/VYUY carry a macropixel phase a texel
+        // shift would break; planar RGB stacks its planes by row.
+        for fmt in [
+            PixelFormat::Nv12,
+            PixelFormat::Nv16,
+            PixelFormat::Nv24,
+            PixelFormat::Yuyv,
+            PixelFormat::Vyuy,
+            PixelFormat::PlanarRgb,
+        ] {
+            assert!(!aligned(fmt, 64, 256, 32), "{fmt:?} must not be exempt");
+        }
     }
 
     // The destination-side rule, which is Vivante's and NOT Mali's: Mali was

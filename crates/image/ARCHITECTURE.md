@@ -305,15 +305,64 @@ samples zeros from a source whose `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not
 256-byte pitch, against 64/256/2048 which sample correctly; #165). V3D was
 measured on the same offsets and imports every one correctly; Tegra/Orin is
 unmeasured, having no DMA heap to build a DMA-BUF source on.
-`mali_rejects_import_offset` declines a *source* import at such an offset in
-both `get_or_create_egl_image` and `get_or_create_nv_r8_egl_image`, and the
-caller uploads the window through `map()` instead. Every plane offset the
-import passes to EGL is checked, not only plane 0: a contiguous two-plane
-NV12 import derives plane 1 as `plane0_offset + pitch * height`
+A source no longer meets that offset. `DmaImportAttrs::from_tensor` imports a
+packed source from the largest 64-byte-aligned base a whole number of pixels
+below its plane offset — the step is `lcm(64, bpp)`, so RGB walks back by 192
+and not 64, because a 64-byte floor lands mid-pixel for a 3-byte texel — and
+widens the import by that remainder in texels at the unchanged pitch. The
+tensor's pixel `(x, y)` is then import texel `(x + x_shift_px, y)`, and
+`GlPlatform::import_origin` carries the shift to the engine, which folds it
+into the sampling rectangle beside the extent it already folded
+(`render::ImportMap`, and the same `scale_roi_to_import` /
+`scale_uv_rect_to_import` / `sample_clamp_rect` the Windows pool-narrowing case
+uses). The rebase runs on every driver rather than only Mali, so the path is
+exercised wherever an unaligned source runs; an aligned offset yields a zero
+shift and is bit-identical to before. Two declines remain: an offset that is
+not a whole number of pixels (a 64-byte-padded pitch need not be a multiple of
+3) and a widened row that would run past the pitch (`rebase_fits_pitch`).
+
+`mali_rejects_import_offset` therefore now guards only the imports the rebase
+could not move, and it is asked about the offset the import will actually
+present rather than the one the tensor carries. `resolve_source_plane0` is the
+single answer both sides read: `from_tensor` builds the import from it, and the
+gate reads the same function through `source_import_plane0_offset`, so an
+exemption keyed on the format alone cannot wave through a shape the rebase
+declined — a 64-wide RGBA window into a tight 256-byte pitch, or a 100-wide RGB
+surface whose 320-byte stride puts a view at byte 323. Both of those reach Mali
+unaligned if the gate guesses, and both sample zeros silently; the two sides are
+held together by `the_gate_reads_the_offset_the_import_presents`, which asserts
+the resolver's answer equals the `plane0_offset` `from_tensor` actually puts in
+the import over five real DMA shapes.
+
+NV is the format that matters among the ones the rebase never covers: the
+combined-plane R8 import's pitch **is** its width (`tex_width`), so widening it
+would overlap every row with the next, and the alternative of a uniform shift
+makes the shader address luma at `y * tex_width + x + shift` — a per-texel
+integer divide and modulo, exactly what `nv_rgba_body_divfree` was written to
+avoid (3.3x on Vivante GC7000UL), and one that leaves the final chroma row's
+last bytes outside the import. NV sources at an unaligned offset keep the
+decline and upload the combined plane through the R8 shader. YUYV/VYUY are
+excluded for a different reason: their two-byte texels carry a two-pixel
+macropixel phase a texel shift would break. Every plane offset the two-plane
+NV12 import passes to EGL is still checked, not only plane 0 — a contiguous
+import derives plane 1 as `plane0_offset + pitch * height`
 (`nv12_plane1_offset`), which a `from_fd`-adopted buffer's unpadded pitch can
-leave unaligned while plane 0 is fine — chroma alone sampling zeros is a
-colour shift rather than a black frame. The R8 entry point needs plane 0
-only, binding the combined plane as one R8 texture.
+leave unaligned while plane 0 is fine, and chroma alone sampling zeros is a
+colour shift rather than a black frame. The R8 entry point needs plane 0 only,
+binding the combined plane as one R8 texture.
+
+Because the Linux import can now be wider than the logical image, the two
+`GL_TEXTURE_EXTERNAL_OES` camera programs
+(`draw_camera_texture_to_rgb_planar`, `draw_camera_texture_eglimage`) carry the
+`src_extent` clamp the `sampler2D` programs already had — the condition
+`GlPlatform::import_extent`'s contract puts on any leaf that reports a
+narrowed extent and has external-OES programs. Routing a coordinate through
+`clamp()` is also what makes its precision qualifier load-bearing: `tc`
+defaulted to `mediump`, and on Mali's fp16 ALU that quantized the sampled
+coordinate to about 0.625 texel at 1280 wide, which `LINEAR` smeared across the
+whole frame. Every shader that computes on `tc` declares it `highp`, pinned by
+`mod tc_precision` in `gl/shaders.rs`; the rule tracks the name `tc` only, so a
+sample coordinate under another name needs its own recorded decision.
 
 Mali **destinations** keep the zero-copy import, and that is measured, not
 assumed: rendering into an unaligned base at the same offsets is correct on

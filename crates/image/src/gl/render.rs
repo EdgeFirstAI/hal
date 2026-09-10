@@ -258,11 +258,39 @@ pub(super) fn plan_batch(n_tiles: usize, rows_per_tile: usize, max_rows: usize) 
     }
 }
 
+/// Where a tensor's logical image sits on the texture its import covers.
+///
+/// Two independent reasons the two can differ, both folded the same way:
+/// a pool buffer narrowed by `configure_image` keeps its whole texture and
+/// reports a larger [`extent`](Self::extent) (Windows/D3D11), and a source
+/// rebased to an aligned DMA-BUF offset starts the logical image partway
+/// into the import and reports a nonzero [`origin`](Self::origin) (Linux,
+/// issue #170). A platform whose import IS the logical image reports
+/// [`ImportMap::WHOLE`], which every helper here treats as the identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ImportMap {
+    /// Texel size of the imported texture when it can exceed the logical
+    /// image ([`super::platform::GlPlatform::import_extent`]); `None` when
+    /// the import is exactly the logical image.
+    pub(super) extent: Option<(u32, u32)>,
+    /// Texels from the texture's origin to the logical image's first pixel
+    /// ([`super::platform::GlPlatform::import_origin`]).
+    pub(super) origin: (u32, u32),
+}
+
+impl ImportMap {
+    /// The import is exactly the logical image: no scale, no shift.
+    pub(super) const WHOLE: Self = Self {
+        extent: None,
+        origin: (0, 0),
+    };
+}
+
 /// How one axis of a logical image maps onto the texture an import covers:
-/// `(scale, limit)` — the factor that places the logical image over its share
-/// of the texture, and the normalized coordinate of its far edge. An axis that
-/// is not narrowed (and a degenerate or contradictory extent) maps as the
-/// identity.
+/// `(origin, scale, limit)` — the normalized coordinate the logical image
+/// starts at, the factor that places it over its share of the texture, and the
+/// normalized coordinate of its far edge. An axis that is not narrowed or
+/// shifted (and a degenerate or contradictory map) maps as the identity.
 ///
 /// The far edge is not pulled half a physical texel inside here. These
 /// coordinates are the endpoints of the quad's texcoord attribute, so moving
@@ -277,56 +305,68 @@ pub(super) fn plan_batch(n_tiles: usize, rows_per_tile: usize, max_rows: usize) 
 /// RTX 3070 and on WARP, the last row and column of an upscaled narrowed
 /// source then match a fresh buffer of the same geometry byte for byte
 /// (492-762 bytes differed by up to 48 without the clamp).
-fn axis_map(logical: usize, extent: u32) -> (f32, f32) {
-    if extent == 0 || logical == 0 || logical as u64 >= extent as u64 {
-        return (1.0, 1.0);
+///
+/// The origin is an ADDITIVE offset and the logical size a MULTIPLICATIVE
+/// scale, in that order: a coordinate `t` over the logical image lands at
+/// `(origin + t * logical) / extent`. A map whose shifted image would run
+/// past the texture is contradictory and maps as the identity, same as a
+/// degenerate one.
+fn axis_map(logical: usize, origin: u32, extent: u32) -> (f32, f32, f32) {
+    let span = (origin as u64).saturating_add(logical as u64);
+    if extent == 0 || logical == 0 || span > extent as u64 {
+        return (0.0, 1.0, 1.0);
     }
-    let scale = logical as f32 / extent as f32;
-    (scale, scale)
+    let texture = extent as f32;
+    (
+        origin as f32 / texture,
+        logical as f32 / texture,
+        span as f32 / texture,
+    )
 }
 
 /// Map a source rectangle from the tensor's logical image onto the larger
 /// texture its import covers.
 ///
-/// `roi` is normalized over the logical image; `extent` is
-/// `GlPlatform::import_extent`. The logical image occupies the texture's own
-/// texels from its origin, so mapping one onto the other is one multiply per
-/// axis — the half-texel inset the crop math already applied scales with it —
-/// held inside the logical edge by [`axis_map`]. `None` and an extent no
-/// larger than the logical image leave `roi` untouched.
+/// `roi` is normalized over the logical image; `map` is where that image sits
+/// on the texture. The logical image occupies a contiguous block of the
+/// texture's own texels starting at the map's origin, so mapping one onto the
+/// other is one shift and one multiply per axis — the half-texel inset the
+/// crop math already applied scales with it — held inside the logical edge by
+/// [`axis_map`]. [`ImportMap::WHOLE`] and an extent no larger than the logical
+/// image leave `roi` untouched.
 pub(super) fn scale_roi_to_import(
     roi: super::RegionOfInterest,
     logical: (usize, usize),
-    extent: Option<(u32, u32)>,
+    map: ImportMap,
 ) -> super::RegionOfInterest {
-    let Some((pw, ph)) = extent else {
+    let Some((pw, ph)) = map.extent else {
         return roi;
     };
-    let (sx, lx) = axis_map(logical.0, pw);
-    let (sy, ly) = axis_map(logical.1, ph);
+    let (ox, sx, lx) = axis_map(logical.0, map.origin.0, pw);
+    let (oy, sy, ly) = axis_map(logical.1, map.origin.1, ph);
     super::RegionOfInterest {
-        left: (roi.left * sx).min(lx),
-        top: (roi.top * sy).min(ly),
-        right: (roi.right * sx).min(lx),
-        bottom: (roi.bottom * sy).min(ly),
+        left: (ox + roi.left * sx).min(lx),
+        top: (oy + roi.top * sy).min(ly),
+        right: (ox + roi.right * sx).min(lx),
+        bottom: (oy + roi.bottom * sy).min(ly),
     }
 }
 
 /// [`scale_roi_to_import`] for the float paths' `src_rect_uv`, which is an
-/// origin and a size rather than two corners: the origin scales, and the size
-/// is trimmed to keep the far edge inside the same limit.
+/// origin and a size rather than two corners: the origin shifts and scales,
+/// and the size is trimmed to keep the far edge inside the same limit.
 pub(super) fn scale_uv_rect_to_import(
     rect: [f32; 4],
     logical: (usize, usize),
-    extent: Option<(u32, u32)>,
+    map: ImportMap,
 ) -> [f32; 4] {
-    let Some((pw, ph)) = extent else {
+    let Some((pw, ph)) = map.extent else {
         return rect;
     };
-    let (sx, lx) = axis_map(logical.0, pw);
-    let (sy, ly) = axis_map(logical.1, ph);
-    let left = (rect[0] * sx).min(lx);
-    let top = (rect[1] * sy).min(ly);
+    let (ox, sx, lx) = axis_map(logical.0, map.origin.0, pw);
+    let (oy, sy, ly) = axis_map(logical.1, map.origin.1, ph);
+    let left = (ox + rect[0] * sx).min(lx);
+    let top = (oy + rect[1] * sy).min(ly);
     [
         left,
         top,
@@ -342,27 +382,35 @@ pub(super) fn scale_uv_rect_to_import(
 ///
 /// A `LINEAR` sample at those bounds is centred on the logical image's edge
 /// texel, so the kernel cannot reach the texel beyond it. On a texture that
-/// is exactly the logical image (`extent` is `None`, or no larger than
-/// `logical`) that texel does not exist and `CLAMP_TO_EDGE` already returns
-/// the edge value, so the clamp changes nothing there. On an import that
-/// covers more of the texture than the logical image the texel beyond the
-/// edge holds the pool buffer's previous content, which an upscale would
-/// otherwise blend into the last row or column.
+/// is exactly the logical image ([`ImportMap::WHOLE`], or an extent no larger
+/// than `logical`) that texel does not exist and `CLAMP_TO_EDGE` already
+/// returns the edge value, so the clamp changes nothing there. On an import
+/// that covers more of the texture than the logical image the texels outside
+/// the image hold the pool buffer's previous content, or — when the map has a
+/// nonzero origin — the bytes the rebase walked back over and the pitch
+/// padding behind the last column, which an upscale would otherwise blend
+/// into the first or last row or column.
 ///
 /// A degenerate logical size yields the whole texture, `[0, 0, 1, 1]`.
-pub(super) fn sample_clamp_rect(logical: (usize, usize), extent: Option<(u32, u32)>) -> [f32; 4] {
-    fn axis(logical: usize, extent: Option<u32>) -> (f32, f32) {
+pub(super) fn sample_clamp_rect(logical: (usize, usize), map: ImportMap) -> [f32; 4] {
+    fn axis(logical: usize, origin: u32, extent: Option<u32>) -> (f32, f32) {
         if logical == 0 {
             return (0.0, 1.0);
         }
-        let texture = match extent {
-            Some(e) if e as u64 > logical as u64 => e as f32,
-            _ => logical as f32,
+        let span = (origin as u64).saturating_add(logical as u64);
+        let (texture, first) = match extent {
+            Some(e) if e as u64 > logical as u64 && e as u64 >= span => (e as f32, origin as f32),
+            // No extent, an extent no larger than the image, or a
+            // contradictory shift: the texture is the image at its origin.
+            _ => (logical as f32, 0.0),
         };
-        (0.5 / texture, (logical as f32 - 0.5) / texture)
+        (
+            (first + 0.5) / texture,
+            (first + logical as f32 - 0.5) / texture,
+        )
     }
-    let (u_min, u_max) = axis(logical.0, extent.map(|e| e.0));
-    let (v_min, v_max) = axis(logical.1, extent.map(|e| e.1));
+    let (u_min, u_max) = axis(logical.0, map.origin.0, map.extent.map(|e| e.0));
+    let (v_min, v_max) = axis(logical.1, map.origin.1, map.extent.map(|e| e.1));
     [u_min, v_min, u_max, v_max]
 }
 
@@ -603,6 +651,14 @@ mod tests {
 mod import_extent_tests {
     use super::*;
 
+    /// The pre-origin shape of every fold call: an extent, at origin `(0, 0)`.
+    fn narrowed(extent: (u32, u32)) -> ImportMap {
+        ImportMap {
+            extent: Some(extent),
+            origin: (0, 0),
+        }
+    }
+
     fn roi() -> super::super::RegionOfInterest {
         super::super::RegionOfInterest {
             left: 0.0,
@@ -616,7 +672,7 @@ mod import_extent_tests {
     /// is not narrowed), v is scaled to the logical image's share.
     #[test]
     fn a_narrowed_logical_image_scales_by_its_share_of_the_texture() {
-        let r = scale_roi_to_import(roi(), (128, 96), Some((128, 128)));
+        let r = scale_roi_to_import(roi(), (128, 96), narrowed((128, 128)));
         assert_eq!(r.left, 0.0);
         assert_eq!(r.right, 1.0);
         assert_eq!(r.top, 0.75);
@@ -631,16 +687,16 @@ mod import_extent_tests {
             right: 0.5,
             bottom: 0.25,
         };
-        let r = scale_roi_to_import(src, (64, 100), Some((128, 200)));
+        let r = scale_roi_to_import(src, (64, 100), narrowed((128, 200)));
         assert_eq!((r.left, r.right), (0.125, 0.25));
         assert_eq!((r.top, r.bottom), (0.375, 0.125));
     }
 
     #[test]
     fn equal_extents_and_no_extent_leave_the_rectangle_alone() {
-        let r = scale_roi_to_import(roi(), (128, 96), Some((128, 96)));
+        let r = scale_roi_to_import(roi(), (128, 96), narrowed((128, 96)));
         assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
-        let r = scale_roi_to_import(roi(), (128, 96), None);
+        let r = scale_roi_to_import(roi(), (128, 96), ImportMap::WHOLE);
         assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
     }
 
@@ -648,13 +704,13 @@ mod import_extent_tests {
     /// rectangle is left alone rather than magnified past the texture.
     #[test]
     fn a_logical_image_larger_than_the_extent_is_not_magnified() {
-        let r = scale_roi_to_import(roi(), (256, 256), Some((128, 128)));
+        let r = scale_roi_to_import(roi(), (256, 256), narrowed((128, 128)));
         assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
     }
 
     #[test]
     fn a_degenerate_extent_leaves_the_rectangle_alone() {
-        let r = scale_roi_to_import(roi(), (128, 96), Some((0, 0)));
+        let r = scale_roi_to_import(roi(), (128, 96), narrowed((0, 0)));
         assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
     }
 
@@ -662,7 +718,7 @@ mod import_extent_tests {
     /// is trimmed so the far edge lands where a corner would.
     #[test]
     fn a_uv_rect_scales_its_origin_and_trims_its_size() {
-        let r = scale_uv_rect_to_import([0.0, 0.0, 1.0, 1.0], (128, 96), Some((128, 128)));
+        let r = scale_uv_rect_to_import([0.0, 0.0, 1.0, 1.0], (128, 96), narrowed((128, 128)));
         assert_eq!([r[0], r[1]], [0.0, 0.0]);
         assert_eq!(r[2], 1.0);
         assert_eq!(r[3], 0.75);
@@ -672,10 +728,10 @@ mod import_extent_tests {
     fn a_uv_rect_keeps_an_interior_crop_and_passes_no_extent_through() {
         // Half the width starting a quarter in, on an axis narrowed to 3/4:
         // both scale, and the far edge (0.25 + 0.5) * 0.75 stays interior.
-        let r = scale_uv_rect_to_import([0.25, 0.25, 0.5, 0.5], (96, 96), Some((128, 128)));
+        let r = scale_uv_rect_to_import([0.25, 0.25, 0.5, 0.5], (96, 96), narrowed((128, 128)));
         assert_eq!([r[0], r[1]], [0.1875, 0.1875]);
         assert_eq!([r[2], r[3]], [0.375, 0.375]);
-        let r = scale_uv_rect_to_import([0.25, 0.25, 0.5, 0.5], (96, 96), None);
+        let r = scale_uv_rect_to_import([0.25, 0.25, 0.5, 0.5], (96, 96), ImportMap::WHOLE);
         assert_eq!(r, [0.25, 0.25, 0.5, 0.5]);
     }
 
@@ -683,7 +739,7 @@ mod import_extent_tests {
     /// a texel, v stops half a texel short of row 96.
     #[test]
     fn a_narrowed_image_clamps_samples_half_a_texel_inside_its_edge() {
-        let r = sample_clamp_rect((128, 96), Some((128, 128)));
+        let r = sample_clamp_rect((128, 96), narrowed((128, 128)));
         assert_eq!(r, [0.5 / 128.0, 0.5 / 128.0, 127.5 / 128.0, 95.5 / 128.0]);
     }
 
@@ -691,9 +747,9 @@ mod import_extent_tests {
     /// the half-texel inset of the whole texture on both axes.
     #[test]
     fn no_extent_clamps_to_the_textures_own_edge_texels() {
-        let r = sample_clamp_rect((128, 96), None);
+        let r = sample_clamp_rect((128, 96), ImportMap::WHOLE);
         assert_eq!(r, [0.5 / 128.0, 0.5 / 96.0, 127.5 / 128.0, 95.5 / 96.0]);
-        assert_eq!(sample_clamp_rect((128, 96), Some((128, 96))), r);
+        assert_eq!(sample_clamp_rect((128, 96), narrowed((128, 96))), r);
     }
 
     /// An extent smaller than the logical image is a contradiction; the
@@ -701,19 +757,19 @@ mod import_extent_tests {
     #[test]
     fn an_extent_smaller_than_the_image_is_ignored() {
         assert_eq!(
-            sample_clamp_rect((256, 256), Some((128, 128))),
-            sample_clamp_rect((256, 256), None)
+            sample_clamp_rect((256, 256), narrowed((128, 128))),
+            sample_clamp_rect((256, 256), ImportMap::WHOLE)
         );
     }
 
     #[test]
     fn a_degenerate_logical_size_leaves_the_whole_texture_reachable() {
         assert_eq!(
-            sample_clamp_rect((0, 0), Some((128, 128))),
+            sample_clamp_rect((0, 0), narrowed((128, 128))),
             [0.0, 0.0, 1.0, 1.0]
         );
         assert_eq!(
-            sample_clamp_rect((0, 96), None),
+            sample_clamp_rect((0, 96), ImportMap::WHOLE),
             [0.0, 0.5 / 96.0, 1.0, 95.5 / 96.0]
         );
     }
@@ -723,9 +779,167 @@ mod import_extent_tests {
     #[test]
     fn a_one_texel_image_clamps_to_its_single_texel_centre() {
         assert_eq!(
-            sample_clamp_rect((1, 1), Some((128, 128))),
+            sample_clamp_rect((1, 1), narrowed((128, 128))),
             [0.5 / 128.0; 4]
         );
-        assert_eq!(sample_clamp_rect((1, 1), None), [0.5; 4]);
+        assert_eq!(sample_clamp_rect((1, 1), ImportMap::WHOLE), [0.5; 4]);
+    }
+
+    /// A shifted import: the logical 16-wide image sits at texel 8 of a
+    /// 24-wide texture. The ROI must land on `[8/24, 24/24]`, not `[0, 16/24]`
+    /// -- the whole point of the origin. This is the (8, 0) view of issue
+    /// #165's probe at RGBA, whose 32-byte offset rebases to 0 with a
+    /// 8-texel shift.
+    #[test]
+    fn scale_roi_to_import_offsets_by_the_origin() {
+        let roi = super::super::RegionOfInterest {
+            left: 0.0,
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+        };
+        let map = ImportMap {
+            extent: Some((24, 16)),
+            origin: (8, 0),
+        };
+        let got = scale_roi_to_import(roi, (16, 16), map);
+        assert!((got.left - 8.0 / 24.0).abs() < 1e-6, "left {}", got.left);
+        assert!((got.right - 1.0).abs() < 1e-6, "right {}", got.right);
+        // The unshifted axis is untouched.
+        assert!((got.top - 0.0).abs() < 1e-6, "top {}", got.top);
+        assert!((got.bottom - 1.0).abs() < 1e-6, "bottom {}", got.bottom);
+    }
+
+    /// A half-width ROI on a shifted import: the origin is an ADDITIVE
+    /// offset and the logical size is the MULTIPLICATIVE scale, so the
+    /// midpoint lands at `(8 + 8) / 24`, not at `8 / 24 * 0.5` or `0.5`.
+    #[test]
+    fn scale_roi_to_import_composes_origin_and_scale() {
+        let roi = super::super::RegionOfInterest {
+            left: 0.0,
+            top: 0.25,
+            right: 0.5,
+            bottom: 0.75,
+        };
+        let map = ImportMap {
+            extent: Some((24, 16)),
+            origin: (8, 0),
+        };
+        let got = scale_roi_to_import(roi, (16, 16), map);
+        assert!((got.left - 8.0 / 24.0).abs() < 1e-6, "left {}", got.left);
+        assert!(
+            (got.right - 16.0 / 24.0).abs() < 1e-6,
+            "right {}",
+            got.right
+        );
+        assert!((got.top - 0.25).abs() < 1e-6, "top {}", got.top);
+        assert!((got.bottom - 0.75).abs() < 1e-6, "bottom {}", got.bottom);
+    }
+
+    /// `ImportMap::WHOLE` is the identity on all three helpers -- the state
+    /// every platform whose import IS the logical image reports, and the
+    /// state every call site had before the origin existed.
+    #[test]
+    fn whole_import_map_is_the_identity() {
+        let roi = super::super::RegionOfInterest {
+            left: 0.1,
+            top: 0.2,
+            right: 0.8,
+            bottom: 0.9,
+        };
+        let got = scale_roi_to_import(roi, (64, 64), ImportMap::WHOLE);
+        assert_eq!(
+            (got.left, got.top, got.right, got.bottom),
+            (0.1, 0.2, 0.8, 0.9)
+        );
+        assert_eq!(
+            scale_uv_rect_to_import([0.1, 0.2, 0.3, 0.4], (64, 64), ImportMap::WHOLE),
+            [0.1, 0.2, 0.3, 0.4]
+        );
+        assert_eq!(ImportMap::default(), ImportMap::WHOLE);
+        let [u0, v0, u1, v1] = sample_clamp_rect((64, 64), ImportMap::WHOLE);
+        assert!((u0 - 0.5 / 64.0).abs() < 1e-9 && (v0 - 0.5 / 64.0).abs() < 1e-9);
+        assert!((u1 - 63.5 / 64.0).abs() < 1e-9 && (v1 - 63.5 / 64.0).abs() < 1e-9);
+    }
+
+    /// The clamp rectangle must bracket the LOGICAL image's texels on a
+    /// shifted texture, so a LINEAR kernel at the left edge cannot blend
+    /// the rebase padding in front of it and one at the right edge cannot
+    /// reach the pitch padding behind it.
+    #[test]
+    fn sample_clamp_rect_brackets_a_shifted_image() {
+        let map = ImportMap {
+            extent: Some((24, 16)),
+            origin: (8, 0),
+        };
+        let [u0, v0, u1, v1] = sample_clamp_rect((16, 16), map);
+        assert!((u0 - 8.5 / 24.0).abs() < 1e-6, "u0 {u0}");
+        assert!((u1 - 23.5 / 24.0).abs() < 1e-6, "u1 {u1}");
+        assert!((v0 - 0.5 / 16.0).abs() < 1e-6, "v0 {v0}");
+        assert!((v1 - 15.5 / 16.0).abs() < 1e-6, "v1 {v1}");
+    }
+
+    /// A contradictory map -- the shifted image would run past the texture
+    /// -- falls back to the identity rather than sampling outside it.
+    #[test]
+    fn a_shifted_image_that_overruns_the_extent_maps_as_the_identity() {
+        let roi = super::super::RegionOfInterest {
+            left: 0.0,
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+        };
+        let map = ImportMap {
+            extent: Some((20, 16)),
+            origin: (8, 0),
+        };
+        let got = scale_roi_to_import(roi, (16, 16), map);
+        assert_eq!((got.left, got.right), (0.0, 1.0));
+        let [u0, _, u1, _] = sample_clamp_rect((16, 16), map);
+        assert!((u0 - 0.5 / 16.0).abs() < 1e-6, "u0 {u0}");
+        assert!((u1 - 15.5 / 16.0).abs() < 1e-6, "u1 {u1}");
+    }
+
+    /// An origin with NO extent is DROPPED by every helper -- the map is the
+    /// identity, and the shift silently goes nowhere. This is why a leaf that
+    /// reports a nonzero origin must report the widened extent alongside it
+    /// (`GLProcessorST::cached_src_import_map` asserts the pairing): the
+    /// failure mode is a wrongly-sampled frame on the one board that rebases,
+    /// with nothing to see anywhere else.
+    #[test]
+    fn an_origin_without_an_extent_is_dropped_by_every_helper() {
+        let map = ImportMap {
+            extent: None,
+            origin: (8, 0),
+        };
+        let r = roi();
+        let got = scale_roi_to_import(r, (16, 16), map);
+        assert_eq!(
+            (got.left, got.top, got.right, got.bottom),
+            (r.left, r.top, r.right, r.bottom)
+        );
+        assert_eq!(
+            scale_uv_rect_to_import([0.1, 0.2, 0.3, 0.4], (16, 16), map),
+            [0.1, 0.2, 0.3, 0.4]
+        );
+        assert_eq!(
+            sample_clamp_rect((16, 16), map),
+            sample_clamp_rect((16, 16), ImportMap::WHOLE)
+        );
+    }
+
+    /// The float paths' origin-and-size rect: the origin shifts and the
+    /// size stays trimmed inside the same limit.
+    #[test]
+    fn scale_uv_rect_to_import_offsets_by_the_origin() {
+        let map = ImportMap {
+            extent: Some((24, 16)),
+            origin: (8, 0),
+        };
+        let got = scale_uv_rect_to_import([0.0, 0.0, 1.0, 1.0], (16, 16), map);
+        assert!((got[0] - 8.0 / 24.0).abs() < 1e-6, "x {}", got[0]);
+        assert!((got[2] - 16.0 / 24.0).abs() < 1e-6, "w {}", got[2]);
+        assert!((got[1] - 0.0).abs() < 1e-6, "y {}", got[1]);
+        assert!((got[3] - 1.0).abs() < 1e-6, "h {}", got[3]);
     }
 }

@@ -707,7 +707,7 @@ mod tests {
         let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!("SKIPPED: DMA not available");
+                crate::test_support::report_skip("DMA not available");
                 return;
             }
         };

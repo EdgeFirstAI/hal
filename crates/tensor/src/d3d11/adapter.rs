@@ -343,7 +343,7 @@ mod tests {
             match DxgiAdapter::fake(description, luid_low, vram, software) {
                 Ok(a) => adapters.push(a),
                 Err(e) => {
-                    eprintln!("DXGI enumeration unavailable — skipping: {e}");
+                    crate::test_support::report_skip(&format!("DXGI enumeration unavailable: {e}"));
                     return;
                 }
             }
@@ -383,7 +383,9 @@ mod tests {
                     assert!(!a.description.is_empty());
                 }
             }
-            Err(e) => eprintln!("DXGI enumeration unavailable — skipping: {e}"),
+            Err(e) => {
+                crate::test_support::report_skip(&format!("DXGI enumeration unavailable: {e}"))
+            }
         }
     }
 

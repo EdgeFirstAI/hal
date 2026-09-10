@@ -14,8 +14,9 @@ use std::os::windows::io::AsRawHandle;
 #[path = "support/cuda_require.rs"]
 mod cuda_require;
 
-/// The WARP exclusion for the three CUDA interop tests, printing
-/// `SKIP {what}: ...` and returning `true` when the caller must return early.
+/// The WARP exclusion for the three CUDA interop tests, reporting
+/// `SKIPPED: {what}: ...` through `report_skip` and returning `true` when the
+/// caller must return early.
 ///
 /// `cudaD3D11GetDevice` has no ordinal for the WARP adapter, so no amount of
 /// working CUDA runtime can give a WARP device a CUDA import: the skip is a
@@ -31,15 +32,26 @@ mod cuda_require;
 fn warp_has_no_cuda_device(what: &str) -> bool {
     let warp = edgefirst_tensor::d3d11::device().is_ok_and(|d| d.is_warp());
     if warp {
-        eprintln!("SKIP {what}: WARP adapter has no CUDA device");
+        report_skip(&format!("{what}: WARP adapter has no CUDA device"));
     }
     warp
+}
+
+/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
+/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
+/// it -- see `edgefirst_tensor`'s (crate-internal) `test_support` module
+/// for the same mechanism in the library's own `#[cfg(test)]` code; this
+/// integration test binary is a separate compilation unit and cannot reach
+/// that `pub(crate)` helper, so it carries a local copy.
+fn report_skip(reason: &str) {
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
 }
 
 #[test]
 fn image_with_dmabuf_on_windows_is_a_texture_tensor() {
     if !edgefirst_tensor::is_gpu_buffer_available() {
-        eprintln!("no D3D11 device on this box -- skipping");
+        report_skip("no D3D11 device on this box");
         return;
     }
     let t = Tensor::<u8>::image(
@@ -848,7 +860,7 @@ fn child_imports_the_exported_blob(path: &str) {
                 !m.device_ptr().is_null(),
                 "the CUDA map has a device pointer"
             ),
-            None => eprintln!("no CUDA registration on the imported texture -- skipping"),
+            None => report_skip("no CUDA registration on the imported texture"),
         }
     }
 }

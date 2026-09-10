@@ -338,9 +338,11 @@ pub(super) trait GlPlatform {
     /// larger than the tensor's logical image; `None` when the import is
     /// always exactly the logical image.
     ///
-    /// Linux creates the DMA-BUF `EGLImage` at the logical size (the physical
-    /// pitch is a separate attribute) and macOS gives the pbuffer explicit
-    /// dimensions, so on both the import *is* the logical image.
+    /// Linux reports the logical size unless the source was rebased onto an
+    /// aligned DMA-BUF offset, where the import is `x_shift_px` texels wider
+    /// and [`Self::import_origin`] says where the image starts on it; macOS
+    /// gives the pbuffer explicit dimensions, so there the import *is* the
+    /// logical image.
     /// `EGL_ANGLE_image_d3d11_texture` has no sub-extent attribute: a pool
     /// buffer narrowed by `configure_image` keeps its texture and imports all
     /// of it, so Windows reports the texture's texel size and the engine
@@ -349,14 +351,30 @@ pub(super) trait GlPlatform {
     /// logical image ([`super::render::sample_clamp_rect`]). A leaf that
     /// returns `None` reaches both as the identity.
     ///
-    /// Not every sampling site clamps: the two `GL_TEXTURE_EXTERNAL_OES`
-    /// camera programs (`draw_camera_texture_to_rgb_planar`,
-    /// `draw_camera_texture_eglimage`) scale their source rectangle and stop
-    /// there. They exist only where [`Self::EXTERNAL_OES`] is true, which
-    /// today is only the leaf that returns `None` here, so a narrowed import
-    /// cannot reach them. A leaf that returns `Some` and has external-OES
-    /// programs must add the clamp to both.
+    /// Every sampling site clamps, the two `GL_TEXTURE_EXTERNAL_OES` camera
+    /// programs (`draw_camera_texture_to_rgb_planar`,
+    /// `draw_camera_texture_eglimage`) included: they now carry the same
+    /// `src_extent` uniform the `sampler2D` programs do, which is what lets
+    /// the Linux leaf report a narrowed extent and a nonzero
+    /// [`Self::import_origin`] and still use them.
     fn import_extent(import: &Self::Import) -> Option<(u32, u32)>;
+
+    /// Texels from the imported texture's origin to the tensor's own first
+    /// pixel, when a leaf can start the logical image partway into the
+    /// import; `(0, 0)` — the default — when the logical image always begins
+    /// at the texture's origin.
+    ///
+    /// The companion of [`Self::import_extent`]: the extent says how much
+    /// texture the import covers, this says where in it the logical image
+    /// starts, and the engine folds both through one
+    /// [`super::render::ImportMap`] at every site that turns logical-image
+    /// coordinates into texture coordinates. Linux returns a nonzero origin
+    /// for a source rebased onto a 64-byte-aligned DMA-BUF base, which the
+    /// import then widens by the same shift (issue #170); every other leaf
+    /// keeps the default.
+    fn import_origin(_import: &Self::Import) -> (u32, u32) {
+        (0, 0)
+    }
 
     /// Attach the import as the image of the CURRENTLY BOUND
     /// `GL_TEXTURE_2D` texture object. Linux:

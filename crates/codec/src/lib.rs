@@ -54,6 +54,8 @@ mod options;
 mod pixel;
 #[cfg(feature = "png")]
 mod png;
+#[cfg(test)]
+mod test_support;
 mod traits;
 
 pub use decoder::{peek_info, ChromaUpsample, DctMethod, ImageDecoder};

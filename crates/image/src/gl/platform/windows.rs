@@ -1298,11 +1298,13 @@ mod tests {
     #[test]
     fn load_egl_lib_finds_angle_or_skips() {
         let Some(dir) = std::env::var_os("EDGEFIRST_ANGLE_PATH") else {
-            eprintln!("EDGEFIRST_ANGLE_PATH unset — skipping ANGLE load probe");
+            crate::test_support::report_skip("EDGEFIRST_ANGLE_PATH unset — no ANGLE load probe");
             return;
         };
         if !Path::new(&dir).join("libEGL.dll").is_file() {
-            eprintln!("no libEGL.dll under EDGEFIRST_ANGLE_PATH — skipping ANGLE load probe");
+            crate::test_support::report_skip(
+                "no libEGL.dll under EDGEFIRST_ANGLE_PATH — no ANGLE load probe",
+            );
             return;
         }
         WindowsPlatform::load_egl_lib()
@@ -1321,11 +1323,11 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(keeper) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let Ok(doomed) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         // `keeper` issues the last commands, so it is the context the
@@ -1357,7 +1359,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(shared) = shared_display() else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let dev = edgefirst_tensor::d3d11::device().expect("device");
@@ -1377,7 +1379,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(display) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let t = edgefirst_tensor::Tensor::<u8>::image(
@@ -1433,7 +1435,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(display) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         assert!(AngleD3d11::native_fence_sync(&display));
