@@ -15,11 +15,13 @@
 //! testing again.
 //!
 //! [`decide`] is the pure core: given whether a precondition held and
-//! whether coverage is required, it returns, prints, or panics -- no
-//! environment access, so its own tests never touch
+//! whether coverage is required, it returns or panics -- no environment
+//! access and no output, so its own tests never touch
 //! `HAL_TEST_REQUIRE_CUDA` and mean the same thing on every host.
 //! [`cuda_available_or_skip`] and [`require_or_skip`] are the two thin,
-//! env-reading callers `gl/tests.rs` uses.
+//! env-reading callers `gl/tests.rs` uses; they print `SKIP {what}: {why}`
+//! when `decide` returns `false`, so a skip is only ever reported once,
+//! from the caller that knows it actually happened.
 //!
 //! Same philosophy as `tests/gpu_policy.py` for GPU-backed tests: on a
 //! platform where the feature must work, a vacuous skip is a product bug.
@@ -31,9 +33,11 @@ fn required() -> bool {
 }
 
 /// The pure decision: `true` when `satisfied`; otherwise a failure or a skip
-/// depending on `require`. No environment access -- callers read
-/// `HAL_TEST_REQUIRE_CUDA` and pass the result in as `require`, which is what
-/// keeps this function (and its tests) meaningful on every host.
+/// depending on `require`. No environment access and no output -- callers
+/// read `HAL_TEST_REQUIRE_CUDA` and pass the result in as `require`, and
+/// print the `SKIP` line themselves on a `false` return, which is what keeps
+/// this function (and its tests) meaningful and side-effect-free on every
+/// host.
 ///
 /// # Panics
 ///
@@ -49,37 +53,42 @@ fn decide(satisfied: bool, require: bool, what: &str, why: &str) -> bool {
         "HAL_TEST_REQUIRE_CUDA=1 but {what} would have skipped while \
          reporting success: {why}"
     );
-    eprintln!("SKIP {what}: {why}");
     false
 }
 
 /// `true` when the caller should run; `false` when it should return early.
+/// Prints `SKIP {what}: {why}` to stderr on a `false` return.
 ///
 /// # Panics
 ///
 /// When `HAL_TEST_REQUIRE_CUDA=1` and CUDA is unavailable -- see [`decide`].
 pub(crate) fn cuda_available_or_skip(what: &str) -> bool {
-    decide(
-        edgefirst_tensor::is_cuda_available(),
-        required(),
-        what,
-        "no libcudart (a supported soname missing from cuda.rs's probe \
-         list, or LD_LIBRARY_PATH does not reach the runtime)",
-    )
+    let why = "no libcudart (a supported soname missing from cuda.rs's probe \
+         list, or LD_LIBRARY_PATH does not reach the runtime)";
+    let run = decide(edgefirst_tensor::is_cuda_available(), required(), what, why);
+    if !run {
+        eprintln!("SKIP {what}: {why}");
+    }
+    run
 }
 
 /// `true` when the caller should run; `false` when it should return early.
 /// For preconditions inside a CUDA test other than the runtime itself --
 /// a GL context, F32 render support, a PBO-backed destination, CUDA-GL
 /// interop -- so that under `HAL_TEST_REQUIRE_CUDA=1` a skip anywhere in a
-/// required CUDA test is a failure, not just an absent runtime.
+/// required CUDA test is a failure, not just an absent runtime. Prints
+/// `SKIP {what}: {why}` to stderr on a `false` return.
 ///
 /// # Panics
 ///
 /// When `HAL_TEST_REQUIRE_CUDA=1` and `satisfied` is `false` -- see
 /// [`decide`].
 pub(crate) fn require_or_skip(satisfied: bool, what: &str, why: &str) -> bool {
-    decide(satisfied, required(), what, why)
+    let run = decide(satisfied, required(), what, why);
+    if !run {
+        eprintln!("SKIP {what}: {why}");
+    }
+    run
 }
 
 #[cfg(test)]

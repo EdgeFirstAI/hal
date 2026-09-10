@@ -1046,8 +1046,13 @@ cargo test -p edgefirst-tensor -- --test-threads=1
 
 These exercise the real zero-copy output path end to end:
 `convert()` → `cuda_map()` → `cudaMemcpy(D2H)` → bit-compare to a CPU reference.
-They run on any CUDA-capable host and **skip cleanly** when `libcudart`, GL, or a
-PBO allocation is unavailable, so they are *not* part of `make test`.
+They run on any CUDA-capable host and are *not* part of `make test`. Without
+the opt-in below they **skip cleanly** when `libcudart`, GL, or a PBO
+allocation is unavailable; under `HAL_TEST_REQUIRE_CUDA=1` — which
+`make test-cuda` sets whenever it locates a runtime — every one of those
+skips is a failure instead of a pass. See
+[`crates/image/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md)
+for the policy that enforces this.
 
 | Test (`crates/image`) | Covers |
 |------------------------|--------|

@@ -712,7 +712,7 @@ test-cuda:
 		fi); \
 	if [ -z "$$CUDART_LIB" ]; then \
 		for d in /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib /usr/local/cuda/targets/x86_64-linux/lib; do \
-			if [ -e "$$d/libcudart.so" ] || [ -e "$$d/libcudart.so.13" ] || [ -e "$$d/libcudart.so.12" ]; then CUDART_LIB="$$d"; break; fi; \
+			if [ -e "$$d/libcudart.so" ] || [ -e "$$d/libcudart.so.13" ] || [ -e "$$d/libcudart.so.12" ] || [ -e "$$d/libcudart.so.11.0" ]; then CUDART_LIB="$$d"; break; fi; \
 		done; \
 	fi; \
 	if [ -n "$$CUDART_LIB" ]; then \
