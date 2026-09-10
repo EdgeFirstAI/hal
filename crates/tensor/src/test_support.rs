@@ -18,7 +18,18 @@
 /// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
 /// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
 /// it.
-#[cfg(test)]
+///
+/// `cfg(unix)`, not just `cfg(test)`: every current call site
+/// (`dma.rs`'s `target_os = "linux"` tests, `lib.rs`'s IOSurface tests
+/// under `target_os = "macos"`, and its shm tests under plain `unix`) is
+/// reachable only on Unix, so an unconditional `pub(crate) fn` here is
+/// dead code on Windows and fails a `-D warnings` build there. Widen this
+/// (or add a Windows-specific caller with its own cfg) if a Windows test
+/// inside this crate's `src/` ever needs it directly --
+/// `crates/tensor/tests/d3d11_tensor.rs` already carries its own local
+/// copy for exactly that reason, since an integration-test binary can't
+/// reach this `pub(crate)` item anyway.
+#[cfg(all(test, unix))]
 pub(crate) fn report_skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
