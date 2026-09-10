@@ -2097,9 +2097,14 @@ jobs:
       - name: Generate JUnit XML from Rust results
         if: always()
         run: |
+          # Floor set from the lane's first real run after the chmod fix
+          # (run 34472605256, job 102858670856): the junit parsed 574 tests,
+          # so the floor is 574 - 15% rounded down. Raise it deliberately when
+          # the suite grows; it exists to catch a silent collapse to zero, not
+          # to track the exact count.
           python3 .github/scripts/generate_junit_xml.py \
             build/rust-test-results build/rust_hardware_results.xml \
-            --min-tests 40
+            --min-tests 487
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
