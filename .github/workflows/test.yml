@@ -1729,7 +1729,10 @@ jobs:
 
       - name: Generate JUnit XML from Rust results
         if: always()
-        run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_runner_results.xml
+        run: |
+          python3 .github/scripts/generate_junit_xml.py \
+            build/rust-test-results build/rust_runner_results.xml \
+            --min-tests 1000
 
       - name: Process Rust coverage
         if: always()
@@ -1919,7 +1922,10 @@ jobs:
           # Only run tests that exercise hardware (G2D, OpenGL/EGL, DMA).
           # CPU-only tests already run on the ubuntu-22.04-arm-xlarge runner.
           mkdir -p build/rust-test-results build/profraw
-          chmod +x hardware-test-binaries/* 2>/dev/null || true
+          # The artifact round trip does not preserve the executable bit, so
+          # every binary arrives 0644 and the `[[ -x ]]` guard below skips it.
+          # This MUST name the same directory the loop iterates.
+          chmod +x hardware-test-binaries-stripped/*
           TEST_FAILED=0
 
           run_filtered() {
@@ -1960,11 +1966,19 @@ jobs:
               echo "=== Skipping $test_name (CPU-only, covered by aarch64 runner) ==="
             fi
           done
+          ran=$(find build/rust-test-results -name '*.txt' | wc -l)
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::imx8mp hardware lane executed 0 test binaries"
+            exit 1
+          fi
           [ $TEST_FAILED -eq 0 ] || exit 1
 
       - name: Generate JUnit XML from Rust results
         if: always()
-        run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
+        run: |
+          python3 .github/scripts/generate_junit_xml.py \
+            build/rust-test-results build/rust_hardware_results.xml \
+            --min-tests 40
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
