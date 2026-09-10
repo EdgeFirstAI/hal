@@ -193,8 +193,11 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
             "expected Error::NotSupported, got {err:?}"
         );
         let msg = err.to_string();
+        // Only pin the stable prefix: the tail names whichever placement
+        // rule declined (ANGLE's whole-buffer binding with no view origin,
+        // or a driver whose import rejects the offset), which isn't asserted.
         assert!(
-            msg.contains("has no view origin to place it by"),
+            msg.contains("GL float destination at plane offset"),
             "expected the float dispatch gate's refusal message, got: {msg}"
         );
     }
