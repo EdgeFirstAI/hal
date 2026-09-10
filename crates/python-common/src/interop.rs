@@ -234,13 +234,22 @@ const _: () = {
 ///   `import_storage`'s DMABUF arm is `cfg(target_os = "linux")`, so an
 ///   import there fails with "dma-buf import off Linux" rather than
 ///   reconstructing anything. A separate pre-existing limitation.
-/// * **PBO** -- not reached. `Tensor::view()` on a PBO-backed image comes
-///   back reporting `TensorMemory::Mem`, so it takes the `HOST` path above.
-///   (Why it demotes has not been traced, and such a view appears to be
-///   detached from the parent buffer entirely -- reproducible on `main`,
-///   so a pre-existing PBO-view issue independent of this one. Issue #162.
-///   If that is fixed so views stay PBO-backed, `PboTensor` needs an arm in
-///   `set_plane_offset` too.)
+/// * **PBO** -- fixed (issues #161 and #162). A `Tensor::view()` of a
+///   PBO-backed image used to come back reporting `TensorMemory::Mem`,
+///   because the `dynamic` backend held the real GL buffer in a field the C
+///   ABI could not see and the view was a window onto the host placeholder
+///   beside it. A PBO is now real `TensorStorage::Pbo` storage inside
+///   `libedgefirst_tensor` (`ef_tensor_wrap_pbo`), so a view stays
+///   PBO-backed and reports `kind::PBO` -- which means it reaches *this*
+///   function, and `PboTensor::view_offset` is written back by
+///   `set_plane_offset` and cleared by `set_format`. Pinned by
+///   `set_plane_offset_moves_the_pbo_map_window` and its two siblings in
+///   `edgefirst-tensor`'s `pbo` module, and end to end by
+///   `test_pbo_view_converts_its_own_sub_region_not_the_parents_origin`
+///   (`tests/interop/test_cross_package.py`), which sets
+///   `EDGEFIRST_FORCE_TRANSFER=pbo` through `monkeypatch` before building
+///   the processor and so runs on any host with GL at all -- not only the
+///   ones where `create_image` happens to fall back to a PBO.
 ///
 /// The audit the IOSurface fix rested on applied unchanged to D3D11, and is
 /// recorded here so it need not be redone: `set_plane_offset`'s callers

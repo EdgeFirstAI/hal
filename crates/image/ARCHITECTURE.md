@@ -554,6 +554,23 @@ channel. The weak sender ensures PBO tensors don't prevent GL thread
 shutdown — see
 [`crates/tensor/ARCHITECTURE.md#pbo-tensors-and-the-weaksender-pattern`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#pbo-tensors-and-the-weaksender-pattern).
 
+**This crate is the client side of the callback channel.** The GL buffer and
+the GL worker thread belong to `edgefirst-image` and stay here; the tensor
+crate never makes a GL call on either backend. What `Tensor::from_pbo` hands
+across is the channel — an `ef_client_state` (an opaque context plus a
+`retain`/`release` pair) and the buffer's two op functions — over which
+`libedgefirst_tensor` builds real PBO storage. `retain` and `release` govern
+that channel and nothing else: this crate's own destructor stays the sole
+caller of `glDeleteBuffers`.
+
+What comes back is deliberately narrow. Every PBO call site in this crate
+reads exactly two facts off a tensor, `pbo_id()` and `pbo_is_mapped()`, and
+those two are the whole surface. `as_pbo()`, which used to lend a
+`PboTensor<T>`, is gone — not as a style preference but because the `dynamic`
+backend has no `PboTensor<T>` to lend once the buffer lives in the library,
+and a borrow that exists on only one backend cannot be the signature this
+crate compiles against on both.
+
 ### GLES 3.1 context and the optional compute path
 
 At context creation time, the GL thread attempts a GLES 3.1 context first;
@@ -617,8 +634,10 @@ truncates. The `W*3/4` reinterpretation belongs to `TwoPassPackedRgb` alone.
 `tensor.map()` on a PBO image — that sends a `PboMap` message back to the
 GL thread itself and deadlocks. `bind_dst` therefore seeds the render
 texture by binding the PBO as `GL_PIXEL_UNPACK_BUFFER` and calling
-`glTexImage2D(NULL)` (GL reads directly from the PBO), and the readback
-targets the PACK binding. Mem tensors map directly — no channel round-trip
+`glTexImage2D` with the view's byte offset into that buffer (GL reads
+directly from the PBO; the argument is an offset, not a pointer, and passing
+a literal null there is what made every view of one PBO upload the parent's
+origin), and the readback targets the PACK binding. Mem tensors map directly — no channel round-trip
 — so the `TextureMem` lowering may map freely.
 
 **Int8 letterbox bias is lowering-independent:** the int8 fragment shader

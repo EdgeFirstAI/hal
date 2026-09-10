@@ -252,8 +252,21 @@ fn restore_d3d11_logical_shape(
 /// of its own -- `from_d3d11_shared_handle` records the one this device's
 /// staging copy reports -- and the producer's is a fact about the
 /// producer's driver, not about the texture as this process sees it.
-/// `PBO` and `CUDA_DEVICE` are excluded because neither import
-/// reconstructs a strided image today.
+/// `PBO` is included for the same reason `DMABUF` and `IOSURFACE` are, and
+/// with the same bound. A GL buffer has no pitch of its own -- it is bytes
+/// -- so the producer's stride is the only description of how its rows are
+/// spaced, and `PboTensor::capacity_bytes` is the whole GL allocation, so
+/// the `stride * rows <= capacity` check below bounds it the same way.
+/// Without it a `view()` of a PBO, whose recorded stride is the PARENT's
+/// pitch, was rebuilt at the window's own tight row and every row after the
+/// first read the wrong columns -- the shear half of issue #162, which the
+/// storage-kind half (a view demoting to a host placeholder) hid until
+/// Stage B fixed it. Excluded before Stage B for a reason that was true
+/// then: `import_descriptor` had no `kind::PBO` arm at all, so no PBO
+/// descriptor ever reached this function.
+///
+/// `CUDA_DEVICE` is excluded because that import does not reconstruct a
+/// strided image today.
 fn restore_imported_row_stride(
     t: &mut TensorDyn,
     desc: &TensorDesc,
@@ -265,6 +278,7 @@ fn restore_imported_row_stride(
         crate::protocol::kind::HOST
             | crate::protocol::kind::DMABUF
             | crate::protocol::kind::IOSURFACE
+            | crate::protocol::kind::PBO
     ) {
         return;
     }

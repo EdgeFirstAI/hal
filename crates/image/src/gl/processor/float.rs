@@ -123,21 +123,21 @@ fn packed_interleaved_layout(w: u32, h: u32) -> Option<(u32, u32)> {
 /// Fetch the PBO buffer id of a float PBO destination tensor.
 ///
 /// Shared by the `TensorDyn::F32`/`F16` arms of `convert_float_to_pbo`:
-/// resolves the tensor's PBO (`NotSupported`-equivalent `OpenGl` error when
-/// the tensor is not PBO-backed) and rejects a currently-mapped PBO.
+/// resolves the tensor's buffer id (`NotSupported`-equivalent `OpenGl` error
+/// when the tensor is not PBO-backed) and rejects a currently-mapped PBO.
 fn float_pbo_buffer_id<T>(t: &edgefirst_tensor::Tensor<T>) -> crate::Result<u32>
 where
     T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
 {
-    let pbo = t.as_pbo().ok_or_else(|| {
+    let buffer_id = t.pbo_id().ok_or_else(|| {
         crate::Error::OpenGl("convert_float_to_pbo: dst is not a PBO tensor".to_string())
     })?;
-    if pbo.is_mapped() {
+    if t.pbo_is_mapped() == Some(true) {
         return Err(crate::Error::OpenGl(
             "Cannot convert to a mapped PBO tensor".to_string(),
         ));
     }
-    Ok(pbo.buffer_id())
+    Ok(buffer_id)
 }
 
 /// Block until all previously-issued GL commands have completed, using a fence
@@ -392,16 +392,52 @@ impl GLProcessorST {
         }
 
         // ── Arm 2: PBO source (GL-internal copy, no CPU visit) ──
-        if let Some(buffer_id) = src_u8.as_pbo().map(|p| p.buffer_id()) {
+        if let Some(buffer_id) = src_u8.pbo_id() {
             unsafe {
                 // Upload directly from the source PBO (zero CPU copy). The PBO
                 // path allocates the same RGBA8 storage that `update_texture`
                 // would (internalformat RGBA, GL_RGBA, UNSIGNED_BYTE), so the
                 // two paths share `camera_normal_texture`'s size/format cache.
                 // On the steady-state video path (fixed input size) reuse the
-                // existing storage with `TexSubImage2D` (PBO-bound, NULL data)
-                // instead of reallocating with `TexImage2D` every frame.
+                // existing storage with `TexSubImage2D` (PBO-bound, the byte
+                // offset below as its data argument) instead of reallocating
+                // with `TexImage2D` every frame.
+                // Where this source's first pixel sits inside the GL buffer,
+                // and how far apart its rows are. Both are the u8 engine's
+                // rules (`draw_src_texture_from_pbo`), and this arm had
+                // neither: with a buffer bound to `PIXEL_UNPACK_BUFFER` the
+                // `pixels` argument is a byte OFFSET, and it was `NULL`, so a
+                // `view()` -- which carries its parent's buffer id, and so
+                // takes this arm -- uploaded the parent's top-left tile
+                // instead of the window it names. Without the row length, a
+                // padded whole-buffer PBO shears on every row after the
+                // first. Silent both ways: right shape, right byte count,
+                // wrong pixels. This arm is RGBA-only (see the
+                // `internalformat` below), hence the fixed 4 bytes per pixel.
+                //
+                // `UNPACK_ROW_LENGTH` is restored to 0 after the upload, the
+                // same as the u8 path: it is context state, and arm 3's
+                // `update_texture` documents that it relies on it being
+                // unset.
+                const SRC_BPP: usize = 4;
+                let src_offset = src_u8.plane_offset().unwrap_or(0);
+                // Through `unpack_row_length` rather than `stride / SRC_BPP`:
+                // that division truncates, and this state counts PIXELS, so a
+                // pitch 4 does not divide would advance GL by up to three
+                // bytes less than the source's real row and shear every row
+                // after the first -- silently. A PBO reaching here can carry
+                // any pitch at or above the format minimum (`set_row_stride`),
+                // including one wrapped straight from C by
+                // `ef_tensor_wrap_pbo`, so the refusal is not theoretical. The
+                // `?` propagates before any pixel-store state is touched.
+                let row_len_px = super::unpack_row_length(
+                    src_u8.effective_row_stride(),
+                    src_w,
+                    SRC_BPP,
+                    "RGBA",
+                )?;
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, buffer_id);
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, row_len_px);
                 let cache = &mut self.camera_normal_texture;
                 let needs_alloc = cache.target != edgefirst_gl::gl::TEXTURE_2D
                     || cache.width != src_w
@@ -417,7 +453,7 @@ impl GLProcessorST {
                         0,
                         edgefirst_gl::gl::RGBA,
                         edgefirst_gl::gl::UNSIGNED_BYTE,
-                        std::ptr::null(),
+                        src_offset as *const c_void,
                     );
                     // Record the true storage state so the cache reflects
                     // reality: a later interleaved u8 `update_texture` (same
@@ -439,9 +475,10 @@ impl GLProcessorST {
                         src_h as i32,
                         edgefirst_gl::gl::RGBA,
                         edgefirst_gl::gl::UNSIGNED_BYTE,
-                        std::ptr::null(),
+                        src_offset as *const c_void,
                     );
                 }
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
             }
             self.convert_stats.src_pbo_uploads += 1;
@@ -821,7 +858,7 @@ impl GLProcessorST {
         // import when the source is Dma-backed, PBO upload, or CPU upload —
         // see `feed_float_src`. (PBO sources must NOT be `map()`ed on this
         // thread: a PBO map round-trips a message to this same GL worker,
-        // deadlocking — the feed checks `as_pbo()` before mapping.)
+        // deadlocking — the feed checks `pbo_id()` before mapping.)
         let feed = self.feed_float_src(src_u8, src_w, src_h, src_filter)?;
         // A zero-copy feed may have imported more of the texture than the
         // logical image; map the source rectangle onto it and clamp samples

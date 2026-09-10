@@ -392,6 +392,27 @@ So by-value structs here evolve by major bump or by successor type, and the
 SONAME is the handshake. Revisit this only if the config structs ever
 outnumber the data structs, and revisit it for all three at once.
 
+**`ef_client_state` — one frozen struct for every callback domain.** Some
+state cannot move into a library because it *is* a callback into a context
+the library must not own: a GL buffer whose map and unmap have to run on the
+client's GL-worker thread, or a CUDA-graphics registration. `ef_client_state`
+is the vocabulary for that — an opaque `ctx` and a `retain`/`release` pair —
+frozen by value and reused verbatim by every such domain rather than
+redeclared per domain. That is deliberate: this vocabulary declines the
+`struct_size` handshake above, so a by-value struct grows only by a major
+bump or a suffixed successor, and freezing one tiny universal struct is what
+keeps that cost paid once instead of once per domain.
+
+**`retain`/`release` govern the callback channel, not the resource.** They
+extend the life of the *way to call back*, never ownership of the GL buffer
+or the CUDA resource. The producing side's own destructor stays the sole
+caller of the real `glDeleteBuffers`, and a library that reconstructed
+operations from the struct treats deletion as a no-op — it holds the channel,
+it does not own the buffer. Getting this backwards double-frees. The rule is
+stated in `tensor.h`'s own doc comment for the same reason it is stated here:
+it is the one part of the contract that cannot be inferred from the
+signature.
+
 **Layout goldens pin all of this — where they exist.** A
 `tests/c/test_layout_goldens.c` is a set of `_Static_assert`s on `sizeof` and
 `offsetof` for a library's by-value structs, compiled by a Rust test, backed
@@ -743,6 +764,27 @@ and JSON/YAML configuration strings.
 
 The C API translates all errors into POSIX `errno` codes; see each leaf's
 header (`edgefirst/tensor.h`, `codec.h`, `image.h`, `decoder.h`, `tracker.h`).
+
+### 10. Authoritative in the library, or a re-derivable cache — never both
+
+A `TensorDyn` under the `dynamic` backend is a lens over a handle inside
+`libedgefirst_tensor.so`. A field on that lens may only ever be a **cache
+that can be re-derived from the handle**; anything authoritative belongs in
+the library.
+
+The reason is mechanical, not stylistic. Fourteen sites construct a
+`TensorDyn` from a bare handle (`TensorDyn::from_handle`) — `view`, `batch`,
+`import`, every derived-handle path — and none of them can carry a field none
+of them knows about. A *cache* dropped there is harmless: the next call
+re-derives it. An *authoritative* field dropped there is silent data loss.
+That is exactly what made a PBO's `view()` return an all-zero window (#162):
+the real GL buffer lived in a field the C ABI could not see.
+
+So the bug class is made unrepresentable rather than guarded. A future
+backing whose answer the library can already compute needs only an accessor;
+one that needs client cooperation gets an `ef_client_state` channel and
+becomes real storage in the library. Neither shape leaves a second source of
+truth on the consumer's side.
 
 ---
 

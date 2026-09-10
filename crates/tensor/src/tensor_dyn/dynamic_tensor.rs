@@ -60,18 +60,6 @@ impl<T: Element> Tensor<T> {
         }
     }
 
-    /// Discard the typed lens, yielding the type-erased handle it wraps.
-    ///
-    /// The inverse of [`from_inner`](Self::from_inner), for the one caller
-    /// that builds through a typed constructor but must hand back a
-    /// `TensorDyn`: `TensorDyn::from_pbo_import` (`dynamic_backend.rs`),
-    /// whose per-dtype dispatch needs `T` only to reach
-    /// [`Self::from_pbo`]. Free -- this type is `#[repr(transparent)]` over
-    /// exactly this field.
-    pub(crate) fn into_inner(self) -> TensorDyn {
-        self.inner
-    }
-
     /// Create a new tensor with the given shape, optional memory backing,
     /// and optional name. Same signature as `static`'s inherent `new` (the
     /// wider constructor `TensorTrait::new` delegates to) -- kept identical
@@ -676,124 +664,76 @@ impl<T: Element> Tensor<T> {
     }
 
     /// Construct a tensor from a PBO tensor (for GL backends that allocate
-    /// PBOs). See [`TensorDyn::pbo`](crate::TensorDyn)'s own doc comment
-    /// (`dynamic_backend.rs`) for the full design: this mints a companion
-    /// `ef_tensor_*` handle sized to match `pbo`'s shape (so format/stride/
-    /// shape queries keep working the ordinary way), then stashes `pbo`
-    /// itself alongside it for [`Self::as_pbo`] and CPU mapping to read
-    /// back.
+    /// PBOs).
     ///
-    /// **This is NOT metadata-only** (an earlier version of this comment
-    /// claimed it was -- corrected in task 18's review, F32). The only
-    /// `ef_tensor_*` primitive `TensorDyn::new` can drive for
-    /// `TensorMemory::Mem` is `ef_tensor_builder_alloc`, which always
-    /// allocates real host memory sized to the full shape it is given --
-    /// there is no ABI primitive today that mints a handle carrying a shape
-    /// without backing it byte for byte. So this genuinely allocates
-    /// `pbo`'s full byte count as ordinary host RAM purely to carry
-    /// metadata, for a buffer whose real data already lives on the GPU --
-    /// for a 4K RGBA16F PBO, ~63.3 MiB. See
-    /// `from_pbo_metadata_handle_allocation_cost_is_the_full_pbo_byte_count`
-    /// (`tests/dynamic_primitives.rs`) for the measured proof and the
-    /// follow-up primitive this should eventually replace it with.
+    /// Drives `ef_tensor_wrap_pbo`: the GL buffer stays this process's, and
+    /// what crosses into `libedgefirst_tensor.so` is the **callback
+    /// channel** -- a frozen `EfClientState` plus the two op functions (see
+    /// [`crate::PboTensor::into_client_parts`]). The library builds real
+    /// `TensorStorage::Pbo` storage over it, so the returned tensor's
+    /// `memory()`, `map()`, `view()` and `capacity_bytes()` are all answered
+    /// by the handle rather than by a field on this side.
     ///
-    /// Returns `Result`, unlike `static`'s infallible `Tensor::from_pbo`
-    /// (`lib.rs`): `static` only wraps an already-validated `PboTensor<T>`
-    /// with no new allocation, but this backend must mint that companion
-    /// handle through the real `ef_tensor_*` builder, which can fail --
-    /// the same allocation-failure surface every other `Tensor::new` call
-    /// already has. `edgefirst-image`'s own call sites (`gl/threaded.rs`)
-    /// propagate this with `?`, same as any other fallible constructor.
+    /// **This allocates no host memory.** The previous implementation minted
+    /// a companion `TensorMemory::Mem` handle sized to the PBO's whole shape
+    /// -- ~63.3 MiB for a 4K RGBA16F surface -- purely to own something with
+    /// the right metadata, and stashed the real `PboTensor` beside it. That
+    /// second source of truth was dropped by every one of the thirteen
+    /// `from_handle` sites, which is what made `view()` on a PBO come back
+    /// as an all-zero host window (issue #162).
+    ///
+    /// # Errors
+    /// Fails for a PBO sub-view (`view_offset != 0`), which
+    /// `ef_tensor_wrap_pbo`'s argument list cannot express -- take the view
+    /// on the far side instead -- and for anything the library refuses
+    /// (unknown dtype, a `size` smaller than the shape needs).
     pub fn from_pbo(pbo: crate::PboTensor<T>) -> Result<Self> {
-        let mut inner = TensorDyn::new(&pbo.shape, T::DTYPE, Some(TensorMemory::Mem), None)?;
-        inner.pbo = Some(Box::new(pbo));
+        let parts = pbo.into_client_parts()?;
+        // SAFETY: `parts.state.ctx` borrows the `Arc<PboHandle>` `parts`
+        // still holds, and `ef_tensor_wrap_pbo` retains it before returning,
+        // so it stays live past the `drop(parts)` below. The op functions
+        // are this crate's own and uphold `PboOps`'s contract.
+        let inner = unsafe {
+            TensorDyn::from_client_pbo(
+                parts.state,
+                parts.map_fn,
+                parts.unmap_fn,
+                parts.buffer_id,
+                parts.size,
+                &parts.shape,
+                T::DTYPE,
+            )
+        }?;
+        // Drops this side's own reference on the channel; the library holds
+        // its own from here.
+        drop(parts);
         Ok(Self::from_inner(inner))
     }
 
-    /// Downcast to PBO tensor reference (for GL backends). `None` when this
-    /// tensor is not PBO-backed.
+    /// The GL buffer name for a PBO-backed tensor; `None` otherwise.
     ///
-    /// The stored `PboTensor`'s element type is **not** required to be `T`.
-    /// `edgefirst-image` allocates a PBO as `u8` and hands it back as an
-    /// `i8` tensor -- under `static` the by-value transmute of
-    /// `Tensor<u8>` -> `Tensor<i8>` carries the whole storage with it, so
-    /// `as_pbo` there really does find a `PboTensor<i8>`. Under `dynamic`
-    /// the `PboTensor<u8>` sits behind a real `Any` vtable that no
-    /// transmute of the enclosing `Tensor<T>` touches, so an exact
-    /// `downcast_ref::<PboTensor<T>>` found nothing and this returned
-    /// `None` for exactly the int8 GPU path it exists to serve.
+    /// This and [`Self::pbo_is_mapped`] replace the borrowed
+    /// `Option<&PboTensor<T>>` this lens used to hand out. There is nothing
+    /// here to borrow: this backend's PBO storage lives inside
+    /// `libedgefirst_tensor.so`. These two scalar facts are the entire
+    /// surface `edgefirst-image`'s call sites ever read off that borrow.
     ///
-    /// So the stored value is found first and *then* reinterpreted as
-    /// `PboTensor<T>`, which is sound: `PboTensor<T>` holds its element
-    /// type only in a `PhantomData` (name, shape, an `Arc<PboHandle>`, an
-    /// identity and a byte offset besides), so every instantiation is
-    /// layout-identical. The `size_of::<T>()` the reinterpreted reference
-    /// then reports is `T`'s, which is the caller's own type and the one it
-    /// means -- and it agrees with the stored type's width, because the
-    /// only way the two differ at all is `TensorDyn::set_dtype`, which
-    /// refuses a width change.
-    pub fn as_pbo(&self) -> Option<&crate::PboTensor<T>> {
-        let any = self.inner.pbo.as_ref()?;
-        // Exact match first: the ordinary case, where nothing was retagged.
-        if let Some(p) = any.downcast_ref::<crate::PboTensor<T>>() {
-            return Some(p);
-        }
-        // Otherwise find whichever instantiation is really stored. At most
-        // one arm can hit -- `downcast_ref` is an exact `TypeId` match -- so
-        // the order is irrelevant.
-        macro_rules! reinterpret_arm {
-            ($t:ty) => {{
-                // The layout fact the cast below rests on, enforced rather
-                // than documented. `PboTensor<T>` holds its element type
-                // only in a `PhantomData` today, so every instantiation is
-                // layout-identical -- but that is exactly the kind of
-                // invariant a future field addition breaks with no compile
-                // error and no failing test. This makes it a build failure
-                // at the moment someone changes the layout. Per-arm, not
-                // once for the function, so it guards each individual cast;
-                // and evaluated per monomorphization, so it covers whichever
-                // `T` a caller actually instantiates.
-                //
-                // It fires at **build**, not at `cargo check` -- an inline
-                // `const` in a generic function is evaluated at codegen, and
-                // `check` does not codegen. So a clean `cargo check` is not
-                // evidence this holds; `make test-tensor-dynamic` (which
-                // builds) is. Verified by adding an inline `Option<T>` field
-                // to `PboTensor` and watching four `error[E0080]: evaluation
-                // panicked` with this message.
-                const {
-                    assert!(
-                        std::mem::size_of::<crate::PboTensor<$t>>()
-                            == std::mem::size_of::<crate::PboTensor<T>>(),
-                        "PboTensor is no longer layout-identical across element types; \
-                         Tensor::as_pbo's reinterpretation is unsound -- see its doc comment"
-                    );
-                    assert!(
-                        std::mem::align_of::<crate::PboTensor<$t>>()
-                            == std::mem::align_of::<crate::PboTensor<T>>(),
-                        "PboTensor's alignment now varies by element type; \
-                         Tensor::as_pbo's reinterpretation is unsound -- see its doc comment"
-                    );
-                }
-                any.downcast_ref::<crate::PboTensor<$t>>().map(|p| {
-                    // SAFETY: layout-identical across element types, asserted
-                    // just above rather than assumed; `p` is borrowed from
-                    // `self`, and the result carries the same lifetime.
-                    unsafe { &*(p as *const crate::PboTensor<$t> as *const crate::PboTensor<T>) }
-                })
-            }};
-        }
-        None.or_else(|| reinterpret_arm!(u8))
-            .or_else(|| reinterpret_arm!(i8))
-            .or_else(|| reinterpret_arm!(u16))
-            .or_else(|| reinterpret_arm!(i16))
-            .or_else(|| reinterpret_arm!(half::f16))
-            .or_else(|| reinterpret_arm!(u32))
-            .or_else(|| reinterpret_arm!(i32))
-            .or_else(|| reinterpret_arm!(f32))
-            .or_else(|| reinterpret_arm!(u64))
-            .or_else(|| reinterpret_arm!(i64))
-            .or_else(|| reinterpret_arm!(f64))
+    /// Note that `T` does not gate the answer. `edgefirst-image` allocates
+    /// a PBO as `u8` and hands it back as an `i8` tensor, so the library's
+    /// own `PboTensor`'s element type need not be this lens's `T`;
+    /// `ef_tensor_pbo_id` reads the GL buffer id off the storage, which no
+    /// dtype retag touches. That is what the borrow-shaped accessor needed a
+    /// layout-asserted reinterpretation of `PboTensor<T>` to achieve, and
+    /// what these two `Copy`-returning accessors get for free.
+    pub fn pbo_id(&self) -> Option<u32> {
+        self.inner.pbo_id()
+    }
+
+    /// Whether a PBO-backed tensor holds (or is establishing) a CPU
+    /// mapping; `None` when the tensor is not PBO-backed. See
+    /// [`Self::pbo_id`].
+    pub fn pbo_is_mapped(&self) -> Option<bool> {
+        self.inner.pbo_is_mapped()
     }
 
     /// Allocate an image tensor with the given geometry, memory backing,

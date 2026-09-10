@@ -6260,8 +6260,20 @@ mod gl_tests {
                 )
                 .unwrap();
             assert_eq!(dst.memory(), dst_mem, "{label}: dst backing not honoured");
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(src, &mut dst, Rotation::None, Flip::None, lb)
                 .unwrap_or_else(|e| panic!("{label} convert failed: {e}"));
+            // Without this the test is vacuous on a GL-declining host: every
+            // convert here, oracle included, would produce the same CPU answer
+            // and every comparison below would pass with no GL coverage at
+            // all. `ComputeBackend::OpenGl` leaves `forced_backend` at `None`,
+            // so a decline is logged at debug and silently served by the CPU.
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "{label}: the GL path declined and ImageProcessor fell back to \
+                 the CPU; the oracle would then be compared against itself"
+            );
             dst.as_i8()
                 .unwrap()
                 .map()
@@ -6286,9 +6298,16 @@ mod gl_tests {
     }
 
     /// On-GPU round-trip: RGBA8 → F32 NHWC `[H,W,3]` PBO via the GL float
-    /// render path. Forces the OpenGL backend (no CPU fallback) so the test
-    /// genuinely exercises `convert_float_to_pbo`. Uses an identity crop so
-    /// the expected values are exact: `dst[y,x,c] == src[y,x,c] / 255`.
+    /// render path, so the test genuinely exercises `convert_float_to_pbo`.
+    /// Uses an identity crop so the expected values are exact:
+    /// `dst[y,x,c] == src[y,x,c] / 255`.
+    ///
+    /// **`ComputeBackend::OpenGl` does NOT disable the CPU fallback** -- it
+    /// leaves `forced_backend` at `None`, so a GL decline logs at debug and
+    /// `ImageProcessor::convert` quietly produces the CPU answer, whose
+    /// float widen (`b as f32 / 255.0`) is bit-exact against the GPU's. The
+    /// route is therefore asserted, not assumed: `convert_fallback_count()`
+    /// must not move across the convert.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f32_nhwc_pbo_roundtrip() {
@@ -6370,8 +6389,16 @@ mod gl_tests {
         // 2nd call). Correctness must hold identically across both iterations.
         let mut max_err = 0.0f32;
         for iter in 0..2 {
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
                 .unwrap();
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "the GL float path declined and ImageProcessor fell back to the CPU; \
+                 this test's expectation is bit-exact against the CPU answer, so it \
+                 would otherwise pass with no GL coverage at all"
+            );
 
             let map = dst.as_f32().unwrap().map().unwrap();
             assert_eq!(map.len(), w * h * 3);
@@ -6405,6 +6432,9 @@ mod gl_tests {
     /// giving value `(2*dx + 0.5) * 16` normalized by `/255`. This value is
     /// distinct from NEAREST (which would land on a single integer texel,
     /// `2*dx * 16`), so the test discriminates bilinear vs NEAREST sampling.
+    ///
+    /// The same route assertion as its siblings, for the same reason: the CPU
+    /// fallback resizes too, and within this tolerance its answer would pass.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f32_nhwc_pbo_resize_bilinear() {
@@ -6480,8 +6510,16 @@ mod gl_tests {
             return;
         }
 
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        assert_eq!(
+            proc.convert_fallback_count(),
+            fallbacks_before,
+            "the GL float path declined and ImageProcessor fell back to the CPU; \
+             this test's expectation is bit-exact against the CPU answer, so it \
+             would otherwise pass with no GL coverage at all"
+        );
 
         let map = dst.as_f32().unwrap().map().unwrap();
         assert_eq!(map.len(), dw * dh * 3);
@@ -6512,9 +6550,15 @@ mod gl_tests {
     }
 
     /// On-GPU round-trip: RGBA8 → F16 NCHW `[3,H,W]` PBO via the GL float
-    /// render path. Forces the OpenGL backend (no CPU fallback). Identity
-    /// crop so `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
-    /// (`2^-8`).
+    /// render path. Identity crop so `dst[c,y,x] == src[y,x,c] / 255` within
+    /// one f16 ULP at 1.0 (`2^-8`).
+    ///
+    /// **`ComputeBackend::OpenGl` does NOT disable the CPU fallback** -- it
+    /// leaves `forced_backend` at `None`, so a GL decline logs at debug and
+    /// `ImageProcessor::convert` quietly produces the CPU answer, whose
+    /// float widen (`b as f32 / 255.0`) is bit-exact against the GPU's. The
+    /// route is therefore asserted, not assumed: `convert_fallback_count()`
+    /// must not move across the convert.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f16_nchw_pbo_roundtrip() {
@@ -6588,8 +6632,16 @@ mod gl_tests {
             return;
         }
 
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        assert_eq!(
+            proc.convert_fallback_count(),
+            fallbacks_before,
+            "the GL float path declined and ImageProcessor fell back to the CPU; \
+             this test's expectation is bit-exact against the CPU answer, so it \
+             would otherwise pass with no GL coverage at all"
+        );
 
         let map = dst.as_f16().unwrap().map().unwrap();
         assert_eq!(map.len(), 3 * w * h);
@@ -6618,11 +6670,16 @@ mod gl_tests {
     }
 
     /// On-GPU round-trip: RGBA8 → F16 NCHW `[3,H,W]` DMA-BUF via the GL
-    /// float render path (`convert_float_to_zero_copy`). Forces the OpenGL backend
-    /// (no CPU fallback) so any GL-path failure surfaces as a hard error
-    /// instead of being silently masked. Identity crop, so the expected values
-    /// are exact: `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
-    /// (`2^-8`).
+    /// float render path (`convert_float_to_zero_copy`). Identity crop, so
+    /// the expected values are exact: `dst[c,y,x] == src[y,x,c] / 255` within
+    /// one f16 ULP at 1.0 (`2^-8`).
+    ///
+    /// **`ComputeBackend::OpenGl` does NOT disable the CPU fallback** -- it
+    /// leaves `forced_backend` at `None`, so a GL decline logs at debug and
+    /// `ImageProcessor::convert` quietly produces the CPU answer, which lands
+    /// within this tolerance. The route is therefore checked, not assumed:
+    /// `convert_fallback_count()` moving means the zero-copy import was
+    /// refused, and the run is reported as a skip rather than a pass.
     ///
     /// Skip conditions (treated as pass):
     /// 1. GL unavailable, or F16 render not supported (e.g. Vivante).
@@ -6630,6 +6687,10 @@ mod gl_tests {
     ///    Orin-nano with permission-denied).
     /// 3. The created tensor's `.memory()` is not `TensorMemory::DmaBuf` — it
     ///    fell back; only the real DMA path is of interest here.
+    /// 4. The GL path declined the destination import and the convert fell
+    ///    back to the CPU — measured, not assumed. This desktop's NVIDIA EGL
+    ///    refuses the import with GL 0x502, so the test used to report a pass
+    ///    here having exercised no GL at all.
     ///
     /// Runs on V3D/Mali targets where dma-heap and GL F16 render are both
     /// available.
@@ -6728,8 +6789,26 @@ mod gl_tests {
             return;
         }
 
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        // Skip condition 4, and the reason it is a skip rather than an
+        // assertion: unlike the PBO siblings -- whose feed has no import to
+        // fail -- this one needs a working zero-copy EGLImage import of the
+        // DESTINATION, and a driver may refuse it (the NVIDIA desktop this
+        // was written on fails with GL 0x502). `ComputeBackend::OpenGl`
+        // keeps a CPU fallback, whose f16 answer is within this tolerance,
+        // so without the check the test reported a pass having exercised no
+        // GL at all.
+        if proc.convert_fallback_count() != fallbacks_before {
+            eprintln!(
+                "SKIPPED: {} - the GL float path declined this DMA-BUF \
+                 destination and ImageProcessor fell back to the CPU; there is \
+                 no zero-copy coverage to check here",
+                function!()
+            );
+            return;
+        }
 
         let map = dst.as_f16().unwrap().map().unwrap();
         assert_eq!(map.len(), 3 * w * h);
@@ -6849,11 +6928,23 @@ mod gl_tests {
         // [6, 8) are padded with the `dst_color`.
         let crop = Crop::letterbox([114, 114, 114, 255]);
 
+        let fallbacks_before = proc.convert_fallback_count();
         let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
         assert!(
             result.is_ok(),
             "F32 PBO letterbox convert must not error: {:?}",
             result.err()
+        );
+        // `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
+        // decline is served by the CPU with only a debug log. The CPU
+        // letterbox writes the same pad colour, so without this the test
+        // passes with zero GL coverage.
+        assert_eq!(
+            proc.convert_fallback_count(),
+            fallbacks_before,
+            "the GL float path declined and ImageProcessor fell back to the \
+             CPU; the CPU letterbox writes the same pad colour, so this test \
+             would otherwise pass without exercising the GL path at all"
         );
 
         let map = dst.as_f32().unwrap().map().unwrap();
@@ -6961,8 +7052,22 @@ mod gl_tests {
         ) {
             return;
         }
+        // `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a
+        // declined GL float path is served by the CPU into this same PBO and
+        // the CUDA mapping below reads the CPU's answer -- a pass with no GL
+        // coverage. Reported as a skip rather than a failure because the
+        // decline is a property of the host's driver, not of this code.
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        if proc.convert_fallback_count() != fallbacks_before {
+            eprintln!(
+                "SKIPPED: convert_f32_pbo_cuda_map_roundtrip - the GL float path \
+                 declined and the convert was served by the CPU; there is no \
+                 GL coverage to check here"
+            );
+            return;
+        }
         let cm = match dst.cuda_map() {
             Some(cm) => cm,
             None => {
@@ -7073,8 +7178,22 @@ mod gl_tests {
         ) {
             return;
         }
+        // `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a
+        // declined GL float path is served by the CPU into this same PBO and
+        // the CUDA mapping below reads the CPU's answer -- a pass with no GL
+        // coverage. Reported as a skip rather than a failure because the
+        // decline is a property of the host's driver, not of this code.
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        if proc.convert_fallback_count() != fallbacks_before {
+            eprintln!(
+                "SKIPPED: convert_f32_pbo_cuda_map_numeric - the GL float path \
+                 declined and the convert was served by the CPU; there is no \
+                 GL coverage to check here"
+            );
+            return;
+        }
 
         let cm = match dst.cuda_map() {
             Some(cm) => cm,
@@ -10458,8 +10577,12 @@ mod gl_tests {
             );
             return;
         }
-        // Force the GL backend so a declined float path is a hard error rather
-        // than a CPU fallback that would make this test vacuous.
+        // `ComputeBackend::OpenGl` selects the GL backend but does NOT disable
+        // the CPU fallback -- it leaves `forced_backend` at `None`, so a
+        // declined float path is served by the CPU with only a debug log, and
+        // both sides of every comparison below would then be the same CPU
+        // answer. `convert_fallback_count()` is asserted across each convert
+        // for that reason.
         let mut proc = match crate::ImageProcessor::with_config(crate::ImageProcessorConfig {
             backend: crate::ComputeBackend::OpenGl,
             ..Default::default()
@@ -10508,6 +10631,7 @@ mod gl_tests {
                 eprintln!("SKIPPED: {} - no F32 PBO destination", function!());
                 return;
             };
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(
                 &pool,
                 &mut recycled,
@@ -10516,6 +10640,13 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "frame {i}: the GL float path declined and the convert was \
+                 served by the CPU; the oracle below would then be the same \
+                 CPU answer and the comparison would prove nothing"
+            );
             let recycled_bytes = recycled.as_f32().unwrap().map().unwrap().to_vec();
 
             let fresh = TensorDyn::image(
@@ -10529,6 +10660,7 @@ mod gl_tests {
             .unwrap();
             fill_rgba_pattern(&fresh, w, h, salt);
             let mut oracle = float_dst(&proc).unwrap();
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(
                 &fresh,
                 &mut oracle,
@@ -10537,6 +10669,11 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "frame {i}: the oracle convert fell back to the CPU"
+            );
             let oracle_bytes = oracle.as_f32().unwrap().map().unwrap().to_vec();
 
             assert_eq!(
@@ -10594,6 +10731,7 @@ mod gl_tests {
                 typed.copy_to_flat(&mut out).expect("compact padded rows");
                 out
             };
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(
                 &pool,
                 &mut zc_recycled,
@@ -10610,6 +10748,12 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "frame {i}: a zero-copy float destination convert fell back to \
+                 the CPU; both sides would then be the same CPU answer"
+            );
             assert_eq!(
                 flat_f32(&zc_recycled),
                 flat_f32(&zc_oracle),
@@ -11039,5 +11183,452 @@ mod gl_tests {
              offset {offset} (subject={subject}) -- the view's import bases at 0, so \
              no offset rule should have applied to it"
         );
+    }
+
+    // ── The PBO transfer gates ──────────────────────────────────────────
+    //
+    // Four tests over the three `PIXEL_UNPACK_BUFFER`-bound uploads and the
+    // PBO readback. They share three properties worth stating once.
+    //
+    // **They allocate through `GLProcessorThreaded::create_pbo_image*`**,
+    // which mints a GL buffer directly, rather than through
+    // `ImageProcessor::create_image`, which returns a PBO only where the
+    // zero-copy DMA-BUF import does not work. So they run on every GL host,
+    // including the boards, with no environment variable to remember.
+    //
+    // **`GLProcessorThreaded` has no CPU fallback.** `ImageProcessor` with
+    // `ComputeBackend::OpenGl` does -- that variant leaves `forced_backend`
+    // at `None` and a GL decline logs at debug and silently falls to the CPU
+    // path, whose float widen (`b as f32 / 255.0`) is bit-exact against the
+    // GPU's. A gate built on it would pass on a board where GL declined
+    // every frame. Here a decline is a hard `Err` at the `convert` call.
+    //
+    // **Each asserts the route positively**, via `assert_pbo_source_route`:
+    // exactly one PBO source feed, no CPU upload, no zero-copy import. A
+    // hard error plus a byte comparison still leaves "the engine ran, but
+    // fed the source some other way"; the counter closes it.
+    //
+    // Nothing here needs `EDGEFIRST_FORCE_TRANSFER`. To run just these four:
+    //
+    // ```sh
+    // EDGEFIRST_TESTDATA_DIR=<repo>/testdata \
+    //   cargo test -p edgefirst-image --lib -- --exact \
+    //   opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_gl \
+    //   opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_to_f32_gl \
+    //   opengl_headless::tests::gl_tests::a_padded_pbo_source_does_not_shear_the_f32_upload \
+    //   opengl_headless::tests::gl_tests::a_padded_pbo_destination_is_written_at_its_own_pitch
+    // ```
+
+    /// A GL processor that allocates PBOs, or `None` with a skip line.
+    /// Nothing about it is host-dependent beyond having GL at all.
+    ///
+    /// The skip lines below go to `std::io::stderr()` directly rather than
+    /// through `eprintln!`. `eprintln!` passes through libtest's per-test
+    /// output capture, which is discarded for a test that passes -- and a
+    /// skip *is* a pass -- so a board that skipped all four PBO gates read
+    /// green in the fleet log with no line saying so. This is the shape
+    /// `pbo_reports_why_it_cannot_pin` (`crates/image/src/lib.rs`) already
+    /// uses. The `SKIPPED:` prefix is load-bearing: TESTING.md and the
+    /// on-target harness both key off it. Written out at each site rather
+    /// than behind a local helper on purpose -- a house-wide sweep with a
+    /// shared helper is landing separately, and a second helper here would
+    /// collide with it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn pbo_gl_or_skip(what: &str) -> Option<GLProcessorThreaded> {
+        use std::io::Write;
+        if !is_opengl_available() {
+            let mut err = std::io::stderr();
+            let _ = writeln!(&mut err, "SKIPPED: {what} - OpenGL not available");
+            let _ = err.flush();
+            return None;
+        }
+        match GLProcessorThreaded::new(None) {
+            Ok(gl) => Some(gl),
+            Err(e) => {
+                let mut err = std::io::stderr();
+                let _ = writeln!(&mut err, "SKIPPED: {what} - GL processor unavailable: {e}");
+                let _ = err.flush();
+                None
+            }
+        }
+    }
+
+    /// [`pbo_gl_or_skip`] plus the F32 render capability the float gates
+    /// need. Separate so the u8 gates do not inherit a skip they have no
+    /// reason to take. Same raw-stderr rule for the skip line, same reason.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn float_pbo_gl_or_skip(what: &str) -> Option<GLProcessorThreaded> {
+        use std::io::Write;
+        let gl = pbo_gl_or_skip(what)?;
+        if !gl.supported_render_dtypes().f32 {
+            let mut err = std::io::stderr();
+            let _ = writeln!(&mut err, "SKIPPED: {what} - F32 render not supported");
+            let _ = err.flush();
+            return None;
+        }
+        Some(gl)
+    }
+
+    /// An RGBA8 PBO of the given size. Infallible on a host that has GL:
+    /// this allocates a GL buffer outright, with no DMA-BUF attempt to
+    /// decline.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn rgba8_pbo(gl: &GLProcessorThreaded, w: usize, h: usize) -> TensorDyn {
+        let t = gl
+            .create_pbo_image(w, h, PixelFormat::Rgba)
+            .expect("allocate an RGBA8 PBO on the GL thread");
+        assert_eq!(
+            TensorTrait::memory(&t),
+            TensorMemory::Pbo,
+            "create_pbo_image must produce a PBO"
+        );
+        t.into()
+    }
+
+    /// Assert the convert just performed fed its source from a PBO, exactly
+    /// once, and did not reach either of the other two feeds.
+    ///
+    /// `ConvertStats` counts source feeds 1:1 with frames -- every convert
+    /// is exactly one of import / pbo / upload -- so this is a complete
+    /// statement about the route, not a lower bound on it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn assert_pbo_source_route(
+        gl: &GLProcessorThreaded,
+        before: &crate::opengl_headless::cache::ConvertStats,
+        what: &str,
+    ) {
+        let after = gl.convert_stats().expect("convert stats after");
+        assert_eq!(
+            after.src_pbo_uploads - before.src_pbo_uploads,
+            1,
+            "{what}: expected exactly one PBO source feed; the byte comparison \
+             below is meaningless if the engine took another route"
+        );
+        assert_eq!(
+            after.src_uploads - before.src_uploads,
+            0,
+            "{what}: the source was fed by CPU map + upload, not from its PBO"
+        );
+        assert_eq!(
+            after.src_imports - before.src_imports,
+            0,
+            "{what}: the source was fed by zero-copy import, not from its PBO"
+        );
+    }
+
+    /// Stamp `R = x % 256`, `G = y % 256`, `B = 128`, honouring the tensor's
+    /// own pitch. Plain index values rather than multiples: at 240 rows and
+    /// 320 columns a multiplier wraps, and two positions these tests compare
+    /// could then share a value.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn stamp_rgba8_positionally(t: &TensorDyn, w: usize, h: usize) {
+        let pitch = t.effective_row_stride().unwrap_or(w * 4);
+        let mut m = t
+            .map_bytes(edgefirst_tensor::CpuAccess::ReadWrite)
+            .expect("map the source PBO");
+        let s = m.as_mut_slice();
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * pitch + x * 4;
+                s[i] = (x % 256) as u8;
+                s[i + 1] = (y % 256) as u8;
+                s[i + 2] = 128;
+                s[i + 3] = 255;
+            }
+        }
+    }
+
+    /// Assert an F32 RGB destination holds [`stamp_rgba8_positionally`]'s
+    /// pattern for the source window starting at `(x0, y0)`, read from the
+    /// live mapping. The crop is the identity and the sizes match, so there
+    /// is no resampling and the exact expectation is the source byte over
+    /// 255 -- the same reference `convert_f32_nhwc_pbo_roundtrip` uses.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn assert_f32_dst_matches_rgba8_pattern(
+        dst: &TensorDyn,
+        w: usize,
+        h: usize,
+        x0: usize,
+        y0: usize,
+        case: &str,
+    ) {
+        let pitch_f32 = dst.effective_row_stride().unwrap_or(w * 3 * 4) / 4;
+        let m = dst.as_f32().unwrap().map().unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                let expect = [
+                    ((x + x0) % 256) as f32 / 255.0,
+                    ((y + y0) % 256) as f32 / 255.0,
+                    128.0 / 255.0,
+                ];
+                for (c, &want) in expect.iter().enumerate() {
+                    let got = m[y * pitch_f32 + x * 3 + c];
+                    assert!(
+                        (got - want).abs() < 1e-3,
+                        "{case}: f32 dst[{y},{x},{c}]={got}, expected {want} \
+                         (source pixel ({}, {})); the parent's origin would be \
+                         ({x}, {y})",
+                        x + x0,
+                        y + y0
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `view()` of a PBO-backed source converts its OWN sub-region.
+    ///
+    /// The u8 engine feeds a PBO source by binding it to
+    /// `PIXEL_UNPACK_BUFFER` and letting `glTexImage2D` read from it. With a
+    /// buffer bound, that call's `pixels` argument is a byte OFFSET, and it
+    /// was `NULL` -- so every view of one buffer uploaded the parent's
+    /// top-left tile instead of the window it names. Silent: the right
+    /// shape, the right byte count, the wrong pixels. Issue #162's converter
+    /// half; the storage half (a view demoting to a host placeholder under
+    /// the `dynamic` backend) is pinned in
+    /// `tests/interop/test_cross_package.py`.
+    ///
+    /// The origin is non-zero and the window is NARROWER than its parent, so
+    /// both halves of the addressing are exercised: a fix that got the
+    /// offset right but stepped rows by the window's own tight pitch reads
+    /// row 0 correctly and shears every row after it. QVGA-scale rather than
+    /// a toy size, because tiny textures have their own failure modes on
+    /// Mali that would confound this one.
+    ///
+    /// Route, allocation and fallback: see the block comment above.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_pbo_view_source_converts_its_own_region_gl() {
+        const W: usize = 320;
+        const H: usize = 240;
+        const SIDE: usize = 96;
+        const X0: usize = 40;
+        const Y0: usize = 32;
+
+        let Some(mut gl) = pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W, H);
+        stamp_rgba8_positionally(&src, W, H);
+
+        let view = src
+            .view(edgefirst_tensor::Region::new(X0, Y0, SIDE, SIDE))
+            .expect("view a narrow window of the PBO");
+        let mut dst = rgba8_pbo(&gl, SIDE, SIDE);
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a PBO view source");
+        assert_pbo_source_route(&gl, &before, "u8 PBO view");
+
+        // Read from the live mapping, inside the guard.
+        let m = dst
+            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+            .expect("map the destination");
+        let out = m.as_slice();
+        let dst_pitch = dst.effective_row_stride().unwrap_or(SIDE * 4);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let i = y * dst_pitch + x * 4;
+                assert_eq!(
+                    (out[i], out[i + 1]),
+                    (((x + X0) % 256) as u8, ((y + Y0) % 256) as u8),
+                    "output pixel ({x}, {y}) must be source ({}, {}); \
+                     ({x}, {y}) would be the parent's origin tile",
+                    x + X0,
+                    y + Y0
+                );
+            }
+        }
+    }
+
+    /// The float engine's PBO source arm reads the view's own region.
+    ///
+    /// `feed_float_src`'s PBO arm is the float sibling of
+    /// `draw_src_texture_from_pbo`, and it carried the identical pair of
+    /// defects: `TexImage2D`/`TexSubImage2D` were handed `NULL` with the
+    /// source bound to `PIXEL_UNPACK_BUFFER`, and no `UNPACK_ROW_LENGTH` was
+    /// set. The arm is taken on any `pbo_id()`, and a `view()` carries its
+    /// parent's id, so `convert(pbo_view, f32_dst)` uploaded the parent's
+    /// top-left tile.
+    ///
+    /// Route, allocation and fallback: see the block comment above. The
+    /// route assertion is what makes this test about the float GL path
+    /// rather than about arithmetic: the CPU fallback's widen is bit-exact
+    /// against the GPU's, so byte agreement alone would prove nothing.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_pbo_view_source_converts_its_own_region_to_f32_gl() {
+        const W: usize = 320;
+        const H: usize = 240;
+        const SIDE: usize = 96;
+        const X0: usize = 40;
+        const Y0: usize = 32;
+
+        let Some(mut gl) = float_pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W, H);
+        stamp_rgba8_positionally(&src, W, H);
+
+        let view = src
+            .view(edgefirst_tensor::Region::new(X0, Y0, SIDE, SIDE))
+            .expect("view a narrow window of the PBO");
+        let mut dst = gl
+            .create_pbo_image_dtype(SIDE, SIDE, PixelFormat::Rgb, DType::F32)
+            .expect("allocate an F32 RGB PBO destination");
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a PBO view source into an F32 destination");
+        assert_pbo_source_route(&gl, &before, "float PBO view");
+
+        assert_f32_dst_matches_rgba8_pattern(&dst, SIDE, SIDE, X0, Y0, "view at (40, 32)");
+    }
+
+    /// A padded source pitch must not shear the float engine's upload.
+    ///
+    /// The other half of `feed_float_src`'s PBO arm: with no
+    /// `UNPACK_ROW_LENGTH`, GL reads the rows back to back and every row
+    /// after the first lands on the wrong columns. Isolated from the offset
+    /// deliberately -- this source starts at byte 0 -- so the two defects
+    /// fail this suite independently rather than as one lump.
+    ///
+    /// The padded pitch comes from viewing a WIDER parent at `(0, 0)`:
+    /// `Tensor::view` records the parent's pitch on any multi-row window,
+    /// which is exactly the "rows are further apart than the image is wide"
+    /// shape a pitch-aligned producer hands over, and the only way to build
+    /// one here without lying to `set_row_stride` about a buffer.
+    ///
+    /// Route, allocation and fallback: see the block comment above.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_padded_pbo_source_does_not_shear_the_f32_upload() {
+        const W_ALLOC: usize = 320;
+        const W: usize = 256;
+        const H: usize = 240;
+
+        let Some(mut gl) = float_pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W_ALLOC, H);
+        stamp_rgba8_positionally(&src, W_ALLOC, H);
+
+        let view = src
+            .view(edgefirst_tensor::Region::new(0, 0, W, H))
+            .expect("view the left W columns of a wider PBO");
+        assert_eq!(
+            view.effective_row_stride(),
+            Some(W_ALLOC * 4),
+            "precondition: the window's rows are the PARENT's pitch apart, not \
+             its own {} bytes",
+            W * 4
+        );
+        assert_eq!(
+            view.plane_offset().unwrap_or(0),
+            0,
+            "precondition: this case starts at byte 0, so only the pitch is \
+             under test"
+        );
+
+        let mut dst = gl
+            .create_pbo_image_dtype(W, H, PixelFormat::Rgb, DType::F32)
+            .expect("allocate an F32 RGB PBO destination");
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a padded PBO source into an F32 destination");
+        assert_pbo_source_route(&gl, &before, "float padded PBO source");
+
+        assert_f32_dst_matches_rgba8_pattern(&dst, W, H, 0, 0, "padded pitch");
+    }
+
+    /// A padded whole-buffer PBO destination is written at its own pitch.
+    ///
+    /// The destination half of the family. `plan_pbo_readback` accepts a
+    /// pitch-aligned destination -- that is what `pack_row_length` exists
+    /// for -- so both directions have to honour it:
+    /// `setup_renderbuffer_from_pbo` seeds the render texture from the
+    /// destination's current bytes on the way in, and the readback places
+    /// the rendered rows on the way out.
+    ///
+    /// **What this pins, and what nothing can.** It pins the readback, which
+    /// is observable: get the pitch wrong there and the visible rows land on
+    /// top of each other. It does NOT pin the seed's own
+    /// `UNPACK_ROW_LENGTH`, and no test can, because no path lets the seeded
+    /// content survive to be read: `Crop::resolve` only ever produces a
+    /// `dst_rect` together with a `dst_color` (`Fit::Letterbox`), so a
+    /// partial convert always clears first, `Fit::Stretch` covers the whole
+    /// destination, and `draw_decoded_masks`/`draw_proto_masks` guarantee
+    /// they fully write `dst`. The seed is fixed anyway -- an upload should
+    /// describe the buffer it reads -- and this test is what keeps the
+    /// destination pitch honest end to end.
+    ///
+    /// There is no destination-side counter in `ConvertStats`, so the route
+    /// is pinned from the source side plus a structural fact: the source
+    /// feed is asserted to be the PBO arm, and `lower_dst` maps a `Pbo`
+    /// destination to `TexturePbo` unconditionally (pinned by
+    /// `lower_dst_full_table`), so once the engine ran the destination went
+    /// through the PBO readback.
+    ///
+    /// The padded destination is built the way a pool really produces one:
+    /// allocate at the wider width, then `configure_image` down and declare
+    /// the pitch the allocation still has. Nothing here lies to
+    /// `set_row_stride` -- 240 rows at 1280 B fit the 307200 B the 320-wide
+    /// allocation holds. `create_pbo_image` itself never pads: every width
+    /// comes back tight, so a pool is the only way a padded one arises.
+    ///
+    /// Route, allocation and fallback: see the block comment above.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_padded_pbo_destination_is_written_at_its_own_pitch() {
+        const W_ALLOC: usize = 320;
+        const W: usize = 256;
+        const H: usize = 240;
+        const PITCH: usize = W_ALLOC * 4;
+
+        let Some(mut gl) = pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W, H);
+        stamp_rgba8_positionally(&src, W, H);
+
+        let mut dst = rgba8_pbo(&gl, W_ALLOC, H);
+        dst.configure_image(W, H, PixelFormat::Rgba)
+            .expect("narrow a pool tensor to the image it will hold");
+        dst.set_row_stride(PITCH)
+            .expect("declare the pitch the allocation still has");
+        assert_eq!(
+            dst.effective_row_stride(),
+            Some(PITCH),
+            "precondition: the destination's rows are {PITCH} B apart, not its \
+             own {} B",
+            W * 4
+        );
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a pitch-aligned PBO destination");
+        assert_pbo_source_route(&gl, &before, "padded PBO destination");
+
+        // Read from the live mapping, inside the guard. Only the visible
+        // bytes of each row are checked: a driver may write the padding
+        // between rows while packing (Vivante does, issue #167).
+        let m = dst
+            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+            .expect("map the destination");
+        let out = m.as_slice();
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * PITCH + x * 4;
+                assert_eq!(
+                    (out[i], out[i + 1]),
+                    ((x % 256) as u8, (y % 256) as u8),
+                    "dst pixel ({x}, {y}) at pitch {PITCH}; reading the rows back \
+                     to back would put source row {} here",
+                    y * PITCH / (W * 4)
+                );
+            }
+        }
     }
 }

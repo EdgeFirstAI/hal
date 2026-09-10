@@ -205,7 +205,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HAL_TEST_REQUIRE_CUDA=1` (set by `make test-cuda` whenever it located a
   runtime) makes such a skip a failure rather than a silent pass.
 
+- **A `view()` of a PBO-backed image read as all zeros, from every Python
+  package.** On a machine with OpenGL but no working zero-copy DMA-BUF
+  import -- an NVIDIA desktop, where the EGL import fails with GL `0x502`
+  -- `ImageProcessor.create_image` returns a PBO, and
+  `ImageProcessor.convert(img.view(region), dst)` produced an empty
+  destination with no error. Under the `dynamic` backend (which all five
+  wheels use) a PBO tensor was a full-sized *host placeholder* with the real
+  GL buffer held in a Rust field beside it; `view()` went through the C ABI,
+  which never saw that field, so the view was a window onto the placeholder.
+
+  A PBO is now real storage inside `libedgefirst_tensor`. The GL buffer
+  stays the client's -- the library never makes a GL call -- and what
+  crosses is the callback channel: a new frozen `ef_client_state` (`ctx`,
+  `retain`, `release`) plus the buffer's map/unmap functions, through the
+  new `ef_tensor_wrap_pbo`. `ef_tensor_pbo_id`, `ef_tensor_pbo_is_mapped`
+  and `ef_tensor_pbo_vtable` read back what a GL consumer needs. `retain`
+  and `release` govern the *channel* only: the client's own destructor stays
+  the sole caller of `glDeleteBuffers`, and a view now keeps the buffer
+  alive after its parent tensor is gone. (#162)
+
+- **`set_plane_offset` was a no-op on PBO and shared-memory storage.** The
+  last reachable arms of the same issue class as the IOSurface and D3D11
+  fixes above: a `PboTensor` carries a `view_offset` its own `map()` adds and
+  its own `view()` sets, and a `ShmTensor` carries the same offset, but
+  nothing wrote either back, so restoring an offset onto an already-built
+  tensor left the map at the parent's origin. `set_format` gains the paired
+  clear on both; `reshape` needs none for PBO, since `PboTensor::reshape`
+  zeroes the offset itself. The three mutator matches are now exhaustive
+  rather than ending in a catch-all, so a new backing has to state its
+  behaviour instead of silently doing nothing. (#161)
+
+- **`Tensor::from_pbo` allocated the PBO's whole byte count as host RAM.**
+  66,355,200 bytes (~63.3 MiB) for a 4K RGBA16F surface, purely to own a
+  handle with the right metadata for a buffer whose data already lives on
+  the GPU. Gone with the placeholder; the test that measured it is inverted
+  rather than deleted, so a reintroduction fails loudly.
+
+- **A GL convert of a PBO view uploaded the parent's origin.** With a buffer
+  bound to `GL_PIXEL_UNPACK_BUFFER`, `glTexImage2D`'s `pixels` argument is a
+  byte offset into that buffer, and both the u8 and the float source paths
+  passed `NULL`. Every view of one PBO therefore converted the same top-left
+  tile, and a padded PBO sheared because `GL_UNPACK_ROW_LENGTH` was left at
+  the tight row. Both paths now pass the view's byte offset and the
+  effective row stride. Pre-existing on the `static` backend; the `dynamic`
+  backend only reached it once the storage-kind demotion above stopped
+  masking it.
+
+- **A PBO view rebuilt from its capsule lost the parent's row pitch.**
+  `restore_imported_row_stride` restored a producer's stride for the `HOST`,
+  `DMABUF` and IOSurface kinds but excluded `PBO`, so a reconstructed view
+  of a padded PBO read at the tight row and sheared. A PBO destination pre-
+  seed had the matching gap on the readback pitch. Also pre-existing on the
+  `static` backend.
+
+- **A PBO sub-view now refuses `reshape` cleanly.** A reshape must fill the
+  whole GL allocation, so a sub-view cannot honour one; it returns an error
+  and leaves the map window intact rather than accepting the call and
+  reading the wrong bytes.
+
 ### Changed
+
+- **`Tensor::as_pbo()` is removed** (Rust API; pre-1.0, so removed rather
+  than deprecated). It lent a `PboTensor<T>`, which the `dynamic` backend no
+  longer has -- the buffer lives in `libedgefirst_tensor`. Every caller read
+  exactly two facts off that borrow, so those are the API:
+  `Tensor::pbo_id() -> Option<u32>` and
+  `Tensor::pbo_is_mapped() -> Option<bool>`, on both backends. The C ABI
+  gains four symbols (102 declarations become 106) and one by-value struct
+  frozen at 24 bytes; nothing existing moves, so `ef_tensor_abi_version()`
+  stays `1`.
+
+- **`pin_host` on a PBO-backed tensor is now refused on the `dynamic`
+  backend**, as it always was on `static`; both report the same message. The
+  user-visible consequence is in Python: requesting the tensor capsule with
+  an explicit access on a PBO-backed tensor now raises, where it previously
+  returned a capsule whose descriptor carried a host address in the field
+  consumers read as the PBO op-vtable pointer. The `access=None` form, which
+  is what `convert` uses, is unaffected.
 
 - A malformed quantization descriptor in a tensor capsule is now reported
   rather than silently treated as "no quantization". Conflating the two is

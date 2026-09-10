@@ -606,7 +606,7 @@ fn two_distinct_views_of_one_dma_parent_share_one_identity_and_do_not_collide_wi
 
 // --- Task 18: PBO / CUDA / typed-downcast primitive family ----------------
 //
-// `Tensor::as_pbo`/`from_pbo`/`set_cuda_handle`, `TensorDyn::as_u8`/`as_i8`/
+// `Tensor::pbo_id`/`from_pbo`/`set_cuda_handle`, `TensorDyn::as_u8`/`as_i8`/
 // `as_f32`/`as_f16`/`as_i16`/`into_u8`/... did not exist at all under
 // `dynamic` before this task -- not stubs, absent (the exact gap that blocked
 // `edgefirst-image-capi`'s own flip, task 9's report). Every test below
@@ -636,6 +636,13 @@ impl MockPboOps {
             unmaps: AtomicUsize::new(0),
             deletes: AtomicUsize::new(0),
         })
+    }
+
+    /// How many times `delete_buffer` has fired -- the observable that says
+    /// whether the GL buffer's lifetime really is refcounted across the
+    /// tensors sharing it, rather than tied to whichever one drops first.
+    fn delete_count(&self) -> usize {
+        self.deletes.load(Ordering::Acquire)
     }
 }
 
@@ -668,12 +675,13 @@ unsafe impl edgefirst_tensor::PboOps for MockPboOps {
     }
 }
 
-/// `Tensor::from_pbo`/`as_pbo` genuinely round-trip a PBO-backed tensor
-/// through the `dynamic` backend: `memory()` reports `Pbo` (not whatever the
-/// metadata-only real handle underneath happens to be), `as_pbo()` recovers
-/// the exact `buffer_id`, and a CPU map through the recovered `PboTensor`
-/// actually reaches the mock's own backing storage -- proving the map/unmap
-/// calls are real `PboOps` dispatch, not a no-op stub.
+/// `Tensor::from_pbo` genuinely round-trips a PBO-backed tensor through the
+/// `dynamic` backend: `memory()` reports `Pbo` (which the handle answers on
+/// its own since Stage B, with no override on this side), `pbo_id()`
+/// recovers the exact `buffer_id`, `pbo_is_mapped()` tracks the map, and a
+/// CPU map reaches the mock's own backing storage -- proving the map/unmap
+/// calls are real `PboOps` dispatch routed back out through the client
+/// channel, not a no-op stub.
 #[test]
 fn dynamic_pbo_wraps_and_reads_back_through_the_typed_tensor() {
     let ops = MockPboOps::new(16);
@@ -684,8 +692,18 @@ fn dynamic_pbo_wraps_and_reads_back_through_the_typed_tensor() {
     assert_eq!(
         TensorTrait::memory(&tensor),
         TensorMemory::Pbo,
-        "a PBO-backed dynamic tensor must report TensorMemory::Pbo, not the metadata handle's \
-         own (host) storage kind"
+        "a PBO-backed dynamic tensor must report TensorMemory::Pbo, which the library's \
+         own TensorStorage::Pbo answers with no override on this side"
+    );
+    assert_eq!(
+        tensor.pbo_id(),
+        Some(7),
+        "pbo_id must preserve the real GL buffer id"
+    );
+    assert_eq!(
+        tensor.pbo_is_mapped(),
+        Some(false),
+        "a freshly wrapped PBO holds no CPU mapping"
     );
 
     tensor
@@ -693,38 +711,258 @@ fn dynamic_pbo_wraps_and_reads_back_through_the_typed_tensor() {
         .expect("set_format on a PBO-backed tensor (real edgefirst-image call shape)");
 
     {
-        let pbo_ref = tensor
-            .as_pbo()
-            .expect("as_pbo must recover the wrapped PboTensor");
+        let mut map = tensor.map().expect("map the PBO through the mock ops");
         assert_eq!(
-            pbo_ref.buffer_id(),
-            7,
-            "as_pbo must preserve the real GL buffer id"
+            tensor.pbo_is_mapped(),
+            Some(true),
+            "pbo_is_mapped must see the outstanding map -- this is the fact bind_dst \
+             refuses a convert on"
         );
-        let mut map = pbo_ref.map().expect("PboTensor::map through the mock ops");
         map.as_mut_slice().fill(0xEE);
     }
+    assert_eq!(
+        tensor.pbo_is_mapped(),
+        Some(false),
+        "...and must go back to false once the map drops, or every later convert \
+         to this tensor would be refused"
+    );
     // A second map proves the write above genuinely reached the mock's own
     // backing storage through PboOps::map_buffer/unmap_buffer -- not just a
     // local copy the first map handed out.
-    let map = tensor
-        .as_pbo()
-        .expect("as_pbo must still resolve after the write")
-        .map()
-        .expect("second PboTensor::map");
+    let map = tensor.map().expect("second map");
     assert!(
         map.as_slice().iter().all(|&b| b == 0xEE),
         "the byte written through the first PBO map must be visible through a fresh one"
     );
+    drop(map);
 
     let dyn_tensor: TensorDyn = tensor.into();
+    assert_eq!(
+        dyn_tensor.pbo_id(),
+        Some(7),
+        "the erased TensorDyn answers the same buffer id"
+    );
+}
+
+/// The Stage B constructor across the real ABI: `from_client_pbo` hands a
+/// client's callback channel to `ef_tensor_wrap_pbo` inside
+/// `libedgefirst_tensor.so`, which builds real `TensorStorage::Pbo` storage
+/// over it and hands back an opaque handle.
+///
+/// This is the crossing no in-process test can prove: the `PboTensor` lives
+/// on the far side of the `.so` boundary, so `memory()` reporting `Pbo` and
+/// a map landing in *this* side's buffer together show the library really
+/// built PBO storage and really called back out, rather than allocating
+/// host memory and reporting a kind it invented.
+///
+/// It would fail against a `from_client_pbo` that returned
+/// `Err(NotImplemented)`, one that dropped the channel (the retain/release
+/// balance), and one that wrapped the bytes as `Mem`.
+mod client_pbo {
+    use std::ffi::{c_int, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    pub static RETAINS: AtomicUsize = AtomicUsize::new(0);
+    pub static RELEASES: AtomicUsize = AtomicUsize::new(0);
+    pub static STORAGE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    pub unsafe extern "C" fn retain(_ctx: *const c_void) {
+        RETAINS.fetch_add(1, Ordering::AcqRel);
+    }
+    pub unsafe extern "C" fn release(_ctx: *const c_void) {
+        RELEASES.fetch_add(1, Ordering::AcqRel);
+    }
+    pub unsafe extern "C" fn map(
+        _ctx: *const c_void,
+        _id: u32,
+        size: usize,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> c_int {
+        let mut s = STORAGE.lock().expect("lock");
+        s.resize(size, 0);
+        unsafe {
+            *out_ptr = s.as_mut_ptr();
+            *out_len = size;
+        }
+        0
+    }
+    pub unsafe extern "C" fn unmap(_ctx: *const c_void, _id: u32) -> c_int {
+        0
+    }
+
+    /// Non-NULL and never dereferenced -- a real static's address rather
+    /// than a fabricated integer, so a regression that *did* dereference it
+    /// reads a valid byte instead of becoming undefined behaviour.
+    pub static CTX: u8 = 0;
+}
+
+#[test]
+fn dynamic_from_client_pbo_crosses_the_abi_and_maps_through_the_clients_callback() {
+    use edgefirst_tensor::{EfClientState, TensorMapTrait};
+    use std::sync::atomic::Ordering;
+
+    client_pbo::RETAINS.store(0, Ordering::Release);
+    client_pbo::RELEASES.store(0, Ordering::Release);
+
+    let state = EfClientState {
+        ctx: std::ptr::addr_of!(client_pbo::CTX) as *const std::ffi::c_void,
+        retain: Some(client_pbo::retain),
+        release: Some(client_pbo::release),
+    };
+
+    // SAFETY: `state`, `map` and `unmap` are the module above's own valid
+    // channel; `CTX` is a `'static` the callbacks never dereference.
+    let tensor = unsafe {
+        TensorDyn::from_client_pbo(
+            state,
+            client_pbo::map,
+            client_pbo::unmap,
+            11,
+            64,
+            &[64],
+            DType::U8,
+        )
+    }
+    .expect("from_client_pbo must cross ef_tensor_wrap_pbo");
+
+    assert_eq!(
+        tensor.memory(),
+        TensorMemory::Pbo,
+        "the library must report PBO storage, not the host memory it would          have allocated if it ignored the channel"
+    );
+    assert_eq!(
+        client_pbo::RETAINS.load(Ordering::Acquire),
+        1,
+        "the library retains the channel exactly once"
+    );
+
+    {
+        let mut map = tensor
+            .map_bytes(edgefirst_tensor::CpuAccess::ReadWrite)
+            .expect("map a wrapped PBO through the client's map_fn");
+        map.as_mut_slice()[0] = 0xC3;
+    }
+    assert_eq!(
+        client_pbo::STORAGE.lock().expect("lock")[0],
+        0xC3,
+        "the write landed in this side's own buffer, so the map really went          out through map_fn rather than into library-allocated host memory"
+    );
+
+    drop(tensor);
+    assert_eq!(
+        client_pbo::RELEASES.load(Ordering::Acquire),
+        1,
+        "the channel is released exactly once, when the handle is freed"
+    );
+}
+
+/// A NULL `ctx`, `retain` or `release` is refused across the ABI with a real
+/// error, not a silently non-owning wrap that would later release a channel
+/// it never took — and with the **same `Error` variant** the `static`
+/// backend returns for the same input.
+///
+/// `Error::InvalidArgument` is what `client_state_pbo_ops` returns and what
+/// `pbo.rs`'s `a_client_state_missing_any_part_is_refused` asserts under
+/// `static`. Getting a different variant here would mean the same malformed
+/// channel is classified two different ways depending on which backend a
+/// consumer linked — the class the library recorded through
+/// `set_last_error_classified` exists precisely so it does not have to be.
+#[test]
+fn dynamic_from_client_pbo_refuses_an_incomplete_channel() {
+    use edgefirst_tensor::EfClientState;
+
+    let good = EfClientState {
+        ctx: std::ptr::addr_of!(client_pbo::CTX) as *const std::ffi::c_void,
+        retain: Some(client_pbo::retain),
+        release: Some(client_pbo::release),
+    };
+    let broken = [
+        EfClientState {
+            ctx: std::ptr::null(),
+            ..good
+        },
+        EfClientState {
+            retain: None,
+            ..good
+        },
+        EfClientState {
+            release: None,
+            ..good
+        },
+    ];
+    for state in broken {
+        // SAFETY: the op functions are valid; only the state is malformed,
+        // which is exactly what the entry point must detect.
+        let r = unsafe {
+            TensorDyn::from_client_pbo(
+                state,
+                client_pbo::map,
+                client_pbo::unmap,
+                11,
+                64,
+                &[64],
+                DType::U8,
+            )
+        };
+        let Err(err) = r else {
+            panic!("an incomplete client state must be refused across the ABI");
+        };
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected the same InvalidArgument the static backend returns, \
+             got {err:?}"
+        );
+    }
+}
+
+/// Malformed geometry crosses the ABI as `InvalidArgument` too, not as the
+/// fallback variant.
+///
+/// This is the arm that actually exercised the bug: `read_dims` records the
+/// NULL-`dims`/zero-`ndim` refusal through the **unclassified**
+/// `set_last_error`, so before `ef_tensor_wrap_pbo` classified it here,
+/// this path reached `dynamic` with class `Unspecified` and came out as
+/// whatever `from_client_pbo`'s fallback happened to be. The NULL-channel
+/// test cannot see that: its class is set explicitly, so it would pass with
+/// either fallback. Only an `Unspecified`-class failure distinguishes them.
+#[test]
+fn dynamic_from_client_pbo_refuses_malformed_geometry_with_the_same_variant() {
+    use edgefirst_tensor::EfClientState;
+
+    let state = EfClientState {
+        ctx: std::ptr::addr_of!(client_pbo::CTX) as *const std::ffi::c_void,
+        retain: Some(client_pbo::retain),
+        release: Some(client_pbo::release),
+    };
+    // An empty shape is `ndim == 0` at the ABI, which is the one `read_dims`
+    // refusal this Rust wrapper can reach: it always passes a real `dims`
+    // pointer, so the NULL arm is C-only (covered by
+    // `wrap_pbo_refuses_malformed_geometry` in `tensor-capi`), and on an
+    // LP64 host every `u64` dimension fits a `usize`, so the out-of-range
+    // arm is unreachable from here -- a huge dimension gets past `read_dims`
+    // and is refused later, correctly, as `InvalidShape`.
+    let shape: Vec<usize> = Vec::new();
+    // SAFETY: the channel is the module's own valid one; only the geometry
+    // is malformed, which is what the entry point must detect.
+    let r = unsafe {
+        TensorDyn::from_client_pbo(
+            state,
+            client_pbo::map,
+            client_pbo::unmap,
+            11,
+            64,
+            &shape,
+            DType::U8,
+        )
+    };
+    let Err(err) = r else {
+        panic!("zero ndim must be refused across the ABI");
+    };
     assert!(
-        dyn_tensor
-            .as_u8()
-            .expect("as_u8 on the erased PBO tensor")
-            .as_pbo()
-            .is_some(),
-        "as_pbo must still resolve after erasing back to TensorDyn and downcasting again"
+        matches!(err, Error::InvalidArgument(_)),
+        "zero ndim: expected InvalidArgument, got {err:?}"
     );
 }
 
@@ -799,62 +1037,155 @@ fn dynamic_typed_downcast_family_matches_dtype_and_rejects_mismatch() {
     assert_eq!(f32_tensor.shape(), &[4]);
 }
 
-/// Task-18 review, F32: `Tensor::from_pbo`'s metadata handle
-/// (`dynamic_tensor.rs::from_pbo`, `TensorDyn::new(&pbo.shape, T::DTYPE,
-/// Some(TensorMemory::Mem), None)`) is NOT metadata-only. `TensorDyn::new`
-/// for `TensorMemory::Mem` can only drive `ef_tensor_builder_alloc`
-/// (`tensor-capi/src/builder.rs`), which always allocates real host memory
-/// sized to the full shape it is given -- there is no way through today's
-/// ABI to mint a handle that carries a shape without backing it byte for
-/// byte. This test performs exactly that same construction call directly
-/// (not through `from_pbo`, since the `map_pin` guard added in this same
-/// task correctly refuses to map a PBO-backed `TensorDyn` directly -- see
-/// its own doc comment) and proves, by successfully mapping back the FULL
-/// byte count, that the allocation is real and full-sized, not a small
-/// placeholder.
+/// `Tensor::from_pbo` allocates **no host memory**.
 ///
-/// For a realistic 4K RGBA16F PBO (3840x2160x4, `f16`) this is
-/// **66,355,200 bytes (~63.3 MiB) of real host RAM**, allocated purely to
-/// carry shape/dtype/format metadata for a buffer whose real data already
-/// lives on the GPU -- exactly the host copy the PBO path exists to avoid.
+/// This test used to assert the opposite. Before Stage B of the
+/// client-side-state work, `from_pbo` minted a companion
+/// `TensorMemory::Mem` handle sized to the PBO's whole shape purely to
+/// carry metadata, because the only primitive `TensorDyn::new` could drive
+/// for `Mem` was `ef_tensor_builder_alloc`, which always allocates real
+/// host memory. For a 4K RGBA16F PBO (3840x2160x4, `f16`) that was
+/// 66,355,200 bytes -- ~63.3 MiB of host RAM for a buffer whose data
+/// already lives on the GPU, exactly the copy the PBO path exists to avoid.
+/// The test is **inverted rather than deleted**: it is the proof the
+/// placeholder is gone, and it fails loudly if a future change quietly
+/// reintroduces a host allocation behind `from_pbo`.
 ///
-/// This is a confirmed, unresolved finding, not something this task fixes:
-/// no `ef_tensor_*` primitive today can decouple a handle's logical shape
-/// from its backing size (`ef_tensor_builder_wrap` requires a real fd of at
-/// least the shape's byte count; `TensorDyn::reshape` has no primitive at
-/// all -- see its own doc comment in `dynamic_backend.rs`), and
-/// `tensor-capi`/`tensor-ffi` -- where a genuinely metadata-only primitive
-/// would have to live -- were mid-edit by a concurrent implementer
-/// throughout this task's own review round, making landing one here both
-/// out of scope and unsafe to attempt. Follow-up: a primitive along the
-/// lines of `ef_tensor_builder_alloc_metadata` (or a `wrap`-style adopt of a
-/// zero/near-zero-size in-process placeholder buffer) that records shape/
-/// dtype/format without a matching allocation, paired with the existing
-/// `map_pin` refusal (already in place) so nothing can be tricked into
-/// reading past a metadata-only handle's real, tiny backing.
+/// The measurement is the handle's own storage kind and capacity, not a
+/// process RSS reading: a `TensorMemory::Pbo` handle carrying the GL
+/// buffer's capacity is exactly "no host allocation", and unlike RSS it
+/// does not depend on the allocator's own behaviour.
+///
+/// **Why the last block is the one that actually bites.** The first three
+/// assertions all held on the placeholder design too: `memory()` overrode
+/// itself to `Pbo` whenever the side-car `PboTensor` was set,
+/// `capacity_bytes()` read that same side-car in preference to the handle,
+/// and `map_pin` detoured to it. The side-car was invisible from the
+/// tensor it was attached to, and visible only from a handle *derived* from
+/// it -- every `TensorDyn::from_handle` site (view, batch, plane, import)
+/// left it behind, so a derived handle fell through to the companion's real
+/// host bytes. That is issue #162: `view()` on a PBO came back as an
+/// all-zero host window. So the proof that no companion exists is that a
+/// view is still the PBO, and still reads the GL buffer's own bytes.
 #[test]
-fn from_pbo_metadata_handle_allocation_cost_is_the_full_pbo_byte_count() {
+fn from_pbo_allocates_no_host_memory_for_the_metadata_handle() {
     let (w, h, c) = (3840usize, 2160usize, 4usize); // 4K, RGBA16F
-    let expected_bytes = w * h * c * std::mem::size_of::<half::f16>();
+    let bytes = w * h * c * std::mem::size_of::<half::f16>();
     assert_eq!(
-        expected_bytes, 66_355_200,
-        "sanity check on the 4K RGBA16F byte count itself"
+        bytes, 66_355_200,
+        "sanity check on the 4K RGBA16F byte count"
     );
 
-    // Exactly the call `Tensor::<f16>::from_pbo` makes internally.
-    let metadata_handle = TensorDyn::new(&[h, w, c], DType::F16, Some(TensorMemory::Mem), None)
-        .expect("the same allocation from_pbo performs for a real PBO of this shape");
+    // The GL allocation is deliberately LARGER than the shape product, the
+    // way a pitch-aligned PBO really is. A `capacity_bytes` that reported a
+    // shape-sized host buffer -- which is exactly what the deleted `Mem`
+    // companion was -- would answer `bytes` and fail below.
+    let allocated = bytes + 4096;
+    let ops = MockPboOps::new(allocated);
+    let pbo = edgefirst_tensor::PboTensor::<half::f16>::from_pbo(
+        41,
+        allocated,
+        &[h, w, c],
+        Some("4k_rgba16f"),
+        ops,
+    )
+    .expect("PboTensor::from_pbo");
+    let tensor = Tensor::<half::f16>::from_pbo(pbo).expect("Tensor::from_pbo");
+    let mut erased: TensorDyn = tensor.into();
 
-    let mapped = metadata_handle
+    assert_eq!(
+        erased.memory(),
+        TensorMemory::Pbo,
+        "the handle IS the PBO now -- a Mem companion would report Mem once \
+         memory()'s override is gone"
+    );
+    assert_eq!(
+        erased.capacity_bytes(),
+        allocated,
+        "capacity comes from the GL allocation, which is larger than the shape \
+         product -- not from a shape-sized host buffer"
+    );
+    // `map_bytes` on a genuine host allocation succeeds; on a PBO the
+    // library either goes through the client's map callback or refuses,
+    // because a PBO has no address outside its own map guard.
+    //
+    // Stamped POSITIONALLY, not with one sentinel byte. A sentinel proves
+    // only that the view reads the GL buffer rather than a zeroed host
+    // placeholder; it says nothing about *where* in that buffer, so a view
+    // that landed at the parent's origin passed it. `251` is prime and
+    // coprime with every row pitch here, so no two byte offsets this test
+    // compares share a value by accident.
+    {
+        let mut mapped = erased
+            .map_bytes(CpuAccess::ReadWrite)
+            .expect("a PBO-backed handle maps through the client's own map callback");
+        for (i, b) in mapped.as_mut_slice().iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+    }
+
+    // The decisive check: a DERIVED handle must still be the PBO. The
+    // placeholder design attached the `PboTensor` beside the handle, and
+    // `TensorDyn::from_handle` -- which every derived handle goes through --
+    // dropped it, so the view fell through to the companion's own 66 MiB of
+    // host zeros.
+    erased
+        .set_format(PixelFormat::Rgba)
+        .expect("a 4K RGBA tensor takes the packed RGBA format");
+    // A NON-ZERO origin, deliberately: a view at (0, 0) reads the same
+    // bytes whether the offset survived or was dropped, so it cannot tell
+    // "the right place" from "the buffer's start".
+    const VX: usize = 16;
+    const VY: usize = 8;
+    let pitch = erased
+        .effective_row_stride()
+        .expect("a formatted 4K RGBA16F tensor reports a pitch");
+    let expect_offset = VY * pitch + VX * 4 * std::mem::size_of::<half::f16>();
+    let view = erased
+        .view(Region::new(VX, VY, 64, 64))
+        .expect("view a 64x64 window of the PBO at a non-zero origin");
+    assert_eq!(
+        view.memory(),
+        TensorMemory::Pbo,
+        "a view of a PBO is a PBO -- a Mem here is the host companion this \
+         constructor must no longer mint"
+    );
+    assert_eq!(
+        view.pbo_id(),
+        Some(41),
+        "...and it names the same GL buffer, which is what a cross-package \
+         re-import of a view needs"
+    );
+    assert_eq!(
+        view.plane_offset(),
+        Some(expect_offset),
+        "the view's window starts {expect_offset} bytes into the GL buffer; a \
+         `None`/0 here is a view that names the parent's origin"
+    );
+    let mapped = view
         .map_bytes(CpuAccess::Read)
-        .expect("a genuine TensorMemory::Mem handle must be host-mappable");
+        .expect("a PBO view maps through the same client callback");
+    let seen = mapped.as_slice();
     assert_eq!(
-        mapped.len(),
-        expected_bytes,
-        "from_pbo's metadata handle allocates the FULL pbo byte count as real host memory -- \
-         confirmed by task-18's review (F32); not a small metadata-only footprint, and not yet \
-         fixable without a new ef_tensor_* primitive (see this test's own doc comment)"
+        seen[0],
+        (expect_offset % 251) as u8,
+        "the view's first mapped byte must be the GL buffer's byte at \
+         {expect_offset}, not its byte 0 -- read live, inside the guard"
     );
+    // The whole first row, so a view that got the offset right but the
+    // pitch wrong still fails.
+    for (x, &b) in seen
+        .iter()
+        .take(64 * 4 * std::mem::size_of::<half::f16>())
+        .enumerate()
+    {
+        assert_eq!(
+            b,
+            ((expect_offset + x) % 251) as u8,
+            "view byte {x} must be the GL buffer's byte at {}",
+            expect_offset + x
+        );
+    }
 }
 
 // --- Task P2a: the primitives `edgefirst-python-common` needs --------------
@@ -1267,14 +1598,15 @@ fn cuda_map_is_none_without_a_handle_and_maps_with_one() {
 }
 
 /// A PBO whose GL buffer is larger than its shape product reports the
-/// buffer's size, not the companion metadata handle's.
+/// buffer's size, not the shape product.
 ///
 /// `PboTensor::from_pbo` explicitly permits `size > shape.product()` for a
-/// pitch-aligned PBO, while `Tensor::from_pbo` sizes the companion `Mem`
-/// handle to the shape product exactly. Reading the companion understates
-/// the real allocation, which clamps a `kind::PBO` descriptor's `capacity`
-/// and leaves a consumer's `from_pbo_import` mapping only part of the
-/// buffer -- the same pool-reuse breakage already fixed for `kind::HOST`.
+/// pitch-aligned PBO, and `ef_tensor_wrap_pbo` carries that `size` into the
+/// library as the storage's real capacity. Reporting the shape product
+/// instead understates the allocation, which clamps a `kind::PBO`
+/// descriptor's `capacity` and leaves a consumer's re-import mapping only
+/// part of the buffer -- the same pool-reuse breakage already fixed for
+/// `kind::HOST`.
 ///
 /// Every production caller happens to size a PBO to match its shape today
 /// (`edgefirst-image`'s `gl/threaded.rs`), so nothing else in the tree can
@@ -1299,8 +1631,8 @@ fn an_oversized_pbos_capacity_is_the_gl_buffers_not_the_metadata_handles() {
     assert_eq!(
         t.capacity_bytes(),
         ALLOCATED,
-        "capacity_bytes must report the GL buffer's real size, not the companion \
-         metadata handle's shape-sized allocation"
+        "capacity_bytes must report the GL buffer's real size, not the shape \
+         product"
     );
     assert_eq!(
         t.descriptor().capacity,
@@ -1490,7 +1822,7 @@ fn clone_fd_works_for_shm_not_only_dma() {
 /// Mapping a PBO-backed tensor through the type-erased handle reads the GL
 /// buffer, rather than refusing.
 ///
-/// It used to refuse ("use `Tensor::as_pbo().map()` instead"). That was a
+/// It used to refuse ("map the wrapped `PboTensor` instead"). That was a
 /// defensible half-truth -- mapping the *companion* handle would hand back
 /// unrelated host bytes -- but the static backend simply dispatches
 /// (`TensorStorage::Pbo(t) => t.map_with(..)`), and Python's
@@ -1506,10 +1838,10 @@ fn mapping_a_pbo_backed_tensor_reads_the_gl_buffer() {
     let pbo = edgefirst_tensor::PboTensor::<u8>::from_pbo(31, 16, &[4, 4, 1], None, ops)
         .expect("PboTensor::from_pbo");
     let tensor = Tensor::<u8>::from_pbo(pbo).expect("Tensor::from_pbo");
-    // Write a marker through the PBO's own typed path...
+    // Write a marker through the typed tensor's own map, which routes to
+    // the wrapped PboTensor...
     {
-        let pbo_ref = tensor.as_pbo().expect("as_pbo");
-        let mut m = pbo_ref.map().expect("typed PBO map");
+        let mut m = tensor.map().expect("typed PBO map");
         m.as_mut_slice().fill(0xC3);
     }
     let dyn_t: TensorDyn = tensor.into();
@@ -1531,13 +1863,16 @@ fn mapping_a_pbo_backed_tensor_reads_the_gl_buffer() {
 ///
 /// `edgefirst-image` allocates an int8 PBO as `u8` and hands it back as an
 /// `i8` tensor. `From<Tensor<T>> for TensorDyn` retags the *handle* so the
-/// dtype is honest, but the `PboTensor<u8>` behind `TensorDyn::pbo` sits
-/// behind a real `Any` vtable that no transmute of the enclosing
-/// `Tensor<T>` touches. Every accessor that picked its downcast target from
-/// `dtype()` therefore looked for a `PboTensor<i8>`, found nothing, and
-/// reported the tensor as having no PBO at all -- `pbo_id()` was `None`, so
-/// its descriptor carried no buffer id and a cross-package re-import died
-/// with `InvalidArgument("PBO descriptor carries no buffer id")`.
+/// dtype is honest. The retag must not cost the tensor its PBO: when the
+/// `PboTensor<u8>` still sat beside the handle behind an `Any` vtable, every
+/// accessor picked its downcast target from `dtype()`, looked for a
+/// `PboTensor<i8>`, found nothing, and reported the tensor as having no PBO
+/// at all -- `pbo_id()` was `None`, so its descriptor carried no buffer id
+/// and a cross-package re-import died with `InvalidArgument("PBO descriptor
+/// carries no buffer id")`. Since Stage B the storage is the library's own
+/// `TensorStorage::Pbo` and there is no second value to keep in step, which
+/// is what this now pins: the four accessors and the map all still resolve
+/// through a retagged handle.
 #[test]
 fn a_retagged_pbo_still_resolves_its_buffer_id_vtable_and_map() {
     let ops = MockPboOps::new(16);
@@ -1545,8 +1880,7 @@ fn a_retagged_pbo_still_resolves_its_buffer_id_vtable_and_map() {
         .expect("PboTensor::from_pbo -- allocated as u8, as the GL backend does");
     let as_u8 = Tensor::<u8>::from_pbo(pbo).expect("Tensor::from_pbo");
     {
-        let p = as_u8.as_pbo().expect("as_pbo before retagging");
-        let mut m = p.map().expect("typed PBO map");
+        let mut m = as_u8.map().expect("typed PBO map before retagging");
         m.as_mut_slice().fill(0x7E);
     }
 
@@ -1554,9 +1888,15 @@ fn a_retagged_pbo_still_resolves_its_buffer_id_vtable_and_map() {
     // transmute, exactly as `crates/image/src/lib.rs` does it.
     // SAFETY: same rationale as that call site.
     let as_i8: Tensor<i8> = unsafe { std::mem::transmute(as_u8) };
-    assert!(
-        as_i8.as_pbo().is_some(),
-        "as_pbo must find the stored PboTensor whatever element type it was created with"
+    assert_eq!(
+        as_i8.pbo_id(),
+        Some(41),
+        "pbo_id must find the stored PboTensor whatever element type it was created with"
+    );
+    assert_eq!(
+        as_i8.pbo_is_mapped(),
+        Some(false),
+        "...and so must pbo_is_mapped, which gates every convert into this tensor"
     );
 
     let erased: TensorDyn = as_i8.into();
@@ -1637,48 +1977,69 @@ fn a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask() {
     assert!(host.dmabuf().is_err());
 }
 
-/// Geometry changes reach the wrapped `PboTensor`, not just the companion
-/// handle.
+/// The three geometry mutators leave a PBO-backed tensor coherent.
 ///
-/// A PBO-backed `TensorDyn` carries geometry in **two** places: the
-/// `ef_tensor_*` handle (which serves `shape()`) and the `PboTensor` behind
-/// `TensorDyn::pbo` (which serves `as_pbo()`, and which `edgefirst-image`
-/// reads for the GL buffer's own geometry). A mutator that updates only the
-/// first leaves the two disagreeing -- `shape()` says one thing and
-/// `as_pbo().shape` another. Reviewed as F6 on task P2b.
+/// There is only ONE copy of the geometry since Stage B: a PBO-backed
+/// `TensorDyn` *is* `TensorStorage::Pbo` inside `libedgefirst_tensor.so`,
+/// so `shape()`, the map's extent and the GL buffer's own geometry are all
+/// the same fact read through the same handle. This test used to guard the
+/// two-copy design -- a side-car `PboTensor` mirrored beside the handle,
+/// which a mutator that updated only the handle left stale (reviewed as F6
+/// on task P2b, and mirrored by `TensorDyn::sync_pbo_shape`, now deleted).
 ///
-/// The byte length coincides for `reshape`, since it preserves the element
-/// count, so a map still returns the right span and nothing errors. That is
-/// what makes it the "stops erroring but returns something subtly
-/// different" case rather than a loud one.
+/// What it asserts now is what survives that deletion, for each mutator in
+/// turn: the handle's shape follows, the tensor is *still the same PBO*
+/// (`pbo_id` unchanged -- a mutator that rebuilt the storage as host memory
+/// would lose it, which is what issue #162 looked like), and a live CPU map
+/// is sized from the new shape and reads the GL buffer's own bytes rather
+/// than a zeroed placeholder. The map is read inside its own guard, never
+/// from a copy.
 ///
-/// Covers all three mutators that change geometry the `PboTensor` also
-/// carries. `set_format`, `set_row_stride`, `set_colorimetry`,
-/// `set_quantization` and `set_dtype` are **not** here on purpose: a
-/// `PboTensor` holds no parallel copy of any of those, and
-/// `set_plane_offset` explicitly skips PBO storage on the static side too
-/// (`lib.rs`'s `_ => {}`).
+/// Covers all three mutators that change geometry. `set_format`,
+/// `set_row_stride`, `set_colorimetry`, `set_quantization` and `set_dtype`
+/// are not here on purpose: none of them changes the extent a map spans.
 #[test]
-fn geometry_mutators_keep_the_wrapped_pbo_in_step() {
+fn geometry_mutators_keep_a_pbo_backed_tensor_coherent() {
+    const SENTINEL: u8 = 0x5C;
+
     fn pbo_tensor(bytes: usize, shape: &[usize]) -> TensorDyn {
         let ops = MockPboOps::new(bytes);
         let pbo = edgefirst_tensor::PboTensor::<u8>::from_pbo(51, bytes, shape, None, ops)
             .expect("PboTensor::from_pbo");
-        Tensor::<u8>::from_pbo(pbo)
+        let t: TensorDyn = Tensor::<u8>::from_pbo(pbo)
             .expect("Tensor::from_pbo")
-            .into()
+            .into();
+        // Stamp the GL buffer so a later read can tell the PBO's own bytes
+        // from a placeholder's zeros.
+        let mut map = t.map_bytes(CpuAccess::ReadWrite).expect("stamp the PBO");
+        map.as_mut_slice().fill(SENTINEL);
+        drop(map);
+        t
+    }
+
+    /// Assert the live mapping -- read inside the guard, never copied out --
+    /// spans exactly `expect` bytes of the PBO's own buffer.
+    fn assert_maps_pbo_bytes(t: &TensorDyn, expect: usize, what: &str) {
+        let map = t
+            .map_bytes(CpuAccess::Read)
+            .expect("a PBO-backed tensor must be mappable");
+        assert_eq!(
+            map.as_slice().len(),
+            expect,
+            "{what}: the map's extent must follow the new shape"
+        );
+        assert!(
+            map.as_slice().iter().all(|&b| b == SENTINEL),
+            "{what}: the map must read the GL buffer, not a zeroed placeholder"
+        );
     }
 
     // --- reshape: same element count, different rank -----------------
     let mut t = pbo_tensor(16, &[4, 4, 1]);
     t.reshape(&[2, 8]).expect("equal element count");
     assert_eq!(t.shape(), &[2, 8], "the handle's shape follows");
-    assert_eq!(
-        t.as_u8().expect("as_u8").as_pbo().expect("as_pbo").shape,
-        vec![2, 8],
-        "and so must the wrapped PboTensor's -- edgefirst-image reads the GL buffer's \
-         geometry off as_pbo(), so a stale shape here is a wrong answer that never errors"
-    );
+    assert_eq!(t.pbo_id(), Some(51), "reshape keeps the same GL buffer");
+    assert_maps_pbo_bytes(&t, 16, "reshape");
 
     // --- set_logical_shape: fewer elements, still fits ---------------
     let mut t = pbo_tensor(16, &[4, 4, 1]);
@@ -1686,19 +2047,188 @@ fn geometry_mutators_keep_the_wrapped_pbo_in_step() {
         .expect("8 bytes fits a 16-byte GL buffer");
     assert_eq!(t.shape(), &[2, 4]);
     assert_eq!(
-        t.as_u8().expect("as_u8").as_pbo().expect("as_pbo").shape,
-        vec![2, 4],
-        "the capacity-based reconfigure must reach the PboTensor too"
+        t.pbo_id(),
+        Some(51),
+        "set_logical_shape keeps the same GL buffer"
     );
+    assert_maps_pbo_bytes(&t, 8, "set_logical_shape");
+
+    // --- reshape after a view: refused, and refused cleanly ----------
+    //
+    // `set_plane_offset`'s `Pbo` arm (Stage B) made a reconstructed view
+    // address its own sub-region, so the paired question is whether the
+    // clear sites keep up. For `reshape` the answer is that it never gets
+    // that far: `PboTensor::reshape` requires the new shape to fill the
+    // whole GL allocation (`shape product == handle.size`), and a sub-view
+    // shares its parent's handle while covering less of it -- so every
+    // reshape of a PBO view is a `ShapeMismatch`, and `TensorStorage::Pbo`'s
+    // arm in `Tensor::reshape` is unreachable from a view by construction.
+    //
+    // Pinned because "unreachable" is the whole reason the offset cannot go
+    // stale here, and because a refusal must not half-apply: `Tensor::
+    // reshape` calls the storage first and propagates, so the window it
+    // declined to change is still exactly the window it had. A reshape that
+    // cleared `plane_offset` before consulting the storage would leave the
+    // wrapper reporting no offset over a map that still starts at the old
+    // one -- a stale window rather than a lost one.
+    let mut t = {
+        let ops = MockPboOps::new(64);
+        let pbo = edgefirst_tensor::PboTensor::<u8>::from_pbo(52, 64, &[8, 8, 1], None, ops)
+            .expect("PboTensor::from_pbo");
+        let mut t: TensorDyn = Tensor::<u8>::from_pbo(pbo)
+            .expect("Tensor::from_pbo")
+            .into();
+        // Positional, not a sentinel: this case is about WHERE the map
+        // starts, and a uniform fill cannot tell two offsets apart.
+        {
+            let mut map = t.map_bytes(CpuAccess::ReadWrite).expect("stamp the PBO");
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+        }
+        t.set_format(PixelFormat::Grey).expect("set_format");
+        t.view(Region::new(2, 3, 4, 4)).expect("view at (2, 3)")
+    };
+    const VIEW_OFFSET: usize = 3 * 8 + 2;
+    assert_eq!(
+        t.plane_offset(),
+        Some(VIEW_OFFSET),
+        "precondition: the view starts {VIEW_OFFSET} bytes into the GL buffer"
+    );
+    assert!(
+        matches!(t.reshape(&[4, 4]), Err(Error::ShapeMismatch(_))),
+        "a PBO sub-view covers less than its parent's allocation, which \
+         `PboTensor::reshape`'s equal-size rule refuses"
+    );
+    assert_eq!(
+        t.plane_offset(),
+        Some(VIEW_OFFSET),
+        "the refused reshape must leave the window exactly as it was"
+    );
+    {
+        let map = t
+            .map_bytes(CpuAccess::Read)
+            .expect("the view still maps after the refusal");
+        assert_eq!(
+            map.as_slice()[0],
+            (VIEW_OFFSET % 251) as u8,
+            "...and the storage agrees: the map still starts at the view's \
+             own byte {VIEW_OFFSET}, read live inside the guard"
+        );
+    }
 
     // --- configure_image: the pool-reuse path ------------------------
     let mut t = pbo_tensor(64, &[8, 8, 1]);
     t.configure_image(4, 4, PixelFormat::Grey)
         .expect("a smaller image fits the 64-byte buffer");
+    assert_eq!(t.shape().iter().product::<usize>(), 16);
     assert_eq!(
-        t.as_u8().expect("as_u8").as_pbo().expect("as_pbo").shape,
-        t.shape().to_vec(),
-        "configure_image is the decode-into-a-pool path; the two geometries must agree \
-         after it, or the next GL import reads the old one"
+        t.pbo_id(),
+        Some(51),
+        "configure_image is the decode-into-a-pool path; it must reconfigure the \
+         SAME GL buffer, or the next import reads a different one"
+    );
+    assert_maps_pbo_bytes(&t, 16, "configure_image");
+}
+
+/// A PBO view is a real PBO sub-view, and the GL buffer survives its
+/// parent tensor.
+///
+/// Two properties in one test because they are the same mechanism seen
+/// twice. Before Stage B, `Tensor::view` on a PBO produced a window onto a
+/// host placeholder (issue #162), and the callback channel's lifetime was
+/// enforced by an external keepalive the `dynamic` path had nothing to
+/// hold -- so a child that outlived its parent read freed memory.
+///
+/// Written to fail against a plausible wrong implementation, not only
+/// against absence: a view that reported `Pbo` but addressed the parent's
+/// origin passes the storage-kind assertion and fails the byte comparison.
+#[test]
+fn a_pbo_view_reads_its_own_region_and_outlives_its_parent() {
+    const W: usize = 32;
+    const H: usize = 32;
+    const SIDE: usize = 8;
+    const X0: usize = 8;
+    const Y0: usize = 8;
+
+    let ops = MockPboOps::new(W * H);
+    let pbo = edgefirst_tensor::PboTensor::<u8>::from_pbo(
+        51,
+        W * H,
+        &[H, W, 1],
+        None,
+        ops.clone() as std::sync::Arc<dyn edgefirst_tensor::PboOps>,
+    )
+    .expect("PboTensor::from_pbo");
+    let mut parent_dyn: TensorDyn = Tensor::<u8>::from_pbo(pbo)
+        .expect("Tensor::from_pbo")
+        .into();
+    parent_dyn
+        .set_format(PixelFormat::Grey)
+        .expect("set_format");
+    {
+        let mut m = parent_dyn
+            .map_bytes(CpuAccess::ReadWrite)
+            .expect("map parent");
+        let s = m.as_mut_slice();
+        for y in 0..H {
+            for x in 0..W {
+                s[y * W + x] = ((y * 4 + x) & 0xff) as u8;
+            }
+        }
+    }
+
+    let view = parent_dyn
+        .view(Region::new(X0, Y0, SIDE, SIDE))
+        .expect("view a PBO-backed tensor");
+    assert_eq!(
+        view.memory(),
+        TensorMemory::Pbo,
+        "a view of a PBO must stay PBO-backed (issue #162)"
+    );
+    assert_eq!(
+        view.pbo_id(),
+        Some(51),
+        "the view shares the parent's GL buffer"
+    );
+
+    // The parent goes away first: the case the external-keepalive design
+    // could not express at all.
+    drop(parent_dyn);
+    assert_eq!(
+        ops.delete_count(),
+        0,
+        "the GL buffer must survive its parent tensor while a view holds it"
+    );
+
+    // A view's map exposes `stride * rows` from its own origin, so index by
+    // the parent pitch (W) rather than by the view's width.
+    let stride = view
+        .effective_row_stride()
+        .expect("a formatted view reports a pitch");
+    assert_eq!(
+        stride, W,
+        "a multi-row view's rows are spaced by the PARENT pitch, not its own \
+         tight row -- the shear half of issue #162"
+    );
+    let m = view.map_bytes(CpuAccess::Read).expect("map the view");
+    let s = m.as_slice();
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            assert_eq!(
+                s[y * stride + x],
+                (((y + Y0) * 4 + (x + X0)) & 0xff) as u8,
+                "view pixel ({x}, {y}) must be parent ({}, {})",
+                x + X0,
+                y + Y0
+            );
+        }
+    }
+    drop(m);
+    drop(view);
+    assert_eq!(
+        ops.delete_count(),
+        1,
+        "the GL buffer is deleted exactly once, when the last holder goes"
     );
 }
