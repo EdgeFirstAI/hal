@@ -67,7 +67,7 @@ pub(crate) fn cuda_available_or_skip(what: &str) -> bool {
          list, or LD_LIBRARY_PATH does not reach the runtime)";
     let run = decide(edgefirst_tensor::is_cuda_available(), required(), what, why);
     if !run {
-        eprintln!("SKIP {what}: {why}");
+        crate::test_support::report_skip(&format!("{what}: {why}"));
     }
     run
 }
@@ -86,7 +86,7 @@ pub(crate) fn cuda_available_or_skip(what: &str) -> bool {
 pub(crate) fn require_or_skip(satisfied: bool, what: &str, why: &str) -> bool {
     let run = decide(satisfied, required(), what, why);
     if !run {
-        eprintln!("SKIP {what}: {why}");
+        crate::test_support::report_skip(&format!("{what}: {why}"));
     }
     run
 }

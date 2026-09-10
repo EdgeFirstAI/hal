@@ -14,6 +14,17 @@
 
 use std::path::{Path, PathBuf};
 
+/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
+/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
+/// it -- see `edgefirst_tensor`'s (crate-internal) `test_support` module
+/// for the same mechanism in the library's own `#[cfg(test)]` code; this
+/// integration test binary is a separate compilation unit and cannot reach
+/// that `pub(crate)` helper, so it carries a local copy.
+fn report_skip(reason: &str) {
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+}
+
 const ALLOWED: &[(&str, &str)] = &[
     (
         "SHARED_DRM_FD",
@@ -244,11 +255,11 @@ fn edgefirst_tensor_declares_no_new_global_state() {
     // board, which is the exact failure mode this gate exists to catch.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     if !src.is_dir() {
-        eprintln!(
-            "SKIP: {} - source tree not present at {} (deployed test binary)",
+        report_skip(&format!(
+            "{} - source tree not present at {} (deployed test binary)",
             module_path!(),
             src.display()
-        );
+        ));
         return;
     }
 

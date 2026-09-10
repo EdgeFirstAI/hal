@@ -1915,7 +1915,7 @@ mod g2d_tests {
     #[cfg(target_os = "linux")]
     fn d01_nv12_odd_w_g2d_vs_cpu() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: d01_nv12_odd_w_g2d_vs_cpu - DMA not available");
+            crate::test_support::report_skip("d01_nv12_odd_w_g2d_vs_cpu - DMA not available");
             return;
         }
         let (w, h) = (65usize, 64usize);
@@ -1974,7 +1974,9 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}");
+                crate::test_support::report_skip(&format!(
+                    "d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}"
+                ));
                 return;
             }
         };
@@ -2028,7 +2030,7 @@ mod g2d_tests {
     #[cfg(target_os = "linux")]
     fn d03_nv12_odd_both_g2d_vs_cpu() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: d03_nv12_odd_both_g2d_vs_cpu - DMA not available");
+            crate::test_support::report_skip("d03_nv12_odd_both_g2d_vs_cpu - DMA not available");
             return;
         }
         let (w, h) = (65usize, 63usize);
@@ -2087,7 +2089,9 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}");
+                crate::test_support::report_skip(&format!(
+                    "d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}"
+                ));
                 return;
             }
         };

@@ -133,6 +133,8 @@ pub mod protocol;
 #[cfg(all(unix, feature = "static"))]
 mod shm;
 mod tensor_dyn;
+#[cfg(test)]
+mod test_support;
 pub mod view;
 mod vocabulary;
 pub use colorimetry::{
@@ -6493,7 +6495,7 @@ mod image_tests {
         let _lock = crate::tests::fd_lock_shared();
         // Skip if DMA not available (e.g. sandboxed CI lacking dma_heap access).
         if !is_dma_available() {
-            eprintln!("SKIPPED: DMA heap not available");
+            crate::test_support::report_skip("DMA heap not available");
             return;
         }
         // 3004×1688 RGBA8: natural pitch 12016, padded to 12032 (64-aligned).
@@ -6576,7 +6578,7 @@ mod image_tests {
         // it needs both Linux and a dma-heap: it skips on macOS and on Orin
         // (nvmap, no CONFIG_DMABUF_HEAPS).
         if !is_dma_available() {
-            eprintln!("SKIPPED: DMA heap not available");
+            crate::test_support::report_skip("DMA heap not available");
             return;
         }
         let backing =
@@ -6629,7 +6631,7 @@ mod image_tests {
         // returning a slice larger than the backing mmap (that would be UB
         // in `DmaMap::as_slice`).
         if !is_dma_available() {
-            eprintln!("SKIPPED: DMA heap not available");
+            crate::test_support::report_skip("DMA heap not available");
             return;
         }
         // Allocate a 640×480 RGBA8 padded canvas (stride = 3072 = 768 px).
@@ -6959,7 +6961,7 @@ mod cpu_access_tests {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
         let Ok(t) = Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None) else {
-            eprintln!("SKIPPED: IOSurface unavailable");
+            crate::test_support::report_skip("IOSurface unavailable");
             return;
         };
         {
@@ -7583,7 +7585,7 @@ mod tests {
         // and 4 must share the segment (zero-copy, via cloned fd) and be
         // independently writable — view 0 owns [0,4), view 1 owns [4,8).
         if !crate::is_shm_available() {
-            eprintln!("SKIPPED: shm not available");
+            crate::test_support::report_skip("shm not available");
             return;
         }
         let parent = Tensor::<u8>::new(&[2, 4], Some(TensorMemory::Shm), None).unwrap();
@@ -7619,7 +7621,7 @@ mod tests {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
         if !crate::is_shm_available() {
-            eprintln!("SKIPPED: shm not available");
+            crate::test_support::report_skip("shm not available");
             return;
         }
         // f32 align 4: a 2-byte offset cannot back a valid `*const f32`.
@@ -7642,7 +7644,7 @@ mod tests {
         let dma = match Tensor::<u8>::new(&[8], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(_) => {
-                eprintln!("SKIPPED: DMA not available");
+                crate::test_support::report_skip("DMA not available");
                 return;
             }
         };
@@ -7675,7 +7677,7 @@ mod tests {
         let parent = match Tensor::<u8>::new(&[2048], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(_) => {
-                eprintln!("SKIPPED: DMA not available");
+                crate::test_support::report_skip("DMA not available");
                 return;
             }
         };
@@ -7721,7 +7723,7 @@ mod tests {
         ) {
             Ok(t) => t,
             Err(_) => {
-                eprintln!("SKIPPED: DMA not available");
+                crate::test_support::report_skip("DMA not available");
                 return;
             }
         };

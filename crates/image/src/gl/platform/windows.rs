@@ -1321,11 +1321,11 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(keeper) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let Ok(doomed) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         // `keeper` issues the last commands, so it is the context the
@@ -1357,7 +1357,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(shared) = shared_display() else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let dev = edgefirst_tensor::d3d11::device().expect("device");
@@ -1377,7 +1377,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(display) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let t = edgefirst_tensor::Tensor::<u8>::image(
@@ -1433,7 +1433,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(display) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         assert!(AngleD3d11::native_fence_sync(&display));

@@ -11,6 +11,17 @@ use edgefirst_tensor::{
 };
 use std::os::windows::io::AsRawHandle;
 
+/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
+/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
+/// it -- see `edgefirst_tensor`'s (crate-internal) `test_support` module
+/// for the same mechanism in the library's own `#[cfg(test)]` code; this
+/// integration test binary is a separate compilation unit and cannot reach
+/// that `pub(crate)` helper, so it carries a local copy.
+fn report_skip(reason: &str) {
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+}
+
 #[test]
 fn image_with_dmabuf_on_windows_is_a_texture_tensor() {
     if !edgefirst_tensor::is_gpu_buffer_available() {
@@ -432,14 +443,14 @@ fn copy_rows(dst: &mut [u8], src: &[u8], row_bytes: usize, dst_stride: usize) {
 #[test]
 fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
     if !edgefirst_tensor::is_cuda_available() {
-        eprintln!("SKIP: no CUDA runtime");
+        report_skip("no CUDA runtime");
         return;
     }
     let device = edgefirst_tensor::d3d11::device().unwrap();
     if device.is_warp() {
         // `cudaD3D11GetDevice` has no ordinal for the WARP adapter, so the
         // import fails and the tensor is CUDA-less by design.
-        eprintln!("SKIP: WARP adapter has no CUDA device");
+        report_skip("WARP adapter has no CUDA device");
         return;
     }
     let t = Tensor::<u8>::image(
@@ -510,11 +521,11 @@ fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
 #[test]
 fn cuda_map_covers_a_texture_whose_allocation_the_driver_padded() {
     if !edgefirst_tensor::is_cuda_available() {
-        eprintln!("SKIP: no CUDA runtime");
+        report_skip("no CUDA runtime");
         return;
     }
     if edgefirst_tensor::d3d11::device().unwrap().is_warp() {
-        eprintln!("SKIP: WARP adapter has no CUDA device");
+        report_skip("WARP adapter has no CUDA device");
         return;
     }
     let (w, h) = (640usize, 480usize);
@@ -557,11 +568,11 @@ fn cuda_map_covers_a_texture_whose_allocation_the_driver_padded() {
 #[test]
 fn cuda_map_reads_the_nv12_combined_plane() {
     if !edgefirst_tensor::is_cuda_available() {
-        eprintln!("SKIP: no CUDA runtime");
+        report_skip("no CUDA runtime");
         return;
     }
     if edgefirst_tensor::d3d11::device().unwrap().is_warp() {
-        eprintln!("SKIP: WARP adapter has no CUDA device");
+        report_skip("WARP adapter has no CUDA device");
         return;
     }
     let (w, h) = (640usize, 480usize);

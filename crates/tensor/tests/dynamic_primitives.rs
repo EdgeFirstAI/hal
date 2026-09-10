@@ -47,6 +47,17 @@ use edgefirst_tensor::{
     TensorMemory, TensorTrait,
 };
 
+/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
+/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
+/// it -- see `edgefirst_tensor`'s (crate-internal) `test_support` module
+/// for the same mechanism in the library's own `#[cfg(test)]` code; this
+/// integration test binary is a separate compilation unit and cannot reach
+/// that `pub(crate)` helper, so it carries a local copy.
+fn report_skip(reason: &str) {
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+}
+
 /// Allocate a bare (formatless) `TensorDyn` of the given shape/dtype code,
 /// the same way `ef_tensor_new` does -- the smallest live handle every test
 /// below builds on before attaching format/quantization metadata.
@@ -351,9 +362,9 @@ fn family5_from_planes_is_genuinely_multiplane_and_chroma_is_independently_writa
 #[test]
 fn dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest() {
     if !edgefirst_tensor::is_dma_available() {
-        eprintln!(
-            "SKIPPED: dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest - \
-                    DMA not available"
+        report_skip(
+            "dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest - \
+                    DMA not available",
         );
         return;
     }
@@ -409,9 +420,9 @@ fn dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest() {
 #[test]
 fn dma_buffer_identity_is_derived_from_the_inode_not_the_handle_address() {
     if !edgefirst_tensor::is_dma_available() {
-        eprintln!(
-            "SKIPPED: dma_buffer_identity_is_derived_from_the_inode_not_the_handle_address \
-                    - DMA not available"
+        report_skip(
+            "dma_buffer_identity_is_derived_from_the_inode_not_the_handle_address \
+                    - DMA not available",
         );
         return;
     }
@@ -478,12 +489,11 @@ fn a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_addres
         ) {
             Ok(t) if t.d3d11_texture().is_some() => drop(t),
             other => {
-                eprintln!(
-                    "SKIPPED: \
+                report_skip(&format!("\
                      a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_address \
                      - no D3D11 {format:?} texture tensors on this host ({:?})",
                     other.map(|t| t.memory())
-                );
+                ));
                 return;
             }
         }
@@ -560,7 +570,7 @@ fn two_distinct_views_of_one_dma_parent_share_one_identity_and_do_not_collide_wi
     // sharing an identity with something that is not actually the same
     // buffer would be the ABA hazard this fix closes).
     if !edgefirst_tensor::is_dma_available() {
-        eprintln!("SKIPPED: two_distinct_views_of_one_dma_parent... - DMA not available");
+        report_skip("two_distinct_views_of_one_dma_parent... - DMA not available");
         return;
     }
     let (w, h) = (64usize, 32usize);

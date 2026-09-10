@@ -496,7 +496,7 @@ mod tests {
     #[cfg(feature = "dma_test_formats")]
     fn from_tensor_source_view_imports_own_region_dst_imports_parent() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: from_tensor_source_view... - DMA not available");
+            crate::test_support::report_skip("from_tensor_source_view... - DMA not available");
             return;
         }
         // 64x64 RGBA with a padded 320-byte stride (tight row = 64*4 = 256).
@@ -510,7 +510,7 @@ mod tests {
         ) {
             Ok(t) => t,
             Err(_) => {
-                eprintln!("SKIPPED: image_with_stride DMA unavailable");
+                crate::test_support::report_skip("image_with_stride DMA unavailable");
                 return;
             }
         };
@@ -562,14 +562,18 @@ mod tests {
         let luma_buf = match alloc_dma(luma_bytes, "luma_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_true_multiplane_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_true_multiplane_attrs - DMA not available",
+                );
                 return;
             }
         };
         let chroma_buf = match alloc_dma(chroma_bytes, "chroma_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_true_multiplane_attrs - DMA alloc failed");
+                crate::test_support::report_skip(
+                    "test_nv12_true_multiplane_attrs - DMA alloc failed",
+                );
                 return;
             }
         };
@@ -625,7 +629,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "shared_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_same_fd_multiplane_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_same_fd_multiplane_attrs - DMA not available",
+                );
                 return;
             }
         };
@@ -680,7 +686,9 @@ mod tests {
         let buf = match alloc_dma(total, "nv12_even_w") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_even_width_relaxed_gate - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_even_width_relaxed_gate - DMA not available",
+                );
                 return;
             }
         };
@@ -723,7 +731,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "contiguous_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_contiguous_single_fd_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_contiguous_single_fd_attrs - DMA not available",
+                );
                 return;
             }
         };
@@ -772,7 +782,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "padded_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_contiguous_padded_stride_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_contiguous_padded_stride_attrs - DMA not available",
+                );
                 return;
             }
         };
@@ -810,14 +822,16 @@ mod tests {
         let luma_buf = match alloc_dma(luma_bytes, "luma_padded") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_multiplane_padded_strides_attrs - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_multiplane_padded_strides_attrs - DMA not available",
+                );
                 return;
             }
         };
         let chroma_buf = match alloc_dma(chroma_bytes, "chroma_padded") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: DMA alloc failed");
+                crate::test_support::report_skip("DMA alloc failed");
                 return;
             }
         };
@@ -862,7 +876,9 @@ mod tests {
         let buf = match alloc_dma(total_bytes, "offset_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_same_fd_nonzero_luma_offset - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_same_fd_nonzero_luma_offset - DMA not available",
+                );
                 return;
             }
         };
@@ -908,7 +924,9 @@ mod tests {
         let y_buf = match alloc_dma(y_size, "y_only_buf") {
             Some(t) => t,
             None => {
-                eprintln!("SKIPPED: test_nv12_chroma_offset_exceeds_buffer - DMA not available");
+                crate::test_support::report_skip(
+                    "test_nv12_chroma_offset_exceeds_buffer - DMA not available",
+                );
                 return;
             }
         };
@@ -1228,7 +1246,9 @@ mod tests {
     #[test]
     fn test_from_tensor_accepts_non_4_aligned_rgba() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_from_tensor_accepts_non_4_aligned_rgba — DMA not available");
+            crate::test_support::report_skip(
+                "test_from_tensor_accepts_non_4_aligned_rgba — DMA not available",
+            );
             return;
         }
         use crate::{align_pitch_bytes_to_gpu_alignment, primary_plane_bpp};
@@ -1245,7 +1265,9 @@ mod tests {
             ) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("SKIPPED: image_with_stride failed at width {w}: {e}");
+                    crate::test_support::report_skip(&format!(
+                        "image_with_stride failed at width {w}: {e}"
+                    ));
                     return;
                 }
             };
@@ -1267,7 +1289,9 @@ mod tests {
     #[test]
     fn test_from_tensor_accepts_non_4_aligned_bgra() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_from_tensor_accepts_non_4_aligned_bgra — DMA not available");
+            crate::test_support::report_skip(
+                "test_from_tensor_accepts_non_4_aligned_bgra — DMA not available",
+            );
             return;
         }
         use crate::{align_pitch_bytes_to_gpu_alignment, primary_plane_bpp};
@@ -1283,7 +1307,7 @@ mod tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: image_with_stride failed: {e}");
+                crate::test_support::report_skip(&format!("image_with_stride failed: {e}"));
                 return;
             }
         };
