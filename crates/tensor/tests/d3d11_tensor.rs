@@ -25,7 +25,7 @@ fn report_skip(reason: &str) {
 #[test]
 fn image_with_dmabuf_on_windows_is_a_texture_tensor() {
     if !edgefirst_tensor::is_gpu_buffer_available() {
-        eprintln!("no D3D11 device on this box -- skipping");
+        report_skip("no D3D11 device on this box");
         return;
     }
     let t = Tensor::<u8>::image(
@@ -839,7 +839,7 @@ fn child_imports_the_exported_blob(path: &str) {
                 !m.device_ptr().is_null(),
                 "the CUDA map has a device pointer"
             ),
-            None => eprintln!("no CUDA registration on the imported texture -- skipping"),
+            None => report_skip("no CUDA registration on the imported texture"),
         }
     }
 }
