@@ -10583,4 +10583,219 @@ mod gl_tests {
             );
         }
     }
+
+    /// An NV12 DMA/IOSurface/D3D11 source at an UNALIGNED plane offset must
+    /// still convert through GL, on every backing that can hold one.
+    ///
+    /// This is `tests/offset_source_view_alignment.rs`'s NV case as a LIB test,
+    /// and it is here rather than only there because the integration binaries
+    /// reach almost no CI lane: the Linux runners have no DMA heap, and the
+    /// i.MX 8M Plus hardware lane runs only the `edgefirst_image-*` lib-test
+    /// binary filtered on `opengl`/`g2d`. Three lanes do reach the code below,
+    /// each through a different one of the two NV import-failure arms:
+    ///
+    /// * **macOS / Windows (ANGLE).** `import_buffer_nv_r8` refuses an offset
+    ///   source outright (`refuse_offset_source`), so the ShaderR8 arm's
+    ///   failure path runs.
+    /// * **i.MX 8M Plus (Vivante).** `select_nv_path` takes the external
+    ///   sampler for single-plane NV12 there, and Vivante's EGL refuses the
+    ///   unaligned offset, so the OTHER failure arm runs.
+    /// * **i.MX 95 (Mali).** The engine's own decline fires
+    ///   (`mali_rejects_import_offset`), then the ShaderR8 arm's failure path.
+    ///
+    /// V3D imports an unaligned offset correctly and takes neither arm, which
+    /// is why the routing assertion below is an implication rather than a flat
+    /// "an upload happened": what every backing must satisfy is that a
+    /// DECLINED zero-copy feed became an upload and not a CPU convert
+    /// (issue #166). `GLProcessorThreaded` is driven directly, so a CPU
+    /// fallback cannot pass this test at all.
+    #[test]
+    fn nv12_source_at_a_plane_offset_converts_through_gl_on_every_zero_copy_backing() {
+        // QVGA rather than a tiny frame: Mali has a minimum texture size that
+        // 64x64 tests have tripped over, and a 4-aligned width is also what
+        // Vivante's sampler path requires -- without it that lane would take
+        // the shader arm and leave the sampler arm uncovered.
+        const W: usize = 320;
+        const H: usize = 240;
+        const TOLERANCE: u8 = 8;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+        #[cfg(target_os = "macos")]
+        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            eprintln!(
+                "SKIPPED: {} - ANGLE dlopen gate closed (coverage pass 1)",
+                function!()
+            );
+            return;
+        }
+        // Two rows taller than the logical frame, so a window starting a row
+        // in is still fully backed.
+        let allocated = match TensorDyn::image(
+            W,
+            H + 2,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
+            other => {
+                // `is_gpu_buffer_available` is the portable "can this host hold
+                // a zero-copy image at all" probe: a DMA heap on Linux, an
+                // IOSurface on macOS, a D3D11 device on Windows. Where it says
+                // yes, a REQUIRE_GL lane must not let this test evaporate --
+                // the arms it covers are reachable nowhere else.
+                let what = match &other {
+                    Ok(t) => format!("fell back to {:?}", t.memory()),
+                    Err(e) => format!("failed: {e}"),
+                };
+                assert!(
+                    !(require_gl && edgefirst_tensor::is_gpu_buffer_available()),
+                    "HAL_TEST_REQUIRE_GL=1 and this host reports a zero-copy \
+                     buffer backing, but the NV12 zero-copy allocation {what}"
+                );
+                eprintln!(
+                    "SKIPPED: {} - no zero-copy NV12 image here ({what})",
+                    function!()
+                );
+                return;
+            }
+        };
+        let mut src = allocated;
+        let pitch = src.effective_row_stride().unwrap_or(W);
+        // The same pattern `tests/offset_source_view_alignment.rs` uses, and
+        // for the same reasons: period 31 is coprime with the pitch and with
+        // 64, so a window read at the wrong offset cannot coincide with the
+        // right one, and the 112..=142 band keeps both the luma and the chroma
+        // it also feeds clear of RGB clamping, where two different reads could
+        // agree by saturation. Written BEFORE the re-tag, while the map still
+        // spans the whole allocation.
+        {
+            let mut m = src
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map the NV12 allocation");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = 112 + (i % 31) as u8;
+            }
+        }
+        src.set_logical_shape(&[H * 3 / 2, W])
+            .expect("narrow to one frame's geometry");
+        assert_eq!(src.height(), Some(H), "precondition: one frame is {H} rows");
+        assert_eq!(
+            src.effective_row_stride(),
+            Some(pitch),
+            "precondition: the re-tag kept the surface pitch"
+        );
+        // A row in, plus 32 bytes: rounding the row up to 64 first makes the
+        // result 32 (mod 64) whatever the driver's pitch is, so the offset is
+        // unaligned on every host rather than only on the ones whose pitch is
+        // already padded.
+        let offset = pitch.next_multiple_of(64) + 32;
+        src.set_plane_offset(offset);
+        assert_eq!(
+            src.plane_offset(),
+            Some(offset),
+            "precondition: the offset stuck"
+        );
+        assert_ne!(offset % 64, 0, "precondition: {offset} is unaligned");
+        // Full-range BT.601 so both converters resolve the same matrix by the
+        // tag rather than by the untagged-SD heuristic.
+        src.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
+
+        let rgba_dst = || {
+            TensorDyn::image(
+                W,
+                H,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("RGBA destination")
+        };
+        let read = |t: &TensorDyn| {
+            t.map_bytes(edgefirst_tensor::CpuAccess::Read)
+                .expect("map destination")
+                .as_slice()
+                .to_vec()
+        };
+
+        let mut reference = rgba_dst();
+        crate::CPUProcessor::new()
+            .convert(
+                &src,
+                &mut reference,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .expect("CPU reference convert of the offset NV12 frame");
+        let want = read(&reference);
+        // A flat reference would make any wrong read agree; the pattern must
+        // survive into the converted pixels.
+        assert!(
+            want.chunks(4).any(|p| p != &want[..4]),
+            "precondition: the CPU reference is flat, so agreement would prove nothing"
+        );
+
+        let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
+        let before = gl.convert_stats().expect("convert stats before");
+        let mut dst = rgba_dst();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect(
+                "GL refused an NV12 source at an unaligned plane offset; a declined \
+                 zero-copy NV import must reach the R8 upload (issue #166)",
+            );
+        let after = gl.convert_stats().expect("convert stats after");
+        let got = read(&dst);
+        let bad = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.abs_diff(**w) > TOLERANCE)
+            .count();
+        assert_eq!(
+            bad,
+            0,
+            "{bad} bytes differ from the CPU reference over the same tensor; \
+             first got={:?} want={:?} (offset {offset}, pitch {pitch})",
+            &got[..4],
+            &want[..4]
+        );
+        // The routing contract: a zero-copy feed that was DECLINED must have
+        // become an upload. Vacuous where the import succeeded (V3D), which is
+        // why it is an implication and not an unconditional count.
+        let declines = after.zero_copy_declines - before.zero_copy_declines;
+        let uploads = after.src_uploads - before.src_uploads;
+        let imports = after.src_imports - before.src_imports;
+        // Say which route this host took, at `info` so it reaches the log even
+        // under libtest's output capture (which swallows `eprintln!` from a
+        // passing test). The whole point of this test is per-platform routing,
+        // and without this a green lane does not say WHICH arm it covered.
+        log::info!(
+            "{}: offset {offset} pitch {pitch} -> declines={declines} uploads={uploads} \
+             imports={imports}",
+            function!()
+        );
+        if declines > 0 {
+            assert!(
+                uploads > 0,
+                "the NV import was declined ({declines}) but no upload was recorded \
+                 (uploads={uploads}, imports={imports}) -- the convert fell to a path \
+                 issue #166 exists to prevent"
+            );
+        }
+        assert!(
+            uploads + imports > 0,
+            "the convert recorded neither an upload nor an import \
+             (declines={declines}) -- it was not fed by the GL engine at all"
+        );
+    }
 }
