@@ -2016,6 +2016,19 @@ jobs:
               # crates/image/tests/*.rs GL integration binaries: whole-binary
               # GPU/EGL tests, run unfiltered (no g2d/opengl/dma split).
               run_unfiltered "$test_bin" "GL integration test"
+            elif [[ "$test_name" == pin-* || "$test_name" == protocol-* || \
+                    "$test_name" == protocol_roundtrip-* || "$test_name" == dynamic_primitives-* || \
+                    "$test_name" == identity-* || "$test_name" == vocabulary-* ]]; then
+              # crates/tensor/tests/*.rs DMA-BUF-touching integration
+              # binaries: whole-binary tests, run unfiltered, same reasoning
+              # as the crates/image/tests/*.rs branch above. `dynamic_
+              # primitives-*` is `#![cfg(feature = "dynamic")]`-gated and
+              # this artifact is built with default features only (no
+              # `dynamic`), so it currently runs zero tests here -- routed
+              # anyway rather than silently left in the skip branch, so it
+              # picks up coverage for free the day this crate's hardware
+              # build gains that feature.
+              run_unfiltered "$test_bin" "tensor integration test"
             else
               # CPU-only, covered by aarch64 runner: edgefirst-image benches
               # (image_benchmark, pipeline_benchmark, nv_path_benchmark,
@@ -2026,12 +2039,11 @@ jobs:
               # tiled_convert_benchmark, opencv_benchmark), and any decoder/
               # tracker/capi binaries that end up in this artifact.
               #
-              # NOTE: crates/tensor/tests/*.rs integration binaries also land
-              # here (d3d11_tensor, dynamic_primitives, identity,
-              # logical_shape, map_access, no_global_state, pin, protocol,
-              # protocol_roundtrip, scenarios, vocabulary). This is scoped
-              # out of the current fix -- see the task report for whether
-              # any of these need DMA-heap routing like edgefirst_tensor-*.
+              # crates/tensor/tests/*.rs binaries that do NOT touch DMA-BUF
+              # stay here: logical_shape, map_access, no_global_state,
+              # scenarios. `d3d11_tensor` also lands here -- it is
+              # `#![cfg(target_os = "windows")]`-gated and compiles to an
+              # empty binary on this Linux runner regardless of routing.
               echo "=== Skipping $test_name (CPU-only, covered by aarch64 runner) ==="
             fi
           done
