@@ -6898,8 +6898,9 @@ mod gl_tests {
     fn convert_f32_pbo_cuda_map_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
-        if !edgefirst_tensor::is_cuda_available() {
-            eprintln!("SKIP: no libcudart");
+        if !crate::opengl_headless::cuda_policy::cuda_available_or_skip(
+            "convert_f32_pbo_cuda_map_roundtrip",
+        ) {
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -6908,12 +6909,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("SKIP: no GL");
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_roundtrip",
+                    "no GL",
+                );
                 return;
             }
         };
-        if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIP: no f32 render");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            proc.supported_render_dtypes().f32,
+            "convert_f32_pbo_cuda_map_roundtrip",
+            "no f32 render",
+        ) {
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -6946,8 +6954,11 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-        if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIP: dst not PBO (no CUDA-GL alloc here)");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            dst.memory() == TensorMemory::Pbo,
+            "convert_f32_pbo_cuda_map_roundtrip",
+            "dst not PBO (no CUDA-GL alloc here)",
+        ) {
             return;
         }
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
@@ -6955,8 +6966,10 @@ mod gl_tests {
         let cm = match dst.cuda_map() {
             Some(cm) => cm,
             None => {
-                eprintln!(
-                    "SKIP: cuda_map returned None (CUDA-GL interop unavailable for this context)"
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_roundtrip",
+                    "cuda_map returned None: CUDA-GL interop unavailable for this context",
                 );
                 return;
             }
@@ -6992,8 +7005,9 @@ mod gl_tests {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
         use std::ffi::c_void;
 
-        if !edgefirst_tensor::is_cuda_available() {
-            eprintln!("SKIP: no libcudart");
+        if !crate::opengl_headless::cuda_policy::cuda_available_or_skip(
+            "convert_f32_pbo_cuda_map_numeric",
+        ) {
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -7002,12 +7016,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("SKIP: no GL");
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_numeric",
+                    "no GL",
+                );
                 return;
             }
         };
-        if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIP: no f32 render");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            proc.supported_render_dtypes().f32,
+            "convert_f32_pbo_cuda_map_numeric",
+            "no f32 render",
+        ) {
             return;
         }
         let (w, h) = (16usize, 16usize);
@@ -7045,8 +7066,11 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-        if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIP: dst not PBO");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            dst.memory() == TensorMemory::Pbo,
+            "convert_f32_pbo_cuda_map_numeric",
+            "dst not PBO",
+        ) {
             return;
         }
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
@@ -7055,8 +7079,10 @@ mod gl_tests {
         let cm = match dst.cuda_map() {
             Some(cm) => cm,
             None => {
-                eprintln!(
-                    "SKIP: cuda_map returned None (CUDA-GL interop unavailable for this context)"
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_numeric",
+                    "cuda_map returned None: CUDA-GL interop unavailable for this context",
                 );
                 return;
             }
@@ -7117,8 +7143,7 @@ mod gl_tests {
         use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
         use std::ffi::c_void;
 
-        if !edgefirst_tensor::is_cuda_available() {
-            eprintln!("SKIP {fixture}: no libcudart");
+        if !crate::opengl_headless::cuda_policy::cuda_available_or_skip(fixture) {
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -7127,12 +7152,15 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("SKIP {fixture}: no GL");
+                crate::opengl_headless::cuda_policy::require_or_skip(false, fixture, "no GL");
                 return;
             }
         };
-        if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIP {fixture}: no f32 render");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            proc.supported_render_dtypes().f32,
+            fixture,
+            "no f32 render",
+        ) {
             return;
         }
 
@@ -7190,8 +7218,11 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-        if pbo_dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIP {fixture}: dst not PBO");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            pbo_dst.memory() == TensorMemory::Pbo,
+            fixture,
+            "dst not PBO",
+        ) {
             return;
         }
         proc.convert(
@@ -7205,7 +7236,11 @@ mod gl_tests {
         let cm = match pbo_dst.cuda_map() {
             Some(cm) => cm,
             None => {
-                eprintln!("SKIP {fixture}: cuda_map None (CUDA-GL interop unavailable)");
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    fixture,
+                    "cuda_map returned None: CUDA-GL interop unavailable for this context",
+                );
                 return;
             }
         };

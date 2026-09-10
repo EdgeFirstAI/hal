@@ -940,7 +940,10 @@ def _view_source_or_skip(cls, mem, shape, fmt):
     if mem == TensorMemory.DMABUF:
         try:
             t = cls(shape, "uint8", mem)
-        except Exception as e:  # pragma: no cover - depends on the host's heaps
+        except (
+            RuntimeError,
+            OSError,
+        ) as e:  # pragma: no cover - depends on the host's heaps
             pytest.skip(f"DMA-BUF allocation unavailable here: {e}")
         if t.memory != TensorMemory.DMABUF:
             pytest.skip(f"DMA-BUF request fell back to {t.memory!r}")
@@ -980,7 +983,8 @@ def test_view_converts_its_own_sub_region_not_the_parents_origin(source, mem_nam
     import numpy as np
     from edgefirst.image import ImageProcessor
     from edgefirst.image import Tensor as ImageTensor
-    from edgefirst.tensor import PixelFormat, Region, Tensor as CoreTensor, TensorMemory
+    from edgefirst.tensor import PixelFormat, Region, TensorMemory
+    from edgefirst.tensor import Tensor as CoreTensor
 
     # Distinct per-row and per-column values, so a mask that is off by the
     # view's origin cannot coincidentally match the expected tile.

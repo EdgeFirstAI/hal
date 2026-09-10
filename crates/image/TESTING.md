@@ -107,6 +107,15 @@ The zero-copy tier probes `is_gpu_image_buffer_available()`
 (`edgefirst_tensor::is_gpu_buffer_available`) instead of the Linux-flavored
 `is_dma_available()`.
 
+The six CUDA device-pointer tests in the Linux-only tier are the one place
+this self-skip rule is deliberately overridden: `make test-cuda` exports
+`HAL_TEST_REQUIRE_CUDA=1` whenever it locates a `libcudart`, and under that
+opt-in every skip inside those tests — no runtime, no GL, no F32 render
+support, a destination that didn't land on a PBO, `cuda_map()` returning
+`None` — is a failure instead of a pass. `crates/image/src/gl/cuda_policy.rs`
+is the shared guard; a developer machine without CUDA still sees ordinary
+skips, since the opt-in is unset there.
+
 The `test_opengl_*` integration tests in `src/lib.rs` (resize, grey,
 src/dst crop, the rotation × flip × backing matrix, 10-thread bring-up,
 the YUYV/VYUY zero-copy imports and the F16 GL/CPU parity check) follow the
