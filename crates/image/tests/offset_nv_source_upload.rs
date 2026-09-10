@@ -11,11 +11,12 @@
 //! offset -- or, as here, refused the window as too short -- so an offset NV
 //! source never converted its own frame through GL.
 //!
-//! A zero-copy NV source the ANGLE leaves refuse at an offset
-//! (`refuse_offset_source`) does not reach this upload yet: the R8 import's
-//! failure arm falls to `draw_src_texture`, which has no NV arm, and
-//! `ImageProcessor::convert` then converts on the CPU. Routing that case
-//! through this upload is a follow-up; this file pins the upload itself.
+//! A zero-copy NV source whose R8 import is refused — by the ANGLE leaves'
+//! `refuse_offset_source`, or by Mali's unaligned-plane-offset rule — now
+//! reaches this same upload: the import's failure arm used to fall to
+//! `draw_src_texture`, which has no NV arm, so `ImageProcessor::convert`
+//! converted on the CPU (issue #166). This file pins the upload itself;
+//! `offset_source_view_alignment.rs` pins the route into it.
 //!
 //! A `GLProcessorThreaded` is driven directly: `ImageProcessor::convert`
 //! would hide the bug behind its CPU fallback.

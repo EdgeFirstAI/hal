@@ -300,6 +300,11 @@ pub struct GLProcessorST {
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     pub(super) is_vivante: bool,
+    /// Whether the GPU is an Arm Mali core (GL_RENDERER). Used to decline a
+    /// source DMA-BUF import at a plane offset Mali would sample zeros from,
+    /// so the upload path takes it instead — see `mali_rejects_import_offset`
+    /// and issue #165.
+    is_mali: bool,
     /// Whether the GPU is a virtualized/paravirtual device (GL_RENDERER).
     /// Concurrent GL across contexts mis-renders on paravirtual Metal
     /// (observed on macOS CI runners: parallel processors produce ~60-86%
@@ -873,6 +878,11 @@ fn apply_forced_transfer(backend: &mut TransferBackend) {
 struct RendererTraits {
     /// Verisilicon/Vivante core — GPU-hang workarounds + Full serialization.
     vivante: bool,
+    /// Arm Mali (i.MX 95 G310 and kin). Its DMA-BUF import silently samples
+    /// zeros when `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not 64-byte aligned —
+    /// the import succeeds and no EGL error follows — so a source at such an
+    /// offset is declined and uploaded instead (issue #165).
+    mali: bool,
     /// Software rasterizer (llvmpipe/softpipe/swrast) — rejected unless the
     /// coverage-lane override is set.
     software: bool,
@@ -1248,6 +1258,7 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
     let lower = renderer.to_ascii_lowercase();
     RendererTraits {
         vivante: lower.contains("vivante") || lower.contains("gc7000") || lower.contains("galcore"),
+        mali: lower.contains("mali"),
         software: lower.contains("llvmpipe")
             || lower.contains("softpipe")
             || lower.contains("swrast")
@@ -1257,6 +1268,113 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
         virtual_gpu: lower.contains("paravirtual") || lower.contains("virtio"),
         angle: lower.contains("angle"),
     }
+}
+
+/// The plane-offset alignment the two embedded drivers that have been measured
+/// need from a DMA-BUF import. Both landed on the same 64 bytes, from opposite
+/// symptoms:
+///
+/// * **Mali** (i.MX 95, source sampling, issue #165): offsets 32 and 2080
+///   sample zeros with no EGL error at all; 64, 256 and 2048 sample correctly,
+///   and offset 0 (the whole image, not a window) is the control.
+/// * **Vivante GC7000UL** (i.MX 8M Plus, destination import): offset 2048
+///   imports and renders correctly, offset 2080 fails `eglCreateImage` with
+///   `EGL_BAD_ACCESS`.
+///
+/// Two data points bracket the Vivante rule rather than pin it — the true
+/// requirement is somewhere in `(32, 2048]` — so 64 is the tightest value
+/// consistent with both drivers rather than a documented driver constant.
+const DMA_IMPORT_OFFSET_ALIGN: usize = 64;
+
+/// Whether `plane_offset` is one of the offsets no measured embedded driver
+/// imports correctly. Pure, so the per-driver rules below are unit-testable
+/// without a GL context, like [`classify_renderer`].
+fn unaligned_import_offset(plane_offset: usize) -> bool {
+    !plane_offset.is_multiple_of(DMA_IMPORT_OFFSET_ALIGN)
+}
+
+/// Whether a Mali import at `plane_offset` would sample zeros.
+///
+/// Checks ONE plane's offset. Every plane the import passes to EGL has to be
+/// checked by its caller: a two-plane NV12 import hands EGL a plane-1 offset
+/// of its own, which can be unaligned while plane 0 is aligned — see
+/// [`nv12_plane1_offset`].
+fn mali_rejects_import_offset(is_mali: bool, plane_offset: usize) -> bool {
+    is_mali && unaligned_import_offset(plane_offset)
+}
+
+/// Whether Vivante would fail to import a DESTINATION at `plane_offset`.
+///
+/// Distinct from [`mali_rejects_import_offset`] in symptom and in side: this is
+/// a hard `EGL_BAD_ACCESS` from `eglCreateImage`, not silent zero-sampling, and
+/// it hits the destination import, which Mali handles correctly at the same
+/// offsets (measured on i.MX 95 by
+/// `tests/offset_source_view_alignment.rs`). The engine already has a seam for
+/// "this platform cannot place a destination at its offset" —
+/// `Platform::dst_import_places` — and this joins it, so an unaligned Vivante
+/// destination lowers to the mapped-texture path, whose readback writes through
+/// `map()` at the offset, instead of letting the EGL error end the convert.
+///
+/// Takes the offset the import being guarded actually bases at, which differs
+/// by route: [`view_collapsed_dst_base`] for `bind_dst`'s import, and the raw
+/// `plane_offset()` for the `import_buffer_packed` ones.
+fn vivante_rejects_dst_import_offset(is_vivante: bool, plane_offset: usize) -> bool {
+    is_vivante && unaligned_import_offset(plane_offset)
+}
+
+/// The byte offset a destination import bases at **on the route that collapses
+/// a view to its parent** — `bind_dst`'s `get_or_create_egl_image(Dst)`.
+///
+/// The engine has two zero-copy destination import routes and they treat a
+/// `view()` differently, so a driver rule about the base offset has to know
+/// which one it guards:
+///
+/// * **`bind_dst` → `get_or_create_egl_image(CacheKind::Dst)` →
+///   `Platform::import_buffer(.., for_dst = true)`.** A fresh `view()`/`batch()`
+///   destination imports its PARENT and places the tile with `glViewport`, so
+///   the import bases at 0 however far into the buffer the view's own bytes
+///   start: `DmaImportAttrs::from_tensor` (`dma_import.rs` ~`:202`) and
+///   `BufferImportKey::from_tensor` (`cache.rs` ~`:167`) both collapse to 0
+///   whenever `view_origin` is `Some`. **This function.**
+/// * **`convert_via_engine`'s packed-RGB plan and the zero-copy float paths →
+///   `get_or_create_egl_image_rgb` → `Platform::import_buffer_packed`.** That
+///   one passes `plane_offset()` straight to `EGL_DMA_BUF_PLANE0_OFFSET_EXT`
+///   with no `view_origin` collapse (`platform/linux.rs` ~`:199`), so a
+///   destination there IS imported at its own offset. Those sites pass the raw
+///   `plane_offset()` and must NOT use this function.
+///
+/// Getting the first case wrong is not merely a lost fast path: asking
+/// `plane_offset()` there made [`vivante_rejects_dst_import_offset`] fire on
+/// every tile view whose byte offset happened to be unaligned (an RGBA `x0` of
+/// 8 is 32 bytes), and the mapped-texture readback it lowered to returns wrong
+/// pixels for a view destination on that driver.
+///
+/// Pure, and takes the two field values rather than a tensor, so it serves both
+/// `Tensor<u8>` and `TensorDyn` call sites and is unit-testable without either.
+fn view_collapsed_dst_base(
+    view_origin: Option<edgefirst_tensor::ViewOrigin>,
+    plane_offset: Option<usize>,
+) -> usize {
+    if view_origin.is_some() {
+        0
+    } else {
+        plane_offset.unwrap_or(0)
+    }
+}
+
+/// The plane-1 (interleaved CbCr) byte offset a *contiguous* NV12 import hands
+/// EGL: the chroma plane follows the full-height luma plane in the same buffer,
+/// so it starts `pitch * height` past the luma offset. Mirrors
+/// `DmaImportAttrs::from_tensor`'s contiguous arm (`dma_import.rs` ~`:225`) —
+/// keep the two in step.
+///
+/// A multiplane NV12 does not use this: its chroma is a separate DMA-BUF whose
+/// import offset is the chroma tensor's own `plane_offset()`.
+///
+/// Pure and saturating so a nonsense geometry cannot panic in release or wrap
+/// into a spuriously aligned value in debug.
+fn nv12_plane1_offset(plane0_offset: usize, pitch: usize, height: usize) -> usize {
+    plane0_offset.saturating_add(pitch.saturating_mul(height))
 }
 
 impl GLProcessorST {
@@ -1312,6 +1430,7 @@ impl GLProcessorST {
             renderer:
                 RendererTraits {
                     vivante: is_vivante,
+                    mali: is_mali,
                     software: is_software_renderer,
                     virtual_gpu: is_virtual_gpu,
                     angle: is_angle,
@@ -1636,6 +1755,7 @@ impl GLProcessorST {
             bgra_warned: false,
             readback_scratch: Vec::new(),
             is_vivante,
+            is_mali,
             is_virtual_gpu,
             is_angle,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
@@ -1991,12 +2111,31 @@ impl GLProcessorST {
                         Platform::dst_import_places(dst.as_typed::<f32>().expect("dtype checked"))
                     }
                     _ => unreachable!("dst_dtype is F16 or F32 in this branch"),
-                };
+                }
+                // Same driver-side term as `bind_dst`: Vivante cannot import a
+                // destination at an unaligned offset at all. There is no
+                // mapped-texture readback for a float DMA destination to lower
+                // to, so this declines to the CPU converter rather than letting
+                // `EGL_BAD_ACCESS` escape.
+                // The RAW `plane_offset`, not the view-collapsed base: these
+                // four float paths import through `import_buffer_packed`,
+                // which passes `plane_offset()` straight to
+                // `EGL_DMA_BUF_PLANE0_OFFSET_EXT` with no `view_origin`
+                // collapse (`platform/linux.rs` ~`:199`). Only `bind_dst`'s
+                // `get_or_create_egl_image(Dst)` route collapses a view to 0 —
+                // see `view_collapsed_dst_base`.
+                && !vivante_rejects_dst_import_offset(
+                    self.is_vivante,
+                    dst.plane_offset().unwrap_or(0),
+                );
                 if !places {
                     return Err(Error::NotSupported(format!(
-                        "GL float destination at plane offset {} has no view origin \
-                         to place it by, and the zero-copy float import binds the \
-                         whole buffer from its origin; CPU fallback handles it",
+                        "GL float destination at plane offset {} cannot be placed by \
+                         this platform/driver -- either no view origin and an import \
+                         that binds the whole buffer from its origin, or a driver whose \
+                         import rejects the offset -- and there is no mapped-texture \
+                         readback for a float DMA destination to lower to; CPU fallback \
+                         handles it",
                         dst.plane_offset().unwrap_or(0)
                     )));
                 }
@@ -2199,13 +2338,21 @@ impl GLProcessorST {
         // plane offset but no `view_origin`, so without this it would still
         // take `DstLowering::ZeroCopy` here and render at the buffer's
         // origin.
-        let places = Platform::dst_import_places(dst);
+        // Vivante's driver-side half of the same question: an unaligned
+        // destination offset fails `eglCreateImage` (see `bind_dst`). The RAW
+        // `plane_offset` here, not the view-collapsed base: this plan imports
+        // through `import_buffer_packed`, which passes `plane_offset()` straight
+        // to EGL with no `view_origin` collapse (`platform/linux.rs` ~`:199`),
+        // so a view destination on this route really is imported at its own
+        // offset. See `view_collapsed_dst_base` for the route that differs.
+        let dst_offset = dst.plane_offset().unwrap_or(0);
+        let places = Platform::dst_import_places(dst)
+            && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
         if !places {
             log::debug!(
-                "convert_via_engine: zero-copy destination at plane offset {} \
-                 has no view origin; rendering to a texture and reading back \
-                 through map()",
-                dst.plane_offset().unwrap_or(0)
+                "convert_via_engine: zero-copy destination importing at base offset \
+                 {dst_offset} cannot be placed by this platform/driver; rendering \
+                 to a texture and reading back through map()"
             );
         }
         let lowering = super::render::lower_dst(
@@ -2699,6 +2846,7 @@ impl GLProcessorST {
             .unwrap_or_default();
         let RendererTraits {
             vivante: is_vivante,
+            mali: is_mali,
             software: is_software_renderer,
             virtual_gpu: is_virtual_gpu,
             angle: is_angle,
@@ -2707,6 +2855,14 @@ impl GLProcessorST {
             log::warn!(
                 "Vivante GPU detected — NV12 → planar RGB conversions will use \
                  two-pass workaround to avoid GPU hang (EDGEAI-1180)"
+            );
+        }
+        if is_mali {
+            log::info!(
+                "Mali GPU detected — a source DMA-BUF whose plane offset is not \
+                 {DMA_IMPORT_OFFSET_ALIGN}-byte aligned will be uploaded \
+                 rather than imported: Mali's import samples zeros from such an \
+                 offset without reporting an EGL error (issue #165)"
             );
         }
         if is_software_renderer {
@@ -2829,13 +2985,19 @@ impl GLProcessorST {
         // A zero-copy destination the platform cannot place -- one carrying a
         // plane offset with no `view_origin` to lower to a viewport -- takes
         // the mapped texture path, whose readback writes through `map()` at
-        // the offset.
-        let places = Platform::dst_import_places(dst);
+        // the offset. Vivante joins that rule from the driver side: its
+        // `eglCreateImage` fails outright on an unaligned destination offset,
+        // and without this the EGL error ended the convert instead of lowering
+        // it (measured on i.MX 8M Plus: offset 2048 renders, 2080 is
+        // `EGL_BAD_ACCESS`).
+        let dst_offset = view_collapsed_dst_base(dst.view_origin(), dst.plane_offset());
+        let places = Platform::dst_import_places(dst)
+            && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
         if !places {
             log::debug!(
-                "bind_dst: zero-copy destination at plane offset {} has no view \
-                 origin; rendering to a texture and reading back through map()",
-                dst.plane_offset().unwrap_or(0)
+                "bind_dst: zero-copy destination importing at base offset {dst_offset} \
+                 cannot be placed by this platform/driver; rendering to a texture and \
+                 reading back through map()"
             );
         }
         match super::render::lower_dst(
@@ -3183,6 +3345,10 @@ impl GLProcessorST {
             edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
             if direct_read_supported(format) {
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
+                // The bytes between rows at this pitch are the destination's
+                // padding; a driver may write them while packing (Vivante
+                // does, issue #167). `needed` keeps every written byte inside
+                // the buffer either way.
                 if let Some(pixels) = row_length {
                     edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, pixels);
                 }
@@ -3946,9 +4112,12 @@ impl GLProcessorST {
 
     /// Pick the NV* GPU conversion path for `src`/`src_fmt`, honoring the
     /// `EDGEFIRST_NV_CONVERT_PATH` preference. Returns the path to *attempt*;
-    /// the caller maps an EGLImage-creation error to the [`NvConvertPath::Cpu`]
-    /// fallback. Forcing an unavailable path logs a warning and falls back to
-    /// the only viable one rather than failing.
+    /// an EGLImage-creation error does not end the convert — the caller retries
+    /// a single-plane NV source as an R8 *upload* of the combined plane, which
+    /// is still [`NvConvertPath::ShaderR8`] (#166), and only a true-multiplane
+    /// NV12 is left to reach [`NvConvertPath::Cpu`]. Forcing an unavailable
+    /// path logs a warning and falls back to the only viable one rather than
+    /// failing.
     ///
     /// Capability:
     /// - [`NvConvertPath::ShaderR8`] needs a single combined-plane buffer, so it
@@ -4218,10 +4387,12 @@ impl GLProcessorST {
                             src_fmt = ?src_fmt,
                             "image.convert.gl.nv_path"
                         );
-                        self.last_nv_convert_path = NvConvertPath::ShaderR8;
                         self.convert_stats.src_imports += 1;
                         tracing::Span::current().record("src_feed", "import");
-                        self.draw_nv_texture_2d(
+                        // Recorded from the draw's result, not before it: a
+                        // failed draw must not leave a ShaderR8 claim, and it
+                        // must not leave the PREVIOUS convert's value either.
+                        match self.draw_nv_texture_2d(
                             src,
                             src_fmt,
                             Some(r8_egl),
@@ -4230,47 +4401,73 @@ impl GLProcessorST {
                             rotation_offset,
                             flip,
                             is_int8,
-                        )?;
+                        ) {
+                            Ok(()) => self.last_nv_convert_path = NvConvertPath::ShaderR8,
+                            Err(e) => {
+                                self.last_nv_convert_path = NvConvertPath::Cpu;
+                                return Err(e);
+                            }
+                        }
                     }
                     Err(e) => {
                         let src_w = src.width().unwrap_or(0);
                         let src_h = src.height().unwrap_or(0);
-                        // Path B failed — this means no GPU NV* path is available.
-                        // Record the CPU fallback so tests/profiler can detect it.
-                        self.last_nv_convert_path = NvConvertPath::Cpu;
                         self.convert_stats.zero_copy_declines += 1;
                         // Warn once per buffer — a steady-state video pipeline
                         // hits this every frame with the same buffers, and a
                         // per-frame warn floods the log. Repeats drop to debug.
+                        // `log`, not `tracing`: the workspace installs no
+                        // `tracing-log` bridge, so a `tracing::warn!` reaches no
+                        // ordinary board or field log at all -- and this is the
+                        // line that diagnoses #165 on a Mali box. The sibling
+                        // arm below already uses `log`. Same warn-once shape.
                         if self.nv_import_warned.insert(src.buffer_identity().id()) {
-                            tracing::warn!(
-                                src_fmt = ?src_fmt,
-                                src_w,
-                                src_h,
-                                error = %e,
+                            log::warn!(
                                 "Path B R8 EGLImage creation failed for {src_fmt} \
-                                 ({src_w}x{src_h}); falling back to CPU path (no GPU NV16/NV24)"
+                                 ({src_w}x{src_h}); uploading the combined plane instead: {e}"
                             );
                         } else {
-                            tracing::debug!(
-                                src_fmt = ?src_fmt,
-                                src_w,
-                                src_h,
-                                error = %e,
-                                "Path B R8 EGLImage creation failed (repeat)"
+                            log::debug!(
+                                "Path B R8 EGLImage creation failed for {src_fmt} \
+                                 ({src_w}x{src_h}) (repeat): {e}"
                             );
                         }
+                        // The same shader on an R8 *upload* of the combined
+                        // plane, which reads the source through `map()` — the
+                        // route the non-DMA NV branch below already takes.
+                        // `draw_src_texture` has no NV arm and would have
+                        // returned NotSupported, sending the whole convert to
+                        // the CPU (issue #166). `draw_nv_texture_2d(.., None,
+                        // ..)` cannot map a PBO source, and refuses one itself;
+                        // no PBO can reach here anyway, this arm being inside
+                        // the `TensorMemory::DmaBuf` branch.
+                        self.convert_stats.src_uploads += 1;
+                        tracing::Span::current().record("src_feed", "upload");
                         let start = Instant::now();
-                        self.draw_src_texture(
+                        // The R8 import declined (Mali's alignment rule, the
+                        // ANGLE leaves' offset refusal, or a driver that cannot
+                        // import the buffer at all). If the upload draws, this
+                        // is still a GPU convert and records ShaderR8, not Cpu
+                        // -- recorded from the result, so a failed upload
+                        // records Cpu rather than keeping the previous
+                        // convert's value.
+                        match self.draw_nv_texture_2d(
                             src,
                             src_fmt,
+                            None,
                             src_roi,
                             dst_roi,
                             rotation_offset,
                             flip,
                             is_int8,
-                        )?;
-                        log::debug!("draw_src_texture takes {:?}", start.elapsed());
+                        ) {
+                            Ok(()) => self.last_nv_convert_path = NvConvertPath::ShaderR8,
+                            Err(e) => {
+                                self.last_nv_convert_path = NvConvertPath::Cpu;
+                                return Err(e);
+                            }
+                        }
+                        log::debug!("NV R8 upload takes {:?}", start.elapsed());
                     }
                 }
             } else {
@@ -4281,11 +4478,13 @@ impl GLProcessorST {
                     Ok(src_egl) => {
                         if src_fmt == PixelFormat::Nv12 {
                             tracing::trace!(path = "ExternalSampler", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
-                            self.last_nv_convert_path = NvConvertPath::ExternalSampler;
                         }
                         self.convert_stats.src_imports += 1;
                         tracing::Span::current().record("src_feed", "import");
-                        self.draw_camera_texture_eglimage(
+                        // Recorded from the draw's result (see the ShaderR8
+                        // arm): a failed draw records neither ExternalSampler
+                        // nor the previous convert's value.
+                        match self.draw_camera_texture_eglimage(
                             src,
                             src_fmt,
                             src_egl,
@@ -4294,12 +4493,36 @@ impl GLProcessorST {
                             rotation_offset,
                             flip,
                             is_int8,
-                        )?;
+                        ) {
+                            Ok(()) => {
+                                if src_fmt == PixelFormat::Nv12 {
+                                    self.last_nv_convert_path = NvConvertPath::ExternalSampler;
+                                }
+                            }
+                            Err(e) => {
+                                if src_fmt == PixelFormat::Nv12 {
+                                    self.last_nv_convert_path = NvConvertPath::Cpu;
+                                }
+                                return Err(e);
+                            }
+                        }
                     }
                     Err(e) => {
                         let src_w = src.width().unwrap_or(0);
                         let src_h = src.height().unwrap_or(0);
-                        if src_fmt == PixelFormat::Nv12 {
+                        // A single-plane NV source has a GPU route left even
+                        // when the sampler import is refused: the R8 upload of
+                        // the combined plane, exactly as in the ShaderR8 arm
+                        // above. `draw_src_texture` has no NV arm, so without
+                        // this the whole convert died here (issue #166) — which
+                        // is how an unaligned NV12 plane offset failed on
+                        // Vivante, whose Auto policy takes the sampler and
+                        // whose EGL refuses such an offset outright.
+                        let nv_upload_capable = matches!(
+                            src_fmt,
+                            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+                        ) && !src.is_multiplane();
+                        if src_fmt == PixelFormat::Nv12 && !nv_upload_capable {
                             self.last_nv_convert_path = NvConvertPath::Cpu;
                         }
                         self.convert_stats.zero_copy_declines += 1;
@@ -4317,16 +4540,52 @@ impl GLProcessorST {
                             );
                         }
                         let start = Instant::now();
-                        self.draw_src_texture(
-                            src,
-                            src_fmt,
-                            src_roi,
-                            dst_roi,
-                            rotation_offset,
-                            flip,
-                            is_int8,
-                        )?;
-                        log::debug!("draw_src_texture takes {:?}", start.elapsed());
+                        if nv_upload_capable {
+                            // Same shader, same in-shader matrix, source read
+                            // through `map()`. No PBO can reach here: this arm
+                            // is inside the `TensorMemory::DmaBuf` branch, and
+                            // `draw_nv_texture_2d(.., None, ..)` refuses a PBO
+                            // source itself in any case.
+                            self.convert_stats.src_uploads += 1;
+                            tracing::Span::current().record("src_feed", "upload");
+                            // Recorded from the result: a drawn upload is still
+                            // a GPU convert (ShaderR8), a failed one records Cpu
+                            // rather than keeping the previous convert's value.
+                            match self.draw_nv_texture_2d(
+                                src,
+                                src_fmt,
+                                None,
+                                src_roi,
+                                dst_roi,
+                                rotation_offset,
+                                flip,
+                                is_int8,
+                            ) {
+                                Ok(()) => {
+                                    if src_fmt == PixelFormat::Nv12 {
+                                        self.last_nv_convert_path = NvConvertPath::ShaderR8;
+                                    }
+                                }
+                                Err(e) => {
+                                    if src_fmt == PixelFormat::Nv12 {
+                                        self.last_nv_convert_path = NvConvertPath::Cpu;
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                            log::debug!("NV R8 upload takes {:?}", start.elapsed());
+                        } else {
+                            self.draw_src_texture(
+                                src,
+                                src_fmt,
+                                src_roi,
+                                dst_roi,
+                                rotation_offset,
+                                flip,
+                                is_int8,
+                            )?;
+                            log::debug!("draw_src_texture takes {:?}", start.elapsed());
+                        }
                     }
                 }
             }
@@ -4342,10 +4601,12 @@ impl GLProcessorST {
             // replacing the old CPU fallback. Multiplane NV12 (separate Y/UV
             // buffers) cannot be uploaded as one R8 texture → CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
-            self.last_nv_convert_path = NvConvertPath::ShaderR8;
             self.convert_stats.src_uploads += 1;
             tracing::Span::current().record("src_feed", "upload");
-            self.draw_nv_texture_2d(
+            // Recorded from the draw's result, like the four DMA arms above: a
+            // failed upload records Cpu rather than leaving a ShaderR8 claim or
+            // the previous convert's value.
+            match self.draw_nv_texture_2d(
                 src,
                 src_fmt,
                 None,
@@ -4354,7 +4615,13 @@ impl GLProcessorST {
                 rotation_offset,
                 flip,
                 is_int8,
-            )?;
+            ) {
+                Ok(()) => self.last_nv_convert_path = NvConvertPath::ShaderR8,
+                Err(e) => {
+                    self.last_nv_convert_path = NvConvertPath::Cpu;
+                    return Err(e);
+                }
+            }
         } else {
             // Non-DMA source, non-NV (or multiplane NV): CPU texture-upload path.
             if matches!(
@@ -5913,6 +6180,24 @@ impl GLProcessorST {
         // import without consulting the platform at all, so an identity that
         // has stopped naming its buffer would be served a stale image.
         Platform::validate_import_identity(img, "NV source")?;
+        // Mali samples zeros from an unaligned plane offset without reporting
+        // an EGL error, so refuse the import here and let the caller's failure
+        // arm upload the window through `map()` instead (issue #165). Always a
+        // source, so there is no destination case to exempt.
+        //
+        // Plane 0 is the whole check here: this path binds the COMBINED
+        // semi-planar plane as ONE R8 texture at plane 0's offset and the
+        // shader addresses the chroma bytes inside it by texel arithmetic, so
+        // EGL is never handed a second plane offset. The two-plane import in
+        // `get_or_create_egl_image` is the one that needs plane 1 checked too.
+        let offset = img.plane_offset().unwrap_or(0);
+        if mali_rejects_import_offset(self.is_mali, offset) {
+            return Err(crate::Error::NotSupported(format!(
+                "Mali samples zeros from a DMA-BUF imported at a plane offset that \
+                 is not {DMA_IMPORT_OFFSET_ALIGN}-byte aligned ({offset}); \
+                 uploading the window instead (issue #165)"
+            )));
+        }
         // The NV R8 path imports a SOURCE (NV12/16/24 as one R8 texture), so it
         // never collapses onto a destination parent import.
         let id = BufferImportKey::from_tensor(img, img_fmt, false);
@@ -5959,6 +6244,55 @@ impl GLProcessorST {
                 CacheKind::Dst => "destination",
             },
         )?;
+        // Mali samples zeros from a source imported at a plane offset that is
+        // not 64-byte aligned, with no EGL error to notice (issue #165). Refuse
+        // it so the caller's failure arm uploads the window through `map()`.
+        // Destinations are untouched: a destination view imports its parent at
+        // offset 0 and is rendered into by viewport, never sampled at an
+        // offset.
+        if cache == CacheKind::Src {
+            // Every plane offset this import will pass to EGL, not just plane
+            // 0. A two-plane NV12 import hands EGL a plane-1 offset of its own
+            // (`dma_import.rs` ~`:225`), and that one can be unaligned while
+            // plane 0 is aligned. It cannot happen on a HAL allocation, whose
+            // 64-aligned pitch makes `pitch * height` 64-aligned at every
+            // height; it can on a DMA-BUF adopted through `from_fd`, whose
+            // pitch is the producer's and need not be padded, and on a
+            // multiplane NV12 whose chroma buffer carries its own offset. Mali
+            // would then sample zeros for chroma alone — silently
+            // colour-shifted output rather than a black frame, which is harder
+            // to notice than the luma case.
+            let offset = img.plane_offset().unwrap_or(0);
+            let chroma_offset = (img_fmt == PixelFormat::Nv12).then(|| {
+                if img.is_multiplane() {
+                    // A separate chroma DMA-BUF imports at its own offset.
+                    img.chroma().and_then(|c| c.plane_offset()).unwrap_or(0)
+                } else {
+                    nv12_plane1_offset(
+                        offset,
+                        img.effective_row_stride()
+                            .unwrap_or_else(|| img.width().unwrap_or(0)),
+                        img.height().unwrap_or(0),
+                    )
+                }
+            });
+            // A fixed array, not a `Vec`: this runs on every convert.
+            let planes = [
+                Some(("plane 0", offset)),
+                chroma_offset.map(|o| ("chroma plane", o)),
+            ];
+            if let Some((which, bad)) = planes
+                .into_iter()
+                .flatten()
+                .find(|&(_, o)| mali_rejects_import_offset(self.is_mali, o))
+            {
+                return Err(crate::Error::NotSupported(format!(
+                    "Mali samples zeros from a DMA-BUF imported at a plane offset that \
+                     is not {DMA_IMPORT_OFFSET_ALIGN}-byte aligned ({which} at \
+                     {bad}); uploading the window instead (issue #165)"
+                )));
+            }
+        }
         // Identity + offset + geometry: sub-region views share one buffer
         // identity but need distinct EGLImages (offset), and a pooled buffer
         // reconfigured to a new size/format/stride needs a fresh import
@@ -7719,6 +8053,7 @@ impl GLProcessorST {
             // rejected in `new` before a processor exists.
             serialize_gl: requires_full_serialization(RendererTraits {
                 vivante: self.is_vivante(),
+                mali: self.is_mali,
                 software: false,
                 virtual_gpu: self.is_virtual_gpu,
                 angle: self.is_angle,
@@ -7933,7 +8268,7 @@ mod tests {
 
         // imx8mp (Vivante GC7000UL)
         let t = classify_renderer("Vivante GC7000UL");
-        assert!(t.vivante && !t.software && !t.virtual_gpu && !t.angle);
+        assert!(t.vivante && !t.software && !t.virtual_gpu && !t.angle && !t.mali);
         // Apple Silicon via ANGLE (developer machines) — a REAL GPU, not
         // paravirtual, but still ANGLE and still loses per-draw state under
         // concurrent GL.
@@ -7942,8 +8277,26 @@ mod tests {
              Version 26.4.1 (Build 25E253))",
         );
         assert!(t.angle && !t.virtual_gpu && !t.software && !t.vivante);
-        // Mali / V3D / Tegra: plain hardware, the P0-validated parallel set
-        assert_eq!(classify_renderer("Mali-G310"), real_gpu);
+        // Mali: plain hardware for the serialization policy, but carries the
+        // `mali` trait that gates the unaligned-source-offset decline (#165).
+        assert_eq!(
+            classify_renderer("Mali-G310"),
+            RendererTraits {
+                mali: true,
+                ..RendererTraits::default()
+            }
+        );
+        assert_eq!(
+            classify_renderer("Mali-G52"),
+            RendererTraits {
+                mali: true,
+                ..RendererTraits::default()
+            }
+        );
+        // V3D / Tegra: plain hardware, the P0-validated parallel set, and NOT
+        // Mali. V3D was measured importing an unaligned source offset
+        // correctly (#165); Tegra/Orin is unmeasured — that board has no DMA
+        // heap, so no DMA-BUF source can be built on it to test.
         assert_eq!(classify_renderer("V3D 7.1"), real_gpu);
         assert_eq!(
             classify_renderer("NVIDIA Tegra Orin (nvgpu)/integrated"),
@@ -7971,6 +8324,176 @@ mod tests {
              Version 15.7.7 (Build 24G720))",
         );
         assert!(t.virtual_gpu && t.angle && !t.software && !t.vivante);
+    }
+
+    // The plane-offset rule that decides whether a Mali source DMA-BUF is
+    // imported or uploaded. The offsets are the ones measured on i.MX 95
+    // (issue #165): 32 and 2080 sampled zeros; 64, 256 and 2048 sampled
+    // correctly, and offset 0 is the whole-image control, not a window.
+    #[test]
+    fn mali_declines_only_unaligned_source_offsets() {
+        use super::mali_rejects_import_offset as rejects;
+
+        // Mali, unaligned — declined so the upload path takes the source.
+        assert!(rejects(true, 32));
+        assert!(rejects(true, 2080));
+        // Mali, aligned — imported, as measured.
+        assert!(!rejects(true, 0));
+        assert!(!rejects(true, 64));
+        assert!(!rejects(true, 2048));
+        // Every other driver imports any offset; the rule must not touch them.
+        assert!(!rejects(false, 32));
+        assert!(!rejects(false, 2080));
+        // 256 was measured too, and is the RGBA test's `(0, 1)` origin.
+        assert!(!rejects(true, 256));
+    }
+
+    // The destination-side rule, which is Vivante's and NOT Mali's: Mali was
+    // measured rendering into offset 2080 correctly, Vivante fails to import it
+    // (`EGL_BAD_ACCESS`). Both halves matter, so both are asserted -- gating
+    // Mali destinations would cost it the zero-copy path for nothing.
+    #[test]
+    fn only_vivante_declines_an_unaligned_destination_import() {
+        use super::{mali_rejects_import_offset, vivante_rejects_dst_import_offset as dst_rejects};
+
+        // Vivante: 2048 imports, 2080 is EGL_BAD_ACCESS -- the two measured
+        // points on i.MX 8M Plus.
+        assert!(!dst_rejects(true, 2048));
+        assert!(dst_rejects(true, 2080));
+        assert!(!dst_rejects(true, 0));
+        assert!(dst_rejects(true, 32));
+
+        // Not Vivante: no destination gate at all. Mali included -- its
+        // destination renders correctly at 2080, and only its SOURCE sampling
+        // is affected.
+        assert!(!dst_rejects(false, 2080));
+        assert!(!dst_rejects(false, 32));
+        assert!(
+            mali_rejects_import_offset(true, 2080),
+            "the Mali rule is the source rule, and 2080 is in it"
+        );
+    }
+
+    // The offset a destination import actually bases at, which is what the
+    // Vivante rule must be asked of -- and which of the two routes is being
+    // guarded. `bind_dst`'s import collapses a fresh view() to 0 however far
+    // into the buffer its own bytes start, so asking `plane_offset()` there
+    // made the rule fire on tile views the driver handles perfectly. The
+    // `import_buffer_packed` routes do NOT collapse, so they must keep asking
+    // the raw offset; both shapes are asserted here.
+    #[test]
+    fn a_view_destination_imports_at_base_zero_and_escapes_the_offset_rule() {
+        use super::{
+            view_collapsed_dst_base as base, vivante_rejects_dst_import_offset as dst_rejects,
+        };
+        use edgefirst_tensor::ViewOrigin;
+
+        // A fresh view: `view_origin` is Some, so the import bases at 0 -- even
+        // at an unaligned byte offset like an RGBA x0 of 8 (2080 here).
+        let vo = Some(ViewOrigin {
+            parent_width: 64,
+            parent_height: 64,
+            parent_row_stride: 256,
+            x: 8,
+            y: 8,
+        });
+        assert_eq!(base(vo, Some(2080)), 0);
+        assert!(
+            !dst_rejects(true, base(vo, Some(2080))),
+            "a fresh view destination must KEEP zero-copy on Vivante"
+        );
+        // Still 0 at an aligned offset, and 0 even if the offset is absent.
+        assert_eq!(base(vo, Some(2048)), 0);
+        assert_eq!(base(vo, None), 0);
+
+        // No view_origin -- rebuilt from a descriptor, or a whole tensor at a
+        // foreign offset. Now the import really does base at the offset, and
+        // the rule applies.
+        assert_eq!(base(None, Some(2080)), 2080);
+        assert!(dst_rejects(true, base(None, Some(2080))));
+        assert_eq!(base(None, Some(2048)), 2048);
+        assert!(!dst_rejects(true, base(None, Some(2048))));
+        // A whole tensor with no offset at all is base 0.
+        assert_eq!(base(None, None), 0);
+        assert!(!dst_rejects(true, base(None, None)));
+
+        // Nothing here touches a non-Vivante driver.
+        assert!(!dst_rejects(false, base(None, Some(2080))));
+
+        // THE OTHER ROUTE. `import_buffer_packed` passes `plane_offset()`
+        // straight to EGL with no collapse, so `convert_via_engine`'s packed
+        // plan and the float paths ask the RAW offset -- and a view destination
+        // there really is imported at its own offset, so the rule must fire on
+        // it. Collapsing at those sites would under-fire and hand Vivante the
+        // `EGL_BAD_ACCESS` this rule exists to avoid.
+        let raw = |plane_offset: Option<usize>| plane_offset.unwrap_or(0);
+        assert_eq!(raw(Some(2080)), 2080);
+        assert!(
+            dst_rejects(true, raw(Some(2080))),
+            "a view destination on the packed route imports at its own offset, \
+             so the rule must still fire there"
+        );
+        assert!(!dst_rejects(true, raw(Some(2048))));
+        assert!(!dst_rejects(true, raw(None)));
+        // The two routes genuinely disagree for the same tensor: that is the
+        // whole reason the helper is route-specific.
+        assert_ne!(base(vo, Some(2080)), raw(Some(2080)));
+    }
+
+    // The chroma-plane offset a contiguous NV12 import hands EGL, and whether
+    // Mali's rule catches an unaligned one while plane 0 looks fine.
+    //
+    // A 64-aligned pitch makes `pitch * height` 64-aligned at EVERY height, so
+    // a HAL allocation can never produce an unaligned plane 1 — which is why
+    // plane 0 alone looked sufficient. It stops being sufficient for a DMA-BUF
+    // adopted through `from_fd`, whose pitch is the producer's and need not be
+    // padded at all: then `pitch * height` is unaligned for any height that
+    // does not itself supply the missing factor of 64.
+    #[test]
+    fn nv12_chroma_plane_offset_is_checked_independently_of_plane_zero() {
+        use super::{mali_rejects_import_offset as rejects, nv12_plane1_offset as plane1};
+
+        // HAL-shaped: 64-aligned pitch, offset 0. Both planes aligned, at an
+        // even height and at an odd one alike.
+        assert_eq!(plane1(0, 256, 64), 16384);
+        assert_eq!(plane1(0, 256, 65), 16640);
+        assert!(!rejects(true, plane1(0, 256, 64)));
+        assert!(!rejects(true, plane1(0, 256, 65)));
+
+        // A foreign pitch from `from_fd`: plane 0 is aligned and plane 1 is
+        // NOT. This is the case a plane-0-only check misses, and the shorter
+        // the frame the likelier it is.
+        assert!(!rejects(true, 0), "plane 0 looks fine");
+        assert_eq!(plane1(0, 100, 3), 300);
+        assert!(rejects(true, plane1(0, 100, 3)), "plane 1 must be caught");
+        assert_eq!(plane1(0, 48, 5), 240);
+        assert!(rejects(true, plane1(0, 48, 5)));
+        assert_eq!(plane1(0, 96, 1), 96);
+        assert!(rejects(true, plane1(0, 96, 1)));
+
+        // A foreign pitch whose height DOES supply the missing factor keeps
+        // plane 1 aligned and must NOT be declined — the rule is the offset's
+        // alignment, not whether the pitch was padded.
+        assert_eq!(plane1(0, 100, 64), 6400);
+        assert!(!rejects(true, plane1(0, 100, 64)));
+        assert_eq!(plane1(0, 96, 2), 192);
+        assert!(!rejects(true, plane1(0, 96, 2)));
+
+        // The luma offset carries into plane 1: aligned + aligned stays
+        // aligned, and an unaligned plane 0 shifts plane 1 out of alignment
+        // too (plane 0 is checked first, so the message names plane 0).
+        assert_eq!(plane1(2048, 256, 64), 18432);
+        assert!(!rejects(true, plane1(2048, 256, 64)));
+        assert!(rejects(true, plane1(32, 256, 64)));
+
+        // Saturating, so a nonsense geometry cannot wrap into a spuriously
+        // aligned value or panic in debug.
+        assert_eq!(plane1(usize::MAX, 256, 64), usize::MAX);
+        assert_eq!(plane1(0, usize::MAX, 2), usize::MAX);
+
+        // Non-Mali is untouched at every one of them.
+        assert!(!rejects(false, plane1(0, 100, 3)));
+        assert!(!rejects(false, plane1(0, 96, 1)));
     }
 
     // The serialization policy each fleet renderer selects. The parallel

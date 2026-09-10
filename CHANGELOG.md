@@ -165,6 +165,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crates/tensor/tests/d3d11_tensor.rs` and the Windows arm of
   `crates/image/tests/reconstructed_view_convert.rs`, on the Windows CI
   lanes.
+- **Mali sampled zeros from a source view at an unaligned DMA-BUF offset.**
+  On i.MX 95 the EGL DMA-BUF import silently returns zeros when
+  `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not 64-byte aligned — a 16×16 source
+  `view()` at (8, 8) of a 256-byte-pitched RGBA image converted to black
+  while (0, 8) and (16, 0) were fine, and V3D handled every origin. The GL
+  engine now recognises Mali from `GL_RENDERER` and declines a *source*
+  import at such an offset, uploading the window through `map()` instead;
+  destinations are unaffected (a view imports its parent at offset 0).
+  Pinned by `offset_source_view_alignment.rs` on imx95, imx8mp and rpi5.
+  Zero-copy for those views (an aligned base with the remainder folded into
+  the sampling rectangle) is follow-up #170. (#165)
+- **A refused zero-copy NV source ended on the CPU.** When the R8 import of
+  an NV12/16/24 source was declined — the ANGLE leaves' offset refusal, or
+  the Mali rule above — the engine fell to `draw_src_texture`, which has no
+  NV arm, so the convert left the GPU entirely. Both NV import-failure arms
+  now upload the combined plane through the same R8 shader. On i.MX 8M Plus
+  this is what a single-plane NV12 source at an unaligned plane offset now
+  takes: Vivante's `Auto` policy sends it to the external sampler, whose EGL
+  refuses the offset, and the convert stays on the GPU through the R8 shader
+  on an upload instead of dropping to the CPU. Vivante also refuses a
+  *destination* import at an unaligned offset outright, with
+  `EGL(BadAccess)`, which used to fail the convert; the engine now lowers
+  such a destination to the mapped-texture path, whose readback writes
+  through `map()` at the offset. (#166)
+- **A test asserted padding no readback promises.**
+  `gl_padded_pbo_dst_rows_land_at_the_declared_stride` required the bytes
+  between pitched rows to stay untouched; Vivante writes them while packing
+  rows at `GL_PACK_ROW_LENGTH`, and the read-tight-and-spread route always
+  left leftovers there. The test now asserts the pixel bytes of every row at
+  the declared pitch, which is the contract. CI's imx8mp lane never ran that
+  binary, which is why the desk found it first. (#167)
 
 ### Changed
 
