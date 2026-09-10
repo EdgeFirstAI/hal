@@ -95,16 +95,23 @@ so a *freshly created* view was right and only a tensor rebuilt from a
 cfg-multiplexed name rather than one type, so the Linux-gated arm did not
 fail to compile on macOS, it silently became a fall-through.
 
+Two follow-ups complete it: the descriptor import now restores an IOSurface
+view's pitch (`restore_imported_row_stride` includes `IOSURFACE`; a
+surface's `bytesPerRow` is shared, unlike a D3D11 staging pitch), and the
+GL engine's Apple leaf refuses to zero-copy attach a source carrying a
+plane offset, as the Windows leaf does, because the ANGLE IOSurface
+binding has no offset attribute.
+
 D3D11 (Windows) is fixed too, and the bug had a different shape there. A
 view's descriptor was refused rather than rebuilt at the wrong origin: the
 import checks the shape against the texture's own geometry, and a window
 was neither spelling it accepted. It now accepts a packed window, opens the
 whole texture and narrows it, keeping the texture's pitch as the row
 stride; the storage offset is then written back by `set_plane_offset` and
-cleared by `set_format` and `reshape`. Two Windows-only details follow from
-the texture being the unit of import. The ANGLE image binds the whole
-texture from its origin and cannot express an offset, so the GL engine's
-Windows leaf refuses to attach a *source* carrying a plane offset and the
+cleared by `set_format` and `reshape`. Two details follow from the texture
+being the unit of import. The ANGLE image binds the whole texture from its
+origin and cannot express an offset, so the engine's ANGLE leaves (D3D11
+and IOSurface) refuse to attach a *source* carrying a plane offset and the
 engine uploads it through `map()` instead — without that refusal even a
 fresh `view()` converted the parent's origin. A *destination* rebuilt from a
 descriptor is the same problem from the other side — it has the offset but

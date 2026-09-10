@@ -199,6 +199,11 @@ const _: () = {
 ///   `set_plane_offset_moves_the_iosurface_map_window`,
 ///   `nested_iosurface_subviews_do_not_compound_their_plane_offset` and
 ///   `set_format_clears_the_iosurface_map_window`.
+///   Two review follow-ups complete it: the import restores the view's
+///   pitch (`descriptor_import_restores_the_iosurface_pitch_onto_a_view`),
+///   and the GL leaf refuses an offset *source* the way Windows' does,
+///   since the ANGLE IOSurface binding has no offset attribute
+///   (`reconstructed_view_convert.rs`, case A, on the macOS lane).
 /// * **D3D11 (Windows)** -- fixed (issue #161), in three parts, because
 ///   the bug had a different shape there. A view's descriptor was not
 ///   reconstructed wrongly, it was *refused*: the `D3D11_TEXTURE` import
@@ -209,13 +214,13 @@ const _: () = {
 ///   is then written back by `set_plane_offset` and cleared by
 ///   `set_format` and `reshape` (unlike `IoSurfaceTensor`, its own
 ///   `reshape` leaves the offset alone). And because the ANGLE import binds
-///   the whole texture from its origin and cannot express an offset, the GL
-///   engine's Windows leaf refuses to attach a source carrying one and
-///   uploads it through `map()` instead -- without which even a *fresh*
-///   `view()` converted the parent's origin on the GL path. A rebuilt
-///   *destination* has the offset but not the `view_origin` the engine
-///   lowers a fresh view's tile to a viewport from, so the engine asks the
-///   platform whether a zero-copy destination can be placed
+///   the whole texture from its origin and cannot express an offset, the
+///   engine's ANGLE leaves (D3D11 and IOSurface) refuse to attach a source
+///   carrying one and upload it through `map()` instead -- without which
+///   even a *fresh* `view()` converted the parent's origin on the GL path.
+///   A rebuilt *destination* has the offset but not the `view_origin` the
+///   engine lowers a fresh view's tile to a viewport from, so the engine
+///   asks the platform whether a zero-copy destination can be placed
 ///   (`GlPlatform::dst_import_places`) and lowers one that cannot to the
 ///   mapped texture path, whose readback writes through `map()` at the
 ///   offset. Pinned by the `d3d11` plane-offset tests in
