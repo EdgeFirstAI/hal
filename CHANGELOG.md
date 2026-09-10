@@ -205,6 +205,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HAL_TEST_REQUIRE_CUDA=1` (set by `make test-cuda` whenever it located a
   runtime) makes such a skip a failure rather than a silent pass.
 
+- **The imx8mp hardware lane executed zero Rust tests, silently, since
+  2026-05-14 (`a87ae59c`).** The artifact-restoring `chmod +x` named
+  `hardware-test-binaries/`, a directory the artifact stopped shipping the
+  day that commit switched to `hardware-test-binaries-stripped/`; the glob
+  matched nothing, the error was swallowed by `2>/dev/null || true`, and
+  every binary then failed the loop's `[[ -x ]]` guard in complete silence
+  -- no `=== Running`, no `=== Skipping`, and the JUnit generator reported
+  `tests="0"` with nothing downstream asserting a floor. Four months of a
+  green-but-empty gate. Fixed by naming the directory the loop actually
+  iterates, dropping the error suppression so a real mismatch fails loudly
+  instead of vanishing, and adding a zero-tests guard plus a `--min-tests`
+  floor on the generated JUnit XML (also applied to the aarch64 runner's
+  identical step). The lane now also runs 15 integration binaries
+  (`crates/image/tests/*.rs`'s GL binaries and `crates/tensor/tests/*.rs`'s
+  DMA-BUF-touching ones) that previously fell into a CPU-only skip branch
+  unconditionally, and every crate's `testdata/` (not just the repository
+  root's) is shipped to the boards and to CI's own testdata artifact, so
+  fixtures under a crate-local `testdata/` directory reach on-target runs
+  the same way root-level fixtures already did.
+- **A hardware-gated test that returned early after `eprintln!`-ing its
+  skip reason reported bare `ok`, indistinguishable from having actually
+  run.** libtest captures `println!`/`eprintln!` and replays it only for a
+  *failing* test, so the reason was silently discarded on every passing
+  skip -- both locally and on the boards. Every such site across
+  `edgefirst-image`, `edgefirst-tensor`, `edgefirst-codec`, and
+  `edgefirst-decoder` now writes `SKIPPED: <reason>` directly to stderr,
+  bypassing libtest's capture hook, so `scripts/on-target-test.sh`'s
+  per-board skip count (and a human reading captured CI logs) can actually
+  see it.
+- **Cross-building `edgefirst-tensor`'s `dynamic` backend test lane for a
+  board needed a hand-rolled `RUSTFLAGS`.** `crates/tensor/build.rs`'s
+  `dynamic-test-link` feature hardcoded a link-search path relative to this
+  crate's own manifest directory, which is wrong for any cross (`--target`)
+  build. It now honours `EDGEFIRST_TENSOR_LIB_DIR` when set and otherwise
+  derives the search path from `OUT_DIR`, matching whatever `target/
+  <profile>` or `target/<target-triple>/<profile>` layout the actual build
+  used.
+- **`test_merge_tiled_detections_releases_the_gil`'s 20% gap floor failed
+  on a two-vCPU hosted CI runner** that measured a real, repeatable ~17-19%
+  gap for a short CPU-bound op -- a headroom shortfall on that runner, not
+  a regression (a GIL-holding mutation still measures a gap near 0% under
+  the same harness). Lowered to 10%, which still discriminates a genuine
+  hold from a genuine release by roughly an order of magnitude.
+
 ### Changed
 
 - A malformed quantization descriptor in a tensor capsule is now reported

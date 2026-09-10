@@ -40,7 +40,7 @@ def generate_junit_xml(results_dir: str, output_file: str, min_tests: int = 0) -
         with open(output_file, 'w') as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
             f.write('<testsuites name="rust-hardware" tests="0" failures="0" errors="0"></testsuites>\n')
-        if 0 < min_tests:
+        if min_tests > 0:
             print(f"::error::junit has 0 tests, floor is {min_tests}")
             return 1
         return 0

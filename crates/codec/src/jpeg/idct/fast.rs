@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn fast_neon_matches_fast_scalar_exactly() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut quant = [0u16; 64];

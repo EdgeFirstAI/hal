@@ -19,17 +19,17 @@
 /// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
 /// it.
 ///
-/// `cfg(unix)`, not just `cfg(test)`: every current call site
-/// (`dma.rs`'s `target_os = "linux"` tests, `lib.rs`'s IOSurface tests
-/// under `target_os = "macos"`, and its shm tests under plain `unix`) is
-/// reachable only on Unix, so an unconditional `pub(crate) fn` here is
-/// dead code on Windows and fails a `-D warnings` build there. Widen this
-/// (or add a Windows-specific caller with its own cfg) if a Windows test
-/// inside this crate's `src/` ever needs it directly --
-/// `crates/tensor/tests/d3d11_tensor.rs` already carries its own local
-/// copy for exactly that reason, since an integration-test binary can't
-/// reach this `pub(crate)` item anyway.
-#[cfg(all(test, unix))]
+/// Plain `cfg(test)`, not `cfg(all(test, unix))`: this crate's Unix-only
+/// call sites (`dma.rs`'s `target_os = "linux"` tests, `lib.rs`'s IOSurface
+/// tests under `target_os = "macos"`, its shm tests under plain `unix`)
+/// once left this dead code on Windows, but `d3d11/adapter.rs`'s tests
+/// (that whole module is `#[cfg(target_os = "windows")]`, see `lib.rs`)
+/// are a real Windows-only caller now, so every platform this crate builds
+/// for has at least one caller and the narrower gate is no longer needed.
+/// `crates/tensor/tests/d3d11_tensor.rs` still carries its own local copy
+/// rather than reaching this one -- it's a separate integration-test
+/// compilation unit and can't reach a `pub(crate)` item in the lib crate.
+#[cfg(test)]
 pub(crate) fn report_skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");

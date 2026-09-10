@@ -1298,11 +1298,13 @@ mod tests {
     #[test]
     fn load_egl_lib_finds_angle_or_skips() {
         let Some(dir) = std::env::var_os("EDGEFIRST_ANGLE_PATH") else {
-            eprintln!("EDGEFIRST_ANGLE_PATH unset — skipping ANGLE load probe");
+            crate::test_support::report_skip("EDGEFIRST_ANGLE_PATH unset — no ANGLE load probe");
             return;
         };
         if !Path::new(&dir).join("libEGL.dll").is_file() {
-            eprintln!("no libEGL.dll under EDGEFIRST_ANGLE_PATH — skipping ANGLE load probe");
+            crate::test_support::report_skip(
+                "no libEGL.dll under EDGEFIRST_ANGLE_PATH — no ANGLE load probe",
+            );
             return;
         }
         WindowsPlatform::load_egl_lib()

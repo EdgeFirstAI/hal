@@ -2097,7 +2097,9 @@ mod tests {
     #[test]
     fn expf_neon_f32x8_via_f16_matches_libm_relative() {
         if !fp16_supported() {
-            eprintln!("fp16 not supported on this CPU; skipping FP16 expf parity test");
+            crate::test_support::report_skip(
+                "fp16 not supported on this CPU (FP16 expf parity test)",
+            );
             return;
         }
         // f16 polynomial expf has ~1% relative error in exp(r) — wider
@@ -2142,7 +2144,7 @@ mod tests {
     #[test]
     fn sigmoid_slice_f32_neon_fp16_matches_scalar() {
         if !fp16_supported() {
-            eprintln!("fp16 not supported; skipping");
+            crate::test_support::report_skip("fp16 not supported");
             return;
         }
         // 32 elements: 4 chunks of 8, no tail.
@@ -2168,7 +2170,7 @@ mod tests {
     #[test]
     fn softmax_neon_fp16_matches_scalar() {
         if !fp16_supported() {
-            eprintln!("fp16 not supported; skipping");
+            crate::test_support::report_skip("fp16 not supported");
             return;
         }
         // 16 elements: 2 chunks of 8, exact reg_max boundary.

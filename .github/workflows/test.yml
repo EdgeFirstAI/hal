@@ -111,6 +111,18 @@ jobs:
           # would break.
           for dir in crates/*/testdata; do
             [ -d "${dir}" ] || continue
+            # `cp -a` silently overwrites on a name collision (with the
+            # root testdata/ tree, or with an earlier crate merged this
+            # same loop) -- checked file by file before copying so a
+            # collision fails the step loudly, naming the exact path,
+            # instead of one crate's fixture silently replacing another's.
+            while IFS= read -r -d '' f; do
+              rel="${f#"${dir}"/}"
+              if [ -e "testdata/${rel}" ]; then
+                echo "::error::${dir}/${rel} collides with an existing testdata/${rel}"
+                exit 1
+              fi
+            done < <(find "${dir}" -type f -print0)
             cp -a "${dir}/." testdata/
           done
 
@@ -2010,8 +2022,7 @@ jobs:
               run_filtered "$test_bin" dma "DMA tests"
             elif [[ "$test_name" == dst_view_stride-* || "$test_name" == offset_nv_source_upload-* || \
                     "$test_name" == offset_source_view_alignment-* || "$test_name" == gl_concurrent_stress-* || \
-                    "$test_name" == reconstructed_view_convert-* || "$test_name" == reconstructed_view_draw-* || \
-                    "$test_name" == reconstructed_planar_dst-* || "$test_name" == pin_convert-* || \
+                    "$test_name" == reconstructed_view_convert-* || "$test_name" == pin_convert-* || \
                     "$test_name" == crop_golden-* || "$test_name" == mask_golden-* || "$test_name" == odd_dim_cpu-* ]]; then
               # crates/image/tests/*.rs GL integration binaries: whole-binary
               # GPU/EGL tests, run unfiltered (no g2d/opengl/dma split).
@@ -2029,25 +2040,54 @@ jobs:
               # picks up coverage for free the day this crate's hardware
               # build gains that feature.
               run_unfiltered "$test_bin" "tensor integration test"
+            elif [[ "$test_name" == reconstructed_planar_dst-* || "$test_name" == reconstructed_view_draw-* ]]; then
+              # These two compile to a zero-test binary on this Linux
+              # runner: `reconstructed_planar_dst.rs` is
+              # `#![cfg(all(any(target_os = "macos", target_os = "ios"),
+              # feature = "opengl"))]` and `reconstructed_view_draw.rs` is
+              # `#![cfg(all(any(target_os = "macos", target_os = "ios",
+              # target_os = "windows"), feature = "opengl"))]` -- neither
+              # cfg includes linux, so running them here is a guaranteed
+              # "0 tests" no-op, not coverage. Every other routed binary in
+              # the branches above was checked the same way and has no such
+              # gate (or, for `offset_nv_source_upload`/
+              # `offset_source_view_alignment`, includes linux).
+              echo "=== Skipping $test_name (compiles to 0 tests on linux: macOS/iOS/Windows-only) ==="
             else
-              # CPU-only, covered by aarch64 runner: edgefirst-image benches
-              # (image_benchmark, pipeline_benchmark, nv_path_benchmark,
-              # mask_benchmark, parallel_processors_benchmark,
-              # mask_decode_benchmark, sanity_check, decode_pipeline_benchmark,
-              # nvjpeg_benchmark, convert_matrix_benchmark,
-              # cpu_preprocess_benchmark, batch_convert_benchmark,
-              # tiled_convert_benchmark, opencv_benchmark), and any decoder/
-              # tracker/capi binaries that end up in this artifact.
-              #
-              # crates/tensor/tests/*.rs binaries that do NOT touch DMA-BUF
-              # stay here: logical_shape, map_access, no_global_state,
-              # scenarios. `d3d11_tensor` also lands here -- it is
-              # `#![cfg(target_os = "windows")]`-gated and compiles to an
-              # empty binary on this Linux runner regardless of routing.
+              # What actually lands in hardware-test-binaries-stripped/ is
+              # NOT scoped to edgefirst-image/edgefirst-tensor: this job's
+              # earlier "Build runner test binaries" step (`cargo nextest
+              # run --no-run --workspace --exclude <the six python-*
+              # crates>`) and this step both run under the SAME
+              # `CARGO_TARGET_DIR=target/llvm-cov-target` (`source
+              # /tmp/coverage-env.sh` in both), so the `find
+              # target/llvm-cov-target/profiling/deps/ -type f -executable`
+              # above -- which has no package filter -- copies every
+              # lib-test and integration-test binary the workspace build
+              # produced, not just the two packages this step explicitly
+              # names. So this branch actually sees: edgefirst-codec,
+              # edgefirst-decoder, edgefirst-tracker, edgefirst-bench,
+              # edgefirst-egl, edgefirst-gl, edgefirst-gpu-probe,
+              # edgefirst-tensor-abi, edgefirst-decoder-abi,
+              # edgefirst-tensor-ffi, and the five -capi crates' own
+              # lib-test binaries (and edgefirst-tensor's non-DMA
+              # `crates/tensor/tests/*.rs`: logical_shape, map_access,
+              # no_global_state, scenarios, plus `d3d11_tensor` --
+              # `#![cfg(target_os = "windows")]`-gated, empty here
+              # regardless of routing). None of these exercise the GPU/DMA
+              # hardware this lane exists for; they are already covered by
+              # `Test (aarch64)`, which runs the full `--workspace` set on
+              # real hardware. The fourteen `edgefirst-image`
+              # `[[bench]]` targets (image_benchmark, ...) are NOT here:
+              # every one is `harness = false` with no explicit
+              # `test = true`, so cargo's default (`test = false` for a
+              # bench target) means nextest never builds them as test
+              # binaries in the first place -- there is nothing from them
+              # to skip.
               echo "=== Skipping $test_name (CPU-only, covered by aarch64 runner) ==="
             fi
           done
-          ran=$(find build/rust-test-results -name '*.txt' | wc -l)
+          ran=$(find build/rust-test-results -maxdepth 1 -name '*.txt' | wc -l)
           if [ "$ran" -eq 0 ]; then
             echo "::error::imx8mp hardware lane executed 0 test binaries"
             exit 1

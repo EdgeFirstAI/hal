@@ -308,18 +308,36 @@ for i in "${!OK_HOSTS[@]}"; do
     echo "SKIP: binary sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue; }
 
   if [[ "${SYNC_TESTDATA}" == "1" && -d "${ROOT}/testdata" ]]; then
-    echo "    syncing testdata"
-    rsync -az --delete --info=none "${ROOT}/testdata/" "${target}:${REMOTE_DIR}/testdata/" || {
-      echo "SKIP: testdata sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue; }
-
     # Per-crate testdata (e.g. `crates/decoder/testdata/infer/`) merges into
-    # the SAME remote testdata/ tree above, not a separate location: every
+    # the SAME remote testdata/ tree below, not a separate location: every
     # `EDGEFIRST_TESTDATA_DIR`-aware fixture loader resolves relative to one
     # deploy root (see e.g. `infer.rs`'s `infer_fixture_dir()`), so a second
-    # root here would just be a place fixtures are never looked for. No
-    # `--delete`: each crate contributes a disjoint subtree of the merged
-    # tree, so a stale file left by a DIFFERENT crate's sync must not be
-    # pruned by this one.
+    # root here would just be a place fixtures are never looked for.
+    #
+    # The root sync below runs with `--delete` (to prune fixtures this repo
+    # no longer ships), which would otherwise delete every merged crate
+    # subtree on every single invocation -- it isn't present in the LOCAL
+    # `${ROOT}/testdata/` source, so `--delete` reads it as removed on the
+    # remote, immediately undone by the per-crate merge that follows. Excludes
+    # derived from this same `crates/*/testdata` loop keep `--delete` from
+    # ever touching what the merge owns, so a run that doesn't change any
+    # crate's fixtures doesn't re-transfer them either.
+    crate_testdata_excludes=()
+    for crate_testdata in "${ROOT}"/crates/*/testdata; do
+      [[ -d "${crate_testdata}" ]] || continue
+      for entry in "${crate_testdata}"/*; do
+        [[ -e "${entry}" ]] || continue
+        crate_testdata_excludes+=(--exclude "$(basename "${entry}")")
+      done
+    done
+
+    echo "    syncing testdata"
+    rsync -az --delete --info=none "${crate_testdata_excludes[@]}"         "${ROOT}/testdata/" "${target}:${REMOTE_DIR}/testdata/" || {
+      echo "SKIP: testdata sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue; }
+
+    # No `--delete` here: each crate contributes a disjoint subtree of the
+    # merged tree, so a stale file left by a DIFFERENT crate's sync must not
+    # be pruned by this one.
     crate_testdata_sync_failed=0
     for crate_testdata in "${ROOT}"/crates/*/testdata; do
       [[ -d "${crate_testdata}" ]] || continue
