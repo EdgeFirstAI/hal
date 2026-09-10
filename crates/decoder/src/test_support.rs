@@ -20,11 +20,12 @@
 /// it.
 ///
 /// `cfg(target_arch = "aarch64")`, not just `cfg(test)`: this crate's only
-/// call site today is `per_scale/kernels/neon_baseline.rs`, whose whole
-/// file is `#![cfg(target_arch = "aarch64")]` (NEON kernels have no other
-/// target). An unconditional `pub(crate) fn` here would be dead code on
-/// x86_64 and fail a `-D warnings` build there. Widen this if a
-/// non-aarch64 caller is ever added.
+/// call site today is `per_scale/kernels/neon_baseline.rs`, whose module
+/// declaration in `per_scale/kernels/mod.rs` carries an outer
+/// `#[cfg(target_arch = "aarch64")]` (NEON kernels have no other target),
+/// so the file compiles only on aarch64. An unconditional `pub(crate) fn`
+/// here would be dead code on x86_64 and fail a `-D warnings` build there.
+/// Widen this if a non-aarch64 caller is ever added.
 #[cfg(all(test, target_arch = "aarch64"))]
 pub(crate) fn report_skip(reason: &str) {
     use std::io::Write;
