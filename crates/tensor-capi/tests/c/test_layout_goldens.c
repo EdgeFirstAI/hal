@@ -56,4 +56,14 @@ _Static_assert(offsetof(ef_quantization_info, axis) == 0, "");
 _Static_assert(offsetof(ef_quantization_info, count) == 4, "");
 _Static_assert(offsetof(ef_quantization_info, has_quantization) == 8, "");
 
+/* Three pointer-sized members at align 8. Frozen forever: this vocabulary
+ * declines a struct_size handshake, so a field added here is a new suffixed
+ * struct, never an edit. Mirrored by offset_of! assertions in
+ * edgefirst-tensor-abi's own tests. */
+_Static_assert(sizeof(ef_client_state) == 24, "client state frozen at 24");
+_Static_assert(_Alignof(ef_client_state) == 8, "client state align 8");
+_Static_assert(offsetof(ef_client_state, ctx) == 0, "");
+_Static_assert(offsetof(ef_client_state, retain) == 8, "");
+_Static_assert(offsetof(ef_client_state, release) == 16, "");
+
 int main(void) { return 0; }

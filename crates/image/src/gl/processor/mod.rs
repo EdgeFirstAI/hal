@@ -1032,6 +1032,54 @@ fn pack_row_length(tight_row: usize, stride: usize, pixel_bytes: usize) -> Optio
     i32::try_from(stride / pixel_bytes).ok()
 }
 
+/// `GL_UNPACK_ROW_LENGTH` for a source whose rows sit `stride` bytes apart, or
+/// `0` for a tight source (GL's own "rows are `width` pixels" default).
+///
+/// The upload counterpart of [`pack_row_length`], and it refuses where that
+/// one falls back: a readback whose pitch is not a whole number of pixels can
+/// be read tight and spread afterwards, but an *upload* has no equivalent --
+/// GL would have to read pixels that are not there. Truncating the division
+/// instead is silent corruption: `UNPACK_ROW_LENGTH` counts PIXELS, so a
+/// 64-byte-aligned RGB pitch of 1024 truncates to 341 and GL advances 1023
+/// bytes per row, shearing the image by one byte per row with the right shape,
+/// the right byte count, and no error. Refuse the source instead and let the
+/// caller decline to the CPU backend -- what the CPU upload path in
+/// `draw_src_texture` already does with the same wording.
+///
+/// `pixel_bytes` is what one pixel of the *unpack format* occupies (the
+/// channel count for the u8 paths, a fixed 4 for the RGBA-only float PBO arm).
+/// `what` names the format in the refusal.
+///
+/// Reads back to the byte pitch only because `UNPACK_ALIGNMENT` is 1 (set once
+/// in `new`), exactly as [`pack_row_length`] documents for the pack side.
+fn unpack_row_length(
+    stride: Option<usize>,
+    tight_px: usize,
+    pixel_bytes: usize,
+    what: &str,
+) -> Result<i32, Error> {
+    let Some(stride) = stride else {
+        return Ok(0);
+    };
+    if pixel_bytes == 0 || !stride.is_multiple_of(pixel_bytes) {
+        return Err(Error::NotSupported(format!(
+            "source row pitch {stride} B is not a whole number of \
+             {what} pixels ({pixel_bytes} B/px); upload would \
+             shear rows"
+        )));
+    }
+    let px = stride / pixel_bytes;
+    if px == tight_px {
+        return Ok(0);
+    }
+    i32::try_from(px).map_err(|_| {
+        Error::NotSupported(format!(
+            "source row pitch {stride} B is {px} {what} pixels, past what \
+             GL_UNPACK_ROW_LENGTH can express"
+        ))
+    })
+}
+
 /// What a PBO readback has to know about its destination before it can issue
 /// the `glReadPixels`: the pitch to place the rows at, the bytes they will
 /// occupy, and the `GL_PACK_ROW_LENGTH` that expresses the pitch -- `None`
@@ -2407,16 +2455,15 @@ impl GLProcessorST {
         let crop = Self::int8_bias_clear(is_int8, crop);
 
         let start = Instant::now();
-        match src.as_pbo() {
-            Some(src_pbo) => {
+        match src.pbo_id() {
+            Some(src_buffer_id) => {
                 // A PBO source uploads via its UNPACK binding — mapping it on
                 // the GL thread would deadlock on the Pbo message round-trip.
-                if src_pbo.is_mapped() {
+                if src.pbo_is_mapped() == Some(true) {
                     return Err(crate::Error::OpenGl(
                         "Cannot convert from a mapped PBO tensor".to_string(),
                     ));
                 }
-                let src_buffer_id = src_pbo.buffer_id();
                 self.draw_src_texture_from_pbo(
                     src,
                     src_fmt,
@@ -2481,8 +2528,8 @@ impl GLProcessorST {
             );
         }
         let pbo_buffer_id = if memory == TensorMemory::Pbo {
-            match dst.as_pbo() {
-                Some(p) if !p.is_mapped() => Some(p.buffer_id()),
+            match (dst.pbo_id(), dst.pbo_is_mapped()) {
+                (Some(id), Some(false)) => Some(id),
                 _ => None,
             }
         } else {
@@ -2637,8 +2684,8 @@ impl GLProcessorST {
             );
         }
         let pbo_buffer_id = if memory == TensorMemory::Pbo {
-            match dst.as_pbo() {
-                Some(p) if !p.is_mapped() => Some(p.buffer_id()),
+            match (dst.pbo_id(), dst.pbo_is_mapped()) {
+                (Some(id), Some(false)) => Some(id),
                 _ => None,
             }
         } else {
@@ -3009,17 +3056,16 @@ impl GLProcessorST {
                 Ok(DstTarget::ZeroCopyImage)
             }
             super::render::DstLowering::TexturePbo => {
-                let dst_pbo = dst.as_pbo().ok_or_else(|| {
+                let id = dst.pbo_id().ok_or_else(|| {
                     crate::Error::OpenGl(
                         "bind_dst: PBO-lowered destination is not a PBO tensor".to_string(),
                     )
                 })?;
-                if dst_pbo.is_mapped() {
+                if dst.pbo_is_mapped() == Some(true) {
                     return Err(crate::Error::OpenGl(
                         "Cannot convert to a mapped PBO tensor".to_string(),
                     ));
                 }
-                let id = dst_pbo.buffer_id();
                 self.setup_renderbuffer_from_pbo(dst, dst_fmt, id)?;
                 Ok(DstTarget::Texture {
                     readback: DstReadback::Pbo(id),
@@ -3734,6 +3780,7 @@ impl GLProcessorST {
     /// # Safety (caller responsibility)
     /// `internal_format`, `client_format`, and `gl_type` must form a valid
     /// `TexImage2D` combination for the bound GLES context.
+    #[allow(clippy::too_many_arguments)]
     fn setup_renderbuffer_from_pbo_inner(
         &mut self,
         width: i32,
@@ -3742,6 +3789,7 @@ impl GLProcessorST {
         internal_format: u32,
         client_format: u32,
         gl_type: u32,
+        row_length: Option<i32>,
     ) -> crate::Result<()> {
         self.convert_fbo.bind();
         unsafe {
@@ -3752,7 +3800,23 @@ impl GLProcessorST {
 
             // Upload existing PBO content to the render texture.
             // Binding PBO as UNPACK buffer makes TexImage2D read from it.
+            //
+            // `row_length` is the destination's own pitch expressed in pixels
+            // (`None` when its rows are tight, or when the pitch is not a
+            // whole number of pixels and GL therefore cannot express it --
+            // the same limit `plan_pbo_readback` works around on the way
+            // back out). Without it a pitch-aligned destination is read back
+            // to back and the seed shears.
+            //
+            // The `pixels` argument stays 0: with a buffer bound it is a byte
+            // offset, and the only destinations that would need a non-zero
+            // one -- a `view()`, or any tensor carrying a plane offset -- are
+            // refused before the readback by `plan_pbo_readback`, so none
+            // reaches here.
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, buffer_id);
+            if let Some(px) = row_length {
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, px);
+            }
             edgefirst_gl::gl::TexImage2D(
                 edgefirst_gl::gl::TEXTURE_2D,
                 0,
@@ -3764,6 +3828,9 @@ impl GLProcessorST {
                 gl_type,
                 std::ptr::null(),
             );
+            if row_length.is_some() {
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
+            }
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
             // TexImage2D overwrites any EGLImage binding on this texture.
             self.render_texture.invalidate_egl_binding();
@@ -3828,6 +3895,22 @@ impl GLProcessorST {
             }
         };
 
+        // The seed reads the destination's CURRENT bytes, so it has to know
+        // how far apart its rows are. `pack_row_length`'s rule is the same on
+        // this side as on the readback's: `None` for a tight pitch (nothing
+        // to express) and for one that is not a whole number of pixels (GL
+        // cannot express it either way -- the readback reads tight and
+        // spreads afterwards; there is no equivalent for an upload).
+        let px_bytes = match format {
+            edgefirst_gl::gl::RGBA => 4,
+            edgefirst_gl::gl::RGB => 3,
+            _ => 1, // RED: Grey, and every plane of a planar destination
+        };
+        let tight_row = width as usize * px_bytes;
+        let row_length = dst
+            .effective_row_stride()
+            .and_then(|stride| pack_row_length(tight_row, stride, px_bytes));
+
         self.setup_renderbuffer_from_pbo_inner(
             width,
             height,
@@ -3835,14 +3918,18 @@ impl GLProcessorST {
             format,
             format,
             edgefirst_gl::gl::UNSIGNED_BYTE,
+            row_length,
         )
     }
 
     /// Upload source image from a PBO and render to the current framebuffer.
     /// This is the PBO equivalent of draw_src_texture — instead of mapping
     /// the tensor to CPU and calling glTexImage2D with a data pointer, we
-    /// bind the source PBO as GL_PIXEL_UNPACK_BUFFER and pass NULL, causing
-    /// GL to read directly from the PBO (zero CPU copy).
+    /// bind the source PBO as GL_PIXEL_UNPACK_BUFFER and pass the source's
+    /// own byte offset into it, causing GL to read directly from the PBO
+    /// (zero CPU copy). With a buffer bound, that argument is an offset
+    /// rather than an address, so a `view()` -- which shares its parent's
+    /// buffer id -- names its own window there and nowhere else.
     #[allow(clippy::too_many_arguments)]
     fn draw_src_texture_from_pbo(
         &mut self,
@@ -3972,16 +4059,39 @@ impl GLProcessorST {
             // non-PBO `draw_src_texture` path (GL_UNPACK_ROW_LENGTH in pixels);
             // 0 means "tightly packed = src_w". Without this a padded PBO source
             // shears on every row after the first.
+            // `unpack_row_length`, not `stride / bpp`: that division
+            // TRUNCATES, and this state counts pixels. A 64-byte-aligned RGB
+            // pitch (1024 B) becomes 341 px = 1023 B and every row after the
+            // first lands a byte early -- right shape, right byte count,
+            // sheared image, no error. The CPU upload path below already
+            // refuses such a pitch; an externally wrapped PBO (`set_row_stride`
+            // takes any pitch at or above the minimum, and
+            // `ef_tensor_wrap_pbo` hands one straight in) reaches this arm
+            // instead, so the same rule has to hold here.
             let src_bpp = src_fmt.channels();
-            let row_len_px = src
-                .effective_row_stride()
-                .map(|s| s / src_bpp)
-                .filter(|&px| px != src_w)
-                .unwrap_or(0);
+            let row_len_px = unpack_row_length(
+                src.effective_row_stride(),
+                src_w,
+                src_bpp,
+                &format!("{src_fmt:?}"),
+            )?;
+
+            // Where this source's first pixel sits inside the GL buffer. A
+            // `view()` of a PBO shares its parent's buffer id and names its
+            // sub-region with `plane_offset` + the parent's pitch (carried
+            // by `row_len_px` above), so an upload that always started at
+            // byte 0 converted the parent's top-left tile in place of the
+            // region the caller asked for -- silently, and identically for
+            // every view of one buffer. Issue #162's second half: Stage B
+            // made the view stay PBO-backed, and this is what makes it read
+            // its own pixels. With a buffer bound to `PIXEL_UNPACK_BUFFER`
+            // the `pixels` argument is a byte offset into that buffer, not
+            // an address, which is why this is the whole fix.
+            let src_offset = src.plane_offset().unwrap_or(0);
 
             // Bind source PBO as UNPACK buffer — glTexImage2D reads from it
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
-            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
+            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, row_len_px);
             edgefirst_gl::gl::TexImage2D(
                 texture_target,
                 0,
@@ -3991,7 +4101,7 @@ impl GLProcessorST {
                 0,
                 texture_format,
                 edgefirst_gl::gl::UNSIGNED_BYTE,
-                std::ptr::null(), // NULL = read from bound UNPACK buffer
+                src_offset as *const c_void, // offset into the bound UNPACK buffer
             );
             edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
@@ -5638,30 +5748,20 @@ impl GLProcessorST {
                 // pixels) — decline to the CPU backend rather than upload
                 // sheared rows. Reachable on Android, where gralloc may pad
                 // the RGB-in-RGBA8888 surface to a byte pitch that 3 does
-                // not divide.
-                if let Some(s) = src.effective_row_stride() {
-                    if !s.is_multiple_of(src_bpp) {
-                        return Err(Error::NotSupported(format!(
-                            "source row pitch {s} B is not a whole number of \
-                             {src_fmt:?} pixels ({src_bpp} B/px); upload would \
-                             shear rows"
-                        )));
-                    }
-                }
+                // not divide. `unpack_row_length` is the one place that rule
+                // lives, shared with the two PBO upload arms.
+                let row_len_px = unpack_row_length(
+                    src.effective_row_stride(),
+                    src_w,
+                    src_bpp,
+                    &format!("{src_fmt:?}"),
+                )?;
                 self.convert_stats.src_uploads += 1;
                 tracing::Span::current().record("src_feed", "upload");
                 // Map before touching pixel-store state: a `?` here must not
                 // leave `UNPACK_ROW_LENGTH` set for the next upload.
                 let pixels = src.map_read()?;
-                let row_len_px = src
-                    .effective_row_stride()
-                    .map(|s| s / src_bpp)
-                    .filter(|&px| px != src_w)
-                    .unwrap_or(0);
-                edgefirst_gl::gl::PixelStorei(
-                    edgefirst_gl::gl::UNPACK_ROW_LENGTH,
-                    row_len_px as i32,
-                );
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, row_len_px);
                 // What GL will read: every row but the last at the stride
                 // `UNPACK_ROW_LENGTH` just set, plus the last row's own
                 // pixels. `UNPACK_ALIGNMENT` is 1, so no row is padded
@@ -5669,7 +5769,7 @@ impl GLProcessorST {
                 let row_stride_b = if row_len_px == 0 {
                     src_w * src_bpp
                 } else {
-                    row_len_px * src_bpp
+                    row_len_px as usize * src_bpp
                 };
                 let required = if src_h == 0 {
                     0
@@ -6012,7 +6112,7 @@ impl GLProcessorST {
                     // the GL thread deadlocks (the buffer is GL-owned). PBO sources
                     // go through `draw_src_texture_from_pbo`; guard the invariant
                     // locally rather than relying solely on the dispatch call graph.
-                    if src.as_pbo().is_some() {
+                    if src.pbo_id().is_some() {
                         return Err(Error::NotSupported(
                             "NV R8 upload cannot map a PBO source on the GL thread; \
                              route PBO sources through the PBO upload path"
@@ -8069,7 +8169,8 @@ impl GLProcessorST {
 mod tests {
     use super::{
         pack_row_length, padded_readback_bytes, plan_pbo_readback, resolve_egl_cache_capacity,
-        should_reject_software_gl, spread_rows, DEFAULT_EGL_CACHE_CAPACITY,
+        should_reject_software_gl, spread_rows, unpack_row_length, Error,
+        DEFAULT_EGL_CACHE_CAPACITY,
     };
 
     /// A tight destination is the common case and must not be touched: the
@@ -8149,6 +8250,44 @@ mod tests {
         // A single-byte pixel divides every pitch.
         assert_eq!(pack_row_length(16, 17, 1), Some(17));
         assert_eq!(pack_row_length(16, 17, 0), None);
+    }
+
+    /// The upload rule, which REFUSES where the pack side falls back: GL has
+    /// no read-tight-and-spread for an upload, and `UNPACK_ROW_LENGTH` counts
+    /// pixels, so a pitch no pixel size divides has to be declined rather
+    /// than truncated. The 1024/3 case is the one the padded-RGB PBOs hit.
+    #[test]
+    fn unpack_row_length_refuses_a_pitch_that_is_not_whole_pixels() {
+        // No recorded pitch: GL's own default, nothing to express.
+        assert!(matches!(unpack_row_length(None, 64, 4, "Rgba"), Ok(0)));
+        // A tight pitch resolves to the same width GL already assumes.
+        assert!(matches!(unpack_row_length(Some(256), 64, 4, "Rgba"), Ok(0)));
+        // RGBA at a 64-byte-aligned pitch: 80 pixels per row.
+        assert!(matches!(
+            unpack_row_length(Some(320), 64, 4, "Rgba"),
+            Ok(80)
+        ));
+        // A single-byte pixel divides every pitch.
+        assert!(matches!(unpack_row_length(Some(17), 16, 1, "Grey"), Ok(17)));
+        // RGB at a 64-byte-aligned pitch: 3 does not divide 1024. Truncating
+        // would give 341 px = 1023 B and shear every row by a byte.
+        let Err(e) = unpack_row_length(Some(1024), 341, 3, "Rgb") else {
+            panic!("a pitch that is not a whole number of pixels must be refused");
+        };
+        assert!(
+            matches!(e, Error::NotSupported(ref m) if m.contains("1024") && m.contains("Rgb")),
+            "unexpected error: {e:?}"
+        );
+        // Likewise an RGBA pitch 4 does not divide -- the float PBO arm's case.
+        assert!(matches!(
+            unpack_row_length(Some(1026), 256, 4, "RGBA"),
+            Err(Error::NotSupported(_))
+        ));
+        // A zero pixel size cannot describe anything.
+        assert!(matches!(
+            unpack_row_length(Some(16), 16, 0, "Rgba"),
+            Err(Error::NotSupported(_))
+        ));
     }
 
     /// The planner is the one place a PBO readback decides what it may write,

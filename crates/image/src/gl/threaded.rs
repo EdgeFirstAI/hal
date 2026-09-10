@@ -1502,8 +1502,7 @@ mod tests {
                 return;
             }
         };
-        let pbo_a = tensor_a.as_pbo().expect("just created a PBO tensor");
-        let buffer_id = pbo_a.buffer_id();
+        let buffer_id = tensor_a.pbo_id().expect("just created a PBO tensor");
         let size = tensor_a.capacity_bytes();
         let shape = tensor_a.shape().to_vec();
 

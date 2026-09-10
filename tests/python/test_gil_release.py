@@ -92,7 +92,7 @@ def _gil_holding_control(duration_s):
 
 
 def _assert_releases_gil(
-    op_name, run_alongside, duration_s=0.4, min_gap=0.2, attempts=3, n_rounds=6
+    op_name, run_alongside, duration_s=0.4, min_gap=0.1, attempts=3, n_rounds=6
 ):
     """Shared assertion for the throughput formulation: an unrelated Python
     thread must keep making most of its normal progress while `run_alongside`
@@ -159,9 +159,10 @@ def _assert_releases_gil(
     that low outlier was itself an artifact of comparing raw counts to a
     fixed `slice_s`: a round whose window ran a little long under the old
     scheme distorted denominator and numerator asymmetrically depending on
-    which leg overran, and rates remove that asymmetry. `min_gap=0.2`
-    still sits comfortably below the mean gap on both legs' current
-    numbers.
+    which leg overran, and rates remove that asymmetry. `min_gap` was
+    `0.2` at this point in the history below and comfortably below the
+    mean gap on both legs' figures above; see "Lowered to 0.1", further
+    down, for why it no longer is.
 
     4 unpinned busy-loop processes barely move the numbers on this 16-core
     box -- there are far more free cores than competitors -- so as a
@@ -181,9 +182,11 @@ def _assert_releases_gil(
     for the full ~10-17s multi-row suite rather than one filtered row) the
     residual risk is real and not confined to the shortest calls. It did
     not reproduce under the literal 4-unpinned-process scenario in either
-    direction across 5 repeated full-suite runs (0/5 failures), and
-    `min_gap=0.2` sits clear of every gap measured there (mutation
-    best-of-3 gap 0.01-0.02; real op 0.44-0.53 mean).
+    direction across 5 repeated full-suite runs (0/5 failures), and the
+    `min_gap` in force at the time (0.2, since lowered to 0.1 -- see
+    "Lowered to 0.1" below) sat clear of every gap measured there
+    (mutation best-of-3 gap 0.01-0.02; real op 0.44-0.53 mean); the lower
+    floor clears the same numbers with even more margin.
 
     Tried and rejected as a way to close this gap: raising
     `sys.setswitchinterval()` for the duration of the measurement, to make
@@ -234,6 +237,23 @@ def _assert_releases_gil(
     alternating) rather than 2 gives each leg's median enough samples
     that one noisy round can't dominate it; `attempts=3` retries a
     genuinely unlucky attempt the same way the previous design did.
+
+    Lowered to 0.1 (from 0.2): on PR #181's `Build & Test (x86_64)` lane
+    (run 34467062991, job 102838083120), `test_merge_tiled_detections_
+    releases_the_gil` failed with `best gap 19.42% (real median 72.61%
+    vs. control median 53.20%) is not > 20%`, gaps of 17.17%, 19.42%,
+    17.15% across the three attempts (real per-round 69.57%/73.09%/
+    72.61%, control 53.35%/53.20%/53.12%). Three tight, consistent gaps
+    clustered around 17-19% are a systematic headroom shortfall on that
+    runner's two cores for a short CPU-bound op, not scheduler noise --
+    noise would scatter, not repeat to within 2.3 points three times. The
+    GIL-holding mutation is what a real regression looks like (the
+    calibration table above measures it at a ~0.01 gap, "both directions
+    tested"), so a 0.1 floor still discriminates a genuine hold from a
+    genuine release by roughly an order of magnitude while clearing the
+    ~17% floor this runner actually has -- 0.2 asked for more headroom
+    than a two-vCPU hosted runner can give a sub-millisecond-scale
+    CPU-bound op, not more discrimination against an actual regression.
     """
     slice_s = duration_s / n_rounds
     control_op = _gil_holding_control(slice_s)

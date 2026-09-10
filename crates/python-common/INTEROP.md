@@ -130,8 +130,9 @@ row.
 The other backings are not silently affected: `Mem`/`Shm` report
 `kind::HOST` and take the pinned-pointer path; Android reports
 `kind::DMABUF` whose import arm is Linux-only, so it fails loudly instead of
-reconstructing; and a `view()` of a PBO-backed image comes back as host
-memory, so it never reaches the PBO arm. See
+reconstructing; and a `view()` of a PBO-backed image now stays PBO-backed,
+so it does reach the PBO arm and carries its own offset (it used to demote
+to host memory and bypass that arm entirely — issues #161 and #162). See
 `interop::apply_plane_offset`'s doc comment for the full per-backing
 accounting, including the caller audit that showed no other
 `set_plane_offset` caller can reach either backing.
@@ -239,6 +240,16 @@ still pins host memory, but no consumer can reach the pixels through that
 address, because the pixels live in the texture. The pin is a keepalive and
 nothing more. A consumer that wants the bytes imports the descriptor and maps
 the imported tensor.
+
+The `PBO` kind's `ptr` still carries a `PboOpsVtable` address, but that vtable
+now embeds an `ef_client_state` — an opaque context plus a `retain`/`release`
+pair — alongside the map and unmap function pointers. A consumer's
+reconstruction takes its own reference on that channel through `retain`, so it
+no longer depends on the producer's keepalive still being held: a reconstructed
+PBO tensor keeps the buffer's map and unmap reachable even after the producing
+tensor and its capsule are gone. `retain` and `release` govern the channel
+only. The producer's own destructor stays the sole caller of `glDeleteBuffers`,
+and a reconstructed tensor's delete operation is a no-op.
 
 ### Carrying a texture between processes
 
@@ -382,6 +393,25 @@ misread at `_v2`'s larger layout.
 
 Once 0.31.0 ships, `_v2` is frozen on the same terms `_v1` was: the next
 payload change, however small, is `_v3`.
+
+**The `ef_client_state` work needs no rename; the name stays
+`edgefirst_tensor_v2`.** `TensorCapsulePayload`'s layout is unchanged by it —
+the only layout that moved is `PboOpsVtable`'s, which is not part of the
+payload. That struct crosses solely between separately-compiled copies of
+`edgefirst-tensor` inside one process, and those copies ship as a single
+release set; `_v2` itself is unreleased until 0.31.0 ships, so no mismatched
+pair can exist in the field. That freedom expires with the release:
+`PboOpsVtable` grew from 24 to 40 bytes here under an unchanged
+`protocol::ABI_VERSION` of `1` and an unchanged capsule name, and that was
+only safe because `_v2` had never shipped. **Any further change to
+`PboOpsVtable`'s layout after 0.31.0 ships must bump the capsule name**, on
+the same terms as a `TensorCapsulePayload` change — once a `_v2` producer
+exists in the field, a differently-sized vtable behind an unchanged name is
+read at the wrong offsets with nothing to catch it. `TensorCapsulePayload::pbo_keepalive` is now
+belt-and-braces rather than load-bearing, because the importer holds its own
+channel reference. Retiring it is a payload change and therefore takes the
+capsule name with it, so that decision belongs to Stage E — still before
+0.31.0 ships, and therefore still free.
 
 The descriptor's own `version` field is `ABI_VERSION` (currently `1`,
 checked by `TensorDyn::import_descriptor` in

@@ -20,10 +20,10 @@ use std::ffi::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_tensor::{CpuAccess, TensorMapTrait};
-use edgefirst_tensor_abi::EfTensorView;
+use edgefirst_tensor_abi::{EfErrorClass, EfTensorView};
 
 use crate::handle::{impl_of, EfTensor};
-use crate::last_error::{set_last_error, shield_int};
+use crate::last_error::{set_last_error, set_last_error_classified, shield_int};
 
 /// The live state behind an outstanding `ef_tensor_map`.
 ///
@@ -260,17 +260,33 @@ unsafe fn map_window(
             if access.writes() {
                 let refs = imp.refs.load(std::sync::atomic::Ordering::Acquire);
                 if refs > 1 {
-                    set_last_error(&format!(
-                        "{what}: write map refused: tensor handle is shared (refcount \
+                    // `InvalidOperation`, not `Unspecified`: the vocabulary's
+                    // own word for "legal, but not permitted right now -- a
+                    // live map, a shared handle". A caller that must
+                    // distinguish this from a malformed argument cannot be
+                    // asked to parse the advisory message, whose contract is
+                    // "never parse this".
+                    set_last_error_classified(
+                        EfErrorClass::InvalidOperation,
+                        &format!(
+                            "{what}: write map refused: tensor handle is shared (refcount \
                      {refs}); write access requires a unique handle"
-                    ));
+                        ),
+                    );
                     return libc::EBUSY;
                 }
             }
             if slot.is_some() {
-                set_last_error(&format!(
-                    "{what}: a map is already outstanding on this tensor"
-                ));
+                // Stage B, controller ruling 2: a second concurrent map on
+                // one handle fails LOUDLY -- the outstanding guard is never
+                // dropped or replaced. A PBO's own `PboHandle` does support N
+                // concurrent readers, but routed through this entry point it
+                // gets the same one-guard rule as every other backing, and a
+                // caller that hits it is told which rule it hit.
+                set_last_error_classified(
+                    EfErrorClass::InvalidOperation,
+                    &format!("{what}: a map is already outstanding on this tensor"),
+                );
                 return libc::EBUSY;
             }
             let mapped = if non_blocking {
@@ -848,6 +864,73 @@ mod tests {
              on the Mem backend"
         );
         assert_eq!(unsafe { ef_tensor_unmap(t) }, 0);
+        unsafe { ef_tensor_free(t) };
+    }
+
+    /// Stage B, controller ruling 2: a second concurrent map on one handle
+    /// must fail *loudly* -- never drop the outstanding guard, never
+    /// silently replace it. `EBUSY` alone was already the return; the class
+    /// was `Unspecified`, which a caller cannot distinguish from "some
+    /// unclassified failure". `InvalidOperation` is the vocabulary's own
+    /// word for "legal, but not permitted right now -- a live map".
+    ///
+    /// This matters most for a PBO-backed handle, whose `PboHandle` does
+    /// support N concurrent readers directly; routed through
+    /// `ef_tensor_map` it gets this one-guard rule instead, the same rule
+    /// every other backing already has. No in-tree caller holds two maps on
+    /// one handle (the tiling and convert paths take a separate tensor per
+    /// plane or per tile), so nothing loses a working path -- but a caller
+    /// that tries must be told which rule it hit.
+    #[test]
+    fn a_second_map_on_one_handle_is_refused_with_a_classified_error() {
+        let dims = [2u64, 2];
+        let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 2) };
+        let mut first = empty_view();
+        assert_eq!(unsafe { ef_tensor_map(t, 1, &mut first) }, 0);
+
+        let mut second = empty_view();
+        assert_eq!(
+            unsafe { ef_tensor_map(t, 1, &mut second) },
+            libc::EBUSY,
+            "a second outstanding map on one handle must be refused"
+        );
+        assert_eq!(
+            crate::last_error::last_class(),
+            edgefirst_tensor_abi::EfErrorClass::InvalidOperation,
+            "the refusal must be classified, not left Unspecified for the \
+             caller to parse out of the message"
+        );
+        assert!(
+            second.ptr.is_null() && second.len == 0,
+            "the refused map must not hand back a view"
+        );
+
+        // The first map is untouched: it still unmaps cleanly.
+        assert_eq!(unsafe { ef_tensor_unmap(t) }, 0);
+        unsafe { ef_tensor_free(t) };
+    }
+
+    /// The shared-handle write gate is the same failure class: the map is
+    /// legal, just not permitted while another handle holds a reference.
+    #[test]
+    fn a_write_map_on_a_shared_handle_is_refused_with_a_classified_error() {
+        let dims = [2u64, 2];
+        let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 2) };
+        let second_ref = unsafe { crate::handle::ef_tensor_retain(t) };
+        assert_eq!(second_ref, 0, "retain must succeed");
+
+        let mut view = empty_view();
+        assert_eq!(
+            unsafe { ef_tensor_map(t, 2, &mut view) },
+            libc::EBUSY,
+            "a writable map on a shared handle must be refused"
+        );
+        assert_eq!(
+            crate::last_error::last_class(),
+            edgefirst_tensor_abi::EfErrorClass::InvalidOperation,
+        );
+
+        unsafe { ef_tensor_free(t) };
         unsafe { ef_tensor_free(t) };
     }
 }

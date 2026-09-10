@@ -846,6 +846,31 @@ environment variable from the table below and re-run with
 | `EDGEFIRST_FORCE_TRANSFER=sync` | Memcpy upload/readback via `glTexImage2D` / `glReadnPixels` | Non-zero-copy baseline; useful for measuring fast-path cost |
 | `EDGEFIRST_TENSOR_FORCE_MEM=1` | Forces heap tensors; disables DMA / SHM | Pure-CPU regression baseline |
 
+**The four PBO correctness gates need none of these.** They allocate through
+`GLProcessorThreaded::create_pbo_image`, which returns a PBO regardless of what
+the host's DMA-BUF import can do, and each asserts its route positively through
+`convert_stats()` — one PBO source feed, zero CPU uploads, zero imports — so a
+GL decline is a hard failure rather than a quiet CPU-fallback pass. They are
+plain `--lib` tests and therefore already in the default run on every lane, and
+they pass unforced, under `EDGEFIRST_FORCE_TRANSFER=pbo`, and under
+`EDGEFIRST_FORCE_TRANSFER=dmabuf` alike:
+
+```bash
+cargo test -p edgefirst-image --lib -- --exact \
+  opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_gl \
+  opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_to_f32_gl \
+  opengl_headless::tests::gl_tests::a_padded_pbo_source_does_not_shear_the_f32_upload \
+  opengl_headless::tests::gl_tests::a_padded_pbo_destination_is_written_at_its_own_pitch
+```
+
+An earlier revision of these gates entered through `ImageProcessor::convert`
+with `ComputeBackend::OpenGl`, which leaves `forced_backend` at `None` — a GL
+decline logged at debug and the CPU fallback produced a bit-exact answer, so
+the gate went green with zero GL coverage. That is the hazard the route
+assertion exists to remove; a GL test that compares against a CPU-computable
+expectation without asserting `convert_fallback_count()` or its route can pass
+without ever touching the GPU.
+
 ### Warm up before measuring
 
 The first few frames through a pipeline pay one-time costs that do not

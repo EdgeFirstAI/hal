@@ -37,6 +37,7 @@ pub mod last_error;
 pub mod log;
 pub mod map;
 pub mod mutate;
+pub mod pbo;
 pub mod probe;
 pub mod quant;
 pub mod serialize;

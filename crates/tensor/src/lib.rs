@@ -176,7 +176,10 @@ pub use crate::d3d11::geometry::{d3d11_shared_handle_geometry, d3d11_texture_geo
 pub use crate::iosurface_layout::image_iosurface_layout;
 #[cfg(feature = "static")]
 pub(crate) use crate::mem::MemTensor;
-pub use crate::pbo::{PboMapping, PboOps, PboTensor};
+pub use crate::pbo::{
+    client_state_pbo_ops, read_pbo_vtable_parts, EfClientState, EfPboMapFn, EfPboUnmapFn,
+    PboClientParts, PboMapping, PboOps, PboOpsVtableParts, PboTensor,
+};
 #[cfg(all(unix, feature = "static"))]
 pub(crate) use crate::shm::ShmTensor;
 pub use cuda::{
@@ -3090,24 +3093,14 @@ where
                  handoff pass the buffer itself."
                     .to_owned(),
             )),
-            // PBO is the same shape of constraint as AHardwareBuffer:
-            // glMapBufferRange's pointer is valid only until glUnmapBuffer, and
-            // this backend maps with MAP_READ_BIT | MAP_WRITE_BIT -- no
-            // GL_MAP_PERSISTENT_BIT, and no glBufferStorage anywhere. Holding
-            // the map open for the pin's lifetime would keep the buffer mapped
-            // across GL work, which is exactly what a PBO is not for.
-            //
-            // Persistent mapping (EXT_buffer_storage on GLES) would make this
-            // implementable, but that is a buffer-allocation feature, not
-            // wiring -- it changes how every PBO is created and needs fences
-            // for coherency.
+            // PBO is the same shape of constraint as AHardwareBuffer. The
+            // message is a shared constant because `TensorDyn::pin_host`
+            // (`tensor_dyn/dynamic_backend.rs`) must repeat this refusal --
+            // the ABI has `ef_tensor_map` and no `ef_tensor_pin_host`, so the
+            // library cannot tell a pin from a map. See
+            // `crate::pbo::PIN_HOST_PBO_REFUSAL` for the reasoning at length.
             TensorStorage::Pbo(_) => Err(Error::NotImplemented(
-                "pin_host: a PBO has no host address outside \
-                 glMapBufferRange/glUnmapBuffer, so it cannot hand out one that \
-                 outlives a guard. Use map()/map_with(). Persistent mapping \
-                 (EXT_buffer_storage, GL_MAP_PERSISTENT_BIT) is not used by this \
-                 backend."
-                    .to_owned(),
+                crate::pbo::PIN_HOST_PBO_REFUSAL.to_owned(),
             )),
         }?;
         Ok(pin.narrowed(logical))
@@ -4150,7 +4143,27 @@ where
                 // `reshape`'s clear site carries this arm as well.
                 #[cfg(target_os = "windows")]
                 TensorStorage::Dma(ref mut tex) => tex.set_view_offset(0),
-                _ => {}
+                // Paired with the arm in `set_plane_offset`: a setter that
+                // takes effect on this backing needs a clear that does too.
+                // `reshape`'s clear site needs no `Pbo` arm --
+                // `PboTensor::reshape` zeroes `view_offset` itself before the
+                // match there runs, exactly as `IoSurfaceTensor::reshape`
+                // does. `set_logical_shape` deliberately does not, matching
+                // `Mem`.
+                TensorStorage::Pbo(ref mut p) => p.view_offset = 0,
+                // Same pair, `Shm` side. `cfg(unix)` mirrors the `Shm`
+                // variant's own gate on `TensorStorage`, not a per-OS
+                // multiplex -- see the comment on the `set_plane_offset`
+                // arm.
+                #[cfg(unix)]
+                TensorStorage::Shm(ref mut s) => s.set_offset(0),
+                // No-op, pairing with `set_plane_offset`'s Android arm:
+                // nothing writes `AHardwareBufferTensor::view_offset` there
+                // either yet, so there is nothing here for a format change
+                // to clear. See that arm's comment for the full accounting
+                // of the still-incomplete gap.
+                #[cfg(target_os = "android")]
+                TensorStorage::Dma(_) => {}
             }
         }
         self.format = Some(format);
@@ -4650,20 +4663,11 @@ where
         // Note that `TensorStorage::Dma` is a cfg-multiplexed *name* rather
         // than one type -- `DmaTensor` on Linux, `IoSurfaceTensor` on
         // macOS/iOS, `AHardwareBufferTensor` on Android,
-        // `D3d11TextureTensor` on Windows -- so a `cfg`-gated `Dma` arm does
-        // not fail to compile on the other targets, it silently becomes a
-        // fall-through to `_ => {}`. That is how macOS went without one.
-        //
-        // STILL INCOMPLETE: `AHardwareBufferTensor` (Android) and
-        // `PboTensor` each have a `view_offset` that their own `map()` adds
-        // and their own `view()` sets, but nothing writes it here, so they
-        // fall into `_ => {}` and a caller that sets the offset on them gets
-        // a map at the parent's origin. Neither is reachable through
-        // `TensorDyn::import_descriptor` today: Android's `import_storage`
-        // arm is `cfg(target_os = "linux")`, and a PBO `view()` demotes to
-        // host memory before it gets here (issue #162). See
-        // `edgefirst-python-common`'s `interop::apply_plane_offset` for the
-        // full per-backing accounting.
+        // `D3d11TextureTensor` on Windows -- so each platform needs its own
+        // arm below; a missing one would silently become a fall-through
+        // rather than a compile error, which is how macOS went without one
+        // for a while. The match is kept exhaustive (no `_ => {}`)
+        // specifically so that hazard is a compile error, not a silent gap.
         match self.storage {
             TensorStorage::Mem(ref mut m) => m.set_offset(offset),
             #[cfg(target_os = "linux")]
@@ -4686,7 +4690,43 @@ where
             // `d3d11` plane-offset tests in `crates/tensor/tests`.
             #[cfg(target_os = "windows")]
             TensorStorage::Dma(ref mut tex) => tex.set_view_offset(offset),
-            _ => {}
+            // The offset `PboTensor::scoped_pin` adds to the mapped base.
+            // Writing it here is what makes a *reconstructed* view address
+            // its own sub-region instead of the parent buffer's origin;
+            // `PboTensor::view` already set it on the fresh-view path, which
+            // is why only the round trip was ever wrong -- the same shape
+            // IOSurface had. Idempotent against `subview`, which sets the
+            // same absolute value by both routes -- pinned by
+            // `nested_pbo_subviews_do_not_compound_their_plane_offset`.
+            //
+            // Not `cfg`-gated, and deliberately so: unlike
+            // `TensorStorage::Dma` -- a cfg-multiplexed *name* whose gated
+            // arm silently becomes `_ => {}` on the other targets, the
+            // mechanism behind this whole issue class -- `TensorStorage::Pbo`
+            // is one type on every platform.
+            TensorStorage::Pbo(ref mut p) => p.view_offset = offset,
+            // The offset `ShmTensor::map_inner`/`host_pin` add to the mmap
+            // base, exactly like `MemTensor::offset`. `cfg(unix)` here
+            // mirrors `TensorStorage::Shm`'s own gate on the enum
+            // definition -- it is not a per-OS multiplex the way
+            // `TensorStorage::Dma` is, so this arm cannot silently become
+            // `_ => {}` on a target where the `Shm` variant still exists.
+            #[cfg(unix)]
+            TensorStorage::Shm(ref mut s) => s.set_offset(offset),
+            // STILL INCOMPLETE: `AHardwareBufferTensor` (Android) has a
+            // `view_offset` that its own `map()` adds and its own `view()`
+            // sets, but nothing writes it here yet, so restoring an offset
+            // onto an already-built tensor is silently a no-op on this
+            // backing -- a caller gets a map at the parent's origin. Not
+            // reachable through `TensorDyn::import_descriptor` today
+            // (`import_storage`'s DMABUF arm is `cfg(target_os = "linux")`),
+            // so it is latent rather than silent. See
+            // `edgefirst-python-common`'s `interop::apply_plane_offset` for
+            // the full per-backing accounting. PBO and Shm were on this list
+            // until Stage B of the client-side-state work gave them the arms
+            // above.
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(_) => {}
         }
     }
 
@@ -4995,8 +5035,15 @@ where
         }
     }
 
-    /// Downcast to PBO tensor reference (for GL backends).
-    pub fn as_pbo(&self) -> Option<&PboTensor<T>> {
+    /// The wrapped `PboTensor`, for this module's own PBO accessors.
+    ///
+    /// Crate-private: `PboTensor<T>` is a `static`-side value with no
+    /// `dynamic` counterpart to lend (there the buffer lives inside
+    /// `libedgefirst_tensor.so`), so a public borrow of it could not have
+    /// the same signature on both backends. Callers use
+    /// [`Self::pbo_id`]/[`Self::pbo_is_mapped`], which are the whole surface
+    /// `edgefirst-image` ever used.
+    pub(crate) fn as_pbo(&self) -> Option<&PboTensor<T>> {
         match &self.storage {
             TensorStorage::Pbo(p) => Some(p),
             _ => None,
@@ -5008,6 +5055,17 @@ where
     /// PBO-backed.
     pub fn pbo_id(&self) -> Option<u32> {
         self.as_pbo().map(PboTensor::buffer_id)
+    }
+
+    /// Whether this PBO currently holds -- or is establishing -- a CPU
+    /// mapping. `None` when the tensor is not PBO-backed.
+    ///
+    /// The question a GL caller is really asking is "is this buffer free
+    /// for GL operations?", so a map or unmap still in flight answers
+    /// `Some(true)`: the GL side must not touch the buffer until the
+    /// transition finishes. See [`PboTensor::is_mapped`].
+    pub fn pbo_is_mapped(&self) -> Option<bool> {
+        self.as_pbo().map(PboTensor::is_mapped)
     }
 
     /// The C-ABI `PboOpsVtable` address backing this tensor (for the
@@ -5891,12 +5949,35 @@ where
             TensorStorage::Mem(ref mut m) => m.set_offset(0),
             #[cfg(target_os = "linux")]
             TensorStorage::Dma(ref mut dma) => dma.mmap_offset = 0,
-            // `IoSurfaceTensor::reshape` zeroes its own `view_offset`;
-            // `D3d11TextureTensor::reshape` does not, so the clear that
-            // pairs with `set_plane_offset`'s D3D11 arm lives here.
+            // No-op: `IoSurfaceTensor::reshape` (iosurface.rs) zeroes its
+            // own `view_offset` before this match runs.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            TensorStorage::Dma(_) => {}
+            // `D3d11TextureTensor::reshape` does not self-zero, so the clear
+            // that pairs with `set_plane_offset`'s D3D11 arm lives here.
             #[cfg(target_os = "windows")]
             TensorStorage::Dma(ref mut tex) => tex.set_view_offset(0),
-            _ => {}
+            // No-op: `AHardwareBufferTensor::reshape` (ahardwarebuffer.rs)
+            // zeroes its own `view_offset` before this match runs, the same
+            // as `IoSurfaceTensor`. Unlike `set_plane_offset`'s Android arm,
+            // this one is a genuine self-zeroing no-op, not a still-
+            // incomplete gap: `view_offset` never survives a reshape here
+            // regardless of whether `set_plane_offset` can restore it.
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(_) => {}
+            // No-op: `PboTensor::reshape` (pbo.rs) zeroes its own
+            // `view_offset` before this match runs, the same as
+            // `IoSurfaceTensor`/`AHardwareBufferTensor` above -- which is
+            // why, unlike `set_format`'s clear block, this match never
+            // needed a `Pbo` arm that writes anything.
+            TensorStorage::Pbo(_) => {}
+            // Unlike `PboTensor::reshape`, `ShmTensor::reshape` (shm.rs)
+            // only revalidates the element count and swaps `self.shape` --
+            // it never touches `self.offset` -- so this clear site needs
+            // the arm `set_format`'s does. `cfg(unix)` mirrors the `Shm`
+            // variant's own gate, not a per-OS multiplex.
+            #[cfg(unix)]
+            TensorStorage::Shm(ref mut s) => s.set_offset(0),
         }
         Ok(())
     }

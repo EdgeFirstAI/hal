@@ -64,6 +64,15 @@ the descriptor without ever naming the producer's type.
 The capsule owns both the descriptor **and** the producer's `HostPin`, so
 the address stays valid for the capsule's life.
 
+For a PBO-backed tensor the descriptor's `ptr` names a `PboOpsVtable` rather
+than a host address, and that vtable now embeds an `ef_client_state` (an
+opaque context plus a `retain`/`release` pair) beside the map and unmap
+function pointers. A consumer's reconstruction takes its own reference on that
+channel, so it no longer depends on the producer's keepalive still being held.
+The payload layout is unchanged by this, so the capsule name stays
+`edgefirst_tensor_v2`; see INTEROP.md § Versioning for why, and for why
+retiring the now-redundant `pbo_keepalive` field is a separate decision.
+
 ## PEP 420 namespace
 
 There is no `edgefirst/__init__.py` in any wheel. `edgefirst` is an implicit

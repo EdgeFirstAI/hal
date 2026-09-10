@@ -142,6 +142,19 @@ include = [
 "EfErrorClass" = "ef_error_class"
 "EfLogLevel" = "ef_log_level"
 "EfD3d11Layout" = "ef_d3d11_layout"
+"EfClientState" = "ef_client_state"
+# The *nullable* aliases carry the C names, because a C function-pointer
+# parameter is nullable by nature and `ef_tensor_wrap_pbo` must be able to
+# refuse a NULL rather than call through it. The bare `EfPboMapFn` /
+# `EfPboUnmapFn` are Rust-side vocabulary for an already-checked pointer
+# (what `PboOpsVtable` stores) and deliberately reach no signature, so they
+# are not emitted and there is no name collision.
+"EfPboMapFnNullable" = "ef_pbo_map_fn"
+"EfPboUnmapFnNullable" = "ef_pbo_unmap_fn"
+# `EfClientRefFn` has no entry: it never reaches the header. cbindgen
+# only turns `Option<T>` into a plain C function pointer when `T` is
+# syntactically a bare `fn`, so `EfClientState`'s two fields spell the
+# signature out and the alias stays a Rust-side convenience.
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

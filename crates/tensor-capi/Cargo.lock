@@ -180,6 +180,7 @@ name = "edgefirst-tensor"
 version = "0.31.0"
 dependencies = [
  "dma-heap",
+ "edgefirst-tensor-abi",
  "half",
  "libc",
  "libloading",

@@ -312,6 +312,129 @@ pub struct EfTensorView {
     pub len: usize,
 }
 
+/// A retain or release call on a client-owned callback context.
+///
+/// Must be safe to call from any thread and must not unwind.
+pub type EfClientRefFn = unsafe extern "C" fn(ctx: *const core::ffi::c_void);
+
+/// Client-owned state a library entry point calls back into — **frozen by
+/// value, forever**, and reused verbatim by every domain that needs one
+/// (PBO today; CUDA-GL next).
+///
+/// # What `retain`/`release` govern — and what they do not
+///
+/// They extend the life of the **callback channel only**. They never
+/// transfer ownership of the GL buffer, the CUDA resource, or anything else
+/// the context happens to address. Getting this backwards double-frees a GL
+/// buffer:
+///
+/// * The producing side's own destructor stays the sole caller of the real
+///   `delete_buffer`.
+/// * A library that reconstructed operations from this struct treats
+///   `delete_buffer` as a no-op — it borrows the resource, it does not own
+///   it.
+///
+/// # Ownership at an entry point
+///
+/// An entry point that stores this struct calls `retain(ctx)` itself and
+/// calls `release(ctx)` exactly once when the object holding it is
+/// destroyed. The caller keeps its own count and may drop it at any time
+/// after the call returns.
+///
+/// # Freezing
+///
+/// This vocabulary declines the `struct_size` handshake (see the root
+/// `ARCHITECTURE.md`, "Why there is no `struct_size` handshake"), so a
+/// by-value struct grows only by a major bump or a suffixed successor.
+/// Freezing **one** tiny universal struct — rather than one per domain, or
+/// one that grows per domain — is what keeps that cost paid once. Its size
+/// and offsets are pinned by `tests/c/test_layout_goldens.c` in
+/// `edgefirst-tensor-capi` and by `client_state_layout_is_pinned` below.
+///
+/// `ctx` is opaque to the library: only the producing copy of the code ever
+/// dereferences it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EfClientState {
+    /// Opaque to every caller except this struct's own function pointers.
+    pub ctx: *const core::ffi::c_void,
+    // Spelled out rather than as `Option<EfClientRefFn>` -- the identical
+    // type -- because cbindgen resolves `Option<T>` to a plain C function
+    // pointer only when `T` is syntactically a bare `fn`. Given the alias it
+    // emits an opaque wrapper struct and uses it *by value*, an incomplete
+    // type in C: the header would not even compile, let alone match this
+    // struct's 24 bytes. (A third form also works and is what the PBO ops
+    // use -- an alias whose right-hand side is itself `Option<bare fn>`;
+    // see `EfPboMapFnNullable`. It is not used here because these fields
+    // want no name of their own in the header.)
+    //
+    // This comment is `//`, not `///`, on purpose: it would otherwise be
+    // copied into the C header, where it would describe Rust machinery to a
+    // C reader and name a struct that does not exist in the emitted output.
+    /// Add one reference to the callback channel. Never NULL in a valid
+    /// state; an entry point receiving NULL must fail with `EINVAL`.
+    pub retain: Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void)>,
+    /// Drop one reference to the callback channel. Never NULL in a valid
+    /// state; an entry point receiving NULL must fail with `EINVAL`.
+    pub release: Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void)>,
+}
+
+/// Map a PBO for CPU access. `0` on success; `-1` when the GL context is
+/// gone; any other non-zero value a generic failure.
+pub type EfPboMapFn = unsafe extern "C" fn(
+    ctx: *const core::ffi::c_void,
+    buffer_id: u32,
+    size: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> core::ffi::c_int;
+
+/// Unmap a PBO previously mapped by an [`EfPboMapFn`]. Same return codes.
+pub type EfPboUnmapFn =
+    unsafe extern "C" fn(ctx: *const core::ffi::c_void, buffer_id: u32) -> core::ffi::c_int;
+
+// This doc is what a C reader sees for `ef_pbo_map_fn`, so it says what the
+// callback does and nothing about Rust. The mechanics, for Rust readers:
+//
+// Two Rust aliases, one C type. In C there is only ever a function pointer
+// that may or may not be NULL, so this one carries the `ef_pbo_map_fn` name
+// in the header and the bare `EfPboMapFn` is not emitted at all. The bare
+// alias is the Rust-side vocabulary for a pointer already checked -- what
+// `PboOpsVtable` stores and what `client_state_pbo_ops` takes -- and it must
+// stay bare, or every holder would carry an `Option` it has already proved
+// is `Some`.
+//
+// This one is spelled as `Option<` over a *bare* `fn`, not over
+// `EfPboMapFn`: cbindgen resolves `Option<T>` to a nullable C function
+// pointer only when `T` is syntactically a bare `fn`. Given the alias it
+// emits an opaque `struct Option_EfPboMapFn` and passes it by value -- an
+// incomplete type no C caller can name. Given this, it emits
+// `typedef int (*ef_pbo_map_fn)(...)` and uses that name at the call site,
+// which is why `ef_tensor_wrap_pbo`'s header signature does not move.
+/// Map a PBO for CPU access. `0` on success; `-1` when the GL context is
+/// gone; any other non-zero value a generic failure.
+///
+/// May be NULL where an entry point takes one; such an entry point refuses
+/// a NULL rather than calling through it.
+pub type EfPboMapFnNullable = Option<
+    unsafe extern "C" fn(
+        ctx: *const core::ffi::c_void,
+        buffer_id: u32,
+        size: usize,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> core::ffi::c_int,
+>;
+
+// See `EfPboMapFnNullable` for why there are two aliases and why this one
+// spells the `fn` out rather than naming `EfPboUnmapFn`.
+/// Unmap a PBO previously mapped by an `ef_pbo_map_fn`. Same return codes.
+///
+/// May be NULL where an entry point takes one; such an entry point refuses
+/// a NULL rather than calling through it.
+pub type EfPboUnmapFnNullable =
+    Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void, buffer_id: u32) -> core::ffi::c_int>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +516,80 @@ mod tests {
         // deliberate, visible change here.
         assert_eq!(std::mem::size_of::<EfQuantizationInfo>(), 12);
         assert_eq!(std::mem::align_of::<EfQuantizationInfo>(), 4);
+    }
+
+    #[test]
+    fn a_nullable_pbo_op_is_one_pointer_and_matches_its_bare_alias() {
+        // The nullable aliases are what `ef_tensor_wrap_pbo` receives and
+        // what the header's `ef_pbo_map_fn` typedef describes. If the
+        // null-pointer optimization did not apply they would not be plain C
+        // function pointers, and the header would describe an argument the
+        // ABI does not pass.
+        assert_eq!(
+            core::mem::size_of::<EfPboMapFnNullable>(),
+            core::mem::size_of::<EfPboMapFn>()
+        );
+        assert_eq!(
+            core::mem::size_of::<EfPboUnmapFnNullable>(),
+            core::mem::size_of::<EfPboUnmapFn>()
+        );
+        assert_eq!(
+            core::mem::size_of::<EfPboMapFnNullable>(),
+            core::mem::size_of::<*const core::ffi::c_void>()
+        );
+        // And `Some(f)` really is `f`: the two aliases describe one C type,
+        // so these assignments must compile.
+        unsafe extern "C" fn m(
+            _: *const core::ffi::c_void,
+            _: u32,
+            _: usize,
+            _: *mut *mut u8,
+            _: *mut usize,
+        ) -> core::ffi::c_int {
+            0
+        }
+        unsafe extern "C" fn u(_: *const core::ffi::c_void, _: u32) -> core::ffi::c_int {
+            0
+        }
+        let f: EfPboMapFn = m;
+        let _: EfPboMapFnNullable = Some(f);
+        let g: EfPboUnmapFn = u;
+        let _: EfPboUnmapFnNullable = Some(g);
+    }
+
+    #[test]
+    fn client_state_layout_is_pinned() {
+        // Three pointer-sized members at align 8. Frozen forever: this
+        // vocabulary declines a `struct_size` handshake, so a field added
+        // here is a new suffixed struct, not an edit. Mirrored by
+        // `_Static_assert`s in edgefirst-tensor-capi's C layout goldens.
+        assert_eq!(std::mem::size_of::<EfClientState>(), 24);
+        assert_eq!(std::mem::align_of::<EfClientState>(), 8);
+        assert_eq!(std::mem::offset_of!(EfClientState, ctx), 0);
+        assert_eq!(std::mem::offset_of!(EfClientState, retain), 8);
+        assert_eq!(std::mem::offset_of!(EfClientState, release), 16);
+    }
+
+    #[test]
+    fn a_nullable_client_ref_fn_is_pointer_sized() {
+        // `Option<extern "C" fn(..)>` must use the null-pointer
+        // optimization, or `retain`/`release` would not be a plain C
+        // function pointer and the struct above would not be 24 bytes.
+        // `EfClientRefFn` is the same type the two fields spell out (they
+        // spell it out only so cbindgen emits a C function pointer rather
+        // than an opaque `Option_` struct), so this covers both.
+        assert_eq!(
+            std::mem::size_of::<Option<EfClientRefFn>>(),
+            std::mem::size_of::<*const core::ffi::c_void>()
+        );
+        // And they really are the same type, not merely the same size: this
+        // assignment would not compile otherwise.
+        let _: Option<EfClientRefFn> = EfClientState {
+            ctx: core::ptr::null(),
+            retain: None,
+            release: None,
+        }
+        .retain;
     }
 
     #[test]

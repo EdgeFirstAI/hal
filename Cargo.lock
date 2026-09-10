@@ -708,6 +708,7 @@ dependencies = [
  "ctor",
  "dma-heap",
  "edgefirst-bench",
+ "edgefirst-tensor-abi",
  "edgefirst-tensor-ffi",
  "env_logger",
  "half",
