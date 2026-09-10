@@ -20,19 +20,31 @@ from edgefirst.tensor import TensorMemory
 
 
 def _python_throughput(duration_s, run_alongside=None):
-    """Count how many pure-Python loop iterations complete in `duration_s`
-    seconds on a background thread, optionally running `run_alongside` (a
-    zero-arg callable, executed in a tight loop on *this* thread) at the
-    same time.
+    """Measure the rate (iterations/second) of a pure-Python loop running on
+    a background thread for approximately `duration_s` seconds, optionally
+    running `run_alongside` (a zero-arg callable, executed in a tight loop
+    on *this* thread) at the same time.
 
     The counter thread never touches Rust or any `edgefirst` object -- it
     is plain `while not stop: n += 1`. Its only dependency on the rest of
     the process is whether the GIL is available for the interpreter to
-    schedule it at all. That makes the ratio between a lone counter run and
-    one run alongside `run_alongside` a direct measurement of GIL
-    availability, independent of whether `run_alongside`'s own work can
-    physically run in parallel with anything else (a single GL context, or
-    a mutex-guarded backend, may not be able to -- see the note below).
+    schedule it at all. That makes the *rate* a lone counter run achieves
+    vs. the rate it achieves alongside `run_alongside` a direct measurement
+    of GIL availability, independent of whether `run_alongside`'s own work
+    can physically run in parallel with anything else (a single GL context,
+    or a mutex-guarded backend, may not be able to -- see the note below).
+
+    This returns a rate, not a raw count, because the `run_alongside` loop
+    below can only check the deadline *between* calls: it cannot stop mid-
+    call, so the round's actual window is `run_alongside`'s own duration
+    rounded up to the completion of whichever call was in flight when
+    `duration_s` elapsed, not `duration_s` itself. A callable slower than
+    the nominal round length overruns it while the counting thread keeps
+    accumulating for the whole overrun, inflating a raw count without
+    inflating the time it took. Dividing by the window's actual measured
+    length (thread start to the moment the deadline was observed, just
+    before `stop.set()`) turns every leg into a rate that is comparable
+    regardless of how long its round actually ran.
     """
     stop = threading.Event()
     counted = []
@@ -51,9 +63,11 @@ def _python_throughput(duration_s, run_alongside=None):
     else:
         while time.perf_counter() - t0 < duration_s:
             run_alongside()
+    t1 = time.perf_counter()
     stop.set()
     t.join()
-    return counted[0]
+    elapsed = t1 - t0
+    return counted[0] / elapsed
 
 
 def _gil_holding_control(duration_s):
@@ -114,15 +128,40 @@ def _assert_releases_gil(
     and "held" (a real regression's ratio converges *onto* the control's,
     it doesn't just drop).
 
+    Every ratio above (baseline, real leg, control leg) is a rate --
+    `_python_throughput` divides its count by the round's own measured
+    elapsed time, not the nominal `slice_s` -- because a round's
+    `run_alongside` loop can only check the deadline between calls, so a
+    slow callable overruns the round while the counting thread keeps
+    accumulating for the whole overrun; a round's actual window is that
+    callable's own duration rounded up to the completion of whichever call
+    was in flight when the deadline passed. Comparing raw counts against a
+    fixed `slice_s` let a GIL-holding call that runs long enough to overrun
+    several rounds report an inflated count relative to its true rate and
+    beat the control on that inflation alone -- a false pass an isolated
+    reproduction confirmed at a 0.90 gap for a 200ms-per-call holder against
+    ~67ms rounds. Dividing by each round's own measured elapsed time removes
+    that overrun credit regardless of which leg it lands on.
+
     Calibrated on this machine (`duration_s=0.4`, `n_rounds=6`,
     `decode_tracked()` as the real op), median-of-3-rounds-per-leg,
     best-of-3-attempts:
 
     | condition                                            | real ratio | control ratio | gap                    |
     |-------------------------------------------------------|-----------:|---------------:|------------------------|
-    | unloaded (this machine has 16 cores)                   | ~0.84-1.18 | ~0.48-0.72     | ~0.41 mean, 0.16 min single-round |
+    | unloaded (this machine has 16 cores)                   | ~0.84-1.19 | ~0.41-0.72     | ~0.44 mean, 0.72 min single-round |
     | 4 background `while True: pass` processes (unpinned)  | ~0.97-1.04 | ~0.46-0.62     | ~0.49 mean             |
     | same, GIL-held mutation (real op := the control)       | ~0         | ~0             | ~0.01 (both directions tested) |
+
+    Re-measured after the rate change (`decode_tracked()` still the real
+    op): median-of-3 ranges are close to the pre-rate figures above, but
+    the unloaded row's single-round minimum moved from 0.16 to ~0.72 --
+    that low outlier was itself an artifact of comparing raw counts to a
+    fixed `slice_s`: a round whose window ran a little long under the old
+    scheme distorted denominator and numerator asymmetrically depending on
+    which leg overran, and rates remove that asymmetry. `min_gap=0.2`
+    still sits comfortably below the mean gap on both legs' current
+    numbers.
 
     4 unpinned busy-loop processes barely move the numbers on this 16-core
     box -- there are far more free cores than competitors -- so as a
