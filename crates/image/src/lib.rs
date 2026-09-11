@@ -410,6 +410,8 @@ mod error;
 mod g2d;
 #[path = "gl/mod.rs"]
 mod opengl_headless;
+#[cfg(test)]
+mod test_support;
 mod tiling;
 pub use tiling::{tile_grid, TilePlacement, TileSpec, TilingConfig};
 
@@ -3771,10 +3773,10 @@ mod image_tests {
         let mut proc = match ImageProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — ImageProcessor init failed ({e:?})",
+                crate::test_support::report_skip(&format!(
+                    "{} — ImageProcessor init failed ({e:?})",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -3797,10 +3799,10 @@ mod image_tests {
         ) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — tall DMA destination alloc failed ({e:?})",
+                crate::test_support::report_skip(&format!(
+                    "{} — tall DMA destination alloc failed ({e:?})",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -3894,7 +3896,10 @@ mod image_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — CPU init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -3976,7 +3981,10 @@ mod image_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — CPU init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -4044,10 +4052,10 @@ mod image_tests {
         let mut proc = match ImageProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — ImageProcessor init failed ({e:?})",
+                crate::test_support::report_skip(&format!(
+                    "{} — ImageProcessor init failed ({e:?})",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -4066,10 +4074,10 @@ mod image_tests {
         ) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — tall DMA parent alloc failed ({e:?})",
+                crate::test_support::report_skip(&format!(
+                    "{} — tall DMA parent alloc failed ({e:?})",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -4125,7 +4133,10 @@ mod image_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — CPU init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -4158,7 +4169,10 @@ mod image_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — CPU init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -4184,7 +4198,10 @@ mod image_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — CPU init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -4707,7 +4724,9 @@ mod image_tests {
             }
             Err(e) => {
                 // Skip cleanly on hosts without a dma-heap.
-                eprintln!("SKIPPED: create_image NV12 DMA non-aligned width: {e}");
+                crate::test_support::report_skip(&format!(
+                    "create_image NV12 DMA non-aligned width: {e}"
+                ));
             }
         }
     }
@@ -4825,18 +4844,18 @@ mod image_tests {
     fn gl_backend_available_canary() {
         let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
         if !require_gl {
-            eprintln!(
-                "SKIPPED: {} — HAL_TEST_REQUIRE_GL is not set to 1",
+            crate::test_support::report_skip(&format!(
+                "{} — HAL_TEST_REQUIRE_GL is not set to 1",
                 function!()
-            );
+            ));
             return;
         }
         #[cfg(target_os = "macos")]
         if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
-            eprintln!(
-                "SKIPPED: {} — ANGLE dlopen gate closed (coverage pass 1)",
+            crate::test_support::report_skip(&format!(
+                "{} — ANGLE dlopen gate closed (coverage pass 1)",
                 function!()
-            );
+            ));
             return;
         }
         GLProcessorThreaded::new(None).expect(
@@ -5032,8 +5051,8 @@ mod image_tests {
     fn test_convert_rgba_non_4_aligned_width_end_to_end() {
         use edgefirst_tensor::is_dma_available;
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_convert_rgba_non_4_aligned_width_end_to_end — DMA not available"
+            crate::test_support::report_skip(
+                "test_convert_rgba_non_4_aligned_width_end_to_end — DMA not available",
             );
             return;
         }
@@ -5117,8 +5136,8 @@ mod image_tests {
     fn test_load_jpeg_rgba_non_aligned_pitch_padded_dma() {
         use edgefirst_tensor::is_dma_available;
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_load_jpeg_rgba_non_aligned_pitch_padded_dma — DMA not available"
+            crate::test_support::report_skip(
+                "test_load_jpeg_rgba_non_aligned_pitch_padded_dma — DMA not available",
             );
             return;
         }
@@ -5242,7 +5261,9 @@ mod image_tests {
     fn test_load_png_grey_misaligned_width_dma() {
         use edgefirst_tensor::is_dma_available;
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_load_png_grey_misaligned_width_dma — DMA not available");
+            crate::test_support::report_skip(
+                "test_load_png_grey_misaligned_width_dma — DMA not available",
+            );
             return;
         }
         let png = make_grey_png(612, 388);
@@ -5323,13 +5344,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_g2d_resize() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_g2d_resize - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_g2d_resize - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_g2d_resize - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_g2d_resize - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -5402,7 +5423,7 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_resize() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -5470,7 +5491,7 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_10_threads() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -5500,7 +5521,7 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_grey() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -5560,13 +5581,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_g2d_src_crop() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_g2d_src_crop - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_g2d_src_crop - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_g2d_src_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_g2d_src_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -5628,13 +5649,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_g2d_dst_crop() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_g2d_dst_crop - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_g2d_dst_crop - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_g2d_dst_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_g2d_dst_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -5696,13 +5717,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_g2d_all_rgba() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_g2d_all_rgba - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_g2d_all_rgba - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_g2d_all_rgba - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_g2d_all_rgba - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -5797,7 +5818,7 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_src_crop() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -5861,7 +5882,7 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_dst_crop() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -6059,7 +6080,7 @@ mod image_tests {
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn windows_padded_float_pbo_rows_land_at_the_declared_stride() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         const W: usize = 64;
@@ -6090,18 +6111,24 @@ mod image_tests {
 
         for (fmt, dtype, supported, strides) in cases {
             if !supported {
-                eprintln!("SKIPPED: {} - {fmt:?}/{dtype:?} not reported", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - {fmt:?}/{dtype:?} not reported",
+                    function!()
+                ));
                 continue;
             }
             let Some(gl) = gpu.opengl.as_ref() else {
-                eprintln!("SKIPPED: {} - no GL processor", function!());
+                crate::test_support::report_skip(&format!("{} - no GL processor", function!()));
                 return;
             };
             // The oracle: a tight PBO of the target geometry, same route.
             let mut reference = match gl.create_pbo_image_dtype(W, H, fmt, dtype) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("SKIPPED: {} - no float PBO images: {e:?}", function!());
+                    crate::test_support::report_skip(&format!(
+                        "{} - no float PBO images: {e:?}",
+                        function!()
+                    ));
                     return;
                 }
             };
@@ -6177,11 +6204,14 @@ mod image_tests {
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn windows_float_destinations_match_the_cpu_converter_for_every_layout() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut gpu = ImageProcessor::new().unwrap();
@@ -6284,16 +6314,19 @@ mod image_tests {
         use edgefirst_tensor::CpuAccess;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut p = match ImageProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} - ImageProcessor init failed ({e:?})",
+                crate::test_support::report_skip(&format!(
+                    "{} - ImageProcessor init failed ({e:?})",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -6306,7 +6339,10 @@ mod image_tests {
             })
             .collect();
         if dsts[0].memory() != TensorMemory::DmaBuf {
-            eprintln!("SKIPPED: {} - destinations are not textures", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - destinations are not textures",
+                function!()
+            ));
             return;
         }
         for dst in &mut dsts {
@@ -6385,7 +6421,10 @@ mod image_tests {
         use edgefirst_tensor::CpuAccess;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let src = synthetic_rgba(320, 240);
@@ -6393,7 +6432,10 @@ mod image_tests {
             let mut p = match ImageProcessor::new() {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("SKIPPED: {} - init failed ({e:?})", function!());
+                    crate::test_support::report_skip(&format!(
+                        "{} - init failed ({e:?})",
+                        function!()
+                    ));
                     return;
                 }
             };
@@ -6408,7 +6450,10 @@ mod image_tests {
                 )
                 .unwrap();
             if dst.memory() != TensorMemory::DmaBuf {
-                eprintln!("SKIPPED: {} - destination is not a texture", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - destination is not a texture",
+                    function!()
+                ));
                 return;
             }
             p.convert_deferred(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
@@ -6443,7 +6488,10 @@ mod image_tests {
         use std::os::windows::io::AsRawHandle;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut p = ImageProcessor::new().unwrap();
@@ -6464,11 +6512,11 @@ mod image_tests {
         if dst.memory() != TensorMemory::DmaBuf
             && !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
         {
-            eprintln!(
-                "SKIPPED: {} - create_image gave {:?}, not a texture (no GL backend)",
+            crate::test_support::report_skip(&format!(
+                "{} - create_image gave {:?}, not a texture (no GL backend)",
                 function!(),
                 dst.memory()
-            );
+            ));
             return;
         }
         assert_eq!(
@@ -6562,10 +6610,10 @@ mod image_tests {
                 t.memory()
             );
         }
-        eprintln!(
-            "SKIPPED: {test} - create_image gave {:?}, not a texture (no GL backend)",
+        crate::test_support::report_skip(&format!(
+            "{test} - create_image gave {:?}, not a texture (no GL backend)",
             t.memory()
-        );
+        ));
         false
     }
 
@@ -6581,7 +6629,10 @@ mod image_tests {
         use ndarray::Array3;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut p = ImageProcessor::new().unwrap();
@@ -6645,7 +6696,10 @@ mod image_tests {
         use edgefirst_tensor::{CpuAccess, Tensor};
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         // Forcing OpenGL fails outright without a GL backend (CI's no-ANGLE
@@ -6654,7 +6708,10 @@ mod image_tests {
         let mut p = match with_force_backend(Some("opengl"), ImageProcessor::new) {
             Ok(p) => p,
             Err(e) if !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1") => {
-                eprintln!("SKIPPED: {} - no OpenGL backend: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - no OpenGL backend: {e}",
+                    function!()
+                ));
                 return;
             }
             Err(e) => panic!("forced OpenGL backend unavailable: {e}"),
@@ -6702,7 +6759,10 @@ mod image_tests {
         use edgefirst_tensor::CpuAccess;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut p = ImageProcessor::new().unwrap();
@@ -6727,7 +6787,10 @@ mod image_tests {
         use edgefirst_tensor::CpuAccess;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut p = ImageProcessor::new().unwrap();
@@ -6767,7 +6830,10 @@ mod image_tests {
         use edgefirst_tensor::CpuAccess;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (32usize, 64usize);
@@ -6842,7 +6908,10 @@ mod image_tests {
         use ndarray::Array3;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         const CUSTOM: [u8; 4] = [7, 200, 13, 255];
@@ -6872,11 +6941,11 @@ mod image_tests {
         if parent.memory() != TensorMemory::DmaBuf
             && !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
         {
-            eprintln!(
-                "SKIPPED: {} - create_image gave {:?}, not a texture (no GL backend)",
+            crate::test_support::report_skip(&format!(
+                "{} - create_image gave {:?}, not a texture (no GL backend)",
                 function!(),
                 parent.memory()
-            );
+            ));
             return;
         }
         p.set_class_colors(&[CUSTOM]).unwrap();
@@ -6930,7 +6999,10 @@ mod image_tests {
         use edgefirst_tensor::CpuAccess;
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut a = ImageProcessor::new().unwrap();
@@ -7029,7 +7101,7 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_all_rgba() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -7228,7 +7300,7 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_rotate() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -7325,13 +7397,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_g2d_rotate() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_g2d_rotate - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_g2d_rotate - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_g2d_rotate - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_g2d_rotate - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -7499,15 +7571,15 @@ mod image_tests {
     #[ignore = "opengl doesn't support rendering to PixelFormat::Yuyv texture"]
     fn test_rgba_to_yuyv_resize_opengl() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!(
-                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
+            crate::test_support::report_skip(&format!(
+                "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -7575,15 +7647,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_rgba_to_yuyv_resize_g2d() {
         if !is_g2d_available() {
-            eprintln!(
-                "SKIPPED: test_rgba_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available"
+            crate::test_support::report_skip(
+                "test_rgba_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available",
             );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_rgba_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_rgba_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -7795,13 +7865,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgba_g2d() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgba_g2d - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_yuyv_to_rgba_g2d - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_yuyv_to_rgba_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_yuyv_to_rgba_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -7869,16 +7939,16 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         // Zero-copy YUYV source: DMA-BUF on Linux, IOSurface on macOS, a
         // D3D11 texture on Windows; skips where no such backing exists.
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!(
-                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
+            crate::test_support::report_skip(&format!(
+                "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -7913,7 +7983,7 @@ mod image_tests {
         // Desktop NVIDIA cannot sample YUYV as a GL texture; i.MX/Vivante can.
         // Production ImageProcessor falls back to CPU; this oracle skips.
         if let Err(crate::Error::NotSupported(msg)) = &result {
-            eprintln!("SKIPPED: {} — {msg}", function!());
+            crate::test_support::report_skip(&format!("{} — {msg}", function!()));
             return;
         }
         result.unwrap();
@@ -7957,7 +8027,10 @@ mod image_tests {
         let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8049,7 +8122,7 @@ mod image_tests {
         let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!("{} — init failed ({e:?})", function!()));
                 return;
             }
         };
@@ -8064,7 +8137,10 @@ mod image_tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} — NV12 IOSurface alloc: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — NV12 IOSurface alloc: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8085,7 +8161,10 @@ mod image_tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} — F16 PlanarRgb IOSurface: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — F16 PlanarRgb IOSurface: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8102,10 +8181,10 @@ mod image_tests {
             // GL_EXT_color_buffer_half_float may be absent on some configs; the
             // RGBA8 pass-1 + F16 pass-2 path then can't render. Skip rather than
             // fail on a capability gap (the same policy as the F16 path tests).
-            eprintln!(
-                "SKIPPED: {} — NV12→PlanarRgb F16 not available ({e:?})",
+            crate::test_support::report_skip(&format!(
+                "{} — NV12→PlanarRgb F16 not available ({e:?})",
                 function!()
-            );
+            ));
             return;
         }
         let dt = dst.as_typed::<half::f16>().expect("dst is F16 PlanarRgb");
@@ -8142,7 +8221,7 @@ mod image_tests {
         let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!("{} — init failed ({e:?})", function!()));
                 return;
             }
         };
@@ -8161,7 +8240,10 @@ mod image_tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} — R8 pool alloc: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — R8 pool alloc: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8189,7 +8271,10 @@ mod image_tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} — F16 PlanarRgb dst: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — F16 PlanarRgb dst: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8204,10 +8289,10 @@ mod image_tests {
         if let Err(e) =
             ImageProcessorTrait::convert(&mut gpu, &src, &mut dst, Rotation::None, Flip::None, crop)
         {
-            eprintln!(
-                "SKIPPED: {} — NV12→PlanarRgb F16 unavailable ({e:?})",
+            crate::test_support::report_skip(&format!(
+                "{} — NV12→PlanarRgb F16 unavailable ({e:?})",
                 function!()
-            );
+            ));
             return;
         }
         let _ = stride;
@@ -8237,7 +8322,7 @@ mod image_tests {
         let mut proc = match ImageProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!("{} — init failed ({e:?})", function!()));
                 return;
             }
         };
@@ -8252,7 +8337,7 @@ mod image_tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} — pool: {e:?}", function!());
+                crate::test_support::report_skip(&format!("{} — pool: {e:?}", function!()));
                 return;
             }
         };
@@ -8273,7 +8358,7 @@ mod image_tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} — dst: {e:?}", function!());
+                crate::test_support::report_skip(&format!("{} — dst: {e:?}", function!()));
                 return;
             }
         };
@@ -8314,7 +8399,7 @@ mod image_tests {
         let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!("{} — init failed ({e:?})", function!()));
                 return;
             }
         };
@@ -8336,7 +8421,7 @@ mod image_tests {
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("SKIPPED: {} — pool: {e:?}", function!());
+                        crate::test_support::report_skip(&format!("{} — pool: {e:?}", function!()));
                         return;
                     }
                 },
@@ -8352,7 +8437,7 @@ mod image_tests {
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("SKIPPED: {} — dst: {e:?}", function!());
+                        crate::test_support::report_skip(&format!("{} — dst: {e:?}", function!()));
                         return;
                     }
                 },
@@ -8415,7 +8500,10 @@ mod image_tests {
         let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8585,7 +8673,10 @@ mod image_tests {
         let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8682,7 +8773,10 @@ mod image_tests {
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("SKIPPED: {} — R8 pool IOSurface alloc: {e:?}", function!());
+                        crate::test_support::report_skip(&format!(
+                            "{} — R8 pool IOSurface alloc: {e:?}",
+                            function!()
+                        ));
                         return;
                     }
                 };
@@ -8766,13 +8860,13 @@ mod image_tests {
         let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — GL engine init failed ({e:?}). \
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?}). \
                      Install ANGLE via `brew install startergo/angle/angle` \
                      and re-sign per README.md § macOS GPU Acceleration to \
                      run this test.",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -8855,7 +8949,10 @@ mod image_tests {
         let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8933,7 +9030,10 @@ mod image_tests {
         let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9010,7 +9110,10 @@ mod image_tests {
         let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9079,14 +9182,14 @@ mod image_tests {
     fn test_macos_gl_f16_planar_is_gl_backed() {
         let mut proc = ImageProcessor::new().expect("ImageProcessor");
         let Some(ref gl) = proc.opengl else {
-            eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+            crate::test_support::report_skip(&format!("{} — GL backend unavailable", function!()));
             return;
         };
         if !gl.supported_render_dtypes().f16 {
-            eprintln!(
-                "SKIPPED: {} — configuration lacks F16 color-buffer support",
+            crate::test_support::report_skip(&format!(
+                "{} — configuration lacks F16 color-buffer support",
                 function!()
-            );
+            ));
             return;
         }
         let stats_before = gl.egl_cache_stats().expect("cache stats");
@@ -9159,7 +9262,10 @@ mod image_tests {
         }) {
             Ok(p) if p.opengl.is_some() => p,
             _ => {
-                eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL backend unavailable",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9169,13 +9275,13 @@ mod image_tests {
             .map(|g| g.supported_render_dtypes().f16)
             .unwrap_or(false)
         {
-            eprintln!("SKIPPED: {} — no F16 render support", function!());
+            crate::test_support::report_skip(&format!("{} — no F16 render support", function!()));
             return;
         }
         let mem = if edgefirst_tensor::is_gpu_buffer_available() {
             TensorMemory::DmaBuf
         } else {
-            eprintln!("SKIPPED: {} — no zero-copy buffers", function!());
+            crate::test_support::report_skip(&format!("{} — no zero-copy buffers", function!()));
             return;
         };
 
@@ -9236,7 +9342,7 @@ mod image_tests {
         ) {
             Ok(()) => {}
             Err(crate::Error::NotSupported(msg)) => {
-                eprintln!("SKIPPED: {} — {msg}", function!());
+                crate::test_support::report_skip(&format!("{} — {msg}", function!()));
                 return;
             }
             Err(e) => panic!("fused NV12→PlanarF16 GL convert: {e}"),
@@ -9315,12 +9421,15 @@ mod image_tests {
         let mut proc = match ImageProcessor::new() {
             Ok(p) if p.opengl.is_some() => p,
             _ => {
-                eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} — GL backend unavailable",
+                    function!()
+                ));
                 return;
             }
         };
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED: {} — no zero-copy buffers", function!());
+            crate::test_support::report_skip(&format!("{} — no zero-copy buffers", function!()));
             return;
         }
 
@@ -9417,13 +9526,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgb_g2d() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgb_g2d - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_yuyv_to_rgb_g2d - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_yuyv_to_rgb_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_yuyv_to_rgb_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -9490,15 +9599,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_yuyv_resize_g2d() {
         if !is_g2d_available() {
-            eprintln!(
-                "SKIPPED: test_yuyv_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available"
+            crate::test_support::report_skip(
+                "test_yuyv_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available",
             );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_yuyv_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_yuyv_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -9636,15 +9743,13 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgba_crop_flip_g2d() {
         if !is_g2d_available() {
-            eprintln!(
-                "SKIPPED: test_yuyv_to_rgba_crop_flip_g2d - G2D library (libg2d.so.2) not available"
+            crate::test_support::report_skip(
+                "test_yuyv_to_rgba_crop_flip_g2d - G2D library (libg2d.so.2) not available",
             );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_yuyv_to_rgba_crop_flip_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_yuyv_to_rgba_crop_flip_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -9720,15 +9825,15 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_crop_flip_opengl() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!(
-                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
+            crate::test_support::report_skip(&format!(
+                "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -9765,7 +9870,7 @@ mod image_tests {
         );
         // Desktop NVIDIA cannot sample YUYV as a GL texture; i.MX/Vivante can.
         if let Err(crate::Error::NotSupported(msg)) = &result {
-            eprintln!("SKIPPED: {} — {msg}", function!());
+            crate::test_support::report_skip(&format!("{} — {msg}", function!()));
             return;
         }
         result.unwrap();
@@ -9934,13 +10039,13 @@ mod image_tests {
     #[ignore = "G2D does not support VYUY; re-enable when hardware support is added"]
     fn test_vyuy_to_rgba_g2d() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_vyuy_to_rgba_g2d - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_vyuy_to_rgba_g2d - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_vyuy_to_rgba_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_vyuy_to_rgba_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -9974,7 +10079,9 @@ mod image_tests {
         );
         match result {
             Err(Error::G2D(_)) => {
-                eprintln!("SKIPPED: test_vyuy_to_rgba_g2d - G2D does not support PixelFormat::Vyuy format");
+                crate::test_support::report_skip(
+                    "test_vyuy_to_rgba_g2d - G2D does not support PixelFormat::Vyuy format",
+                );
                 return;
             }
             r => r.unwrap(),
@@ -10008,13 +10115,13 @@ mod image_tests {
     #[ignore = "G2D does not support VYUY; re-enable when hardware support is added"]
     fn test_vyuy_to_rgb_g2d() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_vyuy_to_rgb_g2d - G2D library (libg2d.so.2) not available");
+            crate::test_support::report_skip(
+                "test_vyuy_to_rgb_g2d - G2D library (libg2d.so.2) not available",
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_vyuy_to_rgb_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+            crate::test_support::report_skip("test_vyuy_to_rgb_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
             return;
         }
 
@@ -10048,8 +10155,8 @@ mod image_tests {
         );
         match result {
             Err(Error::G2D(_)) => {
-                eprintln!(
-                    "SKIPPED: test_vyuy_to_rgb_g2d - G2D does not support PixelFormat::Vyuy format"
+                crate::test_support::report_skip(
+                    "test_vyuy_to_rgb_g2d - G2D does not support PixelFormat::Vyuy format",
                 );
                 return;
             }
@@ -10096,14 +10203,14 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_vyuy_to_rgba_opengl() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!(
-                "SKIPPED: {} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
+            crate::test_support::report_skip(&format!(
+                "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -10119,10 +10226,10 @@ mod image_tests {
         ) {
             Ok(src) => src,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} - zero-copy VYUY source not allocatable on this platform ({e})",
+                crate::test_support::report_skip(&format!(
+                    "{} - zero-copy VYUY source not allocatable on this platform ({e})",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -10148,10 +10255,10 @@ mod image_tests {
         );
         match result {
             Err(Error::NotSupported(_)) => {
-                eprintln!(
-                    "SKIPPED: {} - OpenGL does not support PixelFormat::Vyuy DMA format",
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL does not support PixelFormat::Vyuy DMA format",
                     function!()
-                );
+                ));
                 return;
             }
             r => r.unwrap(),
@@ -11767,14 +11874,14 @@ mod image_tests {
         require_dma_for_bg: bool,
     ) {
         if require_dma_for_bg && !edgefirst_tensor::is_dma_available() {
-            eprintln!("SKIPPED: {case} — DMA not available on this host");
+            crate::test_support::report_skip(&format!("{case} — DMA not available on this host"));
             return;
         }
         let processor_result = with_force_backend(force_backend, ImageProcessor::new);
         let mut processor = match processor_result {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {case} — backend init failed: {e:?}");
+                crate::test_support::report_skip(&format!("{case} — backend init failed: {e:?}"));
                 return;
             }
         };
@@ -11815,14 +11922,14 @@ mod image_tests {
     #[test]
     fn test_draw_masks_zero_detection_g2d_forced() {
         if !edgefirst_tensor::is_dma_available() {
-            eprintln!("SKIPPED: g2d forced — DMA not available on this host");
+            crate::test_support::report_skip("g2d forced — DMA not available on this host");
             return;
         }
         let processor_result = with_force_backend(Some("g2d"), ImageProcessor::new);
         let mut processor = match processor_result {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: g2d forced — init failed: {e:?}");
+                crate::test_support::report_skip(&format!("g2d forced — init failed: {e:?}"));
                 return;
             }
         };
@@ -12006,10 +12113,10 @@ mod image_tests {
         // a regression appears. (Skip, not #[ignore]: the platform is decided
         // at runtime, not compile time.)
         if std::env::var_os("EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS").is_some() {
-            eprintln!(
-                "SKIPPED: test_multiple_image_processors_separate_threads — known Vivante \
+            crate::test_support::report_skip(
+                "test_multiple_image_processors_separate_threads — known Vivante \
                  GC7000UL concurrent-EGL-teardown double-free \
-                 (EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS set)"
+                 (EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS set)",
             );
             return;
         }
@@ -12188,10 +12295,10 @@ mod image_tests {
         const TIMEOUT: Duration = Duration::from_secs(60);
 
         if std::env::var_os("EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS").is_some() {
-            eprintln!(
-                "SKIPPED: test_parallel_processors_unique_outputs — known Vivante \
+            crate::test_support::report_skip(
+                "test_parallel_processors_unique_outputs — known Vivante \
                  GC7000UL concurrent-multi-processor driver abort \
-                 (EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS set)"
+                 (EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS set)",
             );
             return;
         }
@@ -12650,10 +12757,29 @@ mod image_tests {
 
     /// GL-vs-CPU identity parity for `Rgba → PlanarRgb F16`.
     ///
-    /// Converts the same RGBA8 source via forced `OpenGl` and forced `Cpu`,
-    /// then verifies the two F16 output tensors agree element-wise within
-    /// 2^-8 (two F16 ULPs at 0.5). Skipped when OpenGL or F16 render is
-    /// unavailable.
+    /// Converts the same RGBA8 source via the `OpenGl` backend and the
+    /// forced `Cpu` backend, then verifies the two F16 output tensors agree
+    /// element-wise within 2^-8 (two F16 ULPs at 0.5). Skipped when OpenGL
+    /// or F16 render is unavailable, and when the host cannot hold the
+    /// zero-copy F16 destination the GL float route needs.
+    ///
+    /// **The GL route is asserted, not assumed** (issue #179).
+    /// `ComputeBackend::OpenGl` is not a forced backend: it leaves
+    /// `forced_backend` at `None`, so a GL decline logs at debug and the CPU
+    /// serves the same convert. Both sides of the comparison would then be
+    /// the CPU's answer and the parity claim would be a tautology — which is
+    /// exactly how a host whose RGBA16F FBO is incomplete (desktop NVIDIA:
+    /// `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT`) passed while proving nothing,
+    /// `supported_render_dtypes().f16` above notwithstanding: that flag is
+    /// an extension query, not a completed render. `convert_fallback_count()`
+    /// staying flat across the GL convert is the proof, and a decline is
+    /// reported as a skip rather than a failure because it is a property of
+    /// the host's driver, not of this code — except under
+    /// `HAL_TEST_REQUIRE_GL=1`, which turns it into a named failure, the
+    /// same opt-in `crates/image/tests/dst_view_stride.rs` and
+    /// `reconstructed_view_draw.rs` carry for a GL backend that fails to
+    /// come up. A lane that has asserted it has GL should not be quietly
+    /// losing this test's coverage.
     #[test]
     #[cfg(all(
         any(
@@ -12666,8 +12792,24 @@ mod image_tests {
         feature = "opengl"
     ))]
     fn convert_f16_gl_cpu_parity_identity() {
+        // The macOS coverage lane sets `HAL_TEST_REQUIRE_GL=1` for both
+        // passes but deliberately hobbles pass 1 (unsigned binaries, the
+        // ANGLE dlopen gate closed). Excluded there the same way
+        // `gl_backend_available_canary` excludes it, so the gate below
+        // enforces in pass 2 only.
+        #[cfg(target_os = "macos")]
+        if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+            && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
+        {
+            crate::test_support::report_skip(
+                "convert_f16_gl_cpu_parity_identity - ANGLE dlopen gate closed (coverage pass 1)",
+            );
+            return;
+        }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: convert_f16_gl_cpu_parity_identity - OpenGL not available");
+            crate::test_support::report_skip(
+                "convert_f16_gl_cpu_parity_identity - OpenGL not available",
+            );
             return;
         }
 
@@ -12707,33 +12849,93 @@ mod image_tests {
             }) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!(
-                        "SKIPPED: convert_f16_gl_cpu_parity_identity - GL backend unavailable: {e}"
-                    );
+                    crate::test_support::report_skip(&format!(
+                        "convert_f16_gl_cpu_parity_identity - GL backend unavailable: {e}"
+                    ));
                     return;
                 }
             };
 
             if !gl_proc.supported_render_dtypes().f16 {
-                eprintln!("SKIPPED: convert_f16_gl_cpu_parity_identity - F16 render not supported");
+                crate::test_support::report_skip(
+                    "convert_f16_gl_cpu_parity_identity - F16 render not supported",
+                );
                 return;
             }
 
-            let mut dst = TensorDyn::image(
+            // A destination the GL float route actually serves. A
+            // `TensorMemory::Mem` float destination has no arm in
+            // `float_dispatch::classify_float_render` at all: it classifies as
+            // `FloatRenderPath::None`, the u8 route rejects the dtype, and the
+            // CPU serves every convert. With a host destination the GL half
+            // below was therefore unreachable and this test could only ever
+            // skip. `(Rgba, PlanarRgb, F16, DmaBuf)` -- `ZeroCopyF16Nchw` --
+            // is the zero-copy float tuple EVERY platform's capability set
+            // serves: it is unconditional in `classify_float_render`, so it
+            // holds for the `PlanarF16` set Linux, Android and ANGLE/macOS
+            // declare as well as the `All` set Windows declares.
+            //
+            // One spelling covers all of them. `TensorMemory::DmaBuf` is the
+            // portable name for the platform-native zero-copy GPU buffer --
+            // a DMA-BUF on Linux, an IOSurface on macOS/iOS, an
+            // AHardwareBuffer on Android, an `ID3D11Texture2D` on Windows --
+            // and the classifier matches on that one variant for all of them,
+            // so this needs no `cfg`. Where the platform cannot hold one the
+            // allocation fails or falls back, and both are reported below.
+            let mut dst = match TensorDyn::image(
                 W,
                 H,
                 PixelFormat::PlanarRgb,
                 DType::F16,
-                Some(TensorMemory::Mem),
+                Some(TensorMemory::DmaBuf),
                 edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
-            match gl_proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
-                Ok(()) => dst,
+            ) {
+                Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
+                // No routable float destination on this host. Reported here,
+                // BEFORE the `HAL_TEST_REQUIRE_GL` gate below: that gate
+                // exists to catch a GL backend declining a destination it
+                // should serve, not a host that cannot hold one.
+                Ok(t) => {
+                    crate::test_support::report_skip(&format!(
+                        "convert_f16_gl_cpu_parity_identity - the zero-copy F16 \
+                         destination fell back to {:?}",
+                        t.memory()
+                    ));
+                    return;
+                }
                 Err(e) => {
-                    eprintln!(
-                        "SKIPPED: convert_f16_gl_cpu_parity_identity - GL convert failed: {e}"
-                    );
+                    crate::test_support::report_skip(&format!(
+                        "convert_f16_gl_cpu_parity_identity - no zero-copy F16 \
+                         destination on this host: {e}"
+                    ));
+                    return;
+                }
+            };
+            let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+            let fallbacks_before = gl_proc.convert_fallback_count();
+            match gl_proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
+                Ok(()) => {
+                    if gl_proc.convert_fallback_count() != fallbacks_before {
+                        assert!(
+                            !require_gl,
+                            "HAL_TEST_REQUIRE_GL=1 but \
+                             convert_f16_gl_cpu_parity_identity would have skipped \
+                             while reporting success: the GL F16 path declined and \
+                             the CPU served the convert"
+                        );
+                        crate::test_support::report_skip(
+                            "convert_f16_gl_cpu_parity_identity - the GL F16 path \
+                             declined and the CPU served the convert; comparing that \
+                             against the forced-CPU result would prove nothing",
+                        );
+                        return;
+                    }
+                    dst
+                }
+                Err(e) => {
+                    crate::test_support::report_skip(&format!(
+                        "convert_f16_gl_cpu_parity_identity - GL convert failed: {e}"
+                    ));
                     return;
                 }
             }
@@ -12761,11 +12963,25 @@ mod image_tests {
             dst
         };
 
-        // Compare element-wise.
-        let gl_map = gl_result.as_typed::<half::f16>().unwrap().map().unwrap();
-        let cpu_map = cpu_result.as_typed::<half::f16>().unwrap().map().unwrap();
-        let gl_halfs = gl_map.as_slice();
-        let cpu_halfs = cpu_map.as_slice();
+        // Compare element-wise. Both sides are read through `copy_to_flat`:
+        // the GL destination is a packed zero-copy surface whose rows can be
+        // spaced at a driver pitch, so its mapping is not a flat run of the
+        // logical elements.
+        let flat_f16 = |t: &TensorDyn| -> Vec<half::f16> {
+            let typed = t.as_typed::<half::f16>().expect("F16 image");
+            let mut bytes = vec![0u8; typed.shape().iter().product::<usize>() * 2];
+            typed
+                .copy_to_flat(&mut bytes)
+                .expect("compact any padded rows");
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c))
+                .collect()
+        };
+        let gl_halfs = flat_f16(&gl_result);
+        let cpu_halfs = flat_f16(&cpu_result);
 
         assert_eq!(
             gl_halfs.len(),
@@ -12801,12 +13017,16 @@ mod image_tests {
         let proc = match ImageProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: supported_render_dtypes_linux_smoke — ImageProcessor::new() failed: {e}");
+                crate::test_support::report_skip(&format!(
+                    "supported_render_dtypes_linux_smoke — ImageProcessor::new() failed: {e}"
+                ));
                 return;
             }
         };
         if proc.opengl.is_none() {
-            eprintln!("SKIPPED: supported_render_dtypes_linux_smoke — no GL backend on this host");
+            crate::test_support::report_skip(
+                "supported_render_dtypes_linux_smoke — no GL backend on this host",
+            );
             return;
         }
         // The call must complete without panicking or deadlocking.
@@ -13118,7 +13338,7 @@ mod image_tests {
                 Some(expected),
                 "set_colorimetry must round-trip"
             );
-            eprintln!("SKIPPED import_image_carries_colorimetry (DMA unavailable); storage contract verified via TensorDyn");
+            crate::test_support::report_skip("import_image_carries_colorimetry (DMA unavailable); storage contract verified via TensorDyn");
             return;
         }
 

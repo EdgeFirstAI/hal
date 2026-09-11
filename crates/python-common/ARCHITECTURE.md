@@ -57,11 +57,21 @@ edgefirst.tensor.Tensor is edgefirst.image.Tensor   # False — by design
 Cross-package handoff is **duck-typed** through the
 `__edgefirst_tensor__` capsule protocol rather than an `isinstance` check.
 A producer exposes `__edgefirst_tensor__()` returning a `PyCapsule` named
-`edgefirst_tensor_v1` wrapping a `#[repr(C)] TensorDesc`; a consumer reads
+`edgefirst_tensor_v2` wrapping a `#[repr(C)] TensorDesc` and its
+quantization; a consumer reads
 the descriptor without ever naming the producer's type.
 
 The capsule owns both the descriptor **and** the producer's `HostPin`, so
 the address stays valid for the capsule's life.
+
+For a PBO-backed tensor the descriptor's `ptr` names a `PboOpsVtable` rather
+than a host address, and that vtable now embeds an `ef_client_state` (an
+opaque context plus a `retain`/`release` pair) beside the map and unmap
+function pointers. A consumer's reconstruction takes its own reference on that
+channel, so it no longer depends on the producer's keepalive still being held.
+The payload layout is unchanged by this, so the capsule name stays
+`edgefirst_tensor_v2`; see INTEROP.md § Versioning for why, and for why
+retiring the now-redundant `pbo_keepalive` field is a separate decision.
 
 ## PEP 420 namespace
 

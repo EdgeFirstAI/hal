@@ -27,11 +27,272 @@
 
 use std::sync::Arc;
 
-use edgefirst_tensor::{HostPin, TensorDesc, TensorDyn};
+use edgefirst_tensor::{HostPin, Quantization, TensorDesc, TensorDyn};
+
+/// The capsule's quantization descriptor. Defined in `edgefirst-tensor`'s
+/// `protocol` module -- the payload that embeds it lives here, but the type
+/// and its unsafe decode live where their round-trip tests can actually run
+/// (`make test-rust` excludes every `edgefirst-python-*` package, and this
+/// crate's test binary cannot link libpython anyway). Re-exported so the
+/// producers keep naming one path for it.
+pub use edgefirst_tensor::protocol::QuantDesc;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
-/// Payload of the `edgefirst_tensor_v1` capsule -- the cross-package tensor
+/// Attach `quant` to `tensor`, if there is any.
+///
+/// Shared by every path that rebuilds a tensor from a descriptor. A
+/// validation failure is reported rather than swallowed: the reconstructed
+/// tensor has the producer's shape, so a `Quantization` that does not
+/// validate against it means the two disagree about the tensor, which the
+/// caller needs to know about before it dequantizes anything.
+fn apply_quantization(tensor: &mut TensorDyn, quant: Option<Quantization>) -> PyResult<()> {
+    if let Some(q) = quant {
+        tensor.set_quantization(q).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "tensor quantization does not match the imported descriptor: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Everything a consumer must copy out of a capsule while it is still
+/// alive, before it rebuilds the tensor.
+///
+/// A struct rather than a widening tuple: every field is metadata
+/// [`TensorDyn::import_descriptor`] cannot rebuild from the descriptor
+/// alone, and that list has grown twice already (quantization, then the
+/// plane offset). A tuple return made each addition touch every caller's
+/// destructuring and, being positional, let two same-typed members be
+/// transposed silently -- the same argument `protocol::DescParts` records
+/// for the descriptor's own construction.
+pub struct CapsuleParts {
+    pub desc: TensorDesc,
+    pub quant: Option<Quantization>,
+    pub plane_offset: u64,
+}
+
+/// Copy [`CapsuleParts`] out of a validated capsule payload.
+///
+/// Shared by [`TensorArg::call_protocol`] and
+/// `proto_interop::import_tensor_capsule`, which read the identical payload
+/// through the identical contract and differ only in the error text they
+/// wrap a failure in.
+///
+/// # Safety
+///
+/// `ptr` must address the payload of a live `PyCapsule` whose name
+/// [`PyCapsule::pointer_checked`] has already confirmed to be
+/// `edgefirst_tensor_v2` -- the name is what pins the layout being read
+/// here. The capsule must stay alive across the call, since the borrowed
+/// quantization arrays are copied out of it.
+unsafe fn read_capsule_parts(ptr: *const TensorCapsulePayload) -> PyResult<CapsuleParts> {
+    // Field projection through the raw pointer, deliberately: `&*ptr` would
+    // assert validity over the WHOLE struct, including the trailing
+    // Rust-layout keepalives whose size this protocol does not fix across
+    // independently built `.so`s -- the capsule name pins only the
+    // `#[repr(C)]` prefix read here (see the `const` block below). A
+    // producer built against a different pyo3 or `edgefirst-tensor` can
+    // have a shorter payload, and a reference spanning it would claim bytes
+    // that are not there. Each field below is a place expression, so no
+    // intermediate reference to the whole payload is ever formed.
+    //
+    // SAFETY: the caller's obligation, above -- `ptr` addresses a live
+    // `edgefirst_tensor_v2` payload, so its `#[repr(C)]` prefix is valid.
+    let desc = unsafe { (*ptr).desc };
+    // `QuantDesc` is `Copy`; copying it out first keeps the read confined
+    // to the prefix and detaches it from the capsule's lifetime.
+    // SAFETY: as above.
+    let quant_desc = unsafe { (*ptr).quant };
+    // SAFETY: as above.
+    let plane_offset = unsafe { (*ptr).plane_offset };
+    Ok(CapsuleParts {
+        desc,
+        // SAFETY: `to_quantization` copies the borrowed scale arrays out
+        // while the capsule -- which owns them through `quant_keepalive` --
+        // is still alive, which the caller also guarantees.
+        //
+        // Its `Err` is `edgefirst-tensor`'s, because the decoder lives
+        // there now (so it can be unit-tested); this is the seam that turns
+        // it into the Python exception a binding must raise.
+        quant: unsafe { quant_desc.to_quantization() }
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
+        plane_offset,
+    })
+}
+
+/// The wire format's `#[repr(C)]` prefix, pinned at compile time.
+///
+/// `crates/tensor/tests/protocol.rs`'s `descriptor_layout_is_pinned` covers
+/// `TensorDesc` alone, which is only the payload's *first field*; the
+/// versioning rule (INTEROP.md) binds on the whole payload layout. This
+/// pins the rest of what a foreign consumer actually reads, so a field
+/// added or reordered here fails the build instead of shipping under an
+/// unchanged capsule name.
+///
+/// A `const` rather than a `#[cfg(test)]` test on purpose: `make test-rust`
+/// excludes every `edgefirst-python-*` package by name, so a test in this
+/// crate would never run in CI. This is checked on every build.
+///
+/// Only the prefix is pinned. The trailing keepalives (`pin`,
+/// `quant_keepalive`, `pbo_keepalive`) are Rust-layout by design and are
+/// never read by a foreign consumer -- see [`TensorCapsulePayload`]'s doc.
+/// If any of these assertions fires, move the capsule name to `_v3` in the
+/// same commit.
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    // Spelled in terms of its members rather than as a literal `32`, so a
+    // 32-bit target fails only if a field is actually added or removed --
+    // a hardcoded size would fail there for having narrower pointers,
+    // which is not the mistake this is guarding against.
+    assert!(size_of::<QuantDesc>() == 2 * size_of::<u64>() + 2 * size_of::<*const ()>());
+    assert!(align_of::<QuantDesc>() == align_of::<u64>());
+    // Every field, not just the total size: `len` and `axis_plus_one` are
+    // both `u64` and `scales` and `zero_points` are both pointers, so
+    // swapping either pair leaves size and alignment untouched. Size alone
+    // would let a reordering -- which breaks every shipped `_v2` consumer
+    // exactly as an added field would -- pass this guard and ship without
+    // the rename.
+    assert!(offset_of!(QuantDesc, len) == 0);
+    assert!(offset_of!(QuantDesc, axis_plus_one) == size_of::<u64>());
+    assert!(offset_of!(QuantDesc, scales) == 2 * size_of::<u64>());
+    assert!(offset_of!(QuantDesc, zero_points) == 2 * size_of::<u64>() + size_of::<*const ()>());
+    assert!(offset_of!(TensorCapsulePayload, desc) == 0);
+    assert!(offset_of!(TensorCapsulePayload, quant) == size_of::<TensorDesc>());
+    assert!(
+        offset_of!(TensorCapsulePayload, plane_offset)
+            == size_of::<TensorDesc>() + size_of::<QuantDesc>()
+    );
+};
+
+/// Restore the producer's plane offset onto a tensor rebuilt from `desc`.
+///
+/// The second metadata field a descriptor round trip drops, and the one
+/// that costs wrong *pixels* rather than a refusal: `Tensor::view` records
+/// the sub-region's byte offset with `set_plane_offset`, and
+/// [`TensorDesc`] has nowhere to carry it.
+///
+/// **Only for a handle-based import.** Under `kind::HOST` the descriptor's
+/// `ptr` is the producer's pinned address *for the view itself*, so the
+/// offset is already baked into it and applying it again would advance past
+/// the sub-region a second time. Every other kind re-derives the base from
+/// a handle naming the whole parent buffer -- `DMABUF` dup's the fd,
+/// `IOSURFACE` looks the surface up by id, `D3D11_TEXTURE` opens the NT
+/// handle, `PBO` by buffer id -- and so lands at the parent's origin unless
+/// the offset is put back.
+///
+/// `Tensor::set_plane_offset` records the wrapper field for every backing,
+/// but only syncs the storage-internal offset that `map()` actually adds
+/// for `Mem`, `Dma` under `#[cfg(target_os = "linux")]`, `Dma` under
+/// `#[cfg(any(target_os = "macos", target_os = "ios"))]` and `Dma` under
+/// `#[cfg(target_os = "windows")]`; every other backing falls into its
+/// `_ => {}` arm. Backing by backing:
+///
+/// * **Linux DMA-BUF** -- fixed, and verified end-to-end.
+/// * **IOSurface (macOS/iOS)** -- fixed (issue #161).
+///   `IoSurfaceTensor::view_offset` is now written back by
+///   `set_plane_offset` *and* cleared by `set_format`, so a reconstructed
+///   view addresses its own sub-region and a later format change does not
+///   leave a stale window behind. Pinned by three tests in
+///   `edgefirst-tensor`'s `iosurface` module, which the macOS CI lane runs:
+///   `set_plane_offset_moves_the_iosurface_map_window`,
+///   `nested_iosurface_subviews_do_not_compound_their_plane_offset` and
+///   `set_format_clears_the_iosurface_map_window`.
+///   Two review follow-ups complete it: the import restores the view's
+///   pitch (`descriptor_import_restores_the_iosurface_pitch_onto_a_view`),
+///   and the GL leaf refuses an offset *source* the way Windows' does,
+///   since the ANGLE IOSurface binding has no offset attribute
+///   (`reconstructed_view_convert.rs`, case A, on the macOS lane).
+/// * **D3D11 (Windows)** -- fixed (issue #161), in three parts, because
+///   the bug had a different shape there. A view's descriptor was not
+///   reconstructed wrongly, it was *refused*: the `D3D11_TEXTURE` import
+///   checks the descriptor's shape against the texture's own geometry, and
+///   a window is neither of its two spellings. The import now accepts a
+///   packed window, narrows the whole-texture tensor to it and keeps the
+///   texture's pitch as the row stride. `D3d11TextureTensor::view_offset`
+///   is then written back by `set_plane_offset` and cleared by
+///   `set_format` and `reshape` (unlike `IoSurfaceTensor`, its own
+///   `reshape` leaves the offset alone). And because the ANGLE import binds
+///   the whole texture from its origin and cannot express an offset, the
+///   engine's ANGLE leaves (D3D11 and IOSurface) refuse to attach a source
+///   carrying one and upload it through `map()` instead -- without which
+///   even a *fresh* `view()` converted the parent's origin on the GL path.
+///   A rebuilt *destination* has the offset but not the `view_origin` the
+///   engine lowers a fresh view's tile to a viewport from, so the engine
+///   asks the platform whether a zero-copy destination can be placed
+///   (`GlPlatform::dst_import_places`) and lowers one that cannot to the
+///   mapped texture path, whose readback writes through `map()` at the
+///   offset. Pinned by the `d3d11` plane-offset tests in
+///   `crates/tensor/tests/d3d11_tensor.rs` and by
+///   `crates/image/tests/reconstructed_view_convert.rs`, which the Windows
+///   CI lanes run (the latter on WARP).
+/// * **`Mem`/`Shm`** -- never affected. Both report `kind::HOST`, so this
+///   function skips them and the pinned `desc.ptr` already addresses the
+///   view.
+/// * **Android** -- not silently wrong: it reports `kind::DMABUF`, and
+///   `import_storage`'s DMABUF arm is `cfg(target_os = "linux")`, so an
+///   import there fails with "dma-buf import off Linux" rather than
+///   reconstructing anything. A separate pre-existing limitation.
+/// * **PBO** -- fixed (issues #161 and #162). A `Tensor::view()` of a
+///   PBO-backed image used to come back reporting `TensorMemory::Mem`,
+///   because the `dynamic` backend held the real GL buffer in a field the C
+///   ABI could not see and the view was a window onto the host placeholder
+///   beside it. A PBO is now real `TensorStorage::Pbo` storage inside
+///   `libedgefirst_tensor` (`ef_tensor_wrap_pbo`), so a view stays
+///   PBO-backed and reports `kind::PBO` -- which means it reaches *this*
+///   function, and `PboTensor::view_offset` is written back by
+///   `set_plane_offset` and cleared by `set_format`. Pinned by
+///   `set_plane_offset_moves_the_pbo_map_window` and its two siblings in
+///   `edgefirst-tensor`'s `pbo` module, and end to end by
+///   `test_pbo_view_converts_its_own_sub_region_not_the_parents_origin`
+///   (`tests/interop/test_cross_package.py`), which sets
+///   `EDGEFIRST_FORCE_TRANSFER=pbo` through `monkeypatch` before building
+///   the processor and so runs on any host with GL at all -- not only the
+///   ones where `create_image` happens to fall back to a PBO.
+///
+/// The audit the IOSurface fix rested on applied unchanged to D3D11, and is
+/// recorded here so it need not be redone: `set_plane_offset`'s callers
+/// beyond this one cannot reach either backing.
+///
+/// * `image::import_image` -- the whole method is
+///   `#[cfg(target_os = "linux")]` (`crates/image/src/lib.rs`), so it does
+///   not exist on macOS or Windows. Note that its internal
+///   `memory() != TensorMemory::DmaBuf` rejection is **not** what excludes
+///   them: `TensorMemory::DmaBuf` is the portable spelling of "platform
+///   zero-copy buffer", so IOSurface and D3D11 both report it and would
+///   pass that check. The `cfg` is the gate.
+/// * `tensor-capi`'s builder (`builder.rs`, the `wrap` path) -- constructs
+///   storage only through `TensorDyn::from_fd`. Its
+///   `cfg(all(unix, not(target_os = "linux")))` arm always yields a
+///   `ShmTensor`, never an `IoSurfaceTensor`, and its `cfg(not(unix))` arm
+///   returns `ENOSYS`, so neither backing is reachable.
+/// * `Tensor::subview` -- does reach them, and writes the same absolute
+///   value the storage's own `view()` already computed, so the write is
+///   idempotent rather than a double-apply -- the failure this protocol
+///   produced once on `MEM` (see the `HOST` arm above).
+///
+/// **D3D11 applies the offset verbatim, and the descriptor's stride is not
+/// a pitch to translate it by.** A texture tensor's `map()` goes through a
+/// staging texture whose row pitch the driver chooses, and `view()` measures
+/// its offset in that pitch (`y * pitch + x * bpp`). The consumer opens the
+/// same texture through its NT handle, which only the adapter that created
+/// it can open, so the staging texture it creates for its own `map()` gets
+/// the same pitch from the same driver, and the offset names the same texel
+/// without translation. Translating by `strides[0]` would be wrong in the
+/// one case it looks needed: a single-row `view()` records a *tight* row
+/// stride for its map span (`Tensor::view`), while its offset is still in
+/// the pitch, so dividing that offset by the descriptor's stride yields a
+/// different row. The offset is bounded on the consumer's side instead:
+/// `D3d11TextureTensor`'s pins refuse one past the backing.
+fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u64) {
+    if plane_offset == 0 || desc.kind == edgefirst_tensor::tensor_kind::HOST {
+        return;
+    }
+    tensor.set_plane_offset(plane_offset as usize);
+}
+
+/// Payload of the `edgefirst_tensor_v2` capsule -- the cross-package tensor
 /// protocol's wire format.
 ///
 /// `#[repr(C)]`: this crosses an `.so` boundary the same way
@@ -58,11 +319,39 @@ use pyo3::types::PyCapsule;
 ///
 /// Any change to this struct's layout -- including a change to *how* the
 /// layout is guaranteed, not only to the fields themselves -- moves the
-/// capsule name to `edgefirst_tensor_v2`, per INTEROP.md's Versioning rule.
+/// capsule name to `edgefirst_tensor_v3`, per INTEROP.md's Versioning rule.
+/// `_v2` is what this struct is *now*, so naming it here would read as
+/// "rename it to the name it already has", i.e. as no rename at all.
 #[repr(C)]
 pub struct TensorCapsulePayload {
     pub desc: TensorDesc,
+    /// Quantization metadata, borrowing [`Self::quant_keepalive`]'s arrays.
+    /// [`QuantDesc::absent`] when the tensor carries none.
+    ///
+    /// Not in [`TensorDesc`] because that descriptor is also the C ABI's,
+    /// where nothing reconstructs a tensor -- see [`QuantDesc`]'s own doc.
+    pub quant: QuantDesc,
+    /// The producer's [`TensorDyn::plane_offset`] -- the byte offset within
+    /// the underlying buffer where this tensor's data starts. `0` for a
+    /// whole tensor, which is also what "no offset recorded" means, so no
+    /// separate presence flag is needed.
+    ///
+    /// Carried for the same reason [`Self::quant`] is, and lost the same
+    /// way without it: see [`apply_plane_offset`], which also explains why
+    /// a `HOST` descriptor must *not* have it re-applied.
+    pub plane_offset: u64,
     pub pin: Option<HostPin<'static>>,
+    /// Owns the arrays [`Self::quant`] points at, for the capsule's life.
+    ///
+    /// A Rust-layout field, like `pin` and `pbo_keepalive`, and sound for
+    /// the identical reason spelled out in this struct's doc comment: a
+    /// foreign consumer reads only the `#[repr(C)]` `desc`/`quant`, and this
+    /// field's `Drop` runs solely in the producer's own `.so`.
+    ///
+    /// `Arc`, not the `Quantization` by value: the producer's tensor may be
+    /// dropped while the capsule lives on, so the metadata is cloned out of
+    /// it once here rather than borrowed from it.
+    pub quant_keepalive: Option<Arc<Quantization>>,
     /// Keepalive for a PBO-backed `desc`'s `ptr` (a `PboOpsVtable` address
     /// under `kind::PBO` -- see [`edgefirst_tensor::TensorDesc::ptr`]'s own
     /// doc comment). Mirrors `pin`'s role for the `HOST` kind exactly:
@@ -214,18 +503,28 @@ impl<'py> TensorArg<'py> {
             ))
         })?;
 
-        let (mut capsule_obj, mut desc) = Self::call_protocol(&method, access)?;
+        let (mut capsule_obj, mut parts) = Self::call_protocol(&method, access)?;
         if let Some(retry_access) = retry_access {
-            if desc.kind == edgefirst_tensor::tensor_kind::HOST && desc.ptr.is_null() {
-                (capsule_obj, desc) = Self::call_protocol(&method, Some(retry_access))?;
+            if parts.desc.kind == edgefirst_tensor::tensor_kind::HOST && parts.desc.ptr.is_null() {
+                (capsule_obj, parts) = Self::call_protocol(&method, Some(retry_access))?;
             }
         }
 
-        let tensor = TensorDyn::import_descriptor(&desc).map_err(|e| {
+        let mut tensor = TensorDyn::import_descriptor(&parts.desc).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to import tensor via the __edgefirst_tensor__ protocol: {e}"
             ))
         })?;
+        // `import_descriptor` rebuilds the buffer, not the metadata that
+        // describes how to read its integers. Without this an int8 tensor
+        // arrives looking unquantized, and any consumer that dequantizes --
+        // `materialize_masks`, `draw_proto_masks`, the decoder's own
+        // dequant paths -- refuses it.
+        apply_quantization(&mut tensor, parts.quant)?;
+        // Likewise the sub-region offset: without it a DMA-backed `view()`
+        // arrives addressing the parent buffer's origin, which is silently
+        // wrong pixels rather than a refusal.
+        apply_plane_offset(&mut tensor, &parts.desc, parts.plane_offset);
 
         Ok(Self::Foreign {
             tensor: Box::new(tensor),
@@ -241,7 +540,7 @@ impl<'py> TensorArg<'py> {
     fn call_protocol(
         method: &Bound<'py, PyAny>,
         access: Option<&str>,
-    ) -> PyResult<(Bound<'py, PyAny>, TensorDesc)> {
+    ) -> PyResult<(Bound<'py, PyAny>, CapsuleParts)> {
         let capsule_obj = match access {
             Some(a) => {
                 let kwargs = pyo3::types::PyDict::new(method.py());
@@ -253,7 +552,7 @@ impl<'py> TensorArg<'py> {
 
         let capsule = capsule_obj.cast::<PyCapsule>().map_err(|_| {
             pyo3::exceptions::PyTypeError::new_err(
-                "__edgefirst_tensor__() must return a PyCapsule named \"edgefirst_tensor_v1\", \
+                "__edgefirst_tensor__() must return a PyCapsule named \"edgefirst_tensor_v2\", \
                  per the cross-package tensor protocol",
             )
         })?;
@@ -263,7 +562,7 @@ impl<'py> TensorArg<'py> {
         // the name and reading it. This name check is what makes the
         // unchecked-size read below sound: the name uniquely identifies
         // the payload's layout, and any future change to that layout moves
-        // the name to `_v2` in the same commit (see INTEROP.md's
+        // the name to `_v3` in the same commit (see INTEROP.md's
         // Versioning section). A producer built against a different name --
         // including a stale sibling `.so` in a partially-rebuilt
         // environment -- is rejected right here, before its payload is ever
@@ -272,24 +571,27 @@ impl<'py> TensorArg<'py> {
         // out-of-bounds/misaligned bytes are already read into `desc` by
         // the time `version` could be inspected.
         let ptr = capsule
-            .pointer_checked(Some(c"edgefirst_tensor_v1"))
+            .pointer_checked(Some(c"edgefirst_tensor_v2"))
             .map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err(
                     "__edgefirst_tensor__() returned a capsule not named \
-                     \"edgefirst_tensor_v1\"; it does not follow the cross-package tensor \
-                     protocol",
+                     \"edgefirst_tensor_v2\". Either the object does not follow the \
+                     cross-package tensor protocol, or it comes from an edgefirst.* \
+                     package built against an older capsule version \
+                     (edgefirst_tensor_v1 shipped in 0.29.0-0.30.0) -- install \
+                     matching edgefirst.* versions",
                 )
             })?;
         // SAFETY: `pointer_checked` above confirmed the capsule is named
-        // "edgefirst_tensor_v1", which by the protocol's contract (see
+        // "edgefirst_tensor_v2", which by the protocol's contract (see
         // `PyTensor::__edgefirst_tensor__`) is only ever created via
         // `PyCapsule::new_with_value` wrapping exactly a
-        // `TensorCapsulePayload`. `TensorDesc` is `Copy`; copying `.desc`
-        // out ends the borrow here instead of tying it to the capsule's
-        // lifetime.
-        let desc = unsafe { (*(ptr.as_ptr() as *const TensorCapsulePayload)).desc };
+        // `TensorCapsulePayload`. `capsule_obj` -- which owns the borrowed
+        // quantization arrays through the payload's `quant_keepalive` -- is
+        // alive and in scope for the whole call.
+        let parts = unsafe { read_capsule_parts(ptr.as_ptr() as *const TensorCapsulePayload) }?;
 
-        Ok((capsule_obj, desc))
+        Ok((capsule_obj, parts))
     }
 }
 
@@ -460,11 +762,26 @@ pub(crate) fn reconstruct(
     } else {
         (desc, None)
     };
-    let imported = TensorDyn::import_descriptor(&desc).map_err(|e| {
+    let mut imported = TensorDyn::import_descriptor(&desc).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "failed to resolve a tensor for a detached region: {e}"
         ))
     })?;
+    // A descriptor carries the buffer, not the metadata describing how to
+    // read its integers -- and this path reconstructs on the *same-module*
+    // side too (see `TensorArg::NativeRef`), so without this a
+    // native-to-native `materialize_masks` loses quantization just as the
+    // cross-package one did. The source tensor is right here, so no wire
+    // format is involved: clone it straight across.
+    apply_quantization(&mut imported, tensor.quantization().cloned())?;
+    // Same for the sub-region offset, and for the same reason it is not in
+    // the descriptor -- this path loses it identically. A DMA-backed
+    // `view()` converted natively read the parent's origin without this.
+    apply_plane_offset(
+        &mut imported,
+        &desc,
+        tensor.plane_offset().unwrap_or(0) as u64,
+    );
     Ok((imported, pin))
 }
 
@@ -801,8 +1118,7 @@ mod decoder_interop {
 #[cfg(any(feature = "image", feature = "decoder"))]
 mod proto_interop {
     use super::{
-        Bound, HostPin, Py, PyAny, PyAnyMethods, PyCapsule, PyResult, PyTypeMethods,
-        TensorCapsulePayload, TensorDyn,
+        Bound, HostPin, Py, PyAny, PyAnyMethods, PyCapsule, PyResult, PyTypeMethods, TensorDyn,
     };
     // Only the `Native` variant below and its `into_raw_access` arm
     // (both feature = "decoder") name PyRef / call `into_pyobject`; an
@@ -1022,7 +1338,7 @@ mod proto_interop {
         }
     }
 
-    /// Validate and import a single `edgefirst_tensor_v1` capsule -- the
+    /// Validate and import a single `edgefirst_tensor_v2` capsule -- the
     /// same capsule shape `TensorArg` imports, factored out here because
     /// `__edgefirst_protodata__` returns two of them directly rather than a
     /// producer method to call.
@@ -1030,26 +1346,38 @@ mod proto_interop {
         let capsule = capsule_obj.cast::<PyCapsule>().map_err(|_| {
             pyo3::exceptions::PyTypeError::new_err(
                 "__edgefirst_protodata__() must return PyCapsule objects named \
-                 \"edgefirst_tensor_v1\", per the cross-package tensor protocol",
+                 \"edgefirst_tensor_v2\", per the cross-package tensor protocol",
             )
         })?;
         let ptr = capsule
-            .pointer_checked(Some(c"edgefirst_tensor_v1"))
+            .pointer_checked(Some(c"edgefirst_tensor_v2"))
             .map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err(
                     "__edgefirst_protodata__() returned a capsule not named \
-                     \"edgefirst_tensor_v1\"; it does not follow the cross-package tensor \
-                     protocol",
+                     \"edgefirst_tensor_v2\". Either the object does not follow the \
+                     cross-package tensor protocol, or it comes from an edgefirst.* \
+                     package built against an older capsule version \
+                     (edgefirst_tensor_v1 shipped in 0.29.0-0.30.0) -- install \
+                     matching edgefirst.* versions",
                 )
             })?;
         // SAFETY: see `TensorArg::call_protocol` -- same capsule shape,
-        // same contract.
-        let desc = unsafe { (*(ptr.as_ptr() as *const TensorCapsulePayload)).desc };
-        TensorDyn::import_descriptor(&desc).map_err(|e| {
+        // same contract, and the same "copy out while `capsule_obj` is
+        // alive" rule for the borrowed scale arrays.
+        let parts = unsafe {
+            super::read_capsule_parts(ptr.as_ptr() as *const super::TensorCapsulePayload)
+        }?;
+        let mut tensor = TensorDyn::import_descriptor(&parts.desc).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to import a ProtoData tensor via the __edgefirst_tensor__ protocol: {e}"
             ))
-        })
+        })?;
+        // The whole reason ProtoData crosses this boundary: the int8 fast
+        // path in `materialize_masks` reads the coefficients' and protos'
+        // quantization off the tensors themselves.
+        super::apply_quantization(&mut tensor, parts.quant)?;
+        super::apply_plane_offset(&mut tensor, &parts.desc, parts.plane_offset);
+        Ok(tensor)
     }
 }
 #[cfg(feature = "decoder")]

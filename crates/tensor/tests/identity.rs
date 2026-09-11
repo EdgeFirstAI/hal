@@ -6,6 +6,21 @@ use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
 
+/// Report a skip as `SKIPPED: {why}`, straight to stderr.
+///
+/// Not `println!`/`eprintln!`: libtest captures both and replays them only
+/// for a *failing* test, and a skip is a pass, so the reason was discarded
+/// exactly when it mattered. The `SKIPPED:` prefix is what
+/// `scripts/on-target-test.sh` greps a board's log for to count skips.
+/// Written out here rather than shared: an integration test is its own
+/// compilation unit and cannot reach `edgefirst-tensor`'s `pub(crate)`
+/// `test_support::report_skip`.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+fn skip(why: &str) {
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
+}
+
 /// Allocates a small DMA-BUF tensor, or reports why it could not and returns
 /// `None`. A dma-heap is a host resource, not something every CI runner or
 /// dev machine provides, so absence must be a loud, visible skip rather than
@@ -15,7 +30,7 @@ fn dma_tensor_or_skip() -> Option<Tensor<u8>> {
     match Tensor::<u8>::new(&[4096], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => Some(t),
         Err(e) => {
-            println!("SKIP: no dma-heap on this host ({e})");
+            skip(&format!("no dma-heap on this host ({e})"));
             None
         }
     }
@@ -47,7 +62,7 @@ fn iosurface_tensor_or_skip() -> Option<Tensor<u8>> {
     match Tensor::<u8>::new(&[4096], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => Some(t),
         Err(e) => {
-            println!("SKIP: no IOSurface support on this host ({e})");
+            skip(&format!("no IOSurface support on this host ({e})"));
             None
         }
     }

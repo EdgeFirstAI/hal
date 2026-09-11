@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_random_strided() {
         if !is_x86_feature_detected!("avx2") {
-            eprintln!("AVX2 not available, skipping");
+            crate::test_support::report_skip("AVX2 not available");
             return;
         }
         const STRIDE: usize = 24;

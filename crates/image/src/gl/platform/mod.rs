@@ -106,6 +106,72 @@ impl PackedImportFormat {
     }
 }
 
+/// A destination whose bytes start at a plane offset the engine cannot lower
+/// to a viewport: one rebuilt from a descriptor, which carries the offset but
+/// not the `view_origin` a `view()` would have given it.
+///
+/// Shared by the platforms whose import binds a whole buffer from its origin.
+/// ANGLE over a D3D11 texture and ANGLE over an IOSurface both do, and neither
+/// extension has a byte-offset attribute, so each one's `dst_import_places`
+/// asks the same question of the same two fields. Linux's DMA-BUF import can
+/// express the offset and keeps the default.
+///
+/// Gated to its callers' platforms: `angle` and `windows` are the only
+/// modules that use it, and both are `cfg`-gated, so on Linux and Android it
+/// would be dead code and fail those lanes under `-D warnings`.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+pub(super) fn unplaced_destination<T>(img: &Tensor<T>) -> Option<usize>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match (img.plane_offset(), img.view_origin()) {
+        (Some(offset), None) if offset != 0 => Some(offset),
+        _ => None,
+    }
+}
+
+/// Refuses to import a source whose pixels do not start at the buffer's
+/// origin.
+///
+/// Shared by the platforms whose import binds a whole buffer from its
+/// origin: ANGLE over a D3D11 texture (`EGL_ANGLE_image_d3d11_texture`) and
+/// ANGLE over an IOSurface (`EGL_ANGLE_iosurface_client_buffer`). Neither
+/// extension has a byte-offset attribute, and the engine samples a source
+/// from the origin of its import, so a `view()` -- or a whole tensor at a
+/// foreign offset -- attached that way converts the parent's top-left tile
+/// in place of the region it names, silently. Declining sends the source
+/// through `map()`, which starts at the offset: the engine's texture upload
+/// for a packed source into a packed destination, and the R8 upload of the
+/// combined plane for a single-plane NV source, whose import failure arms took
+/// over from `draw_src_texture` (which has no NV case) in #166. What is left
+/// on `ImageProcessor::convert`'s CPU fallback is a planar destination's GL
+/// lowering and a true-multiplane NV12, which cannot be uploaded as one R8
+/// texture; a forced OpenGL backend returns the refusal to the caller.
+/// Issue #161 at the convert level.
+/// Linux's DMA-BUF import expresses the offset itself
+/// (`EGL_DMA_BUF_PLANE0_OFFSET_EXT`) and does not need this.
+///
+/// `binding` names the extension in the message, so a log line says which
+/// leaf declined.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+pub(super) fn refuse_offset_source<T>(
+    img: &Tensor<T>,
+    what: &str,
+    binding: &str,
+) -> crate::Result<()>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    match img.plane_offset() {
+        None | Some(0) => Ok(()),
+        Some(offset) => Err(crate::Error::NotSupported(format!(
+            "GL convert: {what} starts {offset} bytes into its buffer, and {binding} \
+             can only bind the whole buffer from its origin; uploading the window \
+             instead"
+        ))),
+    }
+}
+
 /// The compile-time platform contract for the portable GL engine.
 ///
 /// One implementation per OS, selected by the [`Platform`] alias. Methods
@@ -218,6 +284,27 @@ pub(super) trait GlPlatform {
         Ok(())
     }
 
+    /// Whether a zero-copy import of `img` as a destination can place the
+    /// render where the tensor's bytes start.
+    ///
+    /// A `view()` destination carries a `view_origin`, and the engine
+    /// imports its parent and lowers the tile to a viewport. A destination
+    /// reconstructed from a descriptor carries only a `plane_offset`: no
+    /// `view_origin` is transported, so the viewport is the surface's origin
+    /// and the import itself has to start at the offset. Linux's DMA-BUF
+    /// import does. A platform whose import always binds the whole buffer
+    /// from its origin returns `false` for such a tensor, and the engine
+    /// lowers it to the mapped texture path, whose readback writes through
+    /// `map()` at the offset.
+    ///
+    /// Default `true`: every import that can express an offset.
+    fn dst_import_places<T>(_img: &Tensor<T>) -> bool
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        true
+    }
+
     /// Import an NV12/NV16/NV24 tensor's combined semi-planar plane as ONE
     /// R8 buffer (luma + interleaved chroma addressed by the shader — the
     /// "Path B" NV sampling strategy). On Linux a single-plane R8 EGLImage
@@ -251,9 +338,11 @@ pub(super) trait GlPlatform {
     /// larger than the tensor's logical image; `None` when the import is
     /// always exactly the logical image.
     ///
-    /// Linux creates the DMA-BUF `EGLImage` at the logical size (the physical
-    /// pitch is a separate attribute) and macOS gives the pbuffer explicit
-    /// dimensions, so on both the import *is* the logical image.
+    /// Linux reports the logical size unless the source was rebased onto an
+    /// aligned DMA-BUF offset, where the import is `x_shift_px` texels wider
+    /// and [`Self::import_origin`] says where the image starts on it; macOS
+    /// gives the pbuffer explicit dimensions, so there the import *is* the
+    /// logical image.
     /// `EGL_ANGLE_image_d3d11_texture` has no sub-extent attribute: a pool
     /// buffer narrowed by `configure_image` keeps its texture and imports all
     /// of it, so Windows reports the texture's texel size and the engine
@@ -262,14 +351,30 @@ pub(super) trait GlPlatform {
     /// logical image ([`super::render::sample_clamp_rect`]). A leaf that
     /// returns `None` reaches both as the identity.
     ///
-    /// Not every sampling site clamps: the two `GL_TEXTURE_EXTERNAL_OES`
-    /// camera programs (`draw_camera_texture_to_rgb_planar`,
-    /// `draw_camera_texture_eglimage`) scale their source rectangle and stop
-    /// there. They exist only where [`Self::EXTERNAL_OES`] is true, which
-    /// today is only the leaf that returns `None` here, so a narrowed import
-    /// cannot reach them. A leaf that returns `Some` and has external-OES
-    /// programs must add the clamp to both.
+    /// Every sampling site clamps, the two `GL_TEXTURE_EXTERNAL_OES` camera
+    /// programs (`draw_camera_texture_to_rgb_planar`,
+    /// `draw_camera_texture_eglimage`) included: they now carry the same
+    /// `src_extent` uniform the `sampler2D` programs do, which is what lets
+    /// the Linux leaf report a narrowed extent and a nonzero
+    /// [`Self::import_origin`] and still use them.
     fn import_extent(import: &Self::Import) -> Option<(u32, u32)>;
+
+    /// Texels from the imported texture's origin to the tensor's own first
+    /// pixel, when a leaf can start the logical image partway into the
+    /// import; `(0, 0)` — the default — when the logical image always begins
+    /// at the texture's origin.
+    ///
+    /// The companion of [`Self::import_extent`]: the extent says how much
+    /// texture the import covers, this says where in it the logical image
+    /// starts, and the engine folds both through one
+    /// [`super::render::ImportMap`] at every site that turns logical-image
+    /// coordinates into texture coordinates. Linux returns a nonzero origin
+    /// for a source rebased onto a 64-byte-aligned DMA-BUF base, which the
+    /// import then widens by the same shift (issue #170); every other leaf
+    /// keeps the default.
+    fn import_origin(_import: &Self::Import) -> (u32, u32) {
+        (0, 0)
+    }
 
     /// Attach the import as the image of the CURRENTLY BOUND
     /// `GL_TEXTURE_2D` texture object. Linux:
@@ -404,5 +509,31 @@ mod tests {
     #[test]
     fn rgba32323232f_is_16_bytes_per_pixel() {
         assert_eq!(PackedImportFormat::Rgba32323232F.bytes_per_pixel(), 16);
+    }
+
+    /// The refusal is a pure function of `plane_offset`, so a host tensor
+    /// exercises it without a GL context.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn an_offset_source_is_refused_and_an_origin_source_is_not() {
+        use edgefirst_tensor::{Tensor, TensorMemory};
+
+        let mut t = Tensor::<u8>::new(&[4, 4, 4], Some(TensorMemory::Mem), None).expect("alloc");
+        assert!(
+            super::refuse_offset_source(&t, "source", "ext").is_ok(),
+            "no offset recorded: attachable"
+        );
+        t.set_plane_offset(0);
+        assert!(
+            super::refuse_offset_source(&t, "source", "ext").is_ok(),
+            "a zero offset is the origin: attachable"
+        );
+        t.set_plane_offset(16);
+        let err = super::refuse_offset_source(&t, "source", "ext")
+            .expect_err("a source 16 bytes in cannot be bound from the origin");
+        assert!(
+            matches!(err, crate::Error::NotSupported(_)),
+            "NotSupported is what sends the engine to the upload path; got {err}"
+        );
     }
 }

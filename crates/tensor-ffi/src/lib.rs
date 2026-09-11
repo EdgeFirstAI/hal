@@ -18,7 +18,8 @@
 use std::ffi::{c_char, c_int};
 
 pub use edgefirst_tensor_abi::{
-    EfCompression, EfCpuAccess, EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView,
+    EfClientRefFn, EfClientState, EfCompression, EfCpuAccess, EfD3d11Layout, EfDtype, EfErrorClass,
+    EfImageDescView, EfPboMapFn, EfPboMapFnNullable, EfPboUnmapFn, EfPboUnmapFnNullable,
     EfQuantizationInfo, EfStorageKind, EfTensorPlane, EfTensorView, EfViewOrigin,
 };
 
@@ -144,6 +145,19 @@ declare_abi! {
         dims: *const u64,
         ndim: u32,
     ) -> *mut EfTensor;
+    pub fn ef_tensor_wrap_pbo(
+        state: EfClientState,
+        buffer_id: u32,
+        size: usize,
+        dtype: u32,
+        dims: *const u64,
+        ndim: u32,
+        map_fn: EfPboMapFnNullable,
+        unmap_fn: EfPboUnmapFnNullable,
+    ) -> *mut EfTensor;
+    pub fn ef_tensor_pbo_id(t: *const EfTensor, out_id: *mut u32) -> c_int;
+    pub fn ef_tensor_pbo_is_mapped(t: *const EfTensor) -> c_int;
+    pub fn ef_tensor_pbo_vtable(t: *const EfTensor) -> *const std::ffi::c_void;
     pub fn ef_tensor_from_iosurface_id(
         id: u32,
         dtype: u32,
@@ -494,7 +508,19 @@ mod tests {
     /// Python bindings after each convert, and the dynamic backend's
     /// descriptor export -- paid a `DuplicateHandle` and a `CloseHandle`
     /// for a number they already had a fence for.
-    const HEADER_DECLARATION_COUNT: usize = 102;
+    /// **Now 106** with the PBO storage family (Stage B of the client-side
+    /// state design): `ef_tensor_wrap_pbo` -- the constructor that makes a
+    /// client's GL buffer real `TensorStorage::Pbo` storage inside this
+    /// library, over a frozen `ef_client_state` callback channel -- plus
+    /// `ef_tensor_pbo_id` and `ef_tensor_pbo_is_mapped`, the whole surface
+    /// `edgefirst-image`'s nine PBO call sites use, and
+    /// `ef_tensor_pbo_vtable`, which the dynamic backend's
+    /// `descriptor_pinned` needs for the cross-package capsule's `PBO`
+    /// kind. It is a *constructor*, not an attach: the storage IS the GL
+    /// buffer, so there is no pre-existing tensor to decorate, and an
+    /// attach would have reproduced the host placeholder this stage
+    /// deletes.
+    const HEADER_DECLARATION_COUNT: usize = 106;
 
     #[test]
     fn declared_matches_the_header_derived_count() {

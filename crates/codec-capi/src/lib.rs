@@ -49,7 +49,7 @@ mod tests {
             Ok(o) => Some(o),
             Err(e) => {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr(), "SKIP: no C compiler ({cc}: {e})");
+                let _ = writeln!(std::io::stderr(), "SKIPPED: no C compiler ({cc}: {e})");
                 None
             }
         }
@@ -109,7 +109,7 @@ mod tests {
                     use std::io::Write;
                     let _ = writeln!(
                         std::io::stderr(),
-                        "SKIP: libedgefirst_{name} not built; collision check not run"
+                        "SKIPPED: libedgefirst_{name} not built; collision check not run"
                     );
                     return;
                 }
@@ -209,7 +209,7 @@ mod tests {
             .unwrap_or_default();
         if found.is_empty() {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "SKIP: nothing built; name not checked");
+            let _ = writeln!(std::io::stderr(), "SKIPPED: nothing built; name not checked");
             return;
         }
         assert!(

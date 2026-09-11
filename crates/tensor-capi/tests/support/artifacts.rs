@@ -15,14 +15,31 @@
 
 use std::path::{Path, PathBuf};
 
-/// Report a skipped check on stderr.
+/// Report a skipped check on stderr as `SKIPPED: {reason}`.
 ///
 /// Straight to the handle, not `eprintln!`: libtest captures a passing
 /// test's `eprintln!`, and a skip nobody sees is indistinguishable from a
 /// pass.
+///
+/// The `SKIPPED:` spelling is the wire format, not a nicety --
+/// `scripts/on-target-test.sh` greps each board's captured log for that
+/// literal to report a skip count, and `edgefirst-image`'s
+/// `test_support::report_skip` emits the same line. The earlier `SKIP:`
+/// prefix here was invisible to that count.
+///
+/// Every skip line the five leaves EMIT carries that prefix. Three places
+/// cannot call this function and write it themselves, each for a stated
+/// reason: `msvc.rs` beside this file (its own `#[path]`-included twin),
+/// `tests/check_abi.rs` (an integration test cannot see the library
+/// crate's `#[cfg(test)]` items -- its header says so), and the
+/// `codec`/`decoder`/`tracker` leaves, which do not `#[path]`-include this
+/// module at all. The `SKIP:` lines left in `tests/c/*.c` are not an
+/// exception to that: a C leaf test's output is captured into the
+/// `std::process::Output` its Rust caller inspects and prints only on
+/// failure, so those lines never reach a board log in the first place.
 pub fn skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "SKIP: {reason}");
+    let _ = writeln!(std::io::stderr(), "SKIPPED: {reason}");
 }
 
 /// Directories that may hold this leaf's built C libraries, in the order

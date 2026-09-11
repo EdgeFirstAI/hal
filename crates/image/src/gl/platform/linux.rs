@@ -28,6 +28,11 @@ pub(in crate::opengl_headless) struct EglImage {
     pub(in crate::opengl_headless) egl_image: egl::Image,
     pub(in crate::opengl_headless) egl: Rc<Egl>,
     pub(in crate::opengl_headless) display: egl::Display,
+    /// Texel the logical image starts at inside this import, and the
+    /// import's own texel size — both `(0, 0)` / `None` unless a source was
+    /// rebased onto an aligned DMA-BUF offset (issue #170).
+    pub(in crate::opengl_headless) sample_origin_px: (u32, u32),
+    pub(in crate::opengl_headless) sample_extent_px: Option<(u32, u32)>,
 }
 
 impl Drop for EglImage {
@@ -87,10 +92,16 @@ impl GlPlatform for LinuxEgl {
         import.egl_image
     }
 
-    fn import_extent(_import: &EglImage) -> Option<(u32, u32)> {
-        // The DMA-BUF EGLImage is created at the tensor's logical size; the
-        // buffer's physical pitch is a separate import attribute.
-        None
+    fn import_extent(import: &EglImage) -> Option<(u32, u32)> {
+        // The DMA-BUF EGLImage is created at the tensor's logical size --
+        // the buffer's physical pitch is a separate import attribute -- so
+        // this is `None` except for a source rebased onto an aligned offset
+        // (issue #170), which imports `x_shift_px` texels wider.
+        import.sample_extent_px
+    }
+
+    fn import_origin(import: &EglImage) -> (u32, u32) {
+        import.sample_origin_px
     }
 
     unsafe fn attach_tex_image_2d(_display: &GlContext, handle: egl::Image) -> crate::Result<()> {
@@ -224,7 +235,20 @@ impl GlPlatform for LinuxEgl {
         for_dst: bool,
     ) -> crate::Result<EglImage> {
         let attrs = DmaImportAttrs::from_tensor(img, fmt, for_dst)?;
-        new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
+        let mut image =
+            new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())?;
+        // A source rebased onto an aligned base imports wider than the
+        // logical image and starts it `x_shift_px` texels in; the engine
+        // folds both through `import_extent` / `import_origin`. Zero for
+        // every other import, which then reports the logical image as
+        // before. The extent travels WITH the origin: the fold ignores an
+        // origin whose map has no extent, which would put the shift nowhere
+        // and show up only as a black frame on the one board that rebases.
+        if attrs.x_shift_px != 0 {
+            image.sample_origin_px = (attrs.x_shift_px, 0);
+            image.sample_extent_px = Some((attrs.width as u32, attrs.height as u32));
+        }
+        Ok(image)
     }
 
     fn import_buffer_nv_r8(
@@ -271,5 +295,7 @@ pub(in crate::opengl_headless) fn new_egl_image_owned(
         egl_image: image,
         display: display.display,
         egl: Rc::clone(&display.egl),
+        sample_origin_px: (0, 0),
+        sample_extent_px: None,
     })
 }

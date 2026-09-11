@@ -907,7 +907,7 @@ impl TensorDyn {
     }
 
     /// Rebuild a type-erased PBO tensor from a cross-cdylib `ops` (see
-    /// [`crate::pbo::import_pbo_ops`]) plus the geometry a
+    /// [`crate::client_state_pbo_ops`]) plus the geometry a
     /// [`crate::TensorDesc`] under [`crate::protocol::kind::PBO`] carries.
     /// Mirrors [`Self::from_fd`]'s per-dtype dispatch shape exactly; the
     /// only caller is [`Self::import_descriptor`].
@@ -942,6 +942,32 @@ impl TensorDyn {
             DType::F64 => crate::PboTensor::<f64>::from_pbo(buffer_id, size, shape, None, ops)
                 .and_then(|p| Tensor::from_pbo(p).map(Self::F64)),
         }
+    }
+
+    /// Build a PBO-backed tensor from a client's callback channel -- the
+    /// `.so`-side half of `ef_tensor_wrap_pbo`.
+    ///
+    /// The GL buffer stays the client's; what crosses is the channel, per
+    /// [`crate::EfClientState`]'s contract. The result is ordinary
+    /// `TensorStorage::Pbo` storage: `memory()` reports `Pbo`, `map()` goes
+    /// through the client's `map_fn`, and `view()` produces a real PBO
+    /// sub-view rather than a host placeholder.
+    ///
+    /// # Safety
+    /// `state`, `map_fn` and `unmap_fn` must satisfy
+    /// [`crate::client_state_pbo_ops`]'s contract.
+    pub unsafe fn from_client_pbo(
+        state: crate::EfClientState,
+        map_fn: crate::EfPboMapFn,
+        unmap_fn: crate::EfPboUnmapFn,
+        buffer_id: u32,
+        size: usize,
+        shape: &[usize],
+        dtype: DType,
+    ) -> crate::Result<TensorDyn> {
+        // SAFETY: this function's own contract, forwarded verbatim.
+        let ops = unsafe { crate::client_state_pbo_ops(state, map_fn, unmap_fn) }?;
+        Self::from_pbo_import(buffer_id, size, shape, dtype, ops)
     }
 
     /// Wrap a producer's host pointer as a type-erased tensor without
@@ -1077,8 +1103,20 @@ impl TensorDyn {
                 // `desc.handle`, so interpreting it as a `PboOpsVtable*` is
                 // not a new hazard relative to the `HOST` arm's own use of
                 // `desc.ptr`.
-                let ops = unsafe { crate::pbo::import_pbo_ops(desc.ptr.0 as *const _)? };
-                Self::from_pbo_import(buffer_id, desc.capacity as usize, shape, dtype, ops)
+                let parts = unsafe { crate::read_pbo_vtable_parts(desc.ptr.0 as *const _) }?;
+                // SAFETY: the parts came from a table this crate built, read
+                // above while the producer's keepalive holds it live.
+                unsafe {
+                    Self::from_client_pbo(
+                        parts.state,
+                        parts.map_fn,
+                        parts.unmap_fn,
+                        buffer_id,
+                        desc.capacity as usize,
+                        shape,
+                        dtype,
+                    )
+                }
             }
             #[cfg(target_os = "windows")]
             crate::protocol::kind::D3D11_TEXTURE => {
@@ -1326,6 +1364,13 @@ impl TensorDyn {
     /// PBO-backed.
     pub fn pbo_id(&self) -> Option<u32> {
         dispatch!(self, pbo_id)
+    }
+
+    /// Whether this PBO currently holds (or is establishing) a CPU
+    /// mapping. `None` when the tensor is not PBO-backed. See
+    /// [`crate::Tensor::pbo_is_mapped`].
+    pub fn pbo_is_mapped(&self) -> Option<bool> {
+        dispatch!(self, pbo_is_mapped)
     }
 
     /// The C-ABI `PboOpsVtable` address for this PBO, for cross-cdylib

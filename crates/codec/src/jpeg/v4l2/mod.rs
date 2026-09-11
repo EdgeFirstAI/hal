@@ -2013,7 +2013,7 @@ mod tests {
         // SAFETY: mplane variant.
         let cap_fmt = *unsafe { gfmt.pix_mp() };
         if cap_fmt.num_planes != 1 {
-            eprintln!("  capture is not single-plane; skipping");
+            crate::test_support::report_skip("capture is not single-plane");
             return None;
         }
         let sizeimage = cap_fmt.plane_fmt[0].sizeimage as usize;

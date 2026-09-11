@@ -45,9 +45,15 @@ fn luma_mapper(full_range: bool) -> fn(u8) -> u8 {
 /// `Balanced` relies on Q15 rounded-doubling multiply-accumulate (`SQRDMLAH`,
 /// Armv8.1 "rdm"). Cores without it — Cortex-A53/A35-class — emulate the op
 /// with a `vqrdmulh`+`vqadd` pair per accumulate, roughly doubling the cost of
-/// every conversion row. On those cores `Fast` (lower-precision integer
-/// approximation, error ≤ ~2/255) is 2×+ faster and visually
+/// every conversion row. On those cores `Fast` is 2×+ faster and visually
 /// indistinguishable; everywhere else `Balanced` keeps full precision.
+///
+/// `Fast`'s measured accuracy, swept over every (Y,Cb,Cr) triple on an i.MX8MP
+/// against exact BT.601 limited-range math: worst error 6/255 across the whole
+/// legal luma span 16..=235, and 2..3/255 typical. (An earlier comment here
+/// claimed ≤ ~2/255; that was never measured and is wrong.) Above the legal
+/// luma ceiling the kernel wraps outright — see [`FAST_PATH_MAX_LUMA`], which
+/// is why callers must route super-white luma through [`fast_path_luma`].
 #[inline]
 fn yuv_mode() -> yuv::YuvConversionMode {
     #[cfg(target_arch = "aarch64")]
@@ -57,6 +63,101 @@ fn yuv_mode() -> yuv::YuvConversionMode {
         }
     }
     yuv::YuvConversionMode::Balanced
+}
+
+/// Luma ceiling imposed on the `yuv` crate's `Fast` kernel in limited range:
+/// the nominal limited-range white point, chosen with margin to spare.
+///
+/// Past its real threshold the kernel silently wraps a bright pixel to its
+/// opposite. The `Fast` NV12/16/24→RGB row evaluates each channel in Q6 in a
+/// *signed 16-bit* accumulator that does not saturate (aarch64
+/// `neon_yuv_nv_to_rgba_fast_row` via `vmlal_s8`; the x86 SSE row is the same
+/// shape). Blue is `(Y - 16)·y_coef + (Cb - 128)·cb_coef`, and with the
+/// limited-range BT.601 coefficients — `y_coef` 75, `cb_coef` 129 clamped by the
+/// crate to the i8 ceiling 127 — a super-white Y = 249 with a saturated Cb = 253
+/// gives `233·75 + 125·127 = 33 350`, past `i16::MAX`. It wraps negative and the
+/// closing saturating narrow turns that into 0, so the brightest blue in the
+/// frame is emitted as black.
+///
+/// Solving `(Y - 16)·75 + 127·127 ≤ 32 767` puts the **arithmetic** ceiling at
+/// **Y = 237**: 237 gives `221·75 + 16 129 = 32 704` and fits, 238 gives
+/// `32 779` and does not. This constant is 235 rather than 237 because 235 is
+/// the limited-range white point — the value a conforming frame already
+/// respects, so the clamp is a no-op on real content — and it leaves two levels
+/// of margin against the true break point. At 235 the accumulator peaks at
+/// `219·75 + 127·127 = 32 554` against the 32 767 limit. No matrix overflows at
+/// that luma, and full range (`y_coef` 64, `bias_y` 0, `cb_coef` ≤ 120) never
+/// overflows at any luma. `fast_path_max_luma_is_below_the_kernel_wrap_point`
+/// pins both halves of that claim against the kernel itself.
+///
+/// The low end needs no guard: the kernel's saturating `y - 16` already takes
+/// sub-black luma to 0, which is what clamping to 16 would produce.
+pub(super) const FAST_PATH_MAX_LUMA: u8 = 235;
+
+/// Return a luma plane the `Fast` kernel can decode without wrapping, copying
+/// only when the frame actually carries super-white luma.
+///
+/// Borrows the caller's plane untouched on the exact path, in full range, and
+/// for any frame already within `0..=`[`FAST_PATH_MAX_LUMA`] — so the common
+/// case costs one read-only scan and output stays bit-identical. Only a frame
+/// that would otherwise wrap pays a bounded copy.
+///
+/// Clipping super-white is an approximation, and it applies to out-of-spec
+/// input only: 235 *is* limited-range white, so a conforming frame never
+/// reaches the clamp. For a frame that does, a channel that lands back in range
+/// (bright luma pulled down by strong chroma) shifts by at most
+/// `(255 - 235) · 255/219 ≈ 23`, against the 255 the unguarded kernel got wrong.
+/// `limit_to_full` above already clamps into the same span for the same reason.
+///
+/// The exact alternative is to decode super-white frames with
+/// `YuvConversionMode::Balanced`, which needs no copy and no approximation but
+/// costs ~2× on the non-`rdm` cores this path exists to serve — and, because
+/// the choice is per frame, a scene full of specular highlights would pay that
+/// 2× continuously rather than a bounded, predictable overhead. Revisit if the
+/// upstream kernel ever widens its accumulator; `yuv` 0.8.17 does not.
+///
+/// `scan` is the byte range to inspect — a caller that decodes only part of the
+/// plane passes just those rows, so an untouched region cannot force a copy.
+/// The copy, when one happens, still covers the whole plane.
+///
+/// The returned plane always has the caller's exact length. That is load-bearing,
+/// not incidental: the crate's 4:2:0 odd-last-row handling walks the luma plane
+/// with `chunks_exact(2 · stride)` and takes its `remainder()`, so a plane
+/// shortened even to the crate's own documented minimum (`stride · (height-1) +
+/// width`, which drops only the last row's padding) re-chunks the frame and
+/// corrupts its bottom rows — measured on an i.MX8MP, where trimming the pad
+/// left 63×64 and 65×64 still wrong while 64×64 came good. Callers hand over the
+/// whole plane they would otherwise pass; a caller that slices per strip clamps
+/// once, before slicing.
+pub(super) fn fast_path_luma(
+    y_plane: &[u8],
+    scan: std::ops::Range<usize>,
+    range: yuv::YuvRange,
+    mode: yuv::YuvConversionMode,
+) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    if mode != yuv::YuvConversionMode::Fast || range != yuv::YuvRange::Limited {
+        return Cow::Borrowed(y_plane);
+    }
+    let scan = scan.start.min(y_plane.len())..scan.end.min(y_plane.len());
+    // Chunked max-reduction, not `iter().any()`: the per-byte predicate carries
+    // a branch that blocks vectorization, and the common case (no super-white)
+    // has to read the whole plane before it can conclude anything — measured at
+    // ~2.5 ns/pixel on an A53, a 41% tax on the convert it guards. Folding a max
+    // over a chunk is branch-free and lowers to `umaxv`/`vmaxq_u8`, while the
+    // chunk loop still exits early on a frame that does carry super-white.
+    const SCAN_CHUNK: usize = 4096;
+    let clipping = y_plane[scan]
+        .chunks(SCAN_CHUNK)
+        .any(|c| c.iter().copied().fold(0u8, u8::max) > FAST_PATH_MAX_LUMA);
+    if !clipping {
+        return Cow::Borrowed(y_plane);
+    }
+    let mut clamped = y_plane.to_vec();
+    for l in clamped.iter_mut() {
+        *l = (*l).min(FAST_PATH_MAX_LUMA);
+    }
+    Cow::Owned(clamped)
 }
 
 /// One row of a YUYV-destination convert, split into its whole macropixels and
@@ -374,6 +475,7 @@ impl CPUProcessor {
         height: usize,
         y_stride: usize,
         uv_stride: usize,
+        range: yuv::YuvRange,
         dst: &mut Tensor<u8>,
         decode: F,
     ) -> Result<()>
@@ -384,8 +486,11 @@ impl CPUProcessor {
             u32,
         ) -> std::result::Result<(), yuv::YuvError>,
     {
+        // Super-white luma wraps to black in the `Fast` kernel; see
+        // `fast_path_luma`. Borrows unless this frame actually carries it.
+        let y_plane = fast_path_luma(y_plane, 0..y_plane.len(), range, yuv_mode());
         let src = yuv::YuvBiPlanarImage {
-            y_plane,
+            y_plane: &y_plane,
             y_stride: y_stride as u32,
             uv_plane,
             uv_stride: uv_stride as u32,
@@ -402,7 +507,12 @@ impl CPUProcessor {
     /// plane's own stride (a raw tensor whose `effective_row_stride()` has no
     /// width fallback — default to even(width)); the contiguous buffer's two
     /// planes share the one stride.
-    fn convert_nv12<F>(src: &Tensor<u8>, dst: &mut Tensor<u8>, decode: F) -> Result<()>
+    fn convert_nv12<F>(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        range: yuv::YuvRange,
+        decode: F,
+    ) -> Result<()>
     where
         F: FnOnce(
             &yuv::YuvBiPlanarImage<u8>,
@@ -430,6 +540,7 @@ impl CPUProcessor {
                 src_h,
                 stride,
                 uv_stride,
+                range,
                 dst,
                 decode,
             )
@@ -441,7 +552,9 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::semi_planar_decode(y_plane, uv_plane, src_w, src_h, stride, stride, dst, decode)
+            Self::semi_planar_decode(
+                y_plane, uv_plane, src_w, src_h, stride, stride, range, dst, decode,
+            )
         }
     }
 
@@ -450,7 +563,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        Self::convert_nv12(src, dst, |img, out, stride| {
+        Self::convert_nv12(src, dst, cp.range, |img, out, stride| {
             yuv::yuv_nv12_to_rgb(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
@@ -463,7 +576,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        Self::convert_nv12(src, dst, |img, out, stride| {
+        Self::convert_nv12(src, dst, cp.range, |img, out, stride| {
             yuv::yuv_nv12_to_rgba(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
@@ -1313,7 +1426,12 @@ impl CPUProcessor {
     /// bytes per chroma row, i.e. the SAME pitch as luma; both planes use the
     /// buffer's (possibly even-padded) row stride (the logical width would
     /// corrupt every row past the first for an odd width where stride > width).
-    fn convert_nv16<F>(src: &Tensor<u8>, dst: &mut Tensor<u8>, decode: F) -> Result<()>
+    fn convert_nv16<F>(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        range: yuv::YuvRange,
+        decode: F,
+    ) -> Result<()>
     where
         F: FnOnce(
             &yuv::YuvBiPlanarImage<u8>,
@@ -1336,6 +1454,7 @@ impl CPUProcessor {
                 src_h,
                 stride,
                 stride,
+                range,
                 dst,
                 decode,
             )
@@ -1347,7 +1466,9 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::semi_planar_decode(y_plane, uv_plane, src_w, src_h, stride, stride, dst, decode)
+            Self::semi_planar_decode(
+                y_plane, uv_plane, src_w, src_h, stride, stride, range, dst, decode,
+            )
         }
     }
 
@@ -1356,7 +1477,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        Self::convert_nv16(src, dst, |img, out, stride| {
+        Self::convert_nv16(src, dst, cp.range, |img, out, stride| {
             yuv::yuv_nv16_to_rgb(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
@@ -1366,7 +1487,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        Self::convert_nv16(src, dst, |img, out, stride| {
+        Self::convert_nv16(src, dst, cp.range, |img, out, stride| {
             yuv::yuv_nv16_to_rgba(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
@@ -1377,7 +1498,12 @@ impl CPUProcessor {
     /// chroma row), so the UV stride is twice the luma stride. Handles
     /// true-multiplane (separate Y / CbCr buffers) as well as the contiguous
     /// buffer so NV24 is not silently mis-sliced when chroma is its own tensor.
-    fn convert_nv24<F>(src: &Tensor<u8>, dst: &mut Tensor<u8>, decode: F) -> Result<()>
+    fn convert_nv24<F>(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        range: yuv::YuvRange,
+        decode: F,
+    ) -> Result<()>
     where
         F: FnOnce(
             &yuv::YuvBiPlanarImage<u8>,
@@ -1401,6 +1527,7 @@ impl CPUProcessor {
                 src_h,
                 stride,
                 uv_stride,
+                range,
                 dst,
                 decode,
             )
@@ -1413,7 +1540,7 @@ impl CPUProcessor {
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
             Self::semi_planar_decode(
-                y_plane, uv_plane, src_w, src_h, stride, uv_stride, dst, decode,
+                y_plane, uv_plane, src_w, src_h, stride, uv_stride, range, dst, decode,
             )
         }
     }
@@ -1423,7 +1550,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        Self::convert_nv24(src, dst, |img, out, stride| {
+        Self::convert_nv24(src, dst, cp.range, |img, out, stride| {
             yuv::yuv_nv24_to_rgb(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
@@ -1433,7 +1560,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        Self::convert_nv24(src, dst, |img, out, stride| {
+        Self::convert_nv24(src, dst, cp.range, |img, out, stride| {
             yuv::yuv_nv24_to_rgba(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
@@ -1796,6 +1923,21 @@ impl CPUProcessor {
         let flush_bottom = region_top + out_h == src_h;
         let needs_pack =
             region_left != 0 || (src_fmt == Nv12 && !out_h.is_multiple_of(2) && !flush_bottom);
+
+        // Super-white luma wraps to black in the `Fast` kernel; see
+        // `fast_path_luma`. Clamped ONCE here, for the whole plane, rather than
+        // per strip: both arms below slice this plane by absolute row offset,
+        // and clamping a strip's slice would change the length the crate chunks
+        // over. Only this region's rows are scanned, so super-white elsewhere in
+        // a cropped source cannot force a copy. Borrows unless the frame
+        // actually carries super-white luma.
+        let y_guard = fast_path_luma(
+            y_plane,
+            region_top * y_stride..(region_top + out_h) * y_stride,
+            cp.range,
+            yuv_mode(),
+        );
+        let y_plane: &[u8] = &y_guard;
         let mut y_pack = std::mem::take(&mut self.nv_strip_y_pack);
         let mut uv_pack = std::mem::take(&mut self.nv_strip_uv_pack);
         if needs_pack {

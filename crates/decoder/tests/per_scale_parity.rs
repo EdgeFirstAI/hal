@@ -682,9 +682,8 @@ fn parity_yolov8n_seg_per_scale_int8() {
         .join("per_scale")
         .join("yolov8n_seg_per_scale_int8.tflite");
     if !model.exists() {
-        eprintln!(
-            "skipping: real-model fixture not present at {model:?} — \
-                   contact validator team for the binary"
+        skip_note!(
+            "real-model fixture not present at {model:?} — contact validator team for the binary"
         );
         return;
     }

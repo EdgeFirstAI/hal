@@ -7,6 +7,488 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-09-08
+
+### Fixed
+
+- **A `view()` destination on the GPU's mapped-texture readback got the wrong
+  pixels and wrote over its parent (#177).** The mapped-texture lowering
+  renders into an offscreen texture that *is* the tile, at origin (0, 0), and
+  places the tile afterwards by reading back through the view's `map()` at the
+  parent's pitch. It nevertheless inherited the band `glScissor` that places a
+  tile inside a shared zero-copy parent import, which clipped away the tile's
+  own left and top edges — those pixels kept whatever the previous frame had
+  left in the reused texture. The readback then wrote outside the view as well:
+  `glReadPixels` packs its rows tight, so the read filled the head of the
+  view's window and the rows were re-spaced to the parent's pitch afterwards,
+  leaving the read's own tail in the gaps between them, which for a view are
+  the parent's columns to the right of the tile. Measured on i.MX 8M Plus with
+  a 320x240 view of a 512x320 parent: 4416 wrong tile pixels at view origin
+  (8, 8), 23552 at (64, 32), and 28800 parent pixels overwritten per convert at
+  every origin including (0, 0).
+
+  The band now reaches the renderer only where the render target really is the
+  shared parent import, and the readback places each row at the pitch and
+  writes nothing between them — through `GL_PACK_ROW_LENGTH` where the pitch is
+  a whole number of pixels (what the PBO readback has always done) and
+  otherwise by reading the frame tight into the existing scratch buffer. Both
+  defects are ordinary software errors, not driver behaviour: the issue's
+  Vivante attribution was an artefact of how it was found, since the commit
+  that exposed the path routed only Vivante down it, so Mali and V3D were green
+  for want of ever entering it.
+
+- **A zero-copy destination the driver refuses now falls back instead of
+  failing the convert (#175).** A failed *source* import has always lowered to
+  the upload path; a failed *destination* import was propagated as the
+  convert's error, which is why the driver that refuses one had to be predicted
+  by name. `bind_dst` now lowers to the mapped-texture readback when the
+  zero-copy setup fails — the import, the attach, or the framebuffer binding —
+  and the packed-RGB plan asks for its destination import before pass 1 renders
+  so a refusal re-plans rather than throwing pass 1 away. The lowering the
+  engine decided is what `bind_dst` binds, rather than being re-derived from
+  the placement rule, so a re-plan is honoured instead of silently
+  contradicted. The decline is warned once per buffer and counted in
+  `ConvertStats::dst_import_fallbacks`, the destination-side twin of
+  `zero_copy_declines`, and recorded as `dst_feed` on the `image.convert.gl`
+  span.
+
+  The Vivante predicate is gone with it: `eglCreateImage` returning
+  `EGL_BAD_ACCESS` for a destination at an offset that is not 64-byte aligned
+  is now simply the fallback's trigger, so a future driver quirk of the same
+  kind needs no new trait. What stays is `dst_import_places`, which asks
+  whether an import would *succeed but place the destination wrongly* (ANGLE
+  binds a whole buffer from its origin) — a wrong placement produces no error
+  to fall back from. The Mali source-offset rule stays for the same reason: it
+  predicts a driver that samples zeros silently. Float destinations still
+  decline to the CPU converter when their import is refused; there is no
+  mapped-texture readback for a float DMA destination to lower to.
+
+  **A refused destination import is retried on every convert.** Nothing
+  remembers the refusal, so an unaligned destination on i.MX 8M Plus pays one
+  failed `eglCreateImage` per frame rather than skipping the attempt the way
+  the removed predicate did. Measured on that board — 1280x720 RGBA into a
+  320x240 tile at an unaligned offset in a 640x480 parent, 200 frames after
+  warmup — the retry costs about 28 us on a 3.29 ms convert, or 0.9%. What a
+  refusal does cost is the copy it falls back to: 3.29 ms against 0.71 ms for
+  the same convert into an aligned destination the driver imports. That is the
+  price of a destination the GPU will not render into directly, not of the
+  retry.
+
+  A packed-RGB or planar `view()`/`batch()` destination is now refused before
+  the lowering is chosen rather than after. Neither route can place one — the
+  zero-copy band is a viewport in destination pixels the `W*3/4` packed
+  surface does not have, and the readback writes `dst_w`-wide rows — and
+  keying the refusal on the lowering left it reading a decision a refused
+  import can still change underneath it.
+
+- **Bright highlights rendered as black on Cortex-A53 CPU conversion.** Any
+  NV12/NV16/NV24 → RGB(A) convert on a core without the ARMv8.1 `rdm` feature
+  — Cortex-A53/A35-class, which includes the i.MX8MP — takes the `yuv` crate's
+  `Fast` kernel, and that kernel accumulates each channel in a non-saturating
+  signed 16-bit lane. Super-white luma (above the limited-range white point
+  235) combined with strong chroma pushes the accumulator past `i16::MAX`; it
+  wraps negative and the final saturating narrow emits 0, so the brightest
+  pixel in a frame comes out black instead of clipping to white. Decoded video
+  reaches that range routinely — a specular highlight is enough.
+
+  `cpu/convert.rs` now caps luma at the white point before the fast kernel, on
+  that path only. The plane is scanned with a vectorized chunked max-reduction
+  and copied only when the frame really carries super-white luma, so an
+  in-range frame keeps byte-identical output and pays 8% (6.06 → 6.56
+  ns/pixel, 1920×1080 NV12 → RGBA on an i.MX8MP); a frame that would otherwise
+  be wrong pays 26%. Clipping super-white is an approximation bounded at ~23
+  levels, against the 255 the unguarded kernel got wrong, and 235 is
+  limited-range white so a conforming frame never reaches it. The exact
+  alternative, running the accurate kernel on these cores, costs ~2× on every
+  frame. Full range and the accurate kernel are untouched — neither can
+  overflow.
+
+  Exposed by the G2D odd-dimension tests (`d01_nv12_odd_w_g2d_vs_cpu`,
+  `d03_nv12_odd_both_g2d_vs_cpu`), which had never run in CI and failed at
+  `max_diff=255` on the imx8mp lane's first execution in four months. The
+  divergence was the CPU *reference*, not G2D: G2D was correct throughout, and
+  the residual against a correct reference is 23–24 across widths 63–81, well
+  inside the tests' existing bound. Upstream `yuv` 0.8.17 does not fix the
+  kernel.
+
+- **BREAKING (Python interop): the tensor capsule now carries quantization,
+  and is renamed `edgefirst_tensor_v2`.** An int8 `ProtoData` produced by
+  `edgefirst.decoder` could not be used by `edgefirst.image` at all:
+  `materialize_masks` refused it with `I8 mask_coefficients require
+  quantization metadata`, and `draw_proto_masks` and the fused
+  `Decoder.draw_onto` failed identically. The `_v1` payload carried only a
+  `TensorDesc`, which has no quantization field, so `import_tensor_capsule`'s
+  `TensorDyn::import_descriptor` rebuilt the prototype tensors without the
+  scales the int8 fast path reads off them. Every NPU segmentation model is
+  quantized, so this was segmentation-from-Python entirely, not an edge case.
+
+  `TensorCapsulePayload` gains a `#[repr(C)] QuantDesc` — length, channel
+  axis, and pointers to the scale/zero-point arrays, borrowed from an
+  `Arc<Quantization>` the payload owns, since per-channel quantization is
+  variable-length and cannot be inlined. The consumer copies the values out
+  during import. Per INTEROP.md's Versioning rule a payload layout change
+  takes the capsule name with it, so `edgefirst_tensor_v1` becomes
+  `edgefirst_tensor_v2`: a 0.30.0 producer meeting a `_v2` consumer is
+  rejected at the name check, before any byte of the mismatched payload is
+  read, rather than misread.
+
+  Quantization deliberately does **not** go into `TensorDesc`. That
+  descriptor is also the C ABI's, and the modular C libraries pass real
+  `ef_tensor` handles into one shared `libedgefirst_tensor.so` — nothing
+  there rebuilds a tensor from a descriptor, so nothing there loses the
+  metadata. `ABI_VERSION` and the C headers are unchanged.
+
+- **`interop::reconstruct` dropped quantization on the same-module path
+  too.** `TensorArg::NativeRef` and `ProtoDataArg::into_raw_access`
+  reconstruct an independent `TensorDyn` from a descriptor — deliberately, so
+  a GIL-released region never aliases a live `PyTensor` — which lost the
+  same metadata even when producer and consumer were one package. It now
+  clones the quantization straight off the source tensor; no wire format is
+  involved on that path.
+
+- **A DMA-backed `Tensor.view()` converted the wrong pixels.** The same root
+  cause, found while fixing the above, with a worse symptom: silently wrong
+  data instead of a refusal. `TensorDesc` has no field for the plane offset,
+  so a tensor rebuilt from a descriptor came back addressing the *parent*
+  buffer's origin rather than the sub-region `view()` asked for.
+  `ImageProcessor.convert(t.view(region), dst)` returned the top-left tile
+  of the parent image, with no error. DMA-BUF is the preferred backing on
+  Linux, so this hit the embedded targets by default; `MEM`/`SHM` views were
+  unaffected, because a host import rebuilds from the producer's pinned
+  pointer, which already addresses the view.
+
+  `TensorCapsulePayload` gains a `plane_offset`, and `interop::reconstruct`
+  clones it across for the same-module path, which had the identical bug.
+  It is applied only to a handle-based import, which re-derives its base
+  from the whole parent buffer; applying it to a `HOST` import would advance
+  past the sub-region a second time. Both directions are covered by
+  `test_view_converts_its_own_sub_region_not_the_parents_origin`.
+
+  **Fixed on Linux DMA-BUF, on IOSurface (macOS/iOS) and on D3D11
+  (Windows).** `Tensor::set_plane_offset` now syncs the storage-internal
+  offset for `Mem`, Linux `Dma`, Apple `Dma` and Windows `Dma`, so a
+  reconstructed IOSurface or D3D11 view addresses its own sub-region rather
+  than the parent buffer's origin. `MEM`/`SHM` were never affected (they take
+  the pinned-pointer path), Android fails the import outright rather than
+  reconstructing, and a PBO image's `view()` comes back as host memory so it
+  never reaches the PBO arm. See `interop::apply_plane_offset`'s doc comment
+  for the per-backing accounting.
+
+  The IOSurface half was easy to miss because `IoSurfaceTensor::view` always
+  set its own `view_offset` correctly — a *freshly created* view was right on
+  every platform, and only restoring an offset onto a tensor rebuilt from a
+  `TensorDesc` was broken. `TensorStorage::Dma` compounds that: it is a
+  cfg-multiplexed *name* rather than one type, so the `cfg(target_os =
+  "linux")` arm did not fail to compile elsewhere, it silently became a
+  fall-through.
+
+  The fix is a set/clear pair, not a single arm: `set_format` drops the
+  offset when the format changes, through the same Linux-gated match, so
+  making only the setter take effect would have left `plane_offset()`
+  reporting `None` while `map()` still started at the old offset — trading a
+  lost window for a stale one. (`reshape`'s clear site needed nothing:
+  `IoSurfaceTensor::reshape` zeroes its own `view_offset`.) Three regression
+  tests in `edgefirst-tensor` pin it —
+  `set_plane_offset_moves_the_iosurface_map_window` for the restore,
+  `nested_iosurface_subviews_do_not_compound_their_plane_offset` for the
+  double-apply the restore risks, and
+  `set_format_clears_the_iosurface_map_window` for the clear — all on the
+  macOS CI lane, which runs the Rust suite the Python interop tests cannot
+  reach there.
+
+  Two more IOSurface gaps surfaced in review of that fix and are closed
+  here. `restore_imported_row_stride` was `HOST | DMABUF` only, so a real
+  capsule import of an IOSurface view kept the window's tight row over a
+  pitched surface; the merged test had hidden it by restoring the stride
+  by hand. An IOSurface's `bytesPerRow` is a property of the shared
+  surface — unlike a D3D11 staging pitch, which stays excluded — so the
+  producer's stride is now restored, bounded by the surface's capacity.
+  And ANGLE over IOSurface binds plane 0 from the surface origin with no
+  offset attribute, exactly as ANGLE over D3D11 does, so a *fresh* source
+  `view()` was sampled from the parent's origin on the zero-copy path; the
+  Apple leaf now shares Windows' `refuse_offset_source` and uploads such a
+  source through `map()`. The convert test allocates a real image surface
+  (its Apple source had been a one-row byte-bag ANGLE could not bind, so it
+  never reached the zero-copy import) and reconstructs through
+  `import_descriptor` on both platforms. The convert engine now asks
+  `dst_import_places` for two more destination imports: the packed-RGB
+  two-pass plan lowers one it cannot place to the mapped-texture path, whose
+  readback writes through `map()` at the offset, the same as `bind_dst`; the
+  float zero-copy path has no such texture to lower to, so it declines
+  outright and `ImageProcessor`'s CPU fallback handles it instead, pinned on
+  macOS by `reconstructed_planar_dst.rs`. The packed-RGB path has no
+  platform pin: no ANGLE leaf can allocate a zero-copy RGB destination to
+  test it against (IOSurface falls back to a byte-bag ANGLE cannot bind;
+  D3D11 has no 24-bit format), and Linux places the offset itself, so it is
+  verified by reasoning and by the Linux suite staying unchanged. And the NV
+  R8 upload no longer adds the plane offset on top of `map()`, which already
+  starts at the offset on every backing, pinned by
+  `offset_nv_source_upload.rs`.
+
+  The D3D11 half had a different shape, and needed three parts. A view's
+  descriptor was not reconstructed at the wrong origin, it was *refused*: the
+  `D3D11_TEXTURE` import checks the descriptor's shape against the texture's
+  own geometry, and a window is neither of the two spellings it accepted. The
+  import now takes a packed window as a third spelling, opens the whole
+  texture and narrows it to the window, with `Tensor::set_logical_shape`
+  keeping the texture's pitch as the row stride while it does.
+
+  That adoption is not D3D11-specific: `set_logical_shape` now keeps the
+  backing's own pitch for every backing that reports one — IOSurface and
+  Android `AHardwareBuffer` as well — matching what `configure_image`
+  already did, and reachable through `ef_tensor_set_logical_shape`. Same
+  rule, one place.
+
+  The storage arms then follow the IOSurface pair — plus one at
+  `reshape`'s clear site, because `D3d11TextureTensor::reshape` does not
+  zero its own offset — and the pins refuse an offset past the backing
+  rather than trusting a descriptor's value. Last, and the part no
+  `map()` test could see: the ANGLE D3D11 import binds the whole texture
+  from its origin and cannot express an offset, so the GL engine sampled
+  every offset *source* from the texture's top-left — a *fresh* `view()`
+  converted the parent's origin on Windows, not only a reconstructed one.
+  The engine's ANGLE leaves (D3D11 and IOSurface) refuse to attach a
+  source carrying a plane offset and the engine uploads it through
+  `map()`, which honours the offset. A *destination* rebuilt from a
+  descriptor has the same problem from the other side: it carries the
+  offset but not the `view_origin` a `view()` would have given it, so the
+  engine has no viewport to place it by and the render would land at the
+  texture's origin. The engine now asks the platform whether a zero-copy
+  destination import can place the tensor (`GlPlatform::dst_import_places`),
+  and lowers one it cannot to the mapped texture path, whose readback writes
+  through `map()` at the offset. A single-row window keeps `view()`'s tight
+  row stride when a descriptor narrows it (`Tensor::set_logical_shape`), so
+  it maps in the texture's last row, and the offset is applied as the
+  producer measured it: the consumer opens the same texture on the same
+  adapter, so its staging pitch is the same, and the descriptor's stride is
+  not a pitch to translate it by. Pinned by eight `d3d11` tests in
+  `crates/tensor/tests/d3d11_tensor.rs` and the Windows arm of
+  `crates/image/tests/reconstructed_view_convert.rs`, on the Windows CI
+  lanes.
+- **Mali sampled zeros from a source view at an unaligned DMA-BUF offset.**
+  On i.MX 95 the EGL DMA-BUF import silently returns zeros when
+  `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not 64-byte aligned — a 16×16 source
+  `view()` at (8, 8) of a 256-byte-pitched RGBA image converted to black
+  while (0, 8) and (16, 0) were fine, and V3D handled every origin. The GL
+  engine now recognises Mali from `GL_RENDERER` and declines a *source*
+  import at such an offset, uploading the window through `map()` instead;
+  destinations are unaffected (a view imports its parent at offset 0).
+  Pinned by `offset_source_view_alignment.rs` on imx95, imx8mp and rpi5.
+  Those views are zero-copy again as of #170: the import starts at the
+  64-byte-aligned base below the offset, widened by the remainder in pixels,
+  and the engine folds that shift into the sampling rectangle. (#165, #170)
+- **A refused zero-copy NV source ended on the CPU.** When the R8 import of
+  an NV12/16/24 source was declined — the ANGLE leaves' offset refusal, or
+  the Mali rule above — the engine fell to `draw_src_texture`, which has no
+  NV arm, so the convert left the GPU entirely. Both NV import-failure arms
+  now upload the combined plane through the same R8 shader. On i.MX 8M Plus
+  this is what a single-plane NV12 source at an unaligned plane offset now
+  takes: Vivante's `Auto` policy sends it to the external sampler, whose EGL
+  refuses the offset, and the convert stays on the GPU through the R8 shader
+  on an upload instead of dropping to the CPU. Vivante also refuses a
+  *destination* import at an unaligned offset outright, with
+  `EGL(BadAccess)`, which used to fail the convert; the engine now lowers
+  such a destination to the mapped-texture path, whose readback writes
+  through `map()` at the offset. (#166)
+- **A test asserted padding no readback promises.**
+  `gl_padded_pbo_dst_rows_land_at_the_declared_stride` required the bytes
+  between pitched rows to stay untouched; Vivante writes them while packing
+  rows at `GL_PACK_ROW_LENGTH`, and the read-tight-and-spread route always
+  left leftovers there. The test now asserts the pixel bytes of every row at
+  the declared pitch, which is the contract. CI's imx8mp lane never ran that
+  binary, which is why the desk found it first. (#167)
+
+- **CUDA tests passed without running.** `cuda.rs`'s runtime probe listed
+  `libcudart.so.12` and `.so.11.0` only, and current NVIDIA pip toolkits ship
+  `libcudart.so.13` with no unversioned symlink — so `is_cuda_available()`
+  returned false and all six CUDA tests reported `SKIP: no libcudart`
+  followed by `ok` on any CUDA 13 host. The soname is now probed, and
+  `HAL_TEST_REQUIRE_CUDA=1` (set by `make test-cuda` whenever it located a
+  runtime) makes such a skip a failure rather than a silent pass.
+
+- **A `view()` of a PBO-backed image read as all zeros, from every Python
+  package.** On a machine with OpenGL but no working zero-copy DMA-BUF
+  import -- an NVIDIA desktop, where the EGL import fails with GL `0x502`
+  -- `ImageProcessor.create_image` returns a PBO, and
+  `ImageProcessor.convert(img.view(region), dst)` produced an empty
+  destination with no error. Under the `dynamic` backend (which all five
+  wheels use) a PBO tensor was a full-sized *host placeholder* with the real
+  GL buffer held in a Rust field beside it; `view()` went through the C ABI,
+  which never saw that field, so the view was a window onto the placeholder.
+
+  A PBO is now real storage inside `libedgefirst_tensor`. The GL buffer
+  stays the client's -- the library never makes a GL call -- and what
+  crosses is the callback channel: a new frozen `ef_client_state` (`ctx`,
+  `retain`, `release`) plus the buffer's map/unmap functions, through the
+  new `ef_tensor_wrap_pbo`. `ef_tensor_pbo_id`, `ef_tensor_pbo_is_mapped`
+  and `ef_tensor_pbo_vtable` read back what a GL consumer needs. `retain`
+  and `release` govern the *channel* only: the client's own destructor stays
+  the sole caller of `glDeleteBuffers`, and a view now keeps the buffer
+  alive after its parent tensor is gone. (#162)
+
+- **`set_plane_offset` was a no-op on PBO and shared-memory storage.** The
+  last reachable arms of the same issue class as the IOSurface and D3D11
+  fixes above: a `PboTensor` carries a `view_offset` its own `map()` adds and
+  its own `view()` sets, and a `ShmTensor` carries the same offset, but
+  nothing wrote either back, so restoring an offset onto an already-built
+  tensor left the map at the parent's origin. `set_format` gains the paired
+  clear on both; `reshape` needs none for PBO, since `PboTensor::reshape`
+  zeroes the offset itself. The three mutator matches are now exhaustive
+  rather than ending in a catch-all, so a new backing has to state its
+  behaviour instead of silently doing nothing. (#161)
+
+- **`Tensor::from_pbo` allocated the PBO's whole byte count as host RAM.**
+  66,355,200 bytes (~63.3 MiB) for a 4K RGBA16F surface, purely to own a
+  handle with the right metadata for a buffer whose data already lives on
+  the GPU. Gone with the placeholder; the test that measured it is inverted
+  rather than deleted, so a reintroduction fails loudly.
+
+- **A GL convert of a PBO view uploaded the parent's origin.** With a buffer
+  bound to `GL_PIXEL_UNPACK_BUFFER`, `glTexImage2D`'s `pixels` argument is a
+  byte offset into that buffer, and both the u8 and the float source paths
+  passed `NULL`. Every view of one PBO therefore converted the same top-left
+  tile, and a padded PBO sheared because `GL_UNPACK_ROW_LENGTH` was left at
+  the tight row. Both paths now pass the view's byte offset and the
+  effective row stride. Pre-existing on the `static` backend; the `dynamic`
+  backend only reached it once the storage-kind demotion above stopped
+  masking it.
+
+- **A PBO view rebuilt from its capsule lost the parent's row pitch.**
+  `restore_imported_row_stride` restored a producer's stride for the `HOST`,
+  `DMABUF` and IOSurface kinds but excluded `PBO`, so a reconstructed view
+  of a padded PBO read at the tight row and sheared. A PBO destination pre-
+  seed had the matching gap on the readback pitch. Also pre-existing on the
+  `static` backend.
+
+- **A PBO sub-view now refuses `reshape` cleanly.** A reshape must fill the
+  whole GL allocation, so a sub-view cannot honour one; it returns an error
+  and leaves the map window intact rather than accepting the call and
+  reading the wrong bytes.
+
+- **The imx8mp hardware lane executed zero Rust tests, silently, since
+  2026-05-14 (`a87ae59c`).** The artifact-restoring `chmod +x` named
+  `hardware-test-binaries/`, a directory the artifact stopped shipping the
+  day that commit switched to `hardware-test-binaries-stripped/`; the glob
+  matched nothing, the error was swallowed by `2>/dev/null || true`, and
+  every binary then failed the loop's `[[ -x ]]` guard in complete silence
+  -- no `=== Running`, no `=== Skipping`, and the JUnit generator reported
+  `tests="0"` with nothing downstream asserting a floor. Four months of a
+  green-but-empty gate. Fixed by naming the directory the loop actually
+  iterates, dropping the error suppression so a real mismatch fails loudly
+  instead of vanishing, and adding a zero-tests guard plus a `--min-tests`
+  floor on the generated JUnit XML (also applied to the aarch64 runner's
+  identical step). The lane now also runs 15 integration binaries
+  (`crates/image/tests/*.rs`'s GL binaries and `crates/tensor/tests/*.rs`'s
+  DMA-BUF-touching ones) that previously fell into a CPU-only skip branch
+  unconditionally, and every crate's `testdata/` (not just the repository
+  root's) is shipped to the boards and to CI's own testdata artifact, so
+  fixtures under a crate-local `testdata/` directory reach on-target runs
+  the same way root-level fixtures already did. The JUnit generator now
+  counts executed tests from libtest's own `test result:` summary lines
+  rather than from a per-test regex that could not span a test's interleaved
+  log output: on the lane's first real run that regex named 574 of the 778
+  cases the summaries account for, so the floor moved with logging verbosity
+  as much as with test count. Both the reported count and the floor are now
+  the summary-line total (757 executed on that run), and the recovered cases
+  appear in the XML.
+- **A hardware-gated test that returned early after `eprintln!`-ing its
+  skip reason reported bare `ok`, indistinguishable from having actually
+  run.** libtest captures `println!`/`eprintln!` and replays it only for a
+  *failing* test, so the reason was silently discarded on every passing
+  skip -- both locally and on the boards. Every such site across
+  `edgefirst-image`, `edgefirst-tensor`, `edgefirst-codec`, and
+  `edgefirst-decoder` now writes `SKIPPED: <reason>` directly to stderr,
+  bypassing libtest's capture hook, so `scripts/on-target-test.sh`'s
+  per-board skip count (and a human reading captured CI logs) can actually
+  see it.
+- **Cross-building `edgefirst-tensor`'s `dynamic` backend test lane for a
+  board needed a hand-rolled `RUSTFLAGS`.** `crates/tensor/build.rs`'s
+  `dynamic-test-link` feature hardcoded a link-search path relative to this
+  crate's own manifest directory, which is wrong for any cross (`--target`)
+  build. It now honours `EDGEFIRST_TENSOR_LIB_DIR` when set and otherwise
+  derives the search path from `OUT_DIR`, matching whatever `target/
+  <profile>` or `target/<target-triple>/<profile>` layout the actual build
+  used.
+- **`test_merge_tiled_detections_releases_the_gil`'s 20% gap floor failed
+  on a two-vCPU hosted CI runner** that measured a real, repeatable ~17-19%
+  gap for a short CPU-bound op -- a headroom shortfall on that runner, not
+  a regression (a GIL-holding mutation still measures a gap near 0% under
+  the same harness). Lowered to 10%, which still discriminates a genuine
+  hold from a genuine release by roughly an order of magnitude.
+
+### Changed
+
+- **`Tensor::as_pbo()` is removed** (Rust API; pre-1.0, so removed rather
+  than deprecated). It lent a `PboTensor<T>`, which the `dynamic` backend no
+  longer has -- the buffer lives in `libedgefirst_tensor`. Every caller read
+  exactly two facts off that borrow, so those are the API:
+  `Tensor::pbo_id() -> Option<u32>` and
+  `Tensor::pbo_is_mapped() -> Option<bool>`, on both backends. The C ABI
+  gains four symbols (102 declarations become 106) and one by-value struct
+  frozen at 24 bytes; nothing existing moves, so `ef_tensor_abi_version()`
+  stays `1`.
+
+- **`pin_host` on a PBO-backed tensor is now refused on the `dynamic`
+  backend**, as it always was on `static`; both report the same message. The
+  user-visible consequence is in Python: requesting the tensor capsule with
+  an explicit access on a PBO-backed tensor now raises, where it previously
+  returned a capsule whose descriptor carried a host address in the field
+  consumers read as the PBO op-vtable pointer. The `access=None` form, which
+  is what `convert` uses, is unaffected.
+
+- **A packed DMA-BUF source at an unaligned plane offset is zero-copy again.**
+  Where 0.31.0 declined such a source on Mali and uploaded it through `map()`,
+  the GL engine now imports it from the largest 64-byte-aligned base a whole
+  number of pixels below the offset — `lcm(64, bpp)`, so RGB steps by 192 —
+  widens the import by the remainder in texels at the same pitch, and folds
+  the shift into the sampling rectangle through the new
+  `GlPlatform::import_origin`, beside the extent it already folded. Aligned
+  offsets are untouched. RGBA/BGRA/RGB/Grey sources only: NV's combined-plane
+  R8 import has no room to widen (its pitch is its width) and keeps the upload,
+  YUYV carries a two-pixel macropixel phase, and destinations are unchanged.
+  The two external-OES camera programs gained the sample clamp the `sampler2D`
+  ones already had. Pinned on imx95 (Mali), imx8mp (Vivante) and rpi5 (V3D) by
+  `offset_source_view_alignment.rs`, which now asserts the route was an import
+  and not an upload. (#170)
+
+- **The Mali offset gate asks about the offset the import will present.** A
+  gate keyed on the pixel format alone would exempt sources the rebase cannot
+  actually move — a 64-wide RGBA window into a tight 256-byte pitch, whose
+  widened row would run past the pitch, and a 100-wide RGB surface whose
+  64-byte-padded 320-byte stride puts a view at byte 323, which is not a whole
+  number of pixels — and both would then import unaligned on Mali and sample
+  zeros silently, where 0.31.0 declined and uploaded. `resolve_source_plane0`
+  is now the one place the decision lives: the import is built from it and the
+  gate reads the same function, held together by a test that asserts the two
+  agree over five real DMA shapes. (#170)
+
+- **A clamped sample coordinate is computed at `highp`.** The `tc` varying
+  defaulted to `mediump`, which was harmless while it only reached
+  `texture()`; routing it through the new `clamp()` put it on Mali's fp16 ALU,
+  quantizing the coordinate to about 0.625 texel at 1280 wide, which `LINEAR`
+  then smeared across the whole frame (max_diff 50 on i.MX 95, flat, not an
+  edge artifact). Every shader that computes on `tc` declares it `highp`,
+  including two that predate this change, pinned by name — not by count — in
+  `mod tc_precision`. The rule tracks the name `tc`; a sample coordinate under
+  another name needs its own recorded decision. (#170)
+
+- `scripts/on-target-test.sh` takes a `FEATURES` variable, applied to the test
+  build only. Feature-gated tests such as the `dma_test_formats` DMA-BUF import
+  suite otherwise never ran on a board, although CI's hardware lane builds
+  them; `FEATURES=edgefirst-image/dma_test_formats` is what verified this
+  change's gated tests on the three boards. See TESTING.md.
+
+- A malformed quantization descriptor in a tensor capsule is now reported
+  rather than silently treated as "no quantization". Conflating the two is
+  what made the bug above hard to place: the failure resurfaced later as the
+  consumer's own "requires quantization metadata", which names the symptom
+  and not the cause.
+
+- The capsule name-mismatch error now names version skew as a likely cause.
+  After the first-ever capsule rename, a 0.30.0 `edgefirst.tensor` beside a
+  0.31.0 `edgefirst.image` is the most probable reason a consumer sees it,
+  and the old text told the user their object was unsupported instead.
+
 ## [0.30.0] - 2026-09-07
 
 ### Added

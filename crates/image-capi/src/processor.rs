@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn convert_fence_handle_returns_an_owned_event_set_on_completion() {
         if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIP: no D3D11 device on this host");
+            crate::artifacts::skip("no D3D11 device on this host");
             return;
         }
         let p = processor();

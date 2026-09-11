@@ -594,7 +594,7 @@ impl PyProtoData {
     /// rather than describing its own layout: a ``ProtoData`` is just two
     /// tensors and an enum, and both tensors already cross packages safely
     /// through that protocol (see ``interop::TensorArg``). Returns the
-    /// ``mask_coefficients`` and ``protos`` tensors as ``edgefirst_tensor_v1``
+    /// ``mask_coefficients`` and ``protos`` tensors as ``edgefirst_tensor_v2``
     /// capsules -- exactly what ``Tensor.__edgefirst_tensor__()`` would
     /// return for each -- plus the prototype layout as a string. No raw
     /// pointer to ``ProtoData`` itself is ever exchanged, so unlike
@@ -622,7 +622,7 @@ impl PyProtoData {
     }
 }
 
-/// Build an ``edgefirst_tensor_v1`` capsule for `tensor`, pinned for host
+/// Build an ``edgefirst_tensor_v2`` capsule for `tensor`, pinned for host
 /// reads. Shared by [`PyProtoData::__edgefirst_protodata__`]; the payload
 /// shape (`crate::interop::TensorCapsulePayload`) is exactly what
 /// `PyTensor::__edgefirst_tensor__` produces, so any
@@ -637,16 +637,30 @@ fn tensor_capsule<'py>(
         .pin_host(CpuAccess::Read)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
     let desc = tensor.descriptor_pinned(Some(&pin));
+    // Cloned into an `Arc` the payload owns: `quant` borrows these arrays,
+    // and the producing tensor may be dropped while the capsule lives.
+    // Carrying it matters most on exactly this path -- an int8 `ProtoData`
+    // is unusable by `materialize_masks` without its scales.
+    let quant_keepalive = tensor.quantization().cloned().map(std::sync::Arc::new);
     let payload = crate::interop::TensorCapsulePayload {
         desc,
+        quant: quant_keepalive
+            .as_deref()
+            .map_or_else(crate::interop::QuantDesc::absent, |q| {
+                crate::interop::QuantDesc::borrowing(q)
+            }),
+        // See `PyTensor::__edgefirst_tensor__`; the payload shape is the
+        // same one, so this field is filled the same way.
+        plane_offset: tensor.plane_offset().unwrap_or(0) as u64,
         pin: Some(pin),
         // `pin_host` above already succeeded, and PBO refuses `pin_host`
         // outright -- so `tensor` is never PBO-backed here in practice, but
         // asking is free and keeps this in sync with `PyTensor::
         // __edgefirst_tensor__`'s shape rather than hand-assuming `None`.
         pbo_keepalive: tensor.pbo_keepalive(),
+        quant_keepalive,
     };
-    pyo3::types::PyCapsule::new_with_value(py, payload, c"edgefirst_tensor_v1").map_err(|e| {
+    pyo3::types::PyCapsule::new_with_value(py, payload, c"edgefirst_tensor_v2").map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build tensor capsule: {e}"))
     })
 }

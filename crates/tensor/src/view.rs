@@ -90,13 +90,12 @@ where
     /// (`tensor_dyn/static_backend.rs`), the type-erased byte-level guard a
     /// C ABI consumer needs (it does not know `T` and cannot call the typed
     /// `map_with`); it is not meant as a public entry point in its own
-    /// right. It was `static`-only on the reasoning that `dynamic` never has
-    /// a typed `HostView<T>` to re-view, since its own `TensorDyn::map_bytes`
-    /// builds a byte view straight from `ef_tensor_map`. That stopped being
-    /// true when the dynamic backend learned to map a PBO-backed tensor
-    /// (`dynamic_backend.rs::map_pin_pbo`): a PBO's real bytes live in the GL
-    /// buffer, so that path goes through `PboTensor<T>::map_with` and gets a
-    /// typed guard it must erase.
+    /// right. `static`-only: `dynamic` never has a typed `HostView<T>` to
+    /// re-view, since its own `TensorDyn::map_bytes` builds a byte view
+    /// straight from `ef_tensor_map` -- including for a PBO, whose storage
+    /// lives inside `libedgefirst_tensor.so` since Stage B and is mapped by
+    /// the library rather than by a `PboTensor<T>` on this side.
+    #[cfg(feature = "static")]
     pub(crate) fn into_bytes(self) -> HostView<'a, u8> {
         let elem = std::mem::size_of::<T>().max(1);
         let requested_bytes = match self.byte_size_override {

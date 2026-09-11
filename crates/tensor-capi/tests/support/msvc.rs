@@ -81,14 +81,16 @@ pub struct Toolchain {
     scratch: PathBuf,
 }
 
-/// Report a skipped check on stderr.
+/// Report a skipped check on stderr as `SKIPPED: {reason}`.
 ///
 /// Straight to the handle, not `eprintln!`: libtest captures a passing
 /// test's `eprintln!` and a skip nobody sees is indistinguishable from a
-/// pass.
+/// pass. Same wire format as `artifacts::skip` beside it -- both are
+/// `#[path]`-included per leaf, and `scripts/on-target-test.sh` counts a
+/// board's skips by grepping for the literal `SKIPPED`.
 pub fn skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "SKIP: {reason}");
+    let _ = writeln!(std::io::stderr(), "SKIPPED: {reason}");
 }
 
 /// The toolchain for this process, or the reason there is none.

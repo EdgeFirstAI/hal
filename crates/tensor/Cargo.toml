@@ -41,6 +41,11 @@ tracing = ["dep:tracing-chrome", "dep:tracing-subscriber"]
 
 [dependencies]
 edgefirst-tensor-ffi = { workspace = true, optional = true }
+# The frozen `EfClientState` vocabulary. Always on, both backends: `pbo.rs`'s
+# `PboOpsVtable` is a C-ABI view onto `PboOps` and is compiled into both, so
+# the struct it embeds has to be visible in both. That crate is
+# dependency-free by charter, so the edge costs nothing downstream.
+edgefirst-tensor-abi = { workspace = true }
 half = { workspace = true }
 libloading = { workspace = true }
 log = { workspace = true }

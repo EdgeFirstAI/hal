@@ -513,6 +513,82 @@ typedef struct ef_tensor_view {
 } ef_tensor_view;
 
 /**
+ * Client-owned state a library entry point calls back into — **frozen by
+ * value, forever**, and reused verbatim by every domain that needs one
+ * (PBO today; CUDA-GL next).
+ *
+ * # What `retain`/`release` govern — and what they do not
+ *
+ * They extend the life of the **callback channel only**. They never
+ * transfer ownership of the GL buffer, the CUDA resource, or anything else
+ * the context happens to address. Getting this backwards double-frees a GL
+ * buffer:
+ *
+ * * The producing side's own destructor stays the sole caller of the real
+ *   `delete_buffer`.
+ * * A library that reconstructed operations from this struct treats
+ *   `delete_buffer` as a no-op — it borrows the resource, it does not own
+ *   it.
+ *
+ * # Ownership at an entry point
+ *
+ * An entry point that stores this struct calls `retain(ctx)` itself and
+ * calls `release(ctx)` exactly once when the object holding it is
+ * destroyed. The caller keeps its own count and may drop it at any time
+ * after the call returns.
+ *
+ * # Freezing
+ *
+ * This vocabulary declines the `struct_size` handshake (see the root
+ * `ARCHITECTURE.md`, "Why there is no `struct_size` handshake"), so a
+ * by-value struct grows only by a major bump or a suffixed successor.
+ * Freezing **one** tiny universal struct — rather than one per domain, or
+ * one that grows per domain — is what keeps that cost paid once. Its size
+ * and offsets are pinned by `tests/c/test_layout_goldens.c` in
+ * `edgefirst-tensor-capi` and by `client_state_layout_is_pinned` below.
+ *
+ * `ctx` is opaque to the library: only the producing copy of the code ever
+ * dereferences it.
+ */
+typedef struct ef_client_state {
+  /**
+   * Opaque to every caller except this struct's own function pointers.
+   */
+  const void *ctx;
+  /**
+   * Add one reference to the callback channel. Never NULL in a valid
+   * state; an entry point receiving NULL must fail with `EINVAL`.
+   */
+  void (*retain)(const void *ctx);
+  /**
+   * Drop one reference to the callback channel. Never NULL in a valid
+   * state; an entry point receiving NULL must fail with `EINVAL`.
+   */
+  void (*release)(const void *ctx);
+} ef_client_state;
+
+/**
+ * Map a PBO for CPU access. `0` on success; `-1` when the GL context is
+ * gone; any other non-zero value a generic failure.
+ *
+ * May be NULL where an entry point takes one; such an entry point refuses
+ * a NULL rather than calling through it.
+ */
+typedef int (*ef_pbo_map_fn)(const void *ctx,
+                             uint32_t buffer_id,
+                             uintptr_t size,
+                             uint8_t **out_ptr,
+                             uintptr_t *out_len);
+
+/**
+ * Unmap a PBO previously mapped by an `ef_pbo_map_fn`. Same return codes.
+ *
+ * May be NULL where an entry point takes one; such an entry point refuses
+ * a NULL rather than calling through it.
+ */
+typedef int (*ef_pbo_unmap_fn)(const void *ctx, uint32_t buffer_id);
+
+/**
  * Presence/shape summary of a tensor's quantization metadata.
  *
  * The first half of the two-call idiom `ef_tensor_quantization_info` /
@@ -2133,6 +2209,110 @@ int ef_tensor_set_dtype(ef_tensor *t, uint32_t dtype);
  * NUL-terminated string.
  */
 int ef_tensor_configure_image(ef_tensor *t, uintptr_t width, uintptr_t height, const char *format);
+
+/**
+ * Wrap a client-owned OpenGL Pixel Buffer Object as a tensor.
+ *
+ * `state` is the callback channel this library keeps for the tensor's
+ * life: it calls `state.retain` before returning and `state.release` once,
+ * when the last reference to the returned tensor is freed. The caller
+ * keeps its own reference and may drop it as soon as this returns.
+ *
+ * **`retain`/`release` govern the channel only.** They never transfer
+ * ownership of the GL buffer: this library never deletes it, and the
+ * caller's own destructor stays the sole caller of `glDeleteBuffers`.
+ * Getting this backwards double-frees the buffer.
+ *
+ * `size` is the GL allocation's full byte count, which may exceed the
+ * product of `dims` — a PBO allocated at a 64-byte-aligned row stride is
+ * larger than its shape implies, and clamping to the shape would lose the
+ * padding a strided map needs.
+ *
+ * `map_fn` and `unmap_fn` are called on the caller's own thread, never on
+ * a thread this library creates. They must be safe to call concurrently
+ * and must not unwind.
+ *
+ * **The whole channel is checked, not assumed.** `state.ctx`,
+ * `state.retain`, `state.release`, `map_fn` and `unmap_fn` are five
+ * non-NULL requirements, and all five are rejected rather than
+ * dereferenced: a NULL function pointer this library called would be
+ * undefined behaviour, not a diagnosable failure, so the check happens
+ * before anything is constructed. The two op parameters are nullable
+ * function pointers in C for exactly that reason.
+ *
+ * @retval a new tensor the caller must free with `ef_tensor_free`.
+ * @retval `NULL` for a NULL `state.ctx`/`state.retain`/`state.release`/
+ *         `map_fn`/`unmap_fn`, a NULL `dims`, `ndim == 0`, an
+ *         unrecognized `dtype`, or a `size` smaller than the shape needs
+ *         — `ef_tensor_last_error_message` carries the reason and
+ *         `ef_tensor_last_error_class` its class. `errno` is set to
+ *         `EINVAL` for the argument-validation refusals, alongside the
+ *         `NULL` return that is this entry point's contract.
+ *
+ * # Safety
+ * `dims` must point to `ndim` readable `uint64_t`. `state.ctx` must remain
+ * valid until this library's `release` call, and `map_fn`/`unmap_fn`, when
+ * non-NULL, must remain callable for the same span.
+ */
+ef_tensor *ef_tensor_wrap_pbo(struct ef_client_state state,
+                              uint32_t buffer_id,
+                              uintptr_t size,
+                              uint32_t dtype,
+                              const uint64_t *dims,
+                              uint32_t ndim,
+                              ef_pbo_map_fn map_fn,
+                              ef_pbo_unmap_fn unmap_fn);
+
+/**
+ * The GL buffer name behind a PBO-backed tensor.
+ *
+ * @retval 0 success; `*out_id` holds the buffer name.
+ * @retval EINVAL `t` is NULL/unresolvable, `out_id` is NULL, or `t` is not
+ *         PBO-backed. `ef_tensor_storage_kind` is the unambiguous
+ *         predicate; do not infer the backing from this call's failure.
+ *
+ * # Safety
+ * `t` must be NULL or a live handle; `out_id` must be NULL or a writable
+ * `uint32_t`.
+ */
+int ef_tensor_pbo_id(const ef_tensor *t, uint32_t *out_id);
+
+/**
+ * Whether a PBO-backed tensor currently holds (or is establishing) a CPU
+ * mapping — "is this buffer free for GL operations?", not "does a CPU
+ * pointer exist right now".
+ *
+ * @retval 1 mapped, or a map/unmap is in flight.
+ * @retval 0 fully unmapped.
+ * @retval -1 `t` is NULL/unresolvable or not PBO-backed.
+ *
+ * @warning Three-valued behind an `int`. Test `< 0` **before**
+ * truthiness: `if (ef_tensor_pbo_is_mapped(t))` is true for the error
+ * value, so a caller that writes it that way treats "not a PBO" as
+ * "mapped". The shape is
+ * `int r = ef_tensor_pbo_is_mapped(t); if (r < 0) { ...error... } else if
+ * (r) { ...mapped... }`.
+ *
+ * # Safety
+ * `t` must be NULL or a live handle.
+ */
+int ef_tensor_pbo_is_mapped(const ef_tensor *t);
+
+/**
+ * The address of this PBO's callback vtable, for the cross-package
+ * descriptor protocol's `ptr` field under its `PBO` kind.
+ *
+ * Borrowed, never owned: valid for as long as `t` is, and a consumer that
+ * reconstructs operations from it takes its own reference through the
+ * `ef_client_state` embedded in it.
+ *
+ * @retval the vtable address.
+ * @retval `NULL` when `t` is NULL/unresolvable or not PBO-backed.
+ *
+ * # Safety
+ * `t` must be NULL or a live handle.
+ */
+const void *ef_tensor_pbo_vtable(const ef_tensor *t);
 
 /**
  * Whether CUDA interop symbols resolved. Declared and answered on every

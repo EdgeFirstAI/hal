@@ -28,6 +28,16 @@
 #                      workspace, see each crate's own Cargo.toml comment)
 #   GLIBC              glibc floor for the build (default: the project floor,
 #                      see README "Toolchain and Platform Floors")
+#   FEATURES           cargo features for the TEST build, space- or
+#                      comma-separated (default: none, so the crates build
+#                      with their own defaults). Use it to reach tests that
+#                      are behind a feature and would otherwise never run on
+#                      a board -- `FEATURES=dma_test_formats` is the DMA-BUF
+#                      import suite, which CI's hardware lane builds and this
+#                      script did not. With more than one package selected,
+#                      cargo wants a feature that is not shared spelled
+#                      `<pkg>/<feature>`. Applied to the test build only, not
+#                      to the C-API leaves.
 #   FILTER             test-name filter passed to each binary
 #   REMOTE_DIR         remote scratch dir      (default: /tmp/hal-ontarget)
 #   SYNC_TESTDATA      1 to rsync testdata/    (default: 1)
@@ -55,6 +65,7 @@ CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi track
 # against it so one set runs on every supported target. Declared alongside the
 # MSRV in the README -- change it there and here together.
 GLIBC="${GLIBC:-2.35}"
+FEATURES="${FEATURES:-}"
 FILTER="${FILTER:-}"
 REMOTE_DIR="${REMOTE_DIR:-/tmp/hal-ontarget}"
 SYNC_TESTDATA="${SYNC_TESTDATA:-1}"
@@ -132,10 +143,18 @@ build_for() {
   local pkgs=() c
   for c in ${CRATES}; do pkgs+=(-p "$c"); done
 
+  # Empty FEATURES must not become a bare `--features ''`, which cargo reads
+  # as a request for a feature named "" and rejects.
+  local feats=()
+  if [ -n "${FEATURES}" ]; then
+    feats=(--features "${FEATURES}")
+    echo "==> test build features: ${FEATURES}"
+  fi
+
   echo "==> building tests for ${triple}"
   local json="${RESULTS}/build-${triple//[.\/]/_}.json"
   if ! cargo-zigbuild test --no-run --release --target "${triple}" \
-        "${pkgs[@]}" --message-format=json > "${json}" 2>"${json}.err"; then
+        "${pkgs[@]}" ${feats[@]+"${feats[@]}"} --message-format=json > "${json}" 2>"${json}.err"; then
     echo "BUILD FAILED for ${triple}; last lines of stderr:" >&2
     tail -30 "${json}.err" >&2
     return 1
@@ -308,9 +327,46 @@ for i in "${!OK_HOSTS[@]}"; do
     echo "SKIP: binary sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue; }
 
   if [[ "${SYNC_TESTDATA}" == "1" && -d "${ROOT}/testdata" ]]; then
+    # Per-crate testdata (e.g. `crates/decoder/testdata/infer/`) merges into
+    # the SAME remote testdata/ tree below, not a separate location: every
+    # `EDGEFIRST_TESTDATA_DIR`-aware fixture loader resolves relative to one
+    # deploy root (see e.g. `infer.rs`'s `infer_fixture_dir()`), so a second
+    # root here would just be a place fixtures are never looked for.
+    #
+    # The root sync below runs with `--delete` (to prune fixtures this repo
+    # no longer ships), which would otherwise delete every merged crate
+    # subtree on every single invocation -- it isn't present in the LOCAL
+    # `${ROOT}/testdata/` source, so `--delete` reads it as removed on the
+    # remote, immediately undone by the per-crate merge that follows. Excludes
+    # derived from this same `crates/*/testdata` loop keep `--delete` from
+    # ever touching what the merge owns, so a run that doesn't change any
+    # crate's fixtures doesn't re-transfer them either.
+    crate_testdata_excludes=()
+    for crate_testdata in "${ROOT}"/crates/*/testdata; do
+      [[ -d "${crate_testdata}" ]] || continue
+      for entry in "${crate_testdata}"/*; do
+        [[ -e "${entry}" ]] || continue
+        crate_testdata_excludes+=(--exclude "$(basename "${entry}")")
+      done
+    done
+
     echo "    syncing testdata"
-    rsync -az --delete --info=none "${ROOT}/testdata/" "${target}:${REMOTE_DIR}/testdata/" || {
+    rsync -az --delete --info=none "${crate_testdata_excludes[@]}"         "${ROOT}/testdata/" "${target}:${REMOTE_DIR}/testdata/" || {
       echo "SKIP: testdata sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue; }
+
+    # No `--delete` here: each crate contributes a disjoint subtree of the
+    # merged tree, so a stale file left by a DIFFERENT crate's sync must not
+    # be pruned by this one.
+    crate_testdata_sync_failed=0
+    for crate_testdata in "${ROOT}"/crates/*/testdata; do
+      [[ -d "${crate_testdata}" ]] || continue
+      echo "    syncing $(basename "$(dirname "${crate_testdata}")")'s testdata"
+      rsync -az --info=none "${crate_testdata}/" "${target}:${REMOTE_DIR}/testdata/" || {
+        crate_testdata_sync_failed=1; break; }
+    done
+    if [[ "${crate_testdata_sync_failed}" == "1" ]]; then
+      echo "SKIP: per-crate testdata sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue
+    fi
   fi
 
   # Deploy the five C-API libraries + their `.so.0` symlinks + the G3
@@ -358,6 +414,11 @@ for i in "${!OK_HOSTS[@]}"; do
   # a regression in whatever you just changed.
   extra_env=""
   [[ "${caps}" == *"galcore=yes"* ]] && extra_env="EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1"
+  # A board with a DRM render node has a GPU, so "the GL backend did not come
+  # up" is a defect there and not a fact of the machine. Without this every
+  # require-gated test -- the `gl_backend_available_canary` most visibly --
+  # skips on every board and the run stays green through a broken GL stack.
+  [[ "${caps}" =~ render=[1-9] ]] && extra_env="${extra_env} HAL_TEST_REQUIRE_GL=1"
 
   pass=0; fail=0; failed_bins=()
   for bin in "${bins[@]}"; do

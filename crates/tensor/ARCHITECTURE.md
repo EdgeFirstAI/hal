@@ -183,6 +183,17 @@ Each backend provides its own map type implementing `TensorMapTrait<T>`:
 `ndarray` feature enabled, `TensorMapTrait` also provides `view()` /
 `view_mut()` returning ndarray `ArrayView` / `ArrayViewMut`.
 
+**The `dynamic` lens holds caches only.** `shape_cache`,
+`quantization_cache`, `identity` and `descriptor_texture_handle` are all
+re-derivable from the handle. Three fields once were not, and each was a
+silent-loss bug waiting on the next `from_handle`:
+
+| Field | Held | Now |
+|---|---|---|
+| `pbo` | the real `PboTensor<T>` | `TensorStorage::Pbo` in the library, via `ef_tensor_wrap_pbo` |
+| `cuda` | a `CudaHandle` | *pending — stage C* |
+| `multiplane_chroma` | the chroma plane's own handle | *pending — stage D* |
+
 ### Views and sub-regions
 
 A **view** is a lightweight, zero-allocation sub-region of a tensor. It shares
@@ -237,6 +248,23 @@ the mapped `ArrayView` (the decoder reads batched model outputs this way). The
 Python binding mirrors this with `numpy` + the buffer protocol; the C API exposes
 first-class `ef_tensor_view` / `ef_tensor_batch` handles (it does not make
 callers hand-roll pixel→byte math).
+
+**Set/clear pairing, and the cfg-multiplexed-name hazard.** A backing whose
+`map()` adds a storage-internal offset needs `set_plane_offset` to write that
+offset **and** `set_format` (and `reshape`, where the storage does not zero it
+itself) to clear it. A setter without its clear trades a lost window for a
+*stale* one, which is harder to notice.
+
+`TensorStorage::Dma` is a cfg-multiplexed **name**, not one type — `DmaTensor`
+on Linux, `IoSurfaceTensor` on Apple, `AHardwareBufferTensor` on Android,
+`D3d11TextureTensor` on Windows — so a `cfg`-gated `Dma` arm does not fail to
+compile elsewhere, it silently becomes `_ => {}`. That is the mechanism behind
+this whole issue class, and it must be checked wherever a per-backing arm is
+added. `TensorStorage::Pbo` is one type on every target, so its arm is
+ungated; saying so stops the next reader adding a `cfg` out of
+pattern-matching. The three mutator matches are now exhaustive — no trailing
+`_ => {}`, and no `allow(unreachable_patterns)` — so a new variant has to
+state its behaviour rather than inherit silence.
 
 ### Memory selection logic
 
@@ -414,6 +442,26 @@ crate's channel implementation. The `WeakSender` is the mechanism
 that lets the GL thread exit cleanly when `ImageProcessor` is
 dropped, even while PBO tensors are still alive; subsequent PBO
 operations on orphaned tensors return `PboDisconnected`.
+
+**A PBO is real library storage, reached through a callback channel.**
+`libedgefirst_tensor` never makes a GL call. `ef_tensor_wrap_pbo` takes an
+`ef_client_state` (`ctx` + `retain`/`release`) and the buffer's map/unmap
+functions, and builds an ordinary `TensorStorage::Pbo` tensor over them — so
+`view()`, `map()`, `set_plane_offset()` and `capacity_bytes()` behave like any
+other backing while every GL operation calls back out to the owning process's
+GL worker.
+
+`PboOpsVtable` is that same triple plus the two op pointers, which is why the
+cross-`cdylib` capsule path and the C constructor assemble the identical
+thing. The vtable **borrows** its `ctx` (`Arc::as_ptr` on the `PboHandle`)
+rather than owning a reference: it lives in a `OnceLock` inside that very
+handle, so a reference taken there could never reach zero and every PBO would
+leak its buffer. An importer takes its own reference through `state.retain`
+instead, which is what lets a child outlive its parent.
+
+**Ownership, once more, because reversing it double-frees.** `retain` and
+`release` keep the *channel* alive. `PboHandle::Drop` stays the sole caller of
+the real `delete_buffer`, and imported ops keep `delete_buffer` a no-op.
 
 ### BufferIdentity and EGL image caching
 
