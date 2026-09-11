@@ -182,12 +182,23 @@ const _: () = {
 /// handle, `PBO` by buffer id -- and so lands at the parent's origin unless
 /// the offset is put back.
 ///
-/// `Tensor::set_plane_offset` records the wrapper field for every backing,
-/// but only syncs the storage-internal offset that `map()` actually adds
-/// for `Mem`, `Dma` under `#[cfg(target_os = "linux")]`, `Dma` under
-/// `#[cfg(any(target_os = "macos", target_os = "ios"))]` and `Dma` under
-/// `#[cfg(target_os = "windows")]`; every other backing falls into its
-/// `_ => {}` arm. Backing by backing:
+/// `Tensor::set_plane_offset` records the wrapper field for every backing
+/// and syncs the storage-internal offset that `map()` actually adds for
+/// every one but Android's. Its match is exhaustive -- there is no
+/// `_ => {}`, deliberately, so a backing left out is a compile error
+/// rather than the silent fall-through that produced this issue class --
+/// with arms for `Mem`, `Pbo`, `Shm` under `#[cfg(unix)]`, and `Dma`
+/// under each of `#[cfg(target_os = "linux")]`,
+/// `#[cfg(any(target_os = "macos", target_os = "ios"))]` and
+/// `#[cfg(target_os = "windows")]`. The lone exception is
+/// `AHardwareBufferTensor` under `#[cfg(target_os = "android")]`, whose
+/// arm is an explicit no-op: it has a `view_offset` its own `map()` adds,
+/// but nothing writes it here, so restoring an offset onto an
+/// already-built tensor would be lost. That is latent rather than silent,
+/// since `TensorDyn::import_descriptor` cannot reach the backing today.
+/// The clear sites in `set_format` and `reshape` are exhaustive the same
+/// way, each arm either zeroing the storage offset or recording that the
+/// storage's own `reshape` zeroed it first. Backing by backing:
 ///
 /// * **Linux DMA-BUF** -- fixed, and verified end-to-end.
 /// * **IOSurface (macOS/iOS)** -- fixed (issue #161).

@@ -3042,6 +3042,14 @@ impl GLProcessorST {
         self.set_opacity_uniform(opacity)?;
         self.render_box(dst_w, dst_h, detect, color_mode)?;
         self.render_proto_segmentation(detect, proto_data, color_mode)?;
+        // Leave blending off, as `draw_decoded_masks_impl` does on its drawing
+        // path at the end of `render_segmentation`. Blend-off is this file's resting state -- a
+        // path that needs blending enables it on entry, as both mask draws do
+        // -- and every drawing call above has already been issued, so this
+        // changes nothing about what was composited, only what a later
+        // operation on this processor inherits -- which until now was the
+        // mask draw's `SRC_ALPHA, ONE_MINUS_SRC_ALPHA`, still enabled.
+        edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
 
         edgefirst_gl::finish();
         if !is_dma {
@@ -8124,13 +8132,16 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         let num_layers = num_protos.div_ceil(4);
 
-        // Save the caller's FBO and viewport so we can restore after dequant.
-        let (saved_fbo, saved_viewport) = unsafe {
+        // Save the caller's FBO, viewport and blend state so we can restore
+        // all three after dequant.
+        let (saved_fbo, saved_viewport, blend_was_enabled) = unsafe {
             let mut fbo: i32 = 0;
             edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::FRAMEBUFFER_BINDING, &mut fbo);
             let mut vp = [0i32; 4];
             edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::VIEWPORT, vp.as_mut_ptr());
-            (fbo as u32, vp)
+            let blend =
+                edgefirst_gl::gl::IsEnabled(edgefirst_gl::gl::BLEND) == edgefirst_gl::gl::TRUE;
+            (fbo as u32, vp, blend)
         };
 
         // Pass 1: Dequantize int8 → RGBA16F texture via the persistent
@@ -8148,6 +8159,19 @@ impl GLProcessorST {
         ) {
             Self::set_proto_tex_params(texture_target, edgefirst_gl::gl::LINEAR);
         }
+
+        // The dequant render is not a composite, so blending must be off for
+        // it. `draw_proto_masks_impl` enables `GL_BLEND` with
+        // `SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ZERO, ONE` for the mask quads, and
+        // this pass inherits that state. But it writes four dequantized protos
+        // per RGBA16F texel, so the alpha channel carries proto `4k+3` as data
+        // rather than coverage: blended, protos `4k..4k+2` come out scaled by
+        // their group's alpha proto, and the `ZERO`/`ONE` alpha factors mean
+        // every `4k+3` proto is never written at all, leaving whatever the
+        // `TexStorage3D` allocation above happened to contain. That made the
+        // rendered mask a function of uninitialised GPU memory -- issue #184,
+        // whose run-to-run drift on Vivante was exactly that recycled memory.
+        edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
 
         let (proto_scale, proto_zp) = quantization;
         let proto_scaled_zp = -(proto_zp as f32) * proto_scale;
@@ -8187,6 +8211,15 @@ impl GLProcessorST {
                 saved_viewport[2],
                 saved_viewport[3],
             );
+        }
+        // Pass 2 *is* a composite -- it draws the mask quads the single-pass
+        // proto paths draw -- so hand it back the blend state it came in
+        // with. Restored rather than unconditionally enabled: the caller's
+        // state is what pass 2 is entitled to, and nothing here says blending
+        // was on. An error return from pass 1 leaves blending disabled, which
+        // is where `render_segmentation` leaves it on success too.
+        if blend_was_enabled {
+            edgefirst_gl::enable(edgefirst_gl::gl::BLEND);
         }
 
         // Pass 2: render with existing f16 shader reading from dequant texture

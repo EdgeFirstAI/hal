@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Masks rendered by the non-default two-pass int8 proto mode varied from run
+  to run (#184).** `draw_proto_masks` enables blending to composite its mask
+  quads over the destination, and `Int8InterpolationMode::TwoPass` ran its
+  dequantization pass with that blending still switched on. That pass is not a
+  composite: it packs four dequantized protos into one RGBA16F texel, so its
+  alpha channel carries a proto as data rather than coverage. Blended, three
+  protos of every group of four came out scaled by the fourth, and the fourth
+  was never written at all — so those protos, and every mask sampling them,
+  read whatever the texture allocation happened to contain. That is why the
+  same binary scored 0.74 to 0.75 against the bilinear mode when the test ran
+  alone and passed inside the full suite: the recycled memory differed, and a
+  pass was luck. Blending is now disabled for the dequantization pass and
+  restored for the pass that does composite. Measured against the bilinear
+  mode after the fix, bit-identical across three isolated runs on each board:
+  0.9957 on i.MX 8M Plus (Vivante GC7000UL), 0.9982 on i.MX 95 (Mali G310) and
+  0.9962 on Raspberry Pi 5 (V3D 7.1). The default interpolation mode was never
+  affected, and neither was any float proto path.
+
+  The proto mask draw now also leaves blending disabled when it returns, as
+  the decoded mask draw already did, so the overlay's blend function no longer
+  applies to the next operation on the same processor.
+
 - **A `view()` destination on the GPU's mapped-texture readback got the wrong
   pixels and wrote over its parent (#177).** The mapped-texture lowering
   renders into an offscreen texture that *is* the tile, at origin (0, 0), and

@@ -85,8 +85,12 @@ parent buffer, so for those it must be put back. See
 `interop::apply_plane_offset`.
 
 `Tensor::set_plane_offset` syncs the storage-internal offset that `map()`
-adds for `Mem` and for `Dma` on Linux, macOS/iOS and Windows; every other
-backing hits its `_ => {}` arm.
+adds for every backing but one: `Mem`, `Pbo`, `Shm` and `Dma` on Linux,
+macOS/iOS and Windows. Its match is exhaustive — there is no `_ => {}`, so
+a backing left out of it is a compile error rather than a silent
+fall-through — and the lone exception is Android's `AHardwareBufferTensor`,
+whose arm is an explicit no-op and which no import path reaches today. The
+clear sites in `set_format` and `reshape` are exhaustive the same way.
 
 IOSurface (macOS/iOS) had the defect and is fixed. It was easy to miss
 because `IoSurfaceTensor::view` always set its own `view_offset` correctly,

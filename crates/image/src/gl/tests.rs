@@ -4594,11 +4594,24 @@ mod gl_tests {
         // first render despite the dequant texture/FBO created in between.
         let bilinear_again = render_mode(Int8InterpolationMode::Bilinear);
 
-        // Measured actuals: Vivante GC7000UL >= 0.95; Mali G310 = 0.8153 —
-        // a PRE-EXISTING driver filtering delta (bit-identical score on the
-        // pre-refactor build), believed to be Mali's coarser fixed-point
-        // f16 texture interpolation. 0.80 still catches structural
-        // breakage: the broken compute-repack upload scored ~0.77.
+        // Measured actuals, all bit-identical across three isolated runs
+        // per board: Vivante GC7000UL 0.9957, Mali G310 0.9982, V3D 7.1
+        // 0.9962 against TwoPass; 0.9602 / 0.9599 / 0.9601 against Nearest.
+        //
+        // The Mali figure used to read 0.8153 and was attributed to that
+        // driver's coarser fixed-point f16 texture interpolation. It was
+        // not a driver difference at all — it was issue #184, the overlay's
+        // `GL_BLEND` leaking into the two-pass dequantization render, which
+        // made every TwoPass mask partly a function of uninitialised GPU
+        // memory. With blending off for that pass the three GPUs agree to
+        // better than 0.995.
+        //
+        // The thresholds stay loose deliberately. What these modes owe each
+        // other is equivalent filtering, not bit-exactness, and no lane
+        // measures Tegra or the ANGLE backends, so the margin is headroom
+        // for a GPU none of the three boards represents. They still catch
+        // structural breakage by a wide margin: the broken compute-repack
+        // upload scored ~0.77, and #184's blended dequant scored 0.74–0.75.
         compare_images(&bilinear, &two_pass, 0.80, function!());
         compare_images(&bilinear, &nearest, 0.90, function!());
         let a = bilinear.as_u8().unwrap().map().unwrap();
