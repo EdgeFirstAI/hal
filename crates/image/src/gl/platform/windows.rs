@@ -939,6 +939,16 @@ impl GlPlatform for AngleD3d11 {
         })
     }
 
+    /// `EGL_ANGLE_image_d3d11_texture` binds the whole texture from its
+    /// origin, so a destination that starts elsewhere is placed only when
+    /// it carries a `view_origin` for the viewport.
+    fn dst_import_places<T>(img: &Tensor<T>) -> bool
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+    {
+        super::unplaced_destination(img).is_none()
+    }
+
     /// Windows keys its imports on a raw `ID3D11Texture2D` address that the
     /// tensor crate derives independently in each of its two backends, so the
     /// identity and the texture can disagree without anything else noticing.
@@ -965,7 +975,7 @@ impl GlPlatform for AngleD3d11 {
         display: &D3d11Display,
         img: &Tensor<u8>,
         fmt: PixelFormat,
-        _for_dst: bool,
+        for_dst: bool,
     ) -> Result<D3d11EglImage> {
         // `EGL_ANGLE_image_d3d11_texture` has no sub-extent attribute, so
         // the image always covers the whole texture. That is what a
@@ -974,17 +984,27 @@ impl GlPlatform for AngleD3d11 {
         // no branch here. A source whose logical image is smaller than its
         // texture -- a pool buffer narrowed by `configure_image` -- is
         // sampled through the extent reported by `import_extent`, which the
-        // engine folds into the source rectangle.
+        // engine folds into the source rectangle from the texture's origin.
+        // A source whose pixels start elsewhere -- a `view()`, or a tensor
+        // carrying a plane offset -- therefore cannot be attached at all, and
+        // is refused so the engine uploads it through `map()`, which honours
+        // the offset. A destination carrying an offset without the
+        // `view_origin` a `view()` would have given it -- one rebuilt from a
+        // descriptor -- has no viewport to place it either; the engine asks
+        // `dst_import_places` before it asks for a destination import, so
+        // that case never reaches here and is not re-checked.
         //
-        // `for_dst` is unused for the same reason there is no bind-flag
-        // refusal here: the tensor crate's layout ABI is frozen and carries
-        // no bind flags, so this leaf cannot ask whether an externally
-        // wrapped texture was created with `D3D11_BIND_RENDER_TARGET`. Such
-        // a texture is imported and attached, and rejected at
-        // `CheckFramebufferStatus`, which falls the frame back to the CPU
-        // converter -- correct, at the cost of one `eglCreateImage` and one
-        // FBO probe per frame. Textures the HAL allocates always carry the
-        // flag.
+        // There is no bind-flag refusal here: the tensor crate's layout ABI
+        // is frozen and carries no bind flags, so this leaf cannot ask
+        // whether an externally wrapped texture was created with
+        // `D3D11_BIND_RENDER_TARGET`. Such a texture is imported and
+        // attached, and rejected at `CheckFramebufferStatus`, which falls
+        // the frame back to the CPU converter -- correct, at the cost of one
+        // `eglCreateImage` and one FBO probe per frame. Textures the HAL
+        // allocates always carry the flag.
+        if !for_dst {
+            super::refuse_offset_source(img, "source", "EGL_ANGLE_image_d3d11_texture")?;
+        }
         let (texture, layout) = texture_of(img, "source/destination")?;
         check_dxgi_format(&layout, img, fmt)?;
         import_texture(display, texture, &layout, "image")
@@ -995,6 +1015,7 @@ impl GlPlatform for AngleD3d11 {
         img: &Tensor<u8>,
         _fmt: PixelFormat,
     ) -> Result<D3d11EglImage> {
+        super::refuse_offset_source(img, "NV source", "EGL_ANGLE_image_d3d11_texture")?;
         let (texture, layout) = texture_of(img, "NV source")?;
         // The HAL's own semi-planar allocations are always R8, and so is any
         // externally wrapped one the tensor crate accepted. That acceptance
@@ -1277,11 +1298,13 @@ mod tests {
     #[test]
     fn load_egl_lib_finds_angle_or_skips() {
         let Some(dir) = std::env::var_os("EDGEFIRST_ANGLE_PATH") else {
-            eprintln!("EDGEFIRST_ANGLE_PATH unset — skipping ANGLE load probe");
+            crate::test_support::report_skip("EDGEFIRST_ANGLE_PATH unset — no ANGLE load probe");
             return;
         };
         if !Path::new(&dir).join("libEGL.dll").is_file() {
-            eprintln!("no libEGL.dll under EDGEFIRST_ANGLE_PATH — skipping ANGLE load probe");
+            crate::test_support::report_skip(
+                "no libEGL.dll under EDGEFIRST_ANGLE_PATH — no ANGLE load probe",
+            );
             return;
         }
         WindowsPlatform::load_egl_lib()
@@ -1300,11 +1323,11 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(keeper) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let Ok(doomed) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         // `keeper` issues the last commands, so it is the context the
@@ -1336,7 +1359,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(shared) = shared_display() else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let dev = edgefirst_tensor::d3d11::device().expect("device");
@@ -1356,7 +1379,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(display) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         let t = edgefirst_tensor::Tensor::<u8>::image(
@@ -1412,7 +1435,7 @@ mod tests {
         // other tests in this binary; see `lifecycle_guard`.
         let _lifecycle = super::super::super::threaded::lifecycle_guard();
         let Ok(display) = AngleD3d11::init_display(None) else {
-            eprintln!("SKIP: no ANGLE");
+            crate::test_support::report_skip("no ANGLE");
             return;
         };
         assert!(AngleD3d11::native_fence_sync(&display));

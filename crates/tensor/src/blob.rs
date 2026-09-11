@@ -1461,7 +1461,8 @@ fn import_referenced_d3d11_blob(
     // this device's staging copy reports -- and the producer's is a fact
     // about the producer's driver, not about the texture as this process
     // sees it. The descriptor path makes the same exclusion for the same
-    // reason (`restore_imported_row_stride` is `HOST | DMABUF` only).
+    // reason (`restore_imported_row_stride` excludes `D3D11_TEXTURE` for
+    // the same reason).
     t.set_colorimetry(colorimetry_from(strings));
     Ok(t)
 }
@@ -1937,7 +1938,6 @@ mod tests {
     /// A reference-capable tensor, or `None` on a host that has no shareable
     /// backing (no dma-heap, or one this user cannot open).
     fn reference_capable(w: usize, h: usize) -> Option<TensorDyn> {
-        use std::io::Write;
         match Tensor::<u8>::image(
             w,
             h,
@@ -1947,11 +1947,10 @@ mod tests {
         ) {
             Ok(t) => Some(TensorDyn::from(t)),
             Err(e) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "SKIP: no shareable backing on this host ({e:?}); \
-                     reference transport not exercised"
-                );
+                crate::test_support::report_skip(&format!(
+                    "no shareable backing on this host ({e:?}); reference \
+                     transport not exercised"
+                ));
                 None
             }
         }

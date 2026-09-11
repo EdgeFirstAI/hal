@@ -18,7 +18,38 @@ use std::{
 // Used by `PboOpsVtable` and friends (the cross-cdylib capsule protocol's
 // PBO support), which are compiled into both backends since task P2a — see
 // that type's own doc comment.
-use std::{os::raw::c_int, sync::OnceLock};
+use std::os::raw::c_int;
+// `PboHandle::abi_vtable`'s cell, and so `static`-only with it: under
+// `dynamic` the library owns the table (`ef_tensor_pbo_vtable`).
+#[cfg(feature = "static")]
+use std::sync::OnceLock;
+// The frozen client-state vocabulary the table is expressed over. Re-exported
+// (`crate::EfClientState` and friends) so a C entry point assembling the same
+// three parts names one type, not a copy of it.
+pub use edgefirst_tensor_abi::{EfClientState, EfPboMapFn, EfPboUnmapFn};
+
+/// The refusal both backends give when asked to pin a PBO's host address.
+///
+/// One string, two arms: `Tensor::pin_host` (`lib.rs`, `static`) refuses its
+/// own `TensorStorage::Pbo`, and `TensorDyn::pin_host`
+/// (`tensor_dyn/dynamic_backend.rs`) has to repeat the refusal because the
+/// ABI exposes `ef_tensor_map` and no `ef_tensor_pin_host`, so the library
+/// cannot tell a pin from a map. Shared as a constant rather than copied so
+/// the two cannot drift into refusing with different words.
+///
+/// The reason, at length: `glMapBufferRange`'s pointer is valid only until
+/// `glUnmapBuffer`, and this backend maps with `MAP_READ_BIT |
+/// MAP_WRITE_BIT` -- no `GL_MAP_PERSISTENT_BIT`, and no `glBufferStorage`
+/// anywhere. Holding the map open for a pin's lifetime would keep the buffer
+/// mapped across GL work, which is exactly what a PBO is not for. Persistent
+/// mapping (`EXT_buffer_storage` on GLES) would make this implementable, but
+/// that is a buffer-allocation feature, not wiring -- it changes how every
+/// PBO is created and needs fences for coherency.
+pub(crate) const PIN_HOST_PBO_REFUSAL: &str = "pin_host: a PBO has no host address outside \
+     glMapBufferRange/glUnmapBuffer, so it cannot hand out one that \
+     outlives a guard. Use map()/map_with(). Persistent mapping \
+     (EXT_buffer_storage, GL_MAP_PERSISTENT_BIT) is not used by this \
+     backend.";
 
 /// Raw mapped pointer from a PBO. CPU-accessible while the buffer is mapped.
 /// The pointer is only valid between map and unmap calls.
@@ -49,6 +80,13 @@ unsafe impl Send for PboMapping {}
 pub unsafe trait PboOps: Send + Sync {
     /// Map the PBO for CPU read/write access.
     /// The returned PboMapping is valid until `unmap_buffer` is called.
+    ///
+    /// A returned `PboMapping::size` below `size` is treated as a FAILED
+    /// map, not a partial one: `PboHandle::acquire_map` refuses it and
+    /// unmaps the buffer. Callers of the resulting pin size their host
+    /// slice from the tensor's own allocation, so there is nowhere for a
+    /// shorter mapping to be recorded. Report the shortfall as an `Err`
+    /// rather than a short success if the implementation can tell.
     fn map_buffer(&self, buffer_id: u32, size: usize) -> Result<PboMapping>;
 
     /// Unmap a previously mapped PBO. Must be called before GL operations
@@ -94,7 +132,10 @@ pub unsafe trait PboOps: Send + Sync {
 /// establishes this for every other kind's use of `ptr`). This struct's own
 /// address IS the `PboHandle`'s address plus a fixed field offset, so it
 /// disappears exactly when `PboHandle` does — no separate allocation to
-/// leak, no registry entry to remove on drop.
+/// leak, no registry entry to remove on drop. The external contract only has
+/// to hold for the *read*: an importer calls `state.retain` while reading
+/// the table and holds its own reference from then on (see
+/// [`client_state_pbo_ops`]).
 ///
 /// Compiled into both backends. It was `static`-only while the
 /// cross-package capsule protocol had no `dynamic` counterpart; task P2a
@@ -104,74 +145,56 @@ pub unsafe trait PboOps: Send + Sync {
 /// a backend-agnostic GL extension point.
 #[repr(C)]
 pub struct PboOpsVtable {
-    /// Opaque to every caller except this struct's own function pointers —
-    /// a caller crossing a `cdylib` boundary calls through them and never
-    /// dereferences `ctx` itself.
-    ctx: *const c_void,
-    map_buffer_fn: unsafe extern "C" fn(
-        ctx: *const c_void,
-        buffer_id: u32,
-        size: usize,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-    ) -> c_int,
-    unmap_buffer_fn: unsafe extern "C" fn(ctx: *const c_void, buffer_id: u32) -> c_int,
+    /// The callback channel: an opaque `ctx` plus the pair that extends its
+    /// life. `ctx` addresses the producing [`PboHandle`]; only this module's
+    /// own `extern "C"` functions ever dereference it.
+    ///
+    /// **Borrowed, not owned.** [`Self::new`] takes no reference of its own,
+    /// because this struct lives in a `OnceLock` *inside* the very
+    /// `PboHandle` its `ctx` names — a count taken here could never reach
+    /// zero and every PBO would leak its GL buffer. An importer takes its
+    /// own reference through `state.retain` instead; see
+    /// [`client_state_pbo_ops`].
+    state: EfClientState,
+    map_buffer_fn: EfPboMapFn,
+    unmap_buffer_fn: EfPboUnmapFn,
     // No `delete_buffer_fn`: deliberately absent, not merely unused. A
     // consumer reconstructing a `PboTensor` from this vtable does not own
-    // the GL buffer -- it borrows it for the descriptor's lifetime (see
+    // the GL buffer -- it holds the channel alive through `state.retain`
+    // and lets the producer's own `PboHandle::Drop` do the deleting (see
     // `ImportedPboOps`'s own doc comment) -- so there is no legitimate
-    // caller for it on that side, and the producer's own `PboHandle::Drop`
-    // already calls the real `delete_buffer` directly through its own
-    // `Arc<dyn PboOps>`, never through this vtable. Including a pointer
-    // nothing may safely call is worse than omitting it.
+    // caller for it on that side. Including a pointer nothing may safely
+    // call is worse than omitting it.
 }
 
 // SAFETY: every field is either a raw pointer this struct never
-// dereferences itself (only its own `extern "C" fn`s do, and those forward
+// dereferences itself (only its own `extern "C"` fns do, and those forward
 // into `PboOps`, itself `Send + Sync`) or a plain function pointer — both
 // safe to share and move across threads.
 unsafe impl Send for PboOpsVtable {}
 unsafe impl Sync for PboOpsVtable {}
 
 impl PboOpsVtable {
-    /// Build a vtable dispatching into `ops`. `ctx` addresses `ops` itself,
-    /// so `ops` must already be at its final, stable address — a field of a
-    /// `PboHandle` that already lives inside its own `Arc` (see
-    /// [`PboTensor::pbo_vtable`]), since nothing here pins or moves it.
-    fn new(ops: &Arc<dyn PboOps>) -> Self {
+    /// Build a vtable dispatching into `handle`'s `ops`.
+    ///
+    /// `ctx` is the `PboHandle`'s own address, taken with `Arc::as_ptr` so
+    /// `retain`/`release` can drive its strong count — a pointer into the
+    /// `ops` field (what this used to store) is not a value
+    /// `Arc::increment_strong_count` accepts. No reference is taken here;
+    /// see the field's own doc comment for why that would leak.
+    ///
+    /// `static`-only: under `dynamic` the library builds and owns the table.
+    #[cfg(feature = "static")]
+    fn new(handle: &Arc<PboHandle>) -> Self {
         PboOpsVtable {
-            ctx: ops as *const Arc<dyn PboOps> as *const c_void,
+            state: EfClientState {
+                ctx: Arc::as_ptr(handle) as *const c_void,
+                retain: Some(vt_retain),
+                release: Some(vt_release),
+            },
             map_buffer_fn: vt_map_buffer,
             unmap_buffer_fn: vt_unmap_buffer,
         }
-    }
-
-    /// # Safety
-    /// `self` must be a table this module built (via [`Self::new`]) whose
-    /// `ctx` is still live — the `PboHandle` it addresses must not have
-    /// dropped. A raw pointer reconstructed from a [`crate::TensorDesc`]
-    /// satisfies this for exactly as long as that descriptor's own borrow
-    /// contract does.
-    unsafe fn map_buffer(&self, buffer_id: u32, size: usize) -> Result<PboMapping> {
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut len: usize = 0;
-        // SAFETY: caller's contract above.
-        let rc = unsafe { (self.map_buffer_fn)(self.ctx, buffer_id, size, &mut ptr, &mut len) };
-        if rc != 0 {
-            return Err(vtable_errno_to_error(rc));
-        }
-        Ok(PboMapping { ptr, size: len })
-    }
-
-    /// # Safety
-    /// Same as [`Self::map_buffer`].
-    unsafe fn unmap_buffer(&self, buffer_id: u32) -> Result<()> {
-        // SAFETY: caller's contract above.
-        let rc = unsafe { (self.unmap_buffer_fn)(self.ctx, buffer_id) };
-        if rc != 0 {
-            return Err(vtable_errno_to_error(rc));
-        }
-        Ok(())
     }
 }
 
@@ -232,16 +255,16 @@ unsafe extern "C" fn vt_map_buffer(
     out_len: *mut usize,
 ) -> c_int {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: the caller's contract (`PboOpsVtable::map_buffer`)
-        // guarantees `ctx` still addresses a live `Arc<dyn PboOps>`.
-        let ops = unsafe { &*(ctx as *const Arc<dyn PboOps>) };
-        ops.map_buffer(buffer_id, size)
+        // SAFETY: the caller's contract (`client_state_pbo_ops`, or this
+        // crate's own `PboOpsVtable`) guarantees `ctx` still addresses a
+        // live `PboHandle`.
+        let handle = unsafe { &*(ctx as *const PboHandle) };
+        handle.ops.map_buffer(buffer_id, size)
     }));
     match result {
         Ok(Ok(mapping)) => {
             // SAFETY: `out_ptr`/`out_len` are valid out-params for the
-            // duration of this call, per this function's own contract with
-            // its caller (`PboOpsVtable::map_buffer`).
+            // duration of this call, per this function's own contract.
             unsafe {
                 *out_ptr = mapping.ptr;
                 *out_len = mapping.size;
@@ -256,8 +279,8 @@ unsafe extern "C" fn vt_map_buffer(
 unsafe extern "C" fn vt_unmap_buffer(ctx: *const c_void, buffer_id: u32) -> c_int {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: see `vt_map_buffer`.
-        let ops = unsafe { &*(ctx as *const Arc<dyn PboOps>) };
-        ops.unmap_buffer(buffer_id)
+        let handle = unsafe { &*(ctx as *const PboHandle) };
+        handle.ops.unmap_buffer(buffer_id)
     }));
     match result {
         Ok(Ok(())) => 0,
@@ -266,44 +289,97 @@ unsafe extern "C" fn vt_unmap_buffer(ctx: *const c_void, buffer_id: u32) -> c_in
     }
 }
 
-/// Adapts a [`PboOpsVtable`] reconstructed from a cross-package
-/// [`crate::TensorDesc`] back into a [`PboOps`] implementation, so
-/// [`PboTensor::from_pbo`] needs no separate cross-package constructor —
-/// [`import_pbo_ops`] builds the exact same `Arc<dyn PboOps>` shape this
-/// crate already uses for a same-process PBO.
+/// The `retain` half of [`PboOpsVtable::new`]'s [`EfClientState`].
 ///
-/// `delete_buffer` is deliberately a no-op: this tensor does not own the
-/// GL buffer, it borrows it for the descriptor's lifetime (the producer's
-/// own capsule-keepalive contract), so dropping it must not delete a
-/// buffer the producer's own tensor may still be using. The producer's own
-/// `PboHandle::Drop` is the only thing that ever calls the real
-/// `delete_buffer`.
-struct ImportedPboOps {
-    vtable: NonNull<PboOpsVtable>,
+/// Compiled into the producing copy of this crate, which is the only one
+/// that knows `PboHandle` — the whole reason `ctx` is opaque everywhere
+/// else. `catch_unwind`-shielded like its siblings: an unwind across an
+/// `extern "C"` boundary is undefined behaviour, and an `Arc` refcount
+/// operation cannot fail in any other way, so there is nothing to report.
+unsafe extern "C" fn vt_retain(ctx: *const c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` came from `Arc::as_ptr` on a live `Arc<PboHandle>`
+        // (or from a matching `retain` the caller has not released yet),
+        // per `EfClientState`'s own contract.
+        unsafe { Arc::increment_strong_count(ctx as *const PboHandle) }
+    }));
 }
 
-// SAFETY: the vtable this addresses is `Send + Sync` (see its own impl),
-// and this struct never mutates through the pointer, only calls through
-// its function pointers, which are themselves safe to call from any thread
-// (see `PboOps`'s own trait-level contract, which the real implementation
-// behind this vtable already upholds).
+/// The `release` half. See [`vt_retain`].
+unsafe extern "C" fn vt_release(ctx: *const c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: balances exactly one prior `vt_retain`.
+        unsafe { Arc::decrement_strong_count(ctx as *const PboHandle) }
+    }));
+}
+
+/// Adapts a [`PboOpsVtable`]'s three parts back into a [`PboOps`]
+/// implementation, so [`PboTensor::from_pbo`] needs no separate
+/// cross-package constructor.
+///
+/// **Holds the channel open.** Construction calls `state.retain` and
+/// [`Drop`] calls `state.release`, so this value keeps the producing
+/// `PboHandle` alive by itself. That is what lets a child outlive its
+/// parent, and it is the difference from the design this replaces, where
+/// the lifetime was enforced externally by a `pbo_keepalive()` `Arc` some
+/// unrelated object had to hold. The Python capsule still holds that
+/// keepalive; it is now belt-and-braces rather than the only thing standing
+/// between a consumer and freed memory.
+///
+/// `delete_buffer` is deliberately a no-op: this tensor does not own the GL
+/// buffer, it holds the *channel* to it (see [`EfClientState`]'s own
+/// contract), so dropping it must not delete a buffer the producer's own
+/// tensor may still be using. The producer's own `PboHandle::Drop` is the
+/// only thing that ever calls the real `delete_buffer`.
+struct ImportedPboOps {
+    state: EfClientState,
+    map_buffer_fn: EfPboMapFn,
+    unmap_buffer_fn: EfPboUnmapFn,
+}
+
+// SAFETY: the parts this holds are a raw pointer it never dereferences
+// itself (only the function pointers do, and those forward into a real
+// `PboOps` implementation, itself `Send + Sync`) plus plain function
+// pointers, safe to call from any thread — see `PboOps`'s own trait-level
+// contract, which the real implementation behind them already upholds.
 unsafe impl Send for ImportedPboOps {}
 unsafe impl Sync for ImportedPboOps {}
 
-// SAFETY: forwards every call through `PboOpsVtable`'s own dispatch, which
-// forwards into a real `PboOps` implementation upholding this trait's
-// contract already — this wrapper adds no new unsafety beyond the pointer
-// dereference `import_pbo_ops`'s own safety contract covers.
+impl Drop for ImportedPboOps {
+    fn drop(&mut self) {
+        if let Some(release) = self.state.release {
+            // SAFETY: balances the `retain` in `client_state_pbo_ops`,
+            // which is this type's only constructor.
+            unsafe { release(self.state.ctx) };
+        }
+    }
+}
+
+// SAFETY: forwards every call through the client's own op functions, which
+// forward into a real `PboOps` implementation upholding this trait's
+// contract already — this wrapper adds no unsafety beyond the calls
+// `client_state_pbo_ops`'s own safety contract covers.
 unsafe impl PboOps for ImportedPboOps {
     fn map_buffer(&self, buffer_id: u32, size: usize) -> Result<PboMapping> {
-        // SAFETY: `import_pbo_ops` (this type's only constructor) upholds
-        // `PboOpsVtable::map_buffer`'s safety contract.
-        unsafe { self.vtable.as_ref().map_buffer(buffer_id, size) }
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        // SAFETY: `client_state_pbo_ops` retained the channel, so `ctx` is
+        // live for as long as `self` is.
+        let rc =
+            unsafe { (self.map_buffer_fn)(self.state.ctx, buffer_id, size, &mut ptr, &mut len) };
+        if rc != 0 {
+            return Err(vtable_errno_to_error(rc));
+        }
+        Ok(PboMapping { ptr, size: len })
     }
 
     fn unmap_buffer(&self, buffer_id: u32) -> Result<()> {
         // SAFETY: see `map_buffer` above.
-        unsafe { self.vtable.as_ref().unmap_buffer(buffer_id) }
+        let rc = unsafe { (self.unmap_buffer_fn)(self.state.ctx, buffer_id) };
+        if rc != 0 {
+            return Err(vtable_errno_to_error(rc));
+        }
+        Ok(())
     }
 
     fn delete_buffer(&self, _buffer_id: u32) {
@@ -311,23 +387,82 @@ unsafe impl PboOps for ImportedPboOps {
     }
 }
 
-/// Reconstruct a live [`PboOps`] from a [`crate::TensorDesc::ptr`] carrying
-/// a [`PboOpsVtable`] address under [`crate::protocol::kind::PBO`].
+/// The three parts of a [`PboOpsVtable`], read out of a descriptor's `ptr`
+/// or supplied directly by a C caller.
+pub struct PboOpsVtableParts {
+    pub state: EfClientState,
+    pub map_fn: EfPboMapFn,
+    pub unmap_fn: EfPboUnmapFn,
+}
+
+/// Read a [`crate::TensorDesc::ptr`]'s vtable into its parts, so a caller
+/// can hand them to a constructor rather than reassembling a
+/// `dyn PboOps` first.
 ///
 /// # Safety
-/// `vtable_ptr` must be a genuine `*const PboOpsVtable` this module built
-/// (i.e. it came from a real `TensorDesc.ptr` under `kind::PBO`, not a
-/// forged or reinterpreted value), and the `PboHandle` it addresses must
-/// stay alive for as long as the returned `Arc<dyn PboOps>` (and anything
-/// built from it) is used — the same capsule-keepalive contract
-/// `TensorDesc::ptr` already documents for every other kind.
-pub(crate) unsafe fn import_pbo_ops(vtable_ptr: *const c_void) -> Result<Arc<dyn PboOps>> {
+/// `vtable_ptr` must be a table this
+/// module built, live for the duration of this call.
+pub unsafe fn read_pbo_vtable_parts(vtable_ptr: *const c_void) -> Result<PboOpsVtableParts> {
     let Some(vtable) = NonNull::new(vtable_ptr as *mut PboOpsVtable) else {
         return Err(Error::InvalidArgument(
             "PBO descriptor carries no ops vtable".into(),
         ));
     };
-    Ok(Arc::new(ImportedPboOps { vtable }))
+    // SAFETY: caller's contract -- the table is live for this call.
+    let v = unsafe { vtable.as_ref() };
+    Ok(PboOpsVtableParts {
+        state: v.state,
+        map_fn: v.map_buffer_fn,
+        unmap_fn: v.unmap_buffer_fn,
+    })
+}
+
+/// Build a live [`PboOps`] from a client's [`EfClientState`] and its two op
+/// functions — the one place the three parts are assembled, whether they
+/// arrived through a [`crate::TensorDesc`] under
+/// [`crate::protocol::kind::PBO`] or through `ef_tensor_wrap_pbo`'s
+/// arguments.
+///
+/// Takes its own reference on the channel (`state.retain`) and releases it
+/// when the returned `Arc`'s last clone drops.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] for a NULL `ctx`, `retain` or `release` — a
+/// silently non-owning attach is exactly the class of quiet loss this
+/// design exists to remove.
+///
+/// # Safety
+/// `state.ctx` must be a genuine context the supplied `retain`/`release`
+/// understand, and `map_fn`/`unmap_fn` must uphold [`PboOps`]'s own
+/// contract for it.
+pub unsafe fn client_state_pbo_ops(
+    state: EfClientState,
+    map_fn: EfPboMapFn,
+    unmap_fn: EfPboUnmapFn,
+) -> Result<Arc<dyn PboOps>> {
+    if state.ctx.is_null() {
+        return Err(Error::InvalidArgument(
+            "PBO client state carries a NULL ctx".into(),
+        ));
+    }
+    let Some(retain) = state.retain else {
+        return Err(Error::InvalidArgument(
+            "PBO client state carries a NULL retain".into(),
+        ));
+    };
+    if state.release.is_none() {
+        return Err(Error::InvalidArgument(
+            "PBO client state carries a NULL release".into(),
+        ));
+    }
+    // SAFETY: the caller's contract above. Taken before the value is stored
+    // so `Drop`'s release always balances exactly one retain.
+    unsafe { retain(state.ctx) };
+    Ok(Arc::new(ImportedPboOps {
+        state,
+        map_buffer_fn: map_fn,
+        unmap_buffer_fn: unmap_fn,
+    }))
 }
 
 /// Opaque handle to a PBO's GL resources.
@@ -344,8 +479,13 @@ struct PboHandle {
     /// [`crate::TensorDesc`]. Built once, lazily, on first
     /// [`PboTensor::pbo_vtable`] call — see [`PboOpsVtable`]'s own doc
     /// comment for why this exists and what it replaces (a same-process-only
-    /// registry, which cannot cross a `cdylib` boundary at all). Present on
-    /// both backends — see [`PboOpsVtable`]'s own doc comment.
+    /// registry, which cannot cross a `cdylib` boundary at all).
+    ///
+    /// `static`-only since Stage B: under `dynamic` a PBO's storage lives
+    /// inside `libedgefirst_tensor.so`, which builds and owns the table
+    /// itself, and `TensorDyn::pbo_vtable_ptr` asks it through
+    /// `ef_tensor_pbo_vtable` rather than building one here.
+    #[cfg(feature = "static")]
     abi_vtable: OnceLock<PboOpsVtable>,
 }
 
@@ -440,6 +580,24 @@ impl PboHandle {
             // No lock held here — see this function's Locking note.
             let mapped = self.ops.map_buffer(self.buffer_id, self.size);
             let base = match mapped {
+                // A SHORT mapping is a failed mapping. `scoped_pin` and
+                // `map_internal` both hand out `self.size` bytes from this
+                // base -- they have nothing else to go on -- so an
+                // implementation that reports success while mapping fewer
+                // bytes (a client's `map_fn` across the `ef_client_state`
+                // channel is untrusted here, and its `out_len` is its own
+                // claim) would turn into an out-of-bounds host slice with
+                // no error anywhere. Refuse it the same way a NULL pointer
+                // is refused below: GL still considers the buffer mapped,
+                // so release it rather than strand it.
+                Ok(mapping) if mapping.size < self.size => {
+                    let _ = self.ops.unmap_buffer(self.buffer_id);
+                    self.finish_map(None, writable);
+                    return Err(Error::InsufficientCapacity {
+                        needed: self.size,
+                        capacity: mapping.size,
+                    });
+                }
                 Ok(mapping) => NonNull::new(mapping.ptr as *mut c_void),
                 Err(e) => {
                     self.finish_map(None, writable);
@@ -576,6 +734,9 @@ where
     /// Returns `Error::ShapeMismatch` if `size` does not equal
     /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()`.
     /// Returns `Error::InvalidSize` if `size` is zero.
+    /// Returns `Error::InvalidShape` if that shape footprint overflows
+    /// `usize` — refused rather than wrapped to a small byte count an
+    /// undersized `size` would then satisfy.
     pub fn from_pbo(
         buffer_id: u32,
         size: usize,
@@ -586,7 +747,14 @@ where
         if size == 0 {
             return Err(Error::InvalidSize(0));
         }
-        let expected = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        // Checked, not `product() * size_of::<T>()`: this shape arrives
+        // straight from a C caller through `ef_tensor_wrap_pbo`, and a
+        // product that wraps `usize` in a release build computes a *small*
+        // footprint, slips past the `size <` test below, and mints a tensor
+        // whose logical extent runs far past the GL allocation. One shared
+        // helper with `reshape`/`set_logical_shape`/`view` so all four
+        // footprints in this file obey the same rule.
+        let expected = crate::ahardwarebuffer_layout::checked_shape_bytes::<T>(shape)?;
         // Allow `size >= expected`: PBOs allocated with a 64-byte-aligned row
         // stride may be larger than the shape product.  Reject only if the
         // allocation is strictly smaller than the logical content.
@@ -606,6 +774,7 @@ where
                 size,
                 map_state: Mutex::new(MapState::Unmapped),
                 map_cv: Condvar::new(),
+                #[cfg(feature = "static")]
                 abi_vtable: OnceLock::new(),
             }),
             // A GL buffer name is meaningful only inside its creating
@@ -625,30 +794,37 @@ where
 
     /// The C-ABI vtable dispatching into this PBO's `ops`, for cross-cdylib
     /// export via [`crate::TensorDesc`]. See [`PboOpsVtable`]'s own doc
-    /// comment. Called from both backends' `pbo_vtable_ptr`
-    /// (`lib.rs`/`static_backend.rs`, and `dynamic_backend.rs` via
-    /// `with_pbo!`).
+    /// comment. Called from `static`'s `pbo_vtable_ptr`
+    /// (`lib.rs`/`static_backend.rs`); `dynamic` reads the library's own
+    /// table through `ef_tensor_pbo_vtable` instead, so this is
+    /// `static`-only.
+    #[cfg(feature = "static")]
     pub(crate) fn pbo_vtable(&self) -> &PboOpsVtable {
         self.handle
             .abi_vtable
-            .get_or_init(|| PboOpsVtable::new(&self.handle.ops))
+            .get_or_init(|| PboOpsVtable::new(&self.handle))
     }
 
     /// A type-erased keepalive holding this PBO's `Arc<PboHandle>` alive --
     /// the same shape as [`crate::pin::HostPin`]'s own `Keepalive` (an
-    /// `Arc<dyn Send + Sync>`), for the identical reason: [`PboOpsVtable::
-    /// new`] hands out `ctx`, a raw pointer straight into this `PboHandle`'s
-    /// own `ops` field, and that pointer is only valid for as long as the
-    /// `PboHandle` it addresses is alive. Cloning this `Arc` (not the
-    /// `PboHandle`'s *contents*) is what a cross-package capsule holds
-    /// alongside the descriptor, exactly the way `pin` already does for the
-    /// `HOST` kind -- see `TensorCapsulePayload` (`edgefirst-python-common`).
-    /// Type-erased so this crate's public surface never has to name
-    /// `PboHandle`, which stays private.
+    /// `Arc<dyn Send + Sync>`), for a now-narrower reason: [`PboOpsVtable::
+    /// new`] hands out `state.ctx`, this `PboHandle`'s own address, and that
+    /// pointer must still be live at the moment an importer reads the table
+    /// and calls `state.retain`. Past that call the importer holds its own
+    /// reference (see [`client_state_pbo_ops`]) and needs nothing external,
+    /// so this is belt-and-braces over the import window rather than the
+    /// only thing standing between a consumer and freed memory. Cloning this
+    /// `Arc` (not the `PboHandle`'s *contents*) is what a cross-package
+    /// capsule holds alongside the descriptor, exactly the way `pin` already
+    /// does for the `HOST` kind -- see `TensorCapsulePayload`
+    /// (`edgefirst-python-common`). Type-erased so this crate's public
+    /// surface never has to name `PboHandle`, which stays private.
     ///
-    /// Called from both backends' `pbo_keepalive`
-    /// (`lib.rs`/`static_backend.rs`, and `dynamic_backend.rs` via
-    /// `with_pbo!`).
+    /// Called from `static`'s `pbo_keepalive`
+    /// (`lib.rs`/`static_backend.rs`); `dynamic` holds a retained reference
+    /// on the handle that owns the library-side `PboTensor` instead, so this
+    /// is `static`-only.
+    #[cfg(feature = "static")]
     pub(crate) fn pbo_keepalive(&self) -> Arc<dyn Send + Sync> {
         self.handle.clone()
     }
@@ -663,6 +839,90 @@ where
     /// pointer exist right now".
     pub fn is_mapped(&self) -> bool {
         self.handle.is_mapped()
+    }
+}
+
+/// The C-ABI parts `ef_tensor_wrap_pbo` takes, from a [`PboTensor`] **at
+/// the origin** of its buffer.
+///
+/// "At the origin", not "whole-buffer": what
+/// [`PboTensor::into_client_parts`] guards is the byte offset, not the
+/// extent. `view(0, &[16])` on a 32-byte buffer passes and yields
+/// `shape = [16]`, `size = 32` — a correct, representable tensor, because
+/// `size` is the GL allocation's full byte count and is *documented* to
+/// exceed the shape's product (that is exactly how a stride-padded PBO is
+/// carried). A non-zero `view_offset` is the only thing this struct cannot
+/// express, and that is what is refused.
+///
+/// `state.ctx` **borrows** the channel this value still owns; the callee is
+/// expected to `retain` it (which [`client_state_pbo_ops`] does) before this
+/// struct drops. Dropping it without retaining releases the client's own
+/// last reference and deletes the GL buffer — which is why the `Arc` is a
+/// field here rather than something the caller has to remember to hold.
+///
+/// Deliberately neither `Send` nor `Sync`: `EfClientState` holds a raw
+/// pointer and `edgefirst-tensor-abi` adds no `unsafe impl`. That is right
+/// for a value whose only purpose is to be handed straight to a C entry
+/// point on the calling thread. If this ever needs to cross a thread, that
+/// is a design question to raise, not something to unblock with an
+/// `unsafe impl`.
+pub struct PboClientParts {
+    /// The callback channel, borrowing this value's own reference.
+    pub state: EfClientState,
+    pub map_fn: EfPboMapFn,
+    pub unmap_fn: EfPboUnmapFn,
+    pub buffer_id: u32,
+    /// The GL allocation's full byte count, which may exceed the shape's
+    /// product (a 64-byte-aligned row stride).
+    pub size: usize,
+    pub shape: Vec<usize>,
+    /// The client's own strong count on the channel, released when this
+    /// value drops. Private: `PboHandle` is not part of this crate's
+    /// public surface.
+    _handle: Arc<PboHandle>,
+}
+
+impl<T> PboTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Decompose this tensor into the parts a C entry point takes.
+    ///
+    /// The shape is carried through as-is and is **not** required to fill
+    /// the allocation: `size` is the GL buffer's full byte count and may
+    /// exceed the shape's product by design (a 64-byte-aligned row stride
+    /// is the usual reason). Only the *origin* is constrained.
+    ///
+    /// # Errors
+    /// [`Error::InvalidOperation`] for a sub-view (`view_offset != 0`).
+    /// A sub-view's window is not expressible in `ef_tensor_wrap_pbo`'s
+    /// argument list, and a wrap that silently dropped it would land the
+    /// far side at the parent's origin — issue #162 in reverse. Views are
+    /// taken on the far side (`Tensor::view`) once the buffer is wrapped,
+    /// so nothing needs this.
+    pub fn into_client_parts(self) -> Result<PboClientParts> {
+        if self.view_offset != 0 {
+            return Err(Error::InvalidOperation(format!(
+                "PboTensor::into_client_parts: cannot wrap a sub-view \
+                 (view_offset = {}); wrap the whole buffer and take the view \
+                 on the other side",
+                self.view_offset
+            )));
+        }
+        let state = EfClientState {
+            ctx: Arc::as_ptr(&self.handle) as *const c_void,
+            retain: Some(vt_retain),
+            release: Some(vt_release),
+        };
+        Ok(PboClientParts {
+            state,
+            map_fn: vt_map_buffer,
+            unmap_fn: vt_unmap_buffer,
+            buffer_id: self.handle.buffer_id,
+            size: self.handle.size,
+            shape: self.shape.clone(),
+            _handle: self.handle,
+        })
     }
 }
 
@@ -706,7 +966,7 @@ where
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
-        let new_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let new_size = crate::ahardwarebuffer_layout::checked_shape_bytes::<T>(shape)?;
         if new_size != self.handle.size {
             return Err(Error::ShapeMismatch(format!(
                 "Cannot reshape incompatible shape: {:?} to {:?}",
@@ -730,7 +990,7 @@ where
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
-        let needed = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let needed = crate::ahardwarebuffer_layout::checked_shape_bytes::<T>(shape)?;
         if needed > self.handle.size {
             return Err(Error::InsufficientCapacity {
                 needed,
@@ -774,7 +1034,7 @@ where
             .view_offset
             .checked_add(offset_bytes)
             .ok_or(Error::InvalidSize(offset_bytes))?;
-        let logical = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let logical = crate::ahardwarebuffer_layout::checked_shape_bytes::<T>(shape)?;
         let needed = abs_offset
             .checked_add(logical)
             .ok_or(Error::InvalidSize(logical))?;
@@ -1062,6 +1322,122 @@ mod tests {
         }
 
         fn delete_buffer(&self, _buffer_id: u32) {}
+    }
+
+    /// An implementation that reports success while mapping FEWER bytes than
+    /// were asked for. The bytes it does map are real, so a caller that
+    /// trusted the success would read `size` bytes from a `size / 2`-byte
+    /// allocation — the shape of the bug, not a null-pointer stand-in.
+    #[derive(Default)]
+    struct ShortMappingOps {
+        storage: Mutex<Vec<u8>>,
+        unmaps: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ShortMappingOps {
+        fn unmap_count(&self) -> usize {
+            self.unmaps.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    // SAFETY: the pointer addresses a `Vec<u8>` this value owns for its
+    // whole life, and the mapping is rejected before reaching a slice.
+    unsafe impl PboOps for ShortMappingOps {
+        fn map_buffer(&self, _buffer_id: u32, size: usize) -> Result<PboMapping> {
+            let short = size / 2;
+            let mut storage = self.storage.lock().expect("lock");
+            storage.resize(short, 0);
+            Ok(PboMapping {
+                ptr: storage.as_mut_ptr(),
+                size: short,
+            })
+        }
+
+        fn unmap_buffer(&self, _buffer_id: u32) -> Result<()> {
+            self.unmaps
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn delete_buffer(&self, _buffer_id: u32) {}
+    }
+
+    /// A short mapping is a failed mapping: every consumer of the returned
+    /// base (`scoped_pin`, `map_internal`) sizes its host slice from
+    /// `handle.size`, so accepting `out_len < size` would hand out an
+    /// out-of-bounds slice with no error anywhere. The buffer GL does
+    /// consider mapped is released, exactly as for a null mapping.
+    #[test]
+    fn short_mapping_is_refused_and_the_buffer_released() {
+        let ops = Arc::new(ShortMappingOps::default());
+        let dyn_ops: Arc<dyn PboOps> = ops.clone();
+        let tensor = PboTensor::<u8>::from_pbo(13, 32, &[32], None, dyn_ops).unwrap();
+
+        let Err(err) = tensor.map_read() else {
+            panic!("a mapping shorter than the allocation must not succeed");
+        };
+        assert!(
+            matches!(
+                err,
+                Error::InsufficientCapacity {
+                    needed: 32,
+                    capacity: 16
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            ops.unmap_count(),
+            1,
+            "GL still holds the buffer mapped — the refused map must release it"
+        );
+        assert!(
+            !tensor.is_mapped(),
+            "state must return to Unmapped so later maps can proceed"
+        );
+    }
+
+    /// A shape whose byte footprint wraps `usize` must be refused, not
+    /// multiplied down to something an eight-byte allocation satisfies.
+    /// `ef_tensor_wrap_pbo` forwards a C caller's `dims` here unchecked, so
+    /// this is the boundary that has to hold: `2^63 * 4` is `0` modulo
+    /// `usize`, and the accepted tensor would then report `2^65` elements
+    /// over eight real bytes.
+    #[test]
+    fn from_pbo_refuses_a_shape_whose_footprint_overflows() {
+        let ops = MockPboOps::new(8);
+        let dyn_ops: Arc<dyn PboOps> = ops.clone();
+        let result = PboTensor::<u8>::from_pbo(14, 8, &[1usize << 63, 4], None, dyn_ops);
+        let Err(err) = result else {
+            panic!("an overflowing shape footprint must be refused");
+        };
+        assert!(
+            matches!(err, Error::InvalidShape(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// The same rule on the three reshaping paths, which recompute the
+    /// footprint against an allocation that is already fixed.
+    #[test]
+    fn reshape_paths_refuse_an_overflowing_footprint() {
+        let ops = MockPboOps::new(8);
+        let dyn_ops: Arc<dyn PboOps> = ops.clone();
+        let mut tensor = PboTensor::<u8>::from_pbo(15, 8, &[8], None, dyn_ops).unwrap();
+        let huge = [1usize << 63, 4];
+
+        assert!(
+            matches!(tensor.reshape(&huge), Err(Error::InvalidShape(_))),
+            "reshape must refuse a wrapping footprint"
+        );
+        assert!(
+            matches!(tensor.set_logical_shape(&huge), Err(Error::InvalidShape(_))),
+            "set_logical_shape must refuse a wrapping footprint"
+        );
+        assert!(
+            matches!(tensor.view(0, &huge), Err(Error::InvalidShape(_))),
+            "view must refuse a wrapping footprint"
+        );
     }
 
     /// A map that "succeeds" with a null pointer leaves GL considering the
@@ -1458,6 +1834,407 @@ mod tests {
             1,
             "the real delete_buffer must still fire exactly once, from PboHandle::Drop, \
              completely unaffected by whether a descriptor was ever exported"
+        );
+    }
+
+    /// The callback channel a `PboOpsVtable` hands out is self-sufficient:
+    /// an importer that retains it keeps the producer's `PboHandle` — and
+    /// therefore the real GL buffer — alive after the producing tensor has
+    /// dropped, and the buffer is deleted exactly once, when the last
+    /// reference goes.
+    ///
+    /// This is the case today's design cannot express. `PboOpsVtable::new`
+    /// used to hand out a bare borrowed pointer with the lifetime enforced
+    /// *externally* by a `pbo_keepalive()` `Arc` some other object had to
+    /// hold; nothing in the vtable itself could extend it. A child that
+    /// outlived its parent read freed memory. Against a change that added
+    /// the retain but forgot the `release` in `ImportedPboOps::drop`,
+    /// `delete_count()` stays 0 and the LAST assertion fails instead.
+    #[test]
+    fn an_imported_channel_keeps_the_producers_buffer_alive() {
+        let ops = MockPboOps::new(64);
+        let producer = PboTensor::<u8>::from_pbo(21, 64, &[64], None, ops.clone())
+            .expect("PboTensor::from_pbo");
+        let vtable_ptr = producer.pbo_vtable() as *const PboOpsVtable as *const c_void;
+
+        // SAFETY: `vtable_ptr` came from `pbo_vtable()` on a live tensor.
+        let parts = unsafe { read_pbo_vtable_parts(vtable_ptr) }.expect("read_pbo_vtable_parts");
+        // SAFETY: the parts came from a table this module built.
+        let imported = unsafe { client_state_pbo_ops(parts.state, parts.map_fn, parts.unmap_fn) }
+            .expect("client_state_pbo_ops");
+        let child = PboTensor::<u8>::from_pbo(21, 64, &[64], None, imported)
+            .expect("reconstruct across the boundary");
+
+        // The producing tensor goes away first — the case the external
+        // keepalive design could not express at all.
+        drop(producer);
+        assert_eq!(
+            ops.delete_count(),
+            0,
+            "the producer's PboHandle must still be alive: the imported \
+             channel holds a reference to it"
+        );
+
+        // The child still works through the retained channel.
+        {
+            let mut m = child.map().expect("map through the imported channel");
+            m.as_mut_slice()[0] = 0xA5;
+        }
+        assert_eq!(ops.map_count(), 1, "the map went through the real ops");
+
+        drop(child);
+        assert_eq!(
+            ops.delete_count(),
+            1,
+            "the GL buffer is deleted exactly once, when the last reference \
+             to the channel goes"
+        );
+    }
+
+    /// `into_client_parts` hands out a *borrowed* channel: the parts carry
+    /// the producer's own `Arc`, so a callee that retains before they drop
+    /// keeps the GL buffer, and a callee that never retains does not.
+    ///
+    /// This is the shape `ef_tensor_wrap_pbo` consumes, exercised here
+    /// against `client_state_pbo_ops` — the same assembly point a C caller
+    /// reaches.
+    #[test]
+    fn client_parts_hand_over_a_channel_the_callee_retains() {
+        let ops = MockPboOps::new(32);
+        let tensor = PboTensor::<u8>::from_pbo(7, 32, &[32], None, ops.clone())
+            .expect("PboTensor::from_pbo");
+        let parts = tensor.into_client_parts().expect("into_client_parts");
+        // Before the reattach, and on its own line: consuming the tensor must
+        // not have dropped the channel. `PboClientParts::_handle` is what
+        // keeps it, and a regression that removed that field would otherwise
+        // survive to the `client_state_pbo_ops` call below and retain a dead
+        // `Arc` -- undefined behaviour instead of a test failure.
+        assert_eq!(
+            ops.delete_count(),
+            0,
+            "into_client_parts must hand over a live channel, not a dead one"
+        );
+        assert_eq!(parts.buffer_id, 7);
+        assert_eq!(parts.size, 32);
+        assert_eq!(parts.shape, vec![32]);
+
+        // SAFETY: the parts came from a live `PboTensor`, so they satisfy
+        // `client_state_pbo_ops`'s contract by construction.
+        let reattached = unsafe { client_state_pbo_ops(parts.state, parts.map_fn, parts.unmap_fn) }
+            .expect("client_state_pbo_ops");
+
+        // The producer's own last reference goes. The callee retained, so
+        // the GL buffer is still there.
+        drop(parts);
+        assert_eq!(
+            ops.delete_count(),
+            0,
+            "the callee's retain must outlive the parts it was handed"
+        );
+
+        reattached
+            .map_buffer(7, 32)
+            .expect("map through the channel");
+        reattached.unmap_buffer(7).expect("unmap");
+        assert_eq!(ops.map_count(), 1);
+
+        drop(reattached);
+        assert_eq!(
+            ops.delete_count(),
+            1,
+            "the buffer goes exactly once, when the last reference does"
+        );
+    }
+
+    /// A sub-view has a window `ef_tensor_wrap_pbo`'s argument list cannot
+    /// carry, so it is refused rather than silently wrapped at the parent's
+    /// origin — #162 in reverse.
+    #[test]
+    fn client_parts_refuse_a_sub_view() {
+        let ops = MockPboOps::new(32);
+        let tensor =
+            PboTensor::<u8>::from_pbo(8, 32, &[32], None, ops).expect("PboTensor::from_pbo");
+        let view = tensor.view(16, &[16]).expect("view");
+        let Err(err) = view.into_client_parts() else {
+            panic!("a sub-view must not wrap silently");
+        };
+        assert!(
+            matches!(err, Error::InvalidOperation(_)),
+            "expected InvalidOperation, got {err:?}"
+        );
+    }
+
+    /// `TensorDyn::from_client_pbo` refuses a NULL `ctx`, `retain` or
+    /// `release` with `Error::InvalidArgument` — the **static twin** of
+    /// `dynamic_primitives.rs`'s
+    /// `dynamic_from_client_pbo_refuses_an_incomplete_channel`.
+    ///
+    /// Both assert the same variant on the same call deliberately: a
+    /// consumer must not get a different `Error` for the same malformed
+    /// channel depending on which backend it linked. Under `dynamic` that
+    /// only holds because the C entry point classifies the failure and
+    /// `ffi_error` rebuilds it from the class rather than guessing.
+    #[test]
+    fn from_client_pbo_refuses_an_incomplete_channel() {
+        let ops = MockPboOps::new(16);
+        let tensor =
+            PboTensor::<u8>::from_pbo(9, 16, &[16], None, ops).expect("PboTensor::from_pbo");
+        let parts = tensor.into_client_parts().expect("into_client_parts");
+        // A genuine `ctx`, for the reason
+        // `a_client_state_missing_any_part_is_refused` gives below.
+        let full = parts.state;
+        for (name, state) in [
+            (
+                "ctx",
+                EfClientState {
+                    ctx: std::ptr::null(),
+                    ..full
+                },
+            ),
+            (
+                "retain",
+                EfClientState {
+                    retain: None,
+                    ..full
+                },
+            ),
+            (
+                "release",
+                EfClientState {
+                    release: None,
+                    ..full
+                },
+            ),
+        ] {
+            // SAFETY: `full` came from a live `PboTensor`, so every variant
+            // of it is a state this constructor may legally inspect.
+            let r = unsafe {
+                crate::TensorDyn::from_client_pbo(
+                    state,
+                    parts.map_fn,
+                    parts.unmap_fn,
+                    9,
+                    16,
+                    &[16],
+                    crate::DType::U8,
+                )
+            };
+            let Err(err) = r else {
+                panic!("a NULL {name} must be refused");
+            };
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "NULL {name}: expected InvalidArgument, got {err:?}"
+            );
+        }
+    }
+
+    /// The lower half of the same contract: `client_state_pbo_ops` itself,
+    /// which both backends' `from_client_pbo` delegate to. A NULL `ctx`,
+    /// `retain` or `release` is a loud `InvalidArgument`, not a silently
+    /// non-owning attach — spec §6, the failure class this design exists to
+    /// remove.
+    #[test]
+    fn a_client_state_missing_any_part_is_refused() {
+        let ops = MockPboOps::new(16);
+        let tensor =
+            PboTensor::<u8>::from_pbo(9, 16, &[16], None, ops).expect("PboTensor::from_pbo");
+        let parts = tensor.into_client_parts().expect("into_client_parts");
+        // A *genuine* `ctx` on purpose. If one of the checks below ever
+        // regressed, the call would retain a real `Arc` -- a refcount the
+        // `else` arm's panic reports cleanly -- rather than drive
+        // `Arc::increment_strong_count` through a forged pointer, which
+        // would turn a test failure into undefined behaviour.
+        let full = parts.state;
+        for (name, state) in [
+            (
+                "ctx",
+                EfClientState {
+                    ctx: std::ptr::null(),
+                    ..full
+                },
+            ),
+            (
+                "retain",
+                EfClientState {
+                    retain: None,
+                    ..full
+                },
+            ),
+            (
+                "release",
+                EfClientState {
+                    release: None,
+                    ..full
+                },
+            ),
+        ] {
+            // SAFETY: `full` came from a live `PboTensor`, so every variant
+            // of it is a state `client_state_pbo_ops` may legally inspect.
+            let Err(err) = (unsafe { client_state_pbo_ops(state, parts.map_fn, parts.unmap_fn) })
+            else {
+                panic!("a NULL {name} must be refused");
+            };
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "NULL {name}: expected InvalidArgument, got {err:?}"
+            );
+        }
+    }
+
+    /// `set_plane_offset` must move a PBO's CPU-map window, not merely
+    /// record a number on the wrapper.
+    ///
+    /// The PBO mirror of `set_plane_offset_moves_the_iosurface_map_window`
+    /// (`crates/tensor/src/iosurface.rs`). `PboTensor::view_offset` is the
+    /// offset `scoped_pin` adds to the mapped base, and `PboTensor::view`
+    /// already set it on the fresh-view path — so, exactly like IOSurface,
+    /// only *restoring* an offset onto an already-built tensor was broken,
+    /// which is why a freshly created view was right and only the
+    /// descriptor round trip was wrong. Before the `Pbo` arm this falls
+    /// into `set_plane_offset`'s `_ => {}` and the map starts at the
+    /// parent's origin.
+    #[test]
+    fn set_plane_offset_moves_the_pbo_map_window() {
+        use crate::{Tensor, TensorTrait};
+
+        const PARENT: usize = 256;
+        const OFFSET: usize = 64;
+        const WINDOW: usize = 64;
+
+        // Ramp the buffer so byte i holds i: a window at the wrong origin
+        // cannot coincidentally match the expected bytes.
+        let ops = MockPboOps::new(PARENT);
+        let whole = Tensor::<u8>::from_pbo(
+            PboTensor::<u8>::from_pbo(31, PARENT, &[PARENT], None, ops.clone()).expect("from_pbo"),
+        )
+        .expect("wrap");
+        {
+            let mut m = whole.map().expect("map the whole buffer");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        // Re-wrap the WHOLE buffer, as an import does: the handle names the
+        // parent, so this lands at its origin.
+        let mut rebuilt = Tensor::<u8>::from_pbo(
+            PboTensor::<u8>::from_pbo(31, PARENT, &[PARENT], None, ops.clone()).expect("from_pbo"),
+        )
+        .expect("wrap");
+        rebuilt
+            .set_logical_shape(&[WINDOW])
+            .expect("narrow to the window's shape");
+        {
+            let m = rebuilt.map().expect("map before the offset");
+            assert_eq!(
+                m.as_slice()[0],
+                0,
+                "precondition: a bare wrap starts at the parent's origin"
+            );
+        }
+
+        // The restore under test.
+        rebuilt.set_plane_offset(OFFSET);
+        assert_eq!(
+            rebuilt.plane_offset(),
+            Some(OFFSET),
+            "the wrapper field records the offset on every backing"
+        );
+
+        let m = rebuilt.map().expect("map after the offset");
+        let s = m.as_slice();
+        assert_eq!(s.len(), WINDOW, "the window exposes its logical length");
+        assert_ne!(
+            s[0], 0,
+            "map() still starts at the parent's origin — set_plane_offset was \
+             a no-op on PBO storage (issue #161)"
+        );
+        for (i, b) in s.iter().enumerate() {
+            assert_eq!(
+                *b,
+                ((i + OFFSET) & 0xff) as u8,
+                "window byte {i} must be parent[{}]",
+                i + OFFSET
+            );
+        }
+    }
+
+    /// A nested `subview` must not compound its offset now that
+    /// `set_plane_offset` writes through to PBO storage.
+    ///
+    /// The double-apply guard, and the reason it needs checking rather than
+    /// assuming: `Tensor::subview` sets the offset *twice* by two different
+    /// routes — `PboTensor::view` computes `view_offset + offset_bytes`
+    /// inside `TensorStorage::view`, and then `subview` calls
+    /// `set_plane_offset(plane_offset + offset_bytes)` on the result. Those
+    /// are the same number only while the wrapper field and the storage
+    /// field stay in sync, which is what the new arm makes true. Two levels,
+    /// because a single level cannot tell an idempotent write apart from one
+    /// that compounds from zero.
+    #[test]
+    fn nested_pbo_subviews_do_not_compound_their_plane_offset() {
+        use crate::{Tensor, TensorTrait};
+
+        let ops = MockPboOps::new(256);
+        let parent = Tensor::<u8>::from_pbo(
+            PboTensor::<u8>::from_pbo(32, 256, &[256], None, ops).expect("from_pbo"),
+        )
+        .expect("wrap");
+        {
+            let mut m = parent.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        let first = parent.subview(32, &[128]).expect("first subview");
+        assert_eq!(first.plane_offset(), Some(32));
+        let second = first.subview(16, &[64]).expect("nested subview");
+        assert_eq!(
+            second.plane_offset(),
+            Some(48),
+            "a nested subview composes 32 + 16, it does not compound"
+        );
+        let m = second.map().expect("map the nested view");
+        for (i, b) in m.as_slice().iter().enumerate() {
+            assert_eq!(*b, ((i + 48) & 0xff) as u8, "nested byte {i}");
+        }
+    }
+
+    /// `set_format` must clear the PBO's storage-internal window, not only
+    /// the wrapper field.
+    ///
+    /// The clear that pairs with the setter above: without it, changing the
+    /// format leaves `plane_offset() == None` while `map()` still starts at
+    /// the old offset — a *stale* window rather than a lost one, which is
+    /// strictly harder to notice.
+    #[test]
+    fn set_format_clears_the_pbo_map_window() {
+        use crate::{PixelFormat, Tensor, TensorTrait};
+
+        let ops = MockPboOps::new(256);
+        let mut t = Tensor::<u8>::from_pbo(
+            PboTensor::<u8>::from_pbo(33, 256, &[256], None, ops).expect("from_pbo"),
+        )
+        .expect("wrap");
+        {
+            let mut m = t.map().expect("map");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+        t.set_logical_shape(&[8, 8, 1]).expect("narrow");
+        t.set_plane_offset(64);
+
+        t.set_format(PixelFormat::Grey).expect("set_format");
+        assert_eq!(t.plane_offset(), None, "the wrapper field is cleared");
+        let m = t.map().expect("map after set_format");
+        assert_eq!(
+            m.as_slice()[0],
+            0,
+            "map() must be back at the origin: a cleared wrapper field over a \
+             live storage offset is a stale window"
         );
     }
 }

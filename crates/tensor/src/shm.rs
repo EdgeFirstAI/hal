@@ -444,6 +444,14 @@ where
         let len = mmap_size - self.offset;
         Ok(crate::pin::HostPin::new(owner, data, len))
     }
+
+    /// Set the byte offset of the logical window into the backing segment
+    /// (mirrors `MemTensor::set_offset`). Unvalidated here -- `map_inner`
+    /// bounds- and alignment-checks `self.offset` against the segment at
+    /// map time, the same way `MemTensor`'s consumer validates at `map()`.
+    pub(crate) fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
+    }
 }
 
 impl<T> AsRawFd for ShmTensor<T>
@@ -576,15 +584,204 @@ mod tests {
         // than asserting a property this platform cannot provide.
         let a = ShmTensor::<u8>::new(&[8], None).unwrap();
         if a.buffer_identity().kind() != crate::IdentityKind::Shm {
-            println!(
-                "SKIP: a_dup_of_the_same_shm_segment_has_the_same_identity - \
-                 this platform's fstat gives no usable shm inode, so identity \
-                 falls back to the fd number (see identity_from_stat)"
+            crate::test_support::report_skip(
+                "a_dup_of_the_same_shm_segment_has_the_same_identity - this \
+                 platform's fstat gives no usable shm inode, so identity falls \
+                 back to the fd number (see identity_from_stat)",
             );
             return;
         }
         let dup_fd = a.clone_fd().unwrap();
         let dup = ShmTensor::<u8>::from_fd(dup_fd, &[8], None).unwrap();
         assert_eq!(a.buffer_identity().id(), dup.buffer_identity().id());
+    }
+
+    /// `set_plane_offset` must move a Shm tensor's CPU-map window, not
+    /// merely record a number on the wrapper.
+    ///
+    /// The Shm mirror of the PBO/IOSurface `set_plane_offset` tests.
+    /// `ShmTensor::offset` is the offset `map_inner`/`host_pin` add to the
+    /// mmap base, and `ShmTensor::view` already set it on the fresh-view
+    /// path -- so only *restoring* an offset onto an already-built tensor
+    /// was broken, which is why a freshly created view was right and only
+    /// the descriptor round trip (the `from_fd` reconstruction below,
+    /// mirroring a cross-process import) was wrong. Before the `Shm` arm
+    /// this falls into `set_plane_offset`'s `_ => {}` and the map starts at
+    /// the parent's origin.
+    #[test]
+    fn set_plane_offset_moves_the_shm_map_window() {
+        if !shm_or_skip("set_plane_offset_moves_the_shm_map_window") {
+            return;
+        }
+        use crate::{Tensor, TensorMemory, TensorTrait};
+
+        const PARENT: usize = 256;
+        const OFFSET: usize = 64;
+        const WINDOW: usize = 64;
+
+        // Ramp the buffer so byte i holds i: a window at the wrong origin
+        // cannot coincidentally match the expected bytes.
+        let whole = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::Shm), None).expect("alloc");
+        {
+            let mut m = whole.map().expect("map the whole buffer");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        // Re-wrap the WHOLE segment via a cloned fd, as a cross-process
+        // import does: the fd names the parent segment, so this lands at
+        // its origin.
+        let fd = whole.clone_fd().expect("clone_fd");
+        let mut rebuilt = Tensor::<u8>::from_fd(fd, &[PARENT], None).expect("from_fd");
+        rebuilt
+            .set_logical_shape(&[WINDOW])
+            .expect("narrow to the window's shape");
+        {
+            let m = rebuilt.map().expect("map before the offset");
+            assert_eq!(
+                m.as_slice()[0],
+                0,
+                "precondition: a bare wrap starts at the parent's origin"
+            );
+        }
+
+        // The restore under test.
+        rebuilt.set_plane_offset(OFFSET);
+        assert_eq!(
+            rebuilt.plane_offset(),
+            Some(OFFSET),
+            "the wrapper field records the offset on every backing"
+        );
+
+        let m = rebuilt.map().expect("map after the offset");
+        let s = m.as_slice();
+        assert_eq!(s.len(), WINDOW, "the window exposes its logical length");
+        assert_ne!(
+            s[0], 0,
+            "map() still starts at the parent's origin — set_plane_offset was \
+             a no-op on Shm storage (issue #161)"
+        );
+        for (i, b) in s.iter().enumerate() {
+            assert_eq!(
+                *b,
+                ((i + OFFSET) & 0xff) as u8,
+                "window byte {i} must be parent[{}]",
+                i + OFFSET
+            );
+        }
+    }
+
+    /// A nested `subview` must not compound its offset now that
+    /// `set_plane_offset` writes through to Shm storage.
+    ///
+    /// The double-apply guard: `Tensor::subview` sets the offset *twice* by
+    /// two different routes -- `ShmTensor::view` computes `self.offset +
+    /// offset_bytes` inside `TensorStorage::view`, and then `subview` calls
+    /// `set_plane_offset(plane_offset + offset_bytes)` on the result. Those
+    /// are the same number only while the wrapper field and the storage
+    /// field stay in sync, which is what the new arm makes true.
+    #[test]
+    fn nested_shm_subviews_do_not_compound_their_plane_offset() {
+        if !shm_or_skip("nested_shm_subviews_do_not_compound_their_plane_offset") {
+            return;
+        }
+        use crate::{Tensor, TensorMemory, TensorTrait};
+
+        let parent = Tensor::<u8>::new(&[256], Some(TensorMemory::Shm), None).expect("alloc");
+        {
+            let mut m = parent.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        let first = parent.subview(32, &[128]).expect("first subview");
+        assert_eq!(first.plane_offset(), Some(32));
+        let second = first.subview(16, &[64]).expect("nested subview");
+        assert_eq!(
+            second.plane_offset(),
+            Some(48),
+            "a nested subview composes 32 + 16, it does not compound"
+        );
+        let m = second.map().expect("map the nested view");
+        for (i, b) in m.as_slice().iter().enumerate() {
+            assert_eq!(*b, ((i + 48) & 0xff) as u8, "nested byte {i}");
+        }
+    }
+
+    /// `set_format` must clear the Shm tensor's storage-internal window,
+    /// not only the wrapper field.
+    ///
+    /// The clear that pairs with the setter above: without it, changing
+    /// the format leaves `plane_offset() == None` while `map()` still
+    /// starts at the old offset -- a *stale* window rather than a lost
+    /// one, which is strictly harder to notice.
+    #[test]
+    fn set_format_clears_the_shm_map_window() {
+        if !shm_or_skip("set_format_clears_the_shm_map_window") {
+            return;
+        }
+        use crate::{PixelFormat, Tensor, TensorMemory, TensorTrait};
+
+        let mut t = Tensor::<u8>::new(&[256], Some(TensorMemory::Shm), None).expect("alloc");
+        {
+            let mut m = t.map().expect("map");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+        t.set_logical_shape(&[8, 8, 1]).expect("narrow");
+        t.set_plane_offset(64);
+
+        t.set_format(PixelFormat::Grey).expect("set_format");
+        assert_eq!(t.plane_offset(), None, "the wrapper field is cleared");
+        let m = t.map().expect("map after set_format");
+        assert_eq!(
+            m.as_slice()[0],
+            0,
+            "map() must be back at the origin: a cleared wrapper field over a \
+             live storage offset is a stale window"
+        );
+    }
+
+    /// `reshape` must clear the Shm tensor's storage-internal window too --
+    /// unlike `PboTensor::reshape`/`IoSurfaceTensor::reshape`, `ShmTensor`'s
+    /// own `reshape` (this file, `fn reshape`) only revalidates the element
+    /// count and swaps `self.shape`; it never zeroes `self.offset`. The
+    /// clear has to live at `Tensor::<T>::reshape`'s call site instead.
+    #[test]
+    fn reshape_clears_the_shm_map_window() {
+        if !shm_or_skip("reshape_clears_the_shm_map_window") {
+            return;
+        }
+        use crate::{Tensor, TensorMemory, TensorTrait};
+
+        let mut t = Tensor::<u8>::new(&[256], Some(TensorMemory::Shm), None).expect("alloc");
+        {
+            let mut m = t.map().expect("map");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+        t.set_logical_shape(&[64]).expect("narrow");
+        t.set_plane_offset(64);
+        assert_eq!(t.plane_offset(), Some(64));
+
+        // Same element count (64), so `TensorTrait::reshape`'s equal-count
+        // rule accepts it.
+        t.reshape(&[8, 8]).expect("reshape to an equal-size shape");
+        assert_eq!(
+            t.plane_offset(),
+            None,
+            "the wrapper field is cleared unconditionally by reshape"
+        );
+        let m = t.map().expect("map after reshape");
+        assert_eq!(
+            m.as_slice()[0],
+            0,
+            "map() must be back at the origin: a cleared wrapper field over a \
+             live storage offset is a stale window"
+        );
     }
 }

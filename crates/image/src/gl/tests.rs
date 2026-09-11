@@ -22,7 +22,7 @@ mod gl_tests {
         use edgefirst_tensor::Segmentation;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -64,7 +64,7 @@ mod gl_tests {
         use edgefirst_tensor::Segmentation;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -107,7 +107,7 @@ mod gl_tests {
         use ndarray::Array3;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -190,7 +190,7 @@ mod gl_tests {
         use edgefirst_tensor::DetectBox;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -464,13 +464,19 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_pool_steady_state_zero_imports() {
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut renderer = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -558,13 +564,19 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn reimported_buffer_hits_the_cache() {
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut renderer = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -690,13 +702,16 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn convert_with_fence_blocking_fallback_matches() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - GL not available", function!());
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
             return;
         }
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -760,16 +775,43 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn float_dma_src_import_matches_upload() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers or GL", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or GL",
+                function!()
+            ));
             return;
         }
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
+        // The F16 destinations below are a render target, and Vivante has no
+        // float color buffer at all (`float_render_support` returns
+        // `{f32: false, f16: false}` for it), so `convert` refuses the
+        // destination outright. Gated the way
+        // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
+        // `lib.rs` already gate, on the capability the processor reports
+        // rather than on a driver name.
+        //
+        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
+        // and replays it only for FAILING tests, so a skip would print
+        // "... ok" with its reason discarded and be indistinguishable from
+        // having run. See TESTING.md.
+        if !gl.supported_render_dtypes().f16 {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - this GPU has no F16 render target",
+                function!()
+            );
+            return;
+        }
         let (sw, sh, dw) = (96usize, 72usize, 64usize);
         let bytes = rgba_gradient(sw, sh, 0);
         let src_dma = load_raw_image(
@@ -856,16 +898,43 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn float_src_feed_alternating_frames() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers or GL", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or GL",
+                function!()
+            ));
             return;
         }
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
+        // The F16 destinations below are a render target, and Vivante has no
+        // float color buffer at all (`float_render_support` returns
+        // `{f32: false, f16: false}` for it), so `convert` refuses the
+        // destination outright. Gated the way
+        // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
+        // `lib.rs` already gate, on the capability the processor reports
+        // rather than on a driver name.
+        //
+        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
+        // and replays it only for FAILING tests, so a skip would print
+        // "... ok" with its reason discarded and be indistinguishable from
+        // having run. See TESTING.md.
+        if !gl.supported_render_dtypes().f16 {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - this GPU has no F16 render target",
+                function!()
+            );
+            return;
+        }
         let (sw, sh, dw) = (96usize, 72usize, 64usize);
         let content_a = rgba_gradient(sw, sh, 0x00);
         let content_b = rgba_gradient(sw, sh, 0x5A);
@@ -964,16 +1033,43 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn float_dma_src_pool_steady_state() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers or GL", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or GL",
+                function!()
+            ));
             return;
         }
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
+        // The F16 destinations below are a render target, and Vivante has no
+        // float color buffer at all (`float_render_support` returns
+        // `{f32: false, f16: false}` for it), so `convert` refuses the
+        // destination outright. Gated the way
+        // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
+        // `lib.rs` already gate, on the capability the processor reports
+        // rather than on a driver name.
+        //
+        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
+        // and replays it only for FAILING tests, so a skip would print
+        // "... ok" with its reason discarded and be indistinguishable from
+        // having run. See TESTING.md.
+        if !gl.supported_render_dtypes().f16 {
+            use std::io::Write;
+            let _ = writeln!(
+                &mut std::io::stderr(),
+                "SKIPPED: {} - this GPU has no F16 render target",
+                function!()
+            );
+            return;
+        }
         let (sw, sh, dw) = (128usize, 96usize, 64usize);
         const FRAMES: usize = 100;
         let pool: Vec<TensorDyn> = (0..2)
@@ -1062,13 +1158,19 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn repeat_convert_rgba_mem_to_rgb_dma() {
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let mut renderer = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -1105,7 +1207,9 @@ mod gl_tests {
             ) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("SKIPPED cell {dtype:?}: DMA RGB dst unavailable: {e}");
+                    crate::test_support::report_skip(&format!(
+                        "cell {dtype:?}: DMA RGB dst unavailable: {e}"
+                    ));
                     continue;
                 }
             };
@@ -1160,13 +1264,16 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn int8_mem_convert_is_xor_biased_u8() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let mut renderer = match GLProcessorThreaded::new(None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -1209,7 +1316,9 @@ mod gl_tests {
                     if fmt == PixelFormat::Rgba {
                         panic!("nv12@mem -> rgba.{dtype:?}@mem must be supported: {e}");
                     }
-                    eprintln!("SKIPPED cell nv12@mem -> {fmt}.{dtype:?}@mem: {e}");
+                    crate::test_support::report_skip(&format!(
+                        "cell nv12@mem -> {fmt}.{dtype:?}@mem: {e}"
+                    ));
                     continue 'fmt;
                 }
                 out[slot] = match dtype {
@@ -1260,10 +1369,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_nv12_to_rgba_reference() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         // Load PixelFormat::Nv12 source with DMA
@@ -1337,10 +1446,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_yuyv_to_rgba_reference() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         // Load PixelFormat::Yuyv source with DMA
@@ -1424,10 +1533,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn opengl_render_into_dma_subviews_no_aliasing() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -1636,10 +1745,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_grey_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -1659,10 +1768,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_nv12_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -1679,10 +1788,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_nv16_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -1702,10 +1811,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_pool_recycle_all_frames_match_oracle() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -1806,10 +1915,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_geometry_change_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         // Oversized pool (like the profiler's pool_w x 3*max_h R8 surface),
@@ -1894,10 +2003,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_pool_geometry_interleaved_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let mut pool = [
@@ -1984,10 +2093,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_single_shot_grey_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -2045,13 +2154,19 @@ mod gl_tests {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("SKIPPED: {} - EGL not available: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - EGL not available: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if displays.is_empty() {
-            eprintln!("SKIPPED: {} - No EGL displays available", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - No EGL displays available",
+                function!()
+            ));
             return;
         }
 
@@ -2088,13 +2203,19 @@ mod gl_tests {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("SKIPPED: {} - EGL not available: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - EGL not available: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if displays.is_empty() {
-            eprintln!("SKIPPED: {} - No EGL displays available", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - No EGL displays available",
+                function!()
+            ));
             return;
         }
 
@@ -2107,10 +2228,10 @@ mod gl_tests {
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} - GLProcessorThreaded failed: {e:?}",
+                crate::test_support::report_skip(&format!(
+                    "{} - GLProcessorThreaded failed: {e:?}",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -2157,13 +2278,19 @@ mod gl_tests {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("SKIPPED: {} - EGL not available: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - EGL not available: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if displays.is_empty() {
-            eprintln!("SKIPPED: {} - No EGL displays available", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - No EGL displays available",
+                function!()
+            ));
             return;
         }
 
@@ -2218,7 +2345,10 @@ mod gl_tests {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("SKIPPED: {} - EGL not available: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - EGL not available: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -2243,10 +2373,10 @@ mod gl_tests {
             );
             eprintln!("  Correctly returned error: {:?}", result.unwrap_err());
         } else {
-            eprintln!(
-                "SKIPPED: {} - All three display kinds are available",
+            crate::test_support::report_skip(&format!(
+                "{} - All three display kinds are available",
                 function!()
-            );
+            ));
         }
     }
 
@@ -2256,7 +2386,7 @@ mod gl_tests {
     #[cfg(target_os = "linux")] // Linux display probing
     fn test_auto_detect_display() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -2454,7 +2584,10 @@ mod gl_tests {
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -2583,7 +2716,9 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_nv12_to_bgra() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: test_opengl_nv12_to_bgra - no zero-copy GPU buffers or OpenGL");
+            crate::test_support::report_skip(
+                "test_opengl_nv12_to_bgra - no zero-copy GPU buffers or OpenGL",
+            );
             return;
         }
 
@@ -2670,7 +2805,9 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_yuyv_to_bgra() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: test_opengl_yuyv_to_bgra - no zero-copy GPU buffers or OpenGL");
+            crate::test_support::report_skip(
+                "test_opengl_yuyv_to_bgra - no zero-copy GPU buffers or OpenGL",
+            );
             return;
         }
 
@@ -2755,7 +2892,7 @@ mod gl_tests {
         use edgefirst_tensor::Segmentation;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_draw_decoded_masks_bgra - OpenGL not available");
+            crate::test_support::report_skip("test_draw_decoded_masks_bgra - OpenGL not available");
             return;
         }
 
@@ -2853,7 +2990,9 @@ mod gl_tests {
         use edgefirst_tensor::DetectBox;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_draw_decoded_masks_bgra_mem - OpenGL not available");
+            crate::test_support::report_skip(
+                "test_draw_decoded_masks_bgra_mem - OpenGL not available",
+            );
             return;
         }
 
@@ -2941,7 +3080,7 @@ mod gl_tests {
     #[test]
     fn test_gl_mask_render_smoke() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -2973,7 +3112,7 @@ mod gl_tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn test_gl_pbo_destination_smoke() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -2987,7 +3126,10 @@ mod gl_tests {
             }
             Err(e) => {
                 // PBO may not be supported on all GL implementations
-                eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - PBO not supported: {e:?}",
+                    function!()
+                ));
             }
         }
     }
@@ -3007,7 +3149,7 @@ mod gl_tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn test_gl_convert_any_to_pbo_no_deadlock() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -3015,7 +3157,10 @@ mod gl_tests {
         let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - PBO not supported: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -3065,7 +3210,10 @@ mod gl_tests {
                     !msg.contains("GL converter thread exited"),
                     "PBO destination convert deadlocked: {msg}"
                 );
-                eprintln!("SKIPPED: {} - convert failed unrelated: {msg}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - convert failed unrelated: {msg}",
+                    function!()
+                ));
             }
         }
     }
@@ -3077,7 +3225,7 @@ mod gl_tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn test_gl_convert_pbo_to_pbo_no_deadlock() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -3085,14 +3233,20 @@ mod gl_tests {
         let pbo_src = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - PBO not supported: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
         let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("SKIPPED: {} - PBO dst not supported: {e:?}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - PBO dst not supported: {e:?}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -3115,7 +3269,10 @@ mod gl_tests {
                     !msg.contains("GL converter thread exited"),
                     "PBO→PBO convert deadlocked: {msg}"
                 );
-                eprintln!("SKIPPED: {} - convert failed unrelated: {msg}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - convert failed unrelated: {msg}",
+                    function!()
+                ));
             }
         }
     }
@@ -3153,7 +3310,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_multiplane_nv12_to_rgba_opengl() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
 
@@ -3249,11 +3406,11 @@ mod gl_tests {
         use edgefirst_tensor::PlaneDescriptor;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -3275,7 +3432,7 @@ mod gl_tests {
         let buf = match buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: {} - DMA alloc failed", function!());
+                crate::test_support::report_skip(&format!("{} - DMA alloc failed", function!()));
                 return;
             }
         };
@@ -3375,7 +3532,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_multiplane_nv12_to_rgb_letterbox_opengl() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
 
@@ -3452,7 +3609,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_multiplane_nv12_to_rgb_int8_letterbox_opengl() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
 
@@ -3544,18 +3701,31 @@ mod gl_tests {
     /// to hide behind — and it equally catches the inverse bug (letterbox
     /// dropped entirely: pad rows would hold content). Covers PlanarRgb /
     /// PlanarRgba × u8 / i8 × Dma (the GL TwoPassNvPlanar plan) and Mem
-    /// destinations — GL has no planar texture destination, so the Mem legs
-    /// pin the backend `ImageProcessor` resolves instead (CPU fallback),
-    /// guarding the whole dispatch surface against the bug class.
-    /// (`dma_test_formats` gate matches the helpers it uses; the Mem legs
-    /// still run on the llvmpipe coverage lane, which enables the feature.)
+    /// destinations, guarding the whole dispatch surface against the bug
+    /// class. (`dma_test_formats` gate matches the helpers it uses; the Mem
+    /// legs still run on the llvmpipe coverage lane, which enables the
+    /// feature.)
+    ///
+    /// **Each leg asserts its own route** (issue #179).
+    /// `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
+    /// decline logs at debug and the CPU serves the same convert — and the
+    /// CPU places the content band correctly, so a silent decline reads as
+    /// a pass here. The route each leg is entitled to comes from
+    /// `check_dst_format_supported`: it accepts `PlanarRgb` on both the
+    /// zero-copy DMA arm and the texture arm, so every `PlanarRgb` leg must
+    /// stay on GL and `convert_fallback_count()` must not move across it.
+    /// It accepts `PlanarRgba` on neither, so those legs take the CPU
+    /// fallback **by design** — they are the CPU half of the dispatch
+    /// surface this test exists to cover, and are asserted to fall back
+    /// rather than left unasserted, so the day GL grows a four-plane
+    /// readback this test says so instead of quietly changing meaning.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn letterbox_nv_to_planar_content_band_geometry() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -3564,10 +3734,25 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
+        // Without this the route assertions below go vacuous in one
+        // direction and wrong in the other: with no GL backend at all
+        // nothing ever declines, so every `PlanarRgb` leg would pass having
+        // run on the CPU while every `PlanarRgba` leg would fail for the
+        // wrong reason.
+        if proc.opengl.is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ImageProcessor resolved no GL backend",
+                function!()
+            ));
+            return;
+        }
 
         // Synthetic NV12: Y=200, U=V=128 is neutral grey, so BT.601 vs BT.709
         // coefficients cancel and the converted RGB is ~200 (full range) to
@@ -3610,8 +3795,27 @@ mod gl_tests {
                             edgefirst_tensor::CpuAccess::ReadWrite,
                         )
                         .unwrap();
+                    let fallbacks_before = proc.convert_fallback_count();
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
                         .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
+                    let declines = proc.convert_fallback_count() - fallbacks_before;
+                    if dst_fmt == PixelFormat::PlanarRgb {
+                        assert_eq!(
+                            declines, 0,
+                            "{label}: the GL backend declined this convert and the \
+                             CPU served it — the band probes below would pass on the \
+                             CPU answer, so this leg proved nothing about the GL \
+                             two-pass plan"
+                        );
+                    } else {
+                        assert_eq!(
+                            declines, 1,
+                            "{label}: GL was expected to decline PlanarRgba (no \
+                             four-plane readback geometry) and leave this leg to the \
+                             CPU; it did not, so either the GL gate changed or the \
+                             fallback counter did"
+                        );
+                    }
 
                     // Raw bytes; undo the int8 XOR-0x80 bias so both dtypes
                     // share one set of thresholds.
@@ -3674,7 +3878,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn letterbox_nv12_to_planar_matches_rgba_reference() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
 
@@ -3758,7 +3962,7 @@ mod gl_tests {
     #[test]
     fn gl_planar_heap_matches_cpu() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (sw, sh) = (1280usize, 720usize);
@@ -3770,7 +3974,10 @@ mod gl_tests {
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -3818,15 +4025,15 @@ mod gl_tests {
         use crate::ImageProcessor;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let mut proc = ImageProcessor::new().unwrap();
         if proc.opengl.is_none() {
-            eprintln!(
-                "SKIPPED: {} - ImageProcessor resolved no GL backend",
+            crate::test_support::report_skip(&format!(
+                "{} - ImageProcessor resolved no GL backend",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -3870,7 +4077,7 @@ mod gl_tests {
     #[test]
     fn gl_planar_heap_rgba_src_matches_cpu() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let src = crate::load_image_test_helper(
@@ -3886,7 +4093,10 @@ mod gl_tests {
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -3925,15 +4135,15 @@ mod gl_tests {
         use crate::ImageProcessor;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let mut proc = ImageProcessor::new().unwrap();
         if proc.opengl.is_none() {
-            eprintln!(
-                "SKIPPED: {} - ImageProcessor resolved no GL backend",
+            crate::test_support::report_skip(&format!(
+                "{} - ImageProcessor resolved no GL backend",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -3978,7 +4188,7 @@ mod gl_tests {
     #[test]
     fn test_proto_fused_vs_hybrid_ssim() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -4285,7 +4495,7 @@ mod gl_tests {
     #[test]
     fn proto_float_dtypes_match_int8_reference() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (boxes, proto_i8) = decode_yolov8_proto_fixture();
@@ -4308,7 +4518,7 @@ mod gl_tests {
     #[test]
     fn proto_f32_no_float_linear_fallback_matches() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (boxes, proto_i8) = decode_yolov8_proto_fixture();
@@ -4336,7 +4546,7 @@ mod gl_tests {
     #[test]
     fn proto_compute_repack_matches_cpu_repack() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (boxes, proto_i8) = decode_yolov8_proto_fixture();
@@ -4367,7 +4577,7 @@ mod gl_tests {
         use crate::Int8InterpolationMode;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (boxes, proto_i8) = decode_yolov8_proto_fixture();
@@ -4384,11 +4594,24 @@ mod gl_tests {
         // first render despite the dequant texture/FBO created in between.
         let bilinear_again = render_mode(Int8InterpolationMode::Bilinear);
 
-        // Measured actuals: Vivante GC7000UL >= 0.95; Mali G310 = 0.8153 —
-        // a PRE-EXISTING driver filtering delta (bit-identical score on the
-        // pre-refactor build), believed to be Mali's coarser fixed-point
-        // f16 texture interpolation. 0.80 still catches structural
-        // breakage: the broken compute-repack upload scored ~0.77.
+        // Measured actuals, all bit-identical across three isolated runs
+        // per board: Vivante GC7000UL 0.9957, Mali G310 0.9982, V3D 7.1
+        // 0.9962 against TwoPass; 0.9602 / 0.9599 / 0.9601 against Nearest.
+        //
+        // The Mali figure used to read 0.8153 and was attributed to that
+        // driver's coarser fixed-point f16 texture interpolation. It was
+        // not a driver difference at all — it was issue #184, the overlay's
+        // `GL_BLEND` leaking into the two-pass dequantization render, which
+        // made every TwoPass mask partly a function of uninitialised GPU
+        // memory. With blending off for that pass the three GPUs agree to
+        // better than 0.995.
+        //
+        // The thresholds stay loose deliberately. What these modes owe each
+        // other is equivalent filtering, not bit-exactness, and no lane
+        // measures Tegra or the ANGLE backends, so the margin is headroom
+        // for a GPU none of the three boards represents. They still catch
+        // structural breakage by a wide margin: the broken compute-repack
+        // upload scored ~0.77, and #184's blended dequant scored 0.74–0.75.
         compare_images(&bilinear, &two_pass, 0.80, function!());
         compare_images(&bilinear, &nearest, 0.90, function!());
         let a = bilinear.as_u8().unwrap().map().unwrap();
@@ -4410,7 +4633,7 @@ mod gl_tests {
     #[test]
     fn proto_dims_and_format_churn_uploads_correctly() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (boxes, proto_i8) = decode_yolov8_proto_fixture();
@@ -4470,11 +4693,11 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_dst_offset_zero_regression() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -4545,11 +4768,11 @@ mod gl_tests {
         use std::os::fd::AsFd;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -4627,11 +4850,11 @@ mod gl_tests {
         use std::os::fd::AsFd;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -4717,11 +4940,11 @@ mod gl_tests {
         use std::os::fd::AsFd;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -4812,18 +5035,18 @@ mod gl_tests {
         use std::os::fd::AsFd;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         if !is_neutron_available() {
-            eprintln!(
-                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+            crate::test_support::report_skip(&format!(
+                "{} - Neutron not available (/dev/neutron0 not found)",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -4834,11 +5057,11 @@ mod gl_tests {
         let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!(
-                    "SKIPPED: {} - cannot allocate {} MB DMA buffer",
+                crate::test_support::report_skip(&format!(
+                    "{} - cannot allocate {} MB DMA buffer",
                     function!(),
                     total_size / 1_048_576
-                );
+                ));
                 return;
             }
         };
@@ -4891,18 +5114,18 @@ mod gl_tests {
         use std::os::fd::AsFd;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         if !is_neutron_available() {
-            eprintln!(
-                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+            crate::test_support::report_skip(&format!(
+                "{} - Neutron not available (/dev/neutron0 not found)",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -4922,7 +5145,10 @@ mod gl_tests {
         let rgba_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!("SKIPPED: {} - cannot allocate DMA buffer", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - cannot allocate DMA buffer",
+                    function!()
+                ));
                 return;
             }
         };
@@ -4953,10 +5179,10 @@ mod gl_tests {
         let rgb_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!(
-                    "SKIPPED: {} - cannot allocate second DMA buffer",
+                crate::test_support::report_skip(&format!(
+                    "{} - cannot allocate second DMA buffer",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -4992,18 +5218,18 @@ mod gl_tests {
         use std::os::fd::AsFd;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         if !is_neutron_available() {
-            eprintln!(
-                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+            crate::test_support::report_skip(&format!(
+                "{} - Neutron not available (/dev/neutron0 not found)",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -5026,7 +5252,10 @@ mod gl_tests {
         let u8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!("SKIPPED: {} - cannot allocate DMA buffer", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - cannot allocate DMA buffer",
+                    function!()
+                ));
                 return;
             }
         };
@@ -5055,10 +5284,10 @@ mod gl_tests {
         let i8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!(
-                    "SKIPPED: {} - cannot allocate second DMA buffer",
+                crate::test_support::report_skip(&format!(
+                    "{} - cannot allocate second DMA buffer",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -5094,18 +5323,18 @@ mod gl_tests {
         use std::os::fd::AsFd;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         if !is_neutron_available() {
-            eprintln!(
-                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+            crate::test_support::report_skip(&format!(
+                "{} - Neutron not available (/dev/neutron0 not found)",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -5129,7 +5358,10 @@ mod gl_tests {
         let aligned_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!("SKIPPED: {} - cannot allocate DMA buffer", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - cannot allocate DMA buffer",
+                    function!()
+                ));
                 return;
             }
         };
@@ -5162,10 +5394,10 @@ mod gl_tests {
         {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!(
-                    "SKIPPED: {} - cannot allocate second DMA buffer",
+                crate::test_support::report_skip(&format!(
+                    "{} - cannot allocate second DMA buffer",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -5208,7 +5440,9 @@ mod gl_tests {
         use edgefirst_tensor::PlaneDescriptor;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_import_image_rgba_with_stride - DMA not available");
+            crate::test_support::report_skip(
+                "test_import_image_rgba_with_stride - DMA not available",
+            );
             return;
         }
 
@@ -5226,7 +5460,9 @@ mod gl_tests {
         let buf = match buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: test_import_image_rgba_with_stride - DMA alloc failed");
+                crate::test_support::report_skip(
+                    "test_import_image_rgba_with_stride - DMA alloc failed",
+                );
                 return;
             }
         };
@@ -5262,7 +5498,9 @@ mod gl_tests {
         use edgefirst_tensor::PlaneDescriptor;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_import_image_rgba_padded_stride - DMA not available");
+            crate::test_support::report_skip(
+                "test_import_image_rgba_padded_stride - DMA not available",
+            );
             return;
         }
 
@@ -5285,7 +5523,9 @@ mod gl_tests {
         let buf = match buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: test_import_image_rgba_padded_stride - DMA alloc failed");
+                crate::test_support::report_skip(
+                    "test_import_image_rgba_padded_stride - DMA alloc failed",
+                );
                 return;
             }
         };
@@ -5322,7 +5562,9 @@ mod gl_tests {
         use edgefirst_tensor::PlaneDescriptor;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_import_image_nv12_with_offset - DMA not available");
+            crate::test_support::report_skip(
+                "test_import_image_nv12_with_offset - DMA not available",
+            );
             return;
         }
 
@@ -5343,7 +5585,9 @@ mod gl_tests {
         let buf = match buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: test_import_image_nv12_with_offset - DMA alloc failed");
+                crate::test_support::report_skip(
+                    "test_import_image_nv12_with_offset - DMA alloc failed",
+                );
                 return;
             }
         };
@@ -5386,11 +5630,11 @@ mod gl_tests {
         use edgefirst_tensor::PlaneDescriptor;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -5414,7 +5658,10 @@ mod gl_tests {
         let luma_buf = match luma_buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: {} - luma DMA alloc failed", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - luma DMA alloc failed",
+                    function!()
+                ));
                 return;
             }
         };
@@ -5428,7 +5675,10 @@ mod gl_tests {
         let chroma_buf = match chroma_buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: {} - chroma DMA alloc failed", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - chroma DMA alloc failed",
+                    function!()
+                ));
                 return;
             }
         };
@@ -5519,11 +5769,11 @@ mod gl_tests {
         use edgefirst_tensor::PlaneDescriptor;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -5542,7 +5792,7 @@ mod gl_tests {
         let buf = match buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: {} - DMA alloc failed", function!());
+                crate::test_support::report_skip(&format!("{} - DMA alloc failed", function!()));
                 return;
             }
         };
@@ -5633,7 +5883,9 @@ mod gl_tests {
         use edgefirst_tensor::PlaneDescriptor;
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_import_image_stride_too_small - DMA not available");
+            crate::test_support::report_skip(
+                "test_import_image_stride_too_small - DMA not available",
+            );
             return;
         }
 
@@ -5650,7 +5902,9 @@ mod gl_tests {
         let buf = match buf {
             Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
             _ => {
-                eprintln!("SKIPPED: test_import_image_stride_too_small - DMA alloc failed");
+                crate::test_support::report_skip(
+                    "test_import_image_stride_too_small - DMA alloc failed",
+                );
                 return;
             }
         };
@@ -5724,7 +5978,9 @@ mod gl_tests {
     #[test]
     fn test_src_rect_crop_no_bleed_gl() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_src_rect_crop_no_bleed_gl - OpenGL not available");
+            crate::test_support::report_skip(
+                "test_src_rect_crop_no_bleed_gl - OpenGL not available",
+            );
             return;
         }
 
@@ -5759,7 +6015,7 @@ mod gl_tests {
             // logic is still covered on RGBA-capable drivers (e.g. Mesa); Vivante
             // RGB-source support is tracked for separate investigation.
             if e.to_string().contains("RGB source") {
-                eprintln!("SKIPPED: {} - {e}", function!());
+                crate::test_support::report_skip(&format!("{} - {e}", function!()));
                 return;
             }
             panic!("{e}");
@@ -5794,7 +6050,9 @@ mod gl_tests {
     #[test]
     fn test_src_rect_boundary_crop_no_bleed_gl() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_src_rect_boundary_crop_no_bleed_gl - OpenGL not available");
+            crate::test_support::report_skip(
+                "test_src_rect_boundary_crop_no_bleed_gl - OpenGL not available",
+            );
             return;
         }
 
@@ -5826,7 +6084,7 @@ mod gl_tests {
             // logic is still covered on RGBA-capable drivers (e.g. Mesa); Vivante
             // RGB-source support is tracked for separate investigation.
             if e.to_string().contains("RGB source") {
-                eprintln!("SKIPPED: {} - {e}", function!());
+                crate::test_support::report_skip(&format!("{} - {e}", function!()));
                 return;
             }
             panic!("{e}");
@@ -5850,7 +6108,9 @@ mod gl_tests {
     #[test]
     fn test_src_rect_crop_left_half_no_bleed_gl() {
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_src_rect_crop_left_half_no_bleed_gl - OpenGL not available");
+            crate::test_support::report_skip(
+                "test_src_rect_crop_left_half_no_bleed_gl - OpenGL not available",
+            );
             return;
         }
 
@@ -5880,7 +6140,7 @@ mod gl_tests {
             // logic is still covered on RGBA-capable drivers (e.g. Mesa); Vivante
             // RGB-source support is tracked for separate investigation.
             if e.to_string().contains("RGB source") {
-                eprintln!("SKIPPED: {} - {e}", function!());
+                crate::test_support::report_skip(&format!("{} - {e}", function!()));
                 return;
             }
             panic!("{e}");
@@ -6176,7 +6436,7 @@ mod gl_tests {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -6185,7 +6445,10 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -6202,10 +6465,10 @@ mod gl_tests {
             )
             .unwrap();
         if probe.memory() != TensorMemory::Pbo {
-            eprintln!(
-                "SKIPPED: {} - target does not allocate PBO images",
+            crate::test_support::report_skip(&format!(
+                "{} - target does not allocate PBO images",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -6260,8 +6523,20 @@ mod gl_tests {
                 )
                 .unwrap();
             assert_eq!(dst.memory(), dst_mem, "{label}: dst backing not honoured");
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(src, &mut dst, Rotation::None, Flip::None, lb)
                 .unwrap_or_else(|e| panic!("{label} convert failed: {e}"));
+            // Without this the test is vacuous on a GL-declining host: every
+            // convert here, oracle included, would produce the same CPU answer
+            // and every comparison below would pass with no GL coverage at
+            // all. `ComputeBackend::OpenGl` leaves `forced_backend` at `None`,
+            // so a decline is logged at debug and silently served by the CPU.
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "{label}: the GL path declined and ImageProcessor fell back to \
+                 the CPU; the oracle would then be compared against itself"
+            );
             dst.as_i8()
                 .unwrap()
                 .map()
@@ -6286,16 +6561,23 @@ mod gl_tests {
     }
 
     /// On-GPU round-trip: RGBA8 → F32 NHWC `[H,W,3]` PBO via the GL float
-    /// render path. Forces the OpenGL backend (no CPU fallback) so the test
-    /// genuinely exercises `convert_float_to_pbo`. Uses an identity crop so
-    /// the expected values are exact: `dst[y,x,c] == src[y,x,c] / 255`.
+    /// render path, so the test genuinely exercises `convert_float_to_pbo`.
+    /// Uses an identity crop so the expected values are exact:
+    /// `dst[y,x,c] == src[y,x,c] / 255`.
+    ///
+    /// **`ComputeBackend::OpenGl` does NOT disable the CPU fallback** -- it
+    /// leaves `forced_backend` at `None`, so a GL decline logs at debug and
+    /// `ImageProcessor::convert` quietly produces the CPU answer, whose
+    /// float widen (`b as f32 / 255.0`) is bit-exact against the GPU's. The
+    /// route is therefore asserted, not assumed: `convert_fallback_count()`
+    /// must not move across the convert.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f32_nhwc_pbo_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -6307,13 +6589,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - F32 render not supported",
+                function!()
+            ));
             return;
         }
 
@@ -6332,7 +6620,10 @@ mod gl_tests {
             )
             .unwrap();
         if src.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - RGBA8 src not PBO-backed",
+                function!()
+            ));
             return;
         }
         {
@@ -6360,7 +6651,7 @@ mod gl_tests {
             )
             .unwrap();
         if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - F32 dst not PBO-backed", function!());
+            crate::test_support::report_skip(&format!("{} - F32 dst not PBO-backed", function!()));
             return;
         }
 
@@ -6370,8 +6661,16 @@ mod gl_tests {
         // 2nd call). Correctness must hold identically across both iterations.
         let mut max_err = 0.0f32;
         for iter in 0..2 {
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
                 .unwrap();
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "the GL float path declined and ImageProcessor fell back to the CPU; \
+                 this test's expectation is bit-exact against the CPU answer, so it \
+                 would otherwise pass with no GL coverage at all"
+            );
 
             let map = dst.as_f32().unwrap().map().unwrap();
             assert_eq!(map.len(), w * h * 3);
@@ -6405,13 +6704,16 @@ mod gl_tests {
     /// giving value `(2*dx + 0.5) * 16` normalized by `/255`. This value is
     /// distinct from NEAREST (which would land on a single integer texel,
     /// `2*dx * 16`), so the test discriminates bilinear vs NEAREST sampling.
+    ///
+    /// The same route assertion as its siblings, for the same reason: the CPU
+    /// fallback resizes too, and within this tolerance its answer would pass.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f32_nhwc_pbo_resize_bilinear() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -6421,13 +6723,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - F32 render not supported",
+                function!()
+            ));
             return;
         }
 
@@ -6448,7 +6756,10 @@ mod gl_tests {
             )
             .unwrap();
         if src.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - RGBA8 src not PBO-backed",
+                function!()
+            ));
             return;
         }
         {
@@ -6476,12 +6787,20 @@ mod gl_tests {
             )
             .unwrap();
         if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - F32 dst not PBO-backed", function!());
+            crate::test_support::report_skip(&format!("{} - F32 dst not PBO-backed", function!()));
             return;
         }
 
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        assert_eq!(
+            proc.convert_fallback_count(),
+            fallbacks_before,
+            "the GL float path declined and ImageProcessor fell back to the CPU; \
+             this test's expectation is bit-exact against the CPU answer, so it \
+             would otherwise pass with no GL coverage at all"
+        );
 
         let map = dst.as_f32().unwrap().map().unwrap();
         assert_eq!(map.len(), dw * dh * 3);
@@ -6512,9 +6831,15 @@ mod gl_tests {
     }
 
     /// On-GPU round-trip: RGBA8 → F16 NCHW `[3,H,W]` PBO via the GL float
-    /// render path. Forces the OpenGL backend (no CPU fallback). Identity
-    /// crop so `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
-    /// (`2^-8`).
+    /// render path. Identity crop so `dst[c,y,x] == src[y,x,c] / 255` within
+    /// one f16 ULP at 1.0 (`2^-8`).
+    ///
+    /// **`ComputeBackend::OpenGl` does NOT disable the CPU fallback** -- it
+    /// leaves `forced_backend` at `None`, so a GL decline logs at debug and
+    /// `ImageProcessor::convert` quietly produces the CPU answer, whose
+    /// float widen (`b as f32 / 255.0`) is bit-exact against the GPU's. The
+    /// route is therefore asserted, not assumed: `convert_fallback_count()`
+    /// must not move across the convert.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
     fn convert_f16_nchw_pbo_roundtrip() {
@@ -6522,7 +6847,7 @@ mod gl_tests {
         use half::f16;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -6532,13 +6857,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if !proc.supported_render_dtypes().f16 {
-            eprintln!("SKIPPED: {} - F16 render not supported", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - F16 render not supported",
+                function!()
+            ));
             return;
         }
 
@@ -6556,7 +6887,10 @@ mod gl_tests {
             )
             .unwrap();
         if src.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - RGBA8 src not PBO-backed",
+                function!()
+            ));
             return;
         }
         {
@@ -6584,12 +6918,20 @@ mod gl_tests {
             )
             .unwrap();
         if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - F16 dst not PBO-backed", function!());
+            crate::test_support::report_skip(&format!("{} - F16 dst not PBO-backed", function!()));
             return;
         }
 
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        assert_eq!(
+            proc.convert_fallback_count(),
+            fallbacks_before,
+            "the GL float path declined and ImageProcessor fell back to the CPU; \
+             this test's expectation is bit-exact against the CPU answer, so it \
+             would otherwise pass with no GL coverage at all"
+        );
 
         let map = dst.as_f16().unwrap().map().unwrap();
         assert_eq!(map.len(), 3 * w * h);
@@ -6618,11 +6960,16 @@ mod gl_tests {
     }
 
     /// On-GPU round-trip: RGBA8 → F16 NCHW `[3,H,W]` DMA-BUF via the GL
-    /// float render path (`convert_float_to_zero_copy`). Forces the OpenGL backend
-    /// (no CPU fallback) so any GL-path failure surfaces as a hard error
-    /// instead of being silently masked. Identity crop, so the expected values
-    /// are exact: `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
-    /// (`2^-8`).
+    /// float render path (`convert_float_to_zero_copy`). Identity crop, so
+    /// the expected values are exact: `dst[c,y,x] == src[y,x,c] / 255` within
+    /// one f16 ULP at 1.0 (`2^-8`).
+    ///
+    /// **`ComputeBackend::OpenGl` does NOT disable the CPU fallback** -- it
+    /// leaves `forced_backend` at `None`, so a GL decline logs at debug and
+    /// `ImageProcessor::convert` quietly produces the CPU answer, which lands
+    /// within this tolerance. The route is therefore checked, not assumed:
+    /// `convert_fallback_count()` moving means the zero-copy import was
+    /// refused, and the run is reported as a skip rather than a pass.
     ///
     /// Skip conditions (treated as pass):
     /// 1. GL unavailable, or F16 render not supported (e.g. Vivante).
@@ -6630,6 +6977,10 @@ mod gl_tests {
     ///    Orin-nano with permission-denied).
     /// 3. The created tensor's `.memory()` is not `TensorMemory::DmaBuf` — it
     ///    fell back; only the real DMA path is of interest here.
+    /// 4. The GL path declined the destination import and the convert fell
+    ///    back to the CPU — measured, not assumed. This desktop's NVIDIA EGL
+    ///    refuses the import with GL 0x502, so the test used to report a pass
+    ///    here having exercised no GL at all.
     ///
     /// Runs on V3D/Mali targets where dma-heap and GL F16 render are both
     /// available.
@@ -6639,7 +6990,7 @@ mod gl_tests {
         use half::f16;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -6652,16 +7003,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if !proc.supported_render_dtypes().f16 {
-            eprintln!(
-                "SKIPPED: {} - F16 render not supported (Vivante?)",
+            crate::test_support::report_skip(&format!(
+                "{} - F16 render not supported (Vivante?)",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -6709,10 +7063,10 @@ mod gl_tests {
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} - F16 DMA tensor alloc failed (no dma-heap?): {e}",
+                crate::test_support::report_skip(&format!(
+                    "{} - F16 DMA tensor alloc failed (no dma-heap?): {e}",
                     function!()
-                );
+                ));
                 return;
             }
         };
@@ -6720,16 +7074,34 @@ mod gl_tests {
         // Confirm the tensor is genuinely DMA-backed — skip if the allocator
         // fell back to a different memory type.
         if dst.memory() != TensorMemory::DmaBuf {
-            eprintln!(
-                "SKIPPED: {} - F16 dst memory is {:?}, not Dma; DMA path not exercised",
+            crate::test_support::report_skip(&format!(
+                "{} - F16 dst memory is {:?}, not Dma; DMA path not exercised",
                 function!(),
                 dst.memory()
-            );
+            ));
             return;
         }
 
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        // Skip condition 4, and the reason it is a skip rather than an
+        // assertion: unlike the PBO siblings -- whose feed has no import to
+        // fail -- this one needs a working zero-copy EGLImage import of the
+        // DESTINATION, and a driver may refuse it (the NVIDIA desktop this
+        // was written on fails with GL 0x502). `ComputeBackend::OpenGl`
+        // keeps a CPU fallback, whose f16 answer is within this tolerance,
+        // so without the check the test reported a pass having exercised no
+        // GL at all.
+        if proc.convert_fallback_count() != fallbacks_before {
+            crate::test_support::report_skip(&format!(
+                "{} - the GL float path declined this DMA-BUF destination and \
+                 ImageProcessor fell back to the CPU; there is no zero-copy \
+                 coverage to check here",
+                function!()
+            ));
+            return;
+        }
 
         let map = dst.as_f16().unwrap().map().unwrap();
         assert_eq!(map.len(), 3 * w * h);
@@ -6779,7 +7151,7 @@ mod gl_tests {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
 
@@ -6789,13 +7161,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
 
         if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - F32 render not supported",
+                function!()
+            ));
             return;
         }
 
@@ -6816,7 +7194,10 @@ mod gl_tests {
             )
             .unwrap();
         if src.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - RGBA8 src not PBO-backed",
+                function!()
+            ));
             return;
         }
         {
@@ -6841,7 +7222,7 @@ mod gl_tests {
             )
             .unwrap();
         if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIPPED: {} - F32 dst not PBO-backed", function!());
+            crate::test_support::report_skip(&format!("{} - F32 dst not PBO-backed", function!()));
             return;
         }
 
@@ -6849,11 +7230,23 @@ mod gl_tests {
         // [6, 8) are padded with the `dst_color`.
         let crop = Crop::letterbox([114, 114, 114, 255]);
 
+        let fallbacks_before = proc.convert_fallback_count();
         let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
         assert!(
             result.is_ok(),
             "F32 PBO letterbox convert must not error: {:?}",
             result.err()
+        );
+        // `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
+        // decline is served by the CPU with only a debug log. The CPU
+        // letterbox writes the same pad colour, so without this the test
+        // passes with zero GL coverage.
+        assert_eq!(
+            proc.convert_fallback_count(),
+            fallbacks_before,
+            "the GL float path declined and ImageProcessor fell back to the \
+             CPU; the CPU letterbox writes the same pad colour, so this test \
+             would otherwise pass without exercising the GL path at all"
         );
 
         let map = dst.as_f32().unwrap().map().unwrap();
@@ -6898,8 +7291,9 @@ mod gl_tests {
     fn convert_f32_pbo_cuda_map_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
-        if !edgefirst_tensor::is_cuda_available() {
-            eprintln!("SKIP: no libcudart");
+        if !crate::opengl_headless::cuda_policy::cuda_available_or_skip(
+            "convert_f32_pbo_cuda_map_roundtrip",
+        ) {
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -6908,12 +7302,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("SKIP: no GL");
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_roundtrip",
+                    "no GL",
+                );
                 return;
             }
         };
-        if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIP: no f32 render");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            proc.supported_render_dtypes().f32,
+            "convert_f32_pbo_cuda_map_roundtrip",
+            "no f32 render",
+        ) {
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -6946,17 +7347,36 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-        if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIP: dst not PBO (no CUDA-GL alloc here)");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            dst.memory() == TensorMemory::Pbo,
+            "convert_f32_pbo_cuda_map_roundtrip",
+            "dst not PBO (no CUDA-GL alloc here)",
+        ) {
             return;
         }
+        // `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a
+        // declined GL float path is served by the CPU into this same PBO and
+        // the CUDA mapping below reads the CPU's answer -- a pass with no GL
+        // coverage. Reported as a skip rather than a failure because the
+        // decline is a property of the host's driver, not of this code.
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        if proc.convert_fallback_count() != fallbacks_before {
+            crate::test_support::report_skip(
+                "convert_f32_pbo_cuda_map_roundtrip - the GL float path declined \
+                 and the convert was served by the CPU; there is no GL coverage \
+                 to check here",
+            );
+            return;
+        }
         let cm = match dst.cuda_map() {
             Some(cm) => cm,
             None => {
-                eprintln!(
-                    "SKIP: cuda_map returned None (CUDA-GL interop unavailable for this context)"
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_roundtrip",
+                    "cuda_map returned None: CUDA-GL interop unavailable for this context",
                 );
                 return;
             }
@@ -6992,8 +7412,9 @@ mod gl_tests {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
         use std::ffi::c_void;
 
-        if !edgefirst_tensor::is_cuda_available() {
-            eprintln!("SKIP: no libcudart");
+        if !crate::opengl_headless::cuda_policy::cuda_available_or_skip(
+            "convert_f32_pbo_cuda_map_numeric",
+        ) {
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -7002,12 +7423,19 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("SKIP: no GL");
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_numeric",
+                    "no GL",
+                );
                 return;
             }
         };
-        if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIP: no f32 render");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            proc.supported_render_dtypes().f32,
+            "convert_f32_pbo_cuda_map_numeric",
+            "no f32 render",
+        ) {
             return;
         }
         let (w, h) = (16usize, 16usize);
@@ -7045,18 +7473,37 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-        if dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIP: dst not PBO");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            dst.memory() == TensorMemory::Pbo,
+            "convert_f32_pbo_cuda_map_numeric",
+            "dst not PBO",
+        ) {
             return;
         }
+        // `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a
+        // declined GL float path is served by the CPU into this same PBO and
+        // the CUDA mapping below reads the CPU's answer -- a pass with no GL
+        // coverage. Reported as a skip rather than a failure because the
+        // decline is a property of the host's driver, not of this code.
+        let fallbacks_before = proc.convert_fallback_count();
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
+        if proc.convert_fallback_count() != fallbacks_before {
+            crate::test_support::report_skip(
+                "convert_f32_pbo_cuda_map_numeric - the GL float path declined \
+                 and the convert was served by the CPU; there is no GL coverage \
+                 to check here",
+            );
+            return;
+        }
 
         let cm = match dst.cuda_map() {
             Some(cm) => cm,
             None => {
-                eprintln!(
-                    "SKIP: cuda_map returned None (CUDA-GL interop unavailable for this context)"
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    "convert_f32_pbo_cuda_map_numeric",
+                    "cuda_map returned None: CUDA-GL interop unavailable for this context",
                 );
                 return;
             }
@@ -7110,6 +7557,13 @@ mod gl_tests {
     /// end to end. On a Jetson (no `/dev/dma_heap`) the NV source has no GPU
     /// path, so `convert()` runs on the CPU and writes into the CUDA-registered
     /// output PBO; this test exercises exactly that CPU→PBO→CUDA hand-off.
+    ///
+    /// **Exercising the CPU fallback is the point here, so this one asserts
+    /// no route** (issue #179). The subject and the reference are the same
+    /// `convert()` on the same processor, differing only in where the
+    /// destination lives, so whichever backend serves them serves both; the
+    /// claim under test is about the device pointer's contents, not about
+    /// which engine produced them.
     #[cfg(target_os = "linux")]
     fn jpeg_cuda_devptr_check(fixture: &str, expect_fmt: PixelFormat, w: usize, h: usize) {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
@@ -7117,8 +7571,7 @@ mod gl_tests {
         use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
         use std::ffi::c_void;
 
-        if !edgefirst_tensor::is_cuda_available() {
-            eprintln!("SKIP {fixture}: no libcudart");
+        if !crate::opengl_headless::cuda_policy::cuda_available_or_skip(fixture) {
             return;
         }
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
@@ -7127,12 +7580,15 @@ mod gl_tests {
         }) {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("SKIP {fixture}: no GL");
+                crate::opengl_headless::cuda_policy::require_or_skip(false, fixture, "no GL");
                 return;
             }
         };
-        if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIP {fixture}: no f32 render");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            proc.supported_render_dtypes().f32,
+            fixture,
+            "no f32 render",
+        ) {
             return;
         }
 
@@ -7190,8 +7646,11 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-        if pbo_dst.memory() != TensorMemory::Pbo {
-            eprintln!("SKIP {fixture}: dst not PBO");
+        if !crate::opengl_headless::cuda_policy::require_or_skip(
+            pbo_dst.memory() == TensorMemory::Pbo,
+            fixture,
+            "dst not PBO",
+        ) {
             return;
         }
         proc.convert(
@@ -7205,7 +7664,11 @@ mod gl_tests {
         let cm = match pbo_dst.cuda_map() {
             Some(cm) => cm,
             None => {
-                eprintln!("SKIP {fixture}: cuda_map None (CUDA-GL interop unavailable)");
+                crate::opengl_headless::cuda_policy::require_or_skip(
+                    false,
+                    fixture,
+                    "cuda_map returned None: CUDA-GL interop unavailable for this context",
+                );
                 return;
             }
         };
@@ -7336,7 +7799,10 @@ mod gl_tests {
     fn test_gpu_nv16_to_rgba_path_b() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
 
@@ -7374,7 +7840,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -7460,13 +7929,16 @@ mod gl_tests {
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
 
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -7596,7 +8068,7 @@ mod gl_tests {
     fn test_nv12_path_env_override() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         let (w, h) = (64usize, 64usize); // width % 4 == 0 so the sampler import is accepted
@@ -7617,7 +8089,10 @@ mod gl_tests {
             let mut gl = match gl {
                 Ok(g) => g,
                 Err(e) => {
-                    eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                    crate::test_support::report_skip(&format!(
+                        "{} - GL not available: {e}",
+                        function!()
+                    ));
                     return None;
                 }
             };
@@ -7687,7 +8162,7 @@ mod gl_tests {
     fn test_nv12_nondma_upload_uses_shader() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -7703,7 +8178,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -7772,7 +8250,7 @@ mod gl_tests {
     fn test_nv12_to_planar_rgb_uses_shader_path() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -7801,7 +8279,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -7863,14 +8344,17 @@ mod gl_tests {
     fn test_nv16_nv24_nondma_upload_uses_shader() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_opengl_available() {
-            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (w, h) = (64usize, 64usize);
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -7954,7 +8438,7 @@ mod gl_tests {
     fn probe_nv12_sampler_vs_shader_divergence() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         let (w, h) = (64usize, 64usize); // width % 4 == 0 for the sampler import
@@ -7983,7 +8467,10 @@ mod gl_tests {
             let mut gl = match gl {
                 Ok(g) => g,
                 Err(e) => {
-                    eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                    crate::test_support::report_skip(&format!(
+                        "{} - GL not available: {e}",
+                        function!()
+                    ));
                     return None;
                 }
             };
@@ -8084,7 +8571,7 @@ mod gl_tests {
         use crate::opengl_headless::processor::GLProcessorST;
         use crate::{Fit, Region};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         // 16:9 source so fitting into a square model produces top/bottom bars.
@@ -8130,7 +8617,7 @@ mod gl_tests {
             let mut g = match g {
                 Ok(x) => x,
                 Err(e) => {
-                    eprintln!("SKIPPED: {} - GL: {e}", function!());
+                    crate::test_support::report_skip(&format!("{} - GL: {e}", function!()));
                     return None;
                 }
             };
@@ -8254,7 +8741,10 @@ mod gl_tests {
     fn test_gpu_nv24_to_rgba_path_b() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
 
@@ -8291,7 +8781,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8334,7 +8827,10 @@ mod gl_tests {
     fn test_gpu_nv16_matches_cpu_reference() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
 
@@ -8391,7 +8887,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8432,7 +8931,10 @@ mod gl_tests {
     fn test_gpu_nv24_matches_cpu_reference() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
 
@@ -8489,7 +8991,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8531,7 +9036,7 @@ mod gl_tests {
     fn test_nv12_dma_gpu_path_no_cpu_fallback() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
 
@@ -8555,7 +9060,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8585,7 +9093,7 @@ mod gl_tests {
     fn test_gpu_nv16_path_b_int8_output() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
 
@@ -8650,7 +9158,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8882,7 +9393,10 @@ mod gl_tests {
     fn g03_nv16_odd_w_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
@@ -8919,7 +9433,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -8957,7 +9474,10 @@ mod gl_tests {
     fn g04_nv24_odd_w_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
@@ -8994,7 +9514,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9036,7 +9559,10 @@ mod gl_tests {
     fn g05_nv16_odd_both_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
@@ -9073,7 +9599,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9115,7 +9644,10 @@ mod gl_tests {
     fn g06_nv24_odd_both_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
@@ -9152,7 +9684,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9202,7 +9737,7 @@ mod gl_tests {
     fn g09_odd_dst_unaligned_stride_guarded() {
         use crate::opengl_headless::processor::GLProcessorST;
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         let (w, h) = (321usize, 240usize);
@@ -9229,7 +9764,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9268,7 +9806,10 @@ mod gl_tests {
     fn g01_nv12_odd_w_path_b_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
@@ -9305,7 +9846,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9354,7 +9898,10 @@ mod gl_tests {
     fn g02_nv12_odd_h_path_b_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         // Even width, odd height — exercises odd-H chroma row boundary.
@@ -9392,7 +9939,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9454,7 +10004,10 @@ mod gl_tests {
         use crate::opengl_headless::processor::GLProcessorST;
         use edgefirst_codec::{ImageDecoder, ImageLoad};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let jpeg: &[u8] = &edgefirst_bench::testdata::read("coco_grey_odd.jpg");
@@ -9476,7 +10029,10 @@ mod gl_tests {
                 TensorDyn::from(t)
             }
             Err(e) => {
-                eprintln!("SKIPPED: {} - DMA Grey alloc failed: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - DMA Grey alloc failed: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9527,7 +10083,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9573,7 +10132,7 @@ mod gl_tests {
     fn g07_nv12_odd_w_i8_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
@@ -9612,7 +10171,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9662,7 +10224,7 @@ mod gl_tests {
     fn g08_nv16_odd_both_i8_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
         let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
@@ -9701,7 +10263,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9743,7 +10308,10 @@ mod gl_tests {
     fn g_even_nv16_64x64_regression() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -9780,7 +10348,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9812,7 +10383,10 @@ mod gl_tests {
     fn g_even_nv24_64x64_regression() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -9849,7 +10423,10 @@ mod gl_tests {
         let mut gl = match GLProcessorST::new(None, None) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9962,10 +10539,10 @@ mod gl_tests {
     #[test]
     fn recycled_narrowed_destination_matches_a_fresh_one() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let src = match crate::load_image_test_helper(
@@ -9975,7 +10552,10 @@ mod gl_tests {
         ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("SKIPPED: {} - source decode failed ({e:?})", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - source decode failed ({e:?})",
+                    function!()
+                ));
                 return;
             }
         };
@@ -9991,10 +10571,10 @@ mod gl_tests {
             )
         };
         let Ok(mut pool) = rgba_dst(256, 192) else {
-            eprintln!(
-                "SKIPPED: {} - texture destination alloc failed",
+            crate::test_support::report_skip(&format!(
+                "{} - texture destination alloc failed",
                 function!()
-            );
+            ));
             return;
         };
         // Seed the whole texture, so anything the narrowed convert fails to
@@ -10153,10 +10733,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_narrowed_source_resized_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let mut pool = seeded_grey_pool();
@@ -10204,10 +10784,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_narrowed_source_upscaled_edges_match_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let mut pool = seeded_grey_pool();
@@ -10259,10 +10839,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_narrowed_source_cropped_and_rotated_edges_match_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let mut pool = seeded_grey_pool();
@@ -10321,10 +10901,10 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_narrowed_yuyv_source_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
         let mut pool = TensorDyn::image(
@@ -10407,9 +10987,12 @@ mod gl_tests {
     /// full scale.
     ///
     /// Each frame drives both float destination kinds: an F32 `Rgb` PBO (the
-    /// readback float path) and a zero-copy F32 `PlanarRgb` texture, which
+    /// readback float path) and a zero-copy F16 `PlanarRgb` texture, which
     /// the packed float path renders into directly. They share the uv
-    /// builder, so the mapping has to hold on both. The last frame upscales,
+    /// builder, so the mapping has to hold on both. The two halves ask for
+    /// different render capabilities -- F32 for the PBO, F16 for the
+    /// zero-copy texture -- because those are what their respective
+    /// `float_dispatch` arms are gated on. The last frame upscales,
     /// which reaches the sample clamp (`src_extent`) on the narrowed axis;
     /// that axis is half the pool so the scaled coordinates are exact and the
     /// clamp is the only difference from the fresh buffer.
@@ -10417,27 +11000,64 @@ mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_narrowed_source_into_float_dst_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
-            eprintln!(
-                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or OpenGL",
                 function!()
-            );
+            ));
             return;
         }
-        // Force the GL backend so a declined float path is a hard error rather
-        // than a CPU fallback that would make this test vacuous.
+        // A lane that has declared it has a working GL stack must not lose
+        // this test's zero-copy coverage to a driver decline, so the decline
+        // below is a failure there and a skip elsewhere. The macOS coverage
+        // lane sets the flag for BOTH passes but deliberately hobbles pass 1
+        // (unsigned binaries, the ANGLE dlopen gate closed), so pass 1 is
+        // excluded the same way `gl_backend_available_canary` and the
+        // sibling test below exclude it.
+        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+        #[cfg(target_os = "macos")]
+        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ANGLE dlopen gate closed (coverage pass 1)",
+                function!()
+            ));
+            return;
+        }
+        // `ComputeBackend::OpenGl` selects the GL backend but does NOT disable
+        // the CPU fallback -- it leaves `forced_backend` at `None`, so a
+        // declined float path is served by the CPU with only a debug log, and
+        // both sides of every comparison below would then be the same CPU
+        // answer. `convert_fallback_count()` is asserted across each convert
+        // for that reason.
         let mut proc = match crate::ImageProcessor::with_config(crate::ImageProcessorConfig {
             backend: crate::ComputeBackend::OpenGl,
             ..Default::default()
         }) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - OpenGL backend unavailable: {e}",
+                    function!()
+                ));
                 return;
             }
         };
         if !proc.supported_render_dtypes().f32 {
-            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - F32 render not supported",
+                function!()
+            ));
             return;
+        }
+        // The zero-copy half below needs the F16 planar render specifically,
+        // which is a separate capability from the F32 the PBO half needs: a
+        // GPU can report one without the other. Asked once rather than per
+        // frame, since it cannot change between frames.
+        let zero_copy_float = proc.supported_render_dtypes().f16;
+        if !zero_copy_float {
+            crate::test_support::report_skip(&format!(
+                "(zero-copy float dst): {} - F16 render not supported",
+                function!()
+            ));
         }
         let mut pool = TensorDyn::image(
             128,
@@ -10470,9 +11090,13 @@ mod gl_tests {
                     .create_pbo_image_dtype(dw, dh, PixelFormat::Rgb, DType::F32)
             };
             let Ok(mut recycled) = float_dst(&proc) else {
-                eprintln!("SKIPPED: {} - no F32 PBO destination", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - no F32 PBO destination",
+                    function!()
+                ));
                 return;
             };
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(
                 &pool,
                 &mut recycled,
@@ -10481,6 +11105,13 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "frame {i}: the GL float path declined and the convert was \
+                 served by the CPU; the oracle below would then be the same \
+                 CPU answer and the comparison would prove nothing"
+            );
             let recycled_bytes = recycled.as_f32().unwrap().map().unwrap().to_vec();
 
             let fresh = TensorDyn::image(
@@ -10494,6 +11125,7 @@ mod gl_tests {
             .unwrap();
             fill_rgba_pattern(&fresh, w, h, salt);
             let mut oracle = float_dst(&proc).unwrap();
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(
                 &fresh,
                 &mut oracle,
@@ -10502,6 +11134,11 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+            assert_eq!(
+                proc.convert_fallback_count(),
+                fallbacks_before,
+                "frame {i}: the oracle convert fell back to the CPU"
+            );
             let oracle_bytes = oracle.as_f32().unwrap().map().unwrap().to_vec();
 
             assert_eq!(
@@ -10520,45 +11157,63 @@ mod gl_tests {
                  fresh buffer by up to {worst}"
             );
 
-            // ── The same source into a zero-copy float destination: an F32
+            // ── The same source into a zero-copy float destination: an F16
             // PlanarRgb texture, rendered straight into by the packed float
             // path rather than read back through a PBO. The extent mapping
             // lives in the shared uv builder, so both destinations must show
             // it; this one is the path that exists only where the platform
             // renders float zero-copy.
+            //
+            // F16 rather than F32, because `(Rgba, PlanarRgb, F16, DmaBuf)` is
+            // the one zero-copy float tuple BOTH capability sets serve --
+            // `FloatRenderPath::ZeroCopyF16Nchw`. The F32 zero-copy
+            // destinations are gated on `ZeroCopyFloatSet::All`, which only
+            // the Windows leaf reports; Linux, Android and ANGLE/macOS report
+            // `PlanarF16`, so an F32 PlanarRgb DMA destination classifies as
+            // `FloatRenderPath::None` there, the u8 route rejects the dtype
+            // and the CPU serves the convert. `float_dispatch.rs`'s
+            // `the_planar_set_leaves_the_windows_only_shaders_unreachable`
+            // pins that decision. Allocating such a destination still succeeds
+            // on Mali and V3D, so a successful allocation cannot stand in for
+            // the routing question -- which is why this half asks the
+            // capability rather than inferring it from the allocator.
+            if !zero_copy_float {
+                continue;
+            }
             let planar_dst = || {
                 TensorDyn::image(
                     dw,
                     dh,
                     PixelFormat::PlanarRgb,
-                    DType::F32,
+                    DType::F16,
                     Some(TensorMemory::DmaBuf),
                     edgefirst_tensor::CpuAccess::ReadWrite,
                 )
             };
             let (Ok(mut zc_recycled), Ok(mut zc_oracle)) = (planar_dst(), planar_dst()) else {
-                eprintln!(
-                    "SKIPPED (zero-copy float dst): {} - no F32 PlanarRgb texture",
+                crate::test_support::report_skip(&format!(
+                    "(zero-copy float dst): {} - no F16 PlanarRgb texture",
                     function!()
-                );
+                ));
                 continue;
             };
             if zc_recycled.memory() != TensorMemory::DmaBuf {
-                eprintln!(
-                    "SKIPPED (zero-copy float dst): {} - F32 PlanarRgb dst is not zero-copy",
+                crate::test_support::report_skip(&format!(
+                    "(zero-copy float dst): {} - F16 PlanarRgb dst is not zero-copy",
                     function!()
-                );
+                ));
                 continue;
             }
             // Both sides are read through `copy_to_flat`: a Windows texture
             // destination spaces its rows at a padded pitch, whose bytes are
             // not written by the render.
-            let flat_f32 = |t: &TensorDyn| -> Vec<u8> {
-                let typed = t.as_typed::<f32>().expect("F32 image");
-                let mut out = vec![0u8; typed.shape().iter().product::<usize>() * 4];
+            let flat_f16 = |t: &TensorDyn| -> Vec<u8> {
+                let typed = t.as_typed::<half::f16>().expect("F16 image");
+                let mut out = vec![0u8; typed.shape().iter().product::<usize>() * 2];
                 typed.copy_to_flat(&mut out).expect("compact padded rows");
                 out
             };
+            let fallbacks_before = proc.convert_fallback_count();
             proc.convert(
                 &pool,
                 &mut zc_recycled,
@@ -10575,12 +11230,1501 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+            // A driver that refuses the zero-copy float destination has
+            // nothing inside GL to lower to -- there is no mapped-texture
+            // readback for a float DMA destination -- so the CPU serves the
+            // convert and both sides become the same CPU answer, which would
+            // make the comparison below prove nothing. That is a property of
+            // the host's driver and not of this code (this desktop's NVIDIA
+            // EGL fails its DMA-BUF roundtrip check and drops to PBO
+            // transfers), so it is reported as a skip -- except under
+            // `HAL_TEST_REQUIRE_GL=1`, where a lane that has asserted it has a
+            // working GL stack must not quietly lose this coverage. The boards
+            // run with it set.
+            if proc.convert_fallback_count() != fallbacks_before {
+                assert!(
+                    !require_gl,
+                    "HAL_TEST_REQUIRE_GL=1 but frame {i}'s zero-copy float destination \
+                     convert fell back to the CPU"
+                );
+                crate::test_support::report_skip(&format!(
+                    "(zero-copy float dst): {} - the GL float path declined and the \
+                     CPU served the convert",
+                    function!()
+                ));
+                continue;
+            }
             assert_eq!(
-                flat_f32(&zc_recycled),
-                flat_f32(&zc_oracle),
-                "frame {i} ({w}x{h} -> {dw}x{dh}): narrowed source into a zero-copy F32 \
+                flat_f16(&zc_recycled),
+                flat_f16(&zc_oracle),
+                "frame {i} ({w}x{h} -> {dw}x{dh}): narrowed source into a zero-copy F16 \
                  PlanarRgb destination differs from a fresh buffer"
             );
         }
+    }
+
+    /// An NV12 DMA/IOSurface/D3D11 source at an UNALIGNED plane offset must
+    /// still convert through GL, on every backing that can hold one.
+    ///
+    /// This is `tests/offset_source_view_alignment.rs`'s NV case as a LIB test,
+    /// and it is here rather than only there because the integration binaries
+    /// reach almost no CI lane: the Linux runners have no DMA heap, and the
+    /// i.MX 8M Plus hardware lane runs only the `edgefirst_image-*` lib-test
+    /// binary filtered on `opengl`/`g2d`. Three lanes do reach the code below,
+    /// each through a different one of the two NV import-failure arms:
+    ///
+    /// * **macOS / Windows (ANGLE).** `import_buffer_nv_r8` refuses an offset
+    ///   source outright (`refuse_offset_source`), so the ShaderR8 arm's
+    ///   failure path runs.
+    /// * **i.MX 8M Plus (Vivante).** `select_nv_path` takes the external
+    ///   sampler for single-plane NV12 there, and Vivante's EGL refuses the
+    ///   unaligned offset, so the OTHER failure arm runs.
+    /// * **i.MX 95 (Mali).** The engine's own decline fires
+    ///   (`mali_rejects_import_offset`), then the ShaderR8 arm's failure path.
+    ///
+    /// V3D imports an unaligned offset correctly and takes neither arm, which
+    /// is why the routing assertion below is an implication rather than a flat
+    /// "an upload happened": what every backing must satisfy is that a
+    /// DECLINED zero-copy feed became an upload and not a CPU convert
+    /// (issue #166). `GLProcessorThreaded` is driven directly, so a CPU
+    /// fallback cannot pass this test at all.
+    #[test]
+    fn nv12_source_at_a_plane_offset_converts_through_gl_on_every_zero_copy_backing() {
+        // QVGA rather than a tiny frame: Mali has a minimum texture size that
+        // 64x64 tests have tripped over, and a 4-aligned width is also what
+        // Vivante's sampler path requires -- without it that lane would take
+        // the shader arm and leave the sampler arm uncovered.
+        const W: usize = 320;
+        const H: usize = 240;
+        const TOLERANCE: u8 = 8;
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+        #[cfg(target_os = "macos")]
+        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ANGLE dlopen gate closed (coverage pass 1)",
+                function!()
+            ));
+            return;
+        }
+        // Two rows taller than the logical frame, so a window starting a row
+        // in is still fully backed.
+        let allocated = match TensorDyn::image(
+            W,
+            H + 2,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
+            other => {
+                // `is_gpu_buffer_available` is the portable "can this host hold
+                // a zero-copy image at all" probe: a DMA heap on Linux, an
+                // IOSurface on macOS, a D3D11 device on Windows. Where it says
+                // yes, a REQUIRE_GL lane must not let this test evaporate --
+                // the arms it covers are reachable nowhere else.
+                let what = match &other {
+                    Ok(t) => format!("fell back to {:?}", t.memory()),
+                    Err(e) => format!("failed: {e}"),
+                };
+                assert!(
+                    !(require_gl && edgefirst_tensor::is_gpu_buffer_available()),
+                    "HAL_TEST_REQUIRE_GL=1 and this host reports a zero-copy \
+                     buffer backing, but the NV12 zero-copy allocation {what}"
+                );
+                crate::test_support::report_skip(&format!(
+                    "{} - no zero-copy NV12 image here ({what})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let mut src = allocated;
+        let pitch = src.effective_row_stride().unwrap_or(W);
+        // The same pattern `tests/offset_source_view_alignment.rs` uses, and
+        // for the same reasons: period 31 is coprime with the pitch and with
+        // 64, so a window read at the wrong offset cannot coincide with the
+        // right one, and the 112..=142 band keeps both the luma and the chroma
+        // it also feeds clear of RGB clamping, where two different reads could
+        // agree by saturation. Written BEFORE the re-tag, while the map still
+        // spans the whole allocation.
+        {
+            let mut m = src
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map the NV12 allocation");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = 112 + (i % 31) as u8;
+            }
+        }
+        src.set_logical_shape(&[H * 3 / 2, W])
+            .expect("narrow to one frame's geometry");
+        assert_eq!(src.height(), Some(H), "precondition: one frame is {H} rows");
+        assert_eq!(
+            src.effective_row_stride(),
+            Some(pitch),
+            "precondition: the re-tag kept the surface pitch"
+        );
+        // A row in, plus 32 bytes: rounding the row up to 64 first makes the
+        // result 32 (mod 64) whatever the driver's pitch is, so the offset is
+        // unaligned on every host rather than only on the ones whose pitch is
+        // already padded.
+        let offset = pitch.next_multiple_of(64) + 32;
+        src.set_plane_offset(offset);
+        assert_eq!(
+            src.plane_offset(),
+            Some(offset),
+            "precondition: the offset stuck"
+        );
+        assert_ne!(offset % 64, 0, "precondition: {offset} is unaligned");
+        // Full-range BT.601 so both converters resolve the same matrix by the
+        // tag rather than by the untagged-SD heuristic.
+        src.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
+
+        let rgba_dst = || {
+            TensorDyn::image(
+                W,
+                H,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("RGBA destination")
+        };
+        let read = |t: &TensorDyn| {
+            t.map_bytes(edgefirst_tensor::CpuAccess::Read)
+                .expect("map destination")
+                .as_slice()
+                .to_vec()
+        };
+
+        let mut reference = rgba_dst();
+        crate::CPUProcessor::new()
+            .convert(
+                &src,
+                &mut reference,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .expect("CPU reference convert of the offset NV12 frame");
+        let want = read(&reference);
+        // A flat reference would make any wrong read agree; the pattern must
+        // survive into the converted pixels.
+        assert!(
+            want.chunks(4).any(|p| p != &want[..4]),
+            "precondition: the CPU reference is flat, so agreement would prove nothing"
+        );
+
+        let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
+        let before = gl.convert_stats().expect("convert stats before");
+        let mut dst = rgba_dst();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect(
+                "GL refused an NV12 source at an unaligned plane offset; a declined \
+                 zero-copy NV import must reach the R8 upload (issue #166)",
+            );
+        let after = gl.convert_stats().expect("convert stats after");
+        let got = read(&dst);
+        let bad = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.abs_diff(**w) > TOLERANCE)
+            .count();
+        assert_eq!(
+            bad,
+            0,
+            "{bad} bytes differ from the CPU reference over the same tensor; \
+             first got={:?} want={:?} (offset {offset}, pitch {pitch})",
+            &got[..4],
+            &want[..4]
+        );
+        // The routing contract: a zero-copy feed that was DECLINED must have
+        // become an upload. Vacuous where the import succeeded (V3D), which is
+        // why it is an implication and not an unconditional count.
+        let declines = after.zero_copy_declines - before.zero_copy_declines;
+        let uploads = after.src_uploads - before.src_uploads;
+        let imports = after.src_imports - before.src_imports;
+        // Say which route this host took, at `info` so it reaches the log even
+        // under libtest's output capture (which swallows `eprintln!` from a
+        // passing test). The whole point of this test is per-platform routing,
+        // and without this a green lane does not say WHICH arm it covered.
+        log::info!(
+            "{}: offset {offset} pitch {pitch} -> declines={declines} uploads={uploads} \
+             imports={imports}",
+            function!()
+        );
+        if declines > 0 {
+            assert!(
+                uploads > 0,
+                "the NV import was declined ({declines}) but no upload was recorded \
+                 (uploads={uploads}, imports={imports}) -- the convert fell to a path \
+                 issue #166 exists to prevent"
+            );
+        }
+        assert!(
+            uploads + imports > 0,
+            "the convert recorded neither an upload nor an import \
+             (declines={declines}) -- it was not fed by the GL engine at all"
+        );
+    }
+
+    /// A fresh `view()` destination at an UNALIGNED byte offset must keep the
+    /// zero-copy destination import.
+    ///
+    /// A destination `view()` imports its PARENT and places the tile with
+    /// `glViewport`, so its import bases at 0 however far into the buffer its
+    /// own bytes start (`DmaImportAttrs::from_tensor` with `for_dst = true`,
+    /// `BufferImportKey::from_tensor`). Any rule about the base offset --
+    /// `dst_import_places` today -- must therefore be asked of
+    /// `view_collapsed_dst_base`, not of `plane_offset()`; asking the latter
+    /// fires on every tile view whose byte offset is unaligned -- an RGBA `x0`
+    /// of 8 is 32 bytes -- and costs the zero-copy path for an import that
+    /// bases at 0 and would have succeeded.
+    ///
+    /// `convert_fallback_count` cannot see this: the over-fire lowers WITHIN
+    /// GL, to the mapped-texture readback, and never reaches the CPU backend.
+    /// What distinguishes the two is whether a destination import happened at
+    /// all, so this reads the `dst` import cache.
+    ///
+    /// Self-calibrating, via a CONTROL convert into a whole zero-copy
+    /// destination. A host that imports nothing there cannot run the subject at
+    /// all -- the engine declines a `view()` destination outright unless the
+    /// transfer backend is zero-copy -- so it skips, which is what a desktop
+    /// whose EGL cannot import a DMA-BUF does. Where the control imports, the
+    /// unaligned view must import too, and that assertion is never vacuous.
+    #[test]
+    fn a_fresh_unaligned_view_destination_keeps_the_zero_copy_import() {
+        const W: usize = 320;
+        const H: usize = 240;
+        const SIDE: usize = 64;
+        const BPP: usize = 4;
+        // x0 = 8 -> 32 bytes, never 64-aligned whatever the pitch.
+        const X0: usize = 8;
+        const Y0: usize = 8;
+        const BLANK: u8 = 0x55;
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+        #[cfg(target_os = "macos")]
+        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ANGLE dlopen gate closed (coverage pass 1)",
+                function!()
+            ));
+            return;
+        }
+        let dma_rgba = |w: usize, h: usize| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+        };
+        let canvas = match dma_rgba(W, H) {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
+            other => {
+                let what = match &other {
+                    Ok(t) => format!("fell back to {:?}", t.memory()),
+                    Err(e) => format!("failed: {e}"),
+                };
+                assert!(
+                    !(require_gl && edgefirst_tensor::is_gpu_buffer_available()),
+                    "HAL_TEST_REQUIRE_GL=1 and this host reports a zero-copy buffer \
+                     backing, but the RGBA zero-copy allocation {what}"
+                );
+                crate::test_support::report_skip(&format!(
+                    "{} - no zero-copy RGBA image here ({what})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let pitch = canvas.effective_row_stride().unwrap_or(W * BPP);
+        let offset = Y0 * pitch + X0 * BPP;
+        assert_ne!(
+            offset % 64,
+            0,
+            "precondition: ({X0},{Y0}) at pitch {pitch} is byte offset {offset}, \
+             which must be unaligned for this test to mean anything"
+        );
+
+        let want = |x: usize, y: usize| -> [u8; BPP] {
+            [((y * 3) % 256) as u8, ((x * 5) % 256) as u8, 255, 255]
+        };
+        let src = TensorDyn::image(
+            SIDE,
+            SIDE,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("source");
+        {
+            let mut m = src
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map source");
+            let s = m.as_mut_slice();
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    s[(y * SIDE + x) * BPP..][..BPP].copy_from_slice(&want(X0 + x, Y0 + y));
+                }
+            }
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
+        let imports = |g: &GLProcessorThreaded| {
+            let c = g.egl_cache_stats().expect("cache stats").dst;
+            c.misses + c.hits
+        };
+
+        // CONTROL: a WHOLE zero-copy destination, no view and no offset. This
+        // is what says whether this host imports destinations at all.
+        let mut whole = dma_rgba(SIDE, SIDE).expect("control destination");
+        let before_control = imports(&gl);
+        gl.convert(
+            &src,
+            &mut whole,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .expect("control convert into a whole zero-copy destination");
+        let control = imports(&gl) - before_control;
+
+        // A view destination is only supported at all on a zero-copy transfer
+        // backend (`GLProcessorST::convert` declines it outright otherwise), and
+        // the control is exactly that question, so a host that imported nothing
+        // cannot run the subject. This desktop is one: its EGL cannot import a
+        // DMA-BUF, so the backend falls back to PBO.
+        if control == 0 {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy destination import on this host, so a \
+                 view() destination is declined by the engine and there is nothing \
+                 to measure",
+                function!()
+            ));
+            log::info!(
+                "{}: pitch {pitch} offset {offset} -> control_dst_imports=0, skipped",
+                function!()
+            );
+            return;
+        }
+
+        // SUBJECT: a fresh view at the unaligned byte offset.
+        {
+            let mut m = canvas
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map canvas");
+            m.as_mut_slice().fill(BLANK);
+        }
+        let mut tile = canvas
+            .view(edgefirst_tensor::Region::new(X0, Y0, SIDE, SIDE))
+            .expect("fresh destination view");
+        assert_eq!(
+            tile.plane_offset(),
+            Some(offset),
+            "precondition: the view carries the unaligned byte offset"
+        );
+        assert!(
+            tile.view_origin().is_some(),
+            "precondition: a fresh view has a view_origin, which is what bases its \
+             import at 0"
+        );
+        let before_subject = imports(&gl);
+        gl.convert(&src, &mut tile, Rotation::None, Flip::None, Crop::default())
+            .expect("convert into a fresh view destination at an unaligned offset");
+        let subject = imports(&gl) - before_subject;
+        log::info!(
+            "{}: pitch {pitch} offset {offset} -> control_dst_imports={control} \
+             subject_dst_imports={subject}",
+            function!()
+        );
+
+        // The pixels first: a lowered path is slow, a misplaced tile is wrong.
+        let out = canvas
+            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+            .expect("map canvas")
+            .as_slice()
+            .to_vec();
+        let px = |x: usize, y: usize| &out[y * pitch + x * BPP..][..BPP];
+        assert_eq!(
+            px(0, 0),
+            &[BLANK; BPP],
+            "the tile landed at the canvas ORIGIN, so the view's offset was lost"
+        );
+        for y in Y0..Y0 + SIDE {
+            for x in X0..X0 + SIDE {
+                assert_eq!(px(x, y), &want(x, y), "tile pixel ({x}, {y})");
+            }
+        }
+
+        // Then the routing. `control > 0` is guaranteed by the guard above, so
+        // this is never vacuous where it runs.
+        assert!(
+            subject > 0,
+            "this host imports whole zero-copy destinations (control={control}) but \
+             performed no destination import for a fresh view at unaligned byte \
+             offset {offset} (subject={subject}) -- the view's import bases at 0, so \
+             no offset rule should have applied to it"
+        );
+    }
+
+    // ── The PBO transfer gates ──────────────────────────────────────────
+    //
+    // Four tests over the three `PIXEL_UNPACK_BUFFER`-bound uploads and the
+    // PBO readback. They share three properties worth stating once.
+    //
+    // **They allocate through `GLProcessorThreaded::create_pbo_image*`**,
+    // which mints a GL buffer directly, rather than through
+    // `ImageProcessor::create_image`, which returns a PBO only where the
+    // zero-copy DMA-BUF import does not work. So they run on every GL host,
+    // including the boards, with no environment variable to remember.
+    //
+    // **`GLProcessorThreaded` has no CPU fallback.** `ImageProcessor` with
+    // `ComputeBackend::OpenGl` does -- that variant leaves `forced_backend`
+    // at `None` and a GL decline logs at debug and silently falls to the CPU
+    // path, whose float widen (`b as f32 / 255.0`) is bit-exact against the
+    // GPU's. A gate built on it would pass on a board where GL declined
+    // every frame. Here a decline is a hard `Err` at the `convert` call.
+    //
+    // **Each asserts the route positively**, via `assert_pbo_source_route`:
+    // exactly one PBO source feed, no CPU upload, no zero-copy import. A
+    // hard error plus a byte comparison still leaves "the engine ran, but
+    // fed the source some other way"; the counter closes it.
+    //
+    // Nothing here needs `EDGEFIRST_FORCE_TRANSFER`. To run just these four:
+    //
+    // ```sh
+    // EDGEFIRST_TESTDATA_DIR=<repo>/testdata \
+    //   cargo test -p edgefirst-image --lib -- --exact \
+    //   opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_gl \
+    //   opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_to_f32_gl \
+    //   opengl_headless::tests::gl_tests::a_padded_pbo_source_does_not_shear_the_f32_upload \
+    //   opengl_headless::tests::gl_tests::a_padded_pbo_destination_is_written_at_its_own_pitch
+    // ```
+
+    /// A GL processor that allocates PBOs, or `None` with a skip line.
+    /// Nothing about it is host-dependent beyond having GL at all.
+    ///
+    /// The skip lines go through [`crate::test_support::report_skip`], which
+    /// writes to `std::io::stderr()` directly rather than through
+    /// `eprintln!`. `eprintln!` passes through libtest's per-test output
+    /// capture, which is discarded for a test that passes -- and a skip *is*
+    /// a pass -- so a board that skipped all four PBO gates read green in
+    /// the fleet log with no line saying so. The `SKIPPED:` prefix is
+    /// load-bearing: `scripts/on-target-test.sh` counts a board's skips by
+    /// grepping its log for that literal, and TESTING.md's "Reading the
+    /// results" section states it as the rule.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn pbo_gl_or_skip(what: &str) -> Option<GLProcessorThreaded> {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{what} - OpenGL not available"));
+            return None;
+        }
+        match GLProcessorThreaded::new(None) {
+            Ok(gl) => Some(gl),
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{what} - GL processor unavailable: {e}"
+                ));
+                None
+            }
+        }
+    }
+
+    /// [`pbo_gl_or_skip`] plus the F32 render capability the float gates
+    /// need. Separate so the u8 gates do not inherit a skip they have no
+    /// reason to take. Same skip-reporting rule, same reason.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn float_pbo_gl_or_skip(what: &str) -> Option<GLProcessorThreaded> {
+        let gl = pbo_gl_or_skip(what)?;
+        if !gl.supported_render_dtypes().f32 {
+            crate::test_support::report_skip(&format!("{what} - F32 render not supported"));
+            return None;
+        }
+        Some(gl)
+    }
+
+    /// An RGBA8 PBO of the given size. Infallible on a host that has GL:
+    /// this allocates a GL buffer outright, with no DMA-BUF attempt to
+    /// decline.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn rgba8_pbo(gl: &GLProcessorThreaded, w: usize, h: usize) -> TensorDyn {
+        let t = gl
+            .create_pbo_image(w, h, PixelFormat::Rgba)
+            .expect("allocate an RGBA8 PBO on the GL thread");
+        assert_eq!(
+            TensorTrait::memory(&t),
+            TensorMemory::Pbo,
+            "create_pbo_image must produce a PBO"
+        );
+        t.into()
+    }
+
+    /// Assert the convert just performed fed its source from a PBO, exactly
+    /// once, and did not reach either of the other two feeds.
+    ///
+    /// `ConvertStats` counts source feeds 1:1 with frames -- every convert
+    /// is exactly one of import / pbo / upload -- so this is a complete
+    /// statement about the route, not a lower bound on it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn assert_pbo_source_route(
+        gl: &GLProcessorThreaded,
+        before: &crate::opengl_headless::cache::ConvertStats,
+        what: &str,
+    ) {
+        let after = gl.convert_stats().expect("convert stats after");
+        assert_eq!(
+            after.src_pbo_uploads - before.src_pbo_uploads,
+            1,
+            "{what}: expected exactly one PBO source feed; the byte comparison \
+             below is meaningless if the engine took another route"
+        );
+        assert_eq!(
+            after.src_uploads - before.src_uploads,
+            0,
+            "{what}: the source was fed by CPU map + upload, not from its PBO"
+        );
+        assert_eq!(
+            after.src_imports - before.src_imports,
+            0,
+            "{what}: the source was fed by zero-copy import, not from its PBO"
+        );
+    }
+
+    /// Stamp `R = x % 256`, `G = y % 256`, `B = 128`, honouring the tensor's
+    /// own pitch. Plain index values rather than multiples: at 240 rows and
+    /// 320 columns a multiplier wraps, and two positions these tests compare
+    /// could then share a value.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn stamp_rgba8_positionally(t: &TensorDyn, w: usize, h: usize) {
+        let pitch = t.effective_row_stride().unwrap_or(w * 4);
+        let mut m = t
+            .map_bytes(edgefirst_tensor::CpuAccess::ReadWrite)
+            .expect("map the source PBO");
+        let s = m.as_mut_slice();
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * pitch + x * 4;
+                s[i] = (x % 256) as u8;
+                s[i + 1] = (y % 256) as u8;
+                s[i + 2] = 128;
+                s[i + 3] = 255;
+            }
+        }
+    }
+
+    /// Assert an F32 RGB destination holds [`stamp_rgba8_positionally`]'s
+    /// pattern for the source window starting at `(x0, y0)`, read from the
+    /// live mapping. The crop is the identity and the sizes match, so there
+    /// is no resampling and the exact expectation is the source byte over
+    /// 255 -- the same reference `convert_f32_nhwc_pbo_roundtrip` uses.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn assert_f32_dst_matches_rgba8_pattern(
+        dst: &TensorDyn,
+        w: usize,
+        h: usize,
+        x0: usize,
+        y0: usize,
+        case: &str,
+    ) {
+        let pitch_f32 = dst.effective_row_stride().unwrap_or(w * 3 * 4) / 4;
+        let m = dst.as_f32().unwrap().map().unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                let expect = [
+                    ((x + x0) % 256) as f32 / 255.0,
+                    ((y + y0) % 256) as f32 / 255.0,
+                    128.0 / 255.0,
+                ];
+                for (c, &want) in expect.iter().enumerate() {
+                    let got = m[y * pitch_f32 + x * 3 + c];
+                    assert!(
+                        (got - want).abs() < 1e-3,
+                        "{case}: f32 dst[{y},{x},{c}]={got}, expected {want} \
+                         (source pixel ({}, {})); the parent's origin would be \
+                         ({x}, {y})",
+                        x + x0,
+                        y + y0
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `view()` of a PBO-backed source converts its OWN sub-region.
+    ///
+    /// The u8 engine feeds a PBO source by binding it to
+    /// `PIXEL_UNPACK_BUFFER` and letting `glTexImage2D` read from it. With a
+    /// buffer bound, that call's `pixels` argument is a byte OFFSET, and it
+    /// was `NULL` -- so every view of one buffer uploaded the parent's
+    /// top-left tile instead of the window it names. Silent: the right
+    /// shape, the right byte count, the wrong pixels. Issue #162's converter
+    /// half; the storage half (a view demoting to a host placeholder under
+    /// the `dynamic` backend) is pinned in
+    /// `tests/interop/test_cross_package.py`.
+    ///
+    /// The origin is non-zero and the window is NARROWER than its parent, so
+    /// both halves of the addressing are exercised: a fix that got the
+    /// offset right but stepped rows by the window's own tight pitch reads
+    /// row 0 correctly and shears every row after it. QVGA-scale rather than
+    /// a toy size, because tiny textures have their own failure modes on
+    /// Mali that would confound this one.
+    ///
+    /// Route, allocation and fallback: see the block comment above.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_pbo_view_source_converts_its_own_region_gl() {
+        const W: usize = 320;
+        const H: usize = 240;
+        const SIDE: usize = 96;
+        const X0: usize = 40;
+        const Y0: usize = 32;
+
+        let Some(mut gl) = pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W, H);
+        stamp_rgba8_positionally(&src, W, H);
+
+        let view = src
+            .view(edgefirst_tensor::Region::new(X0, Y0, SIDE, SIDE))
+            .expect("view a narrow window of the PBO");
+        let mut dst = rgba8_pbo(&gl, SIDE, SIDE);
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a PBO view source");
+        assert_pbo_source_route(&gl, &before, "u8 PBO view");
+
+        // Read from the live mapping, inside the guard.
+        let m = dst
+            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+            .expect("map the destination");
+        let out = m.as_slice();
+        let dst_pitch = dst.effective_row_stride().unwrap_or(SIDE * 4);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let i = y * dst_pitch + x * 4;
+                assert_eq!(
+                    (out[i], out[i + 1]),
+                    (((x + X0) % 256) as u8, ((y + Y0) % 256) as u8),
+                    "output pixel ({x}, {y}) must be source ({}, {}); \
+                     ({x}, {y}) would be the parent's origin tile",
+                    x + X0,
+                    y + Y0
+                );
+            }
+        }
+    }
+
+    /// The float engine's PBO source arm reads the view's own region.
+    ///
+    /// `feed_float_src`'s PBO arm is the float sibling of
+    /// `draw_src_texture_from_pbo`, and it carried the identical pair of
+    /// defects: `TexImage2D`/`TexSubImage2D` were handed `NULL` with the
+    /// source bound to `PIXEL_UNPACK_BUFFER`, and no `UNPACK_ROW_LENGTH` was
+    /// set. The arm is taken on any `pbo_id()`, and a `view()` carries its
+    /// parent's id, so `convert(pbo_view, f32_dst)` uploaded the parent's
+    /// top-left tile.
+    ///
+    /// Route, allocation and fallback: see the block comment above. The
+    /// route assertion is what makes this test about the float GL path
+    /// rather than about arithmetic: the CPU fallback's widen is bit-exact
+    /// against the GPU's, so byte agreement alone would prove nothing.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_pbo_view_source_converts_its_own_region_to_f32_gl() {
+        const W: usize = 320;
+        const H: usize = 240;
+        const SIDE: usize = 96;
+        const X0: usize = 40;
+        const Y0: usize = 32;
+
+        let Some(mut gl) = float_pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W, H);
+        stamp_rgba8_positionally(&src, W, H);
+
+        let view = src
+            .view(edgefirst_tensor::Region::new(X0, Y0, SIDE, SIDE))
+            .expect("view a narrow window of the PBO");
+        let mut dst = gl
+            .create_pbo_image_dtype(SIDE, SIDE, PixelFormat::Rgb, DType::F32)
+            .expect("allocate an F32 RGB PBO destination");
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a PBO view source into an F32 destination");
+        assert_pbo_source_route(&gl, &before, "float PBO view");
+
+        assert_f32_dst_matches_rgba8_pattern(&dst, SIDE, SIDE, X0, Y0, "view at (40, 32)");
+    }
+
+    /// A padded source pitch must not shear the float engine's upload.
+    ///
+    /// The other half of `feed_float_src`'s PBO arm: with no
+    /// `UNPACK_ROW_LENGTH`, GL reads the rows back to back and every row
+    /// after the first lands on the wrong columns. Isolated from the offset
+    /// deliberately -- this source starts at byte 0 -- so the two defects
+    /// fail this suite independently rather than as one lump.
+    ///
+    /// The padded pitch comes from viewing a WIDER parent at `(0, 0)`:
+    /// `Tensor::view` records the parent's pitch on any multi-row window,
+    /// which is exactly the "rows are further apart than the image is wide"
+    /// shape a pitch-aligned producer hands over, and the only way to build
+    /// one here without lying to `set_row_stride` about a buffer.
+    ///
+    /// Route, allocation and fallback: see the block comment above.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_padded_pbo_source_does_not_shear_the_f32_upload() {
+        const W_ALLOC: usize = 320;
+        const W: usize = 256;
+        const H: usize = 240;
+
+        let Some(mut gl) = float_pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W_ALLOC, H);
+        stamp_rgba8_positionally(&src, W_ALLOC, H);
+
+        let view = src
+            .view(edgefirst_tensor::Region::new(0, 0, W, H))
+            .expect("view the left W columns of a wider PBO");
+        assert_eq!(
+            view.effective_row_stride(),
+            Some(W_ALLOC * 4),
+            "precondition: the window's rows are the PARENT's pitch apart, not \
+             its own {} bytes",
+            W * 4
+        );
+        assert_eq!(
+            view.plane_offset().unwrap_or(0),
+            0,
+            "precondition: this case starts at byte 0, so only the pitch is \
+             under test"
+        );
+
+        let mut dst = gl
+            .create_pbo_image_dtype(W, H, PixelFormat::Rgb, DType::F32)
+            .expect("allocate an F32 RGB PBO destination");
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a padded PBO source into an F32 destination");
+        assert_pbo_source_route(&gl, &before, "float padded PBO source");
+
+        assert_f32_dst_matches_rgba8_pattern(&dst, W, H, 0, 0, "padded pitch");
+    }
+
+    /// A padded whole-buffer PBO destination is written at its own pitch.
+    ///
+    /// The destination half of the family. `plan_pbo_readback` accepts a
+    /// pitch-aligned destination -- that is what `pack_row_length` exists
+    /// for -- so both directions have to honour it:
+    /// `setup_renderbuffer_from_pbo` seeds the render texture from the
+    /// destination's current bytes on the way in, and the readback places
+    /// the rendered rows on the way out.
+    ///
+    /// **What this pins, and what nothing can.** It pins the readback, which
+    /// is observable: get the pitch wrong there and the visible rows land on
+    /// top of each other. It does NOT pin the seed's own
+    /// `UNPACK_ROW_LENGTH`, and no test can, because no path lets the seeded
+    /// content survive to be read: `Crop::resolve` only ever produces a
+    /// `dst_rect` together with a `dst_color` (`Fit::Letterbox`), so a
+    /// partial convert always clears first, `Fit::Stretch` covers the whole
+    /// destination, and `draw_decoded_masks`/`draw_proto_masks` guarantee
+    /// they fully write `dst`. The seed is fixed anyway -- an upload should
+    /// describe the buffer it reads -- and this test is what keeps the
+    /// destination pitch honest end to end.
+    ///
+    /// There is no destination-side counter in `ConvertStats`, so the route
+    /// is pinned from the source side plus a structural fact: the source
+    /// feed is asserted to be the PBO arm, and `lower_dst` maps a `Pbo`
+    /// destination to `TexturePbo` unconditionally (pinned by
+    /// `lower_dst_full_table`), so once the engine ran the destination went
+    /// through the PBO readback.
+    ///
+    /// The padded destination is built the way a pool really produces one:
+    /// allocate at the wider width, then `configure_image` down and declare
+    /// the pitch the allocation still has. Nothing here lies to
+    /// `set_row_stride` -- 240 rows at 1280 B fit the 307200 B the 320-wide
+    /// allocation holds. `create_pbo_image` itself never pads: every width
+    /// comes back tight, so a pool is the only way a padded one arises.
+    ///
+    /// Route, allocation and fallback: see the block comment above.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn a_padded_pbo_destination_is_written_at_its_own_pitch() {
+        const W_ALLOC: usize = 320;
+        const W: usize = 256;
+        const H: usize = 240;
+        const PITCH: usize = W_ALLOC * 4;
+
+        let Some(mut gl) = pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let src = rgba8_pbo(&gl, W, H);
+        stamp_rgba8_positionally(&src, W, H);
+
+        let mut dst = rgba8_pbo(&gl, W_ALLOC, H);
+        dst.configure_image(W, H, PixelFormat::Rgba)
+            .expect("narrow a pool tensor to the image it will hold");
+        dst.set_row_stride(PITCH)
+            .expect("declare the pitch the allocation still has");
+        assert_eq!(
+            dst.effective_row_stride(),
+            Some(PITCH),
+            "precondition: the destination's rows are {PITCH} B apart, not its \
+             own {} B",
+            W * 4
+        );
+
+        let before = gl.convert_stats().expect("convert stats before");
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("GL declined a pitch-aligned PBO destination");
+        assert_pbo_source_route(&gl, &before, "padded PBO destination");
+
+        // Read from the live mapping, inside the guard. Only the visible
+        // bytes of each row are checked: a driver may write the padding
+        // between rows while packing (Vivante does, issue #167).
+        let m = dst
+            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+            .expect("map the destination");
+        let out = m.as_slice();
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * PITCH + x * 4;
+                assert_eq!(
+                    (out[i], out[i + 1]),
+                    ((x % 256) as u8, (y % 256) as u8),
+                    "dst pixel ({x}, {y}) at pitch {PITCH}; reading the rows back \
+                     to back would put source row {} here",
+                    y * PITCH / (W * 4)
+                );
+            }
+        }
+    }
+
+    /// Issue #177: a `view()` destination lowered to the **mapped-texture
+    /// readback** must receive exactly the pixels a whole destination of the
+    /// same size receives on the same path, at the parent's pitch, with
+    /// nothing outside the view touched.
+    ///
+    /// The mapped path renders into an offscreen texture that IS the tile —
+    /// its origin is (0, 0), not the view's origin in the parent — so the
+    /// band `glViewport`/`glScissor` that places a tile inside a shared
+    /// zero-copy parent import must NOT be applied here. The placement
+    /// happens afterwards, in the readback, which writes through the view's
+    /// own `map()` at the parent's pitch.
+    ///
+    /// The path is reached the way production reaches it: the destination
+    /// import FAILS and the convert lowers instead of ending. The hook
+    /// (`set_fail_dst_import`) injects that failure at the import itself,
+    /// because a driver that accepts every destination never produces one —
+    /// a fresh `view()` collapses its import base to 0, so `dst_import_places`
+    /// sees an aligned base and keeps the zero-copy route. The route is
+    /// asserted with `dst_import_fallbacks`, so the test cannot pass by
+    /// quietly taking the zero-copy import it means to avoid.
+    ///
+    /// The oracle is the SAME convert into a whole destination on the SAME
+    /// mapped path, so a difference isolates the view-ness of the
+    /// destination rather than the readback path itself.
+    #[test]
+    fn mapped_texture_readback_places_a_view_destination() {
+        const PARENT_W: usize = 512;
+        const PARENT_H: usize = 320;
+        const VIEW_W: usize = 320;
+        const VIEW_H: usize = 240;
+        const BPP: usize = 4;
+        const POISON: u8 = 0xAB;
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ANGLE dlopen gate closed (coverage pass 1)",
+                function!()
+            ));
+            return;
+        }
+        let dma_rgba = |w: usize, h: usize| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+        };
+
+        // Distinct per-row and per-column values so a tile that lands at the
+        // wrong origin, or a row that lands at the wrong pitch, cannot
+        // coincidentally match.
+        let src = TensorDyn::image(
+            VIEW_W,
+            VIEW_H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("source");
+        {
+            let stride = src.effective_row_stride().expect("source stride");
+            let mut m = src
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map source");
+            let b = m.as_mut_slice();
+            for y in 0..VIEW_H {
+                for x in 0..VIEW_W {
+                    let i = y * stride + x * BPP;
+                    b[i] = ((y * 3) % 256) as u8;
+                    b[i + 1] = ((x * 5) % 256) as u8;
+                    b[i + 2] = 255;
+                    b[i + 3] = 255;
+                }
+            }
+        }
+
+        // A DIFFERENT image, converted into a whole destination immediately
+        // before each subject: the mapped path renders into a REUSED offscreen
+        // texture, so any tile pixel the subject fails to redraw shows this
+        // decoy instead of silently matching the oracle that ran before it.
+        let decoy = TensorDyn::image(
+            VIEW_W,
+            VIEW_H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("decoy source");
+        {
+            let mut m = decoy
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map decoy");
+            for px in m.as_mut_slice().as_chunks_mut::<BPP>().0 {
+                px.copy_from_slice(&[7, 11, 13, 255]);
+            }
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
+
+        // CALIBRATION, with the hook OFF: a whole zero-copy destination says
+        // whether this host imports destinations at all. A host that imports
+        // none cannot run the subject either -- the engine declines a `view()`
+        // destination outright unless the transfer backend is zero-copy -- so
+        // it skips, which is what a desktop whose EGL cannot import a DMA-BUF
+        // does. Same self-calibration as
+        // `a_fresh_unaligned_view_destination_keeps_the_zero_copy_import`.
+        let imports = |g: &GLProcessorThreaded| {
+            let c = g.egl_cache_stats().expect("cache stats").dst;
+            c.misses + c.hits
+        };
+        let mut oracle = match dma_rgba(VIEW_W, VIEW_H) {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
+            other => {
+                let what = match &other {
+                    Ok(t) => format!("fell back to {:?}", t.memory()),
+                    Err(e) => format!("failed: {e}"),
+                };
+                crate::test_support::report_skip(&format!(
+                    "{} - no zero-copy RGBA image here ({what})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let before = imports(&gl);
+        gl.convert(
+            &src,
+            &mut oracle,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .expect("calibration convert into a whole zero-copy destination");
+        if imports(&gl) - before == 0 {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy destination import on this host, so a view() \
+                 destination is declined by the engine and the mapped path cannot \
+                 be reached for one",
+                function!()
+            ));
+            return;
+        }
+
+        gl.set_fail_dst_import(true)
+            .expect("make the destination import fail");
+        let fallbacks = |g: &GLProcessorThreaded| {
+            g.convert_stats()
+                .expect("convert stats")
+                .dst_import_fallbacks
+        };
+
+        // The letterbox case carries the `glClear` the band scissor used to
+        // confine, so the two crops together cover both halves of the render.
+        let mut failures = Vec::new();
+        for (label, crop) in [
+            ("stretch", Crop::default()),
+            (
+                "letterbox",
+                Crop::letterbox([114, 114, 114, 255]).with_source(Some(
+                    edgefirst_tensor::Region::new(0, 0, VIEW_W, VIEW_H / 2),
+                )),
+            ),
+        ] {
+            // ORACLE: the same convert into the same WHOLE destination, on the same
+            // mapped-texture path. Comparing the view against this isolates the
+            // view-ness of the destination from the readback path itself.
+            gl.convert(&src, &mut oracle, Rotation::None, Flip::None, crop)
+                .expect("oracle convert into a whole destination on the mapped path");
+            let oracle_stride = oracle.effective_row_stride().expect("oracle stride");
+            let oracle_bytes = oracle
+                .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                .expect("map oracle")
+                .as_slice()
+                .to_vec();
+
+            for (x0, y0) in [(0usize, 0usize), (8, 8), (64, 32)] {
+                let parent = dma_rgba(PARENT_W, PARENT_H).expect("parent");
+                assert_eq!(
+                    parent.memory(),
+                    TensorMemory::DmaBuf,
+                    "the parent must be the zero-copy backing under test"
+                );
+                let pitch = parent.effective_row_stride().expect("parent pitch");
+                {
+                    let mut m = parent
+                        .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                        .expect("map parent");
+                    m.as_mut_slice().fill(POISON);
+                }
+                let mut scratch = dma_rgba(VIEW_W, VIEW_H).expect("decoy destination");
+                gl.convert(
+                    &decoy,
+                    &mut scratch,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                )
+                .expect("decoy convert");
+                let before = fallbacks(&gl);
+                {
+                    let mut view = parent
+                        .view(edgefirst_tensor::Region::new(x0, y0, VIEW_W, VIEW_H))
+                        .expect("destination view");
+                    if let Err(e) = gl.convert(&src, &mut view, Rotation::None, Flip::None, crop) {
+                        failures.push(format!("{label} ({x0},{y0}): GL declined the view: {e}"));
+                        continue;
+                    }
+                }
+                // The route, not just the pixels: without this the test would
+                // still pass if the convert quietly took the zero-copy import
+                // it exists to bypass.
+                let took = fallbacks(&gl) - before;
+                if took != 1 {
+                    failures.push(format!(
+                        "{label} ({x0},{y0}): expected exactly one destination-import \
+                         fallback for this convert, saw {took}"
+                    ));
+                }
+
+                let out = parent
+                    .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                    .expect("map parent")
+                    .as_slice()
+                    .to_vec();
+                let mut wrong = 0usize;
+                let mut first: Option<(usize, usize, Vec<u8>, Vec<u8>)> = None;
+                // Bounding box of the wrong pixels, and whether every one of them
+                // lies in the band a view-origin `glScissor` on an origin-(0,0)
+                // render target would have clipped away.
+                let (mut lx, mut ly, mut hx, mut hy) = (usize::MAX, usize::MAX, 0usize, 0usize);
+                let mut all_in_scissor_band = true;
+                for y in 0..VIEW_H {
+                    for x in 0..VIEW_W {
+                        let got = &out[(y0 + y) * pitch + (x0 + x) * BPP..][..BPP];
+                        let want = &oracle_bytes[y * oracle_stride + x * BPP..][..BPP];
+                        if got != want {
+                            wrong += 1;
+                            first.get_or_insert((x, y, got.to_vec(), want.to_vec()));
+                            lx = lx.min(x);
+                            ly = ly.min(y);
+                            hx = hx.max(x);
+                            hy = hy.max(y);
+                            all_in_scissor_band &= x < x0 || y < y0;
+                        }
+                    }
+                }
+                if let Some((x, y, got, want)) = first {
+                    failures.push(format!(
+                    "{label} ({x0},{y0}) pitch {pitch}: {wrong}/{} tile pixels differ from the \
+                     whole-destination oracle; first at tile ({x},{y}) got={got:?} \
+                     want={want:?}; wrong-pixel bbox x[{lx}..={hx}] y[{ly}..={hy}]; \
+                     every wrong pixel inside the x<{x0}||y<{y0} band: {all_in_scissor_band}",
+                    VIEW_W * VIEW_H,
+                ));
+                }
+                // Nothing outside the view region moved.
+                let mut outside = 0usize;
+                let mut first_outside = None;
+                for y in 0..PARENT_H {
+                    for x in 0..PARENT_W {
+                        if y >= y0 && y < y0 + VIEW_H && x >= x0 && x < x0 + VIEW_W {
+                            continue;
+                        }
+                        let i = y * pitch + x * BPP;
+                        if out[i..i + BPP] != [POISON; BPP] {
+                            outside += 1;
+                            first_outside.get_or_insert((x, y, out[i..i + BPP].to_vec()));
+                        }
+                    }
+                }
+                if let Some((x, y, got)) = first_outside {
+                    failures.push(format!(
+                        "{label} ({x0},{y0}): {outside} parent pixels OUTSIDE the view were \
+                     overwritten; first at ({x},{y}) = {got:?}"
+                    ));
+                }
+            }
+        }
+
+        // A packed-RGB (or planar) view destination has no placement on EITHER
+        // route: the zero-copy band is a `glViewport` in destination pixels
+        // that the `W*3/4` packed surface does not have, and this readback
+        // writes `dst_w`-wide rows at the parent's pitch. So it must be refused
+        // however the destination import went. The hook makes the packed-RGB
+        // plan's import fail, which is the case that used to slip through --
+        // the refusal was keyed on the lowering, and a refused import re-plans
+        // onto the mapped route, flipping the very term the guard read.
+        // Asserted with the counter too: the refusal must come BEFORE the
+        // engine spends an import on a destination it is going to decline.
+        #[cfg(target_os = "linux")]
+        if let Ok(rgb_parent) = TensorDyn::image(
+            PARENT_W,
+            PARENT_H,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            if rgb_parent.memory() == TensorMemory::DmaBuf {
+                let rgb_src = TensorDyn::image(
+                    VIEW_W,
+                    VIEW_H,
+                    PixelFormat::Rgb,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .expect("packed-RGB source");
+                let mut view = rgb_parent
+                    .view(edgefirst_tensor::Region::new(8, 8, VIEW_W, VIEW_H))
+                    .expect("packed-RGB destination view");
+                let before = fallbacks(&gl);
+                let outcome = gl.convert(
+                    &rgb_src,
+                    &mut view,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                );
+                match outcome {
+                    Err(crate::Error::NotSupported(_)) => {}
+                    other => failures.push(format!(
+                        "a packed-RGB view() destination must be declined on every \
+                         destination route, got {other:?}"
+                    )),
+                }
+                let spent = fallbacks(&gl) - before;
+                if spent != 0 {
+                    failures.push(format!(
+                        "a packed-RGB view() destination was declined only after \
+                         spending {spent} destination import(s) on it"
+                    ));
+                }
+            }
+        }
+        // A WHOLE packed-RGB destination whose import is refused re-plans onto
+        // the mapped route, and must spend exactly ONE destination import
+        // doing so. The re-plan happens in `convert_via_engine`, before pass 1
+        // renders; `bind_dst` then has to BIND what was re-planned. Re-deriving
+        // the lowering there instead answers "zero-copy" (the import failed,
+        // the placement is fine), binds a zero-copy destination under a plan
+        // chosen for a texture one, and self-corrects only because the second
+        // import fails too -- at the cost of a wasted import, a second tick
+        // here, and an engine span whose `lowering` field says the opposite of
+        // what happened.
+        #[cfg(target_os = "linux")]
+        if let Ok(mut rgb_dst) = TensorDyn::image(
+            VIEW_W,
+            VIEW_H,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            if rgb_dst.memory() == TensorMemory::DmaBuf {
+                let rgb_src = TensorDyn::image(
+                    VIEW_W,
+                    VIEW_H,
+                    PixelFormat::Rgb,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .expect("packed-RGB source");
+                {
+                    let mut m = rgb_src
+                        .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                        .expect("map packed-RGB source");
+                    m.as_mut_slice().fill(0x5A);
+                }
+                let before = fallbacks(&gl);
+                match gl.convert(
+                    &rgb_src,
+                    &mut rgb_dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                ) {
+                    Ok(()) => {
+                        let spent = fallbacks(&gl) - before;
+                        if spent != 1 {
+                            failures.push(format!(
+                                "a refused packed-RGB destination import must re-plan \
+                                 after exactly one attempt, spent {spent}"
+                            ));
+                        }
+                        let out = rgb_dst
+                            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                            .expect("map packed-RGB destination")
+                            .as_slice()
+                            .to_vec();
+                        if out.iter().all(|&b| b == 0) {
+                            failures.push(
+                                "the re-planned packed-RGB convert wrote nothing".to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => failures.push(format!(
+                        "a refused packed-RGB destination import must re-plan onto the \
+                         mapped route, not end the convert: {e}"
+                    )),
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A refused destination import must re-plan, not just re-bind.
+    ///
+    /// A non-NV source into a `PlanarRgb` destination is planned `SinglePass`
+    /// against the zero-copy lowering. When the import is then refused,
+    /// `bind_dst` falls back to the mapped-texture readback -- but the plan was
+    /// chosen for a lowering that no longer holds, and the single-pass planar
+    /// shader (`convert_to_planar`) imports its source UNCONDITIONALLY. A heap
+    /// source therefore failed there and the whole convert fell out to the CPU
+    /// backend, throwing away the fallback that had just been set up for it.
+    /// `plan_convert` calls that pair impossible; the engine has to re-plan
+    /// against what `bind_dst` actually bound.
+    ///
+    /// Both triggers are exercised: the hook, which reaches the case on any
+    /// host with a zero-copy destination import, and a real driver refusal at
+    /// an unaligned plane offset, which is what Vivante does on i.MX 8M Plus.
+    #[test]
+    fn a_refused_planar_destination_import_replans_onto_the_mapped_route() {
+        const W: usize = 320;
+        const H: usize = 240;
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("host source");
+        {
+            let mut m = src
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map source");
+            for (i, px) in m
+                .as_mut_slice()
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                px.copy_from_slice(&[(i % 251) as u8, (i % 199) as u8, (i % 157) as u8, 255]);
+            }
+        }
+
+        // The oracle: the same convert on the CPU backend.
+        let mut reference = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("reference destination");
+        crate::CPUProcessor::new()
+            .convert(
+                &src,
+                &mut reference,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .expect("CPU reference convert");
+        let want = reference
+            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+            .expect("map reference")
+            .as_slice()
+            .to_vec();
+
+        let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
+        let planar_dma = || {
+            TensorDyn::image(
+                W,
+                H,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .ok()
+            .filter(|t| t.memory() == TensorMemory::DmaBuf)
+        };
+        let Some(mut dst) = planar_dma() else {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy PlanarRgb destination here",
+                function!()
+            ));
+            return;
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+        let measure = |gl: &mut GLProcessorThreaded,
+                       label: &str,
+                       dst: &mut TensorDyn,
+                       failures: &mut Vec<String>|
+         -> u64 {
+            let before = gl
+                .convert_stats()
+                .expect("convert stats")
+                .dst_import_fallbacks;
+            let outcome = gl.convert(&src, dst, Rotation::None, Flip::None, Crop::default());
+            let spent = gl
+                .convert_stats()
+                .expect("convert stats")
+                .dst_import_fallbacks
+                - before;
+            match outcome {
+                Ok(()) if spent > 0 => {
+                    if spent != 1 {
+                        failures.push(format!(
+                            "{label}: expected exactly one destination-import fallback, \
+                             saw {spent}"
+                        ));
+                    }
+                    let got = dst
+                        .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                        .expect("map destination")
+                        .as_slice()
+                        .to_vec();
+                    if got.len() != want.len() || got != want {
+                        let first = got
+                            .iter()
+                            .zip(want.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(0);
+                        failures.push(format!(
+                            "{label}: the re-planned convert does not match the CPU \
+                             reference; first differing byte {first} got={} want={}",
+                            got[first], want[first]
+                        ));
+                    }
+                }
+                Ok(()) => {}
+                Err(e) => failures.push(format!(
+                    "{label}: a refused planar destination import must complete through the \
+                     mapped-texture route, not end the convert ({spent} fallback(s) spent): {e}"
+                )),
+            }
+            spent
+        };
+
+        // TRIGGER 1 -- the hook, so the case is reachable on any host whose
+        // driver accepts every destination.
+        gl.set_fail_dst_import(true).expect("arm the hook");
+        let hooked = measure(&mut gl, "hooked refusal", &mut dst, &mut failures);
+        gl.set_fail_dst_import(false).expect("disarm the hook");
+        if hooked == 0 {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy destination import is attempted on this host",
+                function!()
+            ));
+            return;
+        }
+
+        // TRIGGER 2 -- a real driver refusal: a plane offset that is not
+        // 64-byte aligned, which Vivante answers with `EGL_BAD_ACCESS`. Where
+        // the driver accepts it there is no refusal and nothing to assert, so
+        // the arm reports what it saw and stays silent.
+        if let Some(mut offset_dst) = planar_dma() {
+            offset_dst.set_plane_offset(32);
+            let real = measure(
+                &mut gl,
+                "driver refusal at offset 32",
+                &mut offset_dst,
+                &mut failures,
+            );
+            if real == 0 {
+                // Mali and V3D import an unaligned destination happily, so
+                // there is no refusal here and this arm asserted nothing. Said
+                // out loud, because a silent no-op arm is how a lane stops
+                // covering the production trigger without anyone noticing.
+                crate::test_support::report_skip(&format!(
+                    "{} - this driver accepts an unaligned PlanarRgb destination, so the \
+                     real-refusal arm had nothing to measure (the hooked arm still ran)",
+                    function!()
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

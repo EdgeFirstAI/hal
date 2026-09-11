@@ -175,9 +175,16 @@ fn restore_descriptor_metadata(
 /// producer that called `set_logical_shape` was carrying the *addressing*
 /// shape instead (`[h, w]` for a semi-planar image rather than
 /// `[combined_h, w]`), and the descriptor faithfully reported it; without
-/// this the consumer would see a shape its producer did not have. The
-/// import arm has already checked `shape` is one of those two spellings of
-/// the geometry the texture itself reports, so nothing untrusted reaches
+/// this the consumer would see a shape its producer did not have. The same
+/// narrowing rebuilds a `view()`: its descriptor carries the window's shape,
+/// the import opens the whole texture, and this cuts it down to the window
+/// (`Tensor::set_logical_shape` keeps the texture's pitch as the row stride
+/// while it does, or `view()`'s tight stride for a single-row window, so
+/// the window maps in the texture's last row). Where the window sits is the
+/// plane offset, which the
+/// descriptor cannot carry and the capsule restores afterwards. The import
+/// arm has already checked `shape` is one of those three spellings of the
+/// geometry the texture itself reports, so nothing untrusted reaches
 /// `set_logical_shape` here.
 ///
 /// After the format restore, not before: `set_format` validates the shape it
@@ -231,11 +238,35 @@ fn restore_d3d11_logical_shape(
 /// tighter one instead -- silent misalignment for any GPU
 /// consumer reading at the true (wider) physical pitch.
 ///
-/// `IOSURFACE` is not included: nothing has reported this gap for
-/// it, and unlike `DMABUF` its CPU-mapping was never restricted by
-/// `is_imported` in the first place, so there is no known-broken
-/// case pulling it in yet. The same argument would apply if one
-/// surfaces.
+/// `IOSURFACE` is included for the same reason `DMABUF` is, and with the
+/// same bound. An IOSurface's `bytesPerRow` is a property of the surface
+/// itself -- the same in every process that maps it -- so the producer's
+/// stride is the consumer's, and `IoSurfaceTensor::capacity_bytes` is the
+/// whole surface, so the `stride * rows <= capacity` check below bounds
+/// it the same way. Without it a view of a pitched surface, reopened at
+/// the window's shape, was read at the window's tight row over rows the
+/// surface stores a pitch apart (issue #161; pinned by
+/// `descriptor_import_restores_the_iosurface_pitch_onto_a_view`).
+///
+/// `D3D11_TEXTURE` is deliberately excluded: a texture import has a pitch
+/// of its own -- `from_d3d11_shared_handle` records the one this device's
+/// staging copy reports -- and the producer's is a fact about the
+/// producer's driver, not about the texture as this process sees it.
+/// `PBO` is included for the same reason `DMABUF` and `IOSURFACE` are, and
+/// with the same bound. A GL buffer has no pitch of its own -- it is bytes
+/// -- so the producer's stride is the only description of how its rows are
+/// spaced, and `PboTensor::capacity_bytes` is the whole GL allocation, so
+/// the `stride * rows <= capacity` check below bounds it the same way.
+/// Without it a `view()` of a PBO, whose recorded stride is the PARENT's
+/// pitch, was rebuilt at the window's own tight row and every row after the
+/// first read the wrong columns -- the shear half of issue #162, which the
+/// storage-kind half (a view demoting to a host placeholder) hid until
+/// Stage B fixed it. Excluded before Stage B for a reason that was true
+/// then: `import_descriptor` had no `kind::PBO` arm at all, so no PBO
+/// descriptor ever reached this function.
+///
+/// `CUDA_DEVICE` is excluded because that import does not reconstruct a
+/// strided image today.
 fn restore_imported_row_stride(
     t: &mut TensorDyn,
     desc: &TensorDesc,
@@ -244,7 +275,10 @@ fn restore_imported_row_stride(
 ) {
     if !matches!(
         desc.kind,
-        crate::protocol::kind::HOST | crate::protocol::kind::DMABUF
+        crate::protocol::kind::HOST
+            | crate::protocol::kind::DMABUF
+            | crate::protocol::kind::IOSURFACE
+            | crate::protocol::kind::PBO
     ) {
         return;
     }

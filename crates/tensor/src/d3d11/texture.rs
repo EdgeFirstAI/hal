@@ -1025,6 +1025,7 @@ where
     /// `sync_for_device` move bytes between it and the texture.
     pub(crate) fn host_pin<'a>(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'a>> {
         self.require_access(self.access)?;
+        self.check_view_offset()?;
         if access.writes() {
             // A pin outlives every guard, so there is no drop to notice the
             // write at: `sync_for_device` reads this to decide that the host
@@ -1032,8 +1033,8 @@ where
             self.wrote_host.store(true, Ordering::Release);
         }
         let (base, len) = self.host_buffer().span();
-        // SAFETY: `view` bounds-checks `view_offset` against `backing_bytes()`,
-        // which is the length this buffer was allocated at.
+        // SAFETY: `check_view_offset` above bounds `view_offset` by
+        // `backing_bytes()`, which is the length this buffer was allocated at.
         let at = unsafe { base.add(self.view_offset) };
         // The cell, not the buffer: holding it is what keeps the address live.
         let keepalive: Arc<dyn Send + Sync> = self.host.clone();
@@ -1053,11 +1054,74 @@ where
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'a>> {
         self.require_access(access)?;
+        self.check_view_offset()?;
         self.refuse_partial_write(access)?;
         match self.staging.as_ref() {
             Some(st) => self.staging_pin(st, access, non_blocking),
             None => self.buffer_pin(access),
         }
+    }
+
+    /// Bytes this tensor's image occupies from the start of its window.
+    ///
+    /// Every row but the last at the backing's pitch, plus the last row's own
+    /// bytes. The final row is followed by no padding, which is what lets a
+    /// view in the texture's last row fit its backing exactly --
+    /// [`pitched_extent`](Self::pitched_extent) counts a full pitch for that
+    /// row too, so bounding an offset by it would refuse
+    /// `one_row_d3d11_view_descriptor_maps_the_producers_texels`.
+    fn addressable_span(&self) -> usize {
+        let tight_row = self.image_row_bytes();
+        if tight_row == 0 {
+            return 0;
+        }
+        let tight = self.shape.iter().product::<usize>() * self.dtype.size();
+        let rows = tight.div_ceil(tight_row);
+        if rows == 0 {
+            return 0;
+        }
+        let last_row = tight - (rows - 1) * tight_row;
+        (rows - 1) * self.backing_pitch() + last_row
+    }
+
+    /// Refuses a window that cannot hold this tensor's own image.
+    ///
+    /// `view` computes `view_offset` under a bounds check, but
+    /// `set_view_offset` takes whatever `Tensor::set_plane_offset` was handed
+    /// -- a descriptor's restored offset, untrusted cross-package input -- so
+    /// every pin re-checks before it offsets a base pointer by it.
+    ///
+    /// Bounding only the *start* is not enough. A pin's length is the backing
+    /// less the offset, so an offset near the end yields a map shorter than
+    /// the image while the tensor still reports its full width and height; a
+    /// consumer reading `width x height` through the pointer then runs past
+    /// the allocation, which the GL upload path did. An offset equal to the
+    /// backing is the extreme case: a legal one-past-the-end pointer and an
+    /// empty window for a non-empty tensor. Both are refused here, and
+    /// `checked_add` keeps a hostile offset from wrapping into range.
+    fn check_view_offset(&self) -> Result<()> {
+        let capacity = self.backing_bytes();
+        let end = self.view_offset.checked_add(self.addressable_span());
+        match end {
+            Some(end) if end <= capacity => Ok(()),
+            _ => Err(Error::InsufficientCapacity {
+                needed: end.unwrap_or(usize::MAX),
+                capacity,
+            }),
+        }
+    }
+
+    /// Moves this tensor's window to `offset` bytes from the backing's
+    /// origin, in the pitched space `view` measures in.
+    ///
+    /// The write-back half of `Tensor::set_plane_offset` (and the clear half
+    /// of `set_format`/`reshape`): a tensor rebuilt from a descriptor is
+    /// opened at the texture's origin, and this is how the sub-region it
+    /// described is put back. Unchecked here so the setter stays infallible;
+    /// `check_view_offset` refuses an offset past the backing when a pin is
+    /// taken.
+    pub(crate) fn set_view_offset(&mut self, offset: usize) {
+        self.view_offset = offset;
     }
 
     /// Refuses a write-only window that covers less than the whole backing.
@@ -1208,8 +1272,8 @@ where
         len: usize,
         guard: G,
     ) -> crate::pin::HostPin<'a> {
-        // SAFETY: `view` bounds-checks `view_offset` against `backing_bytes()`,
-        // which is the length of both backings.
+        // SAFETY: `pin_impl` ran `check_view_offset`, which bounds
+        // `view_offset` by `backing_bytes()`, the length of both backings.
         let at = unsafe { base.add(self.view_offset) };
         crate::pin::HostPin::new(Arc::new(guard), at, len.saturating_sub(self.view_offset))
     }

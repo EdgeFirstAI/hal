@@ -39,14 +39,41 @@ impl Texture {
         }
     }
 
+    /// Upload `data` as this texture's contents.
+    ///
+    /// `required` is how many bytes GL will read: `(height - 1)` row strides
+    /// plus the last row's own pixels, where the stride is whatever
+    /// `UNPACK_ROW_LENGTH` the caller has set (`UNPACK_ALIGNMENT` is 1 from
+    /// `new`, so rows carry no extra padding). GL reads through a raw
+    /// pointer and cannot see the slice's length, so a `data` shorter than
+    /// that would have the driver read past the mapping -- which is not a
+    /// hypothetical: a tensor's map is clamped to what its window actually
+    /// covers (`HostView::len_elems`), so a plane offset restored from an
+    /// untrusted descriptor shortens the map while width and height stay
+    /// whole. Refusing here turns that into a fallback to the CPU converter
+    /// instead of an out-of-bounds read. See
+    /// `crates/tensor/src/d3d11/texture.rs::check_view_offset` and
+    /// `IoSurfaceTensor::check_view_offset`, which refuse the same window at
+    /// the source; this is the check that does not depend on which backing
+    /// produced the map.
     pub(super) fn update_texture(
         &mut self,
         target: edgefirst_gl::gl::types::GLenum,
         width: usize,
         height: usize,
         format: edgefirst_gl::gl::types::GLenum,
+        required: usize,
         data: &[u8],
-    ) {
+    ) -> crate::Result<()> {
+        if data.len() < required {
+            return Err(crate::Error::NotSupported(format!(
+                "GL upload: {width}x{height} texture needs {required} B but the \
+                 source maps only {} B -- a window that does not cover its own \
+                 image (a restored plane offset past the buffer?); converting \
+                 on the CPU instead",
+                data.len()
+            )));
+        }
         if target != self.target
             || width != self.width
             || height != self.height
@@ -86,6 +113,7 @@ impl Texture {
                 );
             }
         }
+        Ok(())
     }
 
     /// Attach a platform import to this GL_TEXTURE_2D texture if the key

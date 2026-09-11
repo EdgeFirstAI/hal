@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         // Default coefficients live in rows 0–3 / cols 0–3: exercises both
@@ -705,7 +705,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_row0_only() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut coeffs = [0i16; 64];
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_left_dc_right_ac() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut coeffs = [0i16; 64];
@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_right_half_coeffs() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut coeffs = make_test_coeffs();
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_bottom_row_coeffs() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut coeffs = make_test_coeffs();
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_dense() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut coeffs = make_test_coeffs();
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_with_quant() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut quant = [0u16; 64];
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_zero_block() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         assert_parity(&[0i16; 64], &UNIT_QUANT, "zero-block");
@@ -811,7 +811,7 @@ mod tests {
     #[test]
     fn idct_8x8_parity_strided() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
 
@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn idct_8x8_k_tiers_match_scalar() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
         let mut quant = [0u16; 64];
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn idct_dc_only_parity() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
+            crate::test_support::report_skip("SIMD feature not available");
             return;
         }
 

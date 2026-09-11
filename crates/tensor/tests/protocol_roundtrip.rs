@@ -318,7 +318,7 @@ fn dmabuf_import_has_no_coverage_off_linux() {
     use std::io::Write;
     let _ = writeln!(
         std::io::stderr(),
-        "SKIP: TensorDyn::import_descriptor's kind::DMABUF arm is untested on \
+        "SKIPPED: TensorDyn::import_descriptor's kind::DMABUF arm is untested on \
          this platform (dma-buf is Linux-only). No aliasing coverage for the \
          dma-buf import path outside a Linux run."
     );
@@ -350,7 +350,7 @@ fn dmabuf_roundtrip_sees_the_same_bytes() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: dmabuf_roundtrip_sees_the_same_bytes -- this platform has no \
+                "SKIPPED: dmabuf_roundtrip_sees_the_same_bytes -- this platform has no \
                  DMA-BUF heap (Tensor::image(.., TensorMemory::DmaBuf, ..) returned \
                  NotFound); dma-buf allocation is unavailable here, not broken."
             );
@@ -406,7 +406,7 @@ fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable -- \
+                "SKIPPED: imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable -- \
                  this platform has no DMA-BUF heap; dma-buf allocation is unavailable \
                  here, not broken."
             );
@@ -469,7 +469,7 @@ fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse -- \
+                "SKIPPED: dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse -- \
                  this platform has no DMA-BUF heap; dma-buf allocation is unavailable \
                  here, not broken."
             );
@@ -523,21 +523,22 @@ fn iosurface_roundtrip_sees_the_same_bytes() {
 
     let imported = TensorDyn::import_descriptor(&desc).unwrap();
     assert_eq!(imported.shape(), dyn_t.shape());
-    // The row-stride restoration `import_descriptor` applies for pool-reuse
-    // (`host_import_preserves_the_producers_row_stride_for_pool_reuse`) is
-    // scoped to `kind::HOST` -- applying it to a `Dma`-kind import broke
-    // Linux DMA-BUF's CPU mapping (an imported, non-self-allocated DMA-BUF
-    // is CPU-mappable only while `row_stride` stays `None`; see
-    // `tensor_dyn.rs`'s comment at the `HOST`-only gate). That regression
-    // has no macOS-native coverage since IOSurface tolerates a strided
-    // import either way -- this assertion is the closest a macOS run gets
-    // to guarding the same invariant the Linux-only
-    // `dmabuf_roundtrip_sees_the_same_bytes` test caught it with.
+    // `restore_imported_row_stride` lists the kinds whose pitch is a
+    // property of the shared buffer itself, and since issue #161 an
+    // IOSurface is one of them. This used to assert the opposite, guarding
+    // a Linux DMA-BUF CPU-map restriction that has since been lifted at the
+    // map site (`imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable`
+    // pins that). The stride must now survive the round trip, and the map
+    // below must still alias with it recorded. At 64 RGB texels the pitch
+    // equals the tight row, so this only proves the restore ran; the
+    // padded-pitch case is
+    // `descriptor_import_restores_the_iosurface_pitch_onto_a_view` in the
+    // `iosurface` module.
     assert_eq!(
         imported.row_stride(),
-        None,
-        "a non-HOST (Dma) import must not have row_stride set by the HOST-only \
-         restoration path"
+        Some(desc.strides()[0] as usize),
+        "an IOSurface import must carry the producer's pitch \
+         (restore_imported_row_stride)"
     );
     let m = imported.as_u8().unwrap().map_read().unwrap();
     assert_eq!(
@@ -639,4 +640,205 @@ fn import_refuses_a_d3d11_completion_with_no_fence_handle() {
         msg.contains("fence handle"),
         "the error must name what it refused, got: {msg}"
     );
+}
+
+// --- A PBO's descriptor pointer, on both backends -------------------------
+
+/// Mock [`edgefirst_tensor::PboOps`] over a `Vec<u8>`, so this file can
+/// build a PBO-backed tensor with no GL context. A sibling of the one in
+/// `dynamic_primitives.rs`, reimplemented here for the same reason: an
+/// integration test can only reach the crate's public API, and this file
+/// runs on BOTH backends where that one is `dynamic`-only.
+struct MockPboOps {
+    storage: std::sync::Mutex<Vec<u8>>,
+}
+
+// SAFETY: the returned pointer addresses a `Vec<u8>` allocated once in
+// `new` and never resized, so it stays valid for as long as the
+// `MockPboOps` does -- which outlives every mapping handed out, since the
+// tensor holds an `Arc` to it.
+unsafe impl edgefirst_tensor::PboOps for MockPboOps {
+    fn map_buffer(
+        &self,
+        _buffer_id: u32,
+        size: usize,
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::PboMapping> {
+        let storage = self.storage.lock().expect("lock");
+        assert_eq!(storage.len(), size, "mock PBO size mismatch");
+        Ok(edgefirst_tensor::PboMapping {
+            ptr: storage.as_ptr() as *mut u8,
+            size,
+        })
+    }
+
+    fn unmap_buffer(&self, _buffer_id: u32) -> edgefirst_tensor::Result<()> {
+        Ok(())
+    }
+
+    fn delete_buffer(&self, _buffer_id: u32) {}
+}
+
+fn pbo_backed(buffer_id: u32, bytes: usize, shape: &[usize]) -> TensorDyn {
+    let ops = std::sync::Arc::new(MockPboOps {
+        storage: std::sync::Mutex::new(vec![0u8; bytes]),
+    }) as std::sync::Arc<dyn edgefirst_tensor::PboOps>;
+    let pbo = edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, bytes, shape, None, ops)
+        .expect("PboTensor::from_pbo");
+    Tensor::<u8>::from_pbo(pbo)
+        .expect("Tensor::from_pbo")
+        .into()
+}
+
+/// A PBO-backed tensor's descriptor carries the PBO vtable pointer in
+/// `ptr`, never a host address.
+///
+/// `TensorDesc::ptr` is filled from a pin *before* `pbo_vtable_ptr`
+/// (`protocol.rs`'s `from_parts`), a precedence that is only safe because
+/// the two are mutually exclusive: a PBO refuses `pin_host` on both
+/// backends, so no PBO descriptor can carry a pin. That makes this a real
+/// invariant rather than a restatement of the code -- swap the two arms and
+/// nothing changes today, but the day a PBO acquires a pin the consumer
+/// would open a host address as a vtable. Pinning the *value* is what
+/// catches that; pinning the ordering would not.
+///
+/// The consumer side is the reason it matters: `import_descriptor`'s
+/// `kind::PBO` arm reads `ptr` as an `EfClientState` vtable and calls
+/// through it. A host address there is a call through whatever bytes the
+/// producer's pixels happen to spell.
+#[test]
+fn a_pbo_descriptor_carries_the_vtable_pointer_not_a_host_address() {
+    let t = pbo_backed(77, 4 * 4, &[4, 4, 1]);
+    let vtable = t
+        .pbo_vtable_ptr()
+        .expect("a PBO-backed tensor has a client-state vtable");
+    assert!(!vtable.is_null(), "the vtable pointer must be real");
+
+    let d = t.descriptor();
+    assert_eq!(
+        d.kind,
+        edgefirst_tensor::tensor_kind::PBO,
+        "a PBO reports the PBO kind"
+    );
+    assert_eq!(
+        d.ptr.0 as *const std::ffi::c_void, vtable,
+        "`ptr` is the PBO vtable, which is what `import_descriptor`'s PBO arm \
+         calls through -- a host address here would be called as a vtable"
+    );
+
+    // The same descriptor, taken the way a capsule takes it: an explicit
+    // (absent) pin. `descriptor_pinned(None)` is the `access=None` form the
+    // converter uses, and it must reach the same answer.
+    let d = t.descriptor_pinned(None);
+    assert_eq!(
+        d.ptr.0 as *const std::ffi::c_void, vtable,
+        "the pinned-descriptor entry point agrees with the plain one when \
+         there is no pin to prefer"
+    );
+
+    // And the precondition the precedence rests on: a PBO has no pin to
+    // take, on either backend, so `pin` can never win the `or_else` above.
+    assert!(
+        matches!(
+            t.pin_host(CpuAccess::Read),
+            Err(edgefirst_tensor::Error::NotImplemented(_))
+        ),
+        "a PBO must refuse pin_host, or `ptr` could carry a host address"
+    );
+}
+
+/// A PBO `view()` keeps its parent's pitch across the descriptor.
+///
+/// The sibling of `host_import_preserves_the_producers_row_stride_for_pool_reuse`
+/// and its DMA-BUF twin, for the kind that was left out of
+/// `restore_imported_row_stride`'s allowlist. A sub-view's recorded stride
+/// is the PARENT's pitch -- that is how its rows are spaced -- so a rebuild
+/// that recomputed a tight pitch from the window's own width put every row
+/// after the first on the wrong columns. Silent: the shape, the dtype, the
+/// buffer id and the offset all survive, and only the pixels are wrong.
+///
+/// A GL buffer has no pitch of its own to fall back on (it is bytes), so
+/// unlike a D3D11 texture the producer's stride is the only description
+/// there is. The exclusion was correct before Stage B for a reason that
+/// stopped being true: `import_descriptor` had no `kind::PBO` arm at all,
+/// so no PBO descriptor ever reached that function.
+///
+/// The narrow window is load-bearing: a full-width band's tight pitch and
+/// its parent's pitch are the same number, so it passes either way.
+#[test]
+fn pbo_import_preserves_a_views_parent_pitch() {
+    const W: usize = 64;
+    const H: usize = 64;
+    const SIDE: usize = 16;
+    const X0: usize = 8;
+    const Y0: usize = 8;
+
+    let mut parent = pbo_backed(88, W * H * 3, &[H, W, 3]);
+    parent
+        .set_format(PixelFormat::Rgb)
+        .expect("a packed RGB image");
+    let parent_pitch = parent
+        .effective_row_stride()
+        .expect("a formatted image reports a pitch");
+    assert_eq!(parent_pitch, W * 3, "precondition: the parent is tight");
+
+    let view = parent
+        .view(edgefirst_tensor::Region::new(X0, Y0, SIDE, SIDE))
+        .expect("view a narrow window");
+    assert_eq!(
+        view.row_stride(),
+        Some(parent_pitch),
+        "precondition: a multi-row view records the parent's pitch, not its own \
+         tight row"
+    );
+
+    let imported = TensorDyn::import_descriptor(&view.descriptor())
+        .expect("a PBO descriptor imports through its client-state vtable");
+    assert_eq!(
+        imported.effective_row_stride(),
+        Some(parent_pitch),
+        "the rebuilt view must step rows by the parent pitch ({parent_pitch}); \
+         {} is the window's own tight row, which shears every row after the \
+         first (issue #162)",
+        SIDE * 3
+    );
+}
+
+/// `pin_host` is refused on a PBO by BOTH backends, with the same message.
+///
+/// `glMapBufferRange`'s address is valid only until `glUnmapBuffer`, so a
+/// pin -- which promises an address that outlives the call -- has nothing
+/// to hand back. The static backend refuses in `Tensor::pin_host`'s
+/// `TensorStorage::Pbo` arm; the dynamic backend cannot forward to it,
+/// because `ef_tensor_map` is `map`, not `pin_host`, and the library cannot
+/// tell the two callers apart -- so the refusal is repeated in
+/// `dynamic_backend.rs` and both arms read the same
+/// `crate::pbo::PIN_HOST_PBO_REFUSAL`. Without the repeat, a PBO pinned on
+/// one backend and refused on the other from the identical call, which is
+/// precisely the divergence G13 cannot see.
+///
+/// This file, not `dynamic_primitives.rs`: only a test that COMPILES on
+/// both backends can make a claim about both, and this one is in
+/// `DYNAMIC_TEST_TARGETS` as well as the default static run.
+///
+/// The host half is not padding: it proves the refusal is keyed on the
+/// storage kind rather than a `pin_host` that simply never works here.
+#[test]
+fn pin_host_is_refused_by_a_pbo_on_both_backends() {
+    let host: TensorDyn = Tensor::<u8>::new(&[4, 4], Some(TensorMemory::Mem), None)
+        .expect("host allocation")
+        .into();
+    host.pin_host(CpuAccess::Read)
+        .expect("host memory has an address that outlives the call");
+
+    let pbo_t = pbo_backed(9, 16, &[4, 4, 1]);
+    match pbo_t.pin_host(CpuAccess::Read) {
+        Err(Error::NotImplemented(msg)) => assert!(
+            msg.contains("PBO"),
+            "the refusal must name the backing it applies to, got: {msg}"
+        ),
+        other => panic!(
+            "a PBO has no host address outside its own map guard, so pin_host \
+             must refuse it on this backend exactly as it does on the other, got: {other:?}"
+        ),
+    }
 }

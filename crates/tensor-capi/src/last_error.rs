@@ -92,6 +92,36 @@ pub(crate) fn set_last_error_classified(class: EfErrorClass, msg: &str) {
     LAST_CLASS.with(|c| c.set(class));
 }
 
+/// Re-class the failure just recorded, keeping its message.
+///
+/// The one legitimate exception to "every path that writes `LAST` writes
+/// `LAST_CLASS` too": an entry point that calls a **shared** helper which
+/// records an accurate message but no class, and that wants the class
+/// without discarding the helper's wording. `read_dims` is the case --
+/// `ef_tensor_wrap_pbo` classifies its refusal `InvalidArgument` while
+/// `ef_tensor_wrap_host` does not, so the class cannot move into the
+/// helper, and restating the message at the call site would lose the
+/// helper's distinction between "null dims or zero ndim" and "a dimension
+/// is out of range for this host's usize".
+///
+/// Only ever call this **immediately** after the write it re-classes, on
+/// the same thread, with nothing in between. Anywhere else it would attach
+/// a class to a message describing a different failure, which is the exact
+/// confident falsehood `LAST_CLASS` exists to prevent.
+pub(crate) fn reclass_last_error(class: EfErrorClass) {
+    LAST_CLASS.with(|c| c.set(class));
+}
+
+/// The calling thread's last recorded class, for this crate's own tests.
+///
+/// The C surface reads this through `ef_tensor_last_error_class`, which
+/// takes no handle and so cannot be pointed at another thread's slot; this
+/// is the same read without going through the entry point.
+#[cfg(test)]
+pub(crate) fn last_class() -> EfErrorClass {
+    LAST_CLASS.with(|c| c.get())
+}
+
 /// Set the calling thread's `errno`, for the entry points whose only
 /// failure channel is a `NULL` return.
 ///

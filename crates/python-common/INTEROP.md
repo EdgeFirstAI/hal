@@ -43,9 +43,107 @@ the same duck-typed pattern for the same reason.
 
 | Object | Producer method | Capsule name | Payload |
 |---|---|---|---|
-| Tensor | `__edgefirst_tensor__(access=None)` | `edgefirst_tensor_v1` | `#[repr(C)] TensorCapsulePayload` — an `TensorDesc` (shape, dtype, backing-store kind, capacity) plus an optional host pin |
-| ProtoData | `__edgefirst_protodata__()` | *(none — composed of two tensor capsules)* | `(mask_coefficients_capsule, protos_capsule, layout_str)`, each capsule an `edgefirst_tensor_v1` |
+| Tensor | `__edgefirst_tensor__(access=None)` | `edgefirst_tensor_v2` | `#[repr(C)] TensorCapsulePayload` — a `TensorDesc` (shape, dtype, backing-store kind, capacity), a `QuantDesc` (scale/zero-point arrays, borrowed), the `plane_offset`, plus an optional host pin |
+| ProtoData | `__edgefirst_protodata__()` | *(none — composed of two tensor capsules)* | `(mask_coefficients_capsule, protos_capsule, layout_str)`, each capsule an `edgefirst_tensor_v2` |
 | Decoder | `__edgefirst_decoder__()` | `edgefirst_decoder_v1` | `#[repr(C)]` payload: raw pointer + `size_of`/`align_of` layout guard |
+
+### Quantization
+
+The tensor capsule carries quantization metadata alongside the descriptor,
+in a `#[repr(C)] QuantDesc`: a length, a channel axis (`+1`, so all-zeroes
+means "none"), and pointers to the scale and zero-point arrays. The arrays
+are **borrowed**, not inlined — per-channel quantization is variable-length
+— and the payload's `quant_keepalive` (an `Arc<Quantization>` cloned out of
+the producing tensor) owns them for the capsule's life, on exactly the terms
+`TensorDesc::ptr` borrows the producer's host address. A consumer copies the
+values out during import and never retains the pointers.
+
+It rides in the capsule rather than in `TensorDesc` because `TensorDesc` is
+also the C ABI's descriptor, and the C libraries pass real `ef_tensor`
+handles into one shared `libedgefirst_tensor.so` — nothing there rebuilds a
+tensor from a descriptor, so nothing there loses the metadata. The Python
+packages are the only consumers that reconstruct, so they are the only ones
+that need it on the wire.
+
+### Plane offset
+
+The payload also carries `plane_offset`, the byte offset within the backing
+buffer where this tensor's data starts — what `Tensor::view()` records for a
+sub-region. It is in the capsule for the same reason quantization is, and
+was lost the same way without it, but with a worse symptom: a dropped
+quantization makes a consumer *refuse* the tensor, whereas a dropped plane
+offset makes it silently convert the parent buffer's origin instead of the
+requested sub-region.
+
+The consumer applies it only to a **handle-based** import. Under
+`kind::HOST` the descriptor's `ptr` is the producer's pinned address for the
+view itself, so the offset is already in it and re-applying it would advance
+past the sub-region a second time. `DMABUF` (dup's the fd), `IOSURFACE`
+(looks the surface up by id), `D3D11_TEXTURE` (opens the NT handle) and
+`PBO` (by buffer id) all re-derive the base from a handle naming the whole
+parent buffer, so for those it must be put back. See
+`interop::apply_plane_offset`.
+
+`Tensor::set_plane_offset` syncs the storage-internal offset that `map()`
+adds for every backing but one: `Mem`, `Pbo`, `Shm` and `Dma` on Linux,
+macOS/iOS and Windows. Its match is exhaustive — there is no `_ => {}`, so
+a backing left out of it is a compile error rather than a silent
+fall-through — and the lone exception is Android's `AHardwareBufferTensor`,
+whose arm is an explicit no-op and which no import path reaches today. The
+clear sites in `set_format` and `reshape` are exhaustive the same way.
+
+IOSurface (macOS/iOS) had the defect and is fixed. It was easy to miss
+because `IoSurfaceTensor::view` always set its own `view_offset` correctly,
+so a *freshly created* view was right and only a tensor rebuilt from a
+`TensorDesc` was wrong — and because `TensorStorage::Dma` is a
+cfg-multiplexed name rather than one type, so the Linux-gated arm did not
+fail to compile on macOS, it silently became a fall-through.
+
+Two follow-ups complete it: the descriptor import now restores an IOSurface
+view's pitch (`restore_imported_row_stride` includes `IOSURFACE`; a
+surface's `bytesPerRow` is shared, unlike a D3D11 staging pitch), and the
+GL engine's Apple leaf refuses to zero-copy attach a source carrying a
+plane offset, as the Windows leaf does, because the ANGLE IOSurface
+binding has no offset attribute.
+
+D3D11 (Windows) is fixed too, and the bug had a different shape there. A
+view's descriptor was refused rather than rebuilt at the wrong origin: the
+import checks the shape against the texture's own geometry, and a window
+was neither spelling it accepted. It now accepts a packed window, opens the
+whole texture and narrows it, keeping the texture's pitch as the row
+stride; the storage offset is then written back by `set_plane_offset` and
+cleared by `set_format` and `reshape`. Two details follow from the texture
+being the unit of import. The ANGLE image binds the whole texture from its
+origin and cannot express an offset, so the engine's ANGLE leaves (D3D11
+and IOSurface) refuse to attach a *source* carrying a plane offset and the
+engine uploads it through `map()` instead — without that refusal even a
+fresh `view()` converted the parent's origin. A *destination* rebuilt from a
+descriptor is the same problem from the other side — it has the offset but
+not the `view_origin` the engine lowers a fresh view's tile to a viewport
+from — so the engine asks the platform whether a zero-copy destination can
+be placed (`GlPlatform::dst_import_places`) and lowers one that cannot to
+the mapped texture path, whose readback writes through `map()` at the
+offset. The offset itself is applied as the producer measured it: a texture
+tensor measures it in the row pitch of its staging texture, and a consumer
+opens the same texture on the same adapter, so its own staging has the same
+pitch. The descriptor's stride is deliberately *not* used to translate it — a
+single-row `view()` records a tight stride for its map span while its offset
+is still in the pitch, so dividing by that stride would name a different
+row.
+
+The other backings are not silently affected: `Mem`/`Shm` report
+`kind::HOST` and take the pinned-pointer path; Android reports
+`kind::DMABUF` whose import arm is Linux-only, so it fails loudly instead of
+reconstructing; and a `view()` of a PBO-backed image now stays PBO-backed,
+so it does reach the PBO arm and carries its own offset (it used to demote
+to host memory and bypass that arm entirely — issues #161 and #162). See
+`interop::apply_plane_offset`'s doc comment for the full per-backing
+accounting, including the caller audit that showed no other
+`set_plane_offset` caller can reach either backing.
+
+`interop::reconstruct` — the same-module path, where no capsule is involved
+— carries the offset across the same way, because it reconstructs through
+the identical `TensorDesc` and lost it identically.
 
 A consumer never constructs one of these by hand; it calls the producer's
 method and reads the capsule back through the matching `interop::*Arg`
@@ -147,6 +245,16 @@ address, because the pixels live in the texture. The pin is a keepalive and
 nothing more. A consumer that wants the bytes imports the descriptor and maps
 the imported tensor.
 
+The `PBO` kind's `ptr` still carries a `PboOpsVtable` address, but that vtable
+now embeds an `ef_client_state` — an opaque context plus a `retain`/`release`
+pair — alongside the map and unmap function pointers. A consumer's
+reconstruction takes its own reference on that channel through `retain`, so it
+no longer depends on the producer's keepalive still being held: a reconstructed
+PBO tensor keeps the buffer's map and unmap reachable even after the producing
+tensor and its capsule are gone. `retain` and `release` govern the channel
+only. The producer's own destructor stays the sole caller of `glDeleteBuffers`,
+and a reconstructed tensor's delete operation is a no-op.
+
 ### Carrying a texture between processes
 
 The descriptor protocol is an in-process contract: its handle values mean
@@ -240,7 +348,7 @@ read itself: old producers and consumers keep working against each other,
 and a new consumer talking to an old producer degrades to "not exportable"
 — rejected before any byte of the mismatched payload is read — instead of
 misreading memory. `ProtoData` inherits this transitively: it carries no
-capsule name of its own, but composes two `edgefirst_tensor_v1` capsules, so
+capsule name of its own, but composes two `edgefirst_tensor_v2` capsules, so
 a tensor-capsule name bump covers it automatically.
 
 This is the same conclusion DLPack reached, the hard way. DLPack shipped
@@ -259,26 +367,68 @@ the underlying point — the identity of the wire format has to be knowable
 before the payload is touched.
 
 **The rule binds at first release, not during development.** Until
-`edgefirst_tensor_v1` ships in a tagged release there is no producer or
-consumer in the wild to protect, so the descriptor can still grow freely
-under the same name -- and it has, twice, to reserve `flags` and `sync`
-before the layout is fixed. Renaming during development instead buys
-nothing and actively misleads: a published `_v3` would tell every future
-maintainer that two earlier wire formats exist and might need compatibility
-consideration, when none ever did. Once a release goes out, every layout
-change takes the name with it.
+`edgefirst_tensor_v1` shipped in a tagged release there was no producer or
+consumer in the wild to protect, so the descriptor could still grow freely
+under that name -- and it did, twice, to reserve `flags` and `sync` before
+the layout was fixed. Renaming during development instead buys nothing and
+actively misleads: a `_v3` published before the first release would tell
+every future maintainer that two earlier wire formats exist and might need
+compatibility consideration, when none ever did. **That grace period is
+over.** `_v1` shipped in 0.29.0 and `_v2` ships next, so from here every
+layout change takes the name with it -- including a change to the payload's
+Rust-layout tail, and including a field slotted into existing padding.
 
-**Tensor** (`edgefirst_tensor_v1`, `TensorCapsulePayload` in
-`crates/python-common/src/interop.rs`): this is the protocol's initial
-published version; no earlier capsule name was ever released. The
-descriptor's own `version` field is `ABI_VERSION` (currently `1`,
+**Tensor** (`edgefirst_tensor_v2`, `TensorCapsulePayload` in
+`crates/python-common/src/interop.rs`). `edgefirst_tensor_v1` shipped in
+0.29.0-0.30.0 and carried no quantization: a consumer rebuilt the tensor
+from the descriptor alone, so an integer tensor arrived on the far side
+looking unquantized and every dequantizing consumer refused it — an int8
+`ProtoData` could not be materialized into masks at all. It also carried no
+plane offset, so a DMA-backed `view()` was rebuilt addressing the parent
+buffer's origin -- the same loss, with wrong pixels instead of a refusal.
+
+`_v2` adds both a `QuantDesc` and a `plane_offset` to the payload. Two
+layout changes, one rename: they landed in the same unreleased cycle, and
+the rule above binds at *release*, not at commit -- so both ride under the
+one new name rather than burning `_v2` and `_v3` on a version nobody ever
+received. A 0.30.0 producer and a `_v2` consumer meet at the name check and
+the object is reported as not exportable, rather than a `_v1` payload being
+misread at `_v2`'s larger layout.
+
+Once 0.31.0 ships, `_v2` is frozen on the same terms `_v1` was: the next
+payload change, however small, is `_v3`.
+
+**The `ef_client_state` work needs no rename; the name stays
+`edgefirst_tensor_v2`.** `TensorCapsulePayload`'s layout is unchanged by it —
+the only layout that moved is `PboOpsVtable`'s, which is not part of the
+payload. That struct crosses solely between separately-compiled copies of
+`edgefirst-tensor` inside one process, and those copies ship as a single
+release set; `_v2` itself is unreleased until 0.31.0 ships, so no mismatched
+pair can exist in the field. That freedom expires with the release:
+`PboOpsVtable` grew from 24 to 40 bytes here under an unchanged
+`protocol::ABI_VERSION` of `1` and an unchanged capsule name, and that was
+only safe because `_v2` had never shipped. **Any further change to
+`PboOpsVtable`'s layout after 0.31.0 ships must bump the capsule name**, on
+the same terms as a `TensorCapsulePayload` change — once a `_v2` producer
+exists in the field, a differently-sized vtable behind an unchanged name is
+read at the wrong offsets with nothing to catch it. `TensorCapsulePayload::pbo_keepalive` is now
+belt-and-braces rather than load-bearing, because the importer holds its own
+channel reference. Retiring it is a payload change and therefore takes the
+capsule name with it, so that decision belongs to Stage E — still before
+0.31.0 ships, and therefore still free.
+
+The descriptor's own `version` field is `ABI_VERSION` (currently `1`,
 checked by `TensorDyn::import_descriptor` in
 `crates/tensor/src/tensor_dyn.rs`), and it is the second line of defense,
 not the first: it covers a hypothetical future change to what a same-sized
 `TensorDesc`'s fields *mean*, which a name bump does not imply by itself.
 Any change to the layout — a new field, a reordering, a size change — goes
-to `edgefirst_tensor_v2` in the same commit that makes it, not as a
-follow-up.
+to `edgefirst_tensor_v3` in the same commit that makes it, not as a
+follow-up. `TensorCapsulePayload`'s `#[repr(C)]` prefix
+(`desc` + `quant` + `plane_offset`) is pinned by a `const` assertion in
+`interop.rs` so the rename is not left to memory;
+`crates/tensor/tests/protocol.rs` pins `TensorDesc` alone, which is only
+the first field of that prefix.
 
 **Decoder** (`edgefirst_decoder_v1`, `DecoderCapsulePayload` in the same
 file): the same rule, and likewise an initial version. A layout change to

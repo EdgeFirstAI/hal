@@ -1412,7 +1412,7 @@ mod tests {
         access: u32,
     ) -> Option<*mut EfTensor> {
         if crate::probe::ef_is_gpu_buffer_available() == 0 {
-            eprintln!("SKIP: no D3D11 device on this host");
+            crate::artifacts::skip("no D3D11 device on this host");
             return None;
         }
         let f = std::ffi::CString::new(format).unwrap();

@@ -18,6 +18,10 @@ crates/image/
 │       └── tests.rs        # OpenGL backend tests (gated via OnceLock probe)
 ├── tests/
 │   ├── crop_golden.rs      # Frozen per-architecture cropped-convert fixtures
+│   ├── convert_span_feed_fields.rs  # src_feed/dst_feed land on image.convert.gl
+│   │                       # (own binary + a GLOBAL subscriber: tracing caches
+│   │                       #  callsite interest per PROCESS, so a scoped one
+│   │                       #  among parallel tests is a coin flip)
 │   ├── odd_dim_cpu.rs      # End-to-end odd-dimension CPU conversion
 │   └── data/               # crop_golden.{aarch64,x86_64}.json
 └── benches/
@@ -106,6 +110,19 @@ DLLs next to the test binary); `scripts/test-windows.ps1` sets that up and
 The zero-copy tier probes `is_gpu_image_buffer_available()`
 (`edgefirst_tensor::is_gpu_buffer_available`) instead of the Linux-flavored
 `is_dma_available()`.
+
+The six CUDA device-pointer tests in the Linux-only tier are the one place
+this self-skip rule is deliberately overridden: `make test-cuda` exports
+`HAL_TEST_REQUIRE_CUDA=1` whenever it locates a `libcudart`, and under that
+opt-in every skip inside those tests — no runtime, no GL, no F32 render
+support, a destination that didn't land on a PBO, `cuda_map()` returning
+`None` — is a failure instead of a pass. `crates/image/src/gl/cuda_policy.rs`
+is the shared guard; a developer machine without CUDA still sees ordinary
+skips, since the opt-in is unset there. The Windows counterpart is
+`crates/tensor/tests/d3d11_tensor.rs`'s three D3D11 CUDA interop tests,
+gated the same way under `HAL_TEST_REQUIRE_CUDA=1` via
+`scripts/test-windows.ps1 -RequireCuda` — see
+[`crates/tensor/TESTING.md § Windows D3D11 CUDA interop tests`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md#windows-d3d11-cuda-interop-tests).
 
 The `test_opengl_*` integration tests in `src/lib.rs` (resize, grey,
 src/dst crop, the rotation × flip × backing matrix, 10-thread bring-up,

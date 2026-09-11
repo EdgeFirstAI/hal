@@ -788,6 +788,391 @@ def test_materialize_masks_accepts_foreign_proto_data():
     )
 
 
+def test_materialize_masks_carries_quantization_across_packages():
+    """An int8 `ProtoData` must keep its quantization when it crosses from
+    `edgefirst.decoder` into `edgefirst.image`.
+
+    Regression for the `_v1` capsule, which carried only a `TensorDesc`.
+    `TensorDesc` has no quantization field, so `import_tensor_capsule`
+    rebuilt the prototype tensors without it and `materialize_masks`' int8
+    fast path -- which reads `.quantization()` off the tensors themselves --
+    refused them with "I8 mask_coefficients require quantization metadata".
+    Every real NPU segmentation model is int8, so this was the whole feature
+    on quantized hardware, not an edge case. `_v2` adds a `QuantDesc` to the
+    payload; see INTEROP.md's Quantization section.
+
+    The values are chosen so the answer is checkable by hand rather than
+    merely non-raising: with `scale=0.5` the coefficient dequantizes to
+    `4 x 0.5 = 2.0` and each proto element to `2 x 0.5 = 1.0`, so every
+    logit is `+2.0` -- positive, i.e. foreground everywhere. Dropping the
+    quantization (the bug) would not produce a *wrong* mask here, it would
+    raise; asserting the mask's contents as well pins the arithmetic that
+    the carried scales feed.
+    """
+    import numpy as np
+    from edgefirst.decoder import Decoder
+    from edgefirst.decoder import Tensor as DTensor
+    from edgefirst.image import ImageProcessor
+
+    nc, nm, n_anchors, proto_h, proto_w = 1, 1, 1, 4, 4
+    scale, zero_point = 0.5, 0
+    metadata = {
+        "decoder_version": "yolov8",
+        "nms": "class_agnostic",
+        "outputs": [
+            {
+                "type": "detection",
+                "decoder": "ultralytics",
+                "shape": [1, 4 + nc + nm, n_anchors],
+                "score_format": "per_class",
+                "quantization": [scale, zero_point],
+            },
+            {
+                "type": "protos",
+                "decoder": "ultralytics",
+                "shape": [1, nm, proto_h, proto_w],
+                "dshape": [
+                    {"batch": 1},
+                    {"num_protos": nm},
+                    {"height": proto_h},
+                    {"width": proto_w},
+                ],
+                "quantization": [scale, zero_point],
+            },
+        ],
+    }
+    dec = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
+
+    # Quantized ints: the dequantized values match the float32 sibling test
+    # above (full-frame box, score 0.9 is not representable at scale 0.5 so
+    # the score here is 1.0, coefficient 2.0, protos 1.0).
+    combined = np.zeros((1, 4 + nc + nm, n_anchors), dtype=np.int8)
+    combined[0, 0:4, 0] = [1, 1, 2, 2]  # xc, yc, w, h -> 0.5, 0.5, 1.0, 1.0
+    combined[0, 4, 0] = 2  # class score -> 1.0
+    combined[0, 5, 0] = 4  # mask coefficient -> 2.0
+    protos = np.full((1, nm, proto_h, proto_w), 2, dtype=np.int8)  # -> 1.0
+
+    t_combined = DTensor(list(combined.shape), dtype="int8")
+    t_combined.from_numpy(combined)
+    t_combined.set_quantization_per_tensor(scale, zero_point)
+    t_protos = DTensor(list(protos.shape), dtype="int8")
+    t_protos.from_numpy(protos)
+    t_protos.set_quantization_per_tensor(scale, zero_point)
+
+    boxes, scores, classes, proto_data = dec.decode_proto([t_combined, t_protos])
+    assert proto_data is not None
+    assert len(boxes) == 1
+
+    proc = ImageProcessor()
+    masks = proc.materialize_masks(
+        boxes, scores, classes, proto_data
+    )  # <-- crosses decoder -> image, carrying quantization
+
+    assert len(masks) == 1
+    m = masks[0]
+    assert m.dtype == np.uint8
+    assert m.shape == (proto_h, proto_w, 1)
+    # coef 2.0 dotted with protos 1.0 -> logit +2.0 everywhere, foreground.
+    assert np.array_equal(m, np.full_like(m, 255)), (
+        "expected the whole proto-resolution tile to be foreground; a mask "
+        "of zeros would mean the carried scales were not applied"
+    )
+
+
+def test_tensor_capsule_is_v2_for_a_per_channel_producer():
+    """Pin the capsule name, on a per-channel-quantized producer.
+
+    The name is the protocol's gate (INTEROP.md's Versioning section): it is
+    checked before a single byte of the payload is read, so a payload change
+    that forgets to move the name is exactly the mistake that produces a
+    misread rather than a clean rejection. Asserting it here fails with that
+    sentence rather than as a segfault somewhere downstream.
+
+    Per-channel because `QuantDesc` *borrows* variable-length arrays rather
+    than inlining them, so building the capsule at all is the producer half
+    of that encoding (`QuantDesc::borrowing`). This test cannot reach the
+    consumer half: no Python binding hands back the quantization of an
+    *imported* tensor, so there is nothing here to compare against. The
+    borrow-then-copy round trip is covered in Rust instead, by
+    `protocol::quant_desc_tests` in `crates/tensor/src/protocol.rs` -- which
+    is where `QuantDesc` lives precisely so those tests run under
+    `make test`.
+    """
+    import numpy as np
+    from edgefirst.decoder import Decoder  # noqa: F401  (forces a sibling .so in)
+    from edgefirst.image import ImageProcessor  # noqa: F401
+    from edgefirst.tensor import Tensor as CoreTensor
+
+    src = CoreTensor([3, 2], dtype="int8")
+    src.from_numpy(np.zeros((3, 2), dtype=np.int8))
+    src.set_quantization_per_channel([0.5, 0.25, 0.125], [1, 2, 3], 0)
+
+    cap = src.__edgefirst_tensor__()
+    assert "edgefirst_tensor_v2" in repr(cap), (
+        f"capsule name must move with any payload layout change, got {cap!r}"
+    )
+
+    # The producer's own metadata, i.e. what `QuantDesc::borrowing` was
+    # handed. Not a round-trip assertion -- see the docstring.
+    q = src.quantization
+    assert q is not None
+    assert q.scale == pytest.approx([0.5, 0.25, 0.125])
+    assert q.zero_point == [1, 2, 3]
+    assert q.axis == 0
+    assert q.is_per_channel
+
+
+def _view_source_or_skip(cls, mem, shape, fmt):
+    """Allocate a whole image in `mem`, skipping only if DMA-BUF is absent.
+
+    A skip rather than a fallback: silently converting a DMA request into a
+    MEM allocation would run the parametrised case below twice against the
+    same backing store and report the DMA half as passing without ever
+    having imported through an fd.
+
+    The skip is scoped to `DMABUF` on purpose. `MEM` is the always-available
+    host constructor and is the half CI actually runs, so a failure there is
+    a real regression; swallowing it into a skip would quietly delete the
+    only coverage this test has on a machine with no DMA heap.
+    """
+    from edgefirst.tensor import TensorMemory
+
+    if mem == TensorMemory.DMABUF:
+        try:
+            t = cls(shape, "uint8", mem)
+        except (
+            RuntimeError,
+            OSError,
+        ) as e:  # pragma: no cover - depends on the host's heaps
+            pytest.skip(f"DMA-BUF allocation unavailable here: {e}")
+        if t.memory != TensorMemory.DMABUF:
+            pytest.skip(f"DMA-BUF request fell back to {t.memory!r}")
+    else:
+        t = cls(shape, "uint8", mem)
+    t.set_format(fmt)
+    return t
+
+
+@pytest.mark.parametrize("mem_name", ["DMABUF", "MEM"])
+@pytest.mark.parametrize("source", ["foreign", "native"])
+def test_view_converts_its_own_sub_region_not_the_parents_origin(source, mem_name):
+    """A ``view()`` handed to ``convert()`` must read its OWN sub-region.
+
+    ``TensorDesc`` has no field for the plane offset, so rebuilding a tensor
+    from a descriptor dropped it and the view came back addressing the
+    parent buffer's origin -- wrong pixels, silently, with no error to
+    follow. The same root cause as the quantization loss above, but this one
+    corrupts data instead of refusing to run. ``_v2`` carries
+    ``plane_offset`` in the capsule payload, and ``interop::reconstruct``
+    clones it across for the same-module path, which had the identical bug.
+
+    Both parameters are load-bearing, because the two halves fail in
+    *opposite* directions and only running both pins the guard in
+    ``interop::apply_plane_offset``:
+
+    * ``DMABUF`` re-derives its base from the fd, which names the whole
+      parent buffer, so the offset must be put back.
+    * ``MEM`` rebuilds from the producer's pinned ``ptr``, which already
+      points at the sub-region's first byte, so putting it back again would
+      advance past it a second time -- an equal and opposite corruption.
+
+    ``source`` covers the two independent code paths that reconstruct: the
+    capsule (``TensorArg::Foreign``) and ``interop::reconstruct``
+    (``TensorArg::NativeRef``).
+    """
+    import numpy as np
+    from edgefirst.image import ImageProcessor
+    from edgefirst.image import Tensor as ImageTensor
+    from edgefirst.tensor import PixelFormat, Region, TensorMemory
+    from edgefirst.tensor import Tensor as CoreTensor
+
+    # Distinct per-row and per-column values, so a mask that is off by the
+    # view's origin cannot coincidentally match the expected tile.
+    w = h = 64
+    x0 = y0 = 8
+    side = 16
+    img = np.zeros((h, w, 3), np.uint8)
+    img[..., 0] = (np.arange(h)[:, None] * 4) % 256
+    img[..., 1] = (np.arange(w)[None, :] * 4) % 256
+    img[..., 2] = 255
+
+    cls = CoreTensor if source == "foreign" else ImageTensor
+    mem = getattr(TensorMemory, mem_name)
+    src = _view_source_or_skip(cls, mem, [h, w, 3], PixelFormat.Rgb)
+    src.from_numpy(img)
+    view = src.view(Region(x0, y0, side, side))
+
+    dst = cls([side, side, 3], "uint8", TensorMemory.MEM)
+    dst.set_format(PixelFormat.Rgb)
+    ImageProcessor().convert(view, dst)
+    with dst.map() as m:
+        out = np.frombuffer(m, np.uint8).reshape(side, side, 3).copy()
+
+    expected = img[y0 : y0 + side, x0 : x0 + side]
+    origin = img[0:side, 0:side]
+    assert np.array_equal(out, expected), (
+        "convert() read the wrong region of the parent buffer; "
+        + (
+            "it read the parent's origin, i.e. the plane offset was lost"
+            if np.array_equal(out, origin)
+            else f"out[0,0]={out[0, 0]} expected={expected[0, 0]}"
+        )
+    )
+
+
+def _pbo_processor_and_source(monkeypatch, make_proc, w, h, fmt):
+    """A PBO-backed image and the processor that owns it.
+
+    ``create_image`` is the only route to a PBO from Python, and left to
+    itself whether it returns one is a property of the host: the engine
+    allocates a PBO only when it has GL but no working zero-copy DMA-BUF
+    import. That would make these tests silently vanish on every DMA-capable
+    machine, which is all four embedded boards and most of CI -- coverage
+    that exists on one desktop is not coverage.
+
+    ``EDGEFIRST_FORCE_TRANSFER=pbo`` removes the host dependency:
+    ``apply_forced_transfer`` pins the GL transfer backend at converter
+    construction, and ``ImageProcessor::create_image`` skips its DMA attempt
+    whenever GL has selected PBO. It must be set BEFORE the processor is
+    built, which is why this takes the constructor rather than an instance.
+    ``monkeypatch`` unsets it again at teardown, so no other test in the
+    session inherits it.
+
+    The remaining skip is only the no-GL backstop: with no GL there is no
+    PBO allocator at all, and nothing here can force one into existence.
+    """
+    from edgefirst.tensor import TensorMemory
+
+    monkeypatch.setenv("EDGEFIRST_FORCE_TRANSFER", "pbo")
+    try:
+        proc = make_proc()
+        src = proc.create_image(w, h, fmt)
+    except (RuntimeError, OSError) as e:  # pragma: no cover - host-dependent
+        pytest.skip(f"no GL image allocator here: {e}")
+    if src.memory != TensorMemory.PBO:  # pragma: no cover - host-dependent
+        pytest.skip(
+            f"create_image returned {src.memory!r} even under "
+            "EDGEFIRST_FORCE_TRANSFER=pbo"
+        )
+    return proc, src
+
+
+def test_pbo_view_converts_its_own_sub_region_not_the_parents_origin(monkeypatch):
+    """A ``view()`` of a PBO-backed image must stay PBO-backed and read its
+    OWN sub-region -- issue #162.
+
+    The PBO sibling of the DMABUF/MEM case above, and it failed for three
+    independent reasons, each of which alone produces wrong pixels with no
+    error:
+
+    1. Under the ``dynamic`` backend -- which every wheel uses -- a PBO
+       tensor was a host placeholder with the real ``PboTensor`` stashed
+       beside it in a Rust field. ``view()`` went through
+       ``ef_tensor_view_region``, which never saw that field, so the view
+       came back reporting ``TensorMemory.MEM``: a window onto the
+       placeholder, which reads as all zeros. Not the wrong region -- no
+       region at all.
+    2. The GL engine's PBO source upload bound the buffer and read from byte
+       0, ignoring the view's plane offset, so every view of one buffer
+       converted the parent's top-left tile.
+    3. Rebuilding the view from its capsule dropped the recorded row stride
+       -- which for a sub-view is the PARENT's pitch -- so rows were read at
+       the window's own tight row and each one after the first landed on the
+       wrong columns.
+
+    The origin is non-zero and the pattern is positional in both axes, so a
+    view that reads the right number of bytes from the wrong place fails
+    rather than coincidentally matching. The window is also NARROWER than
+    its parent, which is what keeps reason 3 in play: a full-width band's
+    tight pitch and its parent's pitch are the same number, so it would pass
+    either way. QVGA-scale rather than a toy size, because tiny textures
+    have their own failure modes on Mali that would confound this one.
+    """
+    import numpy as np
+    from edgefirst.image import ImageProcessor
+    from edgefirst.tensor import PixelFormat, Region, TensorMemory
+    from edgefirst.tensor import Tensor as CoreTensor
+
+    w, h = 320, 240
+    x0, y0 = 40, 32
+    side = 96
+    # Plain index values, not multiples: every row of a 240-row image and
+    # every column the window touches (40..135) then has its own value, so
+    # no two positions this test compares can collide.
+    img = np.zeros((h, w, 3), np.uint8)
+    img[..., 0] = np.arange(h)[:, None] % 256
+    img[..., 1] = np.arange(w)[None, :] % 256
+    img[..., 2] = 255
+
+    proc, src = _pbo_processor_and_source(
+        monkeypatch, ImageProcessor, w, h, PixelFormat.Rgb
+    )
+
+    src.from_numpy(img)
+    view = src.view(Region(x0, y0, side, side))
+    assert view.memory == TensorMemory.PBO, (
+        f"a view of a PBO must stay PBO-backed, got {view.memory!r}; "
+        "it demoted to a host placeholder (issue #162)"
+    )
+
+    dst = CoreTensor([side, side, 3], "uint8", TensorMemory.MEM)
+    dst.set_format(PixelFormat.Rgb)
+    proc.convert(view, dst)
+    with dst.map() as m:
+        out = np.frombuffer(m, np.uint8).reshape(side, side, 3).copy()
+
+    if np.array_equal(out, np.zeros_like(out)):
+        pytest.fail(
+            "convert() read all zeros: the view was a window onto the host "
+            "placeholder, not the GL buffer (issue #162)"
+        )
+    expected = img[y0 : y0 + side, x0 : x0 + side]
+    origin = img[0:side, 0:side]
+    assert np.array_equal(out, expected), (
+        "convert() read the wrong region of the parent buffer; "
+        + (
+            "it read the parent's origin, i.e. the plane offset was lost"
+            if np.array_equal(out, origin)
+            else f"out[0,0]={out[0, 0]} expected={expected[0, 0]}"
+        )
+    )
+
+
+def test_pbo_capsule_refuses_an_explicit_access_and_allows_the_unpinned_form(
+    monkeypatch,
+):
+    """A PBO-backed tensor hands out a descriptor, but never a host address.
+
+    ``__edgefirst_tensor__(access=...)`` pins; ``glMapBufferRange``'s
+    address is valid only until ``glUnmapBuffer``, so there is no address to
+    pin and both backends refuse. The ``access=None`` form -- the one
+    ``ImageProcessor.convert`` actually uses -- must still succeed, because
+    that descriptor carries the PBO vtable pointer rather than an address,
+    and refusing it would take the whole zero-copy path down with it.
+
+    The pair is the point. A build that refused both would pass a
+    single-sided "PBO capsules raise" assertion while breaking every
+    converter, and a build that allowed both would hand the consumer a stale
+    address to read after the unmap.
+    """
+    from edgefirst.image import ImageProcessor
+    from edgefirst.tensor import PixelFormat
+
+    _proc, src = _pbo_processor_and_source(
+        monkeypatch, ImageProcessor, 320, 240, PixelFormat.Rgb
+    )
+
+    capsule = src.__edgefirst_tensor__()
+    assert capsule is not None, (
+        "the unpinned capsule is what convert() takes; refusing it would "
+        "disable the zero-copy PBO path entirely"
+    )
+
+    for access in ("read", "write", "readwrite"):
+        with pytest.raises(RuntimeError, match="PBO"):
+            src.__edgefirst_tensor__(access=access)
+
+
 def test_materialize_masks_rejects_an_object_without_the_protocol():
     """Mirrors `test_codec_tensor_rejected_before_the_fix_with_a_clear_message`
     for `ProtoData`: an unrelated object is rejected with a message naming

@@ -93,6 +93,39 @@ jobs:
       - name: Checkout LFS objects
         run: git lfs checkout
 
+      - name: Merge per-crate testdata into the shared testdata/ tree
+        run: |
+          # Every `crates/<name>/testdata/` (currently only
+          # `crates/decoder/testdata/infer/`) merges into the top-level
+          # `testdata/` tree uploaded below, so every job that downloads the
+          # `testdata-lfs` artifact -- rather than doing its own full LFS
+          # checkout -- gets crate-local fixtures too, at the same relative
+          # path `EDGEFIRST_TESTDATA_DIR`-aware fixture loaders resolve
+          # against (see e.g. `infer.rs`'s `infer_fixture_dir()`, and
+          # `scripts/on-target-test.sh`'s testdata sync, which merges the
+          # same way). A second `path:` entry on the upload step below would
+          # do this too, but `upload-artifact` strips only the paths' least
+          # common ancestor, which for `testdata/` and
+          # `crates/decoder/testdata/` is the repo root -- every job that
+          # downloads this artifact expecting a bare `testdata/` layout
+          # would break.
+          for dir in crates/*/testdata; do
+            [ -d "${dir}" ] || continue
+            # `cp -a` silently overwrites on a name collision (with the
+            # root testdata/ tree, or with an earlier crate merged this
+            # same loop) -- checked file by file before copying so a
+            # collision fails the step loudly, naming the exact path,
+            # instead of one crate's fixture silently replacing another's.
+            while IFS= read -r -d '' f; do
+              rel="${f#"${dir}"/}"
+              if [ -e "testdata/${rel}" ]; then
+                echo "::error::${dir}/${rel} collides with an existing testdata/${rel}"
+                exit 1
+              fi
+            done < <(find "${dir}" -type f -print0)
+            cp -a "${dir}/." testdata/
+          done
+
       - name: Upload testdata as artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -1729,7 +1762,14 @@ jobs:
 
       - name: Generate JUnit XML from Rust results
         if: always()
-        run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_runner_results.xml
+        run: |
+          # Executed tests (passed + failed) summed from libtest's summary
+          # lines. Run 34435075152 reported 1669 passed / 0 failed here, so
+          # 1000 keeps a wide margin; it guards against a collapse toward
+          # zero, not against small movement.
+          python3 .github/scripts/generate_junit_xml.py \
+            build/rust-test-results build/rust_runner_results.xml \
+            --min-tests 1000
 
       - name: Process Rust coverage
         if: always()
@@ -1919,7 +1959,10 @@ jobs:
           # Only run tests that exercise hardware (G2D, OpenGL/EGL, DMA).
           # CPU-only tests already run on the ubuntu-22.04-arm-xlarge runner.
           mkdir -p build/rust-test-results build/profraw
-          chmod +x hardware-test-binaries/* 2>/dev/null || true
+          # The artifact round trip does not preserve the executable bit, so
+          # every binary arrives 0644 and the `[[ -x ]]` guard below skips it.
+          # This MUST name the same directory the loop iterates.
+          chmod +x hardware-test-binaries-stripped/*
           TEST_FAILED=0
 
           run_filtered() {
@@ -1930,6 +1973,31 @@ jobs:
             EXIT_CODE=0
             local logfile="build/rust-test-results/${test_name}-${label// /-}.txt"
             "$test_bin" "$filter" --test-threads=1 2>&1 | tee "$logfile" || EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+              # Check if all tests actually passed but process crashed on
+              # exit (Vivante GPU driver SIGABRT during library unload)
+              if grep -q 'test result: ok' "$logfile" && \
+                 ! grep -q 'FAILED' "$logfile"; then
+                echo "::warning::$test_name ($label) exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
+              else
+                echo "FAILED: $test_name ($label)"
+                TEST_FAILED=1
+              fi
+            fi
+          }
+
+          run_unfiltered() {
+            # Same as run_filtered but without a substring filter: used for
+            # the crates/image/tests/*.rs integration binaries below, which
+            # are each a single dedicated whole-binary GL test rather than a
+            # multi-category lib test binary split by g2d/opengl/dma filter.
+            local test_bin="$1" label="$2"
+            local test_name
+            test_name=$(basename "$test_bin")
+            echo "=== Running $test_name ($label) ==="
+            EXIT_CODE=0
+            local logfile="build/rust-test-results/${test_name}-${label// /-}.txt"
+            "$test_bin" --test-threads=1 2>&1 | tee "$logfile" || EXIT_CODE=$?
             if [ $EXIT_CODE -ne 0 ]; then
               # Check if all tests actually passed but process crashed on
               # exit (Vivante GPU driver SIGABRT during library unload)
@@ -1956,15 +2024,94 @@ jobs:
             elif [[ "$test_name" == edgefirst_tensor-* ]]; then
               # DMA-heap tensor tests only
               run_filtered "$test_bin" dma "DMA tests"
+            elif [[ "$test_name" == dst_view_stride-* || "$test_name" == offset_nv_source_upload-* || \
+                    "$test_name" == offset_source_view_alignment-* || "$test_name" == gl_concurrent_stress-* || \
+                    "$test_name" == reconstructed_view_convert-* || "$test_name" == pin_convert-* || \
+                    "$test_name" == crop_golden-* || "$test_name" == mask_golden-* || "$test_name" == odd_dim_cpu-* ]]; then
+              # crates/image/tests/*.rs GL integration binaries: whole-binary
+              # GPU/EGL tests, run unfiltered (no g2d/opengl/dma split).
+              run_unfiltered "$test_bin" "GL integration test"
+            elif [[ "$test_name" == pin-* || "$test_name" == protocol-* || \
+                    "$test_name" == protocol_roundtrip-* || "$test_name" == dynamic_primitives-* || \
+                    "$test_name" == identity-* || "$test_name" == vocabulary-* ]]; then
+              # crates/tensor/tests/*.rs DMA-BUF-touching integration
+              # binaries: whole-binary tests, run unfiltered, same reasoning
+              # as the crates/image/tests/*.rs branch above. `dynamic_
+              # primitives-*` is `#![cfg(feature = "dynamic")]`-gated and
+              # this artifact is built with default features only (no
+              # `dynamic`), so it currently runs zero tests here -- routed
+              # anyway rather than silently left in the skip branch, so it
+              # picks up coverage for free the day this crate's hardware
+              # build gains that feature.
+              run_unfiltered "$test_bin" "tensor integration test"
+            elif [[ "$test_name" == reconstructed_planar_dst-* || "$test_name" == reconstructed_view_draw-* ]]; then
+              # These two compile to a zero-test binary on this Linux
+              # runner: `reconstructed_planar_dst.rs` is
+              # `#![cfg(all(any(target_os = "macos", target_os = "ios"),
+              # feature = "opengl"))]` and `reconstructed_view_draw.rs` is
+              # `#![cfg(all(any(target_os = "macos", target_os = "ios",
+              # target_os = "windows"), feature = "opengl"))]` -- neither
+              # cfg includes linux, so running them here is a guaranteed
+              # "0 tests" no-op, not coverage. Every other routed binary in
+              # the branches above was checked the same way and has no such
+              # gate (or, for `offset_nv_source_upload`/
+              # `offset_source_view_alignment`, includes linux).
+              echo "=== Skipping $test_name (compiles to 0 tests on linux: macOS/iOS/Windows-only) ==="
             else
+              # What actually lands in hardware-test-binaries-stripped/ is
+              # NOT scoped to edgefirst-image/edgefirst-tensor: this job's
+              # earlier "Build runner test binaries" step (`cargo nextest
+              # run --no-run --workspace --exclude <the six python-*
+              # crates>`) and this step both run under the SAME
+              # `CARGO_TARGET_DIR=target/llvm-cov-target` (`source
+              # /tmp/coverage-env.sh` in both), so the `find
+              # target/llvm-cov-target/profiling/deps/ -type f -executable`
+              # above -- which has no package filter -- copies every
+              # lib-test and integration-test binary the workspace build
+              # produced, not just the two packages this step explicitly
+              # names. So this branch actually sees: edgefirst-codec,
+              # edgefirst-decoder, edgefirst-tracker, edgefirst-bench,
+              # edgefirst-egl, edgefirst-gl, edgefirst-gpu-probe,
+              # edgefirst-tensor-abi, edgefirst-decoder-abi,
+              # edgefirst-tensor-ffi, and the five -capi crates' own
+              # lib-test binaries (and edgefirst-tensor's non-DMA
+              # `crates/tensor/tests/*.rs`: logical_shape, map_access,
+              # no_global_state, scenarios, plus `d3d11_tensor` --
+              # `#![cfg(target_os = "windows")]`-gated, empty here
+              # regardless of routing). None of these exercise the GPU/DMA
+              # hardware this lane exists for; they are already covered by
+              # `Test (aarch64)`, which runs the full `--workspace` set on
+              # real hardware. The fourteen `edgefirst-image`
+              # `[[bench]]` targets (image_benchmark, ...) are NOT here:
+              # every one is `harness = false` with no explicit
+              # `test = true`, so cargo's default (`test = false` for a
+              # bench target) means nextest never builds them as test
+              # binaries in the first place -- there is nothing from them
+              # to skip.
               echo "=== Skipping $test_name (CPU-only, covered by aarch64 runner) ==="
             fi
           done
+          ran=$(find build/rust-test-results -maxdepth 1 -name '*.txt' | wc -l)
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::imx8mp hardware lane executed 0 test binaries"
+            exit 1
+          fi
           [ $TEST_FAILED -eq 0 ] || exit 1
 
       - name: Generate JUnit XML from Rust results
         if: always()
-        run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
+        run: |
+          # Floor set from the lane's first real runs after the chmod fix
+          # (runs 34472605256 and 34477168418, identical): the 36 summary
+          # lines sum to 752 passed + 5 failed = 757 executed, so the floor is
+          # 757 - 15% rounded down. It counts executed tests from libtest's
+          # own summary lines, so it does not move when a test becomes more or
+          # less chatty. Raise it deliberately when the suite grows; it exists
+          # to catch a silent collapse toward zero, not to track the exact
+          # count.
+          python3 .github/scripts/generate_junit_xml.py \
+            build/rust-test-results build/rust_hardware_results.xml \
+            --min-tests 643
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

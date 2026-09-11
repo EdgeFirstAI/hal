@@ -148,7 +148,12 @@ fn load() -> Option<CudaTable> {
 
 #[cfg(all(not(miri), not(target_os = "windows")))]
 fn load() -> Option<CudaTable> {
-    for name in ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"] {
+    for name in [
+        "libcudart.so",
+        "libcudart.so.13",
+        "libcudart.so.12",
+        "libcudart.so.11.0",
+    ] {
         // SAFETY: `name` is one of the fixed soname literals above. Loading
         // a shared object runs its init routines, an unavoidable side effect
         // of dynamic loading that this whole module's design accepts (see

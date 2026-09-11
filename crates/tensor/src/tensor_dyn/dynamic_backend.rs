@@ -30,7 +30,7 @@ use edgefirst_tensor_ffi::EfTensor;
 
 use crate::{
     BufferIdentity, Colorimetry, CpuAccess, DType, Error, IdentityKind, PixelFormat, PixelLayout,
-    Region, Result, TensorMemory, TensorTrait, ViewOrigin,
+    Region, Result, TensorMemory, ViewOrigin,
 };
 
 /// The tensor handle, plus the facts this backend cannot re-derive from the
@@ -88,46 +88,14 @@ pub struct TensorDyn {
     /// path) read as "read chroma from the combined buffer" -- wrong for a
     /// tensor that is actually two independent DMA-BUFs.
     pub(crate) multiplane_chroma: Option<Box<TensorDyn>>,
-    /// This tensor's `PboTensor<T>` (type-erased), when it wraps a GL
-    /// Pixel Buffer Object rather than data the real `ef_tensor_*` handle
-    /// itself owns. `None` for every other tensor.
-    ///
-    /// Exists for the same "state the ABI cannot answer" reason
-    /// `multiplane_chroma` does: `PboTensor<T>`'s own state (a GL
-    /// `buffer_id`, an `Arc<dyn PboOps>` routing map/unmap to the owning
-    /// process's own GL worker thread, and CPU-map bookkeeping) is
-    /// in-process Rust state with no wire representation at all -- there is
-    /// no `ef_tensor_*` primitive that could hand back an equivalent
-    /// "something" here, the same class of gap task 17's report already
-    /// closed for `multiplane_chroma` and left open for `cuda` below.
-    /// `PboTensor<T>` itself is `static`/`dynamic`-agnostic already (see
-    /// its own module doc in `pbo.rs`); only `static`'s `Tensor::as_pbo`/
-    /// `from_pbo`, which store it inside `TensorStorage::Pbo`, were
-    /// `static`-only. This handle still carries a real `ef_tensor_*`
-    /// backing (see [`Self::handle`]) sized to match, purely so shape/
-    /// dtype/format/stride metadata queries keep working the ordinary way;
-    /// only CPU-mapping operations need to know to route through this
-    /// field's `PboOps` instead (see [`Self::memory`]/`map_pin`). That
-    /// backing is a REAL, full-sized host allocation, not a cheap
-    /// placeholder -- task 18's review (F32) found and measured this: see
-    /// `Tensor::from_pbo`'s own doc comment (`dynamic_tensor.rs`) and
-    /// `tests/dynamic_primitives.rs`'s
-    /// `from_pbo_metadata_handle_allocation_cost_is_the_full_pbo_byte_count`
-    /// for the number and the follow-up primitive this should replace.
-    ///
-    /// `Box<dyn Any>` because `TensorDyn` itself carries no element type;
-    /// the typed lens (`Tensor<T>::as_pbo`, `dynamic_tensor.rs`) downcasts
-    /// back to `PboTensor<T>`, the same technique `lens.rs`'s `as_typed`
-    /// already uses for the handle itself.
-    pub(crate) pbo: Option<Box<dyn std::any::Any + Send + Sync>>,
     /// CUDA registration attached to this tensor, if any -- same "state the
-    /// ABI cannot answer" reasoning as [`Self::pbo`] and `multiplane_chroma`
-    /// above. `CudaHandle` (`crate::cuda`) is already `static`/`dynamic`-
-    /// agnostic (see that module's own doc comment); only `static`'s
+    /// ABI cannot answer" reasoning as `multiplane_chroma` above.
+    /// `CudaHandle` (`crate::cuda`) is already `static`/`dynamic`-agnostic
+    /// (see that module's own doc comment); only `static`'s
     /// `Tensor::cuda`/`cuda_map`/`set_cuda_handle` (`lib.rs`), which store
     /// it as a plain field of `Tensor<T>`, were `static`-only. Not
-    /// type-erased via `Any` like `pbo`: `CudaHandle` itself carries no
-    /// element type to erase.
+    /// type-erased via `Any`: `CudaHandle` itself carries no element type
+    /// to erase.
     pub(crate) cuda: Option<Box<crate::cuda::CudaHandle>>,
     /// The texture NT handle [`Self::descriptor_pinned`] puts in a
     /// [`crate::protocol::kind::D3D11_TEXTURE`] descriptor, kept here for as
@@ -164,14 +132,11 @@ pub struct TensorDyn {
 // is `OnceLock<Option<Quantization>>`, `Sync` by construction whenever its
 // contents are (`Quantization` is plain owned data, `Send + Sync`
 // automatically) -- see that field's own doc comment for why concurrent
-// access through it specifically is sound, not just asserted here. `pbo` is
-// `Box<dyn Any + Send + Sync>` (the bound is part of the trait object type,
-// checked by the compiler) wrapping a `PboTensor<T>`, itself `Send + Sync`
-// by its own explicit `unsafe impl` in `pbo.rs`; `cuda` is `Box<CudaHandle>`,
-// and `CudaHandle`'s own fields (`cuda.rs`) are process-global handles or
-// routed through a `Send + Sync` GL-ops trait object, the same reasoning
-// `static`'s own `Tensor<T>` (`lib.rs`) already relies on for these same two
-// types as plain fields.
+// access through it specifically is sound, not just asserted here. `cuda` is
+// `Box<CudaHandle>`, and `CudaHandle`'s own fields (`cuda.rs`) are
+// process-global handles or routed through a `Send + Sync` GL-ops trait
+// object, the same reasoning `static`'s own `Tensor<T>` (`lib.rs`) already
+// relies on for that type as a plain field.
 unsafe impl Send for TensorDyn {}
 unsafe impl Sync for TensorDyn {}
 
@@ -197,7 +162,6 @@ impl TensorDyn {
             identity,
             quantization_cache: std::sync::OnceLock::new(),
             multiplane_chroma: None,
-            pbo: None,
             cuda: None,
             #[cfg(target_os = "windows")]
             descriptor_texture_handle: std::sync::OnceLock::new(),
@@ -525,33 +489,11 @@ impl TensorDyn {
         // `shape()` serves the cached vector, not the handle, so it would
         // keep reporting the OLD geometry the moment after this succeeded.
         self.shape_cache = Self::query_shape(self.handle);
-        // ...and a PBO-backed tensor carries geometry in a THIRD place: the
-        // wrapped `PboTensor`, which `as_pbo()` hands to `edgefirst-image`.
-        // The handle already validated this shape, so the same call on the
-        // PBO cannot refuse for a reason the handle accepted -- but its
-        // result is propagated rather than dropped, because a PBO whose
-        // buffer is smaller than the companion allocation would be a real
-        // disagreement worth surfacing rather than swallowing.
-        self.sync_pbo_shape(shape, by_capacity)?;
+        // A PBO-backed handle keeps its geometry in ONE place now -- the
+        // library's own `TensorStorage::Pbo` -- so there is no second copy
+        // to sync. Before Stage B this had to mirror every shape change onto
+        // a `PboTensor` stashed beside the handle.
         Ok(())
-    }
-
-    /// Apply a geometry change to the wrapped `PboTensor`, if there is one.
-    ///
-    /// Mirrors the operation rather than always using one of them: `reshape`
-    /// resets the PBO's `view_offset` to 0 and `set_logical_shape` does not,
-    /// which is the static backend's behaviour and the difference a caller
-    /// of `as_pbo()` would see.
-    fn sync_pbo_shape(&mut self, shape: &[usize], by_capacity: bool) -> Result<()> {
-        let r = if by_capacity {
-            with_pbo_mut!(self, set_logical_shape, shape)
-        } else {
-            with_pbo_mut!(self, reshape, shape)
-        };
-        match r {
-            None => Ok(()), // not PBO-backed; nothing to keep in step
-            Some(res) => res,
-        }
     }
 
     /// Return the tensor name.
@@ -563,19 +505,14 @@ impl TensorDyn {
         String::new()
     }
 
-    /// Return the memory allocation type.
+    /// Return the memory allocation type, as the library reports it.
     ///
-    /// `Pbo` when [`Self::pbo`] is set, regardless of what the backing
-    /// `ef_tensor_*` handle's own storage kind reports: that handle exists
-    /// only to carry shape/dtype/format metadata (see `pbo`'s own doc
-    /// comment), and is allocated as ordinary host memory since no
-    /// `ef_tensor_*` primitive can mint a genuinely GL-buffer-backed handle
-    /// -- `memory()` must still report the tensor's real backing to match
-    /// `static`'s own `PboTensor::memory() -> TensorMemory::Pbo`.
+    /// No PBO special case: since Stage B a PBO-backed handle *is*
+    /// `TensorStorage::Pbo` inside `libedgefirst_tensor.so`, so
+    /// `ef_tensor_storage_kind` returns `TensorMemory::Pbo` on its own. The
+    /// override this replaces existed because the handle underneath was
+    /// ordinary host memory.
     pub fn memory(&self) -> TensorMemory {
-        if self.pbo.is_some() {
-            return TensorMemory::Pbo;
-        }
         // SAFETY: `self.handle` is a live handle for as long as `self` exists.
         let code = unsafe { edgefirst_tensor_ffi::ef_tensor_storage_kind(self.handle.as_ptr()) };
         TensorMemory::from_code(code).unwrap_or(TensorMemory::Mem)
@@ -655,29 +592,14 @@ impl TensorDyn {
     /// [`map_pin`](Self::map_pin), with the choice of `ef_tensor_map` or
     /// `ef_tensor_try_map`.
     ///
-    /// One body rather than two: the PBO detour, the retain that makes the
-    /// pin `'static`, and the unmap-on-retain-failure unwind are identical
-    /// for both, and the ABI call is the only line that differs.
+    /// One body rather than two: the retain that makes the pin `'static`
+    /// and the unmap-on-retain-failure unwind are identical for both, and
+    /// the ABI call is the only line that differs.
     pub(crate) fn map_pin_with(
         &self,
         access: CpuAccess,
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'static>> {
-        // A PBO-backed handle's real (GPU-resident) bytes live in the GL
-        // buffer `pbo` addresses, not in this companion `ef_tensor_*`
-        // handle's own host allocation (real and full-sized, not
-        // metadata-only -- see `from_pbo`'s doc comment, `dynamic_tensor.rs`,
-        // for why and what it costs) -- mapping the latter would silently
-        // hand back unrelated host bytes, not the PBO's actual data. No real
-        // caller in this
-        // workspace reaches this: `edgefirst-image` always downcasts via
-        // `Tensor::as_pbo()` first and calls `PboTensor::map`/`map_with`
-        // directly (confirmed by reading every non-test call site). Failing
-        // loudly here, rather than silently mapping the wrong bytes, is the
-        // same rule `TensorDyn::reshape`'s own honest-`Err` above follows.
-        if self.pbo.is_some() {
-            return self.map_pin_pbo(access);
-        }
         let code = match access {
             CpuAccess::None => {
                 return Err(Error::InvalidArgument(
@@ -736,84 +658,6 @@ impl TensorDyn {
         Ok(crate::pin::HostPin::new(keepalive, view.ptr, view.len))
     }
 
-    /// [`map_pin`](Self::map_pin) for a PBO-backed tensor: route the mapping
-    /// through the wrapped `PboTensor` instead of the companion handle.
-    ///
-    /// This used to refuse outright ("use `Tensor::as_pbo().map()` instead of
-    /// mapping the type-erased handle directly"). That was defensible as far
-    /// as it went -- mapping the companion handle really would hand back
-    /// unrelated host bytes, since a PBO's real data lives in the GL buffer
-    /// (see [`Self::pbo`]) -- but it made a refusal out of something the
-    /// static backend simply does: `TensorStorage::Pbo(t) => t.map_with(..)`.
-    /// Python's `normalize_to_numpy()` maps whatever `convert()` returned,
-    /// and on a GL machine that is a PBO, so every GPU conversion result
-    /// became unreadable under `dynamic`.
-    ///
-    /// The guard `PboTensor::map_with` returns *is* the keepalive: dropping
-    /// it runs `glUnmapBuffer` through the owning process's GL worker. So it
-    /// is moved into the pin whole rather than having its pointer copied out
-    /// and its lifetime managed separately -- the address stays valid for
-    /// exactly as long as the pin does, which is the contract `HostPin`
-    /// exists to express.
-    fn map_pin_pbo(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'static>> {
-        // `map_with` needs the concrete `T` to reach `PboTensor<T>`, so this
-        // is the same dtype dispatch `with_pbo!` performs -- written out
-        // here rather than reusing that macro because this one takes an
-        // argument and normalises each arm's `HostView<T>` to bytes.
-        macro_rules! map_arm {
-            ($any:expr, $t:ty) => {
-                $any.downcast_ref::<crate::PboTensor<$t>>().map(|p| {
-                    <crate::PboTensor<$t> as crate::TensorTrait<$t>>::map_with(p, access)
-                        .map(|v| v.into_bytes())
-                })
-            };
-        }
-        let any = self
-            .pbo
-            .as_ref()
-            .ok_or_else(|| Error::NotImplemented("map: not a PBO-backed tensor".into()))?;
-        // Each instantiation in turn, not the one `dtype()` names -- see
-        // `with_pbo!` for why those two can disagree. Here `T` does affect
-        // the result (the view's element count), which is exactly why the
-        // *stored* type is the right one to use: it is the type the buffer
-        // was created with.
-        let mapped = None
-            .or_else(|| map_arm!(any, u8))
-            .or_else(|| map_arm!(any, i8))
-            .or_else(|| map_arm!(any, u16))
-            .or_else(|| map_arm!(any, i16))
-            .or_else(|| map_arm!(any, half::f16))
-            .or_else(|| map_arm!(any, u32))
-            .or_else(|| map_arm!(any, i32))
-            .or_else(|| map_arm!(any, f32))
-            .or_else(|| map_arm!(any, u64))
-            .or_else(|| map_arm!(any, i64))
-            .or_else(|| map_arm!(any, f64));
-        let mut view = mapped
-            .ok_or_else(|| {
-                Error::NotImplemented(
-                    "map: the wrapped PboTensor's element type does not match this handle's dtype"
-                        .into(),
-                )
-            })?
-            .map_err(|e| Error::InvalidOperation(format!("map: PBO map failed: {e}")))?;
-        // Same rule `ef_tensor_map` follows: only a writable map may take
-        // `as_mut_slice` (the guard debug-asserts writability), and a read
-        // map still yields a `*mut u8` because `HostPin` has one pointer for
-        // both directions.
-        let (ptr, len) = if access.writes() {
-            let s = crate::TensorMapTrait::as_mut_slice(&mut view);
-            (s.as_mut_ptr(), s.len())
-        } else {
-            let s = crate::TensorMapTrait::as_slice(&view);
-            (s.as_ptr() as *mut u8, s.len())
-        };
-        // The pointer addresses the GL mapping, not `view` itself, so it
-        // stays valid across this move.
-        let keepalive: std::sync::Arc<dyn Send + Sync> = std::sync::Arc::new(view);
-        Ok(crate::pin::HostPin::new(keepalive, ptr, len))
-    }
-
     /// Map this tensor's whole extent for CPU access, type-erased to raw
     /// bytes. Returns a `'static` view, same contract as the static
     /// backend's own `map_bytes`.
@@ -844,7 +688,29 @@ impl TensorDyn {
     /// plus a retained reference (the same primitive `map_bytes` uses) is
     /// the only mapping operation the ABI exposes, so this shares
     /// [`map_pin`](Self::map_pin) rather than duplicating it.
+    ///
+    /// Which is why the PBO refusal has to be **repeated** here rather than
+    /// forwarded. `Tensor::pin_host` (`lib.rs`) refuses `TensorStorage::Pbo`
+    /// -- `glMapBufferRange`'s address is valid only until `glUnmapBuffer`,
+    /// so a pin would have to hold the buffer mapped across GL work -- but
+    /// `ef_tensor_map` is `map`, not `pin_host`, and the library cannot tell
+    /// the two callers apart. Without this guard a PBO pinned on this
+    /// backend and refused on the other, from the same call. The message is
+    /// [`crate::pbo::PIN_HOST_PBO_REFUSAL`], the one both arms read, so they
+    /// cannot drift. A real `ef_tensor_pin_host` entry point (Stage E) is
+    /// what removes the duplication.
+    ///
+    /// The AHardwareBuffer arm, which the static backend refuses for the
+    /// same reason, is deliberately **not** mirrored: Android reports it as
+    /// `TensorMemory::DmaBuf`, indistinguishable here from a Linux DMA-BUF
+    /// or an IOSurface, both of which pin. Guessing from the storage kind
+    /// would refuse two backings that work.
     pub fn pin_host(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'static>> {
+        if self.memory() == TensorMemory::Pbo {
+            return Err(Error::NotImplemented(
+                crate::pbo::PIN_HOST_PBO_REFUSAL.to_owned(),
+            ));
+        }
         self.map_pin(access)
     }
 
@@ -1360,14 +1226,6 @@ impl TensorDyn {
         // first time, or `Self::shape()`/`Self::width()`/`Self::height()`
         // would report the pre-reconfigure geometry forever after.
         self.shape_cache = Self::query_shape(self.handle);
-        // Third copy: the wrapped `PboTensor`. This is the decode-into-a-
-        // pool path, so a stale geometry here is read by the very next GL
-        // import. Capacity-based, matching the static backend, whose
-        // `configure_image` calls `storage.set_logical_shape(&shape)`: the
-        // new image is usually SMALLER than the pool buffer, which the
-        // strict rule would refuse.
-        let new_shape = self.shape_cache.clone();
-        self.sync_pbo_shape(&new_shape, true)?;
         Ok(())
     }
 
@@ -1540,20 +1398,6 @@ impl TensorDyn {
     /// exactly the pool-sized and pitch-padded tensors that make the
     /// distinction matter.
     pub fn capacity_bytes(&self) -> usize {
-        // A PBO-backed tensor's allocation is the GL buffer's, not the
-        // companion `Mem` handle's. `Tensor::from_pbo` sizes that companion
-        // to `shape.product() * size_of::<T>()` exactly, while
-        // `PboTensor::from_pbo` explicitly permits `size > shape.product()`
-        // ("PBOs allocated with a 64-byte-aligned row stride may be larger
-        // than the shape product"). Reading the companion would understate
-        // the real buffer, clamping a `kind::PBO` descriptor's `capacity`
-        // and leaving a consumer's `from_pbo_import` mapping only part of
-        // it -- the same pool-reuse breakage this method already fixes for
-        // `kind::HOST`, left standing for `PBO`. Same precedence
-        // [`Self::memory`] applies, for the same reason.
-        if let Some(bytes) = with_pbo!(self, capacity_bytes) {
-            return bytes;
-        }
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let n = unsafe { edgefirst_tensor_ffi::ef_tensor_capacity_bytes(self.handle.as_ptr()) };
         // `-1` is the entry point's invalid-handle sentinel. Falling back to
@@ -1652,25 +1496,11 @@ impl TensorDyn {
         } else {
             "sync_for_device"
         };
-        // A PBO-backed tensor's real bytes live in the GL buffer `pbo`
-        // addresses; the `ef_tensor_*` handle beside it is ordinary host
-        // memory (see [`Self::pbo`]'s own doc comment). Forwarding to the
-        // ABI would therefore sync *that companion allocation* and report
-        // `Ok(())` -- a bracket that ran no maintenance on the buffer the
-        // caller meant, and said nothing about it. [`Self::map_pin`]
-        // refuses here for the identical reason, and the static backend
-        // gives the same refusal for its own `TensorStorage::Pbo`, so both
-        // backends answer alike. Verified by inducing the failure: without
-        // this guard, `sync_brackets_succeed_on_host_memory_and_are_
-        // refused_by_a_pbo` (`tests/dynamic_primitives.rs`) sees `Ok(())`.
-        if self.pbo.is_some() {
-            return Err(Error::NotImplemented(format!(
-                "{what}: a PBO has no coherency window independent of its map -- \
-                 glMapBufferRange establishes the address and the visibility \
-                 together, and glUnmapBuffer publishes the writes. Use \
-                 Tensor::as_pbo().map() instead, which owns the pair."
-            )));
-        }
+        // No PBO guard: the library refuses a PBO's sync bracket itself
+        // (`TensorStorage::Pbo` in `Tensor::sync_for_cpu`/`_for_device`),
+        // and its message -- which names "PBO" -- travels back through
+        // `ffi_last_error` as a `NotImplemented`, the same error kind the
+        // static backend raises.
         let code = match access {
             CpuAccess::None => {
                 return Err(Error::InvalidArgument(format!(
@@ -1983,28 +1813,59 @@ impl TensorDyn {
 
     /// GL buffer ID for this PBO; `None` when the tensor is not PBO-backed.
     ///
-    /// Reads [`Self::pbo`], with no `ef_tensor_*` entry: a `PboTensor`'s
-    /// state is in-process Rust state with no wire representation at all
-    /// (see that field's own doc comment). The backing `ef_tensor_*` handle
-    /// is ordinary host memory and knows nothing about the GL buffer.
+    /// Drives `ef_tensor_pbo_id`. Before Stage B this read a `PboTensor`
+    /// stashed on this struct; the buffer now lives in the library, which is
+    /// the only place that can answer.
     pub fn pbo_id(&self) -> Option<u32> {
-        with_pbo!(self, buffer_id)
+        let mut id: u32 = 0;
+        // SAFETY: `self.handle` is live; `id` is a valid out-param.
+        let rc = unsafe { edgefirst_tensor_ffi::ef_tensor_pbo_id(self.handle.as_ptr(), &mut id) };
+        (rc == 0).then_some(id)
+    }
+
+    /// Whether this PBO holds (or is establishing) a CPU mapping; `None`
+    /// when the tensor is not PBO-backed.
+    ///
+    /// Drives `ef_tensor_pbo_is_mapped`, whose answer is three-valued: `1`
+    /// mapped, `0` not, negative "not a PBO".
+    pub fn pbo_is_mapped(&self) -> Option<bool> {
+        // SAFETY: `self.handle` is live for the call.
+        let rc = unsafe { edgefirst_tensor_ffi::ef_tensor_pbo_is_mapped(self.handle.as_ptr()) };
+        match rc {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
     }
 
     /// The C-ABI `PboOpsVtable` address for this PBO, for cross-cdylib
     /// export via [`crate::TensorDesc::ptr`]; `None` when not PBO-backed.
-    /// See [`Self::pbo_id`] for why this needs no `ef_tensor_*` entry.
+    ///
+    /// Drives `ef_tensor_pbo_vtable`. The address is the library's, borrowed
+    /// for as long as this handle lives -- which is exactly what
+    /// [`Self::pbo_keepalive`] holds.
     pub fn pbo_vtable_ptr(&self) -> Option<*const std::ffi::c_void> {
-        with_pbo!(self, pbo_vtable).map(|v| v as *const _ as *const std::ffi::c_void)
+        // SAFETY: `self.handle` is live for the call.
+        let p = unsafe { edgefirst_tensor_ffi::ef_tensor_pbo_vtable(self.handle.as_ptr()) };
+        (!p.is_null()).then_some(p)
     }
 
-    /// A type-erased keepalive that must stay alive for at least as long as
-    /// [`Self::pbo_vtable_ptr`]'s address is used; `None` when not
-    /// PBO-backed. See [`crate::pbo::PboTensor::pbo_keepalive`]'s own doc
-    /// comment, and [`Self::pbo_id`] for why this needs no `ef_tensor_*`
-    /// entry.
+    /// A keepalive holding [`Self::pbo_vtable_ptr`]'s address valid: a
+    /// retained reference on this tensor's own handle, which owns the
+    /// library-side `PboTensor` the vtable belongs to.
+    ///
+    /// `None` when the tensor is not PBO-backed, or when the retain fails.
+    /// Under `static` this is an `Arc<PboHandle>`; here it is a handle
+    /// reference, which is the same guarantee expressed in this backend's
+    /// own currency.
     pub fn pbo_keepalive(&self) -> Option<std::sync::Arc<dyn Send + Sync>> {
-        with_pbo!(self, pbo_keepalive)
+        self.pbo_id()?;
+        // SAFETY: `self.handle` is live for the call.
+        let rc = unsafe { edgefirst_tensor_ffi::ef_tensor_retain(self.handle.as_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        Some(std::sync::Arc::new(HandleKeepalive(self.handle.as_ptr())))
     }
 
     /// Wrap a producer's host pointer as a type-erased tensor without
@@ -2224,48 +2085,49 @@ impl TensorDyn {
         }
     }
 
-    /// Rebuild a type-erased PBO tensor from a cross-cdylib `ops` (see
-    /// [`crate::pbo::import_pbo_ops`]) plus the geometry a
-    /// [`crate::TensorDesc`] under [`crate::protocol::kind::PBO`] carries.
+    /// See the static backend's `TensorDyn::from_client_pbo`.
     ///
-    /// Needs no `ef_tensor_*` primitive: a `PboTensor` is in-process Rust
-    /// state (a GL buffer id plus an `Arc<dyn PboOps>` routing map/unmap
-    /// back through the producer's vtable) with no wire representation at
-    /// all -- see [`Self::pbo`]'s own doc comment. The per-dtype dispatch
-    /// mirrors the static backend's `from_pbo_import` exactly; the
-    /// difference is only where the resulting `PboTensor<T>` is stored
-    /// (that field, versus a `TensorStorage::Pbo` variant).
+    /// Drives `ef_tensor_wrap_pbo`: the library owns the `PboTensor`, this
+    /// side owns only the handle.
     ///
-    /// Inherits [`crate::Tensor::from_pbo`]'s cost: minting the companion
-    /// metadata handle allocates the PBO's full byte count as ordinary host
-    /// RAM. See that constructor's doc comment for the measurement and the
-    /// follow-up primitive that should replace it.
-    pub(crate) fn from_pbo_import(
+    /// # Safety
+    /// `state`, `map_fn` and `unmap_fn` must satisfy
+    /// [`crate::client_state_pbo_ops`]'s contract.
+    pub unsafe fn from_client_pbo(
+        state: crate::EfClientState,
+        map_fn: crate::EfPboMapFn,
+        unmap_fn: crate::EfPboUnmapFn,
         buffer_id: u32,
         size: usize,
         shape: &[usize],
         dtype: DType,
-        ops: std::sync::Arc<dyn crate::PboOps>,
-    ) -> Result<Self> {
-        macro_rules! arm {
-            ($t:ty) => {
-                crate::PboTensor::<$t>::from_pbo(buffer_id, size, shape, None, ops)
-                    .and_then(crate::Tensor::<$t>::from_pbo)
-                    .map(crate::Tensor::<$t>::into_inner)
-            };
-        }
-        match dtype {
-            DType::U8 => arm!(u8),
-            DType::I8 => arm!(i8),
-            DType::U16 => arm!(u16),
-            DType::I16 => arm!(i16),
-            DType::U32 => arm!(u32),
-            DType::I32 => arm!(i32),
-            DType::U64 => arm!(u64),
-            DType::I64 => arm!(i64),
-            DType::F16 => arm!(half::f16),
-            DType::F32 => arm!(f32),
-            DType::F64 => arm!(f64),
+    ) -> Result<TensorDyn> {
+        let dims: Vec<u64> = shape.iter().map(|d| *d as u64).collect();
+        // SAFETY: `dims` is a live local for the call; the state and op
+        // pointers carry this function's own contract into the library.
+        let handle = unsafe {
+            edgefirst_tensor_ffi::ef_tensor_wrap_pbo(
+                state,
+                buffer_id,
+                size,
+                dtype.code(),
+                dims.as_ptr(),
+                dims.len() as u32,
+                Some(map_fn),
+                Some(unmap_fn),
+            )
+        };
+        match NonNull::new(handle) {
+            Some(h) => Ok(Self::from_handle(h)),
+            // `ffi_error`, not a hand-rolled variant: the library just
+            // recorded a class through `set_last_error_classified`, and
+            // throwing it away would make `dynamic` report
+            // `InvalidOperation` where `static` reports `InvalidArgument`
+            // for the very same malformed channel. `InvalidArgument` is the
+            // fallback the neighbouring `from_d3d11_*` constructors use, and
+            // it is only reached for an `Unspecified` class -- every
+            // classified failure keeps the class the library recorded.
+            None => Err(ffi_error(Error::InvalidArgument)),
         }
     }
 
@@ -2319,11 +2181,22 @@ impl TensorDyn {
             }
             crate::protocol::kind::PBO => {
                 let buffer_id = crate::protocol::descriptor_pbo_buffer_id(desc)?;
-                // SAFETY: same capsule contract as the `HOST` arm above,
-                // extended to what `desc.ptr` means under `kind::PBO` (see
-                // `TensorDesc::ptr`'s own doc comment).
-                let ops = unsafe { crate::pbo::import_pbo_ops(desc.ptr.0 as *const _)? };
-                Self::from_pbo_import(buffer_id, desc.capacity as usize, shape, dtype, ops)
+                // SAFETY: `desc.ptr` carries a `PboOpsVtable` address under
+                // `kind::PBO`, held live for this call by the producer's
+                // capsule keepalive.
+                let parts = unsafe { crate::read_pbo_vtable_parts(desc.ptr.0 as *const _) }?;
+                // SAFETY: the parts came from a table this crate built.
+                unsafe {
+                    Self::from_client_pbo(
+                        parts.state,
+                        parts.map_fn,
+                        parts.unmap_fn,
+                        buffer_id,
+                        desc.capacity as usize,
+                        shape,
+                        dtype,
+                    )
+                }
             }
             #[cfg(target_os = "windows")]
             crate::protocol::kind::D3D11_TEXTURE => {
@@ -2381,9 +2254,10 @@ impl TensorDyn {
     pub fn descriptor_pinned(&self, pin: Option<&crate::HostPin<'_>>) -> crate::TensorDesc {
         let memory = self.memory();
         let handle: i64 = match memory {
-            // A PBO's "native handle" is its GL buffer id, which lives in
-            // `pbo` and never in the backing `ef_tensor_*` handle -- plane 0
-            // would report `-1` here.
+            // A PBO's "native handle" is its GL buffer id, which only
+            // `ef_tensor_pbo_id` can answer -- plane 0 would report `-1`
+            // here, since a GL buffer name is not a value
+            // `ef_tensor_plane_at`'s `native_handle` carries.
             TensorMemory::Pbo => self.pbo_id().map(|id| id as i64).unwrap_or(-1),
             // A D3D11 texture's plane 0 reports `-1`: an NT handle is not a
             // value `ef_tensor_plane_at` carries. The handle comes from
@@ -2442,138 +2316,6 @@ impl TensorDyn {
             .unwrap_or(-1)
     }
 }
-
-/// Call a `PboTensor<T>` method through [`TensorDyn::pbo`]'s type erasure.
-///
-/// `pbo` is a `Box<dyn Any>` because `TensorDyn` carries no element type,
-/// so reaching `PboTensor<T>`'s inherent methods needs a concrete `T` --
-/// recovered here by matching on [`TensorDyn::dtype`], which
-/// `Tensor::from_pbo` (`dynamic_tensor.rs`) guarantees agrees with the
-/// stored value's `T` (it mints the backing handle with `T::DTYPE`). The
-/// same downcast technique `lens.rs`'s `as_typed` already uses for the
-/// handle itself, applied to the eleven element types instead of one.
-///
-/// Yields `None` for a tensor with no PBO, which is every tensor except one
-/// built by `Tensor::from_pbo`.
-/// [`with_pbo!`]'s mutable sibling, for the geometry mutators.
-///
-/// A PBO-backed `TensorDyn` carries geometry in two places -- the
-/// `ef_tensor_*` handle and the `PboTensor` behind [`TensorDyn::pbo`] -- and
-/// a mutator that updates only the first leaves them disagreeing, with
-/// `shape()` saying one thing and `as_pbo().shape` another. Nothing errors,
-/// because the byte length still matches; `edgefirst-image` just reads the
-/// stale geometry off `as_pbo()`. Reviewed as F6 on task P2b.
-///
-/// Tries each concrete instantiation rather than picking one from
-/// `dtype()`, for the same reason [`with_pbo!`] does: after a
-/// [`TensorDyn::set_dtype`] retag the two can legitimately disagree, and
-/// keying on the dtype finds nothing.
-macro_rules! with_pbo_mut {
-    ($self:expr, $method:ident, $arg:expr) => {{
-        match $self.pbo.as_mut() {
-            None => None,
-            Some(any) => {
-                macro_rules! arm {
-                    ($t:ty) => {
-                        any.downcast_mut::<crate::PboTensor<$t>>().map(|p| {
-                            <crate::PboTensor<$t> as crate::TensorTrait<$t>>::$method(p, $arg)
-                        })
-                    };
-                }
-                None.or_else(|| arm!(u8))
-                    .or_else(|| arm!(i8))
-                    .or_else(|| arm!(u16))
-                    .or_else(|| arm!(i16))
-                    .or_else(|| arm!(half::f16))
-                    .or_else(|| arm!(u32))
-                    .or_else(|| arm!(i32))
-                    .or_else(|| arm!(f32))
-                    .or_else(|| arm!(u64))
-                    .or_else(|| arm!(i64))
-                    .or_else(|| arm!(f64))
-            }
-        }
-    }};
-}
-use with_pbo_mut;
-
-macro_rules! with_pbo {
-    ($self:expr, $method:ident) => {{
-        match $self.pbo.as_ref() {
-            None => None,
-            Some(any) => {
-                // Try each concrete instantiation until one matches, rather
-                // than picking one from `$self.dtype()`.
-                //
-                // Those two can legitimately disagree. `edgefirst-image`
-                // allocates a PBO as `u8` and hands it back as an `i8`
-                // tensor; `From<Tensor<T>> for TensorDyn` retags the
-                // *handle*'s dtype to match (see its doc comment), but the
-                // `PboTensor<u8>` in this box is a real value behind a real
-                // `Any` vtable, which no transmute of the enclosing
-                // `Tensor<T>` touches. Keying on `dtype()` therefore looked
-                // for a `PboTensor<i8>`, found nothing, and reported the
-                // tensor as having no PBO at all -- `pbo_id()` returned
-                // `None`, so its descriptor carried no buffer id and a
-                // cross-package re-import failed with "PBO descriptor
-                // carries no buffer id".
-                //
-                // Sound because `downcast_ref` is an exact `TypeId` match,
-                // so at most one arm can hit and the order is irrelevant,
-                // and because every method reached through this macro
-                // (`buffer_id`, `pbo_vtable`, `pbo_keepalive`) reads the
-                // shared `PboHandle` and does not depend on `T`.
-                let p = None
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<u8>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<i8>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<u16>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<i16>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<half::f16>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<u32>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<i32>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<f32>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<u64>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<i64>>()
-                            .map(|p| p.$method())
-                    })
-                    .or_else(|| {
-                        any.downcast_ref::<crate::PboTensor<f64>>()
-                            .map(|p| p.$method())
-                    });
-                p
-            }
-        }
-    }};
-}
-use with_pbo;
 
 /// Turn `ef_tensor_batch`'s `NULL` into the error [`crate::Tensor::batch`]
 /// would have returned.
@@ -2643,7 +2385,7 @@ fn builder_error(errno: std::ffi::c_int) -> Error {
     }
 }
 
-/// Derive a [`BufferIdentity`] from an fd's `(st_dev, st_ino)`./// Derive a [`BufferIdentity`] from an fd's `(st_dev, st_ino)`. See
+/// Derive a [`BufferIdentity`] from an fd's `(st_dev, st_ino)`. See
 /// [`TensorDyn::derive_identity`]'s doc comment for why this is the correct
 /// key for a DMA-BUF handle. Mirrors `dma.rs::identity_from_stat` exactly
 /// (that one is `static`-backend-private and `target_os = "linux"`-gated;
@@ -2824,6 +2566,24 @@ pub(crate) fn ffi_error(fallback: fn(String) -> Error) -> Error {
         C::AllocationFailed => Error::IoError(std::io::Error::other(msg)),
         C::QuantizationInvalid => Error::InvalidArgument(msg),
         C::Unspecified => fallback(msg),
+    }
+}
+
+/// Holds one `ef_tensor_retain` on a handle for a keepalive's lifetime, so
+/// an address borrowed out of that handle (a `PboOpsVtable`, today) stays
+/// valid independently of the `TensorDyn` it came from.
+struct HandleKeepalive(*mut EfTensor);
+
+// SAFETY: an `ef_tensor` handle is refcounted and documented as safe to
+// cross threads (`ef_tensor_retain`); this holds one reference and does
+// nothing else with the pointer.
+unsafe impl Send for HandleKeepalive {}
+unsafe impl Sync for HandleKeepalive {}
+
+impl Drop for HandleKeepalive {
+    fn drop(&mut self) {
+        // SAFETY: releases exactly the reference `pbo_keepalive` took.
+        unsafe { edgefirst_tensor_ffi::ef_tensor_free(self.0) }
     }
 }
 

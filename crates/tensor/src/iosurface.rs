@@ -379,6 +379,9 @@ where
                 "IOSurfaceGetBaseAddress returned null after lock",
             ))
         })?;
+        // SAFETY: the sole caller, `map_inner`, refuses `view_offset + exposed`
+        // past `buf_size` before it gets here, so this stays inside the
+        // surface's allocation.
         let data = unsafe { (base_ptr.as_ptr() as *mut u8).add(self.view_offset) };
         let len = self.buf_size.saturating_sub(self.view_offset);
         Ok(crate::pin::HostPin::new(keepalive, data, len))
@@ -1533,6 +1536,341 @@ mod tests {
             mp.as_slice()[64],
             0xAB,
             "write through view is visible in parent"
+        );
+    }
+
+    /// Pins the bound `map_inner` already enforces, which issue #161 made
+    /// load-bearing: before it, `view_offset` could only come from `view()`
+    /// under that function's own bounds check, and now `set_plane_offset`
+    /// writes a descriptor's restored offset -- untrusted cross-package input
+    /// -- straight into it.
+    ///
+    /// Nothing here is new behaviour; the point is that removing the
+    /// `view_offset + exposed <= buf_size` check in `map_inner` would now be
+    /// reachable from a descriptor rather than only from a bug in `view()`.
+    /// Two things would go wrong. `scoped_pin` offsets the locked base
+    /// address by `view_offset`, which leaves the allocation entirely -- and
+    /// forming that pointer is undefined behaviour before anything reads it.
+    /// And an offset merely *close* to the end yields a map shorter than the
+    /// image while the tensor still reports its full shape, which the GL
+    /// upload path reads `width x height` from through a raw pointer that
+    /// cannot see a slice's length.
+    ///
+    /// `D3d11TextureTensor` had no equivalent of this check; see
+    /// `d3d11_map_refuses_a_plane_offset_past_the_backing`, which this test's
+    /// bounds now match.
+    #[test]
+    fn iosurface_map_refuses_a_plane_offset_that_cannot_hold_the_image() {
+        use crate::{DType, Tensor, TensorDyn, TensorTrait};
+
+        const PARENT: usize = 256;
+        const WINDOW: usize = 64;
+
+        let parent = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        assert_eq!(parent.memory(), TensorMemory::DmaBuf);
+        let parent_dyn = TensorDyn::from(parent);
+        let id = parent_dyn
+            .iosurface_id()
+            .expect("parent is IOSurface-backed");
+        // The surface's own allocation, which IOSurface may round up past the
+        // 256 bytes asked for -- the bound is the real one, not the request.
+        let capacity = parent_dyn
+            .map_bytes(crate::CpuAccess::Read)
+            .expect("map parent")
+            .as_slice()
+            .len();
+
+        let mut rebuilt = TensorDyn::from_iosurface_id(id, &[WINDOW], DType::U8, None)
+            .expect("reconstruct at the view's shape");
+
+        // A window that still holds its whole 64 bytes is fine, including the
+        // one that ends exactly at the surface's end.
+        rebuilt.set_plane_offset(capacity - WINDOW);
+        assert_eq!(
+            rebuilt
+                .map_bytes(crate::CpuAccess::Read)
+                .expect("the last window that fits")
+                .as_slice()
+                .len(),
+            WINDOW,
+            "a window ending exactly at the surface's end must still map"
+        );
+
+        // One byte further and the image no longer fits. Refused, rather than
+        // handed back one byte short.
+        rebuilt.set_plane_offset(capacity - WINDOW + 1);
+        let err = rebuilt
+            .map_bytes(crate::CpuAccess::Read)
+            .expect_err("a window one byte short of its image");
+        assert!(
+            matches!(err, Error::InsufficientCapacity { .. }),
+            "expected InsufficientCapacity, got {err}"
+        );
+
+        // The degenerate one-past-the-end offset: a legal pointer, an empty
+        // window, and a tensor that still calls itself 64 bytes wide.
+        rebuilt.set_plane_offset(capacity);
+        assert!(
+            rebuilt.map_bytes(crate::CpuAccess::Read).is_err(),
+            "an empty window for a non-empty tensor must not map"
+        );
+
+        // Far past the surface, and a value chosen to overflow if the bound
+        // were computed with wrapping arithmetic.
+        rebuilt.set_plane_offset(usize::MAX);
+        assert!(
+            rebuilt.map_bytes(crate::CpuAccess::Read).is_err(),
+            "usize::MAX must not wrap into range"
+        );
+    }
+
+    /// Restoring a plane offset onto a *reconstructed* IOSurface tensor must
+    /// move where `map()` starts. Regression test for issue #161.
+    ///
+    /// `TensorDesc` has no field for the plane offset, so every path that
+    /// rebuilds a tensor from a descriptor puts the offset back by calling
+    /// `Tensor::set_plane_offset` — `edgefirst-python-common`'s
+    /// `interop::apply_plane_offset` is the caller that matters. That call was
+    /// a silent no-op on this backing: `set_plane_offset`'s `Dma` arm was
+    /// `cfg(target_os = "linux")`, and because `TensorStorage::Dma` is a
+    /// cfg-multiplexed *name* rather than one type, macOS did not fail to
+    /// compile — it fell through to the catch-all. A reconstructed `view()`
+    /// therefore addressed the parent surface's origin, silently, with no
+    /// error to follow.
+    ///
+    /// Distinct from `subview_iosurface_shares_identity_and_offsets_map`
+    /// above, which covers the *fresh* view path: `IoSurfaceTensor::view` sets
+    /// its own `view_offset` and always did. Only restoring an offset onto an
+    /// already-built tensor was broken — which is exactly why a freshly
+    /// created view was correct on every platform and only the descriptor
+    /// round trip was wrong.
+    ///
+    /// The reconstruction is spelled with `TensorDyn::from_iosurface_id`
+    /// because that is the same `lookup_by_id` + `from_iosurface` pair that
+    /// `import_storage`'s `kind::IOSURFACE` arm runs, without needing the
+    /// Python capsule layer to reach it.
+    #[test]
+    fn set_plane_offset_moves_the_iosurface_map_window() {
+        use crate::{DType, Tensor, TensorDyn, TensorTrait};
+
+        const PARENT: usize = 256;
+        const OFFSET: usize = 64;
+        const WINDOW: usize = 64;
+
+        // Ramp the parent surface so byte i holds i: a window that lands at
+        // the wrong origin cannot coincidentally match the expected bytes.
+        let parent = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        assert_eq!(parent.memory(), TensorMemory::DmaBuf);
+        {
+            let mut m = parent.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+        let parent_dyn = TensorDyn::from(parent);
+        let id = parent_dyn
+            .iosurface_id()
+            .expect("parent is IOSurface-backed");
+
+        // Reopen the *whole* surface at the sub-region's shape, as an import
+        // does: the handle names the parent, so this lands at its origin.
+        let mut rebuilt = TensorDyn::from_iosurface_id(id, &[WINDOW], DType::U8, None)
+            .expect("reconstruct at the view's shape");
+        {
+            let m = rebuilt
+                .map_bytes(crate::CpuAccess::Read)
+                .expect("map rebuilt before the offset");
+            assert_eq!(
+                m.as_slice()[0],
+                0,
+                "precondition: a bare import starts at the parent's origin"
+            );
+        }
+
+        // The restore under test.
+        rebuilt.set_plane_offset(OFFSET);
+        assert_eq!(
+            rebuilt.plane_offset(),
+            Some(OFFSET),
+            "the wrapper field records the offset on every backing"
+        );
+
+        let m = rebuilt
+            .map_bytes(crate::CpuAccess::Read)
+            .expect("map rebuilt after the offset");
+        let s = m.as_slice();
+        assert_eq!(s.len(), WINDOW, "the window exposes its logical length");
+        assert_ne!(
+            s[0], 0,
+            "map() still starts at the parent's origin — set_plane_offset was \
+             a no-op on IOSurface storage (issue #161)"
+        );
+        for (i, b) in s.iter().enumerate() {
+            assert_eq!(
+                *b,
+                ((i + OFFSET) & 0xff) as u8,
+                "window byte {i} must be parent[{}]",
+                i + OFFSET
+            );
+        }
+    }
+
+    /// A nested `subview` must not compound its offset now that
+    /// `set_plane_offset` writes through to IOSurface storage.
+    ///
+    /// The double-apply guard for the fix above, and the reason it needed
+    /// checking rather than assuming: `Tensor::subview` sets the offset
+    /// *twice* by two different routes. `TensorStorage::view` computes
+    /// `view_offset + offset_bytes` inside `IoSurfaceTensor::view`, and then
+    /// `subview` calls `set_plane_offset(plane_offset + offset_bytes)` on the
+    /// result. Those are the same number only while the wrapper field and the
+    /// storage field stay in sync — which is what the new arm makes true, and
+    /// what an unguarded restore got wrong on `MEM` in the DMA-BUF half of
+    /// this fix (PR #160). Two levels, because a single level cannot tell an
+    /// idempotent write apart from one that compounds from zero.
+    #[test]
+    fn nested_iosurface_subviews_do_not_compound_their_plane_offset() {
+        use crate::{Tensor, TensorTrait};
+
+        let parent = Tensor::<u8>::new(&[256], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        {
+            let mut m = parent.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        let outer = parent.subview(64, &[128]).expect("outer subview");
+        assert_eq!(outer.plane_offset(), Some(64));
+        let inner = outer.subview(32, &[64]).expect("inner subview");
+        assert_eq!(
+            inner.plane_offset(),
+            Some(96),
+            "offsets add once, not twice (64 + 32)"
+        );
+
+        let m = inner.map().expect("map nested subview");
+        for (i, b) in m.as_slice().iter().enumerate() {
+            assert_eq!(
+                *b,
+                ((i + 96) & 0xff) as u8,
+                "nested window byte {i} must be parent[{}], not a compounded offset",
+                i + 96
+            );
+        }
+    }
+
+    /// `set_format` must clear the IOSurface storage offset, not just the
+    /// wrapper field.
+    ///
+    /// The mirror of `set_plane_offset_moves_the_iosurface_map_window`, and
+    /// the reason the fix for it is a set/clear pair rather than one arm:
+    /// `set_format` deliberately drops stride and offset when the format
+    /// changes, because neither is necessarily valid for the new one. It
+    /// dropped them with the same Linux-gated match the setter had, so
+    /// clearing on macOS left `plane_offset()` reporting `None` while
+    /// `map()` still started at the old offset -- a stale window instead of
+    /// a lost one, and the failure mode that making the setter take effect
+    /// would otherwise have introduced.
+    #[test]
+    fn set_format_clears_the_iosurface_map_window() {
+        use crate::{PixelFormat, Tensor, TensorTrait};
+
+        const PARENT: usize = 256;
+        const OFFSET: usize = 64;
+
+        let mut t = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::DmaBuf), None).expect("alloc");
+        {
+            let mut m = t.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        // An 8x8 greyscale window carrying an offset, so there is something
+        // to clear. The surface is a 256-byte byte-bag, so the 64-byte window
+        // plus the offset still fits.
+        t.set_logical_shape(&[8, 8, 1]).expect("logical shape");
+        t.set_format(PixelFormat::Grey).expect("format");
+        t.set_plane_offset(OFFSET);
+        assert_eq!(
+            t.map().expect("map before").as_slice()[0],
+            OFFSET as u8,
+            "precondition: the offset is live before the format change"
+        );
+
+        // Changing the format drops the offset it cannot vouch for.
+        t.set_logical_shape(&[4, 8, 3]).expect("rgb logical shape");
+        t.set_format(PixelFormat::Rgb).expect("new format");
+        assert_eq!(t.plane_offset(), None, "the wrapper field is cleared");
+        assert_eq!(
+            t.map().expect("map after").as_slice()[0],
+            0,
+            "map() still starts at the old offset — set_format cleared the \
+             wrapper field but not the IOSurface storage (issue #161)"
+        );
+    }
+
+    /// A descriptor round trip must restore the surface's pitch onto an
+    /// IOSurface view import. Regression test for the second half of issue
+    /// #161's IOSurface fix.
+    ///
+    /// `restore_imported_row_stride` was `HOST | DMABUF` only, on the
+    /// grounds that nothing had reported the gap for IOSurface. A view of a
+    /// pitched surface reports its parent's pitch in `strides[0]`; the import
+    /// reopened the whole surface at the window's shape and, dropping that
+    /// stride, read a 16-texel RGBA window at 64-byte rows over a surface
+    /// whose rows are 256 bytes apart -- every row but the first sheared.
+    /// The merged convert test hid it by calling `set_row_stride` by hand,
+    /// which a real capsule consumer never does.
+    ///
+    /// Unlike D3D11 (whose exclusion stands: a staging pitch is the local
+    /// driver's), an IOSurface's `bytesPerRow` is a property of the shared
+    /// surface, so the producer's stride is the consumer's.
+    #[test]
+    fn descriptor_import_restores_the_iosurface_pitch_onto_a_view() {
+        use crate::{Region, Tensor, TensorDyn, TensorTrait};
+
+        // Width 50 RGBA: a 200-byte natural row, which IOSurface pads to a
+        // 64-aligned 256-byte pitch. The two must differ or this test cannot
+        // tell a restored pitch from a dropped one.
+        let parent = Tensor::<u8>::image(
+            50,
+            8,
+            PixelFormat::Rgba,
+            Some(TensorMemory::DmaBuf),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("alloc a pitched RGBA surface");
+        assert_eq!(parent.memory(), TensorMemory::DmaBuf);
+        let pitch = parent.effective_row_stride().expect("surface pitch");
+        assert_ne!(pitch, 50 * 4, "precondition: the pitch is padded");
+
+        let view = parent.view(Region::new(4, 2, 16, 4)).expect("view");
+        assert_eq!(
+            view.effective_row_stride(),
+            Some(pitch),
+            "a multi-row view carries its parent's pitch"
+        );
+        let desc = TensorDyn::from(view).descriptor_pinned(None);
+        assert_eq!(
+            desc.strides()[0],
+            pitch as i64,
+            "the descriptor reports the pitch in bytes"
+        );
+
+        let rebuilt = TensorDyn::import_descriptor(&desc).expect("import the view's descriptor");
+        assert_eq!(
+            rebuilt.shape(),
+            &[4, 16, 4],
+            "imported at the window's shape"
+        );
+        assert_eq!(
+            rebuilt.effective_row_stride(),
+            Some(pitch),
+            "restore_imported_row_stride dropped the IOSurface pitch: a 16-wide \
+             window over a {pitch}-byte-pitched surface would be read at 64-byte \
+             rows (issue #161)"
         );
     }
 }

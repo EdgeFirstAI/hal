@@ -237,6 +237,7 @@ Git Bash's `/usr/bin/link.exe` shadows it):
 pwsh scripts/test-windows.ps1 -RequireGl                       # real GPU: all crates, -j 1
 pwsh scripts/test-windows.ps1 -RequireGl -p edgefirst-image    # image crate only
 pwsh scripts/test-windows.ps1 -Warp -RequireGl -p edgefirst-image   # no GPU: D3D11 WARP
+pwsh scripts/test-windows.ps1 -RequireGl -RequireCuda -p edgefirst-tensor   # real GPU + CUDA
 ```
 
 The script defaults `EDGEFIRST_ANGLE_PATH` to the fetched directory, `-Warp`
@@ -244,6 +245,29 @@ sets `EDGEFIRST_ANGLE_ADAPTER=warp` + `EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and
 `-RequireGl` sets `HAL_TEST_REQUIRE_GL=1`; everything after the switches is
 passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
 serialization policy.
+
+`-RequireCuda` sets `HAL_TEST_REQUIRE_CUDA=1`, turning a silent
+`SKIPPED: <test> - no CUDA runtime …` in
+`crates/tensor/tests/d3d11_tensor.rs`'s three D3D11 CUDA interop tests into
+a failure naming the test and the reason. The
+WARP-adapter skip is unaffected — it is correct by design, and those tests
+check the adapter *before* the gate so an armed gate cannot convert it into a
+failure.
+
+The script arms the gate without the switch when the host looks like an NVIDIA
+box (`nvidia-smi` on PATH and exiting zero, or `CUDA_PATH` set), printing
+"NVIDIA driver or toolkit present: requiring CUDA coverage". Read that for what
+it is: evidence about the *host*, not about the adapter the D3D11 device is
+created on. That adapter comes from `EDGEFIRST_D3D11_ADAPTER` (or the
+`EDGEFIRST_ANGLE_ADAPTER` alias), and unset means DXGI adapter 0, which on a
+hybrid laptop can be the integrated GPU. Auto-detection is therefore suppressed
+when WARP is the selected adapter — via `-Warp` or either variable inherited
+from the shell — which prints "WARP adapter selected: not auto-requiring CUDA
+coverage". On a hybrid box whose adapter 0 is not the NVIDIA one, either name
+the NVIDIA adapter (`EDGEFIRST_D3D11_ADAPTER=discrete`, or a description
+substring such as `RTX 3070`) or pass `-NoRequireCuda`. `-RequireCuda` passed
+explicitly, and an inherited `HAL_TEST_REQUIRE_CUDA=1`, arm the gate whatever
+the adapter; `-NoRequireCuda` disarms it whatever the environment.
 
 One variable picks the adapter for both the device and ANGLE's display, since
 ANGLE builds its display on the HAL's device: `EDGEFIRST_D3D11_ADAPTER` is the
@@ -322,6 +346,16 @@ somewhere the suite never looks.
 `HAL_TEST_REQUIRE_GL=1`, and then requires a GPU-backed destination. The
 Windows `edgefirst-image` wheel bundles ANGLE when built with
 `EDGEFIRST_ANGLE_PATH` set, so an installed wheel needs no env var.
+
+Export `EDGEFIRST_ANGLE_PATH` for the `maturin build` step itself, the way
+`scripts/test-windows.ps1` sets it for the cargo runs — `crates/python-image/build.rs`
+reads it at build time and ships the wheel CPU-only when it is unset. A wheel
+built without it fails seven of the gpu-marked tests with
+`create_image() yielded TensorMemory.MEM on Windows with HAL_TEST_REQUIRE_GL=1`,
+since nothing in the wheel supplies ANGLE and the runtime fallback has no
+`EDGEFIRST_ANGLE_PATH` to fall back to. The build says which it did: look for
+the `bundling ANGLE (libEGL.dll, libGLESv2.dll)` cargo warning, or check the
+installed package for `edgefirst/image/libEGL.dll`.
 
 One asymmetry to know when writing a test: after a Python `convert`,
 `convert_deferred` or `convert_with_fence`, the destination's
@@ -656,6 +690,15 @@ Two details worth knowing:
   because the Vivante driver has an intermittent double-free that otherwise
   masquerades as a regression in whatever you just changed. The workaround
   keys off the hardware, so it applies to any Vivante board.
+- **Feature-gated tests need `FEATURES`.** The script builds the test crates
+  with their default features, so a test behind a cargo feature never runs on
+  a board unless you ask for it. `FEATURES=edgefirst-image/dma_test_formats`
+  reaches the DMA-BUF import suite, which CI's hardware lane builds and this
+  script did not; spell a feature that is not shared by every selected package
+  as `<pkg>/<feature>`, which is what cargo requires with more than one `-p`.
+  It applies to the test build only, not to the C-API leaves. `g2d_test_formats`
+  is imx8mp-only, so enabling it across a mixed set of boards lights up tests
+  the others cannot serve.
 
 ### What a given board can actually exercise
 
@@ -690,6 +733,20 @@ what and why — never summarise a run that skipped every DMA test as
 > does. Both hold their own handle to the real stderr. Cross-check against
 > the board's `capabilities.txt` before claiming a hardware path was
 > exercised.
+>
+> **Start that line with `SKIPPED: `.** That literal prefix is what
+> `scripts/on-target-test.sh` greps each board's captured log for to report
+> the per-board skip count, so a skip announced under any other spelling is
+> invisible to the summary even when it reaches the log. Prefer the helper
+> your crate already has — `edgefirst-image`'s
+> `crate::test_support::report_skip`, or `artifacts::skip` in the two C-API
+> leaves that carry the `artifacts` module, `edgefirst-tensor-capi` and
+> `edgefirst-image-capi`. The other three modular leaves
+> (`edgefirst-codec-capi`, `edgefirst-decoder-capi`,
+> `edgefirst-tracker-capi`) do not include that module, so their tests write
+> the `writeln!(std::io::stderr(), "SKIPPED: …")` by hand; do the same
+> anywhere else an integration test cannot reach a helper, as
+> `crates/tensor/tests/support/cuda_require.rs` does.
 
 The `--test-threads=1` flag is mandatory on target for the same reasons
 as local development — CMA pool exhaustion risk is higher on embedded
@@ -708,6 +765,29 @@ ssh imx95-frdm 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./<b
 
 The `python-*` crates are excluded from cross-builds — PyO3 requires a
 target Python installation.
+
+**Cross-compiling the `dynamic` backend's tests** (`dynamic_primitives`,
+`protocol_roundtrip`, and the rest of `make test-tensor-dynamic`'s
+`DYNAMIC_TEST_TARGETS`) needs one more step: these link against
+`libedgefirst_tensor.so`, cross-built from `crates/tensor-capi`, not the
+plain `edgefirst-tensor` rlib. `crates/tensor/build.rs`'s
+`dynamic-test-link` feature honours `EDGEFIRST_TENSOR_LIB_DIR` when set,
+otherwise it derives the search path from `OUT_DIR` (the
+`target/<target-triple>/<profile>` layout `cargo-zigbuild` itself produces)
+— so cross-building this lane no longer needs a hand-rolled `RUSTFLAGS`:
+
+```bash
+cargo-zigbuild build --target aarch64-unknown-linux-gnu.2.35 \
+  --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
+cargo-zigbuild test --target aarch64-unknown-linux-gnu.2.35 --no-run \
+  -p edgefirst-tensor --no-default-features --features dynamic,dynamic-test-link,ndarray \
+  --test dynamic_primitives
+```
+
+Set `EDGEFIRST_TENSOR_LIB_DIR` to the directory containing
+`libedgefirst_tensor.so` only when the producer build landed somewhere the
+derived path can't find on its own (a different `--target-dir`, or a `.so`
+fetched from elsewhere).
 
 CI automates this flow in
 [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).
@@ -812,6 +892,31 @@ environment variable from the table below and re-run with
 | `EDGEFIRST_FORCE_TRANSFER=dmabuf` | DMA-buf transfers; fails if EGLImage import fails | DMA-buf path on systems where it normally falls back |
 | `EDGEFIRST_FORCE_TRANSFER=sync` | Memcpy upload/readback via `glTexImage2D` / `glReadnPixels` | Non-zero-copy baseline; useful for measuring fast-path cost |
 | `EDGEFIRST_TENSOR_FORCE_MEM=1` | Forces heap tensors; disables DMA / SHM | Pure-CPU regression baseline |
+
+**The four PBO correctness gates need none of these.** They allocate through
+`GLProcessorThreaded::create_pbo_image`, which returns a PBO regardless of what
+the host's DMA-BUF import can do, and each asserts its route positively through
+`convert_stats()` — one PBO source feed, zero CPU uploads, zero imports — so a
+GL decline is a hard failure rather than a quiet CPU-fallback pass. They are
+plain `--lib` tests and therefore already in the default run on every lane, and
+they pass unforced, under `EDGEFIRST_FORCE_TRANSFER=pbo`, and under
+`EDGEFIRST_FORCE_TRANSFER=dmabuf` alike:
+
+```bash
+cargo test -p edgefirst-image --lib -- --exact \
+  opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_gl \
+  opengl_headless::tests::gl_tests::a_pbo_view_source_converts_its_own_region_to_f32_gl \
+  opengl_headless::tests::gl_tests::a_padded_pbo_source_does_not_shear_the_f32_upload \
+  opengl_headless::tests::gl_tests::a_padded_pbo_destination_is_written_at_its_own_pitch
+```
+
+An earlier revision of these gates entered through `ImageProcessor::convert`
+with `ComputeBackend::OpenGl`, which leaves `forced_backend` at `None` — a GL
+decline logged at debug and the CPU fallback produced a bit-exact answer, so
+the gate went green with zero GL coverage. That is the hazard the route
+assertion exists to remove; a GL test that compares against a CPU-computable
+expectation without asserting `convert_fallback_count()` or its route can pass
+without ever touching the GPU.
 
 ### Warm up before measuring
 
@@ -1046,8 +1151,13 @@ cargo test -p edgefirst-tensor -- --test-threads=1
 
 These exercise the real zero-copy output path end to end:
 `convert()` → `cuda_map()` → `cudaMemcpy(D2H)` → bit-compare to a CPU reference.
-They run on any CUDA-capable host and **skip cleanly** when `libcudart`, GL, or a
-PBO allocation is unavailable, so they are *not* part of `make test`.
+They run on any CUDA-capable host and are *not* part of `make test`. Without
+the opt-in below they **skip cleanly** when `libcudart`, GL, or a PBO
+allocation is unavailable; under `HAL_TEST_REQUIRE_CUDA=1` — which
+`make test-cuda` sets whenever it locates a runtime — every one of those
+skips is a failure instead of a pass. See
+[`crates/image/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md)
+for the policy that enforces this.
 
 | Test (`crates/image`) | Covers |
 |------------------------|--------|
@@ -1168,7 +1278,7 @@ Tests run across multiple runner types:
 | Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | Paravirtual Metal GPU (ANGLE; Full GL serialization policy) |
 | Build & Link (iOS) | `macos-latest` | arm64 | No runtime tests — build + link closure only |
 | Build & Link (Android) | `ubuntu-22.04` | x86_64 host | No runtime tests — see Device Farm section below |
-| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating) and image-crate GL tests on ANGLE Direct3D 11 WARP (software; best-effort), both under cargo-llvm-cov into one LCOV (`coverage-windows` → SonarCloud); C-API leaf tests and gpu pytest on WARP (best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl` |
+| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating) and image-crate GL tests on ANGLE Direct3D 11 WARP (software; best-effort), both under cargo-llvm-cov into one LCOV (`coverage-windows` → SonarCloud); C-API leaf tests and gpu pytest on WARP (best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl -RequireCuda` |
 | Software-GL Coverage (llvmpipe) | `ubuntu-22.04-xlarge` | x86_64 | Mesa llvmpipe (software GL) |
 | Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
 | Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |

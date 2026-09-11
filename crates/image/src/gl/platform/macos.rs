@@ -304,9 +304,9 @@ mod tests {
             .iter()
             .any(|p| std::path::Path::new(p).exists());
         if !exists_at_any {
-            eprintln!(
-                "ANGLE not installed at any default path — skipping. \
-                 Run `brew install startergo/angle/angle` to enable this test."
+            crate::test_support::report_skip(
+                "ANGLE not installed at any default path — run `brew install \
+                 startergo/angle/angle` to enable this test",
             );
             return;
         }
@@ -317,9 +317,9 @@ mod tests {
         // check above is the portable smoke-test, and the integration
         // test exercises the real load path.
         if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
-            eprintln!(
-                "HAL_TEST_ALLOW_DLOPEN_ANGLE unset — skipping ANGLE dlopen \
-                 probe (run via scripts/test-macos.sh to exercise it)."
+            crate::test_support::report_skip(
+                "HAL_TEST_ALLOW_DLOPEN_ANGLE unset — run via \
+                 scripts/test-macos.sh to exercise the ANGLE dlopen probe",
             );
             return;
         }

@@ -80,6 +80,31 @@ pub(super) fn generate_vertex_shader() -> &'static str {
 /// last column's sample in by up to half a texel. At `highp` the bound is
 /// exact, so clamping to it reproduces `CLAMP_TO_EDGE` wherever the texture
 /// is the logical image.
+///
+/// `tc` is `highp` for a second, sharper reason: the SAMPLED COORDINATE must
+/// not go through a `mediump` ALU. Passing a varying straight to `texture()`
+/// lets a driver hand the interpolator's own coordinate to the texture unit,
+/// but `clamp()` is arithmetic, and at `mediump` it rounds the result to fp16
+/// — a step of 2^-11 near 1.0, which is 0.625 texel on a 1280-wide source.
+/// `LINEAR` then blends the neighbour in by that fraction. Measured on
+/// Mali-G310 (i.MX 95) with a 1280x720 RGBA identity blit: 96% of the frame
+/// differed from the CPU reference, worst 50/255 mid-frame at an implied
+/// blend fraction of 0.40 texel, and the error was flat across the width
+/// rather than confined to the edges — so it was the coordinate, not the
+/// bound. Clamping to the full texture `[0,0,1,1]` reproduced the corruption
+/// byte for byte; declaring `tc` `highp` removed it. Vivante GC7000UL and
+/// V3D did not show it (issue #170).
+///
+/// Only the CONSUMER's qualifier matters here. The vertex stage still writes
+/// `out vec2 tc;` under a `mediump` default (`shaders_common::VERTEX_SHADER`,
+/// byte-pinned by `golden/vertex.glsl`) and is deliberately left alone:
+/// GLSL ES 3.00 does not match precision across stages, so the fragment
+/// shader's own qualifier governs the interpolation and the ALU it feeds.
+/// Two independent facts confirm it. Removing only the `clamp()` while
+/// leaving that same vertex shader in place made the Mali case pass, so the
+/// vertex write was never the limiting step; and the `highp` shaders that
+/// have always sampled correctly on Mali — `YUYV_RGBA_2D_FRAGMENT` and
+/// `NV_RGBA_FRAGMENT` — are fed by this very vertex shader.
 pub(super) fn generate_texture_fragment_shader() -> &'static str {
     "\
 #version 300 es
@@ -88,7 +113,7 @@ precision mediump float;
 uniform sampler2D tex;
 uniform highp vec4 src_extent;
 in vec3 fragPos;
-in vec2 tc;
+in highp vec2 tc;
 
 out vec4 color;
 
@@ -98,19 +123,28 @@ void main(){
 "
 }
 
+/// `src_extent` is the rectangle a sample may reach
+/// (`render::sample_clamp_rect`), the same uniform and the same reason as
+/// [`generate_texture_fragment_shader`]: an EGLImage import can cover more
+/// texture than the logical image — a narrowed pool buffer, or a source
+/// rebased onto an aligned DMA-BUF offset (issue #170) — and a `LINEAR`
+/// kernel at the edge must not blend the texels outside it. `highp` although
+/// this shader's default is `mediump`, because a `mediump` bound rounds near
+/// 1.0 and would pull the last column's sample in.
 pub(super) fn generate_texture_fragment_shader_yuv() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
 uniform samplerExternalOES tex;
+uniform highp vec4 src_extent;
 in vec3 fragPos;
-in vec2 tc;
+in highp vec2 tc;
 
 out vec4 color;
 
 void main(){
-    color = texture(tex, tc);
+    color = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
 }
 "
 }
@@ -127,13 +161,14 @@ pub(super) fn generate_planar_rgb_shader() -> &'static str {
 #extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
 uniform samplerExternalOES tex;
+uniform highp vec4 src_extent;
 in vec3 fragPos;
-in vec2 tc;
+in highp vec2 tc;
 
 out vec4 color;
 
 void main(){
-    color = texture(tex, tc);
+    color = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
 }
 "
 }
@@ -171,12 +206,14 @@ void main(){
 /// Int8 variant of [`generate_texture_fragment_shader_yuv`]. Applies XOR 0x80 bias
 /// to each RGB channel (uint8 → int8 conversion).
 /// Used for single-pass int8 output with external OES sources (YUV EGLImage).
+/// Carries the same `src_extent` clamp, for the same reason.
 pub(super) fn generate_texture_int8_shader_yuv() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision highp float;
 uniform samplerExternalOES tex;
+uniform highp vec4 src_extent;
 in vec3 fragPos;
 in vec2 tc;
 
@@ -188,7 +225,7 @@ vec3 int8_bias(vec3 v) {
 }
 
 void main(){
-    vec4 c = texture(tex, tc);
+    vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
     color = vec4(int8_bias(c.rgb), c.a);
 }
 "
@@ -197,12 +234,14 @@ void main(){
 /// Int8 variant of [`generate_planar_rgb_shader`]. Applies XOR 0x80 bias
 /// to each RGB channel (uint8 → int8 conversion) using the bit-exact
 /// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.
+/// Carries the same `src_extent` clamp, for the same reason.
 pub(super) fn generate_planar_rgb_int8_shader() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision highp float;
 uniform samplerExternalOES tex;
+uniform highp vec4 src_extent;
 in vec3 fragPos;
 in vec2 tc;
 
@@ -214,7 +253,7 @@ vec3 int8_bias(vec3 v) {
 }
 
 void main(){
-    vec4 c = texture(tex, tc);
+    vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
     color = vec4(int8_bias(c.rgb), c.a);
 }
 "
@@ -278,7 +317,7 @@ uniform int background_index;
 uniform float opacity;
 
 in vec3 fragPos;
-in vec2 tc;
+in highp vec2 tc;
 in vec4 fragColor;
 
 out vec4 color;
@@ -903,4 +942,419 @@ void main() {
     }
 }
 "
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tc_precision {
+    /// Every shader this module can link, paired with its source: each
+    /// generator here, plus the `shaders_common` fragment constants that
+    /// carry a `tc` and are linked directly rather than through a generator
+    /// (`YUYV_RGBA_2D_FRAGMENT` is, at `processor/mod.rs`'s
+    /// `yuyv_program_2d`).
+    ///
+    /// The list is written out by hand rather than discovered, so a new
+    /// shader has to be added here deliberately —
+    /// [`the_list_names_every_shader`] fails until it is. Add new shaders to
+    /// this list.
+    fn all_shaders() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("generate_vertex_shader", super::generate_vertex_shader()),
+            (
+                "generate_texture_fragment_shader",
+                super::generate_texture_fragment_shader(),
+            ),
+            (
+                "generate_texture_fragment_shader_yuv",
+                super::generate_texture_fragment_shader_yuv(),
+            ),
+            (
+                "generate_planar_rgb_shader",
+                super::generate_planar_rgb_shader(),
+            ),
+            (
+                "generate_texture_int8_shader",
+                super::generate_texture_int8_shader(),
+            ),
+            (
+                "generate_texture_int8_shader_yuv",
+                super::generate_texture_int8_shader_yuv(),
+            ),
+            (
+                "generate_planar_rgb_int8_shader",
+                super::generate_planar_rgb_int8_shader(),
+            ),
+            (
+                "generate_planar_rgb_shader_2d",
+                super::generate_planar_rgb_shader_2d(),
+            ),
+            (
+                "generate_planar_rgb_int8_shader_2d",
+                super::generate_planar_rgb_int8_shader_2d(),
+            ),
+            (
+                "generate_segmentation_shader",
+                super::generate_segmentation_shader(),
+            ),
+            (
+                "generate_instanced_segmentation_shader",
+                super::generate_instanced_segmentation_shader(),
+            ),
+            (
+                "generate_proto_segmentation_shader",
+                super::generate_proto_segmentation_shader(),
+            ),
+            (
+                "generate_proto_segmentation_shader_int8_nearest",
+                super::generate_proto_segmentation_shader_int8_nearest(),
+            ),
+            (
+                "generate_proto_segmentation_shader_int8_bilinear",
+                super::generate_proto_segmentation_shader_int8_bilinear(),
+            ),
+            (
+                "generate_proto_dequant_shader_int8",
+                super::generate_proto_dequant_shader_int8(),
+            ),
+            (
+                "generate_proto_segmentation_shader_f32",
+                super::generate_proto_segmentation_shader_f32(),
+            ),
+            (
+                "generate_packed_f32_nhwc_shader",
+                super::generate_packed_f32_nhwc_shader(),
+            ),
+            (
+                "generate_planar_rgb_f16_packed_shader",
+                super::generate_planar_rgb_f16_packed_shader(),
+            ),
+            (
+                "generate_float_nhwc_packed_shader",
+                super::generate_float_nhwc_packed_shader(),
+            ),
+            (
+                "generate_float_rgba_shader",
+                super::generate_float_rgba_shader(),
+            ),
+            ("generate_color_shader", super::generate_color_shader()),
+            (
+                "generate_packed_rgba8_shader_2d",
+                super::generate_packed_rgba8_shader_2d(),
+            ),
+            (
+                "generate_packed_rgba8_int8_shader_2d",
+                super::generate_packed_rgba8_int8_shader_2d(),
+            ),
+            (
+                "generate_nv_to_rgba_shader_2d",
+                super::generate_nv_to_rgba_shader_2d(),
+            ),
+            (
+                "generate_nv_to_rgba_int8_shader_2d",
+                super::generate_nv_to_rgba_int8_shader_2d(),
+            ),
+            (
+                "generate_proto_repack_compute_shader",
+                super::generate_proto_repack_compute_shader(),
+            ),
+            // Linked straight from the constant, with no generator wrapper.
+            (
+                "YUYV_RGBA_2D_FRAGMENT",
+                super::super::shaders_common::YUYV_RGBA_2D_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_FRAGMENT,
+            ),
+        ]
+    }
+
+    /// `//` and `/* */` stripped, so a commented-out sample cannot be counted
+    /// as a real one. Without this a commented `texture(tex, tc)` would raise
+    /// the verbatim-fetch tally and mask a genuine arithmetic use beside it.
+    fn strip_comments(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Byte offsets of every occurrence of the identifier `tc` — `tc` with a
+    /// non-identifier character (or nothing) on each side, so `tc.x` counts
+    /// and `tcoord` does not.
+    fn tc_identifier_offsets(src: &str) -> Vec<usize> {
+        let b = src.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(k) = src[i..].find("tc") {
+            let at = i + k;
+            let before_ok = at == 0 || !ident(b[at - 1]);
+            let after_ok = at + 2 >= b.len() || !ident(b[at + 2]);
+            if before_ok && after_ok {
+                out.push(at);
+            }
+            i = at + 2;
+        }
+        out
+    }
+
+    /// How many of those occurrences are `tc` handed VERBATIM to a texture
+    /// fetch — the exact shape `texture(<sampler>, tc)`, the one use that
+    /// needs no arithmetic and so needs no precision promise.
+    fn verbatim_fetch_count(src: &str) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while let Some(k) = src[i..].find("texture(") {
+            let at = i + k + "texture(".len();
+            let rest = &src[at..];
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(0);
+            if name_len > 0 && rest[name_len..].starts_with(", tc)") {
+                n += 1;
+            }
+            i = at;
+        }
+        n
+    }
+
+    /// The effective precision of the `in ... vec2 tc;` declaration, and
+    /// whether the shader does anything with `tc` beyond handing it straight
+    /// to a texture fetch. `None` when the shader has no `tc` input.
+    fn tc_precision_and_use(src: &str) -> Option<(&'static str, bool)> {
+        let src = &strip_comments(src);
+        let decl = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("in ") && l.trim_end().ends_with("vec2 tc;"))?;
+        let declared = if decl.contains("highp") {
+            Some("highp")
+        } else if decl.contains("mediump") {
+            Some("mediump")
+        } else if decl.contains("lowp") {
+            Some("lowp")
+        } else {
+            None
+        };
+        let file_default = src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("precision ")?.strip_suffix(" float;"))
+            .map(|p| match p {
+                "highp" => "highp",
+                "mediump" => "mediump",
+                "lowp" => "lowp",
+                _ => "unknown",
+            })
+            .unwrap_or("unknown");
+        let effective = declared.unwrap_or(file_default);
+        // Every `tc` outside the declaration line, minus the ones that are a
+        // verbatim `texture(sampler, tc)` argument.
+        let in_decl = tc_identifier_offsets(decl).len();
+        let total = tc_identifier_offsets(src).len() - in_decl;
+        Some((effective, total > verbatim_fetch_count(src)))
+    }
+
+    /// A shader that does ARITHMETIC on `tc` must declare it `highp`.
+    ///
+    /// Handing a varying straight to `texture()` lets a driver give the
+    /// interpolator's own coordinate to the texture unit, but any operation
+    /// on it — `clamp()`, a `vec3(tc, i)` constructor, a multiply — runs on
+    /// the ALU, and a `mediump` ALU is fp16 on Mali: a 2^-11 step, which is
+    /// 0.625 texel on a 1280-wide source, and `LINEAR` blends the neighbour
+    /// in by that fraction (the measurement is in the comment above
+    /// [`super::generate_texture_fragment_shader`]). No other lane can catch
+    /// it — Vivante, V3D and every desktop GL evaluate `mediump` at fp32, and
+    /// the desktop cannot import a DMA-BUF at all — so this test is the only
+    /// guard, and it is textual on purpose.
+    ///
+    /// The rule: count the `tc` identifiers outside the declaration line; a
+    /// shader is doing arithmetic if any of them is not the second argument
+    /// of a verbatim `texture(<sampler>, tc)`.
+    #[test]
+    fn shaders_that_compute_on_tc_declare_it_highp() {
+        let mut offenders = Vec::new();
+        let mut checked = 0;
+        for (name, src) in all_shaders() {
+            let Some((precision, computes)) = tc_precision_and_use(src) else {
+                continue;
+            };
+            checked += 1;
+            if computes && precision != "highp" {
+                offenders.push(format!("{name} (tc is {precision})"));
+            }
+        }
+        // Cross-check the line parser against a dumb substring test: if the
+        // parser silently stops matching a declaration, the two disagree.
+        let expected = all_shaders()
+            .iter()
+            .filter(|(_, src)| {
+                [
+                    "in vec2 tc;",
+                    "in highp vec2 tc;",
+                    "in mediump vec2 tc;",
+                    "in lowp vec2 tc;",
+                ]
+                .iter()
+                .any(|d| src.contains(d))
+            })
+            .count();
+        assert_eq!(
+            checked, expected,
+            "the declaration parser matched {checked} shaders but {expected} contain an \
+             `in ... vec2 tc;` declaration — the parser stopped matching one"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these shaders do arithmetic on a `tc` that is not `highp`; on Mali the \
+             fp16 ALU quantizes the sampled coordinate to a 2^-11 step, which is \
+             0.625 texel on a 1280-wide source, and the measured shift was 0.40 \
+             texel -- a truncation, not a rounding, so the error does not halve: \
+             {offenders:?}"
+        );
+    }
+
+    /// Every shader name the sources declare: each function in this file
+    /// whose name starts with `generate_`, at ANY visibility, plus each
+    /// `shaders_common` constant ending `_FRAGMENT` whose body carries a
+    /// `tc`. Textual on purpose — it must not share the parser it checks.
+    fn shader_names_in_source() -> Vec<String> {
+        let mut names = Vec::new();
+        let this = include_str!("shaders.rs");
+        let mut i = 0;
+        // A definition, not a call: the marker is the `fn ` keyword, which
+        // `super::generate_x()` in the list above does not have.
+        while let Some(k) = this[i..].find("fn generate_") {
+            let at = i + k + "fn ".len();
+            let rest = &this[at..];
+            let n = rest.find('(').unwrap_or(0);
+            if n > 0
+                && rest[..n]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                names.push(rest[..n].to_string());
+            }
+            i = at;
+        }
+        let common = include_str!("shaders_common.rs");
+        let mut i = 0;
+        while let Some(k) = common[i..].find("const ") {
+            let at = i + k + "const ".len();
+            let rest = &common[at..];
+            let n = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(0);
+            let name = &rest[..n];
+            // `_FRAGMENT` also filters out GLSL's own `const` declarations.
+            if n > 0 && name.ends_with("_FRAGMENT") {
+                let body = &common[at + n..];
+                let end = body.find("\npub(crate) const ").unwrap_or(body.len());
+                if body[..end].contains("vec2 tc;") {
+                    names.push(name.to_string());
+                }
+            }
+            i = at;
+        }
+        names
+    }
+
+    /// [`all_shaders`] is hand-written, so it can fall behind the sources.
+    /// This pins it by NAME rather than by count, so an omission, a
+    /// duplicate and a shader declared at a different visibility all fail,
+    /// each naming what is wrong. A count alone would let an omission and an
+    /// accidental duplicate cancel out.
+    #[test]
+    fn the_list_names_every_shader() {
+        let listed: Vec<String> = all_shaders().iter().map(|(n, _)| n.to_string()).collect();
+        let mut unique = listed.clone();
+        unique.sort();
+        let dup_len = unique.len();
+        unique.dedup();
+        let duplicates: Vec<&String> = if unique.len() == dup_len {
+            Vec::new()
+        } else {
+            listed
+                .iter()
+                .filter(|n| listed.iter().filter(|m| m == n).count() > 1)
+                .collect()
+        };
+        assert!(
+            duplicates.is_empty(),
+            "`all_shaders` lists these names more than once: {duplicates:?}"
+        );
+
+        let mut declared = shader_names_in_source();
+        declared.sort();
+        declared.dedup();
+        let missing: Vec<&String> = declared.iter().filter(|n| !unique.contains(n)).collect();
+        let extra: Vec<&String> = unique.iter().filter(|n| !declared.contains(n)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "`all_shaders` is out of step with the sources. Declared but not listed \
+             (add them, so they are precision-checked): {missing:?}. Listed but not \
+             declared (renamed or removed): {extra:?}"
+        );
+    }
+
+    /// The `tc` identifier scan must not match a longer identifier, or the
+    /// rule would fire on unrelated names.
+    #[test]
+    fn tc_scan_matches_the_identifier_only() {
+        assert_eq!(tc_identifier_offsets("tc").len(), 1);
+        assert_eq!(tc_identifier_offsets("tc.x * 2.0").len(), 1);
+        assert_eq!(tc_identifier_offsets("vec3(tc, i)").len(), 1);
+        assert_eq!(tc_identifier_offsets("tcoord + stc + tc_2").len(), 0);
+        assert_eq!(verbatim_fetch_count("texture(tex, tc)"), 1);
+        assert_eq!(verbatim_fetch_count("texture(tex, clamp(tc, a, b))"), 0);
+        assert_eq!(verbatim_fetch_count("texture(tex, vec3(tc, i))"), 0);
+    }
+
+    /// A commented-out verbatim sample must not be counted, or it would
+    /// cancel a real arithmetic use sitting beside it and let an offender
+    /// through.
+    #[test]
+    fn a_commented_out_sample_does_not_mask_an_arithmetic_use() {
+        let src = "\
+#version 300 es
+precision mediump float;
+uniform sampler2D tex;
+in vec2 tc;
+out vec4 color;
+void main(){
+    // color = texture(tex, tc);
+    color = texture(tex, clamp(tc, vec2(0.0), vec2(1.0)));
+}
+";
+        assert_eq!(verbatim_fetch_count(&strip_comments(src)), 0);
+        assert_eq!(
+            tc_precision_and_use(src),
+            Some(("mediump", true)),
+            "the commented sample must not hide the clamp"
+        );
+
+        // The block-comment form, and a comment that is the ONLY use.
+        let only_comment = "\
+#version 300 es
+precision mediump float;
+in vec2 tc;
+void main(){ /* texture(tex, tc) */ color = vec4(0.0); }
+";
+        assert_eq!(tc_precision_and_use(only_comment), Some(("mediump", false)));
+    }
 }

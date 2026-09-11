@@ -72,6 +72,12 @@ mod render;
 // `shaders.rs` and the format code no longer pull in `gbm`.
 #[cfg(target_os = "android")]
 mod ahardwarebuffer_import;
+// CUDA test policy: turns a vacuous CUDA skip into a required-coverage
+// failure under HAL_TEST_REQUIRE_CUDA=1. Test-only -- every item in it is
+// consumed by `tests.rs` under #[cfg(test)] and by its own unit tests, so an
+// ungated module would be empty (and dead-code-flagged) in a release build.
+#[cfg(test)]
+mod cuda_policy;
 // `EGL_ANGLE_image_d3d11_texture` attribute assembly (pure); consumed by the
 // Windows leaf (`platform/windows.rs`) to build the EGLImage import target.
 #[cfg(target_os = "windows")]

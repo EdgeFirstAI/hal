@@ -70,7 +70,7 @@ def test_cross_package_handoff_uses_the_capsule():
     t = tensor.Tensor([16, 16, 3], "uint8")
     assert hasattr(t, "__edgefirst_tensor__")
     cap = t.__edgefirst_tensor__()
-    assert "edgefirst_tensor_v1" in repr(cap)
+    assert "edgefirst_tensor_v2" in repr(cap)
 
 
 @pytest.mark.parametrize("name", ["tensor", "codec", "image", "decoder", "tracker"])
