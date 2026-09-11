@@ -12757,10 +12757,29 @@ mod image_tests {
 
     /// GL-vs-CPU identity parity for `Rgba → PlanarRgb F16`.
     ///
-    /// Converts the same RGBA8 source via forced `OpenGl` and forced `Cpu`,
-    /// then verifies the two F16 output tensors agree element-wise within
-    /// 2^-8 (two F16 ULPs at 0.5). Skipped when OpenGL or F16 render is
-    /// unavailable.
+    /// Converts the same RGBA8 source via the `OpenGl` backend and the
+    /// forced `Cpu` backend, then verifies the two F16 output tensors agree
+    /// element-wise within 2^-8 (two F16 ULPs at 0.5). Skipped when OpenGL
+    /// or F16 render is unavailable, and when the host cannot hold the
+    /// zero-copy F16 destination the GL float route needs.
+    ///
+    /// **The GL route is asserted, not assumed** (issue #179).
+    /// `ComputeBackend::OpenGl` is not a forced backend: it leaves
+    /// `forced_backend` at `None`, so a GL decline logs at debug and the CPU
+    /// serves the same convert. Both sides of the comparison would then be
+    /// the CPU's answer and the parity claim would be a tautology — which is
+    /// exactly how a host whose RGBA16F FBO is incomplete (desktop NVIDIA:
+    /// `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT`) passed while proving nothing,
+    /// `supported_render_dtypes().f16` above notwithstanding: that flag is
+    /// an extension query, not a completed render. `convert_fallback_count()`
+    /// staying flat across the GL convert is the proof, and a decline is
+    /// reported as a skip rather than a failure because it is a property of
+    /// the host's driver, not of this code — except under
+    /// `HAL_TEST_REQUIRE_GL=1`, which turns it into a named failure, the
+    /// same opt-in `crates/image/tests/dst_view_stride.rs` and
+    /// `reconstructed_view_draw.rs` carry for a GL backend that fails to
+    /// come up. A lane that has asserted it has GL should not be quietly
+    /// losing this test's coverage.
     #[test]
     #[cfg(all(
         any(
@@ -12773,6 +12792,20 @@ mod image_tests {
         feature = "opengl"
     ))]
     fn convert_f16_gl_cpu_parity_identity() {
+        // The macOS coverage lane sets `HAL_TEST_REQUIRE_GL=1` for both
+        // passes but deliberately hobbles pass 1 (unsigned binaries, the
+        // ANGLE dlopen gate closed). Excluded there the same way
+        // `gl_backend_available_canary` excludes it, so the gate below
+        // enforces in pass 2 only.
+        #[cfg(target_os = "macos")]
+        if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+            && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
+        {
+            crate::test_support::report_skip(
+                "convert_f16_gl_cpu_parity_identity - ANGLE dlopen gate closed (coverage pass 1)",
+            );
+            return;
+        }
         if !is_opengl_available() {
             crate::test_support::report_skip(
                 "convert_f16_gl_cpu_parity_identity - OpenGL not available",
@@ -12830,17 +12863,75 @@ mod image_tests {
                 return;
             }
 
-            let mut dst = TensorDyn::image(
+            // A destination the GL float route actually serves. A
+            // `TensorMemory::Mem` float destination has no arm in
+            // `float_dispatch::classify_float_render` at all: it classifies as
+            // `FloatRenderPath::None`, the u8 route rejects the dtype, and the
+            // CPU serves every convert. With a host destination the GL half
+            // below was therefore unreachable and this test could only ever
+            // skip. `(Rgba, PlanarRgb, F16, DmaBuf)` -- `ZeroCopyF16Nchw` --
+            // is the zero-copy float tuple EVERY platform's capability set
+            // serves: it is unconditional in `classify_float_render`, so it
+            // holds for the `PlanarF16` set Linux, Android and ANGLE/macOS
+            // declare as well as the `All` set Windows declares.
+            //
+            // One spelling covers all of them. `TensorMemory::DmaBuf` is the
+            // portable name for the platform-native zero-copy GPU buffer --
+            // a DMA-BUF on Linux, an IOSurface on macOS/iOS, an
+            // AHardwareBuffer on Android, an `ID3D11Texture2D` on Windows --
+            // and the classifier matches on that one variant for all of them,
+            // so this needs no `cfg`. Where the platform cannot hold one the
+            // allocation fails or falls back, and both are reported below.
+            let mut dst = match TensorDyn::image(
                 W,
                 H,
                 PixelFormat::PlanarRgb,
                 DType::F16,
-                Some(TensorMemory::Mem),
+                Some(TensorMemory::DmaBuf),
                 edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
+            ) {
+                Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
+                // No routable float destination on this host. Reported here,
+                // BEFORE the `HAL_TEST_REQUIRE_GL` gate below: that gate
+                // exists to catch a GL backend declining a destination it
+                // should serve, not a host that cannot hold one.
+                Ok(t) => {
+                    crate::test_support::report_skip(&format!(
+                        "convert_f16_gl_cpu_parity_identity - the zero-copy F16 \
+                         destination fell back to {:?}",
+                        t.memory()
+                    ));
+                    return;
+                }
+                Err(e) => {
+                    crate::test_support::report_skip(&format!(
+                        "convert_f16_gl_cpu_parity_identity - no zero-copy F16 \
+                         destination on this host: {e}"
+                    ));
+                    return;
+                }
+            };
+            let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+            let fallbacks_before = gl_proc.convert_fallback_count();
             match gl_proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
-                Ok(()) => dst,
+                Ok(()) => {
+                    if gl_proc.convert_fallback_count() != fallbacks_before {
+                        assert!(
+                            !require_gl,
+                            "HAL_TEST_REQUIRE_GL=1 but \
+                             convert_f16_gl_cpu_parity_identity would have skipped \
+                             while reporting success: the GL F16 path declined and \
+                             the CPU served the convert"
+                        );
+                        crate::test_support::report_skip(
+                            "convert_f16_gl_cpu_parity_identity - the GL F16 path \
+                             declined and the CPU served the convert; comparing that \
+                             against the forced-CPU result would prove nothing",
+                        );
+                        return;
+                    }
+                    dst
+                }
                 Err(e) => {
                     crate::test_support::report_skip(&format!(
                         "convert_f16_gl_cpu_parity_identity - GL convert failed: {e}"
@@ -12872,11 +12963,25 @@ mod image_tests {
             dst
         };
 
-        // Compare element-wise.
-        let gl_map = gl_result.as_typed::<half::f16>().unwrap().map().unwrap();
-        let cpu_map = cpu_result.as_typed::<half::f16>().unwrap().map().unwrap();
-        let gl_halfs = gl_map.as_slice();
-        let cpu_halfs = cpu_map.as_slice();
+        // Compare element-wise. Both sides are read through `copy_to_flat`:
+        // the GL destination is a packed zero-copy surface whose rows can be
+        // spaced at a driver pitch, so its mapping is not a flat run of the
+        // logical elements.
+        let flat_f16 = |t: &TensorDyn| -> Vec<half::f16> {
+            let typed = t.as_typed::<half::f16>().expect("F16 image");
+            let mut bytes = vec![0u8; typed.shape().iter().product::<usize>() * 2];
+            typed
+                .copy_to_flat(&mut bytes)
+                .expect("compact any padded rows");
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c))
+                .collect()
+        };
+        let gl_halfs = flat_f16(&gl_result);
+        let cpu_halfs = flat_f16(&cpu_result);
 
         assert_eq!(
             gl_halfs.len(),

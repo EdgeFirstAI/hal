@@ -70,6 +70,9 @@ enum GLProcessorMessage {
         crate::ColorimetryMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    /// Test hook (issue #175): make every zero-copy destination import fail.
+    #[cfg(test)]
+    SetFailDstImport(bool, tokio::sync::oneshot::Sender<Result<(), Error>>),
     /// Snapshot the EGLImage cache counters (steady-state import assertions).
     EglCacheStats(tokio::sync::oneshot::Sender<Result<super::cache::GlCacheStats, Error>>),
     /// Snapshot the per-convert source-feed counters (zero-copy observability).
@@ -341,6 +344,10 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
             let _ = resp.send(Err(poison_err));
         }
         GLProcessorMessage::SetColorimetryMode(_, resp) => {
+            let _ = resp.send(Err(poison_err));
+        }
+        #[cfg(test)]
+        GLProcessorMessage::SetFailDstImport(_, resp) => {
             let _ = resp.send(Err(poison_err));
         }
         GLProcessorMessage::EglCacheStats(resp) => {
@@ -640,6 +647,14 @@ fn handle_gl_message(
                 Ok(())
             }));
             reply_caught(result, resp, poisoned, "SetInt8Interpolation");
+        }
+        #[cfg(test)]
+        GLProcessorMessage::SetFailDstImport(fail, resp) => {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                gl_converter.fail_dst_import = fail;
+                Ok(())
+            }));
+            reply_caught(result, resp, poisoned, "SetFailDstImport");
         }
         GLProcessorMessage::EglCacheStats(resp) => {
             let result =
@@ -1158,6 +1173,24 @@ impl GLProcessorThreaded {
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::SetColorimetryMode(mode, err_send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Test hook (issue #175): make every zero-copy DESTINATION import fail,
+    /// the way a driver that refuses the buffer does, so the fallback to the
+    /// mapped-texture readback is exercised on a host whose driver accepts
+    /// every destination. The failure is injected at the import itself, so
+    /// what a test drives is the production trigger.
+    #[cfg(test)]
+    pub(crate) fn set_fail_dst_import(&mut self, fail: bool) -> Result<(), Error> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::SetFailDstImport(fail, err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())

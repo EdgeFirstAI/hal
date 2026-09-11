@@ -3701,11 +3701,24 @@ mod gl_tests {
     /// to hide behind — and it equally catches the inverse bug (letterbox
     /// dropped entirely: pad rows would hold content). Covers PlanarRgb /
     /// PlanarRgba × u8 / i8 × Dma (the GL TwoPassNvPlanar plan) and Mem
-    /// destinations — GL has no planar texture destination, so the Mem legs
-    /// pin the backend `ImageProcessor` resolves instead (CPU fallback),
-    /// guarding the whole dispatch surface against the bug class.
-    /// (`dma_test_formats` gate matches the helpers it uses; the Mem legs
-    /// still run on the llvmpipe coverage lane, which enables the feature.)
+    /// destinations, guarding the whole dispatch surface against the bug
+    /// class. (`dma_test_formats` gate matches the helpers it uses; the Mem
+    /// legs still run on the llvmpipe coverage lane, which enables the
+    /// feature.)
+    ///
+    /// **Each leg asserts its own route** (issue #179).
+    /// `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
+    /// decline logs at debug and the CPU serves the same convert — and the
+    /// CPU places the content band correctly, so a silent decline reads as
+    /// a pass here. The route each leg is entitled to comes from
+    /// `check_dst_format_supported`: it accepts `PlanarRgb` on both the
+    /// zero-copy DMA arm and the texture arm, so every `PlanarRgb` leg must
+    /// stay on GL and `convert_fallback_count()` must not move across it.
+    /// It accepts `PlanarRgba` on neither, so those legs take the CPU
+    /// fallback **by design** — they are the CPU half of the dispatch
+    /// surface this test exists to cover, and are asserted to fall back
+    /// rather than left unasserted, so the day GL grows a four-plane
+    /// readback this test says so instead of quietly changing meaning.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn letterbox_nv_to_planar_content_band_geometry() {
@@ -3728,6 +3741,18 @@ mod gl_tests {
                 return;
             }
         };
+        // Without this the route assertions below go vacuous in one
+        // direction and wrong in the other: with no GL backend at all
+        // nothing ever declines, so every `PlanarRgb` leg would pass having
+        // run on the CPU while every `PlanarRgba` leg would fail for the
+        // wrong reason.
+        if proc.opengl.is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ImageProcessor resolved no GL backend",
+                function!()
+            ));
+            return;
+        }
 
         // Synthetic NV12: Y=200, U=V=128 is neutral grey, so BT.601 vs BT.709
         // coefficients cancel and the converted RGB is ~200 (full range) to
@@ -3770,8 +3795,27 @@ mod gl_tests {
                             edgefirst_tensor::CpuAccess::ReadWrite,
                         )
                         .unwrap();
+                    let fallbacks_before = proc.convert_fallback_count();
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
                         .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
+                    let declines = proc.convert_fallback_count() - fallbacks_before;
+                    if dst_fmt == PixelFormat::PlanarRgb {
+                        assert_eq!(
+                            declines, 0,
+                            "{label}: the GL backend declined this convert and the \
+                             CPU served it — the band probes below would pass on the \
+                             CPU answer, so this leg proved nothing about the GL \
+                             two-pass plan"
+                        );
+                    } else {
+                        assert_eq!(
+                            declines, 1,
+                            "{label}: GL was expected to decline PlanarRgba (no \
+                             four-plane readback geometry) and leave this leg to the \
+                             CPU; it did not, so either the GL gate changed or the \
+                             fallback counter did"
+                        );
+                    }
 
                     // Raw bytes; undo the int8 XOR-0x80 bias so both dtypes
                     // share one set of thresholds.
@@ -7037,12 +7081,12 @@ mod gl_tests {
         // so without the check the test reported a pass having exercised no
         // GL at all.
         if proc.convert_fallback_count() != fallbacks_before {
-            eprintln!(
-                "SKIPPED: {} - the GL float path declined this DMA-BUF \
-                 destination and ImageProcessor fell back to the CPU; there is \
-                 no zero-copy coverage to check here",
+            crate::test_support::report_skip(&format!(
+                "{} - the GL float path declined this DMA-BUF destination and \
+                 ImageProcessor fell back to the CPU; there is no zero-copy \
+                 coverage to check here",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -7306,10 +7350,10 @@ mod gl_tests {
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
         if proc.convert_fallback_count() != fallbacks_before {
-            eprintln!(
-                "SKIPPED: convert_f32_pbo_cuda_map_roundtrip - the GL float path \
-                 declined and the convert was served by the CPU; there is no \
-                 GL coverage to check here"
+            crate::test_support::report_skip(
+                "convert_f32_pbo_cuda_map_roundtrip - the GL float path declined \
+                 and the convert was served by the CPU; there is no GL coverage \
+                 to check here",
             );
             return;
         }
@@ -7432,10 +7476,10 @@ mod gl_tests {
         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
         if proc.convert_fallback_count() != fallbacks_before {
-            eprintln!(
-                "SKIPPED: convert_f32_pbo_cuda_map_numeric - the GL float path \
-                 declined and the convert was served by the CPU; there is no \
-                 GL coverage to check here"
+            crate::test_support::report_skip(
+                "convert_f32_pbo_cuda_map_numeric - the GL float path declined \
+                 and the convert was served by the CPU; there is no GL coverage \
+                 to check here",
             );
             return;
         }
@@ -7500,6 +7544,13 @@ mod gl_tests {
     /// end to end. On a Jetson (no `/dev/dma_heap`) the NV source has no GPU
     /// path, so `convert()` runs on the CPU and writes into the CUDA-registered
     /// output PBO; this test exercises exactly that CPU→PBO→CUDA hand-off.
+    ///
+    /// **Exercising the CPU fallback is the point here, so this one asserts
+    /// no route** (issue #179). The subject and the reference are the same
+    /// `convert()` on the same processor, differing only in where the
+    /// destination lives, so whichever backend serves them serves both; the
+    /// claim under test is about the device pointer's contents, not about
+    /// which engine produced them.
     #[cfg(target_os = "linux")]
     fn jpeg_cuda_devptr_check(fixture: &str, expect_fmt: PixelFormat, w: usize, h: usize) {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
@@ -10923,9 +10974,12 @@ mod gl_tests {
     /// full scale.
     ///
     /// Each frame drives both float destination kinds: an F32 `Rgb` PBO (the
-    /// readback float path) and a zero-copy F32 `PlanarRgb` texture, which
+    /// readback float path) and a zero-copy F16 `PlanarRgb` texture, which
     /// the packed float path renders into directly. They share the uv
-    /// builder, so the mapping has to hold on both. The last frame upscales,
+    /// builder, so the mapping has to hold on both. The two halves ask for
+    /// different render capabilities -- F32 for the PBO, F16 for the
+    /// zero-copy texture -- because those are what their respective
+    /// `float_dispatch` arms are gated on. The last frame upscales,
     /// which reaches the sample clamp (`src_extent`) on the narrowed axis;
     /// that axis is half the pool so the scaled coordinates are exact and the
     /// clamp is the only difference from the fresh buffer.
@@ -10935,6 +10989,22 @@ mod gl_tests {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            ));
+            return;
+        }
+        // A lane that has declared it has a working GL stack must not lose
+        // this test's zero-copy coverage to a driver decline, so the decline
+        // below is a failure there and a skip elsewhere. The macOS coverage
+        // lane sets the flag for BOTH passes but deliberately hobbles pass 1
+        // (unsigned binaries, the ANGLE dlopen gate closed), so pass 1 is
+        // excluded the same way `gl_backend_available_canary` and the
+        // sibling test below exclude it.
+        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+        #[cfg(target_os = "macos")]
+        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ANGLE dlopen gate closed (coverage pass 1)",
                 function!()
             ));
             return;
@@ -10964,6 +11034,17 @@ mod gl_tests {
                 function!()
             ));
             return;
+        }
+        // The zero-copy half below needs the F16 planar render specifically,
+        // which is a separate capability from the F32 the PBO half needs: a
+        // GPU can report one without the other. Asked once rather than per
+        // frame, since it cannot change between frames.
+        let zero_copy_float = proc.supported_render_dtypes().f16;
+        if !zero_copy_float {
+            crate::test_support::report_skip(&format!(
+                "(zero-copy float dst): {} - F16 render not supported",
+                function!()
+            ));
         }
         let mut pool = TensorDyn::image(
             128,
@@ -11063,32 +11144,49 @@ mod gl_tests {
                  fresh buffer by up to {worst}"
             );
 
-            // ── The same source into a zero-copy float destination: an F32
+            // ── The same source into a zero-copy float destination: an F16
             // PlanarRgb texture, rendered straight into by the packed float
             // path rather than read back through a PBO. The extent mapping
             // lives in the shared uv builder, so both destinations must show
             // it; this one is the path that exists only where the platform
             // renders float zero-copy.
+            //
+            // F16 rather than F32, because `(Rgba, PlanarRgb, F16, DmaBuf)` is
+            // the one zero-copy float tuple BOTH capability sets serve --
+            // `FloatRenderPath::ZeroCopyF16Nchw`. The F32 zero-copy
+            // destinations are gated on `ZeroCopyFloatSet::All`, which only
+            // the Windows leaf reports; Linux, Android and ANGLE/macOS report
+            // `PlanarF16`, so an F32 PlanarRgb DMA destination classifies as
+            // `FloatRenderPath::None` there, the u8 route rejects the dtype
+            // and the CPU serves the convert. `float_dispatch.rs`'s
+            // `the_planar_set_leaves_the_windows_only_shaders_unreachable`
+            // pins that decision. Allocating such a destination still succeeds
+            // on Mali and V3D, so a successful allocation cannot stand in for
+            // the routing question -- which is why this half asks the
+            // capability rather than inferring it from the allocator.
+            if !zero_copy_float {
+                continue;
+            }
             let planar_dst = || {
                 TensorDyn::image(
                     dw,
                     dh,
                     PixelFormat::PlanarRgb,
-                    DType::F32,
+                    DType::F16,
                     Some(TensorMemory::DmaBuf),
                     edgefirst_tensor::CpuAccess::ReadWrite,
                 )
             };
             let (Ok(mut zc_recycled), Ok(mut zc_oracle)) = (planar_dst(), planar_dst()) else {
                 crate::test_support::report_skip(&format!(
-                    "(zero-copy float dst): {} - no F32 PlanarRgb texture",
+                    "(zero-copy float dst): {} - no F16 PlanarRgb texture",
                     function!()
                 ));
                 continue;
             };
             if zc_recycled.memory() != TensorMemory::DmaBuf {
                 crate::test_support::report_skip(&format!(
-                    "(zero-copy float dst): {} - F32 PlanarRgb dst is not zero-copy",
+                    "(zero-copy float dst): {} - F16 PlanarRgb dst is not zero-copy",
                     function!()
                 ));
                 continue;
@@ -11096,9 +11194,9 @@ mod gl_tests {
             // Both sides are read through `copy_to_flat`: a Windows texture
             // destination spaces its rows at a padded pitch, whose bytes are
             // not written by the render.
-            let flat_f32 = |t: &TensorDyn| -> Vec<u8> {
-                let typed = t.as_typed::<f32>().expect("F32 image");
-                let mut out = vec![0u8; typed.shape().iter().product::<usize>() * 4];
+            let flat_f16 = |t: &TensorDyn| -> Vec<u8> {
+                let typed = t.as_typed::<half::f16>().expect("F16 image");
+                let mut out = vec![0u8; typed.shape().iter().product::<usize>() * 2];
                 typed.copy_to_flat(&mut out).expect("compact padded rows");
                 out
             };
@@ -11119,16 +11217,34 @@ mod gl_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+            // A driver that refuses the zero-copy float destination has
+            // nothing inside GL to lower to -- there is no mapped-texture
+            // readback for a float DMA destination -- so the CPU serves the
+            // convert and both sides become the same CPU answer, which would
+            // make the comparison below prove nothing. That is a property of
+            // the host's driver and not of this code (this desktop's NVIDIA
+            // EGL fails its DMA-BUF roundtrip check and drops to PBO
+            // transfers), so it is reported as a skip -- except under
+            // `HAL_TEST_REQUIRE_GL=1`, where a lane that has asserted it has a
+            // working GL stack must not quietly lose this coverage. The boards
+            // run with it set.
+            if proc.convert_fallback_count() != fallbacks_before {
+                assert!(
+                    !require_gl,
+                    "HAL_TEST_REQUIRE_GL=1 but frame {i}'s zero-copy float destination \
+                     convert fell back to the CPU"
+                );
+                crate::test_support::report_skip(&format!(
+                    "(zero-copy float dst): {} - the GL float path declined and the \
+                     CPU served the convert",
+                    function!()
+                ));
+                continue;
+            }
             assert_eq!(
-                proc.convert_fallback_count(),
-                fallbacks_before,
-                "frame {i}: a zero-copy float destination convert fell back to \
-                 the CPU; both sides would then be the same CPU answer"
-            );
-            assert_eq!(
-                flat_f32(&zc_recycled),
-                flat_f32(&zc_oracle),
-                "frame {i} ({w}x{h} -> {dw}x{dh}): narrowed source into a zero-copy F32 \
+                flat_f16(&zc_recycled),
+                flat_f16(&zc_oracle),
+                "frame {i} ({w}x{h} -> {dw}x{dh}): narrowed source into a zero-copy F16 \
                  PlanarRgb destination differs from a fresh buffer"
             );
         }
@@ -11355,11 +11471,12 @@ mod gl_tests {
     /// A destination `view()` imports its PARENT and places the tile with
     /// `glViewport`, so its import bases at 0 however far into the buffer its
     /// own bytes start (`DmaImportAttrs::from_tensor` with `for_dst = true`,
-    /// `BufferImportKey::from_tensor`). The Vivante offset rule must therefore
-    /// be asked of `dst_import_base`, not of `plane_offset()`; asking the latter
-    /// made it fire on every tile view whose byte offset was unaligned -- an
-    /// RGBA `x0` of 8 is 32 bytes -- and silently cost Vivante the zero-copy
-    /// path for a case its driver handles perfectly.
+    /// `BufferImportKey::from_tensor`). Any rule about the base offset --
+    /// `dst_import_places` today -- must therefore be asked of
+    /// `view_collapsed_dst_base`, not of `plane_offset()`; asking the latter
+    /// fires on every tile view whose byte offset is unaligned -- an RGBA `x0`
+    /// of 8 is 32 bytes -- and costs the zero-copy path for an import that
+    /// bases at 0 and would have succeeded.
     ///
     /// `convert_fallback_count` cannot see this: the over-fire lowers WITHIN
     /// GL, to the mapped-texture readback, and never reaches the CPU backend.
@@ -11593,32 +11710,27 @@ mod gl_tests {
     /// A GL processor that allocates PBOs, or `None` with a skip line.
     /// Nothing about it is host-dependent beyond having GL at all.
     ///
-    /// The skip lines below go to `std::io::stderr()` directly rather than
-    /// through `eprintln!`. `eprintln!` passes through libtest's per-test
-    /// output capture, which is discarded for a test that passes -- and a
-    /// skip *is* a pass -- so a board that skipped all four PBO gates read
-    /// green in the fleet log with no line saying so. This is the shape
-    /// `pbo_reports_why_it_cannot_pin` (`crates/image/src/lib.rs`) already
-    /// uses. The `SKIPPED:` prefix is load-bearing: TESTING.md and the
-    /// on-target harness both key off it. Written out at each site rather
-    /// than behind a local helper on purpose -- a house-wide sweep with a
-    /// shared helper is landing separately, and a second helper here would
-    /// collide with it.
+    /// The skip lines go through [`crate::test_support::report_skip`], which
+    /// writes to `std::io::stderr()` directly rather than through
+    /// `eprintln!`. `eprintln!` passes through libtest's per-test output
+    /// capture, which is discarded for a test that passes -- and a skip *is*
+    /// a pass -- so a board that skipped all four PBO gates read green in
+    /// the fleet log with no line saying so. The `SKIPPED:` prefix is
+    /// load-bearing: `scripts/on-target-test.sh` counts a board's skips by
+    /// grepping its log for that literal, and TESTING.md's "Reading the
+    /// results" section states it as the rule.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn pbo_gl_or_skip(what: &str) -> Option<GLProcessorThreaded> {
-        use std::io::Write;
         if !is_opengl_available() {
-            let mut err = std::io::stderr();
-            let _ = writeln!(&mut err, "SKIPPED: {what} - OpenGL not available");
-            let _ = err.flush();
+            crate::test_support::report_skip(&format!("{what} - OpenGL not available"));
             return None;
         }
         match GLProcessorThreaded::new(None) {
             Ok(gl) => Some(gl),
             Err(e) => {
-                let mut err = std::io::stderr();
-                let _ = writeln!(&mut err, "SKIPPED: {what} - GL processor unavailable: {e}");
-                let _ = err.flush();
+                crate::test_support::report_skip(&format!(
+                    "{what} - GL processor unavailable: {e}"
+                ));
                 None
             }
         }
@@ -11626,15 +11738,12 @@ mod gl_tests {
 
     /// [`pbo_gl_or_skip`] plus the F32 render capability the float gates
     /// need. Separate so the u8 gates do not inherit a skip they have no
-    /// reason to take. Same raw-stderr rule for the skip line, same reason.
+    /// reason to take. Same skip-reporting rule, same reason.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn float_pbo_gl_or_skip(what: &str) -> Option<GLProcessorThreaded> {
-        use std::io::Write;
         let gl = pbo_gl_or_skip(what)?;
         if !gl.supported_render_dtypes().f32 {
-            let mut err = std::io::stderr();
-            let _ = writeln!(&mut err, "SKIPPED: {what} - F32 render not supported");
-            let _ = err.flush();
+            crate::test_support::report_skip(&format!("{what} - F32 render not supported"));
             return None;
         }
         Some(gl)
@@ -12001,5 +12110,608 @@ mod gl_tests {
                 );
             }
         }
+    }
+
+    /// Issue #177: a `view()` destination lowered to the **mapped-texture
+    /// readback** must receive exactly the pixels a whole destination of the
+    /// same size receives on the same path, at the parent's pitch, with
+    /// nothing outside the view touched.
+    ///
+    /// The mapped path renders into an offscreen texture that IS the tile —
+    /// its origin is (0, 0), not the view's origin in the parent — so the
+    /// band `glViewport`/`glScissor` that places a tile inside a shared
+    /// zero-copy parent import must NOT be applied here. The placement
+    /// happens afterwards, in the readback, which writes through the view's
+    /// own `map()` at the parent's pitch.
+    ///
+    /// The path is reached the way production reaches it: the destination
+    /// import FAILS and the convert lowers instead of ending. The hook
+    /// (`set_fail_dst_import`) injects that failure at the import itself,
+    /// because a driver that accepts every destination never produces one —
+    /// a fresh `view()` collapses its import base to 0, so `dst_import_places`
+    /// sees an aligned base and keeps the zero-copy route. The route is
+    /// asserted with `dst_import_fallbacks`, so the test cannot pass by
+    /// quietly taking the zero-copy import it means to avoid.
+    ///
+    /// The oracle is the SAME convert into a whole destination on the SAME
+    /// mapped path, so a difference isolates the view-ness of the
+    /// destination rather than the readback path itself.
+    #[test]
+    fn mapped_texture_readback_places_a_view_destination() {
+        const PARENT_W: usize = 512;
+        const PARENT_H: usize = 320;
+        const VIEW_W: usize = 320;
+        const VIEW_H: usize = 240;
+        const BPP: usize = 4;
+        const POISON: u8 = 0xAB;
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            crate::test_support::report_skip(&format!(
+                "{} - ANGLE dlopen gate closed (coverage pass 1)",
+                function!()
+            ));
+            return;
+        }
+        let dma_rgba = |w: usize, h: usize| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+        };
+
+        // Distinct per-row and per-column values so a tile that lands at the
+        // wrong origin, or a row that lands at the wrong pitch, cannot
+        // coincidentally match.
+        let src = TensorDyn::image(
+            VIEW_W,
+            VIEW_H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("source");
+        {
+            let stride = src.effective_row_stride().expect("source stride");
+            let mut m = src
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map source");
+            let b = m.as_mut_slice();
+            for y in 0..VIEW_H {
+                for x in 0..VIEW_W {
+                    let i = y * stride + x * BPP;
+                    b[i] = ((y * 3) % 256) as u8;
+                    b[i + 1] = ((x * 5) % 256) as u8;
+                    b[i + 2] = 255;
+                    b[i + 3] = 255;
+                }
+            }
+        }
+
+        // A DIFFERENT image, converted into a whole destination immediately
+        // before each subject: the mapped path renders into a REUSED offscreen
+        // texture, so any tile pixel the subject fails to redraw shows this
+        // decoy instead of silently matching the oracle that ran before it.
+        let decoy = TensorDyn::image(
+            VIEW_W,
+            VIEW_H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("decoy source");
+        {
+            let mut m = decoy
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map decoy");
+            for px in m.as_mut_slice().as_chunks_mut::<BPP>().0 {
+                px.copy_from_slice(&[7, 11, 13, 255]);
+            }
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
+
+        // CALIBRATION, with the hook OFF: a whole zero-copy destination says
+        // whether this host imports destinations at all. A host that imports
+        // none cannot run the subject either -- the engine declines a `view()`
+        // destination outright unless the transfer backend is zero-copy -- so
+        // it skips, which is what a desktop whose EGL cannot import a DMA-BUF
+        // does. Same self-calibration as
+        // `a_fresh_unaligned_view_destination_keeps_the_zero_copy_import`.
+        let imports = |g: &GLProcessorThreaded| {
+            let c = g.egl_cache_stats().expect("cache stats").dst;
+            c.misses + c.hits
+        };
+        let mut oracle = match dma_rgba(VIEW_W, VIEW_H) {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
+            other => {
+                let what = match &other {
+                    Ok(t) => format!("fell back to {:?}", t.memory()),
+                    Err(e) => format!("failed: {e}"),
+                };
+                crate::test_support::report_skip(&format!(
+                    "{} - no zero-copy RGBA image here ({what})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let before = imports(&gl);
+        gl.convert(
+            &src,
+            &mut oracle,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .expect("calibration convert into a whole zero-copy destination");
+        if imports(&gl) - before == 0 {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy destination import on this host, so a view() \
+                 destination is declined by the engine and the mapped path cannot \
+                 be reached for one",
+                function!()
+            ));
+            return;
+        }
+
+        gl.set_fail_dst_import(true)
+            .expect("make the destination import fail");
+        let fallbacks = |g: &GLProcessorThreaded| {
+            g.convert_stats()
+                .expect("convert stats")
+                .dst_import_fallbacks
+        };
+
+        // The letterbox case carries the `glClear` the band scissor used to
+        // confine, so the two crops together cover both halves of the render.
+        let mut failures = Vec::new();
+        for (label, crop) in [
+            ("stretch", Crop::default()),
+            (
+                "letterbox",
+                Crop::letterbox([114, 114, 114, 255]).with_source(Some(
+                    edgefirst_tensor::Region::new(0, 0, VIEW_W, VIEW_H / 2),
+                )),
+            ),
+        ] {
+            // ORACLE: the same convert into the same WHOLE destination, on the same
+            // mapped-texture path. Comparing the view against this isolates the
+            // view-ness of the destination from the readback path itself.
+            gl.convert(&src, &mut oracle, Rotation::None, Flip::None, crop)
+                .expect("oracle convert into a whole destination on the mapped path");
+            let oracle_stride = oracle.effective_row_stride().expect("oracle stride");
+            let oracle_bytes = oracle
+                .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                .expect("map oracle")
+                .as_slice()
+                .to_vec();
+
+            for (x0, y0) in [(0usize, 0usize), (8, 8), (64, 32)] {
+                let parent = dma_rgba(PARENT_W, PARENT_H).expect("parent");
+                assert_eq!(
+                    parent.memory(),
+                    TensorMemory::DmaBuf,
+                    "the parent must be the zero-copy backing under test"
+                );
+                let pitch = parent.effective_row_stride().expect("parent pitch");
+                {
+                    let mut m = parent
+                        .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                        .expect("map parent");
+                    m.as_mut_slice().fill(POISON);
+                }
+                let mut scratch = dma_rgba(VIEW_W, VIEW_H).expect("decoy destination");
+                gl.convert(
+                    &decoy,
+                    &mut scratch,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                )
+                .expect("decoy convert");
+                let before = fallbacks(&gl);
+                {
+                    let mut view = parent
+                        .view(edgefirst_tensor::Region::new(x0, y0, VIEW_W, VIEW_H))
+                        .expect("destination view");
+                    if let Err(e) = gl.convert(&src, &mut view, Rotation::None, Flip::None, crop) {
+                        failures.push(format!("{label} ({x0},{y0}): GL declined the view: {e}"));
+                        continue;
+                    }
+                }
+                // The route, not just the pixels: without this the test would
+                // still pass if the convert quietly took the zero-copy import
+                // it exists to bypass.
+                let took = fallbacks(&gl) - before;
+                if took != 1 {
+                    failures.push(format!(
+                        "{label} ({x0},{y0}): expected exactly one destination-import \
+                         fallback for this convert, saw {took}"
+                    ));
+                }
+
+                let out = parent
+                    .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                    .expect("map parent")
+                    .as_slice()
+                    .to_vec();
+                let mut wrong = 0usize;
+                let mut first: Option<(usize, usize, Vec<u8>, Vec<u8>)> = None;
+                // Bounding box of the wrong pixels, and whether every one of them
+                // lies in the band a view-origin `glScissor` on an origin-(0,0)
+                // render target would have clipped away.
+                let (mut lx, mut ly, mut hx, mut hy) = (usize::MAX, usize::MAX, 0usize, 0usize);
+                let mut all_in_scissor_band = true;
+                for y in 0..VIEW_H {
+                    for x in 0..VIEW_W {
+                        let got = &out[(y0 + y) * pitch + (x0 + x) * BPP..][..BPP];
+                        let want = &oracle_bytes[y * oracle_stride + x * BPP..][..BPP];
+                        if got != want {
+                            wrong += 1;
+                            first.get_or_insert((x, y, got.to_vec(), want.to_vec()));
+                            lx = lx.min(x);
+                            ly = ly.min(y);
+                            hx = hx.max(x);
+                            hy = hy.max(y);
+                            all_in_scissor_band &= x < x0 || y < y0;
+                        }
+                    }
+                }
+                if let Some((x, y, got, want)) = first {
+                    failures.push(format!(
+                    "{label} ({x0},{y0}) pitch {pitch}: {wrong}/{} tile pixels differ from the \
+                     whole-destination oracle; first at tile ({x},{y}) got={got:?} \
+                     want={want:?}; wrong-pixel bbox x[{lx}..={hx}] y[{ly}..={hy}]; \
+                     every wrong pixel inside the x<{x0}||y<{y0} band: {all_in_scissor_band}",
+                    VIEW_W * VIEW_H,
+                ));
+                }
+                // Nothing outside the view region moved.
+                let mut outside = 0usize;
+                let mut first_outside = None;
+                for y in 0..PARENT_H {
+                    for x in 0..PARENT_W {
+                        if y >= y0 && y < y0 + VIEW_H && x >= x0 && x < x0 + VIEW_W {
+                            continue;
+                        }
+                        let i = y * pitch + x * BPP;
+                        if out[i..i + BPP] != [POISON; BPP] {
+                            outside += 1;
+                            first_outside.get_or_insert((x, y, out[i..i + BPP].to_vec()));
+                        }
+                    }
+                }
+                if let Some((x, y, got)) = first_outside {
+                    failures.push(format!(
+                        "{label} ({x0},{y0}): {outside} parent pixels OUTSIDE the view were \
+                     overwritten; first at ({x},{y}) = {got:?}"
+                    ));
+                }
+            }
+        }
+
+        // A packed-RGB (or planar) view destination has no placement on EITHER
+        // route: the zero-copy band is a `glViewport` in destination pixels
+        // that the `W*3/4` packed surface does not have, and this readback
+        // writes `dst_w`-wide rows at the parent's pitch. So it must be refused
+        // however the destination import went. The hook makes the packed-RGB
+        // plan's import fail, which is the case that used to slip through --
+        // the refusal was keyed on the lowering, and a refused import re-plans
+        // onto the mapped route, flipping the very term the guard read.
+        // Asserted with the counter too: the refusal must come BEFORE the
+        // engine spends an import on a destination it is going to decline.
+        #[cfg(target_os = "linux")]
+        if let Ok(rgb_parent) = TensorDyn::image(
+            PARENT_W,
+            PARENT_H,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            if rgb_parent.memory() == TensorMemory::DmaBuf {
+                let rgb_src = TensorDyn::image(
+                    VIEW_W,
+                    VIEW_H,
+                    PixelFormat::Rgb,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .expect("packed-RGB source");
+                let mut view = rgb_parent
+                    .view(edgefirst_tensor::Region::new(8, 8, VIEW_W, VIEW_H))
+                    .expect("packed-RGB destination view");
+                let before = fallbacks(&gl);
+                let outcome = gl.convert(
+                    &rgb_src,
+                    &mut view,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                );
+                match outcome {
+                    Err(crate::Error::NotSupported(_)) => {}
+                    other => failures.push(format!(
+                        "a packed-RGB view() destination must be declined on every \
+                         destination route, got {other:?}"
+                    )),
+                }
+                let spent = fallbacks(&gl) - before;
+                if spent != 0 {
+                    failures.push(format!(
+                        "a packed-RGB view() destination was declined only after \
+                         spending {spent} destination import(s) on it"
+                    ));
+                }
+            }
+        }
+        // A WHOLE packed-RGB destination whose import is refused re-plans onto
+        // the mapped route, and must spend exactly ONE destination import
+        // doing so. The re-plan happens in `convert_via_engine`, before pass 1
+        // renders; `bind_dst` then has to BIND what was re-planned. Re-deriving
+        // the lowering there instead answers "zero-copy" (the import failed,
+        // the placement is fine), binds a zero-copy destination under a plan
+        // chosen for a texture one, and self-corrects only because the second
+        // import fails too -- at the cost of a wasted import, a second tick
+        // here, and an engine span whose `lowering` field says the opposite of
+        // what happened.
+        #[cfg(target_os = "linux")]
+        if let Ok(mut rgb_dst) = TensorDyn::image(
+            VIEW_W,
+            VIEW_H,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            if rgb_dst.memory() == TensorMemory::DmaBuf {
+                let rgb_src = TensorDyn::image(
+                    VIEW_W,
+                    VIEW_H,
+                    PixelFormat::Rgb,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .expect("packed-RGB source");
+                {
+                    let mut m = rgb_src
+                        .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                        .expect("map packed-RGB source");
+                    m.as_mut_slice().fill(0x5A);
+                }
+                let before = fallbacks(&gl);
+                match gl.convert(
+                    &rgb_src,
+                    &mut rgb_dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                ) {
+                    Ok(()) => {
+                        let spent = fallbacks(&gl) - before;
+                        if spent != 1 {
+                            failures.push(format!(
+                                "a refused packed-RGB destination import must re-plan \
+                                 after exactly one attempt, spent {spent}"
+                            ));
+                        }
+                        let out = rgb_dst
+                            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                            .expect("map packed-RGB destination")
+                            .as_slice()
+                            .to_vec();
+                        if out.iter().all(|&b| b == 0) {
+                            failures.push(
+                                "the re-planned packed-RGB convert wrote nothing".to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => failures.push(format!(
+                        "a refused packed-RGB destination import must re-plan onto the \
+                         mapped route, not end the convert: {e}"
+                    )),
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A refused destination import must re-plan, not just re-bind.
+    ///
+    /// A non-NV source into a `PlanarRgb` destination is planned `SinglePass`
+    /// against the zero-copy lowering. When the import is then refused,
+    /// `bind_dst` falls back to the mapped-texture readback -- but the plan was
+    /// chosen for a lowering that no longer holds, and the single-pass planar
+    /// shader (`convert_to_planar`) imports its source UNCONDITIONALLY. A heap
+    /// source therefore failed there and the whole convert fell out to the CPU
+    /// backend, throwing away the fallback that had just been set up for it.
+    /// `plan_convert` calls that pair impossible; the engine has to re-plan
+    /// against what `bind_dst` actually bound.
+    ///
+    /// Both triggers are exercised: the hook, which reaches the case on any
+    /// host with a zero-copy destination import, and a real driver refusal at
+    /// an unaligned plane offset, which is what Vivante does on i.MX 8M Plus.
+    #[test]
+    fn a_refused_planar_destination_import_replans_onto_the_mapped_route() {
+        const W: usize = 320;
+        const H: usize = 240;
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("host source");
+        {
+            let mut m = src
+                .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                .expect("map source");
+            for (i, px) in m
+                .as_mut_slice()
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                px.copy_from_slice(&[(i % 251) as u8, (i % 199) as u8, (i % 157) as u8, 255]);
+            }
+        }
+
+        // The oracle: the same convert on the CPU backend.
+        let mut reference = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("reference destination");
+        crate::CPUProcessor::new()
+            .convert(
+                &src,
+                &mut reference,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .expect("CPU reference convert");
+        let want = reference
+            .map_bytes(edgefirst_tensor::CpuAccess::Read)
+            .expect("map reference")
+            .as_slice()
+            .to_vec();
+
+        let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
+        let planar_dma = || {
+            TensorDyn::image(
+                W,
+                H,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .ok()
+            .filter(|t| t.memory() == TensorMemory::DmaBuf)
+        };
+        let Some(mut dst) = planar_dma() else {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy PlanarRgb destination here",
+                function!()
+            ));
+            return;
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+        let measure = |gl: &mut GLProcessorThreaded,
+                       label: &str,
+                       dst: &mut TensorDyn,
+                       failures: &mut Vec<String>|
+         -> u64 {
+            let before = gl
+                .convert_stats()
+                .expect("convert stats")
+                .dst_import_fallbacks;
+            let outcome = gl.convert(&src, dst, Rotation::None, Flip::None, Crop::default());
+            let spent = gl
+                .convert_stats()
+                .expect("convert stats")
+                .dst_import_fallbacks
+                - before;
+            match outcome {
+                Ok(()) if spent > 0 => {
+                    if spent != 1 {
+                        failures.push(format!(
+                            "{label}: expected exactly one destination-import fallback, \
+                             saw {spent}"
+                        ));
+                    }
+                    let got = dst
+                        .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                        .expect("map destination")
+                        .as_slice()
+                        .to_vec();
+                    if got.len() != want.len() || got != want {
+                        let first = got
+                            .iter()
+                            .zip(want.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(0);
+                        failures.push(format!(
+                            "{label}: the re-planned convert does not match the CPU \
+                             reference; first differing byte {first} got={} want={}",
+                            got[first], want[first]
+                        ));
+                    }
+                }
+                Ok(()) => {}
+                Err(e) => failures.push(format!(
+                    "{label}: a refused planar destination import must complete through the \
+                     mapped-texture route, not end the convert ({spent} fallback(s) spent): {e}"
+                )),
+            }
+            spent
+        };
+
+        // TRIGGER 1 -- the hook, so the case is reachable on any host whose
+        // driver accepts every destination.
+        gl.set_fail_dst_import(true).expect("arm the hook");
+        let hooked = measure(&mut gl, "hooked refusal", &mut dst, &mut failures);
+        gl.set_fail_dst_import(false).expect("disarm the hook");
+        if hooked == 0 {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy destination import is attempted on this host",
+                function!()
+            ));
+            return;
+        }
+
+        // TRIGGER 2 -- a real driver refusal: a plane offset that is not
+        // 64-byte aligned, which Vivante answers with `EGL_BAD_ACCESS`. Where
+        // the driver accepts it there is no refusal and nothing to assert, so
+        // the arm reports what it saw and stays silent.
+        if let Some(mut offset_dst) = planar_dma() {
+            offset_dst.set_plane_offset(32);
+            let real = measure(
+                &mut gl,
+                "driver refusal at offset 32",
+                &mut offset_dst,
+                &mut failures,
+            );
+            if real == 0 {
+                // Mali and V3D import an unaligned destination happily, so
+                // there is no refusal here and this arm asserted nothing. Said
+                // out loud, because a silent no-op arm is how a lane stops
+                // covering the production trigger without anyone noticing.
+                crate::test_support::report_skip(&format!(
+                    "{} - this driver accepts an unaligned PlanarRgb destination, so the \
+                     real-refusal arm had nothing to measure (the hooked arm still ran)",
+                    function!()
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

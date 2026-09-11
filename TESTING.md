@@ -247,8 +247,9 @@ passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
 serialization policy.
 
 `-RequireCuda` sets `HAL_TEST_REQUIRE_CUDA=1`, turning a silent
-`SKIP: no CUDA runtime` in `crates/tensor/tests/d3d11_tensor.rs`'s three
-D3D11 CUDA interop tests into a failure naming the test and the reason. The
+`SKIPPED: <test> - no CUDA runtime …` in
+`crates/tensor/tests/d3d11_tensor.rs`'s three D3D11 CUDA interop tests into
+a failure naming the test and the reason. The
 WARP-adapter skip is unaffected — it is correct by design, and those tests
 check the adapter *before* the gate so an armed gate cannot convert it into a
 failure.
@@ -732,6 +733,20 @@ what and why — never summarise a run that skipped every DMA test as
 > does. Both hold their own handle to the real stderr. Cross-check against
 > the board's `capabilities.txt` before claiming a hardware path was
 > exercised.
+>
+> **Start that line with `SKIPPED: `.** That literal prefix is what
+> `scripts/on-target-test.sh` greps each board's captured log for to report
+> the per-board skip count, so a skip announced under any other spelling is
+> invisible to the summary even when it reaches the log. Prefer the helper
+> your crate already has — `edgefirst-image`'s
+> `crate::test_support::report_skip`, or `artifacts::skip` in the two C-API
+> leaves that carry the `artifacts` module, `edgefirst-tensor-capi` and
+> `edgefirst-image-capi`. The other three modular leaves
+> (`edgefirst-codec-capi`, `edgefirst-decoder-capi`,
+> `edgefirst-tracker-capi`) do not include that module, so their tests write
+> the `writeln!(std::io::stderr(), "SKIPPED: …")` by hand; do the same
+> anywhere else an integration test cannot reach a helper, as
+> `crates/tensor/tests/support/cuda_require.rs` does.
 
 The `--test-threads=1` flag is mandatory on target for the same reasons
 as local development — CMA pool exhaustion risk is higher on embedded

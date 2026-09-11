@@ -53,9 +53,13 @@ fn artifact_is_fresh(artifact: &std::path::Path) -> bool {
         panic!("{msg}");
     }
     // Straight to stderr: libtest swallows `eprintln!` for passing tests,
-    // and a skip nobody sees is indistinguishable from a pass.
+    // and a skip nobody sees is indistinguishable from a pass. `SKIPPED:` is
+    // the wire format `scripts/on-target-test.sh` counts; written out here
+    // rather than through `artifacts::skip` for the reason this file's
+    // header gives -- an integration test cannot see the library crate's
+    // `#[cfg(test)]` items.
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "SKIP: {msg}");
+    let _ = writeln!(std::io::stderr(), "SKIPPED: {msg}");
     false
 }
 

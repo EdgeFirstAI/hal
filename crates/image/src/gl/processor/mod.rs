@@ -115,6 +115,29 @@ enum DstReadback {
     Pbo(u32),
 }
 
+impl DstTarget {
+    /// The `dst_feed` value for this target: how the convert's OUTPUT reached
+    /// the destination tensor.
+    ///
+    /// Recorded for every target, so the field's absence never has to be
+    /// interpreted. `zero_copy` is the render writing the destination buffer
+    /// itself; `mapped_texture` is a render into an offscreen texture read
+    /// back through the tensor's `map()`, whether the destination was always
+    /// host memory or the driver refused its import; `pbo` is the same render
+    /// read back into the destination PBO's PACK binding, with no CPU visit.
+    fn feed(self) -> &'static str {
+        match self {
+            DstTarget::ZeroCopyImage => "zero_copy",
+            DstTarget::Texture {
+                readback: DstReadback::Mem,
+            } => "mapped_texture",
+            DstTarget::Texture {
+                readback: DstReadback::Pbo(_),
+            } => "pbo",
+        }
+    }
+}
+
 impl DstReadback {
     /// The PBO id in the `Option` shape `readback_rendered` consumes.
     fn pbo_id(self) -> Option<u32> {
@@ -297,6 +320,31 @@ pub struct GLProcessorST {
     /// (drivers whose implementation read-pair rejects direct RGB/RED
     /// reads — ANGLE/Metal, V3D). Grown on demand, kept at high-water mark.
     readback_scratch: Vec<u8>,
+    /// Test hook: make every zero-copy DESTINATION import fail, the way a
+    /// driver that refuses the buffer does, so the fallback to the
+    /// mapped-texture readback is exercised on hosts whose driver accepts
+    /// every destination. Injected at the import itself
+    /// (`get_or_create_egl_image` for `CacheKind::Dst` and
+    /// `get_or_create_egl_image_rgb`), not at the routing decision, so what a
+    /// test drives is the real trigger.
+    #[cfg(test)]
+    pub(super) fail_dst_import: bool,
+    /// While set, a failed zero-copy destination import PROPAGATES instead of
+    /// falling back to the mapped-texture readback — at both sites that can
+    /// fall back, `bind_dst` and the packed-RGB pre-flight. Exactly one caller
+    /// sets it: `verify_dma_buf_roundtrip`, whose whole question is whether
+    /// this display can render into a DMA-BUF at all. Serving that convert through
+    /// the fallback would answer the question with the fallback's own output
+    /// and leave a display that cannot import a destination believing it can —
+    /// and would run a texture upload over the shared render texture before
+    /// the first real convert, which is state the probe has no business
+    /// leaving behind.
+    probe_dst_import_only: bool,
+    /// Buffers whose destination import has already been reported as declined
+    /// into the mapped-texture readback. Warn once per buffer, debug on the
+    /// repeats — the same shape as `nv_import_warned` on the source side, so a
+    /// per-frame decline on a pooled buffer does not flood the log.
+    dst_import_warned: std::collections::HashSet<u64>,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     pub(super) is_vivante: bool,
@@ -1271,20 +1319,79 @@ unsafe fn read_pixels_rgba_scratch(w: usize, h: usize, scratch: &mut Vec<u8>) {
 /// the bounds the robust variant checked hold by construction as long as
 /// the caller sized `out`.
 ///
-/// `scratch` is the caller's reusable RGBA staging buffer
+/// `scratch` is the caller's reusable staging buffer
 /// (`GLProcessorST::readback_scratch`) — grown on demand and kept at its
-/// high-water mark, so the fallback path costs no per-call allocation
+/// high-water mark, so neither indirect route costs a per-call allocation
 /// after the first read of a given size.
+///
+/// `stride` is how far apart `out`'s rows sit, and **only the first
+/// `w * channels` bytes of each are ever written**. The bytes between one
+/// row's end and the next row's start belong to somebody else whenever `out`
+/// is a `view()`'s window into a wider parent — they are the sibling columns
+/// to the right of the tile — so a read that packs `h` tight rows at the head
+/// of `out` and re-spaces them afterwards leaves its own tail sitting in
+/// them. It did: a 320-wide tile read into a 512-wide parent overwrote 192
+/// parent pixels on each of the first 150 rows (issue #177). Where the pitch
+/// is a whole number of pixels GL lays the rows out itself through
+/// `GL_PACK_ROW_LENGTH` — which is what the PBO readback has always done —
+/// and where it is not (a 3-byte pixel never divides a 64- or 128-byte
+/// aligned pitch) the frame is read tight into `scratch` and the rows are
+/// copied out one at a time.
+///
+/// The pixel count converts back to the byte pitch only because
+/// `PACK_ALIGNMENT` is 1 (set once in `new`) — see [`pack_row_length`].
 ///
 /// # Safety
 /// Must run on the GL thread with a complete read framebuffer bound and
-/// `ReadBuffer` selected, and `out` must hold `w * h * channels` bytes for
-/// the pack format (nothing here can check it — the read goes through a raw
-/// pointer).
-unsafe fn read_pixels_into(w: usize, h: usize, format: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
+/// `ReadBuffer` selected, and `out` must hold `(h - 1) * stride + w *
+/// channels` bytes for the pack format (nothing here can check it — the read
+/// goes through a raw pointer).
+unsafe fn read_pixels_into(
+    w: usize,
+    h: usize,
+    format: u32,
+    scratch: &mut Vec<u8>,
+    out: &mut [u8],
+    stride: usize,
+) {
+    let channels = pack_channels(format);
+    let tight_row = w * channels;
     unsafe {
-        let direct = direct_read_supported(format);
-        if direct {
+        if direct_read_supported(format) {
+            if stride == tight_row {
+                edgefirst_gl::gl::ReadPixels(
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    format,
+                    edgefirst_gl::gl::UNSIGNED_BYTE,
+                    out.as_mut_ptr() as *mut c_void,
+                );
+                return;
+            }
+            if let Some(px) = pack_row_length(tight_row, stride, channels) {
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, px);
+                edgefirst_gl::gl::ReadPixels(
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    format,
+                    edgefirst_gl::gl::UNSIGNED_BYTE,
+                    out.as_mut_ptr() as *mut c_void,
+                );
+                // Back to GL's own "rows are `width` pixels" default, so the
+                // next read of a tight destination is unaffected.
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, 0);
+                return;
+            }
+            // A pitch `GL_PACK_ROW_LENGTH` cannot express. The scratch is
+            // otherwise unused on this branch, so the tight frame lands there
+            // and each row is copied to its place.
+            if scratch.len() < h * tight_row {
+                scratch.resize(h * tight_row, 0);
+            }
             edgefirst_gl::gl::ReadPixels(
                 0,
                 0,
@@ -1292,23 +1399,27 @@ unsafe fn read_pixels_into(w: usize, h: usize, format: u32, scratch: &mut Vec<u8
                 h as i32,
                 format,
                 edgefirst_gl::gl::UNSIGNED_BYTE,
-                out.as_mut_ptr() as *mut c_void,
+                scratch.as_mut_ptr() as *mut c_void,
             );
+            for y in 0..h {
+                out[y * stride..y * stride + tight_row]
+                    .copy_from_slice(&scratch[y * tight_row..y * tight_row + tight_row]);
+            }
             return;
         }
-        let channels = pack_channels(format);
         read_pixels_rgba_scratch(w, h, scratch);
-        // `take(w * h)`: the scratch keeps its high-water mark from earlier,
-        // larger reads and `out` may be a padded mapping, so without a bound
-        // the zip would write stale pixels past the frame.
-        for (px, dst_px) in scratch
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .take(w * h)
-            .zip(out.chunks_exact_mut(channels))
-        {
-            dst_px.copy_from_slice(&px[..channels]);
+        // Row by row, at the destination's pitch. The scratch keeps its
+        // high-water mark from earlier, larger reads, so each row is taken
+        // from its own `w`-pixel window rather than walked continuously.
+        let rgba = scratch.as_chunks::<4>().0;
+        for y in 0..h {
+            for (px, dst_px) in rgba[y * w..]
+                .iter()
+                .take(w)
+                .zip(out[y * stride..y * stride + tight_row].chunks_exact_mut(channels))
+            {
+                dst_px.copy_from_slice(&px[..channels]);
+            }
         }
     }
 }
@@ -1331,20 +1442,22 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
     }
 }
 
-/// The plane-offset alignment the two embedded drivers that have been measured
-/// need from a DMA-BUF import. Both landed on the same 64 bytes, from opposite
-/// symptoms:
+/// The plane-offset alignment Mali needs from a DMA-BUF **source** import.
 ///
-/// * **Mali** (i.MX 95, source sampling, issue #165): offsets 32 and 2080
-///   sample zeros with no EGL error at all; 64, 256 and 2048 sample correctly,
-///   and offset 0 (the whole image, not a window) is the control.
-/// * **Vivante GC7000UL** (i.MX 8M Plus, destination import): offset 2048
-///   imports and renders correctly, offset 2080 fails `eglCreateImage` with
-///   `EGL_BAD_ACCESS`.
+/// Measured on i.MX 95 (issue #165): offsets 32 and 2080 sample zeros with no
+/// EGL error at all; 64, 256 and 2048 sample correctly, and offset 0 (the
+/// whole image, not a window) is the control. Two data points bracket the rule
+/// rather than pin it — the true requirement is somewhere in `(32, 2048]` — so
+/// 64 is the tightest value consistent with the measurements rather than a
+/// documented driver constant.
 ///
-/// Two data points bracket the Vivante rule rather than pin it — the true
-/// requirement is somewhere in `(32, 2048]` — so 64 is the tightest value
-/// consistent with both drivers rather than a documented driver constant.
+/// Sources only, and deliberately: this is a rule about a driver that fails
+/// SILENTLY, which nothing downstream can detect, so it has to be predicted.
+/// Vivante refuses a *destination* at an unaligned offset the opposite way —
+/// `eglCreateImage` returns `EGL_BAD_ACCESS`, measured at offset 2080 against
+/// 2048 rendering correctly — and a refusal that loud needs no prediction: the
+/// destination arms fall back to the mapped-texture readback when the import
+/// fails, whatever the driver and whatever its reason (issue #175).
 pub(super) const DMA_IMPORT_OFFSET_ALIGN: usize = 64;
 
 /// Whether `plane_offset` is one of the offsets no measured embedded driver
@@ -1395,31 +1508,14 @@ fn source_import_plane0_offset(img: &Tensor<u8>, img_fmt: PixelFormat) -> usize 
     }
 }
 
-/// Whether Vivante would fail to import a DESTINATION at `plane_offset`.
-///
-/// Distinct from [`mali_rejects_import_offset`] in symptom and in side: this is
-/// a hard `EGL_BAD_ACCESS` from `eglCreateImage`, not silent zero-sampling, and
-/// it hits the destination import, which Mali handles correctly at the same
-/// offsets (measured on i.MX 95 by
-/// `tests/offset_source_view_alignment.rs`). The engine already has a seam for
-/// "this platform cannot place a destination at its offset" —
-/// `Platform::dst_import_places` — and this joins it, so an unaligned Vivante
-/// destination lowers to the mapped-texture path, whose readback writes through
-/// `map()` at the offset, instead of letting the EGL error end the convert.
-///
-/// Takes the offset the import being guarded actually bases at, which differs
-/// by route: [`view_collapsed_dst_base`] for `bind_dst`'s import, and the raw
-/// `plane_offset()` for the `import_buffer_packed` ones.
-fn vivante_rejects_dst_import_offset(is_vivante: bool, plane_offset: usize) -> bool {
-    is_vivante && unaligned_import_offset(plane_offset)
-}
-
 /// The byte offset a destination import bases at **on the route that collapses
 /// a view to its parent** — `bind_dst`'s `get_or_create_egl_image(Dst)`.
 ///
 /// The engine has two zero-copy destination import routes and they treat a
-/// `view()` differently, so a driver rule about the base offset has to know
-/// which one it guards:
+/// `view()` differently, so [`GlPlatform::dst_import_places`] — the one
+/// destination question that must be answered BEFORE the import, because the
+/// import it guards succeeds and places the buffer wrongly — has to know which
+/// route it is guarding:
 ///
 /// * **`bind_dst` → `get_or_create_egl_image(CacheKind::Dst)` →
 ///   `Platform::import_buffer(.., for_dst = true)`.** A fresh `view()`/`batch()`
@@ -1435,11 +1531,11 @@ fn vivante_rejects_dst_import_offset(is_vivante: bool, plane_offset: usize) -> b
 ///   destination there IS imported at its own offset. Those sites pass the raw
 ///   `plane_offset()` and must NOT use this function.
 ///
-/// Getting the first case wrong is not merely a lost fast path: asking
-/// `plane_offset()` there made [`vivante_rejects_dst_import_offset`] fire on
-/// every tile view whose byte offset happened to be unaligned (an RGBA `x0` of
-/// 8 is 32 bytes), and the mapped-texture readback it lowered to returns wrong
-/// pixels for a view destination on that driver.
+/// Getting the first case wrong costs the zero-copy path for nothing: asking
+/// `plane_offset()` there declines every tile view whose byte offset happens
+/// to be unaligned (an RGBA `x0` of 8 is 32 bytes) although its import bases
+/// at 0 and would have succeeded. It cost correctness too, until the
+/// mapped-texture path it lowered to was fixed for a view destination (#177).
 ///
 /// Pure, and takes the two field values rather than a tensor, so it serves both
 /// `Tensor<u8>` and `TensorDyn` call sites and is unit-testable without either.
@@ -1865,6 +1961,10 @@ impl GLProcessorST {
             dst_egl_cache: ImportCache::new(egl_cache_capacity),
             bgra_warned: false,
             readback_scratch: Vec::new(),
+            #[cfg(test)]
+            fail_dst_import: false,
+            probe_dst_import_only: false,
+            dst_import_warned: std::collections::HashSet::new(),
             is_vivante,
             is_mali,
             is_virtual_gpu,
@@ -2035,7 +2135,14 @@ impl GLProcessorST {
 
         // Run the full DMA-buf EGLImage render pipeline (RGBA→RGBA DMA is a
         // single-pass zero-copy plan through the engine).
-        if let Err(e) = self.convert_via_engine(
+        // The probe declines the fallback the real converts take (issue #175):
+        // its question is whether this display can render into a DMA-BUF at
+        // all, and the answer demotes the whole transfer backend to PBO,
+        // sources included. A convert serviced by the mapped-texture readback
+        // would answer that question with the fallback's own output. The flag
+        // clears before the `?`-free early return below either way.
+        self.probe_dst_import_only = true;
+        let outcome = self.convert_via_engine(
             &mut dst,
             PixelFormat::Rgba,
             &src,
@@ -2044,7 +2151,9 @@ impl GLProcessorST {
             Rotation::None,
             Flip::None,
             ResolvedCrop::no_crop(),
-        ) {
+        );
+        self.probe_dst_import_only = false;
+        if let Err(e) = outcome {
             log::info!("verify_dma_buf_roundtrip: convert failed: {e}");
             return false;
         }
@@ -2222,23 +2331,17 @@ impl GLProcessorST {
                         Platform::dst_import_places(dst.as_typed::<f32>().expect("dtype checked"))
                     }
                     _ => unreachable!("dst_dtype is F16 or F32 in this branch"),
-                }
-                // Same driver-side term as `bind_dst`: Vivante cannot import a
-                // destination at an unaligned offset at all. There is no
-                // mapped-texture readback for a float DMA destination to lower
-                // to, so this declines to the CPU converter rather than letting
-                // `EGL_BAD_ACCESS` escape.
-                // The RAW `plane_offset`, not the view-collapsed base: these
-                // four float paths import through `import_buffer_packed`,
-                // which passes `plane_offset()` straight to
-                // `EGL_DMA_BUF_PLANE0_OFFSET_EXT` with no `view_origin`
-                // collapse (`platform/linux.rs` ~`:199`). Only `bind_dst`'s
-                // `get_or_create_egl_image(Dst)` route collapses a view to 0 —
-                // see `view_collapsed_dst_base`.
-                && !vivante_rejects_dst_import_offset(
-                    self.is_vivante,
-                    dst.plane_offset().unwrap_or(0),
-                );
+                };
+                // No driver-refusal term here, unlike the u8 arms: there is no
+                // mapped-texture readback for a FLOAT DMA destination to fall
+                // back to (`read_pixels_into` packs `UNSIGNED_BYTE`), so a
+                // driver that refuses such a destination has nothing to lower
+                // to inside GL. Its `eglCreateImage` failure propagates out of
+                // the convert and `ImageProcessor` runs the CPU converter,
+                // which is where the removed Vivante predicate sent it too --
+                // by a cleaner route, but to the same place (issue #175).
+                // What stays is the PLACEMENT question, which no import
+                // failure can answer because such an import succeeds.
                 if !places {
                     return Err(Error::NotSupported(format!(
                         "GL float destination at plane offset {} cannot be placed by \
@@ -2376,6 +2479,15 @@ impl GLProcessorST {
             // Recorded at the source-feed site: import | pbo | upload —
             // the zero-copy observable (see ConvertStats).
             src_feed = tracing::field::Empty,
+            // Recorded at the destination-feed site for EVERY u8 destination:
+            // zero_copy | mapped_texture | pbo -- how the convert's output
+            // reached the tensor (see `DstTarget::feed`). It is deliberately
+            // not a refusal marker: `zero_copy` and `mapped_texture` are both
+            // stated, so a trace never has to read an absent field as "written
+            // directly". Absent means only the float route, which enters no
+            // convert span at all. The field has to be declared here or the
+            // record would be a silent no-op.
+            dst_feed = tracing::field::Empty,
         )
         .entered();
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
@@ -2440,25 +2552,44 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        // Same gate as `bind_dst`, for the two destination imports that do
-        // not go through it: the packed-RGB two-pass plan's pass 2
-        // (`convert_to_packed_rgb` -> `get_or_create_egl_image_rgb`) and the
-        // planar two-pass plan, both zero-copy imports via
-        // `import_buffer_packed`, which on ANGLE binds the whole buffer from
-        // its origin. A destination rebuilt from a descriptor carries a
-        // plane offset but no `view_origin`, so without this it would still
-        // take `DstLowering::ZeroCopy` here and render at the buffer's
-        // origin.
-        // Vivante's driver-side half of the same question: an unaligned
-        // destination offset fails `eglCreateImage` (see `bind_dst`). The RAW
-        // `plane_offset` here, not the view-collapsed base: this plan imports
-        // through `import_buffer_packed`, which passes `plane_offset()` straight
-        // to EGL with no `view_origin` collapse (`platform/linux.rs` ~`:199`),
-        // so a view destination on this route really is imported at its own
-        // offset. See `view_collapsed_dst_base` for the route that differs.
-        let dst_offset = dst.plane_offset().unwrap_or(0);
-        let places = Platform::dst_import_places(dst)
-            && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
+        // Same gate as `bind_dst`, for the destination import that does not go
+        // through it: the packed-RGB two-pass plan's pass 2
+        // (`convert_to_packed_rgb` -> `get_or_create_egl_image_rgb`), a
+        // zero-copy import via `import_buffer_packed`, which on ANGLE binds
+        // the whole buffer from its origin. A destination rebuilt from a
+        // descriptor carries a plane offset but no `view_origin`, so without
+        // this it would still take `DstLowering::ZeroCopy` here and render at
+        // the buffer's origin. The RAW `plane_offset` here, not the
+        // view-collapsed base: this route passes `plane_offset()` straight to
+        // EGL with no `view_origin` collapse (`platform/linux.rs` ~`:199`), so
+        // a view destination on it really is imported at its own offset. See
+        // `view_collapsed_dst_base` for the route that differs.
+        // v1 view()/batch() destination support covers only the SINGLE-PASS
+        // PACKED formats. Packed RGB and every planar layout reinterpret the
+        // destination geometry (`W*3/4 × H`, `H*3` bands), which neither
+        // destination route places a tile in: the zero-copy route's
+        // `glViewport`/`glScissor` band is computed in the destination's own
+        // pixels, and the mapped-texture route's readback writes `dst_w`-wide
+        // rows at the parent's pitch. So such a destination declines here and
+        // the CPU backend takes it. (Band tiling for those is a follow-up.)
+        //
+        // Asked of the destination alone, BEFORE the lowering is chosen, and
+        // deliberately: keying it on `lowering == ZeroCopy` left the refusal
+        // depending on a decision that can still change underneath it — a
+        // refused import re-plans onto the mapped-texture route below, and the
+        // guard would then wave the very destination it exists to refuse
+        // straight onto a path that cannot place it either.
+        if dst.view_origin().is_some()
+            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
+        {
+            return Err(crate::Error::NotSupported(
+                "GL view()/batch() destination not yet supported for packed-RGB / \
+                 planar formats (CPU fallback handles it)"
+                    .into(),
+            ));
+        }
+        let dst_offset = view_collapsed_dst_base(dst.view_origin(), dst.plane_offset());
+        let places = Platform::dst_import_places(dst);
         if !places {
             log::debug!(
                 "convert_via_engine: zero-copy destination importing at base offset \
@@ -2466,11 +2597,45 @@ impl GLProcessorST {
                  to a texture and reading back through map()"
             );
         }
-        let lowering = super::render::lower_dst(
+        // The `image.convert.gl` span, captured BEFORE the engine span below is
+        // entered, because that is the span the feed fields belong to. A
+        // `Span::current()` inside the engine span (or inside a two-pass
+        // pass span) names a child that does not declare them, and a record
+        // against an undeclared field is a silent no-op.
+        let convert_span = tracing::Span::current();
+        let mut lowering = super::render::lower_dst(
             self.gl_context.transfer_backend.is_zero_copy() && places,
             dst.memory(),
         );
-        let plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
+        let mut plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
+        // The packed-RGB plan imports the destination in its pass 2, AFTER
+        // pass 1 has rendered, and a texture-lowered RGB destination is a
+        // different plan entirely (one genuine RGB pass, no W*3/4
+        // reinterpretation). So the import is asked for here, before any
+        // rendering: a refusal re-plans onto the mapped-texture path instead
+        // of ending the convert, and the pass-2 call that follows is a cache
+        // hit. `bind_dst` needs no equivalent — it can fall back in place,
+        // and its guard covers the attach as well as the import.
+        if plan == super::render::ConvertPlan::TwoPassPackedRgb {
+            match self.probe_packed_rgb_dst_import(dst, dst_fmt) {
+                // The packed-RGB plan never reaches `bind_dst` -- its pass 2
+                // attaches the import itself -- so the feed is recorded here
+                // instead, with the same vocabulary, rather than leaving this
+                // one route silent.
+                Ok(()) => {
+                    convert_span.record("dst_feed", DstTarget::ZeroCopyImage.feed());
+                }
+                // The probe declines the fallback too, for the same reason
+                // `bind_dst` does: it is answering the probe's question, not
+                // serving a caller's convert.
+                Err(e) if self.probe_dst_import_only => return Err(e),
+                Err(e) => {
+                    self.note_dst_import_fallback(dst, dst_fmt, &e);
+                    lowering = super::render::lower_dst(false, dst.memory());
+                    plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
+                }
+            }
+        }
         let _span = tracing::trace_span!(
             "image.convert.gl.engine",
             ?plan,
@@ -2479,38 +2644,82 @@ impl GLProcessorST {
         )
         .entered();
 
-        // v1 view()/batch() destination support covers only the single-pass
-        // PACKED zero-copy path (the glViewport/scissor band set in
-        // bind_dst). Packed RGB and every planar layout reinterpret the
-        // destination geometry (`W*3/4 × H`, `H*3` bands), which the band
-        // lowering does not yet handle, so a view destination declines them
-        // → CPU fallback. (Band tiling for those is a follow-up.)
-        if dst.view_origin().is_some()
-            && lowering == super::render::DstLowering::ZeroCopy
-            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
-        {
-            return Err(crate::Error::NotSupported(
-                "GL view()/batch() destination not yet supported for two-pass packed-RGB / \
-                 planar formats (CPU fallback handles it)"
-                    .into(),
-            ));
-        }
-
         match plan {
             super::render::ConvertPlan::TwoPassPackedRgb => {
                 return self.convert_to_packed_rgb(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                    src,
+                    src_fmt,
+                    dst,
+                    dst_fmt,
+                    is_int8,
+                    rotation,
+                    flip,
+                    crop,
+                    &convert_span,
                 )
             }
             super::render::ConvertPlan::TwoPassNvPlanar => {
                 return self.convert_nv_to_planar_two_pass(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                    src,
+                    src_fmt,
+                    dst,
+                    dst_fmt,
+                    is_int8,
+                    rotation,
+                    flip,
+                    crop,
+                    lowering,
+                    &convert_span,
                 )
             }
             super::render::ConvertPlan::SinglePass => {}
         }
 
-        let target = self.bind_dst(dst, dst_fmt, crop)?;
+        let (target, bound) = self.bind_dst(dst, dst_fmt, crop, lowering)?;
+        // A refused import changed the lowering underneath the plan that was
+        // chosen against `ZeroCopy`. Re-plan against what was actually bound:
+        // the pair `(SinglePass, TextureMem)` is legal for a PACKED
+        // destination and not for a planar one, where the single-pass planar
+        // shader imports its source unconditionally -- so a heap source would
+        // have failed out to the CPU backend instead of completing through
+        // the fallback that had just been set up for it.
+        //
+        // The two-pass plan binds the destination itself, at its pass 2, so
+        // the bind above is discarded; that costs one texture setup on a path
+        // the driver has already made slow, and keeps the "one plan, one
+        // route" invariant `plan_convert` documents.
+        let replanned = super::render::plan_convert(src_fmt, dst_fmt, bound);
+        if replanned != super::render::ConvertPlan::SinglePass {
+            debug_assert_eq!(
+                replanned,
+                super::render::ConvertPlan::TwoPassNvPlanar,
+                "a texture lowering can only re-plan onto the planar two-pass route"
+            );
+            return self.convert_nv_to_planar_two_pass(
+                src,
+                src_fmt,
+                dst,
+                dst_fmt,
+                is_int8,
+                rotation,
+                flip,
+                crop,
+                bound,
+                &convert_span,
+            );
+        }
+        Self::record_dst_feed(&convert_span, target);
+        // A `view()`/`batch()` destination is placed by a band viewport ONLY
+        // where the render target is the shared parent import
+        // (`setup_renderbuffer_dma`). The texture lowerings render into an
+        // offscreen target that is the tile itself, at origin (0, 0), and
+        // place it in the readback instead, so they must not carry the band
+        // into `glScissor` — doing so clipped away the tile's own left/top
+        // edge and left the previous frame's pixels there (issue #177).
+        let band = match target {
+            DstTarget::ZeroCopyImage => dst.view_origin(),
+            DstTarget::Texture { .. } => None,
+        };
 
         // Bias the letterbox clear colour for int8 on every lowering: the
         // fragment shader XORs rendered pixels and no readback un-biases,
@@ -2537,11 +2746,21 @@ impl GLProcessorST {
                     rotation,
                     flip,
                     crop,
+                    &convert_span,
                 )?;
             }
             None => {
                 self.render_packed_or_planar(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                    src,
+                    src_fmt,
+                    dst,
+                    dst_fmt,
+                    band,
+                    is_int8,
+                    rotation,
+                    flip,
+                    crop,
+                    &convert_span,
                 )?;
             }
         }
@@ -3082,6 +3301,79 @@ impl GLProcessorST {
         self.camera_normal_texture.invalidate_egl_binding();
     }
 
+    /// Ask the driver for the packed-RGB plan's destination import before any
+    /// rendering happens, so a refusal can re-plan.
+    ///
+    /// Exactly the import `convert_to_packed_rgb`'s pass 2 makes — same
+    /// surface geometry, same packed format — so a success here is the cache
+    /// entry pass 2 will hit and costs nothing twice.
+    ///
+    /// `Ok(())` when there is nothing to ask: a geometry that does not resolve
+    /// (a width whose `W*3` bytes do not divide into whole RGBA texels) is not
+    /// a driver refusal, so it is left for pass 2 to report exactly as it does
+    /// today rather than being reported here as a fallback.
+    fn probe_packed_rgb_dst_import(
+        &mut self,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+    ) -> crate::Result<()> {
+        let (Some(dst_w), Some(dst_h)) = (dst.width(), dst.height()) else {
+            return Ok(());
+        };
+        let Some(layout) = edgefirst_tensor::packed_rgb888_layout(dst_w, dst_h) else {
+            return Ok(());
+        };
+        self.get_or_create_egl_image_rgb(
+            dst,
+            dst_fmt,
+            layout.surface_w,
+            layout.surface_h,
+            super::platform::PackedImportFormat::Rgba8888,
+        )
+        .map(|_| ())
+    }
+
+    /// Record a zero-copy destination import that the driver refused, and
+    /// leave GL in a state the mapped-texture setup can start from.
+    ///
+    /// The destination-side twin of the source arms' decline handling: count
+    /// it in [`ConvertStats::dst_import_fallbacks`], warn once per buffer and
+    /// debug on the repeats (`dst_import_warned`, the shape `nv_import_warned`
+    /// already has), and drain the GL error queue. Draining matters because
+    /// the refusal can be a GL error rather than an EGL one — attaching the
+    /// image raises `GL_INVALID_OPERATION` on some desktop drivers — and
+    /// `check_gl_error` reads one flag per call, so a leftover flag would
+    /// surface as a spurious failure of the fallback that follows.
+    ///
+    /// [`ConvertStats::dst_import_fallbacks`]: super::cache::ConvertStats::dst_import_fallbacks
+    fn note_dst_import_fallback(&mut self, dst: &Tensor<u8>, dst_fmt: PixelFormat, e: &Error) {
+        self.convert_stats.dst_import_fallbacks += 1;
+        let w = dst.width().unwrap_or(0);
+        let h = dst.height().unwrap_or(0);
+        let offset = dst.plane_offset().unwrap_or(0);
+        if self.dst_import_warned.insert(dst.buffer_identity().id()) {
+            log::warn!(
+                "zero-copy destination import refused for {dst_fmt} ({w}x{h}) at plane \
+                 offset {offset}; rendering to a texture and reading back through map() \
+                 (slower, still correct): {e}"
+            );
+        } else {
+            log::debug!(
+                "zero-copy destination import refused for {dst_fmt} ({w}x{h}) at plane \
+                 offset {offset} (repeat): {e}"
+            );
+        }
+        // Bounded: a driver reports a small fixed set of flags, and the loop
+        // ends at the first NO_ERROR either way.
+        unsafe {
+            for _ in 0..8 {
+                if edgefirst_gl::gl::GetError() == edgefirst_gl::gl::NO_ERROR {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Classify and bind the destination render target — the single entry
     /// point absorbing the per-memory `setup_renderbuffer_*` fan-out. The
     /// pure classification lives in [`super::render::lower_dst`]; this
@@ -3091,32 +3383,52 @@ impl GLProcessorST {
         dst: &Tensor<u8>,
         dst_fmt: PixelFormat,
         crop: ResolvedCrop,
-    ) -> crate::Result<DstTarget> {
-        // A zero-copy destination the platform cannot place -- one carrying a
-        // plane offset with no `view_origin` to lower to a viewport -- takes
-        // the mapped texture path, whose readback writes through `map()` at
-        // the offset. Vivante joins that rule from the driver side: its
-        // `eglCreateImage` fails outright on an unaligned destination offset,
-        // and without this the EGL error ended the convert instead of lowering
-        // it (measured on i.MX 8M Plus: offset 2048 renders, 2080 is
-        // `EGL_BAD_ACCESS`).
-        let dst_offset = view_collapsed_dst_base(dst.view_origin(), dst.plane_offset());
-        let places = Platform::dst_import_places(dst)
-            && !vivante_rejects_dst_import_offset(self.is_vivante, dst_offset);
-        if !places {
-            log::debug!(
-                "bind_dst: zero-copy destination importing at base offset {dst_offset} \
-                 cannot be placed by this platform/driver; rendering to a texture and \
-                 reading back through map()"
-            );
-        }
-        match super::render::lower_dst(
-            self.gl_context.transfer_backend.is_zero_copy() && places,
-            dst.memory(),
-        ) {
+        lowering: super::render::DstLowering,
+    ) -> crate::Result<(DstTarget, super::render::DstLowering)> {
+        // The lowering goes IN as the caller's and comes back as the effective
+        // one, and both halves matter.
+        //
+        // In, because `convert_via_engine` pairs it with a `ConvertPlan`: a
+        // refused packed-RGB import re-plans onto the mapped route, and asking
+        // `dst_import_places` again here would answer `true` (the IMPORT
+        // failed, the PLACEMENT is fine), bind a zero-copy destination under a
+        // plan chosen for a texture one.
+        //
+        // Out, because a refusal DISCOVERED here changes it: the caller's plan
+        // was chosen against `ZeroCopy` and may not be legal against the
+        // texture lowering the fallback just took. Returning it lets the
+        // caller re-plan instead of rendering the stale route.
+        let effective = match lowering {
             super::render::DstLowering::ZeroCopy => {
-                self.setup_renderbuffer_dma(dst, dst_fmt)?;
-                Ok(DstTarget::ZeroCopyImage)
+                // A destination import that FAILS lowers the convert to the
+                // mapped-texture readback, exactly as a failed source import
+                // lowers to the upload path -- rather than ending the convert
+                // and sending the whole thing to the CPU backend. That is what
+                // replaced the per-driver refusal predicates: Vivante's
+                // `eglCreateImage` returns `EGL_BAD_ACCESS` for a destination
+                // at an offset that is not 64-byte aligned, and the refusal
+                // itself is now the trigger, so a future driver quirk of the
+                // same kind needs no new trait (issue #175).
+                //
+                // The whole zero-copy setup is guarded, not just the import
+                // call: attaching the image to the texture and the FBO can
+                // fail after `eglCreateImage` succeeded (a desktop NVIDIA EGL
+                // raises `GL_INVALID_OPERATION` there), and either way the
+                // destination has not been written yet.
+                match self.setup_renderbuffer_dma(dst, dst_fmt) {
+                    Ok(()) => (DstTarget::ZeroCopyImage, lowering),
+                    Err(e) if self.probe_dst_import_only => return Err(e),
+                    Err(e) => {
+                        self.note_dst_import_fallback(dst, dst_fmt, &e);
+                        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+                        (
+                            DstTarget::Texture {
+                                readback: DstReadback::Mem,
+                            },
+                            super::render::DstLowering::TextureMem,
+                        )
+                    }
+                }
             }
             super::render::DstLowering::TexturePbo => {
                 let id = dst.pbo_id().ok_or_else(|| {
@@ -3130,17 +3442,38 @@ impl GLProcessorST {
                     ));
                 }
                 self.setup_renderbuffer_from_pbo(dst, dst_fmt, id)?;
-                Ok(DstTarget::Texture {
-                    readback: DstReadback::Pbo(id),
-                })
+                (
+                    DstTarget::Texture {
+                        readback: DstReadback::Pbo(id),
+                    },
+                    lowering,
+                )
             }
             super::render::DstLowering::TextureMem => {
                 self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-                Ok(DstTarget::Texture {
-                    readback: DstReadback::Mem,
-                })
+                (
+                    DstTarget::Texture {
+                        readback: DstReadback::Mem,
+                    },
+                    lowering,
+                )
             }
-        }
+        };
+        Ok(effective)
+    }
+
+    /// Record how the convert's output will reach the destination, for EVERY
+    /// target and not only a refused import: a field present on some routes
+    /// and absent on others reads as "zero-copy" when it really means "nobody
+    /// said", which is how an ordinary texture-lowered convert could pass for
+    /// a zero-copy one in a trace.
+    ///
+    /// Called where the route is COMMITTED rather than inside `bind_dst`,
+    /// because a bind whose lowering the caller then re-plans away from is not
+    /// the route the convert took -- recording there put the same value on the
+    /// span twice, which an `fmt` subscriber prints twice.
+    fn record_dst_feed(convert_span: &tracing::Span, target: DstTarget) {
+        convert_span.record("dst_feed", target.feed());
     }
 
     fn setup_renderbuffer_dma(
@@ -3327,15 +3660,38 @@ impl GLProcessorST {
         src_fmt: PixelFormat,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
+        band: Option<edgefirst_tensor::ViewOrigin>,
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()> {
         if dst_fmt.layout() == PixelLayout::Planar {
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+            self.convert_to_planar(
+                src,
+                src_fmt,
+                dst,
+                dst_fmt,
+                is_int8,
+                rotation,
+                flip,
+                crop,
+                convert_span,
+            )
         } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+            self.convert_to(
+                src,
+                src_fmt,
+                dst,
+                dst_fmt,
+                band,
+                is_int8,
+                rotation,
+                flip,
+                crop,
+                convert_span,
+            )
         }
     }
 
@@ -3350,6 +3706,13 @@ impl GLProcessorST {
     /// the D3D11 staging texture behind a Windows `TensorMemory::DmaBuf`
     /// tensor, an IOSurface, a tensor carrying a declared stride -- and a tight
     /// write into a padded window shears every row after the first.
+    ///
+    /// A `view()` destination is the case where the padding is not the
+    /// destination's own: its window's rows sit at the PARENT's pitch and what
+    /// separates them is the parent's columns to the right of the tile. So the
+    /// readback places each row at the pitch and writes nothing between them
+    /// -- see [`read_pixels_into`], which owns that rule for both of its
+    /// routes (issue #177).
     fn read_pixels_into_tensor(
         &mut self,
         dst: &mut Tensor<u8>,
@@ -3372,10 +3735,10 @@ impl GLProcessorST {
         }
         let mut dst_map = dst.map_mut()?;
         let out = dst_map.as_mut_slice();
-        // `read_pixels_into` writes `rows * tight_row` bytes at the head of
-        // `out` whatever the pitch, and the spread then reaches the padded
-        // span. Both bounds are checked before the read, because the read
-        // itself goes through a raw pointer and cannot check anything.
+        // `read_pixels_into` writes `tight_row` bytes at every `stride`, so the
+        // last row's end is the far bound. It is checked before the read,
+        // because the read itself goes through a raw pointer and cannot check
+        // anything.
         let needed = padded_readback_bytes(rows, tight_row, stride).unwrap_or(rows * tight_row);
         if out.len() < needed {
             return Err(crate::Error::OpenGl(format!(
@@ -3384,14 +3747,13 @@ impl GLProcessorST {
             )));
         }
         // SAFETY: called on the GL thread with a complete read framebuffer
-        // bound; the tight read fits `out` by the check above, which covers the
-        // unpadded case as well as the padded one.
+        // bound; the rows fit `out` at this pitch by the check above, which
+        // covers the unpadded case as well as the padded one.
         unsafe {
             edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
-            read_pixels_into(width, rows, format, &mut self.readback_scratch, out);
+            read_pixels_into(width, rows, format, &mut self.readback_scratch, out, stride);
         }
         check_gl_error(function!(), line!())?;
-        spread_rows(out, rows, tight_row, stride);
         if swap_rb {
             // Row by row: the swap must not walk the padding between rows, and
             // a padded pitch need not be a multiple of the 4-byte chunk.
@@ -3659,9 +4021,26 @@ impl GLProcessorST {
         let map;
         let mut swapped_buf;
 
-        let pixels = if crop.dst_rect.is_none_or(|crop| {
-            crop.top == 0 && crop.left == 0 && crop.height == dst_h && crop.width == dst_w
-        }) {
+        // Seed the render target with the destination's current pixels, so a
+        // letterbox band that is neither cleared nor drawn keeps what the
+        // destination already held.
+        //
+        // Skipped whenever a fill colour was asked for, which is every
+        // letterbox `Crop` the public API can build: `convert_to`'s
+        // `glClear` covers the whole target before anything is drawn, so the
+        // upload would be read back out of the framebuffer having been
+        // overwritten in full — pure cost, and on a strided or `view()`
+        // destination a misleading one, since `TexImage2D` reads the map
+        // tight and would shear the rows it uploaded.
+        let seeded = crop.dst_color.is_none()
+            && crop.dst_rect.is_some_and(|c| {
+                c.top != 0 || c.left != 0 || c.height != dst_h || c.width != dst_w
+            });
+        // No public `Crop` reaches this arm today: `Crop::resolve` returns a
+        // partial `dst_rect` only for `Fit::Letterbox`, which always carries
+        // its pad colour, so a partial rect without one can only come from a
+        // `ResolvedCrop` built inside the crate.
+        let pixels = if !seeded {
             std::ptr::null()
         } else {
             map = dst.map_read()?;
@@ -3751,7 +4130,19 @@ impl GLProcessorST {
                 false,
             )
         } else {
-            self.draw_src_texture(bg, bg_fmt, full_src, full_dst, 0, crate::Flip::None, false)
+            // An overlay background, not a convert: there is no
+            // `image.convert.gl` span to record a source feed on, and
+            // `ConvertStats` counts it either way.
+            self.draw_src_texture(
+                bg,
+                bg_fmt,
+                full_src,
+                full_dst,
+                0,
+                crate::Flip::None,
+                false,
+                &tracing::Span::none(),
+            )
         }
     }
 
@@ -4005,6 +4396,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -4023,7 +4415,7 @@ impl GLProcessorST {
         };
 
         self.convert_stats.src_pbo_uploads += 1;
-        tracing::Span::current().record("src_feed", "pbo");
+        convert_span.record("src_feed", "pbo");
 
         let has_crop = crop
             .dst_rect
@@ -4398,6 +4790,17 @@ impl GLProcessorST {
         }
     }
 
+    /// `band` is the destination tile's origin **inside the bound render
+    /// target**, and is `Some` only when that target is the shared parent
+    /// import a `view()`/`batch()` destination is placed in by
+    /// `setup_renderbuffer_dma`'s viewport. It is NOT `dst.view_origin()`:
+    /// the mapped-texture and PBO lowerings render into an offscreen target
+    /// that IS the tile, at origin (0, 0), and place it afterwards in the
+    /// readback, so scissoring them to the view's parent coordinates would
+    /// clip away the tile's own left/top edge (issue #177). The two-pass
+    /// plans' pass 1 renders into an engine-internal intermediate for the
+    /// same reason and passes `None` too. Callers derive it from what
+    /// [`Self::bind_dst`] classified the destination as.
     #[allow(clippy::too_many_arguments)]
     fn convert_to(
         &mut self,
@@ -4405,10 +4808,12 @@ impl GLProcessorST {
         src_fmt: PixelFormat,
         dst: &Tensor<u8>,
         _dst_fmt: PixelFormat,
+        band: Option<edgefirst_tensor::ViewOrigin>,
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> Result<(), crate::Error> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
@@ -4417,12 +4822,13 @@ impl GLProcessorST {
             src_fmt,
             dst_w,
             dst_h,
-            dst.view_origin(),
+            band,
             _dst_fmt,
             is_int8,
             rotation,
             flip,
             crop,
+            convert_span,
         )
     }
 
@@ -4445,6 +4851,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> Result<(), crate::Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -4552,6 +4959,7 @@ impl GLProcessorST {
                     rotation_offset,
                     flip,
                     is_int8,
+                    convert_span,
                 )?;
             } else if chosen == NvConvertPath::ShaderR8 {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
@@ -4562,7 +4970,7 @@ impl GLProcessorST {
                             "image.convert.gl.nv_path"
                         );
                         self.convert_stats.src_imports += 1;
-                        tracing::Span::current().record("src_feed", "import");
+                        convert_span.record("src_feed", "import");
                         // Recorded from the draw's result, not before it: a
                         // failed draw must not leave a ShaderR8 claim, and it
                         // must not leave the PREVIOUS convert's value either.
@@ -4616,7 +5024,7 @@ impl GLProcessorST {
                         // no PBO can reach here anyway, this arm being inside
                         // the `TensorMemory::DmaBuf` branch.
                         self.convert_stats.src_uploads += 1;
-                        tracing::Span::current().record("src_feed", "upload");
+                        convert_span.record("src_feed", "upload");
                         let start = Instant::now();
                         // The R8 import declined (Mali's alignment rule, the
                         // ANGLE leaves' offset refusal, or a driver that cannot
@@ -4654,7 +5062,7 @@ impl GLProcessorST {
                             tracing::trace!(path = "ExternalSampler", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
                         }
                         self.convert_stats.src_imports += 1;
-                        tracing::Span::current().record("src_feed", "import");
+                        convert_span.record("src_feed", "import");
                         // Recorded from the draw's result (see the ShaderR8
                         // arm): a failed draw records neither ExternalSampler
                         // nor the previous convert's value.
@@ -4721,7 +5129,7 @@ impl GLProcessorST {
                             // `draw_nv_texture_2d(.., None, ..)` refuses a PBO
                             // source itself in any case.
                             self.convert_stats.src_uploads += 1;
-                            tracing::Span::current().record("src_feed", "upload");
+                            convert_span.record("src_feed", "upload");
                             // Recorded from the result: a drawn upload is still
                             // a GPU convert (ShaderR8), a failed one records Cpu
                             // rather than keeping the previous convert's value.
@@ -4757,6 +5165,7 @@ impl GLProcessorST {
                                 rotation_offset,
                                 flip,
                                 is_int8,
+                                convert_span,
                             )?;
                             log::debug!("draw_src_texture takes {:?}", start.elapsed());
                         }
@@ -4776,7 +5185,7 @@ impl GLProcessorST {
             // buffers) cannot be uploaded as one R8 texture → CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
             self.convert_stats.src_uploads += 1;
-            tracing::Span::current().record("src_feed", "upload");
+            convert_span.record("src_feed", "upload");
             // Recorded from the draw's result, like the four DMA arms above: a
             // failed upload records Cpu rather than leaving a ShaderR8 claim or
             // the previous convert's value.
@@ -4813,6 +5222,7 @@ impl GLProcessorST {
                 rotation_offset,
                 flip,
                 is_int8,
+                convert_span,
             )?;
             log::debug!("draw_src_texture takes {:?}", start.elapsed());
         }
@@ -4840,6 +5250,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> Result<(), crate::Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -4937,6 +5348,13 @@ impl GLProcessorST {
 
         let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
+        // This route imports unconditionally -- there is no upload arm to
+        // choose between -- but it is still a source feed, and a field
+        // recorded on every convert except one is worse than no field: the
+        // single-pass planar route would be the only u8 convert whose
+        // `src_feed` is absent, which reads as "not fed by GL at all".
+        self.convert_stats.src_imports += 1;
+        convert_span.record("src_feed", "import");
         // As in `draw_src_texture`: the import may cover more of the texture
         // than the logical image, and may start it partway in. One cache
         // lookup feeds both the source rectangle and the sampling clamp.
@@ -4981,6 +5399,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
@@ -5029,7 +5448,18 @@ impl GLProcessorST {
         // The flag restores before `?` so an error cannot leak defer state.
         let saved_defer = self.defer_finish;
         self.defer_finish = true;
-        let pass1 = self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop);
+        let pass1 = self.convert_to(
+            src,
+            src_fmt,
+            dst,
+            dst_fmt,
+            None,
+            false,
+            rotation,
+            flip,
+            crop,
+            convert_span,
+        );
         self.defer_finish = saved_defer;
         pass1?;
         drop(_pass1);
@@ -5149,6 +5579,8 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        lowering: super::render::DstLowering,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
@@ -5196,7 +5628,18 @@ impl GLProcessorST {
         // finished intermediate, and the convert syncs once at pass 2's end.
         let saved_defer = self.defer_finish;
         self.defer_finish = true;
-        let pass1 = self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop);
+        let pass1 = self.convert_to(
+            src,
+            src_fmt,
+            dst,
+            dst_fmt,
+            None,
+            false,
+            rotation,
+            flip,
+            crop,
+            convert_span,
+        );
         self.defer_finish = saved_defer;
         pass1?;
         drop(_pass1);
@@ -5213,7 +5656,8 @@ impl GLProcessorST {
             dst_h
         )
         .entered();
-        let target = self.bind_dst(dst, dst_fmt, crop)?;
+        let (target, _bound) = self.bind_dst(dst, dst_fmt, crop, lowering)?;
+        Self::record_dst_feed(convert_span, target);
 
         // Pass 2 is a fullscreen blit from the intermediate to the planar
         // destination. Pass 1 (convert_to above) already placed the image
@@ -5666,6 +6110,7 @@ impl GLProcessorST {
         rotation_offset: usize,
         flip: Flip,
         is_int8: bool,
+        convert_span: &tracing::Span,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -5823,7 +6268,7 @@ impl GLProcessorST {
                 // TexSubImage2D into the attached client buffer.
                 self.camera_normal_texture.target = 0;
                 self.convert_stats.src_imports += 1;
-                tracing::Span::current().record("src_feed", "import");
+                convert_span.record("src_feed", "import");
             } else {
                 let src_bpp = src_fmt.channels().max(1);
                 // A recorded pitch that is not a whole number of pixels
@@ -5840,7 +6285,7 @@ impl GLProcessorST {
                     &format!("{src_fmt:?}"),
                 )?;
                 self.convert_stats.src_uploads += 1;
-                tracing::Span::current().record("src_feed", "upload");
+                convert_span.record("src_feed", "upload");
                 // Map before touching pixel-store state: a `?` here must not
                 // leave `UNPACK_ROW_LENGTH` set for the next upload.
                 let pixels = src.map_read()?;
@@ -6445,6 +6890,16 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
     ) -> Result<PlatformHandle, crate::Error> {
+        // Test hook: stand in for a driver that refuses this destination, so
+        // the fallback to the mapped-texture readback is exercised on hosts
+        // whose driver accepts every destination (issue #175). Destinations
+        // only — the source arms have their own decline paths.
+        #[cfg(test)]
+        if cache == CacheKind::Dst && self.fail_dst_import {
+            return Err(crate::Error::OpenGl(
+                "EDGEFIRST test hook: zero-copy destination import refused".to_string(),
+            ));
+        }
         // Before the lookup, not inside the miss arm: a hit returns a cached
         // import without consulting the platform at all, so an identity that
         // has stopped naming its buffer would be served a stale image.
@@ -6742,6 +7197,15 @@ impl GLProcessorST {
         // Before the lookup, not inside the miss arm: a hit returns a cached
         // import without consulting the platform at all, so an identity that
         // has stopped naming its buffer would be served a stale image.
+        // Test hook: stand in for a driver that refuses this destination, so
+        // the fallback to the mapped-texture readback is exercised on hosts
+        // whose driver accepts every destination (issue #175).
+        #[cfg(test)]
+        if self.fail_dst_import {
+            return Err(crate::Error::OpenGl(
+                "EDGEFIRST test hook: zero-copy destination import refused".to_string(),
+            ));
+        }
         Platform::validate_import_identity(img, "packed destination")?;
         // Keyed identically to `cached_dst_renderbuffer` and the logical-dims
         // dst path: the packed render dims derive deterministically from the
@@ -8267,6 +8731,11 @@ impl GLProcessorST {
             rotation,
             flip,
             crop,
+            // The FLOAT route: it returns before `image.convert.gl` is
+            // entered, so there is no convert span for the source feed to land
+            // on. Documented in ARCHITECTURE.md's span catalog; giving this
+            // route its own span is a follow-up.
+            &tracing::Span::none(),
         );
         self.defer_finish = saved_defer;
         pass1?;
@@ -8714,44 +9183,37 @@ mod tests {
         }
     }
 
-    // The destination-side rule, which is Vivante's and NOT Mali's: Mali was
-    // measured rendering into offset 2080 correctly, Vivante fails to import it
-    // (`EGL_BAD_ACCESS`). Both halves matter, so both are asserted -- gating
-    // Mali destinations would cost it the zero-copy path for nothing.
+    // The offset rule is a SOURCE rule, and only Mali's. Vivante's refusal of
+    // an unaligned destination is loud (`EGL_BAD_ACCESS` from
+    // `eglCreateImage`) and is handled by falling back when the import fails,
+    // so no predicate predicts it and no driver is gated on the destination
+    // side -- Mali least of all, which was measured rendering into offset 2080
+    // correctly (issue #175).
     #[test]
-    fn only_vivante_declines_an_unaligned_destination_import() {
-        use super::{mali_rejects_import_offset, vivante_rejects_dst_import_offset as dst_rejects};
+    fn the_offset_rule_is_a_source_rule_and_only_malis() {
+        use super::mali_rejects_import_offset;
 
-        // Vivante: 2048 imports, 2080 is EGL_BAD_ACCESS -- the two measured
-        // points on i.MX 8M Plus.
-        assert!(!dst_rejects(true, 2048));
-        assert!(dst_rejects(true, 2080));
-        assert!(!dst_rejects(true, 0));
-        assert!(dst_rejects(true, 32));
-
-        // Not Vivante: no destination gate at all. Mali included -- its
-        // destination renders correctly at 2080, and only its SOURCE sampling
-        // is affected.
-        assert!(!dst_rejects(false, 2080));
-        assert!(!dst_rejects(false, 32));
         assert!(
             mali_rejects_import_offset(true, 2080),
-            "the Mali rule is the source rule, and 2080 is in it"
+            "the Mali source rule covers 2080"
         );
+        assert!(mali_rejects_import_offset(true, 32));
+        assert!(!mali_rejects_import_offset(true, 2048));
+        assert!(!mali_rejects_import_offset(true, 0));
+        // Every other driver samples an unaligned source correctly.
+        assert!(!mali_rejects_import_offset(false, 2080));
+        assert!(!mali_rejects_import_offset(false, 32));
     }
 
     // The offset a destination import actually bases at, which is what the
-    // Vivante rule must be asked of -- and which of the two routes is being
-    // guarded. `bind_dst`'s import collapses a fresh view() to 0 however far
-    // into the buffer its own bytes start, so asking `plane_offset()` there
-    // made the rule fire on tile views the driver handles perfectly. The
-    // `import_buffer_packed` routes do NOT collapse, so they must keep asking
-    // the raw offset; both shapes are asserted here.
+    // PLACEMENT question must be asked of -- and which of the two routes is
+    // being guarded. `bind_dst`'s import collapses a fresh view() to 0 however
+    // far into the buffer its own bytes start; the `import_buffer_packed`
+    // routes do NOT collapse and really do import at the tensor's own offset.
+    // Both shapes are asserted here.
     #[test]
-    fn a_view_destination_imports_at_base_zero_and_escapes_the_offset_rule() {
-        use super::{
-            view_collapsed_dst_base as base, vivante_rejects_dst_import_offset as dst_rejects,
-        };
+    fn a_view_destination_imports_at_base_zero() {
+        use super::view_collapsed_dst_base as base;
         use edgefirst_tensor::ViewOrigin;
 
         // A fresh view: `view_origin` is Some, so the import bases at 0 -- even
@@ -8764,45 +9226,26 @@ mod tests {
             y: 8,
         });
         assert_eq!(base(vo, Some(2080)), 0);
-        assert!(
-            !dst_rejects(true, base(vo, Some(2080))),
-            "a fresh view destination must KEEP zero-copy on Vivante"
-        );
         // Still 0 at an aligned offset, and 0 even if the offset is absent.
         assert_eq!(base(vo, Some(2048)), 0);
         assert_eq!(base(vo, None), 0);
 
         // No view_origin -- rebuilt from a descriptor, or a whole tensor at a
-        // foreign offset. Now the import really does base at the offset, and
-        // the rule applies.
+        // foreign offset. Now the import really does base at the offset.
         assert_eq!(base(None, Some(2080)), 2080);
-        assert!(dst_rejects(true, base(None, Some(2080))));
         assert_eq!(base(None, Some(2048)), 2048);
-        assert!(!dst_rejects(true, base(None, Some(2048))));
         // A whole tensor with no offset at all is base 0.
         assert_eq!(base(None, None), 0);
-        assert!(!dst_rejects(true, base(None, None)));
-
-        // Nothing here touches a non-Vivante driver.
-        assert!(!dst_rejects(false, base(None, Some(2080))));
 
         // THE OTHER ROUTE. `import_buffer_packed` passes `plane_offset()`
         // straight to EGL with no collapse, so `convert_via_engine`'s packed
-        // plan and the float paths ask the RAW offset -- and a view destination
-        // there really is imported at its own offset, so the rule must fire on
-        // it. Collapsing at those sites would under-fire and hand Vivante the
-        // `EGL_BAD_ACCESS` this rule exists to avoid.
+        // plan and the float paths ask the RAW offset. The two routes
+        // genuinely disagree for the same tensor, which is the whole reason
+        // the helper is route-specific: `dst_import_places` asks whether an
+        // import will PLACE the destination correctly, and the answer differs
+        // by which offset the import will actually base at.
         let raw = |plane_offset: Option<usize>| plane_offset.unwrap_or(0);
         assert_eq!(raw(Some(2080)), 2080);
-        assert!(
-            dst_rejects(true, raw(Some(2080))),
-            "a view destination on the packed route imports at its own offset, \
-             so the rule must still fire there"
-        );
-        assert!(!dst_rejects(true, raw(Some(2048))));
-        assert!(!dst_rejects(true, raw(None)));
-        // The two routes genuinely disagree for the same tensor: that is the
-        // whole reason the helper is route-specific.
         assert_ne!(base(vo, Some(2080)), raw(Some(2080)));
     }
 

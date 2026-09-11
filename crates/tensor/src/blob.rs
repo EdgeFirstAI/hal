@@ -1938,7 +1938,6 @@ mod tests {
     /// A reference-capable tensor, or `None` on a host that has no shareable
     /// backing (no dma-heap, or one this user cannot open).
     fn reference_capable(w: usize, h: usize) -> Option<TensorDyn> {
-        use std::io::Write;
         match Tensor::<u8>::image(
             w,
             h,
@@ -1948,11 +1947,10 @@ mod tests {
         ) {
             Ok(t) => Some(TensorDyn::from(t)),
             Err(e) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "SKIP: no shareable backing on this host ({e:?}); \
-                     reference transport not exercised"
-                );
+                crate::test_support::report_skip(&format!(
+                    "no shareable backing on this host ({e:?}); reference \
+                     transport not exercised"
+                ));
                 None
             }
         }

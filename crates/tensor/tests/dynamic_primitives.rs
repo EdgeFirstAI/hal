@@ -1546,7 +1546,7 @@ fn dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd -- \
+                "SKIPPED: dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd -- \
                  no usable dma-buf heap on this host"
             );
             return;
@@ -1786,7 +1786,7 @@ fn clone_fd_works_for_shm_not_only_dma() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: clone_fd_works_for_shm_not_only_dma -- no usable /dev/shm here"
+                "SKIPPED: clone_fd_works_for_shm_not_only_dma -- no usable /dev/shm here"
             );
             return;
         }
@@ -1958,7 +1958,7 @@ fn a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask -- \
+                "SKIPPED: a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask -- \
                  no usable dma-buf heap here ({e:?})"
             );
             return;

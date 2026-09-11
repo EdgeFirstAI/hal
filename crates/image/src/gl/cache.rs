@@ -101,6 +101,14 @@ pub struct ConvertStats {
     /// copy path (import/attach failure). A nonzero value with Dma
     /// sources means the platform/driver refused the fast path.
     pub zero_copy_declines: u64,
+    /// Times a zero-copy DESTINATION import was attempted and DECLINED into
+    /// the mapped-texture readback (render to a texture, read back through
+    /// `map()` at the destination's offset and pitch). The destination-side
+    /// twin of [`zero_copy_declines`](Self::zero_copy_declines): a nonzero
+    /// value with a Dma destination means the driver refused to render into
+    /// the buffer directly and the convert still produced correct pixels,
+    /// through a copy.
+    pub dst_import_fallbacks: u64,
 }
 
 /// Buffer-import cache owned by the GL processor.

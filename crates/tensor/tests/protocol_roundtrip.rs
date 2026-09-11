@@ -318,7 +318,7 @@ fn dmabuf_import_has_no_coverage_off_linux() {
     use std::io::Write;
     let _ = writeln!(
         std::io::stderr(),
-        "SKIP: TensorDyn::import_descriptor's kind::DMABUF arm is untested on \
+        "SKIPPED: TensorDyn::import_descriptor's kind::DMABUF arm is untested on \
          this platform (dma-buf is Linux-only). No aliasing coverage for the \
          dma-buf import path outside a Linux run."
     );
@@ -350,7 +350,7 @@ fn dmabuf_roundtrip_sees_the_same_bytes() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: dmabuf_roundtrip_sees_the_same_bytes -- this platform has no \
+                "SKIPPED: dmabuf_roundtrip_sees_the_same_bytes -- this platform has no \
                  DMA-BUF heap (Tensor::image(.., TensorMemory::DmaBuf, ..) returned \
                  NotFound); dma-buf allocation is unavailable here, not broken."
             );
@@ -406,7 +406,7 @@ fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable -- \
+                "SKIPPED: imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable -- \
                  this platform has no DMA-BUF heap; dma-buf allocation is unavailable \
                  here, not broken."
             );
@@ -469,7 +469,7 @@ fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse -- \
+                "SKIPPED: dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse -- \
                  this platform has no DMA-BUF heap; dma-buf allocation is unavailable \
                  here, not broken."
             );

@@ -369,29 +369,57 @@ assumed: rendering into an unaligned base at the same offsets is correct on
 i.MX 95, so the defect is in sampling and not in the render target. The
 driver that does fail on the destination side is Vivante, and it fails
 loudly — `eglCreateImage` returns `EGL_BAD_ACCESS` for a destination at
-offset 2080 while offset 2048 renders — so
-`vivante_rejects_dst_import_offset` joins `Platform::dst_import_places` in
-the `places` term that `bind_dst`, `convert_via_engine` and the float
-dispatch share. An unaligned Vivante destination therefore lowers to the
-mapped-texture path, whose readback writes through `map()` at the offset,
-instead of letting the EGL error end the convert; the float paths, which
-have no mapped-texture readback to lower to, decline to the CPU converter.
+offset 2080 while offset 2048 renders. **A loud failure needs no
+prediction.** The destination arms fall back the way the source arms always
+have: `bind_dst` lowers to the mapped-texture path — render to a texture,
+read back through `map()` at the destination's offset and pitch — when the
+zero-copy setup fails, whatever the driver and whatever its reason, warning
+once per buffer and counting the decline in
+`ConvertStats::dst_import_fallbacks`. The guard covers the whole setup, not
+just `eglCreateImage`: attaching the image to the texture and the FBO can
+fail after the import succeeded, and nothing has been written to the
+destination yet either way. So there is no per-driver destination predicate,
+and a future driver quirk of the same kind needs no new trait (#175).
 
-Each site must ask the rule about the offset **its own** import bases at,
-and the two destination routes differ. `bind_dst` imports through
+The one destination question that must still be asked **before** the import
+is `Platform::dst_import_places`, because the import it guards *succeeds* and
+places the destination wrongly, producing no error to fall back from: ANGLE
+over a D3D11 texture or an IOSurface binds a whole buffer from its origin, so
+a destination rebuilt from a descriptor — carrying a plane offset but no
+`view_origin` to lower to a viewport — would be rendered at the buffer's
+origin. That question is about the offset **its own** import bases at, and
+the two destination routes differ. `bind_dst` imports through
 `Platform::import_buffer(.., for_dst = true)`, which collapses a fresh
 `view()`/`batch()` onto its parent at offset 0 and places the tile by
 viewport, so that site asks `view_collapsed_dst_base` and a tile view is
 never gated however unaligned its own bytes are.
 `convert_via_engine`'s packed-RGB plan and the zero-copy float paths import
-through `import_buffer_packed`, which passes `plane_offset()` straight to
-EGL with no collapse, so those sites ask the raw offset and a view
-destination there IS gated. Asking the collapsed base everywhere would
-under-fire on the packed routes; asking the raw offset everywhere over-fires
-on `bind_dst`, and that is not merely a lost fast path — the mapped-texture
-readback returns wrong pixels for a view destination on Vivante, so the
-over-fire silently corrupted unaligned tile views until
-`a_fresh_unaligned_view_destination_keeps_the_zero_copy_import` caught it.
+through `import_buffer_packed`, which passes `plane_offset()` straight to EGL
+with no collapse, so those sites ask the raw offset.
+
+A packed-RGB or planar `view()`/`batch()` destination is refused before the
+lowering is chosen at all, because neither route can place one: the zero-copy
+band is a `glViewport` in destination pixels that the `W*3/4` packed surface
+does not have, and the mapped route's readback writes `dst_w`-wide rows at the
+parent's pitch. Keying that refusal on the lowering would leave it reading a
+decision a refused import can still change underneath it.
+
+The packed-RGB plan asks for its destination import in `convert_via_engine`,
+before pass 1 renders, rather than in the pass 2 that uses it: a
+texture-lowered RGB destination is a different plan (one genuine RGB pass, no
+`W*3/4` reinterpretation), so a refusal has to re-plan, and re-planning after
+pass 1 would throw its work away. The import is cached, so pass 2's own call
+is a hit. The float paths have no mapped-texture readback to lower to —
+`read_pixels_into` packs `UNSIGNED_BYTE` — so a refused float destination
+propagates and `ImageProcessor` runs the CPU converter.
+
+The mapped-texture path had to be made correct for a `view()` destination
+before any of this was safe to adopt (#177): it renders into an offscreen
+texture that IS the tile, at origin (0, 0), so it must not carry the band
+`glScissor` that places a tile inside a shared parent import, and its readback
+must place each row at the destination's pitch and write nothing between the
+rows — for a view those bytes are the parent's columns to the right of the
+tile.
 
 Folding the pixel remainder into the sampling rectangle to keep the aligned
 case zero-copy — the source-side counterpart of the viewport band a
@@ -1474,7 +1502,9 @@ image.convert                                           [user-facing fn, orchest
 │ fields: src_fmt, dst_fmt, src_memory, dst_memory, rotation, flip
 │
 ├── image.convert.gl                                    [OpenGL backend, picked first]
-│   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory, src_feed (import | pbo | upload)
+│   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory, src_feed (import | pbo | upload),
+│   │         dst_feed (zero_copy | mapped_texture | pbo)
+│   │         both feed fields are u8-route only; the float route enters no convert span
 │   ├── image.convert.gl.engine                         ← plan + destination lowering for the convert ({plan, lowering, src_pbo})
 │   ├── image.convert.gl.egl_import                     ← one actual eglCreateImageKHR (cache MISS only; zero in steady state)
 │   ├── image.convert.gl.pack_rgb.pass1_rgba            ← NV* → intermediate RGBA (resize + crop + flip)
@@ -1541,7 +1571,7 @@ image.tile_one                                          [user-facing fn — rend
 |--------------------------------------------------------|--------------------------|------------------|
 | `image.gl_init`                                        | One-time shared-display bring-up: ANGLE dylib discovery + Metal display on macOS/iOS, system EGL default display on Android. An `info_span`, not a trace span. | Fires once per process, not per processor. A second occurrence means the `OnceLock` was re-entered — worth investigating. Linux brings its display up through `context.rs` and emits no span here. |
 | `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. |
-| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. `src_feed` is recorded at the source-feed site (`import` / `pbo` / `upload`) and is the per-call zero-copy observable — anything but `import` on a DMA source means the frame paid a copy. |
+| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. Both feed fields land on `image.convert.gl` itself for **u8 converts**, and both are recorded on every one — including the single-pass planar route, whose source import is unconditional and which used to be the one convert with no `src_feed` at all: `src_feed` (`import` / `pbo` / `upload`) says how the source was fed, `dst_feed` (`zero_copy` / `mapped_texture` / `pbo`) how the output reached the destination. `dst_feed` is recorded where the route is COMMITTED, not where the destination is bound, so a bind the engine then re-plans away from does not put a stale value on the span. `dst_feed` is deliberately NOT an import-refusal marker — it is recorded in `bind_dst`, the one place a `DstTarget` is decided, plus the packed-RGB plan's pre-flight, which is the only destination import that does not go through it. A field that appeared only on the refused route would read as "zero-copy" whenever it was absent, which is how an ordinary texture-lowered convert, or a DMA destination that `dst_import_places` pre-lowered without attempting an import, could pass for a zero-copy one in a trace. `ConvertStats::dst_import_fallbacks` is the refusal count. Anything but `import` on a DMA source means the frame paid a copy. The recording sites take the span's handle rather than `Span::current()`, which inside the engine names `image.convert.gl.engine` (and on the two-pass plans a pass span); `tracing` drops a record against a field the span does not declare, so a record through `Span::current()` there is silently lost. **The float route records neither field**: it returns before `image.convert.gl` is entered and so has no convert span at all (follow-up: give it one). Use `ConvertStats` (`src_imports` / `src_pbo_uploads` / `src_uploads` / `zero_copy_declines` / `dst_import_fallbacks`) for counts on any route. |
 | `image.convert.gl.engine`                              | The convert engine's decision record: which `ConvertPlan` (`SinglePass` / `TwoPassPackedRgb` / `TwoPassNvPlanar`) and which destination lowering (`ZeroCopy` / `TextureMem` / `TexturePbo`) this convert took, plus whether the source is PBO-backed. | The plan/lowering pair maps 1:1 onto the GL work performed — filter traces by these fields to isolate one lowering's latency. Both decisions are pure host-tested tables in `render.rs` (`plan_convert`, `lower_dst`). |
 | `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer paths) funnels through this single choke point. | The cache-behaviour observable: a steady-state frame loop over a fixed buffer pool must emit ZERO of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
 | `image.convert.gl.pack_rgb.pass1_rgba`                 | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |

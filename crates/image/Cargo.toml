@@ -121,6 +121,11 @@ image-compare = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The span-field capture in `gl/tests.rs` needs a subscriber with a real
+# current-span stack: `Span::current()` asks through `Subscriber::current_span`,
+# whose default is `Current::unknown()`, so a hand-rolled subscriber would make
+# every `Span::current().record()` under test look like a no-op.
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "image_benchmark"

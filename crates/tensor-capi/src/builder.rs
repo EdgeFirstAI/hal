@@ -798,7 +798,7 @@ mod tests {
         // silently wipe it. Proves the offset survives a `wrap` call that
         // ALSO carries a format, not just one that omits it.
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         // 720x640 NV12 (480p, combined-plane height 720) plus one extra row
@@ -838,7 +838,7 @@ mod tests {
         // plane `stride` failed unconditionally with `EINVAL`, even when the
         // stride was perfectly valid for that format.
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         // 720x640 NV12 with a padded stride (768, wider than the tight 640
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn wrap_rejects_a_size_smaller_than_shape_and_stride_imply() {
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         let handle = shm_fd(16);
@@ -895,7 +895,7 @@ mod tests {
         // buffer is a normal thing to hand a wrapper and must not be
         // rejected merely for being bigger than the tight requirement.
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         let handle = shm_fd(64);
@@ -923,7 +923,7 @@ mod tests {
         // the tensor has no partial-fill/`bytes_used` concept, so `used <
         // size` cannot be represented either.
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         let handle = shm_fd(16);
@@ -946,7 +946,7 @@ mod tests {
         // compressed buffer silently reinterpreted as linear is exactly the
         // "wrong data disguised as an answer" shape this task exists to fix.
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         let handle = shm_fd(16);
@@ -970,7 +970,7 @@ mod tests {
         // not something this builder composes; an honest refusal beats a
         // silent truncation to the first plane.
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         let handle = shm_fd(16);
@@ -996,7 +996,7 @@ mod tests {
         // `add_plane` with offset/stride/size/used/modifier all zero. None
         // of this task's new rejections may fire on that shape of call.
         if !edgefirst_tensor::is_shm_available() {
-            eprintln!("SKIPPED: SHM not available");
+            crate::artifacts::skip("SHM not available");
             return;
         }
         let handle = shm_fd(16);

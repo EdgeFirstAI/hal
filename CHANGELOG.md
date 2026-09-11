@@ -11,6 +11,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `view()` destination on the GPU's mapped-texture readback got the wrong
+  pixels and wrote over its parent (#177).** The mapped-texture lowering
+  renders into an offscreen texture that *is* the tile, at origin (0, 0), and
+  places the tile afterwards by reading back through the view's `map()` at the
+  parent's pitch. It nevertheless inherited the band `glScissor` that places a
+  tile inside a shared zero-copy parent import, which clipped away the tile's
+  own left and top edges — those pixels kept whatever the previous frame had
+  left in the reused texture. The readback then wrote outside the view as well:
+  `glReadPixels` packs its rows tight, so the read filled the head of the
+  view's window and the rows were re-spaced to the parent's pitch afterwards,
+  leaving the read's own tail in the gaps between them, which for a view are
+  the parent's columns to the right of the tile. Measured on i.MX 8M Plus with
+  a 320x240 view of a 512x320 parent: 4416 wrong tile pixels at view origin
+  (8, 8), 23552 at (64, 32), and 28800 parent pixels overwritten per convert at
+  every origin including (0, 0).
+
+  The band now reaches the renderer only where the render target really is the
+  shared parent import, and the readback places each row at the pitch and
+  writes nothing between them — through `GL_PACK_ROW_LENGTH` where the pitch is
+  a whole number of pixels (what the PBO readback has always done) and
+  otherwise by reading the frame tight into the existing scratch buffer. Both
+  defects are ordinary software errors, not driver behaviour: the issue's
+  Vivante attribution was an artefact of how it was found, since the commit
+  that exposed the path routed only Vivante down it, so Mali and V3D were green
+  for want of ever entering it.
+
+- **A zero-copy destination the driver refuses now falls back instead of
+  failing the convert (#175).** A failed *source* import has always lowered to
+  the upload path; a failed *destination* import was propagated as the
+  convert's error, which is why the driver that refuses one had to be predicted
+  by name. `bind_dst` now lowers to the mapped-texture readback when the
+  zero-copy setup fails — the import, the attach, or the framebuffer binding —
+  and the packed-RGB plan asks for its destination import before pass 1 renders
+  so a refusal re-plans rather than throwing pass 1 away. The lowering the
+  engine decided is what `bind_dst` binds, rather than being re-derived from
+  the placement rule, so a re-plan is honoured instead of silently
+  contradicted. The decline is warned once per buffer and counted in
+  `ConvertStats::dst_import_fallbacks`, the destination-side twin of
+  `zero_copy_declines`, and recorded as `dst_feed` on the `image.convert.gl`
+  span.
+
+  The Vivante predicate is gone with it: `eglCreateImage` returning
+  `EGL_BAD_ACCESS` for a destination at an offset that is not 64-byte aligned
+  is now simply the fallback's trigger, so a future driver quirk of the same
+  kind needs no new trait. What stays is `dst_import_places`, which asks
+  whether an import would *succeed but place the destination wrongly* (ANGLE
+  binds a whole buffer from its origin) — a wrong placement produces no error
+  to fall back from. The Mali source-offset rule stays for the same reason: it
+  predicts a driver that samples zeros silently. Float destinations still
+  decline to the CPU converter when their import is refused; there is no
+  mapped-texture readback for a float DMA destination to lower to.
+
+  **A refused destination import is retried on every convert.** Nothing
+  remembers the refusal, so an unaligned destination on i.MX 8M Plus pays one
+  failed `eglCreateImage` per frame rather than skipping the attempt the way
+  the removed predicate did. Measured on that board — 1280x720 RGBA into a
+  320x240 tile at an unaligned offset in a 640x480 parent, 200 frames after
+  warmup — the retry costs about 28 us on a 3.29 ms convert, or 0.9%. What a
+  refusal does cost is the copy it falls back to: 3.29 ms against 0.71 ms for
+  the same convert into an aligned destination the driver imports. That is the
+  price of a destination the GPU will not render into directly, not of the
+  retry.
+
+  A packed-RGB or planar `view()`/`batch()` destination is now refused before
+  the lowering is chosen rather than after. Neither route can place one — the
+  zero-copy band is a viewport in destination pixels the `W*3/4` packed
+  surface does not have, and the readback writes `dst_w`-wide rows — and
+  keying the refusal on the lowering left it reading a decision a refused
+  import can still change underneath it.
+
 - **Bright highlights rendered as black on Cortex-A53 CPU conversion.** Any
   NV12/NV16/NV24 → RGB(A) convert on a core without the ARMv8.1 `rdm` feature
   — Cortex-A53/A35-class, which includes the i.MX8MP — takes the `yuv` crate's

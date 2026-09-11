@@ -100,7 +100,7 @@ mod tests {
         {
             Ok(o) => Some(o),
             Err(e) => {
-                eprintln!("SKIP: no C compiler ({cc}: {e}); header not syntax-checked");
+                skip(&format!("no C compiler ({cc}: {e}); header not syntax-checked"));
                 None
             }
         }
@@ -130,7 +130,7 @@ mod tests {
         {
             Ok(o) => Some(o),
             Err(e) => {
-                eprintln!("SKIP: no C compiler ({cc}: {e}); header not syntax-checked");
+                skip(&format!("no C compiler ({cc}: {e}); header not syntax-checked"));
                 None
             }
         }
@@ -499,7 +499,7 @@ mod tests {
         // consumer linking `libedgefirst_tensor.a` directly), not a
         // hypothetical.
         let Some(cxx) = find_cpp17_compiler() else {
-            eprintln!("SKIP: no working C++17 toolchain (c++/clang++); header not C++17-checked");
+            skip("no working C++17 toolchain (c++/clang++); header not C++17-checked");
             return;
         };
 

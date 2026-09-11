@@ -18,6 +18,10 @@ crates/image/
 │       └── tests.rs        # OpenGL backend tests (gated via OnceLock probe)
 ├── tests/
 │   ├── crop_golden.rs      # Frozen per-architecture cropped-convert fixtures
+│   ├── convert_span_feed_fields.rs  # src_feed/dst_feed land on image.convert.gl
+│   │                       # (own binary + a GLOBAL subscriber: tracing caches
+│   │                       #  callsite interest per PROCESS, so a scoped one
+│   │                       #  among parallel tests is a coin flip)
 │   ├── odd_dim_cpu.rs      # End-to-end odd-dimension CPU conversion
 │   └── data/               # crop_golden.{aarch64,x86_64}.json
 └── benches/

@@ -342,7 +342,7 @@ fn descriptor_carries_dmabuf_fd_as_handle() {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIP: descriptor_carries_dmabuf_fd_as_handle -- this platform has no \
+                "SKIPPED: descriptor_carries_dmabuf_fd_as_handle -- this platform has no \
                  DMA-BUF heap (Tensor::image(.., TensorMemory::DmaBuf, ..) returned \
                  NotFound); dma-buf allocation is unavailable here, not broken."
             );

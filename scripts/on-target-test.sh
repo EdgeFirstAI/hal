@@ -414,6 +414,11 @@ for i in "${!OK_HOSTS[@]}"; do
   # a regression in whatever you just changed.
   extra_env=""
   [[ "${caps}" == *"galcore=yes"* ]] && extra_env="EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1"
+  # A board with a DRM render node has a GPU, so "the GL backend did not come
+  # up" is a defect there and not a fact of the machine. Without this every
+  # require-gated test -- the `gl_backend_available_canary` most visibly --
+  # skips on every board and the run stays green through a broken GL stack.
+  [[ "${caps}" =~ render=[1-9] ]] && extra_env="${extra_env} HAL_TEST_REQUIRE_GL=1"
 
   pass=0; fail=0; failed_bins=()
   for bin in "${bins[@]}"; do

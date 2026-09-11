@@ -584,10 +584,10 @@ mod tests {
         // than asserting a property this platform cannot provide.
         let a = ShmTensor::<u8>::new(&[8], None).unwrap();
         if a.buffer_identity().kind() != crate::IdentityKind::Shm {
-            println!(
-                "SKIP: a_dup_of_the_same_shm_segment_has_the_same_identity - \
-                 this platform's fstat gives no usable shm inode, so identity \
-                 falls back to the fd number (see identity_from_stat)"
+            crate::test_support::report_skip(
+                "a_dup_of_the_same_shm_segment_has_the_same_identity - this \
+                 platform's fstat gives no usable shm inode, so identity falls \
+                 back to the fd number (see identity_from_stat)",
             );
             return;
         }

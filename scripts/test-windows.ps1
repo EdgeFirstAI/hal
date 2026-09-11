@@ -29,7 +29,7 @@
 .PARAMETER RequireCuda
   Set HAL_TEST_REQUIRE_CUDA=1 so the D3D11 CUDA interop tests in
   crates/tensor/tests/d3d11_tensor.rs fail loudly, naming the test and the
-  reason, instead of printing `SKIP: no CUDA runtime` when the probe in
+  reason, instead of reporting a skip for `no CUDA runtime` when the probe in
   crates/tensor/src/cuda.rs cannot load a runtime. The WARP-adapter skip
   (no CUDA device on the software adapter) is correct by design and is
   unaffected: those tests check the adapter before the gate.

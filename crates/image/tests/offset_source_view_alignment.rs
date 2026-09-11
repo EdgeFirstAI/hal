@@ -54,7 +54,8 @@ const SIDE: usize = 16;
 const BPP: usize = 4;
 
 /// The alignment Mali's DMA-BUF import needs; mirrored from the engine so the
-/// NV12 case can build one offset on either side of it.
+/// NV12 case can build one offset on either side of it, and reused by the
+/// destination case to say which of its two offsets is the aligned one.
 const MALI_ALIGN: usize = 64;
 
 /// The origins the imx95 probe classified; the two unaligned ones (offsets 32
@@ -498,12 +499,15 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
 /// destination exemption in `get_or_create_egl_image` claims it is safe, so it
 /// is measured here rather than assumed.
 ///
-/// Measured: Mali (i.MX 95) and V3D render into offset 2080 correctly, so Mali
-/// destinations keep the zero-copy import. Vivante does NOT — `eglCreateImage`
-/// returns `EGL_BAD_ACCESS` at 2080 while 2048 renders — which this test found
-/// and `vivante_rejects_dst_import_offset` now lowers to the mapped-texture
-/// path. Both offsets are asserted on every driver, so either half regressing
-/// is caught here.
+/// Measured: Mali (i.MX 95) and V3D render into offset 2080 correctly, so their
+/// import succeeds and the destination stays zero-copy. Vivante does NOT —
+/// `eglCreateImage` returns `EGL_BAD_ACCESS` at 2080 while 2048 renders — and
+/// since issue #175 that refusal is itself the trigger rather than something a
+/// per-driver predicate has to predict: the convert falls back to the
+/// mapped-texture readback, which writes through `map()` at the offset, and
+/// still lands the correct pixels. Both offsets are asserted on every driver,
+/// and so is the route (`dst_import_fallbacks`), so a regression on either
+/// half is caught here whichever way it falls.
 ///
 /// The destination is rebuilt from a `view()`'s descriptor, which is the only
 /// shape that reaches the import at a nonzero offset: a fresh `view()` collapses
@@ -522,6 +526,7 @@ fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() 
     let pitch = canvas.effective_row_stride().unwrap_or(W * BPP);
 
     let mut failures = Vec::new();
+    let mut routes: Vec<(usize, usize, usize, u64)> = Vec::new();
     // (0, 8) is 8 * pitch, aligned whenever the pitch is; (8, 8) adds
     // 8 * BPP = 32, which is never 64-aligned. Same construction as the source
     // test, so the two halves are measured at the same two offsets.
@@ -565,10 +570,39 @@ fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() 
                 }
             }
         }
+        let before = gl
+            .convert_stats()
+            .expect("convert stats")
+            .dst_import_fallbacks;
         if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
             failures.push(format!("({x0},{y0}) offset {offset}: convert failed: {e}"));
             continue;
         }
+        // The route this destination took. A driver that imports it renders
+        // into the buffer directly (0); one that refuses it — Vivante at an
+        // unaligned offset — falls back to the mapped-texture readback (1),
+        // and the pixel assertions below must hold either way. What is NOT
+        // acceptable is a fallback at an offset the driver imports happily:
+        // that would mean the convert quietly stopped being zero-copy.
+        let took = gl
+            .convert_stats()
+            .expect("convert stats")
+            .dst_import_fallbacks
+            - before;
+        if took > 1 {
+            failures.push(format!(
+                "({x0},{y0}) offset {offset}: {took} destination-import fallbacks for \
+                 one convert; at most one is expected"
+            ));
+        }
+        if offset.is_multiple_of(MALI_ALIGN) && took != 0 {
+            failures.push(format!(
+                "({x0},{y0}) offset {offset}: the destination import was refused at an \
+                 ALIGNED offset, so this driver lost the zero-copy destination path \
+                 for a buffer it should accept"
+            ));
+        }
+        routes.push((x0, y0, offset, took));
         let out = bytes(&canvas);
         let px = |x: usize, y: usize| &out[y * pitch + x * BPP..][..BPP];
         if px(0, 0) != [BLANK; BPP] {
@@ -614,6 +648,11 @@ fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() 
             ));
         }
     }
+    eprintln!(
+        "destination routes (x0, y0, offset, import fallbacks): {routes:?} \
+         -- 1 means the driver refused the import and the mapped-texture \
+         readback served the convert"
+    );
     assert!(
         failures.is_empty(),
         "pitch {pitch}:\n{}",

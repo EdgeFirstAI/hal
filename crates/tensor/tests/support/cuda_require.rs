@@ -27,7 +27,7 @@
 //! the very function the Windows guard calls, on every lane -- the Linux
 //! ones included, where `d3d11_tensor.rs` compiles to nothing -- rather
 //! than a copy that could drift from it.
-//! [`cuda_available_or_skip`] is the one env-reading, printing caller
+//! [`cuda_available_or_skip`] is the one env-reading, skip-reporting caller
 //! `d3d11_tensor.rs` uses.
 
 /// `true` when `HAL_TEST_REQUIRE_CUDA=1` is set -- the opt-in that turns a
@@ -39,7 +39,7 @@ fn required() -> bool {
 /// The pure decision: `true` when `satisfied`; otherwise a failure or a skip
 /// depending on `require`. No environment access and no output -- the
 /// caller reads `HAL_TEST_REQUIRE_CUDA` and passes the result in as
-/// `require`, and prints the `SKIP` line itself on a `false` return. That
+/// `require`, and reports the skip itself on a `false` return. That
 /// purity is what lets `crates/tensor/tests/cuda_require_policy.rs` test
 /// this exact function on hosts with no CUDA and no D3D11.
 ///
@@ -61,18 +61,31 @@ pub fn decide(satisfied: bool, require: bool, what: &str, why: &str) -> bool {
 }
 
 /// `true` when the caller should run; `false` when it should return early.
-/// Prints `SKIP {what}: {why}` to stderr on a `false` return.
+/// Reports `SKIPPED: {what} - {why}` on a `false` return.
+///
+/// The line is written straight to `std::io::stderr()`, not through
+/// `eprintln!`. `eprintln!` routes via `std::io::_eprint`, which libtest
+/// hooks for per-test output capture and replays only for a *failing*
+/// test -- and a skip is a pass, so the reason was discarded exactly when
+/// it mattered. The `SKIPPED:` prefix is the one `scripts/
+/// on-target-test.sh` greps for to count skips per board, so the previous
+/// `SKIP {what}:` spelling was invisible to it twice over. This is the
+/// same rule (and the same wire format) as `edgefirst-image`'s
+/// `test_support::report_skip`, written out here because an integration
+/// test is its own compilation unit and cannot reach that crate-private
+/// helper.
 ///
 /// # Panics
 ///
 /// When `HAL_TEST_REQUIRE_CUDA=1` and CUDA is unavailable -- see [`decide`].
 pub fn cuda_available_or_skip(what: &str) -> bool {
+    use std::io::Write;
     let why = "no CUDA runtime (a supported soname missing from cuda.rs's \
          probe list -- cudart64_13.dll, cudart64_12.dll, cudart64_110.dll -- \
          or it is not on PATH or CUDA_PATH\\bin)";
     let run = decide(edgefirst_tensor::is_cuda_available(), required(), what, why);
     if !run {
-        eprintln!("SKIP {what}: {why}");
+        let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {what} - {why}");
     }
     run
 }
