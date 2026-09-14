@@ -17,7 +17,7 @@
 #   runner provisioned (orgs/EdgeFirstAI/actions/hosted-runners lists Linux
 #   images only), so windows-latest-8-cores would queue until the job timed
 #   out. Provisioning one is the remaining lever on hal's wall-clock floor.
-# Shared workflows: EdgeFirstAI/.github @ b0a9a8460fbca7707aea403e932d54a85acc272a
+# Shared workflows: EdgeFirstAI/.github @ 480424944946f9dd37e47c097b787737511e43e7
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
 # macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
 # rust-full runs unsigned nextest with a single nextest-args string.
@@ -149,13 +149,31 @@ jobs:
             --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
             --no-report -j 1 \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
+          # The wheels are built instrumented, so loading them from Python
+          # writes profraw as pytest drives pyo3 into the real crates. That
+          # is the whole point of this lane: python-common is an rlib linked
+          # into each cdylib, so its lines only appear if the .so is among
+          # the objects llvm-cov reports against.
           source /tmp/coverage-env.sh
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
-            -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml
-          source /tmp/coverage-env.sh
+            -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
+            2>&1 | tee target/test-metrics-python-x86_64.txt
+          # Deliberately NOT sourcing the coverage env here. That env pins
+          # CARGO_TARGET_DIR at target/llvm-cov-target, and cargo llvm-cov
+          # derives its own object search root from it, so the maturin-built
+          # extension .so files end up outside the tree it inspects and
+          # python-common silently reports zero lines. test.yml never sourced
+          # it here; 1296be75 added the source when it restored this step.
+          echo "=== object and profraw locations ==="
+          find target -name '_*.so' -o -name '*.profraw' 2>/dev/null \
+            | sed 's|/[^/]*$||' | sort | uniq -c | sort -rn | head -15
           cargo llvm-cov report --profile profiling \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             --lcov --output-path target/coverage_rust.lcov
+          echo "=== coverage summary ==="
+          echo "source files: $(grep -c '^SF:' target/coverage_rust.lcov)"
+          echo "PyO3 files with coverage:"
+          grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
           bash tests/packaging/check_coverage_split.sh target/coverage_rust.lcov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
@@ -166,6 +184,7 @@ jobs:
             target/pytest_results.xml
             target/coverage_rust.lcov
             target/test-metrics-rust-x86_64.txt
+            target/test-metrics-python-x86_64.txt
           retention-days: 7
 
   software-gl-coverage:

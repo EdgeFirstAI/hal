@@ -54,7 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profraw nor profiling-profile objects and failed with "no input files". Since
   these are pyo3 wheels, that Rust lcov *is* the binding coverage that
   `check_coverage_split.sh` guards; slipcover only measures the test code. Full
-  had never been run, so nothing caught either.
+  had never been run, so nothing caught either. The report also no longer
+  sources the coverage env: that env pins `CARGO_TARGET_DIR` at
+  `target/llvm-cov-target`, cargo-llvm-cov derives its object search root from
+  it, and the maturin-built extension `.so` files then sit outside the tree it
+  inspects, so `python-common` reported zero lines. `test.yml` never sourced it
+  there.
 - **SonarCloud had no `main` coverage baseline.** Full does not run on push to
   `main` in the label-driven model, and the nightly had no Sonar job, so
   nothing would have refreshed the baseline after this migration. The upload is
