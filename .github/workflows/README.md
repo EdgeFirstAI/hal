@@ -39,7 +39,7 @@ Never tag by hand. Do not introduce `-xlarge` / `-8core` labels unless a Full la
 
 ## Shared pin
 
-Callers pin `0df6528ed96a2430583b09cb02cd05e58b707afa`. The SHA appears only in `uses:`, and Dependabot bumps it. The shared workflows find their own composite actions through `job.workflow_repository` / `job.workflow_sha`, so there is no second value to keep in sync.
+Callers pin `d5df12029d1a1f2e490603b0d2b3514585d3d064`. The SHA appears only in `uses:`, and Dependabot bumps it. The shared workflows find their own composite actions through `job.workflow_repository` / `job.workflow_sha`, so there is no second value to keep in sync.
 
 The license policy lives in `EdgeFirstAI/.github` and is the only copy. `make sbom` fetches it at the pinned commit (`.github/scripts/fetch-ci-scripts.sh`), so local runs and CI enforce the same policy.
 

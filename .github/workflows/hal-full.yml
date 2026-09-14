@@ -17,7 +17,7 @@
 #   runner provisioned (orgs/EdgeFirstAI/actions/hosted-runners lists Linux
 #   images only), so windows-latest-8-cores would queue until the job timed
 #   out. Provisioning one is the remaining lever on hal's wall-clock floor.
-# Shared workflows: EdgeFirstAI/.github @ 0df6528ed96a2430583b09cb02cd05e58b707afa
+# Shared workflows: EdgeFirstAI/.github @ d5df12029d1a1f2e490603b0d2b3514585d3d064
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
 # macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
 # rust-full runs unsigned nextest with a single nextest-args string.
