@@ -1,6 +1,6 @@
 # Nightly Full + G13. Skips when main has not moved since the last success.
 #
-# Shared workflows: EdgeFirstAI/.github @ cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
+# Shared workflows: EdgeFirstAI/.github @ dd391561cdbe9b987ec595f635f868809068a49a
 
 name: Nightly
 
@@ -17,12 +17,12 @@ concurrency:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@dd391561cdbe9b987ec595f635f868809068a49a
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@dd391561cdbe9b987ec595f635f868809068a49a
     with:
       lanes: all
       nightly: true
@@ -33,10 +33,13 @@ jobs:
       scancode: true
       skip-macos: true
       skip-windows: true
-      timeout-minutes: 90
+      timeout-minutes: 45
       board-timeout-minutes: 45
-      runner-class-linux: hosted
-      runner-class-linux-arm: hosted
+      # Same class as Full: a nightly that takes twice as long delays the
+      # failure signal by a working morning. Flip to `hosted` here if the
+      # monthly larger-runner spend needs trimming; nothing blocks on nightly.
+      runner-class-linux: larger
+      runner-class-linux-arm: larger
       pre-command: bash .github/scripts/ci-setup.sh
       board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
       board-extra-args: -j 1 --profile ci

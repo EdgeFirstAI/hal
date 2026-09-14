@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Doc tests run inside the Linux extras job rather than a job of their own,
   which removes one full x86 workspace compile from every Full run.
 
+- Runner class now follows the tier. Quick stays on free standard runners and
+  never bills. Full, Nightly and Release use larger runners: they run once per
+  PR or per tag rather than per push, and the first cut of this migration put
+  them on standard runners, which made Full slower than the 15-to-20-job
+  workflow it replaced. Full's job timeout drops from 90 to 45 minutes and the
+  G13 differential from 180 to 120. Windows lanes stay on `windows-latest`
+  because the organisation has no Windows larger runner provisioned.
+
 ### Fixed
 
 - **SonarCloud had no `main` coverage baseline.** Full does not run on push to

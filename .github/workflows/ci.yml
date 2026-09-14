@@ -1,5 +1,5 @@
 # HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
-# Shared workflows: EdgeFirstAI/.github @ cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
+# Shared workflows: EdgeFirstAI/.github @ dd391561cdbe9b987ec595f635f868809068a49a
 #
 # The shared commit appears only in the uses: pins below. The shared workflows
 # resolve their own repository and commit from the job context, so there is no
@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@dd391561cdbe9b987ec595f635f868809068a49a
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -102,7 +102,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@dd391561cdbe9b987ec595f635f868809068a49a
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       boards: nxp-imx8mp-latest
@@ -116,13 +116,15 @@ jobs:
       # a WARP gating pass that a single nextest-args string cannot express.
       skip-macos: true
       skip-windows: true
-      # Budget deviation: the design page allows Full 30 min. hal's aarch64 lane
-      # builds instrumented binaries for the board and has measured up to 70.
-      # Recorded rather than silently inherited; revisit after the fleet lands.
-      timeout-minutes: 90
+      # Safety net, not a budget. Full ran a 37 min median on these same
+      # xlarge runners before the migration; 45 leaves headroom without
+      # normalising a slow tier.
+      timeout-minutes: 45
       board-timeout-minutes: 45
-      runner-class-linux: hosted
-      runner-class-linux-arm: hosted
+      # Full is speed-optimised and bills for it. Phase 2 moves linux and
+      # linux-arm to the self-hosted build-x86 fleet and these go to zero.
+      runner-class-linux: larger
+      runner-class-linux-arm: larger
       pre-command: bash .github/scripts/ci-setup.sh
       board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
       board-extra-args: -j 1 --profile ci

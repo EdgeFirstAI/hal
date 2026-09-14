@@ -30,6 +30,13 @@
 #   New layout crates (edgefirst-decoder-abi, edgefirst-tensor-abi,
 #   edgefirst-tensor-ffi) need a first upload and Trusted Publishing too.
 
+# runner-class: larger
+#   Release is speed-optimised and bills for it: it runs once per tag, and a
+#   slow release is a release someone is waiting on. Build matrices use larger
+#   runners; the publish and verify jobs stay standard because they are I/O
+#   bound on the registries, not CPU bound. Windows stays standard: the org
+#   has no Windows larger runner provisioned, so a larger label would queue.
+
 name: Release
 
 on:
@@ -117,11 +124,11 @@ jobs:
       matrix:
         include:
           - name: x86_64-linux
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-xlarge
             maturin-args: --sdist --zig --compatibility manylinux2014
             maturin-deps: maturin[patchelf,zig]
           - name: aarch64-linux
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm-xlarge
             maturin-args: --zig --compatibility manylinux2014
             maturin-deps: maturin[patchelf,zig]
           - name: windows
@@ -129,7 +136,7 @@ jobs:
             maturin-args: ''
             maturin-deps: maturin
           - name: macos
-            runner: macos-latest
+            runner: macos-latest-xlarge
             maturin-args: ''
             maturin-deps: maturin
 
@@ -288,19 +295,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-linux
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-xlarge
             rust_target: ''
             libdir: target/release
           - target: aarch64-linux
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm-xlarge
             rust_target: ''
             libdir: target/release
           - target: aarch64-macos
-            runner: macos-latest
+            runner: macos-latest-xlarge
             rust_target: ''
             libdir: target/release
           - target: x86_64-macos
-            runner: macos-latest
+            runner: macos-latest-xlarge
             rust_target: x86_64-apple-darwin
             libdir: target/x86_64-apple-darwin/release
           - target: x86_64-windows

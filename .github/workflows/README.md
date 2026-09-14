@@ -39,10 +39,23 @@ Never tag by hand. Do not introduce `-xlarge` / `-8core` labels unless a Full la
 
 ## Shared pin
 
-Callers pin `cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3`. The SHA appears only in `uses:`, and Dependabot bumps it. The shared workflows find their own composite actions through `job.workflow_repository` / `job.workflow_sha`, so there is no second value to keep in sync.
+Callers pin `dd391561cdbe9b987ec595f635f868809068a49a`. The SHA appears only in `uses:`, and Dependabot bumps it. The shared workflows find their own composite actions through `job.workflow_repository` / `job.workflow_sha`, so there is no second value to keep in sync.
 
 The license policy lives in `EdgeFirstAI/.github` and is the only copy. `make sbom` fetches it at the pinned commit (`.github/scripts/fetch-ci-scripts.sh`), so local runs and CI enforce the same policy.
 
 ## Runners
 
-Quick and Full host lanes use free standard hosted runners (`ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-latest`, `windows-latest`). The board is `nxp-imx8mp-latest`. Larger runners are a recorded exception only.
+What each tier optimises for differs, so the runner class differs with it.
+
+| Tier | Optimise for | Runners |
+|------|--------------|---------|
+| **Quick** | cost **and** speed | free standard (`ubuntu-24.04`). Never bills — this is the per-push path |
+| **Full** | speed, cost accepted | `ubuntu-24.04-xlarge` / `-arm-xlarge`, `macos-latest-xlarge` |
+| **Nightly** | speed, cost accepted | same as Full, including the G13 differential |
+| **Release** | speed, cost accepted | xlarge build matrices; publish/verify stay standard (registry I/O, not CPU) |
+
+Full and Release run once per PR or per tag, so spend follows review cadence, not typing. Phase 2 moves the Linux lanes to the self-hosted `build-x86` fleet and these go to zero; macOS stays billed because there is no free equivalent.
+
+**Windows stays on `windows-latest`.** The organisation has no Windows larger runner provisioned (`orgs/EdgeFirstAI/actions/hosted-runners` lists Linux images only), so `windows-latest-8-cores` would queue until the job timed out. Provisioning one is the remaining lever on hal's wall-clock floor, which the design page measured at 55-63 job-minutes.
+
+The board is `nxp-imx8mp-latest`. Do not put a Quick lane on a billed runner; the org runner audit exists to catch exactly that.

@@ -1,5 +1,23 @@
 # HAL-only Full lanes. Called from ci.yml (ci:full) and nightly.yml.
-# Shared workflows: EdgeFirstAI/.github @ cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
+#
+# runner-class: larger
+#   Full is speed-optimised and bills for it. These lanes name the billed
+#   labels directly rather than going through rust-full's runner-class inputs,
+#   because they are hal-specific jobs, not shared ones. The marker above tells
+#   the org runner audit this is intended rather than a Quick lane that leaked
+#   onto a billed runner.
+#
+#   Assignment follows the pre-migration measurements: the x86 workspace and
+#   software-GL lanes were xlarge and ran a 37 min median; Windows was standard
+#   and set the wall-clock floor at 55-63 job-minutes, so it moves up too.
+#   Phase 2 replaces linux and windows with the self-hosted fleet; macOS stays
+#   billed because there is no free equivalent.
+#
+#   Windows stays on the standard runner: the org has no Windows larger
+#   runner provisioned (orgs/EdgeFirstAI/actions/hosted-runners lists Linux
+#   images only), so windows-latest-8-cores would queue until the job timed
+#   out. Provisioning one is the remaining lever on hal's wall-clock floor.
+# Shared workflows: EdgeFirstAI/.github @ dd391561cdbe9b987ec595f635f868809068a49a
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
 # macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
 # rust-full runs unsigned nextest with a single nextest-args string.
@@ -42,8 +60,8 @@ jobs:
 
   linux-extras:
     name: Linux extras (C-API, Python, clippy)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 60
     needs: checkout-lfs
     permissions:
       contents: read
@@ -129,8 +147,8 @@ jobs:
 
   software-gl-coverage:
     name: Software-GL Coverage (llvmpipe)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 25
     needs: checkout-lfs
     permissions:
       contents: read
@@ -184,8 +202,8 @@ jobs:
 
   test-macos:
     name: Build & Test (macOS, signed ANGLE)
-    runs-on: macos-latest
-    timeout-minutes: 75
+    runs-on: macos-latest-xlarge
+    timeout-minutes: 50
     needs: checkout-lfs
     permissions:
       contents: read
@@ -326,8 +344,8 @@ jobs:
 
   build-android:
     name: Build & Lint (Android, native Rust API)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -461,8 +479,8 @@ jobs:
 
   package-macos-capi-gpu:
     name: Package C Archive & GPU Tests (macOS)
-    runs-on: macos-latest
-    timeout-minutes: 45
+    runs-on: macos-latest-xlarge
+    timeout-minutes: 35
     needs: checkout-lfs
     permissions:
       contents: read

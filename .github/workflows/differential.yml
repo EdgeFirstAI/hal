@@ -45,11 +45,13 @@ env:
 jobs:
   test-differential:
     name: G13 (static vs. dynamic, test for test)
-    # Nightly G13 is two wheel builds plus up to four suite passes. Hosted
-    # standard first; if wall-clock exceeds ~20 min after a measurement week,
-    # record runner-class: larger. Keep 180 min headroom either way.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # runner-class: larger
+    # Two wheel builds plus up to four full suite passes, the longest job in
+    # the fleet. Nightly is speed-optimised like Full: a G13 that runs into the
+    # working day delays the signal it exists to give. Phase 2 moves this to the
+    # self-hosted build-x86 class.
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 120
 
     steps:
       - name: Checkout code
