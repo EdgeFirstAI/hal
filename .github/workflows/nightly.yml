@@ -1,0 +1,40 @@
+# Nightly Full + G13. Skips when main has not moved since the last success.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  changed:
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@fd38981b2b94ae195801a21660e9ccc3fb222a4a  # EDGEAI-1554 pre-command
+
+  nightly:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@fd38981b2b94ae195801a21660e9ccc3fb222a4a  # EDGEAI-1554 pre-command
+    with:
+      lanes: all
+      nightly: true
+      boards: nxp-imx8mp-latest
+      lfs: true
+      sonar: true
+      scancode: true
+      runner-class-linux: hosted
+      pre-command: bash .github/scripts/ci-setup.sh
+      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common
+      shared-sha: fd38981b2b94ae195801a21660e9ccc3fb222a4a
+    secrets: inherit
+
+  nightly-hal:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    uses: ./.github/workflows/hal-full.yml
+    secrets: inherit
+
+  differential:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    uses: ./.github/workflows/differential.yml

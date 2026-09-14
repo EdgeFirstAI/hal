@@ -26,3 +26,6 @@ retries = 2
 junit.path = "test-results.xml"
 junit.store-success-output = true
 junit.store-failure-output = true
+
+# Quarantine named flakes here with [[profile.ci.overrides]] once a test
+# has a ticket. Do not pre-emptively ignore tests to chase the 10% target.

@@ -1,0 +1,147 @@
+# HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
+# Shared workflows: EdgeFirstAI/.github @ fd38981b2b94ae195801a21660e9ccc3fb222a4a
+#
+# Action Versions (hash-pinned):
+# - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
+# - actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 (v6.2.0)
+# - dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d (v4.0.3)
+
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      full:
+        type: boolean
+        default: false
+      hardware:
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.f.outputs.code }}
+      full: ${{ steps.mode.outputs.full }}
+      hardware: ${{ steps.mode.outputs.hardware }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: f
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.*'
+              - 'rust-toolchain.toml'
+              - 'pyproject.toml'
+              - '.github/**'
+              - 'scripts/**'
+              - 'Makefile'
+      - id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          DISPATCH_FULL: ${{ inputs.full }}
+          DISPATCH_HARDWARE: ${{ inputs.hardware }}
+        run: |
+          full=false
+          hardware=false
+          case "$EVENT_NAME" in
+            merge_group) full=true ;;
+            workflow_dispatch)
+              full="$DISPATCH_FULL"
+              hardware="$DISPATCH_HARDWARE"
+              ;;
+          esac
+          case ",$LABELS," in *,ci:full,*) full=true ;; esac
+          case ",$LABELS," in *,ci:hardware,*) hardware=true ;; esac
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "hardware=$hardware" >> "$GITHUB_OUTPUT"
+
+  quick:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@fd38981b2b94ae195801a21660e9ccc3fb222a4a  # EDGEAI-1554 pre-command
+    with:
+      runner: ubuntu-24.04
+      timeout-minutes: 15
+      lfs: true
+      python: false
+      skip-cross-clippy: true
+      pre-command: bash .github/scripts/ci-setup.sh
+      clippy-args: --workspace --all-targets --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
+      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common
+      cache-key: quick-x86_64
+      shared-sha: fd38981b2b94ae195801a21660e9ccc3fb222a4a
+
+  quick-python:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+      - name: ruff
+        run: |
+          pip install ruff
+          ruff format --check .
+          ruff check .
+
+  full:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@fd38981b2b94ae195801a21660e9ccc3fb222a4a  # EDGEAI-1554 pre-command
+    with:
+      lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
+      boards: nxp-imx8mp-latest
+      lfs: true
+      python: false
+      sonar: true
+      scancode: true
+      runner-class-linux: hosted
+      runner-class-linux-arm: hosted
+      runner-class-macos: hosted
+      runner-class-windows: hosted
+      pre-command: bash .github/scripts/ci-setup.sh
+      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common
+      shared-sha: fd38981b2b94ae195801a21660e9ccc3fb222a4a
+    secrets: inherit
+
+  hal-full:
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
+    uses: ./.github/workflows/hal-full.yml
+    secrets: inherit
+
+  ci-gate:
+    if: always()
+    needs: [changes, quick, quick-python, full, hal-full]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -e 'to_entries | all(.value.result == "success" or .value.result == "skipped")'

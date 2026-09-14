@@ -789,8 +789,8 @@ Set `EDGEFIRST_TENSOR_LIB_DIR` to the directory containing
 derived path can't find on its own (a different `--target-dir`, or a `.so`
 fetched from elsewhere).
 
-CI automates this flow in
-[`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).
+CI automates this flow in the Full tier (`ci.yml` + shared `rust-full.yml`)
+when the PR carries `ci:full` or `ci:hardware`.
 Binaries are stripped on the build host (split debuginfo preserved for
 coverage attribution) and uploaded as the `hardware-test-binaries`
 artifact for the hardware runner to download.
@@ -1259,56 +1259,36 @@ Coverage reports:
 - Rust: `target/rust-coverage.lcov` (LCOV)
 - Python: `target/python-coverage.xml` (Cobertura XML)
 
-CI enforces coverage gating on pull requests. A failing coverage check
-blocks the merge. See
-[`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml)
-for the merge logic between host-side and hardware-runner-side coverage.
+CI uploads merged coverage on Full and Nightly (SonarCloud). See
+[`.github/workflows/README.md`](.github/workflows/README.md).
 
 ---
 
 ## CI/CD Test Matrix
 
-Tests run across multiple runner types:
+See [`.github/workflows/README.md`](.github/workflows/README.md) for the
+Quick / Full / Nightly tiers. Unlabelled PRs run Quick only
+(`ubuntu-24.04`). Full (host matrix, HAL extras, Sonar, scancode) and the
+i.MX 8M Plus board run when a reviewer adds `ci:full` or `ci:hardware`.
 
-| Job | Runner | Architecture | Hardware |
-|-----|--------|--------------|----------|
-| Checkout LFS Files | `ubuntu-22.04` | x86_64 | (fetches testdata once for every other job) |
-| Doc Tests | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
-| Build & Test (x86_64) | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
-| Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | Paravirtual Metal GPU (ANGLE; Full GL serialization policy) |
-| Build & Link (iOS) | `macos-latest` | arm64 | No runtime tests — build + link closure only |
-| Build & Link (Android) | `ubuntu-22.04` | x86_64 host | No runtime tests — see Device Farm section below |
-| Build & Test (Windows) | `windows-latest` | x86_64 | Rust tests with GL self-skipping (gating) and image-crate GL tests on ANGLE Direct3D 11 WARP (software; best-effort), both under cargo-llvm-cov into one LCOV (`coverage-windows` → SonarCloud); C-API leaf tests and gpu pytest on WARP (best-effort). Real-GPU runs are local: `scripts/test-windows.ps1 -RequireGl -RequireCuda` |
-| Software-GL Coverage (llvmpipe) | `ubuntu-22.04-xlarge` | x86_64 | Mesa llvmpipe (software GL) |
-| Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
-| Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |
-| Hardware Test (imx8mp) | `nxp-imx8mp-latest` | aarch64 | G2D, DMA-heap, Vivante GL |
-| Process Hardware Coverage | `ubuntu-22.04-arm` | aarch64 | (post-processing host) |
-| SonarCloud Analysis | `ubuntu-22.04` | x86_64 | (aggregates all five coverage artifacts) |
+| Lane (Full) | Runner | Hardware |
+|-------------|--------|----------|
+| Quick / Full linux | `ubuntu-24.04` | no GPU |
+| Full linux-arm | `ubuntu-24.04-arm` | no GPU |
+| Full macOS | `macos-latest` | ANGLE → Metal |
+| Full Windows | `windows-latest` | ANGLE → D3D11 WARP |
+| Software-GL | `ubuntu-24.04` | Mesa llvmpipe |
+| iOS / Android | `macos-latest` / `ubuntu-24.04` | build + lint only |
+| Hardware | `nxp-imx8mp-latest` | G2D, DMA-heap, Vivante GL |
 
-The hardware runner (`nxp-imx8mp-latest`) is the only environment where
-G2D and DMA-BUF tests are fully exercised. Hardware-gated tests that
-return early on x86 and arm runners are counted as passed (not skipped)
-because the gate is an explicit probe, not a `#[ignore]` attribute.
+The hardware runner is the only environment where G2D and DMA-BUF tests
+are fully exercised. Hardware-gated tests that return early on hosted
+runners are counted as passed (not skipped) because the gate is an
+explicit probe, not a `#[ignore]` attribute.
 
-The `software-gl-coverage` lane exists because of that gap: no hosted runner has a
-GPU, so the GL code paths would otherwise show as uncovered even though the imx8mp
-board exercises them. Mesa llvmpipe runs the same code slowly but faithfully, and it
-sets `EDGEFIRST_ALLOW_SOFTWARE_GL=1` to get past the software-renderer rejection.
-
-The x86_64, aarch64, and macOS lanes each publish a "Test Results (…)"
-check on the PR via `EnricoMi/publish-unit-test-result-action` (the
-macOS lane uses the `/macos` composite sub-action — the root action is
-docker-based and Linux-only). The macOS junit comes from coverage
-pass 2, the GL-enabled run on signed binaries.
-
-The x86_64 build steps moved to `ubuntu-22.04-xlarge` (16 vCPU) in the
-v0.22 → v0.23 cycle, cutting build time roughly 30 min → ~12 min.
-Hardware-test binaries are stripped on the build host into a
-`hardware-test-binaries-stripped/` directory and uploaded under the
-artifact name `hardware-test-binaries`; unstripped originals are
-preserved as the `coverage-binaries-aarch64` artifact so source-line
-attribution still works during the post-target coverage merge.
+The `software-gl-coverage` lane exists because no hosted runner has a
+GPU. Mesa llvmpipe runs the same GL paths with
+`EDGEFIRST_ALLOW_SOFTWARE_GL=1`.
 
 ## Android On-Device Validation (Device Farm)
 

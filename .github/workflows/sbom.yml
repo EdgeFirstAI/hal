@@ -16,24 +16,22 @@
 
 name: SBOM Generation & License Compliance
 
+# Dependency policy runs in Quick; full scancode runs in rust-full.
+# This file only attaches SBOM artifacts to a published GitHub Release.
+
 on:
-  push:
-    branches: [main, develop, 'release/**']
-    paths-ignore:
-      - 'benchmarks/**'
-      - 'BENCHMARKS_PLAN.md'
-  pull_request:
-    branches: [main, develop, 'release/**']
-    paths-ignore:
-      - 'benchmarks/**'
-      - 'BENCHMARKS_PLAN.md'
   release:
     types: [published]
+
+concurrency:
+  group: sbom-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   sbom-compliance:
     name: Generate SBOM & Check License Compliance
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code
@@ -91,7 +89,8 @@ jobs:
   release-sbom:
     name: Attach SBOM to Release
     if: github.event_name == 'release'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs: sbom-compliance
 
     steps:

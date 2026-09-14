@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI is now three tiers (Quick / Full / Nightly) via `ci.yml` and shared
+  EdgeFirstAI/.github workflows. Unlabelled PR pushes run Quick only
+  (`ubuntu-24.04`, ~15 min). Full and the i.MX board run when a reviewer
+  adds `ci:full` or `ci:hardware`. `cargo fmt --check` is a hard Quick
+  gate. The profiling profile uses `debug = "line-tables-only"` so
+  instrumented aarch64 archives stay small.
+
 ## [0.31.0] - 2026-09-08
 
 ### Fixed

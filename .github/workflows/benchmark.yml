@@ -29,6 +29,7 @@ jobs:
   build-benchmarks:
     name: Build Benchmarks (aarch64)
     runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
@@ -253,6 +254,7 @@ jobs:
     name: Process Results & Charts
     needs: [run-rust-benchmarks, run-python-benchmarks]
     runs-on: ubuntu-22.04-arm
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code

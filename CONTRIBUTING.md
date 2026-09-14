@@ -24,7 +24,7 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 ### Prerequisites
 
 **System Requirements:**
-- Rust stable. The workspace declares no MSRV; CI pins `1.94.0` (see `RUST_STABLE_VERSION` in `.github/workflows/test.yml`), so build against that or newer.
+- Rust stable. The workspace declares MSRV `1.94.0` (`rust-toolchain.toml` and `rust-version` in `Cargo.toml`). CI uses the same pin.
 - Python 3.8 or later (for Python bindings)
 - Linux, macOS, Windows, Android, or iOS. Linux is the reference host and runs every gate. macOS and Windows both run the Rust suite with the GPU backend on ANGLE — over Metal and over Direct3D 11 respectively — and Windows covers the D3D11 tier on the WARP software adapter, so a box with no GPU still exercises it. What no desktop host covers: CUDA (needs a CUDA-capable adapter) and the i.MX G2D / dma-heap paths (need the boards). See [TESTING.md § Windows Setup](TESTING.md#windows-setup).
 - Optional: NXP i.MX platform for G2D hardware acceleration testing
@@ -356,83 +356,21 @@ runs, and the hardware gating rules.
 
 ## CI/CD Workflows
 
-The project uses GitHub Actions for continuous integration. Workflows are in `.github/workflows/`.
+Workflows are in `.github/workflows/`. HAL uses three tiers — see
+[`.github/workflows/README.md`](.github/workflows/README.md).
 
-### Test Workflow (`test.yml`)
+- **Quick** (`ci.yml`): every non-draft PR. `cargo fmt --check` is a hard gate,
+  plus clippy, nextest, ruff, and the dependency license policy. Target under
+  15 minutes on `ubuntu-24.04`.
+- **Full**: add the `ci:full` label (it sticks on later pushes). Host matrix,
+  HAL extras (iOS, Android, software-GL, C-API, Python), coverage, scancode,
+  SonarCloud. Use `ci:hardware` for the i.MX 8M Plus board only.
+- **Nightly**: Full + G13 differential + cargo hack/audit, only if `main` moved.
+- **Release**: merge `release/X.Y.Z` with `ci:full`; `tag-release.yml` creates
+  the annotated tag; `release.yml` publishes. Never tag by hand.
 
-Runs on every push and PR to `main`, `develop`, or `release/**`:
-
-- **Formatting check**: `cargo fmt --all -- --check` (advisory)
-- **Linting**: `cargo clippy --workspace --all-targets ... -- -D warnings`, plus a
-  separate "Run Clippy (modular C-API leaves)" step (`make lint-capi-modular`)
-  covering the five excluded C-API leaves, which the workspace-wide pass does
-  not reach
-- **Multi-platform testing**: x86_64, aarch64, NXP i.MX8M Plus hardware
-- **Software GL**: the image crate's GL tests under Mesa llvmpipe, covering GL paths
-  no hardware runner reaches
-- **macOS**: Rust tests (incl. the ANGLE/IOSurface GL render path) +
-  C API. Fetches the signed ANGLE xcframeworks from the public
-  `angle-package` release via `scripts/fetch-angle.sh`.
-- **iOS**: build + link validation for `aarch64-apple-ios` (device) and
-  `aarch64-apple-ios-sim` (no runtime tests yet). Also fetches ANGLE from
-  the public release.
-- **Android**: clippy + build + link validation for `aarch64-linux-android`
-  (device) and `x86_64-linux-android` (emulator) via `cargo-ndk` with a
-  pinned NDK (r27c) at the API-26 floor — no runtime tests in CI (GitHub
-  runners have no Android GPU); on-device correctness/performance is gated
-  separately by the internal hal-mobile Device Farm harness.
-  Local prerequisites:
-  `rustup target add aarch64-linux-android x86_64-linux-android`,
-  `cargo install cargo-ndk`, and an NDK (r26+) via `ANDROID_NDK_HOME`.
-- **Windows**: three parallel lanes on `windows-latest`, all under MSVC.
-  `build-and-test-windows` runs clippy (workspace + the five C-API leaves),
-  the Rust suite with coverage (deliberately with ANGLE off the search path,
-  so the GL tests self-skip), the modular C-API tests, the wheel build and
-  layout check, and the gpu-marked pytest on WARP (best-effort).
-  `test-windows-warp` runs the image crate's GL tests on ANGLE over Direct3D
-  11 WARP with its own coverage report — split out because WARP is a software
-  rasterizer and was the slowest step on the lane with the fewest cores.
-  `package-windows-capi` does the release C-API build plus archive package
-  and smoke. All three fetch ANGLE from the public `angle-package` release.
-- **Coverage collection**: Rust (cargo-llvm-cov) + Python (slipcover)
-- **SonarCloud analysis**: Static analysis and coverage aggregation
-
-> The macOS and iOS lanes fetch the ANGLE xcframeworks from the **public**
-> `angle-package` release (`scripts/fetch-angle.sh`) — no credentials
-> needed, so the download works for pushes, same-repo PRs, and fork PRs
-> alike. The full ANGLE-backed validation (the macOS ANGLE/IOSurface GL
-> render tests and the iOS link closure) therefore runs on every event,
-> forks included — no special-casing. (Fork PRs still require a maintainer
-> to approve the workflow run, per GitHub's default first-time-contributor
-> policy.)
-
-### Release Workflow (`release.yml`)
-
-Triggered by version tags (`vX.Y.Z` or `vX.Y.ZrcN`):
-
-- Builds Python wheels for Linux, Windows, and macOS
-- Builds the C API shared library per target
-- Publishes to PyPI and crates.io
-- Creates GitHub Release with changelog
-
-### Tag Release Workflow (`tag-release.yml`)
-
-Runs when a `release/X.Y.Z` PR merges into `main`, and pushes the `vX.Y.Z` tag that
-starts `release.yml`. Never tag by hand — the tag follows the merge.
-
-### SBOM Workflow (`sbom.yml`)
-
-Runs on push/PR to `main`, `develop`, or `release/**`, and on releases:
-
-- Generates Software Bill of Materials (CycloneDX format)
-- Validates license compliance
-- Attaches SBOM to releases
-
-### Benchmark Workflow (`benchmark.yml`)
-
-Manual dispatch only. Builds the aarch64 benchmark binaries, runs the Rust and Python
-suites on the i.MX 8M Plus runner, and regenerates the result tables. Benchmarks are
-never part of CI — they hold the hardware runner for a long time.
+Open PRs as drafts until you want Quick. Fork PRs stay on hosted Quick only;
+a maintainer must label to escalate (keeps fork code off the board).
 
 ## Benchmarking
 

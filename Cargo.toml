@@ -176,7 +176,7 @@ debug = false
 [profile.profiling]
 inherits = "release"
 strip = false
-debug = true
+debug = "line-tables-only"
 
 # Not yet consumed by any member: opting in requires `[lints] workspace =
 # true` in the member's own manifest, and none does today (see
