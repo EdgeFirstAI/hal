@@ -9,23 +9,32 @@ on:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@fd38981b2b94ae195801a21660e9ccc3fb222a4a  # EDGEAI-1554 pre-command
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@dc93642641b94fa8971aa6275408f7ecca2b5a06  # EDGEAI-1554 pre-command
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@fd38981b2b94ae195801a21660e9ccc3fb222a4a  # EDGEAI-1554 pre-command
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@dc93642641b94fa8971aa6275408f7ecca2b5a06  # EDGEAI-1554 pre-command
     with:
       lanes: all
       nightly: true
       boards: nxp-imx8mp-latest
       lfs: true
-      sonar: true
+      python: false
+      sonar: false
       scancode: true
+      skip-macos: true
+      skip-windows: true
+      timeout-minutes: 90
+      board-timeout-minutes: 45
       runner-class-linux: hosted
+      runner-class-linux-arm: hosted
       pre-command: bash .github/scripts/ci-setup.sh
-      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common
-      shared-sha: fd38981b2b94ae195801a21660e9ccc3fb222a4a
+      board-pre-command: SKIP_PACKAGES=1 bash .github/scripts/ci-setup.sh
+      board-extra-args: -j 1 --profile ci
+      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
+      shared-sha: dc93642641b94fa8971aa6275408f7ecca2b5a06
     secrets: inherit
 
   nightly-hal:

@@ -360,8 +360,8 @@ Workflows are in `.github/workflows/`. HAL uses three tiers — see
 [`.github/workflows/README.md`](.github/workflows/README.md).
 
 - **Quick** (`ci.yml`): every non-draft PR. `cargo fmt --check` is a hard gate,
-  plus clippy, nextest, ruff, and the dependency license policy. Target under
-  15 minutes on `ubuntu-24.04`.
+  plus clippy, nextest (`-j 1`), `ruff check`, and the dependency license policy.
+  Target under 20 minutes on `ubuntu-24.04`.
 - **Full**: add the `ci:full` label (it sticks on later pushes). Host matrix,
   HAL extras (iOS, Android, software-GL, C-API, Python), coverage, scancode,
   SonarCloud. Use `ci:hardware` for the i.MX 8M Plus board only.

@@ -14,7 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ubuntu-24.04`, ~15 min). Full and the i.MX board run when a reviewer
   adds `ci:full` or `ci:hardware`. `cargo fmt --check` is a hard Quick
   gate. The profiling profile uses `debug = "line-tables-only"` so
-  instrumented aarch64 archives stay small.
+  instrumented aarch64 archives stay small. Quick nextest is single-threaded
+  (`-j 1`). ruff on Quick is `ruff check` (same as `make lint-python`);
+  format remains `make format`. Signed macOS and Windows rust tests live in
+  `hal-full.yml`; rust-full skips those hosts. SonarCloud aggregates after
+  both reusable workflows. Release attaches SBOM from `release.yml` because
+  `GITHUB_TOKEN` cannot trigger `on: release`.
 
 ## [0.31.0] - 2026-09-08
 

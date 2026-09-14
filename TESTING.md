@@ -791,9 +791,11 @@ fetched from elsewhere).
 
 CI automates this flow in the Full tier (`ci.yml` + shared `rust-full.yml`)
 when the PR carries `ci:full` or `ci:hardware`.
-Binaries are stripped on the build host (split debuginfo preserved for
-coverage attribution) and uploaded as the `hardware-test-binaries`
-artifact for the hardware runner to download.
+The aarch64 host archives instrumented `edgefirst-image` (opengl, G2D and DMA
+test formats) and `edgefirst-tensor` as `nextest-archive-aarch64`, plus
+`rust-llvm-cov-aarch64` objects. The board downloads `ci-testdata` and runs
+`cargo nextest run --archive-file … -j 1`. Coverage profraw is merged into
+`coverage-hardware.lcov`.
 
 ### iOS (build + lint the native Rust API only)
 

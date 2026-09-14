@@ -10,21 +10,19 @@
 # - actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd (v6.0.2)
 # - actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 (v6.2.0)
 # - actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a (v7.0.1)
-# - actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c (v8.0.1)
 # - dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 (v1)
-# - softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda (v3.0.0)
+#
+# GitHub Releases are created with GITHUB_TOKEN, which does not trigger
+# `on: release`. Attach SBOM from release.yml (workflow_call) instead.
 
 name: SBOM Generation & License Compliance
 
-# Dependency policy runs in Quick; full scancode runs in rust-full.
-# This file only attaches SBOM artifacts to a published GitHub Release.
-
 on:
-  release:
-    types: [published]
+  workflow_call:
+  workflow_dispatch:
 
 concurrency:
-  group: sbom-${{ github.ref }}
+  group: sbom-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -78,32 +76,3 @@ jobs:
             sbom.json
             NOTICE
           retention-days: 90
-
-      - name: Fail on License Violations
-        if: failure()
-        run: |
-          echo "❌ SBOM generation or license policy check failed!"
-          echo "Review the output above for details."
-          exit 1
-
-  release-sbom:
-    name: Attach SBOM to Release
-    if: github.event_name == 'release'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    needs: sbom-compliance
-
-    steps:
-      - name: Download SBOM Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          name: sbom-${{ github.sha }}
-
-      - name: Attach SBOM to Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
-        with:
-          files: |
-            sbom.json
-            NOTICE
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -2299,12 +2299,26 @@ mod gl_tests {
                 "Testing override: {:?} ({})",
                 display.kind, display.description
             );
-            let mut gl = GLProcessorThreaded::new(Some(display.kind)).unwrap_or_else(|e| {
-                panic!(
+            let mut gl = match GLProcessorThreaded::new(Some(display.kind)) {
+                Ok(gl) => gl,
+                // Hosted Ubuntu 24.04 exposes Mesa llvmpipe as PlatformDevice.
+                // Production rejects software GL unless EDGEFIRST_ALLOW_SOFTWARE_GL=1
+                // (the Full software-GL lane). Skip that kind here instead of panicking.
+                Err(crate::Error::NotSupported(msg))
+                    if msg.contains("software OpenGL renderer") =>
+                {
+                    crate::test_support::report_skip(&format!(
+                        "{} - {:?}: {msg}",
+                        function!(),
+                        display.kind
+                    ));
+                    continue;
+                }
+                Err(e) => panic!(
                     "GLProcessorThreaded::new(Some({:?})) failed: {e:?}",
                     display.kind
-                )
-            });
+                ),
+            };
 
             // Smoke test: do a simple PixelFormat::Rgba → PixelFormat::Rgba conversion to verify the
             // GL context is fully functional.

@@ -31,7 +31,9 @@ merge_testdata() {
 os="$(uname -s)"
 case "${os}" in
     Linux*)
-        if [[ "${SKIP_PACKAGES:-0}" != "1" ]]; then
+        if [[ "${SKIP_PACKAGES:-0}" == "1" || "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+            echo "ci-setup: skipping apt (SKIP_PACKAGES or self-hosted board)"
+        else
             sudo apt-get update
             sudo apt-get install -y clang libclang-dev libopencv-dev pkg-config nasm
         fi
