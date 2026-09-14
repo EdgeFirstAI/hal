@@ -17,7 +17,7 @@
 #   runner provisioned (orgs/EdgeFirstAI/actions/hosted-runners lists Linux
 #   images only), so windows-latest-8-cores would queue until the job timed
 #   out. Provisioning one is the remaining lever on hal's wall-clock floor.
-# Shared workflows: EdgeFirstAI/.github @ b5d7664b65d22ea0cabe9a7c49df44593a8ca4b2
+# Shared workflows: EdgeFirstAI/.github @ b0a9a8460fbca7707aea403e932d54a85acc272a
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
 # macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
 # rust-full runs unsigned nextest with a single nextest-args string.
@@ -134,6 +134,21 @@ jobs:
               --auditwheel skip
           done
           venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
+          # Accumulate Rust profraw under the same `profiling` profile the
+          # wheels link against. These are pyo3 wheels, so the Rust lcov IS
+          # the binding coverage; slipcover only measures the test code.
+          # Splitting test.yml dropped this step and left the workspace Rust
+          # run in rust-full's linux job, a different machine on the default
+          # profile, so the report below had neither profraw nor
+          # profiling-profile objects and failed with "no input files".
+          # --exclude the python-* crates: --workspace unions features, which
+          # would activate edgefirst-tensor's static and dynamic at once and
+          # trip its mutual-exclusion guard.
+          source /tmp/coverage-env.sh
+          cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
+            --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
+            --no-report -j 1 \
+            2>&1 | tee target/test-metrics-rust-x86_64.txt
           source /tmp/coverage-env.sh
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml
@@ -150,6 +165,7 @@ jobs:
             target/coverage_python.xml
             target/pytest_results.xml
             target/coverage_rust.lcov
+            target/test-metrics-rust-x86_64.txt
           retention-days: 7
 
   software-gl-coverage:

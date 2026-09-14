@@ -46,9 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **The Full tier could not have passed.** Splitting `test.yml` into
-  `hal-full.yml` dropped the `cargo-llvm-cov` / `cargo-nextest` install from the
-  Linux extras lane, which then shells out to `cargo llvm-cov` in
-  `setup-coverage-env.sh`. Full had never been run, so nothing caught it.
+  `hal-full.yml` broke the Linux extras lane twice over: it dropped the
+  `cargo-llvm-cov` / `cargo-nextest` install that `setup-coverage-env.sh`
+  depends on, and it dropped the `--cargo-profile profiling` Rust coverage run,
+  leaving the workspace Rust tests in `rust-full`'s linux job on a different
+  machine under the default profile. The report step was then left with neither
+  profraw nor profiling-profile objects and failed with "no input files". Since
+  these are pyo3 wheels, that Rust lcov *is* the binding coverage that
+  `check_coverage_split.sh` guards; slipcover only measures the test code. Full
+  had never been run, so nothing caught either.
 - **SonarCloud had no `main` coverage baseline.** Full does not run on push to
   `main` in the label-driven model, and the nightly had no Sonar job, so
   nothing would have refreshed the baseline after this migration. The upload is
