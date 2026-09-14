@@ -17,7 +17,7 @@
 #   runner provisioned (orgs/EdgeFirstAI/actions/hosted-runners lists Linux
 #   images only), so windows-latest-8-cores would queue until the job timed
 #   out. Provisioning one is the remaining lever on hal's wall-clock floor.
-# Shared workflows: EdgeFirstAI/.github @ dd391561cdbe9b987ec595f635f868809068a49a
+# Shared workflows: EdgeFirstAI/.github @ b5d7664b65d22ea0cabe9a7c49df44593a8ca4b2
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
 # macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
 # rust-full runs unsigned nextest with a single nextest-args string.
@@ -96,6 +96,13 @@ jobs:
         with:
           shared-key: rust-x86_64-extras
           cache-on-failure: true
+      # setup-coverage-env.sh and the report step below both shell out to
+      # cargo llvm-cov. The split of test.yml into this file dropped the tool
+      # install that the original build-and-test-x86 lane had, and Full had
+      # never run, so nothing caught it. Same pin as the old lane.
+      - uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
+        with:
+          tool: cargo-llvm-cov@0.6.16,cargo-nextest
       # Folded in from the old doc-tests job: same runner, deps and toolchain,
       # so it reuses this job's warm cache instead of compiling the workspace
       # again under its own.

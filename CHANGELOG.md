@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Full tier could not have passed.** Splitting `test.yml` into
+  `hal-full.yml` dropped the `cargo-llvm-cov` / `cargo-nextest` install from the
+  Linux extras lane, which then shells out to `cargo llvm-cov` in
+  `setup-coverage-env.sh`. Full had never been run, so nothing caught it.
 - **SonarCloud had no `main` coverage baseline.** Full does not run on push to
   `main` in the label-driven model, and the nightly had no Sonar job, so
   nothing would have refreshed the baseline after this migration. The upload is
