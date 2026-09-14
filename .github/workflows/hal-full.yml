@@ -1,5 +1,5 @@
 # HAL-only Full lanes. Called from ci.yml (ci:full) and nightly.yml.
-# Shared workflows: EdgeFirstAI/.github @ 513a9de3c0c51322d3431c6888846c694df44804
+# Shared workflows: EdgeFirstAI/.github @ cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
 # macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
 # rust-full runs unsigned nextest with a single nextest-args string.

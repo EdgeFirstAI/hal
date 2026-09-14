@@ -1,6 +1,6 @@
 # Nightly Full + G13. Skips when main has not moved since the last success.
 #
-# Shared workflows: EdgeFirstAI/.github @ 513a9de3c0c51322d3431c6888846c694df44804
+# Shared workflows: EdgeFirstAI/.github @ cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
 
 name: Nightly
 
@@ -17,12 +17,12 @@ concurrency:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@513a9de3c0c51322d3431c6888846c694df44804
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@513a9de3c0c51322d3431c6888846c694df44804
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@cf505b2dbc5fd784a7acbf4ec8ca1e821c02dda3
     with:
       lanes: all
       nightly: true
