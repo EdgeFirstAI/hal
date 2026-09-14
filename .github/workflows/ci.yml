@@ -1,5 +1,5 @@
 # HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
-# Shared workflows: EdgeFirstAI/.github @ 9e5bbdd611470a417275b0dd2ede4070f482b27e
+# Shared workflows: EdgeFirstAI/.github @ 0df6528ed96a2430583b09cb02cd05e58b707afa
 #
 # The shared commit appears only in the uses: pins below. The shared workflows
 # resolve their own repository and commit from the job context, so there is no
@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@9e5bbdd611470a417275b0dd2ede4070f482b27e
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@0df6528ed96a2430583b09cb02cd05e58b707afa
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -102,7 +102,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@9e5bbdd611470a417275b0dd2ede4070f482b27e
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@0df6528ed96a2430583b09cb02cd05e58b707afa
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       boards: nxp-imx8mp-latest
@@ -129,6 +129,11 @@ jobs:
       board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
       board-extra-args: -j 1 --profile ci
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      # The board is an eMMC-constrained i.MX 8M Plus. profiling is thin-LTO
+      # with debug = "line-tables-only", which is what kept the on-target
+      # payload shippable before the migration; the dev profile's full debug
+      # info fills the disk.
+      archive-profile: profiling
       archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
     secrets: inherit
 
