@@ -65,8 +65,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: '3.11'
       - name: Check every version surface against the tag
@@ -647,6 +647,11 @@ jobs:
         with:
           name: sbom-${{ github.sha }}
           path: dist
+
+      # The shared SBOM workflow uploads sbom.json alone; NOTICE is a tracked
+      # file and generate_sbom.sh has already validated it against this SBOM.
+      - name: Stage NOTICE alongside the SBOM
+        run: cp NOTICE dist/NOTICE
 
       - name: Extract changelog
         id: changelog

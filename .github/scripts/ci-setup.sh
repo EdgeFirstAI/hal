@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # Caller pre-command for shared rust-quick / rust-full jobs.
 # Installs host deps, merges crate LFS testdata, fetches ANGLE on Apple/Windows.
-# Env exports persist via GITHUB_ENV when running in Actions.
+#
+# Environment the shared workflows guarantee to a pre-command: the caller
+# checkout as working directory, GH_TOKEN / GITHUB_TOKEN, and GITHUB_ENV /
+# GITHUB_PATH for exporting state to later steps.
+#
+#   SKIP_PACKAGES=1   skip apt (self-hosted boards already have the toolchain)
+#   SKIP_TESTDATA=1   skip the crate testdata merge, but still export the path.
+#                     Board jobs take the merged tree from the ci-testdata
+#                     artifact instead; their checkout has LFS pointers, not
+#                     content, so merging there would stage stub files that the
+#                     artifact then has to overwrite.
 set -euo pipefail
 
 persist() {
@@ -14,17 +24,21 @@ persist() {
 
 merge_testdata() {
     mkdir -p testdata
-    for dir in crates/*/testdata; do
-        [[ -d "${dir}" ]] || continue
-        while IFS= read -r -d '' f; do
-            rel="${f#"${dir}"/}"
-            if [[ -e "testdata/${rel}" ]]; then
-                echo "::error::${dir}/${rel} collides with an existing testdata/${rel}"
-                exit 1
-            fi
-        done < <(find "${dir}" -type f -print0)
-        cp -a "${dir}/." testdata/
-    done
+    if [[ "${SKIP_TESTDATA:-0}" == "1" ]]; then
+        echo "ci-setup: skipping testdata merge (SKIP_TESTDATA)"
+    else
+        for dir in crates/*/testdata; do
+            [[ -d "${dir}" ]] || continue
+            while IFS= read -r -d '' f; do
+                rel="${f#"${dir}"/}"
+                if [[ -e "testdata/${rel}" ]]; then
+                    echo "::error::${dir}/${rel} collides with an existing testdata/${rel}"
+                    exit 1
+                fi
+            done < <(find "${dir}" -type f -print0)
+            cp -a "${dir}/." testdata/
+        done
+    fi
     persist EDGEFIRST_TESTDATA_DIR "${PWD}/testdata"
 }
 
@@ -43,13 +57,11 @@ case "${os}" in
         merge_testdata
         bash scripts/fetch-angle.sh
         persist EDGEFIRST_ANGLE_PATH "${PWD}/target/angle/macos-flat-lib"
-        persist GH_TOKEN "${GH_TOKEN:-${GITHUB_TOKEN:-}}"
         ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT)
         merge_testdata
         bash scripts/fetch-angle.sh --windows
         persist EDGEFIRST_ANGLE_PATH "${PWD}/target/angle/windows-x64/bin"
-        persist GH_TOKEN "${GH_TOKEN:-${GITHUB_TOKEN:-}}"
         ;;
     *)
         echo "::warning::ci-setup.sh: unknown OS '${os}'; testdata merge only"

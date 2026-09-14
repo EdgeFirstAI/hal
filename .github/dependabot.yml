@@ -1,8 +1,8 @@
 version: 2
-# Dependabot bumps action SHAs in workflow YAML. It does not bump
-# `shared-sha:` inputs that must match `uses: EdgeFirstAI/.github@…`.
-# After a shared-workflow bump, update every `shared-sha:` to the same
-# commit or `.github/scripts/check-shared-sha.sh` fails on Quick.
+# Dependabot bumps action SHAs in workflow YAML, including the
+# `uses: EdgeFirstAI/.github@…` pins. That bump is complete on its own: the
+# shared workflows resolve their own commit from the job context, so there is
+# no second value to update alongside it.
 updates:
   - package-ecosystem: github-actions
     directory: /

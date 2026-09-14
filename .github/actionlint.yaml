@@ -1,0 +1,8 @@
+# actionlint configuration.
+#
+# Self-hosted runner labels actionlint cannot know about. The board is reached
+# only from Full and Nightly on same-repository refs; the shared rust-full
+# workflow enforces that.
+self-hosted-runner:
+  labels:
+    - nxp-imx8mp-latest

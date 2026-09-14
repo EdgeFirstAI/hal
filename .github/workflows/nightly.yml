@@ -1,4 +1,6 @@
 # Nightly Full + G13. Skips when main has not moved since the last success.
+#
+# Shared workflows: EdgeFirstAI/.github @ 513a9de3c0c51322d3431c6888846c694df44804
 
 name: Nightly
 
@@ -7,14 +9,20 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+# A manual dispatch must not interleave with the scheduled run: both would race
+# on the same self-hosted board and the same Sonar `main` baseline.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@dc93642641b94fa8971aa6275408f7ecca2b5a06  # EDGEAI-1554 pre-command
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@513a9de3c0c51322d3431c6888846c694df44804
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@dc93642641b94fa8971aa6275408f7ecca2b5a06  # EDGEAI-1554 pre-command
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@513a9de3c0c51322d3431c6888846c694df44804
     with:
       lanes: all
       nightly: true
@@ -30,11 +38,10 @@ jobs:
       runner-class-linux: hosted
       runner-class-linux-arm: hosted
       pre-command: bash .github/scripts/ci-setup.sh
-      board-pre-command: SKIP_PACKAGES=1 bash .github/scripts/ci-setup.sh
+      board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
       board-extra-args: -j 1 --profile ci
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
-      shared-sha: dc93642641b94fa8971aa6275408f7ecca2b5a06
     secrets: inherit
 
   nightly-hal:
@@ -47,3 +54,15 @@ jobs:
     needs: changed
     if: needs.changed.outputs.run == 'true'
     uses: ./.github/workflows/differential.yml
+
+  # The `main` coverage baseline. Full never runs on push to main in the
+  # label-driven model, so without this the baseline goes stale and every PR
+  # decorates against an ageing reference.
+  sonar:
+    needs: [changed, nightly, nightly-hal]
+    if: >-
+      always() && !cancelled() &&
+      needs.changed.outputs.run == 'true' &&
+      (needs.nightly.result == 'success' || needs.nightly-hal.result == 'success')
+    uses: ./.github/workflows/sonar.yml
+    secrets: inherit

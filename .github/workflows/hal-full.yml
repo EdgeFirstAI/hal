@@ -1,4 +1,5 @@
 # HAL-only Full lanes. Called from ci.yml (ci:full) and nightly.yml.
+# Shared workflows: EdgeFirstAI/.github @ 513a9de3c0c51322d3431c6888846c694df44804
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
 # macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
 # rust-full runs unsigned nextest with a single nextest-args string.
@@ -39,24 +40,6 @@ jobs:
           path: testdata/
           retention-days: 1
 
-  doc-tests:
-    name: Doc Tests
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          lfs: true
-      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libopencv-dev nasm
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
-        with:
-          toolchain: ${{ env.RUST_STABLE_VERSION }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        with:
-          shared-key: rust-x86_64-doc
-          cache-on-failure: true
-      - run: make test-doc
-
   linux-extras:
     name: Linux extras (C-API, Python, clippy)
     runs-on: ubuntu-24.04
@@ -95,6 +78,10 @@ jobs:
         with:
           shared-key: rust-x86_64-extras
           cache-on-failure: true
+      # Folded in from the old doc-tests job: same runner, deps and toolchain,
+      # so it reuses this job's warm cache instead of compiling the workspace
+      # again under its own.
+      - run: make test-doc
       - run: make lint-capi-modular
       - run: make lint-tensor-dynamic
       - run: make lint-python-abi3-py38

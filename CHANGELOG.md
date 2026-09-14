@@ -20,6 +20,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hal-full.yml`; rust-full skips those hosts. SonarCloud aggregates after
   both reusable workflows. Release attaches SBOM from `release.yml` because
   `GITHUB_TOKEN` cannot trigger `on: release`.
+- The license policy has one copy, in `EdgeFirstAI/.github`. hal's own
+  `generate_sbom.sh` and `check_license_policy.py` had drifted from it, so the
+  Quick tier and `make sbom` reached different verdicts on the same dependency
+  tree. `make sbom` now fetches the org scripts at the commit `ci.yml` pins
+  (`.github/scripts/fetch-ci-scripts.sh`), and `sbom.yml` calls the shared
+  workflow. `make notice` regenerates NOTICE, which `make sbom` only validates.
+- Callers pin the shared commit once, in `uses:`. The `shared-sha` input and
+  `check-shared-sha.sh` are gone: the shared workflows resolve their own
+  repository and commit from the job context, so the two values cannot drift
+  and Dependabot's bump is complete on its own.
+- Quick gets ruff from the shared workflow (`python: true` with `ruff-paths`)
+  instead of a hand-rolled job, and now checks formatting as well as lint.
+- Doc tests run inside the Linux extras job rather than a job of their own,
+  which removes one full x86 workspace compile from every Full run.
+
+### Fixed
+
+- **SonarCloud had no `main` coverage baseline.** Full does not run on push to
+  `main` in the label-driven model, and the nightly had no Sonar job, so
+  nothing would have refreshed the baseline after this migration. The upload is
+  now `sonar.yml`, called by both `ci.yml` (PR decoration) and `nightly.yml`
+  (the `main` baseline).
+- Two actions in `release.yml` were pinned to floating tags
+  (`actions/checkout@v4`, `actions/setup-python@v5`), against SPS-11.
+- `nightly.yml` had no concurrency group, so a manual dispatch could race the
+  scheduled run on the same board and the same Sonar baseline.
+- Quick's clippy invocation was missing `--locked`.
+- The board pre-command merged crate testdata from a checkout holding LFS
+  pointers, staging stub files that the `ci-testdata` artifact then overwrote.
+  It now takes the merged tree from the artifact (`SKIP_TESTDATA=1`) and only
+  exports `EDGEFIRST_TESTDATA_DIR`.
+- `ci-setup.sh` no longer persists an empty `GH_TOKEN`. The shared workflows
+  guarantee `GH_TOKEN` and `GITHUB_TOKEN` to a pre-command, which is what
+  `fetch-angle.sh` needs on the macOS and Windows lanes.
 
 ## [0.31.0] - 2026-09-08
 

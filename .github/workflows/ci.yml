@@ -1,12 +1,13 @@
 # HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
-# Shared workflows: EdgeFirstAI/.github @ dc93642641b94fa8971aa6275408f7ecca2b5a06
+# Shared workflows: EdgeFirstAI/.github @ 513a9de3c0c51322d3431c6888846c694df44804
+#
+# The shared commit appears only in the uses: pins below. The shared workflows
+# resolve their own repository and commit from the job context, so there is no
+# second value to keep in sync and Dependabot's bump is complete on its own.
 #
 # Action Versions (hash-pinned):
 # - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
-# - actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 (v6.2.0)
 # - dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d (v4.0.3)
-# - actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c (v8.0.1)
-# - SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f (v8.2.1)
 
 name: CI
 
@@ -74,73 +75,59 @@ jobs:
               hardware="$DISPATCH_HARDWARE"
               ;;
           esac
+          # Sticky: Full re-runs on later pushes while the label is present.
           case ",$LABELS," in *,ci:full,*) full=true ;; esac
           case ",$LABELS," in *,ci:hardware,*) hardware=true ;; esac
           echo "full=$full" >> "$GITHUB_OUTPUT"
           echo "hardware=$hardware" >> "$GITHUB_OUTPUT"
 
-  pin-check:
-    if: github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - run: bash .github/scripts/check-shared-sha.sh
-
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@dc93642641b94fa8971aa6275408f7ecca2b5a06  # EDGEAI-1554 pre-command
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@513a9de3c0c51322d3431c6888846c694df44804
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
       lfs: true
-      python: false
+      # ruff lint only. The maturin + pytest pass is Full-tier work and lives in
+      # hal-full.yml, where the nightly toolchain and wheels already exist.
+      python: true
+      ruff-paths: crates/python-tensor crates/python-codec crates/python-image crates/python-decoder crates/python-tracker crates/python-common tests
       skip-cross-clippy: true
       pre-command: bash .github/scripts/ci-setup.sh
-      clippy-args: --workspace --all-targets --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
+      clippy-args: --workspace --all-targets --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       cache-key: quick-x86_64
-      shared-sha: dc93642641b94fa8971aa6275408f7ecca2b5a06
-
-  quick-python:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.11'
-      - name: ruff
-        run: |
-          pip install ruff
-          ruff check crates/python-tensor crates/python-codec crates/python-image crates/python-decoder crates/python-tracker crates/python-common tests
 
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@dc93642641b94fa8971aa6275408f7ecca2b5a06  # EDGEAI-1554 pre-command
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@513a9de3c0c51322d3431c6888846c694df44804
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       boards: nxp-imx8mp-latest
       lfs: true
       python: false
+      # hal runs its own Sonar job (sonar.yml) so the nightly gets the same
+      # upload; the shared one would only cover the shared lanes.
       sonar: false
       scancode: true
+      # macOS and Windows lanes live in hal-full.yml: they need codesigning and
+      # a WARP gating pass that a single nextest-args string cannot express.
       skip-macos: true
       skip-windows: true
+      # Budget deviation: the design page allows Full 30 min. hal's aarch64 lane
+      # builds instrumented binaries for the board and has measured up to 70.
+      # Recorded rather than silently inherited; revisit after the fleet lands.
       timeout-minutes: 90
       board-timeout-minutes: 45
       runner-class-linux: hosted
       runner-class-linux-arm: hosted
       pre-command: bash .github/scripts/ci-setup.sh
-      board-pre-command: SKIP_PACKAGES=1 bash .github/scripts/ci-setup.sh
+      board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
       board-extra-args: -j 1 --profile ci
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
-      shared-sha: dc93642641b94fa8971aa6275408f7ecca2b5a06
     secrets: inherit
 
   hal-full:
@@ -150,7 +137,6 @@ jobs:
     secrets: inherit
 
   sonar:
-    name: SonarCloud
     needs: [changes, full, hal-full]
     if: >-
       always() && !cancelled() &&
@@ -159,49 +145,12 @@ jobs:
       (needs.hal-full.result == 'success' || needs.hal-full.result == 'skipped') &&
       (needs.full.result == 'success' || needs.hal-full.result == 'success') &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        continue-on-error: true
-        with:
-          pattern: coverage-*
-          path: coverage/
-      - name: Organize coverage files
-        run: |
-          set -euo pipefail
-          echo "=== Downloaded coverage artifacts ==="
-          find coverage/ -type f || true
-          for xml in $(find coverage/ -name "coverage_python.xml" -type f); do
-            python3 .github/scripts/fix_coverage_paths.py "$xml" tests
-          done
-          for lcov in $(find coverage/ -name "*.lcov" -type f); do
-            sed -i -E '/^SF:/{s|\\|/|g; s|^SF:.*/work/hal/hal/|SF:|; s|^SF:[A-Za-z]:/a/hal/hal/|SF:|}' "$lcov"
-          done
-          RUST_REPORTS=$(find coverage/ -name "*.lcov" | tr '\n' ',' | sed 's/,$//')
-          PYTHON_REPORTS=$(find coverage/ -name "coverage_python.xml" | tr '\n' ',' | sed 's/,$//')
-          echo "Rust: ${RUST_REPORTS:-}"
-          echo "Python: ${PYTHON_REPORTS:-}"
-          echo "RUST_COVERAGE_PATHS=${RUST_REPORTS:-}" >> "$GITHUB_ENV"
-          echo "PYTHON_COVERAGE_PATHS=${PYTHON_REPORTS:-}" >> "$GITHUB_ENV"
-      - uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f  # v8.2.1
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: >-
-            "-Dsonar.rust.lcov.reportPaths=${{ env.RUST_COVERAGE_PATHS }}"
-            "-Dsonar.python.coverage.reportPaths=${{ env.PYTHON_COVERAGE_PATHS }}"
+    uses: ./.github/workflows/sonar.yml
+    secrets: inherit
 
   ci-gate:
     if: always()
-    needs: [changes, pin-check, quick, quick-python, full, hal-full, sonar]
+    needs: [changes, quick, full, hal-full, sonar]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
