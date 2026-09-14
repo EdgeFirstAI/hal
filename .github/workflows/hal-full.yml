@@ -120,11 +120,24 @@ jobs:
       - run: make test-tensor-dynamic
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
-      - name: Build Python bindings and run pytest
+      # These four stages are deliberately separate steps, not one run block.
+      # /tmp/coverage-env.sh points CARGO_TARGET_DIR and LLVM_PROFILE_FILE at
+      # the llvm-cov tree so maturin and the Python interpreter write profraw
+      # where the report can find it. cargo llvm-cov sets that environment up
+      # itself, so it must NOT inherit the sourced copy. In one shell the
+      # source leaks into every later command and splits the profraw into two
+      # pools, which is what made python-common report zero lines. Separate
+      # steps mean separate shells. test.yml had this shape; the migration
+      # collapsed it.
+      - name: Build Python bindings with coverage instrumentation
         env:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
         run: |
           source /tmp/coverage-env.sh
+          # The wheels are built instrumented: loading them from Python writes
+          # profraw as pytest drives pyo3 into the real crates. python-common is
+          # an rlib linked into each cdylib, so those .so files are the only
+          # object carrying its lines.
           for pkg in tensor codec image decoder tracker; do
             venv/bin/maturin build \
               --manifest-path "crates/python-$pkg/Cargo.toml" \
@@ -133,40 +146,31 @@ jobs:
               --features abi3-py311 \
               --auditwheel skip
           done
+          # --no-deps: every edgefirst-* sibling is in this same wheel set, so
+          # resolving the pins could fetch a published sibling over the local one.
           venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
-          # Accumulate Rust profraw under the same `profiling` profile the
-          # wheels link against. These are pyo3 wheels, so the Rust lcov IS
-          # the binding coverage; slipcover only measures the test code.
-          # Splitting test.yml dropped this step and left the workspace Rust
-          # run in rust-full's linux job, a different machine on the default
-          # profile, so the report below had neither profraw nor
-          # profiling-profile objects and failed with "no input files".
+
+      - name: Run Rust tests with coverage
+        run: |
+          # No source here: cargo llvm-cov manages its own environment.
           # --exclude the python-* crates: --workspace unions features, which
           # would activate edgefirst-tensor's static and dynamic at once and
           # trip its mutual-exclusion guard.
-          source /tmp/coverage-env.sh
           cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
             --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
             --no-report -j 1 \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
-          # The wheels are built instrumented, so loading them from Python
-          # writes profraw as pytest drives pyo3 into the real crates. That
-          # is the whole point of this lane: python-common is an rlib linked
-          # into each cdylib, so its lines only appear if the .so is among
-          # the objects llvm-cov reports against.
+
+      - name: Run Python tests with coverage
+        run: |
           source /tmp/coverage-env.sh
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
             2>&1 | tee target/test-metrics-python-x86_64.txt
-          # Deliberately NOT sourcing the coverage env here. That env pins
-          # CARGO_TARGET_DIR at target/llvm-cov-target, and cargo llvm-cov
-          # derives its own object search root from it, so the maturin-built
-          # extension .so files end up outside the tree it inspects and
-          # python-common silently reports zero lines. test.yml never sourced
-          # it here; 1296be75 added the source when it restored this step.
-          echo "=== object and profraw locations ==="
-          find target -name '_*.so' -o -name '*.profraw' 2>/dev/null \
-            | sed 's|/[^/]*$||' | sort | uniq -c | sort -rn | head -15
+
+      - name: Generate combined Rust coverage report
+        run: |
+          # No source here either, for the same reason as the test step above.
           cargo llvm-cov report --profile profiling \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             --lcov --output-path target/coverage_rust.lcov
@@ -174,7 +178,10 @@ jobs:
           echo "source files: $(grep -c '^SF:' target/coverage_rust.lcov)"
           echo "PyO3 files with coverage:"
           grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
+          # The split into five dynamic objects can silently UNDER-report rather
+          # than error, so assert attribution explicitly.
           bash tests/packaging/check_coverage_split.sh target/coverage_rust.lcov
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
