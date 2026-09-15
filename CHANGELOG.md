@@ -7,95 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rust-toolchain.toml` pins the toolchain to 1.94.0 with `rustfmt` and `clippy`, so a checkout builds and lints against the same compiler CI uses without anyone selecting one.
+- `make notice` regenerates NOTICE. `make sbom` validates it rather than regenerating it.
+
 ### Changed
 
-- CI is now three tiers (Quick / Full / Nightly) via `ci.yml` and shared
-  EdgeFirstAI/.github workflows. Unlabelled PR pushes run Quick only
-  (`ubuntu-24.04`, ~15 min). Full and the i.MX board run when a reviewer
-  adds `ci:full` or `ci:hardware`. `cargo fmt --check` is a hard Quick
-  gate. The profiling profile uses `debug = "line-tables-only"` so
-  instrumented aarch64 archives stay small. Quick nextest is single-threaded
-  (`-j 1`). ruff on Quick is `ruff check` (same as `make lint-python`);
-  format remains `make format`. Signed macOS and Windows rust tests live in
-  `hal-full.yml`; rust-full skips those hosts. SonarCloud aggregates after
-  both reusable workflows. Release attaches SBOM from `release.yml` because
-  `GITHUB_TOKEN` cannot trigger `on: release`.
-- The license policy has one copy, in `EdgeFirstAI/.github`. hal's own
-  `generate_sbom.sh` and `check_license_policy.py` had drifted from it, so the
-  Quick tier and `make sbom` reached different verdicts on the same dependency
-  tree. `make sbom` now fetches the org scripts at the commit `ci.yml` pins
-  (`.github/scripts/fetch-ci-scripts.sh`), and `sbom.yml` calls the shared
-  workflow. `make notice` regenerates NOTICE, which `make sbom` only validates.
-- Callers pin the shared commit once, in `uses:`. The `shared-sha` input and
-  `check-shared-sha.sh` are gone: the shared workflows resolve their own
-  repository and commit from the job context, so the two values cannot drift
-  and Dependabot's bump is complete on its own.
-- Quick gets ruff from the shared workflow (`python: true` with `ruff-paths`)
-  instead of a hand-rolled job, and now checks formatting as well as lint.
-- Doc tests run inside the Linux extras job rather than a job of their own,
-  which removes one full x86 workspace compile from every Full run.
-
-- Runner class now follows the tier. Quick stays on free standard runners and
-  never bills. Full, Nightly and Release use larger runners: they run once per
-  PR or per tag rather than per push, and the first cut of this migration put
-  them on standard runners, which made Full slower than the 15-to-20-job
-  workflow it replaced. Full's job timeout drops from 90 to 45 minutes and the
-  G13 differential from 180 to 120. Windows lanes stay on `windows-latest`
-  because the organisation has no Windows larger runner provisioned.
-
-### Fixed
-
-- **The board ran every test in its packages, not the hardware subset.**
-  `test.yml` ran the image lib binary filtered to `g2d`/`opengl`, the tensor lib
-  binary filtered to `dma`, and the image and tensor integration binaries whole,
-  because CPU-only tests already ran on the aarch64 runner. The migrated lane
-  dropped the filtering and put all 1075 tests of those two packages on the
-  i.MX 8M Plus, turning roughly 16 minutes of on-target Rust tests into a run
-  that exceeded its 45-minute budget and then would not terminate. Restored as
-  a nextest filterset naming the same binaries: the lib tests matching
-  `g2d`/`opengl`/`dma` plus the nine image and six tensor integration binaries
-  that flow routed. A `kind(test)` shorthand is not equivalent, because it also
-  runs tensor's non-hardware integration binaries (`logical_shape`,
-  `map_access`, `no_global_state`, `scenarios`) and two image binaries gated to
-  macOS/Windows, all of which that flow deliberately skipped.
-- **The Full tier could not have passed.** Splitting `test.yml` into
-  `hal-full.yml` broke the Linux extras lane twice over: it dropped the
-  `cargo-llvm-cov` / `cargo-nextest` install that `setup-coverage-env.sh`
-  depends on, and it dropped the `--cargo-profile profiling` Rust coverage run,
-  leaving the workspace Rust tests in `rust-full`'s linux job on a different
-  machine under the default profile. The report step was then left with neither
-  profraw nor profiling-profile objects and failed with "no input files". Since
-  these are pyo3 wheels, that Rust lcov *is* the binding coverage that
-  `check_coverage_split.sh` guards; slipcover only measures the test code. Full
-  had never been run, so nothing caught either.
-- **PyO3 coverage reported zero lines for `python-common`.** `test.yml` ran the
-  coverage flow as four separate steps, sourcing `/tmp/coverage-env.sh` only for
-  maturin and pytest and never for a `cargo llvm-cov` subcommand, which sets up
-  that environment itself. The migration collapsed them into one `run:` block,
-  where the source leaks into every later command in the same shell: the Rust
-  profraw was displaced to `target/` while the Python profraw stayed in
-  `target/llvm-cov-target/`, so the report only ever saw one pool and the
-  instrumented extension modules were not among its objects. Since
-  `python-common` is an rlib linked into each cdylib, those `.so` files are the
-  only object carrying its lines, and it silently reported nothing. Split back
-  into separate steps, which is what kept the environments apart.
-- **SonarCloud had no `main` coverage baseline.** Full does not run on push to
-  `main` in the label-driven model, and the nightly had no Sonar job, so
-  nothing would have refreshed the baseline after this migration. The upload is
-  now `sonar.yml`, called by both `ci.yml` (PR decoration) and `nightly.yml`
-  (the `main` baseline).
-- Two actions in `release.yml` were pinned to floating tags
-  (`actions/checkout@v4`, `actions/setup-python@v5`), against SPS-11.
-- `nightly.yml` had no concurrency group, so a manual dispatch could race the
-  scheduled run on the same board and the same Sonar baseline.
-- Quick's clippy invocation was missing `--locked`.
-- The board pre-command merged crate testdata from a checkout holding LFS
-  pointers, staging stub files that the `ci-testdata` artifact then overwrote.
-  It now takes the merged tree from the artifact (`SKIP_TESTDATA=1`) and only
-  exports `EDGEFIRST_TESTDATA_DIR`.
-- `ci-setup.sh` no longer persists an empty `GH_TOKEN`. The shared workflows
-  guarantee `GH_TOKEN` and `GITHUB_TOKEN` to a pre-command, which is what
-  `fetch-angle.sh` needs on the macOS and Windows lanes.
+- The `profiling` profile carries line tables instead of full debug info (`debug = "line-tables-only"`). Profiles and stack traces still resolve to file and line; binaries are substantially smaller.
+- `make sbom` writes to `sbom/` and enforces the same license policy as CI, fetched from EdgeFirstAI/.github. hal's own copy had drifted, so the two could reach different verdicts on the same dependency tree.
+- Pull requests run a quick lint, format and unit-test pass by default. Add the `ci:full` label for the full platform matrix, or `ci:hardware` for the on-target board run. See CONTRIBUTING.md.
 
 ## [0.31.0] - 2026-09-08
 

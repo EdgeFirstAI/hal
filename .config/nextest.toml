@@ -29,3 +29,28 @@ junit.store-failure-output = true
 
 # Quarantine named flakes here with [[profile.ci.overrides]] once a test
 # has a ticket. Do not pre-emptively ignore tests to chase the 10% target.
+
+[profile.board]
+# The on-target lane. Its needs differ from `ci` in two ways that only show
+# up on the i.MX 8M Plus.
+#
+# terminate-after: nextest marks a test SLOW at `period` but NEVER kills it
+# unless terminate-after is set. The Vivante GPU driver can leave a test
+# process wedged in the kernel, and without this a single wedged test
+# outlives the job's timeout-minutes and the runner cannot reap it -- runs
+# 34914168479 and 34918477796 both sat past 45 minutes and ignored a cancel
+# request until the board was power-cycled. 3 periods is ~3 minutes; the
+# whole historical on-target suite ran in 16, so no healthy test is close.
+#
+# retries: `ci` retries twice. test.yml ran each binary once and treated a
+# non-zero exit as a pass when the log showed `test result: ok`, because the
+# driver SIGABRTs during library unload. nextest runs one process per test,
+# so that abort is charged to the test and every affected GL test would run
+# three times. One retry keeps genuine flake coverage without tripling a
+# lane that is already the slowest in the tier.
+fail-fast = false
+retries = 1
+slow-timeout = { period = "60s", terminate-after = 3 }
+junit.path = "test-results.xml"
+junit.store-success-output = true
+junit.store-failure-output = true
