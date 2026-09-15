@@ -51,7 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because CPU-only tests already ran on the aarch64 runner. The migrated lane
   dropped the filtering and put all 1075 tests of those two packages on the
   i.MX 8M Plus, turning roughly 16 minutes of on-target Rust tests into a run
-  that exceeded its 45-minute budget. Restored as a nextest filterset.
+  that exceeded its 45-minute budget and then would not terminate. Restored as
+  a nextest filterset naming the same binaries: the lib tests matching
+  `g2d`/`opengl`/`dma` plus the nine image and six tensor integration binaries
+  that flow routed. A `kind(test)` shorthand is not equivalent, because it also
+  runs tensor's non-hardware integration binaries (`logical_shape`,
+  `map_access`, `no_global_state`, `scenarios`) and two image binaries gated to
+  macOS/Windows, all of which that flow deliberately skipped.
 - **The Full tier could not have passed.** Splitting `test.yml` into
   `hal-full.yml` broke the Linux extras lane twice over: it dropped the
   `cargo-llvm-cov` / `cargo-nextest` install that `setup-coverage-env.sh`
