@@ -28,6 +28,8 @@ PYTHON_CRATES := $(addprefix crates/python-,$(PYTHON_PACKAGES))
 PYTHON_CRATE_NAMES := edgefirst-python-common \
 	$(addprefix edgefirst-python-,$(PYTHON_PACKAGES))
 TEST_DIR := tests
+# Must match ci.yml ruff-paths; ruff lints Python in python-common's .md files.
+RUFF_PATHS := $(PYTHON_CRATES) crates/python-common $(TEST_DIR)
 
 # The five modular C-API leaves: standalone packages excluded from the
 # workspace (static/dynamic feature conflict, plans R3-R5). Every invocation
@@ -120,9 +122,9 @@ format-rust:
 format-python:
 	@echo "Formatting Python code with ruff..."
 	@if [ -f "venv/bin/ruff" ]; then \
-		. venv/bin/activate && ruff format $(PYTHON_CRATES) $(TEST_DIR); \
+		. venv/bin/activate && ruff format $(RUFF_PATHS); \
 	elif command -v ruff >/dev/null 2>&1; then \
-		ruff format $(PYTHON_CRATES) $(TEST_DIR); \
+		ruff format $(RUFF_PATHS); \
 	else \
 		echo "Warning: ruff not found (see README.md for installation)"; \
 	fi
@@ -176,9 +178,9 @@ lint-python-abi3-py38:
 lint-python:
 	@echo "Running ruff linter..."
 	@if [ -f "venv/bin/ruff" ]; then \
-		. venv/bin/activate && ruff check $(PYTHON_CRATES) $(TEST_DIR); \
+		. venv/bin/activate && ruff check $(RUFF_PATHS); \
 	elif command -v ruff >/dev/null 2>&1; then \
-		ruff check $(PYTHON_CRATES) $(TEST_DIR); \
+		ruff check $(RUFF_PATHS); \
 	else \
 		echo "Warning: ruff not found (see README.md for installation)"; \
 	fi

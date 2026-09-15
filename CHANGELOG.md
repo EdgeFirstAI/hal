@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `profiling` profile carries line tables instead of full debug info (`debug = "line-tables-only"`). Profiles and stack traces still resolve to file and line; binaries are substantially smaller.
 - `make sbom` writes to `sbom/` and enforces the same license policy as CI, fetched from EdgeFirstAI/.github. hal's own copy had drifted, so the two could reach different verdicts on the same dependency tree.
 - Pull requests run a quick lint, format and unit-test pass by default. Add the `ci:full` label for the full platform matrix, or `ci:hardware` for the on-target board run. See CONTRIBUTING.md.
+- `make format` and `make lint` run ruff over `crates/python-common` too, matching `ci.yml`'s `ruff-paths` exactly. ruff lints Python blocks inside Markdown, and that crate's three `.md` files were the gap — a bad snippet there passed locally and failed the Quick tier.
+- `[tool.ruff] required-version` sets a `>=0.16.7` floor. ruff 0.15.8 reports five `F403`s on the `edgefirst.*` star re-exports that 0.16.7 does not, so a stale local ruff failed a gate `main` passes; the floor names the version mismatch instead of the symptom. CI pins the same version through the shared workflow's `ruff-version` input, so `uvx` no longer resolves whatever the runner's uv cache happens to hold.
 
 ### Fixed
 

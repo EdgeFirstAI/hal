@@ -26,6 +26,7 @@ all-features = false
 # a `select` list, so a ruff upgrade adds checks instead of silently keeping
 # the set this repo happened to be clean against.
 target-version = "py38"
+required-version = ">=0.16.7"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
