@@ -1,5 +1,5 @@
 # HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
-# Shared workflows: EdgeFirstAI/.github @ a9b62d8918435787be65aae7f840a666a641a557
+# Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 #
 # The shared commit appears only in the uses: pins below. The shared workflows
 # resolve their own repository and commit from the job context, so there is no

@@ -1,6 +1,6 @@
 # Nightly Full + G13. Skips when main has not moved since the last success.
 #
-# Shared workflows: EdgeFirstAI/.github @ a9b62d8918435787be65aae7f840a666a641a557
+# Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 
 name: Nightly
 
@@ -28,8 +28,8 @@ jobs:
       nightly: true
       # edgefirst-tensor requires exactly one of two mutually exclusive backend
       # features and rejects the combination with compile_error!, so the
-      # powerset'''s bare --no-default-features run builds something the design
-      # forbids. Excluding it tests the guard'''s intent rather than fighting it.
+      # powerset's bare --no-default-features run builds something the design
+      # forbids. Excluding it tests the guard's intent rather than fighting it.
       hack-args: --feature-powerset --depth 2 --exclude-no-default-features
       boards: nxp-imx8mp-latest
       lfs: true
