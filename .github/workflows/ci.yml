@@ -1,5 +1,5 @@
 # HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
-# Shared workflows: EdgeFirstAI/.github @ 0268432b3c13975ed4695eab849df234453c7c3c
+# Shared workflows: EdgeFirstAI/.github @ 633ff1808d361186d14b96f586f69a6608aa33d8
 #
 # The shared commit appears only in the uses: pins below. The shared workflows
 # resolve their own repository and commit from the job context, so there is no
@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@0268432b3c13975ed4695eab849df234453c7c3c
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@633ff1808d361186d14b96f586f69a6608aa33d8
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -102,7 +102,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@0268432b3c13975ed4695eab849df234453c7c3c
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@633ff1808d361186d14b96f586f69a6608aa33d8
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       boards: nxp-imx8mp-latest
