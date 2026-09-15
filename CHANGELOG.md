@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The board ran every test in its packages, not the hardware subset.**
+  `test.yml` ran the image lib binary filtered to `g2d`/`opengl`, the tensor lib
+  binary filtered to `dma`, and the image and tensor integration binaries whole,
+  because CPU-only tests already ran on the aarch64 runner. The migrated lane
+  dropped the filtering and put all 1075 tests of those two packages on the
+  i.MX 8M Plus, turning roughly 16 minutes of on-target Rust tests into a run
+  that exceeded its 45-minute budget. Restored as a nextest filterset.
 - **The Full tier could not have passed.** Splitting `test.yml` into
   `hal-full.yml` broke the Linux extras lane twice over: it dropped the
   `cargo-llvm-cov` / `cargo-nextest` install that `setup-coverage-env.sh`

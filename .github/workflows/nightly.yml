@@ -42,7 +42,13 @@ jobs:
       runner-class-linux-arm: larger
       pre-command: bash .github/scripts/ci-setup.sh
       board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
-      board-extra-args: -j 1 --profile ci
+      # Hardware tests only. test.yml ran the image lib binary filtered to
+      # g2d/opengl, the tensor lib binary filtered to dma, and the image and
+      # tensor integration binaries whole; CPU-only tests already ran on the
+      # aarch64 runner. Without this the board runs all 1075 tests in those
+      # two packages, which is why it went from ~16 min of Rust tests to
+      # timing out. Written without spaces: board-run word-splits this.
+      board-extra-args: -j 1 --profile ci -E (kind(lib)&(test(~g2d)|test(~opengl)|test(~dma)))|kind(test)
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       # The board is an eMMC-constrained i.MX 8M Plus. profiling is thin-LTO
       # with debug = "line-tables-only", which is what kept the on-target
