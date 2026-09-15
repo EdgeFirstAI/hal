@@ -626,8 +626,18 @@ mod tests {
         let undersized: [u64; 2] = [8, 8];
         let overflowing: [u64; 2] = [1u64 << 63, 4];
         let cases: [(&str, usize, &[u64], EfErrorClass); 2] = [
-            ("size below the shape footprint", 8, &undersized, EfErrorClass::InvalidShape),
-            ("shape footprint overflows usize", 8, &overflowing, EfErrorClass::InvalidShape),
+            (
+                "size below the shape footprint",
+                8,
+                &undersized,
+                EfErrorClass::InvalidShape,
+            ),
+            (
+                "shape footprint overflows usize",
+                8,
+                &overflowing,
+                EfErrorClass::InvalidShape,
+            ),
         ];
         for (what, size, dims, class) in cases {
             errno::set_errno(errno::Errno(libc::EEXIST));

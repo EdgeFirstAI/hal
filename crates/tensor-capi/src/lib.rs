@@ -100,7 +100,9 @@ mod tests {
         {
             Ok(o) => Some(o),
             Err(e) => {
-                skip(&format!("no C compiler ({cc}: {e}); header not syntax-checked"));
+                skip(&format!(
+                    "no C compiler ({cc}: {e}); header not syntax-checked"
+                ));
                 None
             }
         }
@@ -130,7 +132,9 @@ mod tests {
         {
             Ok(o) => Some(o),
             Err(e) => {
-                skip(&format!("no C compiler ({cc}: {e}); header not syntax-checked"));
+                skip(&format!(
+                    "no C compiler ({cc}: {e}); header not syntax-checked"
+                ));
                 None
             }
         }
