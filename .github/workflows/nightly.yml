@@ -93,6 +93,77 @@ jobs:
     if: needs.changed.outputs.run == 'true'
     uses: ./.github/workflows/differential.yml
 
+  # Line coverage says a line ran, not that anything would notice if it were
+  # wrong. cargo-mutants injects faults and reports which survive unkilled: a
+  # surviving mutant is a real hole that coverage hides, and a test that kills
+  # nothing is provably worthless. Nightly only -- it recompiles per mutant,
+  # so it is far too slow for a PR gate. EDGEAI-1608.
+  mutants:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    name: Mutation testing
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
+        with:
+          tool: cargo-mutants
+
+      - name: Run cargo-mutants
+        env:
+          # Scope to the pure-logic crates. image and codec reach the GPU and a
+          # mutant there hangs or aborts the driver rather than failing a test,
+          # which reports as "unviable" and tells us nothing. Widen once the
+          # baseline on these is understood.
+          PACKAGES: >-
+            --package edgefirst-tensor
+            --package edgefirst-tracker
+            --package edgefirst-decoder
+        run: |
+          set -euo pipefail
+          # --in-place keeps one target dir rather than a copy per job; the
+          # timeout multiplier is against the measured baseline, so a mutant
+          # that makes a test hang is killed rather than holding the runner.
+          # shellcheck disable=SC2086  # PACKAGES is an argument list and must split
+          cargo mutants --no-shuffle --in-place --timeout-multiplier 3 \
+            $PACKAGES \
+            --output mutants-report \
+            -- --profile ci || true
+
+      - name: Summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          out=mutants-report/mutants.out
+          if [[ ! -d "$out" ]]; then
+            echo "::warning::cargo-mutants produced no report"
+            exit 0
+          fi
+          for f in caught missed timeout unviable; do
+            n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+            echo "$f: $n"
+            echo "$f: $n" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ -s "$out/missed.txt" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Surviving mutants (no test noticed the change)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -50 "$out/missed.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants-report
+          if-no-files-found: warn
+          retention-days: 14
+
   # The `main` coverage baseline. Full never runs on push to main in the
   # label-driven model, so without this the baseline goes stale and every PR
   # decorates against an ageing reference.
