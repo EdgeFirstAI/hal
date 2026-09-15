@@ -36,7 +36,6 @@ env:
   RUST_BACKTRACE: 1
   PYTHON_VERSION: "3.11"
   RUST_STABLE_VERSION: "1.94.0"
-  RUST_NIGHTLY_VERSION: "nightly-2026-03-15"
 
 jobs:
   checkout-lfs:
@@ -87,11 +86,6 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview, clippy, rustfmt
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
-        with:
-          toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
-          components: llvm-tools-preview
-      - run: rustup default ${{ env.RUST_STABLE_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           shared-key: rust-x86_64-extras
@@ -129,9 +123,12 @@ jobs:
       # pools, which is what made python-common report zero lines. Separate
       # steps mean separate shells. test.yml had this shape; the migration
       # collapsed it.
+      # Built on stable, like every other lane and like the wheels we ship.
+      # Coverage measures the configuration that reaches users: the
+      # `#[cfg(nightly)]` native-f16 path is not in a released wheel, so
+      # instrumenting it measured code nobody runs. `build_info()` reports
+      # which implementation is compiled in.
       - name: Build Python bindings with coverage instrumentation
-        env:
-          RUSTUP_TOOLCHAIN: ${{ env.RUST_NIGHTLY_VERSION }}
         run: |
           source /tmp/coverage-env.sh
           # The wheels are built instrumented: loading them from Python writes
