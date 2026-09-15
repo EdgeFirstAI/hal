@@ -1,6 +1,6 @@
 # Nightly Full + G13. Skips when main has not moved since the last success.
 #
-# Shared workflows: EdgeFirstAI/.github @ 2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+# Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 
 name: Nightly
 
@@ -17,15 +17,28 @@ concurrency:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@a9b62d8918435787be65aae7f840a666a641a557
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@a9b62d8918435787be65aae7f840a666a641a557
     with:
       lanes: all
       nightly: true
+      # The feature powerset is not meaningful for this workspace. Its whole
+      # premise is removing default features, and `static` -- which selects
+      # edgefirst-tensor's backend -- is a default feature of every consumer.
+      # 16 of 23 members depend on that crate and it rejects a missing
+      # backend with a deliberate compile_error!, so the powerset spends its
+      # 264 runs building configurations the design declares invalid.
+      #
+      # --exclude-no-default-features skips only the bare
+      # --no-default-features run, 1 of those 264; every subset run still
+      # drops `static`. Empty disables the lane, which is honest rather than
+      # a filter list that has to grow with the workspace. Revisit if
+      # backend selection ever stops being feature-gated.
+      hack-args: ""
       boards: nxp-imx8mp-latest
       lfs: true
       python: false
@@ -108,6 +121,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          # The decoder tests read models through edgefirst_bench::testdata.
+          # Without LFS they get pointer files, which parse as garbage: 35
+          # of 438 baseline tests failed with ShapeError/OutOfBounds, and
+          # cargo-mutants will not test a tree whose baseline is red.
+          lfs: true
 
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
         with:

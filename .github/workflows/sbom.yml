@@ -9,7 +9,7 @@
 # This workflow is the full scancode source scan, called from release.yml and
 # available on demand.
 #
-# Shared workflows: EdgeFirstAI/.github @ 2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+# Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 
 name: SBOM Generation & License Compliance
 
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   sbom:
-    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@a9b62d8918435787be65aae7f840a666a641a557
     with:
       mode: full
       project-name: hal
