@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI builds and tests only on the stable toolchain pinned in `rust-toolchain.toml`. The coverage lane was the last place Rust nightly was used; it now measures the same configuration that ships. The `#[cfg(nightly)]` native-f16 path in the Python bindings still exists and can be built locally, but CI makes no guarantee about it — `build_info()` reports which implementation is compiled in.
+
 - The `profiling` profile carries line tables instead of full debug info (`debug = "line-tables-only"`). Profiles and stack traces still resolve to file and line; binaries are substantially smaller.
 - `make sbom` writes to `sbom/` and enforces the same license policy as CI, fetched from EdgeFirstAI/.github. hal's own copy had drifted, so the two could reach different verdicts on the same dependency tree.
 - Pull requests run a quick lint, format and unit-test pass by default. Add the `ci:full` label for the full platform matrix, or `ci:hardware` for the on-target board run. See CONTRIBUTING.md.
