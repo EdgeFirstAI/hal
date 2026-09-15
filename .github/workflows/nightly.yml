@@ -1,6 +1,6 @@
 # Nightly Full + G13. Skips when main has not moved since the last success.
 #
-# Shared workflows: EdgeFirstAI/.github @ 2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+# Shared workflows: EdgeFirstAI/.github @ a9b62d8918435787be65aae7f840a666a641a557
 
 name: Nightly
 
@@ -17,15 +17,20 @@ concurrency:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@a9b62d8918435787be65aae7f840a666a641a557
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@a9b62d8918435787be65aae7f840a666a641a557
     with:
       lanes: all
       nightly: true
+      # edgefirst-tensor requires exactly one of two mutually exclusive backend
+      # features and rejects the combination with compile_error!, so the
+      # powerset'''s bare --no-default-features run builds something the design
+      # forbids. Excluding it tests the guard'''s intent rather than fighting it.
+      hack-args: --feature-powerset --depth 2 --exclude-no-default-features
       boards: nxp-imx8mp-latest
       lfs: true
       python: false
