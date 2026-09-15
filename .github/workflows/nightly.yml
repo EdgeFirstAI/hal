@@ -1,0 +1,177 @@
+# Nightly Full + G13. Skips when main has not moved since the last success.
+#
+# Shared workflows: EdgeFirstAI/.github @ 2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# A manual dispatch must not interleave with the scheduled run: both would race
+# on the same self-hosted board and the same Sonar `main` baseline.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changed:
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+
+  nightly:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    with:
+      lanes: all
+      nightly: true
+      boards: nxp-imx8mp-latest
+      lfs: true
+      python: false
+      sonar: false
+      scancode: true
+      skip-macos: true
+      skip-windows: true
+      timeout-minutes: 45
+      board-timeout-minutes: 45
+      # Same class as Full: a nightly that takes twice as long delays the
+      # failure signal by a working morning. Flip to `hosted` here if the
+      # monthly larger-runner spend needs trimming; nothing blocks on nightly.
+      runner-class-linux: larger
+      runner-class-linux-arm: larger
+      pre-command: bash .github/scripts/ci-setup.sh
+      board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
+      # One process per binary, not per test. nextest's process-per-test model
+      # costs a full EGL init/teardown per test on this board -- 6 to 22s each,
+      # measured -- and writes one profraw per process, which exhausted the
+      # eMMC at 307 files / 2.8 GB. Running each binary once is what test.yml
+      # did, and it is why the same suite took 16 minutes.
+      #
+      # The selection is the routing test.yml used: the image and tensor lib
+      # binaries filtered to the hardware tests, plus the integration binaries
+      # that are whole-binary GPU/DMA tests. Everything else is CPU-only and
+      # already covered by the aarch64 host lane.
+      board-binaries: |
+        edgefirst_image=g2d,opengl
+        edgefirst_tensor=dma
+        dst_view_stride
+        offset_nv_source_upload
+        offset_source_view_alignment
+        gl_concurrent_stress
+        reconstructed_view_convert
+        pin_convert
+        crop_golden
+        mask_golden
+        odd_dim_cpu
+        pin
+        protocol
+        protocol_roundtrip
+        dynamic_primitives
+        identity
+        vocabulary
+      # A floor, not a target. Guards against a selection that matches nothing
+      # and reports success; tighten once a green run reports the real count.
+      board-min-tests: "100"
+      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      # The board is an eMMC-constrained i.MX 8M Plus. profiling is thin-LTO
+      # with debug = "line-tables-only", which is what kept the on-target
+      # payload shippable before the migration; the dev profile's full debug
+      # info fills the disk.
+      archive-profile: profiling
+      archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
+    secrets: inherit
+
+  nightly-hal:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    uses: ./.github/workflows/hal-full.yml
+    secrets: inherit
+
+  differential:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    uses: ./.github/workflows/differential.yml
+
+  # Line coverage says a line ran, not that anything would notice if it were
+  # wrong. cargo-mutants injects faults and reports which survive unkilled: a
+  # surviving mutant is a real hole that coverage hides, and a test that kills
+  # nothing is provably worthless. Nightly only -- it recompiles per mutant,
+  # so it is far too slow for a PR gate. EDGEAI-1608.
+  mutants:
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
+    name: Mutation testing
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
+        with:
+          tool: cargo-mutants
+
+      - name: Run cargo-mutants
+        env:
+          # Scope to the pure-logic crates. image and codec reach the GPU and a
+          # mutant there hangs or aborts the driver rather than failing a test,
+          # which reports as "unviable" and tells us nothing. Widen once the
+          # baseline on these is understood.
+          PACKAGES: >-
+            --package edgefirst-tensor
+            --package edgefirst-tracker
+            --package edgefirst-decoder
+        run: |
+          set -euo pipefail
+          # --in-place keeps one target dir rather than a copy per job; the
+          # timeout multiplier is against the measured baseline, so a mutant
+          # that makes a test hang is killed rather than holding the runner.
+          # shellcheck disable=SC2086  # PACKAGES is an argument list and must split
+          cargo mutants --no-shuffle --in-place --timeout-multiplier 3 \
+            $PACKAGES \
+            --output mutants-report \
+            -- --profile ci || true
+
+      - name: Summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          out=mutants-report/mutants.out
+          if [[ ! -d "$out" ]]; then
+            echo "::warning::cargo-mutants produced no report"
+            exit 0
+          fi
+          for f in caught missed timeout unviable; do
+            n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+            echo "$f: $n"
+            echo "$f: $n" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ -s "$out/missed.txt" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Surviving mutants (no test noticed the change)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -50 "$out/missed.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants-report
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The `main` coverage baseline. Full never runs on push to main in the
+  # label-driven model, so without this the baseline goes stale and every PR
+  # decorates against an ageing reference.
+  sonar:
+    needs: [changed, nightly, nightly-hal]
+    if: >-
+      always() && !cancelled() &&
+      needs.changed.outputs.run == 'true' &&
+      (needs.nightly.result == 'success' || needs.nightly-hal.result == 'success')
+    uses: ./.github/workflows/sonar.yml
+    secrets: inherit

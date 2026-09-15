@@ -1,0 +1,197 @@
+# HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
+# Shared workflows: EdgeFirstAI/.github @ 2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+#
+# The shared commit appears only in the uses: pins below. The shared workflows
+# resolve their own repository and commit from the job context, so there is no
+# second value to keep in sync and Dependabot's bump is complete on its own.
+#
+# Action Versions (hash-pinned):
+# - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
+# - dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d (v4.0.3)
+
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      full:
+        type: boolean
+        default: false
+      hardware:
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.f.outputs.code }}
+      full: ${{ steps.mode.outputs.full }}
+      hardware: ${{ steps.mode.outputs.hardware }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: f
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.*'
+              - 'rust-toolchain.toml'
+              - 'pyproject.toml'
+              - '.github/**'
+              - 'scripts/**'
+              - 'Makefile'
+      - id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          DISPATCH_FULL: ${{ inputs.full }}
+          DISPATCH_HARDWARE: ${{ inputs.hardware }}
+        run: |
+          full=false
+          hardware=false
+          case "$EVENT_NAME" in
+            merge_group) full=true ;;
+            workflow_dispatch)
+              full="$DISPATCH_FULL"
+              hardware="$DISPATCH_HARDWARE"
+              ;;
+          esac
+          # Sticky: Full re-runs on later pushes while the label is present.
+          case ",$LABELS," in *,ci:full,*) full=true ;; esac
+          case ",$LABELS," in *,ci:hardware,*) hardware=true ;; esac
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "hardware=$hardware" >> "$GITHUB_OUTPUT"
+
+  quick:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    with:
+      runner: ubuntu-24.04
+      timeout-minutes: 20
+      lfs: true
+      # ruff lint only. The maturin + pytest pass is Full-tier work and lives in
+      # hal-full.yml, where the nightly toolchain and wheels already exist.
+      python: true
+      ruff-paths: crates/python-tensor crates/python-codec crates/python-image crates/python-decoder crates/python-tracker crates/python-common tests
+      skip-cross-clippy: true
+      pre-command: bash .github/scripts/ci-setup.sh
+      clippy-args: --workspace --all-targets --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
+      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      cache-key: quick-x86_64
+
+  full:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    with:
+      lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
+      boards: nxp-imx8mp-latest
+      lfs: true
+      python: false
+      # hal runs its own Sonar job (sonar.yml) so the nightly gets the same
+      # upload; the shared one would only cover the shared lanes.
+      sonar: false
+      scancode: true
+      # macOS and Windows lanes live in hal-full.yml: they need codesigning and
+      # a WARP gating pass that a single nextest-args string cannot express.
+      skip-macos: true
+      skip-windows: true
+      # Safety net, not a budget. Full ran a 37 min median on these same
+      # xlarge runners before the migration; 45 leaves headroom without
+      # normalising a slow tier.
+      timeout-minutes: 45
+      board-timeout-minutes: 45
+      # Full is speed-optimised and bills for it. Phase 2 moves linux and
+      # linux-arm to the self-hosted build-x86 fleet and these go to zero.
+      runner-class-linux: larger
+      runner-class-linux-arm: larger
+      pre-command: bash .github/scripts/ci-setup.sh
+      board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
+      # One process per binary, not per test. nextest's process-per-test model
+      # costs a full EGL init/teardown per test on this board -- 6 to 22s each,
+      # measured -- and writes one profraw per process, which exhausted the
+      # eMMC at 307 files / 2.8 GB. Running each binary once is what test.yml
+      # did, and it is why the same suite took 16 minutes.
+      #
+      # The selection is the routing test.yml used: the image and tensor lib
+      # binaries filtered to the hardware tests, plus the integration binaries
+      # that are whole-binary GPU/DMA tests. Everything else is CPU-only and
+      # already covered by the aarch64 host lane.
+      board-binaries: |
+        edgefirst_image=g2d,opengl
+        edgefirst_tensor=dma
+        dst_view_stride
+        offset_nv_source_upload
+        offset_source_view_alignment
+        gl_concurrent_stress
+        reconstructed_view_convert
+        pin_convert
+        crop_golden
+        mask_golden
+        odd_dim_cpu
+        pin
+        protocol
+        protocol_roundtrip
+        dynamic_primitives
+        identity
+        vocabulary
+      # A floor, not a target. Guards against a selection that matches nothing
+      # and reports success; tighten once a green run reports the real count.
+      board-min-tests: "100"
+      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      # The board is an eMMC-constrained i.MX 8M Plus. profiling is thin-LTO
+      # with debug = "line-tables-only", which is what kept the on-target
+      # payload shippable before the migration; the dev profile's full debug
+      # info fills the disk.
+      archive-profile: profiling
+      archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
+    secrets: inherit
+
+  hal-full:
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
+    uses: ./.github/workflows/hal-full.yml
+    secrets: inherit
+
+  sonar:
+    needs: [changes, full, hal-full]
+    if: >-
+      always() && !cancelled() &&
+      (needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true') &&
+      (needs.full.result == 'success' || needs.full.result == 'skipped') &&
+      (needs.hal-full.result == 'success' || needs.hal-full.result == 'skipped') &&
+      (needs.full.result == 'success' || needs.hal-full.result == 'success') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    uses: ./.github/workflows/sonar.yml
+    secrets: inherit
+
+  ci-gate:
+    if: always()
+    needs: [changes, quick, full, hal-full, sonar]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -e 'to_entries | all(.value.result == "success" or .value.result == "skipped")'

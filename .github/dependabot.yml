@@ -1,0 +1,15 @@
+version: 2
+# Dependabot bumps action SHAs in workflow YAML, including the
+# `uses: EdgeFirstAI/.github@…` pins. That bump is complete on its own: the
+# shared workflows resolve their own commit from the job context, so there is
+# no second value to update alongside it.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5

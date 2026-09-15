@@ -51,7 +51,7 @@ Each extension module caches its own `#[pyclass]` type objects in its own
 `static LazyTypeObject`. So:
 
 ```python
-edgefirst.tensor.Tensor is edgefirst.image.Tensor   # False — by design
+edgefirst.tensor.Tensor is edgefirst.image.Tensor  # False — by design
 ```
 
 Cross-package handoff is **duck-typed** through the

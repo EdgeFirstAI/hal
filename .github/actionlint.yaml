@@ -1,0 +1,19 @@
+# actionlint configuration.
+#
+# Labels actionlint cannot know about.
+#
+# The board is reached only from Full and Nightly on same-repository refs; the
+# shared rust-full workflow enforces that.
+#
+# The -xlarge labels are GitHub larger runners provisioned by the organisation
+# rather than predefined by GitHub, so they are absent from actionlint's built-in
+# list. Confirmed present via orgs/EdgeFirstAI/actions/hosted-runners; they sit
+# in the Default runner group. Note there is no Windows larger runner in that
+# list, which is why the Windows lanes stay on windows-latest.
+self-hosted-runner:
+  labels:
+    - nxp-imx8mp-latest
+    - ubuntu-24.04-xlarge
+    - ubuntu-24.04-arm-xlarge
+    - ubuntu-22.04-xlarge
+    - ubuntu-22.04-arm-xlarge

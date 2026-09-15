@@ -1,110 +1,35 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright © 2025 Au-Zone Technologies. All Rights Reserved.
+# SBOM and license compliance, via the org's single policy copy.
 #
-# SBOM Generation & License Compliance Workflow
+# The policy scripts and the allowlist live in EdgeFirstAI/.github. hal used to
+# carry its own generate_sbom.sh and check_license_policy.py, which meant the
+# same repository enforced two different policies: the org copy through the
+# Quick tier and the local copy here. They disagreed.
 #
-# Generates Software Bill of Materials (SBOM) and validates license compliance.
-# Uses cargo-cyclonedx for Rust dependencies and scancode-toolkit for source files.
+# Dependency-mode SBOM and license policy run in Quick (inside rust-quick).
+# This workflow is the full scancode source scan, called from release.yml and
+# available on demand.
 #
-# Action Versions (hash-pinned for security per Au-Zone SPS v2.1):
-# - actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd (v6.0.2)
-# - actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 (v6.2.0)
-# - actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a (v7.0.1)
-# - actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c (v8.0.1)
-# - dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 (v1)
-# - softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda (v3.0.0)
+# Shared workflows: EdgeFirstAI/.github @ 2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
 
 name: SBOM Generation & License Compliance
 
 on:
-  push:
-    branches: [main, develop, 'release/**']
-    paths-ignore:
-      - 'benchmarks/**'
-      - 'BENCHMARKS_PLAN.md'
-  pull_request:
-    branches: [main, develop, 'release/**']
-    paths-ignore:
-      - 'benchmarks/**'
-      - 'BENCHMARKS_PLAN.md'
-  release:
-    types: [published]
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: sbom-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  sbom-compliance:
-    name: Generate SBOM & Check License Compliance
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
-        with:
-          toolchain: stable
-
-      - name: Install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx
-
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.11'
-
-      - name: Install scancode-toolkit
-        run: |
-          python3 -m venv venv
-          venv/bin/pip install --upgrade pip
-          venv/bin/pip install scancode-toolkit
-
-      - name: Install CycloneDX CLI
-        run: |
-          mkdir -p ~/.local/bin
-          wget -q -O ~/.local/bin/cyclonedx \
-            https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.27.1/cyclonedx-linux-x64
-          chmod +x ~/.local/bin/cyclonedx
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Generate Complete SBOM
-        run: .github/scripts/generate_sbom.sh
-
-      - name: Validate SBOM Format
-        run: cyclonedx validate --input-file sbom.json
-
-      - name: Upload SBOM Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: sbom-${{ github.sha }}
-          path: |
-            sbom.json
-            NOTICE
-          retention-days: 90
-
-      - name: Fail on License Violations
-        if: failure()
-        run: |
-          echo "❌ SBOM generation or license policy check failed!"
-          echo "Review the output above for details."
-          exit 1
-
-  release-sbom:
-    name: Attach SBOM to Release
-    if: github.event_name == 'release'
-    runs-on: ubuntu-22.04
-    needs: sbom-compliance
-
-    steps:
-      - name: Download SBOM Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          name: sbom-${{ github.sha }}
-
-      - name: Attach SBOM to Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
-        with:
-          files: |
-            sbom.json
-            NOTICE
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  sbom:
+    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@2cf908d62859aaef0d8fc01aa63b97e601bb6d8b
+    with:
+      mode: full
+      project-name: hal
+      project-type: library
+      version-file: Cargo.toml
+      source-dirs: crates tests
+      timeout-minutes: 20
+      # release.yml downloads this name to attach the SBOM to the release.
+      upload-name: sbom-${{ github.sha }}

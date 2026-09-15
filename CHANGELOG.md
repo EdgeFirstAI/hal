@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rust-toolchain.toml` pins the toolchain to 1.94.0 with `rustfmt` and `clippy`, so a checkout builds and lints against the same compiler CI uses without anyone selecting one.
+- `make notice` regenerates NOTICE. `make sbom` validates it rather than regenerating it.
+
+### Changed
+
+- The `profiling` profile carries line tables instead of full debug info (`debug = "line-tables-only"`). Profiles and stack traces still resolve to file and line; binaries are substantially smaller.
+- `make sbom` writes to `sbom/` and enforces the same license policy as CI, fetched from EdgeFirstAI/.github. hal's own copy had drifted, so the two could reach different verdicts on the same dependency tree.
+- Pull requests run a quick lint, format and unit-test pass by default. Add the `ci:full` label for the full platform matrix, or `ci:hardware` for the on-target board run. See CONTRIBUTING.md.
+
 ## [0.31.0] - 2026-09-08
 
 ### Fixed

@@ -745,30 +745,35 @@ bench-nvjpeg:
 # SBOM & LICENSE COMPLIANCE
 # ===========================================================================
 
+# The policy scripts live in EdgeFirstAI/.github, at the commit ci.yml pins, so
+# this target enforces the same policy the Quick tier does. hal's own copies
+# drifted from the org ones and the two disagreed about the same dependencies.
 .PHONY: sbom
 sbom:
-	@echo "Generating SBOM..."
-	@if [ ! -f ".github/scripts/generate_sbom.sh" ]; then \
-		echo "ERROR: .github/scripts/generate_sbom.sh not found"; \
-		exit 1; \
-	fi
-	@.github/scripts/generate_sbom.sh
+	@echo "Fetching the org license policy..."
+	@CI_SCRIPTS=$$(.github/scripts/fetch-ci-scripts.sh); \
+		echo "Generating SBOM (policy from $$CI_SCRIPTS)..."; \
+		PROJECT_NAME=hal PROJECT_TYPE=library VERSION_FILE=Cargo.toml \
+		SOURCE_DIRS="crates tests" SBOM_MODE=$${SBOM_MODE:-dependency} \
+		OUTPUT_DIR=sbom SCRIPT_DIR="$$CI_SCRIPTS" \
+		"$$CI_SCRIPTS/generate_sbom.sh"
 	@echo "Validating SBOM format..."
 	@if command -v cyclonedx >/dev/null 2>&1; then \
-		cyclonedx validate --input-file sbom.json; \
+		cyclonedx validate --input-file sbom/sbom.json; \
 	else \
 		echo "Warning: cyclonedx CLI not found, skipping validation"; \
 	fi
-	@echo "Checking license policy compliance..."
-	@python3 .github/scripts/check_license_policy.py sbom.json
-	@if [ -f "NOTICE" ]; then \
-		echo "Validating NOTICE file..."; \
-		if [ -f ".github/scripts/validate_notice.py" ]; then \
-			python3 .github/scripts/validate_notice.py NOTICE sbom.json || \
-				echo "⚠️  NOTICE validation failed - may need manual update"; \
-		fi; \
-	fi
-	@echo "✓ SBOM generated and validated"
+	@echo "✓ SBOM generated and validated (sbom/sbom.json)"
+
+# generate_sbom.sh validates NOTICE but never writes it; regenerating is a
+# deliberate step because NOTICE is a published artifact.
+.PHONY: notice
+notice:
+	@CI_SCRIPTS=$$(.github/scripts/fetch-ci-scripts.sh); \
+		python3 .github/scripts/generate_notice.py sbom/sbom.json > NOTICE.new; \
+		mv NOTICE.new NOTICE; \
+		python3 "$$CI_SCRIPTS/validate_notice.py" sbom/sbom.json --notice NOTICE
+	@echo "✓ NOTICE regenerated from sbom/sbom.json"
 
 # ===========================================================================
 # VERSION VERIFICATION

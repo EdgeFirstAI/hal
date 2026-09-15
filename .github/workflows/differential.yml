@@ -25,10 +25,7 @@
 name: Differential (Static vs Dynamic Backend)
 
 on:
-  schedule:
-    # 03:17 UTC daily -- off the hour, clear of the release/tag-release
-    # workflows' own scheduled/triggered load.
-    - cron: '17 3 * * *'
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
@@ -48,10 +45,13 @@ env:
 jobs:
   test-differential:
     name: G13 (static vs. dynamic, test for test)
-    runs-on: ubuntu-22.04-xlarge
-    # Two full wheel builds + up to four full suite passes; give it real
-    # headroom rather than tripping the default 6h limit on a bad day.
-    timeout-minutes: 180
+    # runner-class: larger
+    # Two wheel builds plus up to four full suite passes, the longest job in
+    # the fleet. Nightly is speed-optimised like Full: a G13 that runs into the
+    # working day delays the signal it exists to give. Phase 2 moves this to the
+    # self-hosted build-x86 class.
+    runs-on: ubuntu-24.04-xlarge
+    timeout-minutes: 120
 
     steps:
       - name: Checkout code

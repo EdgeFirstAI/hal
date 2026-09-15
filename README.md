@@ -731,7 +731,7 @@ crate. The workspace uses `resolver = "3"`, the MSRV-aware resolver, so
 `rust-version` also constrains **dependency selection**: `cargo update`
 will not pull a dependency release that requires a newer compiler.
 Raising the MSRV is therefore a user-visible change, not just a build
-detail — bump it here, in the CI `RUST_STABLE_VERSION`, and in the
+detail — bump it here, in `rust-toolchain.toml`, and in the
 CHANGELOG together.
 
 No source change was needed to support 1.94.0; it records the floor the

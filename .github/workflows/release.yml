@@ -30,6 +30,13 @@
 #   New layout crates (edgefirst-decoder-abi, edgefirst-tensor-abi,
 #   edgefirst-tensor-ffi) need a first upload and Trusted Publishing too.
 
+# runner-class: larger
+#   Release is speed-optimised and bills for it: it runs once per tag, and a
+#   slow release is a release someone is waiting on. Build matrices use larger
+#   runners; the publish and verify jobs stay standard because they are I/O
+#   bound on the registries, not CPU bound. Windows stays standard: the org
+#   has no Windows larger runner provisioned, so a larger label would queue.
+
 name: Release
 
 on:
@@ -43,6 +50,10 @@ on:
         description: 'Tag to build release for'
         required: true
         type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -59,9 +70,10 @@ jobs:
   verify-version:
     name: Verify version consistency
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: '3.11'
       - name: Check every version surface against the tag
@@ -84,6 +96,7 @@ jobs:
   verify-publish-manifests:
     name: Verify crates.io manifests package
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [verify-version]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -106,15 +119,16 @@ jobs:
     needs: [verify-version]
     name: Build wheels (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
           - name: x86_64-linux
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-xlarge
             maturin-args: --sdist --zig --compatibility manylinux2014
             maturin-deps: maturin[patchelf,zig]
           - name: aarch64-linux
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm-xlarge
             maturin-args: --zig --compatibility manylinux2014
             maturin-deps: maturin[patchelf,zig]
           - name: windows
@@ -122,7 +136,7 @@ jobs:
             maturin-args: ''
             maturin-deps: maturin
           - name: macos
-            runner: macos-latest
+            runner: macos-latest-xlarge
             maturin-args: ''
             maturin-deps: maturin
 
@@ -274,25 +288,26 @@ jobs:
   build-capi:
     name: Build modular C API (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     needs: [verify-version]
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-linux
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-xlarge
             rust_target: ''
             libdir: target/release
           - target: aarch64-linux
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm-xlarge
             rust_target: ''
             libdir: target/release
           - target: aarch64-macos
-            runner: macos-latest
+            runner: macos-latest-xlarge
             rust_target: ''
             libdir: target/release
           - target: x86_64-macos
-            runner: macos-latest
+            runner: macos-latest-xlarge
             rust_target: x86_64-apple-darwin
             libdir: target/x86_64-apple-darwin/release
           - target: x86_64-windows
@@ -426,6 +441,7 @@ jobs:
   publish-tensor:
     name: Publish edgefirst-tensor
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     needs: [build-wheels, verify-publish-manifests, build-capi]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     environment:
@@ -448,6 +464,7 @@ jobs:
   publish-dependents:
     name: Publish edgefirst-${{ matrix.pkg }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     needs: [publish-tensor]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     strategy:
@@ -477,6 +494,7 @@ jobs:
   verify-release:
     name: Verify the published set installs
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     needs: [publish-dependents]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     steps:
@@ -524,6 +542,7 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     needs: [build-wheels, verify-publish-manifests, build-capi]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     environment:
@@ -592,10 +611,16 @@ jobs:
             sleep 15
           done
 
+  sbom:
+    name: Generate SBOM
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/sbom.yml
+
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-22.04
-    needs: [build-wheels, build-capi]
+    timeout-minutes: 15
+    needs: [build-wheels, build-capi, sbom]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
@@ -623,6 +648,17 @@ jobs:
           pattern: capi-*
           path: dist
           merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: sbom-${{ github.sha }}
+          path: dist
+
+      # The shared SBOM workflow uploads sbom.json alone; NOTICE is a tracked
+      # file and generate_sbom.sh has already validated it against this SBOM.
+      - name: Stage NOTICE alongside the SBOM
+        run: cp NOTICE dist/NOTICE
 
       - name: Extract changelog
         id: changelog
