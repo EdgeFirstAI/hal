@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Updated Cargo dependencies, which clears [RUSTSEC-2026-0204](https://rustsec.org/advisories/RUSTSEC-2026-0204) — an invalid pointer dereference in `crossbeam-epoch`'s `fmt::Pointer` implementation for `Atomic` and `Shared`. The crate reaches this tree transitively through `crossbeam-deque`; the advisory is cleared by `crossbeam-epoch` 0.9.21.
+
+
 ### Added
 
 - `rust-toolchain.toml` pins the toolchain to 1.94.0 with `rustfmt` and `clippy`, so a checkout builds and lints against the same compiler CI uses without anyone selecting one.
