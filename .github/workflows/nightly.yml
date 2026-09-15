@@ -125,12 +125,21 @@ jobs:
             --package edgefirst-decoder
         run: |
           set -euo pipefail
-          # No `-- --profile ci`: `ci` is a NEXTEST profile, defined in
-          # .config/nextest.toml. cargo-mutants passes trailing args to
-          # `cargo test`, which resolves --profile against [profile.*] in
-          # Cargo.toml, so the baseline failed with "profile `ci` is not
-          # defined" and 0 of 7057 enumerated mutants were tested -- while
-          # `|| true` reported the job green.
+          # Argument routing here is easy to get wrong, and did go wrong:
+          # one `--` passes args to `cargo test` itself, so `-- --profile ci`
+          # became `cargo test ... --profile ci`, which cargo resolves
+          # against [profile.*] in Cargo.toml. `ci` is a NEXTEST profile
+          # from .config/nextest.toml, so the baseline failed with
+          # "profile `ci` is not defined" and 0 of 7057 enumerated mutants
+          # were tested, while `|| true` reported the job green.
+          #
+          # A SECOND `--` is what reaches the libtest harness, which is
+          # where --test-threads belongs. Single-threaded is a hard
+          # invariant for this repository, not a tuning knob: GL driver
+          # concurrency, G2D per-process state and CMA pool exhaustion each
+          # require it independently (TESTING.md). cargo-mutants runs
+          # `cargo test`, so it needs --test-threads=1 the same as any
+          # other cargo test invocation here.
           #
           # --in-place keeps one target dir rather than a copy per job; the
           # timeout multiplier is against the measured baseline, so a mutant
@@ -139,7 +148,8 @@ jobs:
           # shellcheck disable=SC2086  # PACKAGES is an argument list and must split
           cargo mutants --no-shuffle --in-place --timeout-multiplier 3 \
             $PACKAGES \
-            --output mutants-report || rc=$?
+            --output mutants-report \
+            -- -- --test-threads=1 || rc=$?
           echo "cargo-mutants exit $rc"
           # 0 all caught, 2 some survived, 3 some timed out: real results
           # this lane reports rather than gates on. 1 usage, 4 baseline
