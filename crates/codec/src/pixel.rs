@@ -133,6 +133,41 @@ impl ImagePixel for f32 {
     }
 }
 
+/// Map a pooled decode destination for CPU fill.
+///
+/// [`crate::ImageLoad::load_image`] first `configure_image`s the tensor to
+/// the current frame, so the mapped window is often shorter than the backing
+/// (a max-size pool). `map_write()` is tried first: it is the cheap,
+/// correct call everywhere except one case — a `CpuAccess::ReadWrite`
+/// -declared D3D11 texture tensor (`edgefirst-profiler`'s own decode pool is
+/// declared this way; see `orchestrator/buffers.rs::create_decode_source_pool`)
+/// has a staging texture, and unmapping a write-only *partial* window through
+/// it would publish the whole staging copy — including rows the caller never
+/// touched — back onto the real texture, so the tensor crate refuses it and
+/// names the fix in its own error: map the window `CpuAccess::ReadWrite`
+/// instead, which triggers the staging refresh that keeps those rows defined.
+///
+/// Falling back only on that refusal, rather than requesting `ReadWrite`
+/// unconditionally, is what keeps every other platform's cheap path cheap: a
+/// `CpuAccess::Write`-declared D3D11 tensor (no staging) and every Linux
+/// dma-buf decode succeed on the first try, so they never pay for the
+/// `ReadWrite` map's extra cache-invalidate work that the destination's own
+/// decoder-only write never needed. A `map_write()` failure that has nothing
+/// to do with a partial window (an access declaration too narrow to write at
+/// all, a tensor already mapped elsewhere, ...) fails the same way through
+/// `map_mut()` -- both request writable access, and whichever declaration or
+/// contention refused one refuses the other -- so the fallback attempt is
+/// harmless and the original, more specific error is what callers see.
+pub(crate) fn map_decode_dst<'a, T: ImagePixel>(
+    dst: &edgefirst_tensor::Tensor<T>,
+) -> Result<edgefirst_tensor::view::HostView<'a, T>, edgefirst_tensor::Error> {
+    use edgefirst_tensor::TensorTrait;
+    match dst.map_write() {
+        Ok(map) => Ok(map),
+        Err(write_err) => dst.map_mut().map_err(|_| write_err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

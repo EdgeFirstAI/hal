@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::{IUnknown, Interface, PCWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Fence, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    ID3D11Fence, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
     D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_MAP_READ_WRITE, D3D11_RESOURCE_MISC_SHARED,
     D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
@@ -1002,7 +1002,17 @@ where
         // both backings on one tensor owns the ordering between them, which is
         // the coherency obligation `crate::pin` already states.
         match (self.wrote_host.load(Ordering::Acquire), self.host.get()) {
-            (true, Some(buffer)) => upload_buffer(self.device, &self.texture, buffer),
+            // `host_pin` hands out the whole backing, never a window, so this
+            // publishes every row -- unlike the windowed publish a scoped
+            // write map's `HostBufferGuard` does.
+            (true, Some(buffer)) => upload_buffer_window(
+                self.device,
+                &self.texture,
+                buffer,
+                self.layout.texture_width,
+                0,
+                self.layout.texture_height,
+            ),
             _ => match &self.staging {
                 // SAFETY: both textures are live and identically described,
                 // and `_staging_claim` is held across this call, so the
@@ -1124,23 +1134,48 @@ where
         self.view_offset = offset;
     }
 
-    /// Refuses a write-only window that covers less than the whole backing.
+    /// This window as `(start_row, row_count)` in the backing's own texel
+    /// rows, when the window is a whole-row range a `D3D11_BOX` can name.
     ///
-    /// Unmapping a writable window publishes the *whole* backing -- a
-    /// `CopyResource` of the staging texture, or an `UpdateSubresource` of the
-    /// host buffer -- and a write-only window is not refreshed from the
-    /// texture first. For a whole-tensor map that is the documented contract
-    /// ("bytes the caller leaves untouched are undefined"). For a sub-view it
-    /// is not a contract the caller can meet: the window spans its own rows
-    /// only, so the rows outside it get published as undefined bytes on first
-    /// use and as a stale snapshot afterwards. `ReadWrite` is the same window
-    /// with the refresh, so it says what it costs.
+    /// `pitched_extent` is always a multiple of `backing_pitch` (it is built
+    /// as a row count times the pitch), so only `view_offset` needs the
+    /// alignment check. A non-row-aligned `view_offset` -- not something
+    /// `configure_image`'s row-window narrowing produces, but a generic
+    /// `set_plane_offset` byte offset can in principle be one -- has no
+    /// `D3D11_BOX` that names it, so callers fall back to refusing the map.
+    fn row_window(&self) -> Option<(usize, usize)> {
+        let pitch = self.backing_pitch();
+        if pitch == 0 || !self.view_offset.is_multiple_of(pitch) {
+            return None;
+        }
+        Some((self.view_offset / pitch, self.pitched_extent() / pitch))
+    }
+
+    /// Refuses a write-only window this backend cannot publish safely.
+    ///
+    /// Unmapping a writable window through the *staging* texture publishes
+    /// the whole backing -- a `CopyResource` of the staging texture -- and a
+    /// write-only window is not refreshed from the real texture first, so
+    /// rows outside the window would be undefined. For a whole-tensor map
+    /// that is the documented contract ("bytes the caller leaves untouched
+    /// are undefined"); for a sub-view it is not a contract the caller can
+    /// meet, so it is refused. `ReadWrite` is the same window with the
+    /// refresh, so it says what it costs.
+    ///
+    /// The host-buffer path (no staging -- a `CpuAccess::Write`-declared
+    /// tensor) has no such hazard: [`HostBufferGuard`] publishes only the
+    /// window's own rows via a partial `UpdateSubresource`, never the rows
+    /// outside it, so a row-aligned partial write is safe there and is not
+    /// refused.
     fn refuse_partial_write(&self, access: CpuAccess) -> Result<()> {
         if access != CpuAccess::Write {
             return Ok(());
         }
         let backing = self.backing_bytes();
         if self.view_offset == 0 && self.pitched_extent() >= backing {
+            return Ok(());
+        }
+        if self.staging.is_none() && self.row_window().is_some() {
             return Ok(());
         }
         Err(Error::InvalidArgument(format!(
@@ -1245,6 +1280,27 @@ where
     }
 
     fn buffer_pin<'a>(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'a>> {
+        // A read map of a write-only tensor must not push its host bytes into
+        // the texture; only a writable map publishes, and only the rows it
+        // actually owns -- `row_window` is what keeps that publish from
+        // touching rows outside this view that belong to a different frame
+        // in the same pooled allocation. `pin_impl`'s `refuse_partial_write`
+        // already refuses a `CpuAccess::Write` request this cannot express;
+        // this also covers a `ReadWrite` request, which that check does not.
+        let write_region = if access.writes() {
+            Some(self.row_window().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "writable map of a D3D11 texture tensor window ({} bytes at offset {}) not \
+                     aligned to the {}-byte backing pitch: the host-buffer path can only \
+                     publish whole rows",
+                    self.pitched_extent(),
+                    self.view_offset,
+                    self.backing_pitch()
+                ))
+            })?)
+        } else {
+            None
+        };
         let buffer = self.host_buffer();
         buffer.state().claim(access.writes())?;
         if access.writes() {
@@ -1257,9 +1313,8 @@ where
             device: self.device,
             texture: self.texture.clone(),
             host: Arc::clone(&self.host),
-            // A read map of a write-only tensor must not push its host bytes
-            // into the texture; only a writable map publishes.
-            writeback: access.writes(),
+            texture_width: self.layout.texture_width,
+            writeback: write_region,
         };
         Ok(self.pin_over(base, len, guard))
     }
@@ -1526,16 +1581,56 @@ fn publish(device: &D3d11Device) {
     unsafe { device.ctx().Flush() };
 }
 
-/// Uploads the host buffer's rows into the texture at the pitch the buffer
-/// was allocated with.
-fn upload_buffer(device: &D3d11Device, texture: &ID3D11Texture2D, buffer: &HostBuffer) {
+/// Uploads `row_count` of the host buffer's own rows into the texture at
+/// `row_offset`, at the pitch the buffer was allocated with.
+///
+/// A boxed `UpdateSubresource`, not the whole-resource form (a `None` box):
+/// publishing exactly the caller's own window is what lets a
+/// `CpuAccess::Write`-declared tensor's sub-view unmap without touching --
+/// and so without corrupting -- rows outside it that hold a different frame
+/// in the same pooled allocation. `left`/`right` still span the whole
+/// pitch-width row, matching `row_window`'s own row-granular contract (see
+/// `pitched_extent`): a row is wholly this tensor's, so nothing outside it is
+/// touched by covering it entirely.
+///
+/// `row_offset`/`row_count` name a sub-range for `buffer_pin`'s windowed
+/// write (derived from `row_window`, itself bounded by `check_view_offset`),
+/// or `(0, texture_height)` for `sync_for_device`'s unwindowed `host_pin`
+/// republish -- 0 is trivially in range regardless of `view_offset`.
+fn upload_buffer_window(
+    device: &D3d11Device,
+    texture: &ID3D11Texture2D,
+    buffer: &HostBuffer,
+    texture_width: usize,
+    row_offset: usize,
+    row_count: usize,
+) {
     let (base, _) = buffer.span();
+    // SAFETY: `row_offset` rows are within the buffer's own span for both
+    // callers -- `buffer_pin`'s window is bounded by `check_view_offset`,
+    // and `sync_for_device` always passes `row_offset = 0`.
+    let src = unsafe { base.add(row_offset * buffer.row_pitch) };
+    let region = D3D11_BOX {
+        left: 0,
+        top: row_offset as u32,
+        front: 0,
+        right: texture_width as u32,
+        bottom: (row_offset + row_count) as u32,
+        back: 1,
+    };
     // SAFETY: the buffer is live for the call, the destination texture is
-    // live, and `row_pitch` is the pitch its rows are laid out at.
+    // live, `region` is bounded by the texture's own extent for the same
+    // reason `src` is bounded by the buffer's, and `row_pitch` is the pitch
+    // `src`'s rows are laid out at.
     unsafe {
-        device
-            .ctx()
-            .UpdateSubresource(texture, 0, None, base.cast(), buffer.row_pitch as u32, 0);
+        device.ctx().UpdateSubresource(
+            texture,
+            0,
+            Some(&region),
+            src.cast(),
+            buffer.row_pitch as u32,
+            0,
+        );
     }
 }
 
@@ -1569,12 +1664,16 @@ impl Drop for StagingGuard {
     }
 }
 
-/// Releases one claim on the host buffer and, for a writable map, uploads it.
+/// Releases one claim on the host buffer and, for a writable map, uploads
+/// the rows it wrote. `writeback` is `Some((row_offset, row_count))` for a
+/// writable map -- `buffer_pin` computed it from `row_window` -- and `None`
+/// for a read map, which must not push its host bytes into the texture.
 struct HostBufferGuard {
     device: &'static D3d11Device,
     texture: ID3D11Texture2D,
     host: Arc<OnceLock<HostBuffer>>,
-    writeback: bool,
+    texture_width: usize,
+    writeback: Option<(usize, usize)>,
 }
 
 impl Drop for HostBufferGuard {
@@ -1588,11 +1687,18 @@ impl Drop for HostBufferGuard {
         // another thread take a write map and mutate the rows in the middle of
         // `UpdateSubresource`.
         let mut state = buffer.state();
-        if self.writeback {
-            upload_buffer(self.device, &self.texture, buffer);
+        if let Some((row_offset, row_count)) = self.writeback {
+            upload_buffer_window(
+                self.device,
+                &self.texture,
+                buffer,
+                self.texture_width,
+                row_offset,
+                row_count,
+            );
             publish(self.device);
         }
-        state.release(self.writeback);
+        state.release(self.writeback.is_some());
     }
 }
 
@@ -2001,6 +2107,68 @@ mod tests {
             assert!(
                 logical(r).iter().all(|&b| b == 0x22),
                 "row {r} is not the byte the GPU write put there"
+            );
+        }
+    }
+
+    /// The bug `crates/codec`'s D3D11 Windows support hit: `CpuAccess::Write`
+    /// is the access the tensor crate documents for decode targets, and a
+    /// `configure_image`d decode into a pooled allocation maps a row-window
+    /// shorter than the backing. Before the windowed `UpdateSubresource` fix,
+    /// unmapping such a write published the *whole* host buffer -- including
+    /// whatever stale bytes sat outside the window -- onto the texture,
+    /// silently clobbering rows that hold a different frame in the same pool.
+    #[test]
+    fn write_only_partial_row_window_does_not_clobber_rows_outside_it() {
+        let d = device().unwrap();
+        const W: usize = 64;
+        const H: usize = 12;
+        const WINDOW_START_ROW: usize = 4;
+        const WINDOW_ROWS: usize = 4;
+
+        let pool = rgba(W, H, CpuAccess::Write);
+        {
+            // A whole-backing write: not windowed, so this alone cannot
+            // exercise the bug. It seeds every row of the real texture with
+            // a sentinel the windowed write below must not disturb.
+            let mut m = pool.map_with(CpuAccess::Write).unwrap();
+            m.as_mut_slice().fill(0xAA);
+        }
+        {
+            let offset = WINDOW_START_ROW * pool.backing_pitch();
+            let shape = vec![WINDOW_ROWS, W, 4];
+            let window = pool
+                .view(offset, &shape)
+                .expect("a CpuAccess::Write tensor's own row-aligned sub-window must be viewable");
+            let mut m = window
+                .map_with(CpuAccess::Write)
+                .expect("a row-aligned partial window must be mappable for write");
+            m.as_mut_slice().fill(0x55);
+        }
+
+        // Read back through a *second*, independently-allocated tensor so
+        // this inspects the real texture, not `pool`'s own host buffer (which
+        // the windowed write above never touched outside its own rows,
+        // whether or not the publish leaked into the texture).
+        let readback = rgba(W, H, CpuAccess::ReadWrite);
+        // SAFETY: both textures are live and identically described.
+        unsafe { d.ctx().CopyResource(&readback.texture, &pool.texture) };
+        let mapped = readback.map_with(CpuAccess::Read).unwrap();
+        let pitch = readback.backing_pitch();
+        let row_bytes = readback.layout().tight_row_bytes();
+        let bytes = mapped.as_slice();
+        let logical = |r: usize| &bytes[r * pitch..r * pitch + row_bytes];
+
+        for r in 0..H {
+            let expect = if (WINDOW_START_ROW..WINDOW_START_ROW + WINDOW_ROWS).contains(&r) {
+                0x55
+            } else {
+                0xAA
+            };
+            assert!(
+                logical(r).iter().all(|&b| b == expect),
+                "row {r}: expected every byte == {expect:#x}, the windowed write touched a row \
+                 outside its own range"
             );
         }
     }

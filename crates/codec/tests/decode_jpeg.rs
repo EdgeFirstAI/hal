@@ -822,3 +822,49 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
         );
     }
 }
+
+/// Profiler decode pools are max-sized Grey surfaces; each JPEG
+/// `configure_image`s a shorter window. On Windows that window is a D3D11
+/// texture sub-region. Covers both real allocations this crate must support:
+/// `CpuAccess::Write` (the tensor crate's documented access for decode
+/// targets, and the cheap no-staging path `map_write` alone now handles) and
+/// `CpuAccess::ReadWrite` (what `edgefirst-profiler`'s own decode pool
+/// actually declares — see `orchestrator/buffers.rs::create_decode_source_pool`
+/// — which keeps a staging texture and needs `map_decode_dst`'s fallback to
+/// `map_mut` for a partial window).
+#[cfg(windows)]
+fn decode_into_oversized_d3d11_pool_with(access: edgefirst_tensor::CpuAccess) {
+    let jpeg = testdata("zidane.jpg");
+    let allocated = Tensor::<u8>::image(
+        1920,
+        1080 * 3,
+        PixelFormat::Grey,
+        Some(TensorMemory::DmaBuf),
+        access,
+    );
+    let mut tensor = match allocated {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skipping: D3D11/DmaBuf image alloc failed: {e}");
+            return;
+        }
+    };
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(&mut decoder, &jpeg)
+        .unwrap_or_else(|e| panic!("decode into a partial D3D11 window ({access:?}): {e}"));
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_into_oversized_d3d11_pool_write() {
+    decode_into_oversized_d3d11_pool_with(edgefirst_tensor::CpuAccess::Write);
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_into_oversized_d3d11_pool_readwrite() {
+    decode_into_oversized_d3d11_pool_with(edgefirst_tensor::CpuAccess::ReadWrite);
+}
