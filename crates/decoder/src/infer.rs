@@ -1490,6 +1490,174 @@ mod tests {
         assert_eq!(proto.dshape[3].1, 32);
     }
 
+    /// The proto output is built field by field over `default_logical()`, so
+    /// a dropped field reads as `None` rather than failing to compile. The
+    /// decoder needs every one of these to dequantize and route the tensor.
+    #[test]
+    fn infer_proto_output_carries_its_name_decoder_dtype_and_quantization() {
+        let quant = Quantization {
+            scale: vec![0.0125],
+            zero_point: Some(vec![-7]),
+            axis: None,
+            dtype: Some(DType::Int8),
+        };
+        let s = ModelSignals {
+            source: ModelSource::TfLite,
+            inputs: vec![TensorInfo {
+                name: "images".into(),
+                shape: vec![1, 640, 640, 3],
+                dtype: DType::Int8,
+                quantization: None,
+            }],
+            outputs: vec![
+                TensorInfo {
+                    name: "output0".into(),
+                    shape: vec![1, 116, 8400],
+                    dtype: DType::Int8,
+                    quantization: Some(Quantization {
+                        scale: vec![0.003_921_6],
+                        zero_point: Some(vec![0]),
+                        axis: None,
+                        dtype: Some(DType::Int8),
+                    }),
+                },
+                TensorInfo {
+                    name: "protos".into(),
+                    shape: vec![1, 160, 160, 32],
+                    dtype: DType::Int8,
+                    quantization: Some(quant.clone()),
+                },
+            ],
+            metadata: synthetic_metadata(80, "segment", "False"),
+        };
+        let r = infer_ultralytics_schema(&s).unwrap();
+        let proto = r
+            .schema
+            .outputs
+            .iter()
+            .find(|o| o.type_ == Some(LogicalType::Protos))
+            .unwrap();
+        assert_eq!(proto.name.as_deref(), Some("protos"));
+        assert_eq!(proto.decoder, Some(DecoderKind::Ultralytics));
+        assert_eq!(proto.dtype, Some(DType::Int8));
+        assert_eq!(proto.quantization.as_ref(), Some(&quant));
+    }
+
+    /// A proto tensor makes the model a segmentation model whether or not the
+    /// metadata says `task: segment`. Requiring both would silently decode a
+    /// segmentation export as plain detection.
+    #[test]
+    fn infer_treats_a_proto_tensor_without_a_task_as_segmentation() {
+        let mut metadata = synthetic_metadata(80, "segment", "False");
+        metadata.remove("task");
+        let s = ModelSignals {
+            source: ModelSource::TfLite,
+            inputs: vec![TensorInfo {
+                name: "images".into(),
+                shape: vec![1, 640, 640, 3],
+                dtype: DType::Float32,
+                quantization: None,
+            }],
+            outputs: vec![
+                TensorInfo {
+                    name: "output0".into(),
+                    shape: vec![1, 116, 8400],
+                    dtype: DType::Float32,
+                    quantization: None,
+                },
+                TensorInfo {
+                    name: "output1".into(),
+                    shape: vec![1, 160, 160, 32],
+                    dtype: DType::Float32,
+                    quantization: None,
+                },
+            ],
+            metadata,
+        };
+        let r = infer_ultralytics_schema(&s).unwrap();
+        assert!(
+            r.schema
+                .outputs
+                .iter()
+                .any(|o| o.type_ == Some(LogicalType::Protos)),
+            "proto tensor present but no protos output was emitted"
+        );
+    }
+
+    fn proto_tensor(shape: Vec<usize>) -> TensorInfo {
+        TensorInfo {
+            name: "protos".into(),
+            shape,
+            dtype: DType::Float32,
+            quantization: None,
+        }
+    }
+
+    /// Both halves of the rank-and-batch guard have to reject on their own.
+    /// Requiring both instead would index past the end of a rank-3 shape.
+    #[test]
+    fn classify_proto_rejects_wrong_rank_or_batch() {
+        for shape in [vec![1, 32, 160], vec![2, 32, 160, 160], vec![1, 160, 160]] {
+            let err = classify_proto(&proto_tensor(shape.clone()), 640, 640).unwrap_err();
+            assert!(
+                matches!(err, InferError::UnsupportedLayout(_)),
+                "shape {shape:?} gave {err:?}"
+            );
+        }
+    }
+
+    /// The NHWC branch needs both spatial dims to line up. Accepting either
+    /// one would read the proto count out of a dimension that is not it.
+    #[test]
+    fn classify_proto_rejects_a_shape_matching_only_one_spatial_dim() {
+        // h/4 = w/4 = 160. s[1] matches, s[2] does not.
+        let err = classify_proto(&proto_tensor(vec![1, 160, 7, 9]), 640, 640).unwrap_err();
+        assert!(matches!(err, InferError::UnsupportedLayout(_)), "{err:?}");
+
+        // The genuine NHWC shape still classifies, with the proto count last.
+        let (k, dshape) = classify_proto(&proto_tensor(vec![1, 160, 160, 32]), 640, 640).unwrap();
+        assert_eq!(k, 32);
+        assert_eq!(dshape[3], (DimName::NumProtos, 32));
+    }
+
+    /// `unquote` strips a matching pair only. A single quote on one end is an
+    /// unterminated value, not a quoted one.
+    #[test]
+    fn unquote_requires_a_matching_pair_of_quotes() {
+        assert_eq!(unquote("'abc'").as_deref(), Some("abc"));
+        assert_eq!(unquote("\"abc\"").as_deref(), Some("abc"));
+        assert_eq!(unquote("'abc"), None);
+        assert_eq!(unquote("abc'"), None);
+        assert_eq!(unquote("\"abc"), None);
+        assert_eq!(unquote("abc\""), None);
+        assert_eq!(unquote("abc"), None);
+    }
+
+    /// A comma inside a quoted value is part of the value. Without the quote
+    /// arm the scanner never enters quoted state and splits straight through
+    /// it.
+    #[test]
+    fn split_top_level_commas_keeps_quoted_commas_together() {
+        let parts = split_top_level_commas("a='x,y', b=2");
+        assert_eq!(parts, vec!["a='x,y'".to_string(), " b=2".to_string()]);
+
+        let parts = split_top_level_commas("a=\"x,y\",b=\"p,q\"");
+        assert_eq!(parts, vec!["a=\"x,y\"".to_string(), "b=\"p,q\"".to_string()]);
+    }
+
+    /// `InferError` is what a rejection reports to the caller. A `Display`
+    /// that writes nothing turns every diagnostic into an empty string.
+    #[test]
+    fn infer_error_display_states_the_reason() {
+        let err = InferError::NotUltralytics("no names key".into());
+        let shown = err.to_string();
+        assert!(shown.contains("no names key"), "{shown}");
+        assert!(shown.contains("Ultralytics"), "{shown}");
+
+        let err = InferError::UnsupportedLayout("rank-3 proto".into());
+        assert!(err.to_string().contains("rank-3 proto"));
+    }
+
     #[test]
     fn infer_segment_task_without_proto_rejected() {
         let s = ModelSignals {

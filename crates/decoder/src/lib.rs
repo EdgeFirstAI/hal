@@ -2398,6 +2398,43 @@ mod decoder_tests {
         assert_eq!(xyxy, [10.0_f32, 20.0, 20.0, 20.0]);
     }
 
+    /// `to_xyxy_float` is the method the postprocess paths call; the
+    /// `ndarray_to_xyxy_float` above only covers XYWH's hand-inlined copy of
+    /// the same arithmetic. Centre 10,20 with a 6x8 box gives a distinct
+    /// value in all four slots, so no swapped operator lands on the same
+    /// answer.
+    #[test]
+    fn to_xyxy_float_converts_centre_and_size_to_corners() {
+        let xyxy: [f32; 4] = XYWH::to_xyxy_float(&[10.0_f32, 20.0, 6.0, 8.0]);
+        assert_eq!(xyxy, [7.0_f32, 16.0, 13.0, 24.0]);
+
+        let xyxy: [f32; 4] = XYXY::to_xyxy_float(&[7.0_f32, 16.0, 13.0, 24.0]);
+        assert_eq!(xyxy, [7.0_f32, 16.0, 13.0, 24.0]);
+    }
+
+    /// XYWH carries the same conversion twice. Nothing forces the copies to
+    /// agree, so a fix applied to one of them can silently miss the other.
+    #[test]
+    fn xywh_array_and_ndarray_conversions_agree() {
+        let input = [10.0_f32, 20.0, 6.0, 8.0];
+        let arr = array![10.0_f32, 20.0, 6.0, 8.0];
+        let from_array: [f32; 4] = XYWH::to_xyxy_float(&input);
+        let from_ndarray: [f32; 4] = XYWH::ndarray_to_xyxy_float(arr.view());
+        assert_eq!(from_array, from_ndarray);
+    }
+
+    /// `arg_max` documents that the last index wins on ties, which is the
+    /// semantics `arg_max_i8` mirrors on aarch64. A strict `>` is what makes
+    /// the fold take the later index; `>=` would keep the earlier one.
+    #[test]
+    fn arg_max_returns_the_last_index_on_a_tie() {
+        let scores = array![1_i32, 5, 5, 2];
+        assert_eq!(crate::arg_max(scores.view()), (5, 2));
+
+        let single = array![7_i32];
+        assert_eq!(crate::arg_max(single.view()), (7, 0));
+    }
+
     #[test]
     fn test_class_aware_nms_float() {
         use crate::float::nms_class_aware_float;

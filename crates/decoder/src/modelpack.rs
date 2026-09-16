@@ -617,6 +617,90 @@ mod modelpack_tests {
         }
     }
 
+    /// The 80.0 cut-off is exclusive. At exactly -80 the smooth branch still
+    /// runs and returns a small positive number; the saturating branch would
+    /// return a hard 0.0, which is a different value, not a rounding of it.
+    #[test]
+    fn fast_sigmoid_saturates_beyond_the_cutoff_not_at_it() {
+        assert!(
+            fast_sigmoid_impl(-80.0) > 0.0,
+            "-80.0 is inside the smooth range, got {}",
+            fast_sigmoid_impl(-80.0)
+        );
+        assert_eq!(fast_sigmoid_impl(-80.5), 0.0);
+        assert_eq!(fast_sigmoid_impl(80.5), 1.0);
+    }
+
+    /// Exercises the float split decode end to end on one 1x1 cell with two
+    /// classes: the class count derived from the last dimension, the box
+    /// decode, and the objectness-weighted class scores.
+    #[test]
+    fn modelpack_split_float_decodes_boxes_and_objectness_weighted_scores() {
+        fn full_sigmoid(x: f32) -> f32 {
+            1.0 / (1.0 + (-x).exp())
+        }
+
+        // (H, W, na * (5 + nc)) with na = 1 and nc = 2.
+        let raw = Array3::from_shape_vec((1, 1, 7), vec![0.0, 0.0, 0.0, 0.0, 2.0, 1.0, -1.0])
+            .expect("shape matches the data");
+        let config = [ModelPackDetectionConfig {
+            anchors: vec![[2.0, 3.0]],
+            quantization: None,
+        }];
+
+        let (boxes, scores) = postprocess_modelpack_split_float(&[raw.view()], &config);
+
+        assert_eq!(boxes.shape(), &[1, 4]);
+        assert_eq!(scores.shape(), &[1, 2]);
+
+        // p = sigmoid(raw); grid cell (0,0) contributes -0.5, and 1/width and
+        // 1/height are both 1.0 for a 1x1 grid.
+        let obj = full_sigmoid(2.0);
+        let expected_box = [
+            0.5 * 2.0 - 0.5,
+            0.5 * 2.0 - 0.5,
+            0.5 * 0.5 * 4.0 * 2.0,
+            0.5 * 0.5 * 4.0 * 3.0,
+        ];
+        let expected_scores = [full_sigmoid(1.0) * obj, full_sigmoid(-1.0) * obj];
+
+        // fast_sigmoid_impl is accurate to 5e-4; the width and height terms
+        // square it and scale by 4 * anchor, so the box tolerance is looser
+        // than the score tolerance by exactly that factor.
+        for (i, want) in expected_box.iter().enumerate() {
+            assert!(
+                (boxes[[0, i]] - want).abs() < 1e-2,
+                "box[{i}] = {} want {want}",
+                boxes[[0, i]]
+            );
+        }
+        for (i, want) in expected_scores.iter().enumerate() {
+            assert!(
+                (scores[[0, i]] - want).abs() < 2e-3,
+                "score[{i}] = {} want {want}",
+                scores[[0, i]]
+            );
+        }
+    }
+
+    /// With one class the objectness is the score outright, and the scores
+    /// array stays a single column.
+    #[test]
+    fn modelpack_split_float_single_class_uses_objectness_as_the_score() {
+        let raw = Array3::from_shape_vec((1, 1, 6), vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .expect("shape matches the data");
+        let config = [ModelPackDetectionConfig {
+            anchors: vec![[1.0, 1.0]],
+            quantization: None,
+        }];
+
+        let (boxes, scores) = postprocess_modelpack_split_float(&[raw.view()], &config);
+
+        assert_eq!(boxes.shape(), &[1, 4]);
+        assert_eq!(scores.shape(), &[1, 1]);
+        assert!((scores[[0, 0]] - 0.5).abs() < 2e-3, "{}", scores[[0, 0]]);
+    }
+
     #[test]
     fn test_modelpack_segmentation_to_mask() {
         let seg = Array3::from_shape_vec(
