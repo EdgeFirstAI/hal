@@ -19,11 +19,20 @@ from pathlib import Path
 import coremltools as ct
 
 # CoreML ArrayFeatureType.ArrayDataType -> decoder schema dtype names.
+#
+# Values are `coremltools.proto.FeatureTypes_pb2.ArrayFeatureType.ArrayDataType`,
+# enumerated against coremltools 9.0. They encode bit-width in the high bits and
+# sit close together, which makes them very easy to transpose by eye -- never
+# edit this table from memory, re-enumerate the proto:
+#
+#   python -c "from coremltools.proto import FeatureTypes_pb2 as ft; \
+#              print(dict(ft.ArrayFeatureType.ArrayDataType.items()))"
 _ARRAY_DTYPE = {
-    65552: "float32",  # FLOAT32
-    65568: "float64",  # DOUBLE
+    65552: "float16",  # FLOAT16
+    65568: "float32",  # FLOAT32
+    65600: "float64",  # DOUBLE
+    131080: "int8",    # INT8
     131104: "int32",   # INT32
-    65550: "float16",  # FLOAT16
 }
 
 
