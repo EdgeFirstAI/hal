@@ -274,8 +274,14 @@ performance requires tensors allocated by `ImageProcessor::create_image()`:
 - **GPU pitch alignment**: row stride padded for Mali DMA-BUF import
 - **CPU access declaration**: decode targets are CPU-written — allocate
   them with `CpuAccess::Write` (the decode loop maps via `map_write()`,
-  which selects a write-oriented mapping / dma-buf sync direction);
-  `ReadWrite` also works but declares reads the decoder never performs
+  which selects a write-oriented mapping / dma-buf sync direction, and is
+  the cheapest correct choice on every backend, including a Windows D3D11
+  texture written to a partial window). `ReadWrite` also works — the decode
+  loop falls back to `map_mut()` only when `map_write()` reports
+  `Error::PartialWriteRequiresReadWrite` (a `CpuAccess::ReadWrite`-declared
+  D3D11 texture keeps a staging copy that a write-only partial window
+  cannot publish through safely) — but otherwise declares reads the
+  decoder never performs
 
 Free-standing `Tensor::new()` or `Tensor::image()` works but:
 - Cannot produce PBO tensors (requires GL context)

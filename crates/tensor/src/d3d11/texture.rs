@@ -1151,34 +1151,38 @@ where
         Some((self.view_offset / pitch, self.pitched_extent() / pitch))
     }
 
-    /// Refuses a write-only window this backend cannot publish safely.
+    /// Refuses a write-only window only the *staging* path cannot publish
+    /// safely -- the one case where retrying with `CpuAccess::ReadWrite` is
+    /// guaranteed to work, which is what makes
+    /// [`Error::PartialWriteRequiresReadWrite`] the right signal here.
     ///
-    /// Unmapping a writable window through the *staging* texture publishes
-    /// the whole backing -- a `CopyResource` of the staging texture -- and a
+    /// Unmapping a writable window through staging publishes the whole
+    /// backing -- a `CopyResource` of the staging texture -- and a
     /// write-only window is not refreshed from the real texture first, so
     /// rows outside the window would be undefined. For a whole-tensor map
     /// that is the documented contract ("bytes the caller leaves untouched
     /// are undefined"); for a sub-view it is not a contract the caller can
     /// meet, so it is refused. `ReadWrite` is the same window with the
-    /// refresh, so it says what it costs.
+    /// refresh (`establish_map`'s pre-copy runs whenever `access.reads()`),
+    /// so it says what it costs and always succeeds here.
     ///
     /// The host-buffer path (no staging -- a `CpuAccess::Write`-declared
-    /// tensor) has no such hazard: [`HostBufferGuard`] publishes only the
-    /// window's own rows via a partial `UpdateSubresource`, never the rows
-    /// outside it, so a row-aligned partial write is safe there and is not
-    /// refused.
+    /// tensor) has no such hazard and is not this function's concern:
+    /// [`HostBufferGuard`] publishes only the window's own rows via a
+    /// partial `UpdateSubresource`, so this returns `Ok` unconditionally and
+    /// leaves validating that window to `buffer_pin`'s own `row_window`
+    /// check -- which, unlike this one, a `ReadWrite` request cannot skip
+    /// past, since no staging means no backend for it to succeed through
+    /// either.
     fn refuse_partial_write(&self, access: CpuAccess) -> Result<()> {
-        if access != CpuAccess::Write {
+        if access != CpuAccess::Write || self.staging.is_none() {
             return Ok(());
         }
         let backing = self.backing_bytes();
         if self.view_offset == 0 && self.pitched_extent() >= backing {
             return Ok(());
         }
-        if self.staging.is_none() && self.row_window().is_some() {
-            return Ok(());
-        }
-        Err(Error::InvalidArgument(format!(
+        Err(Error::PartialWriteRequiresReadWrite(format!(
             "write-only map of a D3D11 texture tensor window ({} bytes at offset {}) that is \
              shorter than the {backing}-byte backing: unmapping publishes the whole texture, \
              so the rows outside the window would become undefined; map the window with \
@@ -1303,11 +1307,17 @@ where
         };
         let buffer = self.host_buffer();
         buffer.state().claim(access.writes())?;
-        if access.writes() {
-            // See `host_pin`: this is what tells `sync_for_device` which
-            // backing carries the caller's writes.
-            self.wrote_host.store(true, Ordering::Release);
-        }
+        // Deliberately does not set `wrote_host`: that flag tells a *later*
+        // `sync_for_device` to republish the whole backing, which is only
+        // correct for `host_pin`'s unwindowed write (no drop to publish at,
+        // so `sync_for_device` is the only place that can). A scoped map's
+        // `HostBufferGuard` already publishes exactly the rows it wrote when
+        // it drops; setting the sticky flag here would make a later
+        // `sync_for_device` call -- from an unrelated `host_pin` elsewhere on
+        // the same tensor, or from code that calls it defensively -- treat
+        // this write's *whole* backing as valid and republish rows outside
+        // this window that belong to a different frame in the same pool,
+        // exactly the corruption `upload_buffer_window` exists to prevent.
         let (base, len) = buffer.span();
         let guard = HostBufferGuard {
             device: self.device,
@@ -2118,6 +2128,9 @@ mod tests {
     /// unmapping such a write published the *whole* host buffer -- including
     /// whatever stale bytes sat outside the window -- onto the texture,
     /// silently clobbering rows that hold a different frame in the same pool.
+    /// Also covers a `sync_for_device` call right after the scoped map, which
+    /// would reproduce the same clobber if the map wrongly left the tensor's
+    /// sticky `wrote_host` flag set for `sync_for_device` to act on later.
     #[test]
     fn write_only_partial_row_window_does_not_clobber_rows_outside_it() {
         let d = device().unwrap();
@@ -2145,6 +2158,15 @@ mod tests {
                 .expect("a row-aligned partial window must be mappable for write");
             m.as_mut_slice().fill(0x55);
         }
+
+        // A scoped map's `HostBufferGuard` already published this window's
+        // own rows on drop above; `sync_for_device` must not do it again for
+        // the *whole* backing. It only would if the scoped map had wrongly
+        // set the sticky `wrote_host` flag `host_pin` relies on -- that flag
+        // has no per-window memory, so `sync_for_device` would treat this
+        // write's rows as license to republish the whole (partly stale)
+        // host buffer, clobbering the very rows this test checks below.
+        pool.sync_for_device(CpuAccess::Write).unwrap();
 
         // Read back through a *second*, independently-allocated tensor so
         // this inspects the real texture, not `pool`'s own host buffer (which

@@ -93,6 +93,11 @@ pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
         // `CpuAccess` (most backends today only log that case as
         // best-effort telemetry, never error) would fall in here too.
         Error::InvalidOperation(_) => libc::EACCES,
+        // A write-only D3D11 map refused only because this exact window
+        // needs `CpuAccess::ReadWrite` to publish safely -- the same shape
+        // of declined-access failure as the `InvalidOperation` arm above,
+        // and a caller that retries with `CpuAccess::ReadWrite` succeeds.
+        Error::PartialWriteRequiresReadWrite(_) => libc::EACCES,
         Error::InvalidArgument(_) | Error::InvalidShape(_) | Error::ShapeMismatch(_) => {
             libc::EINVAL
         }

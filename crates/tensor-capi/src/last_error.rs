@@ -153,9 +153,10 @@ pub(crate) fn class_of(e: &edgefirst_tensor::Error) -> EfErrorClass {
         E::BatchIndexOutOfBounds { .. } => EfErrorClass::BatchIndexOutOfBounds,
         E::RegionOutOfBounds { .. } => EfErrorClass::RegionOutOfBounds,
         E::NotImplemented(_) => EfErrorClass::NotSupported,
-        E::InvalidOperation(_) | E::PboDisconnected | E::PboMapped => {
-            EfErrorClass::InvalidOperation
-        }
+        E::InvalidOperation(_)
+        | E::PboDisconnected
+        | E::PboMapped
+        | E::PartialWriteRequiresReadWrite(_) => EfErrorClass::InvalidOperation,
         E::QuantizationInvalid { .. } => EfErrorClass::QuantizationInvalid,
         E::IoError(_) => EfErrorClass::AllocationFailed,
         #[cfg(unix)]
