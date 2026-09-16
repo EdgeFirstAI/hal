@@ -679,7 +679,10 @@ mod tests {
             .collect();
         let result = nms_extra_float(0.5, None, boxes);
         assert_eq!(result.len(), 1, "{result:?}");
-        assert_eq!(result[0].1, 0, "the surviving box keeps its extra data");
+        // Both boxes score 0.0 and par_sort_by is an unstable sort, so which
+        // of the two survives is not fixed; that it carries its own payload
+        // is.
+        assert!(result[0].1 == 0 || result[0].1 == 1, "{result:?}");
     }
 
     #[test]
@@ -731,8 +734,47 @@ mod tests {
         assert_eq!(result[1].score, 0.7);
     }
 
+    /// A box that overlaps nothing, then a pair that overlaps each other. The
+    /// first box confirms a survivor without suppressing anything, so a loop
+    /// that stops at the first survivor leaves the pair un-deduplicated while
+    /// the three-box chain above, where the first box does the suppressing,
+    /// looks identical either way.
+    fn isolated_then_overlapping_pair() -> Vec<DetectBox> {
+        let mk = |xmin: f32, xmax: f32, score: f32| DetectBox {
+            bbox: BoundingBox {
+                xmin,
+                ymin: 0.0,
+                xmax,
+                ymax: 10.0,
+            },
+            label: 0,
+            score,
+        };
+        vec![
+            mk(100.0, 110.0, 0.9),
+            mk(0.0, 10.0, 0.8),
+            mk(1.0, 11.0, 0.7),
+        ]
+    }
+
+    #[test]
+    fn nms_class_aware_float_keeps_suppressing_after_the_first_survivor() {
+        let result = nms_class_aware_float(0.5, None, isolated_then_overlapping_pair());
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].score, 0.9);
+        assert_eq!(result[1].score, 0.8);
+    }
+
     fn with_index(boxes: Vec<DetectBox>) -> Vec<(DetectBox, usize)> {
         boxes.into_iter().enumerate().map(|(i, b)| (b, i)).collect()
+    }
+
+    #[test]
+    fn nms_extra_class_aware_float_keeps_suppressing_after_the_first_survivor() {
+        let result =
+            nms_extra_class_aware_float(0.5, None, with_index(isolated_then_overlapping_pair()));
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[1].1, 1);
     }
 
     #[test]

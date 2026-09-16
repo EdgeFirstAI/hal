@@ -1198,8 +1198,50 @@ mod tests {
         assert_eq!(result[0].score, 200);
     }
 
+    /// A box that overlaps nothing, then a pair that overlaps each other. The
+    /// first box confirms a survivor without suppressing anything, so a loop
+    /// that stops at the first survivor leaves the pair un-deduplicated while
+    /// the chain above, where the first box does the suppressing, looks
+    /// identical either way.
+    fn isolated_then_overlapping_pair_int() -> Vec<DetectBoxQuantized<u8>> {
+        let mk = |xmin: f32, xmax: f32, score: u8| DetectBoxQuantized {
+            bbox: BoundingBox {
+                xmin,
+                ymin: 0.0,
+                xmax,
+                ymax: 10.0,
+            },
+            label: 0,
+            score,
+        };
+        vec![
+            mk(100.0, 110.0, 200),
+            mk(0.0, 10.0, 180),
+            mk(1.0, 11.0, 160),
+        ]
+    }
+
+    #[test]
+    fn nms_class_aware_int_keeps_suppressing_after_the_first_survivor() {
+        let result = nms_class_aware_int(0.5, None, isolated_then_overlapping_pair_int());
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].score, 200);
+        assert_eq!(result[1].score, 180);
+    }
+
     fn with_index_int(boxes: Vec<DetectBoxQuantized<u8>>) -> Vec<(DetectBoxQuantized<u8>, usize)> {
         boxes.into_iter().enumerate().map(|(i, b)| (b, i)).collect()
+    }
+
+    #[test]
+    fn nms_extra_class_aware_int_keeps_suppressing_after_the_first_survivor() {
+        let result = nms_extra_class_aware_int(
+            0.5,
+            None,
+            with_index_int(isolated_then_overlapping_pair_int()),
+        );
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[1].1, 1);
     }
 
     #[test]

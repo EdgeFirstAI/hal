@@ -1582,6 +1582,9 @@ mod tests {
                 .any(|o| o.type_ == Some(LogicalType::Protos)),
             "proto tensor present but no protos output was emitted"
         );
+        // The task the metadata did not state is the one reported back, which
+        // is the only place `is_segment` is observable.
+        assert!(r.description.contains("segment"), "{}", r.description);
     }
 
     fn proto_tensor(shape: Vec<usize>) -> TensorInfo {
