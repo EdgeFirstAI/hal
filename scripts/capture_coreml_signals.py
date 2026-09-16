@@ -39,6 +39,13 @@ _ARRAY_DTYPE = {
     131104: "int32",   # INT32
 }
 
+# Integer dtype names, matching `edgefirst_decoder::schema::DType::is_integer`
+# -- kept in sync with that method by hand, the same as `_ARRAY_DTYPE` is kept
+# in sync with the CoreML proto. Only `int8`/`int32` are reachable through
+# `_ARRAY_DTYPE` today, but the full set is listed so a future dtype addition
+# there does not silently bypass the output check below.
+_INTEGER_DTYPES = frozenset({"int8", "uint8", "int16", "uint16", "int32", "uint32"})
+
 
 def _tensor(name: str, feature) -> dict:
     kind = feature.WhichOneof("Type")
@@ -79,10 +86,23 @@ def main() -> int:
     spec = ct.models.MLModel(str(args.model), skip_model_load=True).get_spec()
     desc = spec.description
 
+    outputs = [_tensor(o.name, o.type) for o in desc.output]
+    for out in outputs:
+        if out["dtype"] in _INTEGER_DTYPES:
+            raise SystemExit(
+                f"output '{out['name']}' is a CoreML {out['dtype']} tensor. "
+                "The decoder requires per-tensor quantization parameters "
+                "(scale, zero-point) for an integer output boundary, and a "
+                "CoreML MLMultiArray feature description carries no such "
+                "contract -- CoreML quantization is a weight-compression "
+                "concept, not an I/O contract. Re-export the model with "
+                "float16 or float32 outputs."
+            )
+
     signals = {
         "source": "coreml",
         "inputs": [_tensor(i.name, i.type) for i in desc.input],
-        "outputs": [_tensor(o.name, o.type) for o in desc.output],
+        "outputs": outputs,
         "metadata": {
             k: str(v) for k, v in spec.description.metadata.userDefined.items()
         },
