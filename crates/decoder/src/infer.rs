@@ -2116,6 +2116,14 @@ mod tests {
             e2e("yolo26n", E2E, false, None),
             e2e("yolo26n-seg", E2E_SEG, false, P),
             e2e("yolo26n_float32", E2E, true, None),
+            // Same network, different exporter default. The `yolo26n` row above
+            // was captured from ultralytics 8.4.137, whose `nms` arg defaulted to
+            // `False`; `exporter.py`'s `model.end2end = self.args.nms is False`
+            // then selected the one2one (NMS-free, [1, 300, 6]) head. In 8.4.153
+            // that default is `None`, so the same expression is false and the
+            // one2many anchor-grid head ships instead -- hence a Yolov8-shaped
+            // pre-NMS row for a YOLO26 checkpoint. Both heads live in the weights.
+            pre_nms("yolo26n_coreml", DET, false, None),
         ]
     }
 

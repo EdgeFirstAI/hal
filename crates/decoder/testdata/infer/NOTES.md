@@ -114,6 +114,27 @@ models):
 This confirms the spec's assumption (a): ONNX boxes are pixel-space, TFLite
 boxes are normalized [0,1].
 
+## CoreML box convention
+
+`yolo26n_coreml.signals.json` was captured from an fp16 `.mlpackage`
+produced by `ultralytics 8.4.153` / `coremltools 9.0`, re-converted to
+float16 I/O by the profiler's `tools/export_fp16.py`.
+
+The convention is **pixel-space** (`normalized: false`), matching the ONNX
+export rather than TFLite. Reason: Ultralytics' `export_coreml` substitutes
+`IOSDetectModel` — the module that applies the `1/w` (or
+`[1/w, 1/h, 1/w, 1/h]`) normalize — **only** when
+`self.args.nms and self.model.task == "detect"`. `nms` defaults to falsy,
+so a plain `format=coreml` export never takes that branch and passes the
+raw model through exactly as the ONNX exporter does.
+
+This is source-tracing, not runtime measurement: ONNX and TFLite above were
+pinned by feeding a real image through both exports and comparing box
+magnitude (answer 5: 637.25 px vs 0.9957). CoreML has not had that same
+runtime check performed — this entry records why the convention is expected
+to match ONNX, based on reading the exporter's branch condition, not a
+measured decode. Runtime evidence is expected to follow later.
+
 ## Fixture format
 
 Each `<export-name>.signals.json` is `{"source": "onnx"|"tflite", "inputs":
