@@ -41,6 +41,15 @@ pub enum ModelSource {
     /// A TFLite/LiteRT export. Ultralytics emits boxes normalized to
     /// `[0, 1]` here, so the inferred schema sets `normalized: true`.
     TfLite,
+    /// A CoreML export (`.mlpackage` / `.mlmodelc`). Ultralytics' CoreML
+    /// converter traces the same graph the ONNX exporter traces — the
+    /// `1/w` normalize lives only in `IOSDetectModel`, which is used
+    /// solely on the `nms=True` pipeline path — so a no-NMS export emits
+    /// pixel-space box coordinates and the inferred schema sets
+    /// `normalized: false`, matching [`ModelSource::Onnx`].
+    ///
+    /// Measured, not assumed: see `testdata/infer/NOTES.md`.
+    CoreMl,
     /// Any other container. Inference **refuses** this with
     /// [`InferError::UnknownBoxConvention`] rather than assuming a box
     /// convention: whether coordinates are pixel-space or `[0, 1]` follows
@@ -957,7 +966,7 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
     // corruption `tests/infer_builder.rs` exists to pin.
     let normalized = match signals.source {
         ModelSource::TfLite => true,
-        ModelSource::Onnx => false,
+        ModelSource::Onnx | ModelSource::CoreMl => false,
         ModelSource::Other => {
             return Err(InferError::UnknownBoxConvention);
         }
@@ -1228,6 +1237,7 @@ mod tests {
         {
             "onnx" => ModelSource::Onnx,
             "tflite" => ModelSource::TfLite,
+            "coreml" => ModelSource::CoreMl,
             other => panic!("fixture {name}: unknown source `{other}`"),
         };
 
@@ -2369,5 +2379,36 @@ mod tests {
             infer_ultralytics_schema(&s),
             Err(InferError::UnsupportedLayout(_))
         ));
+    }
+
+    #[test]
+    fn coreml_source_resolves_a_box_convention() {
+        // CoreML must not hit the `Other` refusal: a native `.mlpackage`
+        // export is a measured container, not an unknown one.
+        let s = ModelSignals {
+            source: ModelSource::CoreMl,
+            inputs: vec![TensorInfo {
+                name: "images".into(),
+                shape: vec![1, 3, 640, 640],
+                dtype: DType::Float16,
+                quantization: None,
+            }],
+            outputs: vec![TensorInfo {
+                name: "output0".into(),
+                shape: vec![1, 84, 8400],
+                dtype: DType::Float16,
+                quantization: None,
+            }],
+            metadata: synthetic_metadata(80, "detect", "False"),
+        };
+        let r = infer_ultralytics_schema(&s)
+            .expect("CoreML signals must infer, not raise UnknownBoxConvention");
+        let o = &r.schema.outputs[0];
+        assert_eq!(
+            o.normalized,
+            Some(false),
+            "Ultralytics CoreML exports trace the raw model, so boxes are \
+             pixel-space exactly as in the ONNX export"
+        );
     }
 }
