@@ -187,9 +187,18 @@ struct GlPboOps {
 /// Next id handed to a GL worker. Ids are per-process and never reused.
 static NEXT_GL_WORKER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Identity and PBO bookkeeping of the GL worker running on this thread.
+struct GlWorkerState {
+    id: u64,
+    /// Full per-message serialization: this thread holds the process-wide GL
+    /// lock for the whole message, so no other worker can run until it returns.
+    serializes: bool,
+    /// Buffers currently `glMapBufferRange`-ed against this context.
+    mapped: std::collections::HashSet<u32>,
+}
+
 thread_local! {
-    /// `Some((worker_id, mapped_pbo_buffers))` on a GL worker thread, `None`
-    /// everywhere else.
+    /// `Some(state)` on a GL worker thread, `None` everywhere else.
     ///
     /// This exists because a GL message handler can itself need a PBO map:
     /// `handle_image_convert` -> `convert` -> `draw_src_texture` ->
@@ -204,7 +213,7 @@ thread_local! {
     /// inline path and the message path share one view of which buffers are
     /// mapped — `glMapBufferRange` on an already-mapped buffer is undefined
     /// behaviour, and the two paths must not be able to double-map.
-    static GL_WORKER: std::cell::RefCell<Option<(u64, std::collections::HashSet<u32>)>> =
+    static GL_WORKER: std::cell::RefCell<Option<GlWorkerState>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -212,16 +221,60 @@ thread_local! {
 /// The closure must not re-enter `GL_WORKER` (keep it to set bookkeeping — no
 /// GL calls inside).
 fn with_worker_mapped<R>(f: impl FnOnce(&mut std::collections::HashSet<u32>) -> R) -> Option<R> {
-    GL_WORKER.with(|c| c.borrow_mut().as_mut().map(|(_, set)| f(set)))
+    GL_WORKER.with(|c| c.borrow_mut().as_mut().map(|s| f(&mut s.mapped)))
 }
 
 /// True when the calling thread is the GL worker that owns `worker_id`.
 fn on_owning_gl_worker(worker_id: u64) -> bool {
-    GL_WORKER.with(|c| matches!(*c.borrow(), Some((id, _)) if id == worker_id))
+    GL_WORKER.with(|c| matches!(*c.borrow(), Some(ref s) if s.id == worker_id))
 }
 
-// SAFETY: GlPboOps sends all GL operations to the dedicated GL thread via a
-// channel. `map_buffer` returns a CPU-visible pointer from `glMapBufferRange`
+/// True when this thread is a GL worker holding the process-wide per-message
+/// lock, so no other worker can make progress until this message returns.
+fn on_serializing_gl_worker() -> bool {
+    GL_WORKER.with(|c| matches!(*c.borrow(), Some(ref s) if s.serializes))
+}
+
+/// A PBO owned by another worker's context, reached from a worker holding the
+/// process-wide per-message lock. The owning worker cannot take that lock until
+/// this message returns, so sending to it would never be answered.
+fn cross_context_pbo_error(op: &str, buffer_id: u32) -> edgefirst_tensor::Error {
+    edgefirst_tensor::Error::InvalidOperation(format!(
+        "PBO {buffer_id}: cannot {op} a buffer owned by another GL context while \
+         this one holds the serialization lock; convert it through the processor \
+         that created it"
+    ))
+}
+
+thread_local! {
+    /// Set when a re-entrant inline PBO op panicked; the worker loop folds it
+    /// into `poisoned` after the message that raised it.
+    static GL_WORKER_POISON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run a re-entrant PBO op inline on the owning worker, turning a panic into
+/// an error exactly as the channel path's `reply_caught` does.
+///
+/// The unwind MUST stop here. `PboHandle::acquire_map` publishes
+/// `MapState::Mapping` before calling `map_buffer` and clears it only on
+/// return, so a panic crossing it strands that handle in `Mapping` and every
+/// later map on it waits on the condvar forever.
+fn inline_gl_op<T>(what: &str, f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(e) => {
+            GL_WORKER_POISON.with(|p| p.set(true));
+            Err(Error::Internal(format!(
+                "GL thread panicked during {what}: {}",
+                panic_message(e.as_ref()),
+            )))
+        }
+    }
+}
+
+// SAFETY: GlPboOps runs every GL operation on the thread owning the context --
+// via the channel, or inline when that thread is already this one (see
+// `GL_WORKER`). `map_buffer` returns a CPU-visible pointer from `glMapBufferRange`
 // that remains valid until `unmap_buffer` calls `glUnmapBuffer` on the GL thread.
 // `delete_buffer` sends a fire-and-forget deletion command to the GL thread.
 unsafe impl edgefirst_tensor::PboOps for GlPboOps {
@@ -235,9 +288,13 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
         // source mid-convert). The context is already current on this thread,
         // and sending would block on the queue this thread alone drains.
         if on_owning_gl_worker(self.worker_id) {
-            return pbo_map_on_gl_thread(buffer_id, size).map_err(|e| {
+            return inline_gl_op("PboMap", || pbo_map_on_gl_thread(buffer_id, size)).map_err(|e| {
                 edgefirst_tensor::Error::NotImplemented(format!("GL PBO map failed: {e:?}"))
             });
+        }
+        // Foreign context, and this thread holds the lock the owner needs.
+        if on_serializing_gl_worker() {
+            return Err(cross_context_pbo_error("map", buffer_id));
         }
         let sender = self
             .sender
@@ -257,9 +314,13 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
     fn unmap_buffer(&self, buffer_id: u32) -> edgefirst_tensor::Result<()> {
         // See `map_buffer` — same re-entrancy, same reasoning.
         if on_owning_gl_worker(self.worker_id) {
-            return pbo_unmap_on_gl_thread(buffer_id).map_err(|e| {
+            return inline_gl_op("PboUnmap", || pbo_unmap_on_gl_thread(buffer_id)).map_err(|e| {
                 edgefirst_tensor::Error::NotImplemented(format!("GL PBO unmap failed: {e:?}"))
             });
+        }
+        // See `map_buffer`.
+        if on_serializing_gl_worker() {
+            return Err(cross_context_pbo_error("unmap", buffer_id));
         }
         let sender = self
             .sender
@@ -280,10 +341,28 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
         // See `map_buffer` — a drop mid-convert must not queue to itself.
         if on_owning_gl_worker(self.worker_id) {
             with_worker_mapped(|set| set.remove(&buffer_id));
-            unsafe { edgefirst_gl::gl::DeleteBuffers(1, &buffer_id) };
+            // Reached from `PboHandle::Drop`; an unwind out of a drop that is
+            // itself unwinding aborts the process.
+            let _ = inline_gl_op("PboDelete", || {
+                unsafe { edgefirst_gl::gl::DeleteBuffers(1, &buffer_id) };
+                Ok(())
+            });
             return;
         }
         if let Some(sender) = self.sender.upgrade() {
+            // See `map_buffer`: blocking here would deadlock the same way.
+            if on_serializing_gl_worker() {
+                if sender
+                    .try_send(GLProcessorMessage::PboDelete(buffer_id))
+                    .is_err()
+                {
+                    log::warn!(
+                        "PBO {buffer_id}: cross-context delete skipped to avoid a deadlock; \
+                         the buffer is freed when its context is destroyed"
+                    );
+                }
+                return;
+            }
             let _ = sender.blocking_send(GLProcessorMessage::PboDelete(buffer_id));
         }
     }
@@ -514,7 +593,12 @@ fn run_gl_worker(
     // the message path and the re-entrant inline path read them from here —
     // see [`GL_WORKER`] for why the inline path has to exist at all.
     GL_WORKER.with(|c| {
-        *c.borrow_mut() = Some((worker_id, std::collections::HashSet::new()));
+        *c.borrow_mut() = Some(GlWorkerState {
+            id: worker_id,
+            // Set once the policy below is resolved.
+            serializes: false,
+            mapped: std::collections::HashSet::new(),
+        });
     });
     // Clear on every exit path, including unwind, so a recycled thread id can
     // never inherit a dead worker's identity.
@@ -522,6 +606,7 @@ fn run_gl_worker(
     impl Drop for GlWorkerSlot {
         fn drop(&mut self) {
             GL_WORKER.with(|c| *c.borrow_mut() = None);
+            GL_WORKER_POISON.with(|p| p.set(false));
         }
     }
     let _gl_worker_slot = GlWorkerSlot;
@@ -556,6 +641,11 @@ fn run_gl_worker(
             "LifecycleOnly (parallel across processors)"
         }
     );
+    GL_WORKER.with(|c| {
+        if let Some(state) = c.borrow_mut().as_mut() {
+            state.serializes = serialize_per_msg;
+        }
+    });
     while let Some(msg) = recv.blocking_recv() {
         // Full policy: one processor's message at a time, process-wide.
         // Linux locks GL_MUTEX (messages must also exclude the locked
@@ -594,6 +684,10 @@ fn run_gl_worker(
         // a no-op elsewhere). Runs under the lock taken above.
         gl_converter.begin_gpu_pass();
         handle_gl_message(msg, &mut gl_converter, &mut poisoned);
+        // A re-entrant inline PBO op reports its panic here: `inline_gl_op`
+        // converted it to an error so it could not unwind into the tensor
+        // crate, which means `reply_caught` never saw it.
+        poisoned |= GL_WORKER_POISON.with(|p| p.replace(false));
         // Per-pass platform texture attachments (macOS pbuffer
         // binds) are released once the message's GPU work has
         // synced; deferred batches keep theirs until Flush.
@@ -937,7 +1031,7 @@ fn pbo_map_on_gl_thread(
              both hold a live tensor over it)"
         )));
     }
-    let result = unsafe {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
         edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
         let ptr = edgefirst_gl::gl::MapBufferRange(
             edgefirst_gl::gl::PIXEL_PACK_BUFFER,
@@ -954,13 +1048,18 @@ fn pbo_map_on_gl_thread(
                 size,
             })
         }
-    };
-    if result.is_err() {
+    }));
+    if !matches!(result, Ok(Ok(_))) {
         // The map did not take — release the reservation so a retry is not
         // permanently blocked by a mapping that never happened.
         with_worker_mapped(|set| set.remove(&buffer_id));
     }
-    result
+    match result {
+        Ok(result) => result,
+        // Reaches whichever boundary the caller has: `handle_pbo_map` on the
+        // message path, `inline_gl_op` on the re-entrant one.
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// Unmap counterpart of [`pbo_map_on_gl_thread`]; same thread requirement.

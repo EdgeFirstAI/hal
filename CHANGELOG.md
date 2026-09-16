@@ -44,10 +44,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it no longer round-trips through the channel. Each processor carries an id
   so a worker only ever services its own context inline, and the mapped-buffer
   set moved to that thread's state so the inline and message paths cannot
-  double-map a buffer. Measured on an RTX-class desktop: 2 hangs in 10 runs
-  before, 0 in 30 after. Targets reaching the GPU through DMA-BUF zero-copy or
-  CPU staging — the embedded boards — were never affected, since their convert
+  double-map a buffer. The inline path keeps the channel path's failure
+  contract: a GL panic still rolls back the buffer's map reservation and
+  poisons the context, and is not allowed to unwind into
+  `PboHandle::acquire_map`, which would strand that handle mid-map and park
+  every later map on it forever. Measured on an RTX-class desktop: 2 hangs in
+  10 runs before, 0 in 30 after. Targets reaching the GPU through DMA-BUF
+  zero-copy or CPU staging — the embedded boards — were never affected, since their convert
   sources are not PBO-backed.
+
+- **A convert whose PBO source came from a different `ImageProcessor` could
+  hang on drivers that serialize GL per message** — Vivante/galcore, ANGLE on
+  Windows, virtualized GPUs, and anything run under
+  `EDGEFIRST_GL_SERIALIZE=full`. The converting worker holds a process-wide
+  lock for the whole message and sent the map to the worker owning the buffer;
+  that worker needs the same lock to answer, so neither side moved. The
+  cross-context case is now refused with an error naming the owning processor
+  rather than hanging. Platforms on the `LifecycleOnly` policy hold no such
+  lock and still service these maps through the channel unchanged. This
+  predates the fix above and was found while reviewing it.
 
 ## [0.31.0] - 2026-09-08
 

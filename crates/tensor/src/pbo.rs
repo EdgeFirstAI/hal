@@ -66,9 +66,9 @@ unsafe impl Send for PboMapping {}
 
 /// Trait for PBO GL operations, implemented by the image crate.
 ///
-/// All methods are blocking — they send commands to the GL thread
-/// and wait for completion. Implementations must ensure GL context
-/// is current on the thread that executes the actual GL calls.
+/// All methods are blocking. Implementations must ensure the GL context is
+/// current on the thread that executes the actual GL calls — by sending to the
+/// GL worker, or by running inline when the caller already IS that worker.
 ///
 /// # Safety
 ///
@@ -77,6 +77,10 @@ unsafe impl Send for PboMapping {}
 ///   CPU-accessible memory that remains valid until `unmap_buffer` is called.
 /// - `unmap_buffer` invalidates the pointer and releases the mapping.
 /// - `delete_buffer` frees the GL buffer resources.
+/// - No method unwinds. `PboHandle::acquire_map` publishes `MapState::Mapping`
+///   before calling `map_buffer` and clears it only on return, so a panic
+///   crossing this boundary strands that handle and every later map on it waits
+///   on the condvar forever.
 pub unsafe trait PboOps: Send + Sync {
     /// Map the PBO for CPU read/write access.
     /// The returned PboMapping is valid until `unmap_buffer` is called.

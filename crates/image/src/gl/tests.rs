@@ -3291,6 +3291,160 @@ mod gl_tests {
         }
     }
 
+    /// Regression test for the GL worker self-deadlock: a PBO-backed SOURCE
+    /// mapped from inside a GL message handler.
+    ///
+    /// `convert_via_engine` sends PBO sources to `draw_src_texture_from_pbo`,
+    /// which binds the buffer and never maps it — which is why the RGBA→RGBA
+    /// `test_gl_convert_pbo_to_pbo_no_deadlock` above does not reach this. A
+    /// PLANAR destination returns earlier, into `convert_nv_to_planar_two_pass`
+    /// -> `convert_to` -> `convert_to_dims` -> `draw_src_texture`, whose upload
+    /// arm calls `src.map_read()`. On a PBO source that is
+    /// `GlPboOps::map_buffer` running on the worker thread that owns the queue;
+    /// before the fix it `blocking_send`-ed to the capacity-1 channel it is
+    /// itself the only consumer of and hung forever.
+    ///
+    /// `src_uploads` is asserted so this cannot pass by taking some other route
+    /// and never exercising the inline map it exists to guard.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO sources: Linux + Windows
+    fn test_gl_convert_pbo_src_to_planar_no_deadlock() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let pbo_src = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
+            Ok(t) => t,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - PBO not supported: {e:?}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let dst = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::PlanarRgb,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("planar destination tensor");
+
+        let before = gl.convert_stats().map(|s| s.src_uploads).unwrap_or(0);
+        let src_dyn = TensorDyn::from(pbo_src);
+        let mut dst_dyn = TensorDyn::from(dst);
+        let res = gl.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        );
+        match res {
+            Ok(()) => {
+                let after = gl.convert_stats().map(|s| s.src_uploads).unwrap_or(0);
+                assert!(
+                    after > before,
+                    "convert completed with no CPU source upload ({before} -> {after}); \
+                     this test no longer reaches the inline PBO map it guards"
+                );
+            }
+            Err(e) => {
+                let msg = format!("{e:?}");
+                assert!(
+                    !msg.contains("GL converter thread exited"),
+                    "PBO source to planar convert deadlocked: {msg}"
+                );
+                crate::test_support::report_skip(&format!(
+                    "{} - convert failed unrelated: {msg}",
+                    function!()
+                ));
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    struct SerializeEnvGuard;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl SerializeEnvGuard {
+        fn set(v: &str) -> Self {
+            std::env::set_var("EDGEFIRST_GL_SERIALIZE", v);
+            SerializeEnvGuard
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl Drop for SerializeEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("EDGEFIRST_GL_SERIALIZE");
+        }
+    }
+
+    /// A PBO source owned by a DIFFERENT processor's context, converted under
+    /// the `Full` serialization policy.
+    ///
+    /// This deadlock predates the inline-map fix and is not cured by it: under
+    /// `Full` the worker holds a process-wide lock for the whole message, so a
+    /// map sent to the owning worker waits on a reply that worker cannot send
+    /// until the lock is released. It is refused now instead of hanging.
+    /// `LifecycleOnly` platforms are unaffected — there is no lock to hold, and
+    /// the cross-context map still goes through the channel normally.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn test_gl_cross_context_pbo_source_refused_not_deadlocked() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+
+        // Must precede both processors: the policy is read at worker startup.
+        let _serialize = SerializeEnvGuard::set("full");
+        let mut gl_a = GLProcessorThreaded::new(None).unwrap();
+        let gl_b = GLProcessorThreaded::new(None).unwrap();
+
+        let pbo_src = match gl_b.create_pbo_image(64, 64, PixelFormat::Rgba) {
+            Ok(t) => t,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - PBO not supported: {e:?}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let dst = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::PlanarRgb,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("planar destination tensor");
+
+        let src_dyn = TensorDyn::from(pbo_src);
+        let mut dst_dyn = TensorDyn::from(dst);
+        // The planar destination is what routes the source through
+        // `draw_src_texture`'s mapping arm; see the PBO-source test above.
+        let res = gl_a.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        );
+        let msg = format!(
+            "{:?}",
+            res.expect_err("a cross-context PBO map under Full serialization must be refused")
+        );
+        assert!(
+            msg.contains("another GL context"),
+            "must be refused by the cross-context guard, not some other error path: {msg}"
+        );
+    }
+
     // ---- Multiplane PixelFormat::Nv12 GPU tests ----
 
     /// Helper: load PixelFormat::Nv12 raw bytes into separate DMA-backed luma and chroma tensors,
