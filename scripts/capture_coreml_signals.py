@@ -27,10 +27,14 @@ import coremltools as ct
 #
 #   python -c "from coremltools.proto import FeatureTypes_pb2 as ft; \
 #              print(dict(ft.ArrayFeatureType.ArrayDataType.items()))"
+#
+# DOUBLE (65600) is deliberately absent: `edgefirst_decoder::schema::DType`
+# has no Float64 variant, so a captured "float64" signal would produce a
+# fixture nothing downstream can consume. It falls through to the
+# unmapped-dtype error below, which is the correct outcome for it.
 _ARRAY_DTYPE = {
     65552: "float16",  # FLOAT16
     65568: "float32",  # FLOAT32
-    65600: "float64",  # DOUBLE
     131080: "int8",    # INT8
     131104: "int32",   # INT32
 }
@@ -42,6 +46,13 @@ def _tensor(name: str, feature) -> dict:
         ma = feature.multiArrayType
         dtype = _ARRAY_DTYPE.get(ma.dataType)
         if dtype is None:
+            if ma.dataType == 65600:  # DOUBLE
+                raise SystemExit(
+                    f"'{name}' is a CoreML DOUBLE tensor, which has no "
+                    "edgefirst_decoder::schema::DType equivalent (the decoder "
+                    "supports float16/float32/int8/int32 I/O, not float64); "
+                    "re-export the model with float16 or float32 I/O"
+                )
             raise SystemExit(f"unmapped CoreML array dataType {ma.dataType} on '{name}'")
         return {
             "name": name,
