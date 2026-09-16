@@ -129,7 +129,13 @@ jobs:
     # runner could have caught them. arm64 Linux runners are free tier, so
     # covering the other half of the code costs runner time and nothing else.
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    # The arm64 runner is about twice as slow on this work -- shard 0 took 27
+    # minutes on x86_64 and 57 on arm64 in run 35151929668 -- and it also
+    # builds cargo-mutants from source, since no aarch64 binary is published.
+    # At a flat 120 that run's arm64 shard 1 was cancelled mid-sweep while its
+    # x86_64 twin finished in 50 minutes, which loses the shard rather than
+    # reporting it.
+    timeout-minutes: ${{ matrix.runner == 'ubuntu-24.04-arm' && 180 || 120 }}
     strategy:
       fail-fast: false
       # One shard failing says nothing about the others, and the point of the
