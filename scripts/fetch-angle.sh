@@ -219,20 +219,56 @@ if [[ "${PLATFORM}" == windows ]]; then
     exit 0
 fi
 
-# Re-extract only if the destination is missing the EGL framework marker.
-if [[ -f "${DEST}/EGL.xcframework/macos-arm64/libEGL.framework/libEGL" ]]; then
+EGL_BIN="${DEST}/EGL.xcframework/macos-arm64/libEGL.framework/libEGL"
+GLES_BIN="${DEST}/GLESv2.xcframework/macos-arm64/libGLESv2.framework/libGLESv2"
+
+# Re-extract unless BOTH framework binaries are present. Checking only EGL let
+# a half-populated ${DEST} look complete.
+if [[ -f "${EGL_BIN}" && -f "${GLES_BIN}" ]]; then
     echo "fetch-angle: already extracted at ${DEST}"
 else
     echo "fetch-angle: extracting to ${DEST}"
-    extract_zip "${ZIP_PATH}" "${DEST}"
-    # The zip's top level is "dist/"; move its contents up so ${DEST} IS the
-    # dist dir (consumers expect ${DEST}/EGL.xcframework directly).
-    if [[ -d "${DEST}/dist" ]]; then
-        # shellcheck disable=SC2211
-        mv "${DEST}"/dist/* "${DEST}"/ 2>/dev/null || true
-        rmdir "${DEST}/dist" 2>/dev/null || true
-    fi
+    # Extract to a staging dir, then move the payload in deliberately,
+    # replacing whatever is already there.
+    #
+    # This used to extract straight into ${DEST} and flatten the zip's top
+    # level with `mv "${DEST}"/dist/* "${DEST}"/ 2>/dev/null || true`. When
+    # ${DEST}/EGL.xcframework already existed -- which a partially restored
+    # target/ cache leaves behind -- BSD mv refuses to merge one directory into
+    # another and fails. The redirect hid the message and `|| true` hid the
+    # status, so the payload stayed in ${DEST}/dist and the script ran on to
+    # fail in the cp below, reporting "No such file or directory" for a path
+    # the zip definitely contains. It only surfaced on a cache miss, which is
+    # why the same commit passed and failed hours apart.
+    STAGING="${DEST}/.extract"
+    rm -rf "${STAGING}"
+    extract_zip "${ZIP_PATH}" "${STAGING}"
+
+    # The zip's top level is "dist/"; consumers expect ${DEST}/EGL.xcframework
+    # directly. Tolerate the prefix being absent.
+    SRC="${STAGING}/dist"
+    [[ -d "${SRC}" ]] || SRC="${STAGING}"
+
+    for item in EGL.xcframework GLESv2.xcframework BUILD_INFO.txt LICENSE; do
+        [[ -e "${SRC}/${item}" ]] || continue
+        rm -rf "${DEST:?}/${item}"
+        mv "${SRC}/${item}" "${DEST}/"
+    done
+    rm -rf "${STAGING}"
+
+    # A flat-lib left by an earlier extract would otherwise be reused below
+    # without being restaged against the binaries just unpacked.
+    rm -rf "${DEST}/macos-flat-lib"
 fi
+
+# Fail where the cause is legible, rather than in the cp below.
+for required in "${EGL_BIN}" "${GLES_BIN}"; do
+    [[ -f "${required}" ]] || {
+        echo "fetch-angle: ERROR - ${required} missing after extracting ${ZIP_NAME}" >&2
+        echo "fetch-angle: ${DEST} holds: $(ls -A "${DEST}" 2>/dev/null | tr '\n' ' ')" >&2
+        exit 1
+    }
+done
 
 # --- Stage the macOS flat-lib layout ----------------------------------------
 #
@@ -252,10 +288,8 @@ if [[ -f "${FLAT_DIR}/libEGL.dylib" && -f "${FLAT_DIR}/libGLESv2.dylib" ]]; then
 else
     echo "fetch-angle: staging macOS flat-lib at ${FLAT_DIR}"
     mkdir -p "${FLAT_DIR}"
-    cp "${DEST}/EGL.xcframework/macos-arm64/libEGL.framework/libEGL" \
-       "${FLAT_DIR}/libEGL.dylib"
-    cp "${DEST}/GLESv2.xcframework/macos-arm64/libGLESv2.framework/libGLESv2" \
-       "${FLAT_DIR}/libGLESv2.dylib"
+    cp "${EGL_BIN}" "${FLAT_DIR}/libEGL.dylib"
+    cp "${GLES_BIN}" "${FLAT_DIR}/libGLESv2.dylib"
 fi
 
 # Ad-hoc re-sign the flattened dylibs. The release framework binaries are
