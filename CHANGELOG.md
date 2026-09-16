@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CoreML as a recognized model container for schema inference.** `infer_ultralytics_schema` now accepts a CoreML (`.mlpackage` / `.mlmodelc`) export and resolves its box coordinates as pixel-space, matching ONNX — established by source-tracing the Ultralytics CoreML exporter, not the runtime magnitude measurement that pinned ONNX and TFLite. Available from Rust (`ModelSource::CoreMl`), Python (`source="coreml"`), and C (`ef_infer_signals_new(3)`).
 - `rust-toolchain.toml` pins the toolchain to 1.94.0 with `rustfmt` and `clippy`, so a checkout builds and lints against the same compiler CI uses without anyone selecting one.
 - `make notice` regenerates NOTICE. `make sbom` validates it rather than regenerating it.
 
