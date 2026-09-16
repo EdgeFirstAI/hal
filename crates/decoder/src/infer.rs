@@ -116,9 +116,10 @@ pub enum InferError {
     /// per-tensor only, so such a schema would build a decoder that fails.
     UnsupportedQuantization(String),
     /// The signals came from [`ModelSource::Other`], for which the box
-    /// coordinate convention is unmeasured. Only the ONNX (pixel-space)
-    /// and TFLite (`[0, 1]`) conventions are characterized, and picking
-    /// the wrong one silently scales every box by the input size.
+    /// coordinate convention is unmeasured. Only the ONNX (pixel-space),
+    /// TFLite (`[0, 1]`), and CoreML (pixel-space) conventions are
+    /// characterized, and picking the wrong one silently scales every box
+    /// by the input size.
     UnknownBoxConvention,
 }
 
@@ -150,7 +151,8 @@ impl fmt::Display for InferError {
             InferError::UnknownBoxConvention => write!(
                 f,
                 "box coordinate convention is unknown for this container; only \
-                 onnx (pixel-space) and tflite ([0,1]) are characterized"
+                 onnx (pixel-space), tflite ([0,1]), and coreml (pixel-space) \
+                 are characterized"
             ),
         }
     }
@@ -2400,7 +2402,7 @@ mod tests {
     #[test]
     fn coreml_source_resolves_a_box_convention() {
         // CoreML must not hit the `Other` refusal: a native `.mlpackage`
-        // export is a measured container, not an unknown one.
+        // export is a source-traced convention, not an unknown one.
         let s = ModelSignals {
             source: ModelSource::CoreMl,
             inputs: vec![TensorInfo {
