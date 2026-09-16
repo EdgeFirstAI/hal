@@ -134,7 +134,10 @@ jobs:
       fail-fast: false
       # One shard failing says nothing about the others, and the point of the
       # night is breadth. max-parallel leaves concurrency for anything else
-      # that happens to be queued.
+      # that happens to be queued, and stays at 8 now that the matrix is two
+      # architectures deep: the night runs in two passes instead of one rather
+      # than taking twice the concurrency. Nothing waits on this lane, so the
+      # wall clock is not a cost.
       max-parallel: 8
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
