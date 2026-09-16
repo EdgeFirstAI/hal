@@ -51,6 +51,14 @@ pub enum ModelSource {
     /// Established by source-tracing the Ultralytics exporter rather than
     /// by runtime magnitude measurement; `testdata/infer/NOTES.md` records
     /// the reasoning and the captured fixture.
+    ///
+    /// This resolution covers the no-NMS export only. A `nms=True` export
+    /// runs Apple's NMS pipeline (`image`/`iouThreshold`/
+    /// `confidenceThreshold` inputs, dynamically-shaped `confidence`/
+    /// `coordinates` outputs) — a different artifact entirely, not the
+    /// anchor-grid tensor this resolution reasons about. Inference does
+    /// not classify it as a schema: neither output's shape can match the
+    /// `[1, 4+nc, A]` anchor-grid layout this module looks for.
     CoreMl,
     /// Any other container. Inference **refuses** this with
     /// [`InferError::UnknownBoxConvention`] rather than assuming a box
@@ -2428,5 +2436,50 @@ mod tests {
             "Ultralytics CoreML exports trace the raw model, so boxes are \
              pixel-space exactly as in the ONNX export"
         );
+    }
+
+    #[test]
+    fn coreml_nms_pipeline_export_is_refused_not_classified() {
+        // `yolo export ... format=coreml nms=True` does not produce the
+        // anchor-grid tensor `ModelSource::CoreMl`'s pixel-space
+        // resolution reasons about -- it substitutes Apple's own NMS
+        // pipeline, whose two outputs are dynamically shaped and already
+        // post-NMS. Real measured shapes (Task 3b brief, from a genuine
+        // `yolo26n.pt` export): `confidence` and `coordinates` are both
+        // float32 multiArrays with an empty (fully dynamic) shape --
+        // nothing here is the `[1, 4+nc, A]` layout this module looks
+        // for, so inference must refuse it rather than guess. This
+        // refusal is intentional: do not "fix" it into acceptance, since
+        // that would apply CoreMl's pixel-space convention (or none at
+        // all) to output Apple's pipeline has already decoded and scaled
+        // its own way.
+        let s = ModelSignals {
+            source: ModelSource::CoreMl,
+            inputs: vec![TensorInfo {
+                name: "image".into(),
+                shape: vec![1, 3, 640, 640],
+                dtype: DType::Float16,
+                quantization: None,
+            }],
+            outputs: vec![
+                TensorInfo {
+                    name: "confidence".into(),
+                    shape: vec![],
+                    dtype: DType::Float32,
+                    quantization: None,
+                },
+                TensorInfo {
+                    name: "coordinates".into(),
+                    shape: vec![],
+                    dtype: DType::Float32,
+                    quantization: None,
+                },
+            ],
+            metadata: synthetic_metadata(80, "detect", "False"),
+        };
+        assert!(matches!(
+            infer_ultralytics_schema(&s),
+            Err(InferError::UnsupportedLayout(_))
+        ));
     }
 }

@@ -135,6 +135,17 @@ runtime check performed — this entry records why the convention is expected
 to match ONNX, based on reading the exporter's branch condition, not a
 measured decode. Runtime evidence is expected to follow later.
 
+This resolution covers the no-NMS export only. `yolo export ... nms=True`
+takes the `IOSDetectModel` branch above and substitutes Apple's own NMS
+pipeline: a real `yolo26n.pt` export with `nms=True` produces three inputs
+(`image` imageType, `iouThreshold` doubleType, `confidenceThreshold`
+doubleType) and two dynamically-shaped outputs (`confidence`,
+`coordinates`, both float32 with shape `[]`) — not the anchor-grid tensor
+this section reasons about. That export is a different artifact that
+inference does not classify: `capture_coreml_signals.py` refuses
+`imageType` inputs outright, and `infer_ultralytics_schema` cannot match
+either output's shape to the `[1, 4+nc, A]` layout it looks for.
+
 ## Fixture format
 
 Each `<export-name>.signals.json` is `{"source": "onnx"|"tflite"|"coreml",
