@@ -1,0 +1,283 @@
+# Mutation testing, on its own schedule and deliberately not part of Nightly.
+#
+# Mutation testing asks a different question from the rest of CI. The tests are
+# held fixed and the CODE is broken on purpose -- `+` becomes `-`, a function
+# body becomes `Ok(())` -- and the suite is re-run. A mutant that SURVIVES is a
+# line some test executes but nothing asserts on. Line coverage cannot see
+# this, which is the point: 100% coverage and a surviving mutant are perfectly
+# compatible.
+#
+# The corpus is ~7057 mutants across three crates, far more than one machine
+# can chew through in a night. Bolting it onto Nightly meant a 120-minute cap
+# that got through 5%, never once finished, and held the whole run open for two
+# hours after every other lane was done -- which also blocked log retrieval for
+# lanes that had already failed.
+#
+# So: a fixed set of shards each night, fanned out across parallel runners,
+# rotating so the sweep works through the corpus and rolls over. Nothing blocks
+# on this and nothing else waits for it.
+
+name: Mutation testing
+
+on:
+  schedule:
+    # 04:47 UTC, well clear of Nightly's 03:17 so the two never contend for
+    # runners or for the Sonar baseline.
+    - cron: "47 4 * * *"
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: Shards the corpus is divided into.
+        type: string
+        required: false
+        default: "64"
+      window:
+        description: Shards to run in parallel tonight.
+        type: string
+        required: false
+        default: "8"
+      start:
+        description: "First shard index. Default: rotates by date."
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Pick tonight's shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+      total: ${{ steps.p.outputs.total }}
+      start: ${{ steps.p.outputs.start }}
+    steps:
+      - id: p
+        env:
+          TOTAL_IN: ${{ inputs.shards }}
+          WINDOW_IN: ${{ inputs.window }}
+          START_IN: ${{ inputs.start }}
+        run: |
+          set -euo pipefail
+          total="${TOTAL_IN:-64}"
+          window="${WINDOW_IN:-8}"
+          if (( window > total )); then
+            echo "::error::window ${window} exceeds ${total} shards"
+            exit 1
+          fi
+          if [[ -n "${START_IN}" ]]; then
+            start="${START_IN}"
+          else
+            # Days since the epoch, not day-of-year: it increases forever, so
+            # the rotation neither restarts nor skips at a year boundary.
+            # (`date +%j` would additionally need a 10# prefix, since 008 and
+            # 009 are invalid octal in bash arithmetic.)
+            day=$(( $(date -u +%s) / 86400 ))
+            # Advance by exactly one window per night and wrap on `total`.
+            #
+            # Snapping to window-aligned blocks -- (day % (total / window)) *
+            # window -- silently strands the tail whenever window does not
+            # divide total: at 64/10 the integer division gives 6 blocks
+            # covering 0..59, and shards 60-63 are never tested at all.
+            # Walking the start instead covers every shard for any window.
+            start=$(( (day * window) % total ))
+          fi
+          if (( start < 0 || start >= total )); then
+            echo "::error::start ${start} out of range for ${total} shards"
+            exit 1
+          fi
+          list=""
+          for (( i = 0; i < window; i++ )); do
+            idx=$(( (start + i) % total ))
+            list="${list}${list:+,}${idx}"
+          done
+          echo "shards=[${list}]" >> "$GITHUB_OUTPUT"
+          echo "total=${total}" >> "$GITHUB_OUTPUT"
+          echo "start=${start}" >> "$GITHUB_OUTPUT"
+          echo "tonight: shards ${list} of ${total}"
+
+  mutants:
+    name: Shard ${{ matrix.shard }}
+    needs: plan
+    # Free standard runner. Nothing waits on this lane, so speed buys nothing
+    # worth billing for, and `larger` would cost roughly $150/month for an hour
+    # a night. See the advisory exception in the shared copilot-instructions.md
+    # for the same reasoning applied to an ungated lane.
+    #
+    # Parallelism comes from a matrix of separate runners, not from
+    # cargo-mutants' own --jobs. --jobs is documented as incompatible with
+    # --in-place, because parallel jobs on one machine each need their own copy
+    # of the tree and their own target directory, "often 2GB+", which does not
+    # fit a single runner's ~14GB disk. A matrix sidesteps that entirely: every
+    # shard gets a whole machine, so --in-place stays valid and each runner
+    # keeps one target directory and one build cache.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # One shard failing says nothing about the others, and the point of the
+      # night is breadth. max-parallel leaves concurrency for anything else
+      # that happens to be queued.
+      max-parallel: 8
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          # The decoder tests read models through edgefirst_bench::testdata.
+          # Without LFS they get pointer files, which parse as garbage: 35 of
+          # 438 baseline tests failed with ShapeError/OutOfBounds, and
+          # cargo-mutants will not test a tree whose baseline is red.
+          lfs: true
+
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+        with:
+          tool: cargo-mutants
+
+      - name: Run cargo-mutants
+        env:
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ needs.plan.outputs.total }}
+          # Scope to the pure-logic crates. image and codec reach the GPU and a
+          # mutant there hangs or aborts the driver rather than failing a test,
+          # which reports as "unviable" and tells us nothing.
+          PACKAGES: >-
+            --package edgefirst-tensor
+            --package edgefirst-tracker
+            --package edgefirst-decoder
+        run: |
+          set -euo pipefail
+          # No coverage instrumentation here, by design rather than omission.
+          # A mutant is caught when a test FAILS, so which lines executed is
+          # irrelevant, and instrumenting every rebuilt binary would be pure
+          # overhead. Nothing in .cargo/config.toml or the Cargo profiles turns
+          # it on for this target, and this lane does not go through
+          # setup-rust; keep it that way.
+          #
+          # --sharding slice keeps a shard's mutants contiguous in the corpus,
+          # so one shard mutates a handful of nearby files and reuses far more
+          # of the build cache than round-robin would, which touches a
+          # different file for almost every mutant.
+          #
+          # Two `--` are required. One passes args to `cargo test` itself, so
+          # `-- --profile ci` once became `cargo test --profile ci`, which cargo
+          # resolves against [profile.*] in Cargo.toml rather than the nextest
+          # profile intended; the baseline failed and 0 of 7057 mutants were
+          # tested. The SECOND `--` reaches the libtest harness, where
+          # --test-threads belongs.
+          args=(
+            --no-shuffle
+            --in-place
+            --timeout-multiplier 3
+            --shard "${SHARD}/${TOTAL}"
+            --sharding slice
+            --output mutants-report
+          )
+          rc=0
+          # shellcheck disable=SC2086  # PACKAGES is an argument list and must split
+          cargo mutants "${args[@]}" $PACKAGES -- -- --test-threads=1 || rc=$?
+          echo "cargo-mutants exit ${rc}"
+          # 0 all caught, 2 some survived, 3 some timed out: real results this
+          # lane reports rather than gates on. 1 usage, 4 baseline already
+          # failing, 5/6 bad --in-diff, 70 internal: the run measured nothing,
+          # so fail rather than publish an empty report.
+          case "${rc}" in
+            0|2|3) ;;
+            4) echo "::error::cargo-mutants baseline is failing, so no mutants were tested"; exit 1 ;;
+            *) echo "::error::cargo-mutants could not run (exit ${rc})"; exit 1 ;;
+          esac
+
+      - name: Shard summary
+        if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ needs.plan.outputs.total }}
+        run: |
+          set -euo pipefail
+          out=mutants-report/mutants.out
+          if [[ ! -d "${out}" ]]; then
+            echo "::warning::shard ${SHARD} produced no report"
+            exit 0
+          fi
+          tested=0
+          for f in caught missed timeout unviable; do
+            n=$(wc -l < "${out}/${f}.txt" 2>/dev/null || echo 0)
+            echo "${f}: ${n}"
+            [[ "${f}" == unviable ]] || tested=$(( tested + n ))
+          done
+          # A run that enumerates mutants but tests none is a no-op wearing a
+          # green tick, which is how this lane's first execution presented.
+          if [[ "${tested}" -eq 0 ]]; then
+            echo "::error::shard ${SHARD} tested no mutants; the report is empty"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants-report/
+          retention-days: 14
+
+  report:
+    name: Roll up
+    needs: [plan, mutants]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: mutants-shard-*
+          path: shards
+
+      - name: Totals across tonight's shards
+        env:
+          TOTAL: ${{ needs.plan.outputs.total }}
+          START: ${{ needs.plan.outputs.start }}
+        run: |
+          set -euo pipefail
+          # Per-shard step summaries are useful when a shard misbehaves, but
+          # the number anyone actually wants is the night's total, which no
+          # single matrix job can know.
+          declare -A sum=( [caught]=0 [missed]=0 [timeout]=0 [unviable]=0 )
+          shards=0
+          for d in shards/mutants-shard-*/mutants.out; do
+            [[ -d "${d}" ]] || continue
+            shards=$(( shards + 1 ))
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "${d}/${f}.txt" 2>/dev/null || echo 0)
+              sum[${f}]=$(( sum[${f}] + n ))
+            done
+          done
+          tested=$(( sum[caught] + sum[missed] + sum[timeout] ))
+          {
+            echo "### Mutation testing — ${shards} shards from index ${START} of ${TOTAL}"
+            echo ""
+            echo "| outcome | count |"
+            echo "| --- | --- |"
+            echo "| caught | ${sum[caught]} |"
+            echo "| missed | ${sum[missed]} |"
+            echo "| timeout | ${sum[timeout]} |"
+            echo "| unviable | ${sum[unviable]} |"
+            echo ""
+            echo "Tested ${tested} mutants tonight."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "tested=${tested} caught=${sum[caught]} missed=${sum[missed]}"
+          if (( sum[missed] > 0 )); then
+            {
+              echo ""
+              echo "### Surviving mutants (no test noticed the change)"
+              echo '```'
+              cat shards/mutants-shard-*/mutants.out/missed.txt 2>/dev/null | head -60
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
