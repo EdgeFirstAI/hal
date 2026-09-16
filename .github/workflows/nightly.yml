@@ -1,4 +1,5 @@
-# Nightly Full + G13. Skips when main has not moved since the last success.
+# Nightly Full + G13. Skips when main has not moved since the last nightly
+# that reached a verdict. Advisory scanning runs either way.
 #
 # Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 
@@ -8,6 +9,12 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Run even if main has not moved since the last nightly.
+        type: boolean
+        required: false
+        default: false
 
 # A manual dispatch must not interleave with the scheduled run: both would race
 # on the same self-hosted board and the same Sonar `main` baseline.
@@ -17,12 +24,27 @@ concurrency:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@a9b62d8918435787be65aae7f840a666a641a557
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
+    with:
+      # `inputs` is null on the schedule trigger, so the fallback is required;
+      # without it the expression is an empty string and the gate's boolean
+      # input rejects it.
+      force: ${{ inputs.force || false }}
+
+  # Deliberately not `needs: changed`. Every other lane here asks a question
+  # about the code, so skipping an unchanged commit loses nothing. cargo audit
+  # asks a question about the RustSec database, which changes daily whether the
+  # code does or not -- the 2026-09-15 nightly failed on RUSTSEC-2026-0204
+  # against a Cargo.lock nobody had touched. It parses Cargo.lock without
+  # building, on a free standard runner, so running it every night costs
+  # nothing. See the exception in the shared copilot-instructions.md.
+  advisories:
+    uses: EdgeFirstAI/.github/.github/workflows/advisories.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@a9b62d8918435787be65aae7f840a666a641a557
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
     with:
       lanes: all
       nightly: true

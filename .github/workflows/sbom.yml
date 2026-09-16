@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   sbom:
-    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@a9b62d8918435787be65aae7f840a666a641a557
+    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
     with:
       mode: full
       project-name: hal

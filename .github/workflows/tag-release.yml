@@ -11,5 +11,5 @@ on:
 jobs:
   tag:
     if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
-    uses: EdgeFirstAI/.github/.github/workflows/tag-release.yml@a9b62d8918435787be65aae7f840a666a641a557
+    uses: EdgeFirstAI/.github/.github/workflows/tag-release.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
     secrets: inherit

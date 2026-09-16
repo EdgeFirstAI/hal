@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@a9b62d8918435787be65aae7f840a666a641a557
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -102,7 +102,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@a9b62d8918435787be65aae7f840a666a641a557
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       boards: nxp-imx8mp-latest
