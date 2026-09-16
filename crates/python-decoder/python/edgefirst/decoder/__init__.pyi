@@ -825,11 +825,13 @@ def infer_ultralytics_schema(
     Args:
         source: Container format the signals were read from: ``"onnx"``,
             ``"tflite"``, or ``"coreml"``. CoreML resolves pixel-space box
-            coordinates the same way ONNX does. ``"other"`` is accepted but
-            rejected by inference: whether boxes are pixel-space or
-            ``[0, 1]`` follows the exporter and is not derivable from
-            shapes, so an uncharacterized container is refused rather than
-            guessed at.
+            coordinates the same way ONNX does, but only for the no-NMS
+            anchor-grid export; a ``nms=True`` CoreML export produces
+            Apple's NMS-pipeline artifact, which is refused rather than
+            resolved. ``"other"`` is accepted but rejected by inference:
+            whether boxes are pixel-space or ``[0, 1]`` follows the exporter
+            and is not derivable from shapes, so an uncharacterized
+            container is refused rather than guessed at.
         inputs: Input tensors as ``(name, shape, dtype)``, or with a 4th
             ``quantization`` element -- an input's quantization is accepted
             for symmetry with ``outputs`` and ignored.

@@ -151,7 +151,10 @@ fn tensor_info(
 ///
 /// :param source: Container format the signals were read from: ``"onnx"``,
 ///     ``"tflite"``, ``"coreml"``, or ``"other"``. CoreML resolves
-///     pixel-space box coordinates the same way ONNX does.
+///     pixel-space box coordinates the same way ONNX does, but only for the
+///     no-NMS anchor-grid export; a ``nms=True`` CoreML export produces
+///     Apple's NMS-pipeline artifact, which this function refuses rather
+///     than resolves.
 /// :param inputs: Input tensors as ``(name, shape, dtype)``, or
 ///     ``(name, shape, dtype, quantization)`` -- an input's quantization is
 ///     accepted for symmetry with ``outputs`` and ignored.
