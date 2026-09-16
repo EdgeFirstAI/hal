@@ -48,7 +48,9 @@ pub enum ModelSource {
     /// pixel-space box coordinates and the inferred schema sets
     /// `normalized: false`, matching [`ModelSource::Onnx`].
     ///
-    /// Measured, not assumed: see `testdata/infer/NOTES.md`.
+    /// Established by source-tracing the Ultralytics exporter rather than
+    /// by runtime magnitude measurement; `testdata/infer/NOTES.md` records
+    /// the reasoning and the captured fixture.
     CoreMl,
     /// Any other container. Inference **refuses** this with
     /// [`InferError::UnknownBoxConvention`] rather than assuming a box
@@ -958,12 +960,18 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
     }
 
     // Box normalization is the one field shape cannot reveal -- it follows
-    // the exporter, and only the ONNX and TFLite conventions have been
-    // measured (see testdata/infer/NOTES.md answer 5: 637.25 px vs 0.9957 on
-    // the same image). Guessing it wrong scales every box by the input size,
-    // which is why `Other` is refused rather than defaulted: everywhere else
-    // this module errors on ambiguity, and this is the field whose
-    // corruption `tests/infer_builder.rs` exists to pin.
+    // the exporter. ONNX and TFLite are pinned by runtime magnitude
+    // measurement (see testdata/infer/NOTES.md answer 5: 637.25 px vs
+    // 0.9957 on the same image); CoreML resolves alongside ONNX on a
+    // different basis -- source-tracing the Ultralytics exporter shows the
+    // `1/w` normalize lives only in `IOSDetectModel`, used solely on the
+    // `nms=True` path, so a plain no-NMS CoreML export passes the raw model
+    // through pixel-space exactly as ONNX does (see testdata/infer/NOTES.md
+    // for the reasoning and the captured fixture). Guessing it wrong scales
+    // every box by the input size, which is why `Other` is refused rather
+    // than defaulted: everywhere else this module errors on ambiguity, and
+    // this is the field whose corruption `tests/infer_builder.rs` exists to
+    // pin.
     let normalized = match signals.source {
         ModelSource::TfLite => true,
         ModelSource::Onnx | ModelSource::CoreMl => false,
