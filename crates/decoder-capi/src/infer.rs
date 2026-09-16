@@ -231,7 +231,8 @@ pub unsafe extern "C" fn ef_infer_signals_add_output(
 }
 
 /// Insert a metadata key/value pair, as captured verbatim from the model's
-/// container format (ONNX `metadata_props`, TFLite `metadata.json`).
+/// container format (ONNX `metadata_props`, TFLite `metadata.json`,
+/// CoreML's own metadata alongside Ultralytics' props).
 ///
 /// @return 0 on success, `EINVAL` for a null handle or unreadable string.
 ///

@@ -3,7 +3,7 @@
 
 //! Ultralytics YOLO schema inference from raw model I/O signals.
 //!
-//! Model export pipelines (ONNX, TFLite) carry Ultralytics-authored
+//! Model export pipelines (ONNX, TFLite, CoreML) carry Ultralytics-authored
 //! metadata (class names, task, input size) alongside the tensor shapes
 //! and dtypes the runtime reports. This module turns that raw signal into
 //! a [`crate::schema::SchemaV2`] the decoder can act on, without requiring
@@ -81,7 +81,8 @@ pub struct ModelSignals {
     /// Output tensors.
     pub outputs: Vec<TensorInfo>,
     /// Raw model metadata key/values (ONNX metadata_props, TFLite
-    /// metadata entries). Values are passed verbatim; parsing happens here.
+    /// metadata entries, CoreML's own metadata alongside Ultralytics'
+    /// props). Values are passed verbatim; parsing happens here.
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -2237,10 +2238,11 @@ mod tests {
     #[test]
     fn infer_other_source_refuses_rather_than_guessing_normalization() {
         // `normalized` follows the exporter and cannot be read off the
-        // shapes. ONNX (pixel-space) and TFLite ([0,1]) are the two measured
-        // conventions; an uncharacterized container gets a typed refusal,
-        // because guessing scales every box by the input size and the
-        // resulting schema looks perfectly valid.
+        // shapes. ONNX (pixel-space) and TFLite ([0,1]) are measured;
+        // CoreML (pixel-space) is source-traced rather than measured, but
+        // characterized all the same. An uncharacterized container gets a
+        // typed refusal, because guessing scales every box by the input
+        // size and the resulting schema looks perfectly valid.
         let s = ModelSignals {
             source: ModelSource::Other,
             inputs: vec![TensorInfo {

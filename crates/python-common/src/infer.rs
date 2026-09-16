@@ -162,8 +162,9 @@ fn tensor_info(
 ///     decoder consumes per-tensor only, so more than one scale is
 ///     rejected rather than turned into a schema that cannot build.
 /// :param metadata: Raw model metadata key/values, passed through verbatim
-///     (ONNX ``metadata_props``, or the TFLite ``metadata.json`` envelope
-///     under whichever key it was captured).
+///     (ONNX ``metadata_props``, the TFLite ``metadata.json`` envelope
+///     under whichever key it was captured, or CoreML's own metadata
+///     alongside Ultralytics' props).
 /// :returns: ``(schema, labels, description)``: the inferred schema as an
 ///     ``edgefirst.json`` schema v2 dict ready for ``Decoder(schema)``,
 ///     class names in index order, and a human-readable summary (e.g.

@@ -841,8 +841,9 @@ def infer_ultralytics_schema(
             scale is rejected rather than turned into a schema that cannot
             build.
         metadata: Raw model metadata key/values, passed through verbatim
-            (ONNX ``metadata_props``, or the TFLite ``metadata.json``
-            envelope under whichever key it was captured).
+            (ONNX ``metadata_props``, the TFLite ``metadata.json``
+            envelope under whichever key it was captured, or CoreML's own
+            metadata alongside Ultralytics' props).
 
     Note:
         Supported dtype strings are ``"int8"``, ``"uint8"``, ``"int16"``,
