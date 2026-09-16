@@ -109,7 +109,7 @@ inference runtime reports into `ef_infer_signals`, and
 #include <stdint.h>
 #include <stdio.h>
 
-ef_infer_signals *s = ef_infer_signals_new(0); /* 0 onnx, 1 tflite, 3 coreml */
+ef_infer_signals *s = ef_infer_signals_new(0); /* 0 onnx, 1 tflite; see below */
 
 const uintptr_t in_shape[4] = { 1, 3, 640, 640 };
 ef_infer_signals_add_input(s, "images", in_shape, 4, EF_INFER_DTYPE_FLOAT32);
