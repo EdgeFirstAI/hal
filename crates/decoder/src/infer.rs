@@ -1642,7 +1642,10 @@ mod tests {
         assert_eq!(parts, vec!["a='x,y'".to_string(), " b=2".to_string()]);
 
         let parts = split_top_level_commas("a=\"x,y\",b=\"p,q\"");
-        assert_eq!(parts, vec!["a=\"x,y\"".to_string(), "b=\"p,q\"".to_string()]);
+        assert_eq!(
+            parts,
+            vec!["a=\"x,y\"".to_string(), "b=\"p,q\"".to_string()]
+        );
     }
 
     /// `InferError` is what a rejection reports to the caller. A `Display`

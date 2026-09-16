@@ -1632,10 +1632,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    edgefirst_tensor::Error::QuantizationInvalid {
-                        field: "scale",
-                        ..
-                    }
+                    edgefirst_tensor::Error::QuantizationInvalid { field: "scale", .. }
                 ),
                 "axis={axis:?} gave {err:?}"
             );
@@ -1658,10 +1655,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    edgefirst_tensor::Error::QuantizationInvalid {
-                        field: "scale",
-                        ..
-                    }
+                    edgefirst_tensor::Error::QuantizationInvalid { field: "scale", .. }
                 ),
                 "axis={axis:?} gave {err:?}"
             );
