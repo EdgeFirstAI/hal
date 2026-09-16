@@ -1819,18 +1819,28 @@ where
     /// shares ownership through the pin's keepalive, so a map can coexist with
     /// a `&mut` on the same tensor.
     ///
-    /// # Windows D3D11 textures: no write-only map of a partial window
+    /// # Windows D3D11 textures: a write-only map of a partial window
     ///
-    /// A [`CpuAccess::Write`] map is not refreshed from the texture and
-    /// publishes the whole texture when it unmaps, so the bytes the caller
-    /// leaves untouched are undefined. That is a contract a whole-tensor map
-    /// can meet and a sub-view cannot: the window spans its own rows only.
-    /// A write-only map of a tensor whose window is shorter than its backing
-    /// -- a [`view`](Tensor::view), or a shape narrowed with
-    /// `set_logical_shape` -- is therefore refused with
-    /// [`Error::InvalidArgument`] naming [`CpuAccess::ReadWrite`], which is
-    /// the same window with the refresh that makes the untouched rows
-    /// well-defined.
+    /// A [`CpuAccess::Write`] map is not refreshed from the texture first, so
+    /// the bytes the caller leaves untouched are undefined -- the documented
+    /// contract a whole-tensor map can meet and a sub-view cannot, since the
+    /// window spans its own rows only.
+    ///
+    /// A tensor allocated [`CpuAccess::Write`] (no staging texture) publishes
+    /// only the window's own rows on unmap, so a sub-view -- a
+    /// [`view`](Tensor::view), or a shape narrowed with `set_logical_shape`
+    /// -- is refused only when its window is not a whole, pitch-aligned row
+    /// range (a plain-offset [`view`](Tensor::view) always is; an arbitrary
+    /// byte offset from `set_plane_offset` might not be), which fails with
+    /// [`Error::InvalidArgument`].
+    ///
+    /// A tensor allocated [`CpuAccess::Read`] or [`CpuAccess::ReadWrite`]
+    /// (staging texture) has no such per-window publish: unmapping always
+    /// copies the whole staging texture back, so a write-only sub-view is
+    /// refused with [`Error::PartialWriteRequiresReadWrite`], naming
+    /// [`CpuAccess::ReadWrite`] as the same window with the refresh that
+    /// makes the untouched rows well-defined -- and, unlike the
+    /// `CpuAccess::Write` case above, that retry always succeeds.
     fn map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a;

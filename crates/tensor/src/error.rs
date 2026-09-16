@@ -32,6 +32,14 @@ pub enum Error {
     InvalidShape(String),
     InvalidArgument(String),
     InvalidOperation(String),
+    /// A write-only map is refused only because it cannot express the
+    /// requested window; the identical window mapped `CpuAccess::ReadWrite`
+    /// is not refused (at whatever extra cost that backend's `ReadWrite`
+    /// costs — see the message). Distinct from [`Error::InvalidArgument`] so
+    /// a caller that wants to retry with `ReadWrite` can match on this
+    /// variant instead of a message, and knows the retry will not fail the
+    /// same way again.
+    PartialWriteRequiresReadWrite(String),
     /// Structured quantization-invariant failure. Round-trippable through
     /// the C and Python boundaries so callers can diagnose which field
     /// failed without parsing strings.
@@ -186,6 +194,14 @@ mod tests {
         assert!(
             msg.contains("InvalidArgument") && msg.contains("negative"),
             "unexpected InvalidArgument message: {msg}"
+        );
+
+        let e = Error::PartialWriteRequiresReadWrite("retry with ReadWrite".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("PartialWriteRequiresReadWrite") && msg.contains("retry with ReadWrite"),
+            "unexpected PartialWriteRequiresReadWrite message: {msg}"
         );
 
         let e = Error::InvalidOperation("read-only".to_string());

@@ -59,7 +59,7 @@ use crate::error::{CodecError, UnsupportedFeature};
 use crate::exif::read_exif_orientation;
 use crate::options::ImageInfo;
 use crate::pixel::ImagePixel;
-use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
+use edgefirst_tensor::{PixelFormat, Tensor};
 
 /// Reusable JPEG decoder state.
 ///
@@ -385,7 +385,7 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
     let mcu_scratch = state.mcu_scratch.as_mut().unwrap();
 
     {
-        let mut map = dst.map_write()?;
+        let mut map = crate::pixel::map_decode_dst(dst)?;
         let dst_bytes: &mut [T] = &mut map;
         // SAFETY: T is u8 (checked above) — layout-identical reinterpret.
         let dst_u8: &mut [u8] = unsafe {
