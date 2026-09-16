@@ -80,13 +80,17 @@ TRUNCATION_NOTE = (
 class Mutant:
     """One mutant's outcome, flattened out of whichever source supplied it."""
 
-    def __init__(self, key, file, function, line, what, diff=None):
+    def __init__(self, key, file, function, line, what, diff=None, arch=""):
         self.key = key
         self.file = file
         self.function = function
         self.line = line
         self.what = what
         self.diff = diff
+        # Which sweep produced it. The same source line is a different mutant
+        # per architecture: a NEON body is compiled on arm64 and absent on
+        # x86_64, so a survivor means nothing until you know which ran it.
+        self.arch = arch
 
 
 def parse_name(name):
@@ -97,7 +101,16 @@ def parse_name(name):
     return match.group("file"), int(match.group("line")), match.group("what")
 
 
-def read_outcomes_json(out_dir):
+def arch_of(shard_dir):
+    """Name the architecture a shard artifact came from.
+
+    The artifact is named after the runner, so `mutants-shard-3-ubuntu-24.04-arm`
+    is the arm64 sweep and anything else is the x86_64 one.
+    """
+    return "arm64" if shard_dir.name.endswith("-arm") else "x86_64"
+
+
+def read_outcomes_json(out_dir, arch=""):
     """Read one shard's outcomes.json, or None when it is absent or unusable."""
     path = out_dir / "outcomes.json"
     if not path.is_file():
@@ -133,12 +146,13 @@ def read_outcomes_json(out_dir):
                 line=line,
                 what=what,
                 diff=diff,
+                arch=arch,
             )
         )
     return mutants
 
 
-def read_text_files(out_dir):
+def read_text_files(out_dir, arch=""):
     """Rebuild a shard's outcomes from the per-outcome .txt files."""
     mutants = []
     for key in OUTCOME_KEYS:
@@ -151,7 +165,7 @@ def read_text_files(out_dir):
                 continue
             file, line, what = parse_name(name)
             mutants.append(
-                Mutant(key=key, file=file, function="", line=line, what=what)
+                Mutant(key=key, file=file, function="", line=line, what=what, arch=arch)
             )
     return mutants
 
@@ -212,9 +226,10 @@ def collect(shards_dir):
         if not out_dir.is_dir():
             continue
         shards += 1
-        found = read_outcomes_json(out_dir)
+        arch = arch_of(out_dir.parent)
+        found = read_outcomes_json(out_dir, arch)
         if found is None:
-            found = read_text_files(out_dir)
+            found = read_text_files(out_dir, arch)
         mutants.extend(found)
     return mutants, shards
 
@@ -256,11 +271,15 @@ def group_survivors(mutants):
     ]
 
 
-def render_header(counts, shards, total, start):
+def render_header(counts, shards, total, start, arches=()):
     tested = sum(counts[key] for key in TESTED_KEYS)
     scope = plural(shards, "shard")
     if total and start is not None:
         scope += f" from index {start} of {total}"
+    # Naming the architectures only when both ran keeps the common case quiet
+    # and makes the split obvious on the nights it matters.
+    if len(arches) > 1:
+        scope += f", on {' and '.join(arches)}"
 
     lines = [f"### Mutation testing — {scope}", ""]
     lines.append(
@@ -312,7 +331,7 @@ def render_gaps(groups, mutants):
     return lines
 
 
-def render_survivors(groups, with_diffs, limit=None):
+def render_survivors(groups, with_diffs, limit=None, name_arch=False):
     """Render the grouped survivor list. Returns (lines, survivors omitted)."""
     lines = []
     shown = 0
@@ -327,6 +346,8 @@ def render_survivors(groups, with_diffs, limit=None):
                     omitted += 1
                     continue
                 where = f"L{mutant.line} · " if mutant.line else ""
+                if name_arch and mutant.arch:
+                    where = f"[{mutant.arch}] {where}"
                 if with_diffs and mutant.diff:
                     pending_function.extend(
                         [
@@ -357,7 +378,9 @@ def render_survivors(groups, with_diffs, limit=None):
 def render(mutants, shards, total, start, budget):
     counts = tally(mutants)
     groups = group_survivors(mutants)
-    header = render_header(counts, shards, total, start)
+    arches = sorted({m.arch for m in mutants if m.arch})
+    name_arch = len(arches) > 1
+    header = render_header(counts, shards, total, start, arches)
 
     if not counts["missed"]:
         clean = "No mutant survived: every tested mutant failed a test."
@@ -376,12 +399,12 @@ def render(mutants, shards, total, start, budget):
     # Prefer the full report, then the same list without diffs, then a list cut
     # to whatever fits. Diffs are the first thing to go because the grouped
     # names still say which functions to look at.
-    body, _ = render_survivors(groups, with_diffs=True)
+    body, _ = render_survivors(groups, with_diffs=True, name_arch=name_arch)
     text = fits(body, [])
     if text:
         return text
 
-    body, _ = render_survivors(groups, with_diffs=False)
+    body, _ = render_survivors(groups, with_diffs=False, name_arch=name_arch)
     text = fits(body, ["", TRUNCATION_NOTE.format(extra="")])
     if text:
         return text
@@ -389,7 +412,9 @@ def render(mutants, shards, total, start, budget):
     limit = counts["missed"]
     while limit > 0:
         limit = limit // 2
-        body, omitted = render_survivors(groups, with_diffs=False, limit=limit)
+        body, omitted = render_survivors(
+            groups, with_diffs=False, limit=limit, name_arch=name_arch
+        )
         extra = f", {plural(omitted, 'survivor')} not listed"
         text = fits(body, ["", TRUNCATION_NOTE.format(extra=extra)])
         if text:

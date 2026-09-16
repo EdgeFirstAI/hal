@@ -355,6 +355,60 @@ def test_oversized_survivor_set_is_truncated_within_budget(tmp_path, shards):
     assert "mutants-shard-" in md
 
 
+def test_survivor_is_labelled_with_the_architecture_it_survived_on(tmp_path, shards):
+    write_shard(
+        shards,
+        "0-ubuntu-24.04",
+        [
+            mutant(
+                "missed",
+                "crates/decoder/src/lib.rs",
+                "arg_max_i8",
+                595,
+                "a",
+                diff="-x\n",
+            )
+        ],
+    )
+    write_shard(
+        shards,
+        "0-ubuntu-24.04-arm",
+        [
+            mutant(
+                "missed",
+                "crates/decoder/src/lib.rs",
+                "arg_max_i8",
+                595,
+                "b",
+                diff="-y\n",
+            )
+        ],
+    )
+
+    _, md = render(tmp_path)
+
+    assert "arm64" in md
+    assert "x86_64" in md
+    assert "2 shards" in md
+
+
+def test_architecture_is_not_named_when_only_one_was_swept(tmp_path, shards):
+    write_shard(
+        shards,
+        "0-ubuntu-24.04",
+        [
+            mutant(
+                "missed", "crates/decoder/src/lib.rs", "arg_max", 580, "a", diff="-x\n"
+            )
+        ],
+    )
+
+    _, md = render(tmp_path)
+
+    assert "arm64" not in md
+    assert "x86_64" not in md
+
+
 def test_github_actions_mode_appends_to_the_step_summary(tmp_path, shards, monkeypatch):
     write_shard(
         shards,
