@@ -93,6 +93,8 @@ jobs:
       # hal-full.yml, where the nightly toolchain and wheels already exist.
       python: true
       ruff-paths: crates/python-tensor crates/python-codec crates/python-image crates/python-decoder crates/python-tracker crates/python-common tests
+      # Pin what uvx resolves; unpinned it drifts with the runner's uv cache.
+      ruff-version: 0.16.7
       skip-cross-clippy: true
       pre-command: bash .github/scripts/ci-setup.sh
       clippy-args: --workspace --all-targets --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings

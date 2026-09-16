@@ -616,10 +616,24 @@ calling out.
 
 `GLProcessorThreaded` is the public, thread-safe wrapper. It spawns a
 dedicated OS thread that owns the EGL context and all GL state
-(`GLProcessorST`). All operations are sent as `GLProcessorMessage` enum
+(`GLProcessorST`). Operations are sent as `GLProcessorMessage` enum
 variants through a channel and block on a oneshot reply. This design is
 required because EGL contexts are thread-local — every GL call must happen
 on the thread that created the context.
+
+The one exception is a PBO map/unmap/delete issued **by the GL worker itself**,
+mid-message. The context is already current on that thread, and sending would
+block on the capacity-1 queue the thread is the only consumer of, so the
+operation runs inline instead. See `GL_WORKER` in `gl/threaded.rs`: the worker
+id is matched so a worker only ever services its own context inline, and the
+mapped-buffer set is thread-local so the inline and message paths share one
+view of what is mapped.
+
+A PBO owned by one worker and mapped from **another** is refused under the
+`Full` serialization policy: the mapping thread holds the process-wide
+per-message lock the owning worker needs in order to answer, so the send would
+never be replied to. Under `LifecycleOnly` there is no such lock and the map
+goes through the channel as usual.
 
 The [`PboOps`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/trait.PboOps.html)
 trait bridges the tensor crate and the GL thread. `PboTensor` (defined in
@@ -707,9 +721,11 @@ compensate for. Sizing the target at `dst_w/4` (as the non-DMA setup once
 did) has no shader that packs four plane bytes per texel and silently
 truncates. The `W*3/4` reinterpretation belongs to `TwoPassPackedRgb` alone.
 
-**Why the PBO lowering never maps:** the GL thread must not call
-`tensor.map()` on a PBO image — that sends a `PboMap` message back to the
-GL thread itself and deadlocks. `bind_dst` therefore seeds the render
+**Why the PBO lowering never maps:** mapping a PBO image on the GL thread once
+deadlocked outright — the `PboMap` message went back to the queue that thread
+itself drains. That re-entrancy is serviced inline now (see the GL thread
+architecture section), but the lowering still does not map. `bind_dst` seeds
+the render
 texture by binding the PBO as `GL_PIXEL_UNPACK_BUFFER` and calling
 `glTexImage2D` with the view's byte offset into that buffer (GL reads
 directly from the PBO; the argument is an offset, not a pointer, and passing

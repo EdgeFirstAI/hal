@@ -187,7 +187,10 @@ mod tests {
             .unwrap_or_default();
         if found.is_empty() {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "SKIPPED: nothing built; name not checked");
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED: nothing built; name not checked"
+            );
             return;
         }
         assert!(

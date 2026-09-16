@@ -24,6 +24,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `profiling` profile carries line tables instead of full debug info (`debug = "line-tables-only"`). Profiles and stack traces still resolve to file and line; binaries are substantially smaller.
 - `make sbom` writes to `sbom/` and enforces the same license policy as CI, fetched from EdgeFirstAI/.github. hal's own copy had drifted, so the two could reach different verdicts on the same dependency tree.
 - Pull requests run a quick lint, format and unit-test pass by default. Add the `ci:full` label for the full platform matrix, or `ci:hardware` for the on-target board run. See CONTRIBUTING.md.
+- `make format` and `make lint` run ruff over `crates/python-common` too, matching `ci.yml`'s `ruff-paths` exactly. ruff lints Python blocks inside Markdown, and that crate's three `.md` files were the gap — a bad snippet there passed locally and failed the Quick tier.
+- `[tool.ruff] required-version` sets a `>=0.16.7` floor. ruff 0.15.8 reports five `F403`s on the `edgefirst.*` star re-exports that 0.16.7 does not, so a stale local ruff failed a gate `main` passes; the floor names the version mismatch instead of the symptom. CI pins the same version through the shared workflow's `ruff-version` input, so `uvx` no longer resolves whatever the runner's uv cache happens to hold.
+
+### Fixed
+
+- **A GL conversion could hang the calling pipeline outright, roughly one run
+  in five on desktop NVIDIA.** Whenever a convert's *source* tensor was
+  PBO-backed, the GL worker mapped it mid-convert (`handle_image_convert` ->
+  `draw_src_texture` -> `map_read` -> `PboHandle::acquire_map` ->
+  `GlPboOps::map_buffer`), and that map was posted to the worker's own message
+  channel — the queue that same thread is the only consumer of. With the
+  channel's capacity of one already taken, the worker blocked sending to
+  itself and never returned; every other caller then piled up behind it and
+  the whole pipeline stopped, with no timeout anywhere to break it. The
+  process stayed alive and idle, which made it look like a lost reply rather
+  than a deadlock. A PBO map issued from the worker thread that owns the
+  context is now performed inline — the context is already current there — so
+  it no longer round-trips through the channel. Each processor carries an id
+  so a worker only ever services its own context inline, and the mapped-buffer
+  set moved to that thread's state so the inline and message paths cannot
+  double-map a buffer. The inline path keeps the channel path's failure
+  contract: a GL panic still rolls back the buffer's map reservation and
+  poisons the context, and is not allowed to unwind into
+  `PboHandle::acquire_map`, which would strand that handle mid-map and park
+  every later map on it forever. Measured on an RTX-class desktop: 2 hangs in
+  10 runs before, 0 in 30 after. Targets reaching the GPU through DMA-BUF
+  zero-copy or CPU staging — the embedded boards — were never affected, since their convert
+  sources are not PBO-backed.
+
+- **A convert whose PBO source came from a different `ImageProcessor` could
+  hang on drivers that serialize GL per message** — Vivante/galcore, ANGLE on
+  Windows, virtualized GPUs, and anything run under
+  `EDGEFIRST_GL_SERIALIZE=full`. The converting worker holds a process-wide
+  lock for the whole message and sent the map to the worker owning the buffer;
+  that worker needs the same lock to answer, so neither side moved. The
+  cross-context case is now refused with an error naming the owning processor
+  rather than hanging. Platforms on the `LifecycleOnly` policy hold no such
+  lock and still service these maps through the channel unchanged. This
+  predates the fix above and was found while reviewing it.
 
 ## [0.31.0] - 2026-09-08
 
