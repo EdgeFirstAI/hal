@@ -392,6 +392,100 @@ def test_survivor_is_labelled_with_the_architecture_it_survived_on(tmp_path, sha
     assert "2 shards" in md
 
 
+def test_two_mutants_sharing_a_line_and_description_stay_distinct(tmp_path, shards):
+    """cargo-mutants names a mutant `file:line:col: what`, and a line holding
+    two of the same operator yields two mutants with the same name. Merging
+    them would quietly drop half the corpus."""
+    name = "crates/decoder/src/modelpack.rs:409:30: replace * with + in split_float"
+    write_shard(
+        shards,
+        0,
+        [
+            mutant(
+                "missed",
+                "crates/decoder/src/modelpack.rs",
+                "split_float",
+                409,
+                name,
+                diff="-a\n",
+            ),
+            mutant(
+                "missed",
+                "crates/decoder/src/modelpack.rs",
+                "split_float",
+                409,
+                name,
+                diff="-b\n",
+            ),
+        ],
+    )
+
+    _, md = render(tmp_path)
+
+    assert "2 mutants tested" in md, md
+    assert md.count("<details>") == 2
+
+
+def test_mutant_caught_on_one_architecture_is_not_a_survivor(tmp_path, shards):
+    """The same source line is swept on both architectures. `#[cfg]`-gated code
+    is absent from one of the builds, so it cannot be caught there; catching it
+    anywhere means the tests do assert on it."""
+    name = "crates/decoder/src/lib.rs:595:5: replace arg_max_i8 with (0, 0)"
+    write_shard(
+        shards,
+        "0-ubuntu-24.04",
+        [
+            mutant(
+                "missed",
+                "crates/decoder/src/lib.rs",
+                "arg_max_i8",
+                595,
+                name,
+                diff="-x\n",
+            )
+        ],
+    )
+    write_shard(
+        shards,
+        "0-ubuntu-24.04-arm",
+        [mutant("caught", "crates/decoder/src/lib.rs", "arg_max_i8", 595, name)],
+    )
+
+    code, md = render(tmp_path)
+
+    assert code == 0
+    assert "No mutant survived" in md
+    assert "1 mutant tested" in md, md
+
+
+def test_mutant_missed_everywhere_is_reported_once_for_all_architectures(
+    tmp_path, shards
+):
+    name = "crates/decoder/src/lib.rs:580:20: replace > with >= in arg_max"
+    for suffix in ("0-ubuntu-24.04", "0-ubuntu-24.04-arm"):
+        write_shard(
+            shards,
+            suffix,
+            [
+                mutant(
+                    "missed",
+                    "crates/decoder/src/lib.rs",
+                    "arg_max",
+                    580,
+                    name,
+                    diff="-x\n",
+                )
+            ],
+        )
+
+    code, md = render(tmp_path)
+
+    assert code == 1
+    assert "1 mutant tested" in md, md
+    assert md.count("<details>") == 1
+    assert "arm64" in md and "x86_64" in md
+
+
 def test_architecture_is_not_named_when_only_one_was_swept(tmp_path, shards):
     write_shard(
         shards,

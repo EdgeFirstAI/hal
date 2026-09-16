@@ -69,7 +69,7 @@ LABELS = {
 }
 
 # `crates/decoder/src/lib.rs:595:5: replace arg_max_i8 -> (i8, usize) with (0, 0)`
-MUTANT_NAME = re.compile(r"^(?P<file>.+?):(?P<line>\d+):\d+: (?P<what>.*)$")
+MUTANT_NAME = re.compile(r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+): (?P<what>.*)$")
 
 TRUNCATION_NOTE = (
     "> Report truncated to fit GitHub's step-summary limit{extra}. "
@@ -80,13 +80,17 @@ TRUNCATION_NOTE = (
 class Mutant:
     """One mutant's outcome, flattened out of whichever source supplied it."""
 
-    def __init__(self, key, file, function, line, what, diff=None, arch=""):
+    def __init__(self, key, file, function, line, what, diff=None, arch="", col=None):
         self.key = key
         self.file = file
         self.function = function
         self.line = line
+        self.col = col
         self.what = what
         self.diff = diff
+        # Every architecture that ran this mutant, filled in when the sweeps
+        # are merged.
+        self.arches = set()
         # Which sweep produced it. The same source line is a different mutant
         # per architecture: a NEON body is compiled on arm64 and absent on
         # x86_64, so a survivor means nothing until you know which ran it.
@@ -97,8 +101,13 @@ def parse_name(name):
     """Split a cargo-mutants mutant name into (file, line, description)."""
     match = MUTANT_NAME.match(name)
     if not match:
-        return "", None, name
-    return match.group("file"), int(match.group("line")), match.group("what")
+        return "", None, None, name
+    return (
+        match.group("file"),
+        int(match.group("line")),
+        int(match.group("col")),
+        match.group("what"),
+    )
 
 
 def arch_of(shard_dir):
@@ -131,9 +140,11 @@ def read_outcomes_json(out_dir, arch=""):
         if key is None:
             continue
         mutant = scenario["Mutant"]
-        file, line, what = parse_name(mutant.get("name", ""))
+        file, line, col, what = parse_name(mutant.get("name", ""))
         span = mutant.get("span") or {}
-        line = (span.get("start") or {}).get("line", line)
+        start = span.get("start") or {}
+        line = start.get("line", line)
+        col = start.get("column", col)
         function = (mutant.get("function") or {}).get("function_name", "")
         # Only survivors get their diff read; the caught ones are the bulk of
         # the corpus and nobody needs to see a mutation a test already failed.
@@ -147,6 +158,7 @@ def read_outcomes_json(out_dir, arch=""):
                 what=what,
                 diff=diff,
                 arch=arch,
+                col=col,
             )
         )
     return mutants
@@ -163,9 +175,17 @@ def read_text_files(out_dir, arch=""):
             name = name.strip()
             if not name:
                 continue
-            file, line, what = parse_name(name)
+            file, line, col, what = parse_name(name)
             mutants.append(
-                Mutant(key=key, file=file, function="", line=line, what=what, arch=arch)
+                Mutant(
+                    key=key,
+                    file=file,
+                    function="",
+                    line=line,
+                    what=what,
+                    arch=arch,
+                    col=col,
+                )
             )
     return mutants
 
@@ -231,7 +251,51 @@ def collect(shards_dir):
         if found is None:
             found = read_text_files(out_dir, arch)
         mutants.extend(found)
-    return mutants, shards
+    return merge_architectures(mutants), shards
+
+
+# Best outcome first: one architecture catching a mutant settles it.
+OUTCOME_RANK = {"caught": 0, "timeout": 1, "missed": 2, "unviable": 3}
+
+
+def merge_architectures(mutants):
+    """Fold the same mutant seen on several architectures into one.
+
+    Both sweeps mutate the same source, but `#[cfg(target_arch = ...)]` code is
+    compiled into only one of the builds, so the other's tests cannot reach it
+    and it survives there no matter how good they are. A mutant is therefore
+    caught when any architecture's tests caught it, and only counts as having
+    survived when every architecture that tested it let it through. Survivors
+    carry the set of architectures that ran them, which is how a mutant only
+    one build could test is told apart from a plain test gap.
+    """
+    merged = {}
+    order = []
+    # A line holding two of the same operator produces two mutants that
+    # cargo-mutants names identically, so the name alone cannot pair them up
+    # across sweeps. Both sweeps enumerate the same slice in the same order,
+    # which makes "the nth mutant with this name" a stable identity.
+    seen = {}
+    for mutant in mutants:
+        base = (mutant.file, mutant.line, mutant.col, mutant.what)
+        nth = seen.get((mutant.arch, base), 0)
+        seen[(mutant.arch, base)] = nth + 1
+        key = base + (nth,)
+        if key not in merged:
+            merged[key] = mutant
+            mutant.arches = set()
+            order.append(key)
+        best = merged[key]
+        if OUTCOME_RANK[mutant.key] < OUTCOME_RANK[best.key]:
+            # Keep the decisive outcome, and the diff that came with it.
+            mutant.arches = best.arches
+            merged[key] = mutant
+            best = mutant
+        if mutant.arch:
+            best.arches.add(mutant.arch)
+        if best.diff is None and mutant.diff is not None:
+            best.diff = mutant.diff
+    return [merged[key] for key in order]
 
 
 def tally(mutants):
@@ -346,8 +410,8 @@ def render_survivors(groups, with_diffs, limit=None, name_arch=False):
                     omitted += 1
                     continue
                 where = f"L{mutant.line} · " if mutant.line else ""
-                if name_arch and mutant.arch:
-                    where = f"[{mutant.arch}] {where}"
+                if name_arch and mutant.arches:
+                    where = f"[{', '.join(sorted(mutant.arches))}] {where}"
                 if with_diffs and mutant.diff:
                     pending_function.extend(
                         [
@@ -378,7 +442,7 @@ def render_survivors(groups, with_diffs, limit=None, name_arch=False):
 def render(mutants, shards, total, start, budget):
     counts = tally(mutants)
     groups = group_survivors(mutants)
-    arches = sorted({m.arch for m in mutants if m.arch})
+    arches = sorted({a for m in mutants for a in m.arches})
     name_arch = len(arches) > 1
     header = render_header(counts, shards, total, start, arches)
 
