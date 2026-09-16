@@ -34,6 +34,7 @@ fn source_from(code: u32) -> Option<ModelSource> {
         0 => Some(ModelSource::Onnx),
         1 => Some(ModelSource::TfLite),
         2 => Some(ModelSource::Other),
+        3 => Some(ModelSource::CoreMl),
         _ => None,
     }
 }
@@ -68,8 +69,8 @@ pub(crate) fn dtype_from(code: u32) -> Option<DType> {
 }
 
 /// Create empty signals for a model read from `source` (`0` onnx, `1`
-/// tflite, `2` other). `NULL` for an unrecognized source or allocation
-/// failure.
+/// tflite, `2` other, `3` coreml). `NULL` for an unrecognized source or
+/// allocation failure.
 #[no_mangle]
 pub extern "C" fn ef_infer_signals_new(source: u32) -> *mut EfInferSignals {
     let Some(source) = source_from(source) else {
@@ -562,6 +563,15 @@ mod tests {
     #[test]
     fn an_unrecognized_source_yields_null() {
         assert!(ef_infer_signals_new(99).is_null());
+    }
+
+    #[test]
+    fn source_from_maps_coreml_and_rejects_out_of_range() {
+        // `3` was appended for CoreML; `0`-`2` (onnx, tflite, other) are
+        // covered by the surrounding tests and must not be renumbered --
+        // these codes are ABI.
+        assert_eq!(source_from(3), Some(ModelSource::CoreMl));
+        assert_eq!(source_from(4), None);
     }
 
     #[test]

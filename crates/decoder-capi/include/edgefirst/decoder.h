@@ -597,8 +597,8 @@ void ef_segmentation_list_free(ef_segmentation_list *l);
 
 /**
  * Create empty signals for a model read from `source` (`0` onnx, `1`
- * tflite, `2` other). `NULL` for an unrecognized source or allocation
- * failure.
+ * tflite, `2` other, `3` coreml). `NULL` for an unrecognized source or
+ * allocation failure.
  */
 struct ef_infer_signals *ef_infer_signals_new(uint32_t source);
 
