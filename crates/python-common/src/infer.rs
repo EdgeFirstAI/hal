@@ -37,9 +37,10 @@ fn source_from_str(s: &str) -> PyResult<ModelSource> {
     match s {
         "onnx" => Ok(ModelSource::Onnx),
         "tflite" => Ok(ModelSource::TfLite),
+        "coreml" => Ok(ModelSource::CoreMl),
         "other" => Ok(ModelSource::Other),
         other => Err(PyValueError::new_err(format!(
-            "unknown source `{other}` (expected one of: onnx, tflite, other)"
+            "unknown source `{other}` (expected one of: onnx, tflite, coreml, other)"
         ))),
     }
 }
@@ -149,7 +150,8 @@ fn tensor_info(
 /// pre-NMS heads and YOLO26 end-to-end heads.
 ///
 /// :param source: Container format the signals were read from: ``"onnx"``,
-///     ``"tflite"``, or ``"other"``.
+///     ``"tflite"``, ``"coreml"``, or ``"other"``. CoreML resolves
+///     pixel-space box coordinates the same way ONNX does.
 /// :param inputs: Input tensors as ``(name, shape, dtype)``, or
 ///     ``(name, shape, dtype, quantization)`` -- an input's quantization is
 ///     accepted for symmetry with ``outputs`` and ignored.

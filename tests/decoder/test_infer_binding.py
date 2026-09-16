@@ -24,6 +24,15 @@ FIXTURE = (
     / "yolov8n.signals.json"
 )
 
+FIXTURE_COREML = (
+    Path(__file__).resolve().parents[2]
+    / "crates"
+    / "decoder"
+    / "testdata"
+    / "infer"
+    / "yolo26n_coreml.signals.json"
+)
+
 
 def _load_fixture_call_args(path: Path):
     """Maps a captured Task-0 fixture's JSON onto the binding's call
@@ -58,6 +67,19 @@ def test_infer_ultralytics_schema_yolov8n():
         result.labels,
         result.description,
     )
+
+
+def test_infer_ultralytics_schema_coreml():
+    source, inputs, outputs, metadata = _load_fixture_call_args(FIXTURE_COREML)
+    assert source == "coreml"
+
+    result = ef.infer_ultralytics_schema(source, inputs, outputs, metadata)
+
+    assert len(result.labels) == 80
+    assert result.schema["decoder_version"] == "yolov8"
+    # CoreML resolves pixel-space box coordinates the same way ONNX does.
+    det = next(o for o in result.schema["outputs"] if o["name"] == "output0")
+    assert det["normalized"] is False
 
 
 def test_infer_ultralytics_schema_rejects_empty_metadata():
@@ -178,7 +200,10 @@ def test_unknown_dtype_and_source_strings_are_rejected():
         ef.infer_ultralytics_schema(
             "onnx", [("images", [1, 3, 640, 640], "float64")], outputs, metadata
         )
-    with pytest.raises(ValueError, match="unknown source"):
+    with pytest.raises(
+        ValueError,
+        match=r"unknown source .*expected one of: onnx, tflite, coreml, other",
+    ):
         ef.infer_ultralytics_schema(
             "onnxruntime", [("images", [1, 3, 640, 640], "float32")], outputs, metadata
         )
