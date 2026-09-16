@@ -234,6 +234,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      # Before the download: checkout cleans the working directory, so the
+      # other order deletes the shards it just fetched. No LFS here -- this job
+      # reads JSON from the artifacts, never a model.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           pattern: mutants-shard-*
@@ -248,36 +255,15 @@ jobs:
           # Per-shard step summaries are useful when a shard misbehaves, but
           # the number anyone actually wants is the night's total, which no
           # single matrix job can know.
-          declare -A sum=( [caught]=0 [missed]=0 [timeout]=0 [unviable]=0 )
-          shards=0
-          for d in shards/mutants-shard-*/mutants.out; do
-            [[ -d "${d}" ]] || continue
-            shards=$(( shards + 1 ))
-            for f in caught missed timeout unviable; do
-              n=$(wc -l < "${d}/${f}.txt" 2>/dev/null || echo 0)
-              sum[${f}]=$(( sum[${f}] + n ))
-            done
-          done
-          tested=$(( sum[caught] + sum[missed] + sum[timeout] ))
-          {
-            echo "### Mutation testing — ${shards} shards from index ${START} of ${TOTAL}"
-            echo ""
-            echo "| outcome | count |"
-            echo "| --- | --- |"
-            echo "| caught | ${sum[caught]} |"
-            echo "| missed | ${sum[missed]} |"
-            echo "| timeout | ${sum[timeout]} |"
-            echo "| unviable | ${sum[unviable]} |"
-            echo ""
-            echo "Tested ${tested} mutants tonight."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "tested=${tested} caught=${sum[caught]} missed=${sum[missed]}"
-          if (( sum[missed] > 0 )); then
-            {
-              echo ""
-              echo "### Surviving mutants (no test noticed the change)"
-              echo '```'
-              cat shards/mutants-shard-*/mutants.out/missed.txt 2>/dev/null | head -60
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          #
+          # This reads each shard's outcomes.json rather than counting lines in
+          # the per-outcome .txt files, because the JSON also carries the file,
+          # the function and the diff for every mutant -- which is what turns
+          # "168 missed" into a list of functions nothing asserts on.
+          #
+          # The shell version of this rolled the survivor list up with
+          # `cat missed.txt | head -60`. Past 60 survivors head closed the pipe
+          # first, cat took SIGPIPE, and `set -o pipefail` plus `set -e` failed
+          # the step after the report had already been written -- a red X that
+          # said nothing about the mutants. No pipelines here.
+          python3 .github/scripts/mutants_summary.py --shards shards --github-actions
