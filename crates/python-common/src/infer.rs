@@ -37,9 +37,10 @@ fn source_from_str(s: &str) -> PyResult<ModelSource> {
     match s {
         "onnx" => Ok(ModelSource::Onnx),
         "tflite" => Ok(ModelSource::TfLite),
+        "coreml" => Ok(ModelSource::CoreMl),
         "other" => Ok(ModelSource::Other),
         other => Err(PyValueError::new_err(format!(
-            "unknown source `{other}` (expected one of: onnx, tflite, other)"
+            "unknown source `{other}` (expected one of: onnx, tflite, coreml, other)"
         ))),
     }
 }
@@ -149,7 +150,11 @@ fn tensor_info(
 /// pre-NMS heads and YOLO26 end-to-end heads.
 ///
 /// :param source: Container format the signals were read from: ``"onnx"``,
-///     ``"tflite"``, or ``"other"``.
+///     ``"tflite"``, ``"coreml"``, or ``"other"``. CoreML resolves
+///     pixel-space box coordinates the same way ONNX does, but only for the
+///     no-NMS anchor-grid export; a ``nms=True`` CoreML export produces
+///     Apple's NMS-pipeline artifact, which this function refuses rather
+///     than resolves.
 /// :param inputs: Input tensors as ``(name, shape, dtype)``, or
 ///     ``(name, shape, dtype, quantization)`` -- an input's quantization is
 ///     accepted for symmetry with ``outputs`` and ignored.
@@ -160,8 +165,9 @@ fn tensor_info(
 ///     decoder consumes per-tensor only, so more than one scale is
 ///     rejected rather than turned into a schema that cannot build.
 /// :param metadata: Raw model metadata key/values, passed through verbatim
-///     (ONNX ``metadata_props``, or the TFLite ``metadata.json`` envelope
-///     under whichever key it was captured).
+///     (ONNX ``metadata_props``, the TFLite ``metadata.json`` envelope
+///     under whichever key it was captured, or CoreML's own metadata
+///     alongside Ultralytics' props).
 /// :returns: ``(schema, labels, description)``: the inferred schema as an
 ///     ``edgefirst.json`` schema v2 dict ready for ``Decoder(schema)``,
 ///     class names in index order, and a human-readable summary (e.g.

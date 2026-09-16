@@ -3,7 +3,7 @@
 
 //! Ultralytics YOLO schema inference from raw model I/O signals.
 //!
-//! Model export pipelines (ONNX, TFLite) carry Ultralytics-authored
+//! Model export pipelines (ONNX, TFLite, CoreML) carry Ultralytics-authored
 //! metadata (class names, task, input size) alongside the tensor shapes
 //! and dtypes the runtime reports. This module turns that raw signal into
 //! a [`crate::schema::SchemaV2`] the decoder can act on, without requiring
@@ -41,6 +41,25 @@ pub enum ModelSource {
     /// A TFLite/LiteRT export. Ultralytics emits boxes normalized to
     /// `[0, 1]` here, so the inferred schema sets `normalized: true`.
     TfLite,
+    /// A CoreML export (`.mlpackage` / `.mlmodelc`). Ultralytics' CoreML
+    /// converter traces the same graph the ONNX exporter traces — the
+    /// `1/w` normalize lives only in `IOSDetectModel`, which is used
+    /// solely on the `nms=True` pipeline path — so a no-NMS export emits
+    /// pixel-space box coordinates and the inferred schema sets
+    /// `normalized: false`, matching [`ModelSource::Onnx`].
+    ///
+    /// Established by source-tracing the Ultralytics exporter rather than
+    /// by runtime magnitude measurement; `testdata/infer/NOTES.md` records
+    /// the reasoning and the captured fixture.
+    ///
+    /// This resolution covers the no-NMS export only. A `nms=True` export
+    /// runs Apple's NMS pipeline (`image`/`iouThreshold`/
+    /// `confidenceThreshold` inputs, dynamically-shaped `confidence`/
+    /// `coordinates` outputs) — a different artifact entirely, not the
+    /// anchor-grid tensor this resolution reasons about. Inference does
+    /// not classify it as a schema: neither output's shape can match the
+    /// `[1, 4+nc, A]` anchor-grid layout this module looks for.
+    CoreMl,
     /// Any other container. Inference **refuses** this with
     /// [`InferError::UnknownBoxConvention`] rather than assuming a box
     /// convention: whether coordinates are pixel-space or `[0, 1]` follows
@@ -62,7 +81,8 @@ pub struct ModelSignals {
     /// Output tensors.
     pub outputs: Vec<TensorInfo>,
     /// Raw model metadata key/values (ONNX metadata_props, TFLite
-    /// metadata entries). Values are passed verbatim; parsing happens here.
+    /// metadata entries, CoreML's own metadata alongside Ultralytics'
+    /// props). Values are passed verbatim; parsing happens here.
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -105,9 +125,10 @@ pub enum InferError {
     /// per-tensor only, so such a schema would build a decoder that fails.
     UnsupportedQuantization(String),
     /// The signals came from [`ModelSource::Other`], for which the box
-    /// coordinate convention is unmeasured. Only the ONNX (pixel-space)
-    /// and TFLite (`[0, 1]`) conventions are characterized, and picking
-    /// the wrong one silently scales every box by the input size.
+    /// coordinate convention is unmeasured. Only the ONNX (pixel-space),
+    /// TFLite (`[0, 1]`), and CoreML (pixel-space) conventions are
+    /// characterized, and picking the wrong one silently scales every box
+    /// by the input size.
     UnknownBoxConvention,
 }
 
@@ -139,7 +160,8 @@ impl fmt::Display for InferError {
             InferError::UnknownBoxConvention => write!(
                 f,
                 "box coordinate convention is unknown for this container; only \
-                 onnx (pixel-space) and tflite ([0,1]) are characterized"
+                 onnx (pixel-space), tflite ([0,1]), and coreml (pixel-space) \
+                 are characterized"
             ),
         }
     }
@@ -949,15 +971,21 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
     }
 
     // Box normalization is the one field shape cannot reveal -- it follows
-    // the exporter, and only the ONNX and TFLite conventions have been
-    // measured (see testdata/infer/NOTES.md answer 5: 637.25 px vs 0.9957 on
-    // the same image). Guessing it wrong scales every box by the input size,
-    // which is why `Other` is refused rather than defaulted: everywhere else
-    // this module errors on ambiguity, and this is the field whose
-    // corruption `tests/infer_builder.rs` exists to pin.
+    // the exporter. ONNX and TFLite are pinned by runtime magnitude
+    // measurement (see testdata/infer/NOTES.md answer 5: 637.25 px vs
+    // 0.9957 on the same image); CoreML resolves alongside ONNX on a
+    // different basis -- source-tracing the Ultralytics exporter shows the
+    // `1/w` normalize lives only in `IOSDetectModel`, used solely on the
+    // `nms=True` path, so a plain no-NMS CoreML export passes the raw model
+    // through pixel-space exactly as ONNX does (see testdata/infer/NOTES.md
+    // for the reasoning and the captured fixture). Guessing it wrong scales
+    // every box by the input size, which is why `Other` is refused rather
+    // than defaulted: everywhere else this module errors on ambiguity, and
+    // this is the field whose corruption `tests/infer_builder.rs` exists to
+    // pin.
     let normalized = match signals.source {
         ModelSource::TfLite => true,
-        ModelSource::Onnx => false,
+        ModelSource::Onnx | ModelSource::CoreMl => false,
         ModelSource::Other => {
             return Err(InferError::UnknownBoxConvention);
         }
@@ -1228,6 +1256,7 @@ mod tests {
         {
             "onnx" => ModelSource::Onnx,
             "tflite" => ModelSource::TfLite,
+            "coreml" => ModelSource::CoreMl,
             other => panic!("fixture {name}: unknown source `{other}`"),
         };
 
@@ -2098,6 +2127,14 @@ mod tests {
             e2e("yolo26n", E2E, false, None),
             e2e("yolo26n-seg", E2E_SEG, false, P),
             e2e("yolo26n_float32", E2E, true, None),
+            // Same network, different exporter default. The `yolo26n` row above
+            // was captured from ultralytics 8.4.137, whose `nms` arg defaulted to
+            // `False`; `exporter.py`'s `model.end2end = self.args.nms is False`
+            // then selected the one2one (NMS-free, [1, 300, 6]) head. In 8.4.153
+            // that default is `None`, so the same expression is false and the
+            // one2many anchor-grid head ships instead -- hence a Yolov8-shaped
+            // pre-NMS row for a YOLO26 checkpoint. Both heads live in the weights.
+            pre_nms("yolo26n_coreml", DET, false, None),
         ]
     }
 
@@ -2201,10 +2238,11 @@ mod tests {
     #[test]
     fn infer_other_source_refuses_rather_than_guessing_normalization() {
         // `normalized` follows the exporter and cannot be read off the
-        // shapes. ONNX (pixel-space) and TFLite ([0,1]) are the two measured
-        // conventions; an uncharacterized container gets a typed refusal,
-        // because guessing scales every box by the input size and the
-        // resulting schema looks perfectly valid.
+        // shapes. ONNX (pixel-space) and TFLite ([0,1]) are measured;
+        // CoreML (pixel-space) is source-traced rather than measured, but
+        // characterized all the same. An uncharacterized container gets a
+        // typed refusal, because guessing scales every box by the input
+        // size and the resulting schema looks perfectly valid.
         let s = ModelSignals {
             source: ModelSource::Other,
             inputs: vec![TensorInfo {
@@ -2365,6 +2403,82 @@ mod tests {
         // shape[0] == 1; find_anchors_dim must match it).
         let mut s = signals_from_fixture("yolov8n");
         s.outputs[0].shape = vec![2, 84, 8400];
+        assert!(matches!(
+            infer_ultralytics_schema(&s),
+            Err(InferError::UnsupportedLayout(_))
+        ));
+    }
+
+    #[test]
+    fn coreml_source_resolves_a_box_convention() {
+        // CoreML must not hit the `Other` refusal: a native `.mlpackage`
+        // export is a source-traced convention, not an unknown one.
+        let s = ModelSignals {
+            source: ModelSource::CoreMl,
+            inputs: vec![TensorInfo {
+                name: "images".into(),
+                shape: vec![1, 3, 640, 640],
+                dtype: DType::Float16,
+                quantization: None,
+            }],
+            outputs: vec![TensorInfo {
+                name: "output0".into(),
+                shape: vec![1, 84, 8400],
+                dtype: DType::Float16,
+                quantization: None,
+            }],
+            metadata: synthetic_metadata(80, "detect", "False"),
+        };
+        let r = infer_ultralytics_schema(&s)
+            .expect("CoreML signals must infer, not raise UnknownBoxConvention");
+        let o = &r.schema.outputs[0];
+        assert_eq!(
+            o.normalized,
+            Some(false),
+            "Ultralytics CoreML exports trace the raw model, so boxes are \
+             pixel-space exactly as in the ONNX export"
+        );
+    }
+
+    #[test]
+    fn coreml_nms_pipeline_export_is_refused_not_classified() {
+        // `yolo export ... format=coreml nms=True` does not produce the
+        // anchor-grid tensor `ModelSource::CoreMl`'s pixel-space
+        // resolution reasons about -- it substitutes Apple's own NMS
+        // pipeline, whose two outputs are dynamically shaped and already
+        // post-NMS. Real measured shapes (Task 3b brief, from a genuine
+        // `yolo26n.pt` export): `confidence` and `coordinates` are both
+        // float32 multiArrays with an empty (fully dynamic) shape --
+        // nothing here is the `[1, 4+nc, A]` layout this module looks
+        // for, so inference must refuse it rather than guess. This
+        // refusal is intentional: do not "fix" it into acceptance, since
+        // that would apply CoreMl's pixel-space convention (or none at
+        // all) to output Apple's pipeline has already decoded and scaled
+        // its own way.
+        let s = ModelSignals {
+            source: ModelSource::CoreMl,
+            inputs: vec![TensorInfo {
+                name: "image".into(),
+                shape: vec![1, 3, 640, 640],
+                dtype: DType::Float16,
+                quantization: None,
+            }],
+            outputs: vec![
+                TensorInfo {
+                    name: "confidence".into(),
+                    shape: vec![],
+                    dtype: DType::Float32,
+                    quantization: None,
+                },
+                TensorInfo {
+                    name: "coordinates".into(),
+                    shape: vec![],
+                    dtype: DType::Float32,
+                    quantization: None,
+                },
+            ],
+            metadata: synthetic_metadata(80, "detect", "False"),
+        };
         assert!(matches!(
             infer_ultralytics_schema(&s),
             Err(InferError::UnsupportedLayout(_))

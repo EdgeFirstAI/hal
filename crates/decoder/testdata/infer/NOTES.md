@@ -114,13 +114,51 @@ models):
 This confirms the spec's assumption (a): ONNX boxes are pixel-space, TFLite
 boxes are normalized [0,1].
 
+## CoreML box convention
+
+`yolo26n_coreml.signals.json` was captured from an fp16 `.mlpackage`
+produced by `ultralytics 8.4.153` / `coremltools 9.0`, re-converted to
+float16 I/O by the profiler's `tools/export_fp16.py`.
+
+The convention is **pixel-space** (`normalized: false`), matching the ONNX
+export rather than TFLite. Reason: Ultralytics' `export_coreml` substitutes
+`IOSDetectModel` — the module that applies the `1/w` (or
+`[1/w, 1/h, 1/w, 1/h]`) normalize — **only** when
+`self.args.nms and self.model.task == "detect"`. `nms` defaults to falsy,
+so a plain `format=coreml` export never takes that branch and passes the
+raw model through exactly as the ONNX exporter does.
+
+This is source-tracing, not runtime measurement: ONNX and TFLite above were
+pinned by feeding a real image through both exports and comparing box
+magnitude (answer 5: 637.25 px vs 0.9957). CoreML has not had that same
+runtime check performed — this entry records why the convention is expected
+to match ONNX, based on reading the exporter's branch condition, not a
+measured decode. Runtime evidence is expected to follow later.
+
+This resolution covers the no-NMS export only. `yolo export ... nms=True`
+takes the `IOSDetectModel` branch above and substitutes Apple's own NMS
+pipeline: a real `yolo26n.pt` export with `nms=True` produces three inputs
+(`image` imageType, `iouThreshold` doubleType, `confidenceThreshold`
+doubleType) and two dynamically-shaped outputs (`confidence`,
+`coordinates`, both float32 with shape `[]`) — not the anchor-grid tensor
+this section reasons about. That export is a different artifact that
+inference does not classify: `capture_coreml_signals.py` refuses
+`imageType` inputs outright, and `infer_ultralytics_schema` cannot match
+either output's shape to the `[1, 4+nc, A]` layout it looks for.
+
 ## Fixture format
 
-Each `<export-name>.signals.json` is `{"source": "onnx"|"tflite", "inputs":
-[...], "outputs": [...], "metadata": {...}}` per
-`tests/decoder/ultralytics_signals.py::signals_for`. All 11 fixtures parse
-as JSON and have non-empty `inputs`/`outputs`; ONNX fixtures have 15
-metadata keys each, TFLite fixtures have exactly 1 (`metadata.json`).
+Each `<export-name>.signals.json` is `{"source": "onnx"|"tflite"|"coreml",
+"inputs": [...], "outputs": [...], "metadata": {...}}`. The `onnx`/`tflite`
+fixtures are captured per `tests/decoder/ultralytics_signals.py::signals_for`;
+the `coreml` fixture is captured separately, by `scripts/capture_coreml_signals.py`,
+into the same schema. All 12 fixtures parse as JSON and have non-empty
+`inputs`/`outputs`; ONNX fixtures have 15 metadata keys each, TFLite
+fixtures have exactly 1 (`metadata.json`), and the CoreML fixture has 12
+(coremltools' own conversion-provenance keys alongside the Ultralytics
+ones). Tensor `dtype` is a plain string (`"float32"`, `"float16"`, `"int8"`,
+etc.) — the CoreML fixture is the first to use `"float16"` for both input
+and output.
 
 One capture-time transform is applied: Ultralytics stamps the absolute path
 of the dataset YAML from whichever machine trained the released weights into

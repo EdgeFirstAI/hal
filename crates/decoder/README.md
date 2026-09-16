@@ -216,9 +216,10 @@ independent Rust implementation, and nothing from any model-training
 project is vendored, linked or redistributed. Exporting a model is
 something you do with your own tooling; this crate reads what came out.
 
-A vanilla Ultralytics YOLOv8/YOLO11/YOLO26 export (ONNX or TFLite, detection
-or segmentation) carries no `edgefirst.json`, but its own metadata and tensor
-shapes are enough to derive one. `infer_ultralytics_schema` reads the
+A vanilla Ultralytics YOLOv8/YOLO11/YOLO26 export (ONNX, TFLite, or CoreML;
+detection or segmentation) carries no `edgefirst.json`, but its own
+metadata and tensor shapes are enough to derive one.
+`infer_ultralytics_schema` reads the
 model's `names`/`task`/`end2end` metadata plus its I/O tensor shapes and
 dtypes, and returns a `SchemaV2` ready to hand to `DecoderBuilder`, along
 with the ordered class labels. Metadata and shapes are cross-checked, never
@@ -250,10 +251,12 @@ Box normalization follows the export format, not a fixed convention:
 Ultralytics ONNX exports report pixel-space boxes (`normalized: false`),
 while TFLite exports report boxes normalized to `[0, 1]` (`normalized:
 true`) — the inferred schema always matches the tensors the model actually
-produces. Those two conventions are the measured ones;
-`ModelSource::Other` is refused rather than defaulted, because this is the
-one field no tensor shape reveals and picking wrong scales every box by the
-input size. The schema's `decoder_version` (`yolov8` or `yolo26`) is always
+produces. A CoreML export (no-NMS) is pixel-space too, matching ONNX, but
+that convention is established by source-tracing the Ultralytics exporter
+rather than by runtime measurement. `ModelSource::Other` is refused rather
+than defaulted, because this is the one field no tensor shape reveals and
+picking wrong scales every box by the input size. The schema's
+`decoder_version` (`yolov8` or `yolo26`) is always
 set explicitly rather than left for the builder to infer from output shape,
 because shape-based inference of end-to-end vs. pre-NMS layout is
 ambiguous in the general case; inference here settles it once, from the

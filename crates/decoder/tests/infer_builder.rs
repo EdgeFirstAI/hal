@@ -52,6 +52,7 @@ fn signals_from_fixture(name: &str) -> ModelSignals {
     {
         "onnx" => ModelSource::Onnx,
         "tflite" => ModelSource::TfLite,
+        "coreml" => ModelSource::CoreMl,
         other => panic!("fixture {name}: unknown source `{other}`"),
     };
 
@@ -145,6 +146,25 @@ fn inferred_schemas_build_decoders() {
             .build()
             .unwrap_or_else(|e| panic!("{name}: builder rejected schema: {e}"));
     }
+}
+
+/// The CoreML fixture must build a real `Decoder` through `DecoderBuilder`,
+/// not merely produce an internally consistent schema.
+#[test]
+fn coreml_yolo26n_fixture_builds_a_decoder() {
+    let signals = signals_from_fixture("yolo26n_coreml");
+    let inferred = infer_ultralytics_schema(&signals).expect("CoreML fixture must infer a schema");
+    assert_eq!(
+        inferred.schema.outputs[0].normalized,
+        Some(false),
+        "CoreML boxes are pixel-space, matching the ONNX export"
+    );
+    DecoderBuilder::new()
+        .with_schema(inferred.schema)
+        .with_input_dims(640, 640)
+        .with_score_threshold(0.001)
+        .build()
+        .expect("inferred CoreML schema must build a Decoder");
 }
 
 /// Regression test for the downstream profiler bug: auto-discovered

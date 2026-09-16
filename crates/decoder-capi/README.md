@@ -109,7 +109,7 @@ inference runtime reports into `ef_infer_signals`, and
 #include <stdint.h>
 #include <stdio.h>
 
-ef_infer_signals *s = ef_infer_signals_new(0); /* 0 onnx, 1 tflite */
+ef_infer_signals *s = ef_infer_signals_new(0); /* 0 onnx, 1 tflite; see below */
 
 const uintptr_t in_shape[4] = { 1, 3, 640, 640 };
 ef_infer_signals_add_input(s, "images", in_shape, 4, EF_INFER_DTYPE_FLOAT32);
@@ -118,7 +118,8 @@ const uintptr_t out_shape[3] = { 1, 6, 8400 }; /* 4 box + 2 classes */
 ef_infer_signals_add_output(s, "output0", out_shape, 3, EF_INFER_DTYPE_FLOAT32,
                             NULL, NULL, 0); /* quant_len 0 = unquantized */
 
-/* Verbatim from the model: ONNX metadata_props, or TFLite metadata.json. */
+/* Verbatim from the model: ONNX metadata_props, TFLite metadata.json,
+ * or CoreML's own metadata alongside Ultralytics' props. */
 ef_infer_signals_add_metadata(s, "names", "{0: 'person', 1: 'bicycle'}");
 ef_infer_signals_add_metadata(s, "task", "detect");
 ef_infer_signals_add_metadata(s, "end2end", "False");
@@ -168,10 +169,10 @@ deliberately start at `0x100` so the two ranges are disjoint. Both cross as
 bare `uint32_t`, so overlapping ranges would have made every `EF_DTYPE_*`
 value a valid code here meaning something else; disjoint ranges turn passing
 the wrong one into `EINVAL`. `source` is a plain integer with no macros:
-`0` onnx, `1` tflite, `2` other. `2` is accepted by `ef_infer_signals_new`
-but refused by inference — whether boxes are pixel-space or `[0, 1]` follows
-the exporter, is not derivable from shapes, and guessing scales every box by
-the input size.
+`0` onnx, `1` tflite, `2` other, `3` coreml. `2` is accepted by
+`ef_infer_signals_new` but refused by inference — whether boxes are
+pixel-space or `[0, 1]` follows the exporter, is not derivable from shapes,
+and guessing scales every box by the input size.
 
 An inferred schema pins the NMS *mode* and leaves the *thresholds* to you.
 Ultralytics runs NMS class-aware (`agnostic=False`), so a pre-NMS YOLOv8/11

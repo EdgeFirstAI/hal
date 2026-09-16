@@ -122,12 +122,14 @@ works too — but two of the three fields are strings, and naming them is
 cheaper than remembering the order.
 
 `source` decides the box convention: Ultralytics ONNX exports report
-pixel-space coordinates, TFLite exports report `[0, 1]`. `"other"` is
-accepted but refused by inference rather than defaulted — that convention
-follows the exporter, is not derivable from shapes, and guessing it scales
-every box by the input size. Supported dtype strings are `"int8"`,
-`"uint8"`, `"int16"`, `"uint16"`, `"int32"`, `"uint32"`, `"float16"` and
-`"float32"`.
+pixel-space coordinates, TFLite exports report `[0, 1]`, and a CoreML
+export (no-NMS) resolves pixel-space too, the same as ONNX. A `nms=True`
+CoreML export produces Apple's own NMS-pipeline artifact instead, which is
+refused rather than resolved. `"other"` is accepted but refused by
+inference rather than defaulted — that convention follows the exporter, is
+not derivable from shapes, and guessing it scales every box by the input
+size. Supported dtype strings are `"int8"`, `"uint8"`, `"int16"`,
+`"uint16"`, `"int32"`, `"uint32"`, `"float16"` and `"float32"`.
 
 `schema` is a plain dict, ready for `Decoder(schema)` — there is no JSON
 string to parse back. `labels` is the class names in index order, which is

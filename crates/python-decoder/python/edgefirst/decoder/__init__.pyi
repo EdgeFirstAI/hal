@@ -823,8 +823,12 @@ def infer_ultralytics_schema(
     ``edgefirst.json``.
 
     Args:
-        source: Container format the signals were read from: ``"onnx"`` or
-            ``"tflite"``. ``"other"`` is accepted but rejected by inference:
+        source: Container format the signals were read from: ``"onnx"``,
+            ``"tflite"``, or ``"coreml"``. CoreML resolves pixel-space box
+            coordinates the same way ONNX does, but only for the no-NMS
+            anchor-grid export; a ``nms=True`` CoreML export produces
+            Apple's NMS-pipeline artifact, which is refused rather than
+            resolved. ``"other"`` is accepted but rejected by inference:
             whether boxes are pixel-space or ``[0, 1]`` follows the exporter
             and is not derivable from shapes, so an uncharacterized
             container is refused rather than guessed at.
@@ -839,8 +843,9 @@ def infer_ultralytics_schema(
             scale is rejected rather than turned into a schema that cannot
             build.
         metadata: Raw model metadata key/values, passed through verbatim
-            (ONNX ``metadata_props``, or the TFLite ``metadata.json``
-            envelope under whichever key it was captured).
+            (ONNX ``metadata_props``, the TFLite ``metadata.json``
+            envelope under whichever key it was captured, or CoreML's own
+            metadata alongside Ultralytics' props).
 
     Note:
         Supported dtype strings are ``"int8"``, ``"uint8"``, ``"int16"``,
