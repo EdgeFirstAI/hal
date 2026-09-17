@@ -95,6 +95,7 @@ help:
 	@echo "    make test-ontarget  - Run the suite on SSH hosts you supply"
 	@echo "                          TARGETS='host1 host2' (required)"
 	@echo "    make bench          - Run benchmarks"
+	@echo "    make check-macho    - Assert shipped Mach-O string pools are aligned (#200)"
 	@echo ""
 	@echo "  Quality & Release:"
 	@echo "    make sbom           - Generate SBOM and check license policy"
@@ -272,7 +273,31 @@ capi-symlinks:
 package: capi-libs-release
 	@mkdir -p dist
 	@./scripts/package-capi.sh --outdir dist
+	@python3 scripts/check_macho_alignment.py dist
 	@echo "✓ C archive in dist/"
+
+# Issue #200's regression gate, runnable on its own. Pure file parsing, so it
+# is meaningful on any OS: a Linux or Windows runner validates a macOS wheel
+# just as well as a Mac does. `make wheel` and `make package` already run it
+# over what they produce; this target points it at a plain build tree.
+#
+# Override MACHO_DIRS to scan elsewhere, e.g.
+#   make check-macho MACHO_DIRS="target/wheels dist"
+#
+# Paths that do not exist yet are dropped rather than failing: the point is to
+# check what has been built, and "you have not built wheels" is not a
+# violation. The script itself stays strict about a path it is handed.
+MACHO_DIRS ?= target/release target/wheels
+
+.PHONY: check-macho
+check-macho:
+	@built=""; \
+	for d in $(MACHO_DIRS); do [ -e "$$d" ] && built="$$built $$d"; done; \
+	if [ -z "$$built" ]; then \
+		echo "check-macho: nothing to scan (looked in: $(MACHO_DIRS))"; \
+	else \
+		python3 scripts/check_macho_alignment.py $$built; \
+	fi
 
 .PHONY: build-python
 build-python:
@@ -321,6 +346,7 @@ wheel:
 		fi; \
 	done
 	@python3 scripts/check_wheel_layout.py target/wheels
+	@python3 scripts/check_macho_alignment.py target/wheels
 	@echo "✓ Wheel built in target/wheels/"
 
 # ===========================================================================
@@ -365,10 +391,21 @@ test-doc:
 		--exclude edgefirst-python-common
 	@echo "✓ Doctests passed"
 
-.PHONY: test-python
-test-python:
-	@echo "Running Python tests..."
-	@echo "  Installing Python bindings..."
+# The PEP 517 source-directory install, split out of test-python so CI can
+# exercise it without paying for the whole suite. `pip install <dir>/` is a
+# different code path from the `maturin build` + `pip install *.whl` route
+# every workflow uses, and it is the ONLY path issue #199 broke -- so it is
+# the only path worth a dedicated gate. Narrow it with PYTHON_PACKAGES to
+# check the mechanism for one package:
+#
+#   make install-python PYTHON_PACKAGES=tensor
+#
+# tensor is the meaningful single choice: it is the package whose build.rs
+# bundles libedgefirst_tensor, which is the dependency maturin's repair step
+# could not resolve.
+.PHONY: install-python
+install-python:
+	@echo "  Installing Python bindings ($(PYTHON_PACKAGES))..."
 	@# --no-deps is required, not an optimisation. Every edgefirst-* sibling is
 	@# being built from THIS tree in this same loop, so the `~=` pins in each
 	@# pyproject.toml -- which describe what a *published* wheel needs from PyPI
@@ -382,13 +419,41 @@ test-python:
 	else \
 		pip install -q numpy || exit 1; \
 	fi
+	@# MATURIN_PEP517_ARGS is the only channel `pip install <dir>/` has for
+	@# reaching maturin's own CLI -- pip drives the PEP 517 backend, which
+	@# shells out to `maturin pep517 build-wheel` with arguments pip chooses.
+	@# Every OTHER maturin call site in this file and in the workflows already
+	@# passes `--auditwheel skip` (see build-python, wheel, and release.yml's
+	@# wheel job); this loop could not, and was the one path that let maturin's
+	@# repair step run. On macOS that step fails outright (issue #199):
+	@#
+	@#   Cannot repair wheel, because required library
+	@#   @rpath/libedgefirst_tensor.0.dylib could not be located.
+	@#
+	@# The library is not missing. crates/python-tensor/build.rs stages it into
+	@# `python/edgefirst/tensor/`, maturin's `python-source` ships it in the
+	@# wheel as a sibling of `_tensor.cpython-*.so`, and that extension carries
+	@# `-rpath,@loader_path` so it resolves there at import time. maturin's
+	@# repair resolves `@rpath/...` against LINK-time search paths only and
+	@# cannot see what `python-source` is about to package, so it declares a
+	@# self-contained wheel unrepairable. Skipping repair is correct here, not
+	@# a workaround: these wheels are bundled by build.rs by design.
+	@#
+	@# Linux never hit this because maturin skips auditwheel entirely under the
+	@# `--compatibility off` that pip's invocation carries; the macOS dylib
+	@# repair path has no such opt-out.
 	@for c in $(PYTHON_CRATES); do \
 		if [ -f "venv/bin/activate" ]; then \
-			. venv/bin/activate && pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
+			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip" \
+				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		else \
-			pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
+			MATURIN_PEP517_ARGS="--auditwheel skip" \
+				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		fi; \
 	done
+
+.PHONY: test-python
+test-python: install-python
 	@echo "  Running tests..."
 	@if [ -f "venv/bin/slipcover" ]; then \
 		. venv/bin/activate && \

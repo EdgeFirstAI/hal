@@ -13,13 +13,82 @@
 # ad-hoc — see README.md § "Local fp16 / AVX build overrides" and
 # TESTING.md for the documented incantations.
 
-# aarch64 Apple Silicon (M-series) is the one safe exception: every
-# M-series chip (M1 through M4) is ARMv8.6-A+ and supports fp16,
-# dotprod (sdot/udot), and i8mm (smmla/ummla/usmmla). Intel Macs
-# build under the separate `x86_64-apple-darwin` triple, so this
-# entry cannot misfire on non-ARM hardware.
+# macOS targets.
+#
+# `target-feature`: aarch64 Apple Silicon (M-series) is the one safe
+# exception to the baseline-ISA rule above: every M-series chip (M1
+# through M4) is ARMv8.6-A+ and supports fp16, dotprod (sdot/udot), and
+# i8mm (smmla/ummla/usmmla). Intel Macs build under the separate
+# `x86_64-apple-darwin` triple, so that entry cannot misfire on non-ARM
+# hardware — and gets no `target-feature` line of its own.
+#
+# `strip=none` + `-Wl,-x` (issue #200): `[profile.release] strip = true`
+# in the root Cargo.toml makes rustc strip the symbol table itself,
+# in-process, on Apple targets — it does NOT shell out to Apple's
+# `strip(1)`. Verified: a `strip` shim placed earlier on PATH is never
+# invoked, and no `-Wl,-x`/`-Wl,-S` reaches the linker. rustc's own Mach-O
+# writer lays the string table down immediately after the indirect symbol
+# table with no padding. Indirect symbol entries are 4 bytes, so whenever
+# a binary's `nindirectsyms` is ODD the string pool lands 4-byte aligned,
+# and dyld on macOS 26+ rejects the image outright:
+#
+#     ImportError: dlopen(..._tensor.cpython-314-darwin.so, 0x0002):
+#     mis-aligned LINKEDIT string pool, fileOffset=0x0019070C
+#
+# That parity is a coin flip, so the bug is latent in every release Mach-O
+# this workspace produces, not a property of one crate — measured at
+# 0.31.0, `lib_tensor` (435) and `lib_decoder` (493) were odd and would
+# not load, while the other release dylibs were even and fine by luck.
+# `maturin build --release` (release.yml's wheel job) goes through the
+# same path, so this reached published macOS wheels.
+#
+# `strip=none` hands the job back to Apple's linker via `-Wl,-x` (discard
+# local symbols), which pads correctly. `-x` is strictly less destructive
+# than the `strip=symbols` the profile asks for, so nothing that survived
+# stripping before is lost now, and it costs ~6% of artifact size rather
+# than the ~39% of dropping the strip altogether (`_tensor` on aarch64:
+# 1.75 MB here, 1.66 MB broken, 2.31 MB unstripped).
+#
+# The iOS tables below carry the same two flags -- same Mach-O, same rustc
+# writer. The Android tables deliberately do NOT, and that is a
+# measurement rather than a scope call: Android is ELF, which has no
+# LINKEDIT segment and no string-pool alignment rule, so the defect cannot
+# occur there -- and `-Wl,-x` means something different to lld
+# (`--discard-all`, local symbols only) than rustc's strip does. Measured
+# on a real Android link (`tensor-capi` cdylib, aarch64-linux-android via
+# cargo-ndk): rustc's strip drops `.symtab` outright for 1.32 MB, while
+# `strip=none` + `-Wl,-x` puts every global symbol back for 3.30 MB -- a
+# 2.5x APK cost to fix a bug ELF cannot have. Android stays on the
+# profile's own strip.
+#
+# These apply to every macOS profile, not only release, because cargo has
+# no per-profile rustflags. That is harmless: `strip=none` is already the
+# debug default, and `-Wl,-x` discards local symbols without touching the
+# N_OSO debug-map entries Rust symbolicates through -- verified, debug
+# backtraces still resolve both function names and file:line.
+#
+# Note that setting RUSTFLAGS in the environment SUPPRESSES this whole
+# table -- cargo does not merge the two -- which silently drops the
+# workaround along with the target-feature line above. Nothing in the
+# Makefile or the workflows sets it, but cargo-llvm-cov does for its own
+# instrumentation, so coverage builds run without these flags. That is
+# fine (coverage artifacts are not shipped) and is exactly why the fix is
+# backed by a gate rather than trusted on its own.
+#
+# Revisit when rust-toolchain.toml moves: if rustc's Mach-O writer learns
+# to pad, drop both flags and let the profile strip again. The regression
+# gate is `scripts/check_macho_alignment.py` -- `make check-macho`, plus
+# `make wheel`, `make package`, release.yml's wheel job, and
+# tests/packaging/test_macho_alignment.py.
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "target-feature=+fp16,+dotprod,+i8mm"]
+rustflags = [
+    "-C", "target-feature=+fp16,+dotprod,+i8mm",
+    "-C", "strip=none",
+    "-C", "link-arg=-Wl,-x",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "strip=none", "-C", "link-arg=-Wl,-x"]
 
 # iOS targets (aarch64-apple-ios device, aarch64-apple-ios-sim simulator).
 #
@@ -35,9 +104,22 @@ rustflags = ["-C", "target-feature=+fp16,+dotprod,+i8mm"]
 # succeeds WITHOUT the ANGLE frameworks present. The unresolved-symbol
 # warnings from the linker are expected and are satisfied at app-link
 # time by the embedded `EGL.xcframework` + `GLESv2.xcframework`
-# (see README.md § iOS). No rustflags, no linker overrides needed.
+# (see README.md § iOS). No linker overrides are needed for that.
+#
+# They DO carry the Apple strip workaround documented above, for the same
+# reason macOS does: same rustc, same in-process Mach-O writer, same
+# odd-`nindirectsyms` coin flip. This repo only builds rlibs for iOS today
+# (hal-full.yml links nothing for these triples), so the flags are inert
+# here until something does link -- which is exactly why they belong in the
+# table rather than in a reviewer's memory. Measured on a real iOS link
+# (`tensor-capi` cdylib, aarch64-apple-ios): 1.26 MB stripped by rustc vs
+# 1.35 MB here, +7%, matching the macOS figure. `mobile-sdk` owns the final
+# framework link and needs the same two flags on its side.
 [target.aarch64-apple-ios]
+rustflags = ["-C", "strip=none", "-C", "link-arg=-Wl,-x"]
+
 [target.aarch64-apple-ios-sim]
+rustflags = ["-C", "strip=none", "-C", "link-arg=-Wl,-x"]
 
 # Android targets (aarch64-linux-android device, x86_64-linux-android
 # emulator). Minimum supported API level: 26 (Android 8.0) — the

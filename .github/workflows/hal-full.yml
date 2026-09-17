@@ -577,7 +577,34 @@ jobs:
               --features abi3-py311 \
               --auditwheel skip
           done
+          # Issue #200: rustc strips Apple binaries with its own in-process
+          # Mach-O writer, which leaves the LINKEDIT string pool 4-byte
+          # aligned whenever a binary's nindirectsyms is odd -- dyld on macOS
+          # 26+ then refuses the import below. Checked explicitly rather than
+          # left to the import: the parity is a coin flip per binary, so on
+          # any given run some wheels can be fine and others not, and a
+          # passing import proves nothing about the next build.
+          python3 scripts/check_macho_alignment.py target/wheels
           venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
           PY=$(python3 -c "import os; print(os.path.realpath('venv/bin/python3'))")
           codesign --force --sign - --entitlements entitlements.plist "$PY"
           venv/bin/python -m pytest tests/ -m gpu -v --tb=short
+
+      - name: Source-directory install path (issue #199)
+        # Everything above installs from `target/wheels/*.whl`, built by
+        # `maturin build`. So does every other lane. `pip install <dir>/` is a
+        # different code path -- it drives maturin's PEP 517 backend, which is
+        # the one call site that cannot take CLI flags and therefore the only
+        # one whose wheel-repair step runs. On macOS that step fails on the
+        # library python-tensor/build.rs bundles, which is what #199 was, and
+        # nothing exercised it because `make test-python` runs in no lane.
+        #
+        # Narrowed to `tensor` on purpose: it is the package that bundles
+        # libedgefirst_tensor, so it is the one that reproduces the failure,
+        # and one wheel keeps this to a couple of minutes instead of pulling
+        # in the full suite's dependency tail (tensorflow, opencv, ...) for a
+        # packaging check. The import is the point -- a wheel that builds but
+        # will not load is the #200 failure, so this covers both at once.
+        run: |
+          make install-python PYTHON_PACKAGES=tensor
+          venv/bin/python -c "import edgefirst.tensor; print(edgefirst.tensor.__name__, 'imported')"

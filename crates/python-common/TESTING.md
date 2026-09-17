@@ -54,6 +54,14 @@ python -m slipcover --xml --out target/python-coverage.xml -m pytest tests/
 `make test-python` wraps steps 2, 3 and 5. It does **not** wrap step 4 —
 `make wheels` runs the layout gate after building.
 
+`make test-python` installs through `pip install crates/python-*/`, which
+drives maturin's PEP 517 backend. That backend is the one maturin call site
+in the repo that cannot take CLI flags directly, so the target passes
+`MATURIN_PEP517_ARGS="--auditwheel skip"` to reach maturin's own argv —
+matching every other call site. Without it the repair step runs and, on
+macOS, fails on the very library this crate's `build.rs` bundles (issue
+#199). Use the same variable if you install these directories by hand.
+
 ## What the packaging gates protect
 
 These are cheap and catch the failure modes that the split introduced. They
@@ -65,6 +73,7 @@ are not optional extras; each one corresponds to a bug already hit once.
 | `test_wheel_layout.py` | A wheel that is not self-contained, or is missing `py.typed`/stubs |
 | abi3 tag-set check | Mixed `cp38-abi3` and `cp311-abi3` across packages, which forks the supported interpreter range silently. The comparison must include the **python** tag — `cp38-abi3` and `cp311-abi3` share abi and platform tags, so comparing only those two passes a genuinely mixed set |
 | `test_size_baseline.py` | A codec-only install regaining a dependency on `edgefirst-image` |
+| `test_macho_alignment.py` | A macOS wheel whose extension dyld refuses to load — rustc's in-process Apple strip leaves the LINKEDIT string pool 4-byte aligned when `nindirectsyms` is odd. The parity is a coin flip per binary, so an import smoke test on one build says nothing about the next; this parses the Mach-O instead, and therefore runs on every OS (issue #200) |
 
 ## Special Requirements
 
