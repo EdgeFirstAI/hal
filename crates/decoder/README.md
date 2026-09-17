@@ -251,9 +251,9 @@ Box normalization follows the export format, not a fixed convention:
 Ultralytics ONNX exports report pixel-space boxes (`normalized: false`),
 while TFLite exports report boxes normalized to `[0, 1]` (`normalized:
 true`) — the inferred schema always matches the tensors the model actually
-produces. A CoreML export (no-NMS) is pixel-space too, matching ONNX, but
-that convention is established by source-tracing the Ultralytics exporter
-rather than by runtime measurement. `ModelSource::Other` is refused rather
+produces. A CoreML export (no-NMS) is pixel-space too, matching ONNX,
+established by source-tracing the Ultralytics exporter and confirmed by the
+same runtime measurement that pinned the other two. `ModelSource::Other` is refused rather
 than defaulted, because this is the one field no tensor shape reveals and
 picking wrong scales every box by the input size. The schema's
 `decoder_version` (`yolov8` or `yolo26`) is always

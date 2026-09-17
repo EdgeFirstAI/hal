@@ -48,9 +48,10 @@ pub enum ModelSource {
     /// pixel-space box coordinates and the inferred schema sets
     /// `normalized: false`, matching [`ModelSource::Onnx`].
     ///
-    /// Established by source-tracing the Ultralytics exporter rather than
-    /// by runtime magnitude measurement; `testdata/infer/NOTES.md` records
-    /// the reasoning and the captured fixture.
+    /// Established by source-tracing the Ultralytics exporter and
+    /// confirmed by runtime magnitude measurement against a matched fp16
+    /// ONNX pair; `testdata/infer/NOTES.md` records the reasoning, the
+    /// measurement and the captured fixture.
     ///
     /// This resolution covers the no-NMS export only. A `nms=True` export
     /// runs Apple's NMS pipeline (`image`/`iouThreshold`/
@@ -973,16 +974,19 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
     // Box normalization is the one field shape cannot reveal -- it follows
     // the exporter. ONNX and TFLite are pinned by runtime magnitude
     // measurement (see testdata/infer/NOTES.md answer 5: 637.25 px vs
-    // 0.9957 on the same image); CoreML resolves alongside ONNX on a
-    // different basis -- source-tracing the Ultralytics exporter shows the
-    // `1/w` normalize lives only in `IOSDetectModel`, used solely on the
+    // 0.9957 on the same image); CoreML resolves alongside ONNX on both
+    // bases. Source-tracing the Ultralytics exporter shows the `1/w`
+    // normalize lives only in `IOSDetectModel`, used solely on the
     // `nms=True` path, so a plain no-NMS CoreML export passes the raw model
-    // through pixel-space exactly as ONNX does (see testdata/infer/NOTES.md
-    // for the reasoning and the captured fixture). Guessing it wrong scales
-    // every box by the input size, which is why `Other` is refused rather
-    // than defaulted: everywhere else this module errors on ambiguity, and
-    // this is the field whose corruption `tests/infer_builder.rs` exists to
-    // pin.
+    // through pixel-space exactly as ONNX does; the same runtime check run
+    // against a matched fp16 ONNX pair agrees, with x reaching 640.25 on a
+    // 640-pixel input and every coordinate statistic matching within half a
+    // pixel -- fp16 rounding, where a convention difference would be a
+    // factor of 640 (see testdata/infer/NOTES.md for both, and the captured
+    // fixture). Guessing it wrong scales every box by the input size, which
+    // is why `Other` is refused rather than defaulted: everywhere else this
+    // module errors on ambiguity, and this is the field whose corruption
+    // `tests/infer_builder.rs` exists to pin.
     let normalized = match signals.source {
         ModelSource::TfLite => true,
         ModelSource::Onnx | ModelSource::CoreMl => false,
@@ -2413,8 +2417,8 @@ mod tests {
     fn infer_other_source_refuses_rather_than_guessing_normalization() {
         // `normalized` follows the exporter and cannot be read off the
         // shapes. ONNX (pixel-space) and TFLite ([0,1]) are measured;
-        // CoreML (pixel-space) is source-traced rather than measured, but
-        // characterized all the same. An uncharacterized container gets a
+        // CoreML (pixel-space) is both source-traced and measured. An
+        // uncharacterized container gets a
         // typed refusal, because guessing scales every box by the input
         // size and the resulting schema looks perfectly valid.
         let s = ModelSignals {
@@ -2586,7 +2590,7 @@ mod tests {
     #[test]
     fn coreml_source_resolves_a_box_convention() {
         // CoreML must not hit the `Other` refusal: a native `.mlpackage`
-        // export is a source-traced convention, not an unknown one.
+        // export is a characterized convention, not an unknown one.
         let s = ModelSignals {
             source: ModelSource::CoreMl,
             inputs: vec![TensorInfo {
