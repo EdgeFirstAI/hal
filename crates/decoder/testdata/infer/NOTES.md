@@ -156,7 +156,10 @@ Three things follow.
 **Pixel-space, on the same 0..640 scale as ONNX.** The x extent reaches
 640.25 against a 640-pixel input, and widths run 11.75 to 155.75. A `[0,1]`
 head would have emitted `0.0093 .. 1.0004` for those same boxes. The
-magnitudes settle it; no tolerance argument is needed.
+magnitudes settle it; no tolerance argument is needed. That 640.25 overruns
+the input by a quarter pixel, which is ordinary for a raw head and is
+recorded here rather than clipped, per the method above — and the overrun is
+part of what makes the normalized equivalent 1.0004 rather than 1.0000.
 
 **Every coordinate statistic matches within 0.5 px.** Two of the ten sit
 exactly that far apart — `cx max` (599.50 against 599.00) and `w max`
@@ -172,8 +175,12 @@ actually something else".
 
 **The y extent lands inside the letterbox content band.** Content occupies
 y ∈ [107, 533]; the decoded extent is 227.19 .. 507.62, comfortably inside,
-with nothing detected in the grey bars. The coordinates are in the
-letterboxed input frame, exactly where a pixel-space head puts them.
+with nothing above the 0.25 gate landing in the grey bars. The gate is part
+of that claim and not an aside: an ungated decode of all 8400 anchors puts
+low-confidence boxes essentially anywhere, padding included, so the
+statement holds of the population this whole section measures and not of the
+raw head output. The coordinates are in the letterboxed input frame, exactly
+where a pixel-space head puts them.
 
 Scope, deliberately asymmetric: the ONNX arm ran on ORT's CPU EP and the
 CoreML arm through coremltools' default compute units. The question here is
