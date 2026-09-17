@@ -747,18 +747,60 @@ bench-nvjpeg:
 # SBOM & LICENSE COMPLIANCE
 # ===========================================================================
 
+# Targets whose dependency graph reaches a distributed artifact. A graph is
+# resolved per target, so a host-only scan omits every target-conditional
+# dependency, such as the `windows-*` crates.
+#
+# Enumerated rather than cargo-cyclonedx's `all`, which disables platform
+# filtering altogether and so pulls in `[target."cfg(...)"]` blocks for cfgs no
+# build sets, including `cfg(fuzzing)`. An SBOM describes what ships.
+SBOM_TARGETS := \
+	x86_64-unknown-linux-gnu \
+	aarch64-unknown-linux-gnu \
+	x86_64-pc-windows-msvc \
+	aarch64-apple-darwin \
+	x86_64-apple-darwin \
+	aarch64-apple-ios \
+	aarch64-apple-ios-sim \
+	aarch64-linux-android \
+	x86_64-linux-android
+
+# The five C-API leaves are excluded from the workspace, so `cargo cyclonedx
+# --all` never sees them, yet they are the shipped libraries. Each carries its
+# own lockfile, resolving independently of the workspace's, so each is scanned
+# from its own manifest. ci.yml's sbom job passes the same list.
+SBOM_CAPI_MANIFESTS := $(wildcard crates/*-capi/Cargo.toml)
+
 # The policy scripts live in EdgeFirstAI/.github, at the commit ci.yml pins, so
 # this target enforces the same policy the Quick tier does. hal's own copies
 # drifted from the org ones and the two disagreed about the same dependencies.
 .PHONY: sbom
 sbom:
 	@echo "Fetching the org license policy..."
+	@# SBOM_TARGETS and SBOM_EXTRA_MANIFESTS are read by the org policy script,
+	@# which resolves a graph per target and per out-of-workspace manifest, then
+	@# merges only the scans that run produced. Scans left in the tree by an
+	@# earlier run are ignored, so the output depends on the source alone.
+	@mkdir -p target
 	@CI_SCRIPTS=$$(.github/scripts/fetch-ci-scripts.sh); \
 		echo "Generating SBOM (policy from $$CI_SCRIPTS)..."; \
 		PROJECT_NAME=hal PROJECT_TYPE=library VERSION_FILE=Cargo.toml \
 		SOURCE_DIRS="crates tests" SBOM_MODE=$${SBOM_MODE:-dependency} \
+		SBOM_TARGETS="$(SBOM_TARGETS)" \
+		SBOM_EXTRA_MANIFESTS="$(SBOM_CAPI_MANIFESTS)" \
 		OUTPUT_DIR=sbom SCRIPT_DIR="$$CI_SCRIPTS" \
-		"$$CI_SCRIPTS/generate_sbom.sh"
+		"$$CI_SCRIPTS/generate_sbom.sh" 2>&1 | tee target/sbom-policy.log; \
+		exit $${PIPESTATUS[0]}
+	@# The shared validator warns rather than fails on a missing component, which
+	@# suits a NOTICE that is curated by hand. hal generates NOTICE, so a missing
+	@# component there is drift and is worth failing on.
+	@#
+	@# The check asks generate_notice.py what it would write rather than reading
+	@# the validator's warning, because that warning covers every component
+	@# regardless of licence while the generator omits the ones asking for no
+	@# attribution. Gating on the warning would fail on a component NOTICE is
+	@# correct to omit, and `make notice` could never clear it.
+	@python3 .github/scripts/generate_notice.py --check sbom/sbom.json NOTICE
 	@echo "Validating SBOM format..."
 	@if command -v cyclonedx >/dev/null 2>&1; then \
 		cyclonedx validate --input-file sbom/sbom.json; \
