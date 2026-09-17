@@ -4457,45 +4457,12 @@ where
     /// metadata. Used to answer `ef_tensor_chroma` from the handle without a
     /// client-side shadow field.
     pub(crate) fn clone_chroma_plane(&self) -> Result<Self> {
-        let storage = match &self.storage {
-            TensorStorage::Mem(m) => TensorStorage::Mem(m.clone()),
-            #[cfg(target_os = "linux")]
-            TensorStorage::Dma(d) => TensorStorage::Dma(d.try_clone()?),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            TensorStorage::Dma(d) => TensorStorage::Dma(d.clone()),
-            #[cfg(target_os = "android")]
-            TensorStorage::Dma(d) => TensorStorage::Dma(d.clone()),
-            #[cfg(target_os = "windows")]
-            TensorStorage::Dma(_) => {
-                return Err(Error::NotImplemented(
-                    "clone_chroma_plane: D3D11 texture chroma is not independently clonable".into(),
-                ));
-            }
-            #[cfg(unix)]
-            TensorStorage::Shm(_) => {
-                return Err(Error::NotImplemented(
-                    "clone_chroma_plane: SHM chroma is not independently clonable".into(),
-                ));
-            }
-            TensorStorage::Pbo(_) => {
-                return Err(Error::NotImplemented(
-                    "clone_chroma_plane: PBO chroma is not independently clonable".into(),
-                ));
-            }
-        };
-        Ok(Tensor {
-            cuda: None,
-            storage,
-            format: self.format,
-            chroma: None,
-            row_stride: self.row_stride,
-            plane_offset: self.plane_offset,
-            quantization: self.quantization.clone(),
-            colorimetry: self.colorimetry,
-            cpu_access: self.cpu_access,
-            compression: self.compression,
-            view_origin: self.view_origin,
-        })
+        // Every storage accepted by `from_planes` implements `view` as a
+        // shared-backing lens. Using that common path keeps
+        // `is_multiplane() => chroma().is_some()` true for SHM, PBO and
+        // D3D11 too, instead of silently losing chroma when a hand-written
+        // per-storage clone omits a variant.
+        self.subview(0, self.shape())
     }
 
     /// Row stride in bytes (`None` = tightly packed).

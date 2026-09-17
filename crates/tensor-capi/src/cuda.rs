@@ -204,11 +204,24 @@ pub unsafe extern "C" fn ef_tensor_cuda_unmap(map: *mut c_void) {
 /// the tensor (and therefore the `CudaHandle`) is freed. Reuses frozen
 /// `ef_client_state` (24 bytes); this adds no new `repr(C)` struct.
 ///
+/// **`resource` is the client-owned GL buffer handle.** This entry point
+/// never deletes it; the caller's own GL teardown stays the sole caller of
+/// `glDeleteBuffers`. On **success**, the CUDA *graphics registration* for
+/// that buffer is consumed by the library tensor and torn down through
+/// `unregister_fn` when the tensor is freed — do not call
+/// `cudaGraphicsUnregisterResource` on that registration after success. On
+/// **failure** (`EINVAL`), nothing is stored and the registration remains
+/// entirely caller-owned.
+///
 /// `map_fn` / `unmap_fn` / `unregister_fn` must be non-NULL. They run on
 /// the caller's thread (typically the GL worker).
 ///
 /// @retval 0 success.
 /// @retval EINVAL `t` is NULL, the channel is incomplete, or an op is NULL.
+///
+/// @warning Not safe to call concurrently with any other `tensor-capi` call
+/// on the same handle from another thread, or while a live map from
+/// [`ef_tensor_cuda_map`] / [`ef_tensor_cuda_map_mut`] exists on `t`.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle. `state.ctx` must remain valid until

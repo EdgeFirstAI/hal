@@ -66,6 +66,16 @@ pub struct TensorDyn {
     /// limitation, not a memory-safety one (each wrapper's cache is its
     /// own allocation).
     quantization_cache: std::sync::OnceLock<Option<crate::Quantization>>,
+    /// Lazily-derived retained lens over the library-owned chroma plane.
+    ///
+    /// This is a cache, not a second source of truth: the first
+    /// [`Self::chroma`] call obtains it from `ef_tensor_chroma`, and wrappers
+    /// reconstructed with [`Self::from_raw`] derive their own cache from the
+    /// handle again. Keeping the retained lens for this parent's lifetime
+    /// lets the typed API return the same borrowed `Option<&Tensor<T>>` as
+    /// the static backend and keeps native handles borrowed from that chroma
+    /// lens valid through downstream imports.
+    chroma_cache: std::sync::OnceLock<Option<Box<TensorDyn>>>,
     /// The texture NT handle [`Self::descriptor_pinned`] puts in a
     /// [`crate::protocol::kind::D3D11_TEXTURE`] descriptor, kept here for as
     /// long as this value lives.
@@ -97,11 +107,11 @@ pub struct TensorDyn {
 // aliasing rules, and every mutating entry point this backend calls
 // (`ef_tensor_map`/`unmap`, `ef_tensor_set_colorimetry`, ...) is documented
 // as safe to call from any thread holding a valid reference. `shape_cache`
-// and `identity` are ordinary owned `Send + Sync` data; `quantization_cache`
-// is `OnceLock<Option<Quantization>>`, `Sync` by construction whenever its
-// contents are (`Quantization` is plain owned data, `Send + Sync`
-// automatically) -- see that field's own doc comment for why concurrent
-// access through it specifically is sound, not just asserted here.
+// and `identity` are ordinary owned `Send + Sync` data;
+// `quantization_cache` and `chroma_cache` are `OnceLock`s, `Sync` by
+// construction whenever their contents are -- see those fields' own doc
+// comments for why concurrent access through them specifically is sound,
+// not just asserted here.
 unsafe impl Send for TensorDyn {}
 unsafe impl Sync for TensorDyn {}
 
@@ -126,6 +136,7 @@ impl TensorDyn {
             shape_cache,
             identity,
             quantization_cache: std::sync::OnceLock::new(),
+            chroma_cache: std::sync::OnceLock::new(),
             #[cfg(target_os = "windows")]
             descriptor_texture_handle: std::sync::OnceLock::new(),
         }
@@ -223,11 +234,17 @@ impl TensorDyn {
         unsafe { edgefirst_tensor_ffi::ef_tensor_is_multiplane(self.handle.as_ptr()) != 0 }
     }
 
-    /// Owned lens over the chroma plane, or `None` if this is not multiplane.
-    pub fn chroma(&self) -> Option<TensorDyn> {
-        // SAFETY: `self.handle` is live.
-        let p = unsafe { edgefirst_tensor_ffi::ef_tensor_chroma(self.handle.as_ptr()) };
-        std::ptr::NonNull::new(p).map(|h| unsafe { Self::from_raw(h.as_ptr()) })
+    /// Borrowed lens over the chroma plane, or `None` if this is not
+    /// multiplane.
+    pub fn chroma(&self) -> Option<&TensorDyn> {
+        self.chroma_cache
+            .get_or_init(|| {
+                // SAFETY: `self.handle` is live. A non-NULL result carries
+                // one retained reference that the cached lens owns.
+                let p = unsafe { edgefirst_tensor_ffi::ef_tensor_chroma(self.handle.as_ptr()) };
+                std::ptr::NonNull::new(p).map(|h| Box::new(unsafe { Self::from_raw(h.as_ptr()) }))
+            })
+            .as_deref()
     }
 
     /// Read the handle's current shape via `ef_tensor_ndim`/`ef_tensor_shape`.
@@ -1696,8 +1713,13 @@ impl TensorDyn {
     }
 
     /// The registration lives in the library after Stage C. This lens cannot
-    /// borrow that `CudaHandle`, so the getter is always `None`; use
-    /// [`Self::is_cuda_attached`] or [`Self::cuda_map`].
+    /// borrow that `CudaHandle`, so the getter is always `None` even after
+    /// [`Self::set_cuda_handle`]; use [`Self::is_cuda_attached`] or
+    /// [`Self::cuda_map`].
+    #[deprecated(
+        since = "0.32.0",
+        note = "On the dynamic backend use is_cuda_attached() or cuda_map() — the CudaHandle is not borrowable through this lens."
+    )]
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
         None
     }

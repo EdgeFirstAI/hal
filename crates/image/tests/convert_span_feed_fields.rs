@@ -273,6 +273,10 @@ fn the_convert_span_records_the_feed_fields() {
                 m.as_mut_slice().fill(0x40);
             }
             let mut float_dst = t;
+            // Isolate this route from the u8 converts above: otherwise their
+            // feed records can satisfy the assertions even when the float
+            // dispatch never enters or records `image.convert.gl`.
+            records.lock().unwrap().clear();
             match gl.convert(
                 &float_src,
                 &mut float_dst,

@@ -859,6 +859,7 @@ pub unsafe extern "C" fn ef_tensor_from_iosurface_id(
 /// `dims` must be `NULL` or point to `ndim` readable `uint64_t`.
 pub(crate) unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Option<Vec<usize>> {
     if dims.is_null() || ndim == 0 {
+        crate::last_error::set_errno(libc::EINVAL);
         crate::last_error::set_last_error_classified(
             edgefirst_tensor_abi::EfErrorClass::InvalidArgument,
             &format!("{what}: null dims or zero ndim"),
@@ -871,6 +872,7 @@ pub(crate) unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Optio
         .map(|d| usize::try_from(*d).ok())
         .collect::<Option<Vec<usize>>>()
         .or_else(|| {
+            crate::last_error::set_errno(libc::EINVAL);
             crate::last_error::set_last_error_classified(
                 edgefirst_tensor_abi::EfErrorClass::InvalidArgument,
                 &format!("{what}: a dimension is out of range for this host's usize"),

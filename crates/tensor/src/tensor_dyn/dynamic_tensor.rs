@@ -150,11 +150,11 @@ impl<T: Element> Tensor<T> {
     }
 
     /// The chroma plane, if this is a two-allocation semi-planar tensor.
-    /// Owned lens over a retained C handle (`ef_tensor_chroma`).
-    pub fn chroma(&self) -> Option<Self> {
-        let td = self.inner.chroma()?;
-        td.as_typed::<T>()?;
-        Some(Self::from_inner(td))
+    /// Borrowed from a cached lens over the retained `ef_tensor_chroma`
+    /// handle, so native handles borrowed from it remain valid for this
+    /// parent's lifetime.
+    pub fn chroma(&self) -> Option<&Self> {
+        self.inner.chroma()?.as_typed::<T>()
     }
 
     // `as_dma` is deliberately ABSENT on this backend, where the static one
@@ -527,10 +527,18 @@ impl<T: Element> Tensor<T> {
     /// CUDA registration for this tensor, if any.
     ///
     /// On the dynamic lens the `CudaHandle` lives in the library, so this
-    /// cannot borrow it and returns `None`. Use [`Self::is_cuda_attached`]
-    /// or [`Self::cuda_map`].
+    /// cannot borrow it and always returns `None` even after
+    /// [`Self::set_cuda_handle`]. Use [`Self::is_cuda_attached`] or
+    /// [`Self::cuda_map`] instead.
+    #[deprecated(
+        since = "0.32.0",
+        note = "On the dynamic backend use is_cuda_attached() or cuda_map() — the CudaHandle is not borrowable through this lens."
+    )]
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
-        self.inner.cuda()
+        #[allow(deprecated)]
+        {
+            self.inner.cuda()
+        }
     }
 
     /// Whether the library tensor carries a CUDA registration.

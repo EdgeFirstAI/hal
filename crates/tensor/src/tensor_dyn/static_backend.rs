@@ -786,7 +786,7 @@ impl TensorDyn {
     }
 
     /// Owned chroma plane as its own `TensorDyn`, or `None` if this is not
-    /// a two-allocation semi-planar tensor (or the plane cannot be cloned).
+    /// a two-allocation semi-planar tensor.
     pub fn chroma_dyn(&self) -> Option<TensorDyn> {
         match self {
             TensorDyn::U8(t) => t
