@@ -46,6 +46,27 @@ LLVM_COV_PROFILE := --cargo-profile profiling
 # Rust features (all except opencv, which requires libclang at build time)
 RUST_FEATURES := --features opengl,ndarray
 
+# Interpreter used to RUN this repo's helper scripts (check_wheel_layout,
+# check_macho_alignment, generate_notice, ...). `python3` first, as on Linux,
+# macOS and every CI runner; Git Bash on a Windows dev box often has only
+# `python`, and `python3` there may be the Microsoft Store stub, which exits
+# 49 with "Python was not found" instead of failing to resolve. So probe by
+# RUNNING each candidate, not by `command -v` alone -- the same rule, and the
+# same hazard, that scripts/package-capi.sh documented first. Keeping the two
+# in step matters because `make package` calls that script and then a checker.
+#
+# Distinct from PYTHON_INTERPRETER below, which is a different question: that
+# one must be a VERSIONED name for maturin -i and is not used to run anything.
+PYTHON := $(shell \
+	for c in python3 python; do \
+		if command -v "$$c" >/dev/null 2>&1 && "$$c" -c 'pass' >/dev/null 2>&1; then \
+			echo "$$c"; break; \
+		fi; \
+	done)
+# Fall back to the literal so a recipe fails with a readable
+# "python3: command not found" rather than trying to exec the .py file itself.
+PYTHON := $(if $(PYTHON),$(PYTHON),python3)
+
 # Python interpreter name for maturin -i (cross-compile requires a versioned
 # name like 'python3.10' because maturin parses major.minor from the filename
 # — it cannot execute a target-arch Python to introspect its ABI).
@@ -273,7 +294,7 @@ capi-symlinks:
 package: capi-libs-release
 	@mkdir -p dist
 	@./scripts/package-capi.sh --outdir dist
-	@python3 scripts/check_macho_alignment.py dist
+	@$(PYTHON) scripts/check_macho_alignment.py dist
 	@echo "✓ C archive in dist/"
 
 # Issue #200's regression gate, runnable on its own. Pure file parsing, so it
@@ -296,7 +317,7 @@ check-macho:
 	if [ -z "$$built" ]; then \
 		echo "check-macho: nothing to scan (looked in: $(MACHO_DIRS))"; \
 	else \
-		python3 scripts/check_macho_alignment.py $$built; \
+		$(PYTHON) scripts/check_macho_alignment.py $$built; \
 	fi
 
 .PHONY: build-python
@@ -345,8 +366,8 @@ wheel:
 				$(if $(PYABI),--features abi3-$(PYABI)) || exit 1; \
 		fi; \
 	done
-	@python3 scripts/check_wheel_layout.py target/wheels
-	@python3 scripts/check_macho_alignment.py target/wheels
+	@$(PYTHON) scripts/check_wheel_layout.py target/wheels
+	@$(PYTHON) scripts/check_macho_alignment.py target/wheels
 	@echo "✓ Wheel built in target/wheels/"
 
 # ===========================================================================
@@ -730,7 +751,7 @@ venv-dynamic:
 			-m "$$c/Cargo.toml" -i $(DIFFERENTIAL_DYNAMIC_VENV)/bin/python || exit 1; \
 	done
 	@$(call DIFFERENTIAL_ASSERT_ARCH,target/differential-wheels-dynamic)
-	@python3 scripts/check_wheel_layout.py target/differential-wheels-dynamic
+	@$(PYTHON) scripts/check_wheel_layout.py target/differential-wheels-dynamic
 	@$(DIFFERENTIAL_DYNAMIC_VENV)/bin/pip install -q --no-deps \
 		target/differential-wheels-dynamic/*.whl
 	@echo "✓ Dynamic-backend comparison venv ready: $(DIFFERENTIAL_DYNAMIC_VENV)"
@@ -879,9 +900,9 @@ sbom:
 .PHONY: notice
 notice:
 	@CI_SCRIPTS=$$(.github/scripts/fetch-ci-scripts.sh); \
-		python3 .github/scripts/generate_notice.py sbom/sbom.json > NOTICE.new; \
+		$(PYTHON) .github/scripts/generate_notice.py sbom/sbom.json > NOTICE.new; \
 		mv NOTICE.new NOTICE; \
-		python3 "$$CI_SCRIPTS/validate_notice.py" sbom/sbom.json --notice NOTICE
+		$(PYTHON) "$$CI_SCRIPTS/validate_notice.py" sbom/sbom.json --notice NOTICE
 	@echo "✓ NOTICE regenerated from sbom/sbom.json"
 
 # ===========================================================================
