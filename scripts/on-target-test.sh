@@ -38,13 +38,18 @@
 #                      cargo wants a feature that is not shared spelled
 #                      `<pkg>/<feature>`. Applied to the test build only, not
 #                      to the C-API leaves.
-#   FILTER             test-name filter passed to each binary
+#   FILTER             test-name filter passed to each binary. Matches the test
+#                      FUNCTION name, not the file or binary name; one naming a
+#                      source file matches nothing and every binary runs zero
+#                      tests, reported as NO-TESTS.
 #   REMOTE_DIR         remote scratch dir      (default: /tmp/hal-ontarget)
 #   SYNC_TESTDATA      1 to rsync testdata/    (default: 1)
 #
-# Exit status is non-zero if any host reported a test failure. A host that is
-# unreachable, or that lacks the hardware a test needs, is reported separately
-# and does NOT mask a real failure elsewhere. Same rule for the deployed
+# Exit status is non-zero if any host reported a test failure, and also if a
+# host ran no tests at all, reported as NO-TESTS and distinct from FAIL: a run
+# that exercised nothing cannot exit zero. A host that is unreachable, or that
+# lacks the hardware a test needs, is reported separately and does NOT mask a
+# real failure elsewhere. Same rule for the deployed
 # check-single-home.sh: G5 (footprint) and G7 (Miri) only ever make sense on
 # the build host and are never deployed, so they correctly read
 # cannot_measure on every board -- a named, attributable gap for those two
@@ -420,7 +425,7 @@ for i in "${!OK_HOSTS[@]}"; do
   # skips on every board and the run stays green through a broken GL stack.
   [[ "${caps}" =~ render=[1-9] ]] && extra_env="${extra_env} HAL_TEST_REQUIRE_GL=1"
 
-  pass=0; fail=0; failed_bins=()
+  pass=0; fail=0; failed_bins=(); ran_nothing=0
   for bin in "${bins[@]}"; do
     name="$(basename "${bin}")"
     echo "  -- ${name}"
@@ -436,6 +441,13 @@ for i in "${!OK_HOSTS[@]}"; do
       # "ok", so the count alone cannot tell you whether the path ran.
       if grep -q "SKIPPED" "${log}"; then
         echo "     ok, but $(grep -c "SKIPPED" "${log}") skipped"
+      fi
+      # A binary that ran no test also exits 0, and the skip check above cannot
+      # see it: there was no test to skip. Counted separately so the summary
+      # distinguishes a binary that passed from one that ran nothing.
+      if grep -q "^running 0 tests" "${log}"; then
+        ran_nothing=$((ran_nothing + 1))
+        echo "     ok, but ran 0 tests${FILTER:+ (FILTER=\"${FILTER}\" matched no test name)}"
       fi
     else
       fail=$((fail + 1)); failed_bins+=("${name}")
@@ -487,8 +499,15 @@ for i in "${!OK_HOSTS[@]}"; do
   if [[ ${fail} -gt 0 ]]; then
     SUMMARY+=("${target}|FAIL|${arch}|${pass} ok, ${fail} failed: ${failed_bins[*]}")
     overall=1
+  elif [[ ${ran_nothing} -gt 0 && ${ran_nothing} -eq ${#bins[@]} ]]; then
+    # Every binary ran zero tests, so this host exercised nothing. Reported as
+    # NO-TESTS with a non-zero exit rather than PASS.
+    SUMMARY+=("${target}|NO-TESTS|${arch}|all ${ran_nothing} binaries ran 0 tests${FILTER:+ -- FILTER=\"${FILTER}\" matched no test name}")
+    overall=1
   else
-    SUMMARY+=("${target}|PASS|${arch}|${pass} binaries, ${skipped} tests skipped, G1/G2/G3/G4/G9/G11 clean")
+    detail="${pass} binaries, ${skipped} tests skipped"
+    [[ ${ran_nothing} -gt 0 ]] && detail="${detail}, ${ran_nothing} ran 0 tests"
+    SUMMARY+=("${target}|PASS|${arch}|${detail}, G1/G2/G3/G4/G9/G11 clean")
   fi
 done
 
