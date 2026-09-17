@@ -10,10 +10,12 @@ file, the function, the mutation applied, and the path to the diff that was
 compiled and tested. The per-outcome `.txt` files carry the same mutants as
 bare names and are used only when a shard failed to write its JSON.
 
-The report answers the question the lane exists to ask: which lines does the
-suite execute without asserting anything about? A surviving mutant is reported
-with the diff nothing noticed, grouped under its file and function, so the gap
-is readable without downloading an artifact.
+A surviving mutant is one the suite passed with. That is usually a line
+nothing asserts on, but not always -- a mutation to code the target does not
+compile survives for want of ever being built, which is why the sweep runs on
+both architectures and the outcomes are merged. Survivors are reported with
+the diff nothing noticed, grouped under file and function, so the gap is
+readable without downloading an artifact.
 
 Usage:
     python .github/scripts/mutants_summary.py --shards shards/
@@ -56,7 +58,7 @@ TESTED_KEYS = ("caught", "missed", "timeout")
 
 MEANINGS = {
     "caught": "a test failed once the code was broken, so the behaviour is asserted",
-    "missed": "the mutated line ran and every test still passed, so nothing asserts on it",
+    "missed": "the mutation compiled and the whole suite still passed",
     "timeout": "the mutant ran long enough to look like a hang rather than a failure",
     "unviable": "the mutated code did not compile, so it says nothing about the tests",
 }
@@ -550,7 +552,7 @@ def main(argv=None):
     if counts["missed"]:
         print(
             f"::error::{plural(counts['missed'], 'mutant')} survived: "
-            "a test executes the line but nothing asserts on it",
+            "the suite passed with the mutation applied",
             file=sys.stderr,
         )
         return 1

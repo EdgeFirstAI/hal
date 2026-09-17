@@ -2,10 +2,12 @@
 #
 # Mutation testing asks a different question from the rest of CI. The tests are
 # held fixed and the CODE is broken on purpose -- `+` becomes `-`, a function
-# body becomes `Ok(())` -- and the suite is re-run. A mutant that SURVIVES is a
-# line some test executes but nothing asserts on. Line coverage cannot see
-# this, which is the point: 100% coverage and a surviving mutant are perfectly
-# compatible.
+# body becomes `Ok(())` -- and the suite is re-run. A mutant that SURVIVES is
+# one the suite passed with. Usually that means a line some test executes but
+# nothing asserts on, which line coverage cannot see: 100% coverage and a
+# surviving mutant are perfectly compatible. It can also mean the line never
+# ran at all -- a mutation to code this target does not compile survives for
+# want of ever being built, which is what the arm64 lane below is for.
 #
 # The corpus is ~7057 mutants across three crates, far more than one machine
 # can chew through in a night. Bolting it onto Nightly meant a 120-minute cap

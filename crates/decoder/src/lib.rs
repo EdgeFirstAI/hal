@@ -2373,6 +2373,12 @@ mod decoder_tests {
         assert_eq!(xyxy, [10.0_f32, 20.0, 20.0, 20.0]);
     }
 
+    /// Covers the slice conversion directly. It is the single implementation
+    /// per type now that the hand-inlined `ndarray_to_xyxy_float` overrides
+    /// are gone, so the float postprocessors reach it through the trait
+    /// default; while those overrides existed nothing reached it at all, which
+    /// is why its twenty mutants survived.
+    ///
     /// Centre 10,20 with a 6x8 box gives a distinct value in all four slots,
     /// so no swapped operator lands on the same answer.
     #[test]
