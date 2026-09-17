@@ -21,6 +21,13 @@ coverage.xml
 # (e.g. crates/image/test_*.png). Tracked PNG fixtures live under testdata/.
 /crates/image/*.png
 
+# `make sbom` writes a whole generated directory (OUTPUT_DIR=sbom), not one
+# file. `*sbom.json` caught sbom/sbom.json and missed its sibling
+# sbom-dependencies.json, so the mandatory pre-PR gate left an untracked file
+# behind on every run. Ignore the output directory itself and the next
+# artifact the generator adds is covered too. The two patterns below stay for
+# the root-level artifacts `make clean` still removes.
+/sbom/
 *sbom.json
 *.cdx.json
 
