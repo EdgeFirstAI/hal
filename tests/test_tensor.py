@@ -662,7 +662,25 @@ def test_iosurface_id_is_none_for_mem_tensor():
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
 def test_iosurface_roundtrip_via_from_iosurface():
-    """from_iosurface(t.iosurface_ref) recovers a tensor sharing the same surface."""
+    """from_iosurface(t.iosurface_ref) recovers a tensor sharing the same surface.
+
+    "The same surface" is the IOSurfaceID plus the pixels, not the
+    ``IOSurfaceRef`` pointer. The wheel ships the `dynamic` backend, whose C
+    ABI carries the *id* rather than a raw ref -- deliberately, because
+    splitting "look the surface up" from "retain it" across the ABI boundary
+    would leave a window in which the surface can be freed. So the import runs
+    ``IOSurfaceGetID`` then ``IOSurfaceLookup``, and CoreFoundation's
+    ``IOSurfaceLookup`` returns a fresh +1 object every call -- never the
+    caller's pointer, even for a surface already live in this process. Each
+    tensor then owns its own retain, which is what ``iosurface_ref``'s
+    "borrowed, lifetime tied to this tensor" contract describes.
+
+    Asserting pointer equality here therefore tested an accident of the
+    `static` backend (which keeps the ref it was handed) rather than anything
+    the API offers, and failed on every wheel. Assert the documented identity
+    -- same ID, same bytes -- and only that the borrowed ref is a usable
+    non-null pointer of its own.
+    """
     import edgefirst.tensor as hal
 
     if not hal.is_iosurface_available():
@@ -675,7 +693,18 @@ def test_iosurface_roundtrip_via_from_iosurface():
     imported = Tensor.from_iosurface(original_ref, [720, 1280, 4], dtype="uint8")
     assert imported.memory == TensorMemory.DMABUF
     assert imported.iosurface_id == original_id, "re-imported ID must match"
-    assert imported.iosurface_ref == original_ref, "re-imported ref must match"
+    assert imported.iosurface_ref is not None
+    assert imported.iosurface_ref != 0, "the import holds its own live ref"
+
+    # The surface is shared, not copied: a write through the original is
+    # visible through the import. This is the property the pointer comparison
+    # was standing in for, and it holds on both backends.
+    with t.map() as original:
+        original[0] = 0xAB
+        original[1] = 0xCD
+    with imported.map() as shared:
+        assert shared[0] == 0xAB
+        assert shared[1] == 0xCD
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
