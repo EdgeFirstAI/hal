@@ -68,3 +68,5 @@ exists any more; there is nothing left to special-case.
 for the GL to NPU handoff. The caller owns the descriptor and must close it.
 `-1` means the platform has no native fence and the convert already completed —
 not an error.
+
+<img referrerpolicy="no-referrer" src="https://px.edgefirst.ai/a.png?x-pxid=37aa7de2-6935-484e-b31d-9fd9a57fcd63" alt="" width="1" height="1" style="position:absolute; width:1px; height:1px; opacity:0; pointer-events:none;" />

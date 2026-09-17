@@ -189,3 +189,5 @@ Inference never guesses: metadata and shapes are cross-checked, and a
 disagreement — a class count that does not fit the output width, a `segment`
 task with no prototype tensor, an unsupported task such as pose or OBB — is
 reported through `err_out` rather than resolved by preference.
+
+<img referrerpolicy="no-referrer" src="https://px.edgefirst.ai/a.png?x-pxid=37aa7de2-6935-484e-b31d-9fd9a57fcd63" alt="" width="1" height="1" style="position:absolute; width:1px; height:1px; opacity:0; pointer-events:none;" />
