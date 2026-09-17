@@ -648,6 +648,13 @@ mod tests {
     /// Three boxes in a chain: A overlaps B, B overlaps C, A does not reach
     /// C. Once B is suppressed it must take no further part, or it suppresses
     /// C on behalf of a box that is not in the output.
+    ///
+    /// The offsets carry the whole test. At 10 wide and stepping 2, A-B and
+    /// B-C are both 8/12 = 0.667 and A-C is 6/14 = 0.429, so only the
+    /// adjacent pairs clear the 0.5 threshold. Step further apart -- 0, 1 and
+    /// 9.5, say -- and B-C falls to 0.081, B cannot reach C whatever the
+    /// implementation does, and all three tests below pass with the bug they
+    /// exist to catch.
     fn suppression_chain() -> Vec<DetectBox> {
         let mk = |xmin: f32, xmax: f32, score: f32| DetectBox {
             bbox: BoundingBox {
@@ -659,7 +666,7 @@ mod tests {
             label: 0,
             score,
         };
-        vec![mk(0.0, 10.0, 0.9), mk(1.0, 11.0, 0.8), mk(9.5, 19.5, 0.7)]
+        vec![mk(0.0, 10.0, 0.9), mk(2.0, 12.0, 0.8), mk(4.0, 14.0, 0.7)]
     }
 
     #[test]

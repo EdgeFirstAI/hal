@@ -293,7 +293,10 @@ def merge_architectures(mutants):
             mutant.arches = best.arches
             merged[key] = mutant
             best = mutant
-        if mutant.arch:
+        # Only architectures that actually ran it. An unviable mutant never
+        # compiled, so naming its architecture would claim a build tested a
+        # mutation it never produced.
+        if mutant.arch and mutant.key in TESTED_KEYS:
             best.arches.add(mutant.arch)
         if best.diff is None and mutant.diff is not None:
             best.diff = mutant.diff
@@ -381,15 +384,23 @@ def render_gaps(groups, mutants):
         if mutant.key in TESTED_KEYS:
             tested_per_file[mutant.file] = tested_per_file.get(mutant.file, 0) + 1
 
+    # By rate first: four survivors out of four tested is a worse gap than
+    # five out of a hundred, and the count alone puts them the wrong way round.
+    # Count breaks ties so the bigger job of the two comes first.
     rows = sorted(
-        ((file, sum(len(entries) for _, entries in funcs)) for file, funcs in groups),
-        key=lambda row: (-row[1], row[0]),
+        (
+            (file, survivors, tested_per_file.get(file, survivors))
+            for file, survivors in (
+                (file, sum(len(entries) for _, entries in funcs))
+                for file, funcs in groups
+            )
+        ),
+        key=lambda row: (-(row[1] / row[2] if row[2] else 1.0), -row[1], row[0]),
     )
     lines = ["#### Where the gaps are", ""]
     lines.append("| file | survivors | tested | survival rate |")
     lines.append("| --- | ---: | ---: | ---: |")
-    for file, survivors in rows:
-        tested = tested_per_file.get(file, survivors)
+    for file, survivors, tested in rows:
         lines.append(
             f"| `{file}` | {survivors} | {tested} | {pct(survivors, tested)} |"
         )
@@ -450,6 +461,15 @@ def render(mutants, shards, total, start, budget):
 
     if not counts["missed"]:
         clean = "No mutant survived: every tested mutant failed a test."
+        if counts["timeout"]:
+            # A timeout is not a pass. The mutant ran long enough to look like
+            # a hang, so whether a test would have caught it stays unresolved,
+            # and calling that a clean sweep overstates the run.
+            clean = (
+                f"No mutant survived, but {plural(counts['timeout'], 'mutant')} "
+                "timed out rather than failing a test, so this is not a clean "
+                "sweep."
+            )
         return "\n".join(header + [clean]) + "\n"
 
     header.extend(render_gaps(groups, mutants))

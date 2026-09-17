@@ -523,3 +523,72 @@ def test_github_actions_mode_appends_to_the_step_summary(tmp_path, shards, monke
     written = summary.read_text(encoding="utf-8")
     assert written.startswith("existing content\n")
     assert "Mutation testing" in written
+
+
+def test_architecture_label_names_only_the_ones_that_ran_it(tmp_path, shards):
+    """`unviable` means the mutant never compiled, so that architecture did not
+    test it and must not appear in the survivor's label."""
+    only_x86 = "crates/decoder/src/lib.rs:100:5: replace + with - in f"
+    both = "crates/decoder/src/lib.rs:200:5: replace * with / in g"
+    write_shard(
+        shards,
+        "0-ubuntu-24.04",
+        [
+            mutant(
+                "missed", "crates/decoder/src/lib.rs", "f", 100, only_x86, diff="-x\n"
+            ),
+            mutant("missed", "crates/decoder/src/lib.rs", "g", 200, both, diff="-y\n"),
+        ],
+    )
+    write_shard(
+        shards,
+        "0-ubuntu-24.04-arm",
+        [
+            mutant("unviable", "crates/decoder/src/lib.rs", "f", 100, only_x86),
+            mutant("missed", "crates/decoder/src/lib.rs", "g", 200, both, diff="-y\n"),
+        ],
+    )
+
+    _, md = render(tmp_path)
+
+    assert "[x86_64] L100" in md, md
+    assert "[arm64, x86_64] L200" in md, md
+
+
+def test_gap_ranking_is_by_survival_rate_not_raw_count(tmp_path, shards):
+    """A file where everything tested survived is a worse gap than one with more
+    survivors but far more coverage."""
+    wide = [
+        mutant("missed", "crates/decoder/src/byte.rs", "b", i, f"b{i}", diff="-x\n")
+        for i in range(5)
+    ] + [
+        mutant("caught", "crates/decoder/src/byte.rs", "b", 100 + i, f"bc{i}")
+        for i in range(95)
+    ]
+    narrow = [
+        mutant("missed", "crates/decoder/src/lib.rs", "l", i, f"l{i}", diff="-x\n")
+        for i in range(4)
+    ]
+    write_shard(shards, 0, wide + narrow)
+
+    _, md = render(tmp_path)
+
+    ranking = md.split("Where the gaps are", 1)[1].split("###", 1)[0]
+    assert ranking.index("lib.rs") < ranking.index("byte.rs"), ranking
+
+
+def test_timeouts_are_not_reported_as_every_mutant_caught(tmp_path, shards):
+    write_shard(
+        shards,
+        0,
+        [
+            mutant("caught", "crates/decoder/src/lib.rs", "f", 1, "a"),
+            mutant("timeout", "crates/decoder/src/lib.rs", "f", 2, "b"),
+        ],
+    )
+
+    code, md = render(tmp_path)
+
+    assert code == 0
+    assert "every tested mutant failed a test" not in md, md
+    assert "timed out" in md.lower(), md
