@@ -467,9 +467,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run GL tests on WARP
         shell: pwsh
-        continue-on-error: true
         run: pwsh -NoProfile -File scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci
       - name: Generate LCOV
+        if: always()
         shell: pwsh
         run: |
           cargo llvm-cov report --lcov --output-path target/coverage_rust_warp.lcov --ignore-filename-regex '(\.cargo|[\\/]rustc[\\/]|[\\/]target[\\/])'

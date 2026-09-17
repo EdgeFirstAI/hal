@@ -2359,14 +2359,54 @@ impl GLProcessorST {
                 | FloatRenderPath::ZeroCopyF32Nchw
                 | FloatRenderPath::ZeroCopyFloatNhwc
                 | FloatRenderPath::ZeroCopyFloatRgba => {
+                    let _span = Self::enter_image_convert_gl_span(
+                        src_fmt,
+                        dst_fmt,
+                        false,
+                        src.memory(),
+                        dst.memory(),
+                    );
+                    let convert_span = tracing::Span::current();
                     return if nv_src {
-                        self.convert_nv_to_float_two_pass(src, dst, path, rotation, flip, crop)
+                        self.convert_nv_to_float_two_pass(
+                            src,
+                            dst,
+                            path,
+                            rotation,
+                            flip,
+                            crop,
+                            &convert_span,
+                        )
                     } else {
-                        self.convert_float_to_zero_copy(src, dst, path, rotation, flip, crop)
+                        self.convert_float_to_zero_copy(
+                            src,
+                            dst,
+                            path,
+                            rotation,
+                            flip,
+                            crop,
+                            &convert_span,
+                        )
                     };
                 }
                 FloatRenderPath::PboF16Nchw | FloatRenderPath::PboF32Nhwc => {
-                    return self.convert_float_to_pbo(src, dst, path, rotation, flip, crop);
+                    let _span = Self::enter_image_convert_gl_span(
+                        src_fmt,
+                        dst_fmt,
+                        false,
+                        src.memory(),
+                        dst.memory(),
+                    );
+                    let convert_span = tracing::Span::current();
+                    return self.convert_float_to_pbo(
+                        src,
+                        dst,
+                        path,
+                        rotation,
+                        flip,
+                        crop,
+                        &convert_span,
+                    );
                 }
                 FloatRenderPath::None => {}
             }
@@ -2457,6 +2497,40 @@ impl GLProcessorST {
 
     // Internal methods operating on Tensor<u8> + PixelFormat directly.
 
+    /// The convert span both the u8 engine and the float route record feed
+    /// fields on. Recording sites must use this handle, not `Span::current()`,
+    /// because a child (`image.convert.gl.engine`, a two-pass span, or
+    /// `nv_to_planar_float`) does not declare `src_feed`/`dst_feed` and
+    /// `tracing` drops those records silently.
+    pub(super) fn enter_image_convert_gl_span(
+        src_fmt: PixelFormat,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        src_memory: TensorMemory,
+        dst_memory: TensorMemory,
+    ) -> tracing::span::EnteredSpan {
+        tracing::trace_span!(
+            "image.convert.gl",
+            ?src_fmt,
+            ?dst_fmt,
+            is_int8,
+            src_memory = ?src_memory,
+            dst_memory = ?dst_memory,
+            // Recorded at the source-feed site: import | pbo | upload —
+            // the zero-copy observable (see ConvertStats).
+            src_feed = tracing::field::Empty,
+            // Recorded at the destination-feed site for EVERY destination:
+            // zero_copy | mapped_texture | pbo -- how the convert's output
+            // reached the tensor (see `DstTarget::feed`). It is deliberately
+            // not a refusal marker: `zero_copy` and `mapped_texture` are both
+            // stated, so a trace never has to read an absent field as "written
+            // directly". The field has to be declared here or the record
+            // would be a silent no-op.
+            dst_feed = tracing::field::Empty,
+        )
+        .entered()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn convert_impl(
         &mut self,
@@ -2469,27 +2543,13 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        let _span = tracing::trace_span!(
-            "image.convert.gl",
-            ?src_fmt,
-            ?dst_fmt,
+        let _span = Self::enter_image_convert_gl_span(
+            src_fmt,
+            dst_fmt,
             is_int8,
-            src_memory = ?src.memory(),
-            dst_memory = ?dst.memory(),
-            // Recorded at the source-feed site: import | pbo | upload —
-            // the zero-copy observable (see ConvertStats).
-            src_feed = tracing::field::Empty,
-            // Recorded at the destination-feed site for EVERY u8 destination:
-            // zero_copy | mapped_texture | pbo -- how the convert's output
-            // reached the tensor (see `DstTarget::feed`). It is deliberately
-            // not a refusal marker: `zero_copy` and `mapped_texture` are both
-            // stated, so a trace never has to read an absent field as "written
-            // directly". Absent means only the float route, which enters no
-            // convert span at all. The field has to be declared here or the
-            // record would be a silent no-op.
-            dst_feed = tracing::field::Empty,
-        )
-        .entered();
+            src.memory(),
+            dst.memory(),
+        );
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
             if src_fmt == PixelFormat::Vyuy
                 && self.gl_context.transfer_backend.is_dma()
@@ -8706,6 +8766,7 @@ impl GLProcessorST {
     /// convert previously only the legacy macOS backend offered — now
     /// portable (Linux DMA-BUF f16 targets and Windows float textures
     /// included).
+    #[allow(clippy::too_many_arguments)]
     fn convert_nv_to_float_two_pass(
         &mut self,
         src: &TensorDyn,
@@ -8714,6 +8775,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()> {
         // Parity with the float render paths: rotation/flip stay on the CPU
         // fallback until the fused path grows an oracle for them (pass 1
@@ -8764,11 +8826,7 @@ impl GLProcessorST {
             rotation,
             flip,
             crop,
-            // The FLOAT route: it returns before `image.convert.gl` is
-            // entered, so there is no convert span for the source feed to land
-            // on. Documented in ARCHITECTURE.md's span catalog; giving this
-            // route its own span is a follow-up.
-            &tracing::Span::none(),
+            convert_span,
         );
         self.defer_finish = saved_defer;
         pass1?;
@@ -8791,6 +8849,7 @@ impl GLProcessorST {
             pad_color,
             dst,
             path,
+            convert_span,
         )
     }
 

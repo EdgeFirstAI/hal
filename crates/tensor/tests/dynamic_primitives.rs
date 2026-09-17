@@ -332,31 +332,33 @@ fn family5_from_planes_combines_two_independently_allocated_tensors() {
 
 #[test]
 fn family5_from_planes_is_genuinely_multiplane_and_chroma_is_independently_writable() {
-    // Task 17: before this fix, `is_multiplane()`/`chroma()`/`chroma_mut()`
-    // unconditionally reported "no chroma", even for the tensor
-    // `from_planes` had just built -- a real caller (`edgefirst-image`'s
-    // `import_image`) reads chroma back through exactly this path to apply
-    // its own stride/offset, and CPU convert reads chroma bytes through it.
-    // Not DMA-backed (see `bare_u8`): `TensorDyn::multiplane_chroma`
-    // degrades gracefully to `None` for a non-fd-backed chroma plane (see
-    // its own doc comment) rather than failing the whole combine, so this
-    // test intentionally does NOT assert `is_multiplane()` here -- that
-    // needs an fd-backed pair, covered by
-    // `dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest`
-    // below, gated on DMA availability. This test instead proves the
-    // *degraded* path stays exactly what it was before task 17 (still
-    // correct, just not upgraded) so both branches of `from_planes`'s
-    // shadow logic are exercised.
     let (w, h) = (64usize, 48usize);
     let luma = bare_u8(&[h, w]);
-    let chroma = bare_u8(&[h / 2, w]);
+    let mut chroma = bare_u8(&[h / 2, w]);
+    chroma.set_row_stride_unchecked(w + 16);
     let combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)
         .expect("from_planes must succeed");
     assert!(
-        !combined.is_multiplane(),
-        "a Mem-backed chroma plane has no fd to shadow -- must degrade to the pre-task-17 \
-         answer, not panic or silently misreport a `Some`"
+        combined.is_multiplane(),
+        "from_planes stores chroma on the library tensor -- is_multiplane() must be true \
+         even for Mem, and after from_raw"
     );
+    assert_eq!(
+        combined.chroma().and_then(|c| c.effective_row_stride()),
+        Some(w + 16),
+        "chroma stride set before from_planes must read back through chroma()"
+    );
+
+    let raw = TensorDyn::from(combined).into_raw();
+    let wrapped = unsafe { TensorDyn::from_raw(raw) };
+    assert!(
+        wrapped.is_multiplane(),
+        "from_raw after from_planes must still report is_multiplane"
+    );
+    let chroma = wrapped
+        .chroma()
+        .expect("from_raw must yield a working chroma() handle");
+    assert_eq!(chroma.effective_row_stride(), Some(w + 16));
 }
 
 #[test]
@@ -371,10 +373,11 @@ fn dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest() {
     let (w, h) = (64usize, 48usize);
     let luma =
         Tensor::<u8>::new(&[h, w], Some(TensorMemory::DmaBuf), None).expect("dma luma allocation");
-    let chroma = Tensor::<u8>::new(&[h / 2, w], Some(TensorMemory::DmaBuf), None)
+    let mut chroma = Tensor::<u8>::new(&[h / 2, w], Some(TensorMemory::DmaBuf), None)
         .expect("dma chroma allocation");
+    chroma.set_row_stride_unchecked(w + 16);
 
-    let mut combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)
+    let combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)
         .expect("from_planes must succeed against a real ef_tensor_from_planes primitive");
 
     assert!(
@@ -384,22 +387,10 @@ fn dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest() {
          bytes through"
     );
 
-    // The caller-facing scenario `import_image`'s multiplane path exercises:
-    // set the chroma sub-tensor's own stride via `chroma_mut()` (task 17's
-    // `set_row_stride_unchecked` primitive) and read it back through
-    // `chroma()`, proving both the shadow and the new primitive round-trip
-    // correctly together, not just in isolation.
-    {
-        let chroma_ref = combined
-            .chroma_mut()
-            .expect("chroma_mut() must return the shadow this from_planes call built");
-        chroma_ref.set_row_stride_unchecked(w + 16);
-    }
     assert_eq!(
         combined.chroma().and_then(|c| c.effective_row_stride()),
         Some(w + 16),
-        "the stride set through chroma_mut() must read back through chroma() -- this is the \
-         exact round trip edgefirst-image's import_image relies on"
+        "the stride set on chroma before from_planes must read back through chroma()"
     );
 }
 
@@ -977,10 +968,9 @@ fn dynamic_from_client_pbo_refuses_malformed_geometry_with_the_same_variant() {
 }
 
 /// Mock [`edgefirst_tensor::CudaGlOps`] that never actually calls into
-/// libcudart -- `set_cuda_handle`/`cuda()` are pure in-process Rust state
-/// (see `TensorDyn::cuda`'s own doc comment), so proving the attach/read-back
-/// round trip needs no CUDA-capable hardware, only that the handle is really
-/// stored and really recovered.
+/// libcudart -- `set_cuda_handle`/`is_cuda_attached()` attach via
+/// `ef_tensor_cuda_attach`, so proving the attach/read-back round trip needs
+/// no CUDA-capable hardware, only that the library stores the registration.
 struct MockCudaGlOps;
 impl edgefirst_tensor::CudaGlOps for MockCudaGlOps {
     fn map(&self, _resource: *mut std::ffi::c_void) -> Option<(*mut std::ffi::c_void, usize)> {
@@ -997,8 +987,8 @@ impl edgefirst_tensor::CudaGlOps for MockCudaGlOps {
 fn dynamic_set_cuda_handle_is_read_back_through_cuda() {
     let mut tensor = bare_u8(&[4, 4]);
     assert!(
-        tensor.cuda().is_none(),
-        "a tensor with no attached CUDA handle must report None"
+        !tensor.is_cuda_attached(),
+        "a tensor with no attached CUDA handle must report none"
     );
 
     let handle = edgefirst_tensor::CudaHandle::new_gl(
@@ -1009,9 +999,8 @@ fn dynamic_set_cuda_handle_is_read_back_through_cuda() {
     tensor.set_cuda_handle(handle);
 
     assert!(
-        tensor.cuda().is_some(),
-        "set_cuda_handle must make cuda() return Some -- this was unconditionally None before \
-         this task, and set_cuda_handle did not exist at all"
+        tensor.is_cuda_attached(),
+        "set_cuda_handle must make is_cuda_attached() true after ef_tensor_cuda_attach"
     );
 }
 
@@ -1600,9 +1589,15 @@ fn cuda_map_is_none_without_a_handle_and_maps_with_one() {
             as Arc<dyn edgefirst_tensor::CudaGlOps>,
     ));
     let dyn_t: TensorDyn = t.into();
-    let map = dyn_t
+    let raw = dyn_t.into_raw();
+    let wrapped = unsafe { TensorDyn::from_raw(raw) };
+    assert!(
+        wrapped.is_cuda_attached(),
+        "CUDA attach must survive from_handle/from_raw"
+    );
+    let map = wrapped
         .cuda_map()
-        .expect("an attached CUDA handle must produce a map guard");
+        .expect("an attached CUDA handle must produce a map guard after wrap");
     assert_eq!(map.len(), 16);
     assert!(!map.device_ptr().is_null());
 }

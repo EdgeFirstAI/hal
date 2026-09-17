@@ -308,6 +308,88 @@ typedef uint32_t ef_error_class;
 typedef struct ef_tensor_image_desc ef_tensor_image_desc;
 
 /**
+ * Client-owned state a library entry point calls back into — **frozen by
+ * value, forever**, and reused verbatim by every domain that needs one
+ * (PBO today; CUDA-GL next).
+ *
+ * # What `retain`/`release` govern — and what they do not
+ *
+ * They extend the life of the **callback channel only**. They never
+ * transfer ownership of the GL buffer, the CUDA resource, or anything else
+ * the context happens to address. Getting this backwards double-frees a GL
+ * buffer:
+ *
+ * * The producing side's own destructor stays the sole caller of the real
+ *   `delete_buffer`.
+ * * A library that reconstructed operations from this struct treats
+ *   `delete_buffer` as a no-op — it borrows the resource, it does not own
+ *   it.
+ *
+ * # Ownership at an entry point
+ *
+ * An entry point that stores this struct calls `retain(ctx)` itself and
+ * calls `release(ctx)` exactly once when the object holding it is
+ * destroyed. The caller keeps its own count and may drop it at any time
+ * after the call returns.
+ *
+ * # Freezing
+ *
+ * This vocabulary declines the `struct_size` handshake (see the root
+ * `ARCHITECTURE.md`, "Why there is no `struct_size` handshake"), so a
+ * by-value struct grows only by a major bump or a suffixed successor.
+ * Freezing **one** tiny universal struct — rather than one per domain, or
+ * one that grows per domain — is what keeps that cost paid once. Its size
+ * and offsets are pinned by `tests/c/test_layout_goldens.c` in
+ * `edgefirst-tensor-capi` and by `client_state_layout_is_pinned` below.
+ *
+ * `ctx` is opaque to the library: only the producing copy of the code ever
+ * dereferences it.
+ */
+typedef struct ef_client_state {
+  /**
+   * Opaque to every caller except this struct's own function pointers.
+   */
+  const void *ctx;
+  /**
+   * Add one reference to the callback channel. Never NULL in a valid
+   * state; an entry point receiving NULL must fail with `EINVAL`.
+   */
+  void (*retain)(const void *ctx);
+  /**
+   * Drop one reference to the callback channel. Never NULL in a valid
+   * state; an entry point receiving NULL must fail with `EINVAL`.
+   */
+  void (*release)(const void *ctx);
+} ef_client_state;
+
+/**
+ * Map a CUDA graphics resource to a device pointer. `0` on success.
+ *
+ * May be NULL where an entry point takes one; such an entry point refuses
+ * a NULL rather than calling through it.
+ */
+typedef int (*EfCudaMapFnNullable)(const void *ctx,
+                                   void *resource,
+                                   void **out_ptr,
+                                   uintptr_t *out_len);
+
+/**
+ * Unmap a resource previously mapped by an `ef_cuda_map_fn`.
+ *
+ * May be NULL where an entry point takes one; such an entry point refuses
+ * a NULL rather than calling through it.
+ */
+typedef void (*EfCudaUnmapFnNullable)(const void *ctx, void *resource);
+
+/**
+ * Unregister a CUDA graphics resource.
+ *
+ * May be NULL where an entry point takes one; such an entry point refuses
+ * a NULL rather than calling through it.
+ */
+typedef void (*EfCudaUnregisterFnNullable)(const void *ctx, void *resource);
+
+/**
  * The D3D11 texture behind a Windows texture tensor.
  *
  * The scalar block `ef_tensor_d3d11_layout` fills, the same shape as
@@ -511,61 +593,6 @@ typedef struct ef_tensor_view {
   uint8_t *ptr;
   uintptr_t len;
 } ef_tensor_view;
-
-/**
- * Client-owned state a library entry point calls back into — **frozen by
- * value, forever**, and reused verbatim by every domain that needs one
- * (PBO today; CUDA-GL next).
- *
- * # What `retain`/`release` govern — and what they do not
- *
- * They extend the life of the **callback channel only**. They never
- * transfer ownership of the GL buffer, the CUDA resource, or anything else
- * the context happens to address. Getting this backwards double-frees a GL
- * buffer:
- *
- * * The producing side's own destructor stays the sole caller of the real
- *   `delete_buffer`.
- * * A library that reconstructed operations from this struct treats
- *   `delete_buffer` as a no-op — it borrows the resource, it does not own
- *   it.
- *
- * # Ownership at an entry point
- *
- * An entry point that stores this struct calls `retain(ctx)` itself and
- * calls `release(ctx)` exactly once when the object holding it is
- * destroyed. The caller keeps its own count and may drop it at any time
- * after the call returns.
- *
- * # Freezing
- *
- * This vocabulary declines the `struct_size` handshake (see the root
- * `ARCHITECTURE.md`, "Why there is no `struct_size` handshake"), so a
- * by-value struct grows only by a major bump or a suffixed successor.
- * Freezing **one** tiny universal struct — rather than one per domain, or
- * one that grows per domain — is what keeps that cost paid once. Its size
- * and offsets are pinned by `tests/c/test_layout_goldens.c` in
- * `edgefirst-tensor-capi` and by `client_state_layout_is_pinned` below.
- *
- * `ctx` is opaque to the library: only the producing copy of the code ever
- * dereferences it.
- */
-typedef struct ef_client_state {
-  /**
-   * Opaque to every caller except this struct's own function pointers.
-   */
-  const void *ctx;
-  /**
-   * Add one reference to the callback channel. Never NULL in a valid
-   * state; an entry point receiving NULL must fail with `EINVAL`.
-   */
-  void (*retain)(const void *ctx);
-  /**
-   * Drop one reference to the callback channel. Never NULL in a valid
-   * state; an entry point receiving NULL must fail with `EINVAL`.
-   */
-  void (*release)(const void *ctx);
-} ef_client_state;
 
 /**
  * Map a PBO for CPU access. `0` on success; `-1` when the GL context is
@@ -936,6 +963,43 @@ void *ef_tensor_cuda_device_ptr(const void *map, uintptr_t *out_size);
  * [`ef_tensor_cuda_map_mut`].
  */
 void ef_tensor_cuda_unmap(void *map);
+
+/**
+ * Attach a GL-buffer CUDA registration to an existing tensor.
+ *
+ * `state` is the callback channel this library keeps for the registration's
+ * life: it calls `state.retain` before returning and `state.release` when
+ * the tensor (and therefore the `CudaHandle`) is freed. Reuses frozen
+ * `ef_client_state` (24 bytes); this adds no new `repr(C)` struct.
+ *
+ * `map_fn` / `unmap_fn` / `unregister_fn` must be non-NULL. They run on
+ * the caller's thread (typically the GL worker).
+ *
+ * @retval 0 success.
+ * @retval EINVAL `t` is NULL, the channel is incomplete, or an op is NULL.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle. `state.ctx` must remain valid until
+ * this library's `release` call.
+ */
+int ef_tensor_cuda_attach(ef_tensor *t,
+                          struct ef_client_state state,
+                          void *resource,
+                          uintptr_t size,
+                          EfCudaMapFnNullable map_fn,
+                          EfCudaUnmapFnNullable unmap_fn,
+                          EfCudaUnregisterFnNullable unregister_fn);
+
+/**
+ * Whether `t` carries a CUDA registration (GL attach or D3D11 import).
+ *
+ * @retval 1 attached.
+ * @retval 0 `t` is NULL or has no registration.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+int ef_tensor_cuda_attached(const ef_tensor *t);
 
 /**
  * Platforms: Windows.
@@ -1487,7 +1551,8 @@ char *ef_tensor_name(const ef_tensor *t);
  * @retval a new tensor the caller must free with `ef_tensor_free`.
  * @retval `NULL` for a `NULL` `ptr`/`dims`, `ndim == 0`, or an
  *         unrecognized `dtype` -- `ef_tensor_last_error_message` carries
- *         the reason.
+ *         the reason, `ef_tensor_last_error_class` is
+ *         `EF_ERROR_CLASS_INVALID_ARGUMENT`, and `errno` is `EINVAL`.
  *
  * # Safety
  * `ptr` must be non-null, aligned for `dtype`, and valid for
@@ -1757,6 +1822,35 @@ ef_tensor *ef_tensor_batch(const ef_tensor *t, uint64_t n);
  * be `NULL` or a NUL-terminated string.
  */
 ef_tensor *ef_tensor_from_planes(ef_tensor *luma, ef_tensor *chroma, const char *format);
+
+/**
+ * Whether `t` was assembled from separate luma/chroma allocations.
+ *
+ * @retval 1 `t` is a two-allocation NV12/NV16 tensor (`Tensor::from_planes`).
+ * @retval 0 `t` is `NULL`, invalid, or a single contiguous buffer.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+int ef_tensor_is_multiplane(const ef_tensor *t);
+
+/**
+ * Retained handle to the chroma plane of a multiplane tensor.
+ *
+ * The result is an independent handle the caller must free with
+ * `ef_tensor_free`. Geometry mutations (`ef_tensor_set_row_stride_unchecked`,
+ * `ef_tensor_set_plane_offset`) apply to this handle. Stride/offset that
+ * must live on the combined tensor should be set on the chroma input
+ * *before* `ef_tensor_from_planes`.
+ *
+ * @retval a new tensor on success.
+ * @retval `NULL` if `t` is `NULL`, not multiplane, or the chroma plane
+ *         cannot be cloned into its own handle.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+ef_tensor *ef_tensor_chroma(const ef_tensor *t);
 
 /**
  * Advisory detail for the calling thread's last failing `tensor-capi` call,

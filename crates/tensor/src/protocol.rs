@@ -574,6 +574,7 @@ pub(crate) unsafe fn descriptor_d3d11_geometry(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShapeRule {
     /// The allocation shape or the addressing shape, exactly.
+    #[cfg_attr(feature = "dynamic", allow(dead_code))]
     Exact,
     /// `Exact`, or a packed window of the texture (a `view()`).
     OrWindow,
@@ -618,6 +619,7 @@ fn is_packed_window_of(
 /// `texture` must be an NT shared handle of a D3D11 texture, valid in this
 /// process. It stays owned by the caller.
 #[cfg(target_os = "windows")]
+#[cfg_attr(feature = "dynamic", allow(dead_code))]
 pub(crate) unsafe fn d3d11_geometry_checked(
     format: crate::PixelFormat,
     texture: std::os::windows::io::RawHandle,

@@ -26,7 +26,10 @@ use std::ffi::{c_char, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_tensor::{DType, TensorDyn, TensorMemory};
+use edgefirst_tensor_abi::EfErrorClass;
 pub use edgefirst_tensor_abi::{EfCompression, EfTensorPlane, EfViewOrigin};
+
+use crate::last_error::{set_errno, set_last_error_classified};
 
 /// An opaque tensor handle.
 ///
@@ -707,7 +710,8 @@ pub unsafe extern "C" fn ef_tensor_name(t: *const EfTensor) -> *mut c_char {
 /// @retval a new tensor the caller must free with `ef_tensor_free`.
 /// @retval `NULL` for a `NULL` `ptr`/`dims`, `ndim == 0`, or an
 ///         unrecognized `dtype` -- `ef_tensor_last_error_message` carries
-///         the reason.
+///         the reason, `ef_tensor_last_error_class` is
+///         `EF_ERROR_CLASS_INVALID_ARGUMENT`, and `errno` is `EINVAL`.
 ///
 /// # Safety
 /// `ptr` must be non-null, aligned for `dtype`, and valid for
@@ -730,16 +734,20 @@ pub unsafe extern "C" fn ef_tensor_wrap_host(
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             let Some(shape) = read_dims(dims, ndim, "wrap_host") else {
+                set_errno(libc::EINVAL);
                 return std::ptr::null_mut();
             };
             if ptr.is_null() {
-                crate::last_error::set_last_error("wrap_host: null pointer");
+                set_errno(libc::EINVAL);
+                set_last_error_classified(EfErrorClass::InvalidArgument, "wrap_host: null pointer");
                 return std::ptr::null_mut();
             }
             let Some(dt) = DType::from_code(dtype) else {
-                crate::last_error::set_last_error(&format!(
-                    "wrap_host: unknown dtype code {dtype}"
-                ));
+                set_errno(libc::EINVAL);
+                set_last_error_classified(
+                    EfErrorClass::InvalidArgument,
+                    &format!("wrap_host: unknown dtype code {dtype}"),
+                );
                 return std::ptr::null_mut();
             };
             // 0 means "no separate capacity declared": fall back to the
@@ -755,7 +763,8 @@ pub unsafe extern "C" fn ef_tensor_wrap_host(
             match TensorDyn::from_raw_host_with_capacity(ptr, &shape, capacity, dt, None) {
                 Ok(t) => into_handle(t),
                 Err(e) => {
-                    crate::last_error::set_last_error_classified(
+                    set_errno(libc::EINVAL);
+                    set_last_error_classified(
                         crate::last_error::class_of(&e),
                         &format!("wrap_host: {e}"),
                     );
@@ -850,7 +859,10 @@ pub unsafe extern "C" fn ef_tensor_from_iosurface_id(
 /// `dims` must be `NULL` or point to `ndim` readable `uint64_t`.
 pub(crate) unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Option<Vec<usize>> {
     if dims.is_null() || ndim == 0 {
-        crate::last_error::set_last_error(&format!("{what}: null dims or zero ndim"));
+        crate::last_error::set_last_error_classified(
+            edgefirst_tensor_abi::EfErrorClass::InvalidArgument,
+            &format!("{what}: null dims or zero ndim"),
+        );
         return None;
     }
     // SAFETY: the caller contracts `dims` is readable for `ndim` entries.
@@ -859,9 +871,10 @@ pub(crate) unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Optio
         .map(|d| usize::try_from(*d).ok())
         .collect::<Option<Vec<usize>>>()
         .or_else(|| {
-            crate::last_error::set_last_error(&format!(
-                "{what}: a dimension is out of range for this host's usize"
-            ));
+            crate::last_error::set_last_error_classified(
+                edgefirst_tensor_abi::EfErrorClass::InvalidArgument,
+                &format!("{what}: a dimension is out of range for this host's usize"),
+            );
             None
         })
 }

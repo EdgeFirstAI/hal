@@ -414,8 +414,9 @@ exists in the field, a differently-sized vtable behind an unchanged name is
 read at the wrong offsets with nothing to catch it. `TensorCapsulePayload::pbo_keepalive` is now
 belt-and-braces rather than load-bearing, because the importer holds its own
 channel reference. Retiring it is a payload change and therefore takes the
-capsule name with it, so that decision belongs to Stage E — still before
-0.31.0 ships, and therefore still free.
+capsule name with it (`edgefirst_tensor_v3`). That retirement is **out of
+0.32.0**: 0.31.0 already shipped `_v2`, and 0.32.0 must not grow
+`PboOpsVtable` or drop `pbo_keepalive`.
 
 The descriptor's own `version` field is `ABI_VERSION` (currently `1`,
 checked by `TensorDyn::import_descriptor` in

@@ -185,8 +185,8 @@ pub use crate::pbo::{
 #[cfg(all(unix, feature = "static"))]
 pub(crate) use crate::shm::ShmTensor;
 pub use cuda::{
-    gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
-    is_cuda_available, memcpy_device_to_host, memcpy_host_to_device,
+    client_state_cuda_ops, gl_map_resource, gl_register_buffer, gl_unmap_resource,
+    gl_unregister_resource, is_cuda_available, memcpy_device_to_host, memcpy_host_to_device,
     runtime_path as cuda_runtime_path, stream_create, stream_destroy, stream_synchronize,
     CudaGlOps, CudaHandle, CudaMap, CudaStream,
 };
@@ -4453,6 +4453,51 @@ where
         self.chroma.as_deref_mut()
     }
 
+    /// Independent tensor over this plane's allocation, copying geometry
+    /// metadata. Used to answer `ef_tensor_chroma` from the handle without a
+    /// client-side shadow field.
+    pub(crate) fn clone_chroma_plane(&self) -> Result<Self> {
+        let storage = match &self.storage {
+            TensorStorage::Mem(m) => TensorStorage::Mem(m.clone()),
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(d) => TensorStorage::Dma(d.try_clone()?),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            TensorStorage::Dma(d) => TensorStorage::Dma(d.clone()),
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(d) => TensorStorage::Dma(d.clone()),
+            #[cfg(target_os = "windows")]
+            TensorStorage::Dma(_) => {
+                return Err(Error::NotImplemented(
+                    "clone_chroma_plane: D3D11 texture chroma is not independently clonable".into(),
+                ));
+            }
+            #[cfg(unix)]
+            TensorStorage::Shm(_) => {
+                return Err(Error::NotImplemented(
+                    "clone_chroma_plane: SHM chroma is not independently clonable".into(),
+                ));
+            }
+            TensorStorage::Pbo(_) => {
+                return Err(Error::NotImplemented(
+                    "clone_chroma_plane: PBO chroma is not independently clonable".into(),
+                ));
+            }
+        };
+        Ok(Tensor {
+            cuda: None,
+            storage,
+            format: self.format,
+            chroma: None,
+            row_stride: self.row_stride,
+            plane_offset: self.plane_offset,
+            quantization: self.quantization.clone(),
+            colorimetry: self.colorimetry,
+            cpu_access: self.cpu_access,
+            compression: self.compression,
+            view_origin: self.view_origin,
+        })
+    }
+
     /// Row stride in bytes (`None` = tightly packed).
     pub fn row_stride(&self) -> Option<usize> {
         self.row_stride
@@ -5157,6 +5202,11 @@ where
     /// The CUDA registration for this tensor, if any (set at creation on CUDA devices).
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
         self.cuda.as_ref()
+    }
+
+    /// Whether a CUDA registration is attached to this tensor.
+    pub fn is_cuda_attached(&self) -> bool {
+        self.cuda.is_some()
     }
 
     /// Attach a CUDA handle (called by ImageProcessor::create_image after registering a PBO).

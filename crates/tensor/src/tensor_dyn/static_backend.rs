@@ -668,6 +668,16 @@ impl TensorDyn {
         dispatch!(self, cuda_map_mut)
     }
 
+    /// Attach a CUDA handle (PBO `cudaGraphicsGLRegisterBuffer`).
+    pub fn set_cuda_handle(&mut self, h: crate::cuda::CudaHandle) {
+        dispatch!(self, set_cuda_handle, h)
+    }
+
+    /// Whether a CUDA registration is attached.
+    pub fn is_cuda_attached(&self) -> bool {
+        dispatch!(self, is_cuda_attached)
+    }
+
     /// Quantization metadata. Returns `None` for float variants (F16, F32,
     /// F64) — quantization does not apply to floating-point tensors.
     /// Otherwise delegates to the typed `Tensor<T>::quantization()` accessor.
@@ -773,6 +783,57 @@ impl TensorDyn {
     /// Return `true` if this tensor uses separate plane allocations.
     pub fn is_multiplane(&self) -> bool {
         dispatch!(self, is_multiplane)
+    }
+
+    /// Owned chroma plane as its own `TensorDyn`, or `None` if this is not
+    /// a two-allocation semi-planar tensor (or the plane cannot be cloned).
+    pub fn chroma_dyn(&self) -> Option<TensorDyn> {
+        match self {
+            TensorDyn::U8(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::U8),
+            TensorDyn::I8(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::I8),
+            TensorDyn::U16(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::U16),
+            TensorDyn::I16(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::I16),
+            TensorDyn::U32(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::U32),
+            TensorDyn::I32(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::I32),
+            TensorDyn::U64(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::U64),
+            TensorDyn::I64(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::I64),
+            TensorDyn::F16(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::F16),
+            TensorDyn::F32(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::F32),
+            TensorDyn::F64(t) => t
+                .chroma()
+                .and_then(|c| c.clone_chroma_plane().ok())
+                .map(TensorDyn::F64),
+        }
     }
 
     /// Return the [`BufferIdentity`](crate::BufferIdentity) of the underlying

@@ -33,12 +33,13 @@
 //! is nothing refused and that half self-skips; `src_feed` is asserted on every
 //! host, including a desktop whose EGL cannot import a DMA-BUF at all.
 //!
-//! The FLOAT route is out of scope by construction: it returns before
-//! `image.convert.gl` is entered, so it has no convert span and records
-//! neither field. That is what `ARCHITECTURE.md`'s span catalog says; giving
-//! the route its own span is a follow-up.
+//! The float route (planar F16 zero-copy on Linux, F32 on Windows) enters the
+//! same `image.convert.gl` span and records both feed fields. A host that
+//! cannot hold or render that destination skips with a reason; the
+//! `HAL_TEST_REQUIRE_GL=1` gate on processor creation stays after the GL
+//! bring-up skip, not after an unroutable float destination.
 
-#![cfg(all(target_os = "linux", feature = "opengl"))]
+#![cfg(all(feature = "opengl", any(target_os = "linux", target_os = "windows")))]
 
 use edgefirst_image::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{
@@ -247,6 +248,78 @@ fn the_convert_span_records_the_feed_fields() {
         skip("no zero-copy destination render on this host, so dst_feed=zero_copy is unreachable");
     }
     eprintln!("CAPTURE dst_feed values: {feeds:?}");
+
+    // ── Float route: same span, both feed fields ────────────────────────
+    // Mem float destinations never classify as a GL float path. The
+    // destination must be the platform's zero-copy GPU buffer.
+    #[cfg(target_os = "linux")]
+    let (dst_fmt, dst_dtype) = (PixelFormat::PlanarRgb, DType::F16);
+    #[cfg(target_os = "windows")]
+    let (dst_fmt, dst_dtype) = (PixelFormat::Rgba, DType::F32);
+    match TensorDyn::image(
+        W,
+        H,
+        dst_fmt,
+        dst_dtype,
+        Some(TensorMemory::DmaBuf),
+        CpuAccess::ReadWrite,
+    ) {
+        Ok(t) if t.memory() == TensorMemory::DmaBuf => {
+            let float_src = image(W, H, TensorMemory::Mem).expect("host float-route source");
+            {
+                let mut m = float_src
+                    .map_bytes(CpuAccess::Write)
+                    .expect("map float src");
+                m.as_mut_slice().fill(0x40);
+            }
+            let mut float_dst = t;
+            match gl.convert(
+                &float_src,
+                &mut float_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            ) {
+                Ok(()) => {
+                    let seen = records.lock().unwrap().clone();
+                    let src_feeds = values_for(&seen, "src_feed");
+                    let dst_feeds = values_for(&seen, "dst_feed");
+                    assert!(
+                        src_feeds
+                            .iter()
+                            .any(|v| matches!(v.as_str(), "import" | "pbo" | "upload")),
+                        "a float convert recorded no src_feed on image.convert.gl; records: {seen:?}"
+                    );
+                    assert!(
+                        dst_feeds
+                            .iter()
+                            .any(|v| matches!(v.as_str(), "zero_copy" | "pbo")),
+                        "a float convert recorded no dst_feed on image.convert.gl; records: {seen:?}"
+                    );
+                    eprintln!(
+                        "CAPTURE float src_feed={src_feeds:?} dst_feed={dst_feeds:?} for {dst_fmt:?}/{dst_dtype:?}"
+                    );
+                }
+                Err(e) => {
+                    skip(&format!(
+                        "GL float convert not routable on this host ({dst_fmt:?}/{dst_dtype:?}): {e}"
+                    ));
+                }
+            }
+        }
+        Ok(t) => {
+            skip(&format!(
+                "float destination allocated as {:?}, not the zero-copy buffer the GL float \
+                 route serves",
+                t.memory()
+            ));
+        }
+        Err(e) => {
+            skip(&format!(
+                "no zero-copy {dst_fmt:?}/{dst_dtype:?} image: {e}"
+            ));
+        }
+    }
 
     // ── dst_feed on the REFUSED route, where a driver really refuses ─────
     // The rebuilt-view shape `offset_source_view_alignment.rs` pins: it

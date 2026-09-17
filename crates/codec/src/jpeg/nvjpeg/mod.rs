@@ -391,7 +391,7 @@ impl NvJpegProbe {
         // Only CUDA-backed (PBO/DMA-with-handle) destinations can be decoded
         // into zero-copy; anything else falls through to V4L2/CPU. Checked
         // before any reconfigure so a non-CUDA tensor is left untouched.
-        if dst.cuda().is_none() {
+        if !dst.is_cuda_attached() {
             return Ok(None);
         }
 

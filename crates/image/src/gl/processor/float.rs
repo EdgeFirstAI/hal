@@ -308,6 +308,7 @@ impl GLProcessorST {
         src_w: usize,
         src_h: usize,
         src_filter: i32,
+        convert_span: &tracing::Span,
     ) -> crate::Result<FloatSrcFeed> {
         let src_tex_id = self.camera_normal_texture.id;
         unsafe {
@@ -372,7 +373,7 @@ impl GLProcessorST {
                             // upload frame must TexImage2D fresh storage.
                             self.camera_normal_texture.target = 0;
                             self.convert_stats.src_imports += 1;
-                            tracing::Span::current().record("src_feed", "import");
+                            convert_span.record("src_feed", "import");
                             return Ok(FloatSrcFeed::Import);
                         }
                         Err(e) => {
@@ -482,7 +483,7 @@ impl GLProcessorST {
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
             }
             self.convert_stats.src_pbo_uploads += 1;
-            tracing::Span::current().record("src_feed", "pbo");
+            convert_span.record("src_feed", "pbo");
             return Ok(FloatSrcFeed::Pbo);
         }
 
@@ -490,7 +491,7 @@ impl GLProcessorST {
         // The map happens ONLY here — a Dma source that imported above never
         // pays the per-frame lock/sync cache maintenance.
         self.convert_stats.src_uploads += 1;
-        tracing::Span::current().record("src_feed", "upload");
+        convert_span.record("src_feed", "upload");
         let pixels = src_u8.map_read()?;
         // Tight RGBA rows: no `UNPACK_ROW_LENGTH` is set on this path, and
         // `UNPACK_ALIGNMENT` is 1, so GL reads exactly the image.
@@ -714,6 +715,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()> {
         // Only the two PBO float paths are implemented here. `pixel_bytes` is
         // what one texel of the pack format occupies -- one f32 for the NHWC
@@ -859,7 +861,7 @@ impl GLProcessorST {
         // see `feed_float_src`. (PBO sources must NOT be `map()`ed on this
         // thread: a PBO map round-trips a message to this same GL worker,
         // deadlocking — the feed checks `pbo_id()` before mapping.)
-        let feed = self.feed_float_src(src_u8, src_w, src_h, src_filter)?;
+        let feed = self.feed_float_src(src_u8, src_w, src_h, src_filter, convert_span)?;
         // A zero-copy feed may have imported more of the texture than the
         // logical image; map the source rectangle onto it and clamp samples
         // to it.
@@ -944,8 +946,10 @@ impl GLProcessorST {
                 packed_h,
                 client_fmt,
                 gl_type,
-            )
+            )?
         }
+        convert_span.record("dst_feed", "pbo");
+        Ok(())
     }
 
     /// Render an RGBA8 source into a zero-copy float destination, writing the
@@ -973,6 +977,7 @@ impl GLProcessorST {
     /// desktop NVIDIA dma-buf) or returns an incomplete FBO, returns
     /// `Err(NotSupported)` so `convert()` degrades gracefully to the CPU.
     /// Never panics.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn convert_float_to_zero_copy(
         &mut self,
         src: &TensorDyn,
@@ -981,6 +986,7 @@ impl GLProcessorST {
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()> {
         // Rotation/flip are not implemented by the float shaders.
         if rotation != Rotation::None || flip != Flip::None {
@@ -1017,7 +1023,7 @@ impl GLProcessorST {
         // ── Source RGBA8 feed (shared with the PBO F16 path): zero-copy
         // import when the source is Dma-backed, else PBO/CPU upload — see
         // `feed_float_src`.
-        let feed = self.feed_float_src(src_u8, src_w, src_h, src_filter)?;
+        let feed = self.feed_float_src(src_u8, src_w, src_h, src_filter, convert_span)?;
         // As above: the imported texture can be larger than the logical image.
         let (src_rect_uv, src_extent) =
             self.float_src_mapping_for_feed(feed, src_rect_uv, src_u8, src_w, src_h);
@@ -1030,6 +1036,7 @@ impl GLProcessorST {
             pad_color,
             dst,
             path,
+            convert_span,
         )
     }
 
@@ -1064,6 +1071,7 @@ impl GLProcessorST {
         pad_color: [f32; 4],
         dst: &mut TensorDyn,
         path: FloatRenderPath,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
@@ -1150,6 +1158,7 @@ impl GLProcessorST {
                     dst_rect_px,
                     pad_color,
                     dst_image_size,
+                    convert_span,
                 )
             }
             _ => {
@@ -1167,6 +1176,7 @@ impl GLProcessorST {
                     dst_rect_px,
                     pad_color,
                     dst_image_size,
+                    convert_span,
                 )
             }
         }
@@ -1195,6 +1205,7 @@ impl GLProcessorST {
         dst_rect_px: [f32; 4],
         pad_color: [f32; 4],
         dst_image_size: Option<(f32, f32)>,
+        convert_span: &tracing::Span,
     ) -> crate::Result<()>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
@@ -1300,6 +1311,7 @@ impl GLProcessorST {
             finish_via_fence();
         }
         check_gl_error(function!(), line!())?;
+        convert_span.record("dst_feed", "zero_copy");
         Ok(())
     }
 }
