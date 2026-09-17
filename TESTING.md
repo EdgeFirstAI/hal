@@ -669,11 +669,9 @@ CRATES="edgefirst-tensor" ./scripts/on-target-test.sh imx95-frdm
 probes each host, cross-builds with `cargo-zigbuild`, rsyncs the binaries
 and `testdata/`, runs each binary with the mandatory `--test-threads=1`,
 and prints a pass/fail/skip matrix. Logs land in
-`target/on-target-results/<host>/`. It exits non-zero if any host reported
-a test failure; an unreachable host is reported as `UNREACHABLE` and does
-not mask a real failure elsewhere.
+`target/on-target-results/<host>/`. It exits non-zero if any host reported a test failure, and also if a host ran no tests at all — reported as `NO-TESTS` rather than `PASS`, since a run that exercised nothing is not evidence. An unreachable host is reported as `UNREACHABLE` and does not mask a real failure elsewhere.
 
-Two details worth knowing:
+A few details worth knowing:
 
 - **Binaries come from cargo's JSON output**, not a `<hash>` glob. Globbing
   picks up stale binaries from earlier builds, which is how you end up
@@ -699,6 +697,7 @@ Two details worth knowing:
   It applies to the test build only, not to the C-API leaves. `g2d_test_formats`
   is imx8mp-only, so enabling it across a mixed set of boards lights up tests
   the others cannot serve.
+- **`FILTER` matches the test function, not the file.** It is handed to each test binary as a test-*name* filter, so a filter named after the source file — `FILTER=convert_span_feed_fields` for a test declared `fn the_convert_span_records_the_feed_fields()` — matches nothing, and every binary runs zero tests while exiting zero. That is reported as `NO-TESTS` with a non-zero exit rather than `PASS`. Check the executed count, not just the result column.
 
 ### What a given board can actually exercise
 
