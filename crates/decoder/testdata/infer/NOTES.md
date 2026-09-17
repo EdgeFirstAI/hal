@@ -128,12 +128,52 @@ export rather than TFLite. Reason: Ultralytics' `export_coreml` substitutes
 so a plain `format=coreml` export never takes that branch and passes the
 raw model through exactly as the ONNX exporter does.
 
-This is source-tracing, not runtime measurement: ONNX and TFLite above were
-pinned by feeding a real image through both exports and comparing box
-magnitude (answer 5: 637.25 px vs 0.9957). CoreML has not had that same
-runtime check performed — this entry records why the convention is expected
-to match ONNX, based on reading the exporter's branch condition, not a
-measured decode. Runtime evidence is expected to follow later.
+Runtime measurement now backs that source-tracing, by the same method
+answer 5 used to pin ONNX against TFLite (637.25 px vs 0.9957). COCO
+`val2017/000000000139.jpg` (640 × 426, letterboxed to 640 × 640 at scale
+1.0000 — 107 px of grey pads the top and bottom, so content occupies
+y ∈ [107, 533]) was fed through the matched fp16 pair
+`yolo26n_fp16.mlpackage` and `yolo26n_fp16.onnx`: both float16 at the I/O
+boundary, both produced by the profiler's `tools/export_fp16.py` over
+`ultralytics 8.4.153` / `coremltools 9.0`, and the `.mlpackage` is the same
+lineage `yolo26n_coreml.signals.json` was captured from. The raw
+`[1, 84, 8400]` head output was read directly — rows 0-3 as `cx, cy, w, h`,
+columns kept where the max class score exceeds 0.25, converted to
+`x1,y1,x2,y2`. No normalization, letterbox-undo, or rescale to source
+resolution was applied: these are the numbers the head itself emits.
+
+| | CoreML `.mlpackage` | ONNX `.onnx` |
+| --- | --- | --- |
+| boxes kept of 8400 | 90 | 91 |
+| **x range** (min x1 .. max x2) | **5.94 .. 640.25** | **6.00 .. 640.00** |
+| **y range** (min y1 .. max y2) | **227.19 .. 507.62** | **227.10 .. 507.62** |
+| cx min / max | 80.31 / 599.50 | 80.38 / 599.00 |
+| w min / max | 11.75 / 155.75 | 11.81 / 156.25 |
+| h min / max | 15.25 / 149.00 | 15.16 / 148.75 |
+
+Three things follow.
+
+**Pixel-space, on the same 0..640 scale as ONNX.** The x extent reaches
+640.25 against a 640-pixel input, and widths run 11.75 to 155.75. A `[0,1]`
+head would have emitted `0.0093 .. 1.0004` for those same boxes. The
+magnitudes settle it; no tolerance argument is needed.
+
+**The two arms agree to about a quarter of a pixel.** The largest single
+divergence is `w max`, 155.75 against 156.25 — fp16 rounding on a 640-wide
+grid. A convention difference would show up as a factor of 640, not a
+fraction of a pixel. That is what rules out "roughly pixel-like, but
+actually something else".
+
+**The y extent lands inside the letterbox content band.** Content occupies
+y ∈ [107, 533]; the decoded extent is 227.19 .. 507.62, comfortably inside,
+with nothing detected in the grey bars. The coordinates are in the
+letterboxed input frame, exactly where a pixel-space head puts them.
+
+Scope, deliberately asymmetric: the ONNX arm ran on ORT's CPU EP and the
+CoreML arm through coremltools' default compute units. The question here is
+which coordinate convention the *head emits*, which is a property of the
+artifact rather than of the accelerator that executes it. These numbers are
+not an accelerator comparison and must not be cited as one.
 
 This resolution covers the no-NMS export only. `yolo export ... nms=True`
 takes the `IOSDetectModel` branch above and substitutes Apple's own NMS
