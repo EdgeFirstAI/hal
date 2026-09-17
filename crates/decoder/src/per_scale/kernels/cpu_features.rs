@@ -45,8 +45,23 @@ impl CpuFeatures {
     /// `neon_baseline`), `neon_fp16`, `neon_dotprod`. Anything else
     /// returns `ForcedKernelUnavailable`.
     pub(crate) fn from_env_or_probe() -> Result<Self, DecoderError> {
+        Self::from_forced_tier(
+            std::env::var("EDGEFIRST_DECODER_FORCE_KERNEL")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// The tier rules, with the environment factored out.
+    ///
+    /// An environment is per process, so a test that reached these rules by
+    /// setting the variable changed them for every other thread too --
+    /// including [`crate::per_scale::plan`], which reads the same variable
+    /// while building a plan. Taking the tier as an argument means the rules
+    /// can be tested without a process-wide side effect to serialize against.
+    pub(crate) fn from_forced_tier(forced: Option<&str>) -> Result<Self, DecoderError> {
         let probed = Self::probe();
-        let Ok(forced) = std::env::var("EDGEFIRST_DECODER_FORCE_KERNEL") else {
+        let Some(forced) = forced else {
             return Ok(probed);
         };
         match forced.to_ascii_lowercase().as_str() {
@@ -170,9 +185,8 @@ mod tests {
     }
 
     #[test]
-    fn from_env_with_scalar_clears_all_simd() {
-        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");
-        let f = CpuFeatures::from_env_or_probe().unwrap();
+    fn forced_tier_scalar_clears_all_simd() {
+        let f = CpuFeatures::from_forced_tier(Some("scalar")).unwrap();
         assert!(!f.neon_baseline);
         assert!(!f.neon_fp16);
         assert!(!f.neon_dotprod);
@@ -180,9 +194,63 @@ mod tests {
     }
 
     #[test]
-    fn from_env_with_unknown_tier_errors() {
-        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "wibble");
-        let r = CpuFeatures::from_env_or_probe();
-        assert!(r.is_err());
+    fn forced_tier_is_case_insensitive() {
+        let f = CpuFeatures::from_forced_tier(Some("SCALAR")).unwrap();
+        assert_eq!(f, CpuFeatures::default());
+    }
+
+    #[test]
+    fn forced_tier_unknown_errors() {
+        let err = CpuFeatures::from_forced_tier(Some("wibble")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecoderError::ForcedKernelUnavailable {
+                    tier: "unknown",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn no_forced_tier_reports_what_the_cpu_has() {
+        assert_eq!(
+            CpuFeatures::from_forced_tier(None).unwrap(),
+            CpuFeatures::probe()
+        );
+    }
+
+    /// A tier the CPU cannot provide is refused rather than silently downgraded.
+    /// On x86_64 no NEON tier is available; on aarch64 the baseline always is.
+    #[test]
+    fn forced_neon_tier_matches_what_the_cpu_can_do() {
+        let r = CpuFeatures::from_forced_tier(Some("neon"));
+        if CpuFeatures::probe().neon_baseline {
+            assert!(r.unwrap().neon_baseline);
+        } else {
+            assert!(matches!(
+                r.unwrap_err(),
+                DecoderError::ForcedKernelUnavailable {
+                    tier: "neon",
+                    missing_feature: "neon"
+                }
+            ));
+        }
+    }
+
+    /// The only test that touches the process environment, and the one place
+    /// the variable's name is load-bearing. `scalar` is chosen deliberately:
+    /// it is a valid tier, so a plan built concurrently on another thread sees
+    /// a different-but-valid dispatch rather than the `Err` an unknown tier
+    /// would hand it.
+    #[test]
+    fn from_env_or_probe_reads_the_documented_variable() {
+        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");
+        assert_eq!(
+            CpuFeatures::from_env_or_probe().unwrap(),
+            CpuFeatures::default()
+        );
     }
 }
