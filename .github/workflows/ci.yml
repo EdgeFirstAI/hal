@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@2c285adecb450875301984b87acc1225b9d068d7
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -101,10 +101,37 @@ jobs:
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       cache-key: quick-x86_64
 
+  # `make sbom` resolves the dependency graph for every target that reaches a
+  # distributed artifact, and for the workspace-excluded C-API leaves, then fails
+  # when a component is absent from NOTICE.
+  #
+  # On the Quick trigger rather than in hal-full, against the usual tiering,
+  # because hal-full runs only when the ci:full label is applied. NOTICE ships to
+  # downstream consumers with every release.
+  notice:
+    name: NOTICE attribution
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          lfs: false
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+        with:
+          tool: cargo-cyclonedx
+      # No toolchain action: rust-toolchain.toml pins the compiler, and letting
+      # rustup honour it keeps one source of truth.
+      - name: Resolve every shipped target and check NOTICE names each component
+        run: make sbom
+
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@2c285adecb450875301984b87acc1225b9d068d7
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       boards: nxp-imx8mp-latest
@@ -189,7 +216,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [changes, quick, full, hal-full, sonar]
+    needs: [changes, quick, notice, full, hal-full, sonar]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

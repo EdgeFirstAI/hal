@@ -23,9 +23,34 @@ concurrency:
 
 jobs:
   sbom:
-    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
+    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@2c285adecb450875301984b87acc1225b9d068d7
     with:
       mode: full
+      # A graph is resolved per target, so this Linux runner would otherwise miss
+      # every target-conditional dependency, such as the `windows-*` crates.
+      # These are the targets reaching a distributed artifact; keep in step with
+      # the Makefile's SBOM_TARGETS.
+      #
+      # Not cargo-cyclonedx's `all`, which disables platform filtering and so
+      # pulls in `[target."cfg(...)"]` blocks for cfgs no build sets.
+      targets: >-
+        x86_64-unknown-linux-gnu
+        aarch64-unknown-linux-gnu
+        x86_64-pc-windows-msvc
+        aarch64-apple-darwin
+        x86_64-apple-darwin
+        aarch64-apple-ios
+        aarch64-apple-ios-sim
+        aarch64-linux-android
+        x86_64-linux-android
+      # The C-API leaves are excluded from the workspace, so `--all` never reaches
+      # them, yet they are the libraries the C archive consists of.
+      extra-manifests: >-
+        crates/tensor-capi/Cargo.toml
+        crates/image-capi/Cargo.toml
+        crates/codec-capi/Cargo.toml
+        crates/decoder-capi/Cargo.toml
+        crates/tracker-capi/Cargo.toml
       project-name: hal
       project-type: library
       version-file: Cargo.toml

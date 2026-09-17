@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@2c285adecb450875301984b87acc1225b9d068d7
     with:
       # `inputs` is null on the schedule trigger, so the fallback is required;
       # without it the expression is an empty string and the gate's boolean
@@ -39,12 +39,12 @@ jobs:
   # building, on a free standard runner, so running it every night costs
   # nothing. See the exception in the shared copilot-instructions.md.
   advisories:
-    uses: EdgeFirstAI/.github/.github/workflows/advisories.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
+    uses: EdgeFirstAI/.github/.github/workflows/advisories.yml@2c285adecb450875301984b87acc1225b9d068d7
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@797eea745ac3c9896c6b3756251cda0530d6aa27
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@2c285adecb450875301984b87acc1225b9d068d7
     with:
       lanes: all
       nightly: true
