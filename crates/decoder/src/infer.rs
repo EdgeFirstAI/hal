@@ -980,12 +980,13 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
     // `nms=True` path, so a plain no-NMS CoreML export passes the raw model
     // through pixel-space exactly as ONNX does; the same runtime check run
     // against a matched fp16 ONNX pair agrees, with x reaching 640.25 on a
-    // 640-pixel input and the two arms within a quarter pixel of each other
-    // (see testdata/infer/NOTES.md for both, and the captured fixture). Guessing it wrong scales
-    // every box by the input size, which is why `Other` is refused rather
-    // than defaulted: everywhere else this module errors on ambiguity, and
-    // this is the field whose corruption `tests/infer_builder.rs` exists to
-    // pin.
+    // 640-pixel input and every coordinate statistic matching within half a
+    // pixel -- fp16 rounding, where a convention difference would be a
+    // factor of 640 (see testdata/infer/NOTES.md for both, and the captured
+    // fixture). Guessing it wrong scales every box by the input size, which
+    // is why `Other` is refused rather than defaulted: everywhere else this
+    // module errors on ambiguity, and this is the field whose corruption
+    // `tests/infer_builder.rs` exists to pin.
     let normalized = match signals.source {
         ModelSource::TfLite => true,
         ModelSource::Onnx | ModelSource::CoreMl => false,

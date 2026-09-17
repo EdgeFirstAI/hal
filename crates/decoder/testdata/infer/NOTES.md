@@ -158,10 +158,16 @@ Three things follow.
 head would have emitted `0.0093 .. 1.0004` for those same boxes. The
 magnitudes settle it; no tolerance argument is needed.
 
-**The two arms agree to about a quarter of a pixel.** The largest single
-divergence is `w max`, 155.75 against 156.25 — fp16 rounding on a 640-wide
-grid. A convention difference would show up as a factor of 640, not a
-fraction of a pixel. That is what rules out "roughly pixel-like, but
+**Every coordinate statistic matches within 0.5 px.** Two of the ten sit
+exactly that far apart — `cx max` (599.50 against 599.00) and `w max`
+(155.75 against 156.25) — and none exceeds it. Read that as an order of
+magnitude rather than as numerical equivalence between the two heads: the
+arms kept different box sets (90 against 91 through the 0.25 gate), so these
+are extrema over populations that are not identical, and one box's
+membership can move an extremum by itself. What the spread does establish is
+the *kind* of difference in play. Half a pixel on a 640-wide grid is fp16
+rounding; **a convention difference would show up as a factor of 640, not a
+fraction of a pixel.** That is what rules out "roughly pixel-like, but
 actually something else".
 
 **The y extent lands inside the letterbox content band.** Content occupies
