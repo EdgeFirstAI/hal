@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assert every Mach-O we ship has an 8-byte-aligned LINKEDIT string pool.
 
-Issue #200. `[profile.release] strip = true` makes rustc strip the symbol
+`[profile.release] strip = true` makes rustc strip the symbol
 table in-process on Apple targets rather than shelling out to Apple's
 `strip(1)`, and its Mach-O writer places the string table immediately after
 the indirect symbol table with no padding. Indirect symbol entries are four
@@ -157,7 +157,7 @@ def check_bytes(data: bytes, label: str) -> tuple[list[str], int]:
                 f"(0x{stroff:X}) is {stroff % REQUIRED_ALIGNMENT}-byte past an "
                 f"{REQUIRED_ALIGNMENT}-byte boundary; dyld on macOS 26+ rejects "
                 f"this image with 'mis-aligned LINKEDIT string pool'. See "
-                f"issue #200 and the Apple strip notes in .cargo/config.toml "
+                f"the Apple strip notes in .cargo/config.toml "
                 f"(strsize={strsize})"
             )
     return errors, checked

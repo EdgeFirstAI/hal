@@ -229,7 +229,7 @@ jobs:
         run: python3 scripts/check_wheel_layout.py target/wheels
 
       - name: Assert Mach-O LINKEDIT alignment
-        # Issue #200: rustc strips Apple binaries with its own in-process
+        # rustc strips Apple binaries with its own in-process
         # Mach-O writer, which leaves the string pool 4-byte aligned whenever
         # a binary's nindirectsyms is odd, and dyld on macOS 26+ then refuses
         # to load the wheel. The parity is a coin flip per binary, so an

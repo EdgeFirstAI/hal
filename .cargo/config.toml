@@ -22,7 +22,7 @@
 # `x86_64-apple-darwin` triple, so that entry cannot misfire on non-ARM
 # hardware — and gets no `target-feature` line of its own.
 #
-# `strip=none` + `-Wl,-x` (issue #200): `[profile.release] strip = true`
+# `strip=none` + `-Wl,-x`: `[profile.release] strip = true`
 # in the root Cargo.toml makes rustc strip the symbol table itself,
 # in-process, on Apple targets — it does NOT shell out to Apple's
 # `strip(1)`. Verified: a `strip` shim placed earlier on PATH is never

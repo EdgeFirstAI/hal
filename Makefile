@@ -116,7 +116,7 @@ help:
 	@echo "    make test-ontarget  - Run the suite on SSH hosts you supply"
 	@echo "                          TARGETS='host1 host2' (required)"
 	@echo "    make bench          - Run benchmarks"
-	@echo "    make check-macho    - Assert shipped Mach-O string pools are aligned (#200)"
+	@echo "    make check-macho    - Assert shipped Mach-O string pools are aligned"
 	@echo ""
 	@echo "  Quality & Release:"
 	@echo "    make sbom           - Generate SBOM and check license policy"
@@ -297,10 +297,10 @@ package: capi-libs-release
 	@$(PYTHON) scripts/check_macho_alignment.py dist
 	@echo "✓ C archive in dist/"
 
-# Issue #200's regression gate, runnable on its own. Pure file parsing, so it
-# is meaningful on any OS: a Linux or Windows runner validates a macOS wheel
-# just as well as a Mac does. `make wheel` and `make package` already run it
-# over what they produce; this target points it at a plain build tree.
+# The Mach-O alignment regression gate, runnable on its own. Pure file parsing,
+# so it is meaningful on any OS: a Linux or Windows runner validates a macOS
+# wheel just as well as a Mac does. `make wheel` and `make package` already run
+# it over what they produce; this target points it at a plain build tree.
 #
 # Override MACHO_DIRS to scan elsewhere, e.g.
 #   make check-macho MACHO_DIRS="target/wheels dist"
@@ -415,8 +415,8 @@ test-doc:
 # The PEP 517 source-directory install, split out of test-python so CI can
 # exercise it without paying for the whole suite. `pip install <dir>/` is a
 # different code path from the `maturin build` + `pip install *.whl` route
-# every workflow uses, and it is the ONLY path issue #199 broke -- so it is
-# the only path worth a dedicated gate. Narrow it with PYTHON_PACKAGES to
+# every workflow uses, and it is the ONLY path the repair failure broke -- so
+# it is the only path worth a dedicated gate. Narrow it with PYTHON_PACKAGES to
 # check the mechanism for one package:
 #
 #   make install-python PYTHON_PACKAGES=tensor
@@ -446,7 +446,7 @@ install-python:
 	@# Every OTHER maturin call site in this file and in the workflows already
 	@# passes `--auditwheel skip` (see build-python, wheel, and release.yml's
 	@# wheel job); this loop could not, and was the one path that let maturin's
-	@# repair step run. On macOS that step fails outright (issue #199):
+	@# repair step run. On macOS that step fails outright:
 	@#
 	@#   Cannot repair wheel, because required library
 	@#   @rpath/libedgefirst_tensor.0.dylib could not be located.
@@ -886,7 +886,7 @@ sbom:
 	@# regardless of licence while the generator omits the ones asking for no
 	@# attribution. Gating on the warning would fail on a component NOTICE is
 	@# correct to omit, and `make notice` could never clear it.
-	@python3 .github/scripts/generate_notice.py --check sbom/sbom.json NOTICE
+	@$(PYTHON) .github/scripts/generate_notice.py --check sbom/sbom.json NOTICE
 	@echo "Validating SBOM format..."
 	@if command -v cyclonedx >/dev/null 2>&1; then \
 		cyclonedx validate --input-file sbom/sbom.json; \
