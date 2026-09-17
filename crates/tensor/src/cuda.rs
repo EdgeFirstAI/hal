@@ -9,6 +9,7 @@
 //! first; if it returns `None` (no CUDA handle attached or libcudart absent),
 //! fall back to the host mapping via `Tensor::map`. This keeps hot paths
 //! zero-copy on CUDA-capable hardware while remaining correct on CPU-only targets.
+use edgefirst_tensor_abi::{EfClientState, EfCudaMapFn, EfCudaUnmapFn, EfCudaUnregisterFn};
 use libloading::Library;
 #[cfg(target_os = "windows")]
 use std::ffi::c_char;
@@ -1194,6 +1195,9 @@ enum CudaBacking {
     },
     #[cfg(all(target_os = "windows", feature = "static"))]
     D3d11(D3d11External),
+    /// After [`CudaHandle::into_client_parts`] moved a GL registration across
+    /// the ABI; Drop must not unregister a resource the library now owns.
+    Detached,
 }
 
 // SAFETY: CUDA handles/ptrs are process-global; GlBuffer routes to the GL
@@ -1212,6 +1216,7 @@ impl std::fmt::Debug for CudaHandle {
         let kind = match &self.kind {
             CudaBacking::GlBuffer { .. } => "GlBuffer",
             CudaBacking::ExternalMem { .. } => "ExternalMem",
+            CudaBacking::Detached => "Detached",
             #[cfg(all(target_os = "windows", feature = "static"))]
             CudaBacking::D3d11(_) => "D3d11",
         };
@@ -1230,6 +1235,43 @@ impl CudaHandle {
         Self {
             kind: CudaBacking::GlBuffer { resource, ops },
             size,
+        }
+    }
+
+    /// Decompose a GL-buffer registration into the callback channel
+    /// [`ef_tensor_cuda_attach`](crate::TensorDyn::set_cuda_handle) takes.
+    ///
+    /// Consumes `self` without unregistering: the library tensor's
+    /// `CudaHandle` becomes the owner that will unregister on drop.
+    pub fn into_client_parts(self) -> crate::Result<CudaClientParts> {
+        let mut this = self;
+        let kind = std::mem::replace(&mut this.kind, CudaBacking::Detached);
+        let size = this.size;
+        match kind {
+            CudaBacking::GlBuffer { resource, ops } => {
+                let channel = Arc::new(CudaGlChannel { ops });
+                let state = EfClientState {
+                    ctx: Arc::as_ptr(&channel) as *const c_void,
+                    retain: Some(cuda_vt_retain),
+                    release: Some(cuda_vt_release),
+                };
+                Ok(CudaClientParts {
+                    state,
+                    resource,
+                    size,
+                    map_fn: cuda_vt_map,
+                    unmap_fn: cuda_vt_unmap,
+                    unregister_fn: cuda_vt_unregister,
+                    _channel: channel,
+                })
+            }
+            other => {
+                this.kind = other;
+                drop(this);
+                Err(crate::Error::InvalidArgument(
+                    "cuda attach is for GL-buffer registrations only".into(),
+                ))
+            }
         }
     }
 
@@ -1291,6 +1333,7 @@ impl CudaHandle {
                 release: Release::None,
                 _marker: std::marker::PhantomData,
             }),
+            CudaBacking::Detached => None,
         }
     }
 
@@ -1455,6 +1498,7 @@ impl CudaHandle {
 impl Drop for CudaHandle {
     fn drop(&mut self) {
         match &self.kind {
+            CudaBacking::Detached => {}
             CudaBacking::GlBuffer { resource, ops } => ops.unregister(*resource),
             CudaBacking::ExternalMem { ext_mem, dptr: _ } => {
                 // The device pointer comes from `cudaExternalMemoryGetMappedBuffer`,
@@ -1504,6 +1548,132 @@ impl Drop for CudaHandle {
             }
         }
     }
+}
+
+struct CudaGlChannel {
+    ops: Arc<dyn CudaGlOps>,
+}
+
+/// The frozen callback channel a GL-buffer CUDA registration becomes when
+/// it crosses `ef_tensor_cuda_attach`.
+pub struct CudaClientParts {
+    pub state: EfClientState,
+    pub resource: GraphicsResource,
+    pub size: usize,
+    pub map_fn: EfCudaMapFn,
+    pub unmap_fn: EfCudaUnmapFn,
+    pub unregister_fn: EfCudaUnregisterFn,
+    _channel: Arc<CudaGlChannel>,
+}
+
+unsafe extern "C" fn cuda_vt_retain(ctx: *const c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        Arc::increment_strong_count(ctx as *const CudaGlChannel);
+    }));
+}
+
+unsafe extern "C" fn cuda_vt_release(ctx: *const c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        Arc::decrement_strong_count(ctx as *const CudaGlChannel);
+    }));
+}
+
+unsafe extern "C" fn cuda_vt_map(
+    ctx: *const c_void,
+    resource: *mut c_void,
+    out_ptr: *mut *mut c_void,
+    out_len: *mut usize,
+) -> c_int {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let channel = unsafe { &*(ctx as *const CudaGlChannel) };
+        match channel.ops.map(resource) {
+            Some((ptr, len)) => {
+                unsafe {
+                    *out_ptr = ptr;
+                    *out_len = len;
+                }
+                0
+            }
+            None => 1,
+        }
+    }))
+    .unwrap_or(1)
+}
+
+unsafe extern "C" fn cuda_vt_unmap(ctx: *const c_void, resource: *mut c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let channel = unsafe { &*(ctx as *const CudaGlChannel) };
+        channel.ops.unmap(resource);
+    }));
+}
+
+unsafe extern "C" fn cuda_vt_unregister(ctx: *const c_void, resource: *mut c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let channel = unsafe { &*(ctx as *const CudaGlChannel) };
+        channel.ops.unregister(resource);
+    }));
+}
+
+struct ImportedCudaGlOps {
+    state: EfClientState,
+    map_fn: EfCudaMapFn,
+    unmap_fn: EfCudaUnmapFn,
+    unregister_fn: EfCudaUnregisterFn,
+}
+
+unsafe impl Send for ImportedCudaGlOps {}
+unsafe impl Sync for ImportedCudaGlOps {}
+
+impl Drop for ImportedCudaGlOps {
+    fn drop(&mut self) {
+        if let Some(release) = self.state.release {
+            unsafe { release(self.state.ctx) };
+        }
+    }
+}
+
+impl CudaGlOps for ImportedCudaGlOps {
+    fn map(&self, resource: GraphicsResource) -> Option<(*mut c_void, usize)> {
+        let mut ptr = std::ptr::null_mut();
+        let mut len = 0usize;
+        let rc = unsafe { (self.map_fn)(self.state.ctx, resource, &mut ptr, &mut len) };
+        (rc == 0).then_some((ptr, len))
+    }
+
+    fn unmap(&self, resource: GraphicsResource) {
+        unsafe { (self.unmap_fn)(self.state.ctx, resource) };
+    }
+
+    fn unregister(&self, resource: GraphicsResource) {
+        unsafe { (self.unregister_fn)(self.state.ctx, resource) };
+    }
+}
+
+/// Build `CudaGlOps` from a client's frozen `EfClientState` and the three
+/// CUDA op functions. Retains the channel; [`Drop`] of the returned `Arc`
+/// releases it.
+///
+/// # Safety
+/// `state.ctx` must be the context the supplied function pointers understand.
+pub unsafe fn client_state_cuda_ops(
+    state: EfClientState,
+    map_fn: EfCudaMapFn,
+    unmap_fn: EfCudaUnmapFn,
+    unregister_fn: EfCudaUnregisterFn,
+) -> crate::Result<Arc<dyn CudaGlOps>> {
+    if state.ctx.is_null() || state.retain.is_none() || state.release.is_none() {
+        return Err(crate::Error::InvalidArgument(
+            "CUDA client state must carry a non-NULL ctx, retain and release".into(),
+        ));
+    }
+    let retain = state.retain.expect("checked above");
+    unsafe { retain(state.ctx) };
+    Ok(Arc::new(ImportedCudaGlOps {
+        state,
+        map_fn,
+        unmap_fn,
+        unregister_fn,
+    }))
 }
 
 /// What a [`CudaMap`] does when it drops: nothing for a persistent mapping,

@@ -2519,13 +2519,28 @@ impl ImageProcessor {
                 )));
             }
 
-            let chroma_tensor =
+            let mut chroma_tensor =
                 Tensor::<u8>::from_fd(chroma_pd.into_fd(), &[chroma_h, width], Some("chroma"))?;
             if chroma_tensor.memory() != TensorMemory::DmaBuf {
                 return Err(Error::NotSupported(format!(
                     "chroma fd must be DMA-backed, got {:?}",
                     chroma_tensor.memory()
                 )));
+            }
+
+            // Geometry on the chroma plane must be set before from_planes
+            // consumes it: the combined handle answers chroma() from the
+            // library, and there is no chroma_mut() on the dynamic lens.
+            if let Some(s) = chroma_stride {
+                if s < width {
+                    return Err(Error::InvalidShape(format!(
+                        "chroma stride {s} < minimum {width} for {format:?}"
+                    )));
+                }
+                chroma_tensor.set_row_stride_unchecked(s);
+            }
+            if let Some(o) = chroma_offset {
+                chroma_tensor.set_plane_offset(o);
             }
 
             // from_planes creates the combined tensor with format set,
@@ -2538,24 +2553,6 @@ impl ImageProcessor {
             }
             if let Some(o) = image_offset {
                 tensor.set_plane_offset(o);
-            }
-
-            // Apply stride/offset to the chroma sub-tensor.
-            // The chroma tensor is a raw 2D [chroma_h, width] tensor without
-            // format metadata, so we validate stride manually rather than
-            // using set_row_stride (which requires format).
-            if let Some(chroma_ref) = tensor.chroma_mut() {
-                if let Some(s) = chroma_stride {
-                    if s < width {
-                        return Err(Error::InvalidShape(format!(
-                            "chroma stride {s} < minimum {width} for {format:?}"
-                        )));
-                    }
-                    chroma_ref.set_row_stride_unchecked(s);
-                }
-                if let Some(o) = chroma_offset {
-                    chroma_ref.set_plane_offset(o);
-                }
             }
 
             if dtype == DType::I8 {

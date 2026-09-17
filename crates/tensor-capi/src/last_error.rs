@@ -94,15 +94,9 @@ pub(crate) fn set_last_error_classified(class: EfErrorClass, msg: &str) {
 
 /// Re-class the failure just recorded, keeping its message.
 ///
-/// The one legitimate exception to "every path that writes `LAST` writes
-/// `LAST_CLASS` too": an entry point that calls a **shared** helper which
-/// records an accurate message but no class, and that wants the class
-/// without discarding the helper's wording. `read_dims` is the case --
-/// `ef_tensor_wrap_pbo` classifies its refusal `InvalidArgument` while
-/// `ef_tensor_wrap_host` does not, so the class cannot move into the
-/// helper, and restating the message at the call site would lose the
-/// helper's distinction between "null dims or zero ndim" and "a dimension
-/// is out of range for this host's usize".
+/// Use immediately after a helper that already wrote an accurate message
+/// (and, after Stage E, class) when the entry point still needs to force
+/// `InvalidArgument` while keeping the helper's wording.
 ///
 /// Only ever call this **immediately** after the write it re-classes, on
 /// the same thread, with nothing in between. Anywhere else it would attach

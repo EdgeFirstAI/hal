@@ -449,6 +449,55 @@ pub unsafe extern "C" fn ef_tensor_from_planes(
     }
 }
 
+/// Whether `t` was assembled from separate luma/chroma allocations.
+///
+/// @retval 1 `t` is a two-allocation NV12/NV16 tensor (`Tensor::from_planes`).
+/// @retval 0 `t` is `NULL`, invalid, or a single contiguous buffer.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_is_multiplane(t: *const EfTensor) -> c_int {
+    crate::last_error::ensure_hook_installed();
+    catch_unwind(AssertUnwindSafe(|| {
+        tensor_of(t).is_some_and(|inner| inner.is_multiplane()) as c_int
+    }))
+    .unwrap_or(0)
+}
+
+/// Retained handle to the chroma plane of a multiplane tensor.
+///
+/// The result is an independent handle the caller must free with
+/// `ef_tensor_free`. Geometry mutations (`ef_tensor_set_row_stride_unchecked`,
+/// `ef_tensor_set_plane_offset`) apply to this handle. Stride/offset that
+/// must live on the combined tensor should be set on the chroma input
+/// *before* `ef_tensor_from_planes`.
+///
+/// @retval a new tensor on success.
+/// @retval `NULL` if `t` is `NULL`, not multiplane, or the chroma plane
+///         cannot be cloned into its own handle.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_chroma(t: *const EfTensor) -> *mut EfTensor {
+    crate::last_error::ensure_hook_installed();
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(inner) = tensor_of(t) else {
+            set_last_error("chroma: null or invalid tensor");
+            return std::ptr::null_mut();
+        };
+        match inner.chroma_dyn() {
+            Some(chroma) => into_handle(chroma),
+            None => {
+                set_last_error("chroma: tensor is not multiplane");
+                std::ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,7 +591,16 @@ mod tests {
         let combined = unsafe { ef_tensor_from_planes(luma, chroma, nv12.as_ptr()) };
         assert!(!combined.is_null());
         assert_eq!(inner_of(combined).format(), Some(PixelFormat::Nv12));
-        unsafe { ef_tensor_free(combined) };
+        assert_eq!(unsafe { ef_tensor_is_multiplane(combined) }, 1);
+        let chroma_h = unsafe { ef_tensor_chroma(combined) };
+        assert!(
+            !chroma_h.is_null(),
+            "Mem chroma must clone through ef_tensor_chroma"
+        );
+        unsafe {
+            ef_tensor_free(chroma_h);
+            ef_tensor_free(combined);
+        }
     }
 
     #[test]

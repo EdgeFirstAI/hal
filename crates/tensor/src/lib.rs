@@ -185,8 +185,8 @@ pub use crate::pbo::{
 #[cfg(all(unix, feature = "static"))]
 pub(crate) use crate::shm::ShmTensor;
 pub use cuda::{
-    gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
-    is_cuda_available, memcpy_device_to_host, memcpy_host_to_device,
+    client_state_cuda_ops, gl_map_resource, gl_register_buffer, gl_unmap_resource,
+    gl_unregister_resource, is_cuda_available, memcpy_device_to_host, memcpy_host_to_device,
     runtime_path as cuda_runtime_path, stream_create, stream_destroy, stream_synchronize,
     CudaGlOps, CudaHandle, CudaMap, CudaStream,
 };
@@ -4453,6 +4453,18 @@ where
         self.chroma.as_deref_mut()
     }
 
+    /// Independent tensor over this plane's allocation, copying geometry
+    /// metadata. Used to answer `ef_tensor_chroma` from the handle without a
+    /// client-side shadow field.
+    pub(crate) fn clone_chroma_plane(&self) -> Result<Self> {
+        // Every storage accepted by `from_planes` implements `view` as a
+        // shared-backing lens. Using that common path keeps
+        // `is_multiplane() => chroma().is_some()` true for SHM, PBO and
+        // D3D11 too, instead of silently losing chroma when a hand-written
+        // per-storage clone omits a variant.
+        self.subview(0, self.shape())
+    }
+
     /// Row stride in bytes (`None` = tightly packed).
     pub fn row_stride(&self) -> Option<usize> {
         self.row_stride
@@ -5157,6 +5169,11 @@ where
     /// The CUDA registration for this tensor, if any (set at creation on CUDA devices).
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
         self.cuda.as_ref()
+    }
+
+    /// Whether a CUDA registration is attached to this tensor.
+    pub fn is_cuda_attached(&self) -> bool {
+        self.cuda.is_some()
     }
 
     /// Attach a CUDA handle (called by ImageProcessor::create_image after registering a PBO).

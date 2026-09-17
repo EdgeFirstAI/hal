@@ -3,13 +3,19 @@
 
 //! Zero-copy CUDA mapping of a tensor.
 
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use edgefirst_tensor::TensorDyn;
+use edgefirst_tensor::{client_state_cuda_ops, CudaHandle, TensorDyn};
+use edgefirst_tensor_abi::{
+    EfClientState, EfCudaMapFnNullable, EfCudaUnmapFnNullable, EfCudaUnregisterFnNullable,
+    EfErrorClass,
+};
 
-use crate::handle::{ef_tensor_free, ef_tensor_retain, tensor_of, EfTensor};
-use crate::last_error::{ensure_hook_installed, set_errno};
+use crate::handle::{ef_tensor_free, ef_tensor_retain, imp_mut, tensor_of, EfTensor};
+use crate::last_error::{
+    class_of, ensure_hook_installed, set_errno, set_last_error_classified, shield_int,
+};
 
 /// Heap object behind the opaque `void *` returned by [`ef_tensor_cuda_map`].
 ///
@@ -189,6 +195,105 @@ pub unsafe extern "C" fn ef_tensor_cuda_unmap(map: *mut c_void) {
             ef_tensor_free(tensor);
         }));
     }
+}
+
+/// Attach a GL-buffer CUDA registration to an existing tensor.
+///
+/// `state` is the callback channel this library keeps for the registration's
+/// life: it calls `state.retain` before returning and `state.release` when
+/// the tensor (and therefore the `CudaHandle`) is freed. Reuses frozen
+/// `ef_client_state` (24 bytes); this adds no new `repr(C)` struct.
+///
+/// **`resource` is the client-owned GL buffer handle.** This entry point
+/// never deletes it; the caller's own GL teardown stays the sole caller of
+/// `glDeleteBuffers`. On **success**, the CUDA *graphics registration* for
+/// that buffer is consumed by the library tensor and torn down through
+/// `unregister_fn` when the tensor is freed — do not call
+/// `cudaGraphicsUnregisterResource` on that registration after success. On
+/// **failure** (`EINVAL`), nothing is stored and the registration remains
+/// entirely caller-owned.
+///
+/// `map_fn` / `unmap_fn` / `unregister_fn` must be non-NULL. They run on
+/// the caller's thread (typically the GL worker).
+///
+/// @retval 0 success.
+/// @retval EINVAL `t` is NULL, the channel is incomplete, or an op is NULL.
+///
+/// @warning Not safe to call concurrently with any other `tensor-capi` call
+/// on the same handle from another thread, or while a live map from
+/// [`ef_tensor_cuda_map`] / [`ef_tensor_cuda_map_mut`] exists on `t`.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle. `state.ctx` must remain valid until
+/// this library's `release` call.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_cuda_attach(
+    t: *mut EfTensor,
+    state: EfClientState,
+    resource: *mut c_void,
+    size: usize,
+    map_fn: EfCudaMapFnNullable,
+    unmap_fn: EfCudaUnmapFnNullable,
+    unregister_fn: EfCudaUnregisterFnNullable,
+) -> c_int {
+    unsafe {
+        shield_int(|| {
+            let Some(imp) = imp_mut(t) else {
+                set_errno(libc::EINVAL);
+                set_last_error_classified(
+                    EfErrorClass::InvalidArgument,
+                    "cuda_attach: null or invalid tensor",
+                );
+                return libc::EINVAL;
+            };
+            if state.ctx.is_null() || state.retain.is_none() || state.release.is_none() {
+                set_errno(libc::EINVAL);
+                set_last_error_classified(
+                    EfErrorClass::InvalidArgument,
+                    "cuda_attach: client state must carry a non-NULL ctx, retain and release",
+                );
+                return libc::EINVAL;
+            }
+            let (Some(map_fn), Some(unmap_fn), Some(unregister_fn)) =
+                (map_fn, unmap_fn, unregister_fn)
+            else {
+                set_errno(libc::EINVAL);
+                set_last_error_classified(
+                    EfErrorClass::InvalidArgument,
+                    "cuda_attach: map_fn, unmap_fn and unregister_fn must all be non-NULL",
+                );
+                return libc::EINVAL;
+            };
+            match client_state_cuda_ops(state, map_fn, unmap_fn, unregister_fn) {
+                Ok(ops) => {
+                    imp.inner
+                        .set_cuda_handle(CudaHandle::new_gl(resource, size, ops));
+                    0
+                }
+                Err(e) => {
+                    set_errno(libc::EINVAL);
+                    set_last_error_classified(class_of(&e), &format!("cuda_attach: {e}"));
+                    libc::EINVAL
+                }
+            }
+        })
+    }
+}
+
+/// Whether `t` carries a CUDA registration (GL attach or D3D11 import).
+///
+/// @retval 1 attached.
+/// @retval 0 `t` is NULL or has no registration.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_cuda_attached(t: *const EfTensor) -> c_int {
+    crate::last_error::ensure_hook_installed();
+    catch_unwind(AssertUnwindSafe(|| {
+        tensor_of(t).is_some_and(|inner| inner.is_cuda_attached()) as c_int
+    }))
+    .unwrap_or(0)
 }
 
 #[cfg(test)]

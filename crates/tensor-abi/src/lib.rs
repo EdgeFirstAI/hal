@@ -435,6 +435,49 @@ pub type EfPboMapFnNullable = Option<
 pub type EfPboUnmapFnNullable =
     Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void, buffer_id: u32) -> core::ffi::c_int>;
 
+/// Map a CUDA graphics resource to a device pointer. `0` on success.
+pub type EfCudaMapFn = unsafe extern "C" fn(
+    ctx: *const core::ffi::c_void,
+    resource: *mut core::ffi::c_void,
+    out_ptr: *mut *mut core::ffi::c_void,
+    out_len: *mut usize,
+) -> core::ffi::c_int;
+
+/// Unmap a resource previously mapped by an [`EfCudaMapFn`].
+pub type EfCudaUnmapFn =
+    unsafe extern "C" fn(ctx: *const core::ffi::c_void, resource: *mut core::ffi::c_void);
+
+/// Unregister a CUDA graphics resource.
+pub type EfCudaUnregisterFn =
+    unsafe extern "C" fn(ctx: *const core::ffi::c_void, resource: *mut core::ffi::c_void);
+
+/// Map a CUDA graphics resource to a device pointer. `0` on success.
+///
+/// May be NULL where an entry point takes one; such an entry point refuses
+/// a NULL rather than calling through it.
+pub type EfCudaMapFnNullable = Option<
+    unsafe extern "C" fn(
+        ctx: *const core::ffi::c_void,
+        resource: *mut core::ffi::c_void,
+        out_ptr: *mut *mut core::ffi::c_void,
+        out_len: *mut usize,
+    ) -> core::ffi::c_int,
+>;
+
+/// Unmap a resource previously mapped by an `ef_cuda_map_fn`.
+///
+/// May be NULL where an entry point takes one; such an entry point refuses
+/// a NULL rather than calling through it.
+pub type EfCudaUnmapFnNullable =
+    Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void, resource: *mut core::ffi::c_void)>;
+
+/// Unregister a CUDA graphics resource.
+///
+/// May be NULL where an entry point takes one; such an entry point refuses
+/// a NULL rather than calling through it.
+pub type EfCudaUnregisterFnNullable =
+    Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void, resource: *mut core::ffi::c_void)>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

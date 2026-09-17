@@ -183,16 +183,17 @@ Each backend provides its own map type implementing `TensorMapTrait<T>`:
 `ndarray` feature enabled, `TensorMapTrait` also provides `view()` /
 `view_mut()` returning ndarray `ArrayView` / `ArrayViewMut`.
 
-**The `dynamic` lens holds caches only.** `shape_cache`,
-`quantization_cache`, `identity` and `descriptor_texture_handle` are all
-re-derivable from the handle. Three fields once were not, and each was a
-silent-loss bug waiting on the next `from_handle`:
+**The `dynamic` lens holds caches only.** Authoritative state lives in
+`libedgefirst_tensor`. A field on dynamic `TensorDyn` may only be a cache
+re-derived from the handle (`shape_cache`, `quantization_cache`, `identity`,
+and Windows `descriptor_texture_handle`). `from_handle` initializes those
+caches only.
 
 | Field | Held | Now |
 |---|---|---|
 | `pbo` | the real `PboTensor<T>` | `TensorStorage::Pbo` in the library, via `ef_tensor_wrap_pbo` |
-| `cuda` | a `CudaHandle` | *pending — stage C* |
-| `multiplane_chroma` | the chroma plane's own handle | *pending — stage D* |
+| `cuda` | a `CudaHandle` | `Tensor::cuda` in the library, via `ef_tensor_cuda_attach` |
+| `multiplane_chroma` | the chroma plane's own handle | library `chroma` plane, via `ef_tensor_is_multiplane` / `ef_tensor_chroma` |
 
 ### Views and sub-regions
 

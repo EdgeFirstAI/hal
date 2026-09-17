@@ -140,78 +140,21 @@ impl<T: Element> Tensor<T> {
     }
 
     /// Whether this semi-planar tensor was assembled from separate
-    /// luma/chroma *allocations* (`static`'s `from_planes`), as opposed to
-    /// one contiguous combined-plane buffer.
-    ///
-    /// **History, because the previous answer here was wrong and is worth
-    /// understanding.** Until task 17, this unconditionally returned
-    /// `false`, on the reasoning that [`Self::from_planes`] -- the only
-    /// constructor that could ever make it `true` -- itself always returned
-    /// [`Error::NotImplemented`], so `false` was the correct answer for
-    /// every tensor this backend could actually produce. Task 15 then wired
-    /// a real `from_planes` (driving `ef_tensor_from_planes`), and nobody
-    /// revisited this method's premise: the moment `from_planes` started
-    /// succeeding, `is_multiplane()` started lying about the exact tensors
-    /// it produces -- a live caller (`edgefirst-image`'s `import_image`)
-    /// calls `Tensor::<u8>::from_planes` directly, and every downstream
-    /// consumer that branches on `is_multiplane()`/`chroma()` (CPU convert,
-    /// GL/G2D DMA import) would read a genuinely two-fd tensor as if it
-    /// were one contiguous buffer. See task 17's report for the severity of
-    /// that: not a proxy mismatch, a wrong-buffer read.
-    ///
-    /// Now driven by [`TensorDyn::multiplane_chroma`], real Rust-side state
-    /// [`Self::from_planes`] populates from the chroma handle it consumes
-    /// -- see that field's doc comment for why no `ef_tensor_*` primitive
-    /// can answer this after the fact instead.
-    ///
-    /// **Residual risk, not closed by this fix, and not the old one.** The
-    /// shadow is captured by *this crate's* `Tensor::from_planes` at the
-    /// moment it calls `ef_tensor_from_planes` -- it is state this specific
-    /// Rust value carries, not something the C handle itself carries. A
-    /// caller that reaches a genuinely multiplane handle by any *other*
-    /// path -- calling the exported `ef_tensor_from_planes` directly (it is
-    /// `#[no_mangle] pub extern "C"`, reachable from any C caller, or from
-    /// another Rust crate going through raw FFI rather than this crate's
-    /// own wrapper) and then wrapping the result via `TensorDyn::from_raw`
-    /// -- gets a `TensorDyn` whose `multiplane_chroma` was never populated,
-    /// so `is_multiplane()` reports `false` for a tensor that is genuinely
-    /// two allocations. **What would close it:** an `ef_tensor_*` primitive
-    /// the *producer* side can answer from the handle alone (e.g. whether
-    /// plane 0's and plane 1's native handles differ) rather than something
-    /// only the constructing Rust value remembers -- `ef_tensor_plane_at`
-    /// cannot serve this today, per task 17's report. No caller in this
-    /// workspace takes this path currently (the only `ef_tensor_from_planes`
-    /// call site is this file's own `Tensor::from_planes`, below), so this
-    /// is unreached today, not theoretical-and-impossible.
-    ///
-    /// This replaces, rather than restates, the pre-task-17 caveat about a
-    /// raw two-fd tensor built via `ef_tensor_builder_add_plane` called
-    /// twice: task 16 closed that path outright (`ef_tensor_builder_wrap`
-    /// now rejects a second plane with `ENOTSUP`), so restating it here
-    /// would describe a hazard that no longer exists.
+    /// luma/chroma allocations (`from_planes`), as opposed to one
+    /// contiguous combined-plane buffer. Answered from the C handle
+    /// (`ef_tensor_is_multiplane`), so a tensor wrapped via `from_raw`
+    /// after `ef_tensor_from_planes` reports the same as this crate's
+    /// own `from_planes` wrapper.
     pub fn is_multiplane(&self) -> bool {
-        self.inner.multiplane_chroma.is_some()
+        self.inner.is_multiplane()
     }
 
-    /// The linked chroma tensor, if this is a `static`-style multiplane
-    /// tensor built via [`Self::from_planes`]. See [`Self::is_multiplane`]
-    /// for why this can now be genuinely `Some` under `dynamic`.
+    /// The chroma plane, if this is a two-allocation semi-planar tensor.
+    /// Borrowed from a cached lens over the retained `ef_tensor_chroma`
+    /// handle, so native handles borrowed from it remain valid for this
+    /// parent's lifetime.
     pub fn chroma(&self) -> Option<&Self> {
-        // `as_typed` cannot fail here: `from_planes` only ever stores a
-        // shadow it built from a `chroma: Self` argument of this exact `T`
-        // (see its own doc comment), so the dtype always matches.
-        self.inner
-            .multiplane_chroma
-            .as_deref()
-            .and_then(|td| td.as_typed::<T>())
-    }
-
-    /// See [`Self::chroma`]: mutable form.
-    pub fn chroma_mut(&mut self) -> Option<&mut Self> {
-        self.inner
-            .multiplane_chroma
-            .as_deref_mut()
-            .and_then(|td| td.as_typed_mut::<T>())
+        self.inner.chroma()?.as_typed::<T>()
     }
 
     // `as_dma` is deliberately ABSENT on this backend, where the static one
@@ -273,41 +216,13 @@ impl<T: Element> Tensor<T> {
     /// not an oversight; leaking under a caller-created precondition
     /// violation is a bounded, honest cost next to a double-free.
     ///
-    /// **`dynamic`-only: preserves a chroma shadow before consuming
-    /// `chroma`.** No `ef_tensor_*` primitive can recover a genuinely
-    /// multiplane handle's separate chroma fd after this call returns (see
-    /// [`TensorDyn::multiplane_chroma`]'s doc comment), so this captures an
-    /// independent `dup`'d handle onto `chroma`'s own fd *before* it is
-    /// consumed below, and stashes it on the result -- what makes
-    /// [`Self::is_multiplane`]/[`Self::chroma`]/[`Self::chroma_mut`]
-    /// honest afterward for the real, DMA-backed multiplane import every
-    /// caller in this workspace actually builds (`edgefirst-image`'s
-    /// `import_image`).
-    ///
-    /// If `chroma` is not fd-backed (e.g. `TensorMemory::Mem`, the shape a
-    /// unit test unrelated to real hardware might use to exercise the
-    /// combine logic in isolation) the shadow cannot be built at all --
-    /// there is no fd to `dup`. Rather than fail an otherwise-valid combine
-    /// over a case no real caller hits, this degrades to the pre-task-17
-    /// behavior (`is_multiplane()` reports `false`) for that one tensor and
-    /// logs a warning so the gap stays observable rather than silent.
+    /// **Consumes `luma` and `chroma`**. Multiplane is then answered from
+    /// the resulting C handle (`ef_tensor_is_multiplane` /
+    /// `ef_tensor_chroma`), including after `from_raw`.
     pub fn from_planes(luma: Self, chroma: Self, format: PixelFormat) -> Result<Self> {
         let c_format = std::ffi::CString::new(format.as_str()).map_err(|e| {
             Error::InvalidArgument(format!("pixel format string contains a NUL: {e}"))
         })?;
-        #[cfg(unix)]
-        let chroma_shadow = match chroma.inner.shadow_multiplane_chroma() {
-            Ok(shadow) => Some(shadow),
-            Err(e) => {
-                log::warn!(
-                    "Tensor::from_planes: could not preserve a chroma shadow ({e}) -- \
-                     is_multiplane()/chroma() will report no chroma for this tensor, matching \
-                     the behavior before task 17's fix; see TensorDyn::multiplane_chroma's doc \
-                     comment"
-                );
-                None
-            }
-        };
         let luma_raw = TensorDyn::from(luma).into_raw();
         let chroma_raw = TensorDyn::from(chroma).into_raw();
         // SAFETY: both raw pointers are live, own-mint handles this
@@ -320,13 +235,7 @@ impl<T: Element> Tensor<T> {
             Some(h) => {
                 // SAFETY: `h` is a live handle `ef_tensor_from_planes`
                 // returned as the caller-owned result.
-                #[allow(unused_mut)]
-                let mut inner = unsafe { TensorDyn::from_raw(h.as_ptr()) };
-                #[cfg(unix)]
-                {
-                    inner.multiplane_chroma = chroma_shadow.map(Box::new);
-                }
-                Ok(Self::from_inner(inner))
+                Ok(Self::from_inner(unsafe { TensorDyn::from_raw(h.as_ptr()) }))
             }
             None => Err(Error::InvalidArgument(format!(
                 "ef_tensor_from_planes failed: {} -- see this method's doc comment for the \
@@ -418,7 +327,7 @@ impl<T: Element> Tensor<T> {
     /// This used to always panic, because no primitive backed it; that
     /// gap mattered in practice, not just in principle -- it is exactly
     /// what a multiplane chroma sub-tensor needs (see
-    /// [`Self::chroma_mut`]/`from_planes`'s doc comments), and
+    /// `from_planes`'s doc comments), and
     /// `edgefirst-image`'s `import_image` calls it on one.
     pub fn set_row_stride_unchecked(&mut self, stride: usize) {
         self.inner.set_row_stride_unchecked(stride)
@@ -615,52 +524,41 @@ impl<T: Element> Tensor<T> {
         .map(Self::from_inner)
     }
 
-    /// CUDA registration for this tensor, if any (set at creation via
-    /// [`Self::set_cuda_handle`]).
+    /// CUDA registration for this tensor, if any.
     ///
-    /// `CudaHandle` (`crate::cuda`) is already `static`/`dynamic`-agnostic
-    /// in-process Rust state -- see that module's own doc comment ("The
-    /// rest of this module ... stays available under `dynamic`") -- so
-    /// unlike a genuine ABI gap this needed no new `ef_tensor_*` primitive
-    /// at all, only somewhere on `TensorDyn` to hold the value
-    /// (`TensorDyn::cuda`, `dynamic_backend.rs`), the same "state the ABI
-    /// cannot answer" reasoning `multiplane_chroma` already documents.
-    /// Real caller: `edgefirst-image`'s `gl/threaded.rs::register_pbo_cuda`
-    /// (via [`Self::set_cuda_handle`]) and `edgefirst-codec`'s nvJPEG
-    /// decoder (`jpeg/nvjpeg/mod.rs`, this getter) -- which, before this
-    /// existed, unconditionally took the non-CUDA fallback path on
-    /// `dynamic` even for a genuinely CUDA-registered PBO destination.
-    ///
-    /// It answers only for a handle attached here. A registration the C
-    /// library made on the tensor it owns -- every D3D11 texture tensor --
-    /// is out of this field's reach, and is reachable through
-    /// [`Self::cuda_map`] / [`Self::cuda_map_mut`] instead. Gate on the map,
-    /// not on this, when the question is whether CUDA can read this tensor.
+    /// On the dynamic lens the `CudaHandle` lives in the library, so this
+    /// cannot borrow it and always returns `None` even after
+    /// [`Self::set_cuda_handle`]. Use [`Self::is_cuda_attached`] or
+    /// [`Self::cuda_map`] instead.
+    #[deprecated(
+        since = "0.32.0",
+        note = "On the dynamic backend use is_cuda_attached() or cuda_map() — the CudaHandle is not borrowable through this lens."
+    )]
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
-        self.inner.cuda.as_deref()
+        #[allow(deprecated)]
+        {
+            self.inner.cuda()
+        }
     }
 
-    /// See [`Self::cuda`]. `None` when the tensor carries no registration on
-    /// either side of the ABI, same as `static`'s own `Tensor::cuda_map`.
-    ///
-    /// Delegates to `TensorDyn::cuda_map` rather than reading [`Self::cuda`],
-    /// so a tensor whose registration lives inside the C library -- every
-    /// D3D11 texture tensor -- maps here too.
+    /// Whether the library tensor carries a CUDA registration.
+    pub fn is_cuda_attached(&self) -> bool {
+        self.inner.is_cuda_attached()
+    }
+
+    /// See [`Self::cuda`]. `None` when the tensor carries no registration.
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
         self.inner.cuda_map()
     }
 
-    /// See [`Self::cuda_map`]. Writable counterpart, same as `static`'s own
-    /// `Tensor::cuda_map_mut`.
+    /// See [`Self::cuda_map`]. Writable counterpart.
     pub fn cuda_map_mut(&self) -> Option<crate::cuda::CudaMap<'_>> {
         self.inner.cuda_map_mut()
     }
 
-    /// Attach a CUDA handle (called by `ImageProcessor::create_image` after
-    /// registering a PBO with `cudaGraphicsGLRegisterBuffer`). See
-    /// [`Self::cuda`] for why this needed no new `ef_tensor_*` primitive.
+    /// Attach a CUDA handle via `ef_tensor_cuda_attach`.
     pub fn set_cuda_handle(&mut self, h: crate::cuda::CudaHandle) {
-        self.inner.cuda = Some(Box::new(h));
+        self.inner.set_cuda_handle(h);
     }
 
     /// Construct a tensor from a PBO tensor (for GL backends that allocate

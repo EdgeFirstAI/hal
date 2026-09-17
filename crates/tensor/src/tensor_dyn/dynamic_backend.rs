@@ -66,37 +66,16 @@ pub struct TensorDyn {
     /// limitation, not a memory-safety one (each wrapper's cache is its
     /// own allocation).
     quantization_cache: std::sync::OnceLock<Option<crate::Quantization>>,
-    /// If this handle is the combined tensor [`Tensor::from_planes`] built,
-    /// an independent handle over the chroma plane's own allocation --
-    /// `None` for every other tensor, including a genuinely combined-plane
-    /// semi-planar image, which correctly has no separate chroma
-    /// allocation. Exists because no `ef_tensor_*` primitive can recover a
-    /// genuinely-multiplane handle's separate chroma fd after the fact:
-    /// `ef_tensor_plane_at` derives every plane's geometry from the
-    /// format's own plane table over ONE buffer and reports the SAME
-    /// native handle for every plane index (see `vtable.rs::native_handle`
-    /// in `tensor-capi`), so it cannot express "plane 1 lives in a
-    /// different allocation." [`Tensor::from_planes`] therefore captures a
-    /// `dup`'d handle onto the chroma plane's own fd *before* the
-    /// consuming `ef_tensor_from_planes` call (see
-    /// [`Self::shadow_multiplane_chroma`]) and stashes it here, the same
-    /// "state the ABI cannot answer" reasoning `shape_cache`/`identity`
-    /// already document. See task 17's report: before this field existed,
-    /// `is_multiplane()`/`chroma()`/`chroma_mut()` unconditionally
-    /// reported "no chroma" even for a tensor `from_planes` had just
-    /// built, which downstream consumers (`edgefirst-image`'s CPU convert
-    /// path) read as "read chroma from the combined buffer" -- wrong for a
-    /// tensor that is actually two independent DMA-BUFs.
-    pub(crate) multiplane_chroma: Option<Box<TensorDyn>>,
-    /// CUDA registration attached to this tensor, if any -- same "state the
-    /// ABI cannot answer" reasoning as `multiplane_chroma` above.
-    /// `CudaHandle` (`crate::cuda`) is already `static`/`dynamic`-agnostic
-    /// (see that module's own doc comment); only `static`'s
-    /// `Tensor::cuda`/`cuda_map`/`set_cuda_handle` (`lib.rs`), which store
-    /// it as a plain field of `Tensor<T>`, were `static`-only. Not
-    /// type-erased via `Any`: `CudaHandle` itself carries no element type
-    /// to erase.
-    pub(crate) cuda: Option<Box<crate::cuda::CudaHandle>>,
+    /// Lazily-derived retained lens over the library-owned chroma plane.
+    ///
+    /// This is a cache, not a second source of truth: the first
+    /// [`Self::chroma`] call obtains it from `ef_tensor_chroma`, and wrappers
+    /// reconstructed with [`Self::from_raw`] derive their own cache from the
+    /// handle again. Keeping the retained lens for this parent's lifetime
+    /// lets the typed API return the same borrowed `Option<&Tensor<T>>` as
+    /// the static backend and keeps native handles borrowed from that chroma
+    /// lens valid through downstream imports.
+    chroma_cache: std::sync::OnceLock<Option<Box<TensorDyn>>>,
     /// The texture NT handle [`Self::descriptor_pinned`] puts in a
     /// [`crate::protocol::kind::D3D11_TEXTURE`] descriptor, kept here for as
     /// long as this value lives.
@@ -128,15 +107,11 @@ pub struct TensorDyn {
 // aliasing rules, and every mutating entry point this backend calls
 // (`ef_tensor_map`/`unmap`, `ef_tensor_set_colorimetry`, ...) is documented
 // as safe to call from any thread holding a valid reference. `shape_cache`
-// and `identity` are ordinary owned `Send + Sync` data; `quantization_cache`
-// is `OnceLock<Option<Quantization>>`, `Sync` by construction whenever its
-// contents are (`Quantization` is plain owned data, `Send + Sync`
-// automatically) -- see that field's own doc comment for why concurrent
-// access through it specifically is sound, not just asserted here. `cuda` is
-// `Box<CudaHandle>`, and `CudaHandle`'s own fields (`cuda.rs`) are
-// process-global handles or routed through a `Send + Sync` GL-ops trait
-// object, the same reasoning `static`'s own `Tensor<T>` (`lib.rs`) already
-// relies on for that type as a plain field.
+// and `identity` are ordinary owned `Send + Sync` data;
+// `quantization_cache` and `chroma_cache` are `OnceLock`s, `Sync` by
+// construction whenever their contents are -- see those fields' own doc
+// comments for why concurrent access through them specifically is sound,
+// not just asserted here.
 unsafe impl Send for TensorDyn {}
 unsafe impl Sync for TensorDyn {}
 
@@ -161,8 +136,7 @@ impl TensorDyn {
             shape_cache,
             identity,
             quantization_cache: std::sync::OnceLock::new(),
-            multiplane_chroma: None,
-            cuda: None,
+            chroma_cache: std::sync::OnceLock::new(),
             #[cfg(target_os = "windows")]
             descriptor_texture_handle: std::sync::OnceLock::new(),
         }
@@ -254,18 +228,23 @@ impl TensorDyn {
         BufferIdentity::derived(IdentityKind::HostPtr, handle.as_ptr() as u64)
     }
 
-    /// Independently `dup` this handle's fd into a brand-new, standalone
-    /// `TensorDyn` -- not a `retain` (which shares the same handle and
-    /// refcount; `ef_tensor_from_planes` explicitly rejects an outstanding
-    /// one on either input, so a retained keepalive is not an option here).
-    /// [`crate::Tensor::from_planes`] (`dynamic_tensor.rs`) calls this on
-    /// the chroma plane *before* consuming it into the combined handle, so
-    /// [`Self::multiplane_chroma`] has something real to serve afterward.
-    /// See that field's doc comment for why this is necessary at all.
-    #[cfg(unix)]
-    pub(crate) fn shadow_multiplane_chroma(&self) -> Result<TensorDyn> {
-        let fd = self.clone_fd()?;
-        Self::from_fd(fd, self.shape(), self.dtype(), None)
+    /// Whether this handle is a two-allocation semi-planar tensor.
+    pub fn is_multiplane(&self) -> bool {
+        // SAFETY: `self.handle` is live.
+        unsafe { edgefirst_tensor_ffi::ef_tensor_is_multiplane(self.handle.as_ptr()) != 0 }
+    }
+
+    /// Borrowed lens over the chroma plane, or `None` if this is not
+    /// multiplane.
+    pub fn chroma(&self) -> Option<&TensorDyn> {
+        self.chroma_cache
+            .get_or_init(|| {
+                // SAFETY: `self.handle` is live. A non-NULL result carries
+                // one retained reference that the cached lens owns.
+                let p = unsafe { edgefirst_tensor_ffi::ef_tensor_chroma(self.handle.as_ptr()) };
+                std::ptr::NonNull::new(p).map(|h| Box::new(unsafe { Self::from_raw(h.as_ptr()) }))
+            })
+            .as_deref()
     }
 
     /// Read the handle's current shape via `ef_tensor_ndim`/`ef_tensor_shape`.
@@ -766,25 +745,24 @@ impl TensorDyn {
     /// Image height in pixels (`None` if not an image tensor). Pure
     /// function of `shape()` + `format()`, mirroring `Tensor::height`.
     ///
-    /// Unlike the static backend, this backend has no way to tell whether a
-    /// semi-planar tensor was assembled from separate luma/chroma
-    /// allocations (`Tensor::is_multiplane`, which reads a private field no
-    /// `ef_tensor_*` primitive exposes) -- so it always takes the
-    /// combined-plane branch. `PRIMITIVE-INVENTORY.md` found no call site
-    /// that reaches a multiplane `TensorDyn` under the dynamic backend, so
-    /// this is a documented gap rather than a live break.
     pub fn height(&self) -> Option<usize> {
         let fmt = self.format()?;
         let shape = self.shape();
         match fmt.layout() {
             PixelLayout::Packed => shape.first().copied(),
             PixelLayout::Planar => shape.get(1).copied(),
-            PixelLayout::SemiPlanar => match fmt {
-                PixelFormat::Nv12 => shape.first().map(|h| h * 2 / 3),
-                PixelFormat::Nv16 => shape.first().map(|h| h / 2),
-                PixelFormat::Nv24 => shape.first().map(|h| h / 3),
-                _ => None,
-            },
+            PixelLayout::SemiPlanar => {
+                if self.is_multiplane() {
+                    shape.first().copied()
+                } else {
+                    match fmt {
+                        PixelFormat::Nv12 => shape.first().map(|h| h * 2 / 3),
+                        PixelFormat::Nv16 => shape.first().map(|h| h / 2),
+                        PixelFormat::Nv24 => shape.first().map(|h| h / 3),
+                        _ => None,
+                    }
+                }
+            }
         }
     }
 
@@ -1734,28 +1712,53 @@ impl TensorDyn {
         Ok(())
     }
 
-    /// The CUDA registration this wrapper holds, if any.
-    ///
-    /// Reads [`Self::cuda`], with no `ef_tensor_*` entry: `CudaHandle` is
-    /// already backend-agnostic in-process Rust state (see `crate::cuda`'s
-    /// module doc and [`crate::Tensor::cuda`], which task 18 added for the
-    /// typed lens) -- there is nothing about it to send across the
-    /// boundary.
-    ///
-    /// It is not the whole answer to "is this tensor registered with CUDA":
-    /// a tensor the C library allocated carries its registration there, out
-    /// of this field's reach. [`Self::cuda_map`] covers both.
+    /// The registration lives in the library after Stage C. This lens cannot
+    /// borrow that `CudaHandle`, so the getter is always `None` even after
+    /// [`Self::set_cuda_handle`]; use [`Self::is_cuda_attached`] or
+    /// [`Self::cuda_map`].
+    #[deprecated(
+        since = "0.32.0",
+        note = "On the dynamic backend use is_cuda_attached() or cuda_map() — the CudaHandle is not borrowable through this lens."
+    )]
     pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
-        self.cuda.as_deref()
+        None
     }
 
-    /// The C library's own mapping of this tensor, for a registration that
-    /// lives inside it rather than in [`Self::cuda`]: `Tensor::image` and the
-    /// D3D11 constructors attach a `CudaHandle` to the `Tensor` *they*
-    /// allocate, which is the C handle this struct wraps and not this struct,
-    /// so [`Self::cuda`] cannot see it. `mk` is `ef_tensor_cuda_map` or
-    /// `ef_tensor_cuda_map_mut`; both return an opaque map that retains the
-    /// tensor and is released by `ef_tensor_cuda_unmap`.
+    /// Whether the library tensor carries a CUDA registration.
+    pub fn is_cuda_attached(&self) -> bool {
+        // SAFETY: `self.handle` is live.
+        unsafe { edgefirst_tensor_ffi::ef_tensor_cuda_attached(self.handle.as_ptr()) != 0 }
+    }
+
+    /// Attach a GL-buffer CUDA registration on the library tensor.
+    pub fn set_cuda_handle(&mut self, h: crate::cuda::CudaHandle) {
+        match h.into_client_parts() {
+            Ok(parts) => {
+                // SAFETY: `parts` keeps the channel alive for the retain
+                // `ef_tensor_cuda_attach` takes; the function pointers match
+                // `CudaHandle::into_client_parts`.
+                let rc = unsafe {
+                    edgefirst_tensor_ffi::ef_tensor_cuda_attach(
+                        self.handle.as_ptr(),
+                        parts.state,
+                        parts.resource,
+                        parts.size,
+                        Some(parts.map_fn),
+                        Some(parts.unmap_fn),
+                        Some(parts.unregister_fn),
+                    )
+                };
+                if rc != 0 {
+                    log::debug!("ef_tensor_cuda_attach failed: {rc}");
+                }
+            }
+            Err(e) => log::debug!("set_cuda_handle: {e}"),
+        }
+    }
+
+    /// The C library's mapping of this tensor. `mk` is `ef_tensor_cuda_map`
+    /// or `ef_tensor_cuda_map_mut`; both return an opaque map that retains
+    /// the tensor and is released by `ef_tensor_cuda_unmap`.
     fn ffi_cuda_map(
         &self,
         mk: unsafe extern "C" fn(*const EfTensor) -> *mut std::ffi::c_void,
@@ -1770,45 +1773,14 @@ impl TensorDyn {
         unsafe { crate::cuda::CudaMap::from_ffi(map) }
     }
 
-    /// Fast-fail CUDA map: `None` when no handle is attached; else a scoped
-    /// device-pointer guard. Same contract as [`crate::Tensor::cuda_map`]
-    /// and as the static backend's own `TensorDyn::cuda_map`.
-    ///
-    /// A locally-attached handle ([`Self::set_cuda_handle`]'s PBO and nvJPEG
-    /// registrations) is mapped in process; anything else falls through to
-    /// [`Self::ffi_cuda_map`], because a tensor allocated by the C library
-    /// keeps its registration there. Without that fall-through this backend
-    /// answers `None` for every D3D11 texture tensor while the static one
-    /// maps it, which is the divergence the three-backend rule forbids.
-    ///
-    /// The fall-through is skipped for the backings that can never carry a
-    /// library registration: `Mem` and `Shm` are host allocations the C
-    /// library imports nothing into, so it has nothing to answer for them and
-    /// they report `None` without asking it.
+    /// Fast-fail CUDA map through the library (`ef_tensor_cuda_map`).
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
-        match self.cuda() {
-            Some(h) => h.map(),
-            None if !self.can_carry_library_registration() => None,
-            None => self.ffi_cuda_map(edgefirst_tensor_ffi::ef_tensor_cuda_map),
-        }
+        self.ffi_cuda_map(edgefirst_tensor_ffi::ef_tensor_cuda_map)
     }
 
-    /// Whether a tensor of this backing could hold a CUDA registration inside
-    /// the C library. Host memory never does; every device backing may.
-    fn can_carry_library_registration(&self) -> bool {
-        !matches!(self.memory(), TensorMemory::Mem | TensorMemory::Shm)
-    }
-
-    /// Writable counterpart of [`cuda_map`](Self::cuda_map). See
-    /// [`CudaHandle::map_mut`](crate::cuda::CudaHandle::map_mut) for which
-    /// backings distinguish the two, and [`cuda_map`](Self::cuda_map) for why
-    /// the fall-through exists.
+    /// Writable counterpart of [`cuda_map`](Self::cuda_map).
     pub fn cuda_map_mut(&self) -> Option<crate::cuda::CudaMap<'_>> {
-        match self.cuda() {
-            Some(h) => h.map_mut(),
-            None if !self.can_carry_library_registration() => None,
-            None => self.ffi_cuda_map(edgefirst_tensor_ffi::ef_tensor_cuda_map_mut),
-        }
+        self.ffi_cuda_map(edgefirst_tensor_ffi::ef_tensor_cuda_map_mut)
     }
 
     /// GL buffer ID for this PBO; `None` when the tensor is not PBO-backed.

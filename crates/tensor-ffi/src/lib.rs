@@ -18,9 +18,11 @@
 use std::ffi::{c_char, c_int};
 
 pub use edgefirst_tensor_abi::{
-    EfClientRefFn, EfClientState, EfCompression, EfCpuAccess, EfD3d11Layout, EfDtype, EfErrorClass,
-    EfImageDescView, EfPboMapFn, EfPboMapFnNullable, EfPboUnmapFn, EfPboUnmapFnNullable,
-    EfQuantizationInfo, EfStorageKind, EfTensorPlane, EfTensorView, EfViewOrigin,
+    EfClientRefFn, EfClientState, EfCompression, EfCpuAccess, EfCudaMapFn, EfCudaMapFnNullable,
+    EfCudaUnmapFn, EfCudaUnmapFnNullable, EfCudaUnregisterFn, EfCudaUnregisterFnNullable,
+    EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView, EfPboMapFn, EfPboMapFnNullable,
+    EfPboUnmapFn, EfPboUnmapFnNullable, EfQuantizationInfo, EfStorageKind, EfTensorPlane,
+    EfTensorView, EfViewOrigin,
 };
 
 /// Opaque tensor handle (never dereferenced, sized, or copied).
@@ -176,6 +178,8 @@ declare_abi! {
         chroma: *mut EfTensor,
         format: *const c_char,
     ) -> *mut EfTensor;
+    pub fn ef_tensor_is_multiplane(t: *const EfTensor) -> c_int;
+    pub fn ef_tensor_chroma(t: *const EfTensor) -> *mut EfTensor;
 
     pub fn ef_tensor_last_error_message() -> *const c_char;
     pub fn ef_tensor_last_error_class() -> u32;
@@ -280,6 +284,16 @@ declare_abi! {
         out_size: *mut usize,
     ) -> *mut std::ffi::c_void;
     pub fn ef_tensor_cuda_unmap(map: *mut std::ffi::c_void);
+    pub fn ef_tensor_cuda_attach(
+        t: *mut EfTensor,
+        state: EfClientState,
+        resource: *mut std::ffi::c_void,
+        size: usize,
+        map_fn: EfCudaMapFnNullable,
+        unmap_fn: EfCudaUnmapFnNullable,
+        unregister_fn: EfCudaUnregisterFnNullable,
+    ) -> c_int;
+    pub fn ef_tensor_cuda_attached(t: *const EfTensor) -> c_int;
 
     pub fn ef_tensor_from_hardware_buffer(
         dtype: u32,
@@ -520,7 +534,16 @@ mod tests {
     /// buffer, so there is no pre-existing tensor to decorate, and an
     /// attach would have reproduced the host placeholder this stage
     /// deletes.
-    const HEADER_DECLARATION_COUNT: usize = 106;
+    /// **Now 108** with Stage D of the client-side state design:
+    /// `ef_tensor_is_multiplane` and `ef_tensor_chroma`, so a handle
+    /// wrapped via `from_raw` after `ef_tensor_from_planes` answers
+    /// multiplane the same way the constructing `from_planes` wrapper did.
+    /// **Now 110** with Stage C: `ef_tensor_cuda_attach` stores a GL-buffer
+    /// `CudaHandle` on the library tensor over a frozen `ef_client_state`
+    /// plus map/unmap/unregister ops, and `ef_tensor_cuda_attached` reports
+    /// whether that (or a D3D11) registration is present. No new `repr(C)`
+    /// struct: `EfClientState` stays 24 bytes.
+    const HEADER_DECLARATION_COUNT: usize = 110;
 
     #[test]
     fn declared_matches_the_header_derived_count() {

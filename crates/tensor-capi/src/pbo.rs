@@ -109,20 +109,6 @@ pub unsafe extern "C" fn ef_tensor_wrap_pbo(
         ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             let Some(shape) = read_dims(dims, ndim, "wrap_pbo") else {
-                // `read_dims` is shared with `ef_tensor_wrap_host` and
-                // records an accurate message but no class, so the class is
-                // added here rather than in the helper: this entry point's
-                // header groups the NULL-`dims`/zero-`ndim` refusal with its
-                // other argument refusals in one sentence, and a caller
-                // reading `ef_tensor_last_error_class` must find that true.
-                // Fixing the helper would change `wrap_host` too -- a
-                // pre-existing gap, deliberately left for Stage E.
-                //
-                // `reclass_last_error`, not `set_last_error_classified`:
-                // `read_dims` distinguishes "null dims or zero ndim" from "a
-                // dimension is out of range for this host's usize", and
-                // restating a message here would collapse the two and
-                // sometimes name the wrong one.
                 set_errno(libc::EINVAL);
                 reclass_last_error(EfErrorClass::InvalidArgument);
                 return std::ptr::null_mut();
@@ -144,9 +130,7 @@ pub unsafe extern "C" fn ef_tensor_wrap_pbo(
             // `EINVAL`, so `errno` is set as well as the class -- the
             // convention `hardware.rs`, `cuda.rs` and `d3d11.rs` already
             // follow for entry points whose only failure channel is a NULL
-            // return. `ef_tensor_wrap_host` sets no errno on any of its
-            // refusals; that is a pre-existing gap, out of scope here, and
-            // noted for Stage E rather than fixed under a PBO change.
+            // return.
             if state.ctx.is_null() || state.retain.is_none() || state.release.is_none() {
                 set_errno(libc::EINVAL);
                 set_last_error_classified(

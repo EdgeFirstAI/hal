@@ -783,8 +783,10 @@ the real GL buffer lived in a field the C ABI could not see.
 So the bug class is made unrepresentable rather than guarded. A future
 backing whose answer the library can already compute needs only an accessor;
 one that needs client cooperation gets an `ef_client_state` channel and
-becomes real storage in the library. Neither shape leaves a second source of
-truth on the consumer's side.
+becomes real storage (or an attach) in the library. Neither shape leaves a
+second source of truth on the consumer's side. Stages C and D of 0.32.0
+moved CUDA registration (`ef_tensor_cuda_attach`) and multiplane chroma
+(`ef_tensor_is_multiplane` / `ef_tensor_chroma`) onto that library handle.
 
 ---
 

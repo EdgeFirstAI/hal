@@ -175,6 +175,21 @@ where
 unsafe impl<T> Send for MemTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 unsafe impl<T> Sync for MemTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 
+impl<T> Clone for MemTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            shape: self.shape.clone(),
+            data: Arc::clone(&self.data),
+            offset: self.offset,
+            identity: self.identity.clone(),
+        }
+    }
+}
+
 impl<T> MemTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
