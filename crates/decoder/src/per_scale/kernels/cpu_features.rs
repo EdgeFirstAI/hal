@@ -100,6 +100,22 @@ impl CpuFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes every test that overrides an env var.
+    ///
+    /// An environment is per process, not per thread, and plain `cargo test`
+    /// runs tests as threads in one process. Two tests setting
+    /// `EDGEFIRST_DECODER_FORCE_KERNEL` could interleave between one's `set`
+    /// and its read, so `from_env_with_scalar_clears_all_simd` would see the
+    /// other's `wibble` and unwrap an `Err`. It is intermittent and invisible
+    /// under nextest, which gives each test its own process, and under the
+    /// mutation lane's `--test-threads=1`.
+    ///
+    /// Poisoning is ignored: the lock guards an env var that the guard below
+    /// restores on unwind anyway, so a panicking test should fail on its own
+    /// assertion rather than take every later test with it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// RAII guard that overrides an env var for the lifetime of the
     /// guard, capturing the prior value on construction and restoring it
@@ -107,21 +123,26 @@ mod tests {
     /// state from "set to empty string" so we don't accidentally leave a
     /// stray empty value behind.
     ///
-    /// The repo runs tests with `--test-threads=1`, so the per-test
-    /// mutation is serialized with respect to other tests in this
-    /// process. The guard ensures we also don't leak state to test
-    /// invocations that follow this one (or to a developer's shell when
-    /// the env var was set externally before `cargo test`).
+    /// Holding [`ENV_LOCK`] for the guard's lifetime is what makes the
+    /// override safe against other tests; restoring on drop is what keeps it
+    /// from leaking to the tests that follow, or to a developer's shell when
+    /// the variable was already set before `cargo test`.
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
 
