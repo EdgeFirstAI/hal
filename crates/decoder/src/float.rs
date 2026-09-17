@@ -606,6 +606,232 @@ mod tests {
             .collect()
     }
 
+    /// Two boxes at the same place with the same score. Sorting is stable
+    /// enough that the first stays and the second is suppressed; a score of
+    /// exactly 0.0 must not be mistaken for the `-1.0` suppression marker at
+    /// either end of the comparison.
+    fn overlapping_pair(score: f32) -> Vec<DetectBox> {
+        vec![
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 10.0,
+                    ymax: 10.0,
+                },
+                label: 0,
+                score,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 1.0,
+                    ymin: 1.0,
+                    xmax: 11.0,
+                    ymax: 11.0,
+                },
+                label: 0,
+                score,
+            },
+        ]
+    }
+
+    /// A box scoring exactly 0.0 is a real detection that passed the
+    /// threshold, not a suppressed one. Treating `< 0.0` as `<= 0.0` would
+    /// skip it and leave its overlapping neighbour unsuppressed.
+    #[test]
+    fn nms_float_suppresses_overlapping_zero_score_boxes() {
+        let result = nms_float(0.5, None, overlapping_pair(0.0));
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].score, 0.0);
+    }
+
+    /// Three boxes in a chain: A overlaps B, B overlaps C, A does not reach
+    /// C. Once B is suppressed it must take no further part, or it suppresses
+    /// C on behalf of a box that is not in the output.
+    ///
+    /// The offsets carry the whole test. At 10 wide and stepping 2, A-B and
+    /// B-C are both 8/12 = 0.667 and A-C is 6/14 = 0.429, so only the
+    /// adjacent pairs clear the 0.5 threshold. Step further apart -- 0, 1 and
+    /// 9.5, say -- and B-C falls to 0.081, B cannot reach C whatever the
+    /// implementation does, and all three tests below pass with the bug they
+    /// exist to catch.
+    fn suppression_chain() -> Vec<DetectBox> {
+        let mk = |xmin: f32, xmax: f32, score: f32| DetectBox {
+            bbox: BoundingBox {
+                xmin,
+                ymin: 0.0,
+                xmax,
+                ymax: 10.0,
+            },
+            label: 0,
+            score,
+        };
+        vec![mk(0.0, 10.0, 0.9), mk(2.0, 12.0, 0.8), mk(4.0, 14.0, 0.7)]
+    }
+
+    #[test]
+    fn nms_float_does_not_suppress_on_behalf_of_a_suppressed_box() {
+        let result = nms_float(0.5, None, suppression_chain());
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].score, 0.9);
+        assert_eq!(result[1].score, 0.7);
+    }
+
+    #[test]
+    fn nms_extra_float_suppresses_overlapping_zero_score_boxes() {
+        let boxes = overlapping_pair(0.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| (b, i))
+            .collect();
+        let result = nms_extra_float(0.5, None, boxes);
+        assert_eq!(result.len(), 1, "{result:?}");
+        // Both boxes score 0.0 and par_sort_by is an unstable sort, so which
+        // of the two survives is not fixed; that it carries its own payload
+        // is.
+        assert!(result[0].1 == 0 || result[0].1 == 1, "{result:?}");
+    }
+
+    #[test]
+    fn nms_extra_float_does_not_suppress_on_behalf_of_a_suppressed_box() {
+        let boxes = suppression_chain()
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| (b, i))
+            .collect();
+        let result = nms_extra_float(0.5, None, boxes);
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].1, 0);
+        assert_eq!(result[1].1, 2);
+    }
+
+    /// Class-aware NMS with no cap still has to run the whole suppression
+    /// loop. Breaking out of it early leaves overlapping same-class boxes in
+    /// the output.
+    #[test]
+    fn nms_class_aware_float_suppresses_same_class_without_a_cap() {
+        let mut boxes = overlapping_pair(0.9);
+        boxes[1].score = 0.8;
+        let result = nms_class_aware_float(0.5, None, boxes);
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].score, 0.9);
+    }
+
+    /// The same two boxes with different labels are both kept: class-aware
+    /// NMS suppresses within a class, never across.
+    #[test]
+    fn nms_class_aware_float_keeps_overlapping_boxes_of_other_classes() {
+        let mut boxes = overlapping_pair(0.9);
+        boxes[1].score = 0.8;
+        boxes[1].label = 1;
+        let result = nms_class_aware_float(0.5, None, boxes);
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
+
+    #[test]
+    fn nms_class_aware_float_suppresses_overlapping_zero_score_boxes() {
+        let result = nms_class_aware_float(0.5, None, overlapping_pair(0.0));
+        assert_eq!(result.len(), 1, "{result:?}");
+    }
+
+    #[test]
+    fn nms_class_aware_float_does_not_suppress_on_behalf_of_a_suppressed_box() {
+        let result = nms_class_aware_float(0.5, None, suppression_chain());
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[1].score, 0.7);
+    }
+
+    /// A box that overlaps nothing, then a pair that overlaps each other. The
+    /// first box confirms a survivor without suppressing anything, so a loop
+    /// that stops at the first survivor leaves the pair un-deduplicated while
+    /// the three-box chain above, where the first box does the suppressing,
+    /// looks identical either way.
+    fn isolated_then_overlapping_pair() -> Vec<DetectBox> {
+        let mk = |xmin: f32, xmax: f32, score: f32| DetectBox {
+            bbox: BoundingBox {
+                xmin,
+                ymin: 0.0,
+                xmax,
+                ymax: 10.0,
+            },
+            label: 0,
+            score,
+        };
+        vec![
+            mk(100.0, 110.0, 0.9),
+            mk(0.0, 10.0, 0.8),
+            mk(1.0, 11.0, 0.7),
+        ]
+    }
+
+    #[test]
+    fn nms_class_aware_float_keeps_suppressing_after_the_first_survivor() {
+        let result = nms_class_aware_float(0.5, None, isolated_then_overlapping_pair());
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].score, 0.9);
+        assert_eq!(result[1].score, 0.8);
+    }
+
+    fn with_index(boxes: Vec<DetectBox>) -> Vec<(DetectBox, usize)> {
+        boxes.into_iter().enumerate().map(|(i, b)| (b, i)).collect()
+    }
+
+    #[test]
+    fn nms_extra_class_aware_float_keeps_suppressing_after_the_first_survivor() {
+        let result =
+            nms_extra_class_aware_float(0.5, None, with_index(isolated_then_overlapping_pair()));
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[1].1, 1);
+    }
+
+    #[test]
+    fn nms_extra_class_aware_float_suppresses_same_class_without_a_cap() {
+        let mut boxes = overlapping_pair(0.9);
+        boxes[1].score = 0.8;
+        let result = nms_extra_class_aware_float(0.5, None, with_index(boxes));
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].0.score, 0.9);
+        assert_eq!(result[0].1, 0);
+    }
+
+    #[test]
+    fn nms_extra_class_aware_float_keeps_overlapping_boxes_of_other_classes() {
+        let mut boxes = overlapping_pair(0.9);
+        boxes[1].score = 0.8;
+        boxes[1].label = 1;
+        let result = nms_extra_class_aware_float(0.5, None, with_index(boxes));
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
+
+    #[test]
+    fn nms_extra_class_aware_float_suppresses_overlapping_zero_score_boxes() {
+        let result = nms_extra_class_aware_float(0.5, None, with_index(overlapping_pair(0.0)));
+        assert_eq!(result.len(), 1, "{result:?}");
+    }
+
+    #[test]
+    fn nms_extra_class_aware_float_does_not_suppress_on_behalf_of_a_suppressed_box() {
+        let result = nms_extra_class_aware_float(0.5, None, with_index(suppression_chain()));
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[1].1, 2);
+    }
+
+    /// The threshold is a floor, not a cut: a score equal to it is kept.
+    #[test]
+    fn postprocess_boxes_float_keeps_a_score_equal_to_the_threshold() {
+        let boxes = ndarray::array![[0.0_f32, 0.0, 10.0, 10.0], [0.0, 0.0, 10.0, 10.0]];
+        let scores = ndarray::array![[0.5_f32], [0.25]];
+
+        let kept = postprocess_boxes_float::<crate::XYXY, _, _>(0.5, boxes.view(), scores.view());
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].score, 0.5);
+
+        let kept =
+            postprocess_boxes_index_float::<crate::XYXY, _, _>(0.5, boxes.view(), scores.view());
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].1, 0);
+    }
+
     #[test]
     fn nms_float_max_det_matches_full_truncated() {
         let boxes = make_nms_boxes_float(20);

@@ -861,7 +861,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::XYWH;
+    use crate::{XYWH, XYXY};
     use ndarray::Array2;
 
     /// Verify that the column-major path produces identical results to the
@@ -995,6 +995,306 @@ mod tests {
                 score: (200 - i as u32).min(255) as u8,
             })
             .collect()
+    }
+
+    /// Four candidates' worth of boxes, one row each, values distinct enough
+    /// that a mis-indexed read is visible.
+    fn probe_boxes(n: usize) -> Array2<i16> {
+        let mut boxes = Array2::<i16>::zeros((n, 4));
+        for i in 0..n {
+            boxes[[i, 0]] = i as i16 * 10;
+            boxes[[i, 1]] = i as i16 * 10 + 1;
+            boxes[[i, 2]] = i as i16 * 10 + 2;
+            boxes[[i, 3]] = i as i16 * 10 + 3;
+        }
+        boxes
+    }
+
+    fn probe_quant() -> Quantization {
+        Quantization {
+            scale: 1.0,
+            zero_point: 0,
+        }
+    }
+
+    /// The threshold is a floor: a score equal to it is a detection. Both
+    /// entry points share the rule and neither had a test that sat exactly on
+    /// it.
+    #[test]
+    fn postprocess_boxes_quant_keeps_a_score_equal_to_the_threshold() {
+        let boxes = probe_boxes(2);
+        let scores = ndarray::array![[200_u8, 0], [199, 0]];
+
+        let kept = postprocess_boxes_quant::<XYXY, _, _>(
+            200_u8,
+            boxes.view(),
+            scores.view(),
+            probe_quant(),
+        );
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].score, 200);
+
+        let kept = postprocess_boxes_index_quant::<XYXY, _, _>(
+            200_u8,
+            boxes.view(),
+            scores.view(),
+            probe_quant(),
+        );
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].1, 0);
+    }
+
+    /// Class indices in the column-major scan are `u8`, so beyond 255 classes
+    /// it has to hand over to the row-major scan. Running the column scan
+    /// anyway wraps the label: class 260 comes back as 4.
+    #[test]
+    fn column_major_falls_back_beyond_255_classes() {
+        let n_classes = 300usize;
+        let boxes = probe_boxes(2);
+        let mut scores = Array2::<u8>::zeros((2, n_classes));
+        scores[[0, 260]] = 200;
+        scores[[1, 3]] = 10;
+
+        let kept = postprocess_boxes_quant_column_major::<XYXY, _, _>(
+            200_u8,
+            boxes.view(),
+            scores.view(),
+            probe_quant(),
+        );
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].label, 260);
+        assert_eq!(kept[0].score, 200);
+
+        let kept = postprocess_boxes_index_quant_column_major::<XYXY, _, _>(
+            200_u8,
+            boxes.view(),
+            scores.view(),
+            probe_quant(),
+        );
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].0.label, 260);
+        assert_eq!(kept[0].1, 0);
+    }
+
+    /// Driving the column-major scan with an ordinary row-major array: its
+    /// columns are not contiguous, so the running argmax takes its strided
+    /// branch, and the boxes are read in place rather than from the
+    /// column-copy buffers.
+    #[test]
+    fn column_major_scan_handles_row_major_input() {
+        let boxes = probe_boxes(3);
+        // Row-major (3 candidates, 4 classes); the winner differs per row and
+        // is never class 0, so a comparison that keeps the minimum is visible.
+        let scores = ndarray::array![[10_u8, 90, 30, 40], [5, 6, 7, 200], [1, 2, 3, 4]];
+
+        let kept = postprocess_boxes_quant_column_major::<XYXY, _, _>(
+            50_u8,
+            boxes.view(),
+            scores.view(),
+            probe_quant(),
+        );
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!((kept[0].label, kept[0].score), (1, 90));
+        assert_eq!((kept[1].label, kept[1].score), (3, 200));
+        // Boxes were read in place, so row 1's values must line up with it.
+        assert_eq!(kept[1].bbox.xmin, 10.0);
+
+        let kept = postprocess_boxes_index_quant_column_major::<XYXY, _, _>(
+            50_u8,
+            boxes.view(),
+            scores.view(),
+            probe_quant(),
+        );
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[0].1, 0);
+        assert_eq!(kept[1].1, 1);
+        assert_eq!(kept[1].0.label, 3);
+    }
+
+    /// Two overlapping same-class boxes. `SCORE::min_value()` is the
+    /// suppression marker, so for `u8` a score of 0 already means suppressed
+    /// and the lower box here is given a real score.
+    fn overlapping_pair_int() -> Vec<DetectBoxQuantized<u8>> {
+        vec![
+            DetectBoxQuantized {
+                bbox: BoundingBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 10.0,
+                    ymax: 10.0,
+                },
+                label: 0,
+                score: 200,
+            },
+            DetectBoxQuantized {
+                bbox: BoundingBox {
+                    xmin: 1.0,
+                    ymin: 1.0,
+                    xmax: 11.0,
+                    ymax: 11.0,
+                },
+                label: 0,
+                score: 180,
+            },
+        ]
+    }
+
+    /// A overlaps B, B overlaps C, A does not reach C.
+    fn suppression_chain_int() -> Vec<DetectBoxQuantized<u8>> {
+        let mk = |xmin: f32, xmax: f32, score: u8| DetectBoxQuantized {
+            bbox: BoundingBox {
+                xmin,
+                ymin: 0.0,
+                xmax,
+                ymax: 10.0,
+            },
+            label: 0,
+            score,
+        };
+        vec![mk(0.0, 10.0, 200), mk(2.0, 12.0, 180), mk(4.0, 14.0, 160)]
+    }
+
+    #[test]
+    fn nms_class_aware_int_suppresses_same_class_without_a_cap() {
+        let result = nms_class_aware_int(0.5, None, overlapping_pair_int());
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].score, 200);
+    }
+
+    #[test]
+    fn nms_class_aware_int_keeps_overlapping_boxes_of_other_classes() {
+        let mut boxes = overlapping_pair_int();
+        boxes[1].label = 1;
+        let result = nms_class_aware_int(0.5, None, boxes);
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
+
+    #[test]
+    fn nms_class_aware_int_does_not_suppress_on_behalf_of_a_suppressed_box() {
+        let result = nms_class_aware_int(0.5, None, suppression_chain_int());
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].score, 200);
+        assert_eq!(result[1].score, 160);
+    }
+
+    /// A suppressed box is marked with `min_value()`, and the final filter
+    /// drops it. Keeping `>= min_value` instead would hand every suppressed
+    /// box back to the caller.
+    #[test]
+    fn nms_class_aware_int_drops_boxes_already_at_the_minimum_score() {
+        let mut boxes = overlapping_pair_int();
+        boxes.push(DetectBoxQuantized {
+            bbox: BoundingBox {
+                xmin: 50.0,
+                ymin: 50.0,
+                xmax: 60.0,
+                ymax: 60.0,
+            },
+            label: 0,
+            score: u8::MIN,
+        });
+        let result = nms_class_aware_int(0.5, None, boxes);
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].score, 200);
+    }
+
+    /// A box that overlaps nothing, then a pair that overlaps each other. The
+    /// first box confirms a survivor without suppressing anything, so a loop
+    /// that stops at the first survivor leaves the pair un-deduplicated while
+    /// the chain above, where the first box does the suppressing, looks
+    /// identical either way.
+    fn isolated_then_overlapping_pair_int() -> Vec<DetectBoxQuantized<u8>> {
+        let mk = |xmin: f32, xmax: f32, score: u8| DetectBoxQuantized {
+            bbox: BoundingBox {
+                xmin,
+                ymin: 0.0,
+                xmax,
+                ymax: 10.0,
+            },
+            label: 0,
+            score,
+        };
+        vec![
+            mk(100.0, 110.0, 200),
+            mk(0.0, 10.0, 180),
+            mk(1.0, 11.0, 160),
+        ]
+    }
+
+    #[test]
+    fn nms_class_aware_int_keeps_suppressing_after_the_first_survivor() {
+        let result = nms_class_aware_int(0.5, None, isolated_then_overlapping_pair_int());
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].score, 200);
+        assert_eq!(result[1].score, 180);
+    }
+
+    fn with_index_int(boxes: Vec<DetectBoxQuantized<u8>>) -> Vec<(DetectBoxQuantized<u8>, usize)> {
+        boxes.into_iter().enumerate().map(|(i, b)| (b, i)).collect()
+    }
+
+    #[test]
+    fn nms_extra_class_aware_int_keeps_suppressing_after_the_first_survivor() {
+        let result = nms_extra_class_aware_int(
+            0.5,
+            None,
+            with_index_int(isolated_then_overlapping_pair_int()),
+        );
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[1].1, 1);
+    }
+
+    #[test]
+    fn nms_extra_class_aware_int_suppresses_same_class_without_a_cap() {
+        let result = nms_extra_class_aware_int(0.5, None, with_index_int(overlapping_pair_int()));
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].0.score, 200);
+        assert_eq!(result[0].1, 0, "the surviving box keeps its extra data");
+    }
+
+    #[test]
+    fn nms_extra_class_aware_int_keeps_overlapping_boxes_of_other_classes() {
+        let mut boxes = overlapping_pair_int();
+        boxes[1].label = 1;
+        let result = nms_extra_class_aware_int(0.5, None, with_index_int(boxes));
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
+
+    #[test]
+    fn nms_extra_class_aware_int_does_not_suppress_on_behalf_of_a_suppressed_box() {
+        let result = nms_extra_class_aware_int(0.5, None, with_index_int(suppression_chain_int()));
+        assert_eq!(result.len(), 2, "{result:?}");
+        assert_eq!(result[0].1, 0);
+        assert_eq!(result[1].1, 2);
+    }
+
+    #[test]
+    fn nms_extra_class_aware_int_drops_boxes_already_at_the_minimum_score() {
+        let mut boxes = overlapping_pair_int();
+        boxes.push(DetectBoxQuantized {
+            bbox: BoundingBox {
+                xmin: 50.0,
+                ymin: 50.0,
+                xmax: 60.0,
+                ymax: 60.0,
+            },
+            label: 0,
+            score: u8::MIN,
+        });
+        let result = nms_extra_class_aware_int(0.5, None, with_index_int(boxes));
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].0.score, 200);
+    }
+
+    /// A single box is never compared with itself: the inner loop starts one
+    /// past the outer index. Starting at `i` instead makes every box suppress
+    /// itself, since a box's IoU with itself is 1.
+    #[test]
+    fn nms_extra_class_aware_int_keeps_a_lone_box() {
+        let boxes = with_index_int(vec![overlapping_pair_int().remove(0)]);
+        let result = nms_extra_class_aware_int(0.5, None, boxes);
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert_eq!(result[0].0.score, 200);
     }
 
     #[test]

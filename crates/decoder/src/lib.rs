@@ -213,18 +213,6 @@ impl BBoxTypeTrait for XYXY {
         let zp = quant.zero_point.as_();
         input.map(|b| (b.as_() - zp) * scale)
     }
-
-    #[inline(always)]
-    fn ndarray_to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(
-        input: ArrayView1<B>,
-    ) -> [A; 4] {
-        [
-            input[0].as_(),
-            input[1].as_(),
-            input[2].as_(),
-            input[3].as_(),
-        ]
-    }
 }
 
 /// Converts XYWH bounding boxes to XYXY. The XY values are the center of the
@@ -264,19 +252,6 @@ impl BBoxTypeTrait for XYWH {
         ];
 
         [x - w, y - h, x + w, y + h]
-    }
-
-    #[inline(always)]
-    fn ndarray_to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(
-        input: ArrayView1<B>,
-    ) -> [A; 4] {
-        let half = A::one() / (A::one() + A::one());
-        [
-            (input[0].as_()) - (input[2].as_() * half),
-            (input[1].as_()) - (input[3].as_() * half),
-            (input[0].as_()) + (input[2].as_() * half),
-            (input[1].as_()) + (input[3].as_() * half),
-        ]
     }
 }
 
@@ -2396,6 +2371,35 @@ mod decoder_tests {
         let arr = array![10.0_f32, 20.0, 20.0, 20.0];
         let xyxy: [f32; 4] = XYXY::ndarray_to_xyxy_float(arr.view());
         assert_eq!(xyxy, [10.0_f32, 20.0, 20.0, 20.0]);
+    }
+
+    /// Covers the slice conversion directly. It is the single implementation
+    /// per type now that the hand-inlined `ndarray_to_xyxy_float` overrides
+    /// are gone, so the float postprocessors reach it through the trait
+    /// default; while those overrides existed nothing reached it at all, which
+    /// is why its twenty mutants survived.
+    ///
+    /// Centre 10,20 with a 6x8 box gives a distinct value in all four slots,
+    /// so no swapped operator lands on the same answer.
+    #[test]
+    fn to_xyxy_float_converts_centre_and_size_to_corners() {
+        let xyxy: [f32; 4] = XYWH::to_xyxy_float(&[10.0_f32, 20.0, 6.0, 8.0]);
+        assert_eq!(xyxy, [7.0_f32, 16.0, 13.0, 24.0]);
+
+        let xyxy: [f32; 4] = XYXY::to_xyxy_float(&[7.0_f32, 16.0, 13.0, 24.0]);
+        assert_eq!(xyxy, [7.0_f32, 16.0, 13.0, 24.0]);
+    }
+
+    /// `arg_max` documents that the last index wins on ties, which is the
+    /// semantics `arg_max_i8` mirrors on aarch64. A strict `>` is what makes
+    /// the fold take the later index; `>=` would keep the earlier one.
+    #[test]
+    fn arg_max_returns_the_last_index_on_a_tie() {
+        let scores = array![1_i32, 5, 5, 2];
+        assert_eq!(crate::arg_max(scores.view()), (5, 2));
+
+        let single = array![7_i32];
+        assert_eq!(crate::arg_max(single.view()), (7, 0));
     }
 
     #[test]

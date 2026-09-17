@@ -1571,10 +1571,151 @@ mod tests {
             dtype: None,
         };
         let err = edgefirst_tensor::Quantization::try_from(&q).unwrap_err();
+        // The field matters: the per-channel-without-axis arm is what should
+        // reject this. Matching only on the variant also accepts the catch-all
+        // "scale" arm, which would mean the arm above never ran.
         assert!(matches!(
             err,
-            edgefirst_tensor::Error::QuantizationInvalid { .. }
+            edgefirst_tensor::Error::QuantizationInvalid { field: "axis", .. }
         ));
+    }
+
+    /// Both redundant-axis arms map to per-tensor. Losing either one drops the
+    /// conversion through to the catch-all and turns a valid configuration
+    /// into an error.
+    #[test]
+    fn quantization_to_tensor_per_tensor_ignores_a_redundant_axis() {
+        let q = Quantization {
+            scale: vec![0.5],
+            zero_point: Some(vec![3]),
+            axis: Some(0),
+            dtype: Some(DType::Int8),
+        };
+        let t: edgefirst_tensor::Quantization = (&q).try_into().unwrap();
+        assert!(t.is_per_tensor());
+        assert_eq!(t.scale(), &[0.5][..]);
+        assert_eq!(t.zero_point(), Some(&[3][..]));
+    }
+
+    #[test]
+    fn quantization_to_tensor_symmetric_ignores_a_redundant_axis() {
+        let q = Quantization {
+            scale: vec![0.5],
+            zero_point: None,
+            axis: Some(0),
+            dtype: Some(DType::Int8),
+        };
+        let t: edgefirst_tensor::Quantization = (&q).try_into().unwrap();
+        assert!(t.is_per_tensor());
+        assert!(t.is_symmetric());
+        assert_eq!(t.scale(), &[0.5][..]);
+    }
+
+    /// An empty scale is neither per-tensor nor per-channel, so it must reach
+    /// the catch-all and name `scale`. Each of these reaches it down a
+    /// different path: no axis, an axis, and an axis with zero points.
+    #[test]
+    fn quantization_to_tensor_empty_scale_errors_on_scale() {
+        for (zero_point, axis) in [
+            (None, None),
+            (None, Some(0)),
+            (Some(vec![]), Some(0)),
+            (Some(vec![]), None),
+        ] {
+            let q = Quantization {
+                scale: vec![],
+                zero_point,
+                axis,
+                dtype: Some(DType::Int8),
+            };
+            let err = edgefirst_tensor::Quantization::try_from(&q).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    edgefirst_tensor::Error::QuantizationInvalid { field: "scale", .. }
+                ),
+                "axis={axis:?} gave {err:?}"
+            );
+        }
+    }
+
+    /// One scale with two zero points is not per-tensor (the zero point is not
+    /// a single element) and not per-channel (there is one scale), so it is
+    /// the catch-all's job with or without an axis.
+    #[test]
+    fn quantization_to_tensor_single_scale_with_many_zero_points_errors_on_scale() {
+        for axis in [None, Some(0)] {
+            let q = Quantization {
+                scale: vec![0.5],
+                zero_point: Some(vec![1, 2]),
+                axis,
+                dtype: Some(DType::Int8),
+            };
+            let err = edgefirst_tensor::Quantization::try_from(&q).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    edgefirst_tensor::Error::QuantizationInvalid { field: "scale", .. }
+                ),
+                "axis={axis:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_channel_quantization_is_not_per_tensor() {
+        let q = Quantization {
+            scale: vec![0.1, 0.2, 0.3],
+            zero_point: None,
+            axis: Some(0),
+            dtype: Some(DType::Int8),
+        };
+        assert!(q.is_per_channel());
+        assert!(!q.is_per_tensor());
+
+        let per_tensor = Quantization {
+            scale: vec![0.1],
+            zero_point: None,
+            axis: None,
+            dtype: Some(DType::Int8),
+        };
+        assert!(per_tensor.is_per_tensor());
+        assert!(!per_tensor.is_per_channel());
+    }
+
+    /// A single zero point applies to every channel; a per-channel list is
+    /// indexed. Treating the list as if it had one element would return
+    /// channel 0's zero point for every channel.
+    #[test]
+    fn zero_point_at_indexes_per_channel_zero_points() {
+        let per_channel = Quantization {
+            scale: vec![0.1, 0.2, 0.3],
+            zero_point: Some(vec![10, 20, 30]),
+            axis: Some(0),
+            dtype: Some(DType::Int8),
+        };
+        assert_eq!(per_channel.zero_point_at(0), 10);
+        assert_eq!(per_channel.zero_point_at(1), 20);
+        assert_eq!(per_channel.zero_point_at(2), 30);
+        // Out of range falls back to 0 rather than panicking.
+        assert_eq!(per_channel.zero_point_at(3), 0);
+
+        let shared = Quantization {
+            scale: vec![0.1, 0.2, 0.3],
+            zero_point: Some(vec![7]),
+            axis: Some(0),
+            dtype: Some(DType::Int8),
+        };
+        assert_eq!(shared.zero_point_at(0), 7);
+        assert_eq!(shared.zero_point_at(2), 7);
+
+        let symmetric = Quantization {
+            scale: vec![0.1],
+            zero_point: None,
+            axis: None,
+            dtype: Some(DType::Int8),
+        };
+        assert_eq!(symmetric.zero_point_at(0), 0);
     }
 
     #[test]

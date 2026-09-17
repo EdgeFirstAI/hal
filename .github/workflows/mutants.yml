@@ -2,10 +2,12 @@
 #
 # Mutation testing asks a different question from the rest of CI. The tests are
 # held fixed and the CODE is broken on purpose -- `+` becomes `-`, a function
-# body becomes `Ok(())` -- and the suite is re-run. A mutant that SURVIVES is a
-# line some test executes but nothing asserts on. Line coverage cannot see
-# this, which is the point: 100% coverage and a surviving mutant are perfectly
-# compatible.
+# body becomes `Ok(())` -- and the suite is re-run. A mutant that SURVIVES is
+# one the suite passed with. Usually that means a line some test executes but
+# nothing asserts on, which line coverage cannot see: 100% coverage and a
+# surviving mutant are perfectly compatible. It can also mean the line never
+# ran at all -- a mutation to code this target does not compile survives for
+# want of ever being built, which is what the arm64 lane below is for.
 #
 # The corpus is ~7057 mutants across three crates, far more than one machine
 # can chew through in a night. Bolting it onto Nightly meant a 120-minute cap
@@ -104,7 +106,7 @@ jobs:
           echo "tonight: shards ${list} of ${total}"
 
   mutants:
-    name: Shard ${{ matrix.shard }}
+    name: Shard ${{ matrix.shard }} (${{ matrix.runner }})
     needs: plan
     # Free standard runner. Nothing waits on this lane, so speed buys nothing
     # worth billing for, and `larger` would cost roughly $150/month for an hour
@@ -118,16 +120,36 @@ jobs:
     # fit a single runner's ~14GB disk. A matrix sidesteps that entirely: every
     # shard gets a whole machine, so --in-place stays valid and each runner
     # keeps one target directory and one build cache.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    #
+    # Every shard runs on both architectures, because a mutant is a property of
+    # the code as compiled, not of the source line. The decoder's NEON paths --
+    # arg_max_i8, fast_arg_max's dispatch, the column-max kernels and all of
+    # per_scale/kernels -- sit behind #[cfg(target_arch = "aarch64")] and are
+    # absent from an x86_64 build, so mutating them there changes a file the
+    # compiler never reads. The x86_64 sweep dutifully reported 33 of them as
+    # surviving, which said nothing about the tests: no test that runs on that
+    # runner could have caught them. arm64 Linux runners are free tier, so
+    # covering the other half of the code costs runner time and nothing else.
+    runs-on: ${{ matrix.runner }}
+    # The arm64 runner is about twice as slow on this work -- shard 0 took 27
+    # minutes on x86_64 and 57 on arm64 in run 35151929668 -- and it also
+    # builds cargo-mutants from source, since no aarch64 binary is published.
+    # At a flat 120 that run's arm64 shard 1 was cancelled mid-sweep while its
+    # x86_64 twin finished in 50 minutes, which loses the shard rather than
+    # reporting it.
+    timeout-minutes: ${{ matrix.runner == 'ubuntu-24.04-arm' && 180 || 120 }}
     strategy:
       fail-fast: false
       # One shard failing says nothing about the others, and the point of the
       # night is breadth. max-parallel leaves concurrency for anything else
-      # that happens to be queued.
+      # that happens to be queued, and stays at 8 now that the matrix is two
+      # architectures deep: the night runs in two passes instead of one rather
+      # than taking twice the concurrency. Nothing waits on this lane, so the
+      # wall clock is not a cost.
       max-parallel: 8
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -138,6 +160,11 @@ jobs:
           # cargo-mutants will not test a tree whose baseline is red.
           lfs: true
 
+      # cargo-mutants publishes prebuilt binaries for x86_64 linux, macOS and
+      # Windows only (checked at v27.1.0), so on the arm64 runner this falls
+      # back to building it from source. That costs a few minutes per job
+      # against a 120-minute cap and needs no handling; it is only worth
+      # knowing before someone reads the arm lane's setup step as a hang.
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
         with:
           tool: cargo-mutants
@@ -200,11 +227,12 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ needs.plan.outputs.total }}
+          RUNNER_NAME: ${{ matrix.runner }}
         run: |
           set -euo pipefail
           out=mutants-report/mutants.out
           if [[ ! -d "${out}" ]]; then
-            echo "::warning::shard ${SHARD} produced no report"
+            echo "::warning::shard ${SHARD} on ${RUNNER_NAME} produced no report"
             exit 0
           fi
           tested=0
@@ -216,14 +244,17 @@ jobs:
           # A run that enumerates mutants but tests none is a no-op wearing a
           # green tick, which is how this lane's first execution presented.
           if [[ "${tested}" -eq 0 ]]; then
-            echo "::error::shard ${SHARD} tested no mutants; the report is empty"
+            echo "::error::shard ${SHARD} on ${RUNNER_NAME} tested no mutants; the report is empty"
             exit 1
           fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
-          name: mutants-shard-${{ matrix.shard }}
+          # The runner suffix keeps the two architectures' artifacts apart and
+          # is what the roll-up reads the architecture back out of, so a
+          # survivor says which build it survived in.
+          name: mutants-shard-${{ matrix.shard }}-${{ matrix.runner }}
           path: mutants-report/
           retention-days: 14
 
@@ -234,6 +265,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      # Before the download: checkout cleans the working directory, so the
+      # other order deletes the shards it just fetched. No LFS here -- this job
+      # reads JSON from the artifacts, never a model.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           pattern: mutants-shard-*
@@ -248,36 +286,15 @@ jobs:
           # Per-shard step summaries are useful when a shard misbehaves, but
           # the number anyone actually wants is the night's total, which no
           # single matrix job can know.
-          declare -A sum=( [caught]=0 [missed]=0 [timeout]=0 [unviable]=0 )
-          shards=0
-          for d in shards/mutants-shard-*/mutants.out; do
-            [[ -d "${d}" ]] || continue
-            shards=$(( shards + 1 ))
-            for f in caught missed timeout unviable; do
-              n=$(wc -l < "${d}/${f}.txt" 2>/dev/null || echo 0)
-              sum[${f}]=$(( sum[${f}] + n ))
-            done
-          done
-          tested=$(( sum[caught] + sum[missed] + sum[timeout] ))
-          {
-            echo "### Mutation testing — ${shards} shards from index ${START} of ${TOTAL}"
-            echo ""
-            echo "| outcome | count |"
-            echo "| --- | --- |"
-            echo "| caught | ${sum[caught]} |"
-            echo "| missed | ${sum[missed]} |"
-            echo "| timeout | ${sum[timeout]} |"
-            echo "| unviable | ${sum[unviable]} |"
-            echo ""
-            echo "Tested ${tested} mutants tonight."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "tested=${tested} caught=${sum[caught]} missed=${sum[missed]}"
-          if (( sum[missed] > 0 )); then
-            {
-              echo ""
-              echo "### Surviving mutants (no test noticed the change)"
-              echo '```'
-              cat shards/mutants-shard-*/mutants.out/missed.txt 2>/dev/null | head -60
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          #
+          # This reads each shard's outcomes.json rather than counting lines in
+          # the per-outcome .txt files, because the JSON also carries the file,
+          # the function and the diff for every mutant -- which is what turns
+          # "168 missed" into a list of functions nothing asserts on.
+          #
+          # The shell version of this rolled the survivor list up with
+          # `cat missed.txt | head -60`. Past 60 survivors head closed the pipe
+          # first, cat took SIGPIPE, and `set -o pipefail` plus `set -e` failed
+          # the step after the report had already been written -- a red X that
+          # said nothing about the mutants. No pipelines here.
+          python3 .github/scripts/mutants_summary.py --shards shards --github-actions

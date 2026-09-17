@@ -45,8 +45,23 @@ impl CpuFeatures {
     /// `neon_baseline`), `neon_fp16`, `neon_dotprod`. Anything else
     /// returns `ForcedKernelUnavailable`.
     pub(crate) fn from_env_or_probe() -> Result<Self, DecoderError> {
+        Self::from_forced_tier(
+            std::env::var("EDGEFIRST_DECODER_FORCE_KERNEL")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// The tier rules, with the environment factored out.
+    ///
+    /// An environment is per process, so a test that reached these rules by
+    /// setting the variable changed them for every other thread too --
+    /// including [`crate::per_scale::plan`], which reads the same variable
+    /// while building a plan. Taking the tier as an argument means the rules
+    /// can be tested without a process-wide side effect to serialize against.
+    pub(crate) fn from_forced_tier(forced: Option<&str>) -> Result<Self, DecoderError> {
         let probed = Self::probe();
-        let Ok(forced) = std::env::var("EDGEFIRST_DECODER_FORCE_KERNEL") else {
+        let Some(forced) = forced else {
             return Ok(probed);
         };
         match forced.to_ascii_lowercase().as_str() {
@@ -100,6 +115,22 @@ impl CpuFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes every test that overrides an env var.
+    ///
+    /// An environment is per process, not per thread, and plain `cargo test`
+    /// runs tests as threads in one process. Two tests setting
+    /// `EDGEFIRST_DECODER_FORCE_KERNEL` could interleave between one's `set`
+    /// and its read, so `from_env_with_scalar_clears_all_simd` would see the
+    /// other's `wibble` and unwrap an `Err`. It is intermittent and invisible
+    /// under nextest, which gives each test its own process, and under the
+    /// mutation lane's `--test-threads=1`.
+    ///
+    /// Poisoning is ignored: the lock guards an env var that the guard below
+    /// restores on unwind anyway, so a panicking test should fail on its own
+    /// assertion rather than take every later test with it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// RAII guard that overrides an env var for the lifetime of the
     /// guard, capturing the prior value on construction and restoring it
@@ -107,21 +138,26 @@ mod tests {
     /// state from "set to empty string" so we don't accidentally leave a
     /// stray empty value behind.
     ///
-    /// The repo runs tests with `--test-threads=1`, so the per-test
-    /// mutation is serialized with respect to other tests in this
-    /// process. The guard ensures we also don't leak state to test
-    /// invocations that follow this one (or to a developer's shell when
-    /// the env var was set externally before `cargo test`).
+    /// Holding [`ENV_LOCK`] for the guard's lifetime is what makes the
+    /// override safe against other tests; restoring on drop is what keeps it
+    /// from leaking to the tests that follow, or to a developer's shell when
+    /// the variable was already set before `cargo test`.
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
 
@@ -149,9 +185,8 @@ mod tests {
     }
 
     #[test]
-    fn from_env_with_scalar_clears_all_simd() {
-        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");
-        let f = CpuFeatures::from_env_or_probe().unwrap();
+    fn forced_tier_scalar_clears_all_simd() {
+        let f = CpuFeatures::from_forced_tier(Some("scalar")).unwrap();
         assert!(!f.neon_baseline);
         assert!(!f.neon_fp16);
         assert!(!f.neon_dotprod);
@@ -159,9 +194,63 @@ mod tests {
     }
 
     #[test]
-    fn from_env_with_unknown_tier_errors() {
-        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "wibble");
-        let r = CpuFeatures::from_env_or_probe();
-        assert!(r.is_err());
+    fn forced_tier_is_case_insensitive() {
+        let f = CpuFeatures::from_forced_tier(Some("SCALAR")).unwrap();
+        assert_eq!(f, CpuFeatures::default());
+    }
+
+    #[test]
+    fn forced_tier_unknown_errors() {
+        let err = CpuFeatures::from_forced_tier(Some("wibble")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecoderError::ForcedKernelUnavailable {
+                    tier: "unknown",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn no_forced_tier_reports_what_the_cpu_has() {
+        assert_eq!(
+            CpuFeatures::from_forced_tier(None).unwrap(),
+            CpuFeatures::probe()
+        );
+    }
+
+    /// A tier the CPU cannot provide is refused rather than silently downgraded.
+    /// On x86_64 no NEON tier is available; on aarch64 the baseline always is.
+    #[test]
+    fn forced_neon_tier_matches_what_the_cpu_can_do() {
+        let r = CpuFeatures::from_forced_tier(Some("neon"));
+        if CpuFeatures::probe().neon_baseline {
+            assert!(r.unwrap().neon_baseline);
+        } else {
+            assert!(matches!(
+                r.unwrap_err(),
+                DecoderError::ForcedKernelUnavailable {
+                    tier: "neon",
+                    missing_feature: "neon"
+                }
+            ));
+        }
+    }
+
+    /// The only test that touches the process environment, and the one place
+    /// the variable's name is load-bearing. `scalar` is chosen deliberately:
+    /// it is a valid tier, so a plan built concurrently on another thread sees
+    /// a different-but-valid dispatch rather than the `Err` an unknown tier
+    /// would hand it.
+    #[test]
+    fn from_env_or_probe_reads_the_documented_variable() {
+        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");
+        assert_eq!(
+            CpuFeatures::from_env_or_probe().unwrap(),
+            CpuFeatures::default()
+        );
     }
 }
