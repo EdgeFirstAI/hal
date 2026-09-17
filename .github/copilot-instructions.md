@@ -210,10 +210,31 @@ make format lint check test sbom
 This runs, in order:
 1. **format** — `cargo fmt --all` and `ruff format`
 2. **lint** — `cargo clippy -- -D warnings` and `ruff check`
-3. **check** — `cargo check --features opengl,ndarray --workspace` (never
-   `--all-features`: `edgefirst-tensor`'s `static`/`dynamic` backend features
-   are mutually exclusive by design, so enabling every feature at once is
-   permanently illegal for this crate, not merely unusual)
+3. **check** — `cargo check --features opengl,ndarray --workspace` plus an
+   `--exclude` for every `edgefirst-python-*` crate, as the `check` target
+   spells it:
+
+   ```bash
+   cargo check --features opengl,ndarray --workspace \
+       --exclude edgefirst-python-common --exclude edgefirst-python-tensor \
+       --exclude edgefirst-python-codec --exclude edgefirst-python-image \
+       --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker
+   ```
+
+   **The excludes are load-bearing — do not "simplify" them away.** The
+   `python-*` crates default to `edgefirst-tensor/dynamic` while
+   decoder/image/codec/tensor default to `static`, and cargo unifies features
+   across everything one invocation selects. A single `--workspace` run
+   therefore turns both backends on at once for `edgefirst-tensor`, which is
+   permanently illegal for that crate (see below) — on a clean tree the bare
+   command fails with hundreds of errors rather than checking anything. The
+   same applies to `cargo build`, `cargo test` and `cargo clippy`: run them
+   through `make`, which carries the excludes, rather than by hand.
+
+   Also never `--all-features`: `edgefirst-tensor`'s `static`/`dynamic`
+   backend features are mutually exclusive by design, so enabling every
+   feature at once is permanently illegal for this crate, not merely unusual.
+   The excludes above exist to avoid reaching that same state by accident.
 4. **test** — Rust tests with coverage (`cargo llvm-cov nextest`) and Python tests
 5. **sbom** — SBOM generation and license policy validation
 
@@ -226,11 +247,13 @@ failures. This mirrors what CI/CD runs and prevents broken pipelines.
 # MANDATORY before committing (see above)
 make format lint check test sbom
 
-# Build all crates (native, for local development)
-cargo build --workspace
+# Build all crates (native, for local development). Go through make: a bare
+# `cargo build --workspace` unifies the static and dynamic tensor backends
+# and cannot compile (see the check step above).
+make build
 
 # Test all Rust code (native)
-cargo test --workspace
+make test-rust
 
 # Cross-compile for aarch64 (preferred for development)
 cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release --workspace
@@ -244,8 +267,8 @@ python -m pytest tests/
 # Format code
 cargo fmt --all
 
-# Lint
-cargo clippy --workspace
+# Lint (make carries the --excludes a bare --workspace clippy needs)
+make lint
 
 # Run benchmarks
 cargo bench -p edgefirst_image
