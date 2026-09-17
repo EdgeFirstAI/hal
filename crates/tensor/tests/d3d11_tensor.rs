@@ -318,7 +318,7 @@ fn write_only_map_of_a_narrowed_window_is_refused_and_names_readwrite() {
     t.set_logical_shape(&[4, 64, 4]).unwrap();
     let err = t.map_write().unwrap_err();
     assert!(
-        matches!(&err, Error::InvalidArgument(m) if m.contains("CpuAccess::ReadWrite")),
+        matches!(&err, Error::PartialWriteRequiresReadWrite(m) if m.contains("CpuAccess::ReadWrite")),
         "unexpected error: {err}"
     );
     assert!(t.map_mut().is_ok(), "the read-write window is accepted");
