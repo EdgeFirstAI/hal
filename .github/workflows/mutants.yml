@@ -100,9 +100,11 @@ jobs:
             idx=$(( (start + i) % total ))
             list="${list}${list:+,}${idx}"
           done
-          echo "shards=[${list}]" >> "$GITHUB_OUTPUT"
-          echo "total=${total}" >> "$GITHUB_OUTPUT"
-          echo "start=${start}" >> "$GITHUB_OUTPUT"
+          {
+            echo "shards=[${list}]"
+            echo "total=${total}"
+            echo "start=${start}"
+          } >> "$GITHUB_OUTPUT"
           echo "tonight: shards ${list} of ${total}"
 
   mutants:

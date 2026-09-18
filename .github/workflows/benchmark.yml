@@ -70,6 +70,7 @@ jobs:
           cargo bench --workspace --features opengl,ndarray --no-run 2>&1
           mkdir -p benchmark-binaries
           for name in decoder_benchmark image_benchmark pipeline_benchmark tensor_benchmark; do
+            # shellcheck disable=SC2016  # $1 is the inner sh's argument and must not expand here
             find target/release/deps -maxdepth 1 -type f -executable -name "${name}-*" \
               ! -name '*.so' ! -name '*.d' ! -name '*.rlib' -print0 | \
               xargs -0 -I{} sh -c 'cp "$1" benchmark-binaries/ && echo "Copied: $(basename "$1")"' sh '{}'
@@ -85,7 +86,7 @@ jobs:
         run: |
           python3 -m venv venv
           venv/bin/pip install --upgrade pip setuptools wheel maturin[patchelf]
-          echo "PYO3_PYTHON=$(which python3)" >> $GITHUB_ENV
+          echo "PYO3_PYTHON=$(which python3)" >> "$GITHUB_ENV"
           for pkg in tensor codec image decoder tracker; do
             venv/bin/maturin build \
               --manifest-path "crates/python-$pkg/Cargo.toml" \
@@ -149,12 +150,13 @@ jobs:
 
           echo "=== System Info ==="
           uname -a
-          cat /proc/cpuinfo | head -30
+          head -30 /proc/cpuinfo
           free -h
           echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
           echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
 
-          export EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata
+          EDGEFIRST_TESTDATA_DIR="$(pwd)/testdata"
+          export EDGEFIRST_TESTDATA_DIR
 
           for bench in benchmark-binaries/*; do
             if [ -f "$bench" ] && [ -x "$bench" ]; then
@@ -220,7 +222,8 @@ jobs:
           uname -a
           python3 --version
 
-          export EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata
+          EDGEFIRST_TESTDATA_DIR="$(pwd)/testdata"
+          export EDGEFIRST_TESTDATA_DIR
 
           # Run pytest-benchmark if benchmark files exist
           if find tests/ -name "bench_*.py" -o -name "*_bench.py" | grep -q .; then
@@ -614,17 +617,19 @@ jobs:
 
       - name: Write job summary
         run: |
-          cat benchmark-summary.md >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "<details>" >> $GITHUB_STEP_SUMMARY
-          echo "<summary>📋 Full Benchmark Output</summary>" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat benchmark-output.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "</details>" >> $GITHUB_STEP_SUMMARY
+          {
+            cat benchmark-summary.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "<details>"
+            echo "<summary>📋 Full Benchmark Output</summary>"
+            echo ""
+            echo '```'
+            cat benchmark-output.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload processed results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

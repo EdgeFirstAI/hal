@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@f86411f9b2c7a2dbd12f65f1d9f233b08084e142
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@801b787edc47b9ad5d2d890c2828fa8cc286eea5
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -95,7 +95,16 @@ jobs:
       ruff-paths: crates/python-tensor crates/python-codec crates/python-image crates/python-decoder crates/python-tracker crates/python-common tests
       # Pin what uvx resolves; unpinned it drifts with the runner's uv cache.
       ruff-version: 0.16.7
-      skip-cross-clippy: true
+      # The aarch64 pass is back on. It was switched off because the shared
+      # argument list was fixed and hal's six PyO3 crates cannot cross-compile
+      # without an interpreter for the target -- which cost hal aarch64 lint
+      # coverage entirely, on a repository whose products are aarch64. With
+      # `cross-clippy-args` the pass narrows instead of switching off.
+      #
+      # No `opencv` feature here, unlike the host pass: opencv-sys probes for a
+      # target-native OpenCV that is not installed, and this pass is check-only
+      # by design -- native sysroots are Full-tier work.
+      cross-clippy-args: --workspace --all-targets --locked --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
       pre-command: bash .github/scripts/ci-setup.sh
       clippy-args: --workspace --all-targets --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
@@ -131,7 +140,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@f86411f9b2c7a2dbd12f65f1d9f233b08084e142
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@801b787edc47b9ad5d2d890c2828fa8cc286eea5
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       boards: nxp-imx8mp-latest
