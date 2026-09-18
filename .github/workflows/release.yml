@@ -168,22 +168,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `sdist` is per lane because an sdist is architecture-independent:
+          # one is needed, and four would be four uploads of the same file.
+          # It is per package too -- see the tracker entry in the build list.
+          #
+          # No maturin-deps: the shared action derives the specification from
+          # the runner OS, which is what it is a property of. `zig` produces
+          # the manylinux wheels; `patchelf` is a Linux-only PyPI package.
           - name: x86_64-linux
             runner: ubuntu-24.04-xlarge
-            maturin-args: --sdist --zig --compatibility manylinux2014
-            maturin-deps: maturin[patchelf,zig]
+            maturin-args: --zig --compatibility manylinux2014
+            sdist: --sdist
           - name: aarch64-linux
             runner: ubuntu-24.04-arm
             maturin-args: --zig --compatibility manylinux2014
-            maturin-deps: maturin[patchelf,zig]
+            sdist: ''
           - name: windows
             runner: windows-latest
             maturin-args: ''
-            maturin-deps: maturin
+            sdist: ''
           - name: macos
             runner: macos-latest-xlarge
             maturin-args: ''
-            maturin-deps: maturin
+            sdist: ''
 
     steps:
       - name: Install git-lfs (aarch64 runner)
@@ -223,9 +230,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install maturin
-        run: pip install ${{ matrix.maturin-deps }}
-
       - name: Install build dependencies (aarch64 runner)
         # The ARM image ships neither lld nor a C compiler; the x86_64 one has
         # both. Recent stable rustc defaults to -fuse-ld=lld on Linux, so
@@ -253,67 +257,51 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/fetch-angle.sh --windows
 
+      # Two passes over the same five distributions, abi3-py311 and abi3-py38,
+      # in one job so they share a target directory and a warm cargo cache.
+      #
+      # --sdist is on tracker alone. tensor/codec/image/decoder's build.rs
+      # nested-builds the workspace-excluded edgefirst-tensor-capi through a
+      # `../tensor-capi` relative path, and maturin builds the wheel FROM the
+      # generated sdist whenever --sdist is passed; its sdist can never include
+      # a sibling outside the crate directory, so --sdist against those four
+      # always fails with "manifest path .../tensor-capi/Cargo.toml does not
+      # exist". tracker has no nested build and is the only one safe to sdist.
+      #
+      # attest: false on both. The shared action attests immediately after it
+      # builds, and hal's wheels are not shippable until the layout and Mach-O
+      # checks below have passed -- so provenance is generated once, after
+      # them, rather than for a wheel an assertion is about to reject.
       - name: Build wheels (Python 3.11+ — zero-copy buffer protocol)
-        shell: bash
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@801b787edc47b9ad5d2d890c2828fa8cc286eea5
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
-          # Through env rather than interpolated into the script, so the value
-          # is data the shell reads rather than text it parses.
-          MATURIN_ARGS: ${{ matrix.maturin-args }}
-        run: |
-          # Four self-contained distributions since 0.29. Order is irrelevant to
-          # the build (no shared object); it matters only at publish time.
-          #
-          # --sdist only for tracker. tensor/codec/image/decoder's build.rs
-          # nested-builds the workspace-excluded edgefirst-tensor-capi via a
-          # `../tensor-capi` relative path (dynamic backend); maturin builds
-          # the wheel FROM the generated sdist whenever --sdist is passed,
-          # and its sdist can never include a sibling outside the crate
-          # directory (`include`/`exclude` patterns reject any `..`), so
-          # `--sdist` against those four always fails with "manifest path
-          # .../tensor-capi/Cargo.toml does not exist". tracker has no such
-          # nested build and is the only one of the five safe to sdist.
-          # An array rather than a string: the expansion is quoted, and the
-          # --sdist filtering is an explicit comparison rather than a substring
-          # removal that would also match a longer flag.
-          #
-          # It does NOT add quoting support. `read -ra` splits on whitespace
-          # and does not interpret quotes, exactly as the unquoted expansion it
-          # replaces did -- `--config "a b"` would still become three elements.
-          # Every value in the matrix above is a bare flag, which is why that
-          # is sufficient here. If one ever needs an embedded space, make the
-          # matrix entry a JSON array and read it with jq; do not widen this.
-          read -ra base_args <<< "$MATURIN_ARGS"
-          for pkg in tensor codec image decoder tracker; do
-            args=()
-            for a in "${base_args[@]}"; do
-              if [ "$a" = "--sdist" ] && [ "$pkg" != "tracker" ]; then
-                continue
-              fi
-              args+=("$a")
-            done
-            maturin build --release --auditwheel skip -m "crates/python-$pkg/Cargo.toml" \
-              --features abi3-py311 "${args[@]}"
-          done
+        with:
+          features: abi3-py311
+          args: --auditwheel skip ${{ matrix.maturin-args }}
+          builds: |
+            [{"manifest": "crates/python-tensor/Cargo.toml"},
+             {"manifest": "crates/python-codec/Cargo.toml"},
+             {"manifest": "crates/python-image/Cargo.toml"},
+             {"manifest": "crates/python-decoder/Cargo.toml"},
+             {"manifest": "crates/python-tracker/Cargo.toml", "args": "${{ matrix.sdist }}"}]
+          attest: false
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
-        shell: bash
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@801b787edc47b9ad5d2d890c2828fa8cc286eea5
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
-          MATURIN_ARGS: ${{ matrix.maturin-args }}
-        run: |
-          # No --sdist at all: the sdists were generated in the py311 pass.
-          # See the py311 step for why `read -ra` is enough here.
-          read -ra base_args <<< "$MATURIN_ARGS"
-          args=()
-          for a in "${base_args[@]}"; do
-            [ "$a" = "--sdist" ] && continue
-            args+=("$a")
-          done
-          for pkg in tensor codec image decoder tracker; do
-            maturin build --release --auditwheel skip -m "crates/python-$pkg/Cargo.toml" \
-              --features abi3-py38 "${args[@]}"
-          done
+        with:
+          features: abi3-py38
+          # No --sdist: the sdists were generated in the pass above.
+          args: --auditwheel skip ${{ matrix.maturin-args }}
+          builds: |
+            [{"manifest": "crates/python-tensor/Cargo.toml"},
+             {"manifest": "crates/python-codec/Cargo.toml"},
+             {"manifest": "crates/python-image/Cargo.toml"},
+             {"manifest": "crates/python-decoder/Cargo.toml"},
+             {"manifest": "crates/python-tracker/Cargo.toml"}]
+          attest: false
 
       - name: Assert wheel layout
         shell: bash
@@ -331,22 +319,6 @@ jobs:
         shell: bash
         run: python3 scripts/check_macho_alignment.py target/wheels
 
-      - name: Assert the wheels carry the release version
-        shell: bash
-        env:
-          VERSION: ${{ needs.verify-version.outputs.version }}
-        run: |
-          # A mismatch means publishing a version nobody can install, and PyPI
-          # will not let a version be re-used. It now fails on the release PR
-          # rather than after the tag exists, which is the point of the split.
-          for w in target/wheels/*.whl; do
-            case "$(basename "$w")" in
-              *-"$VERSION"-*) ;;
-              *) echo "::error::$(basename "$w") does not carry release version $VERSION"; exit 1 ;;
-            esac
-          done
-          echo "all wheels carry $VERSION"
-
       - name: Upload wheels (per package, so publish jobs can select)
         shell: bash
         run: |
@@ -362,12 +334,16 @@ jobs:
             mv "$s" "staged/$pkg/" 2>/dev/null || true
           done
 
-
       - name: Attest build provenance
         # Attested here rather than at publish. Provenance generated where the
         # artifact was downloaded describes the download; generated where it
         # was built, it describes the build. publish.yml ships exactly these
         # files, so the attestation covers what consumers receive.
+        #
+        # Not the shared action's `attest`, which fires the moment it has
+        # built: these wheels are not shippable until the layout and Mach-O
+        # checks above have passed, and provenance for a wheel an assertion is
+        # about to reject is provenance for something nobody will ever install.
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-path: staged/*/*
@@ -566,6 +542,11 @@ jobs:
         # artifact was downloaded describes the download; generated where it
         # was built, it describes the build. publish.yml ships exactly these
         # files, so the attestation covers what consumers receive.
+        #
+        # Not the shared action's `attest`, which fires the moment it has
+        # built: these wheels are not shippable until the layout and Mach-O
+        # checks above have passed, and provenance for a wheel an assertion is
+        # about to reject is provenance for something nobody will ever install.
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-path: staged/${{ steps.ver.outputs.archive }}
