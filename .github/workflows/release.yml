@@ -141,6 +141,17 @@ jobs:
             maturin-deps: maturin
 
     steps:
+      - name: Install git-lfs (aarch64 runner)
+        # The ARM larger runner image does not ship git-lfs; the x86_64 one
+        # does. actions/checkout shells out to it for `lfs: true`, so without
+        # this the job dies on its very first step with "Unable to locate
+        # executable file: git-lfs". Installed before that checkout, not after,
+        # because it is the checkout itself that needs it.
+        if: matrix.name == 'aarch64-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -163,7 +174,7 @@ jobs:
         run: pip install ${{ matrix.maturin-deps }}
 
       - name: Install lld (aarch64 runner)
-        # ubuntu-22.04-arm does not ship lld by default, unlike ubuntu-latest
+        # The ARM runner does not ship lld by default, unlike the x86_64 one
         # (x86_64) -- recent stable rustc defaults to -fuse-ld=lld on Linux.
         # tensor/codec/image/decoder's build.rs nested-builds the
         # workspace-excluded edgefirst-tensor-capi via a plain `cargo build`
@@ -328,6 +339,17 @@ jobs:
             libdir: target/release
 
     steps:
+      - name: Install git-lfs (aarch64 runner)
+        # The ARM larger runner image does not ship git-lfs; the x86_64 one
+        # does. actions/checkout shells out to it for `lfs: true`, so without
+        # this the job dies on its very first step with "Unable to locate
+        # executable file: git-lfs". Installed before that checkout, not after,
+        # because it is the checkout itself that needs it.
+        if: matrix.target == 'aarch64-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -346,7 +368,7 @@ jobs:
         run: rustup target add ${{ matrix.rust_target }}
 
       - name: Install lld (aarch64 runner)
-        # ubuntu-22.04-arm does not ship lld by default, unlike ubuntu-latest
+        # The ARM runner does not ship lld by default, unlike the x86_64 one
         # (x86_64) -- recent stable rustc defaults to -fuse-ld=lld on Linux,
         # so a bare build here fails at link time with "collect2: fatal
         # error: cannot find 'ld'". test.yml's aarch64 runners already
