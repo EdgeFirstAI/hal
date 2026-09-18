@@ -542,11 +542,6 @@ jobs:
         # artifact was downloaded describes the download; generated where it
         # was built, it describes the build. publish.yml ships exactly these
         # files, so the attestation covers what consumers receive.
-        #
-        # Not the shared action's `attest`, which fires the moment it has
-        # built: these wheels are not shippable until the layout and Mach-O
-        # checks above have passed, and provenance for a wheel an assertion is
-        # about to reject is provenance for something nobody will ever install.
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-path: staged/${{ steps.ver.outputs.archive }}
