@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-09-18
+
+A CI/CD-only release. No library, binding or C API change: every entry below is about how hal is built and published, and this release exists to exercise that chain end to end for the first time.
+
 ### Changed
 
 - The release is now three workflows with one action each, and **a tag deploys without building**. `release.yml` triggers on a push to `release/X.Y.Z` and builds every wheel, C-API archive and the SBOM; `tag-release.yml` creates the annotated `vX.Y.Z` tag on merge, and refuses to create one unless that build is green for the commit being merged; a new `publish.yml` triggers on the tag, resolves the run that built the artifacts, verifies its tree matches the tag's, and publishes to PyPI, crates.io and GitHub Releases without compiling anything.
