@@ -94,7 +94,7 @@ jobs:
       publishing: ${{ steps.resolve.outputs.publishing }}
     steps:
       - id: resolve
-        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@2ecdf8f3d53e0fb34ba34c269528ffe8ed08e18c
+        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@41947187ad817514d1843dfd979f629db443c971
         with:
           build-workflow: release.yml
           tag: ${{ inputs.tag }}
@@ -523,7 +523,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create Release

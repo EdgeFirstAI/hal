@@ -37,12 +37,12 @@ jobs:
           set -euo pipefail
           echo "=== Downloaded coverage artifacts ==="
           find coverage/ -type f || true
-          for xml in $(find coverage/ -name "coverage_python.xml" -type f); do
+          while IFS= read -r xml; do
             python3 .github/scripts/fix_coverage_paths.py "$xml" tests
-          done
-          for lcov in $(find coverage/ -name "*.lcov" -type f); do
+          done < <(find coverage/ -name "coverage_python.xml" -type f)
+          while IFS= read -r lcov; do
             sed -i -E '/^SF:/{s|\\|/|g; s|^SF:.*/work/hal/hal/|SF:|; s|^SF:[A-Za-z]:/a/hal/hal/|SF:|}' "$lcov"
-          done
+          done < <(find coverage/ -name "*.lcov" -type f)
           RUST_REPORTS=$(find coverage/ -name "*.lcov" | tr '\n' ',' | sed 's/,$//')
           PYTHON_REPORTS=$(find coverage/ -name "coverage_python.xml" | tr '\n' ',' | sed 's/,$//')
           echo "Rust: ${RUST_REPORTS:-}"

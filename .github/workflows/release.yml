@@ -135,6 +135,21 @@ jobs:
             -p edgefirst-decoder-abi -p edgefirst-tensor-abi -p edgefirst-tensor-ffi \
             -p edgefirst-egl -p edgefirst-gl -p edgefirst-tensor \
             -p edgefirst-codec -p edgefirst-image -p edgefirst-decoder -p edgefirst-tracker
+          ls -la target/package/*.crate
+
+      # Kept as artifacts because Section 4.5.3 asks for it: publish.yml runs
+      # `cargo publish --no-verify`, and skipping the verification compile on
+      # the tag path is only defensible because packaging was exercised here,
+      # on a branch a human reviewed. The files are provenance -- `cargo
+      # publish` packages from source and cannot consume them -- so they are
+      # the record of exactly what this release packaged.
+      - name: Upload the packaged crates
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: crates
+          path: target/package/*.crate
+          if-no-files-found: error
+          retention-days: 30
 
   build-wheels:
     needs: [verify-version]
@@ -242,6 +257,9 @@ jobs:
         shell: bash
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
+          # Through env rather than interpolated into the script, so the value
+          # is data the shell reads rather than text it parses.
+          MATURIN_ARGS: ${{ matrix.maturin-args }}
         run: |
           # Four self-contained distributions since 0.29. Order is irrelevant to
           # the build (no shared object); it matters only at publish time.
@@ -255,24 +273,38 @@ jobs:
           # `--sdist` against those four always fails with "manifest path
           # .../tensor-capi/Cargo.toml does not exist". tracker has no such
           # nested build and is the only one of the five safe to sdist.
-          ARGS="${{ matrix.maturin-args }}"
+          # An array rather than a string: the arguments are a list, and
+          # splitting a string on whitespace to make one is how an argument
+          # containing a space becomes two.
+          read -ra base_args <<< "$MATURIN_ARGS"
           for pkg in tensor codec image decoder tracker; do
-            pkg_args="$ARGS"
-            [ "$pkg" != "tracker" ] && pkg_args="${pkg_args//--sdist/}"
+            args=()
+            for a in "${base_args[@]}"; do
+              if [ "$a" = "--sdist" ] && [ "$pkg" != "tracker" ]; then
+                continue
+              fi
+              args+=("$a")
+            done
             maturin build --release --auditwheel skip -m "crates/python-$pkg/Cargo.toml" \
-              --features abi3-py311 $pkg_args
+              --features abi3-py311 "${args[@]}"
           done
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
         shell: bash
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
+          MATURIN_ARGS: ${{ matrix.maturin-args }}
         run: |
-          # Strip --sdist from args (sdists already generated in the py311 pass)
-          ARGS="${{ matrix.maturin-args }}"
+          # No --sdist at all: the sdists were generated in the py311 pass.
+          read -ra base_args <<< "$MATURIN_ARGS"
+          args=()
+          for a in "${base_args[@]}"; do
+            [ "$a" = "--sdist" ] && continue
+            args+=("$a")
+          done
           for pkg in tensor codec image decoder tracker; do
             maturin build --release --auditwheel skip -m "crates/python-$pkg/Cargo.toml" \
-              --features abi3-py38 ${ARGS//--sdist/}
+              --features abi3-py38 "${args[@]}"
           done
 
       - name: Assert wheel layout
