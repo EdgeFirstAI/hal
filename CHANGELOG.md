@@ -35,6 +35,10 @@ A CI/CD-only release. No library, binding or C API change: every entry below is 
 
   maturin is no longer named per lane. The action derives it from the runner OS, which is what it is a property of — `maturin[patchelf,zig]` on the two Linux lanes and plain `maturin` on macOS and Windows, exactly what the matrix used to spell out.
 
+- **Release notes were never extracted.** The awk range `/## \[VERSION\]/,/^## \[/` ends on the first line matching its second pattern — and the heading it starts on matches that too, so the range was always a single record, which the body then skipped with `next`. Every release since that step was written shipped empty notes: **v0.32.0's GitHub Release body is zero characters.** The `|| echo "Release $VERSION"` fallback never fired, because awk exits 0 when it prints nothing. Replaced with `.github/scripts/extract_release_notes.py`, which requires a complete version token — a prefix match would take the `## [1.2.30]` section for release 1.2.3 — and exits non-zero when the section is absent, so the failure is loud rather than an empty release body.
+
+  Found by the `publish.yml` rehearsal on this release branch, before any tag existed. It is the first defect the rehearsal has caught, and it had been shipping unnoticed for at least one release.
+
 ### Operational
 
 - **PyPI and crates.io Trusted Publishers must be re-pointed from `release.yml` to `publish.yml` before the next tag.** Both match a publisher on the workflow filename, so all five PyPI distributions and all ten crates will fail to upload until their publisher configuration names the new file. A `publish.yml` rehearsal does not catch this, because a rehearsal skips the upload.
