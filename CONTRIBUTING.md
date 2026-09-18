@@ -366,8 +366,13 @@ Workflows are in `.github/workflows/`. HAL uses three tiers — see
   HAL extras (iOS, Android, software-GL, C-API, Python), coverage, scancode,
   SonarCloud. Use `ci:hardware` for the i.MX 8M Plus board only.
 - **Nightly**: Full + G13 differential + cargo hack/audit, only if `main` moved.
-- **Release**: merge `release/X.Y.Z` with `ci:full`; `tag-release.yml` creates
-  the annotated tag; `release.yml` publishes. Never tag by hand.
+- **Release**: three workflows, and a tag that only deploys. Pushing to
+  `release/X.Y.Z` runs `release.yml`, which builds every wheel and C-API
+  archive and uploads them; merging that PR with `ci:full` runs
+  `tag-release.yml`, which refuses to create the annotated tag unless that
+  build is green for the merged commit; the tag runs `publish.yml`, which
+  ships the artifacts that already exist and builds nothing. Never tag by
+  hand.
 
 Open PRs as drafts until you want Quick. Fork PRs stay on hosted Quick only;
 a maintainer must label to escalate (keeps fork code off the board).

@@ -1,0 +1,413 @@
+# Publish
+#
+# Step 3 of 3. A tag deploys and never builds:
+#
+#   release.yml   push to release/X.Y.Z  -> build every artifact
+#   tag-release.yml  release PR merged   -> annotated vX.Y.Z tag
+#   publish.yml   push of a vX.Y.Z tag   -> publish what was built (this file)
+#
+# THIS WORKFLOW COMPILES NOTHING. It finds the release.yml run that built this
+# tag's artifacts, proves that run produced the tree the tag points at, and
+# then uploads. A missing artifact, an expired artifact or a tree mismatch
+# fails the publish; there is no fallback to a build, because a deploy-only
+# pipeline that cannot prove which build it is shipping is worse than one that
+# rebuilds. A change to HOW anything is built belongs in release.yml.
+#
+# The one exception is `cargo publish`, which has no pre-built input: it always
+# packages from a source tree. `--no-verify` keeps the verification compile off
+# this path, and the same tree was packaged by release.yml's
+# verify-publish-manifests job on the release branch.
+#
+# Publishing is gated inside the shared resolve action on a real tag push, so a
+# workflow_dispatch resolves, verifies and downloads everything and publishes
+# nothing -- a complete rehearsal at no cost and with no tag. Run it before the
+# first tag after any change here.
+#
+# Trusted Publisher Configuration (one per distribution, since 0.29):
+# - PyPI: https://pypi.org/manage/project/<name>/settings/publishing/
+#   for edgefirst-tensor, edgefirst-codec, edgefirst-image, edgefirst-decoder,
+#   edgefirst-tracker
+#   Owner: EdgeFirstAI, Repository: hal, Workflow: publish.yml, Environment: pypi
+#
+#   THESE MOVED WITH THIS SPLIT. Both PyPI and crates.io match a publisher on
+#   the workflow FILENAME, so all five PyPI publishers and all ten crates.io
+#   publishers must be re-pointed from release.yml to publish.yml before the
+#   first tag, or the upload fails on a claim mismatch. A rehearsal does NOT
+#   catch this, because a rehearsal skips the upload.
+#
+#   BOOTSTRAP: Trusted Publishing requires the project to already exist, so each
+#   new distribution needs one manual upload with a local API token before this
+#   workflow can publish it. See scripts/bootstrap_pypi_projects.sh.
+# - crates.io: Owner: EdgeFirstAI, Repository: hal, Workflow: publish.yml,
+#   Environment: crates-io
+#
+# Action Versions (hash-pinned for security per Au-Zone SPS v2.1):
+# - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
+# - actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 (v7.0.0)
+# - actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c (v8.0.1)
+# - dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de (v1)
+# - rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 (v1.0.5)
+# - pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 (v1.14.2)
+# - softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 (v3.0.3)
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to rehearse, e.g. v0.33.0 (publishes nothing)'
+        required: true
+        type: string
+
+concurrency:
+  # No cancel-in-progress. A half-finished publish is not a state anything can
+  # recover from: PyPI and crates.io uploads cannot be undone.
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_STABLE_VERSION: '1.94.0'
+
+jobs:
+  # Finds the release.yml run for this tag's release branch and binds it by
+  # tree SHA -- a squash merge changes the commit but not the tree, so commit
+  # equality would reject every squash-merged release. Needs no checkout, which
+  # is what lets the rehearsal run before the tag exists.
+  resolve:
+    name: Resolve the release build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run-id: ${{ steps.resolve.outputs.run-id }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      publishing: ${{ steps.resolve.outputs.publishing }}
+    steps:
+      - id: resolve
+        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@2ecdf8f3d53e0fb34ba34c269528ffe8ed08e18c
+        with:
+          build-workflow: release.yml
+          tag: ${{ inputs.tag }}
+
+  # release.yml already checked every version surface against the release
+  # branch, and resolve has proved this tag carries that same tree -- so for a
+  # tag created by tag-release.yml this is redundant. It is kept for the one
+  # case where it is not: a maintenance line's tag is created by hand, and
+  # nothing else would catch a hand-typed version that disagrees with the tree.
+  verify-version:
+    name: Verify version consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [resolve]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Check every version surface against the tag
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: python3 .github/scripts/verify_version.py "${VERSION}"
+
+  publish-tensor:
+    name: Publish edgefirst-tensor
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [resolve, verify-version]
+    if: needs.resolve.outputs.publishing == 'true'
+    environment:
+      name: pypi
+      url: https://pypi.org/project/edgefirst-tensor/
+    permissions:
+      id-token: write
+      actions: read      # download the release build run's artifacts
+    steps:
+      - name: Download tensor wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          pattern: wheels-*-tensor
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        with:
+          skip-existing: true
+
+  publish-dependents:
+    name: Publish edgefirst-${{ matrix.pkg }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [resolve, publish-tensor]
+    if: needs.resolve.outputs.publishing == 'true'
+    strategy:
+      # Sequential so a partial-publish failure is unambiguous about which
+      # package got through.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        pkg: [codec, image, decoder, tracker]
+    environment:
+      name: pypi
+      url: https://pypi.org/project/edgefirst-${{ matrix.pkg }}/
+    permissions:
+      id-token: write
+      actions: read      # download the release build run's artifacts
+    steps:
+      - name: Download ${{ matrix.pkg }} wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          pattern: wheels-*-${{ matrix.pkg }}
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        with:
+          skip-existing: true
+
+  verify-release:
+    name: Verify the published set installs
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [resolve, publish-dependents]
+    if: needs.resolve.outputs.publishing == 'true'
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Install each package into a clean environment
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          for p in edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker; do
+            python -m venv "/tmp/v-$p"
+            ok=0
+            # PyPI's index is eventually consistent; a fresh release can 404 for
+            # a short while. Retry rather than yanking a good release.
+            for attempt in 1 2 3 4 5 6; do
+              if "/tmp/v-$p/bin/pip" install --quiet "$p==$VERSION"; then ok=1; break; fi
+              echo "attempt $attempt: $p==$VERSION not installable yet; waiting"
+              sleep 20
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::$p==$VERSION never became installable."
+              echo "::error::The release is partial. Yank every distribution"
+              echo "::error::already published at $VERSION and re-release with a"
+              echo "::error::new patch version -- PyPI forbids re-uploading one."
+              exit 1
+            fi
+            mod="edgefirst.${p#edgefirst-}"
+            "/tmp/v-$p/bin/python" -c "import $mod; print('$mod ok')"
+          done
+
+      - name: Verify a codec-only install does not pull the image stack
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          python -m venv /tmp/v-codec-only
+          /tmp/v-codec-only/bin/pip install --quiet "edgefirst-codec==$VERSION"
+          if /tmp/v-codec-only/bin/pip list --format=freeze | grep -q '^edgefirst-image='; then
+            echo "::error::edgefirst-codec pulled in edgefirst-image; the split is not doing its job"
+            exit 1
+          fi
+          echo "codec-only install is clean"
+
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    needs: [resolve, verify-version]
+    if: needs.resolve.outputs.publishing == 'true'
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/edgefirst-tensor/
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # rust-toolchain.toml pins these components, so rustup installs them
+          # on the first cargo invocation if the action did not. That install
+          # races an already-present cargo-fmt on the ARM image and aborts the
+          # build with "failed to install component: 'rustfmt-preview-...',
+          # detected conflict: 'bin/cargo-fmt'". Naming them here means the
+          # toolchain arrives complete and rustup has nothing left to add.
+          components: clippy, rustfmt
+
+      - name: Authenticate to crates.io (Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
+        id: auth
+
+      - name: Publish crates to crates.io (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          publish_one() {
+            local crate="$1"
+            echo "==> ${crate}"
+            if output=$(cargo publish --no-verify -p "${crate}" 2>&1); then
+              echo "${output}"
+              return 0
+            fi
+            echo "${output}"
+            if echo "${output}" | grep -qE "already uploaded|already exists on crates.io"; then
+              echo "::warning::${crate} already published — skipping"
+              return 0
+            fi
+            return 1
+          }
+          # Leaves first so dependents can resolve the new version on crates.io.
+          # `cargo publish` (even --no-verify) resolves the FULL dependency
+          # graph while packaging -- every `edgefirst-*` entry in Cargo.toml,
+          # optional or not, must already be on crates.io at this exact
+          # version. edgefirst-image optionally depends on both
+          # edgefirst-decoder and edgefirst-tracker (crates/image/Cargo.toml),
+          # so it must publish after both, not before either -- v0.29.3's
+          # tag push had image third-from-last but decoder and tracker after
+          # it, and failed packaging image with "failed to select a version
+          # for the requirement `edgefirst-decoder = \"^0.29.3\"`" before
+          # either had been published.
+          for crate in \
+            edgefirst-decoder-abi \
+            edgefirst-tensor-abi \
+            edgefirst-tensor-ffi \
+            edgefirst-egl \
+            edgefirst-gl \
+            edgefirst-tensor \
+            edgefirst-codec \
+            edgefirst-tracker \
+            edgefirst-decoder \
+            edgefirst-image
+          do
+            publish_one "${crate}"
+            sleep 15
+          done
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [resolve, verify-version]
+    if: needs.resolve.outputs.publishing == 'true'
+    permissions:
+      contents: write
+      actions: read      # download the release build run's artifacts
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The commit the artifacts were verified against, not the ref: a
+          # squash merge means the tag's commit is not the branch head that
+          # was built, and resolve has already proved the trees match.
+          ref: ${{ needs.resolve.outputs.sha }}
+          # Full history + all tags so the make_latest comparison below can see
+          # every released version, not just the one being tagged.
+          fetch-depth: 0
+
+      - name: Download wheel artifacts (all five packages)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download C API artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          pattern: capi-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          # A fixed name, not sbom-<sha>: the build ran on the release branch
+          # head and this job runs at the tag, which after a squash merge is a
+          # different commit.
+          name: sbom
+          path: dist
+
+      # The shared SBOM workflow uploads sbom.json alone; NOTICE is a tracked
+      # file and generate_sbom.sh has already validated it against this SBOM.
+      - name: Stage NOTICE alongside the SBOM
+        run: cp NOTICE dist/NOTICE
+
+      - name: Extract changelog
+        id: changelog
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          awk "/## \[$VERSION\]/,/^## \[/{if (/^## \[/ && !found) {found=1; next} if (/^## \[/ && found) exit; if (found) print}" CHANGELOG.md > RELEASE_NOTES.md || echo "Release $VERSION" > RELEASE_NOTES.md
+
+      - name: Determine 'Latest' eligibility
+        id: latest
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        # Only the highest stable semver tag is marked as the repo's "Latest"
+        # release. A back-version maintenance patch (e.g. v0.22.2 tagged after
+        # v0.24.x already shipped) is published as a normal, non-latest release
+        # so it never displaces the current line's badge. rc tags are excluded
+        # from the comparison and never become Latest. TAG comes from resolve,
+        # which has already validated its shape.
+        run: |
+          CURRENT="${TAG}"
+          HIGHEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ "$CURRENT" = "$HIGHEST" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Tag $CURRENT (highest stable: $HIGHEST) -> make_latest=$([ "$CURRENT" = "$HIGHEST" ] && echo true || echo false)"
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          files: dist/*
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: ${{ needs.resolve.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.latest.outputs.make_latest }}
+          fail_on_unmatched_files: true

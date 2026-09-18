@@ -1,59 +1,62 @@
-# Release Workflow
+# Release Build
 #
-# Builds Python wheels for multiple platforms and publishes to PyPI and crates.io
-# on tagged releases. Supports both stable releases (X.Y.Z) and release candidates (X.Y.ZrcN).
+# Step 1 of 3. A tag deploys and never builds:
+#
+#   release.yml   push to release/X.Y.Z  -> build every artifact  (this file)
+#   tag-release.yml  release PR merged   -> annotated vX.Y.Z tag
+#   publish.yml   push of a vX.Y.Z tag   -> publish what was built
+#
+# This file builds the five Python wheel distributions across four platforms
+# and the five modular C API archives across five targets, verifies them, and
+# uploads them with 30-day retention. It publishes nothing.
+#
+# It runs on `push` to the release branch, not on `pull_request`. A
+# pull_request run builds a merge-preview commit that exists nowhere in
+# history, so publish.yml could never bind its artifacts to the tag; a push
+# run builds the branch head, which is the commit the release PR merges.
+# Confining it to release branches is also what keeps a 9-lane build off
+# every ordinary push.
+#
+# Why it moved off the tag: five of hal's nine release tags failed, and every
+# one of those was a build failure reached only at deploy time -- never a
+# publishing failure. v0.32.0 failed three times in a row on a runner image
+# without git-lfs, then the same image without a C compiler, then a rustup
+# component conflict. No pull request could surface any of them, because no
+# pull request can run a tag-triggered workflow, and each retry cost a tag
+# delete and re-push. Those are now red release PRs.
 #
 # Action Versions (hash-pinned for security per Au-Zone SPS v2.1):
-# - actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd (v6.0.2)
-# - actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 (v6.2.0)
+# - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
+# - actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 (v7.0.0)
 # - actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a (v7.0.1)
-# - actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c (v8.0.1)
-# - dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 (v1)
-# - rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe (v1.0.4)
-# - pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b (v1.14.0)
-# - softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda (v3.0.0)
-#
-# - actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f (v3.2.0)
+# - dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de (v1)
+# - actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 (v4.2.2)
 # - ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 (v1.13.0)
-#
-# Trusted Publisher Configuration (one per distribution, since 0.29):
-# - PyPI: https://pypi.org/manage/project/<name>/settings/publishing/
-#   for edgefirst-tensor, edgefirst-codec, edgefirst-image, edgefirst-decoder,
-#   edgefirst-tracker
-#   Owner: EdgeFirstAI, Repository: hal, Workflow: release.yml, Environment: pypi
-#
-#   BOOTSTRAP: Trusted Publishing requires the project to already exist, so each
-#   new distribution needs one manual upload with a local API token before this
-#   workflow can publish it. See scripts/bootstrap_pypi_projects.sh.
-# - crates.io: https://crates.io/settings/tokens
-#   Owner: EdgeFirstAI, Repository: hal, Workflow: release.yml, Environment: crates-io
-#   New layout crates (edgefirst-decoder-abi, edgefirst-tensor-abi,
-#   edgefirst-tensor-ffi) need a first upload and Trusted Publishing too.
 
 # runner-class: larger
-#   Release is speed-optimised and bills for it: it runs once per tag, and a
-#   slow release is a release someone is waiting on. Build matrices use larger
-#   runners; the publish and verify jobs stay standard because they are I/O
-#   bound on the registries, not CPU bound. Windows stays standard: the org
-#   has no Windows larger runner provisioned, so a larger label would queue.
+#   The release build is speed-optimised and bills for it: it runs a handful of
+#   times per release, and a slow build is a release PR someone is waiting on.
+#   Windows stays standard: the org has no Windows larger runner provisioned,
+#   so a larger label would queue.
 
-name: Release
+name: Release Build
 
 on:
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+rc[0-9]+'
+    branches:
+      # Matches release/X.Y.Z. The shared tag workflow also accepts
+      # release/X.Y.Z-rcN, but hal has never cut a release candidate and its
+      # wheels would need PEP 440 spelling in the manifests first, so the
+      # pattern here stays deliberately narrow.
+      - 'release/[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to build release for'
-        required: true
-        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # A fixup commit on the release branch supersedes the build it interrupts.
+  # publish.yml resolves the most recent successful run for the branch, so a
+  # cancelled predecessor is never the one that gets published.
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,24 +74,34 @@ jobs:
     name: Verify version consistency
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.11'
-      - name: Check every version surface against the tag
+      - name: Check every version surface against the release branch
+        id: version
         env:
-          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          # Never interpolated into the script text: a ref name may contain
+          # shell metacharacters.
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [[ -n "${DISPATCH_TAG}" ]]; then
-            VERSION="${DISPATCH_TAG#v}"
-          else
-            echo "::error::no tag to verify against"
+          case "${REF_NAME}" in
+            release/*) VERSION="${REF_NAME#release/}" ;;
+            *)
+              echo "::error::release.yml builds a release branch; got '${REF_NAME}'."
+              echo "::error::Branch from main as release/X.Y.Z and push there."
+              exit 1
+              ;;
+          esac
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'${REF_NAME}' is not release/X.Y.Z"
             exit 1
           fi
           python3 .github/scripts/verify_version.py "${VERSION}"
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
   # Manifest check runs before anything is uploaded. `cargo package` catches
   # unversioned publish=false deps (G1) without requiring the new version to
@@ -127,6 +140,10 @@ jobs:
     name: Build wheels (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       # Matches build-capi. Without it one platform's failure cancels the rest,
       # so a run reports a single broken lane and hides whatever else is also
@@ -273,20 +290,21 @@ jobs:
         shell: bash
         run: python3 scripts/check_macho_alignment.py target/wheels
 
-      - name: Assert the tag matches the built version
+      - name: Assert the wheels carry the release version
         shell: bash
-        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
         run: |
-          # A mismatch here means publishing a version nobody can install, and
-          # PyPI will not let the version be re-used. Fail before upload.
-          TAG="${GITHUB_REF_NAME#v}"
+          # A mismatch means publishing a version nobody can install, and PyPI
+          # will not let a version be re-used. It now fails on the release PR
+          # rather than after the tag exists, which is the point of the split.
           for w in target/wheels/*.whl; do
             case "$(basename "$w")" in
-              *-"$TAG"-*) ;;
-              *) echo "::error::$(basename "$w") does not carry tag version $TAG"; exit 1 ;;
+              *-"$VERSION"-*) ;;
+              *) echo "::error::$(basename "$w") does not carry release version $VERSION"; exit 1 ;;
             esac
           done
-          echo "all wheels carry $TAG"
+          echo "all wheels carry $VERSION"
 
       - name: Upload wheels (per package, so publish jobs can select)
         shell: bash
@@ -303,25 +321,35 @@ jobs:
             mv "$s" "staged/$pkg/" 2>/dev/null || true
           done
 
+
+      - name: Attest build provenance
+        # Attested here rather than at publish. Provenance generated where the
+        # artifact was downloaded describes the download; generated where it
+        # was built, it describes the build. publish.yml ships exactly these
+        # files, so the attestation covers what consumers receive.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: staged/*/*
+
       - name: Upload tensor wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with: {name: "wheels-${{ matrix.name }}-tensor", path: staged/tensor/*}
+        with: {retention-days: 30, name: "wheels-${{ matrix.name }}-tensor", path: staged/tensor/*}
 
       - name: Upload codec wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with: {name: "wheels-${{ matrix.name }}-codec", path: staged/codec/*}
+        with: {retention-days: 30, name: "wheels-${{ matrix.name }}-codec", path: staged/codec/*}
 
       - name: Upload image wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with: {name: "wheels-${{ matrix.name }}-image", path: staged/image/*}
+        with: {retention-days: 30, name: "wheels-${{ matrix.name }}-image", path: staged/image/*}
 
       - name: Upload decoder wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with: {name: "wheels-${{ matrix.name }}-decoder", path: staged/decoder/*}
+        with: {retention-days: 30, name: "wheels-${{ matrix.name }}-decoder", path: staged/decoder/*}
 
       - name: Upload tracker wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with: {name: "wheels-${{ matrix.name }}-tracker", path: staged/tracker/*}
+        with: {retention-days: 30, name: "wheels-${{ matrix.name }}-tracker", path: staged/tracker/*}
 
   # THE C RELEASE PATH SHIPS ONE ARCHIVE PER TARGET.
   #
@@ -335,6 +363,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     needs: [verify-version]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -427,17 +459,8 @@ jobs:
         id: ver
         shell: bash
         env:
-          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          VERSION: ${{ needs.verify-version.outputs.version }}
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [[ -n "${DISPATCH_TAG}" ]]; then
-            VERSION="${DISPATCH_TAG#v}"
-          else
-            echo "::error::no tag on GITHUB_REF and no workflow_dispatch tag input"
-            exit 1
-          fi
-          python3 .github/scripts/verify_version.py "${VERSION}" >/dev/null
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           TARGET="${{ matrix.target }}"
           case "${TARGET}" in
@@ -496,282 +519,24 @@ jobs:
         shell: bash
         run: ./scripts/smoke-capi-archive-windows.sh "staged/${{ steps.ver.outputs.archive }}"
 
+
+      - name: Attest build provenance
+        # Attested here rather than at publish. Provenance generated where the
+        # artifact was downloaded describes the download; generated where it
+        # was built, it describes the build. publish.yml ships exactly these
+        # files, so the attestation covers what consumers receive.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: staged/${{ steps.ver.outputs.archive }}
+
       - name: Upload C API artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: capi-${{ matrix.target }}
           path: staged/${{ steps.ver.outputs.archive }}
-
-  publish-tensor:
-    name: Publish edgefirst-tensor
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    needs: [build-wheels, verify-publish-manifests, build-capi]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    environment:
-      name: pypi
-      url: https://pypi.org/project/edgefirst-tensor/
-    permissions:
-      id-token: write
-    steps:
-      - name: Download tensor wheels
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          pattern: wheels-*-tensor
-          path: dist
-          merge-multiple: true
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
-        with:
-          skip-existing: true
-
-  publish-dependents:
-    name: Publish edgefirst-${{ matrix.pkg }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    needs: [publish-tensor]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    strategy:
-      # Sequential so a partial-publish failure is unambiguous about which
-      # package got through.
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        pkg: [codec, image, decoder, tracker]
-    environment:
-      name: pypi
-      url: https://pypi.org/project/edgefirst-${{ matrix.pkg }}/
-    permissions:
-      id-token: write
-    steps:
-      - name: Download ${{ matrix.pkg }} wheels
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          pattern: wheels-*-${{ matrix.pkg }}
-          path: dist
-          merge-multiple: true
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
-        with:
-          skip-existing: true
-
-  verify-release:
-    name: Verify the published set installs
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    needs: [publish-dependents]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
-        with:
-          python-version: '3.11'
-      - name: Install each package into a clean environment
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          for p in edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker; do
-            python -m venv "/tmp/v-$p"
-            ok=0
-            # PyPI's index is eventually consistent; a fresh release can 404 for
-            # a short while. Retry rather than yanking a good release.
-            for attempt in 1 2 3 4 5 6; do
-              if "/tmp/v-$p/bin/pip" install --quiet "$p==$VERSION"; then ok=1; break; fi
-              echo "attempt $attempt: $p==$VERSION not installable yet; waiting"
-              sleep 20
-            done
-            if [ "$ok" -ne 1 ]; then
-              echo "::error::$p==$VERSION never became installable."
-              echo "::error::The release is partial. Yank every distribution"
-              echo "::error::already published at $VERSION and re-release with a"
-              echo "::error::new patch version -- PyPI forbids re-uploading one."
-              exit 1
-            fi
-            mod="edgefirst.${p#edgefirst-}"
-            "/tmp/v-$p/bin/python" -c "import $mod; print('$mod ok')"
-          done
-
-      - name: Verify a codec-only install does not pull the image stack
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          python -m venv /tmp/v-codec-only
-          /tmp/v-codec-only/bin/pip install --quiet "edgefirst-codec==$VERSION"
-          if /tmp/v-codec-only/bin/pip list --format=freeze | grep -q '^edgefirst-image='; then
-            echo "::error::edgefirst-codec pulled in edgefirst-image; the split is not doing its job"
-            exit 1
-          fi
-          echo "codec-only install is clean"
-
-  publish-crates:
-    name: Publish to crates.io
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    needs: [build-wheels, verify-publish-manifests, build-capi]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    environment:
-      name: crates-io
-      url: https://crates.io/crates/edgefirst-tensor/
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
-        with:
-          toolchain: ${{ env.RUST_STABLE_VERSION }}
-          # rust-toolchain.toml pins these components, so rustup installs them
-          # on the first cargo invocation if the action did not. That install
-          # races an already-present cargo-fmt on the ARM image and aborts the
-          # build with "failed to install component: 'rustfmt-preview-...',
-          # detected conflict: 'bin/cargo-fmt'". Naming them here means the
-          # toolchain arrives complete and rustup has nothing left to add.
-          components: clippy, rustfmt
-
-      - name: Authenticate to crates.io (Trusted Publishing)
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
-        id: auth
-
-      - name: Publish crates to crates.io (dependency order)
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          set -euo pipefail
-          publish_one() {
-            local crate="$1"
-            echo "==> ${crate}"
-            if output=$(cargo publish --no-verify -p "${crate}" 2>&1); then
-              echo "${output}"
-              return 0
-            fi
-            echo "${output}"
-            if echo "${output}" | grep -qE "already uploaded|already exists on crates.io"; then
-              echo "::warning::${crate} already published — skipping"
-              return 0
-            fi
-            return 1
-          }
-          # Leaves first so dependents can resolve the new version on crates.io.
-          # `cargo publish` (even --no-verify) resolves the FULL dependency
-          # graph while packaging -- every `edgefirst-*` entry in Cargo.toml,
-          # optional or not, must already be on crates.io at this exact
-          # version. edgefirst-image optionally depends on both
-          # edgefirst-decoder and edgefirst-tracker (crates/image/Cargo.toml),
-          # so it must publish after both, not before either -- v0.29.3's
-          # tag push had image third-from-last but decoder and tracker after
-          # it, and failed packaging image with "failed to select a version
-          # for the requirement `edgefirst-decoder = \"^0.29.3\"`" before
-          # either had been published.
-          for crate in \
-            edgefirst-decoder-abi \
-            edgefirst-tensor-abi \
-            edgefirst-tensor-ffi \
-            edgefirst-egl \
-            edgefirst-gl \
-            edgefirst-tensor \
-            edgefirst-codec \
-            edgefirst-tracker \
-            edgefirst-decoder \
-            edgefirst-image
-          do
-            publish_one "${crate}"
-            sleep 15
-          done
+          retention-days: 30
 
   sbom:
     name: Generate SBOM
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [verify-version]
     uses: ./.github/workflows/sbom.yml
-
-  create-release:
-    name: Create GitHub Release
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    needs: [build-wheels, build-capi, sbom]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          # Full history + all tags so the make_latest comparison below can see
-          # every released version, not just the one being tagged.
-          fetch-depth: 0
-
-      - name: Download wheel artifacts (all five packages)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-
-      - name: Download C API artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          pattern: capi-*
-          path: dist
-          merge-multiple: true
-
-      - name: Download SBOM
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          name: sbom-${{ github.sha }}
-          path: dist
-
-      # The shared SBOM workflow uploads sbom.json alone; NOTICE is a tracked
-      # file and generate_sbom.sh has already validated it against this SBOM.
-      - name: Stage NOTICE alongside the SBOM
-        run: cp NOTICE dist/NOTICE
-
-      - name: Extract changelog
-        id: changelog
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          awk "/## \[$VERSION\]/,/^## \[/{if (/^## \[/ && !found) {found=1; next} if (/^## \[/ && found) exit; if (found) print}" CHANGELOG.md > RELEASE_NOTES.md || echo "Release $VERSION" > RELEASE_NOTES.md
-
-      - name: Determine 'Latest' eligibility
-        id: latest
-        # Only the highest stable semver tag is marked as the repo's "Latest"
-        # release. A back-version maintenance patch (e.g. v0.22.2 tagged after
-        # v0.24.x already shipped) is published as a normal, non-latest release
-        # so it never displaces the current line's badge. rc tags are excluded
-        # from the comparison and never become Latest. GITHUB_REF is the tag
-        # ref (trusted, matches the workflow's tag trigger pattern).
-        run: |
-          CURRENT="${GITHUB_REF#refs/tags/}"
-          HIGHEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
-          if [ "$CURRENT" = "$HIGHEST" ]; then
-            echo "make_latest=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "make_latest=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Tag $CURRENT (highest stable: $HIGHEST) -> make_latest=$([ "$CURRENT" = "$HIGHEST" ] && echo true || echo false)"
-
-      - name: Checksums
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
-        with:
-          subject-path: dist/*
-
-      - name: Create Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
-        with:
-          files: dist/*
-          body_path: RELEASE_NOTES.md
-          draft: false
-          prerelease: ${{ contains(github.ref, 'rc') }}
-          make_latest: ${{ steps.latest.outputs.make_latest }}

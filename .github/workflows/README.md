@@ -15,7 +15,8 @@ and are pinned by commit SHA in `uses:`.
 | **Nightly** | 03:17 UTC if `main` moved since the last nightly that reached a verdict | Full + G13 differential + Sonar `main` baseline |
 | **Advisories** | 03:17 UTC, every night, gated or not | `cargo audit`. Ungated on purpose: the RustSec database moves whether the code does or not |
 | **Mutation** | 04:47 UTC, every night | one rotating slice of the mutant corpus, fanned across free runners |
-| **Release** | `vX.Y.Z` tag from `tag-release.yml` | wheels, C-API, PyPI, crates.io, GitHub Release |
+| **Release build** | push to `release/X.Y.Z` | wheels, C-API, SBOM, provenance — built and uploaded, nothing published |
+| **Publish** | `vX.Y.Z` tag from `tag-release.yml` | PyPI, crates.io, GitHub Release, from the artifacts the release build produced |
 
 Draft PRs run nothing. Open as draft, mark ready when you want Quick.
 
@@ -32,9 +33,12 @@ Add **`ci:full`** before approving when the PR touches the build system, `unsafe
 | `nightly.yml` | Change-gated nightly. Also calls the ungated shared `advisories.yml` |
 | `mutants.yml` | Mutation testing. Own schedule, sharded across parallel free runners, gated by nothing |
 | `differential.yml` | G13; nightly and manual only |
-| `tag-release.yml` | Shared caller: merged `release/X.Y.Z` → annotated `vX.Y.Z` |
-| `release.yml` | HAL publish path (wheels / C-API / PyPI / crates). Filename and `pypi` environment stay here — PyPI Trusted Publishing cannot use a reusable workflow in another repo. |
-| `sbom.yml` | Caller of the shared full scancode SBOM. `release.yml` attaches it. |
+| `release.yml` | Release **build**, on push to `release/X.Y.Z`. Wheels, C-API archives, SBOM, provenance. Publishes nothing. |
+| `tag-release.yml` | Shared caller: merged `release/X.Y.Z` → annotated `vX.Y.Z`, and only if `release.yml` is green for that commit (`require-build`). |
+| `publish.yml` | Release **deploy**, on a `vX.Y.Z` tag. Resolves the `release.yml` run, binds it by tree SHA, and publishes to PyPI, crates.io and GitHub Releases. Compiles nothing. Filename and `pypi` environment stay here — PyPI Trusted Publishing cannot use a reusable workflow in another repo. |
+| `sbom.yml` | Caller of the shared full scancode SBOM. `release.yml` runs it; `publish.yml` attaches its artifact. |
+
+**A tag deploys; it never builds.** Five of hal's nine release tags failed, and every one of those was a build failure reached only at deploy time. Under this split those are red release PRs. Rehearse `publish.yml` with its `workflow_dispatch` before the first tag after any change to it — it verifies everything and publishes nothing.
 | `sonar.yml` | Coverage upload, called by both `ci.yml` (PR decoration) and `nightly.yml` (`main` baseline) |
 | `benchmark.yml` | `workflow_dispatch` only |
 
