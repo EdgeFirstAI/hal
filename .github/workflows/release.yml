@@ -12,10 +12,11 @@
 #
 # It runs on `push` to the release branch, not on `pull_request`. A
 # pull_request run builds a merge-preview commit that exists nowhere in
-# history, so publish.yml could never bind its artifacts to the tag; a push
-# run builds the branch head, which is the commit the release PR merges.
-# Confining it to release branches is also what keeps a 9-lane build off
-# every ordinary push.
+# history, so publish.yml could never bind its artifacts to the tag. A push
+# run builds the branch head, and a squash merge reproduces that head's TREE
+# on main even though the commit is a new one -- which is why publish.yml
+# binds by tree rather than by commit. Confining this to release branches is
+# also what keeps a 9-lane build off every ordinary push.
 #
 # Why it moved off the tag: five of hal's nine release tags failed, and every
 # one of those was a build failure reached only at deploy time -- never a

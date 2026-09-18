@@ -370,7 +370,8 @@ Workflows are in `.github/workflows/`. HAL uses three tiers — see
   `release/X.Y.Z` runs `release.yml`, which builds every wheel and C-API
   archive and uploads them; merging that PR with `ci:full` runs
   `tag-release.yml`, which refuses to create the annotated tag unless that
-  build is green for the merged commit; the tag runs `publish.yml`, which
+  build is green for the release-branch head it is merging; the tag runs
+  `publish.yml`, which
   ships the artifacts that already exist and builds nothing. Never tag by
   hand.
 

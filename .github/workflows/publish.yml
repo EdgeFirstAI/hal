@@ -121,11 +121,136 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: python3 .github/scripts/verify_version.py "${VERSION}"
 
+
+  # Everything a rehearsal can prove without publishing anything.
+  #
+  # Deliberately NOT gated on `publishing`. A workflow_dispatch has to be able
+  # to fail on a missing, mis-versioned or expired artifact BEFORE the tag
+  # exists -- that is what the rehearsal is for, and a job skipped during a
+  # rehearsal proves nothing. It also runs ahead of every publish job on a real
+  # tag, so a bad artifact set now fails before the first irreversible upload
+  # rather than after edgefirst-tensor is already on PyPI.
+  #
+  # It validates by downloading rather than by running the publish jobs
+  # unguarded, so a rehearsal never enters the `pypi` or `crates-io`
+  # environments, never trips their protection rules and never has their
+  # credentials in scope.
+  validate-artifacts:
+    name: Validate the built artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [resolve]
+    permissions:
+      contents: read
+      actions: read      # download the release build run's artifacts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Download wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download C API archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          pattern: capi-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          run-id: ${{ needs.resolve.outputs.run-id }}
+          github-token: ${{ github.token }}
+          name: sbom
+          path: dist
+
+      - name: The release set is complete and carries this version
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          fail=0
+          note() { echo "::error::$1"; fail=1; }
+
+          # Five distributions, four platforms each. A package with no wheel at
+          # all is the failure that used to reach PyPI as a partial release.
+          for pkg in tensor codec image decoder tracker; do
+            n="$(find dist -name "edgefirst_${pkg}-${VERSION}-*.whl" | wc -l | tr -d ' ')"
+            if [[ "$n" -eq 0 ]]; then
+              note "no edgefirst_${pkg} wheels at ${VERSION}"
+            else
+              echo "ok  edgefirst_${pkg}: ${n} wheels"
+            fi
+          done
+
+          # Any wheel carrying another version means a lane built from a
+          # different tree; PyPI would take it and never let it be replaced.
+          while IFS= read -r w; do
+            case "$(basename "$w")" in
+              *-"${VERSION}"-*) ;;
+              *) note "$(basename "$w") does not carry ${VERSION}" ;;
+            esac
+          done < <(find dist -name '*.whl')
+
+          # One archive per C-API target.
+          for t in x86_64-linux aarch64-linux aarch64-macos x86_64-macos x86_64-windows; do
+            case "$t" in
+              *-linux) ext=tar.gz ;;
+              *) ext=zip ;;
+            esac
+            if [[ -f "dist/edgefirst-hal-${VERSION}-${t}.${ext}" ]]; then
+              echo "ok  edgefirst-hal-${VERSION}-${t}.${ext}"
+            else
+              note "missing edgefirst-hal-${VERSION}-${t}.${ext}"
+            fi
+          done
+
+          if [[ -f dist/sbom.json ]]; then
+            echo "ok  sbom.json"
+          else
+            note "sbom.json missing"
+          fi
+
+          echo "--- release set ---"
+          find dist -type f | sort | sed 's/^/  /'
+          exit "$fail"
+
+      - name: The changelog has notes for this version
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          # create-release renders the body from this section. An absent one
+          # ships a release with empty notes, and on a real tag that is found
+          # only after the packages are already public.
+          awk "/## \[$VERSION\]/,/^## \[/{if (/^## \[/ && !found) {found=1; next} if (/^## \[/ && found) exit; if (found) print}" \
+            CHANGELOG.md > RELEASE_NOTES.md
+          if [[ ! -s RELEASE_NOTES.md ]]; then
+            echo "::error file=CHANGELOG.md::no '## [$VERSION]' section — the release would ship empty notes"
+            exit 1
+          fi
+          {
+            echo "### Release notes for ${VERSION}"
+            echo '```'
+            cat RELEASE_NOTES.md
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish-tensor:
     name: Publish edgefirst-tensor
     runs-on: ubuntu-22.04
     timeout-minutes: 15
-    needs: [resolve, verify-version]
+    needs: [resolve, verify-version, validate-artifacts]
     if: needs.resolve.outputs.publishing == 'true'
     environment:
       name: pypi
@@ -234,7 +359,7 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    needs: [resolve, verify-version]
+    needs: [resolve, verify-version, validate-artifacts]
     if: needs.resolve.outputs.publishing == 'true'
     environment:
       name: crates-io
@@ -315,7 +440,7 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-22.04
     timeout-minutes: 15
-    needs: [resolve, verify-version]
+    needs: [resolve, verify-version, validate-artifacts]
     if: needs.resolve.outputs.publishing == 'true'
     permissions:
       contents: write

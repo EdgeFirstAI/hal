@@ -34,13 +34,13 @@ Add **`ci:full`** before approving when the PR touches the build system, `unsafe
 | `mutants.yml` | Mutation testing. Own schedule, sharded across parallel free runners, gated by nothing |
 | `differential.yml` | G13; nightly and manual only |
 | `release.yml` | Release **build**, on push to `release/X.Y.Z`. Wheels, C-API archives, SBOM, provenance. Publishes nothing. |
-| `tag-release.yml` | Shared caller: merged `release/X.Y.Z` → annotated `vX.Y.Z`, and only if `release.yml` is green for that commit (`require-build`). |
+| `tag-release.yml` | Shared caller: merged `release/X.Y.Z` → annotated `vX.Y.Z`, and only if `release.yml` is green for the release-branch head being merged (`require-build`). |
 | `publish.yml` | Release **deploy**, on a `vX.Y.Z` tag. Resolves the `release.yml` run, binds it by tree SHA, and publishes to PyPI, crates.io and GitHub Releases. Compiles nothing. Filename and `pypi` environment stay here — PyPI Trusted Publishing cannot use a reusable workflow in another repo. |
 | `sbom.yml` | Caller of the shared full scancode SBOM. `release.yml` runs it; `publish.yml` attaches its artifact. |
-
-**A tag deploys; it never builds.** Five of hal's nine release tags failed, and every one of those was a build failure reached only at deploy time. Under this split those are red release PRs. Rehearse `publish.yml` with its `workflow_dispatch` before the first tag after any change to it — it verifies everything and publishes nothing.
 | `sonar.yml` | Coverage upload, called by both `ci.yml` (PR decoration) and `nightly.yml` (`main` baseline) |
 | `benchmark.yml` | `workflow_dispatch` only |
+
+**A tag deploys; it never builds.** Five of hal's nine release tags failed, and every one of those was a build failure reached only at deploy time. Under this split those are red release PRs. Rehearse `publish.yml` with its `workflow_dispatch` before the first tag after any change to it — it verifies everything and publishes nothing.
 
 Mutation testing lives in its own workflow rather than the nightly. The corpus is ~7057 mutants and roughly 39 hours of work, so it cannot finish in one sitting; as a nightly job it capped at 120 minutes, got through 5%, never once completed, and held the run open for two hours after every other lane had finished. It now tests a rotating window of shards each night across parallel free runners, sweeping the corpus and rolling over. Parallelism is a matrix of runners, not cargo-mutants' `--jobs`, which is incompatible with `--in-place` because each parallel job needs its own tree and target directory.
 
