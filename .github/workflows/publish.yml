@@ -94,7 +94,7 @@ jobs:
       publishing: ${{ steps.resolve.outputs.publishing }}
     steps:
       - id: resolve
-        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@68dd89aa7f781e2a26f2fdb6430c6a43368f9063
+        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@801b787edc47b9ad5d2d890c2828fa8cc286eea5
         with:
           build-workflow: release.yml
           tag: ${{ inputs.tag }}
