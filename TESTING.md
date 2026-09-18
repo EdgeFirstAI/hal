@@ -34,12 +34,14 @@ lives in each sub-crate's `TESTING.md`:
 | `make test` | Run all tests (Rust + Python + C API) with coverage |
 | `make test-rust` | Run Rust tests only with `cargo-llvm-cov nextest` |
 | `make test-python` | Run Python tests with pytest (and slipcover if available) |
+| `make install-python` | Install the bindings from their source directories (the PEP 517 path `make test-python` uses). `PYTHON_PACKAGES=tensor` narrows it to one package — hal-full.yml's macOS job runs exactly that as the regression gate for issue #199 |
 | `make test-capi-modular` | Build and test the five modular C libraries |
 | `make test-capi-link` | Compile headers as C11/C++17 and link-run one consumer per library |
 | `make test-ontarget` | Run the suite on the board fleet over SSH. Not part of `make test` — needs the boards reachable — but it is the **only** evidence that counts for DMA, G2D and embedded-GL work. `BOARDS='imx95-frdm rpi5-hailo'` selects a subset |
 | `make test-cuda` | CUDA device-pointer tests. Not part of `make test` — needs a CUDA GPU and `libcudart` at runtime, and skips cleanly without them |
 | `make bench` | Run the workspace Rust benchmarks (custom `harness = false` binaries backed by [`crates/bench`](https://github.com/EdgeFirstAI/hal/tree/main/crates/bench); not Criterion) |
 | `make build` | Build with coverage instrumentation (profiling profile) |
+| `make check-macho` | Assert every shipped Mach-O has an 8-byte-aligned LINKEDIT string pool (issue #200). Pure file parsing, so it is meaningful on any OS; `make wheel` and `make package` already run it over what they produce |
 | `make format lint check` | Pre-commit gate — required before every commit |
 
 Each modular C library also has C tests under `crates/{tensor,codec,image,decoder,tracker}-capi/tests/`.
@@ -1365,3 +1367,5 @@ devices where the optimization silently can't engage.
 | GL tests all skip | No EGL display available | Expected on headless CI; set `DISPLAY` or use a virtual framebuffer |
 | `EDGEFIRST_TESTDATA_DIR not set` panic | Running cross-compiled bench without env | Export `EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata` on target |
 | CI fmt / clippy failure | Local gate skipped | Run `make format lint check` before committing |
+| macOS: `Cannot repair wheel, because required library @rpath/libedgefirst_tensor.0.dylib could not be located` | maturin's wheel-repair step ran. It resolves `@rpath/...` against link-time search paths and cannot see the library `crates/python-tensor/build.rs` stages into `python-source`, so it calls an already self-contained wheel unrepairable | `make test-python` now sets `MATURIN_PEP517_ARGS="--auditwheel skip"`; pass the same when running `pip install crates/python-*/` by hand (issue #199) |
+| macOS: `ImportError: dlopen(...): mis-aligned LINKEDIT string pool` | rustc strips Apple binaries with its own in-process Mach-O writer, leaving the string pool 4-byte aligned whenever the binary's `nindirectsyms` is odd; dyld on macOS 26+ rejects it | `.cargo/config.toml` hands the strip back to Apple's linker (`-C strip=none -C link-arg=-Wl,-x`). Confirm with `make check-macho`; if it is red, check nothing has overridden `RUSTFLAGS` (issue #200) |
