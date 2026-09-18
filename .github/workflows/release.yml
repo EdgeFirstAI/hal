@@ -103,6 +103,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # rust-toolchain.toml pins these components, so rustup installs them
+          # on the first cargo invocation if the action did not. That install
+          # races an already-present cargo-fmt on the ARM image and aborts the
+          # build with "failed to install component: 'rustfmt-preview-...',
+          # detected conflict: 'bin/cargo-fmt'". Naming them here means the
+          # toolchain arrives complete and rustup has nothing left to add.
+          components: clippy, rustfmt
       - name: cargo package every publishable crate
         run: |
           set -euo pipefail
@@ -121,6 +128,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
+      # Matches build-capi. Without it one platform's failure cancels the rest,
+      # so a run reports a single broken lane and hides whatever else is also
+      # broken -- and this workflow can only be exercised by a dispatch or a
+      # tag, which makes every wasted run expensive.
+      fail-fast: false
       matrix:
         include:
           - name: x86_64-linux
@@ -165,6 +177,13 @@ jobs:
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # rust-toolchain.toml pins these components, so rustup installs them
+          # on the first cargo invocation if the action did not. That install
+          # races an already-present cargo-fmt on the ARM image and aborts the
+          # build with "failed to install component: 'rustfmt-preview-...',
+          # detected conflict: 'bin/cargo-fmt'". Naming them here means the
+          # toolchain arrives complete and rustup has nothing left to add.
+          components: clippy, rustfmt
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -366,6 +385,13 @@ jobs:
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # rust-toolchain.toml pins these components, so rustup installs them
+          # on the first cargo invocation if the action did not. That install
+          # races an already-present cargo-fmt on the ARM image and aborts the
+          # build with "failed to install component: 'rustfmt-preview-...',
+          # detected conflict: 'bin/cargo-fmt'". Naming them here means the
+          # toolchain arrives complete and rustup has nothing left to add.
+          components: clippy, rustfmt
 
       - name: Add cross-compile target
         if: matrix.rust_target != ''
@@ -598,6 +624,13 @@ jobs:
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
+          # rust-toolchain.toml pins these components, so rustup installs them
+          # on the first cargo invocation if the action did not. That install
+          # races an already-present cargo-fmt on the ARM image and aborts the
+          # build with "failed to install component: 'rustfmt-preview-...',
+          # detected conflict: 'bin/cargo-fmt'". Naming them here means the
+          # toolchain arrives complete and rustup has nothing left to add.
+          components: clippy, rustfmt
 
       - name: Authenticate to crates.io (Trusted Publishing)
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
