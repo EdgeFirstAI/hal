@@ -128,7 +128,7 @@ jobs:
             maturin-args: --sdist --zig --compatibility manylinux2014
             maturin-deps: maturin[patchelf,zig]
           - name: aarch64-linux
-            runner: ubuntu-24.04-arm-xlarge
+            runner: ubuntu-24.04-arm
             maturin-args: --zig --compatibility manylinux2014
             maturin-deps: maturin[patchelf,zig]
           - name: windows
@@ -142,10 +142,11 @@ jobs:
 
     steps:
       - name: Install git-lfs (aarch64 runner)
-        # The ARM larger runner image does not ship git-lfs; the x86_64 one
-        # does. actions/checkout shells out to it for `lfs: true`, so without
-        # this the job dies on its very first step with "Unable to locate
-        # executable file: git-lfs". Installed before that checkout, not after,
+        # Defensive. The standard ARM image ships git-lfs, but the larger one
+        # this lane used to run on did not, and actions/checkout shells out to
+        # it for `lfs: true` -- the job then dies on its very first step with
+        # "Unable to locate executable file: git-lfs". apt is a no-op when it
+        # is already present. Installed before that checkout, not after,
         # because it is the checkout itself that needs it.
         if: matrix.name == 'aarch64-linux'
         run: |
@@ -173,19 +174,21 @@ jobs:
       - name: Install maturin
         run: pip install ${{ matrix.maturin-deps }}
 
-      - name: Install lld (aarch64 runner)
-        # The ARM runner does not ship lld by default, unlike the x86_64 one
-        # (x86_64) -- recent stable rustc defaults to -fuse-ld=lld on Linux.
-        # tensor/codec/image/decoder's build.rs nested-builds the
-        # workspace-excluded edgefirst-tensor-capi via a plain `cargo build`
-        # (not routed through maturin's --zig cross-compiler), so it links
-        # natively and hits the same "collect2: fatal error: cannot find
-        # 'ld'" the build-capi job's aarch64 runner hit -- see that job's
-        # identically-named step, and test.yml's aarch64 lane.
+      - name: Install build dependencies (aarch64 runner)
+        # The ARM image ships neither lld nor a C compiler; the x86_64 one has
+        # both. Recent stable rustc defaults to -fuse-ld=lld on Linux, so
+        # without lld a bare build fails at link time with "collect2: fatal
+        # error: cannot find 'ld'". build-essential is what supplies `cc`:
+        # cargo-zigbuild's toolchain covers the TARGET, while build scripts
+        # compile for the HOST, so without it every build script in the graph
+        # fails with "linker `cc` not found". tensor/codec/image/decoder's
+        # build.rs also nested-builds the workspace-excluded
+        # edgefirst-tensor-capi through a plain `cargo build` rather than
+        # maturin's --zig path, so that links natively too.
         if: matrix.name == 'aarch64-linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y lld
+          sudo apt-get install -y lld build-essential
 
       - name: Fetch ANGLE (Windows x64)
         # The Windows edgefirst-image wheel bundles ANGLE's libEGL.dll +
@@ -322,7 +325,7 @@ jobs:
             rust_target: ''
             libdir: target/release
           - target: aarch64-linux
-            runner: ubuntu-24.04-arm-xlarge
+            runner: ubuntu-24.04-arm
             rust_target: ''
             libdir: target/release
           - target: aarch64-macos
@@ -340,10 +343,11 @@ jobs:
 
     steps:
       - name: Install git-lfs (aarch64 runner)
-        # The ARM larger runner image does not ship git-lfs; the x86_64 one
-        # does. actions/checkout shells out to it for `lfs: true`, so without
-        # this the job dies on its very first step with "Unable to locate
-        # executable file: git-lfs". Installed before that checkout, not after,
+        # Defensive. The standard ARM image ships git-lfs, but the larger one
+        # this lane used to run on did not, and actions/checkout shells out to
+        # it for `lfs: true` -- the job then dies on its very first step with
+        # "Unable to locate executable file: git-lfs". apt is a no-op when it
+        # is already present. Installed before that checkout, not after,
         # because it is the checkout itself that needs it.
         if: matrix.target == 'aarch64-linux'
         run: |
@@ -367,16 +371,16 @@ jobs:
         if: matrix.rust_target != ''
         run: rustup target add ${{ matrix.rust_target }}
 
-      - name: Install lld (aarch64 runner)
-        # The ARM runner does not ship lld by default, unlike the x86_64 one
-        # (x86_64) -- recent stable rustc defaults to -fuse-ld=lld on Linux,
-        # so a bare build here fails at link time with "collect2: fatal
-        # error: cannot find 'ld'". test.yml's aarch64 runners already
-        # install it for the same reason (`Install build dependencies`).
+      - name: Install build dependencies (aarch64 runner)
+        # The ARM image ships neither lld nor a C compiler; the x86_64 one has
+        # both. Recent stable rustc defaults to -fuse-ld=lld on Linux, so a
+        # bare build fails at link time with "collect2: fatal error: cannot
+        # find 'ld'", and a build script with no `cc` fails before that. See
+        # the build-wheels job's identically-named step.
         if: matrix.target == 'aarch64-linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y lld
+          sudo apt-get install -y lld build-essential
 
       - name: Build the five modular C API libraries
         shell: bash
