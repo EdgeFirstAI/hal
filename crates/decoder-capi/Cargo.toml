@@ -4,7 +4,7 @@
 [package]
 name = "edgefirst-decoder-capi"
 description = "C API for EdgeFirst model output decoding"
-version = "0.32.0"
+version = "0.32.1"
 edition = "2021"
 rust-version = "1.94.0"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]

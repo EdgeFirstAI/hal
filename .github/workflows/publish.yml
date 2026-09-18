@@ -94,7 +94,7 @@ jobs:
       publishing: ${{ steps.resolve.outputs.publishing }}
     steps:
       - id: resolve
-        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@801b787edc47b9ad5d2d890c2828fa8cc286eea5
+        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@dd267cca3c13cd323fc1e3c1db06fe9b34fc0795
         with:
           build-workflow: release.yml
           tag: ${{ inputs.tag }}
@@ -233,12 +233,7 @@ jobs:
           # create-release renders the body from this section. An absent one
           # ships a release with empty notes, and on a real tag that is found
           # only after the packages are already public.
-          awk "/## \[$VERSION\]/,/^## \[/{if (/^## \[/ && !found) {found=1; next} if (/^## \[/ && found) exit; if (found) print}" \
-            CHANGELOG.md > RELEASE_NOTES.md
-          if [[ ! -s RELEASE_NOTES.md ]]; then
-            echo "::error file=CHANGELOG.md::no '## [$VERSION]' section — the release would ship empty notes"
-            exit 1
-          fi
+          python3 .github/scripts/extract_release_notes.py CHANGELOG.md "$VERSION" > RELEASE_NOTES.md
           {
             echo "### Release notes for ${VERSION}"
             echo '```'
@@ -496,8 +491,7 @@ jobs:
         id: changelog
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          awk "/## \[$VERSION\]/,/^## \[/{if (/^## \[/ && !found) {found=1; next} if (/^## \[/ && found) exit; if (found) print}" CHANGELOG.md > RELEASE_NOTES.md || echo "Release $VERSION" > RELEASE_NOTES.md
+        run: python3 .github/scripts/extract_release_notes.py CHANGELOG.md "$VERSION" > RELEASE_NOTES.md
 
       - name: Determine 'Latest' eligibility
         id: latest
