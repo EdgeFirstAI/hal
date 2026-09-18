@@ -6,8 +6,9 @@
 # Quick tier and the local copy here. They disagreed.
 #
 # Dependency-mode SBOM and license policy run in Quick (inside rust-quick).
-# This workflow is the full scancode source scan, called from release.yml and
-# available on demand.
+# This workflow is the full scancode source scan, called from release.yml (the
+# release-branch build) and available on demand. publish.yml downloads its
+# artifact rather than re-running it.
 #
 # Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 
@@ -23,7 +24,7 @@ concurrency:
 
 jobs:
   sbom:
-    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@2c285adecb450875301984b87acc1225b9d068d7
+    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@f86411f9b2c7a2dbd12f65f1d9f233b08084e142
     with:
       mode: full
       # A graph is resolved per target, so this Linux runner would otherwise miss
@@ -56,5 +57,12 @@ jobs:
       version-file: Cargo.toml
       source-dirs: crates tests
       timeout-minutes: 20
-      # release.yml downloads this name to attach the SBOM to the release.
-      upload-name: sbom-${{ github.sha }}
+      # publish.yml downloads this name to attach the SBOM to the release. It
+      # is fixed, not sbom-<sha>: the build runs on the release branch head and
+      # publish runs at the tag, which after a squash merge is a different
+      # commit, so a sha-keyed name would never be found.
+      upload-name: sbom
+      # publish.yml consumes this after the release PR merges, which is
+      # human-paced; the 7-day full-mode default would expire a release held
+      # for a week and there is no rebuild to fall back on.
+      retention-days: "30"

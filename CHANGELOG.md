@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The release is now three workflows with one action each, and **a tag deploys without building**. `release.yml` triggers on a push to `release/X.Y.Z` and builds every wheel, C-API archive and the SBOM; `tag-release.yml` creates the annotated `vX.Y.Z` tag on merge, and refuses to create one unless that build is green for the commit being merged; a new `publish.yml` triggers on the tag, resolves the run that built the artifacts, verifies its tree matches the tag's, and publishes to PyPI, crates.io and GitHub Releases without compiling anything.
+
+  `release.yml` previously built and published on the tag and had no `pull_request` trigger, so its build ran at the one point in the process nothing could test it. Five of the nine release tags to date failed, and every one of those was a build failure at deploy time rather than a publishing failure: v0.32.0 failed three times in a row on a runner image without `git-lfs`, then the same image without a C compiler, then a `rust-toolchain.toml` component conflict, and `Build wheels (aarch64-linux)` had already failed the same way in v0.29.1 and v0.29.2. Each retry required deleting and re-pushing a tag the release ruleset exists to make immutable. Those failures now appear on the release PR.
+
+  Artifacts are bound to the tag by **tree SHA rather than commit SHA**, since a squash merge changes the commit and not the tree, and are held for 30 days because the release-PR-to-tag gap is human-paced. A missing, expired or mismatched artifact fails the publish; there is no fallback to a build.
+
+- Build provenance is attested where the artifacts are built rather than where they are uploaded. Attesting a downloaded file describes the download; attesting it at build time describes the build that produced what consumers receive.
+
+- `cargo publish` remains on the tag path and is the single exception to "the tag builds nothing", because it has no pre-built input. `--no-verify` keeps the verification compile off that path, and the release branch has already packaged the same tree.
+
+### Operational
+
+- **PyPI and crates.io Trusted Publishers must be re-pointed from `release.yml` to `publish.yml` before the next tag.** Both match a publisher on the workflow filename, so all five PyPI distributions and all ten crates will fail to upload until their publisher configuration names the new file. A `publish.yml` rehearsal does not catch this, because a rehearsal skips the upload.
+
 ## [0.32.0] - 2026-09-17
 
 ### Security
