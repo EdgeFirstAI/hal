@@ -150,7 +150,7 @@ jobs:
 
           echo "=== System Info ==="
           uname -a
-          cat /proc/cpuinfo | head -30
+          head -30 /proc/cpuinfo
           free -h
           echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
           echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
