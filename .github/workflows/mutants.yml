@@ -167,7 +167,7 @@ jobs:
       # back to building it from source. That costs a few minutes per job
       # against a 120-minute cap and needs no handling; it is only worth
       # knowing before someone reads the arm lane's setup step as a hang.
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
         with:
           tool: cargo-mutants
 
