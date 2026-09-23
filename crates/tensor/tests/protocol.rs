@@ -8,10 +8,12 @@ use edgefirst_tensor::{
     format_from_code, tensor_dtype as dtype, tensor_format, tensor_kind, Colorimetry, CpuAccess,
     PixelFormat, Tensor, TensorDesc, TensorDyn, TensorMemory, ABI_VERSION,
 };
-// Only used by the Linux-only `descriptor_carries_dmabuf_fd_as_handle` below
-// -- importing it unconditionally warns as unused on every other platform.
+
+/// The DMA-heap skip policy, shared with every DMA-gated test so a skip under
+/// `HAL_TEST_REQUIRE_DMA=1` fails instead. Linux-only, like its one caller.
 #[cfg(target_os = "linux")]
-use edgefirst_tensor::Error;
+#[path = "support/dma_require.rs"]
+mod dma_require;
 
 #[test]
 fn descriptor_describes_the_tensor() {
@@ -30,6 +32,18 @@ fn descriptor_describes_the_tensor() {
     assert_eq!(d.shape(), &[32u64, 64, 3]);
     assert_eq!(d.len(), 32 * 64 * 3);
     assert!(!d.is_empty());
+}
+
+#[test]
+fn a_descriptor_with_a_zero_extent_is_empty() {
+    let t = Tensor::<u8>::new(&[4, 4], Some(TensorMemory::Mem), None).expect("alloc");
+    let mut d = TensorDyn::from(t).descriptor();
+    d.shape[0] = 0;
+    assert_eq!(d.len(), 0);
+    assert!(
+        d.is_empty(),
+        "a zero-length dimension addresses no elements"
+    );
 }
 
 #[test]
@@ -314,42 +328,20 @@ fn descriptor_carries_dmabuf_fd_as_handle() {
     use std::os::fd::AsRawFd;
     // On Linux, TensorMemory::DmaBuf is a dma-buf fd; the consumer re-imports
     // zero-copy from the fd carried in `handle`.
-    let t = match Tensor::<u8>::image(
+    if !dma_require::available_or_skip(
+        edgefirst_tensor::is_dma_available(),
+        "descriptor_carries_dmabuf_fd_as_handle",
+    ) {
+        return;
+    }
+    let t = Tensor::<u8>::image(
         16,
         16,
         PixelFormat::Grey,
         Some(TensorMemory::DmaBuf),
         CpuAccess::ReadWrite,
-    ) {
-        Ok(t) => t,
-        // No DMA-BUF heap on this platform (e.g. Jetson Orin, which uses
-        // nvmap and ships with CONFIG_DMABUF_HEAPS unset) -- a capability
-        // gap, not a regression. Two error kinds mean "no heap here":
-        // `NotFound`, when the device node does not exist at all, and
-        // `PermissionDenied`, when it exists but this user cannot open it
-        // (a stock x86 desktop ships /dev/dma_heap/system as 0600 root).
-        // A node you cannot open is exactly as unavailable as one that is
-        // absent, and panicking on it reports a host-configuration fact as
-        // a code failure -- which then has to be re-diagnosed on every
-        // on-target run. Any other error kind still fails this test below
-        // via the match's final arm.
-        Err(Error::IoError(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIPPED: descriptor_carries_dmabuf_fd_as_handle -- this platform has no \
-                 DMA-BUF heap (Tensor::image(.., TensorMemory::DmaBuf, ..) returned \
-                 NotFound); dma-buf allocation is unavailable here, not broken."
-            );
-            return;
-        }
-        Err(e) => panic!("alloc dma: {e:?}"),
-    };
+    )
+    .expect("a usable DMA heap allocates");
     let dyn_t = TensorDyn::from(t);
     let expected_fd = dyn_t.dmabuf().expect("dmabuf fd").as_raw_fd();
     let d = dyn_t.descriptor();
@@ -377,6 +369,11 @@ fn planar_row_stride_does_not_clobber_the_plane_stride() {
     // per-row pitch must land on strides[1], not strides[0] -- overwriting
     // strides[0] corrupts the plane stride while leaving the real row
     // stride at strides[1] unfixed, and PlanarRgb@Dma is a live path.
+    //
+    // The plane stride still follows the pitch: a strided planar tensor is
+    // `C * H` rows of one pitch, so plane 1 starts `H * pitch` bytes in (where
+    // `Tensor::map` and `PixelFormat::plane_table` both put it), not at the
+    // tight `H * W`.
     let mut t = Tensor::<u8>::image(
         640,
         480,
@@ -386,7 +383,6 @@ fn planar_row_stride_does_not_clobber_the_plane_stride() {
     )
     .expect("alloc");
     let natural_row = 640; // width * sizeof(u8), Planar's minimum row stride
-    let natural_plane = 480 * 640; // the packed plane stride, in bytes (u8)
     let padded_row = 704; // > natural_row; u8, so bytes and elements coincide
     t.set_row_stride(padded_row).expect("set_row_stride");
 
@@ -399,8 +395,9 @@ fn planar_row_stride_does_not_clobber_the_plane_stride() {
     );
     assert_eq!(
         d.strides()[0],
-        natural_plane as i64,
-        "the plane-count dimension must not be clobbered by the row pitch"
+        480 * padded_row as i64,
+        "the plane stride is H rows of the padded pitch, not the row pitch itself \
+         and not the tight H * W"
     );
     assert_ne!(natural_row, padded_row, "precondition: pitch actually pads");
 }

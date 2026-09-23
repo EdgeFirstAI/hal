@@ -34,3 +34,18 @@ pub(crate) fn report_skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
 }
+
+#[cfg(test)]
+#[path = "../tests/support/dma_require.rs"]
+mod dma_require;
+
+/// `true` when a DMA-heap test should run; `false` after reporting a skip.
+///
+/// # Panics
+///
+/// When `HAL_TEST_REQUIRE_DMA=1` and no DMA heap is usable -- a lane that is
+/// meant to have one must not report the skipped test as a pass.
+#[cfg(test)]
+pub(crate) fn dma_or_skip(what: &str) -> bool {
+    dma_require::available_or_skip(crate::is_dma_available(), what)
+}

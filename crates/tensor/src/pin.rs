@@ -142,7 +142,8 @@ impl<'a> HostPin<'a> {
         if addr == 0 {
             return 0;
         }
-        1usize << addr.trailing_zeros().min(usize::BITS - 1)
+        // A non-zero address has at most BITS - 1 trailing zeros.
+        1usize << addr.trailing_zeros()
     }
 
     /// The pinned window as a byte slice.
@@ -199,6 +200,9 @@ impl MmapOwner {
 
 #[cfg(all(unix, feature = "static"))]
 impl Drop for MmapOwner {
+    // munmap has no in-process observer that is not racy: probing the range
+    // afterwards can see another thread's new mapping at the same address.
+    #[cfg_attr(test, mutants::skip)]
     fn drop(&mut self) {
         // Nothing useful to do on failure at Drop time; the address space is
         // reclaimed at process exit regardless.
@@ -215,5 +219,39 @@ impl std::fmt::Debug for HostPin<'_> {
             .field("len", &self.len)
             .field("alignment", &self.alignment())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pin over a synthetic address; nothing here dereferences it.
+    fn pin_at(addr: usize, len: usize) -> HostPin<'static> {
+        HostPin::new(Arc::new(()), addr as *mut u8, len)
+    }
+
+    #[test]
+    fn is_empty_tracks_the_length() {
+        assert!(pin_at(0x1000, 0).is_empty());
+        assert!(!pin_at(0x1000, 1).is_empty());
+    }
+
+    #[test]
+    fn alignment_is_the_largest_power_of_two_dividing_the_address() {
+        assert_eq!(pin_at(0, 8).alignment(), 0);
+        assert_eq!(pin_at(0x6, 8).alignment(), 2);
+        assert_eq!(pin_at(0x1040, 8).alignment(), 64);
+        assert_eq!(pin_at(0x1000, 8).alignment(), 4096);
+        let top = 1usize << (usize::BITS - 1);
+        assert_eq!(pin_at(top, 8).alignment(), top);
+    }
+
+    #[test]
+    fn debug_names_the_type_and_its_extent() {
+        let text = format!("{:?}", pin_at(0x1040, 7));
+        assert!(text.contains("HostPin"), "{text}");
+        assert!(text.contains("len: 7"), "{text}");
+        assert!(text.contains("alignment: 64"), "{text}");
     }
 }

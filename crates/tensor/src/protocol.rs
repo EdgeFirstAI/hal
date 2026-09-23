@@ -140,7 +140,9 @@ pub mod flags {
     /// value on the timeline of the fence whose NT handle
     /// [`TensorDesc::ptr`] carries, so a producer that sets this flag must
     /// also fill in `ptr`.
-    pub const SYNC_PRESENT: u32 = 1 << 0;
+    ///
+    /// Bit 0.
+    pub const SYNC_PRESENT: u32 = 1;
 }
 
 /// Backing store kind, as reported in [`TensorDesc::kind`].
@@ -703,6 +705,61 @@ pub(crate) struct DescParts<'a, 'p> {
     pub sync: Option<u64>,
 }
 
+/// Row-major byte strides for `shape`, with the row dimension replaced by
+/// `row_stride` when one is recorded.
+///
+/// The one definition of the stride convention both wire formats carry: the
+/// descriptor ([`from_parts`]) and the blob (`blob::export`). See
+/// [`from_parts`] for which dimension is the row dimension per layout, and
+/// why a planar image's plane stride follows the pitch. Also the source of
+/// the C API's `ef_tensor_strides`, so every surface reports one layout.
+pub fn c_byte_strides(
+    shape: &[u64],
+    esz: i64,
+    layout: Option<crate::PixelLayout>,
+    row_stride: Option<usize>,
+) -> Vec<i64> {
+    let mut strides = vec![0i64; shape.len()];
+    let mut acc = esz;
+    for (stride, dim) in strides.iter_mut().zip(shape).rev() {
+        *stride = acc;
+        acc *= *dim as i64;
+    }
+    let Some(rs) = row_stride.map(|rs| rs as i64) else {
+        return strides;
+    };
+    // A formatted tensor one rank above its image rank is a batch `[N, ...]`
+    // of images stacked at the padded pitch, so the row override applies to
+    // the per-image dims and `N` steps over one padded image.
+    let image_rank = match layout {
+        Some(crate::PixelLayout::SemiPlanar) => Some(2),
+        Some(crate::PixelLayout::Packed | crate::PixelLayout::Planar) => Some(3),
+        None => None,
+    };
+    let batch_dims = match image_rank {
+        Some(rank) if shape.len() == rank + 1 => 1,
+        _ => 0,
+    };
+    let (lead, image) = strides.split_at_mut(batch_dims);
+    let image_bytes = match (layout, image, &shape[batch_dims..]) {
+        (Some(crate::PixelLayout::Planar), [plane, row, _, ..], [planes, rows, ..]) => {
+            *row = rs;
+            *plane = rs * *rows as i64;
+            *plane * *planes as i64
+        }
+        // A rank-1 tensor has no row to pad.
+        (_, [row, _, ..], [rows, ..]) => {
+            *row = rs;
+            rs * *rows as i64
+        }
+        _ => return strides,
+    };
+    if let [n] = lead {
+        *n = image_bytes;
+    }
+    strides
+}
+
 /// Build a descriptor from its parts.
 ///
 /// The single construction site: `TensorDyn::descriptor` and any future
@@ -734,10 +791,12 @@ pub(crate) struct DescParts<'a, 'p> {
 /// * Planar (`[C, H, W]`, e.g. `PlanarRgb`): dimension 1 — dimension 0 there
 ///   is the *plane* count, and clobbering it with the row pitch would
 ///   corrupt the plane stride while leaving the true per-row stride
-///   (dimension 1) unfixed. `Tensor` tracks only one row-pitch scalar (no
-///   separate per-plane stride), so dimension 0 keeps its packed value here
-///   exactly as it did before any padding was known — unchanged, not
-///   recomputed.
+///   (dimension 1) unfixed. Dimension 0 becomes `row_stride * H` instead: a
+///   strided planar tensor stores its planes as `C * H` rows of one pitch,
+///   back to back (the layout `Tensor::map`, `copy_to_flat` and
+///   [`PixelFormat::plane_table`](crate::PixelFormat::plane_table) all
+///   assume), so the tight `H * W * size` would place plane 1 inside plane
+///   0's row padding.
 ///
 /// `row_stride` is a byte pitch and is carried verbatim. It need not be a
 /// whole number of `dtype` elements: `set_row_stride` validates only
@@ -794,37 +853,15 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
     for (i, d) in dims.iter().take(filled).enumerate() {
         shape[i] = *d as u64;
     }
-    // Row-major and contiguous, in BYTES: stride[i] = dtype size * product of
-    // trailing dims. Bytes, not elements, because a hardware pitch need not be
-    // a whole number of elements (and sub-byte dtypes have no element size at
-    // all) -- see the `row_stride` override below.
-    let mut acc: i64 = dtype.size() as i64;
-    // `filled`, not `ndim`: the arrays hold MAX_NDIM slots and `ndim` may now
+    // `filled`, not `ndim`: the arrays hold MAX_NDIM slots and `ndim` may
     // legitimately exceed that.
-    for i in (0..filled).rev() {
-        strides[i] = acc;
-        acc *= shape[i] as i64;
-    }
-    if ndim >= 2 {
-        if let Some(rs) = row_stride {
-            // Planar stacks channels ahead of rows ([C, H, W]): the row
-            // dimension is 1, not 0. Every other layout this protocol
-            // carries (Packed [H, W, C], SemiPlanar [combined_H, W]) has the
-            // row dimension at 0. `format` is `None` for a non-image tensor,
-            // in which case `row_stride` should not have been supplied in
-            // the first place; dimension 0 is a harmless default for that
-            // case since it matches the pre-padding behaviour.
-            let row_dim = match format.map(|f| f.layout()) {
-                Some(crate::PixelLayout::Planar) if ndim >= 3 => 1,
-                _ => 0,
-            };
-            // Bytes in, bytes out. The element-stride representation had to
-            // divide here, and a remainder made the pitch unrepresentable --
-            // it fell back to the packed stride and reported a pitch the
-            // buffer does not have. There is nothing left to get wrong.
-            strides[row_dim] = rs as i64;
-        }
-    }
+    let byte_strides = c_byte_strides(
+        &shape[..filled],
+        dtype.size() as i64,
+        format.map(|f| f.layout()),
+        row_stride,
+    );
+    strides[..filled].copy_from_slice(&byte_strides);
     TensorDesc {
         version: ABI_VERSION,
         kind: desc_kind,
@@ -1140,5 +1177,128 @@ mod quant_desc_tests {
         let err =
             unsafe { desc.to_quantization() }.expect_err("a length with a null array is malformed");
         assert!(err.to_string().contains("null scale array"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod desc_tests {
+    use super::{c_byte_strides, from_parts, DescParts};
+    use crate::{DType, PixelFormat, PixelLayout, TensorMemory};
+
+    #[test]
+    fn a_padded_batch_steps_n_over_one_padded_image() {
+        // [N, H, W, C] = [2, 2, 8, 3] at a 32 B pitch: each tile is 2 rows.
+        assert_eq!(
+            c_byte_strides(&[2, 2, 8, 3], 1, Some(PixelLayout::Packed), Some(32)),
+            [64, 32, 3, 1]
+        );
+        // [N, C, H, W] = [2, 3, 4, 8] at 16 B: 3 planes of 4 rows per image.
+        assert_eq!(
+            c_byte_strides(&[2, 3, 4, 8], 1, Some(PixelLayout::Planar), Some(16)),
+            [192, 64, 16, 1]
+        );
+        // [N, H*k, W] = [2, 6, 8] NV12 at 32 B: 6 combined rows per image.
+        assert_eq!(
+            c_byte_strides(&[2, 6, 8], 1, Some(PixelLayout::SemiPlanar), Some(32)),
+            [192, 32, 1]
+        );
+        // Unformatted rank 4 has no batch reading: the pitch lands on dim 0.
+        assert_eq!(
+            c_byte_strides(&[2, 2, 8, 3], 1, None, Some(64)),
+            [64, 24, 3, 1]
+        );
+    }
+
+    #[test]
+    fn a_tight_tensor_gets_row_major_byte_strides() {
+        assert_eq!(c_byte_strides(&[3, 8], 4, None, None), [32, 4]);
+        assert_eq!(
+            c_byte_strides(&[48, 64, 3], 1, Some(PixelLayout::Packed), None),
+            [192, 3, 1]
+        );
+    }
+
+    #[test]
+    fn a_recorded_pitch_replaces_the_row_stride_of_a_packed_or_semi_planar_image() {
+        assert_eq!(
+            c_byte_strides(&[48, 64, 3], 1, Some(PixelLayout::Packed), Some(256)),
+            [256, 3, 1]
+        );
+        assert_eq!(
+            c_byte_strides(&[48, 64], 1, Some(PixelLayout::SemiPlanar), Some(128)),
+            [128, 1]
+        );
+    }
+
+    /// Planes of a strided planar image are `H` rows of the pitch apart, so
+    /// the plane stride follows the pitch rather than staying `H * W`.
+    #[test]
+    fn a_recorded_pitch_moves_both_the_row_and_the_plane_stride_of_a_planar_image() {
+        assert_eq!(
+            c_byte_strides(&[3, 48, 64], 1, Some(PixelLayout::Planar), Some(128)),
+            [128 * 48, 128, 1]
+        );
+        // Bytes, not elements: an f32 planar image at a 320-byte pitch.
+        assert_eq!(
+            c_byte_strides(&[3, 48, 64], 4, Some(PixelLayout::Planar), Some(320)),
+            [320 * 48, 320, 4]
+        );
+    }
+
+    #[test]
+    fn a_rank_one_tensor_has_no_row_to_pad() {
+        assert_eq!(c_byte_strides(&[16], 1, None, Some(64)), [1]);
+    }
+
+    fn parts(
+        memory: TensorMemory,
+        fence_handle: usize,
+        sync: Option<u64>,
+    ) -> DescParts<'static, 'static> {
+        DescParts {
+            dims: &[48, 64, 3],
+            memory,
+            dtype: DType::U8,
+            fourcc: 0,
+            format: Some(PixelFormat::Rgb),
+            row_stride: None,
+            handle: -1,
+            colorimetry: 0,
+            capacity: 48 * 64 * 3,
+            pin: None,
+            pbo_vtable_ptr: None,
+            fence_handle,
+            sync,
+        }
+    }
+
+    /// Only a D3D11 texture has a fence to name. A completion handed to any
+    /// other kind is dropped, never advertised as `SYNC_PRESENT`.
+    #[test]
+    fn a_completion_on_a_kind_with_no_fence_is_not_advertised() {
+        let d = from_parts(parts(TensorMemory::Mem, 5, Some(9)));
+        assert_eq!(d.flags, 0);
+        assert_eq!(d.sync, 0);
+        assert!(d.ptr.is_null());
+    }
+
+    /// On Windows the shared `DmaBuf` discriminant is a D3D11 texture: its
+    /// completion needs both the fence handle and a recorded value.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_texture_completion_needs_a_fence_handle() {
+        use super::flags;
+        let d = from_parts(parts(TensorMemory::DmaBuf, 5, Some(9)));
+        assert_eq!(d.flags, flags::SYNC_PRESENT);
+        assert_eq!(d.sync, 9);
+        assert_eq!(d.ptr.0 as usize, 5);
+
+        let d = from_parts(parts(TensorMemory::DmaBuf, 0, Some(9)));
+        assert_eq!(
+            d.flags, 0,
+            "a value with no fence handle cannot be waited on"
+        );
+        assert_eq!(d.sync, 0);
+        assert!(d.ptr.is_null());
     }
 }

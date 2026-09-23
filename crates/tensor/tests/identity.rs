@@ -15,25 +15,25 @@ use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
 /// Written out here rather than shared: an integration test is its own
 /// compilation unit and cannot reach `edgefirst-tensor`'s `pub(crate)`
 /// `test_support::report_skip`.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn skip(why: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
 }
 
-/// Allocates a small DMA-BUF tensor, or reports why it could not and returns
-/// `None`. A dma-heap is a host resource, not something every CI runner or
-/// dev machine provides, so absence must be a loud, visible skip rather than
-/// a silently vacuous pass.
+/// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
 #[cfg(target_os = "linux")]
-fn dma_tensor_or_skip() -> Option<Tensor<u8>> {
-    match Tensor::<u8>::new(&[4096], Some(TensorMemory::DmaBuf), None) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            skip(&format!("no dma-heap on this host ({e})"));
-            None
-        }
+#[path = "support/dma_require.rs"]
+mod dma_require;
+
+/// Allocates a small DMA-BUF tensor, or reports why it could not and returns
+/// `None` (a failure under `HAL_TEST_REQUIRE_DMA=1`).
+#[cfg(target_os = "linux")]
+fn dma_tensor_or_skip(what: &str) -> Option<Tensor<u8>> {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), what) {
+        return None;
     }
+    Some(Tensor::<u8>::new(&[4096], Some(TensorMemory::DmaBuf), None).expect("DMA allocation"))
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn a_dup_of_the_same_dma_buf_has_the_same_identity() {
     // `from_fd` on a dup'd fd is what a cross-library import does. If dup
     // changed the identity, every such import would miss the GL cache --
     // the measured blocker this derivation exists to fix.
-    let Some(t) = dma_tensor_or_skip() else {
+    let Some(t) = dma_tensor_or_skip("a_dup_of_the_same_dma_buf_has_the_same_identity") else {
         return;
     };
     let dup_fd = t.clone_fd().expect("dup");

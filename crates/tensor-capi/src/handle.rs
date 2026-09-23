@@ -573,16 +573,12 @@ unsafe fn release_own(t: *mut EfTensor) {
 /// format) so the two never drift apart.
 fn derive_caches(inner: &TensorDyn) -> (Vec<u64>, Vec<i64>, CString) {
     let shape_u64: Vec<u64> = inner.shape().iter().map(|d| *d as u64).collect();
-    let esz = inner.dtype().size() as i64;
-    let mut strides_i64 = vec![0i64; shape_u64.len()];
-    let mut acc = esz;
-    for i in (0..shape_u64.len()).rev() {
-        strides_i64[i] = acc;
-        acc *= shape_u64[i] as i64;
-    }
-    if let (Some(rs), true) = (inner.row_stride(), shape_u64.len() >= 2) {
-        strides_i64[0] = rs as i64;
-    }
+    let strides_i64 = edgefirst_tensor::protocol::c_byte_strides(
+        &shape_u64,
+        inner.dtype().size() as i64,
+        inner.format().map(|f| f.layout()),
+        inner.row_stride(),
+    );
     let format_c =
         CString::new(inner.format().map(|f| f.as_str()).unwrap_or("")).unwrap_or_default();
     (shape_u64, strides_i64, format_c)

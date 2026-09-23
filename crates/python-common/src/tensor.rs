@@ -774,6 +774,24 @@ impl TensorMapT {
         map_dispatch!(self, size)
     }
 
+    /// Bytes the mapping actually spans. For a strided image this is every
+    /// padded row, which is more than [`size`](Self::size)'s logical bytes.
+    pub fn mapped_bytes(&self) -> usize {
+        match self {
+            TensorMapT::TensorU8(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorI8(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorU16(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorI16(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorU32(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorI32(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorU64(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorI64(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorF16(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorF32(m) => std::mem::size_of_val(m.as_slice()),
+            TensorMapT::TensorF64(m) => std::mem::size_of_val(m.as_slice()),
+        }
+    }
+
     // Deliberately ungated: pure size_of arithmetic per variant, no
     // PyO3/buffer-protocol dependency, and called from both `numpy()`
     // branches below -- the `__getbuffer__`-based one (any(not(Py_LIMITED_API),
@@ -1148,19 +1166,32 @@ fn copy_numpy_padded<
              but tensor has no effective_row_stride"
         ))
     })?;
-    let height = tensor.height().ok_or_else(|| {
-        Error::Format("destination buffer is padded but tensor has no height".to_string())
-    })?;
-    if height == 0 || elem_sz == 0 {
+    if elem_sz == 0 || stride_bytes == 0 {
         return Ok(());
     }
+    // A strided map spans exactly `rows * stride` bytes, where `rows` counts
+    // every padded row: `H` per packed image, `C * H` per planar one and the
+    // combined `H*k` per semi-planar one, times any batch. Deriving `rows`
+    // from the mapping keeps this copy in step with that layout rather than
+    // assuming one row per pixel of height.
+    if !stride_bytes.is_multiple_of(elem_sz) {
+        return Err(Error::Format(format!(
+            "stride-padded copy: row pitch {stride_bytes} B is not a whole number of \
+             {elem_sz}-byte elements, so rows cannot be addressed in this dtype"
+        )));
+    }
     let dst_stride_elems = stride_bytes / elem_sz;
-    let row_elems = tensor_len / height;
+    let height = dst_len / dst_stride_elems;
+    let row_elems = tensor_len.checked_div(height).unwrap_or(0);
 
-    if dst_stride_elems * height != dst_len || row_elems * height != tensor_len {
+    if height == 0
+        || dst_stride_elems * height != dst_len
+        || row_elems * height != tensor_len
+        || row_elems > dst_stride_elems
+    {
         return Err(Error::Format(format!(
             "stride-padded copy: inconsistent dimensions: \
-             dst_len={dst_len}, tensor_len={tensor_len}, height={height}, \
+             dst_len={dst_len}, tensor_len={tensor_len}, rows={height}, \
              dst_stride_elems={dst_stride_elems}, row_elems={row_elems}"
         )));
     }
@@ -2071,6 +2102,7 @@ impl PyTensor {
         // DMA tensor's plane-0 stride is the whole allocation, and treating
         // that as strides[0] makes numpy `.fill` walk off the mapping.
         let row_stride = self.0.format().and(self.0.effective_row_stride());
+        let layout = self.0.format().map(|f| f.layout());
         let mapped = map_tensor_dyn(&self.0, access, MapWait::Block)?;
         Ok(PyTensorMap {
             // Derived from the mapping, not from `access`: see
@@ -2078,6 +2110,7 @@ impl PyTensor {
             readonly: !mapped.is_writable(),
             mapped: Some(mapped),
             row_stride,
+            layout,
         })
     }
 
@@ -2108,11 +2141,13 @@ impl PyTensor {
             .into());
         }
         let row_stride = self.0.format().and(self.0.effective_row_stride());
+        let layout = self.0.format().map(|f| f.layout());
         let mapped = map_tensor_dyn(&self.0, access, MapWait::Fail).map_err(would_block_err)?;
         Ok(PyTensorMap {
             readonly: !mapped.is_writable(),
             mapped: Some(mapped),
             row_stride,
+            layout,
         })
     }
 
@@ -2870,10 +2905,43 @@ pub struct PyTensorMap {
     /// `--features abi3-py38`, so `-D warnings` fails there without this.
     #[cfg_attr(all(Py_LIMITED_API, not(Py_3_11)), allow(dead_code))]
     pub(crate) row_stride: Option<usize>,
+    /// Pixel layout at map time, which says which dimension `row_stride`
+    /// pads: `[H, W, C]` and `[H*k, W]` pad dim 0, planar `[C, H, W]` pads
+    /// dim 1 and makes each plane `row_stride * H` bytes.
+    pub(crate) layout: Option<tensor::PixelLayout>,
 }
 
 unsafe impl Send for PyTensorMap {}
 unsafe impl Sync for PyTensorMap {}
+
+impl PyTensorMap {
+    /// Byte strides and byte length of the buffer `mapped` exposes, in the
+    /// stride convention the descriptor, the blob and the C API share
+    /// (`edgefirst_tensor::protocol::c_byte_strides`). A padded image spans
+    /// its padded rows; a tight buffer keeps C-contiguous strides.
+    fn buffer_geometry(&self, mapped: &TensorMapT) -> (Vec<isize>, usize) {
+        let shape = mapped.shape();
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+        let itemsize = mapped.element_size() as i64;
+        let tight = tensor::protocol::c_byte_strides(&dims, itemsize, self.layout, None);
+        let tight_len = mapped.size();
+        // `row_stride` is only captured for formatted tensors, so it is a real
+        // pitch. The padded strides apply when they differ from the tight ones
+        // and the rows they describe lie inside the mapping -- which also holds
+        // for a one-row image whose pitch exceeds its whole logical size.
+        let padded = self
+            .row_stride
+            .map(|rs| tensor::protocol::c_byte_strides(&dims, itemsize, self.layout, Some(rs)))
+            .filter(|p| *p != tight);
+        match (padded, shape.first()) {
+            (Some(p), Some(&outer)) if p[0] as usize * outer <= mapped.mapped_bytes() => {
+                let len = p[0] as usize * outer;
+                (p.into_iter().map(|s| s as isize).collect(), len)
+            }
+            _ => (tight.into_iter().map(|s| s as isize).collect(), tight_len),
+        }
+    }
+}
 
 #[pymethods]
 impl PyTensorMap {
@@ -2957,37 +3025,14 @@ impl PyTensorMap {
         let shape: Vec<isize> = mapped.shape().iter().map(|&s| s as isize).collect();
         let ndim = shape.len();
 
-        // Compute C-contiguous strides: strides[i] = itemsize * product(shape[i+1..])
-        let itemsize = mapped.element_size() as isize;
-        let mut strides = vec![0isize; ndim];
-        if ndim > 0 {
-            strides[ndim - 1] = itemsize;
-            for i in (0..ndim - 1).rev() {
-                strides[i] = strides[i + 1] * shape[i + 1];
-            }
-        }
-
-        // Default (tight / contiguous) byte length.
-        let mut buf_len = mapped.size() as isize;
-
         // Row-padded image backing (DMA / GPU pitch alignment): `map().as_slice()`
-        // exposes the full padded buffer, so the rows sit at `row_stride` bytes,
-        // wider than the tight outer stride. Expose that pitch as the outer
-        // (row) stride and widen `len` to span the padded buffer, so a consumer
-        // (`np.asarray(memoryview(map))`) reads the logical pixels zero-copy
-        // instead of a sheared contiguous reinterpretation. Tight buffers
-        // (`row_stride == strides[0]`, or non-image `None`) are unchanged.
-        if ndim > 0 {
-            if let Some(rs) = slf2.row_stride {
-                let rs = rs as isize;
-                // A row pitch cannot be the whole mapping: that is the
-                // formatless plane-0 fallback (capacity as stride), not padding.
-                if rs > strides[0] && rs < buf_len {
-                    strides[0] = rs;
-                    buf_len = rs * shape[0];
-                }
-            }
-        }
+        // exposes the full padded buffer, so a consumer
+        // (`np.asarray(memoryview(map))`) must be handed the padded strides to
+        // read the logical pixels zero-copy instead of a sheared contiguous
+        // reinterpretation.
+        let (strides, buf_len) = slf2.buffer_geometry(mapped);
+        let buf_len = buf_len as isize;
+        let itemsize = mapped.element_size() as isize;
 
         // Box both arrays together so we can recover the length in __releasebuffer__.
         // Store (shape_ptr, strides_ptr, ndim) using view.internal.
@@ -3069,24 +3114,7 @@ impl PyTensorMap {
             let borrow = slf.borrow();
             let mapped = borrow.mapped.as_ref().unwrap();
             let shape: Vec<usize> = mapped.shape().to_vec();
-            let itemsize = mapped.element_size();
-            let ndim = shape.len();
-            let mut strides = vec![0isize; ndim];
-            if ndim > 0 {
-                strides[ndim - 1] = itemsize as isize;
-                for i in (0..ndim - 1).rev() {
-                    strides[i] = strides[i + 1] * shape[i + 1] as isize;
-                }
-            }
-            let mut buf_len = mapped.size();
-            if ndim > 0 {
-                if let Some(rs) = borrow.row_stride {
-                    if (rs as isize) > strides[0] && rs < buf_len {
-                        strides[0] = rs as isize;
-                        buf_len = rs * shape[0];
-                    }
-                }
-            }
+            let (strides, buf_len) = borrow.buffer_geometry(mapped);
             let ptr = mapped.data_ptr() as *mut c_char;
             let flag = if borrow.readonly {
                 0x100 // PyBUF_READ

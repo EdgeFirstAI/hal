@@ -81,6 +81,17 @@ For every non-subsampled multi-channel format the first two coincide, which is w
 
 **Strides are in bytes**, signed, on both `TensorDesc` and `PlaneGeometry`. Bytes rather than elements so a hardware row pitch is always representable: a pitch need not be a whole number of `dtype` elements, and a sub-byte dtype (int4 NPU weights) has no element size to divide by at all. The element-stride representation this replaced could not express such a pitch — it fell back to the packed stride and reported a pitch the buffer does not have, across an ABI boundary.
 
+**One stride convention, one function.** `protocol::c_byte_strides(shape, esz, layout, row_stride)` is the only place byte strides are computed, and every surface reports its result: `TensorDesc` (`from_parts`), the blob's strides array, the C API's `ef_tensor_strides`, and the Python buffer protocol (`memoryview`, `np.asarray`, `TensorMap.numpy()`). A recorded row stride lands on the row dimension, and every dimension above it steps over padded rows:
+
+| Layout | Shape | Strides with pitch `rs` |
+|---|---|---|
+| Packed | `[H, W, C]` | `[rs, C·esz, esz]` |
+| Semi-planar | `[H·k, W]` | `[rs, esz]` |
+| Planar | `[C, H, W]` | `[rs·H, rs, esz]` |
+| Batched (any of the above, rank + 1) | `[N, …]` | `[image bytes, …]` — `N` steps over one padded image |
+
+A planar image's plane stride follows the pitch, so plane `c` starts at `c·rs·H`, the offset the plane table and a strided `map()` use. A batched image is `N` images stacked at the padded pitch, which is the layout `batch(n)`, `map()` and `copy_to_flat` address. `width()`/`height()` describe one element of a batched tensor. A single image blob cannot describe a batch, so `blob::export` refuses one.
+
 **Chroma extent is derived, never recomputed.** `plane_table` takes its chroma row count from `combined_plane_height`, which is exact for odd heights (`H + ceil(H/2)`, e.g. 483 → 725) where a hand-written `H/2` is off by a row.
 
 ### Agreement with the IPC schema

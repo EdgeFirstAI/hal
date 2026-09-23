@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from edgefirst.tensor import PixelFormat, Tensor, TensorMemory
 
-from tests.dma_skip import image_or_skip_dma, tensor_or_skip_dma
+from tests.dma_skip import image_or_skip_dma, skip_dma, tensor_or_skip_dma
 
 # fmt: off
 DTYPE_PARAMS = [
@@ -72,7 +72,7 @@ def test_from_fd_dma():
             [100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF
         )
     except (AttributeError, RuntimeError):
-        pytest.skip("DMA memory not supported on this platform")
+        skip_dma("DMA memory not supported on this platform")
 
     assert tensor.memory == TensorMemory.DMABUF
 
@@ -102,7 +102,7 @@ def test_dma_zero_copy_perf():
             [100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF
         )
     except (AttributeError, RuntimeError):
-        pytest.skip("DMA memory not supported on this platform")
+        skip_dma("DMA memory not supported on this platform")
 
     assert tensor.memory == TensorMemory.DMABUF
 

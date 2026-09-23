@@ -21,6 +21,7 @@ from edgefirst.image import (
 from edgefirst.tensor import ColorEncoding, Colorimetry, ColorRange, TensorMemory
 from PIL import Image
 
+from tests.dma_skip import skip_dma
 from tests.gpu_policy import skip_unless_gpu_backed
 
 
@@ -373,9 +374,9 @@ def _dma_image_or_skip(w, h, fmt):
     try:
         t = Tensor.image(w, h, format=fmt, mem=TensorMemory.DMABUF, access="readwrite")
     except (AttributeError, RuntimeError):
-        pytest.skip("DMA memory not supported on this platform")
+        skip_dma("DMA memory not supported on this platform")
     if t.memory != TensorMemory.DMABUF:
-        pytest.skip("DMA requested but backend substituted another memory type")
+        skip_dma("DMA requested but backend substituted another memory type")
     return t
 
 
@@ -457,6 +458,62 @@ def test_dma_semiplanar_buffer_protocol_strided(fmt):
         )
 
 
+@pytest.mark.parametrize(
+    "fmt",
+    [PixelFormat.Nv12, PixelFormat.Nv16, PixelFormat.Nv24],
+    ids=["nv12", "nv16", "nv24"],
+)
+def test_dma_semiplanar_from_numpy_writes_every_combined_row(fmt):
+    """``from_numpy`` into a padded semi-planar tensor writes all of its
+    combined ``[H*k, W]`` rows at the physical pitch, luma and chroma alike,
+    and reads back unchanged through the buffer protocol."""
+    w, h = 595, 438
+    t = _dma_image_or_skip(w, h, fmt)
+    _skip_unless_pitch_is_padded_and_aligned(t, w)
+
+    rows = t.shape[0]
+    ref = (np.arange(rows * w, dtype=np.uint8) % 251).reshape(rows, w)
+    t.from_numpy(ref)
+
+    with t.map() as m:
+        assert np.array_equal(np.asarray(memoryview(m)), ref), (
+            "semi-planar write sheared"
+        )
+
+
+def test_dma_planar_buffer_protocol_pads_rows_and_planes():
+    """A padded planar ``[C, H, W]`` DMA tensor puts its pitch on the row
+    dimension, and each plane spans ``pitch * H`` bytes -- the same strides
+    the descriptor, the blob and the C API report. Padding only the outermost
+    stride would start plane 1 inside plane 0's row padding."""
+    w, h = 595, 438
+    t = _dma_image_or_skip(w, h, PixelFormat.PlanarRgb)
+    _skip_unless_pitch_is_padded_and_aligned(t, w)
+
+    ref = (np.arange(3 * h * w, dtype=np.uint8) % 251).reshape(3, h, w)
+    t.from_numpy(ref)
+
+    with t.map() as m:
+        mv = memoryview(m)
+        assert mv.shape == (3, h, w)
+        assert mv.strides == (t.row_stride * h, t.row_stride, 1)
+        assert np.array_equal(np.asarray(mv), ref), (
+            "planar buffer-protocol read sheared"
+        )
+
+
+def test_dma_one_row_planar_buffer_keeps_its_pitch():
+    """A one-row planar image's pitch exceeds its whole logical size, and the
+    planes still sit one padded row apart."""
+    t = _dma_image_or_skip(2, 1, PixelFormat.PlanarRgb)
+    if t.row_stride == 2:
+        pytest.skip("this heap returned a tight pitch; nothing to pad")
+    with t.map() as m:
+        mv = memoryview(m)
+        assert mv.shape == (3, 1, 2)
+        assert mv.strides == (t.row_stride, t.row_stride, 1)
+
+
 def test_mem_tight_buffer_protocol_contiguous():
     """A tight (non-padded) image tensor still exposes a plain C-contiguous
     buffer — the strided exposure must only engage for padded backings."""
@@ -489,7 +546,7 @@ def test_from_fd_dma():
     try:
         tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
     except (AttributeError, RuntimeError):
-        pytest.skip("DMA memory not supported on this platform")
+        skip_dma("DMA memory not supported on this platform")
 
     tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMABUF)
     with tensor.map() as m:
@@ -681,7 +738,7 @@ def test_import_image_dma_success():
     try:
         src = Tensor([480, 640, 4], dtype="uint8", mem=TensorMemory.DMABUF)
     except RuntimeError:
-        pytest.skip("DMA allocation not available on this platform")
+        skip_dma("DMA allocation not available on this platform")
     fd = src.fd
     processor = ImageProcessor()
     imported = processor.import_image(

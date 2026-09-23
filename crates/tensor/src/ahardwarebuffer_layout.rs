@@ -294,6 +294,22 @@ mod tests {
     }
 
     #[test]
+    fn egl_vendor_emulation_marker_wins_over_a_vendor_name() {
+        // An emulation stack names the host GPU it forwards to; each marker
+        // must veto the vendor match on its own.
+        assert_eq!(scheme_for_egl_vendor("emulation-mali"), None);
+        assert_eq!(scheme_for_egl_vendor("angle-adreno"), None);
+        assert_eq!(scheme_for_egl_vendor("swiftshader_mali"), None);
+        assert_eq!(scheme_for_egl_vendor("Emulation-PowerVR"), None);
+        // Surrounding whitespace is not an empty string.
+        assert_eq!(
+            scheme_for_egl_vendor("  Mali  "),
+            Some(crate::CompressionScheme::Afbc)
+        );
+        assert_eq!(scheme_for_egl_vendor("   "), None);
+    }
+
+    #[test]
     fn compression_eligibility_table() {
         // Initial table: RGBA8888 u8/i8 only.
         assert!(compression_eligible(PixelFormat::Rgba, DType::U8));

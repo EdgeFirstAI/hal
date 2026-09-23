@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Blob import dropped per-channel zero points.** An asymmetric per-channel quantized tensor exported with `blob::export` came back from `blob::import` as symmetric. Import now rebuilds `Quantization::per_channel` when zero points are present. Quantization the header declares but cannot be rebuilt (bad axis, mismatched counts) is an `InvalidArgument` error rather than a silently unquantized tensor.
+- **Blob reference-mode import lost quantization** on both the Unix and D3D11 paths.
+- **Some valid blobs could not be parsed.** The strings region was padded relative to its own start rather than the blob, so an export whose quantization arrays ended 4-byte aligned (e.g. per-tensor symmetric) failed `BlobView::parse`.
+- **Padded planar tensors reported the wrong plane stride.** For `[C, H, W]` with a row stride, the descriptor, blob and `ef_tensor_strides` now report `[row_stride * H, row_stride, esz]`, agreeing with the plane table and the mapped layout. Previously `strides[0]` was the tight `H * W * esz` (descriptor, blob) or the row stride (C API). A padded batched `[N, ...]` image now steps `N` over one padded image, and `batch(n)` starts at that padded offset rather than at `n` tight images, which put the element inside the previous element's padding. A single image blob refuses a batched tensor instead of describing it as one image.
+- **Python planar and semi-planar tensors with a padded pitch.** The buffer protocol (`memoryview`, `np.asarray`, `TensorMap.numpy()`) padded only the outermost stride, so a planar `[C, H, W]` view started each plane inside the previous plane's row padding. `from_numpy` assumed one padded row per pixel of height and refused padded planar tensors, and semi-planar ones whose combined `H*k` rows exceed the height. Both now use the same strides as the descriptor, including a one-row image whose pitch exceeds its whole logical size. `from_numpy` refuses a pitch that is not a whole number of elements rather than truncating it.
+- **`Tensor::width()`/`height()` on a batched `[N, H, W, C]` image** returned H as the width, which gave `batch()` and strided maps the wrong pitch. They now describe one element of a batched tensor and return `None` for ranks that are not an image (previously a panic on a flattened formatted tensor). Strided maps and `copy_to_flat` of a batched packed tensor now cover all `N * H` rows.
+- **`configure_image` could keep a stale row stride** when reconfiguring to the same format, reporting a pitch below the new width's minimum.
+- A reference import whose producer pitch the format refuses is now an error instead of being ignored.
+- DRM ioctl request codes are built with nix's `request_code_*` macros instead of hand-rolled x86/ARM encoding.
+
+### Changed
+
+- `TensorTrait::capacity_bytes` and `TensorTrait::set_logical_shape` no longer have default bodies; every implementor provides them.
+- `edgefirst_tensor::protocol::c_byte_strides` is public: the one stride convention shared by the descriptor, the blob and the C API.
+
 ## [0.32.1] - 2026-09-18
 
 A CI/CD-only release. No library, binding or C API change: every entry below is about how hal is built and published, and this release exists to exercise that chain end to end for the first time.

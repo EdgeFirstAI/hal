@@ -105,11 +105,19 @@ inspects the source array's strides and dispatches three ways:
 handoff use the capsule protocol or a pinned tensor.
 
 A stride-padded **destination** is handled ahead of all three: a DMA-BUF or
-PBO allocated with GPU pitch alignment exposes `stride × height` while the
+PBO allocated with GPU pitch alignment exposes `stride × rows` while the
 logical element count is smaller, so the copy places `row_elems` per row and
-steps the padding. `HostView.numpy()` must honour the same row stride as
-`memoryview` — a tight `W*C` read of a padded DMA tensor shears every row
-after the first.
+steps the padding. `rows` is derived from the mapping, not from the image
+height: it is `H` per packed image, `C × H` per planar one and the combined
+`H·k` per semi-planar one, times any batch.
+
+Reads use the same geometry. `memoryview`, `np.asarray` and `TensorMap.numpy()`
+take their strides from `edgefirst_tensor::protocol::c_byte_strides`, the
+convention the descriptor, blob and C API report (see
+`crates/tensor/ARCHITECTURE.md` § Shape, strides and planes), so a padded planar
+tensor puts the pitch on the row dimension and `pitch × H` on the plane
+dimension. A tight `W*C` read of a padded tensor shears every row after the
+first.
 
 ## Mapping, pinning and sync
 

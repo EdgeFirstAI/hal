@@ -806,4 +806,53 @@ mod tests {
         assert_eq!(a.buffer_identity().kind(), crate::IdentityKind::HostPtr);
         assert_ne!(a.buffer_identity().id(), b.buffer_identity().id());
     }
+
+    fn expect_insufficient<V: fmt::Debug>(r: Result<V>, want: (usize, usize)) {
+        match r {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), want);
+            }
+            other => panic!("expected InsufficientCapacity{want:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_capacity_bytes_counts_bytes_of_a_multi_byte_element() {
+        let t = MemTensor::<u32>::with_capacity_bytes(&[4], 16, None).expect("exact fit");
+        assert_eq!(t.capacity_bytes(), 16);
+        assert_eq!(t.shape(), &[4]);
+        expect_insufficient(
+            MemTensor::<u32>::with_capacity_bytes(&[5], 16, None),
+            (20, 16),
+        );
+    }
+
+    #[test]
+    fn map_bounds_an_offset_window_in_bytes() {
+        let mut t = MemTensor::<u32>::with_capacity_bytes(&[4], 16, None).unwrap();
+        t.set_offset(4);
+        expect_insufficient(t.map(), (20, 16));
+        t.set_logical_shape(&[3])
+            .expect("the window's own capacity");
+        assert_eq!(t.map().expect("fits after the offset").as_slice().len(), 3);
+    }
+
+    #[test]
+    fn reshape_and_logical_shape_count_bytes_of_a_multi_byte_element() {
+        let mut t = MemTensor::<u32>::with_capacity_bytes(&[2, 3], 24, None).unwrap();
+        t.reshape(&[6]).expect("same element count");
+        assert_eq!(t.shape(), &[6]);
+
+        let mut t = MemTensor::<u32>::with_capacity_bytes(&[4], 16, None).unwrap();
+        expect_insufficient(t.set_logical_shape(&[5]), (20, 16));
+        assert_eq!(t.shape(), &[4]);
+    }
+
+    #[test]
+    fn view_bounds_the_window_in_bytes() {
+        let t = MemTensor::<u32>::with_capacity_bytes(&[4], 16, None).unwrap();
+        expect_insufficient(t.view(8, &[3]), (20, 16));
+        let v = t.view(4, &[3]).expect("exact fit");
+        assert_eq!(v.map().unwrap().as_slice().len(), 3);
+    }
 }

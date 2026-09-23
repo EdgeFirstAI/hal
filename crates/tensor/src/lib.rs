@@ -1078,6 +1078,8 @@ fn deserialize_scalar_or_vec_f32<'de, D: serde::Deserializer<'de>>(
     struct V;
     impl<'de> Visitor<'de> for V {
         type Value = Vec<f32>;
+        // Only serde's error text reads this; no value flows from it.
+        #[cfg_attr(test, mutants::skip)]
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("f32 or array of f32")
         }
@@ -1113,12 +1115,18 @@ fn deserialize_opt_scalar_or_vec_i32<'de, D: serde::Deserializer<'de>>(
     struct V;
     impl<'de> Visitor<'de> for V {
         type Value = Option<Vec<i32>>;
+        // Only serde's error text reads this; no value flows from it.
+        #[cfg_attr(test, mutants::skip)]
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("null, i32, or array of i32")
         }
+        // `Ok(None)` is `Ok(Default::default())`, the only replacement.
+        #[cfg_attr(test, mutants::skip)]
         fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
             Ok(None)
         }
+        // As `visit_none`.
+        #[cfg_attr(test, mutants::skip)]
         fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
             Ok(None)
         }
@@ -1129,6 +1137,8 @@ fn deserialize_opt_scalar_or_vec_i32<'de, D: serde::Deserializer<'de>>(
             struct Inner;
             impl<'de> Visitor<'de> for Inner {
                 type Value = Vec<i32>;
+                // Only serde's error text reads this; no value flows from it.
+                #[cfg_attr(test, mutants::skip)]
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                     f.write_str("i32 or array of i32")
                 }
@@ -1790,16 +1800,11 @@ where
     fn reshape(&mut self, shape: &[usize]) -> Result<()>;
 
     /// Bytes of the underlying allocation (>= the current logical `size()`).
-    /// Defaults to the logical size for storages without spare capacity.
-    fn capacity_bytes(&self) -> usize {
-        self.size()
-    }
+    fn capacity_bytes(&self) -> usize;
 
     /// Set the logical shape to any shape whose byte size fits the allocation
     /// capacity, without the equal-size constraint of `reshape`.
-    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
-        self.reshape(shape)
-    }
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()>;
 
     /// Map the tensor into memory with the given access direction and
     /// return a TensorMap for accessing the data.
@@ -2287,6 +2292,15 @@ where
     /// pool tensor is reconfigured to a smaller logical image — so the decode
     /// writes rows at the surface's real stride and the GPU samples them with
     /// the same stride (the physical-grid / logical-ROI decoupling).
+    ///
+    /// Compiled only where such a backing exists; on Linux and other unix
+    /// targets it would always answer `None`.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     pub(crate) fn backing_row_stride(&self) -> Option<usize> {
         match self {
             // Only genuine image-formatted IOSurfaces (height > 1) carry a real
@@ -4219,7 +4233,10 @@ where
         let prior_stride = self.row_stride;
 
         self.storage.set_logical_shape(&shape)?;
-        self.set_format(format)?; // clears any stale row_stride
+        self.set_format(format)?;
+        // `set_format` keeps the stride when the format is unchanged; the new
+        // geometry's stride is chosen below, never inherited by accident.
+        self.row_stride = None;
 
         // Restore the correct row pitch for the new geometry. A DMA buffer of
         // ANY layout, and a semi-planar buffer on any backing, MUST carry a
@@ -4243,55 +4260,67 @@ where
         let needs_align = self.storage.memory() == TensorMemory::DmaBuf
             || format.layout() == PixelLayout::SemiPlanar;
 
-        let active_stride = if let Some(pitch) = self.storage.backing_row_stride() {
-            // macOS IOSurface: use the surface's native pitch.
-            let natural = self.effective_row_stride().unwrap_or(0);
-            if pitch > natural {
+        // A backing with its own fixed pitch (IOSurface, AHardwareBuffer, a
+        // staged D3D11 texture) keeps it whenever it exceeds the new row.
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
+        if let Some(pitch) = self.storage.backing_row_stride() {
+            let active_stride = if pitch > min_stride {
                 self.set_row_stride_unchecked(pitch);
                 pitch
             } else {
-                natural
+                min_stride
+            };
+            if !needs_align {
+                return Ok(());
             }
-        } else if needs_align {
-            // Priority:
-            //   1. Prior stride (pool reuse): if the pre-existing stride is
-            //      64-aligned, >= this layout's minimum row, and fits the
-            //      allocation, keep it. This is the hot-loop reuse case (large
-            //      pool, small image).
-            //   2. Compute a fresh 64-aligned stride for the current width.
-            let aligned = min_stride.next_multiple_of(64);
-            let capacity = self.storage.capacity_bytes();
+            return self.check_configured_stride(active_stride, total_rows);
+        }
 
-            let candidate = if let Some(ps) = prior_stride {
-                if ps >= min_stride && ps % 64 == 0 && ps * total_rows <= capacity {
-                    ps
-                } else {
-                    aligned
-                }
+        if !needs_align {
+            return Ok(());
+        }
+        // Priority:
+        //   1. Prior stride (pool reuse): if the pre-existing stride is
+        //      64-aligned, >= this layout's minimum row, and fits the
+        //      allocation, keep it. This is the hot-loop reuse case (large
+        //      pool, small image).
+        //   2. Compute a fresh 64-aligned stride for the current width.
+        let aligned = min_stride.next_multiple_of(64);
+        let capacity = self.storage.capacity_bytes();
+
+        let candidate = if let Some(ps) = prior_stride {
+            if ps >= min_stride && ps % 64 == 0 && ps * total_rows <= capacity {
+                ps
             } else {
                 aligned
-            };
-
-            if candidate * total_rows <= capacity {
-                self.set_row_stride_unchecked(candidate);
-                candidate
-            } else {
-                // Shouldn't happen for legitimate pools, but don't crash.
-                self.effective_row_stride().unwrap_or(0)
             }
         } else {
-            self.effective_row_stride().unwrap_or(0)
+            aligned
         };
 
-        // Ensure the active stride fits the allocation. A pool reconfigured to a
-        // wider image than its backing would silently SIGBUS on any subsequent
-        // map/write — catch it here instead.
-        if needs_align && active_stride > 0 {
-            let needed = active_stride * total_rows;
-            let capacity = self.storage.capacity_bytes();
-            if needed > capacity {
-                return Err(Error::InsufficientCapacity { needed, capacity });
-            }
+        let active_stride = if candidate * total_rows <= capacity {
+            self.set_row_stride_unchecked(candidate);
+            candidate
+        } else {
+            // The tight row may still fit where the aligned one does not.
+            min_stride
+        };
+        self.check_configured_stride(active_stride, total_rows)
+    }
+
+    /// The last step of [`configure_image`](Self::configure_image) for an
+    /// aligned layout: rows that do not fit the allocation are refused here,
+    /// rather than left to fault on a later map or write.
+    fn check_configured_stride(&self, active_stride: usize, total_rows: usize) -> Result<()> {
+        let needed = active_stride * total_rows;
+        let capacity = self.storage.capacity_bytes();
+        if needed > capacity {
+            return Err(Error::InsufficientCapacity { needed, capacity });
         }
         Ok(())
     }
@@ -4316,18 +4345,32 @@ where
         self.format
     }
 
-    /// Image width (None if not an image).
-    pub fn width(&self) -> Option<usize> {
+    /// The format and the trailing shape dims that describe one image: packed
+    /// `[H, W, C]`, planar `[C, H, W]` or semi-planar `[H*k, W]`, optionally
+    /// behind a leading batch `N` (see [`batch`](Self::batch)). `None` when
+    /// unformatted or when the shape has any other rank --
+    /// `set_logical_shape` keeps the format on a shape it no longer describes.
+    fn image_dims(&self) -> Option<(PixelFormat, &[usize])> {
         let fmt = self.format?;
         let shape = self.shape();
+        let rank = image_rank(fmt.layout());
+        let batch_dims = shape.len().checked_sub(rank).filter(|&n| n <= 1)?;
+        Some((fmt, &shape[batch_dims..]))
+    }
+
+    /// Image width (None if not an image). For a batched `[N, ...]` tensor
+    /// this is the width of one element.
+    pub fn width(&self) -> Option<usize> {
+        let (fmt, dims) = self.image_dims()?;
         match fmt.layout() {
-            PixelLayout::Packed => Some(shape[1]),
-            PixelLayout::Planar => Some(shape[2]),
-            PixelLayout::SemiPlanar => Some(shape[1]),
+            PixelLayout::Packed => Some(dims[1]),
+            PixelLayout::Planar => Some(dims[2]),
+            PixelLayout::SemiPlanar => Some(dims[1]),
         }
     }
 
-    /// Image height (None if not an image).
+    /// Image height (None if not an image). For a batched `[N, ...]` tensor
+    /// this is the height of one element.
     ///
     /// For semi-planar formats the combined-plane shape row count is divided
     /// by the format's luma-to-total ratio to recover logical height. This
@@ -4336,19 +4379,18 @@ where
     /// `configure_image` stores the actual `(width, height)` in the format's
     /// `allocation_shape`, which round-trips losslessly via these accessors.
     pub fn height(&self) -> Option<usize> {
-        let fmt = self.format?;
-        let shape = self.shape();
+        let (fmt, dims) = self.image_dims()?;
         match fmt.layout() {
-            PixelLayout::Packed => Some(shape[0]),
-            PixelLayout::Planar => Some(shape[1]),
+            PixelLayout::Packed => Some(dims[0]),
+            PixelLayout::Planar => Some(dims[1]),
             PixelLayout::SemiPlanar => {
                 if self.is_multiplane() {
-                    Some(shape[0])
+                    Some(dims[0])
                 } else {
                     match fmt {
-                        PixelFormat::Nv12 => Some(shape[0] * 2 / 3),
-                        PixelFormat::Nv16 => Some(shape[0] / 2),
-                        PixelFormat::Nv24 => Some(shape[0] / 3),
+                        PixelFormat::Nv12 => Some(dims[0] * 2 / 3),
+                        PixelFormat::Nv16 => Some(dims[0] / 2),
+                        PixelFormat::Nv24 => Some(dims[0] / 3),
                         _ => None,
                     }
                 }
@@ -4532,42 +4574,23 @@ where
         };
         let Some(stride) = self.row_stride else {
             // Tight layout: the mapped window is exactly the logical bytes.
-            let got = src.len().min(tight_bytes);
-            if got < tight_bytes {
+            let Some(tight) = src.get(..tight_bytes) else {
                 return Err(Error::InvalidOperation(format!(
-                    "copy_to_flat: mapped {got} bytes < tight footprint {tight_bytes}"
+                    "copy_to_flat: mapped {} bytes < tight footprint {tight_bytes}",
+                    src.len()
                 )));
-            }
-            dst.copy_from_slice(&src[..tight_bytes]);
+            };
+            dst.copy_from_slice(tight);
             return Ok(());
         };
-        // Strided: row count follows the strided-map convention (planar
-        // stacks C planes of H rows; packed/semi-planar use shape[0]), and
-        // the logical row is tight_bytes / rows for every layout.
-        let rows = match self.format.map(|f| f.layout()) {
-            Some(PixelLayout::Planar) => {
-                let s = self.shape();
-                if s.len() < 2 {
-                    return Err(Error::InvalidOperation(
-                        "copy_to_flat: strided planar tensor requires [C, H, W] shape".into(),
-                    ));
-                }
-                s[0].checked_mul(s[1]).ok_or_else(|| {
-                    Error::InvalidOperation(format!(
-                        "copy_to_flat: planar rows {} × {} overflows usize",
-                        s[0], s[1]
-                    ))
-                })?
-            }
-            _ => *self.shape().first().ok_or_else(|| {
-                Error::InvalidOperation("copy_to_flat: tensor has an empty shape".into())
-            })?,
-        };
-        if rows == 0 || !tight_bytes.is_multiple_of(rows) {
-            return Err(Error::InvalidOperation(format!(
-                "copy_to_flat: tight footprint {tight_bytes} does not divide \
-                 into {rows} rows"
-            )));
+        // Strided: the rows the strided map spans, each holding one tight
+        // logical row. `rows` is a factor of the element count, so it divides
+        // the tight footprint exactly.
+        let rows = strided_rows(self)?;
+        if rows == 0 {
+            return Err(Error::InvalidOperation(
+                "copy_to_flat: a strided tensor with no rows has nothing to copy".into(),
+            ));
         }
         let row_bytes = tight_bytes / rows;
         let need = (rows - 1)
@@ -4766,8 +4789,8 @@ where
     /// capabilities (constructors and importers set it; arbitrary widening
     /// would defeat the contract).
     // Only the Android AHardwareBuffer importer derives a declaration from
-    // an existing allocation's usage bits today.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    // an existing allocation's usage bits.
+    #[cfg(target_os = "android")]
     pub(crate) fn set_cpu_access_unchecked(&mut self, access: CpuAccess) {
         self.cpu_access = access;
     }
@@ -4785,8 +4808,8 @@ where
     /// Record the compression scheme — crate-private: recording is an
     /// allocation-time fact ([`Tensor::image_desc`] sets it; arbitrary
     /// mutation would misdescribe the physical layout).
-    // Only the Android allocation path records a scheme today.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    // Only the Android allocation path records a scheme.
+    #[cfg(target_os = "android")]
     pub(crate) fn set_compression_unchecked(&mut self, scheme: Option<CompressionScheme>) {
         self.compression = scheme;
     }
@@ -4895,10 +4918,7 @@ where
         // `N` is a misuse we reject rather than silently treating a spatial dim
         // as the batch. Raw tensors take shape[0] as `N` by contract.
         if let Some(fmt) = self.format {
-            let elem_rank = match fmt.layout() {
-                PixelLayout::SemiPlanar => 2,
-                _ => 3,
-            };
+            let elem_rank = image_rank(fmt.layout());
             if shape.len() != elem_rank + 1 {
                 return Err(Error::InvalidShape(format!(
                     "batch(): tensor is not batched ({fmt:?} expects a leading N over a \
@@ -4914,9 +4934,18 @@ where
         }
         let elem_shape: Vec<usize> = shape[1..].to_vec();
         let elem_count: usize = elem_shape.iter().product();
-        let elem_bytes = elem_count
+        elem_count
             .checked_mul(std::mem::size_of::<T>())
             .ok_or(Error::InvalidSize(elem_count))?;
+        // One element's footprint including row padding: the descriptor's
+        // stride for `N`, so a padded batch is addressed the way it is mapped.
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+        let elem_bytes = crate::protocol::c_byte_strides(
+            &dims,
+            std::mem::size_of::<T>() as i64,
+            self.format.map(|f| f.layout()),
+            self.row_stride,
+        )[0] as usize;
         let offset = n.checked_mul(elem_bytes).ok_or(Error::InvalidSize(n))?;
         // For a packed `[N, H, W, C]` tensor the N tiles stack vertically in the
         // shared buffer, so the GL import sees one `(W, N*H)` parent and each
@@ -4930,8 +4959,9 @@ where
                 let tile_w = elem_shape[1];
                 // Per-row pitch of the tall `(W, N*H)` parent — padded stride if
                 // set, else the tight row width. The GL import keys on this.
-                let bpp = elem_shape[2] * std::mem::size_of::<T>();
-                let parent_stride = self.effective_row_stride().unwrap_or(tile_w * bpp);
+                let parent_stride = self
+                    .effective_row_stride()
+                    .expect("a formatted tensor of its batched rank has a width");
                 Some(self.compose_view_origin(tile_w, batch * tile_h, parent_stride, 0, n * tile_h))
             }
             _ => None,
@@ -4996,7 +5026,9 @@ where
         }
         let elem = std::mem::size_of::<T>();
         let bpp = fmt.channels() * elem;
-        let stride = self.effective_row_stride().unwrap_or(w * bpp);
+        let stride = self
+            .effective_row_stride()
+            .expect("a tensor with an image width has a row stride");
         let offset = region
             .y
             .checked_mul(stride)
@@ -5580,6 +5612,16 @@ where
     }
 }
 
+/// Rank of one image's shape in `layout`: `[H, W, C]` / `[C, H, W]` are 3-D,
+/// semi-planar `[H*k, W]` is 2-D. A batched tensor has one more.
+#[cfg(feature = "static")]
+fn image_rank(layout: PixelLayout) -> usize {
+    match layout {
+        PixelLayout::SemiPlanar => 2,
+        PixelLayout::Packed | PixelLayout::Planar => 3,
+    }
+}
+
 #[cfg(feature = "static")]
 fn map_strided_host_view<'a, T>(
     tensor: &Tensor<T>,
@@ -5590,15 +5632,8 @@ fn map_strided_host_view<'a, T>(
 where
     T: Num + Clone + fmt::Debug + Send + Sync + 'a,
 {
-    // Rows sit at `stride`-byte spacing. The row count is the first
-    // shape dim for packed `[H, W, C]` and semi-planar `[H*k, W]`,
-    // but planar `[C, H, W]` stacks C planes of H rows — its surface
-    // row count is `C × H` (`shape[0]` alone would expose a 3-row
-    // window and truncate the map; first hit by Android planar-F16
-    // AHardwareBuffers, whose gralloc pads the pitch — macOS/Linux
-    // planar pitches happen to be naturally aligned so no stride was
-    // ever recorded there).
-    let rows = strided_map_rows(tensor)?;
+    // Rows sit at `stride`-byte spacing; see `strided_rows` for the count.
+    let rows = strided_rows(tensor)?;
     let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
         Error::InvalidOperation(format!(
             "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
@@ -5607,32 +5642,34 @@ where
     map_strided_storage(tensor, stride, rows, total_bytes, access, non_blocking)
 }
 
+/// Rows a strided map or flat copy of `tensor` spans at its row stride: a
+/// raw tensor's leading dim, else every image row of every batch element --
+/// `H` per packed image, `C * H` per planar one (C planes of H rows), and the
+/// combined `H*k` per semi-planar one. No product here can overflow: each is
+/// a factor of the shape's element count, which the allocation already holds.
 #[cfg(feature = "static")]
-fn strided_map_rows<T>(tensor: &Tensor<T>) -> Result<usize>
+fn strided_rows<T>(tensor: &Tensor<T>) -> Result<usize>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    match tensor.format.map(|f| f.layout()) {
-        Some(PixelLayout::Planar) => {
-            let s = tensor.shape();
-            if s.len() < 2 {
-                return Err(Error::InvalidOperation(
-                    "Tensor::map: strided planar mapping requires [C, H, W] shape".into(),
-                ));
-            }
-            s[0].checked_mul(s[1]).ok_or_else(|| {
-                Error::InvalidOperation(format!(
-                    "Tensor::map: planar rows {} × {} overflows usize",
-                    s[0], s[1]
-                ))
-            })
-        }
-        _ => tensor.shape().first().copied().ok_or_else(|| {
-            Error::InvalidOperation(
-                "Tensor::map: strided mapping requires a non-empty shape".into(),
-            )
-        }),
-    }
+    let shape = tensor.shape();
+    let Some(fmt) = tensor.format else {
+        return shape.first().copied().ok_or_else(|| {
+            Error::InvalidOperation("strided access requires a non-empty shape".into())
+        });
+    };
+    let (_, dims) = tensor.image_dims().ok_or_else(|| {
+        Error::InvalidOperation(format!(
+            "strided access to a {fmt:?} tensor requires its image shape, optionally \
+             batched; got {shape:?}"
+        ))
+    })?;
+    let per_image = match fmt.layout() {
+        PixelLayout::Planar => dims[0] * dims[1],
+        PixelLayout::Packed | PixelLayout::SemiPlanar => dims[0],
+    };
+    let batch: usize = shape[..shape.len() - dims.len()].iter().product();
+    Ok(batch * per_image)
 }
 
 #[cfg(feature = "static")]
@@ -5873,40 +5910,64 @@ where
         if let Some(stride) = self.row_stride {
             return map_strided_host_view(self, stride, access, non_blocking);
         }
-        // Offset tensors are supported for storages that apply the offset
-        // inside their own `map()`: DMA (`DmaMap`/IOSurface adjust the mapped
-        // base), Mem (`MemMap` adjusts the slice base), Shm (`ShmMap` adjusts
-        // the slice base), and PBO (the staged copy starts at the offset). Every
-        // self-allocated backing now carries a sub-region concept via `view`, so
-        // a non-zero offset is honoured rather than rejected.
-        if self.plane_offset.is_some_and(|o| o > 0) {
-            let supported = matches!(self.storage, TensorStorage::Mem(_) | TensorStorage::Pbo(_));
-            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF; Android
-            // `Dma` is the AHardwareBuffer, Windows `Dma` is the D3D11 texture
-            // (whose pin and map both add the storage's own `view_offset`, the
-            // same way IOSurface does) — all apply the offset in their map.
-            // (`Dma` is the same variant name on each, hence one `cfg(any(...))`
-            // arm rather than four.)
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "android",
-                target_os = "windows"
-            ))]
-            let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
-            #[cfg(unix)]
-            let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
-            if !supported {
-                return Err(Error::InvalidOperation(
-                    "plane offset only supported for DMA, Mem, Shm, and PBO tensors".into(),
-                ));
-            }
-        }
+        // A non-zero plane offset needs no check here: every storage applies
+        // its own offset inside its map -- Mem/Shm adjust the slice base, the
+        // Linux DMA-BUF and Android AHardwareBuffer the mapped base, IOSurface
+        // and D3D11 textures add their `view_offset`, and PBO starts the
+        // staged copy at it.
         if non_blocking {
             self.storage.try_map_with(access)
         } else {
             self.storage.map_with(access)
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "static",
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    )
+))]
+impl<T> Tensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// The pitched-backing half of [`TensorTrait::set_logical_shape`]: record
+    /// the backing's own pitch as the row stride of the new `shape`.
+    fn adopt_backing_pitch(&mut self, shape: &[usize]) {
+        // Only a backing with a pitch of its own, and only while the shape
+        // still has the rank the format's row is measured on: a caller may
+        // flatten an image to one dimension and leave the format behind.
+        let Some(pitch) = self.storage.backing_row_stride() else {
+            return;
+        };
+        let Some((rank, rows)) = self.format.map(|f| match f.layout() {
+            PixelLayout::Packed => (3, shape.first().copied()),
+            PixelLayout::Planar => (3, shape.get(1).copied()),
+            PixelLayout::SemiPlanar => (2, shape.first().copied()),
+        }) else {
+            return;
+        };
+        if rank != shape.len() {
+            return;
+        }
+        // The natural stride of the new shape, not of the stride recorded for
+        // the old one.
+        let prior = self.row_stride.take();
+        let Some(natural) = self.effective_row_stride() else {
+            self.row_stride = prior;
+            return;
+        };
+        if rows == Some(1) {
+            self.set_row_stride_unchecked(natural);
+        } else if pitch > natural {
+            self.set_row_stride_unchecked(pitch);
+        } else {
+            self.row_stride = prior;
         }
     }
 }
@@ -6014,19 +6075,10 @@ where
     /// Set the logical shape to any shape whose bytes fit the allocation,
     /// without [`reshape`](TensorTrait::reshape)'s equal-count constraint.
     ///
-    /// Overridden rather than inherited, which it was not for most of this
-    /// crate's life. The trait's default body is `self.reshape(shape)`, so
-    /// a caller reaching this through `Tensor<T>` silently got the strict
-    /// rule under a name that promises the opposite -- on both backends,
-    /// which is why G13 cannot see it.
-    ///
-    /// The capacity-aware implementations were never dead: every storage
-    /// type has one, and [`Tensor::configure_image`] reaches them by
-    /// calling `self.storage.set_logical_shape(..)` directly. That is the
-    /// pool-reuse path -- a decode into an oversized reusable buffer
-    /// reconfiguring it to a smaller image without reallocating -- and it
-    /// worked precisely because it bypassed this method. This forwards the
-    /// same way, so the two agree.
+    /// Forwards to the storage's capacity-aware implementation -- the same
+    /// one [`Tensor::configure_image`] uses for pool reuse, a decode into an
+    /// oversized reusable buffer reconfiguring it to a smaller image without
+    /// reallocating -- so the two agree. The pixel format is kept.
     ///
     /// A narrower image inside a pitched backing (an IOSurface, an
     /// AHardwareBuffer, a D3D11 texture) still advances rows by the backing's
@@ -6039,36 +6091,13 @@ where
     /// runs past the backing when the window sits in the last row.
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
         self.storage.set_logical_shape(shape)?;
-        // Only a backing with a pitch of its own, and only while the shape
-        // still has the rank the format's row is measured on: a caller may
-        // flatten an image to one dimension and leave the format behind.
-        let Some(pitch) = self.storage.backing_row_stride() else {
-            return Ok(());
-        };
-        let Some((rank, rows)) = self.format.map(|f| match f.layout() {
-            PixelLayout::Packed => (3, shape.first().copied()),
-            PixelLayout::Planar => (3, shape.get(1).copied()),
-            PixelLayout::SemiPlanar => (2, shape.first().copied()),
-        }) else {
-            return Ok(());
-        };
-        if rank != shape.len() {
-            return Ok(());
-        }
-        // The natural stride of the new shape, not of the stride recorded for
-        // the old one.
-        let prior = self.row_stride.take();
-        let Some(natural) = self.effective_row_stride() else {
-            self.row_stride = prior;
-            return Ok(());
-        };
-        if rows == Some(1) {
-            self.set_row_stride_unchecked(natural);
-        } else if pitch > natural {
-            self.set_row_stride_unchecked(pitch);
-        } else {
-            self.row_stride = prior;
-        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
+        self.adopt_backing_pitch(shape);
         Ok(())
     }
 
@@ -6601,9 +6630,7 @@ mod image_tests {
     fn image_tensor_with_stride_preserves_logical_width() {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
-        // Skip if DMA not available (e.g. sandboxed CI lacking dma_heap access).
-        if !is_dma_available() {
-            crate::test_support::report_skip("DMA heap not available");
+        if !crate::test_support::dma_or_skip("image_tensor_with_stride_preserves_logical_width") {
             return;
         }
         // 3004×1688 RGBA8: natural pitch 12016, padded to 12032 (64-aligned).
@@ -6685,8 +6712,9 @@ mod image_tests {
         // board with a dma-heap when the behaviour changed, unnoticed because
         // it needs both Linux and a dma-heap: it skips on macOS and on Orin
         // (nvmap, no CONFIG_DMABUF_HEAPS).
-        if !is_dma_available() {
-            crate::test_support::report_skip("DMA heap not available");
+        if !crate::test_support::dma_or_skip(
+            "image_tensor_foreign_strided_map_is_bounds_checked_not_refused",
+        ) {
             return;
         }
         let backing =
@@ -6738,8 +6766,8 @@ mod image_tests {
         // after allocation must not be able to coerce `Tensor::map()` into
         // returning a slice larger than the backing mmap (that would be UB
         // in `DmaMap::as_slice`).
-        if !is_dma_available() {
-            crate::test_support::report_skip("DMA heap not available");
+        if !crate::test_support::dma_or_skip("image_tensor_with_stride_map_rejects_tampered_stride")
+        {
             return;
         }
         // Allocate a 640×480 RGBA8 padded canvas (stride = 3072 = 768 px).
@@ -7000,6 +7028,976 @@ mod compression_tests {
     }
 }
 
+#[cfg(all(test, feature = "static"))]
+mod vocabulary_and_probe_tests {
+    use super::*;
+
+    #[test]
+    fn dtype_displays_its_wire_name() {
+        for (dt, name) in [
+            (DType::U8, "u8"),
+            (DType::I8, "i8"),
+            (DType::U16, "u16"),
+            (DType::I16, "i16"),
+            (DType::U32, "u32"),
+            (DType::I32, "i32"),
+            (DType::U64, "u64"),
+            (DType::I64, "i64"),
+            (DType::F16, "f16"),
+            (DType::F32, "f32"),
+            (DType::F64, "f64"),
+        ] {
+            assert_eq!(dt.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn dtype_of_maps_every_element_type_and_nothing_else() {
+        assert_eq!(dtype_of::<u8>(), Some(DType::U8));
+        assert_eq!(dtype_of::<i8>(), Some(DType::I8));
+        assert_eq!(dtype_of::<u16>(), Some(DType::U16));
+        assert_eq!(dtype_of::<i16>(), Some(DType::I16));
+        assert_eq!(dtype_of::<u32>(), Some(DType::U32));
+        assert_eq!(dtype_of::<i32>(), Some(DType::I32));
+        assert_eq!(dtype_of::<u64>(), Some(DType::U64));
+        assert_eq!(dtype_of::<i64>(), Some(DType::I64));
+        assert_eq!(dtype_of::<half::f16>(), Some(DType::F16));
+        assert_eq!(dtype_of::<f32>(), Some(DType::F32));
+        assert_eq!(dtype_of::<f64>(), Some(DType::F64));
+        assert_eq!(dtype_of::<bool>(), None);
+    }
+
+    #[test]
+    fn tensor_memory_converts_to_and_from_its_wire_string() {
+        assert_eq!(String::from(TensorMemory::DmaBuf), "dmabuf");
+        assert_eq!(String::from(TensorMemory::Shm), "shm");
+        assert_eq!(
+            TensorMemory::try_from("dmabuf").unwrap(),
+            TensorMemory::DmaBuf
+        );
+        assert_eq!(
+            TensorMemory::try_from("dma").unwrap(),
+            TensorMemory::DmaBuf,
+            "the legacy spelling still parses"
+        );
+        assert_eq!(TensorMemory::try_from("mem").unwrap(), TensorMemory::Mem);
+        match TensorMemory::try_from("bogus") {
+            Err(Error::InvalidMemoryType(s)) => assert_eq!(s, "bogus"),
+            other => panic!("expected InvalidMemoryType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tensor_memory_is_available_matches_a_real_allocation() {
+        let _lock = crate::tests::fd_lock_shared();
+        assert!(TensorMemory::Mem.is_available());
+        assert!(!TensorMemory::IoSurface.is_available());
+        assert!(!TensorMemory::Pbo.is_available());
+        assert!(!TensorMemory::Cuda.is_available());
+        #[cfg(unix)]
+        assert_eq!(
+            TensorMemory::Shm.is_available(),
+            Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).is_ok()
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            TensorMemory::DmaBuf.is_available(),
+            Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None).is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_probes_report_what_linux_can_allocate() {
+        let _lock = crate::tests::fd_lock_shared();
+        let dma = DmaTensor::<u8>::new(&[64], None).is_ok();
+        assert_eq!(is_dma_available(), dma);
+        assert_eq!(is_gpu_buffer_available(), dma);
+        assert!(!is_iosurface_available());
+        assert!(!is_ahardwarebuffer_available());
+        // Linux (unlike Android's bionic) always has POSIX shared memory.
+        assert!(is_shm_available());
+    }
+}
+
+#[cfg(all(test, feature = "static"))]
+mod quantization_serde_tests {
+    use super::*;
+
+    fn parse(json: &str) -> Quantization {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"))
+    }
+
+    #[test]
+    fn scale_accepts_every_json_number_form() {
+        assert_eq!(parse(r#"{"scale": 0.5}"#).scale(), &[0.5]);
+        assert_eq!(parse(r#"{"scale": 2}"#).scale(), &[2.0]);
+        assert_eq!(parse(r#"{"scale": -2}"#).scale(), &[-2.0]);
+        assert_eq!(parse(r#"{"scale": [0.25, 4]}"#).scale(), &[0.25, 4.0]);
+    }
+
+    #[test]
+    fn zero_point_accepts_null_scalar_and_array() {
+        assert_eq!(
+            parse(r#"{"scale": 0.1, "zero_point": -5}"#).zero_point(),
+            Some(&[-5][..])
+        );
+        assert_eq!(
+            parse(r#"{"scale": 0.1, "zero_point": 3}"#).zero_point(),
+            Some(&[3][..])
+        );
+        assert_eq!(
+            parse(r#"{"scale": [0.1, 0.2], "zero_point": [1, -2], "axis": 0}"#).zero_point(),
+            Some(&[1, -2][..])
+        );
+        assert_eq!(
+            parse(r#"{"scale": 0.1, "zero_point": null}"#).zero_point(),
+            None
+        );
+        assert_eq!(parse(r#"{"scale": 0.1}"#).zero_point(), None);
+    }
+
+    /// Deserializers whose `deserialize_option` forwards to
+    /// `deserialize_any` (serde's value deserializers among them) reach the
+    /// zero-point visitor's scalar and sequence arms directly, not through
+    /// `visit_some`.
+    #[test]
+    fn zero_point_visitor_accepts_values_without_an_option_wrapper() {
+        use serde::de::value::{
+            Error as ValueError, I64Deserializer, SeqDeserializer, U64Deserializer,
+        };
+        assert_eq!(
+            deserialize_opt_scalar_or_vec_i32(I64Deserializer::<ValueError>::new(-7)).unwrap(),
+            Some(vec![-7])
+        );
+        assert_eq!(
+            deserialize_opt_scalar_or_vec_i32(U64Deserializer::<ValueError>::new(9)).unwrap(),
+            Some(vec![9])
+        );
+        let seq = SeqDeserializer::<_, ValueError>::new(vec![4i32, -4].into_iter());
+        assert_eq!(
+            deserialize_opt_scalar_or_vec_i32(seq).unwrap(),
+            Some(vec![4, -4])
+        );
+    }
+
+    #[test]
+    fn per_channel_is_not_per_tensor() {
+        let q = Quantization::per_channel(vec![0.1, 0.2], vec![0, 1], 0).unwrap();
+        assert!(!q.is_per_tensor());
+        assert!(Quantization::per_tensor(0.1, 0).is_per_tensor());
+    }
+
+    #[test]
+    fn validate_accepts_matching_per_channel_and_names_the_failing_field() {
+        let mut t = Tensor::<i8>::new(&[1, 1, 4], Some(TensorMemory::Mem), None).unwrap();
+        let q = Quantization::per_channel(vec![0.1, 0.2, 0.3, 0.4], vec![0, 1, 2, 3], 2).unwrap();
+        t.set_quantization(q)
+            .expect("four channels on axis 2 of [1, 1, 4]");
+        assert_eq!(
+            t.quantization().and_then(Quantization::zero_point),
+            Some(&[0, 1, 2, 3][..])
+        );
+
+        let q = Quantization::per_channel(vec![0.1, 0.2, 0.3, 0.4], vec![0, 1, 2, 3], 3).unwrap();
+        match t.set_quantization(q) {
+            Err(Error::QuantizationInvalid { field, got, .. }) => {
+                assert_eq!(field, "axis");
+                assert_eq!(got, "axis=3");
+            }
+            other => panic!("axis 3 of a rank-3 tensor must be refused, got {other:?}"),
+        }
+
+        let q = Quantization::per_channel_symmetric(vec![0.1, 0.2, 0.3, 0.4], 1).unwrap();
+        match t.set_quantization(q) {
+            Err(Error::QuantizationInvalid { field, got, .. }) => {
+                assert_eq!(field, "scale.len");
+                assert_eq!(got, "length 4");
+            }
+            other => panic!("four scales on a length-1 axis must be refused, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "static"))]
+mod image_geometry_tests {
+    use super::*;
+
+    fn mem_image<T>(width: usize, height: usize, format: PixelFormat) -> Tensor<T>
+    where
+        T: Num + Clone + fmt::Debug + Send + Sync + 'static,
+    {
+        Tensor::<T>::image(
+            width,
+            height,
+            format,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap_or_else(|e| panic!("Mem {format:?} {width}x{height}: {e}"))
+    }
+
+    fn raw_mem<T>(shape: &[usize]) -> Tensor<T>
+    where
+        T: Num + Clone + fmt::Debug + Send + Sync + 'static,
+    {
+        Tensor::<T>::new(shape, Some(TensorMemory::Mem), None).unwrap()
+    }
+
+    #[test]
+    fn semi_planar_image_stride_scales_with_the_element_size() {
+        // u16 NV12 at width 100: 200 B rows, aligned to 256.
+        let t = mem_image::<u16>(100, 64, PixelFormat::Nv12);
+        assert_eq!(t.row_stride(), Some(256));
+        assert_eq!(t.capacity_bytes(), 256 * 96);
+    }
+
+    #[test]
+    fn host_planar_image_is_tight_at_every_element_size() {
+        let t = mem_image::<u8>(320, 240, PixelFormat::PlanarRgb);
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(320));
+        assert_eq!(t.capacity_bytes(), 320 * 240 * 3);
+
+        let t = mem_image::<f32>(100, 40, PixelFormat::PlanarRgb);
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(400));
+        assert_eq!(t.capacity_bytes(), 400 * 120);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dma_packed_image_records_the_aligned_pitch_only_when_padded() {
+        let _lock = crate::tests::fd_lock_shared();
+        if !crate::test_support::dma_or_skip(
+            "dma_packed_image_records_the_aligned_pitch_only_when_padded",
+        ) {
+            return;
+        }
+        let t = Tensor::<u8>::image(
+            100,
+            10,
+            PixelFormat::Rgba,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        assert_eq!(t.row_stride(), Some(448), "400 B rows pad to 448");
+        let t = Tensor::<u8>::image(
+            64,
+            10,
+            PixelFormat::Rgba,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        assert_eq!(t.row_stride(), None, "256 B rows are already aligned");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn image_with_stride_validates_the_stride_before_the_memory() {
+        match Tensor::<u8>::image_with_stride(
+            640,
+            480,
+            PixelFormat::Rgba,
+            2559,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        ) {
+            Err(Error::InvalidArgument(msg)) => {
+                assert!(msg.contains("2559 < minimum 2560"), "{msg}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        match Tensor::<u8>::image_with_stride(
+            640,
+            480,
+            PixelFormat::Rgba,
+            2560,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        ) {
+            Err(Error::NotImplemented(msg)) => assert!(msg.contains("only TensorMemory::DmaBuf")),
+            other => panic!("a valid stride on Mem must reach the memory check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_format_checks_the_planar_and_semi_planar_shape() {
+        let mut t = raw_mem::<u8>(&[480, 640, 3]);
+        match t.set_format(PixelFormat::PlanarRgb) {
+            Err(Error::InvalidShape(msg)) => assert!(msg.contains("[3, H, W]"), "{msg}"),
+            other => panic!("[480, 640, 3] is not planar, got {other:?}"),
+        }
+        assert!(raw_mem::<u8>(&[3, 480, 640])
+            .set_format(PixelFormat::PlanarRgb)
+            .is_ok());
+
+        for (format, bad, good) in [
+            (PixelFormat::Nv12, 721, [720usize, 722]),
+            (PixelFormat::Nv16, 481, [480, 482]),
+            (PixelFormat::Nv24, 1441, [1440, 1443]),
+        ] {
+            match raw_mem::<u8>(&[bad, 640]).set_format(format) {
+                Err(Error::InvalidShape(msg)) => {
+                    assert!(msg.contains(&bad.to_string()), "{format:?}: {msg}")
+                }
+                other => panic!("{format:?} [{bad}, 640] must be refused, got {other:?}"),
+            }
+            for rows in good {
+                raw_mem::<u8>(&[rows, 640])
+                    .set_format(format)
+                    .unwrap_or_else(|e| panic!("{format:?} [{rows}, 640]: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_semi_planar_height_divides_the_combined_rows() {
+        assert_eq!(
+            mem_image::<u8>(320, 240, PixelFormat::Nv24).height(),
+            Some(240)
+        );
+        assert_eq!(
+            mem_image::<u8>(320, 240, PixelFormat::Nv16).height(),
+            Some(240)
+        );
+        assert_eq!(
+            mem_image::<u8>(320, 241, PixelFormat::Nv12).height(),
+            Some(241)
+        );
+    }
+
+    #[test]
+    fn effective_row_stride_scales_with_the_element_size() {
+        assert_eq!(
+            mem_image::<f32>(10, 4, PixelFormat::Rgb).effective_row_stride(),
+            Some(120)
+        );
+        assert_eq!(
+            mem_image::<f32>(10, 4, PixelFormat::PlanarRgb).effective_row_stride(),
+            Some(40)
+        );
+        let mut t = raw_mem::<u16>(&[360, 320]);
+        t.set_format(PixelFormat::Nv12).unwrap();
+        assert_eq!(t.effective_row_stride(), Some(640));
+        let mut t = raw_mem::<u16>(&[360, 321]);
+        t.set_format(PixelFormat::Nv12).unwrap();
+        assert_eq!(
+            t.effective_row_stride(),
+            Some(644),
+            "odd width rounds up to even"
+        );
+    }
+
+    #[test]
+    fn set_row_stride_minimum_scales_with_the_element_size() {
+        let refuse = |mut t: Tensor<f32>, stride: usize, min: usize| match t.set_row_stride(stride)
+        {
+            Err(Error::InvalidArgument(msg)) => {
+                assert!(msg.contains(&format!("{stride} < minimum {min}")), "{msg}")
+            }
+            other => panic!("stride {stride} under {min} must be refused, got {other:?}"),
+        };
+        refuse(mem_image::<f32>(10, 4, PixelFormat::Rgb), 119, 120);
+        refuse(mem_image::<f32>(10, 4, PixelFormat::PlanarRgb), 39, 40);
+        let mut t = mem_image::<f32>(10, 4, PixelFormat::Rgb);
+        t.set_row_stride(120).unwrap();
+        assert_eq!(t.row_stride(), Some(120));
+        let mut t = mem_image::<f32>(10, 4, PixelFormat::PlanarRgb);
+        t.set_row_stride(40).unwrap();
+        assert_eq!(t.row_stride(), Some(40));
+
+        let mut t = mem_image::<u16>(101, 64, PixelFormat::Nv12);
+        match t.set_row_stride(203) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("203 < minimum 204"), "{msg}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        t.set_row_stride(204).unwrap();
+    }
+
+    #[test]
+    fn configure_image_semi_planar_stride_scales_with_the_element_size() {
+        let mut t = mem_image::<u16>(640, 480, PixelFormat::Rgba);
+        t.configure_image(100, 64, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), Some(256));
+    }
+
+    #[test]
+    fn configure_image_keeps_host_packed_odd_widths_tight() {
+        let mut t = mem_image::<u8>(640, 480, PixelFormat::Rgb);
+        t.configure_image(321, 240, PixelFormat::Rgb).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(963));
+    }
+
+    #[test]
+    fn configure_image_does_not_inherit_a_stride_under_the_same_format() {
+        // Host packed: a stride set for one geometry must not survive into
+        // the next, where it is below the new minimum row.
+        let mut t = mem_image::<u8>(640, 480, PixelFormat::Rgb);
+        t.configure_image(100, 100, PixelFormat::Rgb).unwrap();
+        t.set_row_stride(400).unwrap();
+        t.configure_image(300, 100, PixelFormat::Rgb).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(900));
+
+        // Semi-planar whose aligned stride does not fit: the tight row does,
+        // and must be what the tensor reports -- not the old 64.
+        let mut t = mem_image::<u8>(64, 1000, PixelFormat::Nv12);
+        assert_eq!(t.row_stride(), Some(64));
+        t.configure_image(200, 300, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(200));
+    }
+
+    #[test]
+    fn configure_image_pool_reuse_picks_the_stride_that_fits() {
+        // A prior stride narrower than the new row is replaced by the
+        // aligned one.
+        let mut t = mem_image::<u8>(64, 1024, PixelFormat::Nv12);
+        t.configure_image(200, 100, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), Some(256));
+
+        // An unaligned prior stride is replaced too.
+        let mut t = mem_image::<u8>(64, 64, PixelFormat::Nv12);
+        t.set_row_stride(100).unwrap();
+        t.configure_image(64, 64, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), Some(64));
+
+        // A wide prior stride whose rows would overrun the allocation gives
+        // way to the aligned stride of the new width.
+        let mut t = mem_image::<u8>(640, 480, PixelFormat::Nv12);
+        t.configure_image(320, 900, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), Some(320));
+
+        // Neither the aligned stride fits nor is it needed: the tight row
+        // exactly fills a raw allocation.
+        let mut t = raw_mem::<u8>(&[150 * 100]);
+        t.configure_image(100, 100, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(100));
+    }
+
+    #[test]
+    fn configure_image_refuses_rows_that_overrun_the_allocation() {
+        // Odd width 99: the shape [150, 99] fits 14850 bytes, but NV12 rows
+        // are at least the even width, 100 * 150 = 15000 bytes.
+        let mut t = raw_mem::<u8>(&[150 * 99]);
+        match t.configure_image(99, 100, PixelFormat::Nv12) {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (15000, 14850))
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn configure_image_on_dma_aligns_packed_and_planar_rows() {
+        let _lock = crate::tests::fd_lock_shared();
+        if !crate::test_support::dma_or_skip("configure_image_on_dma_aligns_packed_and_planar_rows")
+        {
+            return;
+        }
+        // Packed u16 Rgb at width 100: 600 B rows align to 640.
+        let mut t = Tensor::<u16>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        t.configure_image(100, 50, PixelFormat::Rgb).unwrap();
+        assert_eq!(t.row_stride(), Some(640));
+
+        // Planar u16 at width 100: 200 B rows would align to 256, but 150
+        // rows of 256 B overrun the 32 KiB buffer while 150 rows of 200 B fit.
+        let mut t = Tensor::<u16>::new(&[16 * 1024], Some(TensorMemory::DmaBuf), None).unwrap();
+        assert_eq!(t.capacity_bytes(), 32 * 1024);
+        t.configure_image(100, 50, PixelFormat::PlanarRgb).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(200));
+        t.configure_image(100, 40, PixelFormat::PlanarRgb).unwrap();
+        assert_eq!(t.row_stride(), Some(256), "120 rows of 256 B fit");
+    }
+
+    #[test]
+    fn from_planes_requires_a_raw_two_dimensional_chroma() {
+        let formatted_chroma = mem_image::<u8>(640, 240, PixelFormat::Grey);
+        match Tensor::from_planes(
+            raw_mem::<u8>(&[480, 640]),
+            formatted_chroma,
+            PixelFormat::Nv12,
+        ) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("raw tensor"), "{msg}"),
+            other => panic!("a formatted chroma plane must be refused, got {other:?}"),
+        }
+        match Tensor::from_planes(
+            raw_mem::<u8>(&[480, 640, 1]),
+            raw_mem::<u8>(&[240, 640]),
+            PixelFormat::Nv12,
+        ) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("2D shapes"), "{msg}"),
+            other => panic!("a 3-D luma plane must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_planes_nv16_needs_full_height_chroma() {
+        let img = Tensor::from_planes(
+            raw_mem::<u8>(&[480, 640]),
+            raw_mem::<u8>(&[480, 640]),
+            PixelFormat::Nv16,
+        )
+        .expect("NV16 chroma is full height");
+        assert_eq!(img.format(), Some(PixelFormat::Nv16));
+        assert_eq!(img.height(), Some(480));
+
+        match Tensor::from_planes(
+            raw_mem::<u8>(&[480, 640]),
+            raw_mem::<u8>(&[240, 640]),
+            PixelFormat::Nv16,
+        ) {
+            Err(Error::InvalidArgument(msg)) => {
+                assert!(msg.contains("NV16 chroma height"), "{msg}")
+            }
+            other => panic!("half-height NV16 chroma must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chroma_mut_writes_the_chroma_plane() {
+        let mut img = Tensor::from_planes(
+            raw_mem::<u8>(&[4, 8]),
+            raw_mem::<u8>(&[2, 8]),
+            PixelFormat::Nv12,
+        )
+        .unwrap();
+        let chroma = img.chroma_mut().expect("a multiplane image has chroma");
+        chroma.map().unwrap().as_mut_slice().fill(0x80);
+        let chroma = img.chroma().unwrap();
+        assert!(chroma.map().unwrap().as_slice().iter().all(|&b| b == 0x80));
+    }
+
+    #[test]
+    fn view_offset_and_stride_scale_with_the_element_size() {
+        let t = mem_image::<u8>(100, 80, PixelFormat::Rgba);
+        let v = t.view(Region::new(10, 20, 30, 40)).unwrap();
+        assert_eq!(v.plane_offset(), Some(20 * 400 + 10 * 4));
+        assert_eq!(v.row_stride(), Some(400));
+
+        let t = mem_image::<u16>(100, 80, PixelFormat::Rgba);
+        let v = t.view(Region::new(10, 20, 30, 40)).unwrap();
+        assert_eq!(v.plane_offset(), Some(20 * 800 + 10 * 8));
+        assert_eq!(v.row_stride(), Some(800));
+        assert_eq!(v.view_origin().map(|o| o.parent_row_stride), Some(800));
+    }
+
+    #[test]
+    fn single_row_view_keeps_a_tight_stride() {
+        let t = mem_image::<u8>(8, 4, PixelFormat::Rgba);
+        let row = t.view(Region::new(2, 3, 4, 1)).unwrap();
+        assert_eq!(row.effective_row_stride(), Some(16));
+        assert_eq!(row.map().unwrap().as_slice().len(), 16);
+        assert_eq!(row.view_origin().map(|o| o.parent_row_stride), Some(32));
+
+        let two_rows = t.view(Region::new(2, 2, 4, 2)).unwrap();
+        assert_eq!(two_rows.effective_row_stride(), Some(32));
+    }
+
+    #[test]
+    fn view_refuses_a_region_past_either_edge() {
+        let t = mem_image::<u8>(64, 40, PixelFormat::Rgba);
+        for region in [Region::new(0, 30, 10, 20), Region::new(60, 0, 10, 1)] {
+            match t.view(region) {
+                Err(Error::RegionOutOfBounds { region: r, bounds }) => {
+                    assert_eq!((r, bounds), (region, (64, 40)))
+                }
+                other => panic!("{region:?} must be refused, got {other:?}"),
+            }
+        }
+        assert!(Region::new(0, 0, 64, 40).fits_within(64, 40));
+        assert!(!Region::new(1, 0, 64, 40).fits_within(64, 40));
+        assert!(!Region::new(0, 1, 64, 40).fits_within(64, 40));
+    }
+}
+
+#[cfg(all(test, feature = "static"))]
+mod strided_access_tests {
+    use super::*;
+
+    /// A patterned byte view of `t`'s whole mapping: byte `i` is `i % 251`.
+    fn fill_pattern<T>(t: &Tensor<T>)
+    where
+        T: Num + Clone + fmt::Debug + Send + Sync,
+    {
+        let mut m = t.map().unwrap();
+        let s = m.as_mut_slice();
+        // SAFETY: plain numeric elements; every byte pattern is a valid value
+        // for the integer and float types these tests use.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, std::mem::size_of_val(s))
+        };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+    }
+
+    fn expected_rows(rows: usize, stride: usize, row_bytes: usize) -> Vec<u8> {
+        (0..rows)
+            .flat_map(|r| (r * stride..r * stride + row_bytes).map(|i| (i % 251) as u8))
+            .collect()
+    }
+
+    fn padded<T>(format: PixelFormat, stride: usize) -> Tensor<T>
+    where
+        T: Num + Clone + fmt::Debug + Send + Sync + 'static,
+    {
+        let mut t = Tensor::<T>::image_with_capacity(
+            16,
+            4,
+            format,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        t.configure_image(8, 4, format).unwrap();
+        t.set_row_stride(stride).unwrap();
+        t
+    }
+
+    #[test]
+    fn copy_to_flat_compacts_padded_packed_rows() {
+        // 8 px * 3 B = 24 B rows at a 32 B pitch.
+        let t = padded::<u8>(PixelFormat::Rgb, 32);
+        fill_pattern(&t);
+        let mut dst = vec![0u8; 96];
+        t.copy_to_flat(&mut dst).unwrap();
+        assert_eq!(dst, expected_rows(4, 32, 24));
+    }
+
+    #[test]
+    fn copy_to_flat_compacts_padded_planar_rows() {
+        // f32 planar: 3 planes x 4 rows of 32 B at a 64 B pitch.
+        let t = padded::<f32>(PixelFormat::PlanarRgb, 64);
+        fill_pattern(&t);
+        let mut dst = vec![0u8; 384];
+        t.copy_to_flat(&mut dst).unwrap();
+        assert_eq!(dst, expected_rows(12, 64, 32));
+    }
+
+    #[test]
+    fn copy_to_flat_of_a_tight_stride_is_the_mapping() {
+        let t = padded::<u8>(PixelFormat::Rgb, 24);
+        fill_pattern(&t);
+        let mut dst = vec![0u8; 96];
+        t.copy_to_flat(&mut dst).unwrap();
+        assert_eq!(dst, expected_rows(1, 96, 96));
+
+        let t = Tensor::<u8>::image(
+            8,
+            4,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill_pattern(&t);
+        let mut dst = vec![0u8; 96];
+        t.copy_to_flat(&mut dst).unwrap();
+        assert_eq!(dst, expected_rows(1, 96, 96));
+    }
+
+    #[test]
+    fn copy_to_flat_needs_a_tight_sized_destination() {
+        let t = padded::<u8>(PixelFormat::Rgb, 32);
+        let mut dst = vec![0u8; 95];
+        match t.copy_to_flat(&mut dst) {
+            Err(Error::InvalidArgument(msg)) => {
+                assert!(
+                    msg.contains("dst is 95 bytes") && msg.contains("96 bytes"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_to_flat_compacts_a_padded_batch() {
+        // Two 8x2 RGB tiles at a 32 B pitch: four rows in all.
+        let mut t = padded::<u8>(PixelFormat::Rgb, 32);
+        t.set_logical_shape(&[2, 2, 8, 3]).unwrap();
+        fill_pattern(&t);
+        let mut dst = vec![0u8; 96];
+        t.copy_to_flat(&mut dst).unwrap();
+        assert_eq!(dst, expected_rows(4, 32, 24));
+    }
+
+    #[test]
+    fn strided_planar_map_spans_every_plane_row() {
+        let t = padded::<u8>(PixelFormat::PlanarRgb, 16);
+        assert_eq!(t.map().unwrap().as_slice().len(), 16 * 12);
+    }
+
+    #[test]
+    fn batch_of_a_padded_batch_starts_at_its_padded_tile() {
+        // Tile 1 starts after two 32 B rows, not after 48 tight bytes.
+        let mut t = padded::<u8>(PixelFormat::Rgb, 32);
+        t.set_logical_shape(&[2, 2, 8, 3]).unwrap();
+        fill_pattern(&t);
+        let e = t.batch(1).unwrap();
+        assert_eq!(e.plane_offset(), Some(64));
+        let mut dst = vec![0u8; 48];
+        e.copy_to_flat(&mut dst).unwrap();
+        let tile1: Vec<u8> = expected_rows(4, 32, 24).split_off(48);
+        assert_eq!(dst, tile1);
+    }
+
+    #[test]
+    fn strided_packed_batch_map_spans_every_tile_row() {
+        let mut t = padded::<u8>(PixelFormat::Rgb, 32);
+        t.set_logical_shape(&[2, 2, 8, 3]).unwrap();
+        assert_eq!(t.map().unwrap().as_slice().len(), 32 * 4);
+    }
+
+    #[test]
+    fn strided_access_to_a_flattened_image_is_refused() {
+        let mut t = padded::<u8>(PixelFormat::PlanarRgb, 16);
+        t.set_logical_shape(&[96]).unwrap();
+        match t.map() {
+            Err(Error::InvalidOperation(msg)) => assert!(msg.contains("[96]"), "{msg}"),
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        }
+        let mut dst = vec![0u8; 96];
+        match t.copy_to_flat(&mut dst) {
+            Err(Error::InvalidOperation(msg)) => assert!(msg.contains("[96]"), "{msg}"),
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strided_shm_map_is_bounded_by_the_segment() {
+        let _lock = crate::tests::fd_lock_shared();
+        let mut t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Shm),
+            CpuAccess::ReadWrite,
+        )
+        .expect("Linux has POSIX shared memory");
+        assert_eq!(t.capacity_bytes(), 640 * 720);
+        assert_eq!(t.map().unwrap().as_slice().len(), 640 * 720);
+
+        t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), Some(640), "the pool pitch fits and is kept");
+        assert_eq!(t.map().unwrap().as_slice().len(), 640 * 360);
+
+        t.configure_image(640, 480, PixelFormat::Nv12).unwrap();
+        t.set_row_stride(704).unwrap();
+        match t.map() {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (704 * 720, 640 * 720))
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+    }
+
+    /// Minimal host-memory `PboOps`: a fixed buffer, never resized.
+    struct HostPbo(Vec<u8>);
+
+    // SAFETY: the pointer addresses `self.0`, allocated once and never
+    // resized, and the tensor holds the `Arc` to `self` for every map's life.
+    unsafe impl PboOps for HostPbo {
+        fn map_buffer(&self, _buffer_id: u32, size: usize) -> Result<PboMapping> {
+            assert!(size <= self.0.len());
+            Ok(PboMapping {
+                ptr: self.0.as_ptr() as *mut u8,
+                size,
+            })
+        }
+        fn unmap_buffer(&self, _buffer_id: u32) -> Result<()> {
+            Ok(())
+        }
+        fn delete_buffer(&self, _buffer_id: u32) {}
+    }
+
+    fn pbo_rgba(width: usize, height: usize) -> Tensor<u8> {
+        let bytes = width * height * 4;
+        let pbo = PboTensor::<u8>::from_pbo(
+            7,
+            bytes,
+            &[height, width, 4],
+            None,
+            Arc::new(HostPbo(vec![0; bytes])),
+        )
+        .unwrap();
+        let mut t = Tensor::from_pbo(pbo).unwrap();
+        t.set_format(PixelFormat::Rgba).unwrap();
+        t
+    }
+
+    #[test]
+    fn strided_pbo_map_is_bounded_by_the_buffer() {
+        let mut t = pbo_rgba(8, 4);
+        t.set_row_stride(32).unwrap();
+        assert_eq!(t.map().unwrap().as_slice().len(), 128);
+
+        t.set_row_stride(64).unwrap();
+        match t.map() {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (256, 128))
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pbo_accessors_answer_only_for_a_pbo_tensor() {
+        let mem = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
+        assert_eq!(mem.pbo_is_mapped(), None);
+        assert!(mem.pbo_keepalive().is_none());
+
+        let t = pbo_rgba(8, 4);
+        assert_eq!(t.pbo_is_mapped(), Some(false));
+        assert!(t.pbo_keepalive().is_some());
+        let m = t.map().unwrap();
+        assert_eq!(t.pbo_is_mapped(), Some(true));
+        drop(m);
+        assert_eq!(t.pbo_is_mapped(), Some(false));
+    }
+}
+
+#[cfg(all(test, feature = "static"))]
+mod accessor_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    #[cfg(unix)]
+    fn plane_descriptor_carries_its_stride_and_offset() {
+        use std::os::fd::AsFd;
+        let _lock = crate::tests::fd_lock_shared();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let pd = PlaneDescriptor::new(file.as_fd()).unwrap();
+        assert_eq!((pd.stride(), pd.offset()), (None, None));
+        let pd = pd.with_stride(832).with_offset(4096);
+        assert_eq!((pd.stride(), pd.offset()), (Some(832), Some(4096)));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn as_dma_answers_only_for_a_dma_buffer() {
+        use std::os::fd::AsRawFd;
+        let _lock = crate::tests::fd_lock_shared();
+        let mem = Tensor::<u8>::new(&[64], Some(TensorMemory::Mem), None).unwrap();
+        assert!(mem.as_dma().is_none());
+        if !crate::test_support::dma_or_skip("as_dma_answers_only_for_a_dma_buffer") {
+            return;
+        }
+        let t = Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None).unwrap();
+        let dma = t.as_dma().expect("a DMA tensor downcasts");
+        assert_eq!(
+            dma.fd.as_raw_fd(),
+            t.dmabuf().unwrap().as_raw_fd(),
+            "the downcast is this tensor's own buffer"
+        );
+    }
+
+    #[test]
+    fn derived_identity_mixes_the_kind_into_the_key() {
+        let id = BufferIdentity::derived(IdentityKind::Shm, u64::MAX);
+        assert_eq!(id.id(), ((IdentityKind::Shm as u64) << 56) ^ u64::MAX);
+        assert_ne!(
+            id.id(),
+            BufferIdentity::derived(IdentityKind::DmaBuf, u64::MAX).id()
+        );
+    }
+
+    #[test]
+    fn empty_is_a_zero_element_shape() {
+        let mut t = Tensor::<f32>::new(&[2, 3], Some(TensorMemory::Mem), None).unwrap();
+        assert!(!TensorTrait::is_empty(&t));
+        {
+            let m = t.map().unwrap();
+            assert_eq!(TensorMapTrait::len(&m), 6);
+            assert_eq!(TensorMapTrait::size(&m), 24);
+            assert!(!TensorMapTrait::is_empty(&m));
+        }
+        t.set_logical_shape(&[0]).unwrap();
+        assert!(TensorTrait::is_empty(&t));
+        let m = t.map().unwrap();
+        assert_eq!(TensorMapTrait::size(&m), 0);
+        assert!(TensorMapTrait::is_empty(&m));
+    }
+
+    struct CountingCudaOps {
+        maps: AtomicUsize,
+    }
+
+    impl CudaGlOps for CountingCudaOps {
+        fn map(&self, _r: crate::cuda::GraphicsResource) -> Option<(*mut std::ffi::c_void, usize)> {
+            self.maps.fetch_add(1, Ordering::SeqCst);
+            Some((0x1000usize as *mut _, 64))
+        }
+        fn unmap(&self, _r: crate::cuda::GraphicsResource) {}
+        fn unregister(&self, _r: crate::cuda::GraphicsResource) {}
+    }
+
+    #[test]
+    fn cuda_accessors_follow_the_attached_handle() {
+        let mut t = Tensor::<f32>::new(&[16], Some(TensorMemory::Mem), None).unwrap();
+        assert!(!t.is_cuda_attached());
+        assert!(t.cuda().is_none());
+        assert!(t.cuda_map().is_none());
+        assert!(t.cuda_map_mut().is_none());
+
+        let ops = Arc::new(CountingCudaOps {
+            maps: AtomicUsize::new(0),
+        });
+        t.set_cuda_handle(CudaHandle::new_gl(
+            0x1usize as crate::cuda::GraphicsResource,
+            64,
+            ops.clone(),
+        ));
+        assert!(t.is_cuda_attached());
+        assert!(t.cuda().is_some());
+        assert_eq!(t.cuda_map().map(|m| m.device_ptr() as usize), Some(0x1000));
+        assert_eq!(t.cuda_map_mut().map(|m| m.len()), Some(64));
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn from_slice_copies_values_of_a_matching_shape() {
+        let t = Tensor::<u16>::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]).unwrap();
+        assert_eq!(t.shape(), &[2, 3]);
+        assert_eq!(t.map().unwrap().as_slice(), &[1, 2, 3, 4, 5, 6]);
+        match Tensor::<u16>::from_slice(&[1, 2, 3, 4, 5], &[2, 3]) {
+            Err(Error::InvalidShape(msg)) => assert!(msg.contains("values.len()=5"), "{msg}"),
+            other => panic!("expected InvalidShape, got {other:?}"),
+        }
+    }
+
+    /// An `Any` compression request with no pinned memory tries the
+    /// platform's zero-copy image first and falls back when it cannot serve
+    /// the format (packed RGB f32 has no IOSurface layout, for one).
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn any_compression_request_falls_back_when_zero_copy_cannot_serve() {
+        let _lock = crate::tests::fd_lock_shared();
+        let desc =
+            ImageDesc::new(10, 10, PixelFormat::Rgb, DType::F32).with_compression(Compression::Any);
+        let t = Tensor::<f32>::image_desc(&desc).expect("Any never fails for compression reasons");
+        assert_eq!(t.shape(), &[10, 10, 3]);
+        assert_eq!(t.compression(), None);
+    }
+}
+
 #[cfg(test)]
 mod cpu_access_tests {
     use super::*;
@@ -7094,10 +8092,6 @@ mod cpu_access_tests {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use nix::unistd::{access, AccessFlags};
-    #[cfg(target_os = "linux")]
-    use std::io::Write as _;
     use std::sync::{PoisonError, RwLock};
 
     use super::*;
@@ -7181,25 +8175,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_dma_tensor() {
         let _lock = crate::tests::fd_lock_shared();
-        match access(
-            "/dev/dma_heap/linux,cma",
-            AccessFlags::R_OK | AccessFlags::W_OK,
-        ) {
-            Ok(_) => println!("/dev/dma_heap/linux,cma is available"),
-            Err(_) => match access(
-                "/dev/dma_heap/system",
-                AccessFlags::R_OK | AccessFlags::W_OK,
-            ) {
-                Ok(_) => println!("/dev/dma_heap/system is available"),
-                Err(e) => {
-                    writeln!(
-                        &mut std::io::stdout(),
-                        "[WARNING] DMA Heap is unavailable: {e}"
-                    )
-                    .unwrap();
-                    return;
-                }
-            },
+        if !crate::test_support::dma_or_skip("test_dma_tensor") {
+            return;
         }
 
         let shape = vec![2, 3, 4];
@@ -7552,7 +8529,11 @@ mod tests {
 
         // Dma == DMA-BUF on Linux, IOSurface on macOS, AHardwareBuffer on
         // Android; same public variant.
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        if crate::test_support::dma_or_skip("subview_shares_buffer_identity_all_backends (Dma)") {
+            assert_shares(TensorMemory::DmaBuf, "Dma");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         if crate::is_gpu_buffer_available() {
             assert_shares(TensorMemory::DmaBuf, "Dma");
         }
@@ -7749,13 +8730,10 @@ mod tests {
         let _lock = crate::tests::fd_lock_shared();
         // Identical sub-view semantics across Dma (shared fd) and Mem (shared
         // Arc): same offsets → same logical windows → same partition.
-        let dma = match Tensor::<u8>::new(&[8], Some(TensorMemory::DmaBuf), None) {
-            Ok(t) => t,
-            Err(_) => {
-                crate::test_support::report_skip("DMA not available");
-                return;
-            }
-        };
+        if !crate::test_support::dma_or_skip("dma_subview_matches_mem_subview") {
+            return;
+        }
+        let dma = Tensor::<u8>::new(&[8], Some(TensorMemory::DmaBuf), None).unwrap();
         let mem = Tensor::<u8>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
         for parent in [&dma, &mem] {
             let v0 = parent.subview(0, &[4]).unwrap();
@@ -7782,13 +8760,10 @@ mod tests {
         // batched-render-to-DMA case). Mirrors
         // `mem_strided_subview_maps_offset_and_byte_size` on a Dma parent.
         let _lock = crate::tests::fd_lock_shared();
-        let parent = match Tensor::<u8>::new(&[2048], Some(TensorMemory::DmaBuf), None) {
-            Ok(t) => t,
-            Err(_) => {
-                crate::test_support::report_skip("DMA not available");
-                return;
-            }
-        };
+        if !crate::test_support::dma_or_skip("dma_strided_subview_maps_padded_window") {
+            return;
+        }
+        let parent = Tensor::<u8>::new(&[2048], Some(TensorMemory::DmaBuf), None).unwrap();
         let mut view = parent.subview(128, &[8, 16]).unwrap();
         assert_eq!(view.plane_offset(), Some(128));
         view.set_row_stride_unchecked(32); // padded stride (> 16)
@@ -7821,20 +8796,18 @@ mod tests {
         // same parent import.
         let _lock = crate::tests::fd_lock_shared();
         // 8x4 RGBA with a padded 64-byte row stride (tight row = 8*4 = 32).
-        let parent = match Tensor::<u8>::image_with_stride(
+        if !crate::test_support::dma_or_skip("view_single_row_snapshots_parent_stride") {
+            return;
+        }
+        let parent = Tensor::<u8>::image_with_stride(
             8,
             4,
             PixelFormat::Rgba,
             64,
             Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(_) => {
-                crate::test_support::report_skip("DMA not available");
-                return;
-            }
-        };
+        )
+        .unwrap();
         assert_eq!(parent.effective_row_stride(), Some(64));
         // Bottom row (y=3) at x>0 — the case the tight single-row stride guards.
         let row = parent.view(Region::new(2, 3, 4, 1)).unwrap();
@@ -7900,11 +8873,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_dma_no_fd_leaks() {
         let _lock = fd_lock_exclusive();
-        if !is_dma_available() {
-            log::warn!(
-                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
-                function!()
-            );
+        if !crate::test_support::dma_or_skip(function!()) {
             return;
         }
 
@@ -7940,11 +8909,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_dma_from_fd_no_fd_leaks() {
         let _lock = fd_lock_exclusive();
-        if !is_dma_available() {
-            log::warn!(
-                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
-                function!()
-            );
+        if !crate::test_support::dma_or_skip(function!()) {
             return;
         }
 
@@ -8050,8 +9015,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_from_fd_dma_imports_as_dma() {
         let _lock = crate::tests::fd_lock_shared();
-        if !is_dma_available() {
-            log::warn!("SKIPPED: {} - DMA memory not available", function!());
+        if !crate::test_support::dma_or_skip(function!()) {
             return;
         }
 

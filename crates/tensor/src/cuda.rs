@@ -1970,23 +1970,9 @@ mod d3d11_desc_layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn cuda_table_loads_when_libcudart_present() {
-        let avail = is_cuda_available();
-        if avail {
-            assert!(table().is_some(), "table present when available");
-            let path = runtime_path().expect("runtime_path set whenever the table loaded");
-            assert!(
-                !path.as_os_str().is_empty(),
-                "runtime_path must name the DLL/soname the loader opened"
-            );
-            // Printed so the report's "which DLL did the loader open" claim
-            // is reproducible straight from this test's output.
-            eprintln!("[cuda] runtime_path = {}", path.display());
-        }
-        // total + non-panicking either way
-    }
 
+    // The loaded-runtime half (a table, a runtime path, a working stream) is
+    // `tests/cuda_runtime_loader.rs`, behind `HAL_TEST_REQUIRE_CUDA`.
     #[test]
     fn pub_primitives_degrade_without_libcudart() {
         // On hosts without libcudart (all CI coverage lanes), the public CUDA
@@ -1994,8 +1980,14 @@ mod tests {
         // Skip on a CUDA host, where these would touch the real driver without
         // a current GL context.
         if is_cuda_available() {
+            crate::test_support::report_skip(
+                "pub_primitives_degrade_without_libcudart - a CUDA runtime is loaded",
+            );
             return;
         }
+        assert!(table().is_none());
+        assert!(runtime_path().is_none());
+        assert!(stream_create().is_none());
         assert!(gl_register_buffer(0).is_none());
         assert!(gl_map_resource(0).is_none());
         gl_unmap_resource(0); // no-op without a table — must not panic
@@ -2063,6 +2055,27 @@ mod handle_tests {
         );
     }
 
+    /// Off D3D11, a writable mapping is the same mapping as a read one, with
+    /// the same unmap on drop.
+    #[test]
+    fn map_mut_of_a_glbuffer_maps_and_unmaps_like_map() {
+        let unmaps = Arc::new(AtomicUsize::new(0));
+        let h = CudaHandle::new_gl(
+            0x3usize as GraphicsResource,
+            4096,
+            Arc::new(MockOps {
+                unmaps: unmaps.clone(),
+                unregisters: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        {
+            let m = h.map_mut().expect("map_mut");
+            assert_eq!(m.device_ptr() as usize, 0x1000);
+            assert_eq!(m.len(), 4096);
+        }
+        assert_eq!(unmaps.load(Ordering::SeqCst), 1);
+    }
+
     /// A GlBuffer handle whose ops.map() fails yields None from CudaHandle::map.
     struct NoneOps;
     impl CudaGlOps for NoneOps {
@@ -2119,6 +2132,119 @@ mod handle_tests {
         // HOST-SAFETY: dropping `h` would call the real cudaDestroyExternalMemory
         // on this synthetic handle (libcudart is present on dev hosts). Forget it.
         std::mem::forget(h);
+    }
+
+    /// Calls a client's channel received, keyed by the `ctx` it was given.
+    #[derive(Default)]
+    struct ClientCalls {
+        retains: AtomicUsize,
+        releases: AtomicUsize,
+        maps: AtomicUsize,
+        unmaps: AtomicUsize,
+        unregisters: AtomicUsize,
+    }
+
+    fn calls<'a>(ctx: *const std::ffi::c_void) -> &'a ClientCalls {
+        // SAFETY: every `ctx` below is a `&ClientCalls` that outlives the ops.
+        unsafe { &*(ctx as *const ClientCalls) }
+    }
+
+    unsafe extern "C" fn fake_retain(ctx: *const std::ffi::c_void) {
+        calls(ctx).retains.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn fake_release(ctx: *const std::ffi::c_void) {
+        calls(ctx).releases.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Maps resource `1` to 64 bytes at `0x1000`; fails for any other.
+    unsafe extern "C" fn fake_map(
+        ctx: *const std::ffi::c_void,
+        resource: *mut std::ffi::c_void,
+        out_ptr: *mut *mut std::ffi::c_void,
+        out_len: *mut usize,
+    ) -> std::ffi::c_int {
+        calls(ctx).maps.fetch_add(1, Ordering::SeqCst);
+        if resource as usize != 1 {
+            return 7;
+        }
+        // SAFETY: the out-params are valid for this call.
+        unsafe {
+            *out_ptr = 0x1000usize as *mut std::ffi::c_void;
+            *out_len = 64;
+        }
+        0
+    }
+
+    unsafe extern "C" fn fake_unmap(ctx: *const std::ffi::c_void, _r: *mut std::ffi::c_void) {
+        calls(ctx).unmaps.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn fake_unregister(ctx: *const std::ffi::c_void, _r: *mut std::ffi::c_void) {
+        calls(ctx).unregisters.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A client channel's ops forward each call through its function
+    /// pointers once, map a non-zero return code to `None`, and hold one
+    /// reference on the channel for their lifetime.
+    #[test]
+    fn client_channel_ops_forward_through_the_clients_functions() {
+        let log = ClientCalls::default();
+        let state = EfClientState {
+            ctx: &log as *const ClientCalls as *const std::ffi::c_void,
+            retain: Some(fake_retain),
+            release: Some(fake_release),
+        };
+        // SAFETY: `ctx` is a live `ClientCalls` the fake functions understand.
+        let ops = unsafe { client_state_cuda_ops(state, fake_map, fake_unmap, fake_unregister) }
+            .expect("a complete client state");
+        assert_eq!(log.retains.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            ops.map(1usize as GraphicsResource),
+            Some((0x1000usize as *mut std::ffi::c_void, 64))
+        );
+        assert_eq!(ops.map(2usize as GraphicsResource), None);
+        assert_eq!(log.maps.load(Ordering::SeqCst), 2);
+
+        ops.unmap(1usize as GraphicsResource);
+        ops.unregister(1usize as GraphicsResource);
+        assert_eq!(log.unmaps.load(Ordering::SeqCst), 1);
+        assert_eq!(log.unregisters.load(Ordering::SeqCst), 1);
+
+        assert_eq!(log.releases.load(Ordering::SeqCst), 0);
+        drop(ops);
+        assert_eq!(log.releases.load(Ordering::SeqCst), 1);
+        assert_eq!(log.retains.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_client_state_missing_a_part_is_refused_without_a_retain() {
+        let log = ClientCalls::default();
+        let ctx = &log as *const ClientCalls as *const std::ffi::c_void;
+        let incomplete = [
+            EfClientState {
+                ctx: std::ptr::null(),
+                retain: Some(fake_retain),
+                release: Some(fake_release),
+            },
+            EfClientState {
+                ctx,
+                retain: None,
+                release: Some(fake_release),
+            },
+            EfClientState {
+                ctx,
+                retain: Some(fake_retain),
+                release: None,
+            },
+        ];
+        for state in incomplete {
+            // SAFETY: refused before any function pointer is called.
+            let r = unsafe { client_state_cuda_ops(state, fake_map, fake_unmap, fake_unregister) };
+            assert!(matches!(r, Err(crate::Error::InvalidArgument(_))));
+        }
+        assert_eq!(log.retains.load(Ordering::SeqCst), 0);
     }
 
     #[test]

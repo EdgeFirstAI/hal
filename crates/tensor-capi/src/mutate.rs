@@ -650,6 +650,20 @@ mod tests {
     }
 
     #[test]
+    fn set_row_stride_on_planar_pads_rows_and_planes() {
+        // PlanarRgb [C, H, W] = [3, 48, 64]: a padded pitch moves the row
+        // stride (dim 1) and makes each plane `pitch * H` bytes (dim 0).
+        let dims = [3u64, 48, 64];
+        let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 3) };
+        let planar_c = std::ffi::CString::new(Fmt::PlanarRgb.as_str()).unwrap();
+        assert_eq!(unsafe { ef_tensor_set_format(t, planar_c.as_ptr()) }, 0);
+        assert_eq!(unsafe { ef_tensor_set_row_stride(t, 128) }, 0);
+        let strides = unsafe { std::slice::from_raw_parts(crate::handle::ef_tensor_strides(t), 3) };
+        assert_eq!(strides, [128 * 48, 128, 1]);
+        unsafe { ef_tensor_free(t) };
+    }
+
+    #[test]
     fn set_plane_offset_is_read_back_through_ef_tensor_plane_offset() {
         // `ef_tensor_plane_at`'s `offset` is `plane_table`'s intra-buffer
         // plane layout (e.g. where NV12's chroma plane starts within the

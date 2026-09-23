@@ -13,24 +13,17 @@ use edgefirst_tensor::{
     TensorTrait,
 };
 
-/// Host has no usable dma-heap. The dynamic backend wraps the OS error in
-/// `io::ErrorKind::Other` (`image_alloc: IoError(Os { kind: PermissionDenied })`),
-/// so matching only `e.kind()` panics on GitHub-hosted runners.
+/// The DMA-heap skip policy, shared with every DMA-gated test so a skip under
+/// `HAL_TEST_REQUIRE_DMA=1` fails instead. Linux-only, like its callers.
 #[cfg(target_os = "linux")]
-fn platform_resource_absent(err: &Error) -> bool {
-    match err {
-        Error::IoError(e) => {
-            matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) || e.to_string().contains("Permission denied")
-                || e.to_string().contains("No such file or directory")
-        }
-        Error::NotImplemented(msg) => {
-            msg.contains("Permission denied") || msg.contains("errno 13") || msg.contains("errno 2")
-        }
-        _ => false,
-    }
+#[path = "support/dma_require.rs"]
+mod dma_require;
+
+/// `true` when `what` should run: a usable DMA heap, or a skip reported
+/// (and refused under `HAL_TEST_REQUIRE_DMA=1`).
+#[cfg(target_os = "linux")]
+fn dma_or_skip(what: &str) -> bool {
+    dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), what)
 }
 
 #[test]
@@ -299,8 +292,8 @@ fn host_import_without_pin_fails() {
     let desc = TensorDyn::from(t).descriptor();
     let err = TensorDyn::import_descriptor(&desc).unwrap_err();
     assert!(
-        matches!(err, Error::InvalidArgument(_)),
-        "expected InvalidArgument, got {err:?}"
+        matches!(&err, Error::InvalidArgument(m) if m.contains("descriptive-only capsule")),
+        "expected the no-address refusal naming the producer-side fix, got {err:?}"
     );
 }
 
@@ -327,37 +320,17 @@ fn dmabuf_import_has_no_coverage_off_linux() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dmabuf_roundtrip_sees_the_same_bytes() {
-    let t = match Tensor::<u8>::image(
+    if !dma_or_skip("dmabuf_roundtrip_sees_the_same_bytes") {
+        return;
+    }
+    let t = Tensor::<u8>::image(
         64,
         32,
         PixelFormat::Rgb,
         Some(TensorMemory::DmaBuf),
         CpuAccess::ReadWrite,
-    ) {
-        Ok(t) => t,
-        // No DMA-BUF heap on this platform (e.g. Jetson Orin, which uses
-        // nvmap and ships with CONFIG_DMABUF_HEAPS unset) -- a capability
-        // gap, not a regression. Two error kinds mean "no heap here":
-        // `NotFound`, when the device node does not exist at all, and
-        // `PermissionDenied`, when it exists but this user cannot open it
-        // (a stock x86 desktop ships /dev/dma_heap/system as 0600 root).
-        // A node you cannot open is exactly as unavailable as one that is
-        // absent, and panicking on it reports a host-configuration fact as
-        // a code failure -- which then has to be re-diagnosed on every
-        // on-target run. Any other error kind still fails this test below
-        // via the match's final arm.
-        Err(e) if platform_resource_absent(&e) => {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIPPED: dmabuf_roundtrip_sees_the_same_bytes -- this platform has no \
-                 DMA-BUF heap (Tensor::image(.., TensorMemory::DmaBuf, ..) returned \
-                 NotFound); dma-buf allocation is unavailable here, not broken."
-            );
-            return;
-        }
-        Err(e) => panic!("alloc dma: {e:?}"),
-    };
+    )
+    .expect("a usable DMA heap allocates");
     {
         let mut m = t.map_write().unwrap();
         m.as_mut_slice()[0] = 0xEF;
@@ -394,26 +367,17 @@ fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
     // copy of its own fd (so `is_imported = true`), record a stride on the
     // import the way `configure_image` would, and confirm the write through
     // it both succeeds and is visible through the original owner.
-    let owner = match Tensor::<u8>::image(
+    if !dma_or_skip("imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable") {
+        return;
+    }
+    let owner = Tensor::<u8>::image(
         64,
         32,
         PixelFormat::Rgb,
         Some(TensorMemory::DmaBuf),
         CpuAccess::ReadWrite,
-    ) {
-        Ok(t) => t,
-        Err(e) if platform_resource_absent(&e) => {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIPPED: imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable -- \
-                 this platform has no DMA-BUF heap; dma-buf allocation is unavailable \
-                 here, not broken."
-            );
-            return;
-        }
-        Err(e) => panic!("alloc dma: {e:?}"),
-    };
+    )
+    .expect("a usable DMA heap allocates");
 
     let fd = TensorTrait::clone_fd(&owner).expect("clone dma-buf fd");
     let mut imported = Tensor::<u8>::from_fd(fd, &[32, 64, 3], None).expect("import via from_fd");
@@ -457,26 +421,17 @@ fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
     // (wider) pitch -- silent misalignment for any GPU consumer reading at
     // the buffer's real physical stride. Mirrors the `HOST` test exactly,
     // for `TensorMemory::DmaBuf`.
-    let t = match Tensor::<u8>::image(
+    if !dma_or_skip("dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse") {
+        return;
+    }
+    let t = Tensor::<u8>::image(
         1920,
         1080,
         PixelFormat::Nv12,
         Some(TensorMemory::DmaBuf),
         CpuAccess::ReadWrite,
-    ) {
-        Ok(t) => t,
-        Err(e) if platform_resource_absent(&e) => {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIPPED: dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse -- \
-                 this platform has no DMA-BUF heap; dma-buf allocation is unavailable \
-                 here, not broken."
-            );
-            return;
-        }
-        Err(e) => panic!("alloc dma: {e:?}"),
-    };
+    )
+    .expect("a usable DMA heap allocates");
     assert_eq!(
         t.row_stride(),
         Some(1920),
@@ -794,6 +749,11 @@ fn pbo_import_preserves_a_views_parent_pitch() {
     let imported = TensorDyn::import_descriptor(&view.descriptor())
         .expect("a PBO descriptor imports through its client-state vtable");
     assert_eq!(
+        imported.pbo_id(),
+        Some(88),
+        "the import names the producer's GL buffer"
+    );
+    assert_eq!(
         imported.effective_row_stride(),
         Some(parent_pitch),
         "the rebuilt view must step rows by the parent pitch ({parent_pitch}); \
@@ -840,5 +800,90 @@ fn pin_host_is_refused_by_a_pbo_on_both_backends() {
             "a PBO has no host address outside its own map guard, so pin_host \
              must refuse it on this backend exactly as it does on the other, got: {other:?}"
         ),
+    }
+}
+
+/// The descriptor's buffer id is carried verbatim, whatever its value, and
+/// only a negative one means "no buffer".
+#[test]
+fn a_pbo_descriptor_carries_any_buffer_id_and_refuses_a_missing_one() {
+    let t = pbo_backed(0, 16, &[4, 4, 1]);
+    let imported = TensorDyn::import_descriptor(&t.descriptor())
+        .expect("buffer id 0 is a descriptor value like any other");
+    assert_eq!(imported.pbo_id(), Some(0));
+
+    let mut desc = t.descriptor();
+    desc.handle = -1;
+    let err = TensorDyn::import_descriptor(&desc).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidArgument(m) if m == "PBO descriptor carries no buffer id"),
+        "got {err:?}"
+    );
+}
+
+/// A `Shm` tensor's descriptor relabelled `kind::DMABUF` around a dup of its
+/// fd, which is what the dma-buf import arm receives from a real producer:
+/// it dups the fd and lets `from_fd` classify it, so this reaches that arm on
+/// a host with no DMA heap.
+#[cfg(target_os = "linux")]
+fn shm_relabelled_as_dmabuf(
+    first: u8,
+) -> (
+    TensorDyn,
+    std::os::fd::OwnedFd,
+    edgefirst_tensor::TensorDesc,
+) {
+    use std::os::fd::AsRawFd;
+    let t = Tensor::<u8>::new(&[16, 16], Some(TensorMemory::Shm), None).expect("shm allocation");
+    t.map_write().expect("map shm").as_mut_slice()[0] = first;
+    let t = TensorDyn::from(t);
+    let fd = t.clone_fd().expect("shm fd");
+    let mut desc = t.descriptor();
+    desc.kind = edgefirst_tensor::tensor_kind::DMABUF;
+    desc.handle = fd.as_raw_fd() as i64;
+    (t, fd, desc)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dmabuf_descriptor_imports_a_dup_of_its_fd() {
+    let (_src, fd, desc) = shm_relabelled_as_dmabuf(0x5A);
+    let imported = TensorDyn::import_descriptor(&desc).expect("the dma-buf arm imports the fd");
+    // The import holds its own dup, so the descriptor's fd may close.
+    drop(fd);
+    assert_eq!(
+        imported.memory(),
+        TensorMemory::Shm,
+        "from_fd classifies the tmpfs fd it was handed"
+    );
+    let m = imported.as_u8().unwrap().map_read().unwrap();
+    assert_eq!(m.as_slice()[0], 0x5A, "the import aliases the producer");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dmabuf_descriptor_with_a_negative_handle_carries_no_fd() {
+    let (_src, _fd, mut desc) = shm_relabelled_as_dmabuf(0);
+    desc.handle = -1;
+    let err = TensorDyn::import_descriptor(&desc).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidArgument(m) if m == "dma-buf descriptor carries no fd"),
+        "got {err:?}"
+    );
+}
+
+/// `0` is an fd number like any other; only a negative handle is absent.
+/// Whatever this process's fd 0 is, the import must try it rather than
+/// refuse it as missing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dmabuf_descriptor_naming_fd_zero_is_not_refused_as_absent() {
+    let (_src, _fd, mut desc) = shm_relabelled_as_dmabuf(0);
+    desc.handle = 0;
+    if let Err(err) = TensorDyn::import_descriptor(&desc) {
+        assert!(
+            !err.to_string().contains("carries no fd"),
+            "fd 0 is a descriptor, got {err:?}"
+        );
     }
 }

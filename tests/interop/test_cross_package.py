@@ -23,6 +23,7 @@ import sys
 import pytest
 from edgefirst.tensor import PixelFormat, Tensor, is_gpu_buffer_available
 
+from tests.dma_skip import skip_dma
 from tests.gpu_policy import skip_unless_gpu_backed
 
 
@@ -944,9 +945,9 @@ def _view_source_or_skip(cls, mem, shape, fmt):
             RuntimeError,
             OSError,
         ) as e:  # pragma: no cover - depends on the host's heaps
-            pytest.skip(f"DMA-BUF allocation unavailable here: {e}")
+            skip_dma(f"DMA-BUF allocation unavailable here: {e}")
         if t.memory != TensorMemory.DMABUF:
-            pytest.skip(f"DMA-BUF request fell back to {t.memory!r}")
+            skip_dma(f"DMA-BUF request fell back to {t.memory!r}")
     else:
         t = cls(shape, "uint8", mem)
     t.set_format(fmt)

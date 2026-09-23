@@ -7,9 +7,9 @@
 # nothing asserts on, which line coverage cannot see: 100% coverage and a
 # surviving mutant are perfectly compatible. It can also mean the line never
 # ran at all -- a mutation to code this target does not compile survives for
-# want of ever being built, which is what the arm64 lane below is for.
+# want of ever being built, which is what the per-OS legs below are for.
 #
-# The corpus is ~7057 mutants across three crates, far more than one machine
+# The corpus is ~6,900 mutants across three crates, far more than one machine
 # can chew through in a night. Bolting it onto Nightly meant a 120-minute cap
 # that got through 5%, never once finished, and held the whole run open for two
 # hours after every other lane was done -- which also blocked log retrieval for
@@ -18,6 +18,11 @@
 # So: a fixed set of shards each night, fanned out across parallel runners,
 # rotating so the sweep works through the corpus and rolls over. Nothing blocks
 # on this and nothing else waits for it.
+#
+# The roll-up FAILS on any legitimate survivor: a mutant compiled on at least
+# one leg and missed on every leg that compiled it. Mutants in code no leg
+# that ran them compiles are listed but never counted. A red night is the
+# tracking signal until coverage catches up; see TESTING.md § Mutation testing.
 
 name: Mutation testing
 
@@ -28,18 +33,33 @@ on:
     - cron: "47 4 * * *"
   workflow_dispatch:
     inputs:
-      shards:
-        description: Shards the corpus is divided into.
+      tensor_shards:
+        description: Shards the edgefirst-tensor corpus is divided into.
         type: string
         required: false
-        default: "64"
-      window:
-        description: Shards to run in parallel tonight.
+        default: "16"
+      tensor_window:
+        description: edgefirst-tensor shards to run tonight, on every leg.
         type: string
         required: false
-        default: "8"
+        default: "2"
+      other_shards:
+        description: Shards the decoder + tracker corpus is divided into.
+        type: string
+        required: false
+        default: "48"
+      other_window:
+        description: Decoder + tracker shards to run tonight, on the Linux legs.
+        type: string
+        required: false
+        default: "6"
       start:
-        description: "First shard index. Default: rotates by date."
+        description: "First shard index in both corpora. Default: rotates by date."
+        type: string
+        required: false
+        default: ""
+      legs:
+        description: "Comma-separated runners. Default: all four legs."
         type: string
         required: false
         default: ""
@@ -57,60 +77,142 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      shards: ${{ steps.p.outputs.shards }}
-      total: ${{ steps.p.outputs.total }}
-      start: ${{ steps.p.outputs.start }}
+      matrix: ${{ steps.p.outputs.matrix }}
     steps:
       - id: p
         env:
-          TOTAL_IN: ${{ inputs.shards }}
-          WINDOW_IN: ${{ inputs.window }}
+          TENSOR_TOTAL_IN: ${{ inputs.tensor_shards }}
+          TENSOR_WINDOW_IN: ${{ inputs.tensor_window }}
+          OTHER_TOTAL_IN: ${{ inputs.other_shards }}
+          OTHER_WINDOW_IN: ${{ inputs.other_window }}
           START_IN: ${{ inputs.start }}
+          LEGS_IN: ${{ inputs.legs }}
         run: |
           set -euo pipefail
-          total="${TOTAL_IN:-64}"
-          window="${WINDOW_IN:-8}"
-          if (( window > total )); then
-            echo "::error::window ${window} exceeds ${total} shards"
-            exit 1
-          fi
-          if [[ -n "${START_IN}" ]]; then
-            start="${START_IN}"
-          else
-            # Days since the epoch, not day-of-year: it increases forever, so
-            # the rotation neither restarts nor skips at a year boundary.
-            # (`date +%j` would additionally need a 10# prefix, since 008 and
-            # 009 are invalid octal in bash arithmetic.)
-            day=$(( $(date -u +%s) / 86400 ))
-            # Advance by exactly one window per night and wrap on `total`.
-            #
-            # Snapping to window-aligned blocks -- (day % (total / window)) *
-            # window -- silently strands the tail whenever window does not
-            # divide total: at 64/10 the integer division gives 6 blocks
-            # covering 0..59, and shards 60-63 are never tested at all.
-            # Walking the start instead covers every shard for any window.
-            start=$(( (day * window) % total ))
-          fi
-          if (( start < 0 || start >= total )); then
-            echo "::error::start ${start} out of range for ${total} shards"
-            exit 1
-          fi
-          list=""
-          for (( i = 0; i < window; i++ )); do
-            idx=$(( (start + i) % total ))
-            list="${list}${list:+,}${idx}"
+          # Two corpora, because the legs do not all test the same packages.
+          #
+          # edgefirst-tensor carries the target_os code (d3d11 on Windows,
+          # IOSurface on macOS, DMA on Linux), so it runs on all four legs.
+          # The decoder and tracker have no target_os code, only
+          # target_arch, so re-running them on macOS and Windows would only
+          # repeat Linux; they run on the two Linux legs.
+          #
+          # Every leg that runs a corpus runs the SAME shard indices of it
+          # on the same night. The roll-up merges legs by mutant name and
+          # counts a mutant as caught if any leg caught it; a shard index
+          # that meant different mutants on different legs would leave a
+          # mutant only one leg can kill judged by a leg that cannot.
+          #
+          # Sizing, from outcomes.json start/end times: a tensor mutant costs
+          # ~2 s on x86_64 and ~4 s on arm64, a decoder mutant ~25 s and
+          # ~45 s. 16 tensor shards is ~200 mutants each; 48 decoder+tracker
+          # shards is ~80 each. Both windows sweep their corpus in 8 nights.
+          tensor_total="${TENSOR_TOTAL_IN:-16}"
+          tensor_window="${TENSOR_WINDOW_IN:-2}"
+          other_total="${OTHER_TOTAL_IN:-48}"
+          other_window="${OTHER_WINDOW_IN:-6}"
+          all_legs="ubuntu-24.04,ubuntu-24.04-arm,macos-latest,windows-latest"
+          for n in "${tensor_total}" "${tensor_window}" "${other_total}" \
+                   "${other_window}" "${START_IN:-0}"; do
+            # Validated before any arithmetic: bash evaluates expressions
+            # inside $(( )), so a non-numeric input would be executed, and
+            # reads a leading zero as octal, so `08` would abort mid-plan.
+            if [[ ! "${n}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::'${n}' is not a non-negative decimal integer without leading zeros"
+              exit 1
+            fi
           done
+          legs="${LEGS_IN:-${all_legs}}"
+          legs="${legs// /}"
+          IFS=, read -r -a leg_list <<< "${legs}"
+          for leg in "${leg_list[@]}"; do
+            if [[ ",${all_legs}," != *",${leg},"* ]]; then
+              echo "::error::unknown leg '${leg}'; expected one of ${all_legs}"
+              exit 1
+            fi
+          done
+
+          # Days since the epoch, not day-of-year: it increases forever, so
+          # the rotation neither restarts nor skips at a year boundary.
+          day=$(( $(date -u +%s) / 86400 ))
+
+          # Prints tonight's shard indices of one corpus, comma-separated.
+          # Advance by exactly one window per night and wrap on `total`.
+          #
+          # Snapping to window-aligned blocks -- (day % (total / window)) *
+          # window -- silently strands the tail whenever window does not
+          # divide total: at 64/10 the integer division gives 6 blocks
+          # covering 0..59, and shards 60-63 are never tested at all.
+          # Walking the start instead covers every shard for any window.
+          pick() {
+            local total="$1" window="$2" start list="" i
+            if (( window < 1 || window > total )); then
+              echo "::error::window ${window} is outside 1..${total}" >&2
+              return 1
+            fi
+            if [[ -n "${START_IN}" ]]; then
+              start=$(( START_IN % total ))
+            else
+              start=$(( (day * window) % total ))
+            fi
+            for (( i = 0; i < window; i++ )); do
+              list="${list}${list:+,}$(( (start + i) % total ))"
+            done
+            echo "${list}"
+          }
+          tensor_list="$(pick "${tensor_total}" "${tensor_window}")"
+          other_list="$(pick "${other_total}" "${other_window}")"
+
+          # timeout-minutes per runner. The Linux values are measured: the
+          # arm64 runner is about twice as slow as x86_64 on this work and
+          # also builds cargo-mutants from source. macOS and Windows start
+          # conservative; tune them from a night's shard wall times
+          # (outcomes.json end_time - start_time, plus ~5 minutes of setup)
+          # with a 2x margin, as the arm64 value was.
+          timeout_for() {
+            case "$1" in
+              ubuntu-24.04) echo 120 ;;
+              ubuntu-24.04-arm) echo 180 ;;
+              macos-latest) echo 150 ;;
+              windows-latest) echo 240 ;;
+            esac
+          }
+
+          matrix="$(
+            for leg in "${leg_list[@]}"; do
+              IFS=, read -r -a shards <<< "${tensor_list}"
+              for shard in "${shards[@]}"; do
+                jq -cn --arg runner "${leg}" --argjson shard "${shard}" \
+                  --argjson total "${tensor_total}" --argjson timeout "$(timeout_for "${leg}")" \
+                  '{corpus: "tensor", shard: $shard, total: $total, runner: $runner,
+                    packages: "--package edgefirst-tensor", timeout: $timeout}'
+              done
+              [[ "${leg}" == ubuntu-* ]] || continue
+              IFS=, read -r -a shards <<< "${other_list}"
+              for shard in "${shards[@]}"; do
+                jq -cn --arg runner "${leg}" --argjson shard "${shard}" \
+                  --argjson total "${other_total}" --argjson timeout "$(timeout_for "${leg}")" \
+                  '{corpus: "other", shard: $shard, total: $total, runner: $runner,
+                    packages: "--package edgefirst-decoder --package edgefirst-tracker",
+                    timeout: $timeout}'
+              done
+            done | jq -cs '{include: .}'
+          )"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
           {
-            echo "shards=[${list}]"
-            echo "total=${total}"
-            echo "start=${start}"
-          } >> "$GITHUB_OUTPUT"
-          echo "tonight: shards ${list} of ${total}"
+            echo "### Tonight's mutation shards"
+            echo ""
+            echo "| corpus | shards | of | legs |"
+            echo "| --- | --- | ---: | --- |"
+            echo "| edgefirst-tensor | ${tensor_list} | ${tensor_total} | ${legs//,/, } |"
+            echo "| decoder + tracker | ${other_list} | ${other_total} | Linux legs only |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "tonight: ${matrix}"
 
   mutants:
-    name: Shard ${{ matrix.shard }} (${{ matrix.runner }})
+    name: ${{ matrix.corpus }} ${{ matrix.shard }}/${{ matrix.total }} (${{ matrix.runner }})
     needs: plan
-    # Free standard runner. Nothing waits on this lane, so speed buys nothing
+    # Free standard runners. Nothing waits on this lane, so speed buys nothing
     # worth billing for, and `larger` would cost roughly $150/month for an hour
     # a night. See the advisory exception in the shared copilot-instructions.md
     # for the same reasoning applied to an ungated lane.
@@ -123,35 +225,28 @@ jobs:
     # shard gets a whole machine, so --in-place stays valid and each runner
     # keeps one target directory and one build cache.
     #
-    # Every shard runs on both architectures, because a mutant is a property of
-    # the code as compiled, not of the source line. The decoder's NEON paths --
-    # arg_max_i8, fast_arg_max's dispatch, the column-max kernels and all of
-    # per_scale/kernels -- sit behind #[cfg(target_arch = "aarch64")] and are
-    # absent from an x86_64 build, so mutating them there changes a file the
-    # compiler never reads. The x86_64 sweep dutifully reported 33 of them as
-    # surviving, which said nothing about the tests: no test that runs on that
-    # runner could have caught them. arm64 Linux runners are free tier, so
-    # covering the other half of the code costs runner time and nothing else.
+    # A mutant is a property of the code as compiled, not of the source line,
+    # so every leg is a different build of the same text. The decoder's NEON
+    # paths sit behind #[cfg(target_arch = "aarch64")] and exist only on the
+    # arm64 leg; tensor's d3d11/ backend only on Windows, iosurface*.rs and
+    # the Apple arms only on macOS, the DMA heap only on Linux. A mutant in
+    # code a leg does not compile passes that leg by construction; the
+    # roll-up reads the cfg and the build log to tell those apart from real
+    # survivors.
     runs-on: ${{ matrix.runner }}
-    # The arm64 runner is about twice as slow on this work -- shard 0 took 27
-    # minutes on x86_64 and 57 on arm64 in run 35151929668 -- and it also
-    # builds cargo-mutants from source, since no aarch64 binary is published.
-    # At a flat 120 that run's arm64 shard 1 was cancelled mid-sweep while its
-    # x86_64 twin finished in 50 minutes, which loses the shard rather than
-    # reporting it.
-    timeout-minutes: ${{ matrix.runner == 'ubuntu-24.04-arm' && 180 || 120 }}
+    timeout-minutes: ${{ matrix.timeout }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       # One shard failing says nothing about the others, and the point of the
       # night is breadth. max-parallel leaves concurrency for anything else
-      # that happens to be queued, and stays at 8 now that the matrix is two
-      # architectures deep: the night runs in two passes instead of one rather
-      # than taking twice the concurrency. Nothing waits on this lane, so the
-      # wall clock is not a cost.
+      # that happens to be queued; the night runs in several passes instead of
+      # taking more concurrency. Nothing waits on this lane, so the wall clock
+      # is not a cost.
       max-parallel: 8
-      matrix:
-        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -164,24 +259,38 @@ jobs:
 
       # cargo-mutants publishes prebuilt binaries for x86_64 linux, macOS and
       # Windows only (checked at v27.1.0), so on the arm64 runner this falls
-      # back to building it from source. That costs a few minutes per job
-      # against a 120-minute cap and needs no handling; it is only worth
-      # knowing before someone reads the arm lane's setup step as a hang.
+      # back to building it from source. That costs a few minutes per job and
+      # needs no handling; it is only worth knowing before someone reads the
+      # arm lane's setup step as a hang.
       - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
         with:
           tool: cargo-mutants
 
+      # Runs before cargo-mutants so its baseline sees the result. When the
+      # heap allocates, HAL_TEST_REQUIRE_DMA=1 makes any DMA test that would
+      # skip fail instead; a heap that stops working then fails the baseline
+      # (cargo-mutants exit 4, a red shard) rather than turning every
+      # DMA-only mutant into a silent survivor.
+      - name: DMA heap
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/dma-heap-setup.sh
+
+      # The hosted Windows runners have no GPU, so DXGI adapter 0 is already
+      # the Microsoft Basic Render Driver. Naming WARP pins that rather than
+      # trusting the adapter order of the runner image. See
+      # crates/tensor/src/d3d11/adapter.rs for the selection rules.
+      - name: D3D11 adapter
+        if: runner.os == 'Windows'
+        run: echo "EDGEFIRST_D3D11_ADAPTER=warp" >> "$GITHUB_ENV"
+
       - name: Run cargo-mutants
         env:
           SHARD: ${{ matrix.shard }}
-          TOTAL: ${{ needs.plan.outputs.total }}
-          # Scope to the pure-logic crates. image and codec reach the GPU and a
-          # mutant there hangs or aborts the driver rather than failing a test,
-          # which reports as "unviable" and tells us nothing.
-          PACKAGES: >-
-            --package edgefirst-tensor
-            --package edgefirst-tracker
-            --package edgefirst-decoder
+          TOTAL: ${{ matrix.total }}
+          # Scoped to the pure-logic crates. image and codec reach the GPU and
+          # a mutant there hangs or aborts the driver rather than failing a
+          # test, which reports as "unviable" and tells us nothing.
+          PACKAGES: ${{ matrix.packages }}
         run: |
           set -euo pipefail
           # No coverage instrumentation here, by design rather than omission.
@@ -190,6 +299,11 @@ jobs:
           # overhead. Nothing in .cargo/config.toml or the Cargo profiles turns
           # it on for this target, and this lane does not go through
           # setup-rust; keep it that way.
+          #
+          # .cargo/mutants.toml is read from the workspace root automatically:
+          # it carries the file exclusions and the equivalent-mutant
+          # exclude_re list, so the corpus and its shards are the same here
+          # and in a local `cargo mutants --list`.
           #
           # --sharding slice keeps a shard's mutants contiguous in the corpus,
           # so one shard mutates a handful of nearby files and reuses far more
@@ -210,6 +324,7 @@ jobs:
             --sharding slice
             --output mutants-report
           )
+          echo "DMA require gate: HAL_TEST_REQUIRE_DMA=${HAL_TEST_REQUIRE_DMA:-unset}"
           rc=0
           # shellcheck disable=SC2086  # PACKAGES is an argument list and must split
           cargo mutants "${args[@]}" $PACKAGES -- -- --test-threads=1 || rc=$?
@@ -228,14 +343,25 @@ jobs:
         if: always()
         env:
           SHARD: ${{ matrix.shard }}
-          TOTAL: ${{ needs.plan.outputs.total }}
+          TOTAL: ${{ matrix.total }}
+          CORPUS: ${{ matrix.corpus }}
           RUNNER_NAME: ${{ matrix.runner }}
+          PACKAGES: ${{ matrix.packages }}
         run: |
           set -euo pipefail
+          # leg.json travels in the artifact beside mutants.out so the roll-up
+          # can name the leg and its DMA state without parsing job names.
+          # Every value is set by the plan job or dma-heap-setup.sh and none
+          # holds a quote, so printf is enough and needs no jq on the runner.
+          mkdir -p mutants-report
+          printf '{"runner": "%s", "corpus": "%s", "shard": %s, "total": %s, "packages": "%s", "dma": "%s"}\n' \
+            "${RUNNER_NAME}" "${CORPUS}" "${SHARD}" "${TOTAL}" "${PACKAGES}" \
+            "${HAL_CI_DMA_STATE:-n/a}" > mutants-report/leg.json
+          cat mutants-report/leg.json
           out=mutants-report/mutants.out
           if [[ ! -d "${out}" ]]; then
-            echo "::warning::shard ${SHARD} on ${RUNNER_NAME} produced no report"
-            exit 0
+            echo "::error::${CORPUS} shard ${SHARD} on ${RUNNER_NAME} produced no report"
+            exit 1
           fi
           tested=0
           for f in caught missed timeout unviable; do
@@ -246,17 +372,17 @@ jobs:
           # A run that enumerates mutants but tests none is a no-op wearing a
           # green tick, which is how this lane's first execution presented.
           if [[ "${tested}" -eq 0 ]]; then
-            echo "::error::shard ${SHARD} on ${RUNNER_NAME} tested no mutants; the report is empty"
+            echo "::error::${CORPUS} shard ${SHARD} on ${RUNNER_NAME} tested no mutants; the report is empty"
             exit 1
           fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
-          # The runner suffix keeps the two architectures' artifacts apart and
-          # is what the roll-up reads the architecture back out of, so a
-          # survivor says which build it survived in.
-          name: mutants-shard-${{ matrix.shard }}-${{ matrix.runner }}
+          # The runner suffix keeps the legs' artifacts apart and is what the
+          # roll-up reads the target back out of when leg.json is missing, so
+          # a survivor says which build it survived in.
+          name: mutants-shard-${{ matrix.corpus }}-${{ matrix.shard }}-${{ matrix.runner }}
           path: mutants-report/
           retention-days: 14
 
@@ -268,8 +394,9 @@ jobs:
     timeout-minutes: 10
     steps:
       # Before the download: checkout cleans the working directory, so the
-      # other order deletes the shards it just fetched. No LFS here -- this job
-      # reads JSON from the artifacts, never a model.
+      # other order deletes the shards it just fetched. The roll-up also reads
+      # the Rust sources of this same commit to evaluate #[cfg] against each
+      # leg's target. No LFS here -- this job never reads a model.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
@@ -281,8 +408,9 @@ jobs:
 
       - name: Totals across tonight's shards
         env:
-          TOTAL: ${{ needs.plan.outputs.total }}
-          START: ${{ needs.plan.outputs.start }}
+          # The plan's shard list, so a shard that left no artifact (timed
+          # out, cancelled) fails the roll-up instead of shrinking the totals.
+          EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
           set -euo pipefail
           # Per-shard step summaries are useful when a shard misbehaves, but
@@ -291,8 +419,12 @@ jobs:
           #
           # This reads each shard's outcomes.json rather than counting lines in
           # the per-outcome .txt files, because the JSON also carries the file,
-          # the function and the diff for every mutant -- which is what turns
-          # "168 missed" into a list of functions nothing asserts on.
+          # the function, the diff and the build log for every mutant -- which
+          # is what turns "168 missed" into a list of functions nothing asserts
+          # on, and what tells a real survivor from one no leg compiled.
+          #
+          # Exit 1 on any legitimate survivor, or when a leg left unbuilt a
+          # file its target compiles (a broken leg, not weak tests).
           #
           # The shell version of this rolled the survivor list up with
           # `cat missed.txt | head -60`. Past 60 survivors head closed the pipe

@@ -70,6 +70,7 @@ nix = { workspace = true }
 windows = { workspace = true }
 
 [dev-dependencies]
+mutants = { workspace = true }
 ctor = { workspace = true }
 env_logger = { workspace = true }
 edgefirst-bench = { workspace = true }

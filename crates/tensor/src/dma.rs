@@ -500,20 +500,12 @@ impl<T> DmaTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    /// Shared map constructor.
+    /// Validate the window a map would expose, before any syscall.
     ///
-    /// Carries forward every check the deleted `DmaMap::new_internal`
-    /// performed, with the same error variants — these are asserted by the
-    /// tests below, and a mapping that slipped past them would SIGBUS on
-    /// access rather than fail cleanly.
-    fn map_inner<'a>(
-        &self,
-        byte_size_override: Option<usize>,
-        access: crate::CpuAccess,
-    ) -> Result<crate::view::HostView<'a, T>>
-    where
-        T: 'a,
-    {
+    /// A mapping that slipped past these checks would SIGBUS on access rather
+    /// than fail cleanly. The alignment and multiple-of checks are no-ops for
+    /// single-byte `T` (`align_of` and `size_of` are both 1).
+    fn check_map_window(&self, byte_size_override: Option<usize>) -> Result<()> {
         let t_size = std::mem::size_of::<T>();
         let logical_size = self.shape.iter().product::<usize>() * t_size;
         if logical_size == 0 {
@@ -526,7 +518,7 @@ where
         if total_needed > self.buf_size {
             return Err(Error::InvalidSize(total_needed));
         }
-        if t_size > 1 && !self.mmap_offset.is_multiple_of(std::mem::align_of::<T>()) {
+        if !self.mmap_offset.is_multiple_of(std::mem::align_of::<T>()) {
             return Err(Error::InvalidOperation(format!(
                 "DMA map: offset {} not aligned to align_of::<T>()={}",
                 self.mmap_offset,
@@ -537,7 +529,7 @@ where
             if byte_size == 0 {
                 return Err(Error::InvalidSize(0));
             }
-            if t_size > 1 && !byte_size.is_multiple_of(t_size) {
+            if !byte_size.is_multiple_of(t_size) {
                 return Err(Error::InvalidOperation(format!(
                     "DMA map: byte_size {byte_size} is not a multiple of size_of::<T>()={t_size}"
                 )));
@@ -546,6 +538,20 @@ where
                 return Err(Error::InvalidSize(byte_size));
             }
         }
+        Ok(())
+    }
+
+    /// Shared map constructor: [`check_map_window`](Self::check_map_window),
+    /// then a sync-bracketed pin.
+    fn map_inner<'a>(
+        &self,
+        byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.check_map_window(byte_size_override)?;
         Ok(crate::view::HostView::new(
             self.scoped_pin(access)?,
             self.shape.clone(),
@@ -636,28 +642,221 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TensorMapTrait;
+    use crate::{CpuAccess, TensorMapTrait};
+    use std::os::fd::FromRawFd;
 
-    /// Returns a valid fd backed by /dev/null.  The new error paths in
-    /// DmaMap::new() all fire before any fd-specific syscall (mmap,
-    /// DMA_BUF_IOCTL_SYNC), so any readable fd is sufficient.
-    #[cfg(target_os = "linux")]
-    fn dummy_fd() -> std::os::fd::OwnedFd {
-        use std::os::fd::FromRawFd;
-        use std::os::unix::io::IntoRawFd;
-        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
-        unsafe { std::os::fd::OwnedFd::from_raw_fd(f.into_raw_fd()) }
+    /// A fd backed by /dev/null: `fstat` reports `st_size == 0`, and every
+    /// window check fires before any fd-specific syscall.
+    fn dummy_fd() -> OwnedFd {
+        OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null"))
+    }
+
+    /// An anonymous memory file of `len` bytes: mmap-able, a real `st_size`,
+    /// but not a dma-buf, so sync ioctls on it fail with `ENOTTY`.
+    fn memfd(len: usize, fill: impl Fn(usize) -> u8) -> OwnedFd {
+        use std::io::Write;
+        let raw = unsafe { libc::memfd_create(c"dma-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(
+            raw >= 0,
+            "memfd_create: {}",
+            std::io::Error::last_os_error()
+        );
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let bytes: Vec<u8> = (0..len).map(fill).collect();
+        std::fs::File::from(fd.try_clone().expect("dup"))
+            .write_all(&bytes)
+            .expect("fill memfd");
+        fd
+    }
+
+    fn zeroed_stat() -> nix::sys::stat::FileStat {
+        // SAFETY: `libc::stat` is plain old data; all-zero is a valid value.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// `st_dev` lands in the high half and `st_ino` is XORed in: an inode
+    /// whose bit 32 overlaps the device's bit 0 cancels it.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn identity_from_stat_folds_the_device_into_the_high_half() {
+        let mut st = zeroed_stat();
+        st.st_dev = 1;
+        st.st_ino = (1 << 32) | 5;
+        let id = identity_from_stat(&st);
+        assert_eq!(id.kind(), crate::IdentityKind::DmaBuf);
+        assert_eq!(
+            id.id(),
+            crate::BufferIdentity::derived(crate::IdentityKind::DmaBuf, 5).id()
+        );
+
+        st.st_dev = 2;
+        st.st_ino = 3;
+        assert_eq!(
+            identity_from_stat(&st).id(),
+            crate::BufferIdentity::derived(crate::IdentityKind::DmaBuf, (2 << 32) | 3).id()
+        );
+    }
+
+    #[test]
+    fn from_fd_records_name_shape_capacity_and_fd() {
+        let fd = dummy_fd();
+        let raw = fd.as_raw_fd();
+        let t = DmaTensor::<u8>::from_fd(fd, &[4096], Some("imported")).expect("import");
+        assert_eq!(t.name(), "imported");
+        assert_eq!(t.shape(), &[4096]);
+        assert_eq!(t.capacity_bytes(), 4096);
+        assert_eq!(t.as_raw_fd(), raw);
+        assert_eq!(t.memory(), TensorMemory::DmaBuf);
+    }
+
+    #[test]
+    fn from_fd_rejects_empty_and_zero_sized_shapes() {
+        assert!(matches!(
+            DmaTensor::<u8>::from_fd(dummy_fd(), &[], None),
+            Err(Error::InvalidSize(0))
+        ));
+        assert!(matches!(
+            DmaTensor::<u32>::from_fd(dummy_fd(), &[4, 0], None),
+            Err(Error::InvalidSize(0))
+        ));
+    }
+
+    /// Capacity is the fd's `st_size` when that covers the logical size, and
+    /// the logical size otherwise (including kernels reporting 0).
+    #[test]
+    fn from_fd_capacity_is_the_fstat_size_only_when_it_covers_the_shape() {
+        let bigger = DmaTensor::<u32>::from_fd(memfd(8192, |_| 0), &[1024], None).unwrap();
+        assert_eq!(bigger.capacity_bytes(), 8192);
+
+        let smaller = DmaTensor::<u32>::from_fd(memfd(1000, |_| 0), &[1024], None).unwrap();
+        assert_eq!(smaller.capacity_bytes(), 4096);
+
+        let unsized_fd = DmaTensor::<u32>::from_fd(dummy_fd(), &[1024], None).unwrap();
+        assert_eq!(unsized_fd.capacity_bytes(), 4096);
+    }
+
+    #[test]
+    fn distinct_segments_get_distinct_identities_and_a_dup_keeps_its_own() {
+        let a_fd = memfd(64, |_| 0);
+        let a = DmaTensor::<u8>::from_fd(a_fd.try_clone().unwrap(), &[64], None).unwrap();
+        let again = DmaTensor::<u8>::from_fd(a_fd, &[64], None).unwrap();
+        let b = DmaTensor::<u8>::from_fd(memfd(64, |_| 0), &[64], None).unwrap();
+        assert_eq!(a.buffer_identity().id(), again.buffer_identity().id());
+        assert_ne!(a.buffer_identity().id(), b.buffer_identity().id());
+    }
+
+    #[test]
+    fn reshape_keeps_the_byte_size_of_a_multi_byte_element() {
+        let mut t = DmaTensor::<u32>::from_fd(dummy_fd(), &[1024], None).unwrap();
+        t.reshape(&[32, 32]).expect("same element count");
+        assert_eq!(t.shape(), &[32, 32]);
+        assert!(matches!(t.reshape(&[7]), Err(Error::ShapeMismatch(_))));
+        assert!(matches!(t.reshape(&[]), Err(Error::InvalidSize(0))));
+        assert_eq!(t.shape(), &[32, 32], "a refused reshape leaves the shape");
+    }
+
+    #[test]
+    fn set_logical_shape_is_bounded_by_capacity_in_bytes() {
+        let mut t = DmaTensor::<u32>::from_fd(dummy_fd(), &[1024], None).unwrap();
+        t.set_logical_shape(&[512]).expect("shrink");
+        t.set_logical_shape(&[1024]).expect("exact fit");
+        match t.set_logical_shape(&[1025]) {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (4100, 4096));
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+        assert_eq!(t.shape(), &[1024]);
+        assert!(matches!(
+            t.set_logical_shape(&[]),
+            Err(Error::InvalidSize(0))
+        ));
+    }
+
+    #[test]
+    fn view_checks_alignment_and_the_byte_window() {
+        let t = DmaTensor::<u32>::from_fd(dummy_fd(), &[1024], Some("p")).unwrap();
+
+        let v = t.view(4, &[1023]).expect("exact fit at an aligned offset");
+        assert_eq!(v.shape(), &[1023]);
+        assert_eq!(v.mmap_offset, 4);
+        assert_eq!(v.capacity_bytes(), 4096);
+        assert_eq!(v.name(), "p");
+        assert_eq!(v.buffer_identity().id(), t.buffer_identity().id());
+        let nested = v.view(4, &[1022]).expect("nested view composes");
+        assert_eq!(nested.mmap_offset, 8);
+
+        assert!(matches!(t.view(2, &[1]), Err(Error::InvalidOperation(_))));
+        match t.view(4, &[1024]) {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (4100, 4096));
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_window_checks_for_a_multi_byte_element() {
+        let mut t = DmaTensor::<u32>::from_fd(dummy_fd(), &[1024], None).unwrap();
+        assert!(t.check_map_window(None).is_ok(), "exact fit");
+        assert!(t.check_map_window(Some(4096)).is_ok(), "override exact fit");
+        assert!(matches!(
+            t.check_map_window(Some(0)),
+            Err(Error::InvalidSize(0))
+        ));
+        assert!(matches!(
+            t.check_map_window(Some(6)),
+            Err(Error::InvalidOperation(_))
+        ));
+        assert!(matches!(
+            t.check_map_window(Some(4100)),
+            Err(Error::InvalidSize(4100))
+        ));
+
+        t.shape = vec![1023];
+        t.mmap_offset = 4;
+        assert!(
+            t.check_map_window(None).is_ok(),
+            "aligned offset, exact fit"
+        );
+        assert!(t.check_map_window(Some(4092)).is_ok());
+        assert!(matches!(
+            t.check_map_window(Some(4096)),
+            Err(Error::InvalidSize(4096))
+        ));
+
+        t.mmap_offset = 2;
+        assert!(matches!(
+            t.check_map_window(None),
+            Err(Error::InvalidOperation(_))
+        ));
+
+        t.mmap_offset = 0;
+        t.shape = vec![1024];
+        t.buf_size = 1024;
+        assert!(matches!(
+            t.check_map_window(None),
+            Err(Error::InvalidSize(4096))
+        ));
+    }
+
+    #[test]
+    fn map_window_checks_accept_any_offset_for_a_byte_element() {
+        let mut t = DmaTensor::<u8>::from_fd(dummy_fd(), &[4095], None).unwrap();
+        t.buf_size = 4096;
+        t.mmap_offset = 1;
+        assert!(t.check_map_window(None).is_ok());
+        assert!(t.check_map_window(Some(3)).is_ok());
     }
 
     /// offset + logical_size exceeds buf_size — must return InvalidSize.
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_dma_map_offset_exceeds_buf_size() {
         let fd = dummy_fd();
         let mut t = DmaTensor::<u8>::from_fd(fd, &[4096], None).expect("import");
         t.buf_size = 4096;
         t.mmap_offset = 4096;
-        let result = t.map_inner(None, crate::CpuAccess::ReadWrite);
+        let result = t.map_inner(None, CpuAccess::ReadWrite);
         match result {
             Err(Error::InvalidSize(n)) => assert_eq!(n, 8192),
             other => panic!("expected InvalidSize(8192), got {other:?}"),
@@ -666,13 +865,12 @@ mod tests {
 
     /// Offset not aligned to align_of::<T>() — must return InvalidOperation.
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_dma_map_misaligned_offset() {
         let fd = dummy_fd();
         let mut t = DmaTensor::<u32>::from_fd(fd, &[1024], None).expect("import");
         t.buf_size = 8192;
         t.mmap_offset = 3;
-        let result = t.map_inner(None, crate::CpuAccess::ReadWrite);
+        let result = t.map_inner(None, CpuAccess::ReadWrite);
         assert!(
             matches!(result, Err(Error::InvalidOperation(_))),
             "expected InvalidOperation for misaligned offset, got {result:?}"
@@ -681,36 +879,128 @@ mod tests {
 
     /// offset + logical_size overflows usize — must return InvalidSize(0).
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_dma_map_offset_overflow() {
         let fd = dummy_fd();
         let mut t = DmaTensor::<u8>::from_fd(fd, &[1], None).expect("import");
         t.buf_size = 4096;
         t.mmap_offset = usize::MAX;
-        let result = t.map_inner(None, crate::CpuAccess::ReadWrite);
+        let result = t.map_inner(None, CpuAccess::ReadWrite);
         match result {
             Err(Error::InvalidSize(n)) => assert_eq!(n, 0),
             other => panic!("expected InvalidSize(0), got {other:?}"),
         }
     }
 
+    /// `host_pin` needs no sync, so it works over any mmap-able fd: the pin
+    /// starts at the tensor's offset and spans the rest of the buffer.
     #[test]
-    #[cfg(target_os = "linux")]
+    fn host_pin_of_an_imported_segment_is_offset_adjusted_and_readable() {
+        let fd = memfd(8192, |i| (i % 251) as u8);
+        let mut t = DmaTensor::<u8>::from_fd(fd, &[8192], None).unwrap();
+        t.mmap_offset = 16;
+        let pin = t.host_pin().expect("pin");
+        assert_eq!(pin.len(), 8192 - 16);
+        let bytes = unsafe { pin.as_slice() };
+        assert_eq!(bytes[0], 16);
+        assert_eq!(bytes[300 - 16], (300 % 251) as u8);
+    }
+
+    /// A map opens a coherency bracket; over a fd that is not a dma-buf the
+    /// START sync fails, and the map must report it rather than hand back an
+    /// unbracketed view.
+    #[test]
+    fn map_of_a_fd_that_is_not_a_dma_buf_fails_on_the_start_sync() {
+        let t = DmaTensor::<u8>::from_fd(memfd(4096, |_| 0), &[4096], None).unwrap();
+        let before = crate::dmabuf::SYNC_CALLS.with(|c| c.get());
+        match t.map_with(CpuAccess::Read) {
+            Err(Error::NixError(nix::errno::Errno::ENOTTY)) => {}
+            other => panic!("expected NixError(ENOTTY), got {other:?}"),
+        }
+        let after = crate::dmabuf::SYNC_CALLS.with(|c| c.get());
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (1, 0),
+            "a failed START must not be followed by an END"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn new_with_byte_size_refuses_a_byte_size_below_the_shape() {
+        assert!(matches!(
+            DmaTensor::<u32>::new_with_byte_size(&[10], 39, None),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            DmaTensor::<u8>::new_with_byte_size(&[usize::MAX, 2], 1, None),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    fn fstat_size(fd: &OwnedFd) -> usize {
+        nix::sys::stat::fstat(fd).expect("fstat").st_size as usize
+    }
+
+    /// Heap allocations are page-rounded; capacity must report what the
+    /// kernel actually allocated, not the request.
+    #[test]
+    #[cfg(not(miri))]
+    fn heap_allocation_capacity_is_the_fstat_size() {
+        if !crate::test_support::dma_or_skip("heap_allocation_capacity_is_the_fstat_size") {
+            return;
+        }
+        let t = DmaTensor::<u8>::new(&[1000], Some("heap")).expect("alloc");
+        assert_eq!(t.name(), "heap");
+        assert_eq!(t.capacity_bytes(), fstat_size(&t.fd));
+        assert!(t.capacity_bytes() >= 1000);
+
+        let padded = DmaTensor::<u32>::new_with_byte_size(&[10, 25], 1000, None).expect("alloc");
+        assert_eq!(padded.shape(), &[10, 25]);
+        assert_eq!(padded.capacity_bytes(), fstat_size(&padded.fd));
+        assert!(padded.capacity_bytes() > 1000, "page rounding");
+        assert!(padded.name().starts_with('/'), "generated name");
+    }
+
+    /// Every map issues exactly one START and, when the view drops, exactly
+    /// one END.
+    #[test]
+    #[cfg(not(miri))]
+    fn a_map_brackets_with_one_start_and_one_end_sync() {
+        if !crate::test_support::dma_or_skip("a_map_brackets_with_one_start_and_one_end_sync") {
+            return;
+        }
+        let t = DmaTensor::<u32>::new(&[256], None).expect("alloc");
+        let before = crate::dmabuf::SYNC_CALLS.with(|c| c.get());
+        {
+            let mut m = t.map_with(CpuAccess::ReadWrite).expect("map");
+            assert_eq!(m.as_slice().len(), 256);
+            m.as_mut_slice()[255] = 0xDEAD_BEEF;
+            let mid = crate::dmabuf::SYNC_CALLS.with(|c| c.get());
+            assert_eq!((mid.0 - before.0, mid.1 - before.1), (1, 0));
+        }
+        let after = crate::dmabuf::SYNC_CALLS.with(|c| c.get());
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+
+        let wide = t
+            .map_with_byte_size(t.capacity_bytes(), CpuAccess::Read)
+            .expect("map the whole buffer");
+        assert_eq!(wide.as_slice().len(), t.capacity_bytes() / 4);
+        assert_eq!(wide.as_slice()[255], 0xDEAD_BEEF);
+    }
+
+    #[test]
     fn test_dma_map_with_offset() {
         use crate::{Tensor, TensorMemory, TensorTrait};
 
-        // Skip if DMA heap not available
+        if !crate::test_support::dma_or_skip("test_dma_map_with_offset") {
+            return;
+        }
         let total_size: usize = 4096 * 4; // 16KB
         let offset: usize = 4096; // 4KB offset
         let data_size: usize = 4096; // 4KB of data after offset
 
-        let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip("DMA not available");
-                return;
-            }
-        };
+        let large_buf = Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None)
+            .expect("DMA allocation");
 
         // Fill entire buffer with sentinel
         {

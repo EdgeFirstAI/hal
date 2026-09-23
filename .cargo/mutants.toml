@@ -1,0 +1,50 @@
+# cargo-mutants configuration, read automatically from the workspace root by
+# every `cargo mutants` run (the nightly lane and local runs alike).
+# `--no-config` ignores it; `cargo mutants --emit-schema config` lists the keys.
+
+# Files no mutation leg compiles. There is no Android runner, so every mutant
+# in the AHardwareBuffer backend would pass unbuilt on every leg. Its pure
+# layout arithmetic lives in ahardwarebuffer_layout.rs, which is compiled and
+# mutated everywhere.
+exclude_globs = ["crates/tensor/src/ahardwarebuffer.rs"]
+
+# Single equivalent mutations inside functions whose other mutants are
+# killable, matched against the names `cargo mutants --list` prints
+# (`file:line:col: description`). A mutation is equivalent when no test can
+# tell it apart from the original, e.g. `|` to `^` on bit flags that never
+# overlap. Whole functions that are equivalent get
+# `#[cfg_attr(test, mutants::skip)]` in the source instead.
+#
+# Convention: one entry per mutation, each preceded by a comment saying why
+# it cannot be killed. Anchor on the file and function rather than the line
+# and column, which move with every edit above them, e.g.
+#
+#   # FLAG_A and FLAG_B are disjoint bits, so `|` and `^` agree.
+#   'crates/tensor/src/dma\.rs:\d+:\d+: replace \| with \^ in sync_flags$',
+exclude_re = [
+    # Each axis is packed into its own byte, so `|` and `^` agree.
+    'crates/tensor/src/colorimetry\.rs:\d+:\d+: replace \| with \^ in Colorimetry::pack$',
+    # The CPU read (0xF) and write (0xF0) usage masks share no bits.
+    'crates/tensor/src/ahardwarebuffer_layout\.rs:\d+:\d+: replace \| with \^ in lock_usage_for$',
+    # The rank comparison only chooses whether to log a warning.
+    'crates/tensor/src/protocol\.rs:\d+:\d+: replace > with (==|<|>=) in from_parts$',
+    # A `Compression::Scheme` request returns before this guard off Android,
+    # so the guard only ever sees `Compression::Any` there.
+    'crates/tensor/src/lib\.rs:\d+:\d+: replace match guard matches!\(request, Compression::Scheme\(_\)\) with false in Tensor<T>::image_desc$',
+    # PROT_READ and PROT_WRITE are disjoint bits.
+    'crates/tensor/src/(dma|shm)\.rs:\d+:\d+: replace \| with \^ in .*(scoped_pin|host_pin|map_inner)$',
+    # The O_* open flags and the S_I* mode bits are disjoint within each set.
+    'crates/tensor/src/shm\.rs:\d+:\d+: replace \| with \^ in ShmTensor<T>::alloc_anon_fd$',
+    # O_RDWR and O_CLOEXEC are disjoint bits.
+    'crates/tensor/src/dmabuf\.rs:\d+:\d+: replace \| with \^ in shared_drm_fd$',
+    # `open` returns fd 0 only when stdin has been closed.
+    'crates/tensor/src/dmabuf\.rs:\d+:\d+: replace < with <= in shared_drm_fd$',
+    # With `st_size == 0` the second clause already fails: the logical size
+    # of a tensor is never 0 here.
+    'crates/tensor/src/dma\.rs:\d+:\d+: replace > with >= in <impl TensorTrait<T> for DmaTensor<T>>::from_fd$',
+    # With `st_size == 0`, `max(0, byte_size)` is `byte_size` either way.
+    'crates/tensor/src/dma\.rs:\d+:\d+: replace > with >= in DmaTensor<T>::new_with_byte_size$',
+    # The end-of-mapping check already bounds the window to
+    # `mmap_size - offset`, so the pin length never binds.
+    'crates/tensor/src/shm\.rs:\d+:\d+: replace - with \+ in ShmTensor<T>::map_inner$',
+]
