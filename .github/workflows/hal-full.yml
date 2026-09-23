@@ -94,7 +94,7 @@ jobs:
       # cargo llvm-cov. The split of test.yml into this file dropped the tool
       # install that the original build-and-test-x86 lane had, and Full had
       # never run, so nothing caught it. Same pin as the old lane.
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
       # Folded in from the old doc-tests job: same runner, deps and toolchain,
@@ -222,7 +222,7 @@ jobs:
         with:
           shared-key: rust-x86_64
           cache-on-failure: true
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
       - name: Probe software-GL
@@ -273,7 +273,7 @@ jobs:
           shared-key: rust-macos
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - run: bash scripts/fetch-angle.sh
@@ -327,7 +327,7 @@ jobs:
           shared-key: rust-windows
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - name: Clippy
@@ -454,7 +454,7 @@ jobs:
           shared-key: rust-windows-warp
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - name: Fetch ANGLE
