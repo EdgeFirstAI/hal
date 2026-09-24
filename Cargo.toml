@@ -44,6 +44,9 @@ errno = "0.3"
 argminmax = { version = "0.6.3", default-features = false }
 crc32fast = "1.5.0"
 ctor = "1.0.7"
+# Attribute-only crate cargo-mutants reads for `#[cfg_attr(test, mutants::skip)]`;
+# a dev-dependency wherever used, so it never reaches a release build.
+mutants = "0.0.4"
 dma-heap = "0.4.1"
 # fast-math removed: upstream abandoned (last release 2019). Its single use
 # (an approximate sigmoid in the decoder) now calls a bit-identical `exp_raw`

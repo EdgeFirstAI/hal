@@ -230,10 +230,42 @@ mod tests {
             needed: 100,
             capacity: 64,
         };
-        let msg = format!("{e}");
-        assert!(
-            msg.contains("100") && msg.contains("64"),
-            "unexpected message: {msg}"
+        assert_eq!(
+            e.to_string(),
+            "insufficient tensor capacity: need 100 bytes, have 64"
+        );
+    }
+
+    #[test]
+    fn region_out_of_bounds_message_names_the_frame() {
+        let region = crate::Region::new(2, 3, 8, 8);
+        let e = Error::RegionOutOfBounds {
+            region,
+            bounds: (4, 5),
+        };
+        assert_eq!(
+            e.to_string(),
+            format!("region {region:?} out of bounds for 4x5 frame")
+        );
+    }
+
+    #[test]
+    fn batch_index_out_of_bounds_message_names_index_and_size() {
+        let e = Error::BatchIndexOutOfBounds { index: 9, batch: 4 };
+        assert_eq!(
+            e.to_string(),
+            "batch index 9 out of bounds for batch size 4"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_buffer_type_message_names_the_magic() {
+        let e = Error::UnknownBufferType(0x1234);
+        assert_eq!(
+            e.to_string(),
+            "UnknownBufferType: fd is on an unrecognized filesystem (magic 0x00001234); \
+             expected a DMA-BUF or tmpfs/shm fd"
         );
     }
 }

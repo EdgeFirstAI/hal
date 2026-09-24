@@ -413,6 +413,14 @@ The hardware-gated test pattern (a single `OnceLock<bool>` probe that
 short-circuits on missing devices) is documented in
 [`crates/image/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md#gl-hardware-gated-tests).
 
+### CI guard against silent DMA skips
+
+A DMA test that finds no usable heap skips and reports `ok`, so a lane that lost its heap looks exactly like one that tested it. `HAL_TEST_REQUIRE_DMA=1` turns that skip into a failure naming the test and the reason, the way `HAL_TEST_REQUIRE_GL=1` does for GL and `HAL_TEST_REQUIRE_CUDA=1` for CUDA. The mechanism is described in [`crates/tensor/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md#special-requirements).
+
+CI sets it through `.github/scripts/dma-heap-setup.sh`, which opens `/dev/dma_heap/system` to the job user (`sudo chmod a+rw` where it can), allocates and maps one page through the heap ioctl, and exports `HAL_TEST_REQUIRE_DMA=1` only when that probe succeeds. The step summary says which: `DMA: required (system heap, host-coherent)` or `DMA: unavailable — DMA tests skipped (<reason>)`. It runs on the Linux mutation legs and, through `.github/scripts/ci-setup.sh`, on the hosted Linux Quick/Full lanes and the board pre-command.
+
+A hosted-runner pass is **not** hardware validation. That heap is cached, cache-coherent system memory with no `/dev/dri` behind it, so it proves the DMA code paths run but says nothing about coherency (a missing end-of-access sync), CMA contiguity or GPU import. Only the board lanes cover those.
+
 ---
 
 ## Single-Threaded Execution
@@ -612,6 +620,7 @@ Use environment variables to isolate tests to specific backends:
 | Variable | Effect |
 |----------|--------|
 | `EDGEFIRST_TENSOR_FORCE_MEM=1` | Force heap (`MemTensor`) allocation; skips DMA-heap and shared memory |
+| `HAL_TEST_REQUIRE_DMA=1` | Fail, rather than skip, any DMA test that finds no usable heap. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
 | `EDGEFIRST_FORCE_BACKEND=cpu` | Force CPU-only image processing |
 | `EDGEFIRST_FORCE_BACKEND=opengl` | Force OpenGL backend |
 | `EDGEFIRST_FORCE_BACKEND=g2d` | Force G2D backend |
@@ -639,6 +648,67 @@ bugs, so set them only on the affected hardware:
 |----------|--------|
 | `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1` | Skips `test_multiple_image_processors_separate_threads`. Its four concurrent ImageProcessor/EGL contexts trip a `double free or corruption` in the Vivante GC7000UL driver. The abort is cumulative and uncatchable, so it takes the whole suite down with it — the test passes in isolation. **Always set this when running the suite on an i.MX 8M Plus**, or an unrelated refactor will look like it caused a regression. The imx8mp CI runner sets it; the test must still pass on every other GPU. |
 | `EDGEFIRST_ENABLE_NVJPEG=1` | Opts the nvJPEG decode cells into the codec benchmark on Jetson. Off by default because the library is not on the standard loader path (`make bench-nvjpeg` sets both this and `LD_LIBRARY_PATH`). |
+
+---
+
+## Mutation Testing
+
+`.github/workflows/mutants.yml` runs [cargo-mutants](https://mutants.rs) every night. It breaks the code on purpose (`+` becomes `-`, a function body becomes `Ok(())`) and re-runs the tests; a mutant the suite still passes with is a **survivor**, usually a line some test executes but nothing asserts on.
+
+### Legs and corpora
+
+A mutant is a property of the code as compiled, so the sweep runs on four legs:
+
+| Leg | Runner | Packages | What only this leg compiles |
+|-----|--------|----------|-----------------------------|
+| linux-x86_64 | `ubuntu-24.04` | tensor, decoder, tracker | x86_64 arms |
+| linux-arm64 | `ubuntu-24.04-arm` | tensor, decoder, tracker | the decoder's NEON kernels |
+| macos-arm64 | `macos-latest` | tensor | `iosurface*.rs` and the Apple arms |
+| windows-x86_64 | `windows-latest` | tensor | `d3d11/**` (on the WARP adapter) and the Windows arms |
+
+The decoder and tracker have no `target_os` code, so they run on the Linux legs only. That makes two corpora, each cut into shards: `edgefirst-tensor` (16 shards, 2 a night, on all four legs) and decoder + tracker (48 shards, 6 a night, on the Linux legs). Every leg runs the same shard indices of a corpus on the same night, so the roll-up can compare legs mutant by mutant. Both sweep their corpus in 8 nights. The Linux legs run `.github/scripts/dma-heap-setup.sh` first, so DMA tests run and are required wherever the runner's heap allocates.
+
+### How the roll-up decides
+
+`.github/scripts/mutants_summary.py` merges the shards. cargo-mutants mutates source text and has no cfg awareness, so for each leg it first marks a mutant **unbuilt** when:
+
+- the build phase left the mutated crate `Fresh` (the file is not in that target's dependency graph);
+- the file's `mod` declaration chain is cfg'd out for the leg's target and features; or
+- the mutated line sits inside a `#[cfg(...)]` item, statement, field, arm or block, or under a file-level `#![cfg(...)]`, that is false for the leg.
+
+A mutant caught on any leg is caught. One built on no leg is listed per file under "not built" and never counted. Otherwise it survived if every leg that built it missed it. The job **fails** on any such survivor, and also when a leg left unbuilt a file its target compiles (a Windows leg with `d3d11/**` unbuilt means the leg is broken). Timeouts are reported, not gated. Until coverage catches up, red is expected and the survivor list is the work queue.
+
+### Equivalent mutants
+
+Some mutants cannot be killed: `|` to `^` on bit flags that never overlap, a fallback no input reaches, a function every implementor overrides. Prefer deleting the dead code. For what remains:
+
+- **A whole function that is equivalent** (a serde `expecting`, a `Debug` impl nothing asserts on): annotate it in the source with a one-line reason.
+
+  ```rust
+  // Only reached by serde's error path; the message is not part of the contract.
+  #[cfg_attr(test, mutants::skip)]
+  fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { ... }
+  ```
+
+  The `mutants` crate is a dev-dependency only, so the attribute is inert in release builds and absent from the SBOM.
+- **A single mutation inside a function whose other mutants are killable**: add a regex to `exclude_re` in `.cargo/mutants.toml`, one entry per mutation, each with a comment saying why it is equivalent. The attribute is function-granular and would hide the killable mutants too.
+
+Files no leg compiles at all go in `exclude_globs` in the same file (`ahardwarebuffer.rs` today, since there is no Android runner).
+
+### Running it locally
+
+cargo-mutants reads `.cargo/mutants.toml` automatically. Mutate one file in place and run its crate's tests single-threaded (the two `--` reach cargo test and then the libtest harness):
+
+```bash
+cargo install cargo-mutants --locked
+cargo mutants -p edgefirst-tensor --file crates/tensor/src/blob.rs --in-place -- -- --test-threads=1
+# List without building:
+cargo mutants -p edgefirst-tensor --file crates/tensor/src/blob.rs --list
+```
+
+`--in-place` edits your working tree and restores each file afterwards; do not interrupt it with uncommitted work in the same files. Results land in `mutants.out/` (`missed.txt`, `caught.txt`, `outcomes.json`). To prove a DMA-only kill is not a skip, run with `HAL_TEST_REQUIRE_DMA=1`; see [`crates/tensor/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md#special-requirements).
+
+The roll-up can be run over downloaded artifacts from the repo root: `gh run download <run-id>`, then `python .github/scripts/mutants_summary.py --shards <dir>`.
 
 ---
 

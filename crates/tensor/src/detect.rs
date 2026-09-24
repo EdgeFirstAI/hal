@@ -289,4 +289,51 @@ mod tests {
             assert!(v.is_finite(), "degenerate axis produced {v}");
         }
     }
+
+    #[test]
+    fn unletter_norm_removes_offset_and_rescales_by_the_content_span() {
+        // Every operand is a short binary fraction, so the exact result is
+        // representable and the comparison can be exact.
+        let got = unletter_norm(
+            BoundingBox::new(0.375, 0.25, 0.625, 0.5),
+            [0.25, 0.125, 0.75, 0.625],
+        );
+        assert_eq!(got, BoundingBox::new(0.25, 0.25, 0.75, 0.75));
+    }
+
+    #[test]
+    fn unletter_norm_uses_independent_spans_per_axis() {
+        // x content spans 0.5 (scale 2), y content spans 0.25 (scale 4).
+        let got = unletter_norm(
+            BoundingBox::new(0.5, 0.5, 0.625, 0.5625),
+            [0.25, 0.375, 0.75, 0.625],
+        );
+        assert_eq!(got, BoundingBox::new(0.5, 0.5, 0.75, 0.75));
+    }
+
+    #[test]
+    fn unletter_norm_maps_a_zero_span_axis_with_unit_scale() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+
+        // Both axes degenerate: only the offset is removed, then clamped.
+        let got = unletter_norm(BoundingBox::new(0.2, 0.2, 0.8, 0.8), [0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(got.xmin, 0.0);
+        assert_eq!(got.ymin, 0.0);
+        assert!(close(got.xmax, 0.3), "xmax {}", got.xmax);
+        assert!(close(got.ymax, 0.3), "ymax {}", got.ymax);
+
+        // Only x degenerate: y still rescales by its span.
+        let got = unletter_norm(
+            BoundingBox::new(0.625, 0.375, 0.75, 0.625),
+            [0.5, 0.25, 0.5, 0.75],
+        );
+        assert_eq!(got, BoundingBox::new(0.125, 0.25, 0.25, 0.75));
+
+        // Only y degenerate: x still rescales by its span.
+        let got = unletter_norm(
+            BoundingBox::new(0.375, 0.625, 0.625, 0.75),
+            [0.25, 0.5, 0.75, 0.5],
+        );
+        assert_eq!(got, BoundingBox::new(0.25, 0.125, 0.75, 0.25));
+    }
 }

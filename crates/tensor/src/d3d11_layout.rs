@@ -74,10 +74,10 @@ impl D3d11ImageLayout {
     }
 }
 
+/// Every caller has already rejected a zero `width` or `height`, and each
+/// arm's texel width and row count are then non-zero, so this cannot build an
+/// empty texture.
 fn lay(dxgi_format: u32, w: usize, h: usize, bpt: usize, gl: u32) -> Option<D3d11ImageLayout> {
-    if w == 0 || h == 0 {
-        return None;
-    }
     Some(D3d11ImageLayout {
         dxgi_format,
         texture_width: w,
@@ -377,6 +377,67 @@ mod tests {
             ),
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 640, 480, 8)
         );
+    }
+
+    #[test]
+    fn interleaved_float_rgb_f16_packs_three_halves_per_rgba_texel() {
+        assert_eq!(
+            image_d3d11_layout(PixelFormat::Rgb, DType::F16, 640, 480),
+            Some(D3d11ImageLayout {
+                dxgi_format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                texture_width: 480,
+                texture_height: 480,
+                bytes_per_texel: 8,
+                gl_internal_format: GL_RGBA,
+            })
+        );
+        assert!(image_d3d11_layout(PixelFormat::Rgb, DType::F16, 641, 480).is_none());
+    }
+
+    #[test]
+    fn interleaved_float_rgba_f32_is_one_pixel_per_texel() {
+        assert_eq!(
+            image_d3d11_layout(PixelFormat::Rgba, DType::F32, 640, 480),
+            Some(D3d11ImageLayout {
+                dxgi_format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                texture_width: 640,
+                texture_height: 480,
+                bytes_per_texel: 16,
+                gl_internal_format: GL_RGBA,
+            })
+        );
+    }
+
+    #[test]
+    fn a_zero_dimension_has_no_layout_for_any_supported_pair() {
+        let supported = [
+            (PixelFormat::Rgba, DType::U8),
+            (PixelFormat::Bgra, DType::U8),
+            (PixelFormat::Rgb, DType::U8),
+            (PixelFormat::Grey, DType::U8),
+            (PixelFormat::Nv12, DType::U8),
+            (PixelFormat::Nv16, DType::U8),
+            (PixelFormat::Nv24, DType::U8),
+            (PixelFormat::Yuyv, DType::U8),
+            (PixelFormat::PlanarRgb, DType::F16),
+            (PixelFormat::PlanarRgba, DType::F32),
+            (PixelFormat::Rgb, DType::F16),
+            (PixelFormat::Rgb, DType::F32),
+            (PixelFormat::Rgba, DType::F16),
+            (PixelFormat::Rgba, DType::F32),
+        ];
+        for (fmt, dtype) in supported {
+            assert!(
+                image_d3d11_layout(fmt, dtype, 64, 64).is_some(),
+                "{fmt:?}/{dtype:?} 64x64 is supported"
+            );
+            for (w, h) in [(0, 64), (64, 0), (0, 0)] {
+                assert!(
+                    image_d3d11_layout(fmt, dtype, w, h).is_none(),
+                    "{fmt:?}/{dtype:?} {w}x{h}"
+                );
+            }
+        }
     }
 
     #[test]

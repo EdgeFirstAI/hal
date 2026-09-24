@@ -1885,6 +1885,7 @@ mod tests {
             m.as_mut_slice()[0] = 0xA5;
         }
         assert_eq!(ops.map_count(), 1, "the map went through the real ops");
+        assert_eq!(ops.unmap_count(), 1, "so did the unmap");
 
         drop(child);
         assert_eq!(
@@ -2240,5 +2241,90 @@ mod tests {
             "map() must be back at the origin: a cleared wrapper field over a \
              live storage offset is a stale window"
         );
+    }
+
+    /// Mock whose map and unmap both fail: with `PboDisconnected` when
+    /// `disconnected`, otherwise with an unrelated error.
+    struct FailingOps {
+        disconnected: bool,
+    }
+
+    impl FailingOps {
+        fn error(&self) -> Error {
+            if self.disconnected {
+                Error::PboDisconnected
+            } else {
+                Error::InvalidOperation("GL call failed".into())
+            }
+        }
+    }
+
+    // SAFETY: never produces a pointer at all.
+    unsafe impl PboOps for FailingOps {
+        fn map_buffer(&self, _buffer_id: u32, _size: usize) -> Result<PboMapping> {
+            Err(self.error())
+        }
+
+        fn unmap_buffer(&self, _buffer_id: u32) -> Result<()> {
+            Err(self.error())
+        }
+
+        fn delete_buffer(&self, _buffer_id: u32) {}
+    }
+
+    /// `ops` as an importer on the far side of the vtable sees it.
+    fn import_through_the_vtable(ops: Arc<dyn PboOps>) -> Arc<dyn PboOps> {
+        let producer = PboTensor::<u8>::from_pbo(4, 16, &[16], None, ops).expect("from_pbo");
+        let vtable_ptr = producer.pbo_vtable() as *const PboOpsVtable as *const c_void;
+        // SAFETY: `vtable_ptr` came from `pbo_vtable()` on a live tensor, and
+        // the importer retains the channel before the producer drops.
+        unsafe {
+            let parts = read_pbo_vtable_parts(vtable_ptr).expect("read_pbo_vtable_parts");
+            client_state_pbo_ops(parts.state, parts.map_fn, parts.unmap_fn)
+                .expect("client_state_pbo_ops")
+        }
+    }
+
+    /// A disconnected GL context crosses the vtable as itself, so an importer
+    /// can tell "gone" from any other failure.
+    #[test]
+    fn a_disconnected_producer_is_reported_as_disconnected_across_the_vtable() {
+        let imported = import_through_the_vtable(Arc::new(FailingOps { disconnected: true }));
+        assert!(matches!(
+            imported.map_buffer(4, 16),
+            Err(Error::PboDisconnected)
+        ));
+        assert!(matches!(
+            imported.unmap_buffer(4),
+            Err(Error::PboDisconnected)
+        ));
+    }
+
+    /// Any other producer failure crosses the vtable as a generic failure.
+    #[test]
+    fn other_producer_failures_cross_the_vtable_as_a_generic_errno() {
+        let imported = import_through_the_vtable(Arc::new(FailingOps {
+            disconnected: false,
+        }));
+        for result in [
+            imported.map_buffer(4, 16).map(|_| ()),
+            imported.unmap_buffer(4),
+        ] {
+            match result {
+                Err(Error::NotImplemented(msg)) => assert!(msg.ends_with("errno 1"), "{msg}"),
+                other => panic!("expected NotImplemented(.. errno 1), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn debug_names_the_buffer() {
+        let t = PboTensor::<u8>::from_pbo(77, 16, &[16], Some("dbg"), MockPboOps::new(16))
+            .expect("from_pbo");
+        let text = format!("{t:?}");
+        assert!(text.contains("PboTensor"), "{text}");
+        assert!(text.contains("buffer_id: 77"), "{text}");
+        assert!(text.contains("size: 16"), "{text}");
+        assert!(text.contains("\"dbg\""), "{text}");
     }
 }

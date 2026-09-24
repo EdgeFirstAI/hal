@@ -733,32 +733,44 @@ impl TensorDyn {
     /// Image width in pixels (`None` if not an image tensor). Pure function
     /// of `shape()` + `format()`, mirroring `Tensor::width`.
     pub fn width(&self) -> Option<usize> {
+        let (fmt, dims) = self.image_dims()?;
+        match fmt.layout() {
+            PixelLayout::Packed => dims.get(1).copied(),
+            PixelLayout::Planar => dims.get(2).copied(),
+            PixelLayout::SemiPlanar => dims.get(1).copied(),
+        }
+    }
+
+    /// The format and the trailing shape dims that describe one image,
+    /// allowing one leading batch `N`; `None` when unformatted or when the
+    /// shape has any other rank. Mirrors `Tensor::image_dims`.
+    fn image_dims(&self) -> Option<(PixelFormat, &[usize])> {
         let fmt = self.format()?;
         let shape = self.shape();
-        match fmt.layout() {
-            PixelLayout::Packed => shape.get(1).copied(),
-            PixelLayout::Planar => shape.get(2).copied(),
-            PixelLayout::SemiPlanar => shape.get(1).copied(),
-        }
+        let rank = match fmt.layout() {
+            PixelLayout::SemiPlanar => 2,
+            PixelLayout::Packed | PixelLayout::Planar => 3,
+        };
+        let batch_dims = shape.len().checked_sub(rank).filter(|&n| n <= 1)?;
+        Some((fmt, &shape[batch_dims..]))
     }
 
     /// Image height in pixels (`None` if not an image tensor). Pure
     /// function of `shape()` + `format()`, mirroring `Tensor::height`.
     ///
     pub fn height(&self) -> Option<usize> {
-        let fmt = self.format()?;
-        let shape = self.shape();
+        let (fmt, dims) = self.image_dims()?;
         match fmt.layout() {
-            PixelLayout::Packed => shape.first().copied(),
-            PixelLayout::Planar => shape.get(1).copied(),
+            PixelLayout::Packed => dims.first().copied(),
+            PixelLayout::Planar => dims.get(1).copied(),
             PixelLayout::SemiPlanar => {
                 if self.is_multiplane() {
-                    shape.first().copied()
+                    dims.first().copied()
                 } else {
                     match fmt {
-                        PixelFormat::Nv12 => shape.first().map(|h| h * 2 / 3),
-                        PixelFormat::Nv16 => shape.first().map(|h| h / 2),
-                        PixelFormat::Nv24 => shape.first().map(|h| h / 3),
+                        PixelFormat::Nv12 => dims.first().map(|h| h * 2 / 3),
+                        PixelFormat::Nv16 => dims.first().map(|h| h / 2),
+                        PixelFormat::Nv24 => dims.first().map(|h| h / 3),
                         _ => None,
                     }
                 }

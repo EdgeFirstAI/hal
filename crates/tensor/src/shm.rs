@@ -187,7 +187,7 @@ where
                 capacity: mmap_size,
             });
         }
-        if std::mem::size_of::<T>() > 1 && !self.offset.is_multiple_of(std::mem::align_of::<T>()) {
+        if !self.offset.is_multiple_of(std::mem::align_of::<T>()) {
             return Err(Error::InvalidOperation(format!(
                 "ShmMap: offset {} not aligned to align_of::<T>()={}",
                 self.offset,
@@ -481,8 +481,222 @@ mod tests {
         if crate::is_shm_available() {
             return true;
         }
-        log::warn!("SKIPPED: {what} - SHM allocation unavailable on this platform");
+        crate::test_support::report_skip(&format!(
+            "{what} - SHM allocation unavailable on this platform"
+        ));
         false
+    }
+
+    fn dev_null() -> OwnedFd {
+        OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null"))
+    }
+
+    fn zeroed_stat() -> nix::sys::stat::FileStat {
+        // SAFETY: `libc::stat` is plain old data; all-zero is a valid value.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// A 256-byte u8 segment holding the ramp `i & 0xff`.
+    fn ramp_256() -> ShmTensor<u8> {
+        let t = ShmTensor::<u8>::new(&[256], None).unwrap();
+        let mut m = t.map().unwrap();
+        for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+        drop(m);
+        t
+    }
+
+    /// An all-zero `(st_dev, st_ino)` carries no identity, so the fd number
+    /// stands in; any non-zero half keys on the pair.
+    #[test]
+    fn identity_from_stat_falls_back_to_the_fd_only_when_both_halves_are_zero() {
+        let fd = dev_null();
+        let mut st = zeroed_stat();
+        let id = identity_from_stat(&fd, &st);
+        assert_eq!(id.kind(), crate::IdentityKind::HostPtr);
+        assert_eq!(
+            id.id(),
+            crate::BufferIdentity::derived(crate::IdentityKind::HostPtr, fd.as_raw_fd() as u64)
+                .id()
+        );
+
+        st.st_ino = 5;
+        let id = identity_from_stat(&fd, &st);
+        assert_eq!(id.kind(), crate::IdentityKind::Shm);
+        assert_eq!(
+            id.id(),
+            crate::BufferIdentity::derived(crate::IdentityKind::Shm, 5).id()
+        );
+
+        st.st_ino = 0;
+        st.st_dev = 5;
+        let id = identity_from_stat(&fd, &st);
+        assert_eq!(id.kind(), crate::IdentityKind::Shm);
+        assert_eq!(
+            id.id(),
+            crate::BufferIdentity::derived(crate::IdentityKind::Shm, 5 << 32).id()
+        );
+    }
+
+    /// `st_dev` lands in the high half and `st_ino` is XORed in: an inode
+    /// whose bit 32 overlaps the device's bit 0 cancels it.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn identity_from_stat_folds_the_device_into_the_high_half() {
+        let fd = dev_null();
+        let mut st = zeroed_stat();
+        st.st_dev = 1;
+        st.st_ino = (1 << 32) | 5;
+        assert_eq!(
+            identity_from_stat(&fd, &st).id(),
+            crate::BufferIdentity::derived(crate::IdentityKind::Shm, 5).id()
+        );
+    }
+
+    /// The segment is private to its owner: `shm_open` mode `0600`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_anonymous_segment_is_owner_read_write_only() {
+        if !shm_or_skip("an_anonymous_segment_is_owner_read_write_only") {
+            return;
+        }
+        let t = ShmTensor::<u8>::new(&[64], None).unwrap();
+        let mode = fstat(&t.fd).expect("fstat").st_mode & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn new_with_byte_size_needs_room_for_the_shape_in_bytes() {
+        match ShmTensor::<u32>::new_with_byte_size(&[4], 8, None) {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (16, 8));
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+        if !shm_or_skip("new_with_byte_size_needs_room_for_the_shape_in_bytes") {
+            return;
+        }
+        let exact = ShmTensor::<u32>::new_with_byte_size(&[4], 16, None).unwrap();
+        assert_eq!(exact.byte_len, 16);
+        let padded = ShmTensor::<u32>::new_with_byte_size(&[4], 32, None).unwrap();
+        assert_eq!(padded.shape(), &[4]);
+        assert_eq!(padded.byte_len, 32);
+        assert!(padded.capacity_bytes() >= 32);
+    }
+
+    #[test]
+    fn map_checks_the_offset_against_capacity_and_element_alignment() {
+        if !shm_or_skip("map_checks_the_offset_against_capacity_and_element_alignment") {
+            return;
+        }
+        let mut t = ShmTensor::<u32>::new(&[4], None).unwrap();
+        let cap = t.capacity_bytes();
+
+        t.set_offset(cap);
+        match t.map() {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (cap + 16, cap));
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+
+        t.shape = vec![3];
+        t.set_offset(2);
+        assert!(matches!(t.map(), Err(Error::InvalidOperation(_))));
+
+        t.set_offset(4);
+        let m = t.map().expect("aligned offset inside the segment");
+        assert_eq!(m.as_slice().len(), 3);
+    }
+
+    #[test]
+    fn from_fd_rejects_empty_and_zero_sized_shapes() {
+        assert!(matches!(
+            ShmTensor::<u8>::from_fd(dev_null(), &[], None),
+            Err(Error::InvalidSize(0))
+        ));
+        assert!(matches!(
+            ShmTensor::<u8>::from_fd(dev_null(), &[0], None),
+            Err(Error::InvalidSize(0))
+        ));
+        let t = ShmTensor::<u32>::from_fd(dev_null(), &[1], Some("n")).expect("one u32");
+        assert_eq!(t.name(), "n");
+        assert_eq!(t.shape(), &[1]);
+    }
+
+    #[test]
+    fn reshape_and_logical_shape_count_bytes_of_a_multi_byte_element() {
+        if !shm_or_skip("reshape_and_logical_shape_count_bytes_of_a_multi_byte_element") {
+            return;
+        }
+        let mut t = ShmTensor::<u32>::new(&[4], None).unwrap();
+        t.reshape(&[2, 2]).expect("same element count");
+        assert_eq!(t.shape(), &[2, 2]);
+        assert!(matches!(t.reshape(&[3]), Err(Error::ShapeMismatch(_))));
+
+        let cap = t.capacity_bytes();
+        t.set_logical_shape(&[cap / 4]).expect("exact fit");
+        match t.set_logical_shape(&[cap / 4 + 1]) {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (cap + 4, cap));
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+        assert_eq!(t.shape(), &[cap / 4]);
+    }
+
+    #[test]
+    fn view_is_bounded_by_the_segment_length_in_bytes() {
+        if !shm_or_skip("view_is_bounded_by_the_segment_length_in_bytes") {
+            return;
+        }
+        let t = ShmTensor::<u32>::new(&[64], None).unwrap();
+        let v = t.view(4, &[63]).expect("exact fit");
+        assert_eq!(v.offset, 4);
+        assert_eq!(v.shape(), &[63]);
+        assert!(matches!(t.view(2, &[1]), Err(Error::InvalidOperation(_))));
+        match t.view(0, &[65]) {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (260, 256));
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_pin_starts_at_the_offset_and_refuses_one_past_the_segment() {
+        if !shm_or_skip("host_pin_starts_at_the_offset_and_refuses_one_past_the_segment") {
+            return;
+        }
+        let mut t = ramp_256();
+        let cap = t.capacity_bytes();
+
+        t.set_offset(64);
+        let pin = t.host_pin().expect("pin at 64");
+        assert_eq!(pin.len(), cap - 64);
+        assert_eq!(unsafe { pin.as_slice() }[0], 64);
+
+        t.set_offset(cap);
+        assert_eq!(t.host_pin().expect("pin at the end").len(), 0);
+
+        t.set_offset(cap + 44);
+        match t.host_pin() {
+            Err(Error::InsufficientCapacity { needed, capacity }) => {
+                assert_eq!((needed, capacity), (cap + 44, cap));
+            }
+            other => panic!("expected InsufficientCapacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn as_raw_fd_is_the_segment_fd() {
+        if !shm_or_skip("as_raw_fd_is_the_segment_fd") {
+            return;
+        }
+        let t = ShmTensor::<u8>::new(&[8], None).unwrap();
+        assert_eq!(t.as_raw_fd(), t.fd.as_raw_fd());
+        assert!(t.as_raw_fd() > 2);
     }
 
     #[test]

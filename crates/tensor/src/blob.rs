@@ -205,6 +205,8 @@ pub struct BlobHeader {
 
 impl BlobHeader {
     /// An all-zero header, for tests and for `..` update syntax.
+    // Its body is `Default::default()`, the one replacement cargo-mutants tries.
+    #[cfg_attr(test, mutants::skip)]
     pub fn empty() -> Self {
         Self::default()
     }
@@ -476,26 +478,29 @@ pub struct BlobStrings<'a> {
 /// Number of strings in the region. Fixed by the format, not by the header.
 const STRING_COUNT: usize = 5;
 
-/// Encoded length of a strings region, padded so the planes region that follows
-/// starts 8-aligned.
-pub fn strings_encoded_len(s: &BlobStrings<'_>) -> usize {
+/// Encoded length of a strings region that begins `start` bytes into its
+/// blob, padded so the planes region that follows starts 8-aligned.
+///
+/// The padding depends on `start` because the quantization regions before this
+/// one are 4-byte-element arrays and can leave it merely 4-aligned.
+pub fn strings_encoded_len(s: &BlobStrings<'_>, start: usize) -> usize {
     let raw: usize = STRING_COUNT * 4
         + s.format.len()
         + s.color_space.len()
         + s.color_transfer.len()
         + s.color_encoding.len()
         + s.color_range.len();
-    raw.next_multiple_of(8)
+    (start + raw).next_multiple_of(8) - start
 }
 
-/// Append the strings region to `out`, padded to an 8-byte boundary.
+/// Append the strings region to `out`, which holds the blob from its first
+/// byte, padded until `out` is a whole number of 8-byte words.
 ///
 /// The padding is not cosmetic: plane records are read as `u64`s, so the
-/// planes region must begin 8-aligned. The quantization regions before this one
-/// are 4-byte-element arrays and can leave the offset merely 4-aligned, which
-/// makes this region the place alignment is restored.
+/// planes region must begin 8-aligned *within the blob*. The quantization
+/// regions before this one are 4-byte-element arrays and can leave the offset
+/// merely 4-aligned, which makes this region the place alignment is restored.
 pub fn write_strings(s: &BlobStrings<'_>, out: &mut Vec<u8>) {
-    let start = out.len();
     for part in [
         s.format,
         s.color_space,
@@ -506,7 +511,7 @@ pub fn write_strings(s: &BlobStrings<'_>, out: &mut Vec<u8>) {
         out.extend_from_slice(&(part.len() as u32).to_le_bytes());
         out.extend_from_slice(part.as_bytes());
     }
-    while !(out.len() - start).is_multiple_of(8) {
+    while !out.len().is_multiple_of(8) {
         out.push(0);
     }
 }
@@ -817,7 +822,8 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
     // differ, and the blob carries the grid because extent comes from planes.
     let shape = export_addressing_shape(t, fmt)?;
     let esz = t.dtype().size() as i64;
-    let strides = export_c_strides(t, fmt, &shape, esz);
+    let strides =
+        crate::protocol::c_byte_strides(&shape, esz, fmt.map(|f| f.layout()), t.row_stride());
 
     let quant = t.quantization();
     let (quant_axis, scales, zeros): (i32, &[f32], &[i32]) = match quant {
@@ -840,7 +846,7 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
 
     // Plane geometry: from the format's table when this is an image, otherwise
     // a single plane spanning the whole allocation.
-    let geoms = export_plane_geoms(t, fmt, esz)?;
+    let geoms = export_plane_geoms(t, fmt)?;
 
     // Bytes, only when inlining. `pin_host` is the one read here; reference
     // mode performs no syscalls at all.
@@ -889,7 +895,6 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
         &mut planes_buf,
     )?;
 
-    let strings_bytes = strings_encoded_len(&strings);
     let header = BlobHeader {
         size: 0, // patched below
         required_mask: 0,
@@ -909,7 +914,7 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
         plane_count: geoms.len() as u32,
         quant_scales_len: scales.len() as u32,
         quant_zero_points_len: zeros.len() as u32,
-        strings_bytes: strings_bytes as u32,
+        strings_bytes: 0, // patched below
         strides_len: strides.len() as u32,
     };
 
@@ -926,10 +931,13 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
     for z in zeros {
         out.extend_from_slice(&z.to_le_bytes());
     }
+    let strings_start = out.len();
     write_strings(&strings, &mut out);
+    let strings_bytes = out.len() - strings_start;
     out.extend_from_slice(&planes_buf);
 
     let mut header = header;
+    header.strings_bytes = strings_bytes as u32;
     header.size = out.len() as u64;
     header.write_to(&mut out);
     Ok((out, fds))
@@ -954,39 +962,14 @@ fn export_addressing_shape(
     }
 }
 
-fn export_c_strides(
-    t: &crate::TensorDyn,
-    fmt: Option<crate::PixelFormat>,
-    shape: &[u64],
-    esz: i64,
-) -> Vec<i64> {
-    let mut acc = esz;
-    let mut v = vec![0i64; shape.len()];
-    for i in (0..shape.len()).rev() {
-        v[i] = acc;
-        acc *= shape[i] as i64;
-    }
-    if let (Some(rs), true) = (t.row_stride(), shape.len() >= 2) {
-        let row_dim = match fmt.map(|f| f.layout()) {
-            Some(crate::PixelLayout::Planar) if shape.len() >= 3 => 1,
-            _ => 0,
-        };
-        v[row_dim] = rs as i64;
-    }
-    v
-}
-
 fn export_plane_geoms(
     t: &crate::TensorDyn,
     fmt: Option<crate::PixelFormat>,
-    esz: i64,
 ) -> crate::Result<Vec<crate::PlaneGeometry>> {
     match fmt {
         Some(f) => {
             let (w, h) = image_dims(t, f)?;
-            let rs = t
-                .effective_row_stride()
-                .unwrap_or(w * f.channels() * esz as usize);
+            let rs = image_row_stride(t, f)?;
             f.plane_table(w, h, rs)
                 .ok_or_else(|| crate::Error::InvalidArgument(format!("no plane table for {f:?}")))
         }
@@ -1062,33 +1045,36 @@ fn write_export_planes(
 fn image_dims(t: &crate::TensorDyn, f: crate::PixelFormat) -> crate::Result<(usize, usize)> {
     let shape = t.shape();
     let bad = || crate::Error::InvalidShape(format!("shape {shape:?} is not an image for {f:?}"));
-    match f.layout() {
-        crate::PixelLayout::Packed => {
-            if shape.len() < 2 {
-                return Err(bad());
-            }
-            Ok((shape[1], shape[0]))
-        }
-        crate::PixelLayout::Planar => {
-            if shape.len() < 3 {
-                return Err(bad());
-            }
-            Ok((shape[2], shape[1]))
-        }
-        crate::PixelLayout::SemiPlanar => {
-            if shape.len() < 2 {
-                return Err(bad());
-            }
+    // Exact image ranks only: a batched `[N, ...]` tensor is several images,
+    // which one image header cannot describe.
+    match (f.layout(), shape) {
+        (crate::PixelLayout::Packed, [h, w, _]) => Ok((*w, *h)),
+        (crate::PixelLayout::Planar, [_, h, w]) => Ok((*w, *h)),
+        (crate::PixelLayout::SemiPlanar, [total, w]) => {
             // The stored shape is the combined-plane allocation; invert it to
             // recover the luma height rather than assuming h*2/3, which is
             // wrong for odd heights and for NV16/NV24.
-            let total = shape[0];
-            let h = (0..=total)
-                .find(|&h| f.combined_plane_height(h) == Some(total))
+            let h = (0..=*total)
+                .find(|&h| f.combined_plane_height(h) == Some(*total))
                 .ok_or_else(bad)?;
-            Ok((shape[1], h))
+            Ok((*w, h))
         }
+        _ => Err(bad()),
     }
+}
+
+/// The row pitch an image's plane table is built from.
+///
+/// A formatted tensor always reports one -- recorded, or derived from its
+/// width -- so a `None` means the tensor is not the image its format claims,
+/// and is refused rather than papered over with a guessed pitch.
+fn image_row_stride(t: &crate::TensorDyn, f: crate::PixelFormat) -> crate::Result<usize> {
+    t.effective_row_stride().ok_or_else(|| {
+        crate::Error::InvalidShape(format!(
+            "{f:?} tensor of shape {:?} reports no row pitch",
+            t.shape()
+        ))
+    })
 }
 
 /// The handle a reference-mode export borrows, or an error when the storage
@@ -1257,27 +1243,11 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
     // zeroes `offset` on an inline plane (it names a position inside a handle
     // that is not being carried), so the layout is rebuilt from the plane
     // table rather than trusted from the wire.
-    blit_inline_planes(&mut t, &planes, format, &grid, dtype)?;
+    blit_inline_planes(&mut t, &planes, format, &grid)?;
 
     t.set_colorimetry(colorimetry_from(&strings));
-    if h.quant_axis != -2 {
-        let scales: Vec<f32> = (0..h.quant_scales_len as usize)
-            .map(|i| {
-                let mut b = [0u8; 4];
-                let off = v.regions.quant_scales + i * 4;
-                b.copy_from_slice(&blob[off..off + 4]);
-                f32::from_le_bytes(b)
-            })
-            .collect();
-        let zeros: Vec<i32> = (0..h.quant_zero_points_len as usize)
-            .map(|i| {
-                let off = v.regions.quant_zero_points + i * 4;
-                rd_u32(blob, off) as i32
-            })
-            .collect();
-        if let Some(q) = quantization_from(h.quant_axis, &scales, &zeros) {
-            t.set_quantization(q)?;
-        }
+    if let Some(q) = import_quantization(&v)? {
+        t.set_quantization(q)?;
     }
     Ok(t)
 }
@@ -1367,12 +1337,18 @@ fn import_referenced_blob(
     let mut t = open_referenced_tensor(h.storage_kind, raw, &alloc_shape, dtype)?;
     if let Some(f) = format {
         t.set_format(f)?;
-    }
-    if first.stride > 0 {
-        // The producer's pitch, which the shape alone cannot express.
-        let _ = t.set_row_stride(first.stride as usize);
+        // The producer's pitch, which the shape alone cannot express. Zero
+        // means the producer recorded none. A pitch the format refuses is a
+        // malformed blob, not one to import at a pitch the producer never
+        // used. A tensor without a format has no rows, so no pitch applies.
+        if first.stride > 0 {
+            t.set_row_stride(first.stride as usize)?;
+        }
     }
     t.set_colorimetry(colorimetry_from(strings));
+    if let Some(q) = import_quantization(v)? {
+        t.set_quantization(q)?;
+    }
     Ok(t)
 }
 
@@ -1464,6 +1440,9 @@ fn import_referenced_d3d11_blob(
     // reason (`restore_imported_row_stride` excludes `D3D11_TEXTURE` for
     // the same reason).
     t.set_colorimetry(colorimetry_from(strings));
+    if let Some(q) = import_quantization(v)? {
+        t.set_quantization(q)?;
+    }
     Ok(t)
 }
 
@@ -1686,16 +1665,13 @@ fn blit_inline_planes(
     planes: &[BlobPlane<'_>],
     format: Option<crate::PixelFormat>,
     grid: &[usize],
-    dtype: crate::DType,
 ) -> crate::Result<()> {
     let pin = t.pin_host(crate::CpuAccess::Write)?;
     let dst = unsafe { std::slice::from_raw_parts_mut(pin.as_mut_ptr(), pin.len()) };
     let geoms: Vec<crate::PlaneGeometry> = match format {
         Some(f) => {
             let (w, h_px) = dims_from_grid(f, grid)?;
-            let rs = t
-                .effective_row_stride()
-                .unwrap_or(w * f.channels() * dtype.size());
+            let rs = image_row_stride(t, f)?;
             f.plane_table(w, h_px, rs)
                 .ok_or_else(|| crate::Error::InvalidShape(format!("no plane table for {f:?}")))?
         }
@@ -1743,17 +1719,61 @@ fn colorimetry_from(s: &BlobStrings<'_>) -> Option<crate::Colorimetry> {
     }
 }
 
-/// Rebuild a `Quantization` from the wire representation.
-fn quantization_from(axis: i32, scales: &[f32], zeros: &[i32]) -> Option<crate::Quantization> {
-    let first = *scales.first()?;
-    match (axis, zeros.first()) {
-        (-1, None) => Some(crate::Quantization::per_tensor_symmetric(first)),
-        (-1, Some(z)) => Some(crate::Quantization::per_tensor(first, *z)),
-        (a, _) if a >= 0 => {
-            crate::Quantization::per_channel_symmetric(scales.to_vec(), a as usize).ok()
-        }
-        _ => None,
+/// The quantization a blob carries, or `None` when its header declares none
+/// (`quant_axis == -2`).
+///
+/// Declared-but-unreadable quantization is an error, never a silent `None`:
+/// a tensor that arrives unquantized surfaces much later as a consumer's own
+/// "requires quantization metadata", which names the symptom and not the
+/// cause.
+fn import_quantization(v: &BlobView<'_>) -> crate::Result<Option<crate::Quantization>> {
+    let h = v.header;
+    if h.quant_axis == -2 {
+        return Ok(None);
     }
+    // Both regions were bounded against `size` by `region_offsets`.
+    let scales: Vec<f32> = (0..h.quant_scales_len as usize)
+        .map(|i| f32::from_bits(rd_u32(v.buf, v.regions.quant_scales + i * 4)))
+        .collect();
+    let zeros: Vec<i32> = (0..h.quant_zero_points_len as usize)
+        .map(|i| rd_u32(v.buf, v.regions.quant_zero_points + i * 4) as i32)
+        .collect();
+    quantization_from(h.quant_axis, scales, zeros).map(Some)
+}
+
+/// Rebuild a `Quantization` from the wire representation: `axis` is `-1`
+/// for per-tensor or the channel axis, and an empty `zeros` means symmetric.
+fn quantization_from(
+    axis: i32,
+    scales: Vec<f32>,
+    zeros: Vec<i32>,
+) -> crate::Result<crate::Quantization> {
+    let malformed = |why: String| {
+        crate::Error::InvalidArgument(format!("blob quantization is malformed: {why}"))
+    };
+    if axis == -1 {
+        return match (scales.as_slice(), zeros.as_slice()) {
+            ([scale], []) => Ok(crate::Quantization::per_tensor_symmetric(*scale)),
+            ([scale], [zero]) => Ok(crate::Quantization::per_tensor(*scale, *zero)),
+            (s, z) => Err(malformed(format!(
+                "per-tensor quantization needs 1 scale and 0 or 1 zero points, \
+                 got {} and {}",
+                s.len(),
+                z.len()
+            ))),
+        };
+    }
+    let axis = usize::try_from(axis).map_err(|_| {
+        malformed(format!(
+            "quant_axis {axis} is neither -2 (none), -1 (per-tensor) nor a channel index"
+        ))
+    })?;
+    let q = if zeros.is_empty() {
+        crate::Quantization::per_channel_symmetric(scales, axis)
+    } else {
+        crate::Quantization::per_channel(scales, zeros, axis)
+    };
+    q.map_err(|e| malformed(e.to_string()))
 }
 
 /// Recover logical width and height from an addressing grid.
@@ -1761,21 +1781,13 @@ fn quantization_from(axis: i32, scales: &[f32], zeros: &[i32]) -> Option<crate::
 /// The inverse of [`PixelFormat::addressing_shape`](crate::PixelFormat::addressing_shape).
 fn dims_from_grid(f: crate::PixelFormat, grid: &[usize]) -> crate::Result<(usize, usize)> {
     let bad = || crate::Error::InvalidShape(format!("grid {grid:?} is not an image for {f:?}"));
-    match f.layout() {
-        crate::PixelLayout::Planar => {
-            if grid.len() < 3 {
-                return Err(bad());
-            }
-            Ok((grid[2], grid[1]))
-        }
+    match (f.layout(), grid) {
+        (crate::PixelLayout::Planar, [_, h, w, ..]) => Ok((*w, *h)),
+        (crate::PixelLayout::Planar, _) => Err(bad()),
         // Packed multi-channel is [h, w, c]; single-channel packed and
         // semi-planar are both [h, w].
-        _ => {
-            if grid.len() < 2 {
-                return Err(bad());
-            }
-            Ok((grid[1], grid[0]))
-        }
+        (_, [h, w, ..]) => Ok((*w, *h)),
+        _ => Err(bad()),
     }
 }
 
@@ -1936,8 +1948,16 @@ mod tests {
     }
 
     /// A reference-capable tensor, or `None` on a host that has no shareable
-    /// backing (no dma-heap, or one this user cannot open).
-    fn reference_capable(w: usize, h: usize) -> Option<TensorDyn> {
+    /// backing.
+    ///
+    /// On Linux that backing is a dma-buf, so the skip goes through the DMA
+    /// require gate: under `HAL_TEST_REQUIRE_DMA=1` a host without a usable
+    /// heap fails `what` instead of skipping it, and a heap that is usable
+    /// but cannot allocate the image is a failure either way.
+    fn reference_capable(w: usize, h: usize, what: &str) -> Option<TensorDyn> {
+        if cfg!(target_os = "linux") && !crate::test_support::dma_or_skip(what) {
+            return None;
+        }
         match Tensor::<u8>::image(
             w,
             h,
@@ -1946,6 +1966,9 @@ mod tests {
             CpuAccess::ReadWrite,
         ) {
             Ok(t) => Some(TensorDyn::from(t)),
+            Err(e) if cfg!(target_os = "linux") => {
+                panic!("{what}: a usable DMA heap must allocate NV12 {w}x{h}: {e:?}")
+            }
             Err(e) => {
                 crate::test_support::report_skip(&format!(
                     "no shareable backing on this host ({e:?}); reference \
@@ -1958,7 +1981,11 @@ mod tests {
 
     #[test]
     fn a_reference_export_puts_an_index_in_the_handle_not_a_raw_fd() {
-        let Some(src) = reference_capable(64, 48) else {
+        let Some(src) = reference_capable(
+            64,
+            48,
+            "a_reference_export_puts_an_index_in_the_handle_not_a_raw_fd",
+        ) else {
             return;
         };
         let (blob, fds) = export(&src, TransportMode::Reference).unwrap();
@@ -1996,7 +2023,11 @@ mod tests {
 
     #[test]
     fn a_reference_round_trip_preserves_content_and_the_source_may_die() {
-        let Some(src) = reference_capable(64, 48) else {
+        let Some(src) = reference_capable(
+            64,
+            48,
+            "a_reference_round_trip_preserves_content_and_the_source_may_die",
+        ) else {
             return;
         };
         fill_ramp(&src);
@@ -2040,7 +2071,7 @@ mod tests {
     fn an_fd_index_past_the_table_is_refused() {
         // The index arrives from an untrusted blob. An unbounded read here
         // would hand an arbitrary descriptor to dup.
-        let Some(src) = reference_capable(64, 48) else {
+        let Some(src) = reference_capable(64, 48, "an_fd_index_past_the_table_is_refused") else {
             return;
         };
         let (blob, fds) = export(&src, TransportMode::Reference).unwrap();
@@ -2130,7 +2161,11 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn a_garbage_texture_handle_is_refused_by_the_constructor() {
-        let Some(src) = reference_capable(64, 48) else {
+        let Some(src) = reference_capable(
+            64,
+            48,
+            "a_garbage_texture_handle_is_refused_by_the_constructor",
+        ) else {
             return;
         };
         let (blob, _) = export(&src, TransportMode::Reference).unwrap();
@@ -2148,7 +2183,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn planes_that_disagree_about_the_texture_are_refused() {
-        let Some(src) = reference_capable(64, 48) else {
+        let Some(src) =
+            reference_capable(64, 48, "planes_that_disagree_about_the_texture_are_refused")
+        else {
             return;
         };
         let (blob, _) = export(&src, TransportMode::Reference).unwrap();
@@ -2207,6 +2244,25 @@ mod tests {
     }
 
     #[test]
+    fn a_batched_image_is_refused_rather_than_exported_as_one_image() {
+        let mut t = Tensor::<u8>::image(
+            8,
+            4,
+            crate::PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        crate::TensorTrait::set_logical_shape(&mut t, &[2, 2, 8, 3]).unwrap();
+        match export(&TensorDyn::from(t), TransportMode::Inline) {
+            Err(crate::Error::InvalidShape(msg)) => {
+                assert!(msg.contains("[2, 2, 8, 3]"), "{msg}")
+            }
+            other => panic!("expected InvalidShape, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_bare_tensor_round_trips_including_byte_strides() {
         let src =
             TensorDyn::from(Tensor::<f32>::new(&[3, 8], Some(TensorMemory::Mem), None).unwrap());
@@ -2227,23 +2283,66 @@ mod tests {
     /// test would pass with the mode-mix guard removed entirely. Building the
     /// plane set directly isolates the one property under test.
     fn build_blob(planes: &[BlobPlane<'_>]) -> Vec<u8> {
-        let strings = BlobStrings::default();
+        build(&BlobSpec::new(planes))
+    }
+
+    /// Everything [`build`] writes into a hand-assembled blob.
+    struct BlobSpec<'a> {
+        planes: &'a [BlobPlane<'a>],
+        storage_kind: u32,
+        dtype: crate::DType,
+        grid: &'a [u64],
+        strings: BlobStrings<'a>,
+        quant_axis: i32,
+        scales: &'a [f32],
+        zeros: &'a [i32],
+    }
+
+    impl<'a> BlobSpec<'a> {
+        /// A formatless, unquantized one-element `u8` blob around `planes`.
+        fn new(planes: &'a [BlobPlane<'a>]) -> Self {
+            Self {
+                planes,
+                storage_kind: 0,
+                dtype: crate::DType::U8,
+                grid: &[1],
+                strings: BlobStrings::default(),
+                quant_axis: -2,
+                scales: &[],
+                zeros: &[],
+            }
+        }
+    }
+
+    fn build(spec: &BlobSpec<'_>) -> Vec<u8> {
         let mut planes_buf = Vec::new();
-        for p in planes {
+        for p in spec.planes {
             write_plane(p, &mut planes_buf);
         }
         let mut out = vec![0u8; HEADER_LEN];
-        out.extend_from_slice(&1u64.to_le_bytes()); // shape [1]
-        write_strings(&strings, &mut out);
+        for d in spec.grid {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        for s in spec.scales {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for z in spec.zeros {
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        let strings_bytes = strings_encoded_len(&spec.strings, out.len());
+        write_strings(&spec.strings, &mut out);
         out.extend_from_slice(&planes_buf);
         let h = BlobHeader {
             size: out.len() as u64,
             planes_bytes: planes_buf.len() as u64,
-            dtype: crate::DType::U8.code(),
-            quant_axis: -2,
-            ndim: 1,
-            plane_count: planes.len() as u32,
-            strings_bytes: strings_encoded_len(&strings) as u32,
+            storage_kind: spec.storage_kind,
+            dtype: spec.dtype.code(),
+            quant_axis: spec.quant_axis,
+            ndim: spec.grid.len() as u32,
+            plane_count: spec.planes.len() as u32,
+            quant_scales_len: spec.scales.len() as u32,
+            quant_zero_points_len: spec.zeros.len() as u32,
+            strings_bytes: strings_bytes as u32,
             ..BlobHeader::empty()
         };
         h.write_to(&mut out);
@@ -2348,9 +2447,18 @@ mod tests {
             data: &[],
         };
         let blob = build_blob(&[referenced, referenced]);
-        let err = import(&blob, &[]).expect_err("reference-mode import is not implemented yet");
+        let err = import(&blob, &[]).expect_err("an index into nothing cannot be opened");
+        // Refused by the reference import itself, which runs after every
+        // plane check: proof the set cleared both the mode check and the rule
+        // that a referenced plane carries no bytes. Windows has no fd table
+        // and refuses the non-zero handle instead.
+        let expected = if cfg!(target_os = "windows") {
+            "must all carry handle 0"
+        } else {
+            "indexes fd 7"
+        };
         assert!(
-            !err.to_string().contains("one transport mode"),
+            err.to_string().contains(expected),
             "a uniform plane set must clear the mode check: {err}"
         );
     }
@@ -2417,6 +2525,9 @@ mod tests {
         assert_eq!(planes[1].size as usize, planes[1].data.len());
         assert_eq!(planes[0].size, 307_200);
         assert_eq!(planes[1].size, 153_600);
+        // The chroma plane sits 307 200 bytes into the allocation, but an
+        // inline plane names no position inside a handle it does not have.
+        assert_eq!(planes[1].offset, 0, "an inline plane carries no offset");
     }
 
     #[test]
@@ -2803,6 +2914,624 @@ mod tests {
         assert!(
             parse_header(&buf).is_err(),
             "size must cover at least the header"
+        );
+    }
+
+    #[test]
+    fn blob_error_display_names_the_field_and_the_values() {
+        let cases = [
+            (
+                BlobError::Truncated { need: 80, have: 72 },
+                "blob truncated: needs 80 bytes, buffer has 72",
+            ),
+            (
+                BlobError::UnsupportedRequirement(0x10),
+                "blob requires unsupported features (required_mask 0x10); refusing rather \
+                 than misreading it",
+            ),
+            (
+                BlobError::ForgedLength {
+                    field: "ndim",
+                    value: 9,
+                },
+                "blob field `ndim` has implausible value 9",
+            ),
+            (
+                BlobError::InvalidUtf8("format"),
+                "blob string `format` is not valid UTF-8",
+            ),
+            (
+                BlobError::Malformed("no planes"),
+                "malformed blob: no planes",
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.to_string(), want);
+        }
+    }
+
+    #[test]
+    fn a_size_past_the_end_of_the_buffer_is_truncation() {
+        let mut buf = vec![0u8; HEADER_LEN];
+        BlobHeader {
+            size: 80,
+            ..BlobHeader::empty()
+        }
+        .write_to(&mut buf);
+        assert_eq!(
+            parse_header(&buf),
+            Err(BlobError::Truncated { need: 80, have: 72 })
+        );
+    }
+
+    #[test]
+    fn bytes_after_the_blob_are_not_part_of_it() {
+        // `size` bounds the blob, not the buffer: a consumer may hand over a
+        // larger read, or a frame with more fields after the tensor.
+        let blob = export(&nv12_mem(64, 48), TransportMode::Inline).unwrap().0;
+        let mut framed = blob.clone();
+        framed.extend_from_slice(&[0xAA; 16]);
+        let v = BlobView::parse(&framed).expect("a buffer longer than `size` parses");
+        assert_eq!(v.header().size, blob.len() as u64);
+        assert_eq!(v.planes().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_header_only_blob_has_every_region_empty_and_ending_at_the_header() {
+        let r = region_offsets(&BlobHeader {
+            size: HEADER_LEN as u64,
+            ..BlobHeader::empty()
+        })
+        .expect("a blob of exactly one header is well-formed");
+        assert_eq!(
+            r,
+            Regions {
+                shape: HEADER_LEN,
+                strides: HEADER_LEN,
+                quant_scales: HEADER_LEN,
+                quant_zero_points: HEADER_LEN,
+                strings: HEADER_LEN,
+                planes: HEADER_LEN,
+                end: HEADER_LEN,
+            }
+        );
+    }
+
+    #[test]
+    fn a_size_below_the_header_is_attributed_to_size() {
+        assert_eq!(
+            region_offsets(&BlobHeader {
+                size: 8,
+                ..BlobHeader::empty()
+            }),
+            Err(BlobError::ForgedLength {
+                field: "size",
+                value: 8
+            })
+        );
+    }
+
+    #[test]
+    fn plane_count_is_bounded_by_the_whole_records_that_fit() {
+        let header = |plane_count| BlobHeader {
+            size: 4096,
+            planes_bytes: 2 * PLANE_RECORD_LEN as u64,
+            plane_count,
+            ..BlobHeader::empty()
+        };
+        assert!(
+            region_offsets(&header(2)).is_ok(),
+            "two minimum-size records fit in {} bytes",
+            2 * PLANE_RECORD_LEN
+        );
+        assert_eq!(
+            region_offsets(&header(3)),
+            Err(BlobError::ForgedLength {
+                field: "plane_count",
+                value: 3
+            })
+        );
+    }
+
+    #[test]
+    fn the_strings_region_ends_8_aligned_in_the_blob_wherever_it_starts() {
+        // The quantization arrays before it are 4-byte elements, so the
+        // region may start 4-aligned; the planes after it may not.
+        let formats = ["", "a", "abc", "NV12", "rgb8_planar"].map(|format| BlobStrings {
+            format,
+            ..Default::default()
+        });
+        // Every string non-empty and of a distinct length, so each one's
+        // length counts toward the total on its own.
+        let all_five = BlobStrings {
+            format: "a",
+            color_space: "bb",
+            color_transfer: "cccc",
+            color_encoding: "dddddddd",
+            color_range: "eeeeeeeeeeeeeeee",
+        };
+        for start in [0usize, 3, 4] {
+            for strings in formats.iter().chain([&all_five]) {
+                let mut out = vec![0xAAu8; start];
+                write_strings(strings, &mut out);
+                assert_eq!(out.len() % 8, 0, "start {start}, {strings:?}");
+                assert_eq!(
+                    out.len() - start,
+                    strings_encoded_len(strings, start),
+                    "start {start}, {strings:?}"
+                );
+                assert_eq!(parse_strings(&out[start..]).unwrap(), *strings);
+            }
+        }
+    }
+
+    /// One scale and no zero points leave the quantization regions ending
+    /// 4-aligned, which the strings region must absorb.
+    #[test]
+    fn an_export_whose_quantization_ends_4_aligned_still_parses() {
+        let mut src =
+            TensorDyn::from(Tensor::<i8>::new(&[3, 8], Some(TensorMemory::Mem), None).unwrap());
+        src.set_quantization(crate::Quantization::per_tensor_symmetric(0.5))
+            .unwrap();
+        let blob = export(&src, TransportMode::Inline).unwrap().0;
+        let v = BlobView::parse(&blob).expect("export must write a blob its parser accepts");
+        assert_eq!(v.planes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn encoded_len_is_exactly_what_write_plane_appends() {
+        let handle_bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        for hb in [&[][..], &handle_bytes[..]] {
+            for n in 0..17usize {
+                let data: Vec<u8> = (0..n as u8).collect();
+                let plane = BlobPlane {
+                    handle_bytes: hb,
+                    data: &data,
+                    ..ref_plane()
+                };
+                // A non-aligned start: the padding is relative to the record.
+                let mut out = vec![0xAAu8; 3];
+                write_plane(&plane, &mut out);
+                assert_eq!(
+                    out.len() - 3,
+                    plane.encoded_len(),
+                    "{} handle bytes, {n} data bytes",
+                    hb.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_plane_is_inline_only_when_its_handle_is_negative() {
+        assert!(
+            !BlobPlane {
+                handle: 0,
+                ..ref_plane()
+            }
+            .is_inline(),
+            "index 0 is the first fd-table entry, a reference"
+        );
+        assert!(BlobPlane {
+            handle: -1,
+            ..ref_plane()
+        }
+        .is_inline());
+    }
+
+    /// A reference plane records where its bytes live inside the handle; an
+    /// inline one (see `export_emits_one_plane_per_plane_table_entry`) does
+    /// not.
+    #[test]
+    fn a_reference_plane_keeps_its_offset_and_extent() {
+        let geoms = [crate::PlaneGeometry {
+            offset: 4096,
+            stride: 64,
+            size: 3072,
+        }];
+        let mut buf = Vec::new();
+        write_export_planes(&geoms, TransportMode::Reference, 0, &[], &[], &mut buf).unwrap();
+        let planes = parse_planes(&buf, 1).unwrap();
+        let p = planes[0];
+        assert_eq!(
+            (p.handle, p.offset, p.stride, p.size, p.used),
+            (0, 4096, 64, 3072, 3072)
+        );
+        assert!(p.data.is_empty(), "a reference carries no bytes");
+    }
+
+    /// A packed, a single-channel packed and a planar image each round trip
+    /// through their own grid spelling (`[h, w, c]`, `[h, w]`, `[c, h, w]`).
+    #[test]
+    fn every_layout_round_trips_inline_through_its_grid() {
+        for (format, grid) in [
+            (PixelFormat::Rgb, vec![48u64, 64, 3]),
+            (PixelFormat::Grey, vec![48, 64]),
+            (PixelFormat::PlanarRgb, vec![3, 48, 64]),
+        ] {
+            let src = TensorDyn::from(
+                Tensor::<u8>::image(
+                    64,
+                    48,
+                    format,
+                    Some(TensorMemory::Mem),
+                    CpuAccess::ReadWrite,
+                )
+                .expect("alloc"),
+            );
+            fill_ramp(&src);
+            let blob = export(&src, TransportMode::Inline).unwrap().0;
+            assert_eq!(BlobView::parse(&blob).unwrap().shape(), grid, "{format:?}");
+            let got = import(&blob, &[]).unwrap();
+            assert_eq!(got.format(), Some(format));
+            assert_eq!(got.shape(), src.shape(), "{format:?}");
+            assert_eq!(bytes_of(&got), bytes_of(&src), "{format:?}");
+        }
+    }
+
+    fn inline_plane(data: &[u8]) -> BlobPlane<'_> {
+        BlobPlane {
+            handle: -1,
+            offset: 0,
+            stride: data.len() as u64,
+            size: data.len() as u64,
+            used: data.len() as u64,
+            modifier: 0,
+            handle_bytes: &[],
+            data,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_hand_built_inline_blob_imports() {
+        // The control for the refusals below: the same builder, nothing wrong.
+        let got = import(&build_blob(&[inline_plane(&[7])]), &[]).expect("well-formed");
+        assert_eq!(got.shape(), &[1]);
+        assert_eq!(bytes_of(&got), vec![7]);
+    }
+
+    #[test]
+    fn an_inline_plane_with_a_modifier_or_handle_bytes_is_refused() {
+        let data = [7u8];
+        for plane in [
+            BlobPlane {
+                modifier: 1,
+                ..inline_plane(&data)
+            },
+            BlobPlane {
+                handle_bytes: &[1],
+                ..inline_plane(&data)
+            },
+        ] {
+            let err = import(&build_blob(&[plane]), &[]).expect_err("must be refused");
+            assert!(
+                err.to_string()
+                    .contains("inline plane must have modifier 0 and no handle_bytes"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_referenced_plane_carrying_bytes_is_refused() {
+        let plane = BlobPlane {
+            handle: 0,
+            ..inline_plane(&[7])
+        };
+        let err = import(&build_blob(&[plane]), &[]).expect_err("must be refused");
+        assert!(
+            err.to_string()
+                .contains("referenced plane must not also carry inline bytes"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_grid_too_short_for_its_format_is_refused() {
+        for (format, grid) in [
+            (PixelFormat::Nv12, &[1u64][..]),
+            (PixelFormat::PlanarRgb, &[48, 64][..]),
+        ] {
+            let data = [0u8];
+            let planes = [inline_plane(&data)];
+            let blob = build(&BlobSpec {
+                grid,
+                strings: BlobStrings {
+                    format: format.as_str(),
+                    ..Default::default()
+                },
+                ..BlobSpec::new(&planes)
+            });
+            let err = import(&blob, &[]).expect_err("must be refused");
+            let want = format!("grid {grid:?} is not an image for {format:?}");
+            assert!(
+                matches!(&err, crate::Error::InvalidShape(m) if m.contains(&want)),
+                "{format:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unquantized_export_declares_no_quantization() {
+        let src =
+            TensorDyn::from(Tensor::<i8>::new(&[3, 8], Some(TensorMemory::Mem), None).unwrap());
+        let blob = export(&src, TransportMode::Inline).unwrap().0;
+        let h = BlobView::parse(&blob).unwrap().header();
+        assert_eq!(h.quant_axis, -2);
+        assert_eq!((h.quant_scales_len, h.quant_zero_points_len), (0, 0));
+        assert!(import(&blob, &[]).unwrap().quantization().is_none());
+    }
+
+    fn round_trip_quantization(q: crate::Quantization) -> crate::Quantization {
+        let mut src =
+            TensorDyn::from(Tensor::<i8>::new(&[2, 2, 3], Some(TensorMemory::Mem), None).unwrap());
+        src.set_quantization(q).unwrap();
+        let blob = export(&src, TransportMode::Inline).unwrap().0;
+        import(&blob, &[])
+            .unwrap()
+            .quantization()
+            .expect("quantization survived")
+            .clone()
+    }
+
+    #[test]
+    fn per_tensor_symmetric_quantization_survives_without_a_zero_point() {
+        let q = round_trip_quantization(crate::Quantization::per_tensor_symmetric(0.5));
+        assert_eq!(q.scale(), &[0.5]);
+        assert_eq!(q.zero_point(), None);
+        assert_eq!(q.axis(), None);
+    }
+
+    #[test]
+    fn per_channel_symmetric_quantization_survives_with_its_axis() {
+        let q = round_trip_quantization(
+            crate::Quantization::per_channel_symmetric(vec![0.1, 0.2, 0.3], 2).unwrap(),
+        );
+        assert_eq!(q.scale(), &[0.1, 0.2, 0.3]);
+        assert_eq!(q.zero_point(), None);
+        assert_eq!(q.axis(), Some(2));
+    }
+
+    #[test]
+    fn per_channel_asymmetric_quantization_keeps_its_zero_points() {
+        let q = round_trip_quantization(
+            crate::Quantization::per_channel(vec![0.1, 0.2, 0.3], vec![-3, 0, 7], 2).unwrap(),
+        );
+        assert_eq!(q.scale(), &[0.1, 0.2, 0.3]);
+        assert_eq!(q.zero_point(), Some(&[-3, 0, 7][..]));
+        assert_eq!(q.axis(), Some(2));
+    }
+
+    /// Declared quantization that cannot be rebuilt is refused, never
+    /// imported as "unquantized".
+    #[test]
+    fn declared_but_malformed_quantization_is_refused() {
+        let data = [0u8; 3];
+        let planes = [inline_plane(&data)];
+        let cases: [(i32, &[f32], &[i32], &str); 4] = [
+            (-3, &[0.5], &[], "quant_axis -3 is neither"),
+            (
+                -1,
+                &[],
+                &[],
+                "needs 1 scale and 0 or 1 zero points, got 0 and 0",
+            ),
+            (-1, &[0.5, 0.25], &[], "got 2 and 0"),
+            (0, &[0.5, 0.25, 0.125], &[1, 2], "zero_point.len"),
+        ];
+        for (quant_axis, scales, zeros, want) in cases {
+            let blob = build(&BlobSpec {
+                dtype: crate::DType::I8,
+                grid: &[3],
+                quant_axis,
+                scales,
+                zeros,
+                ..BlobSpec::new(&planes)
+            });
+            let err = import(&blob, &[]).expect_err("malformed quantization must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("blob quantization is malformed") && msg.contains(want),
+                "axis {quant_axis}, {} scales, {} zeros: got {msg}",
+                scales.len(),
+                zeros.len()
+            );
+        }
+    }
+
+    /// Reference import opens a `Shm` fd the way it opens a dma-buf, so these
+    /// run on a host with no DMA heap.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+    mod shm_reference {
+        use super::*;
+        use std::os::fd::AsRawFd;
+
+        /// Reference planes for `format` at `w`x`h` and `pitch`, all naming
+        /// fd-table entry 0.
+        fn reference_planes(
+            format: PixelFormat,
+            w: usize,
+            h: usize,
+            pitch: usize,
+        ) -> Vec<BlobPlane<'static>> {
+            format
+                .plane_table(w, h, pitch)
+                .unwrap()
+                .iter()
+                .map(|g| BlobPlane {
+                    handle: 0,
+                    offset: g.offset,
+                    stride: g.stride,
+                    size: g.size,
+                    used: g.size,
+                    modifier: 0,
+                    handle_bytes: &[],
+                    data: &[],
+                })
+                .collect()
+        }
+
+        fn nv12_spec<'a>(planes: &'a [BlobPlane<'a>]) -> BlobSpec<'a> {
+            BlobSpec {
+                storage_kind: TensorMemory::Shm.code(),
+                grid: &[48, 64],
+                strings: BlobStrings {
+                    format: "NV12",
+                    ..Default::default()
+                },
+                ..BlobSpec::new(planes)
+            }
+        }
+
+        /// A 128-wide NV12 Shm allocation, which a 64-wide image at a
+        /// 128-byte pitch fits exactly.
+        fn wide_shm() -> TensorDyn {
+            TensorDyn::from(
+                Tensor::<u8>::image(
+                    128,
+                    48,
+                    PixelFormat::Nv12,
+                    Some(TensorMemory::Shm),
+                    CpuAccess::ReadWrite,
+                )
+                .expect("shm allocation"),
+            )
+        }
+
+        #[test]
+        fn a_referenced_shm_blob_aliases_its_producer_at_the_producers_pitch() {
+            let src = wide_shm();
+            fill_ramp(&src);
+            let fd = src.clone_fd().expect("shm fd");
+            let planes = reference_planes(PixelFormat::Nv12, 64, 48, 128);
+            let got = import(&build(&nv12_spec(&planes)), &[fd.as_raw_fd()])
+                .expect("a Shm reference imports");
+            assert_eq!(got.memory(), TensorMemory::Shm);
+            assert_eq!(got.format(), Some(PixelFormat::Nv12));
+            assert_eq!(got.shape(), &[72, 64], "the allocation shape of the grid");
+            assert_eq!(
+                got.row_stride(),
+                Some(128),
+                "the producer's pitch, which the shape cannot express"
+            );
+            let expected = bytes_of(&src);
+            let seen = bytes_of(&got);
+            assert_eq!(
+                seen[..],
+                expected[..seen.len()],
+                "the same bytes, not a copy"
+            );
+        }
+
+        #[test]
+        fn a_zero_pitch_means_none_was_recorded() {
+            let src = wide_shm();
+            let fd = src.clone_fd().expect("shm fd");
+            let mut planes = reference_planes(PixelFormat::Nv12, 64, 48, 128);
+            planes[0].stride = 0;
+            let got = import(&build(&nv12_spec(&planes)), &[fd.as_raw_fd()])
+                .expect("a zero pitch is not an error");
+            assert_ne!(got.row_stride(), Some(0));
+        }
+
+        #[test]
+        fn a_pitch_the_format_refuses_is_refused_not_ignored() {
+            let src = wide_shm();
+            let fd = src.clone_fd().expect("shm fd");
+            let mut planes = reference_planes(PixelFormat::Nv12, 64, 48, 128);
+            planes[0].stride = 32;
+            let err = import(&build(&nv12_spec(&planes)), &[fd.as_raw_fd()])
+                .expect_err("a pitch narrower than a row is malformed");
+            assert!(
+                err.to_string().contains("row_stride 32 < minimum 64"),
+                "got: {err}"
+            );
+        }
+
+        #[test]
+        fn every_plane_index_is_bounded_not_only_the_first() {
+            let src = wide_shm();
+            let fd = src.clone_fd().expect("shm fd");
+            let mut planes = reference_planes(PixelFormat::Nv12, 64, 48, 128);
+            planes[1].handle = 5;
+            let err = import(&build(&nv12_spec(&planes)), &[fd.as_raw_fd()])
+                .expect_err("index 5 is past a one-entry table");
+            assert!(
+                err.to_string()
+                    .contains("plane handle indexes fd 5 but only 1 were provided"),
+                "got: {err}"
+            );
+        }
+
+        #[test]
+        fn quantization_survives_a_reference_round_trip() {
+            let src = TensorDyn::from(
+                Tensor::<i8>::new(&[2, 2, 3], Some(TensorMemory::Shm), None).expect("shm"),
+            );
+            let fd = src.clone_fd().expect("shm fd");
+            let bytes = src.capacity_bytes() as u64;
+            let planes = [BlobPlane {
+                handle: 0,
+                offset: 0,
+                stride: bytes,
+                size: bytes,
+                used: bytes,
+                modifier: 0,
+                handle_bytes: &[],
+                data: &[],
+            }];
+            let blob = build(&BlobSpec {
+                storage_kind: TensorMemory::Shm.code(),
+                dtype: crate::DType::I8,
+                grid: &[2, 2, 3],
+                quant_axis: 2,
+                scales: &[0.1, 0.2, 0.3],
+                zeros: &[-3, 0, 7],
+                ..BlobSpec::new(&planes)
+            });
+            let got = import(&blob, &[fd.as_raw_fd()]).expect("a Shm reference imports");
+            let q = got.quantization().expect("quantization survived");
+            assert_eq!(q.scale(), &[0.1, 0.2, 0.3]);
+            assert_eq!(q.zero_point(), Some(&[-3, 0, 7][..]));
+            assert_eq!(q.axis(), Some(2));
+        }
+    }
+
+    /// A padded planar image's plane stride is the pitch times the height:
+    /// its planes are `C * H` rows of one pitch, which is where the plane
+    /// table puts them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_padded_planar_reference_export_steps_planes_by_the_pitch() {
+        const WHAT: &str = "a_padded_planar_reference_export_steps_planes_by_the_pitch";
+        if !crate::test_support::dma_or_skip(WHAT) {
+            return;
+        }
+        // 50 is not a multiple of 64, so the dma-buf pitch pads each row.
+        let src = TensorDyn::from(
+            Tensor::<u8>::image(
+                50,
+                48,
+                PixelFormat::PlanarRgb,
+                Some(TensorMemory::DmaBuf),
+                CpuAccess::ReadWrite,
+            )
+            .expect("a usable DMA heap allocates a planar image"),
+        );
+        let pitch = src.effective_row_stride().expect("an image has a pitch");
+        assert!(pitch > 50, "precondition: the pitch pads, got {pitch}");
+        let (blob, _fds) = export(&src, TransportMode::Reference).unwrap();
+        let v = BlobView::parse(&blob).unwrap();
+        let planes = v.planes().unwrap();
+        assert_eq!(
+            v.strides(),
+            &[(pitch * 48) as i64, pitch as i64, 1],
+            "row stride is the pitch; plane stride is pitch * height"
+        );
+        assert_eq!(
+            planes[1].offset as i64,
+            v.strides()[0],
+            "the stride array and the plane table agree on where plane 1 starts"
         );
     }
 }

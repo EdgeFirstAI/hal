@@ -14,7 +14,7 @@ and are pinned by commit SHA in `uses:`.
 | **Hardware** | `ci:hardware` (or `ci:full`) on a same-repo PR | on-target i.MX 8M Plus via the shared three-phase pattern |
 | **Nightly** | 03:17 UTC if `main` moved since the last nightly that reached a verdict | Full + G13 differential + Sonar `main` baseline |
 | **Advisories** | 03:17 UTC, every night, gated or not | `cargo audit`. Ungated on purpose: the RustSec database moves whether the code does or not |
-| **Mutation** | 04:47 UTC, every night | one rotating slice of the mutant corpus, fanned across free runners |
+| **Mutation** | 04:47 UTC, every night | one rotating slice of the mutant corpus on four legs (Linux x86_64/arm64, macOS, Windows), fanned across free runners; red on any legitimate survivor |
 | **Release build** | push to `release/X.Y.Z` | wheels, C-API, SBOM, provenance — built and uploaded, nothing published |
 | **Publish** | `vX.Y.Z` tag from `tag-release.yml` | PyPI, crates.io, GitHub Release, from the artifacts the release build produced |
 
@@ -31,7 +31,7 @@ Add **`ci:full`** before approving when the PR touches the build system, `unsafe
 | `ci.yml` | Gate + Quick + Full callers |
 | `hal-full.yml` | HAL-only Full lanes (`workflow_call`) |
 | `nightly.yml` | Change-gated nightly. Also calls the ungated shared `advisories.yml` |
-| `mutants.yml` | Mutation testing. Own schedule, sharded across parallel free runners, gated by nothing |
+| `mutants.yml` | Mutation testing. Own schedule, sharded across parallel free runners, gates nothing else |
 | `differential.yml` | G13; nightly and manual only |
 | `release.yml` | Release **build**, on push to `release/X.Y.Z`. Wheels, C-API archives, SBOM, provenance. Publishes nothing. |
 | `tag-release.yml` | Shared caller: merged `release/X.Y.Z` → annotated `vX.Y.Z`, and only if `release.yml` is green for the release-branch head being merged (`require-build`). |
@@ -42,7 +42,11 @@ Add **`ci:full`** before approving when the PR touches the build system, `unsafe
 
 **A tag deploys; it never builds.** Five of hal's nine release tags failed, and every one of those was a build failure reached only at deploy time. Under this split those are red release PRs. Rehearse `publish.yml` with its `workflow_dispatch` before the first tag after any change to it — it verifies everything and publishes nothing.
 
-Mutation testing lives in its own workflow rather than the nightly. The corpus is ~7057 mutants and roughly 39 hours of work, so it cannot finish in one sitting; as a nightly job it capped at 120 minutes, got through 5%, never once completed, and held the run open for two hours after every other lane had finished. It now tests a rotating window of shards each night across parallel free runners, sweeping the corpus and rolling over. Parallelism is a matrix of runners, not cargo-mutants' `--jobs`, which is incompatible with `--in-place` because each parallel job needs its own tree and target directory.
+Mutation testing lives in its own workflow rather than the nightly. The corpus is ~6,900 mutants and roughly 39 hours of work, so it cannot finish in one sitting; as a nightly job it capped at 120 minutes, got through 5%, never once completed, and held the run open for two hours after every other lane had finished. It now tests a rotating window of shards each night across parallel free runners, sweeping the corpus and rolling over. Parallelism is a matrix of runners, not cargo-mutants' `--jobs`, which is incompatible with `--in-place` because each parallel job needs its own tree and target directory.
+
+The sweep has four legs, because a mutant in code a target does not compile passes there by construction: `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-latest` and `windows-latest`. `edgefirst-tensor` (16 shards, 2 a night) runs on all four; decoder + tracker (48 shards, 6 a night) have no `target_os` code and run on the Linux legs only. The plan job emits one `include` matrix of `{corpus, shard, total, runner, packages, timeout}`, and every leg runs the same shard indices of a corpus on the same night, so the roll-up can merge legs by mutant name. `timeout-minutes` is per runner (120 x86_64, 180 arm64, 150 macOS, 240 Windows); the macOS and Windows values are starting points to tune from measured shard wall times. The Linux legs run `.github/scripts/dma-heap-setup.sh` first, which arms `HAL_TEST_REQUIRE_DMA=1` when the runner's heap allocates, so a lost heap fails the baseline instead of turning DMA-only mutants into silent survivors. The Windows leg pins the D3D11 WARP adapter.
+
+The roll-up (`.github/scripts/mutants_summary.py`, tested by `tests/test_mutants_summary.py`) classifies each mutant per leg as unbuilt when the build left the crate `Fresh` or the mutated line is cfg'd out for that leg's target and features, then merges: caught anywhere wins, built nowhere is listed but never counted, otherwise it survived if every leg that built it missed it. It **fails** on any such survivor, and when a leg leaves unbuilt a file its target compiles (a broken leg). Equivalent mutants are marked with `#[cfg_attr(test, mutants::skip)]` or listed in `.cargo/mutants.toml` `exclude_re`; see [TESTING.md § Mutation Testing](../../TESTING.md#mutation-testing).
 
 Never tag by hand. Do not introduce `-xlarge` / `-8core` labels unless a Full lane measured over 20 minutes on a standard runner; record that exception.
 

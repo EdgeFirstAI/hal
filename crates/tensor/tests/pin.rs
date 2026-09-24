@@ -125,6 +125,16 @@ fn alignment_is_queryable_for_tflite() {
     assert!(pin.alignment().is_power_of_two());
 }
 
+#[test]
+fn alignment_of_a_float_pin_covers_the_element_and_divides_the_address() {
+    let t = Tensor::<f32>::new(&[256], Some(TensorMemory::Mem), None).expect("alloc");
+    let pin = t.pin_host(CpuAccess::Read).expect("pin");
+    assert!(pin.alignment() >= std::mem::align_of::<f32>());
+    assert_eq!(pin.as_ptr() as usize % pin.alignment(), 0);
+    assert_eq!(pin.len(), 256 * 4);
+    assert!(!pin.is_empty());
+}
+
 // --- sync API -------------------------------------------------------------
 
 #[test]
@@ -199,19 +209,10 @@ fn pin_then_bracket_then_mutate_is_the_intended_frame_loop() {
 
 // --- DMA (Linux) ----------------------------------------------------------
 
-/// Report a skip so it survives to the log.
-///
-/// libtest captures `println!`/`eprintln!` and discards it for **passing**
-/// tests, so a test that skips and returns is indistinguishable from one that
-/// did the work — it just prints `... ok`. Writing to `std::io::stderr()`
-/// directly bypasses that capture, which is the same trick the unit tests in
-/// `lib.rs` use for their skip warnings. Without this a board with no DMA heap
-/// silently reports a full green pin suite.
+/// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
 #[cfg(target_os = "linux")]
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED (no DMA): {why}");
-}
+#[path = "support/dma_require.rs"]
+mod dma_require;
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -220,8 +221,10 @@ fn dma_pin_of_a_subview_is_offset_adjusted() {
     // raw mmap base. A freshly allocated tensor has mmap_offset == 0, so it
     // cannot show this -- only a subview can. Proven by writing through the
     // pin and reading the bytes back through the PARENT at the same offset.
-    if !edgefirst_tensor::is_dma_available() {
-        skip("no DMA heap on this host");
+    if !dma_require::available_or_skip(
+        edgefirst_tensor::is_dma_available(),
+        "dma_pin_of_a_subview_is_offset_adjusted",
+    ) {
         return;
     }
     // `view()` is the public crop primitive; it delegates to the same offset
@@ -266,8 +269,10 @@ fn dma_pin_of_a_subview_is_offset_adjusted() {
 fn dma_pin_survives_guard_drops() {
     // Issue #134 criterion 1: the address must stay valid after every map
     // guard has dropped. Skips where no DMA heap is available.
-    if !edgefirst_tensor::is_dma_available() {
-        skip("no DMA heap on this host");
+    if !dma_require::available_or_skip(
+        edgefirst_tensor::is_dma_available(),
+        "dma_pin_survives_guard_drops",
+    ) {
         return;
     }
     let t = Tensor::<u8>::image(
@@ -297,8 +302,10 @@ fn dma_pin_survives_guard_drops() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dma_sync_brackets_round_trip_in_every_direction() {
-    if !edgefirst_tensor::is_dma_available() {
-        skip("no DMA heap on this host");
+    if !dma_require::available_or_skip(
+        edgefirst_tensor::is_dma_available(),
+        "dma_sync_brackets_round_trip_in_every_direction",
+    ) {
         return;
     }
     let t = Tensor::<u8>::image(
@@ -515,8 +522,10 @@ fn dma_relayout_while_pinned_does_not_move_the_mapping() {
     // The Mem case is the easy one -- its base pointer is trivially stable.
     // DMA is where the "a remap moves the address" theory would have to hold
     // if it held anywhere, since the pin owns a real mmap of a heap buffer.
-    if !edgefirst_tensor::is_dma_available() {
-        skip("no DMA heap on this host");
+    if !dma_require::available_or_skip(
+        edgefirst_tensor::is_dma_available(),
+        "dma_relayout_while_pinned_does_not_move_the_mapping",
+    ) {
         return;
     }
     let mut t = Tensor::<u8>::image(

@@ -16,6 +16,7 @@ and skips too.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -36,9 +37,23 @@ def dma_unavailable(exc: BaseException) -> bool:
     )
 
 
+def skip_dma(reason: str) -> None:
+    """Skip a DMA-BUF test, or fail it under ``HAL_TEST_REQUIRE_DMA=1``.
+
+    The Python counterpart of ``crates/tensor/tests/support/dma_require.rs``:
+    a lane that is meant to have a usable heap must not report a skipped DMA
+    test as a pass.
+    """
+    if os.environ.get("HAL_TEST_REQUIRE_DMA") == "1":
+        pytest.fail(
+            f"HAL_TEST_REQUIRE_DMA=1 but a DMA test would have skipped: {reason}"
+        )
+    pytest.skip(reason)
+
+
 def skip_if_dma_unavailable(exc: BaseException) -> None:
     if dma_unavailable(exc):
-        pytest.skip(f"DMA-BUF unavailable on this host: {exc}")
+        skip_dma(f"DMA-BUF unavailable on this host: {exc}")
     raise exc
 
 

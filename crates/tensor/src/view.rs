@@ -196,3 +196,61 @@ impl<T> fmt::Debug for HostView<'_, T> {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A view over `pin_len` bytes of a 64-element backing, so even a length
+    /// computed wrongly stays inside real memory.
+    fn view_u32(
+        pin_len: usize,
+        shape: Vec<usize>,
+        byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
+    ) -> HostView<'static, u32> {
+        let backing: Arc<Vec<u32>> = Arc::new((0..64).collect());
+        let ptr = backing.as_ptr() as *mut u8;
+        HostView::new(
+            HostPin::new(backing, ptr, pin_len),
+            shape,
+            byte_size_override,
+            access,
+        )
+    }
+
+    #[test]
+    fn a_byte_override_exposes_that_many_bytes_as_elements() {
+        let v = view_u32(256, vec![1], Some(8), crate::CpuAccess::Read);
+        assert_eq!(v.as_slice(), &[0, 1]);
+    }
+
+    #[test]
+    fn the_exposed_length_is_clamped_to_the_pinned_bytes() {
+        let v = view_u32(16, vec![4], Some(64), crate::CpuAccess::Read);
+        assert_eq!(v.as_slice(), &[0, 1, 2, 3]);
+        let v = view_u32(16, vec![8], None, crate::CpuAccess::Read);
+        assert_eq!(v.as_slice().len(), 4);
+    }
+
+    #[test]
+    fn unmap_empties_the_view() {
+        let mut v = view_u32(256, vec![4], None, crate::CpuAccess::Read);
+        assert_eq!(v.as_slice().len(), 4);
+        v.unmap();
+        assert!(v.as_slice().is_empty());
+        assert!(format!("{v:?}").contains("mapped: false"));
+    }
+
+    #[test]
+    fn debug_names_the_type_and_its_writability() {
+        let v = view_u32(256, vec![4], Some(16), crate::CpuAccess::ReadWrite);
+        let text = format!("{v:?}");
+        assert!(text.contains("HostView"), "{text}");
+        assert!(text.contains("mapped: true"), "{text}");
+        assert!(text.contains("shape: [4]"), "{text}");
+        assert!(text.contains("byte_size_override: Some(16)"), "{text}");
+        assert!(text.contains("writable: true"), "{text}");
+    }
+}

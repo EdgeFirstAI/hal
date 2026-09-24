@@ -47,12 +47,26 @@ use edgefirst_tensor::{
     TensorMemory, TensorTrait,
 };
 
+/// The DMA-heap skip policy, shared with every DMA-gated test so a skip under
+/// `HAL_TEST_REQUIRE_DMA=1` fails instead.
+#[path = "support/dma_require.rs"]
+mod dma_require;
+
+/// `true` when `what` should run: a usable DMA heap, or a skip reported
+/// (and refused under `HAL_TEST_REQUIRE_DMA=1`).
+fn dma_or_skip(what: &str) -> bool {
+    dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), what)
+}
+
 /// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
 /// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
 /// it -- see `edgefirst_tensor`'s (crate-internal) `test_support` module
 /// for the same mechanism in the library's own `#[cfg(test)]` code; this
 /// integration test binary is a separate compilation unit and cannot reach
-/// that `pub(crate)` helper, so it carries a local copy.
+/// that `pub(crate)` helper, so it carries a local copy. Windows-only: every
+/// DMA-heap skip goes through [`dma_or_skip`], leaving the D3D11 texture
+/// probe as the one caller.
+#[cfg(target_os = "windows")]
 fn report_skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
@@ -363,11 +377,7 @@ fn family5_from_planes_is_genuinely_multiplane_and_chroma_is_independently_writa
 
 #[test]
 fn dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest() {
-    if !edgefirst_tensor::is_dma_available() {
-        report_skip(
-            "dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest - \
-                    DMA not available",
-        );
+    if !dma_or_skip("dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest") {
         return;
     }
     let (w, h) = (64usize, 48usize);
@@ -410,11 +420,7 @@ fn dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest() {
 
 #[test]
 fn dma_buffer_identity_is_derived_from_the_inode_not_the_handle_address() {
-    if !edgefirst_tensor::is_dma_available() {
-        report_skip(
-            "dma_buffer_identity_is_derived_from_the_inode_not_the_handle_address \
-                    - DMA not available",
-        );
+    if !dma_or_skip("dma_buffer_identity_is_derived_from_the_inode_not_the_handle_address") {
         return;
     }
     let t = Tensor::<u8>::new(&[4096], Some(TensorMemory::DmaBuf), None)
@@ -560,8 +566,9 @@ fn two_distinct_views_of_one_dma_parent_share_one_identity_and_do_not_collide_wi
     // must NOT share their identity (the other half of "not colliding":
     // sharing an identity with something that is not actually the same
     // buffer would be the ABA hazard this fix closes).
-    if !edgefirst_tensor::is_dma_available() {
-        report_skip("two_distinct_views_of_one_dma_parent... - DMA not available");
+    if !dma_or_skip(
+        "two_distinct_views_of_one_dma_parent_share_one_identity_and_do_not_collide_with_an_unrelated_buffer",
+    ) {
         return;
     }
     let (w, h) = (64usize, 32usize);
@@ -1333,6 +1340,31 @@ fn sync_refuses_the_non_directional_access() {
 /// `BufferIdentity`. An implementation that allocated a fresh tensor of the
 /// right shape -- the plausible wrong answer -- passes a shape assertion
 /// and fails both of these.
+/// `set_logical_shape` keeps the format, so an `[N*H, W, C]` image can be
+/// re-viewed as a batched `[N, H, W, C]`. Width and height describe one
+/// element, exactly as the static backend reports them.
+#[test]
+fn batched_image_geometry_describes_one_element() {
+    let img = Tensor::<u8>::image(
+        5,
+        12,
+        PixelFormat::Rgba,
+        Some(TensorMemory::Mem),
+        CpuAccess::ReadWrite,
+    )
+    .expect("Mem RGBA 5x12");
+    let mut t: TensorDyn = img.into();
+    t.set_logical_shape(&[4, 3, 5, 4])
+        .expect("[4, 3, 5, 4] is the same bytes as [12, 5, 4]");
+    assert_eq!(t.format(), Some(PixelFormat::Rgba));
+    assert_eq!(t.width(), Some(5));
+    assert_eq!(t.height(), Some(3));
+
+    t.set_logical_shape(&[240]).expect("flatten to bytes");
+    assert_eq!(t.width(), None, "a flat shape is not an image");
+    assert_eq!(t.height(), None);
+}
+
 #[test]
 fn batch_is_a_zero_copy_window_on_the_leading_dimension() {
     let parent = bare_u8(&[4, 2, 3]);
@@ -1529,19 +1561,11 @@ fn dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd() {
         other => panic!("host memory has no dma-buf fd, got: {other:?}"),
     }
 
-    let dma = match Tensor::<u8>::new(&[64, 64], Some(TensorMemory::DmaBuf), None) {
-        Ok(t) => t,
-        Err(e) if platform_resource_absent(&e) => {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIPPED: dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd -- \
-                 no usable dma-buf heap on this host"
-            );
-            return;
-        }
-        Err(e) => panic!("unexpected dma-buf allocation failure: {e:?}"),
-    };
+    if !dma_or_skip("dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd") {
+        return;
+    }
+    let dma = Tensor::<u8>::new(&[64, 64], Some(TensorMemory::DmaBuf), None)
+        .expect("a usable DMA heap allocates");
     let dma_dyn: TensorDyn = dma.into();
     let borrowed = { dma_dyn.plane0().expect("plane 0").handle };
     let cloned = dma_dyn
@@ -1947,18 +1971,11 @@ fn a_retagged_pbo_still_resolves_its_buffer_id_vtable_and_map() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask() {
-    let dma = match Tensor::<u8>::new(&[64, 64], Some(TensorMemory::DmaBuf), None) {
-        Ok(t) => t,
-        Err(e) => {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIPPED: a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask -- \
-                 no usable dma-buf heap here ({e:?})"
-            );
-            return;
-        }
-    };
+    if !dma_or_skip("a_dma_tensor_answers_both_questions_the_gpu_import_sites_ask") {
+        return;
+    }
+    let dma = Tensor::<u8>::new(&[64, 64], Some(TensorMemory::DmaBuf), None)
+        .expect("a usable DMA heap allocates");
 
     // The capability probe (`g2d.rs`'s two call sites).
     assert_eq!(

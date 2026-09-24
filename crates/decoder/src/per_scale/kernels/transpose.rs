@@ -49,7 +49,7 @@ pub(crate) fn nchw_to_nhwc<T: Copy>(src: &[T], h: usize, w: usize, c: usize, dst
     // preserved by the transpose (it's a pure permutation), so we can
     // safely punt the call through the u8 NEON routine via raw bytes.
     #[cfg(target_arch = "aarch64")]
-    if std::mem::size_of::<T>() == 1 && c >= 16 && (h * w) >= 16 {
+    if uses_byte_tile_path(std::mem::size_of::<T>(), h, w, c) {
         // SAFETY: T is byte-sized so the raw-byte view is well-formed and
         // the transpose is a bitwise permutation. Dispatching by size
         // matches both i8 and u8 (and any other 1-byte Copy type).
@@ -72,6 +72,18 @@ pub(crate) fn nchw_to_nhwc<T: Copy>(src: &[T], h: usize, w: usize, c: usize, dst
             }
         }
     }
+}
+
+/// Whether a transpose of `elem_size`-byte elements at this shape takes the
+/// aarch64 16×16 byte-tile path: byte-sized elements with at least one full
+/// tile in each of `c` and `h * w`, the precondition
+/// `nchw_to_nhwc_u8_neon` requires.
+///
+/// Compiled on every target so the routing rule is tested everywhere, not
+/// only where the tile kernel exists.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const fn uses_byte_tile_path(elem_size: usize, h: usize, w: usize, c: usize) -> bool {
+    elem_size == 1 && c >= 16 && h * w >= 16
 }
 
 /// NEON 16×16 byte tile transpose for NCHW → NHWC.
@@ -341,6 +353,70 @@ mod tests {
         let mut dst = vec![0u8; h * w];
         nchw_to_nhwc(&src, h, w, c, &mut dst);
         assert_eq!(dst, src);
+    }
+
+    fn scalar_reference<T: Copy + Default>(src: &[T], h: usize, w: usize, c: usize) -> Vec<T> {
+        let hw = h * w;
+        let mut out = vec![T::default(); hw * c];
+        for p in 0..hw {
+            for ci in 0..c {
+                out[p * c + ci] = src[ci * hw + p];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn byte_tile_path_needs_byte_elements_and_a_full_tile_in_both_dims() {
+        // (elem_size, h, w, c) -> routed
+        let table = [
+            ((1, 4, 4, 16), true),
+            ((1, 1, 16, 16), true),
+            ((1, 16, 1, 16), true),
+            ((1, 20, 20, 80), true),
+            // Not byte-sized.
+            ((2, 4, 4, 16), false),
+            ((4, 4, 4, 16), false),
+            // Fewer than 16 channels.
+            ((1, 4, 4, 15), false),
+            // Fewer than 16 spatial positions, though h + w reaches 16.
+            ((1, 1, 15, 16), false),
+            ((1, 3, 5, 16), false),
+        ];
+        for ((elem_size, h, w, c), routed) in table {
+            assert_eq!(
+                uses_byte_tile_path(elem_size, h, w, c),
+                routed,
+                "elem_size={elem_size} h={h} w={w} c={c}"
+            );
+        }
+    }
+
+    /// A 4-byte element at a shape the byte path would accept (c=16,
+    /// h*w=16) must stay element-wise: every output element is checked.
+    #[test]
+    fn nchw_to_nhwc_f32_at_a_full_tile_shape_moves_whole_elements() {
+        let (h, w, c) = (4, 4, 16);
+        let hw = h * w;
+        let src: Vec<f32> = (0..hw * c).map(|i| i as f32).collect();
+        let mut dst = vec![0f32; hw * c];
+        nchw_to_nhwc(&src, h, w, c, &mut dst);
+        for p in 0..hw {
+            for ci in 0..c {
+                assert_eq!(dst[p * c + ci], (ci * hw + p) as f32, "p={p} ci={ci}");
+            }
+        }
+    }
+
+    /// Sixteen channels but only fifteen spatial positions: not a full tile,
+    /// so the result must still be a correct transpose.
+    #[test]
+    fn nchw_to_nhwc_u8_with_fewer_than_a_tile_of_positions() {
+        let (h, w, c) = (1, 15, 16);
+        let src: Vec<u8> = (0..h * w * c).map(|i| (i % 251) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        nchw_to_nhwc(&src, h, w, c, &mut dst);
+        assert_eq!(dst, scalar_reference(&src, h, w, c));
     }
 
     /// Single-pixel NCHW vs NHWC are bit-equal (h=w=1).

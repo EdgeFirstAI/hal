@@ -745,4 +745,158 @@ mod tests {
         let bits = 0xFFu32 | (0xFFu32 << 8) | (0xFFu32 << 16) | (0xFFu32 << 24);
         assert_eq!(Colorimetry::unpack(bits), Colorimetry::default());
     }
+
+    const SPACES: [(ColorSpace, u32); 4] = [
+        (ColorSpace::Bt709, 1),
+        (ColorSpace::Bt2020, 2),
+        (ColorSpace::Srgb, 3),
+        (ColorSpace::Smpte170m, 4),
+    ];
+    const TRANSFERS: [(ColorTransfer, u32); 5] = [
+        (ColorTransfer::Bt709, 1),
+        (ColorTransfer::Srgb, 2),
+        (ColorTransfer::Pq, 3),
+        (ColorTransfer::Hlg, 4),
+        (ColorTransfer::Linear, 5),
+    ];
+    const ENCODINGS: [(ColorEncoding, u32); 3] = [
+        (ColorEncoding::Bt601, 1),
+        (ColorEncoding::Bt709, 2),
+        (ColorEncoding::Bt2020, 3),
+    ];
+    const RANGES: [(ColorRange, u32); 2] = [(ColorRange::Full, 1), (ColorRange::Limited, 2)];
+
+    #[test]
+    fn pack_places_each_axis_code_in_its_own_byte() {
+        // The per-axis codes are a cross-package wire contract: pin them.
+        for (s, code) in SPACES {
+            let c = Colorimetry::default().with_space(s);
+            assert_eq!(c.pack(), code, "{s:?}");
+            assert_eq!(Colorimetry::unpack(code), c, "{s:?}");
+        }
+        for (t, code) in TRANSFERS {
+            let c = Colorimetry::default().with_transfer(t);
+            assert_eq!(c.pack(), code << 8, "{t:?}");
+            assert_eq!(Colorimetry::unpack(code << 8), c, "{t:?}");
+        }
+        for (e, code) in ENCODINGS {
+            let c = Colorimetry::default().with_encoding(e);
+            assert_eq!(c.pack(), code << 16, "{e:?}");
+            assert_eq!(Colorimetry::unpack(code << 16), c, "{e:?}");
+        }
+        for (r, code) in RANGES {
+            let c = Colorimetry::default().with_range(r);
+            assert_eq!(c.pack(), code << 24, "{r:?}");
+            assert_eq!(Colorimetry::unpack(code << 24), c, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn unpack_decodes_a_fully_populated_word() {
+        assert_eq!(
+            Colorimetry::unpack(0x02_02_05_04),
+            Colorimetry {
+                space: Some(ColorSpace::Smpte170m),
+                transfer: Some(ColorTransfer::Linear),
+                encoding: Some(ColorEncoding::Bt709),
+                range: Some(ColorRange::Limited),
+            }
+        );
+    }
+
+    #[test]
+    fn every_axis_combination_round_trips_through_pack() {
+        for (s, _) in SPACES {
+            for (t, _) in TRANSFERS {
+                for (e, _) in ENCODINGS {
+                    for (r, _) in RANGES {
+                        let c = Colorimetry {
+                            space: Some(s),
+                            transfer: Some(t),
+                            encoding: Some(e),
+                            range: Some(r),
+                        };
+                        assert_eq!(Colorimetry::unpack(c.pack()), c);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn builders_set_exactly_their_own_axis() {
+        let c = Colorimetry::default()
+            .with_space(ColorSpace::Bt2020)
+            .with_transfer(ColorTransfer::Pq)
+            .with_encoding(ColorEncoding::Bt2020)
+            .with_range(ColorRange::Full);
+        assert_eq!(
+            c,
+            Colorimetry {
+                space: Some(ColorSpace::Bt2020),
+                transfer: Some(ColorTransfer::Pq),
+                encoding: Some(ColorEncoding::Bt2020),
+                range: Some(ColorRange::Full),
+            }
+        );
+        // Each builder leaves the other axes as they were.
+        let base = Colorimetry::jfif();
+        assert_eq!(
+            base.with_space(ColorSpace::Bt709),
+            Colorimetry {
+                space: Some(ColorSpace::Bt709),
+                ..base
+            }
+        );
+        assert_eq!(
+            base.with_transfer(ColorTransfer::Hlg),
+            Colorimetry {
+                transfer: Some(ColorTransfer::Hlg),
+                ..base
+            }
+        );
+        assert_eq!(
+            base.with_encoding(ColorEncoding::Bt709),
+            Colorimetry {
+                encoding: Some(ColorEncoding::Bt709),
+                ..base
+            }
+        );
+        assert_eq!(
+            base.with_range(ColorRange::Limited),
+            Colorimetry {
+                range: Some(ColorRange::Limited),
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn from_v4l2_derives_encoding_and_range_for_every_recognised_colorspace() {
+        use ColorEncoding as E;
+        use ColorRange as R;
+        let table = [
+            (V4L2_COLORSPACE_SMPTE170M, E::Bt601, R::Limited),
+            (V4L2_COLORSPACE_REC709, E::Bt709, R::Limited),
+            (V4L2_COLORSPACE_470_SYSTEM_M, E::Bt601, R::Limited),
+            (V4L2_COLORSPACE_470_SYSTEM_BG, E::Bt601, R::Limited),
+            (V4L2_COLORSPACE_JPEG, E::Bt601, R::Full),
+            (V4L2_COLORSPACE_SRGB, E::Bt601, R::Limited),
+            (V4L2_COLORSPACE_BT2020, E::Bt2020, R::Limited),
+        ];
+        for (colorspace, encoding, range) in table {
+            let c = Colorimetry::from_v4l2(colorspace, 0, 0, 0);
+            assert_eq!(c.encoding, Some(encoding), "colorspace {colorspace}");
+            assert_eq!(c.range, Some(range), "colorspace {colorspace}");
+        }
+        // Unrecognised colorspaces leave both axes to the at-use heuristic.
+        for colorspace in [0, 2, 4, 9, 11, 99] {
+            let c = Colorimetry::from_v4l2(colorspace, 0, 0, 0);
+            assert_eq!(
+                (c.encoding, c.range),
+                (None, None),
+                "colorspace {colorspace}"
+            );
+        }
+    }
 }

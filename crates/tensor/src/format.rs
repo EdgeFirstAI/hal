@@ -502,6 +502,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chroma_layout_matches_the_subsampling_of_every_format() {
+        for &fmt in PixelFormat::all() {
+            let expected = match fmt {
+                PixelFormat::Nv12 => Some(ChromaLayout {
+                    shift_x: 1,
+                    shift_y: 1,
+                    uv_rows_per_luma: 1,
+                }),
+                PixelFormat::Nv16 => Some(ChromaLayout {
+                    shift_x: 1,
+                    shift_y: 0,
+                    uv_rows_per_luma: 1,
+                }),
+                PixelFormat::Nv24 => Some(ChromaLayout {
+                    shift_x: 0,
+                    shift_y: 0,
+                    uv_rows_per_luma: 2,
+                }),
+                _ => None,
+            };
+            assert_eq!(fmt.chroma_layout(), expected, "{fmt:?}");
+        }
+    }
+
+    #[test]
+    fn semi_planar_surface_dims_rounds_the_byte_pitch_to_64() {
+        // Two bytes per element: 100 texels = 200 bytes, padded to 256 bytes
+        // = 128 texels.
+        assert_eq!(
+            PixelFormat::Nv12.semi_planar_surface_dims(100, 50, 2),
+            Some((128, 75))
+        );
+        assert_eq!(
+            PixelFormat::Nv12.semi_planar_surface_dims(100, 50, 1),
+            Some((128, 75))
+        );
+        assert_eq!(
+            PixelFormat::Nv16.semi_planar_surface_dims(100, 50, 1),
+            Some((128, 100))
+        );
+        assert_eq!(
+            PixelFormat::Nv24.semi_planar_surface_dims(321, 241, 1),
+            Some((384, 723))
+        );
+        // Four bytes per element: 40 texels = 160 bytes, padded to 192 bytes
+        // = 48 texels.
+        assert_eq!(
+            PixelFormat::Nv24.semi_planar_surface_dims(40, 8, 4),
+            Some((48, 24))
+        );
+        // An already-aligned pitch is left alone.
+        assert_eq!(
+            PixelFormat::Nv12.semi_planar_surface_dims(64, 64, 1),
+            Some((64, 96))
+        );
+    }
+
+    #[test]
+    fn semi_planar_surface_dims_is_none_for_non_semi_planar_formats() {
+        for &fmt in PixelFormat::all() {
+            if fmt.chroma_layout().is_none() {
+                assert_eq!(fmt.semi_planar_surface_dims(64, 64, 1), None, "{fmt:?}");
+            }
+        }
+    }
+
+    #[test]
     fn addressing_shape_is_the_grid_not_the_allocation() {
         // The spec's format table, and the merged schemas goldens
         // (schemas 71b56ed, fixture "Tensor": NV12 640x480 -> shape [480, 640]).

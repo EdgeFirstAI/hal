@@ -22,8 +22,21 @@ crates/tensor/
     └── tensor_benchmark.rs   # Allocation + map/unmap throughput
 ```
 
-There is no `tests/` directory; per-backend coverage lives in the source
-files alongside the implementation.
+Per-backend unit tests live in the source files alongside the implementation. `tests/` holds the integration binaries, which reach the crate only through its public API:
+
+| File | Covers |
+|---|---|
+| `protocol.rs`, `protocol_roundtrip.rs` | Descriptor export/import, including a Shm fd relabelled as `kind::DMABUF` so the import path runs without a heap |
+| `pin.rs`, `identity.rs`, `map_access.rs`, `logical_shape.rs` | Host pins, `BufferIdentity`, CPU-access declarations, logical-shape narrowing |
+| `image_geometry.rs` | Formatted `[N, H, W, C]` geometry: `width()`/`height()` describe one element, `batch()` pitch |
+| `unplanned_access.rs` | `unplanned_cpu_access_count()`, in its own binary because the counter is process-global |
+| `scenarios.rs` | Raw-handle aliasing scenarios for `TensorDyn`, run under Miri by `scripts/miri.sh` |
+| `vocabulary.rs` | `ef_vocabulary!` and the `DType`/`PixelFormat`/`TensorMemory` codes it pins |
+| `no_global_state.rs` | The crate carries no process-wide state that affects behaviour |
+| `dma_require_policy.rs`, `cuda_require_policy.rs` | The `HAL_TEST_REQUIRE_DMA` / `HAL_TEST_REQUIRE_CUDA` decision functions in `support/` |
+| `cuda_runtime_loader.rs` | libcudart loading; under `HAL_TEST_REQUIRE_CUDA=1` a loaded runtime must also create and synchronize a stream |
+| `d3d11_tensor.rs` | Windows D3D11 texture tensors (Windows only) |
+| `dynamic_primitives.rs` | The `dynamic` backend (`--no-default-features --features dynamic`) |
 
 ## Running Tests
 
@@ -65,6 +78,8 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
   cargo test -p edgefirst-tensor --lib --no-run     # build as your user
   sudo ./target/debug/deps/edgefirst_tensor-<hash> --test-threads=1
   ```
+
+  Or set `HAL_TEST_REQUIRE_DMA=1`, which turns every such skip into a failure; see [DMA require gate](#dma-require-gate) below.
 - **Import classification tests** (`test_from_fd_dma_imports_as_dma`,
   `test_from_fd_shm_imports_as_shm`,
   `test_from_fd_rejects_unknown_filesystem`) pin the `from_fd` contract:
@@ -108,6 +123,37 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
   `--no-default-features` compiles those methods out, so any test that touches
   them goes with it. Note these are unrelated to `Tensor::view(region)`, the
   zero-copy sub-region primitive, which is always available.
+
+## DMA require gate
+
+`crates/tensor/tests/support/dma_require.rs` is the guard, mirroring `tests/support/cuda_require.rs`: under `HAL_TEST_REQUIRE_DMA=1` a DMA test that would skip for want of a usable heap fails instead, naming the test and the reason. Without the variable it skips as before and writes `SKIPPED: <test> - <reason>` straight to stderr, so libtest's capture cannot hide it.
+
+- Unit tests in `src/` call `crate::test_support::dma_or_skip("<test name>")`, which `#[path]`-includes the same support module and feeds it `is_dma_available()`.
+- Integration tests in `tests/` include `support/dma_require.rs` with `#[path]` and call `dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), "<test name>")`.
+- Its pure decision core, `decide`, is covered on every platform by `tests/dma_require_policy.rs`, which includes the same file rather than copying it.
+
+A test that needs a DMA heap should return early through one of these, never through a hand-rolled `if !is_dma_available() { return; }`.
+
+CI arms the gate with `.github/scripts/dma-heap-setup.sh` only where a probe allocation from the heap succeeds (the Linux mutation legs, and the hosted Linux lanes and board pre-command through `ci-setup.sh`); see root [TESTING.md § CI guard against silent DMA skips](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#ci-guard-against-silent-dma-skips). macOS and Windows have no DMA heap and leave it unset.
+
+To confirm the gate fails loudly on a workstation that does have a heap, hide the node in a private mount namespace:
+
+```bash
+unshare -rm sh -c 'mount --bind /dev/null /dev/dma_heap/system &&
+  HAL_TEST_REQUIRE_DMA=1 cargo test -p edgefirst-tensor -- --test-threads=1'
+```
+
+`EDGEFIRST_TENSOR_FORCE_MEM=1` also makes every DMA test skip, so do not combine it with the gate.
+
+## Mutation testing
+
+The nightly mutation lane runs this crate on all four legs (Linux x86_64 and arm64, macOS, Windows); see root [TESTING.md § Mutation Testing](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#mutation-testing) for the legs, how survivors are judged and how to mark an equivalent mutant. To mutate one file locally:
+
+```bash
+cargo mutants -p edgefirst-tensor --file crates/tensor/src/<file>.rs --in-place -- -- --test-threads=1
+```
+
+A survivor in a DMA path only counts as a test gap if the tests actually ran against a heap, so run it with `HAL_TEST_REQUIRE_DMA=1` on a host that has one. `ahardwarebuffer.rs` is excluded from the corpus in `.cargo/mutants.toml` (no Android runner); its pure logic is in `ahardwarebuffer_layout.rs`, which is mutated everywhere.
 
 ## Benchmarks
 

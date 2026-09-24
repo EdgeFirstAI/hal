@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Caller pre-command for shared rust-quick / rust-full jobs.
-# Installs host deps, merges crate LFS testdata, fetches ANGLE on Apple/Windows.
+# Installs host deps, merges crate LFS testdata, fetches ANGLE on Apple/Windows,
+# and on Linux arms the DMA require gate when the heap allocates
+# (dma-heap-setup.sh).
 #
 # Environment the shared workflows guarantee to a pre-command: the caller
 # checkout as working directory, GH_TOKEN / GITHUB_TOKEN, and GITHUB_ENV /
@@ -52,6 +54,12 @@ case "${os}" in
             sudo apt-get install -y clang libclang-dev libopencv-dev pkg-config nasm
         fi
         merge_testdata
+        # Opens the DMA heap to the job user and, only when a probe allocation
+        # succeeds, exports HAL_TEST_REQUIRE_DMA=1 through $GITHUB_ENV so the
+        # test step fails instead of skipping DMA tests. A pre-command's own
+        # exports do not reach later steps. Never fails this script.
+        bash "$(dirname "${BASH_SOURCE[0]}")/dma-heap-setup.sh" \
+            || echo "::warning::dma-heap-setup.sh failed; DMA tests may skip"
         ;;
     Darwin*)
         merge_testdata
