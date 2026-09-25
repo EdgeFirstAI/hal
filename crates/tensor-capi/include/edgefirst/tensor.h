@@ -840,8 +840,9 @@ ef_tensor *ef_tensor_builder_alloc(ef_tensor_builder *b);
  * difference from [`ef_tensor_builder_alloc`], and the reason misuse is a
  * per-field error rather than a convention.
  *
- * Adopts the handle: the resulting tensor owns it and the caller must not
- * close it.
+ * Adopts the handle only on success: the resulting tensor owns it and the
+ * caller must not close it. On failure the handle is left open and remains
+ * the caller's to close.
  *
  * **Behaviour change**: earlier versions of this function silently ignored
  * `offset`, `size`, `used`, `modifier`, and every plane past the first --
@@ -2072,6 +2073,22 @@ int ef_tensor_sync_for_device(const ef_tensor *t, uint32_t access);
  * bytes.
  */
 int64_t ef_tensor_copy_to(ef_tensor *t, uint8_t *out, uintptr_t cap);
+
+/**
+ * Runs `f(ctx)` while no tensor CPU mapping can be created in this process.
+ *
+ * For a consumer about to make a GPU-driver call that may unmap an address
+ * range twice (Adreno `eglDestroyImage`): a mapping created between the two
+ * `munmap`s would be destroyed by the second. Every tensor mapping this
+ * library creates waits until `f` returns, so `f` must not map a tensor
+ * itself. `f` is called exactly once, on the calling thread; a NULL `f` is
+ * a no-op.
+ *
+ * # Safety
+ *
+ * `f`, when non-NULL, must be safe to call with `ctx`.
+ */
+void ef_tensor_with_cpu_mappings_excluded(void (*f)(void *ctx), void *ctx);
 
 /**
  * Attach pixel format metadata to a live handle, validating that its shape

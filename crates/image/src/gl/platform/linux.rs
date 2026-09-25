@@ -44,8 +44,11 @@ impl Drop for EglImage {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Display-level EGL op — same dedicated lock as creation.
             let _image_guard = super::super::context::image_lifecycle_guard();
-            let e =
-                GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image);
+            // Adreno unmaps the import's driver mapping twice inside one
+            // eglDestroyImage; no tensor mapping may be created meanwhile.
+            let e = edgefirst_tensor::pin::with_cpu_mappings_excluded(|| {
+                GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image)
+            });
             if let Err(e) = e {
                 log::error!("Could not destroy EGL image: {e:?}");
             }

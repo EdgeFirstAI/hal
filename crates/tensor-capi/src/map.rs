@@ -524,6 +524,29 @@ pub unsafe extern "C" fn ef_tensor_copy_to(t: *mut EfTensor, out: *mut u8, cap: 
     }
 }
 
+/// Runs `f(ctx)` while no tensor CPU mapping can be created in this process.
+///
+/// For a consumer about to make a GPU-driver call that may unmap an address
+/// range twice (Adreno `eglDestroyImage`): a mapping created between the two
+/// `munmap`s would be destroyed by the second. Every tensor mapping this
+/// library creates waits until `f` returns, so `f` must not map a tensor
+/// itself. `f` is called exactly once, on the calling thread; a NULL `f` is
+/// a no-op.
+///
+/// # Safety
+///
+/// `f`, when non-NULL, must be safe to call with `ctx`.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_with_cpu_mappings_excluded(
+    f: Option<unsafe extern "C" fn(ctx: *mut std::ffi::c_void)>,
+    ctx: *mut std::ffi::c_void,
+) {
+    if let Some(f) = f {
+        // SAFETY: the caller guarantees `f` accepts `ctx`.
+        edgefirst_tensor::pin::with_cpu_mappings_excluded(|| unsafe { f(ctx) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,5 +959,26 @@ mod tests {
 
         unsafe { ef_tensor_free(t) };
         unsafe { ef_tensor_free(t) };
+    }
+
+    unsafe extern "C" fn count_call(ctx: *mut std::ffi::c_void) {
+        // SAFETY: the test passes a live `u32`.
+        unsafe { *ctx.cast::<u32>() += 1 };
+    }
+
+    #[test]
+    fn mapping_exclusion_runs_the_callback_once() {
+        let mut calls = 0u32;
+        // SAFETY: `count_call` takes a `*mut u32`, which `ctx` is.
+        unsafe {
+            ef_tensor_with_cpu_mappings_excluded(Some(count_call), (&mut calls as *mut u32).cast())
+        };
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn mapping_exclusion_accepts_a_null_callback() {
+        // SAFETY: a NULL callback is documented as a no-op.
+        unsafe { ef_tensor_with_cpu_mappings_excluded(None, std::ptr::null_mut()) };
     }
 }

@@ -67,6 +67,22 @@ fn skip(why: &str) {
     let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
 }
 
+/// Whether a missing or downgraded zero-copy buffer is a failure rather than
+/// a skip. On macOS and Windows the buffer needs no device node, so it is
+/// required wherever GL is. On Linux it is a DMA-BUF and needs a heap, which
+/// not every GPU board has (Jetson has none): there it is required under
+/// `HAL_TEST_REQUIRE_DMA=1`, or under `HAL_TEST_REQUIRE_GL=1` on a host that
+/// has a heap.
+fn require_zero_copy_buffer() -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+    if cfg!(target_os = "linux") {
+        set("HAL_TEST_REQUIRE_DMA")
+            || (set("HAL_TEST_REQUIRE_GL") && std::path::Path::new("/dev/dma_heap").exists())
+    } else {
+        set("HAL_TEST_REQUIRE_GL")
+    }
+}
+
 fn want(x: usize, y: usize) -> [u8; BPP] {
     [((y * 4) % 256) as u8, ((x * 4) % 256) as u8, 255, 255]
 }
@@ -86,14 +102,13 @@ fn gl_or_skip() -> Option<GLProcessorThreaded> {
     }
 }
 
-/// A DMA-BUF image, or a skip. Under `HAL_TEST_REQUIRE_GL=1` a missing or
-/// downgraded DMA-BUF is a FAILURE, not a skip: the boards this file exists
-/// for all have a heap, so a heap that needs privileges (or an allocation that
-/// quietly lands on the heap allocator) would otherwise let the whole file
-/// pass without importing anything -- vacuously green on exactly the path
-/// under test. The GL bring-up above carries the same rule.
+/// A DMA-BUF image, or a skip. Where [`require_zero_copy_buffer`] holds, a
+/// missing or downgraded DMA-BUF is a FAILURE, not a skip: a heap that needs
+/// privileges (or an allocation that quietly lands on the heap allocator)
+/// would otherwise let the whole file pass without importing anything --
+/// vacuously green on exactly the path under test. The GL bring-up above
+/// carries the same rule.
 fn dmabuf_image_or_skip(w: usize, h: usize, fmt: PixelFormat) -> Option<TensorDyn> {
-    let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
     match TensorDyn::image(
         w,
         h,
@@ -105,8 +120,8 @@ fn dmabuf_image_or_skip(w: usize, h: usize, fmt: PixelFormat) -> Option<TensorDy
         Ok(t) if t.memory() == TensorMemory::DmaBuf => Some(t),
         Ok(t) => {
             assert!(
-                !require_gl,
-                "HAL_TEST_REQUIRE_GL=1 but the {fmt:?} zero-copy request fell back to {:?}",
+                !require_zero_copy_buffer(),
+                "a zero-copy buffer is required here but the {fmt:?} zero-copy request fell back to {:?}",
                 t.memory()
             );
             skip(&format!(
@@ -117,8 +132,8 @@ fn dmabuf_image_or_skip(w: usize, h: usize, fmt: PixelFormat) -> Option<TensorDy
         }
         Err(e) => {
             assert!(
-                !require_gl,
-                "HAL_TEST_REQUIRE_GL=1 but no DMA-BUF could be allocated for {fmt:?}: {e}"
+                !require_zero_copy_buffer(),
+                "a zero-copy buffer is required here but no DMA-BUF could be allocated for {fmt:?}: {e}"
             );
             skip(&format!("{fmt:?}: no DMA-BUF here: {e}"));
             None

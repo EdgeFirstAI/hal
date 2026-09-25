@@ -153,7 +153,9 @@ pub type CompletionFence = std::os::windows::io::OwnedHandle;
 ///   available EGL devices via `eglQueryDevicesEXT`, then selects the first
 ///   device with `eglGetPlatformDisplay(EGL_EXT_platform_device, ...)`.
 ///   Headless and compositor-free with zero external library dependencies.
-///   Works on NVIDIA GPUs and newer Vivante drivers.
+///   Works on NVIDIA GPUs and newer Vivante drivers. Skipped on Qualcomm
+///   Adreno, whose device display crashes in `eglQueryString`; GBM is used
+///   there instead.
 ///
 /// - **`Gbm`** — Opens a DRM render node (e.g. `/dev/dri/renderD128`) and
 ///   creates a GBM (Generic Buffer Manager) device, then calls

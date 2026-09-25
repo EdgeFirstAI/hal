@@ -14,6 +14,10 @@
 #                     artifact instead; their checkout has LFS pointers, not
 #                     content, so merging there would stage stub files that the
 #                     artifact then has to overwrite.
+#   BOARD=1           arm the on-target gates from what the board has, as
+#                     scripts/on-target-test.sh does: HAL_TEST_REQUIRE_GL=1
+#                     with a DRM render node, EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1
+#                     with /dev/galcore.
 set -euo pipefail
 
 persist() {
@@ -60,6 +64,21 @@ case "${os}" in
         # exports do not reach later steps. Never fails this script.
         bash "$(dirname "${BASH_SOURCE[0]}")/dma-heap-setup.sh" \
             || echo "::warning::dma-heap-setup.sh failed; DMA tests may skip"
+        if [[ "${BOARD:-0}" == "1" ]]; then
+            # A board with a render node has a GPU, so a GL backend that does
+            # not come up is a defect there, not a fact of the machine; without
+            # the gate every require-gated test skips and the lane stays green.
+            # The Vivante driver has an intermittent double-free that otherwise
+            # reads as a regression in whatever changed.
+            if compgen -G "/dev/dri/renderD*" >/dev/null; then
+                persist HAL_TEST_REQUIRE_GL 1
+            fi
+            if [[ -e /dev/galcore ]]; then
+                persist EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS 1
+            fi
+            echo "ci-setup: board gates HAL_TEST_REQUIRE_GL=${HAL_TEST_REQUIRE_GL:-unset}" \
+                "EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=${EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS:-unset}"
+        fi
         ;;
     Darwin*)
         merge_testdata

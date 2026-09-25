@@ -161,6 +161,20 @@ fn init_shared_display(
             continue;
         }
 
+        // Adreno's EGL_PLATFORM_DEVICE_EXT display initializes but segfaults
+        // on eglQueryString(EGL_EXTENSIONS); its GBM display is fully
+        // functional. EGL_VENDOR is safe to query on the device display.
+        if kind == EglDisplayKind::PlatformDevice {
+            let is_qualcomm = egl
+                .query_string(Some(display), egl::VENDOR)
+                .is_ok_and(|v| v.to_string_lossy().contains("Qualcomm"));
+            if is_qualcomm {
+                log::debug!("Shared display: skipping {kind} on Qualcomm Adreno");
+                let _ = egl.terminate(display);
+                continue;
+            }
+        }
+
         // Verify required extensions
         let ext_str = match egl.query_string(Some(display), egl::EXTENSIONS) {
             Ok(s) => s,

@@ -2254,3 +2254,27 @@ fn a_pbo_view_reads_its_own_region_and_outlives_its_parent() {
         "the GL buffer is deleted exactly once, when the last holder goes"
     );
 }
+
+#[test]
+fn mapping_exclusion_runs_the_closure_in_the_library_and_returns_its_value() {
+    let mut calls = 0;
+    let out = edgefirst_tensor::pin::with_cpu_mappings_excluded(|| {
+        calls += 1;
+        42
+    });
+    assert_eq!((calls, out), (1, 42));
+}
+
+#[test]
+fn mapping_exclusion_propagates_a_panic_without_crossing_the_c_frame() {
+    let caught = std::panic::catch_unwind(|| {
+        edgefirst_tensor::pin::with_cpu_mappings_excluded(|| panic!("inside the exclusion"))
+    });
+    let payload = caught.expect_err("the closure's panic must reach the caller");
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"inside the exclusion")
+    );
+    // The lock was released: a second exclusion does not deadlock.
+    assert_eq!(edgefirst_tensor::pin::with_cpu_mappings_excluded(|| 7), 7);
+}

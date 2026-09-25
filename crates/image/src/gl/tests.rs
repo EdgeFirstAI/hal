@@ -3447,6 +3447,21 @@ mod gl_tests {
 
     // ---- Multiplane PixelFormat::Nv12 GPU tests ----
 
+    /// Whether `result` is the GL backend's documented decline of a
+    /// semi-planar source whose chroma is a separate DMA-BUF (Adreno imports
+    /// only the first buffer of a multi-fd import). Reports the skip, so a
+    /// test of that import on such a driver is attributed rather than green.
+    #[cfg(feature = "dma_test_formats")]
+    fn declined_separate_chroma(result: &crate::Result<()>, test: &str) -> bool {
+        match result {
+            Err(crate::Error::NotSupported(m)) if m.contains("separate DMA-BUF") => {
+                crate::test_support::report_skip(&format!("{test} - {m}"));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Helper: load PixelFormat::Nv12 raw bytes into separate DMA-backed luma and chroma tensors,
     /// returning a multiplane TensorDyn suitable for GPU EGLImage import.
     #[cfg(feature = "dma_test_formats")]
@@ -3543,14 +3558,17 @@ mod gl_tests {
         .unwrap();
         let src_multiplane_dyn = src_multiplane;
         let mut dst_multi_dyn = dst_multi;
-        gl.convert(
+        let result = gl.convert(
             &src_multiplane_dyn,
             &mut dst_multi_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
-        )
-        .unwrap();
+        );
+        if declined_separate_chroma(&result, function!()) {
+            return;
+        }
+        result.unwrap();
 
         // Same bytes, two import paths, one conversion path → byte-identical.
         let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
@@ -3757,14 +3775,17 @@ mod gl_tests {
         .unwrap();
         let src_multiplane_dyn = src_multiplane;
         let mut dst_multi_dyn = dst_multi;
-        gl.convert(
+        let result = gl.convert(
             &src_multiplane_dyn,
             &mut dst_multi_dyn,
             Rotation::None,
             Flip::None,
             crop,
-        )
-        .unwrap();
+        );
+        if declined_separate_chroma(&result, function!()) {
+            return;
+        }
+        result.unwrap();
 
         let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
         let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
@@ -3836,14 +3857,17 @@ mod gl_tests {
         .unwrap();
         let src_multiplane_dyn = src_multiplane;
         let mut dst_multi_dyn = dst_multi;
-        gl.convert(
+        let result = gl.convert(
             &src_multiplane_dyn,
             &mut dst_multi_dyn,
             Rotation::None,
             Flip::None,
             crop,
-        )
-        .unwrap();
+        );
+        if declined_separate_chroma(&result, function!()) {
+            return;
+        }
+        result.unwrap();
 
         // Map raw i8 bytes as u8 for comparison — both have XOR 0x80 bias.
         let map_contig = dst_contig_dyn.as_i8().unwrap().map().unwrap();
@@ -5894,14 +5918,50 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
+        let result = gl.convert(
             &src,
             &mut dst_multi,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
-        )
-        .unwrap();
+        );
+        if declined_separate_chroma(&result, function!()) {
+            // The decline must still leave the caller a correct convert:
+            // ImageProcessor serves it on the CPU, which must match the CPU's
+            // answer for the same bytes held contiguously.
+            let mut proc = proc;
+            proc.convert(
+                &src,
+                &mut dst_multi,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            let mut dst_cpu = TensorDyn::image(
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            crate::CPUProcessor::new()
+                .convert(
+                    &src_contig,
+                    &mut dst_cpu,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                )
+                .unwrap();
+            let map_multi = dst_multi.as_u8().unwrap().map().unwrap();
+            let map_cpu = dst_cpu.as_u8().unwrap().map().unwrap();
+            assert_pixels_match(map_cpu.as_slice(), map_multi.as_slice(), 0);
+            return;
+        }
+        result.unwrap();
 
         // Render contiguous reference
         let mut dst_contig = TensorDyn::image(
@@ -6334,7 +6394,7 @@ mod gl_tests {
     fn vivante_disables_gl_float() {
         use super::super::processor::float_render_support;
         use crate::RenderDtypeSupport;
-        let s = float_render_support(true, true, true);
+        let s = float_render_support(true, false, true, true);
         assert_eq!(
             s,
             RenderDtypeSupport {
@@ -6348,7 +6408,7 @@ mod gl_tests {
     fn non_vivante_reports_float_when_ext_present() {
         use super::super::processor::float_render_support;
         use crate::RenderDtypeSupport;
-        let s = float_render_support(false, true, true);
+        let s = float_render_support(false, false, true, true);
         assert_eq!(
             s,
             RenderDtypeSupport {
@@ -6359,10 +6419,26 @@ mod gl_tests {
     }
 
     #[test]
+    fn refused_float_import_disables_gl_float() {
+        use super::super::processor::float_render_support;
+        use crate::RenderDtypeSupport;
+        // Adreno on a zero-copy backend: the float color buffer exists, but
+        // no float DMA-BUF import does, so no float destination is servable.
+        let s = float_render_support(false, true, true, true);
+        assert_eq!(
+            s,
+            RenderDtypeSupport {
+                f32: false,
+                f16: false
+            }
+        );
+    }
+
+    #[test]
     fn no_ext_means_no_float() {
         use super::super::processor::float_render_support;
         use crate::RenderDtypeSupport;
-        let s = float_render_support(false, false, false);
+        let s = float_render_support(false, false, false, false);
         assert_eq!(
             s,
             RenderDtypeSupport {
@@ -11448,7 +11524,7 @@ mod gl_tests {
     ///   sampler for single-plane NV12 there, and Vivante's EGL refuses the
     ///   unaligned offset, so the OTHER failure arm runs.
     /// * **i.MX 95 (Mali).** The engine's own decline fires
-    ///   (`mali_rejects_import_offset`), then the ShaderR8 arm's failure path.
+    ///   (`rejects_unaligned_import_offset`), then the ShaderR8 arm's failure path.
     ///
     /// V3D imports an unaligned offset correctly and takes neither arm, which
     /// is why the routing assertion below is an implication rather than a flat
@@ -12783,6 +12859,21 @@ mod gl_tests {
             .as_slice()
             .to_vec();
 
+        // Adreno's and V3D's upload-and-readback route samples the
+        // neighbouring texel in bands, so this sawtooth comes back up to 4
+        // levels off. The re-plan is what is under test. The renderer is read
+        // while the probe processor's context is current.
+        let tolerance: u8 = crate::opengl_headless::processor::GLProcessorST::new(None, None)
+            .map(|g| {
+                let v3d = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER)
+                    .is_ok_and(|r| r.contains("V3D"));
+                if g.is_adreno || v3d {
+                    4
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
         let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
         let planar_dma = || {
             TensorDyn::image(
@@ -12833,12 +12924,9 @@ mod gl_tests {
                         .expect("map destination")
                         .as_slice()
                         .to_vec();
-                    if got.len() != want.len() || got != want {
-                        let first = got
-                            .iter()
-                            .zip(want.iter())
-                            .position(|(a, b)| a != b)
-                            .unwrap_or(0);
+                    let off = |(a, b): (&u8, &u8)| a.abs_diff(*b) > tolerance;
+                    if got.len() != want.len() || got.iter().zip(want.iter()).any(off) {
+                        let first = got.iter().zip(want.iter()).position(off).unwrap_or(0);
                         failures.push(format!(
                             "{label}: the re-planned convert does not match the CPU \
                              reference; first differing byte {first} got={} want={}",

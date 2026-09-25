@@ -186,6 +186,10 @@ declare_abi! {
     pub fn ef_tensor_map(t: *mut EfTensor, access: u32, out: *mut EfTensorView) -> c_int;
     pub fn ef_tensor_try_map(t: *mut EfTensor, access: u32, out: *mut EfTensorView) -> c_int;
     pub fn ef_tensor_unmap(t: *mut EfTensor) -> c_int;
+    pub fn ef_tensor_with_cpu_mappings_excluded(
+        f: Option<unsafe extern "C" fn(ctx: *mut std::ffi::c_void)>,
+        ctx: *mut std::ffi::c_void,
+    );
     pub fn ef_tensor_sync_for_cpu(t: *const EfTensor, access: u32) -> c_int;
     pub fn ef_tensor_sync_for_device(t: *const EfTensor, access: u32) -> c_int;
     pub fn ef_tensor_copy_to(t: *mut EfTensor, out: *mut u8, cap: usize) -> i64;
@@ -543,7 +547,11 @@ mod tests {
     /// plus map/unmap/unregister ops, and `ef_tensor_cuda_attached` reports
     /// whether that (or a D3D11) registration is present. No new `repr(C)`
     /// struct: `EfClientState` stays 24 bytes.
-    const HEADER_DECLARATION_COUNT: usize = 110;
+    /// **Now 111** with `ef_tensor_with_cpu_mappings_excluded`: runs a
+    /// callback while no tensor CPU mapping can be created, so the image
+    /// crate can hold that exclusion across Adreno's `eglDestroyImage`,
+    /// which unmaps its driver mapping twice.
+    const HEADER_DECLARATION_COUNT: usize = 111;
 
     #[test]
     fn declared_matches_the_header_derived_count() {

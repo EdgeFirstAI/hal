@@ -350,7 +350,7 @@ pub struct GLProcessorST {
     pub(super) is_vivante: bool,
     /// Whether the GPU is an Arm Mali core (GL_RENDERER). Used to decline a
     /// source DMA-BUF import at a plane offset Mali would sample zeros from,
-    /// so the upload path takes it instead — see `mali_rejects_import_offset`
+    /// so the upload path takes it instead — see `rejects_unaligned_import_offset`
     /// and issue #165. Its reach is now the imports the aligned-base rebase
     /// does not move: a source it rebases presents an aligned base and stays
     /// zero-copy, so what still declines is NV12's two-plane import, the
@@ -368,6 +368,12 @@ pub struct GLProcessorST {
     /// state there, so ANGLE takes the Full serialization policy; see
     /// [`requires_full_serialization`].
     is_angle: bool,
+    /// Whether the GPU is a Qualcomm Adreno on the proprietary driver
+    /// (GL_RENDERER). Takes the Full serialization policy, and its DMA-BUF
+    /// imports at an unaligned plane offset — destinations included — or of
+    /// a two-buffer NV12 are declined onto the upload / readback routes; see
+    /// [`RendererTraits::adreno`].
+    pub(super) is_adreno: bool,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
     ///
     /// Set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to enable (required on i.MX 95 / Mali-G310
@@ -956,6 +962,15 @@ struct RendererTraits {
     /// per-draw state there; gets the Full serialization policy. See
     /// [`requires_full_serialization`].
     angle: bool,
+    /// Qualcomm Adreno on the proprietary KGSL stack (IQ-9075 / Adreno 663).
+    /// One `eglDestroyImage` unmaps the import's driver mapping twice, which
+    /// destroys any mapping another thread created in between, so it gets the
+    /// Full serialization policy (see `edgefirst_tensor::pin::
+    /// with_cpu_mappings_excluded` for the CPU-side half). Its DMA-BUF import
+    /// also silently misplaces a `EGL_DMA_BUF_PLANE0_OFFSET_EXT` that is not
+    /// 64-byte aligned — for destinations as well as sources — and samples
+    /// garbage from an NV12 whose chroma lives in a second DMA-BUF.
+    adreno: bool,
 }
 
 /// Whether this driver needs per-message global serialization
@@ -986,11 +1001,16 @@ struct RendererTraits {
 ///   virtualization. Silently wrong pixels is the worse failure mode, so
 ///   correctness is the default and `EDGEFIRST_GL_SERIALIZE=lifecycle`
 ///   remains available to re-measure once ANGLE is genuinely validated.
+/// * **Adreno** (proprietary KGSL driver): one `eglDestroyImage` unmaps the
+///   import's driver mapping twice, so a mapping another context's thread
+///   creates in between is destroyed and its next access faults. Measured on
+///   IQ-9075 / Adreno 663: 9/30 runs of four concurrent processors SIGSEGV
+///   under `LifecycleOnly`, 0/30 under `Full`.
 ///
 /// Serialization costs throughput only when a process runs several
 /// `ImageProcessor`s concurrently; a single-processor pipeline is unaffected.
 fn requires_full_serialization(t: RendererTraits) -> bool {
-    t.vivante || t.virtual_gpu || t.angle
+    t.vivante || t.virtual_gpu || t.angle || t.adreno
 }
 
 /// Capability probe results from a freshly-current GL context
@@ -1439,6 +1459,7 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
             || lower.contains("basic render driver"),
         virtual_gpu: lower.contains("paravirtual") || lower.contains("virtio"),
         angle: lower.contains("angle"),
+        adreno: lower.contains("adreno"),
     }
 }
 
@@ -1467,7 +1488,10 @@ fn unaligned_import_offset(plane_offset: usize) -> bool {
     !plane_offset.is_multiple_of(DMA_IMPORT_OFFSET_ALIGN)
 }
 
-/// Whether a Mali import at `plane_offset` would sample zeros.
+/// Whether a source import at `plane_offset` would be silently misread on a
+/// driver that misplaces unaligned offsets: Mali samples zeros,
+/// Adreno samples from the wrong base. `misplaces` is
+/// [`GLProcessorST::misplaces_unaligned_offsets`].
 ///
 /// Checks ONE plane's offset. Every plane the import passes to EGL has to be
 /// checked by its caller: a two-plane NV12 import hands EGL a plane-1 offset
@@ -1478,8 +1502,8 @@ fn unaligned_import_offset(plane_offset: usize) -> bool {
 /// [`source_import_plane0_offset`] rather than the tensor's own: a rebased
 /// source imports at an aligned base and is not declined, an unrebased one
 /// still carries its unaligned offset and is (issue #170).
-fn mali_rejects_import_offset(is_mali: bool, plane_offset: usize) -> bool {
-    is_mali && unaligned_import_offset(plane_offset)
+fn rejects_unaligned_import_offset(misplaces: bool, plane_offset: usize) -> bool {
+    misplaces && unaligned_import_offset(plane_offset)
 }
 
 /// The plane-0 offset a SOURCE import of `img` will present to EGL.
@@ -1548,6 +1572,14 @@ fn view_collapsed_dst_base(
     } else {
         plane_offset.unwrap_or(0)
     }
+}
+
+/// Whether a semi-planar source's chroma plane lives in a different DMA-BUF
+/// from its luma. A multiplane tensor whose planes are `dup`s of one buffer
+/// shares the `(st_dev, st_ino)` identity and is not separate.
+fn chroma_in_separate_buffer(img: &Tensor<u8>) -> bool {
+    img.chroma()
+        .is_some_and(|c| c.buffer_identity().id() != img.buffer_identity().id())
 }
 
 /// The plane-1 (interleaved CbCr) byte offset a *contiguous* NV12 import hands
@@ -1622,6 +1654,7 @@ impl GLProcessorST {
                     software: is_software_renderer,
                     virtual_gpu: is_virtual_gpu,
                     angle: is_angle,
+                    adreno: is_adreno,
                 },
             supports_f32_color,
             supports_f16_color,
@@ -1969,6 +2002,7 @@ impl GLProcessorST {
             is_mali,
             is_virtual_gpu,
             is_angle,
+            is_adreno,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -2286,6 +2320,7 @@ impl GLProcessorST {
             let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
             let support = float_render_support(
                 self.is_vivante,
+                self.float_import_refused(),
                 self.supports_f32_color,
                 self.supports_f16_color,
             );
@@ -2649,7 +2684,11 @@ impl GLProcessorST {
             ));
         }
         let dst_offset = view_collapsed_dst_base(dst.view_origin(), dst.plane_offset());
-        let places = Platform::dst_import_places(dst);
+        // Adreno accepts a destination import at an unaligned base and renders
+        // to the wrong place without an EGL error (Vivante refuses it loudly,
+        // Mali and V3D render correctly), so the refusal has to be predicted.
+        let places = Platform::dst_import_places(dst)
+            && !(self.is_adreno && unaligned_import_offset(dst_offset));
         if !places {
             log::debug!(
                 "convert_via_engine: zero-copy destination importing at base offset \
@@ -2667,7 +2706,8 @@ impl GLProcessorST {
             self.gl_context.transfer_backend.is_zero_copy() && places,
             dst.memory(),
         );
-        let mut plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
+        let src_host = matches!(src.memory(), TensorMemory::Mem | TensorMemory::Shm);
+        let mut plan = super::render::plan_convert(src_fmt, src_host, dst_fmt, lowering);
         // The packed-RGB plan imports the destination in its pass 2, AFTER
         // pass 1 has rendered, and a texture-lowered RGB destination is a
         // different plan entirely (one genuine RGB pass, no W*3/4
@@ -2692,7 +2732,7 @@ impl GLProcessorST {
                 Err(e) => {
                     self.note_dst_import_fallback(dst, dst_fmt, &e);
                     lowering = super::render::lower_dst(false, dst.memory());
-                    plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
+                    plan = super::render::plan_convert(src_fmt, src_host, dst_fmt, lowering);
                 }
             }
         }
@@ -2748,7 +2788,7 @@ impl GLProcessorST {
         // the bind above is discarded; that costs one texture setup on a path
         // the driver has already made slow, and keeps the "one plan, one
         // route" invariant `plan_convert` documents.
-        let replanned = super::render::plan_convert(src_fmt, dst_fmt, bound);
+        let replanned = super::render::plan_convert(src_fmt, src_host, dst_fmt, bound);
         if replanned != super::render::ConvertPlan::SinglePass {
             debug_assert_eq!(
                 replanned,
@@ -3235,18 +3275,23 @@ impl GLProcessorST {
         }
 
         // Detect GPU vendor / software / virtualized renderers via GL_RENDERER.
-        let traits = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER)
+        let mut traits = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER)
             .map(|r| {
                 log::info!("GL_RENDERER: {r}");
                 classify_renderer(&r)
             })
             .unwrap_or_default();
+        // The Adreno workarounds are measured on the proprietary Linux (KGSL)
+        // driver. Android's Adreno system EGL is device-validated thread-safe
+        // and imports through AHardwareBuffer, so none of them apply there.
+        traits.adreno &= cfg!(target_os = "linux");
         let RendererTraits {
             vivante: is_vivante,
             mali: is_mali,
             software: is_software_renderer,
             virtual_gpu: is_virtual_gpu,
             angle: is_angle,
+            adreno: is_adreno,
         } = traits;
         if is_vivante {
             log::warn!(
@@ -3285,6 +3330,15 @@ impl GLProcessorST {
                  per-message (Full policy). Costs throughput only when one \
                  process runs several ImageProcessors concurrently. Override \
                  with EDGEFIRST_GL_SERIALIZE=lifecycle."
+            );
+        }
+        if is_adreno {
+            log::info!(
+                "Adreno GPU detected — processors will serialize per-message \
+                 (Full policy; override with EDGEFIRST_GL_SERIALIZE=lifecycle), \
+                 DMA-BUF imports at a plane offset that is not \
+                 {DMA_IMPORT_OFFSET_ALIGN}-byte aligned and two-buffer NV12 \
+                 sources take the upload / readback routes"
             );
         }
 
@@ -4132,7 +4186,7 @@ impl GLProcessorST {
             edgefirst_gl::gl::TexImage2D(
                 edgefirst_gl::gl::TEXTURE_2D,
                 0,
-                format as i32,
+                self.render_internal_format(format),
                 width,
                 height,
                 0,
@@ -4437,7 +4491,7 @@ impl GLProcessorST {
             width,
             height,
             buffer_id,
-            format,
+            self.render_internal_format(format) as u32,
             format,
             edgefirst_gl::gl::UNSIGNED_BYTE,
             row_length,
@@ -5224,6 +5278,14 @@ impl GLProcessorST {
                                 }
                             }
                             log::debug!("NV R8 upload takes {:?}", start.elapsed());
+                        } else if matches!(
+                            src_fmt,
+                            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+                        ) {
+                            // A multiplane NV source has no upload route
+                            // (`draw_src_texture` has no NV arm), so the
+                            // import's own refusal is the reason to report.
+                            return Err(e);
                         } else {
                             self.draw_src_texture(
                                 src,
@@ -6752,6 +6814,21 @@ impl GLProcessorST {
                             bytes.len()
                         )));
                     }
+                    // Adreno does not orphan an EGLImage sibling on TexImage2D:
+                    // an upload into a texture that last held an imported R8
+                    // plane samples partly from that import. A fresh texture
+                    // name guarantees the upload owns its storage.
+                    if self.is_adreno {
+                        self.nv_r8_texture = Texture::new();
+                        edgefirst_gl::gl::BindTexture(
+                            edgefirst_gl::gl::TEXTURE_2D,
+                            self.nv_r8_texture.id,
+                        );
+                        super::core::set_tex_filter_clamp(
+                            edgefirst_gl::gl::TEXTURE_2D,
+                            edgefirst_gl::gl::NEAREST,
+                        );
+                    }
                     // `UNPACK_ALIGNMENT` is 1 (set once in `new`), so any row width
                     // is valid — no 4-aligned-pitch requirement on the upload.
                     // (TODO/EDGEAI: reuse storage via glTexSubImage2D when dims are
@@ -6915,9 +6992,9 @@ impl GLProcessorST {
         // which issue #166's routing already sends to the R8 upload rather
         // than the CPU.
         let offset = img.plane_offset().unwrap_or(0);
-        if mali_rejects_import_offset(self.is_mali, offset) {
+        if rejects_unaligned_import_offset(self.misplaces_unaligned_offsets(), offset) {
             return Err(crate::Error::NotSupported(format!(
-                "Mali samples zeros from a DMA-BUF imported at a plane offset that \
+                "this GPU misreads a DMA-BUF imported at a plane offset that \
                  is not {DMA_IMPORT_OFFSET_ALIGN}-byte aligned ({offset}); \
                  uploading the window instead (issue #165)"
             )));
@@ -7034,16 +7111,27 @@ impl GLProcessorST {
                 Some(("plane 0", offset)),
                 chroma_offset.map(|o| ("chroma plane", o)),
             ];
-            if let Some((which, bad)) = planes
-                .into_iter()
-                .flatten()
-                .find(|&(_, o)| mali_rejects_import_offset(self.is_mali, o))
-            {
+            if let Some((which, bad)) = planes.into_iter().flatten().find(|&(_, o)| {
+                rejects_unaligned_import_offset(self.misplaces_unaligned_offsets(), o)
+            }) {
                 return Err(crate::Error::NotSupported(format!(
-                    "Mali samples zeros from a DMA-BUF imported at a plane offset that \
+                    "this GPU misreads a DMA-BUF imported at a plane offset that \
                      is not {DMA_IMPORT_OFFSET_ALIGN}-byte aligned ({which} at \
                      {bad}); uploading the window instead (issue #165)"
                 )));
+            }
+            // Adreno imports only the first plane's DMA-BUF of a multi-fd
+            // import and samples chroma from the wrong buffer, with no EGL
+            // error. Chroma in the luma's own buffer — a single-buffer NV12,
+            // or a multiplane tensor whose planes share one DMA-BUF — imports
+            // correctly and stays zero-copy. GL has no upload route for a
+            // semi-planar source, so the convert is declined to the CPU.
+            if self.is_adreno && chroma_in_separate_buffer(img) {
+                return Err(crate::Error::NotSupported(
+                    "Adreno misreads a semi-planar source whose chroma is a \
+                     separate DMA-BUF (only the first buffer is imported)"
+                        .into(),
+                ));
             }
         }
         // Identity + offset + geometry: sub-region views share one buffer
@@ -8750,6 +8838,7 @@ impl GLProcessorST {
     pub(super) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
         float_render_support(
             self.is_vivante,
+            self.float_import_refused(),
             self.supports_f32_color,
             self.supports_f16_color,
         )
@@ -8871,6 +8960,35 @@ impl GLProcessorST {
         Platform::begin_gpu_pass(&self.gl_context);
     }
 
+    /// Whether this driver's DMA-BUF import accepts a plane offset that is
+    /// not [`DMA_IMPORT_OFFSET_ALIGN`]-byte aligned and then reads from the
+    /// wrong place, with no EGL error to catch: Mali and Adreno.
+    /// Such an offset has to be predicted and routed to the upload path.
+    pub(super) fn misplaces_unaligned_offsets(&self) -> bool {
+        self.is_mali || self.is_adreno
+    }
+
+    /// Whether every float destination GL could serve is a DMA-BUF import
+    /// this driver refuses: Adreno imports no float DMA-BUF format, and on a
+    /// zero-copy transfer backend every float destination is such an import.
+    fn float_import_refused(&self) -> bool {
+        self.is_adreno && self.gl_context.transfer_backend.is_zero_copy()
+    }
+
+    /// The `glTexImage2D` internal format for a GL-owned render target whose
+    /// client format is `format`. Adreno leaves a framebuffer whose colour
+    /// attachment has the unsized `GL_RED` internal format incomplete
+    /// (`GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT`, so every draw into a Grey or
+    /// planar target fails `GL_INVALID_FRAMEBUFFER_OPERATION`); the sized
+    /// `GL_R8`, which ES 3.0 lists as colour-renderable, is complete.
+    fn render_internal_format(&self, format: u32) -> i32 {
+        if self.is_adreno && format == edgefirst_gl::gl::RED {
+            edgefirst_gl::gl::R8 as i32
+        } else {
+            format as i32
+        }
+    }
+
     /// Assemble the immutable capability surface for this processor.
     /// Captured ONCE by the dispatch wrapper at worker startup (before its
     /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
@@ -8889,6 +9007,7 @@ impl GLProcessorST {
                 software: false,
                 virtual_gpu: self.is_virtual_gpu,
                 angle: self.is_angle,
+                adreno: self.is_adreno,
             }),
             external_oes: Platform::EXTERNAL_OES,
             native_fence_sync: Platform::native_fence_sync(&self.gl_context),
@@ -9169,6 +9288,14 @@ mod tests {
         // correctly (#165); Tegra/Orin is unmeasured — that board has no DMA
         // heap, so no DMA-BUF source can be built on it to test.
         assert_eq!(classify_renderer("V3D 7.1"), real_gpu);
+        // Qualcomm Adreno (IQ-9075, proprietary KGSL driver).
+        assert_eq!(
+            classify_renderer("Adreno (TM) 663"),
+            RendererTraits {
+                adreno: true,
+                ..RendererTraits::default()
+            }
+        );
         assert_eq!(
             classify_renderer("NVIDIA Tegra Orin (nvgpu)/integrated"),
             real_gpu
@@ -9202,11 +9329,11 @@ mod tests {
     // (issue #165): 32 and 2080 sampled zeros; 64, 256 and 2048 sampled
     // correctly, and offset 0 is the whole-image control, not a window.
     // The offset rule itself is unchanged by issue #170: these are still the
-    // offsets Mali samples zeros from, and `mali_rejects_import_offset` is
+    // offsets Mali samples zeros from, and `rejects_unaligned_import_offset` is
     // still the predicate. What changed is which formats are asked.
     #[test]
     fn mali_declines_only_unaligned_source_offsets() {
-        use super::mali_rejects_import_offset as rejects;
+        use super::rejects_unaligned_import_offset as rejects;
 
         // Mali, unaligned — declined so the upload path takes the source.
         assert!(rejects(true, 32));
@@ -9283,18 +9410,23 @@ mod tests {
     // correctly (issue #175).
     #[test]
     fn the_offset_rule_is_a_source_rule_and_only_malis() {
-        use super::mali_rejects_import_offset;
+        use super::rejects_unaligned_import_offset;
 
         assert!(
-            mali_rejects_import_offset(true, 2080),
+            rejects_unaligned_import_offset(true, 2080),
             "the Mali source rule covers 2080"
         );
-        assert!(mali_rejects_import_offset(true, 32));
-        assert!(!mali_rejects_import_offset(true, 2048));
-        assert!(!mali_rejects_import_offset(true, 0));
-        // Every other driver samples an unaligned source correctly.
-        assert!(!mali_rejects_import_offset(false, 2080));
-        assert!(!mali_rejects_import_offset(false, 32));
+        assert!(rejects_unaligned_import_offset(true, 32));
+        assert!(!rejects_unaligned_import_offset(true, 2048));
+        assert!(!rejects_unaligned_import_offset(true, 0));
+        // The offsets Adreno misread on IQ-9075, against its correct control.
+        assert!(rejects_unaligned_import_offset(true, 16416));
+        assert!(rejects_unaligned_import_offset(true, 6176));
+        assert!(!rejects_unaligned_import_offset(true, 16384));
+        // A driver that places unaligned offsets correctly (V3D, Vivante
+        // sources) is never declined.
+        assert!(!rejects_unaligned_import_offset(false, 2080));
+        assert!(!rejects_unaligned_import_offset(false, 32));
     }
 
     // The offset a destination import actually bases at, which is what the
@@ -9352,7 +9484,7 @@ mod tests {
     // does not itself supply the missing factor of 64.
     #[test]
     fn nv12_chroma_plane_offset_is_checked_independently_of_plane_zero() {
-        use super::{mali_rejects_import_offset as rejects, nv12_plane1_offset as plane1};
+        use super::{nv12_plane1_offset as plane1, rejects_unaligned_import_offset as rejects};
 
         // HAL-shaped: 64-aligned pitch, offset 0. Both planes aligned, at an
         // even height and at an odd one alike.
@@ -9412,6 +9544,8 @@ mod tests {
 
         // Serialized: driver is not thread-safe for concurrent GL.
         assert!(policy("Vivante GC7000UL"));
+        // Serialized: concurrent contexts unmap foreign DMA-BUF mappings.
+        assert!(policy("Adreno (TM) 663"));
         // Serialized: ANGLE on a real Apple GPU loses per-draw state under
         // concurrent GL — the regression this policy exists to prevent.
         assert!(policy(

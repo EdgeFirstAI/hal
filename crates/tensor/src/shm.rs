@@ -195,6 +195,7 @@ where
             )));
         }
         let size = NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?;
+        let _mapping_guard = crate::pin::cpu_mapping_shared();
         let ptr = unsafe {
             nix::sys::mman::mmap(
                 None,
@@ -417,6 +418,7 @@ where
         // mirrors what map_with already does.
         let mmap_size = self.capacity_bytes();
         let size = NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?;
+        let _mapping_guard = crate::pin::cpu_mapping_shared();
         let ptr = unsafe {
             nix::sys::mman::mmap(
                 None,

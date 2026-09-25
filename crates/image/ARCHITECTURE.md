@@ -274,8 +274,10 @@ new `cfg` branches inside the engine.
 `serialize_gl` selects between running several processors' GL work in
 parallel and serializing every message process-wide, and it is decided by
 `requires_full_serialization` from the GL_RENDERER string. Parallelism is
-validated on **Mali G310, V3D and Tegra/Orin only**; Vivante (driver races)
-and ANGLE (per-draw state lost under concurrent contexts) are serialized.
+validated on **Mali G310, V3D and Tegra/Orin only**; Vivante (driver races),
+ANGLE (per-draw state lost under concurrent contexts) and Adreno on the
+proprietary Linux KGSL driver (foreign DMA-BUF mappings unmapped under
+concurrent contexts) are serialized.
 Adding a driver to the parallel set means running it through
 `tests/gl_concurrent_stress.rs` first — ANGLE shipped wrong pixels for a
 release because it was assumed to behave like the drivers that had been
@@ -321,7 +323,7 @@ shift and is bit-identical to before. Two declines remain: an offset that is
 not a whole number of pixels (a 64-byte-padded pitch need not be a multiple of
 3) and a widened row that would run past the pitch (`rebase_fits_pitch`).
 
-`mali_rejects_import_offset` therefore now guards only the imports the rebase
+`rejects_unaligned_import_offset` therefore now guards only the imports the rebase
 could not move, and it is asked about the offset the import will actually
 present rather than the one the tensor carries. `resolve_source_plane0` is the
 single answer both sides read: `from_tensor` builds the import from it, and the
@@ -333,6 +335,16 @@ unaligned if the gate guesses, and both sample zeros silently; the two sides are
 held together by `the_gate_reads_the_offset_the_import_presents`, which asserts
 the resolver's answer equals the `plane0_offset` `from_tensor` actually puts in
 the import over five real DMA shapes.
+
+Adreno on the Linux KGSL driver misreads the same unaligned offsets (measured
+on IQ-9075: 2080, 6176 and 16416 wrong, 2048 and 16384 correct) and shares the
+gate through `misplaces_unaligned_offsets`. It differs from Mali in two more
+ways, each handled where the import is decided. An unaligned **destination**
+base is accepted and rendered to the wrong place (Vivante refuses it, Mali and
+V3D render it correctly), so `convert_via_engine` predicts it and lowers the
+destination to the mapped-texture readback. And a two-buffer semi-planar source
+(chroma in its own DMA-BUF) imports only the first buffer, so it is declined and
+uploaded; a single-buffer NV12 stays zero-copy.
 
 NV is the format that matters among the ones the rebase never covers: the
 combined-plane R8 import's pitch **is** its width (`tex_width`), so widening it
@@ -1415,6 +1427,7 @@ when the worker starts:
 | Driver | Policy | Effect |
 |---|---|---|
 | Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize (the pre-2026-06 behaviour on every platform). |
+| Adreno on Linux (proprietary KGSL driver, e.g. IQ-9075 / Adreno 663) | `Full` | Its `eglCreateImage` maps every imported DMA-BUF into the process (through `msm_gbm`), and one `eglDestroyImage` unmaps that range **twice**; any mapping created between the two `munmap`s is destroyed. `Full` keeps other GL threads out of that window (9/30 crashes of four concurrent processors under `LifecycleOnly`, 0/30 under `Full`); `edgefirst_tensor::pin::with_cpu_mappings_excluded`, run around every `eglDestroyImage` against a shared lock held across every tensor `mmap`, keeps CPU threads' tensor mappings out of it. In a `dynamic` build it reaches the lock inside `libedgefirst_tensor` through `ef_tensor_with_cpu_mappings_excluded`, the one copy that makes the mappings (10-thread convert test: 10/20 crashes under `Full` alone, 0/80 with the guard). |
 | Virtualized GPUs (`Paravirtual`/`virtio` in `GL_RENDERER`) | `Full` | Concurrent GL across contexts mis-renders on paravirtual Metal (observed on GitHub macOS runners: ~60–86% of output bytes diverge under parallel converts). Messages serialize on a process-global mutex (macOS has no lifecycle lock — ANGLE serializes display entry points internally). |
 | Mali/Panfrost, V3D, Tegra, llvmpipe, macOS (real Apple GPU) | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
 | Android (Adreno/Mali system drivers) | `LifecycleOnly` | Messages run unlocked. Android's system EGL is specification-conformant thread-safe, so there is also no Linux-style lifecycle lock around context bring-up (same reasoning as ANGLE's internal serialization); this claim is device-validated by the Device Farm harness. |
@@ -1745,7 +1758,7 @@ Python surface to supply colorimetry from the producer's signalling into
 |--------------|----------------|
 | Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. The EGL image cache is keyed by `BufferIdentity.id`/`chroma_id` plus the import geometry (`width`/`height`/`row_stride`/`format`). New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. Batch tiles key on the parent's identity+geometry, so the destination EGLImage is imported once and reused across the tile loop. |
 | Allocate via `create_image()` | The processor selects DMA-buf, PBO, or heap based on the runtime GPU probe at `new()` time. Bypassing with `Tensor::new(memory=...)` forces a slow transfer path on every `convert()`. |
-| One `ImageProcessor` per pipeline; more pipelines = more processors | Each instance owns its OpenGL context, dedicated GL thread, and per-thread caches (the EGL display is process-global and shared). On Mali, V3D, Tegra, and llvmpipe, instances execute GPU work **in parallel** (see "GL Concurrency Model" — measured up to S(4)=2.05 aggregate scaling on Mali); only Vivante serializes across instances. Within one instance, work is serialized on its own thread — share a processor across threads only behind your own queue. |
+| One `ImageProcessor` per pipeline; more pipelines = more processors | Each instance owns its OpenGL context, dedicated GL thread, and per-thread caches (the EGL display is process-global and shared). On Mali, V3D, Tegra, and llvmpipe, instances execute GPU work **in parallel** (see "GL Concurrency Model" — measured up to S(4)=2.05 aggregate scaling on Mali); only Vivante and Adreno (Linux KGSL) serialize across instances. Within one instance, work is serialized on its own thread — share a processor across threads only behind your own queue. |
 | Native CPU feature builds (Rule 6) | A build-time concern. `RUSTFLAGS` controls whether the f16 mask kernel at [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs) compiles to native widening instructions or to the soft-float `__extendhfsf2` helper. Distributed binaries stay on triple baseline ISA; benchmark hosts opt in via `RUSTFLAGS` overrides. |
 
 See the [Optimization Guide](https://github.com/EdgeFirstAI/hal/blob/main/README.md#optimization-guide)

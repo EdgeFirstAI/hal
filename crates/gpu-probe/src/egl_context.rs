@@ -208,6 +208,19 @@ impl GpuContext {
             &[egl::ATTRIB_NONE],
         )?;
 
+        // Adreno's device display initializes but segfaults on
+        // eglQueryString(EGL_EXTENSIONS); its GBM display is fully functional.
+        // EGL_VENDOR is safe to query on the device display.
+        egl.initialize(display)
+            .map_err(|e| format!("eglInitialize failed: {e}"))?;
+        let is_qualcomm = egl
+            .query_string(Some(display), egl::VENDOR)
+            .is_ok_and(|v| v.to_string_lossy().contains("Qualcomm"));
+        if is_qualcomm {
+            let _ = egl.terminate(display);
+            return Err("PlatformDevice display unusable on Qualcomm Adreno".into());
+        }
+
         Ok((display, DisplayBacking::Device))
     }
 

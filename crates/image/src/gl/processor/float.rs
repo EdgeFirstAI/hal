@@ -66,12 +66,20 @@ fn float_src_import_disabled() -> bool {
 /// Decide reportable float render support. Vivante GC7000UL float readback is
 /// 170-320 ms (probe-measured) so GL float is refused there; `ImageProcessor`
 /// falls back to CPU float output (normalized to `[0, 1]`), not u8.
+///
+/// `float_import_refused` is a driver whose EGL imports no float DMA-BUF
+/// format (Adreno on Linux: `eglQueryDmaBufFormatsEXT` lists no
+/// `AB4H`/`AB8H`, and the import fails `EGL_BAD_MATCH`) running on a
+/// zero-copy transfer backend. Every float destination GL serves there is a
+/// zero-copy import, so none is servable and float output goes to the CPU up
+/// front rather than failing an import per frame.
 pub(in super::super) fn float_render_support(
     is_vivante: bool,
+    float_import_refused: bool,
     f32_ext: bool,
     f16_ext: bool,
 ) -> crate::RenderDtypeSupport {
-    if is_vivante {
+    if is_vivante || float_import_refused {
         return crate::RenderDtypeSupport {
             f32: false,
             f16: false,
