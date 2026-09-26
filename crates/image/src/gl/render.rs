@@ -91,17 +91,21 @@ pub(super) enum ConvertPlan {
     /// ANGLE/Android — `texture_program_planar` is `None` there,
     /// regardless of source format), and even where it exists its source
     /// import is DMA-only, with no upload path for a heap/Mem source.
-    /// Zero-copy keeps the non-NV single-pass route (proven, EXTERNAL_OES
-    /// path with a DMA source). Also the Vivante GC7000UL single-pass
+    /// Zero-copy keeps the non-NV single-pass route for a source it can
+    /// import (proven, EXTERNAL_OES path with a DMA source); a host source
+    /// takes this plan there too. Also the Vivante GC7000UL single-pass
     /// GPU-hang workaround for NV* (EDGEAI-1180).
     TwoPassNvPlanar,
 }
 
-/// Decide the render plan. Pure (src format, dst format, dst lowering) →
-/// plan; capability differences arrive via the lowering, never as platform
-/// branches here.
+/// Decide the render plan. Pure (src format, src residence, dst format, dst
+/// lowering) → plan; capability differences arrive via the lowering, never as
+/// platform branches here. `src_host` is a source in host memory (`Mem`,
+/// `Shm`): one with no GPU import, which only the upload path of the ordinary
+/// packed convert can read.
 pub(super) fn plan_convert(
     src_fmt: PixelFormat,
+    src_host: bool,
     dst_fmt: PixelFormat,
     lowering: DstLowering,
 ) -> ConvertPlan {
@@ -123,6 +127,14 @@ pub(super) fn plan_convert(
     // handles every source format (including a Mem source) on every
     // platform.
     if dst_fmt.layout() == PixelLayout::Planar && lowering != DstLowering::ZeroCopy {
+        return ConvertPlan::TwoPassNvPlanar;
+    }
+    // The same import rule on a zero-copy destination: the single-pass planar
+    // shader cannot read a host source, so it takes pass 1's upload instead.
+    // A driver that refuses the destination import re-plans onto the texture
+    // lowering above and reaches the same answer; one that accepts it (V3D,
+    // Mali) otherwise ended the convert with the source import's error.
+    if dst_fmt.layout() == PixelLayout::Planar && src_host {
         return ConvertPlan::TwoPassNvPlanar;
     }
     // Zero-copy NV*→planar still needs the two-pass ShaderR8 route: the
@@ -577,28 +589,54 @@ mod tests {
         // in one pass).
         for src in nv.iter().chain(&non_nv) {
             assert_eq!(
-                plan_convert(*src, Rgb, ZeroCopy),
+                plan_convert(*src, false, Rgb, ZeroCopy),
                 ConvertPlan::TwoPassPackedRgb,
                 "{src:?}->Rgb zero-copy"
             );
         }
         for src in nv {
             assert_eq!(
-                plan_convert(src, PlanarRgb, ZeroCopy),
+                plan_convert(src, false, PlanarRgb, ZeroCopy),
                 ConvertPlan::TwoPassNvPlanar
             );
             assert_eq!(
-                plan_convert(src, PlanarRgba, ZeroCopy),
+                plan_convert(src, false, PlanarRgba, ZeroCopy),
                 ConvertPlan::TwoPassNvPlanar
             );
-            assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
+            assert_eq!(
+                plan_convert(src, false, Rgba, ZeroCopy),
+                ConvertPlan::SinglePass
+            );
         }
         for src in non_nv {
             assert_eq!(
-                plan_convert(src, PlanarRgb, ZeroCopy),
+                plan_convert(src, false, PlanarRgb, ZeroCopy),
                 ConvertPlan::SinglePass
             );
-            assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
+            assert_eq!(
+                plan_convert(src, false, Rgba, ZeroCopy),
+                ConvertPlan::SinglePass
+            );
+        }
+        // A host source cannot feed the single-pass planar shader, so a
+        // zero-copy planar destination takes the two-pass route for it; a
+        // packed destination is unaffected.
+        for src in nv.iter().chain(&non_nv) {
+            for dst in [PlanarRgb, PlanarRgba] {
+                assert_eq!(
+                    plan_convert(*src, true, dst, ZeroCopy),
+                    ConvertPlan::TwoPassNvPlanar,
+                    "host {src:?}->{dst:?} zero-copy"
+                );
+            }
+            assert_eq!(
+                plan_convert(*src, true, Rgb, ZeroCopy),
+                ConvertPlan::TwoPassPackedRgb
+            );
+            assert_eq!(
+                plan_convert(*src, true, Rgba, ZeroCopy),
+                ConvertPlan::SinglePass
+            );
         }
         // Texture lowerings: packed-RGB single-pass (the texture destination
         // renders genuine RGB); EVERY source→planar is two-pass regardless
@@ -612,14 +650,14 @@ mod tests {
             for src in nv.iter().chain(&non_nv) {
                 for dst in [PlanarRgb, PlanarRgba] {
                     assert_eq!(
-                        plan_convert(*src, dst, lowering),
+                        plan_convert(*src, false, dst, lowering),
                         ConvertPlan::TwoPassNvPlanar,
                         "{src:?}->{dst:?} via {lowering:?}"
                     );
                 }
                 for dst in [Rgba, Bgra, Rgb, Grey] {
                     assert_eq!(
-                        plan_convert(*src, dst, lowering),
+                        plan_convert(*src, false, dst, lowering),
                         ConvertPlan::SinglePass,
                         "{src:?}->{dst:?} via {lowering:?}"
                     );

@@ -14,7 +14,7 @@ on:
 jobs:
   tag:
     if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
-    uses: EdgeFirstAI/.github/.github/workflows/tag-release.yml@dd267cca3c13cd323fc1e3c1db06fe9b34fc0795
+    uses: EdgeFirstAI/.github/.github/workflows/tag-release.yml@4520e6af90ca7661a1a3f59671959034a698f4f9
     with:
       # No tag unless release.yml is green for the exact commit being merged.
       # Branch protection requires ci-gate alone and the release build runs on

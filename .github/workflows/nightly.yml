@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   changed:
-    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@dd267cca3c13cd323fc1e3c1db06fe9b34fc0795
+    uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@4520e6af90ca7661a1a3f59671959034a698f4f9
     with:
       # `inputs` is null on the schedule trigger, so the fallback is required;
       # without it the expression is an empty string and the gate's boolean
@@ -39,12 +39,12 @@ jobs:
   # building, on a free standard runner, so running it every night costs
   # nothing. See the exception in the shared copilot-instructions.md.
   advisories:
-    uses: EdgeFirstAI/.github/.github/workflows/advisories.yml@dd267cca3c13cd323fc1e3c1db06fe9b34fc0795
+    uses: EdgeFirstAI/.github/.github/workflows/advisories.yml@4520e6af90ca7661a1a3f59671959034a698f4f9
 
   nightly:
     needs: changed
     if: needs.changed.outputs.run == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@dd267cca3c13cd323fc1e3c1db06fe9b34fc0795
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@4520e6af90ca7661a1a3f59671959034a698f4f9
     with:
       lanes: all
       nightly: true
@@ -61,7 +61,13 @@ jobs:
       # a filter list that has to grow with the workspace. Revisit if
       # backend selection ever stops being feature-gated.
       hack-args: ""
-      boards: nxp-imx8mp-latest
+      # One job per board identity, each run on that specific board: the NXP
+      # EVKs carry the vendor BSP (G2D, galcore on the 8M Plus) the hardware
+      # tests are written against, where a bare family label could land on a
+      # carrier without it. orin-nano is Ubuntu 22.04 (glibc 2.35), so the
+      # archive is linked against that floor.
+      boards: imx8mp-evk,imx95-evk,rpi5-hailo8l,orin-nano
+      archive-glibc: "2.35"
       lfs: true
       python: false
       sonar: false
@@ -76,9 +82,9 @@ jobs:
       runner-class-linux: larger
       runner-class-linux-arm: larger
       pre-command: bash .github/scripts/ci-setup.sh
-      board-pre-command: SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
+      board-pre-command: BOARD=1 SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
       # One process per binary, not per test. nextest's process-per-test model
-      # costs a full EGL init/teardown per test on this board -- 6 to 22s each,
+      # costs a full EGL init/teardown per test on a board -- 6 to 22s each,
       # measured -- and writes one profraw per process, which exhausted the
       # eMMC at 307 files / 2.8 GB. Running each binary once is what test.yml
       # did, and it is why the same suite took 16 minutes.
@@ -109,10 +115,10 @@ jobs:
       # and reports success; tighten once a green run reports the real count.
       board-min-tests: "100"
       nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
-      # The board is an eMMC-constrained i.MX 8M Plus. profiling is thin-LTO
-      # with debug = "line-tables-only", which is what kept the on-target
-      # payload shippable before the migration; the dev profile's full debug
-      # info fills the disk.
+      # The boards are storage-constrained (the smallest root filesystem is
+      # 12 GB). profiling is thin-LTO with debug = "line-tables-only", which is
+      # what kept the on-target payload shippable before the migration; the
+      # dev profile's full debug info fills the disk.
       archive-profile: profiling
       archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
     secrets: inherit

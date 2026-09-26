@@ -574,6 +574,7 @@ where
         T: 'a,
     {
         let mmap_size = self.buf_size;
+        let _mapping_guard = crate::pin::cpu_mapping_shared();
         let ptr = unsafe {
             nix::sys::mman::mmap(
                 None,
@@ -615,6 +616,7 @@ where
         T: 'a,
     {
         let mmap_size = self.buf_size;
+        let _mapping_guard = crate::pin::cpu_mapping_shared();
         let ptr = unsafe {
             nix::sys::mman::mmap(
                 None,

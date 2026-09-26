@@ -198,6 +198,76 @@ impl MmapOwner {
     }
 }
 
+/// Orders CPU mappings against GPU-driver calls that unmap an address range
+/// twice.
+///
+/// Adreno's proprietary EGL maps every imported DMA-BUF into the process at
+/// `eglCreateImage` and, inside a single `eglDestroyImage`, unmaps that range
+/// twice. A mapping another thread creates between the two `munmap`s can land
+/// in the freed range and is destroyed by the second one, so that thread's
+/// next access faults. Mappings are established under the shared side and
+/// such driver calls run under the exclusive side, which keeps this crate's
+/// own mappings out of that window.
+#[cfg(all(unix, feature = "static"))]
+static CPU_MAPPING_GUARD: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Shared side of [`CPU_MAPPING_GUARD`], held across each `mmap`.
+#[cfg(all(unix, feature = "static"))]
+pub(crate) fn cpu_mapping_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    CPU_MAPPING_GUARD.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `f` while no tensor CPU mapping can be created in this process.
+///
+/// For a GPU-driver call that may unmap a range twice (Adreno
+/// `eglDestroyImage`). `f` must not map a tensor, or it deadlocks.
+#[doc(hidden)]
+#[cfg(feature = "static")]
+pub fn with_cpu_mappings_excluded<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(unix)]
+    let _guard = CPU_MAPPING_GUARD.write().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// The `dynamic` backend's [`with_cpu_mappings_excluded`]: excludes the
+/// library's mappings, which are the only ones this build creates.
+#[doc(hidden)]
+#[cfg(feature = "dynamic")]
+pub fn with_cpu_mappings_excluded<F: FnOnce() -> R, R>(f: F) -> R {
+    struct Call<F, R> {
+        f: Option<F>,
+        out: Option<std::thread::Result<R>>,
+    }
+    unsafe extern "C" fn trampoline<F: FnOnce() -> R, R>(ctx: *mut std::ffi::c_void) {
+        // SAFETY: `ctx` is the `Call` below, alive and exclusively borrowed
+        // for the duration of the export's synchronous callback.
+        let call = unsafe { &mut *ctx.cast::<Call<F, R>>() };
+        if let Some(f) = call.f.take() {
+            // A panic must not unwind through the C frame.
+            call.out = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+        }
+    }
+    let mut call = Call {
+        f: Some(f),
+        out: None,
+    };
+    // SAFETY: the callback and its context stay valid for the whole call,
+    // and the export invokes the callback at most once, synchronously.
+    unsafe {
+        edgefirst_tensor_ffi::ef_tensor_with_cpu_mappings_excluded(
+            Some(trampoline::<F, R>),
+            (&mut call as *mut Call<F, R>).cast(),
+        )
+    };
+    match call
+        .out
+        .expect("ef_tensor_with_cpu_mappings_excluded skipped its callback")
+    {
+        Ok(r) => r,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 #[cfg(all(unix, feature = "static"))]
 impl Drop for MmapOwner {
     // munmap has no in-process observer that is not racy: probing the range

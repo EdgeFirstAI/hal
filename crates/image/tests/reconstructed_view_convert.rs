@@ -91,6 +91,22 @@ fn skip(why: &str) {
     let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
 }
 
+/// Whether a missing or downgraded zero-copy buffer is a failure rather than
+/// a skip. On macOS and Windows the buffer needs no device node, so it is
+/// required wherever GL is. On Linux it is a DMA-BUF and needs a heap, which
+/// not every GPU board has (Jetson has none): there it is required under
+/// `HAL_TEST_REQUIRE_DMA=1`, or under `HAL_TEST_REQUIRE_GL=1` on a host that
+/// has a heap.
+fn require_zero_copy_buffer() -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+    if cfg!(target_os = "linux") {
+        set("HAL_TEST_REQUIRE_DMA")
+            || (set("HAL_TEST_REQUIRE_GL") && std::path::Path::new("/dev/dma_heap").exists())
+    } else {
+        set("HAL_TEST_REQUIRE_GL")
+    }
+}
+
 /// Distinct per-row and per-column values, so a convert that lands on the
 /// wrong region cannot coincidentally match the expected tile.
 fn want(x: usize, y: usize) -> [u8; BPP] {
@@ -122,13 +138,11 @@ fn dst() -> TensorDyn {
 /// A `W`x`H` RGBA image on the platform's zero-copy buffer, or `None` (with
 /// the reason on stderr) where none can be allocated.
 ///
-/// Under `HAL_TEST_REQUIRE_GL=1` -- the macOS and Windows lanes, whose
-/// zero-copy buffer needs no device node -- a skip is a failure, as it is
+/// Where [`require_zero_copy_buffer`] holds, a skip is a failure, as it is
 /// for a GL backend that fails to come up: everything this file pins is
 /// meaningless without the buffer, and a silent skip would leave the lane
 /// green with nothing run.
 fn zero_copy_image() -> Option<TensorDyn> {
-    let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
     match TensorDyn::image(
         W,
         H,
@@ -140,8 +154,8 @@ fn zero_copy_image() -> Option<TensorDyn> {
         Ok(t) if t.memory() == TensorMemory::DmaBuf => Some(t),
         Ok(t) => {
             assert!(
-                !require_gl,
-                "HAL_TEST_REQUIRE_GL=1 but the zero-copy request fell back to {:?}",
+                !require_zero_copy_buffer(),
+                "a zero-copy buffer is required here but the zero-copy request fell back to {:?}",
                 t.memory()
             );
             skip(&format!("zero-copy request fell back to {:?}", t.memory()));
@@ -149,8 +163,8 @@ fn zero_copy_image() -> Option<TensorDyn> {
         }
         Err(e) => {
             assert!(
-                !require_gl,
-                "HAL_TEST_REQUIRE_GL=1 but no zero-copy buffer could be allocated: {e}"
+                !require_zero_copy_buffer(),
+                "a zero-copy buffer is required here but no zero-copy buffer could be allocated: {e}"
             );
             skip(&format!("no zero-copy buffer here: {e}"));
             None

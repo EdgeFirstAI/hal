@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Qualcomm Adreno on Linux** (proprietary KGSL driver, validated on IQ-9075 / Adreno 663). The GL backend detects Adreno from `GL_RENDERER`/`EGL_VENDOR` and applies these fallbacks automatically. None of them apply on Android.
+  - Uses the GBM EGL display; the EGL device-platform display crashes in `eglQueryString` on this driver.
+  - Serializes GL across processors, and guards tensor `mmap`s against `eglDestroyImage`, which unmaps its driver mapping twice. The C API exposes this guard as `ef_tensor_with_cpu_mappings_excluded`, so a consumer linking `libedgefirst_tensor` shares the library's single guard.
+  - Declines DMA-BUF imports at plane offsets that are not 64-byte aligned (sources and destinations), and semi-planar sources whose chroma is a separate DMA-BUF.
+  - Uploads NV planes into a fresh texture rather than one that held an EGLImage.
+  - Creates single-channel render targets with the sized `GL_R8` format.
+  - Reports no GL float render support on a zero-copy backend, so float output goes to the CPU.
+
 ### Fixed
+
+- A two-plane NV source whose GL import is refused now reports the import's reason instead of a misleading "draw_src_texture does not support Nv12".
+- **`ef_tensor_builder_wrap` closed the caller's fd on some failures.** It adopted the handle before building the tensor, so a handle `from_fd` refused, or a format the builder could not apply, was closed on the way out while the other failures left it open. The dynamic backend's `TensorDyn::from_fd` closes the fd itself whenever `wrap` fails, and aborted on the double close ("IO Safety violation: owned file descriptor already closed"). `wrap` now adopts the handle only when it returns a tensor; on any failure the handle stays open and remains the caller's.
+- **GL convert from a host-memory source into a DMA planar destination failed** on drivers that accept the destination import (Mali, V3D). The single-pass planar shader can only read a DMA source, so the convert ended with "OpenGL EGLImage requires DMA tensor, got Mem" and fell back to the CPU. A `Mem`/`Shm` source into a planar destination now takes the two-pass route, whose first pass uploads it. Vivante masked this: it refuses an unaligned destination import, and that refusal already re-planned the convert.
 
 - **Blob import dropped per-channel zero points.** An asymmetric per-channel quantized tensor exported with `blob::export` came back from `blob::import` as symmetric. Import now rebuilds `Quantization::per_channel` when zero points are present. Quantization the header declares but cannot be rebuilt (bad axis, mismatched counts) is an `InvalidArgument` error rather than a silently unquantized tensor.
 - **Blob reference-mode import lost quantization** on both the Unix and D3D11 paths.
@@ -23,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `TensorTrait::capacity_bytes` and `TensorTrait::set_logical_shape` no longer have default bodies; every implementor provides them.
 - `edgefirst_tensor::protocol::c_byte_strides` is public: the one stride convention shared by the descriptor, the blob and the C API.
+- **CI on-target lane runs on four boards**: `imx8mp-evk` (Vivante), `imx95-evk` (Mali), `rpi5-hailo8l` (V3D) and `orin-nano` (Tegra). It replaces the retired `nxp-imx8mp-latest` label, which no runner answers any more. The board archive is linked against glibc 2.35 so it loads on Ubuntu 22.04 (JetPack 6). Board jobs now fail when a board with a render node cannot bring up GL (`HAL_TEST_REQUIRE_GL`), as `scripts/on-target-test.sh` already did. Tests that need a zero-copy buffer treat its absence as a failure only where one must exist: under `HAL_TEST_REQUIRE_DMA`, or under `HAL_TEST_REQUIRE_GL` on a Linux host with a DMA heap. The Jetson has no heap, so they skip there.
 
 ## [0.32.1] - 2026-09-18
 

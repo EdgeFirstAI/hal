@@ -370,8 +370,8 @@ impl TensorDyn {
             let result = match NonNull::new(handle) {
                 Some(h) => Ok(Self::from_handle(h)),
                 None => {
-                    // `wrap` failed before adopting the fd -- reclaim it so
-                    // it is closed instead of leaked.
+                    // `wrap` adopts the fd only on success, so it is still
+                    // ours -- reclaim it so it is closed instead of leaked.
                     drop(std::os::fd::OwnedFd::from_raw_fd(raw_fd));
                     let errno = edgefirst_tensor_ffi::ef_tensor_builder_error(b);
                     Err(Error::NotImplemented(format!(

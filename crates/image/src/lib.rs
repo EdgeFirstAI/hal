@@ -12105,7 +12105,8 @@ mod image_tests {
         // trips it and aborts the whole test binary (SIGABRT, not a catchable
         // panic). The bug is the driver's, not the HAL's; this test is kept so
         // it still exercises the multi-context path on every other GPU. The
-        // on-target GitHub Actions imx8mp runner sets EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS
+        // board lane and scripts/on-target-test.sh set
+        // EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS on any board with /dev/galcore
         // to skip just this case there, while the run stays red anywhere else
         // a regression appears. (Skip, not #[ignore]: the platform is decided
         // at runtime, not compile time.)

@@ -445,8 +445,8 @@ Three independent constraints each require it:
    DMA-BUF import, or draw commands overlap across threads; Broadcom
    V3D 7.1.10.2 (Raspberry Pi 5) drops affected contexts into
    `EGL(NotInitialized)` under similar pressure. At runtime the HAL
-   picks a serialization policy per driver: `Full` on Vivante and
-   paravirtual GPUs, where every message takes the global `GL_MUTEX`,
+   picks a serialization policy per driver: `Full` on Vivante,
+   Adreno (Linux KGSL) and paravirtual GPUs, where every message takes the global `GL_MUTEX`,
    and `LifecycleOnly` on Mali, V3D, Tegra, llvmpipe, Android, and real
    Apple GPUs, where instances run GL concurrently. `--test-threads=1`
    extends the strict discipline to test harness processes regardless of
@@ -1342,7 +1342,7 @@ CI uploads merged coverage on Full and Nightly (SonarCloud). See
 See [`.github/workflows/README.md`](.github/workflows/README.md) for the
 Quick / Full / Nightly tiers. Unlabelled PRs run Quick only
 (`ubuntu-24.04`). Full (host matrix, HAL extras, Sonar, scancode) and the
-i.MX 8M Plus board run when a reviewer adds `ci:full` or `ci:hardware`.
+board lanes run when a reviewer adds `ci:full` or `ci:hardware`.
 
 | Lane (Full) | Runner | Hardware |
 |-------------|--------|----------|
@@ -1352,9 +1352,12 @@ i.MX 8M Plus board run when a reviewer adds `ci:full` or `ci:hardware`.
 | Full Windows | `windows-latest` | ANGLE → D3D11 WARP |
 | Software-GL | `ubuntu-24.04` | Mesa llvmpipe |
 | iOS / Android | `macos-latest` / `ubuntu-24.04` | build + lint only |
-| Hardware | `nxp-imx8mp-latest` | G2D, DMA-heap, Vivante GL |
+| Hardware | `imx8mp-evk` | G2D, DMA-heap, Vivante GL |
+| Hardware | `imx95-evk` | G2D, DMA-heap, Mali GL |
+| Hardware | `rpi5-hailo8l` | DMA-heap, V3D GL |
+| Hardware | `orin-nano` | DMA-heap, Tegra GL |
 
-The hardware runner is the only environment where G2D and DMA-BUF tests
+The hardware runners are the only environments where G2D and DMA-BUF tests
 are fully exercised. Hardware-gated tests that return early on hosted
 runners are counted as passed (not skipped) because the gate is an
 explicit probe, not a `#[ignore]` attribute.

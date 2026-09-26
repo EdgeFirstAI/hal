@@ -596,8 +596,9 @@ pub unsafe extern "C" fn ef_tensor_builder_alloc(
 /// difference from [`ef_tensor_builder_alloc`], and the reason misuse is a
 /// per-field error rather than a convention.
 ///
-/// Adopts the handle: the resulting tensor owns it and the caller must not
-/// close it.
+/// Adopts the handle only on success: the resulting tensor owns it and the
+/// caller must not close it. On failure the handle is left open and remains
+/// the caller's to close.
 ///
 /// **Behaviour change**: earlier versions of this function silently ignored
 /// `offset`, `size`, `used`, `modifier`, and every plane past the first --
@@ -678,10 +679,14 @@ pub unsafe extern "C" fn ef_tensor_builder_wrap(
             }
             #[cfg(unix)]
             {
-                use std::os::fd::FromRawFd;
                 let fd = i32::try_from(first.handle).map_err(|_| libc::EINVAL)?;
-                // SAFETY: the caller contracts that this is a valid fd to adopt.
-                let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+                // The tensor is built on a duplicate so that every failure
+                // below, which drops it, leaves the caller's fd open; `finish`
+                // closes the caller's fd once nothing can fail.
+                // SAFETY: the caller contracts that this is a valid fd; it is
+                // only borrowed for the duplicate.
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                let owned = borrowed.try_clone_to_owned().map_err(|_| libc::EINVAL)?;
                 let t = edgefirst_tensor::TensorDyn::from_fd(owned, &shape, dtype, None)
                     .map_err(|_| libc::EINVAL)?;
                 Ok(t)
@@ -714,6 +719,16 @@ pub unsafe extern "C" fn ef_tensor_builder_wrap(
                 if first.offset > 0 {
                     t.set_plane_offset(first.offset as usize);
                 }
+                // Adopt the caller's fd now that the tensor exists: the tensor
+                // holds the duplicate `body` made, so this one is closed.
+                #[cfg(unix)]
+                {
+                    use std::os::fd::FromRawFd;
+                    // SAFETY: `body` validated the handle as an open fd that
+                    // fits an `int`, and on success ownership is the caller's
+                    // to hand over.
+                    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(first.handle as i32) });
+                }
             }
             Ok(t)
         },
@@ -735,8 +750,7 @@ mod tests {
     /// need `wrap` to actually reach `from_fd` rather than fail earlier.
     /// Leaked as a raw fd deliberately: the caller either hands it to
     /// `wrap` (which adopts and eventually frees it via the returned
-    /// tensor) or must close it itself on a path where `wrap` rejects the
-    /// plane before adoption.
+    /// tensor) or must close it itself when `wrap` fails.
     fn shm_fd(len: usize) -> i64 {
         if !edgefirst_tensor::is_shm_available() {
             return -1;
@@ -986,6 +1000,120 @@ mod tests {
             assert_eq!(ef_tensor_builder_error(p), libc::ENOTSUP);
             ef_tensor_builder_free(p);
             libc::close(handle as i32);
+        }
+    }
+
+    /// The `(dev, inode)` an open fd refers to, or `None` once it is closed.
+    #[cfg(unix)]
+    fn fd_identity(fd: i32) -> Option<(libc::dev_t, libc::ino_t)> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `st` is a valid out-pointer for one `stat`.
+        (unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0).then(|| {
+            // SAFETY: `fstat` succeeded, so `st` is initialised.
+            let st = unsafe { st.assume_init() };
+            (st.st_dev, st.st_ino)
+        })
+    }
+
+    /// A handle `from_fd` refuses leaves `wrap` with NULL and the handle still
+    /// the caller's: closing it here must succeed, and nothing else may have
+    /// closed it first. A second close of it was an IO-safety abort in the
+    /// dynamic backend, whose `from_fd` reclaims the fd whenever `wrap` fails.
+    /// Linux only: it is the one platform whose `from_fd` classifies the fd
+    /// and so refuses a pipe; elsewhere every fd imports as shared memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrap_leaves_a_handle_from_fd_refuses_open() {
+        // A pipe is neither a dma-buf nor tmpfs, so `from_fd` refuses it.
+        // (`/dev/null` would not do: devtmpfs carries the tmpfs magic.)
+        let mut ends = [0i32; 2];
+        // SAFETY: `ends` is a valid out-array of two fds.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        let [handle, write_end] = ends;
+        let before = fd_identity(handle).expect("open fd");
+        let p = b();
+        let dims = [4u64, 4];
+        unsafe {
+            ef_tensor_builder_dtype(p, 0); // U8
+            ef_tensor_builder_shape(p, dims.as_ptr(), 2);
+            assert_eq!(
+                ef_tensor_builder_add_plane(p, handle as i64, 0, 0, 0, 0, 0),
+                0
+            );
+            assert!(ef_tensor_builder_wrap(p).is_null());
+            assert_eq!(ef_tensor_builder_error(p), libc::EINVAL);
+            ef_tensor_builder_free(p);
+        }
+        assert_eq!(
+            fd_identity(handle),
+            Some(before),
+            "wrap closed a handle it refused"
+        );
+        // SAFETY: both ends are this test's own open fds.
+        unsafe {
+            assert_eq!(libc::close(handle), 0);
+            libc::close(write_end);
+        }
+    }
+
+    /// The same contract when the failure comes after `from_fd` succeeded: a
+    /// format the builder cannot parse fails in `apply_metadata`, and the
+    /// handle is still the caller's.
+    #[cfg(unix)]
+    #[test]
+    fn wrap_leaves_the_handle_open_when_metadata_fails() {
+        if !edgefirst_tensor::is_shm_available() {
+            crate::artifacts::skip("SHM not available");
+            return;
+        }
+        let handle = shm_fd(16);
+        let before = fd_identity(handle as i32).expect("open fd");
+        let p = b();
+        let dims = [4u64, 4];
+        unsafe {
+            ef_tensor_builder_dtype(p, 0); // U8
+            ef_tensor_builder_shape(p, dims.as_ptr(), 2);
+            assert_eq!(ef_tensor_builder_format(p, c"not-a-format".as_ptr()), 0);
+            assert_eq!(ef_tensor_builder_add_plane(p, handle, 0, 0, 0, 0, 0), 0);
+            assert!(ef_tensor_builder_wrap(p).is_null());
+            assert_eq!(ef_tensor_builder_error(p), libc::EINVAL);
+            ef_tensor_builder_free(p);
+        }
+        assert_eq!(
+            fd_identity(handle as i32),
+            Some(before),
+            "wrap closed a handle it refused"
+        );
+        assert_eq!(unsafe { libc::close(handle as i32) }, 0);
+    }
+
+    /// On success the caller's handle is adopted: it no longer refers to the
+    /// buffer. The fd number may already be reused by a parallel test, so the
+    /// check is on the file it names, not on whether the number is open.
+    #[cfg(unix)]
+    #[test]
+    fn wrap_adopts_the_handle_on_success() {
+        if !edgefirst_tensor::is_shm_available() {
+            crate::artifacts::skip("SHM not available");
+            return;
+        }
+        let handle = shm_fd(16);
+        let before = fd_identity(handle as i32).expect("open fd");
+        let p = b();
+        let dims = [4u64, 4];
+        unsafe {
+            ef_tensor_builder_dtype(p, 0); // U8
+            ef_tensor_builder_shape(p, dims.as_ptr(), 2);
+            assert_eq!(ef_tensor_builder_add_plane(p, handle, 0, 0, 0, 0, 0), 0);
+            let t = ef_tensor_builder_wrap(p);
+            assert!(!t.is_null());
+            assert_ne!(
+                fd_identity(handle as i32),
+                Some(before),
+                "wrap left the caller's handle open"
+            );
+            crate::handle::ef_tensor_free(t);
+            ef_tensor_builder_free(p);
         }
     }
 

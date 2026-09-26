@@ -115,6 +115,15 @@ const ALLOWED: &[(&str, &str)] = &[
          texture.",
     ),
     (
+        "CPU_MAPPING_GUARD",
+        "mapping-exclusion lock for GPU drivers that unmap a range twice \
+         (pin.rs). It only delays, never changes a result, so copies cannot \
+         disagree about anything. The -capi leaves reach the one copy in \
+         libedgefirst_tensor through `ef_tensor_with_cpu_mappings_excluded`; \
+         artifacts that each link a static copy exclude only the mappings \
+         their own copy makes, the same static-linking limit as GUARD.",
+    ),
+    (
         "SESSION_USED",
         "opt-in trace-capture single-use marker (trace.rs); same reasoning as GUARD",
     ),
