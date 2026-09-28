@@ -15,7 +15,7 @@ self-hosted-runner:
   labels:
     - imx8mp-evk
     - imx95-evk
-    - rpi5-hailo8l
+    - rpi5
     - orin-nano
     - ubuntu-24.04-xlarge
     - ubuntu-24.04-arm-xlarge

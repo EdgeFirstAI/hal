@@ -242,6 +242,8 @@ All benchmarks use the `edgefirst-bench` custom harness which:
 
 See [README.md § Benchmarking](README.md#benchmarking) for full instructions on running benchmarks locally, cross-compiling for aarch64, and deploying to target platforms.
 
+**On the board fleet.** The `hardware-bench.yml` workflow (`workflow_dispatch`) runs every case of [`scripts/on-target-bench.sh`](scripts/on-target-bench.sh) on the boards named by runner label, one job per board entry, and summarises them together: a headline table across boards, every case in full, and a CSV of every median. Board entries join labels one runner must all carry with `+`; the default, `imx8mp-evk, imx95-evk, rpi5, orin-nano, iq9075-evk`, is one board per SoC. Each board's artifact holds one `<case>.json` per case, named as the tables here expect (`pipeline-opengl.json`, `pipeline-cpu.json`, …), and `system.txt` with the CPU and GPU governors, clocks and temperatures at the time of the run. Governors are recorded, never changed. The `-opengl` cases force the GL backend, so a GL path that falls back to the CPU fails its case instead of reporting a CPU number. The same script runs by hand from a bench bundle over ssh; see the README.
+
 ### Benchmark Binaries
 
 | Binary | Crate | What It Measures |

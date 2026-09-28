@@ -1,0 +1,234 @@
+# On-demand full on-hardware test suite across the self-hosted board fleet.
+#
+# Where the CI hardware lane runs a selection of GPU/DMA binaries on four
+# boards, this runs HAL's whole on-target suite -- every test binary of the
+# five crates plus the C-API gates (scripts/check-single-home.sh G1/G2/G4/G9/
+# G11 and the G3 two-library user) -- on every board named, one job per board
+# entry. It is the same bundle and board-side script scripts/on-target-test.sh
+# runs over ssh, so a result here and a result from a desk reproduce each
+# other.
+#
+#   plan     resolve board entries; drop, and report, any no online runner serves
+#   build    cross-build one aarch64 tests bundle (scripts/on-target-bundle.sh)
+#   board    per entry: unpack the bundle, run scripts/on-target-run.sh
+#   summary  one table naming the runner each entry ran on; red if any failed
+#
+# Board entries are runner labels, `+` joining labels one runner must all
+# carry (`imx95-frdm+ara240`). The default is one board per SoC for general
+# HAL work: the EVK where a family has other carriers (FRDM boards are kept
+# for Ara240 work, vendor carriers for vendor tests). Board prerequisites and
+# how a board is validated: Confluence "Self-Hosted Runner Fleet Inventory".
+#
+# The runner check needs FLEET_RUNNERS_TOKEN, an organisation secret that can
+# read self-hosted runners (fine-grained token, organisation permission
+# "Self-hosted runners: read"). Without it every entry is scheduled, and one
+# that no online runner carries queues for 24 hours before failing.
+#
+# Action versions (hash-pinned):
+# - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
+# - actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a (v7.0.1)
+# - actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c (v8.0.1)
+# - taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 (v2.87.15)
+
+name: Hardware tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      boards:
+        description: Board entries, comma-separated; `+` joins labels one runner must all carry
+        type: string
+        default: imx8mp-evk, imx95-evk, rpi5, orin-nano, iq9075-evk
+      features:
+        description: Cargo features for the test build (`<pkg>/<feature>`, space-separated)
+        type: string
+        default: edgefirst-image/dma_test_formats edgefirst-image/g2d_test_formats
+      filter:
+        description: Test-name filter passed to every binary (empty runs everything)
+        type: string
+        default: ""
+      require-gpu:
+        description: Fail a board without a DRM render node instead of skipping its GPU tests
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      board_matrix: ${{ steps.boards.outputs.board_matrix }}
+      unavailable: ${{ steps.boards.outputs.unavailable }}
+      has_boards: ${{ steps.boards.outputs.has_boards }}
+    steps:
+      - id: boards
+        uses: EdgeFirstAI/.github/.github/actions/resolve-boards@871e6da918fe2bb0345c1b902f5d88c8c89a6018
+        with:
+          boards: ${{ inputs.boards }}
+          token: ${{ secrets.FLEET_RUNNERS_TOKEN }}
+
+  build:
+    name: Build tests bundle (aarch64)
+    needs: plan
+    if: needs.plan.outputs.has_boards == 'true'
+    # Free hosted runner: this runs on demand, not per push, so nothing is
+    # waiting on it; the cross-build is zig's, not the host's.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          lfs: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config nasm
+
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
+        with:
+          tool: cargo-zigbuild@0.23.2
+
+      - name: Install zig
+        env:
+          ZIG_VERSION: "0.16.0"
+          SHA256_X86_64: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/zig.tar.xz"
+          curl -fsSL --retry 5 --retry-connrefused -o "$archive" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${SHA256_X86_64}  ${archive}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      # rust-toolchain.toml pins the compiler; rustup honours it on first use.
+      - name: Add the aarch64 target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Build the bundle
+        env:
+          FEATURES: ${{ inputs.features }}
+        run: ./scripts/on-target-bundle.sh tests aarch64 "$RUNNER_TEMP/bundle"
+
+      # A tarball, not the directory: an artifact loses file modes and
+      # symlinks, and the bundle needs both (executables, the .so.0 names).
+      - name: Pack the bundle
+        run: tar -C "$RUNNER_TEMP/bundle" -cf "$RUNNER_TEMP/on-target-tests.tar" .
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: on-target-tests-aarch64
+          path: ${{ runner.temp }}/on-target-tests.tar
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: on-target-tests-build-logs
+          path: target/on-target-bundle-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  board:
+    name: Board ${{ matrix.runner }}
+    needs: [plan, build]
+    runs-on: ${{ matrix.labels }}
+    # A safety net, not a budget: this is the whole suite, not the CI lane's
+    # selection, and the slowest boards are Cortex-A53.
+    timeout-minutes: 120
+    # No concurrency group: the runner application runs one job at a time per
+    # installed instance, and one instance per device is policy.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.board_matrix) }}
+    steps:
+      # Boards run on small storage; a job cut short leaves its bundle behind.
+      - name: Reclaim disk from an earlier run
+        run: rm -rf hal-bundle hal-results on-target-tests.tar
+
+      - name: Board
+        env:
+          ENTRY: ${{ matrix.runner }}
+        run: |
+          echo "::notice::${ENTRY} ran on ${RUNNER_NAME} ($(uname -m))"
+          if [[ "$(uname -m)" != aarch64 ]]; then
+            echo "::error::the bundle is aarch64; ${RUNNER_NAME} is $(uname -m)"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: on-target-tests-aarch64
+
+      - name: Unpack
+        run: |
+          mkdir hal-bundle
+          tar -xf on-target-tests.tar -C hal-bundle
+          rm on-target-tests.tar
+          cat hal-bundle/MANIFEST
+
+      - name: Run the suite
+        env:
+          FILTER: ${{ inputs.filter }}
+          HAL_ONTARGET_REQUIRE_GPU: ${{ inputs.require-gpu && '1' || '0' }}
+        run: hal-bundle/scripts/on-target-run.sh "$GITHUB_WORKSPACE/hal-results"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: hardware-test-${{ matrix.runner }}
+          path: hal-results/
+          retention-days: 30
+          # A job that failed before writing results is reported by the
+          # summary as NO RESULT; failing this step too would add nothing.
+          if-no-files-found: warn
+
+      - name: Clean up
+        if: always()
+        run: rm -rf hal-bundle hal-results on-target-tests.tar
+
+  summary:
+    name: Summary
+    needs: [plan, build, board]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: .github/scripts/fleet_summary.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: hardware-test-*
+          path: results
+
+      - name: Summarize
+        env:
+          REQUESTED: ${{ needs.plan.outputs.board_matrix }}
+          UNAVAILABLE: ${{ needs.plan.outputs.unavailable }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          python3 .github/scripts/fleet_summary.py tests --results results \
+            --requested "${REQUESTED:-[]}" --unavailable "${UNAVAILABLE:-[]}" > summary.md
+          status=$?
+          if [[ "${BUILD_RESULT}" != success && "${BUILD_RESULT}" != skipped ]]; then
+            printf '\n**The bundle build %s, so no board ran.**\n' "${BUILD_RESULT}" >> summary.md
+            status=1
+          fi
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md
+          exit "${status}"

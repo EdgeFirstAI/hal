@@ -718,12 +718,17 @@ The project primarily targets ARM64 embedded Linux (NXP i.MX 8M Plus,
 i.MX 95). Tests that exercise DMA or GPU acceleration must run on
 physical hardware.
 
-**CI already runs the hardware suite on its own runners.** This script is
-for the boards CI does not have — running the same suite against whatever
-hardware you have on hand is how you catch behaviour that differs by SoC
-rather than only on the one runner CI owns. A macOS or x86_64 development
-host cannot exercise DMA-BUF, G2D or embedded GL at all, so a green local
-run says very little about a change to those paths.
+**Three ways to reach hardware.** The CI hardware lane runs a selection of
+GPU/DMA binaries on four boards for every `ci:full` PR. The
+[on-demand fleet workflows](#on-demand-fleet-runs) run the whole suite, or the
+benchmarks, on any boards of the self-hosted fleet you name. This script runs
+the whole suite over ssh on any board you can reach, which is how you catch
+behaviour that differs by SoC on hardware the fleet does not have, and how a
+new board is validated before it is given a fleet label. The workflow and the
+script run the same bundle and the same board-side script, so their results
+reproduce each other. A macOS or x86_64 development host cannot exercise
+DMA-BUF, G2D or embedded GL at all, so a green local run says very little
+about a change to those paths.
 
 ### The one command
 
@@ -738,9 +743,15 @@ CRATES="edgefirst-tensor" ./scripts/on-target-test.sh imx95-frdm
 ```
 
 [`scripts/on-target-test.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-test.sh)
-probes each host, cross-builds with `cargo-zigbuild`, rsyncs the binaries
-and `testdata/`, runs each binary with the mandatory `--test-threads=1`,
-and prints a pass/fail/skip matrix. Logs land in
+probes each host, cross-builds one bundle per architecture with
+[`scripts/on-target-bundle.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-bundle.sh)
+(test binaries, the five C-API libraries and the G3 binary, merged
+`testdata/`), copies it to each host (rsync, or tar over ssh on an image
+without rsync), and runs the bundle's own
+[`scripts/on-target-run.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-run.sh)
+there: each binary with the mandatory `--test-threads=1`, then the C-API
+gates. It prints a pass/fail/skip matrix with each host's passed, failed and
+ignored test totals. Logs, `capabilities.txt` and `summary.json` land in
 `target/on-target-results/<host>/`. It exits non-zero if any host reported a test failure, and also if a host ran no tests at all — reported as `NO-TESTS` rather than `PASS`, since a run that exercised nothing is not evidence. An unreachable host is reported as `UNREACHABLE` and does not mask a real failure elsewhere.
 
 A few details worth knowing:
@@ -759,17 +770,45 @@ A few details worth knowing:
   `/dev/galcore` automatically gets `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1`,
   because the Vivante driver has an intermittent double-free that otherwise
   masquerades as a regression in whatever you just changed. The workaround
-  keys off the hardware, so it applies to any Vivante board.
+  keys off the hardware, so it applies to any Vivante board. The same probe
+  arms the gates the CI board lane arms: `HAL_TEST_REQUIRE_GL=1` on a host
+  with a DRM render node, and `HAL_TEST_REQUIRE_DMA=1` when
+  `.github/scripts/dma-heap-setup.sh` allocates from the DMA heap, so a GL
+  stack or heap that should work and does not fails the run instead of
+  skipping. `REQUIRE_GPU=1` also fails a host with no render node at all, as
+  `NO-GPU`, where every GPU test would otherwise skip.
 - **Feature-gated tests need `FEATURES`.** The script builds the test crates
   with their default features, so a test behind a cargo feature never runs on
   a board unless you ask for it. `FEATURES=edgefirst-image/dma_test_formats`
   reaches the DMA-BUF import suite, which CI's hardware lane builds and this
   script did not; spell a feature that is not shared by every selected package
   as `<pkg>/<feature>`, which is what cargo requires with more than one `-p`.
-  It applies to the test build only, not to the C-API leaves. `g2d_test_formats`
-  is imx8mp-only, so enabling it across a mixed set of boards lights up tests
-  the others cannot serve.
+  It applies to the test build only, not to the C-API leaves.
+  `edgefirst-image/g2d_test_formats` adds the G2D format tests. G2D exists
+  only on the NXP boards, but the tests take that into account where
+  `libg2d.so.2` does not load, so the feature is safe on a mixed set of
+  boards: with it on, the G2D tests pass on V3D and Adreno boards too, and
+  the hardware-test workflow builds with both features by default.
 - **`FILTER` matches the test function, not the file.** It is handed to each test binary as a test-*name* filter, so a filter named after the source file — `FILTER=convert_span_feed_fields` for a test declared `fn the_convert_span_records_the_feed_fields()` — matches nothing, and every binary runs zero tests while exiting zero. That is reported as `NO-TESTS` with a non-zero exit rather than `PASS`. Check the executed count, not just the result column.
+
+### On-demand fleet runs
+
+Two `workflow_dispatch` workflows run on the self-hosted board fleet, one
+job per board entry:
+
+- [`hardware-test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-test.yml) — the whole on-target suite plus the C-API gates, built with `dma_test_formats` and `g2d_test_formats` by default, with `require-gpu` failing a board that has no render node.
+- [`hardware-bench.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-bench.yml) — every benchmark case of [`scripts/on-target-bench.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-bench.sh); see [BENCHMARKS.md § Running Benchmarks](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md#running-benchmarks).
+
+A board entry is a runner label, or labels joined by `+` that one runner must
+all carry (`imx95-frdm+ara240`). The default, `imx8mp-evk, imx95-evk, rpi5,
+orin-nano, iq9075-evk`, is one board per SoC for general HAL work: the EVK
+where a family has other carriers, since FRDM boards are kept for Ara240 work
+and vendor carriers for vendor tests. The summary names the runner that ran
+each entry. An entry no online runner can serve is listed as unavailable
+rather than queued for 24 hours, when the `FLEET_RUNNERS_TOKEN` organisation
+secret (read access to self-hosted runners) is set. Board prerequisites and
+how a new board is validated before it gets a label are on the Confluence
+page "Self-Hosted Runner Fleet Inventory".
 
 ### What a given board can actually exercise
 
@@ -806,7 +845,7 @@ what and why — never summarise a run that skipped every DMA test as
 > exercised.
 >
 > **Start that line with `SKIPPED: `.** That literal prefix is what
-> `scripts/on-target-test.sh` greps each board's captured log for to report
+> `scripts/on-target-run.sh` greps each board's captured log for to report
 > the per-board skip count, so a skip announced under any other spelling is
 > invisible to the summary even when it reaches the log. Prefer the helper
 > your crate already has — `edgefirst-image`'s
@@ -1354,7 +1393,7 @@ board lanes run when a reviewer adds `ci:full` or `ci:hardware`.
 | iOS / Android | `macos-latest` / `ubuntu-24.04` | build + lint only |
 | Hardware | `imx8mp-evk` | G2D, DMA-heap, Vivante GL |
 | Hardware | `imx95-evk` | G2D, DMA-heap, Mali GL |
-| Hardware | `rpi5-hailo8l` | DMA-heap, V3D GL |
+| Hardware | `rpi5` | DMA-heap, V3D GL |
 | Hardware | `orin-nano` | DMA-heap, Tegra GL |
 
 The hardware runners are the only environments where G2D and DMA-BUF tests

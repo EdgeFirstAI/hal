@@ -1033,7 +1033,7 @@ hal/
 ├── testdata/               # Git LFS-tracked fixtures (images, model outputs)
 ├── benchmarks/             # Per-platform benchmark JSON results
 ├── scripts/                # Build / audit / release tooling
-├── .github/workflows/      # CI: ci.yml, nightly.yml, release.yml, tag-release.yml, benchmark.yml
+├── .github/workflows/      # CI: ci.yml, nightly.yml, release.yml, tag-release.yml, hardware-test.yml, hardware-bench.yml
 ├── README.md               # Cross-cutting overview + Optimization Guide
 ├── ARCHITECTURE.md         # This file
 ├── TESTING.md              # Cross-cutting testing guide

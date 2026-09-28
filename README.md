@@ -1447,6 +1447,18 @@ scp target/aarch64-unknown-linux-gnu/release/deps/pipeline_benchmark-* imx8mp-fr
 ssh imx8mp-frdm '/tmp/pipeline_benchmark-* --bench --json /tmp/pipeline.json'
 ```
 
+To run every benchmark case on a board, as the fleet workflow does:
+
+```bash
+./scripts/on-target-bundle.sh bench aarch64 target/on-target-bundle/bench-aarch64
+rsync -a --delete target/on-target-bundle/bench-aarch64/ imx8mp-frdm:/tmp/hal-bench/
+ssh imx8mp-frdm /tmp/hal-bench/scripts/on-target-bench.sh /tmp/hal-bench-results
+```
+
+To benchmark several fleet boards at once, run the **Hardware benchmarks**
+workflow (`hardware-bench.yml`) with the board labels to use; its summary
+compares every board's medians side by side.
+
 All benchmarks accept `--bench --json <path>` for structured output.
 Store results under `benchmarks/<platform>/<name>.json`. Update
 [BENCHMARKS.md](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md)
