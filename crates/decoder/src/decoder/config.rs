@@ -338,8 +338,8 @@ impl ConfigOutput {
     ///   normalized: Some(true),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
-    /// assert_eq!(output.quantization(),
-    /// Some(configs::QuantTuple(0.012345,26))); ```
+    /// assert_eq!(output.quantization(), Some(configs::QuantTuple(0.012345, 26)));
+    /// ```
     pub fn quantization(&self) -> Option<QuantTuple> {
         match self {
             ConfigOutput::Detection(detection) => detection.quantization,

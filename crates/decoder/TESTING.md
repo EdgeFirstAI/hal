@@ -86,12 +86,7 @@ cargo test -p edgefirst-decoder --doc -- --test-threads=1
   suite validates that `Decoder::decode` and `Decoder::decode_proto`
   produce bit-identical detections for the same inputs (the key invariant
   for the GPU fused mask path).
-- **Multi-label coverage** — `multi_label_paths.rs` decodes one synthetic
-  scene (one anchor above threshold for two classes) through every NMS model
-  type in float and quantized form. It checks that argmax output is unchanged
-  and that multi-label adds exactly the second class. With `--features
-  tracker`, it also checks that `decode_tracked` returns the argmax result
-  whether multi-label came from the builder or from `nms_multi_label` metadata.
+- **Multi-label coverage** — `multi_label_paths.rs` decodes one synthetic scene (one anchor above threshold for two classes) through every NMS model type in float and quantized form. It checks that argmax output is unchanged and that multi-label adds exactly the second class. With `--features tracker`, it also checks that `decode_tracked` returns the argmax result whether multi-label came from the builder or from `nms_multi_label` metadata.
 
 ## Benchmarks
 

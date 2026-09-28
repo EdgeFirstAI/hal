@@ -50,7 +50,11 @@ impl TryFrom<&Detection> for ModelPackDetectionConfig {
 /// - scores: (num_boxes, num_classes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_det<
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -88,7 +92,11 @@ where
 /// - scores: (num_boxes, num_classes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_float<
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -128,6 +136,10 @@ where
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
@@ -162,6 +174,10 @@ pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
@@ -191,7 +207,11 @@ pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
 /// - scores: (num_boxes, num_classes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_quant<
     B: BBoxTypeTrait,
@@ -250,7 +270,11 @@ where
 /// - scores: (num_boxes, num_classes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_float<
     B: BBoxTypeTrait,
@@ -299,6 +323,10 @@ where
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
@@ -347,6 +375,10 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`]
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],

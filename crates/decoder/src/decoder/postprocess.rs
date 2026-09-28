@@ -479,7 +479,7 @@ impl Decoder {
         with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
-                let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                let mask_tensor = mask_tensor.slice(s![0, .., ..]).reversed_axes();
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);

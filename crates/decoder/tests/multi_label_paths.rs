@@ -18,7 +18,7 @@ use edgefirst_tensor::{
 
 const NC: usize = 3;
 const N: usize = 4;
-const NM: usize = 4;
+const NM: usize = 3;
 const PH: usize = 8;
 const PW: usize = 8;
 const SCORE_THRESHOLD: f32 = 0.5;
@@ -55,7 +55,9 @@ fn xyxy(b: [f32; 4]) -> [f32; 4] {
 
 #[derive(Clone, Copy, Debug)]
 enum Dtype {
+    F16,
     F32,
+    F64,
     I8,
     U8,
 }
@@ -65,10 +67,22 @@ enum Dtype {
 fn tensor(shape: &[usize], data: &[f32], dtype: Dtype) -> TensorDyn {
     assert_eq!(shape.iter().product::<usize>(), data.len());
     match dtype {
+        Dtype::F16 => {
+            let t = Tensor::<half::f16>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+            let h: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            t.map().unwrap().as_mut_slice().copy_from_slice(&h);
+            TensorDyn::F16(t)
+        }
         Dtype::F32 => {
             let t = Tensor::<f32>::new(shape, Some(TensorMemory::Mem), None).unwrap();
             t.map().unwrap().as_mut_slice().copy_from_slice(data);
             TensorDyn::F32(t)
+        }
+        Dtype::F64 => {
+            let t = Tensor::<f64>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+            let d: Vec<f64> = data.iter().map(|&v| f64::from(v)).collect();
+            t.map().unwrap().as_mut_slice().copy_from_slice(&d);
+            TensorDyn::F64(t)
         }
         Dtype::I8 => {
             let mut t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
@@ -89,7 +103,7 @@ fn tensor(shape: &[usize], data: &[f32], dtype: Dtype) -> TensorDyn {
 
 fn quant(dtype: Dtype) -> Option<QuantTuple> {
     match dtype {
-        Dtype::F32 => None,
+        Dtype::F16 | Dtype::F32 | Dtype::F64 => None,
         Dtype::I8 | Dtype::U8 => Some(QuantTuple(QSCALE, 0)),
     }
 }
@@ -388,6 +402,31 @@ fn yolo_det_f32() {
 #[test]
 fn yolo_det_i8() {
     check("yolo_det i8", &yolo_det(Dtype::I8));
+}
+
+#[test]
+fn yolo_det_f16() {
+    check("yolo_det f16", &yolo_det(Dtype::F16));
+}
+
+#[test]
+fn yolo_det_f64() {
+    check("yolo_det f64", &yolo_det(Dtype::F64));
+}
+
+#[test]
+fn yolo_split_segdet_f16() {
+    check("yolo_split_segdet f16", &yolo_split_segdet(Dtype::F16));
+}
+
+#[test]
+fn yolo_segdet_2way_f64() {
+    check("yolo_segdet_2way f64", &yolo_segdet_2way(Dtype::F64));
+}
+
+#[test]
+fn modelpack_det_f16() {
+    check("modelpack_det f16", &modelpack_det(Dtype::F16));
 }
 
 #[test]

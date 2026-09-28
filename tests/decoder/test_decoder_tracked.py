@@ -891,12 +891,15 @@ def test_decode_tracked_ignores_multi_label():
     )
     output = numpy_to_tensor(per_anchor.T.reshape(1, 7, 4).copy())
 
-    def run(multi_label):
-        decoder = ef.Decoder(config, 0.5, 0.5, multi_label=multi_label)
+    def run(decoder):
         tracker = ByteTrack(high_conf=0.5)
         classes = None
         for ts in range(3):
             _b, _s, classes, _m, _t = decoder.decode_tracked(tracker, ts, [output])
         return sorted(classes.tolist())
 
-    assert run(True) == run(False) == [0, 2]
+    explicit_on = ef.Decoder(config, 0.5, 0.5, multi_label=True)
+    explicit_off = ef.Decoder(config, 0.5, 0.5, multi_label=False)
+    metadata_on = ef.Decoder(dict(config, nms_multi_label=True), 0.5, 0.5)
+    assert metadata_on.multi_label is True
+    assert run(explicit_on) == run(explicit_off) == run(metadata_on) == [0, 2]

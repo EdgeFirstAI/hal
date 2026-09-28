@@ -174,20 +174,9 @@ the wrong one into `EINVAL`. `source` is a plain integer with no macros:
 pixel-space or `[0, 1]` follows the exporter, is not derivable from shapes,
 and guessing scales every box by the input size.
 
-An inferred schema pins the NMS *mode* and leaves the *thresholds* to you.
-Ultralytics runs NMS class-aware (`agnostic=False`), so a pre-NMS YOLOv8/11
-schema says so explicitly. `ef_decoder_params_new` defaults to mode `1`
-(automatic), which takes the config's mode and otherwise resolves to
-class-aware; `ef_decoder_params_set_nms` still overrides. Thresholds are not inferable from shapes, and the library's
-defaults (`0.5`/`0.5`) are not Ultralytics' (`0.25`/`0.45`), so set them
-explicitly as above. YOLO26 end-to-end exports apply their own NMS in-graph
-and carry no mode at all.
+An inferred schema pins the NMS *mode* and leaves the *thresholds* to you. Ultralytics runs NMS class-aware (`agnostic=False`), so a pre-NMS YOLOv8/11 schema says so explicitly. `ef_decoder_params_new` defaults to mode `1` (automatic), which takes the config's mode and otherwise resolves to class-aware; `ef_decoder_params_set_nms` still overrides. Thresholds are not inferable from shapes, and the library's defaults (`0.5`/`0.5`) are not Ultralytics' (`0.25`/`0.45`), so set them explicitly as above. YOLO26 end-to-end exports apply their own NMS in-graph and carry no mode at all.
 
-For validation and mAP runs, `ef_decoder_params_set_multi_label(p, 1)` emits
-one box per class above the score threshold instead of one per anchor. It
-overrides the model config's `nms_multi_label`; tracked decode ignores it and
-always keeps one label per box. `ef_decoder_multi_label(d)` reports the
-setting a built decoder ended up with, including one taken from metadata.
+For validation and mAP runs, `ef_decoder_params_set_multi_label(p, 1)` emits one box per class above the score threshold instead of one per anchor. It overrides the model config's `nms_multi_label`; tracked decode ignores it and always keeps one label per box. `ef_decoder_multi_label(d)` reports the setting a built decoder ended up with, including one taken from metadata.
 
 Inference never guesses: metadata and shapes are cross-checked, and a
 disagreement — a class count that does not fit the output width, a `segment`

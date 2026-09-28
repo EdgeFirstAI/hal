@@ -83,7 +83,7 @@ pub struct Decoder {
     /// multi-label decode.  **OFF by default.**
     ///
     /// # Deployment safety
-    /// [`Decoder::decode_tracked`] ignores this and decodes one label per
+    /// `Decoder::decode_tracked` ignores this and decodes one label per
     /// box: ByteTrack matches on IoU only, so per-class duplicates of one
     /// anchor would spawn phantom tracks.
     pub(crate) multi_label: bool,
@@ -306,8 +306,9 @@ impl Decoder {
     /// Whether [`Decoder::decode`] and [`Decoder::decode_proto`] emit one box
     /// per class above the score threshold instead of one per anchor.
     ///
-    /// [`Decoder::decode_tracked`] ignores this and always uses one label per
-    /// box.
+    /// [`Self::decode_for_tracking`], and `Decoder::decode_tracked` /
+    /// `Decoder::decode_proto_tracked` (behind the `tracker` feature), ignore
+    /// this and always use one label per box.
     ///
     /// # Examples
     ///
@@ -518,7 +519,9 @@ impl Decoder {
     /// Decode quantized model outputs into detection boxes and segmentation
     /// masks. The quantized outputs can be of u8, i8, u16, i16, u32, or i32
     /// types. Clears the provided output vectors before populating them.
-    /// [`Self::decode_quantized_impl`] with the decoder's own multi-label setting.
+    ///
+    /// Test-only: calls [`Self::decode_quantized_impl`] with the decoder's
+    /// own multi-label setting.
     #[cfg(test)]
     pub(crate) fn decode_quantized(
         &self,
@@ -676,7 +679,9 @@ impl Decoder {
     /// Decode floating point model outputs into detection boxes and
     /// segmentation masks. Clears the provided output vectors before
     /// populating them.
-    /// [`Self::decode_float_impl`] with the decoder's own multi-label setting.
+    ///
+    /// Test-only: calls [`Self::decode_float_impl`] with the decoder's own
+    /// multi-label setting.
     #[cfg(test)]
     pub(crate) fn decode_float<T>(
         &self,
@@ -852,7 +857,9 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (detections
     /// are still decoded into `output_boxes`). Returns `Ok(Some(ProtoData))`
     /// for YOLO segmentation models.
-    /// [`Self::decode_quantized_proto_impl`] with the decoder's own multi-label setting.
+    ///
+    /// Test-only: calls [`Self::decode_quantized_proto_impl`] with the
+    /// decoder's own multi-label setting.
     #[cfg(test)]
     pub(crate) fn decode_quantized_proto(
         &self,
@@ -1026,7 +1033,9 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (detections
     /// are still decoded into `output_boxes`). Returns `Ok(Some(ProtoData))`
     /// for YOLO segmentation models.
-    /// [`Self::decode_float_proto_impl`] with the decoder's own multi-label setting.
+    ///
+    /// Test-only: calls [`Self::decode_float_proto_impl`] with the decoder's
+    /// own multi-label setting.
     #[cfg(test)]
     pub(crate) fn decode_float_proto<T>(
         &self,
@@ -1234,7 +1243,8 @@ impl Decoder {
     /// Use this when the boxes feed an external tracker: trackers match on
     /// IoU only, so per-class duplicates of one anchor become phantom tracks.
     /// Logs a warning once per process when the decoder has multi-label
-    /// enabled. [`Self::decode_tracked`] applies the same rule.
+    /// enabled. `Decoder::decode_tracked` and `Decoder::decode_proto_tracked`
+    /// (behind the `tracker` feature) apply the same rule.
     ///
     /// # Errors
     ///
@@ -1893,6 +1903,11 @@ impl Decoder {
     /// dispatches to quantized or float paths based on the tensor dtype, then
     /// updates the tracker with the decoded boxes.
     ///
+    /// Always decodes one label per box, regardless of [`Self::multi_label`]:
+    /// trackers match on IoU only, so per-class duplicates of one anchor would
+    /// spawn phantom tracks. Logs a warning once per process when the decoder
+    /// has multi-label enabled.
+    ///
     /// # Arguments
     ///
     /// * `tracker` - The tracker instance to update
@@ -1983,6 +1998,11 @@ impl Decoder {
     /// Accepts `TensorDyn` outputs directly from model inference.
     /// Returns `Ok(None)` for detection-only and ModelPack models.
     /// Returns `Ok(Some(ProtoData))` for YOLO segmentation models.
+    ///
+    /// Always decodes one label per box, regardless of [`Self::multi_label`]:
+    /// trackers match on IoU only, so per-class duplicates of one anchor would
+    /// spawn phantom tracks. Logs a warning once per process when the decoder
+    /// has multi-label enabled.
     ///
     /// # Arguments
     ///

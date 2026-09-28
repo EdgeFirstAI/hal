@@ -208,6 +208,10 @@ fn cap_or_default<T>(v: &Vec<T>) -> usize {
 ///
 /// See the "Detection cap convention" comment above for how
 /// `output_boxes.capacity()` bounds the result count.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
@@ -235,6 +239,10 @@ where
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn decode_yolo_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
@@ -351,7 +359,11 @@ where
 /// - scores: (num_classes, num_boxes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn decode_yolo_split_det_quant<
     BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -388,7 +400,11 @@ where
 /// - scores: (num_classes, num_boxes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn decode_yolo_split_det_float<T>(
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
@@ -767,6 +783,10 @@ pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<T>, Quantization),
     score_threshold: f32,
@@ -822,6 +842,10 @@ where
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sync>(
     output: ArrayView2<T>,
     score_threshold: f32,
@@ -869,7 +893,11 @@ where
 /// - scores: (num_classes, num_boxes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn impl_yolo_split_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -936,7 +964,11 @@ where
 /// - scores: (num_classes, num_boxes)
 ///
 /// # Panics
-/// Panics if shapes don't match the expected dimensions.
+/// Panics if shapes don't match the expected dimensions (argmax path).
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 pub(crate) fn impl_yolo_split_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -1117,6 +1149,13 @@ where
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
 }
 
+/// Score-filters float boxes (argmax or multi-label), runs NMS, and returns
+/// the survivors with their anchor indices, sorted by score and capped at
+/// `max_det`.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_segdet_get_boxes<
     B: BBoxTypeTrait,
@@ -1247,6 +1286,10 @@ pub(crate) fn impl_yolo_split_segdet_process_masks<
 /// Expected input shapes:
 /// - boxes_tensor: (num_boxes, 4)
 /// - scores_tensor: (num_boxes, num_classes)
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_segdet_quant_get_boxes<
     B: BBoxTypeTrait,
@@ -1427,6 +1470,10 @@ where
 
 /// Proto-extraction variant of `impl_yolo_segdet_quant`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_segdet_quant_proto<
     B: BBoxTypeTrait,
@@ -1490,6 +1537,10 @@ where
 
 /// Proto-extraction variant of `impl_yolo_segdet_float`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_segdet_float_proto<
     B: BBoxTypeTrait,
@@ -1536,6 +1587,10 @@ where
 
 /// Proto-extraction variant of `impl_yolo_split_segdet_float`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+///
+/// # Errors
+/// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
+/// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_segdet_float_proto<
     B: BBoxTypeTrait,

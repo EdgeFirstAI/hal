@@ -249,10 +249,7 @@ reason to serialize it. Nor does Python: its binding returns the schema as
 a dict, which `Decoder(schema)` takes directly. The JSON rendering exists
 for the C API alone, which has no dict to hand across the boundary.
 
-The inferred schema pins the NMS *mode* but not the thresholds. Ultralytics
-runs NMS class-aware (`agnostic=False`), and the schema says so explicitly
-rather than relying on the builder's fallback. `with_nms` still overrides. YOLO26 end-to-end exports
-perform NMS in-graph and carry no mode.
+The inferred schema pins the NMS *mode* but not the thresholds. Ultralytics runs NMS class-aware (`agnostic=False`), and the schema says so explicitly rather than relying on the builder's fallback. `with_nms` still overrides. YOLO26 end-to-end exports perform NMS in-graph and carry no mode.
 
 Box normalization follows the export format, not a fixed convention:
 Ultralytics ONNX exports report pixel-space boxes (`normalized: false`),

@@ -530,16 +530,16 @@ class Decoder:
             outputs: List of Output objects describing the model outputs.
             score_threshold: Minimum confidence score for detections.
             iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.Auto (default; the config's mode, else
-                Nms.ClassAware), Nms.ClassAgnostic, Nms.ClassAware, or None to
-                bypass NMS.
+            nms: NMS mode - Nms.Auto (default; resolves to Nms.ClassAware, since
+                outputs carry no config-level mode), Nms.ClassAgnostic,
+                Nms.ClassAware, or None to bypass NMS.
             decoder_version: Optional decoder version for Ultralytics models.
                 Set to DecoderVersion.Yolo26 for end-to-end models.
             input_dims: Optional ``(width, height)`` model input, used to
                 normalize pixel-space boxes when the config has no input shape.
             multi_label: Emit one box per class above ``score_threshold``
                 instead of one per anchor (validation decode). None (default)
-                uses the config's ``nms_multi_label``, else False.
+                leaves it off, since outputs carry no ``nms_multi_label``.
                 :meth:`decode_tracked` always uses one label per box.
         """
 
@@ -620,6 +620,11 @@ class Decoder:
         Accepts HAL Tensor objects directly from model inference. Quantization
         parameters must be specified in the Decoder configuration when the
         tensors contain quantized data.
+
+        Always decodes one label per box, regardless of :attr:`multi_label`:
+        the tracker matches on IoU only, so per-class duplicates of one anchor
+        would become phantom tracks. Logs a warning once per process when the
+        decoder has multi-label enabled.
 
         Masks are returned at prototype resolution as 3D arrays of shape
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``

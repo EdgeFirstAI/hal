@@ -140,12 +140,7 @@ symbolic axis (`'batch'` from ONNX, `-1` from TFLite); those are refused
 with a `ValueError` naming the tensor and axis, because the layout rules
 need real sizes.
 
-The schema pins the NMS *mode* and leaves the *thresholds* to you.
-Ultralytics runs NMS class-aware (`agnostic=False`), so an inferred pre-NMS
-schema says so explicitly. Passing `nms=` still overrides. Thresholds are not inferable, and
-`Decoder`'s defaults (`score_threshold=0.1`, `iou_threshold=0.7`) are not
-Ultralytics' (`0.25`/`0.45`) — pass them as shown above. YOLO26 end-to-end
-exports apply NMS in-graph and carry no mode at all.
+The schema pins the NMS *mode* and leaves the *thresholds* to you. Ultralytics runs NMS class-aware (`agnostic=False`), so an inferred pre-NMS schema says so explicitly. Passing `nms=` still overrides. Thresholds are not inferable, and `Decoder`'s defaults (`score_threshold=0.1`, `iou_threshold=0.7`) are not Ultralytics' (`0.25`/`0.45`) — pass them as shown above. YOLO26 end-to-end exports apply NMS in-graph and carry no mode at all.
 
 `ValueError` is raised for anything that is not a recognizable Ultralytics
 export — missing or unparsable metadata, an unsupported task (only `detect`

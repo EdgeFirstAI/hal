@@ -291,7 +291,7 @@ impl DecoderBuilder {
     /// Accepts a [`SchemaV2`] as produced by [`SchemaV2::parse_json`],
     /// [`SchemaV2::parse_yaml`], [`SchemaV2::parse_file`], or
     /// constructed programmatically. The builder validates the schema,
-    /// compiles a [`DecodeProgram`] for any split logical outputs
+    /// compiles a decode program for any split logical outputs
     /// (per-scale or channel sub-splits), and downconverts the
     /// logical-level semantics to the legacy [`ConfigOutputs`]
     /// representation consumed by the existing decoder dispatch.
@@ -936,8 +936,9 @@ impl DecoderBuilder {
     ///
     /// **Default:** the model config's `nms_multi_label`, else `false`
     /// (argmax: one class per anchor). An explicit call overrides the config
-    /// either way. [`Decoder::decode_tracked`](crate::Decoder::decode_tracked)
-    /// ignores it and always decodes one label per box.
+    /// either way. [`Decoder::decode_for_tracking`](crate::Decoder::decode_for_tracking),
+    /// and `Decoder::decode_tracked` / `Decoder::decode_proto_tracked` (behind
+    /// the `tracker` feature), ignore it and always decode one label per box.
     ///
     /// When NMS is enabled, multi-label forces class-aware NMS so per-class
     /// duplicates are not suppressed across classes.

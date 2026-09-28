@@ -803,7 +803,8 @@ impl PyDecoder {
     ///         See :meth:`__init__` for semantics.
     ///     multi_label: Emit one box per class above ``score_threshold``
     ///         instead of one per anchor (validation decode). ``None``
-    ///         (default) uses the config's ``nms_multi_label``, else ``False``.
+    ///         (default) leaves it off, since outputs carry no
+    ///         ``nms_multi_label``.
     ///         :meth:`decode_tracked` always uses one label per box.
     #[staticmethod]
     #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::Auto, decoder_version=None, input_dims=None, multi_label=None))]
