@@ -1,0 +1,223 @@
+# On-demand benchmarks across the self-hosted board fleet.
+#
+# Runs HAL's benchmark cases (scripts/on-target-bench.sh) on every board
+# named, one job per board entry, and rolls every board's medians into one
+# summary: a headline table across boards, every case in full, and a CSV of
+# every median. Per-board artifacts keep each case's JSON (the harness's
+# --json output, the shape BENCHMARKS.md's tables are generated from), its
+# log, and system.txt recording the governors, clocks and temperatures the
+# numbers depend on. Governors are read, never changed: a benchmark measures a
+# board as it ships.
+#
+#   plan     resolve board entries; drop, and report, any no online runner serves
+#   build    cross-build one aarch64 bench bundle (scripts/on-target-bundle.sh)
+#   board    per entry: unpack the bundle, run scripts/on-target-bench.sh
+#   summary  one report naming the runner each entry ran on; red if any failed
+#
+# Board entries are runner labels, `+` joining labels one runner must all
+# carry (`imx95-frdm+ara240`). The default is one board per SoC for general
+# HAL work: the EVK where a family has other carriers. Board prerequisites:
+# Confluence "Self-Hosted Runner Fleet Inventory".
+#
+# The runner check needs FLEET_RUNNERS_TOKEN; see hardware-test.yml.
+#
+# Action versions (hash-pinned):
+# - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
+# - actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a (v7.0.1)
+# - actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c (v8.0.1)
+# - taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 (v2.87.15)
+
+name: Hardware benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      boards:
+        description: Board entries, comma-separated; `+` joins labels one runner must all carry
+        type: string
+        default: imx8mp-evk, imx95-evk, rpi5, orin-nano, iq9075-evk
+      cases:
+        description: Benchmark cases, comma-separated (empty runs all; see scripts/on-target-bench.sh)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      board_matrix: ${{ steps.boards.outputs.board_matrix }}
+      unavailable: ${{ steps.boards.outputs.unavailable }}
+      has_boards: ${{ steps.boards.outputs.has_boards }}
+    steps:
+      - id: boards
+        uses: EdgeFirstAI/.github/.github/actions/resolve-boards@871e6da918fe2bb0345c1b902f5d88c8c89a6018
+        with:
+          boards: ${{ inputs.boards }}
+          token: ${{ secrets.FLEET_RUNNERS_TOKEN }}
+
+  build:
+    name: Build bench bundle (aarch64)
+    needs: plan
+    if: needs.plan.outputs.has_boards == 'true'
+    # Free hosted runner: on demand, nothing waits on it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          lfs: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config nasm
+
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # v2.87.15
+        with:
+          tool: cargo-zigbuild@0.23.2
+
+      - name: Install zig
+        env:
+          ZIG_VERSION: "0.16.0"
+          SHA256_X86_64: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/zig.tar.xz"
+          curl -fsSL --retry 5 --retry-connrefused -o "$archive" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${SHA256_X86_64}  ${archive}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      # rust-toolchain.toml pins the compiler; rustup honours it on first use.
+      - name: Add the aarch64 target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Build the bundle
+        run: ./scripts/on-target-bundle.sh bench aarch64 "$RUNNER_TEMP/bundle"
+
+      # A tarball, not the directory: an artifact loses file modes.
+      - name: Pack the bundle
+        run: tar -C "$RUNNER_TEMP/bundle" -cf "$RUNNER_TEMP/on-target-bench.tar" .
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: on-target-bench-aarch64
+          path: ${{ runner.temp }}/on-target-bench.tar
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: on-target-bench-build-logs
+          path: target/on-target-bundle-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  board:
+    name: Board ${{ matrix.runner }}
+    needs: [plan, build]
+    runs-on: ${{ matrix.labels }}
+    # Every case ran in 9 minutes on the IQ-9075 (8x Cortex-A78C); a
+    # Cortex-A53 board takes several times that.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.board_matrix) }}
+    steps:
+      - name: Reclaim disk from an earlier run
+        run: rm -rf hal-bundle hal-results on-target-bench.tar
+
+      - name: Board
+        env:
+          ENTRY: ${{ matrix.runner }}
+        run: |
+          echo "::notice::${ENTRY} ran on ${RUNNER_NAME} ($(uname -m))"
+          if [[ "$(uname -m)" != aarch64 ]]; then
+            echo "::error::the bundle is aarch64; ${RUNNER_NAME} is $(uname -m)"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: on-target-bench-aarch64
+
+      - name: Unpack
+        run: |
+          mkdir hal-bundle
+          tar -xf on-target-bench.tar -C hal-bundle
+          rm on-target-bench.tar
+          cat hal-bundle/MANIFEST
+
+      - name: Run the benchmarks
+        env:
+          CASES: ${{ inputs.cases }}
+        run: hal-bundle/scripts/on-target-bench.sh "$GITHUB_WORKSPACE/hal-results"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: hardware-bench-${{ matrix.runner }}
+          path: hal-results/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Clean up
+        if: always()
+        run: rm -rf hal-bundle hal-results on-target-bench.tar
+
+  summary:
+    name: Summary
+    needs: [plan, build, board]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: .github/scripts/fleet_summary.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: hardware-bench-*
+          path: results
+
+      - name: Summarize
+        env:
+          REQUESTED: ${{ needs.plan.outputs.board_matrix }}
+          UNAVAILABLE: ${{ needs.plan.outputs.unavailable }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          python3 .github/scripts/fleet_summary.py bench --results results \
+            --requested "${REQUESTED:-[]}" --unavailable "${UNAVAILABLE:-[]}" \
+            --csv benchmarks.csv > summary.md
+          status=$?
+          if [[ "${BUILD_RESULT}" != success && "${BUILD_RESULT}" != skipped ]]; then
+            printf '\n**The bundle build %s, so no board ran.**\n' "${BUILD_RESULT}" >> summary.md
+            status=1
+          fi
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit "${status}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: benchmarks-summary
+          path: |
+            summary.md
+            benchmarks.csv
+          retention-days: 90
+          if-no-files-found: warn

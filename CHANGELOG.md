@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Creates single-channel render targets with the sized `GL_R8` format.
   - Reports no GL float render support on a zero-copy backend, so float output goes to the CPU.
 
+- **On-demand hardware tests and benchmarks across the board fleet** (`hardware-test.yml`, `hardware-bench.yml`, both `workflow_dispatch`). One job per board entry: a runner label, or labels joined by `+` that one runner must all carry (`imx95-frdm+ara240`). The default is one board per SoC, `imx8mp-evk, imx95-evk, rpi5, orin-nano, iq9075-evk`. The tests workflow runs the whole on-target suite plus the C-API gates, where the CI hardware lane runs a selection; the bench workflow runs every benchmark case and summarises medians across boards, with a CSV of every median. Each summary names the runner that ran each entry. With the `FLEET_RUNNERS_TOKEN` organisation secret, an entry no online runner carries is reported as unavailable instead of queuing for 24 hours.
+- `scripts/on-target-bundle.sh` builds the self-contained bundle a board runs (tests: binaries, C-API libraries, G3 and gate sources; bench: benchmark binaries; both with merged testdata), and `scripts/on-target-run.sh` and `scripts/on-target-bench.sh` run it on the board. The fleet workflows and `scripts/on-target-test.sh` use the same bundle and scripts.
+
 ### Fixed
 
 - A two-plane NV source whose GL import is refused now reports the import's reason instead of a misleading "draw_src_texture does not support Nv12".
@@ -37,7 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `TensorTrait::capacity_bytes` and `TensorTrait::set_logical_shape` no longer have default bodies; every implementor provides them.
 - `edgefirst_tensor::protocol::c_byte_strides` is public: the one stride convention shared by the descriptor, the blob and the C API.
-- **CI on-target lane runs on four boards**: `imx8mp-evk` (Vivante), `imx95-evk` (Mali), `rpi5-hailo8l` (V3D) and `orin-nano` (Tegra). It replaces the retired `nxp-imx8mp-latest` label, which no runner answers any more. The board archive is linked against glibc 2.35 so it loads on Ubuntu 22.04 (JetPack 6). Board jobs now fail when a board with a render node cannot bring up GL (`HAL_TEST_REQUIRE_GL`), as `scripts/on-target-test.sh` already did. Tests that need a zero-copy buffer treat its absence as a failure only where one must exist: under `HAL_TEST_REQUIRE_DMA`, or under `HAL_TEST_REQUIRE_GL` on a Linux host with a DMA heap. The Jetson has no heap, so they skip there.
+- **`scripts/on-target-test.sh` deploys one bundle and runs it on the board.** Its options and summary are unchanged; the summary now also gives each host's passed, failed and ignored test totals. It arms `HAL_TEST_REQUIRE_DMA` when the board's DMA heap allocates, as the CI board lane does, so a heap that should work and does not fails instead of skipping. `REQUIRE_GPU=1` fails a host with no render node (`NO-GPU`) instead of letting every GPU test skip. A host without `rsync` gets the bundle by tar over ssh instead of failing to sync.
+- **CI on-target lane runs on four boards**: `imx8mp-evk` (Vivante), `imx95-evk` (Mali), `rpi5` (V3D) and `orin-nano` (Tegra). It replaces the retired `nxp-imx8mp-latest` label, which no runner answers any more. The board archive is linked against glibc 2.35 so it loads on Ubuntu 22.04 (JetPack 6). Board jobs now fail when a board with a render node cannot bring up GL (`HAL_TEST_REQUIRE_GL`), as `scripts/on-target-test.sh` already did. Tests that need a zero-copy buffer treat its absence as a failure only where one must exist: under `HAL_TEST_REQUIRE_DMA`, or under `HAL_TEST_REQUIRE_GL` on a Linux host with a DMA heap. The Jetson has no heap, so they skip there.
+
+### Removed
+
+- `benchmark.yml`. It ran four benchmarks on the i.MX 8M Plus only and scraped their text output; `hardware-bench.yml` replaces it.
 
 ## [0.32.1] - 2026-09-18
 

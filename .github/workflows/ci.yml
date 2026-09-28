@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@4520e6af90ca7661a1a3f59671959034a698f4f9
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@871e6da918fe2bb0345c1b902f5d88c8c89a6018
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -140,7 +140,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@4520e6af90ca7661a1a3f59671959034a698f4f9
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@871e6da918fe2bb0345c1b902f5d88c8c89a6018
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       # One job per board identity, each run on that specific board: the NXP
@@ -148,7 +148,7 @@ jobs:
       # tests are written against, where a bare family label could land on a
       # carrier without it. orin-nano is Ubuntu 22.04 (glibc 2.35), so the
       # archive is linked against that floor.
-      boards: imx8mp-evk,imx95-evk,rpi5-hailo8l,orin-nano
+      boards: imx8mp-evk,imx95-evk,rpi5,orin-nano
       archive-glibc: "2.35"
       lfs: true
       python: false
