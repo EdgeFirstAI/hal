@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   sbom:
-    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@871e6da918fe2bb0345c1b902f5d88c8c89a6018
+    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@c2aa96dd21c7ccf0934304aa033bea62ac9a2e2c
     with:
       mode: full
       # A graph is resolved per target, so this Linux runner would otherwise miss

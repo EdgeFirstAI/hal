@@ -55,7 +55,7 @@ jobs:
       has_boards: ${{ steps.boards.outputs.has_boards }}
     steps:
       - id: boards
-        uses: EdgeFirstAI/.github/.github/actions/resolve-boards@871e6da918fe2bb0345c1b902f5d88c8c89a6018
+        uses: EdgeFirstAI/.github/.github/actions/resolve-boards@c2aa96dd21c7ccf0934304aa033bea62ac9a2e2c
         with:
           boards: ${{ inputs.boards }}
           token: ${{ secrets.FLEET_RUNNERS_TOKEN }}
@@ -161,6 +161,7 @@ jobs:
       - name: Run the benchmarks
         env:
           CASES: ${{ inputs.cases }}
+          HAL_BOARD_ENTRY: ${{ matrix.runner }}
         run: hal-bundle/scripts/on-target-bench.sh "$GITHUB_WORKSPACE/hal-results"
 
       - name: Upload results
@@ -199,7 +200,8 @@ jobs:
           UNAVAILABLE: ${{ needs.plan.outputs.unavailable }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
-          set -uo pipefail
+          # Not -e: a failing roll-up must still write its report below.
+          set +e -uo pipefail
           mkdir -p results
           python3 .github/scripts/fleet_summary.py bench --results results \
             --requested "${REQUESTED:-[]}" --unavailable "${UNAVAILABLE:-[]}" \
