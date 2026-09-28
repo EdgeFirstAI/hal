@@ -93,6 +93,7 @@ for line in open(src):
         out.add(m["executable"])
 print("\n".join(sorted(out)))
 PY
+  return 0
 }
 
 build_tests() {
@@ -101,7 +102,7 @@ build_tests() {
   # Empty FEATURES must not become a bare `--features ''`, which cargo reads
   # as a request for a feature named "" and rejects.
   local feats=()
-  if [ -n "${FEATURES}" ]; then
+  if [[ -n "${FEATURES}" ]]; then
     feats=(--features "${FEATURES}")
     echo "==> test build features: ${FEATURES}"
   fi
@@ -115,6 +116,7 @@ build_tests() {
   fi
   executables "${json}" test > "${LOGS}/tests-${ARCH}.txt"
   echo "    $(grep -c . "${LOGS}/tests-${ARCH}.txt") test binaries"
+  return 0
 }
 
 build_benches() {
@@ -135,6 +137,7 @@ build_benches() {
   fi
   executables "${json}" bench > "${LOGS}/bench-${ARCH}.txt"
   echo "    $(grep -c . "${LOGS}/bench-${ARCH}.txt") benchmark binaries"
+  return 0
 }
 
 # The five C-API libraries + the G3 two-library-user binary. G1/G2
@@ -207,6 +210,7 @@ build_libs() {
     tail -30 "${g3log}" >&2
     return 1
   fi
+  return 0
 }
 
 # testdata/ plus every crates/*/testdata merged into one tree: every
@@ -228,6 +232,7 @@ merge_testdata() {
     done < <(find "${dir}" -type f -print0)
     cp -a "${dir}/." "${dst}/"
   done
+  return 0
 }
 
 rm -rf "${OUT}"

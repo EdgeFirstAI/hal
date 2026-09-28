@@ -5,12 +5,14 @@
 Roll the per-board results of hardware-test.yml or hardware-bench.yml into one
 markdown summary, and gate on it.
 
-Each board job uploads one artifact, downloaded here as one directory per
-board: `hardware-test-<entry>/` holding scripts/on-target-run.sh's
-`summary.json`, or `hardware-bench-<entry>/` holding scripts/on-target-bench.sh's
-`summary.json`, `system.txt` and one `<case>.json` per case. `<entry>` is the
-board entry as requested (`imx8mp-evk`, `imx95-frdm+ara240`); the summary
-records which runner actually ran it.
+Each board job uploads one artifact holding scripts/on-target-run.sh's
+`summary.json`, or scripts/on-target-bench.sh's `summary.json`, `system.txt`
+and one `<case>.json` per case. Each `summary.json` records the board entry it
+ran for (`entry`, as requested: `imx8mp-evk`, `imx95-frdm+ara240`) and the
+runner that ran it. Results are found by that entry wherever they sit under
+`--results`: download-artifact puts each of several artifacts in its own
+directory, but extracts a pattern's only match straight into the path. An
+older result without `entry` is matched by its `<prefix>-<entry>` directory.
 
 Every requested entry gets a row. An entry that produced no artifact (the job
 failed before uploading, was cancelled, or timed out) is a failure. An entry
@@ -73,8 +75,17 @@ def fmt_us(value):
     return f"{value:.0f} µs"
 
 
-def artifact_dir(results, prefix, entry):
-    return Path(results) / f"{prefix}-{entry}"
+def find_results(results, prefix):
+    """Directory holding each board entry's summary.json, keyed by entry."""
+    found = {}
+    for path in sorted(Path(results).rglob("summary.json")):
+        summary = load_json(path) or {}
+        entry = summary.get("entry")
+        if not entry and path.parent.name.startswith(f"{prefix}-"):
+            entry = path.parent.name[len(prefix) + 1 :]
+        if entry:
+            found.setdefault(entry, path.parent)
+    return found
 
 
 def load_json(path):
@@ -96,10 +107,9 @@ def summarize_tests(results, requested, unavailable):
     ]
     failed = False
     bundle = None
+    found = find_results(results, "hardware-test")
     for entry in (e["runner"] for e in requested):
-        summary = load_json(
-            artifact_dir(results, "hardware-test", entry) / "summary.json"
-        )
+        summary = load_json(found[entry] / "summary.json") if entry in found else None
         if summary is None:
             failed = True
             lines.append(
@@ -166,9 +176,10 @@ def summarize_bench(results, requested, unavailable, csv_path=None):
     entries = [e["runner"] for e in requested]
     boards = {}
     failed = False
+    found = find_results(results, "hardware-bench")
     for entry in entries:
-        base = artifact_dir(results, "hardware-bench", entry)
-        summary = load_json(base / "summary.json")
+        base = found.get(entry)
+        summary = load_json(base / "summary.json") if base else None
         if summary is None:
             failed = True
             boards[entry] = None

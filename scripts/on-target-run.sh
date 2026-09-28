@@ -14,6 +14,8 @@
 #                               matches the test FUNCTION name; a filter that
 #                               matches nothing makes every binary run zero
 #                               tests, reported as NO-TESTS.
+#   HAL_BOARD_ENTRY             the board entry this run is for, recorded in
+#                               summary.json for the fleet roll-up
 #   HAL_ONTARGET_REQUIRE_GPU    1 to fail, as NO-GPU, on a board without a
 #                               DRM render node, where every GPU test would
 #                               otherwise skip and the run would pass
@@ -42,8 +44,8 @@ cd "${BUNDLE}"
 arch="$(uname -m)"
 heaps="$(ls /dev/dma_heap 2>/dev/null | tr '\n' ',')"
 render="$(ls /dev/dri 2>/dev/null | grep -c render)"
-galcore="$([ -e /dev/galcore ] && echo yes || echo no)"
-neutron="$([ -e /dev/neutron0 ] && echo yes || echo no)"
+galcore="$([[ -e /dev/galcore ]] && echo yes || echo no)"
+neutron="$([[ -e /dev/neutron0 ]] && echo yes || echo no)"
 caps="dma_heap=${heaps:-none} render=${render} galcore=${galcore} neutron=${neutron}"
 echo "${caps}" > "${RESULTS}/capabilities.txt"
 echo "    ${caps}"
@@ -95,12 +97,14 @@ if os.path.exists(manifest):
 json.dump({
     "result": result, "detail": detail, "arch": arch, "capabilities": caps,
     "dma": dma, "host": socket.gethostname(),
+    "entry": os.environ.get("HAL_BOARD_ENTRY", ""),
     "runner": os.environ.get("RUNNER_NAME", ""),
     "tests": {"passed": passed, "failed": failed, "ignored": ignored,
               "skipped": skipped},
     "bundle": meta,
 }, open(os.path.join(results, "summary.json"), "w"), indent=2)
 PY
+  return 0
 }
 
 if [[ "${REQUIRE_GPU}" == "1" && "${render}" -eq 0 ]]; then

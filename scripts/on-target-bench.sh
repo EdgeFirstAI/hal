@@ -13,7 +13,10 @@
 # Usage: <bundle>/scripts/on-target-bench.sh <results-dir>
 #
 # Env:
-#   CASES   comma-separated case names to run (default: all); see CASES below
+#   CASES            comma-separated case names to run (default: all); see
+#                    CASES below
+#   HAL_BOARD_ENTRY  the board entry this run is for, recorded in
+#                    summary.json for the fleet roll-up
 #
 # Each case writes <case>.json (the harness's --json output) and <case>.txt.
 # system.txt records what the numbers depend on: CPU, governors, GPU clocks
@@ -135,7 +138,8 @@ for line in sys.stdin:
                   "status": "missing" if rc == "missing" else ("ok" if rc == "0" else "failed"),
                   "exit": None if rc == "missing" else int(rc),
                   "seconds": int(secs)})
-json.dump({"runner": os.environ.get("RUNNER_NAME", ""), "cases": cases},
+json.dump({"entry": os.environ.get("HAL_BOARD_ENTRY", ""),
+           "runner": os.environ.get("RUNNER_NAME", ""), "cases": cases},
           open(sys.argv[1], "w"), indent=2)
 ' "${RESULTS}/summary.json"
 
