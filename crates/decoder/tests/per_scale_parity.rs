@@ -2087,8 +2087,8 @@ fn multi_label_count_exceeds_argmax() {
 /// box for the same anchor still occupies the same pixel region and spawns an
 /// additional phantom track.
 ///
-/// This is the documented reason for the `debug_assert!(!self.multi_label)`
-/// guards on `decode_tracked_*` entry points.
+/// Why `decode_tracked` forces argmax regardless of the decoder's
+/// `multi_label` setting.
 #[cfg(feature = "tracker")]
 #[test]
 fn tracker_regression_argmax_one_track_multilabel_spawns_extra() {
@@ -2518,4 +2518,53 @@ fn dfl_per_tensor_path_uses_scalar_fast_path() {
     );
     assert_eq!(det.label, 0, "expected class 0");
     assert!(det.score > 0.99, "expected high score, got {}", det.score);
+}
+
+/// Tracked per-scale decode ignores multi-label and matches argmax.
+#[cfg(feature = "tracker")]
+#[test]
+fn tracked_per_scale_decode_ignores_multi_label() {
+    use edgefirst_tracker::ByteTrackBuilder;
+    let box_t = make_zero_box_tensor();
+    let score_t = make_multi_label_score_tensor();
+    let inputs: Vec<&TensorDyn> = vec![&box_t, &score_t];
+    let run = |multi_label: bool| {
+        let d = build_2x2_decoder(multi_label);
+        let mut tracker = ByteTrackBuilder::new().build::<DetectBox>();
+        let (mut boxes, mut masks, mut tracks) = (Vec::with_capacity(10), Vec::new(), Vec::new());
+        for ts in 0..3 {
+            d.decode_tracked(
+                &mut tracker,
+                ts,
+                &inputs,
+                &mut boxes,
+                &mut masks,
+                &mut tracks,
+            )
+            .expect("decode_tracked");
+        }
+        (boxes, tracks.len())
+    };
+    assert_eq!(run(true), run(false));
+}
+
+/// Tracked per-scale proto decode ignores multi-label and matches argmax.
+#[cfg(feature = "tracker")]
+#[test]
+fn tracked_per_scale_decode_proto_ignores_multi_label() {
+    use edgefirst_tracker::ByteTrackBuilder;
+    let box_t = make_zero_box_tensor();
+    let score_t = make_multi_label_score_tensor();
+    let inputs: Vec<&TensorDyn> = vec![&box_t, &score_t];
+    let run = |multi_label: bool| {
+        let d = build_2x2_decoder(multi_label);
+        let mut tracker = ByteTrackBuilder::new().build::<DetectBox>();
+        let (mut boxes, mut tracks) = (Vec::with_capacity(10), Vec::new());
+        for ts in 0..3 {
+            d.decode_proto_tracked(&mut tracker, ts, &inputs, &mut boxes, &mut tracks)
+                .expect("decode_proto_tracked");
+        }
+        (boxes, tracks.len())
+    };
+    assert_eq!(run(true), run(false));
 }

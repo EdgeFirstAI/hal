@@ -59,11 +59,13 @@ class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
     ClassAgnostic: Suppresses all boxes based on IoU regardless of class.
-    ClassAware: Only suppresses boxes of the same class.
+    ClassAware: Only suppresses boxes of the same class (default).
+    Auto: Uses the model config's mode, falling back to ClassAware.
     """
 
     ClassAgnostic: Nms
     ClassAware: Nms
+    Auto: Nms
 
 DetectionOutput: TypeAlias = tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
@@ -418,7 +420,9 @@ class Decoder:
         config: dict,
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
-        nms: Nms | None = Nms.ClassAgnostic,
+        nms: Nms | None = Nms.Auto,
+        input_dims: tuple[int, int] | None = None,
+        multi_label: bool | None = None,
     ) -> None:
         """
         Create a new Decoder instance from a dictionary configuration describing the model outputs.
@@ -427,7 +431,15 @@ class Decoder:
             config: Model output configuration dictionary.
             score_threshold: Minimum confidence score for detections.
             iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+            nms: NMS mode - Nms.Auto (default; the config's mode, else
+                Nms.ClassAware), Nms.ClassAgnostic, Nms.ClassAware, or None to
+                bypass NMS.
+            input_dims: Optional ``(width, height)`` model input, used to
+                normalize pixel-space boxes when the config has no input shape.
+            multi_label: Emit one box per class above ``score_threshold``
+                instead of one per anchor (validation decode). None (default)
+                uses the config's ``nms_multi_label``, else False.
+                :meth:`decode_tracked` always uses one label per box.
         """
 
     @staticmethod
@@ -435,7 +447,9 @@ class Decoder:
         json_str: str,
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
-        nms: Nms | None = Nms.ClassAgnostic,
+        nms: Nms | None = Nms.Auto,
+        input_dims: tuple[int, int] | None = None,
+        multi_label: bool | None = None,
     ) -> Decoder:
         """
         Create a new Decoder instance from a JSON configuration string describing the model outputs.
@@ -444,7 +458,15 @@ class Decoder:
             json_str: JSON configuration string.
             score_threshold: Minimum confidence score for detections.
             iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+            nms: NMS mode - Nms.Auto (default; the config's mode, else
+                Nms.ClassAware), Nms.ClassAgnostic, Nms.ClassAware, or None to
+                bypass NMS.
+            input_dims: Optional ``(width, height)`` model input, used to
+                normalize pixel-space boxes when the config has no input shape.
+            multi_label: Emit one box per class above ``score_threshold``
+                instead of one per anchor (validation decode). None (default)
+                uses the config's ``nms_multi_label``, else False.
+                :meth:`decode_tracked` always uses one label per box.
         """
 
     @staticmethod
@@ -452,7 +474,9 @@ class Decoder:
         yaml_str: str,
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
-        nms: Nms | None = Nms.ClassAgnostic,
+        nms: Nms | None = Nms.Auto,
+        input_dims: tuple[int, int] | None = None,
+        multi_label: bool | None = None,
     ) -> Decoder:
         """
         Create a new Decoder instance from a YAML configuration string describing the model outputs.
@@ -461,7 +485,15 @@ class Decoder:
             yaml_str: YAML configuration string.
             score_threshold: Minimum confidence score for detections.
             iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+            nms: NMS mode - Nms.Auto (default; the config's mode, else
+                Nms.ClassAware), Nms.ClassAgnostic, Nms.ClassAware, or None to
+                bypass NMS.
+            input_dims: Optional ``(width, height)`` model input, used to
+                normalize pixel-space boxes when the config has no input shape.
+            multi_label: Emit one box per class above ``score_threshold``
+                instead of one per anchor (validation decode). None (default)
+                uses the config's ``nms_multi_label``, else False.
+                :meth:`decode_tracked` always uses one label per box.
         """
 
     @staticmethod
@@ -469,8 +501,10 @@ class Decoder:
         outputs: list[Output],
         score_threshold: float = 0.25,
         iou_threshold: float = 0.45,
-        nms: Nms | None = Nms.ClassAgnostic,
+        nms: Nms | None = Nms.Auto,
         decoder_version: DecoderVersion | None = None,
+        input_dims: tuple[int, int] | None = None,
+        multi_label: bool | None = None,
     ) -> Decoder:
         """Create a new Decoder from a list of Output objects.
 
@@ -496,9 +530,17 @@ class Decoder:
             outputs: List of Output objects describing the model outputs.
             score_threshold: Minimum confidence score for detections.
             iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+            nms: NMS mode - Nms.Auto (default; the config's mode, else
+                Nms.ClassAware), Nms.ClassAgnostic, Nms.ClassAware, or None to
+                bypass NMS.
             decoder_version: Optional decoder version for Ultralytics models.
                 Set to DecoderVersion.Yolo26 for end-to-end models.
+            input_dims: Optional ``(width, height)`` model input, used to
+                normalize pixel-space boxes when the config has no input shape.
+            multi_label: Emit one box per class above ``score_threshold``
+                instead of one per anchor (validation decode). None (default)
+                uses the config's ``nms_multi_label``, else False.
+                :meth:`decode_tracked` always uses one label per box.
         """
 
     def decode(
@@ -617,6 +659,14 @@ class Decoder:
         """
         NMS mode used when decoding detections with the `decode` method.
         Returns Nms.ClassAgnostic, Nms.ClassAware, or None if NMS is bypassed.
+        """
+
+    @property
+    def multi_label(self) -> bool:
+        """
+        Whether `decode` emits one box per class above the score threshold
+        instead of one per anchor. `decode_tracked` ignores it and always uses
+        one label per box.
         """
 
     @property

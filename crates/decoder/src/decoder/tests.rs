@@ -4,6 +4,7 @@
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod decoder_builder_tests {
+    use crate::decoder::MultiLabelSource;
     use crate::{
         configs::{self, DecoderType, DecoderVersion, DimName, ModelType, QuantTuple},
         dequantize_ndarray, ConfigOutput, ConfigOutputs, Decoder, DecoderBuilder, DecoderError,
@@ -2209,8 +2210,8 @@ outputs:
             .with_config_yaml_str(yaml_no_nms.to_string())
             .build()
             .unwrap();
-        // Default fallback NMS is ClassAgnostic
-        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
+        // Default fallback NMS is ClassAware
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
 
         // Test with explicit builder NMS
         let decoder = DecoderBuilder::new()
@@ -2234,12 +2235,12 @@ outputs:
       - [num_features, 84]
       - [num_boxes, 8400]
 "#;
-        // Default builder uses Auto → resolves to ClassAgnostic (no config nms)
+        // Default builder uses Auto → resolves to ClassAware (no config nms)
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml_no_nms.to_string())
             .build()
             .unwrap();
-        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
         assert_ne!(decoder.nms, Some(configs::Nms::Auto));
 
         // Explicit Auto → resolves from config (class_aware) rather than default
@@ -2265,7 +2266,7 @@ nms: class_aware
             "Auto should resolve to config nms (class_aware)"
         );
 
-        // ConfigOutputs with nms=Auto directly — resolves to ClassAgnostic
+        // ConfigOutputs with nms=Auto directly — resolves to ClassAware
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Detection(configs::Detection {
                 decoder: configs::DecoderType::Ultralytics,
@@ -2280,15 +2281,122 @@ nms: class_aware
                 normalized: None,
             })],
             nms: Some(configs::Nms::Auto),
+            nms_multi_label: None,
             decoder_version: None,
         };
         let decoder = DecoderBuilder::new().with_config(config).build().unwrap();
         assert_eq!(
             decoder.nms,
-            Some(configs::Nms::ClassAgnostic),
-            "Auto in config should resolve to ClassAgnostic fallback"
+            Some(configs::Nms::ClassAware),
+            "Auto in config should resolve to ClassAware fallback"
         );
         assert_ne!(decoder.nms, Some(configs::Nms::Auto));
+    }
+
+    const YAML_DET_84: &str = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+"#;
+
+    #[test]
+    fn test_nms_auto_in_v1_yaml_resolves_class_aware() {
+        let yaml = format!("{YAML_DET_84}nms: auto\n");
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml)
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
+    }
+
+    fn v2_modelpack_det_json(nms_multi_label: Option<bool>) -> String {
+        let mut cfg: serde_json::Value = serde_json::from_str(
+            &edgefirst_bench::testdata::read_to_string("decoder/modelpack_det_logical.json"),
+        )
+        .unwrap();
+        if let Some(v) = nms_multi_label {
+            cfg["nms_multi_label"] = serde_json::json!(v);
+        }
+        cfg.to_string()
+    }
+
+    #[test]
+    fn test_multi_label_absent_from_metadata_defaults_off() {
+        let decoder = DecoderBuilder::new()
+            .with_config_json_str(v2_modelpack_det_json(None))
+            .build()
+            .unwrap();
+        assert!(!decoder.multi_label());
+    }
+
+    #[test]
+    fn test_multi_label_read_from_v2_metadata() {
+        let decoder = DecoderBuilder::new()
+            .with_config_json_str(v2_modelpack_det_json(Some(true)))
+            .build()
+            .unwrap();
+        assert!(decoder.multi_label());
+        assert_eq!(decoder.multi_label_source, MultiLabelSource::Metadata);
+    }
+
+    #[test]
+    fn test_multi_label_read_from_v1_yaml() {
+        let yaml = format!("{YAML_DET_84}nms_multi_label: true\n");
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml)
+            .build()
+            .unwrap();
+        assert!(decoder.multi_label());
+    }
+
+    #[test]
+    fn test_explicit_builder_false_overrides_metadata_true() {
+        let decoder = DecoderBuilder::new()
+            .with_config_json_str(v2_modelpack_det_json(Some(true)))
+            .with_multi_label(false)
+            .build()
+            .unwrap();
+        assert!(!decoder.multi_label());
+        assert_eq!(decoder.multi_label_source, MultiLabelSource::Explicit);
+    }
+
+    #[test]
+    fn test_explicit_builder_true_overrides_metadata_false() {
+        let decoder = DecoderBuilder::new()
+            .with_config_json_str(v2_modelpack_det_json(Some(false)))
+            .with_multi_label(true)
+            .build()
+            .unwrap();
+        assert!(decoder.multi_label());
+    }
+
+    #[test]
+    fn test_schema_v2_round_trips_nms_multi_label() {
+        let schema: crate::schema::SchemaV2 =
+            serde_json::from_str(&v2_modelpack_det_json(Some(true))).unwrap();
+        let out = serde_json::to_value(&schema).unwrap();
+        assert_eq!(out["nms_multi_label"], serde_json::json!(true));
+        let unset: crate::schema::SchemaV2 =
+            serde_json::from_str(&v2_modelpack_det_json(None)).unwrap();
+        assert!(serde_json::to_value(&unset)
+            .unwrap()
+            .get("nms_multi_label")
+            .is_none());
+    }
+
+    #[test]
+    fn test_nms_explicit_class_agnostic_config_still_honoured() {
+        let yaml = format!("{YAML_DET_84}nms: class_agnostic\n");
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml)
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
     }
 
     #[test]
@@ -3296,8 +3404,10 @@ outputs:
             300,
             None,
             None,
+            false,
             &mut output_boxes,
-        );
+        )
+        .unwrap();
 
         // Verify detections are produced
         assert!(
@@ -3392,8 +3502,10 @@ outputs:
             300,
             None,
             None,
+            false,
             &mut ref_boxes,
-        );
+        )
+        .unwrap();
         assert!(
             !ref_boxes.is_empty(),
             "reference (quant) decode produced no detections — fixture broken"
@@ -3418,7 +3530,8 @@ outputs:
             None,
             false, // multi_label: argmax for this parity test
             &mut output_boxes,
-        );
+        )
+        .unwrap();
 
         // Same detection count as the quantized reference.
         assert_eq!(
@@ -3498,8 +3611,10 @@ outputs:
             300,
             None,
             None,
+            false,
             &mut ref_boxes,
-        );
+        )
+        .unwrap();
         assert!(!ref_boxes.is_empty());
 
         // Dequantize to f32, then narrow to f16.
@@ -3523,7 +3638,8 @@ outputs:
             None,
             false, // multi_label: argmax for this parity test
             &mut output_boxes,
-        );
+        )
+        .unwrap();
 
         // Detection count within ±20% of quantized reference. Tolerance set
         // generously because scores near the 0.45 threshold can flip with
@@ -4391,8 +4507,10 @@ outputs:
             300,
             None,
             None,
+            false,
             &mut output_boxes,
-        );
+        )
+        .unwrap();
 
         // NCHW layout should be detected.
         assert_eq!(
@@ -4458,8 +4576,10 @@ outputs:
             300,
             None,
             None,
+            false,
             &mut output_boxes,
-        );
+        )
+        .unwrap();
 
         // Zero detections should result.
         assert!(

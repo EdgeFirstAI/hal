@@ -773,9 +773,12 @@ mod decoder_tests {
             (scores.slice(s![0, .., ..]), quant_scores),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
+            false,
             300,
             &mut output_boxes,
-        );
+        )
+        .unwrap();
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
                 bbox: BoundingBox {
@@ -895,9 +898,12 @@ mod decoder_tests {
             &[config0, config1],
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
+            false,
             300,
             &mut output_boxes,
-        );
+        )
+        .unwrap();
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
                 bbox: BoundingBox {
@@ -1514,8 +1520,10 @@ mod decoder_tests {
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
+            false,
             &mut output_boxes,
-        );
+        )
+        .unwrap();
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
                 bbox: BoundingBox {
@@ -1937,8 +1945,10 @@ mod decoder_tests {
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
+            false,
             &mut output_boxes_f32,
-        );
+        )
+        .unwrap();
 
         let mut output_boxes1: Vec<_> = Vec::with_capacity(500);
         let mut output_masks1: Vec<_> = Vec::with_capacity(500);
@@ -2559,7 +2569,7 @@ mod decoder_tests {
     fn test_nms_enum_default() {
         // Test that Nms enum has the correct default
         let default_nms: configs::Nms = Default::default();
-        assert_eq!(default_nms, configs::Nms::ClassAgnostic);
+        assert_eq!(default_nms, configs::Nms::ClassAware);
     }
 
     #[test]

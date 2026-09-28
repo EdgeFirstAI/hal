@@ -71,6 +71,7 @@ pub struct EfDecoderParams {
     pre_nms_top_k: usize,
     max_det: usize,
     input_dims: Option<(usize, usize)>,
+    multi_label: Option<bool>,
 }
 
 /// An opaque decoder.
@@ -105,6 +106,7 @@ pub extern "C" fn ef_decoder_params_new() -> *mut EfDecoderParams {
             pre_nms_top_k: 300,
             max_det: 100,
             input_dims: None,
+            multi_label: None,
         }))
     })
     .unwrap_or(std::ptr::null_mut())
@@ -231,7 +233,8 @@ pub unsafe extern "C" fn ef_decoder_params_set_input_dims(
     }
 }
 
-/// NMS mode: 0 = off, 1 = automatic, 2 = class-aware, 3 = class-agnostic.
+/// NMS mode: 0 = off, 1 = automatic (the model config's mode, else
+/// class-aware), 2 = class-aware, 3 = class-agnostic.
 ///
 /// # Safety
 /// `p` must be `NULL` or a live parameter set.
@@ -246,6 +249,30 @@ pub unsafe extern "C" fn ef_decoder_params_set_nms(p: *mut EfDecoderParams, nms:
                 3 => Some(configs::Nms::ClassAgnostic),
                 _ => return libc::EINVAL,
             };
+            0
+        })
+    }
+}
+
+/// Multi-label decode: 1 emits one box per class above the score threshold
+/// (validation decode), 0 one per anchor. Overrides the model config's
+/// `nms_multi_label`; unset, the config decides, else off. Tracked decode
+/// always uses one label per box. Any other value is `EINVAL`.
+///
+/// # Safety
+/// `p` must be `NULL` or a live parameter set.
+#[no_mangle]
+pub unsafe extern "C" fn ef_decoder_params_set_multi_label(
+    p: *mut EfDecoderParams,
+    enabled: i32,
+) -> c_int {
+    unsafe {
+        with_params(p, |p| {
+            p.multi_label = Some(match enabled {
+                0 => false,
+                1 => true,
+                _ => return libc::EINVAL,
+            });
             0
         })
     }
@@ -366,6 +393,9 @@ pub unsafe extern "C" fn ef_decoder_new(p: *const EfDecoderParams) -> *mut EfDec
             if let Some((w, h)) = p.input_dims {
                 b = b.with_input_dims(w, h);
             }
+            if let Some(v) = p.multi_label {
+                b = b.with_multi_label(v);
+            }
             if let Some(v) = p.decoder_version {
                 b = b.with_decoder_version(v);
             }
@@ -377,6 +407,7 @@ pub unsafe extern "C" fn ef_decoder_new(p: *const EfDecoderParams) -> *mut EfDec
                 b = b.with_config(ConfigOutputs {
                     outputs: p.outputs.clone(),
                     nms: p.nms,
+                    nms_multi_label: None,
                     decoder_version: p.decoder_version,
                 });
             } else if let Some(f) = &p.config_file {
@@ -1554,6 +1585,7 @@ mod tests {
             assert_eq!(ef_decoder_params_set_max_det(n, 10), libc::EINVAL);
             assert_eq!(ef_decoder_params_set_input_dims(n, 640, 640), libc::EINVAL);
             assert_eq!(ef_decoder_params_set_nms(n, 1), libc::EINVAL);
+            assert_eq!(ef_decoder_params_set_multi_label(n, 1), libc::EINVAL);
         }
     }
 
@@ -1566,6 +1598,60 @@ mod tests {
             assert_eq!(ef_decoder_params_set_nms(p, 99), libc::EINVAL);
             ef_decoder_params_free(p);
         }
+    }
+
+    #[test]
+    fn multi_label_setter_accepts_zero_and_one_only() {
+        unsafe {
+            let p = ef_decoder_params_new();
+            assert_eq!(ef_decoder_params_set_multi_label(p, 1), 0);
+            assert_eq!(ef_decoder_params_set_multi_label(p, 0), 0);
+            assert_eq!(ef_decoder_params_set_multi_label(p, 2), libc::EINVAL);
+            assert_eq!(ef_decoder_params_set_multi_label(p, -1), libc::EINVAL);
+            assert_eq!(
+                ef_decoder_params_set_multi_label(std::ptr::null_mut(), 1),
+                libc::EINVAL
+            );
+            ef_decoder_params_free(p);
+        }
+    }
+
+    /// Build from a one-output detection config, with optional metadata key
+    /// and optional explicit setter value; report the decoder's setting.
+    fn built_multi_label(metadata: Option<bool>, explicit: Option<i32>) -> bool {
+        let mut cfg = serde_json::json!({
+            "outputs": [{
+                "decoder": "ultralytics",
+                "type": "detection",
+                "shape": [1, 84, 8400],
+                "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 8400]]
+            }]
+        });
+        if let Some(v) = metadata {
+            cfg["nms_multi_label"] = serde_json::json!(v);
+        }
+        let j = std::ffi::CString::new(cfg.to_string()).unwrap();
+        unsafe {
+            let p = ef_decoder_params_new();
+            assert_eq!(ef_decoder_params_set_config_json(p, j.as_ptr(), 0), 0);
+            if let Some(v) = explicit {
+                assert_eq!(ef_decoder_params_set_multi_label(p, v), 0);
+            }
+            let d = ef_decoder_new(p);
+            assert!(!d.is_null());
+            let on = (*d).inner.multi_label();
+            ef_decoder_free(d);
+            ef_decoder_params_free(p);
+            on
+        }
+    }
+
+    #[test]
+    fn multi_label_reaches_the_built_decoder() {
+        assert!(!built_multi_label(None, None));
+        assert!(built_multi_label(None, Some(1)));
+        assert!(built_multi_label(Some(true), None));
+        assert!(!built_multi_label(Some(true), Some(0)));
     }
 
     #[test]

@@ -83,19 +83,39 @@ pub struct Decoder {
     /// multi-label decode.  **OFF by default.**
     ///
     /// # Deployment safety
-    /// Multi-label must never be enabled on the tracked/deployment path:
-    /// the ByteTrack IoU-only tracker spawns one track per detection, so
-    /// duplicate boxes for the same anchor at different labels produce
-    /// phantom tracks.  `decode_tracked_*` entry points assert this is off.
-    ///
-    /// This field is intentionally builder-only (not schema/config-driven)
-    /// so a deployed `edgefirst.json` can never accidentally enable it.
+    /// [`Decoder::decode_tracked`] ignores this and decodes one label per
+    /// box: ByteTrack matches on IoU only, so per-class duplicates of one
+    /// anchor would spawn phantom tracks.
     pub(crate) multi_label: bool,
+    /// Where `multi_label` came from; named in the tracked-decode warning.
+    pub(crate) multi_label_source: MultiLabelSource,
     /// Per-scale fast path. Constructed at build time from a schema-v2
     /// document with per-scale children. Wrapped in `Mutex` because
     /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
     /// the per-scale buffers are mutated per-frame.
     pub(crate) per_scale: Option<std::sync::Mutex<crate::per_scale::PerScaleDecoder>>,
+}
+
+/// Where a decoder's multi-label setting came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MultiLabelSource {
+    /// Neither the caller nor the model config set it.
+    #[default]
+    Default,
+    /// Declared by the model config's `nms_multi_label`.
+    Metadata,
+    /// Set by the caller through [`DecoderBuilder::with_multi_label`].
+    Explicit,
+}
+
+fn warn_once_tracked_multi_label(source: MultiLabelSource) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            ?source,
+            "multi_label is ignored when decoding for tracking; one label per box"
+        );
+    });
 }
 
 impl PartialEq for Decoder {
@@ -111,6 +131,7 @@ impl PartialEq for Decoder {
             && self.normalized == other.normalized
             && self.input_dims == other.input_dims
             && self.multi_label == other.multi_label
+            && self.multi_label_source == other.multi_label_source
             && self.decode_program.is_some() == other.decode_program.is_some()
             && self.per_scale.is_some() == other.per_scale.is_some()
     }
@@ -134,6 +155,7 @@ impl Clone for Decoder {
             normalized: self.normalized,
             input_dims: self.input_dims,
             multi_label: self.multi_label,
+            multi_label_source: self.multi_label_source,
             decode_program: self.decode_program.clone(),
             per_scale: None,
         }
@@ -280,6 +302,30 @@ impl Decoder {
         } else {
             "legacy"
         }
+    }
+
+    /// Whether [`Decoder::decode`] and [`Decoder::decode_proto`] emit one box
+    /// per class above the score threshold instead of one per anchor.
+    ///
+    /// [`Decoder::decode_tracked`] ignores this and always uses one label per
+    /// box.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// #    let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
+    ///     let decoder = DecoderBuilder::default()
+    ///         .with_config_yaml_str(config_yaml)
+    ///         .with_multi_label(true)
+    ///         .build()?;
+    ///     assert!(decoder.multi_label());
+    /// #    Ok(())
+    /// # }
+    /// ```
+    pub fn multi_label(&self) -> bool {
+        self.multi_label
     }
 
     /// This function returns the parsed model type of the decoder.
@@ -473,11 +519,24 @@ impl Decoder {
     /// Decode quantized model outputs into detection boxes and segmentation
     /// masks. The quantized outputs can be of u8, i8, u16, i16, u32, or i32
     /// types. Clears the provided output vectors before populating them.
+    /// [`Self::decode_quantized_impl`] with the decoder's own multi-label setting.
+    #[cfg(test)]
     pub(crate) fn decode_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError> {
+        self.decode_quantized_impl(outputs, output_boxes, output_masks, self.multi_label)
+    }
+
+    /// Dispatch with an explicit multi-label setting; tracked decode passes `false`.
+    pub(crate) fn decode_quantized_impl(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        multi_label: bool,
     ) -> Result<(), DecoderError> {
         output_boxes.clear();
         output_masks.clear();
@@ -487,38 +546,62 @@ impl Decoder {
                 scores,
                 segmentation,
             } => {
-                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_quantized(
+                    outputs,
+                    boxes,
+                    scores,
+                    multi_label,
+                    output_boxes,
+                )?;
                 self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_quantized(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                )?;
                 self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
-            ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)
-            }
-            ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)
-            }
+            ModelType::ModelPackDet { boxes, scores } => self.decode_modelpack_det_quantized(
+                outputs,
+                boxes,
+                scores,
+                multi_label,
+                output_boxes,
+            ),
+            ModelType::ModelPackDetSplit { detection } => self
+                .decode_modelpack_det_split_quantized(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                ),
             ModelType::ModelPackSeg { segmentation } => {
                 self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
             ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_quantized(outputs, boxes, output_boxes)
+                self.decode_yolo_det_quantized(outputs, boxes, multi_label, output_boxes)
             }
             ModelType::YoloSegDet { boxes, protos } => self.decode_yolo_segdet_quantized(
                 outputs,
                 boxes,
                 protos,
+                multi_label,
                 output_boxes,
                 output_masks,
             ),
-            ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_quantized(outputs, boxes, scores, output_boxes)
-            }
+            ModelType::YoloSplitDet { boxes, scores } => self.decode_yolo_split_det_quantized(
+                outputs,
+                boxes,
+                scores,
+                multi_label,
+                output_boxes,
+            ),
             ModelType::YoloSplitSegDet {
                 boxes,
                 scores,
@@ -530,6 +613,7 @@ impl Decoder {
                 scores,
                 mask_coeff,
                 protos,
+                multi_label,
                 output_boxes,
                 output_masks,
             ),
@@ -542,6 +626,7 @@ impl Decoder {
                 boxes,
                 mask_coeff,
                 protos,
+                multi_label,
                 output_boxes,
                 output_masks,
             ),
@@ -592,11 +677,28 @@ impl Decoder {
     /// Decode floating point model outputs into detection boxes and
     /// segmentation masks. Clears the provided output vectors before
     /// populating them.
+    /// [`Self::decode_float_impl`] with the decoder's own multi-label setting.
+    #[cfg(test)]
     pub(crate) fn decode_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
+    {
+        self.decode_float_impl(outputs, output_boxes, output_masks, self.multi_label)
+    }
+
+    /// Dispatch with an explicit multi-label setting; tracked decode passes `false`.
+    pub(crate) fn decode_float_impl<T>(
+        &self,
+        outputs: &[ArrayViewD<T>],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        multi_label: bool,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
@@ -610,33 +712,56 @@ impl Decoder {
                 scores,
                 segmentation,
             } => {
-                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_float(outputs, boxes, scores, multi_label, output_boxes)?;
                 self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_float(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                )?;
                 self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
             }
             ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_float(outputs, boxes, scores, multi_label, output_boxes)?;
             }
             ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_float(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                )?;
             }
             ModelType::ModelPackSeg { segmentation } => {
                 self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
             }
             ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_float(outputs, boxes, output_boxes)?;
+                self.decode_yolo_det_float(outputs, boxes, multi_label, output_boxes)?;
             }
             ModelType::YoloSegDet { boxes, protos } => {
-                self.decode_yolo_segdet_float(outputs, boxes, protos, output_boxes, output_masks)?;
+                self.decode_yolo_segdet_float(
+                    outputs,
+                    boxes,
+                    protos,
+                    multi_label,
+                    output_boxes,
+                    output_masks,
+                )?;
             }
             ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_float(outputs, boxes, scores, output_boxes)?;
+                self.decode_yolo_split_det_float(
+                    outputs,
+                    boxes,
+                    scores,
+                    multi_label,
+                    output_boxes,
+                )?;
             }
             ModelType::YoloSplitSegDet {
                 boxes,
@@ -650,6 +775,7 @@ impl Decoder {
                     scores,
                     mask_coeff,
                     protos,
+                    multi_label,
                     output_boxes,
                     output_masks,
                 )?;
@@ -664,6 +790,7 @@ impl Decoder {
                     boxes,
                     mask_coeff,
                     protos,
+                    multi_label,
                     output_boxes,
                     output_masks,
                 )?;
@@ -726,28 +853,57 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (detections
     /// are still decoded into `output_boxes`). Returns `Ok(Some(ProtoData))`
     /// for YOLO segmentation models.
+    /// [`Self::decode_quantized_proto_impl`] with the decoder's own multi-label setting.
+    #[cfg(test)]
     pub(crate) fn decode_quantized_proto(
         &self,
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        self.decode_quantized_proto_impl(outputs, output_boxes, self.multi_label)
+    }
+
+    /// Dispatch with an explicit multi-label setting; tracked decode passes `false`.
+    pub(crate) fn decode_quantized_proto_impl(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        output_boxes: &mut Vec<DetectBox>,
+        multi_label: bool,
+    ) -> Result<Option<ProtoData>, DecoderError> {
         output_boxes.clear();
         match &self.model_type {
             // Detection-only variants: decode boxes, return None for proto data.
             ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_quantized(
+                    outputs,
+                    boxes,
+                    scores,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_quantized(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_quantized(outputs, boxes, output_boxes)?;
+                self.decode_yolo_det_quantized(outputs, boxes, multi_label, output_boxes)?;
                 Ok(None)
             }
             ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_quantized(outputs, boxes, scores, output_boxes)?;
+                self.decode_yolo_split_det_quantized(
+                    outputs,
+                    boxes,
+                    scores,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::YoloEndToEndDet { boxes } => {
@@ -770,18 +926,34 @@ impl Decoder {
             }
             // ModelPack seg/segdet variants have no YOLO proto data.
             ModelType::ModelPackSegDet { boxes, scores, .. } => {
-                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_quantized(
+                    outputs,
+                    boxes,
+                    scores,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::ModelPackSegDetSplit { detection, .. } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_quantized(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::ModelPackSeg { .. } => Ok(None),
 
             ModelType::YoloSegDet { boxes, protos } => {
-                let proto =
-                    self.decode_yolo_segdet_quantized_proto(outputs, boxes, protos, output_boxes)?;
+                let proto = self.decode_yolo_segdet_quantized_proto(
+                    outputs,
+                    boxes,
+                    protos,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(Some(proto))
             }
             ModelType::YoloSplitSegDet {
@@ -796,6 +968,7 @@ impl Decoder {
                     scores,
                     mask_coeff,
                     protos,
+                    multi_label,
                     output_boxes,
                 )?;
                 Ok(Some(proto))
@@ -810,6 +983,7 @@ impl Decoder {
                     boxes,
                     mask_coeff,
                     protos,
+                    multi_label,
                     output_boxes,
                 )?;
                 Ok(Some(proto))
@@ -853,6 +1027,8 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (detections
     /// are still decoded into `output_boxes`). Returns `Ok(Some(ProtoData))`
     /// for YOLO segmentation models.
+    /// [`Self::decode_float_proto_impl`] with the decoder's own multi-label setting.
+    #[cfg(test)]
     pub(crate) fn decode_float_proto<T>(
         &self,
         outputs: &[ArrayViewD<T>],
@@ -862,23 +1038,48 @@ impl Decoder {
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::yolo::FloatProtoElem,
         f32: AsPrimitive<T>,
     {
+        self.decode_float_proto_impl(outputs, output_boxes, self.multi_label)
+    }
+
+    /// Dispatch with an explicit multi-label setting; tracked decode passes `false`.
+    pub(crate) fn decode_float_proto_impl<T>(
+        &self,
+        outputs: &[ArrayViewD<T>],
+        output_boxes: &mut Vec<DetectBox>,
+        multi_label: bool,
+    ) -> Result<Option<ProtoData>, DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::yolo::FloatProtoElem,
+        f32: AsPrimitive<T>,
+    {
         output_boxes.clear();
         match &self.model_type {
             // Detection-only variants: decode boxes, return None for proto data.
             ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_float(outputs, boxes, scores, multi_label, output_boxes)?;
                 Ok(None)
             }
             ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_float(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_float(outputs, boxes, output_boxes)?;
+                self.decode_yolo_det_float(outputs, boxes, multi_label, output_boxes)?;
                 Ok(None)
             }
             ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_float(outputs, boxes, scores, output_boxes)?;
+                self.decode_yolo_split_det_float(
+                    outputs,
+                    boxes,
+                    scores,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::YoloEndToEndDet { boxes } => {
@@ -901,18 +1102,28 @@ impl Decoder {
             }
             // ModelPack seg/segdet variants have no YOLO proto data.
             ModelType::ModelPackSegDet { boxes, scores, .. } => {
-                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_float(outputs, boxes, scores, multi_label, output_boxes)?;
                 Ok(None)
             }
             ModelType::ModelPackSegDetSplit { detection, .. } => {
-                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_float(
+                    outputs,
+                    detection,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(None)
             }
             ModelType::ModelPackSeg { .. } => Ok(None),
 
             ModelType::YoloSegDet { boxes, protos } => {
-                let proto =
-                    self.decode_yolo_segdet_float_proto(outputs, boxes, protos, output_boxes)?;
+                let proto = self.decode_yolo_segdet_float_proto(
+                    outputs,
+                    boxes,
+                    protos,
+                    multi_label,
+                    output_boxes,
+                )?;
                 Ok(Some(proto))
             }
             ModelType::YoloSplitSegDet {
@@ -927,6 +1138,7 @@ impl Decoder {
                     scores,
                     mask_coeff,
                     protos,
+                    multi_label,
                     output_boxes,
                 )?;
                 Ok(Some(proto))
@@ -941,6 +1153,7 @@ impl Decoder {
                     boxes,
                     mask_coeff,
                     protos,
+                    multi_label,
                     output_boxes,
                 )?;
                 Ok(Some(proto))
@@ -1014,6 +1227,39 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
+        self.decode_impl(outputs, output_boxes, output_masks, self.multi_label)
+    }
+
+    /// Decode with one label per box, whatever [`Self::multi_label`] says.
+    ///
+    /// Use this when the boxes feed an external tracker: trackers match on
+    /// IoU only, so per-class duplicates of one anchor become phantom tracks.
+    /// Logs a warning once per process when the decoder has multi-label
+    /// enabled. [`Self::decode_tracked`] applies the same rule.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::decode`].
+    pub fn decode_for_tracking(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError> {
+        if self.multi_label {
+            warn_once_tracked_multi_label(self.multi_label_source);
+        }
+        self.decode_impl(outputs, output_boxes, output_masks, false)
+    }
+
+    /// [`Self::decode`] with an explicit multi-label setting.
+    fn decode_impl(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        multi_label: bool,
+    ) -> Result<(), DecoderError> {
         let path = self.decode_path_label();
         let _span = tracing::trace_span!("decoder.decode", path = path, n_outputs = outputs.len())
             .entered();
@@ -1035,7 +1281,7 @@ impl Decoder {
                 self.max_det,
                 self.normalized,
                 self.input_dims,
-                self.multi_label,
+                multi_label,
             );
         }
 
@@ -1044,26 +1290,26 @@ impl Decoder {
         if let Some(program) = &self.decode_program {
             let merged = program.execute(outputs)?;
             let views: Vec<_> = merged.iter().map(|a| a.view()).collect();
-            return self.decode_float(&views, output_boxes, output_masks);
+            return self.decode_float_impl(&views, output_boxes, output_masks, multi_label);
         }
 
         let mapped = tensor_bridge::map_tensors(outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
-                self.decode_quantized(&views, output_boxes, output_masks)
+                self.decode_quantized_impl(&views, output_boxes, output_masks, multi_label)
             }
             tensor_bridge::MappedOutputs::Float16(maps) => {
                 let views = tensor_bridge::f16_views(maps)?;
-                self.decode_float(&views, output_boxes, output_masks)
+                self.decode_float_impl(&views, output_boxes, output_masks, multi_label)
             }
             tensor_bridge::MappedOutputs::Float32(maps) => {
                 let views = tensor_bridge::f32_views(maps)?;
-                self.decode_float(&views, output_boxes, output_masks)
+                self.decode_float_impl(&views, output_boxes, output_masks, multi_label)
             }
             tensor_bridge::MappedOutputs::Float64(maps) => {
                 let views = tensor_bridge::f64_views(maps)?;
-                self.decode_float(&views, output_boxes, output_masks)
+                self.decode_float_impl(&views, output_boxes, output_masks, multi_label)
             }
         }
     }
@@ -1098,6 +1344,16 @@ impl Decoder {
         outputs: &[&edgefirst_tensor::TensorDyn],
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        self.decode_proto_impl(outputs, output_boxes, self.multi_label)
+    }
+
+    /// [`Self::decode_proto`] with an explicit multi-label setting.
+    fn decode_proto_impl(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        multi_label: bool,
+    ) -> Result<Option<ProtoData>, DecoderError> {
         let path = self.decode_path_label();
         let _span = tracing::trace_span!(
             "decoder.decode_proto",
@@ -1122,7 +1378,7 @@ impl Decoder {
                 self.max_det,
                 self.normalized,
                 self.input_dims,
-                self.multi_label,
+                multi_label,
             );
         }
 
@@ -1131,26 +1387,26 @@ impl Decoder {
         if let Some(program) = &self.decode_program {
             let merged = program.execute(outputs)?;
             let views: Vec<_> = merged.iter().map(|a| a.view()).collect();
-            return self.decode_float_proto(&views, output_boxes);
+            return self.decode_float_proto_impl(&views, output_boxes, multi_label);
         }
 
         let mapped = tensor_bridge::map_tensors(outputs)?;
         let result = match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
-                self.decode_quantized_proto(&views, output_boxes)
+                self.decode_quantized_proto_impl(&views, output_boxes, multi_label)
             }
             tensor_bridge::MappedOutputs::Float16(maps) => {
                 let views = tensor_bridge::f16_views(maps)?;
-                self.decode_float_proto(&views, output_boxes)
+                self.decode_float_proto_impl(&views, output_boxes, multi_label)
             }
             tensor_bridge::MappedOutputs::Float32(maps) => {
                 let views = tensor_bridge::f32_views(maps)?;
-                self.decode_float_proto(&views, output_boxes)
+                self.decode_float_proto_impl(&views, output_boxes, multi_label)
             }
             tensor_bridge::MappedOutputs::Float64(maps) => {
                 let views = tensor_bridge::f64_views(maps)?;
-                self.decode_float_proto(&views, output_boxes)
+                self.decode_float_proto_impl(&views, output_boxes, multi_label)
             }
         };
         result
@@ -1206,13 +1462,6 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<(), DecoderError> {
-        // multi-label duplicates would spawn phantom tracks in ByteTrack
-        // (tracker matches IoU-only; two boxes for the same anchor at different
-        // labels become two tracks). Deployment must always stay on argmax.
-        debug_assert!(
-            !self.multi_label,
-            "multi_label must be off on the tracked/deployment path"
-        );
         output_boxes.clear();
         output_masks.clear();
         output_tracks.clear();
@@ -1293,7 +1542,7 @@ impl Decoder {
                 output_tracks,
             ),
             _ => {
-                self.decode_quantized(outputs, output_boxes, output_masks)?;
+                self.decode_quantized_impl(outputs, output_boxes, output_masks, false)?;
                 Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
                 Ok(())
             }
@@ -1322,10 +1571,6 @@ impl Decoder {
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
     {
-        debug_assert!(
-            !self.multi_label,
-            "multi_label must be off on the tracked/deployment path"
-        );
         output_boxes.clear();
         output_masks.clear();
         output_tracks.clear();
@@ -1412,7 +1657,7 @@ impl Decoder {
                 )?;
             }
             _ => {
-                self.decode_float(outputs, output_boxes, output_masks)?;
+                self.decode_float_impl(outputs, output_boxes, output_masks, false)?;
                 Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
             }
         }
@@ -1433,10 +1678,6 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError> {
-        debug_assert!(
-            !self.multi_label,
-            "multi_label must be off on the tracked/deployment path"
-        );
         output_boxes.clear();
         output_tracks.clear();
         match &self.model_type {
@@ -1524,7 +1765,7 @@ impl Decoder {
             // Non-seg variants: decode boxes via the non-proto path, then track.
             _ => {
                 let mut masks = Vec::new();
-                self.decode_quantized(outputs, output_boxes, &mut masks)?;
+                self.decode_quantized_impl(outputs, output_boxes, &mut masks, false)?;
                 Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
                 Ok(None)
             }
@@ -1636,7 +1877,7 @@ impl Decoder {
             // Non-seg variants: decode boxes via the non-proto path, then track.
             _ => {
                 let mut masks = Vec::new();
-                self.decode_float(outputs, output_boxes, &mut masks)?;
+                self.decode_float_impl(outputs, output_boxes, &mut masks, false)?;
                 Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
                 Ok(None)
             }
@@ -1675,12 +1916,15 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<(), DecoderError> {
+        if self.multi_label {
+            warn_once_tracked_multi_label(self.multi_label_source);
+        }
         // Per-scale fast path: route via the basic decode then update the
         // tracker. The current implementation keeps the tracker integration simple; per-frame
         // decoupling between detection and tracking is preserved.
         if self.per_scale.is_some() {
             output_tracks.clear();
-            self.decode(outputs, output_boxes, output_masks)?;
+            self.decode_impl(outputs, output_boxes, output_masks, false)?;
             Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
             return Ok(());
         }
@@ -1761,11 +2005,14 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        if self.multi_label {
+            warn_once_tracked_multi_label(self.multi_label_source);
+        }
         // Per-scale fast path: route via the basic decode_proto then
         // update the tracker on the resulting boxes.
         if self.per_scale.is_some() {
             output_tracks.clear();
-            let proto = self.decode_proto(outputs, output_boxes)?;
+            let proto = self.decode_proto_impl(outputs, output_boxes, false)?;
             Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
             return Ok(proto);
         }

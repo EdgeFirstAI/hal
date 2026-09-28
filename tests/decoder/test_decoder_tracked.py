@@ -865,3 +865,38 @@ outputs:
     assert np.allclose(boxes[0], expected_box0, atol=1e-2)
     assert np.allclose(boxes[1], expected_box1, atol=1e-2)
     assert masks == []
+
+
+def test_decode_tracked_ignores_multi_label():
+    # Anchor 0 clears the threshold for classes 0 and 1, anchor 1 for class 2.
+    config = {
+        "outputs": [
+            {
+                "decoder": "ultralytics",
+                "type": "detection",
+                "shape": [1, 7, 4],
+                "dshape": [["batch", 1], ["num_features", 7], ["num_boxes", 4]],
+                "normalized": True,
+            }
+        ]
+    }
+    per_anchor = np.array(
+        [
+            [0.3, 0.3, 0.2, 0.2, 0.9, 0.8, 0.0],
+            [0.7, 0.7, 0.2, 0.2, 0.0, 0.0, 0.9],
+            [0.5, 0.5, 0.1, 0.1, 0.0, 0.0, 0.0],
+            [0.2, 0.8, 0.1, 0.1, 0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    output = numpy_to_tensor(per_anchor.T.reshape(1, 7, 4).copy())
+
+    def run(multi_label):
+        decoder = ef.Decoder(config, 0.5, 0.5, multi_label=multi_label)
+        tracker = ByteTrack(high_conf=0.5)
+        classes = None
+        for ts in range(3):
+            _b, _s, classes, _m, _t = decoder.decode_tracked(tracker, ts, [output])
+        return sorted(classes.tolist())
+
+    assert run(True) == run(False) == [0, 2]

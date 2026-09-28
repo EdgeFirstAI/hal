@@ -13,7 +13,7 @@
 //! [`Nms`] is worth a note: it has no `None` variant. Bypassing suppression is
 //! expressed as `Option<Nms>::None` on the decoder configuration, and
 //! [`Nms::Auto`] means "take the mode from the config document", falling back
-//! to [`Nms::ClassAgnostic`] when the document is silent.
+//! to [`Nms::ClassAware`] when the document is silent.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -290,7 +290,7 @@ impl DecoderVersion {
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
 ///
 /// This enum is used with `Option<Nms>`:
-/// - `Some(Nms::Auto)` — resolve from config or fall back to `ClassAgnostic`
+/// - `Some(Nms::Auto)` — resolve from config or fall back to `ClassAware`
 /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping
 ///   boxes regardless of class label
 /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
@@ -300,16 +300,16 @@ impl DecoderVersion {
 #[serde(rename_all = "snake_case")]
 pub enum Nms {
     /// Let the builder resolve NMS mode from the model config (e.g.
-    /// `edgefirst.json`).  Falls back to [`Nms::ClassAgnostic`] when no
+    /// `edgefirst.json`).  Falls back to [`Nms::ClassAware`] when no
     /// config specifies a mode.  This is the builder default — callers
     /// should only use an explicit variant when they need to override
     /// the config.
     Auto,
-    /// Suppress overlapping boxes regardless of class label (default
-    /// concrete behavior).
-    #[default]
+    /// Suppress overlapping boxes regardless of class label.
     ClassAgnostic,
-    /// Only suppress boxes with the same class label that overlap.
+    /// Only suppress boxes with the same class label that overlap (default
+    /// concrete behavior; matches trainer and COCO evaluation).
+    #[default]
     ClassAware,
 }
 

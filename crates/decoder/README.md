@@ -88,9 +88,18 @@ Decoders can be configured via JSON/YAML matching the model's output specificati
 
 ## NMS Modes
 
-- `ClassAgnostic` - Suppress overlapping boxes regardless of class (default)
-- `ClassAware` - Only suppress boxes with the same class label
+- `Auto` - Use the model config's `nms` mode, falling back to `ClassAware` (builder default)
+- `ClassAware` - Only suppress boxes with the same class label (the default concrete mode, matching trainers and COCO evaluation)
+- `ClassAgnostic` - Suppress overlapping boxes regardless of class
 - `None` - Bypass NMS (for models with built-in NMS)
+
+## Multi-Label Decode
+
+By default the decoder keeps one box per anchor, labelled with its highest-scoring class. Multi-label decode instead emits a box for every class whose score clears `score_threshold`, which is how trainer validators and COCO-style evaluation count detections. Use it for validation and mAP runs, not deployment.
+
+Enable it with `DecoderBuilder::with_multi_label(true)`, the Python `multi_label=True` constructor argument, or `ef_decoder_params_set_multi_label(p, 1)`. A model can also declare it with the optional top-level `nms_multi_label` key in `edgefirst.json`; an explicit API value overrides the key. When NMS is enabled, multi-label forces class-aware NMS.
+
+`decode_tracked` and `decode_proto_tracked` ignore multi-label and always decode one label per box: the tracker matches on IoU only, so per-class duplicates of one anchor would become phantom tracks. Callers that feed their own tracker should use `decode_for_tracking`, which applies the same rule. Each logs a warning once if the decoder has multi-label enabled.
 
 ## Pre-NMS Top-K: Validation vs Deployment
 
@@ -241,10 +250,8 @@ a dict, which `Decoder(schema)` takes directly. The JSON rendering exists
 for the C API alone, which has no dict to hand across the boundary.
 
 The inferred schema pins the NMS *mode* but not the thresholds. Ultralytics
-runs NMS class-aware (`agnostic=False`), and leaving the field unset is not
-neutral — the builder's `Nms::Auto` default resolves an unset config to
-class-agnostic, which suppresses a box against an overlapping box of a
-different class. `with_nms` still overrides. YOLO26 end-to-end exports
+runs NMS class-aware (`agnostic=False`), and the schema says so explicitly
+rather than relying on the builder's fallback. `with_nms` still overrides. YOLO26 end-to-end exports
 perform NMS in-graph and carry no mode.
 
 Box normalization follows the export format, not a fixed convention:

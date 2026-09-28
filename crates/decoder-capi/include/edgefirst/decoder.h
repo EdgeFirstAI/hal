@@ -224,12 +224,24 @@ int ef_decoder_params_set_max_det(ef_decoder_params *p, uintptr_t v);
 int ef_decoder_params_set_input_dims(ef_decoder_params *p, uintptr_t width, uintptr_t height);
 
 /**
- * NMS mode: 0 = off, 1 = automatic, 2 = class-aware, 3 = class-agnostic.
+ * NMS mode: 0 = off, 1 = automatic (the model config's mode, else
+ * class-aware), 2 = class-aware, 3 = class-agnostic.
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.
  */
 int ef_decoder_params_set_nms(ef_decoder_params *p, uint32_t nms);
+
+/**
+ * Multi-label decode: 1 emits one box per class above the score threshold
+ * (validation decode), 0 one per anchor. Overrides the model config's
+ * `nms_multi_label`; unset, the config decides, else off. Tracked decode
+ * always uses one label per box. Any other value is `EINVAL`.
+ *
+ * # Safety
+ * `p` must be `NULL` or a live parameter set.
+ */
+int ef_decoder_params_set_multi_label(ef_decoder_params *p, int32_t enabled);
 
 /**
  * Configure from a JSON string. `len` may be 0 for NUL-terminated.

@@ -37,9 +37,13 @@ pub struct ConfigOutputs {
     ///   boxes regardless of class
     /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes with
     ///   the same class
-    /// - `None` — use builder default or skip NMS (user handles it externally)
+    /// - `None` — use the builder default (`Nms::Auto` resolves to class-aware)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nms: Option<configs::Nms>,
+    /// Emit one box per class above the score threshold (validation decode).
+    /// Tracked decode ignores it; an explicit decoder setting overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nms_multi_label: Option<bool>,
     /// Decoder version for Ultralytics models. Determines the decoding
     /// strategy.
     /// - `Some(Yolo26)` — end-to-end model with embedded NMS

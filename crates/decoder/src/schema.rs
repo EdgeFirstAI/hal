@@ -79,6 +79,11 @@ pub struct SchemaV2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nms: Option<NmsMode>,
 
+    /// Emit one box per class above the score threshold (validation decode).
+    /// Tracked decode ignores it; an explicit decoder setting overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nms_multi_label: Option<bool>,
+
     /// YOLO architecture version for Ultralytics decoders.
     ///
     /// Values: `yolov5`, `yolov8`, `yolo11`, `yolo26`. `yolo26` is
@@ -94,6 +99,7 @@ impl Default for SchemaV2 {
             input: None,
             outputs: Vec::new(),
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         }
     }
@@ -743,7 +749,8 @@ impl SchemaV2 {
             schema_version: 2,
             input: None,
             outputs,
-            nms: v1.nms.as_ref().map(NmsMode::from_v1),
+            nms: v1.nms.as_ref().and_then(NmsMode::from_v1),
+            nms_multi_label: v1.nms_multi_label,
             decoder_version: v1.decoder_version.as_ref().map(DecoderVersion::from_v1),
         })
     }
@@ -824,6 +831,7 @@ impl SchemaV2 {
         Ok(ConfigOutputs {
             outputs,
             nms: self.nms.map(NmsMode::to_v1),
+            nms_multi_label: self.nms_multi_label,
             decoder_version: self.decoder_version.map(|v| v.to_v1()),
         })
     }
@@ -1166,11 +1174,12 @@ impl DecoderVersion {
 }
 
 impl NmsMode {
-    /// Convert a legacy v1 [`configs::Nms`] to a v2 [`NmsMode`].
-    pub fn from_v1(v: &configs::Nms) -> Self {
+    /// Convert a legacy v1 [`configs::Nms`]; `Auto` defers to the builder default.
+    pub fn from_v1(v: &configs::Nms) -> Option<Self> {
         match v {
-            configs::Nms::Auto | configs::Nms::ClassAgnostic => NmsMode::ClassAgnostic,
-            configs::Nms::ClassAware => NmsMode::ClassAware,
+            configs::Nms::Auto => None,
+            configs::Nms::ClassAgnostic => Some(NmsMode::ClassAgnostic),
+            configs::Nms::ClassAware => Some(NmsMode::ClassAware),
         }
     }
 
@@ -1984,6 +1993,7 @@ mod tests {
                 activation_required: None,
             }],
             nms: Some(NmsMode::ClassAgnostic),
+            nms_multi_label: None,
             decoder_version: Some(DecoderVersion::Yolov8),
         };
         let j = serde_json::to_string(&original).unwrap();
@@ -2093,6 +2103,7 @@ mod tests {
                 normalized: Some(true),
             })],
             nms: Some(crate::configs::Nms::ClassAware),
+            nms_multi_label: None,
             decoder_version: Some(crate::configs::DecoderVersion::Yolo11),
         };
         let v2 = SchemaV2::from_v1(&v1).unwrap();
@@ -2193,6 +2204,7 @@ mod tests {
                 },
             ],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
@@ -2234,6 +2246,7 @@ mod tests {
                 activation_required: None,
             }],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
@@ -2278,6 +2291,7 @@ mod tests {
             input: None,
             outputs: vec![lo],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         schema.validate().expect(
@@ -2315,6 +2329,7 @@ mod tests {
                 normalized: None,
             })],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         let v2 = SchemaV2::from_v1(&v1).unwrap();

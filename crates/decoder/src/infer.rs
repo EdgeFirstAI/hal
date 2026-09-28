@@ -1043,13 +1043,9 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
             cameraadaptor: Some("rgb".into()),
         }),
         outputs,
-        // Ultralytics runs NMS with `agnostic=False`, i.e. class-aware, so
-        // that is what a schema describing an Ultralytics model must say.
-        // Leaving it unset is not neutral: the builder's `Nms::Auto` default
-        // resolves an unset config to ClassAgnostic (builder.rs `resolve_auto`),
-        // which suppresses a box against an overlapping box of a *different*
-        // class and silently loses recall against the model's own reference
-        // output. An explicit `.with_nms(..)` on the builder still overrides.
+        // Ultralytics runs NMS with `agnostic=False`, i.e. class-aware; stated
+        // explicitly so the schema describes the model rather than relying on
+        // the builder's fallback. An explicit `.with_nms(..)` still overrides.
         //
         // YOLO26 end-to-end heads do their NMS in-graph, so they carry none:
         // this field describes what the *decoder* must add.
@@ -1057,6 +1053,7 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
             DecoderVersion::Yolo26 => None,
             _ => Some(NmsMode::ClassAware),
         },
+        nms_multi_label: None,
         decoder_version: Some(version),
     };
 

@@ -35,7 +35,7 @@ based on the output tensor layout.
 - [`DetectBox`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.DetectBox.html) — output bounding box + score + class label.
 - [`Segmentation`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Segmentation.html) — per-detection mask matrix.
 - [`Quantization`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Quantization.html) — `(scale, zero_point)` for int8/uint8 outputs.
-- [`Nms`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/configs/enum.Nms.html) — `Auto` / `ClassAgnostic` / `ClassAware`. Bypass is expressed as `Option<Nms>::None` on the decoder configuration, not a variant of the enum.
+- [`Nms`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/configs/enum.Nms.html) — `Auto` / `ClassAgnostic` / `ClassAware`. Bypass is expressed as `Option<Nms>::None` on the decoder configuration, not a variant of the enum. `Auto` resolves at build time to the config's mode, else `ClassAware`; ModelPack and YOLO paths all honour the resolved mode.
 - [`SchemaV2`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.SchemaV2.html) — model metadata document (current schema version).
 
 ## Internal Architecture
@@ -497,6 +497,14 @@ fields: tiles, boxes_in, boxes_out
 - **Early termination in NMS loops** — once the partial score-sort top-K is reached, NMS exits without examining lower-confidence anchors.
 - **NEON FP16 hot paths on aarch64** — see [`per_scale/kernels/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/kernels/). Stable Rust lacks f16 intrinsics, so the kernels use inline `.arch_extension fp16` assembly. Tile-transpose plus 2^k injection (k ∈ [-14, 15]) keeps the GEMM in F16 throughout the inner loop.
 - **Tracing spans** — emitted via `tracing::trace_span!` at every public decode entry point. Near-zero cost when no subscriber is active. See [`README.md#performance-tracing`](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing).
+
+### Multi-label decode
+
+`Decoder.multi_label` comes from `DecoderBuilder::with_multi_label`, else the config's `nms_multi_label`, else `false`; `MultiLabelSource` records which, for the tracked-decode warning.
+
+Candidate selection has an argmax and a multi-label variant for each score representation: `postprocess_boxes_{index_,}float` / `postprocess_boxes_multilabel_{index_,}float` and `postprocess_boxes_{index_,}quant` / `postprocess_boxes_multilabel_{index_,}quant`. The `index` forms keep the anchor index so seg-det paths reuse one mask-coefficient row for every class of an anchor. Every NMS decode path (flat, split, 2-way, fused, per-scale, ModelPack; float and quantized; `decode` and `decode_proto`) chooses between them from one `multi_label` flag, and `yolo::effective_nms` switches enabled NMS to class-aware so per-class duplicates do not suppress each other.
+
+The flag is an argument, not a field read, below the dispatchers: `decode` / `decode_proto` pass `self.multi_label` into `decode_impl` / `decode_proto_impl` and on to `decode_{float,quantized}{,_proto}_impl`. Every tracking entry point passes `false` on every branch, including the per-scale and fallback arms that reuse the untracked dispatch: `decode_tracked`, `decode_proto_tracked`, and `decode_for_tracking` (the entry point for external trackers, used by the Python `decode_tracked`). Tracking therefore always sees one box per anchor, whatever the decoder was built with. A new tracking entry point must route through one of these.
 
 ### `pre_nms_top_k` for deployment vs. mAP evaluation
 

@@ -18,7 +18,8 @@
 #[cfg(target_arch = "aarch64")]
 use crate::arg_max_i8;
 use crate::{
-    arg_max, float::jaccard, BBoxTypeTrait, BoundingBox, DetectBoxQuantized, Quantization,
+    arg_max, float::jaccard, BBoxTypeTrait, BoundingBox, DecoderError, DecoderResult,
+    DetectBoxQuantized, Quantization,
 };
 use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
@@ -451,6 +452,76 @@ pub fn postprocess_boxes_index_quant<
         .collect()
 }
 
+/// Multi-label variant of [`postprocess_boxes_index_quant`]: one entry per
+/// class at or above `threshold`, sharing the anchor's bbox and index.
+///
+/// Intended for validation decode; deployment uses the argmax variant.
+///
+/// # Errors
+/// [`DecoderError::InvalidShape`] unless boxes are `[N, 4]` and scores `[N, C]`.
+pub fn postprocess_boxes_multilabel_index_quant<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+>(
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+) -> DecoderResult<Vec<(DetectBoxQuantized<Scores>, usize)>> {
+    check_candidate_shapes(boxes.dim(), scores.dim())?;
+    let indices: Array1<usize> = (0..boxes.dim().0).collect();
+    Ok(Zip::from(scores.rows())
+        .and(boxes.rows())
+        .and(&indices)
+        .into_par_iter()
+        .flat_map(|(score_row, bbox_row, &anchor_idx)| {
+            let bbox = BoundingBox::from(B::ndarray_to_xyxy_dequant(bbox_row.view(), quant_boxes));
+            score_row
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s >= threshold)
+                .map(move |(label, &score)| (DetectBoxQuantized { label, score, bbox }, anchor_idx))
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+/// [`postprocess_boxes_multilabel_index_quant`] without anchor indices.
+///
+/// # Errors
+/// [`DecoderError::InvalidShape`] unless boxes are `[N, 4]` and scores `[N, C]`.
+pub fn postprocess_boxes_multilabel_quant<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+>(
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+) -> DecoderResult<Vec<DetectBoxQuantized<Scores>>> {
+    Ok(
+        postprocess_boxes_multilabel_index_quant::<B, _, _>(threshold, boxes, scores, quant_boxes)?
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect(),
+    )
+}
+
+/// Candidate generators need `[N, 4]` boxes and `[N, C]` scores.
+pub(crate) fn check_candidate_shapes(
+    boxes: (usize, usize),
+    scores: (usize, usize),
+) -> DecoderResult<()> {
+    if boxes.1 != 4 || boxes.0 != scores.0 {
+        return Err(DecoderError::InvalidShape(format!(
+            "multi-label candidates need boxes [N, 4] and scores [N, C]; got boxes {boxes:?}, scores {scores:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Column-major optimized path for `postprocess_boxes_index_quant`.
 ///
 /// When scores come from a transposed DMA-BUF view ([N_candidates, N_classes]
@@ -863,6 +934,110 @@ mod tests {
     use super::*;
     use crate::{XYWH, XYXY};
     use ndarray::Array2;
+
+    fn unit_quant() -> Quantization {
+        Quantization {
+            scale: 0.1,
+            zero_point: 0,
+        }
+    }
+
+    fn sorted_by_anchor_label(
+        mut v: Vec<(DetectBoxQuantized<i8>, usize)>,
+    ) -> Vec<(DetectBoxQuantized<i8>, usize)> {
+        v.sort_by_key(|(b, i)| (*i, b.label));
+        v
+    }
+
+    #[test]
+    fn multilabel_index_quant_emits_every_class_above_threshold() {
+        let boxes = ndarray::arr2(&[[10i8, 10, 20, 20], [30, 30, 40, 40]]);
+        let scores = ndarray::arr2(&[[60i8, 10, 70], [5, 90, 5]]);
+        let got = sorted_by_anchor_label(
+            postprocess_boxes_multilabel_index_quant::<XYXY, _, _>(
+                50,
+                boxes.view(),
+                scores.view(),
+                unit_quant(),
+            )
+            .unwrap(),
+        );
+        let labels: Vec<(usize, usize)> = got.iter().map(|(b, i)| (*i, b.label)).collect();
+        assert_eq!(labels, vec![(0, 0), (0, 2), (1, 1)]);
+        assert_eq!(got[0].0.bbox, got[1].0.bbox);
+        assert_eq!(got[1].0.score, 70);
+    }
+
+    #[test]
+    fn multilabel_index_quant_column_major_matches_row_major() {
+        let boxes = ndarray::arr2(&[[10i8, 10, 20, 20], [30, 30, 40, 40]]);
+        let scores_t = ndarray::arr2(&[[60i8, 5], [10, 90], [70, 5]]);
+        let scores_cm = scores_t.view().reversed_axes();
+        let scores_rm = scores_cm.to_owned();
+        let a = postprocess_boxes_multilabel_index_quant::<XYXY, _, _>(
+            50,
+            boxes.view(),
+            scores_cm,
+            unit_quant(),
+        )
+        .unwrap();
+        let b = postprocess_boxes_multilabel_index_quant::<XYXY, _, _>(
+            50,
+            boxes.view(),
+            scores_rm.view(),
+            unit_quant(),
+        )
+        .unwrap();
+        assert_eq!(sorted_by_anchor_label(a), sorted_by_anchor_label(b));
+    }
+
+    #[test]
+    fn multilabel_index_quant_rejects_mismatched_shapes() {
+        let boxes = ndarray::arr2(&[[10i8, 10, 20, 20]]);
+        let scores = ndarray::arr2(&[[60i8, 10], [5, 90]]);
+        let r = postprocess_boxes_multilabel_index_quant::<XYXY, _, _>(
+            50,
+            boxes.view(),
+            scores.view(),
+            unit_quant(),
+        );
+        assert!(matches!(r, Err(crate::DecoderError::InvalidShape(_))));
+    }
+
+    #[test]
+    fn multilabel_quant_rejects_non_four_column_boxes() {
+        let boxes = ndarray::arr2(&[[10i8, 10, 20, 20, 0]]);
+        let scores = ndarray::arr2(&[[60i8]]);
+        let r = postprocess_boxes_multilabel_quant::<XYXY, _, _>(
+            50,
+            boxes.view(),
+            scores.view(),
+            unit_quant(),
+        );
+        assert!(matches!(r, Err(crate::DecoderError::InvalidShape(_))));
+    }
+
+    #[test]
+    fn multilabel_quant_drops_indices_only() {
+        let boxes = ndarray::arr2(&[[10i8, 10, 20, 20], [30, 30, 40, 40]]);
+        let scores = ndarray::arr2(&[[60i8, 10, 70], [5, 90, 5]]);
+        let with_idx = postprocess_boxes_multilabel_index_quant::<XYXY, _, _>(
+            50,
+            boxes.view(),
+            scores.view(),
+            unit_quant(),
+        )
+        .unwrap();
+        let without = postprocess_boxes_multilabel_quant::<XYXY, _, _>(
+            50,
+            boxes.view(),
+            scores.view(),
+            unit_quant(),
+        )
+        .unwrap();
+        let stripped: Vec<_> = with_idx.into_iter().map(|(b, _)| b).collect();
+        assert_eq!(stripped, without);
+    }
 
     /// Verify that the column-major path produces identical results to the
     /// row-major path for a transposed (non-contiguous) score array.

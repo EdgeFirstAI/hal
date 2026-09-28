@@ -12,11 +12,12 @@ use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    byte::{nms_int, postprocess_boxes_quant, quantize_score_threshold},
-    configs::Detection,
+    byte::{postprocess_boxes_multilabel_quant, postprocess_boxes_quant, quantize_score_threshold},
+    configs::{Detection, Nms},
     dequant_detect_box,
-    float::{nms_float, postprocess_boxes_float},
-    BBoxTypeTrait, DecoderError, DetectBox, Quantization, XYWH, XYXY,
+    float::{postprocess_boxes_float, postprocess_boxes_multilabel_float},
+    yolo::{dispatch_nms_float, dispatch_nms_int, effective_nms},
+    BBoxTypeTrait, DecoderError, DecoderResult, DetectBox, Quantization, XYWH, XYXY,
 };
 
 /// Configuration for ModelPack split detection decoder. The quantization is
@@ -50,6 +51,7 @@ impl TryFrom<&Detection> for ModelPackDetectionConfig {
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_det<
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -58,9 +60,12 @@ pub(crate) fn decode_modelpack_det<
     scores_tensor: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) where
+) -> DecoderResult<()>
+where
     f32: AsPrimitive<SCORE>,
 {
     impl_modelpack_quant::<XYXY, _, _>(
@@ -68,6 +73,8 @@ pub(crate) fn decode_modelpack_det<
         scores_tensor,
         score_threshold,
         iou_threshold,
+        nms,
+        multi_label,
         max_det,
         output_boxes,
     )
@@ -82,6 +89,7 @@ pub(crate) fn decode_modelpack_det<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_float<
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
@@ -90,9 +98,12 @@ pub(crate) fn decode_modelpack_float<
     scores_tensor: ArrayView2<SCORE>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) where
+) -> DecoderResult<()>
+where
     f32: AsPrimitive<SCORE>,
 {
     impl_modelpack_float::<XYXY, _, _>(
@@ -100,6 +111,8 @@ pub(crate) fn decode_modelpack_float<
         scores_tensor,
         score_threshold,
         iou_threshold,
+        nms,
+        multi_label,
         max_det,
         output_boxes,
     )
@@ -116,19 +129,24 @@ pub(crate) fn decode_modelpack_float<
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) -> DecoderResult<()> {
     impl_modelpack_split_quant::<XYWH, D>(
         outputs,
         configs,
         score_threshold,
         iou_threshold,
+        nms,
+        multi_label,
         max_det,
         output_boxes,
     )
@@ -144,22 +162,27 @@ pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) -> DecoderResult<()> {
     impl_modelpack_split_float::<XYWH, D>(
         outputs,
         configs,
         score_threshold,
         iou_threshold,
+        nms,
+        multi_label,
         max_det,
         output_boxes,
-    );
+    )
 }
 /// Implementation of ModelPack detection decoding for quantized tensors.
 ///
@@ -169,6 +192,7 @@ pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -178,27 +202,45 @@ pub(crate) fn impl_modelpack_quant<
     scores: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) where
+) -> DecoderResult<()>
+where
     f32: AsPrimitive<SCORE>,
 {
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
-        postprocess_boxes_quant::<B, _, _>(
-            score_threshold,
-            boxes_tensor,
-            scores_tensor,
-            quant_boxes,
-        )
+        if multi_label {
+            postprocess_boxes_multilabel_quant::<B, _, _>(
+                score_threshold,
+                boxes_tensor,
+                scores_tensor,
+                quant_boxes,
+            )?
+        } else {
+            postprocess_boxes_quant::<B, _, _>(
+                score_threshold,
+                boxes_tensor,
+                scores_tensor,
+                quant_boxes,
+            )
+        }
     };
-    let boxes = nms_int(iou_threshold, Some(max_det), boxes);
+    let boxes = dispatch_nms_int(
+        effective_nms(nms, multi_label),
+        iou_threshold,
+        Some(max_det),
+        boxes,
+    );
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(dequant_detect_box(&b, quant_scores));
     }
+    Ok(())
 }
 
 /// Implementation of ModelPack detection decoding for float tensors.
@@ -209,6 +251,7 @@ pub(crate) fn impl_modelpack_quant<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -218,18 +261,34 @@ pub(crate) fn impl_modelpack_float<
     scores_tensor: ArrayView2<SCORE>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) where
+) -> DecoderResult<()>
+where
     f32: AsPrimitive<SCORE>,
 {
-    let boxes =
-        postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
-    let boxes = nms_float(iou_threshold, Some(max_det), boxes);
+    let boxes = if multi_label {
+        postprocess_boxes_multilabel_float::<B, _, _>(
+            score_threshold.as_(),
+            boxes_tensor,
+            scores_tensor,
+        )?
+    } else {
+        postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
+    };
+    let boxes = dispatch_nms_float(
+        effective_nms(nms, multi_label),
+        iou_threshold,
+        Some(max_det),
+        boxes,
+    );
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
     }
+    Ok(())
 }
 
 /// Implementation of ModelPack split detection decoding for quantized tensors.
@@ -241,25 +300,42 @@ pub(crate) fn impl_modelpack_float<
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) -> DecoderResult<()> {
     let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_quant(outputs, configs);
-    let boxes = postprocess_boxes_float::<B, _, _>(
-        score_threshold,
-        boxes_tensor.view(),
-        scores_tensor.view(),
+    let boxes = if multi_label {
+        postprocess_boxes_multilabel_float::<B, _, _>(
+            score_threshold,
+            boxes_tensor.view(),
+            scores_tensor.view(),
+        )?
+    } else {
+        postprocess_boxes_float::<B, _, _>(
+            score_threshold,
+            boxes_tensor.view(),
+            scores_tensor.view(),
+        )
+    };
+    let boxes = dispatch_nms_float(
+        effective_nms(nms, multi_label),
+        iou_threshold,
+        Some(max_det),
+        boxes,
     );
-    let boxes = nms_float(iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
     }
+    Ok(())
 }
 
 /// Implementation of ModelPack split detection decoding for float tensors.
@@ -271,25 +347,42 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
+    multi_label: bool,
     max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) -> DecoderResult<()> {
     let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_float(outputs, configs);
-    let boxes = postprocess_boxes_float::<B, _, _>(
-        score_threshold,
-        boxes_tensor.view(),
-        scores_tensor.view(),
+    let boxes = if multi_label {
+        postprocess_boxes_multilabel_float::<B, _, _>(
+            score_threshold,
+            boxes_tensor.view(),
+            scores_tensor.view(),
+        )?
+    } else {
+        postprocess_boxes_float::<B, _, _>(
+            score_threshold,
+            boxes_tensor.view(),
+            scores_tensor.view(),
+        )
+    };
+    let boxes = dispatch_nms_float(
+        effective_nms(nms, multi_label),
+        iou_threshold,
+        Some(max_det),
+        boxes,
     );
-    let boxes = nms_float(iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
     }
+    Ok(())
 }
 
 /// Post processes ModelPack split detection into detection boxes,
@@ -725,5 +818,38 @@ mod modelpack_tests {
     fn test_modelpack_segmentation_to_mask_invalid() {
         let seg = Array3::from_shape_vec((2, 2, 1), vec![0u8, 10, 20, 30]).unwrap();
         let _ = modelpack_segmentation_to_mask(seg.view());
+    }
+
+    #[test]
+    fn modelpack_split_float_multi_label_emits_every_class() {
+        // 1x1 grid, one anchor, two classes both saturated.
+        let p = ndarray::Array3::from_shape_vec(
+            (1, 1, 7),
+            vec![0.0f32, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0],
+        )
+        .unwrap();
+        let cfg = ModelPackDetectionConfig {
+            anchors: vec![[0.5, 0.5]],
+            quantization: None,
+        };
+        let run = |multi_label: bool| {
+            let mut out = Vec::with_capacity(8);
+            decode_modelpack_split_float(
+                &[p.view()],
+                std::slice::from_ref(&cfg),
+                0.5,
+                0.5,
+                Some(Nms::ClassAgnostic),
+                multi_label,
+                8,
+                &mut out,
+            )
+            .unwrap();
+            let mut labels: Vec<usize> = out.iter().map(|b| b.label).collect();
+            labels.sort_unstable();
+            labels
+        };
+        assert_eq!(run(false).len(), 1);
+        assert_eq!(run(true), vec![0, 1]);
     }
 }

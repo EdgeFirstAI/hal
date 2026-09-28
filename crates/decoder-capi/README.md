@@ -176,14 +176,17 @@ and guessing scales every box by the input size.
 
 An inferred schema pins the NMS *mode* and leaves the *thresholds* to you.
 Ultralytics runs NMS class-aware (`agnostic=False`), so a pre-NMS YOLOv8/11
-schema says so — leaving it unset is not neutral, because
-`ef_decoder_params_new` defaults to mode `1` (automatic), which resolves an
-unset config to class-agnostic and would suppress a box against an
-overlapping box of a *different* class. `ef_decoder_params_set_nms` still
-overrides. Thresholds are not inferable from shapes, and the library's
+schema says so explicitly. `ef_decoder_params_new` defaults to mode `1`
+(automatic), which takes the config's mode and otherwise resolves to
+class-aware; `ef_decoder_params_set_nms` still overrides. Thresholds are not inferable from shapes, and the library's
 defaults (`0.5`/`0.5`) are not Ultralytics' (`0.25`/`0.45`), so set them
 explicitly as above. YOLO26 end-to-end exports apply their own NMS in-graph
 and carry no mode at all.
+
+For validation and mAP runs, `ef_decoder_params_set_multi_label(p, 1)` emits
+one box per class above the score threshold instead of one per anchor. It
+overrides the model config's `nms_multi_label`; tracked decode ignores it and
+always keeps one label per box.
 
 Inference never guesses: metadata and shapes are cross-checked, and a
 disagreement — a class count that does not fit the output width, a `segment`

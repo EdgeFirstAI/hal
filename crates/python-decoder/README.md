@@ -56,7 +56,7 @@ boxes, scores, classes, masks = decoder.decode([output])
 print(np.asarray(boxes), np.asarray(scores), np.asarray(classes))
 ```
 
-Boxes come back normalized. NMS runs by default in class-agnostic mode; pass `nms=Nms.ClassAware` or `nms=None` to change or bypass it.
+Boxes come back normalized. NMS runs class-aware by default (unless the model config sets a mode); pass `nms=Nms.ClassAgnostic` or `nms=None` to change or bypass it. For validation and mAP runs, pass `multi_label=True` to emit one box per class above the score threshold instead of one per anchor; `decode_tracked` ignores it.
 
 For a quantized model, attach the quantization parameters to the output description so the decoder dequantizes as it reads:
 
@@ -142,9 +142,7 @@ need real sizes.
 
 The schema pins the NMS *mode* and leaves the *thresholds* to you.
 Ultralytics runs NMS class-aware (`agnostic=False`), so an inferred pre-NMS
-schema says so rather than inheriting `Decoder`'s class-agnostic default,
-which would suppress a box against an overlapping box of a different class.
-Passing `nms=` still overrides. Thresholds are not inferable, and
+schema says so explicitly. Passing `nms=` still overrides. Thresholds are not inferable, and
 `Decoder`'s defaults (`score_threshold=0.1`, `iou_threshold=0.7`) are not
 Ultralytics' (`0.25`/`0.45`) — pass them as shown above. YOLO26 end-to-end
 exports apply NMS in-graph and carry no mode at all.

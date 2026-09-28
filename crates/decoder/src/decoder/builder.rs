@@ -131,7 +131,7 @@ pub struct DecoderBuilder {
     /// NMS mode.
     ///
     /// - `Some(Nms::Auto)` — resolve from config or fallback to
-    ///   `ClassAgnostic` (builder default)
+    ///   `ClassAware` (builder default)
     /// - `Some(Nms::ClassAgnostic)` — explicit class-agnostic override
     /// - `Some(Nms::ClassAware)` — explicit class-aware override
     /// - `None` — bypass NMS entirely
@@ -147,10 +147,9 @@ pub struct DecoderBuilder {
     /// over schema-derived dims; when `None`, the value is read from the
     /// schema's `input.shape` / `input.dshape` at build time.
     input_dims: Option<(usize, usize)>,
-    /// Emit one candidate per (anchor, class) for every class above the score
-    /// threshold — matching Ultralytics `val` multi-label decode.
-    /// OFF by default.  Never read from schema/config (builder-only flag).
-    multi_label: bool,
+    /// Explicit multi-label override; `None` defers to the config's
+    /// `nms_multi_label`, then to off.
+    multi_label: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,7 +194,7 @@ impl Default for DecoderBuilder {
             pre_nms_top_k: 300,
             max_det: 300,
             input_dims: None,
-            multi_label: false,
+            multi_label: None,
         }
     }
 }
@@ -904,7 +903,7 @@ impl DecoderBuilder {
     /// Sets the NMS mode for the decoder.
     ///
     /// - `Some(Nms::Auto)` — resolve from model config (e.g. `edgefirst.json`)
-    ///   or fall back to `ClassAgnostic` (this is the builder default)
+    ///   or fall back to `ClassAware` (this is the builder default)
     /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping
     ///   boxes regardless of class label
     /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
@@ -935,12 +934,13 @@ impl DecoderBuilder {
     /// for every class whose score meets the threshold — matching the
     /// Ultralytics `val` multi-label decode that drives COCO mAP evaluation.
     ///
-    /// **Default: `false`** (argmax: one class per anchor).  This flag is
-    /// intentionally builder-only: a deployed `edgefirst.json` can never
-    /// enable it, and `decode_tracked_*` entry points `debug_assert` it is off.
+    /// **Default:** the model config's `nms_multi_label`, else `false`
+    /// (argmax: one class per anchor). An explicit call overrides the config
+    /// either way. [`Decoder::decode_tracked`](crate::Decoder::decode_tracked)
+    /// ignores it and always decodes one label per box.
     ///
-    /// Multi-label automatically forces class-aware NMS so per-class duplicates
-    /// are suppressed correctly without cross-class suppression.
+    /// When NMS is enabled, multi-label forces class-aware NMS so per-class
+    /// duplicates are not suppressed across classes.
     ///
     /// # Examples
     /// ```rust
@@ -955,7 +955,7 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn with_multi_label(mut self, v: bool) -> Self {
-        self.multi_label = v;
+        self.multi_label = Some(v);
         self
     }
 
@@ -1136,16 +1136,22 @@ impl DecoderBuilder {
             Self::get_normalized(&config.outputs)
         };
 
+        let (multi_label, multi_label_source) = match (self.multi_label, config.nms_multi_label) {
+            (Some(v), _) => (v, super::MultiLabelSource::Explicit),
+            (None, Some(v)) => (v, super::MultiLabelSource::Metadata),
+            (None, None) => (false, super::MultiLabelSource::Default),
+        };
+
         // NMS precedence:
         //   Some(ClassAgnostic|ClassAware) → explicit user override
-        //   Some(Auto) → resolve from config, fallback to ClassAgnostic
+        //   Some(Auto) → resolve from config, fallback to ClassAware
         //   None → NMS disabled (explicit)
         //
         // `Auto` is always resolved to a concrete mode here — it never
         // persists into the built `Decoder`, even if the config itself
         // contains `Auto`.
         let resolve_auto = |nms: Option<configs::Nms>| match nms {
-            Some(configs::Nms::Auto) | None => Some(configs::Nms::ClassAgnostic),
+            Some(configs::Nms::Auto) | None => Some(configs::Nms::ClassAware),
             concrete => concrete,
         };
         let nms = match self.nms {
@@ -1186,7 +1192,8 @@ impl DecoderBuilder {
             max_det: self.max_det,
             normalized,
             input_dims,
-            multi_label: self.multi_label,
+            multi_label,
+            multi_label_source,
             decode_program,
             per_scale,
         })

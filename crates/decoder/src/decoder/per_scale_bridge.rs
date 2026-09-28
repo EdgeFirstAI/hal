@@ -144,7 +144,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
             pre_nms_top_k,
             max_det,
             multi_label,
-        )
+        )?
     };
     // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.
     // Apply EDGEAI-1303 normalization so output bboxes land in the
@@ -212,7 +212,7 @@ pub(super) fn per_scale_to_masks<'a>(
             pre_nms_top_k,
             max_det,
             multi_label,
-        )
+        )?
     };
     // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.
     // Normalize before mask processing so `protobox` sees [0, 1] coords
