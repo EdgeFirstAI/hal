@@ -496,6 +496,24 @@ pub unsafe extern "C" fn ef_decoder_normalized_boxes(d: *const EfDecoder) -> c_i
     }
 }
 
+/// Whether `ef_decoder_decode` emits one box per class above the score
+/// threshold instead of one per anchor. Tracked decode always uses one label
+/// per box.
+///
+/// @return 1 yes, 0 no, -1 when `d` is `NULL`.
+///
+/// # Safety
+/// `d` must be `NULL` or live.
+#[no_mangle]
+pub unsafe extern "C" fn ef_decoder_multi_label(d: *const EfDecoder) -> c_int {
+    unsafe {
+        if d.is_null() {
+            return -1;
+        }
+        catch_unwind(AssertUnwindSafe(|| c_int::from((*d).inner.multi_label()))).unwrap_or(-1)
+    }
+}
+
 /// The model type as a NUL-terminated string the caller must free with
 /// [`ef_decoder_string_free`].
 ///
@@ -1643,6 +1661,36 @@ mod tests {
             ef_decoder_free(d);
             ef_decoder_params_free(p);
             on
+        }
+    }
+
+    #[test]
+    fn multi_label_getter_reports_the_setting() {
+        unsafe {
+            assert_eq!(ef_decoder_multi_label(std::ptr::null()), -1);
+        }
+        assert!(built_multi_label(Some(true), None));
+        let cfg = serde_json::json!({
+            "outputs": [{
+                "decoder": "ultralytics",
+                "type": "detection",
+                "shape": [1, 84, 8400],
+                "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 8400]]
+            }],
+            "nms_multi_label": true
+        });
+        let j = std::ffi::CString::new(cfg.to_string()).unwrap();
+        unsafe {
+            let p = ef_decoder_params_new();
+            assert_eq!(ef_decoder_params_set_config_json(p, j.as_ptr(), 0), 0);
+            let d = ef_decoder_new(p);
+            assert_eq!(ef_decoder_multi_label(d), 1);
+            ef_decoder_free(d);
+            assert_eq!(ef_decoder_params_set_multi_label(p, 0), 0);
+            let d = ef_decoder_new(p);
+            assert_eq!(ef_decoder_multi_label(d), 0);
+            ef_decoder_free(d);
+            ef_decoder_params_free(p);
         }
     }
 

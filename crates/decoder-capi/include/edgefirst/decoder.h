@@ -310,6 +310,18 @@ int ef_decoder_input_dims(const ef_decoder *d, uintptr_t *width, uintptr_t *heig
 int ef_decoder_normalized_boxes(const ef_decoder *d);
 
 /**
+ * Whether `ef_decoder_decode` emits one box per class above the score
+ * threshold instead of one per anchor. Tracked decode always uses one label
+ * per box.
+ *
+ * @return 1 yes, 0 no, -1 when `d` is `NULL`.
+ *
+ * # Safety
+ * `d` must be `NULL` or live.
+ */
+int ef_decoder_multi_label(const ef_decoder *d);
+
+/**
  * The model type as a NUL-terminated string the caller must free with
  * [`ef_decoder_string_free`].
  *

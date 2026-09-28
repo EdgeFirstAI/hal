@@ -186,7 +186,8 @@ and carry no mode at all.
 For validation and mAP runs, `ef_decoder_params_set_multi_label(p, 1)` emits
 one box per class above the score threshold instead of one per anchor. It
 overrides the model config's `nms_multi_label`; tracked decode ignores it and
-always keeps one label per box.
+always keeps one label per box. `ef_decoder_multi_label(d)` reports the
+setting a built decoder ended up with, including one taken from metadata.
 
 Inference never guesses: metadata and shapes are cross-checked, and a
 disagreement — a class count that does not fit the output width, a `segment`

@@ -2157,7 +2157,7 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
+            false, // multi_label: tracked decode is always single-label
         )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
@@ -2272,7 +2272,7 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
+            false, // multi_label: tracked decode is always single-label
         )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
@@ -3083,7 +3083,7 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
+            false, // multi_label: tracked decode is always single-label
         )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
@@ -3210,7 +3210,7 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
+            false, // multi_label: tracked decode is always single-label
         )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked

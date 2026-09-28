@@ -470,6 +470,13 @@ pub fn postprocess_boxes_multilabel_index_quant<
     quant_boxes: Quantization,
 ) -> DecoderResult<Vec<(DetectBoxQuantized<Scores>, usize)>> {
     check_candidate_shapes(boxes.dim(), scores.dim())?;
+    if scores.strides()[0] == 1 && scores.as_slice().is_none() {
+        return Ok(postprocess_boxes_multilabel_index_quant_column_major::<
+            B,
+            _,
+            _,
+        >(threshold, boxes, scores, quant_boxes));
+    }
     let indices: Array1<usize> = (0..boxes.dim().0).collect();
     Ok(Zip::from(scores.rows())
         .and(boxes.rows())
@@ -509,6 +516,55 @@ pub fn postprocess_boxes_multilabel_quant<
     )
 }
 
+/// Column-major path for [`postprocess_boxes_multilabel_index_quant`].
+///
+/// Reads each class column contiguously (the transposed DMA-BUF layout),
+/// then orders hits by `(anchor, class)` to match the row-major output and
+/// dequantizes each anchor's bbox once.
+fn postprocess_boxes_multilabel_index_quant_column_major<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+>(
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+) -> Vec<(DetectBoxQuantized<Scores>, usize)> {
+    let mut hits: Vec<(usize, usize, Scores)> = (0..scores.dim().1)
+        .into_par_iter()
+        .flat_map_iter(|class_idx| {
+            let col = scores.column(class_idx);
+            let above = |(i, &s): (usize, &Scores)| (s >= threshold).then_some((i, class_idx, s));
+            match col.as_slice() {
+                Some(slice) => slice
+                    .iter()
+                    .enumerate()
+                    .filter_map(above)
+                    .collect::<Vec<_>>(),
+                None => col.iter().enumerate().filter_map(above).collect(),
+            }
+        })
+        .collect();
+    hits.par_sort_unstable_by_key(|&(anchor, class, _)| (anchor, class));
+
+    let mut out = Vec::with_capacity(hits.len());
+    let mut current: Option<(usize, BoundingBox)> = None;
+    for (anchor, label, score) in hits {
+        let bbox = match current {
+            Some((a, bbox)) if a == anchor => bbox,
+            _ => {
+                let bbox =
+                    BoundingBox::from(B::ndarray_to_xyxy_dequant(boxes.row(anchor), quant_boxes));
+                current = Some((anchor, bbox));
+                bbox
+            }
+        };
+        out.push((DetectBoxQuantized { label, score, bbox }, anchor));
+    }
+    out
+}
+
 /// Candidate generators need `[N, 4]` boxes and `[N, C]` scores.
 pub(crate) fn check_candidate_shapes(
     boxes: (usize, usize),
@@ -516,7 +572,7 @@ pub(crate) fn check_candidate_shapes(
 ) -> DecoderResult<()> {
     if boxes.1 != 4 || boxes.0 != scores.0 {
         return Err(DecoderError::InvalidShape(format!(
-            "multi-label candidates need boxes [N, 4] and scores [N, C]; got boxes {boxes:?}, scores {scores:?}"
+            "candidate selection needs boxes [N, 4] and scores [N, C]; got boxes {boxes:?}, scores {scores:?}"
         )));
     }
     Ok(())
@@ -1041,6 +1097,70 @@ mod tests {
 
     /// Verify that the column-major path produces identical results to the
     /// row-major path for a transposed (non-contiguous) score array.
+    /// Multi-label on a transposed (DMA-BUF style) score view must match the
+    /// contiguous row-major result exactly, including order.
+    fn multilabel_layouts_agree<S>(n_classes: usize, n_candidates: usize, threshold: S)
+    where
+        S: PrimInt + AsPrimitive<f32> + Send + Sync + std::fmt::Debug,
+        usize: AsPrimitive<S>,
+    {
+        let mut scores_physical = Array2::<S>::zeros((n_classes, n_candidates));
+        for c in 0..n_classes {
+            for i in 0..n_candidates {
+                scores_physical[[c, i]] = ((c * 3 + i * 7) % 100).as_();
+            }
+        }
+        let mut boxes_physical = Array2::<i16>::zeros((4, n_candidates));
+        for i in 0..n_candidates {
+            boxes_physical[[0, i]] = (i * 10) as i16;
+            boxes_physical[[1, i]] = (i * 20) as i16;
+            boxes_physical[[2, i]] = (i * 10 + 50) as i16;
+            boxes_physical[[3, i]] = (i * 20 + 100) as i16;
+        }
+        let quant = Quantization {
+            scale: 0.00390625,
+            zero_point: 0,
+        };
+        let scores_rm = scores_physical.clone().reversed_axes().to_owned();
+        let boxes_rm = boxes_physical.clone().reversed_axes().to_owned();
+        let row = postprocess_boxes_multilabel_index_quant::<XYWH, _, _>(
+            threshold,
+            boxes_rm.view(),
+            scores_rm.view(),
+            quant,
+        )
+        .unwrap();
+        let scores_cm = scores_physical.view().reversed_axes();
+        assert!(scores_cm.as_slice().is_none() && scores_cm.strides()[0] == 1);
+        let col = postprocess_boxes_multilabel_index_quant::<XYWH, _, _>(
+            threshold,
+            boxes_physical.view().reversed_axes(),
+            scores_cm,
+            quant,
+        )
+        .unwrap();
+        assert!(!row.is_empty());
+        assert_eq!(row, col);
+    }
+
+    #[test]
+    fn multilabel_column_major_matches_row_major_u8() {
+        multilabel_layouts_agree::<u8>(80, 100, 60);
+    }
+
+    #[test]
+    fn multilabel_column_major_matches_row_major_i8_many_classes() {
+        multilabel_layouts_agree::<i8>(300, 64, 90);
+    }
+
+    #[test]
+    fn candidate_shape_error_names_candidate_selection() {
+        let err = check_candidate_shapes((3, 5), (3, 2)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("candidate selection"), "{msg}");
+        assert!(!msg.contains("multi-label"), "{msg}");
+    }
+
     #[test]
     fn column_major_matches_row_major() {
         // Create scores in "model output" layout: [num_classes, num_candidates]

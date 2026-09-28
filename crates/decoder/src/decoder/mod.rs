@@ -131,7 +131,6 @@ impl PartialEq for Decoder {
             && self.normalized == other.normalized
             && self.input_dims == other.input_dims
             && self.multi_label == other.multi_label
-            && self.multi_label_source == other.multi_label_source
             && self.decode_program.is_some() == other.decode_program.is_some()
             && self.per_scale.is_some() == other.per_scale.is_some()
     }

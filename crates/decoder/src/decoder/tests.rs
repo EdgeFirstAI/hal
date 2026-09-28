@@ -2355,6 +2355,20 @@ outputs:
     }
 
     #[test]
+    fn test_decoders_equal_regardless_of_multi_label_source() {
+        let from_metadata = DecoderBuilder::new()
+            .with_config_json_str(v2_modelpack_det_json(Some(true)))
+            .build()
+            .unwrap();
+        let explicit = DecoderBuilder::new()
+            .with_config_json_str(v2_modelpack_det_json(None))
+            .with_multi_label(true)
+            .build()
+            .unwrap();
+        assert_eq!(from_metadata, explicit);
+    }
+
+    #[test]
     fn test_explicit_builder_false_overrides_metadata_true() {
         let decoder = DecoderBuilder::new()
             .with_config_json_str(v2_modelpack_det_json(Some(true)))

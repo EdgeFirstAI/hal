@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Multi-label decode on every NMS decode path** (`edgefirst-decoder`). `DecoderBuilder::with_multi_label(true)` now applies to split, quantized, 2-way, detection-only and ModelPack detection models, for both `decode` and `decode_proto`, not only fused float and per-scale models. With NMS disabled, multi-label no longer turns NMS back on.
+- **Multi-label decode on every NMS decode path** (`edgefirst-decoder`). `DecoderBuilder::with_multi_label(true)` now applies to split, quantized, 2-way, detection-only and ModelPack detection models, for both `decode` and `decode_proto`, not only fused float and per-scale models. With NMS disabled, multi-label no longer turns NMS back on. Quantized multi-label candidate selection reads the transposed score layout of a DMA-BUF output one contiguous class column at a time.
 - **`Decoder::decode_for_tracking`** decodes one label per box whatever the decoder's multi-label setting, for callers that feed an external tracker. The Python `Decoder.decode_tracked` uses it.
-- **`multi_label` in the Python decoder and the C API.** Every `Decoder` constructor takes `multi_label=`, `Decoder.multi_label` reports the setting, and C callers use `ef_decoder_params_set_multi_label`.
+- **`multi_label` in the Python decoder and the C API.** Every `Decoder` constructor takes `multi_label=`, and `Decoder.multi_label` reports the setting. C callers set it with `ef_decoder_params_set_multi_label` and read it back with `ef_decoder_multi_label`, which also reflects a model that declares it in metadata.
 - **Qualcomm Adreno on Linux** (proprietary KGSL driver, validated on IQ-9075 / Adreno 663). The GL backend detects Adreno from `GL_RENDERER`/`EGL_VENDOR` and applies these fallbacks automatically. None of them apply on Android.
   - Uses the GBM EGL display; the EGL device-platform display crashes in `eglQueryString` on this driver.
   - Serializes GL across processors, and guards tensor `mmap`s against `eglDestroyImage`, which unmaps its driver mapping twice. The C API exposes this guard as `ef_tensor_with_cpu_mappings_excluded`, so a consumer linking `libedgefirst_tensor` shares the library's single guard.
