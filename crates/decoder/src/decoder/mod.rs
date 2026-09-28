@@ -1559,7 +1559,7 @@ impl Decoder {
     }
 
     /// This function decodes floating point model outputs into detection boxes
-    /// and segmentation masks. Up to `output_boxes.capacity()` boxes and
+    /// and segmentation masks. Up to `max_det` boxes and
     /// masks will be decoded. The function clears the provided output
     /// vectors before populating them with the decoded results.
     ///

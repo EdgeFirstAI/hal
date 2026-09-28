@@ -665,3 +665,100 @@ fn decode_for_tracking_is_single_label() {
         .unwrap();
     assert_eq!(labels(&boxes), vec![0, 2]);
 }
+
+/// `Decoder::max_det` and `pre_nms_top_k` bound the output of every NMS path,
+/// and the caller's `Vec` capacity is only an allocation hint.
+fn decode_with(fx: &Fixture, tune: impl Fn(DecoderBuilder) -> DecoderBuilder, cap: usize) -> usize {
+    let mut b = DecoderBuilder::default()
+        .with_score_threshold(SCORE_THRESHOLD)
+        .with_iou_threshold(0.5)
+        .with_multi_label(true);
+    for c in &fx.configs {
+        b = b.add_output(c.clone());
+    }
+    let d = tune(b).build().unwrap();
+    let inputs: Vec<&TensorDyn> = fx.tensors.iter().collect();
+    let (mut boxes, mut masks) = (Vec::with_capacity(cap), Vec::new());
+    d.decode(&inputs, &mut boxes, &mut masks).unwrap();
+    boxes.len()
+}
+
+fn check_caps(name: &str, fx: &Fixture) {
+    assert_eq!(decode_with(fx, |b| b, 0), 3, "{name}: uncapped");
+    assert_eq!(
+        decode_with(fx, |b| b.with_max_det(1), 0),
+        1,
+        "{name}: max_det"
+    );
+    assert_eq!(
+        decode_with(fx, |b| b.with_pre_nms_top_k(1), 0),
+        1,
+        "{name}: pre_nms_top_k"
+    );
+    assert_eq!(decode_with(fx, |b| b, 1), 3, "{name}: capacity is a hint");
+}
+
+#[test]
+fn caps_yolo_det() {
+    check_caps("yolo_det f32", &yolo_det(Dtype::F32));
+    check_caps("yolo_det i8", &yolo_det(Dtype::I8));
+}
+
+#[test]
+fn caps_yolo_split_det() {
+    check_caps("yolo_split_det f32", &yolo_split_det(Dtype::F32));
+    check_caps("yolo_split_det i8", &yolo_split_det(Dtype::I8));
+}
+
+#[test]
+fn caps_modelpack_det() {
+    check_caps("modelpack_det f32", &modelpack_det(Dtype::F32));
+    check_caps("modelpack_det u8", &modelpack_det(Dtype::U8));
+}
+
+#[test]
+fn caps_yolo_segdet() {
+    check_caps("yolo_segdet f32", &yolo_segdet(Dtype::F32));
+    check_caps("yolo_segdet i8", &yolo_segdet(Dtype::I8));
+}
+
+/// End-to-end (post-NMS) models honour `max_det`, not the `Vec` capacity.
+#[test]
+fn caps_yolo_end_to_end_det() {
+    // Rows: [x1, y1, x2, y2, conf, class] for three detections.
+    let rows = [
+        [0.1f32, 0.1, 0.3, 0.3, 0.9, 0.0],
+        [0.5, 0.5, 0.7, 0.7, 0.8, 1.0],
+        [0.2, 0.6, 0.4, 0.8, 0.7, 2.0],
+    ];
+    let data: Vec<f32> = rows.iter().flatten().copied().collect();
+    let cfg = ConfigOutput::Detection(configs::Detection {
+        decoder: DecoderType::Ultralytics,
+        quantization: None,
+        shape: vec![1, 3, 6],
+        dshape: vec![
+            (DimName::Batch, 1),
+            (DimName::NumBoxes, 3),
+            (DimName::NumFeatures, 6),
+        ],
+        anchors: None,
+        normalized: Some(true),
+    });
+    let t = tensor(&[1, 3, 6], &data, Dtype::F32);
+    let run = |max_det: Option<usize>, cap: usize| {
+        let mut b = DecoderBuilder::default()
+            .with_score_threshold(SCORE_THRESHOLD)
+            .with_decoder_version(configs::DecoderVersion::Yolo26)
+            .add_output(cfg.clone());
+        if let Some(m) = max_det {
+            b = b.with_max_det(m);
+        }
+        let d = b.build().unwrap();
+        let (mut boxes, mut masks) = (Vec::with_capacity(cap), Vec::new());
+        d.decode(&[&t], &mut boxes, &mut masks).unwrap();
+        boxes.len()
+    };
+    assert_eq!(run(None, 0), 3);
+    assert_eq!(run(Some(1), 0), 1, "max_det");
+    assert_eq!(run(None, 1), 3, "capacity is a hint");
+}

@@ -54,12 +54,9 @@ use crate::{
 #[cfg(test)]
 pub(crate) const MAX_NMS_CANDIDATES: usize = 30_000;
 
-/// Default post-NMS detection cap used by the public `decode_yolo_*`
-/// convenience wrappers when no explicit cap is plumbed in. Mirrors the
-/// `Decoder::max_det` default set by `DecoderBuilder` (also 300, matching
-/// the Ultralytics `max_det` default). Pre-EDGEAI-1302 these wrappers
-/// used `output_boxes.capacity()` as the cap, which silently dropped all
-/// detections when the caller passed `Vec::new()`.
+/// Default detection cap for the test-only shims when the output `Vec` has
+/// no capacity; matches the `DecoderBuilder` `max_det` default.
+#[cfg(test)]
 pub(crate) const DEFAULT_MAX_DETECTIONS: usize = 300;
 
 /// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
@@ -83,6 +80,25 @@ fn truncate_to_top_k_by_score_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync,
 ) {
     if top_k > 0 && boxes.len() > top_k {
         boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.cmp(&a.0.score));
+        boxes.truncate(top_k);
+    }
+}
+
+/// [`truncate_to_top_k_by_score`] for boxes without a payload.
+pub(crate) fn truncate_boxes_to_top_k(boxes: &mut Vec<DetectBox>, top_k: usize) {
+    if top_k > 0 && boxes.len() > top_k {
+        boxes.select_nth_unstable_by(top_k, |a, b| b.score.total_cmp(&a.score));
+        boxes.truncate(top_k);
+    }
+}
+
+/// [`truncate_to_top_k_by_score_quant`] for boxes without a payload.
+pub(crate) fn truncate_boxes_to_top_k_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    boxes: &mut Vec<DetectBoxQuantized<S>>,
+    top_k: usize,
+) {
+    if top_k > 0 && boxes.len() > top_k {
+        boxes.select_nth_unstable_by(top_k, |a, b| b.score.cmp(&a.score));
         boxes.truncate(top_k);
     }
 }
@@ -160,14 +176,11 @@ fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Se
     }
 }
 
-/// Detection cap helper for the public free `decode_yolo_*` wrappers.
-///
-/// Encodes the convention documented above: if the caller passed a non-empty
-/// `Vec`, that capacity acts as the per-call cap; otherwise fall back to
-/// [`DEFAULT_MAX_DETECTIONS`] so freshly-constructed `Vec::new()` outputs
-/// don't silently drop every detection.
+/// Detection cap for the test-only seg-det shims: the caller's `Vec`
+/// capacity, else [`DEFAULT_MAX_DETECTIONS`].
+#[cfg(test)]
 #[inline]
-fn cap_or_default<T>(v: &Vec<T>) -> usize {
+pub(crate) fn cap_or_default<T>(v: &Vec<T>) -> usize {
     if v.capacity() > 0 {
         v.capacity()
     } else {
@@ -177,27 +190,10 @@ fn cap_or_default<T>(v: &Vec<T>) -> usize {
 
 // ─── Public free decode_yolo_* convenience wrappers ────────────────────────
 //
-// Detection cap convention (applies to every `decode_yolo_*` free function
-// below):
-//
-// These functions are the convenience layer for callers that don't go
-// through `Decoder::decode()` (benches, FFI shims, ad-hoc test harnesses).
-// They use **`output_boxes.capacity()` as a per-call detection cap**:
-//
-//   - When the caller passes `Vec::with_capacity(N)`, the post-NMS output
-//     is truncated to at most `N` detections.
-//   - When the caller passes `Vec::new()` (capacity 0), the implementation
-//     falls back to the [`DEFAULT_MAX_DETECTIONS`] constant (300) so a
-//     freshly-constructed `Vec` doesn't silently drop every detection.
-//
-// This is intentionally **different** from the `Decoder::decode()` /
-// `Decoder::decode_proto()` contract, which bounds output count solely
-// by [`Decoder::max_det`] (set via `DecoderBuilder::with_max_det`,
-// default 300) regardless of the caller's `Vec` capacity (EDGEAI-1302).
-//
-// Use the `Decoder` API when you need explicit control over `max_det`,
-// schema-driven decoding, or EDGEAI-1303 normalization. Use these free
-// functions when you have raw tensors in hand and want a one-shot decode.
+// These crate-internal wrappers take the detection cap (`max_det`) and the
+// pre-NMS candidate cap (`pre_nms_top_k`) explicitly, so `Decoder` bounds
+// every path by its own settings; a caller's `Vec` capacity is only an
+// allocation hint.
 
 /// Decodes YOLO detection outputs from quantized tensors into detection boxes.
 ///
@@ -206,17 +202,20 @@ fn cap_or_default<T>(v: &Vec<T>) -> usize {
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
 ///
-/// See the "Detection cap convention" comment above for how
-/// `output_boxes.capacity()` bounds the result count.
+/// At most `pre_nms_top_k` candidates (0 = unbounded) enter NMS, and at most
+/// `max_det` detections are returned.
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -228,6 +227,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        pre_nms_top_k,
+        max_det,
         multi_label,
         output_boxes,
     )
@@ -243,11 +244,14 @@ where
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_yolo_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -260,6 +264,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        pre_nms_top_k,
+        max_det,
         multi_label,
         output_boxes,
     )
@@ -364,6 +370,7 @@ where
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_yolo_split_det_quant<
     BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -373,6 +380,8 @@ pub(crate) fn decode_yolo_split_det_quant<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -385,6 +394,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        pre_nms_top_k,
+        max_det,
         multi_label,
         output_boxes,
     )
@@ -405,12 +416,15 @@ where
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_yolo_split_det_float<T>(
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -424,6 +438,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        pre_nms_top_k,
+        max_det,
         multi_label,
         output_boxes,
     )
@@ -446,6 +462,7 @@ where
 pub(crate) fn decode_yolo_end_to_end_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<(), crate::DecoderError>
 where
@@ -466,7 +483,7 @@ where
     let classes = output.slice(s![5, ..]);
     let mut boxes =
         postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
-    boxes.truncate(cap_or_default(output_boxes));
+    boxes.truncate(max_det);
     output_boxes.clear();
     for (mut b, i) in boxes.into_iter() {
         b.label = classes[i].as_() as usize;
@@ -497,6 +514,7 @@ pub(crate) fn decode_yolo_end_to_end_segdet_float<T>(
     output: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<crate::Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -506,7 +524,7 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
-    let cap = cap_or_default(output_boxes);
+    let cap = max_det;
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
@@ -533,11 +551,12 @@ pub(crate) fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>
     scores: ArrayView2<T>,
     classes: ArrayView2<T>,
     score_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<(), crate::DecoderError> {
     let n = boxes.shape()[1];
 
-    let cap = cap_or_default(output_boxes);
+    let cap = max_det;
     output_boxes.clear();
 
     let (boxes, scores, classes) = postprocess_yolo_split_end_to_end_det(boxes, scores, &classes)?;
@@ -580,6 +599,7 @@ pub(crate) fn decode_yolo_split_end_to_end_segdet_float<T>(
     mask_coeff: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<crate::Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -589,7 +609,7 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
-    let cap = cap_or_default(output_boxes);
+    let cap = max_det;
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
@@ -787,11 +807,14 @@ pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -821,15 +844,18 @@ where
         }
     };
 
-    let cap = cap_or_default(output_boxes);
+    let mut boxes = boxes;
+    if effective_nms(nms, multi_label).is_some() {
+        truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
+    }
+    let cap = max_det;
     let boxes = dispatch_nms_int(
         effective_nms(nms, multi_label),
         iou_threshold,
         Some(cap),
         boxes,
     );
-    // Detection cap convention (see `cap_or_default`). NMS already capped to
-    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
@@ -846,11 +872,14 @@ where
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sync>(
     output: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -868,15 +897,18 @@ where
     } else {
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
-    let cap = cap_or_default(output_boxes);
+    let mut boxes = boxes;
+    if effective_nms(nms, multi_label).is_some() {
+        truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
+    }
+    let cap = max_det;
     let boxes = dispatch_nms_float(
         effective_nms(nms, multi_label),
         iou_threshold,
         Some(cap),
         boxes,
     );
-    // Detection cap convention (see `cap_or_default`). NMS already capped to
-    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
@@ -898,6 +930,7 @@ where
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -908,6 +941,8 @@ pub(crate) fn impl_yolo_split_quant<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -940,15 +975,18 @@ where
         }
     };
 
-    let cap = cap_or_default(output_boxes);
+    let mut boxes = boxes;
+    if effective_nms(nms, multi_label).is_some() {
+        truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
+    }
+    let cap = max_det;
     let boxes = dispatch_nms_int(
         effective_nms(nms, multi_label),
         iou_threshold,
         Some(cap),
         boxes,
     );
-    // Detection cap convention (see `cap_or_default`). NMS already capped to
-    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
@@ -969,6 +1007,7 @@ where
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -979,6 +1018,8 @@ pub(crate) fn impl_yolo_split_float<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> crate::DecoderResult<()>
@@ -997,15 +1038,18 @@ where
     } else {
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
-    let cap = cap_or_default(output_boxes);
+    let mut boxes = boxes;
+    if effective_nms(nms, multi_label).is_some() {
+        truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
+    }
+    let cap = max_det;
     let boxes = dispatch_nms_float(
         effective_nms(nms, multi_label),
         iou_threshold,
         Some(cap),
         boxes,
     );
-    // Detection cap convention (see `cap_or_default`). NMS already capped to
-    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
@@ -1643,6 +1687,7 @@ pub(crate) fn decode_yolo_end_to_end_segdet_float_proto<T>(
     output: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<ProtoData, crate::DecoderError>
 where
@@ -1651,7 +1696,7 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
-    let cap = cap_or_default(output_boxes);
+    let cap = max_det;
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
@@ -1677,6 +1722,7 @@ pub(crate) fn decode_yolo_split_end_to_end_segdet_float_proto<T>(
     mask_coeff: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<ProtoData, crate::DecoderError>
 where
@@ -1685,7 +1731,7 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
-    let cap = cap_or_default(output_boxes);
+    let cap = max_det;
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
@@ -2392,7 +2438,8 @@ mod tests {
         let output = Array2::from_shape_vec((6, 3), data).unwrap();
 
         let mut boxes = Vec::with_capacity(10);
-        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, cap_or_default(&boxes), &mut boxes)
+            .unwrap();
 
         // Only 1 detection should pass threshold of 0.5
         assert_eq!(boxes.len(), 1);
@@ -2418,7 +2465,8 @@ mod tests {
         let output = Array2::from_shape_vec((6, 2), data).unwrap();
 
         let mut boxes = Vec::with_capacity(10);
-        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, cap_or_default(&boxes), &mut boxes)
+            .unwrap();
 
         assert_eq!(boxes.len(), 2);
         assert_eq!(boxes[0].label, 1);
@@ -2439,7 +2487,8 @@ mod tests {
         let output = Array2::from_shape_vec((6, 2), data).unwrap();
 
         let mut boxes = Vec::with_capacity(10);
-        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, cap_or_default(&boxes), &mut boxes)
+            .unwrap();
 
         assert_eq!(boxes.len(), 0);
     }
@@ -2458,7 +2507,8 @@ mod tests {
         let output = Array2::from_shape_vec((6, 5), data).unwrap();
 
         let mut boxes = Vec::with_capacity(2); // Only allow 2 boxes
-        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, cap_or_default(&boxes), &mut boxes)
+            .unwrap();
 
         assert_eq!(boxes.len(), 2);
     }
@@ -2469,7 +2519,8 @@ mod tests {
         let output = Array2::<f32>::zeros((6, 0));
 
         let mut boxes = Vec::with_capacity(10);
-        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, cap_or_default(&boxes), &mut boxes)
+            .unwrap();
 
         assert_eq!(boxes.len(), 0);
     }
@@ -2488,7 +2539,8 @@ mod tests {
         let output = Array2::from_shape_vec((6, 1), data).unwrap();
 
         let mut boxes = Vec::with_capacity(10);
-        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, cap_or_default(&boxes), &mut boxes)
+            .unwrap();
 
         assert_eq!(boxes.len(), 1);
         assert_eq!(boxes[0].label, 5);
@@ -2504,7 +2556,12 @@ mod tests {
         let output = Array2::<f32>::zeros((5, 3));
 
         let mut boxes = Vec::with_capacity(10);
-        let result = decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes);
+        let result = decode_yolo_end_to_end_det_float(
+            output.view(),
+            0.5,
+            cap_or_default(&boxes),
+            &mut boxes,
+        );
 
         assert!(result.is_err());
         assert!(matches!(
@@ -2557,6 +2614,7 @@ mod tests {
             output.view(),
             protos.view(),
             0.5,
+            cap_or_default(&boxes),
             &mut boxes,
             &mut masks,
         )
@@ -2592,6 +2650,7 @@ mod tests {
             output.view(),
             protos.view(),
             0.5,
+            cap_or_default(&boxes),
             &mut boxes,
             &mut masks,
         )
@@ -2626,6 +2685,7 @@ mod tests {
             output.view(),
             protos.view(),
             0.5,
+            cap_or_default(&boxes),
             &mut boxes,
             &mut masks,
         )
@@ -2661,6 +2721,7 @@ mod tests {
             output.view(),
             protos.view(),
             0.5,
+            cap_or_default(&boxes),
             &mut boxes,
             &mut masks,
         )
@@ -2682,6 +2743,7 @@ mod tests {
             output.view(),
             protos.view(),
             0.5,
+            cap_or_default(&boxes),
             &mut boxes,
             &mut masks,
         );
@@ -2706,6 +2768,7 @@ mod tests {
             output.view(),
             protos.view(),
             0.5,
+            cap_or_default(&boxes),
             &mut boxes,
             &mut masks,
         );
@@ -2767,6 +2830,7 @@ mod tests {
             mask_coeff,
             protos.view(),
             0.5,
+            cap_or_default(&boxes),
             &mut boxes,
             &mut masks,
         )

@@ -85,6 +85,7 @@ impl Decoder {
                     self.iou_threshold,
                     self.nms,
                     multi_label,
+                    self.pre_nms_top_k,
                     self.max_det,
                     output_boxes,
                 )?;
@@ -193,6 +194,7 @@ impl Decoder {
             self.iou_threshold,
             self.nms,
             multi_label,
+            self.pre_nms_top_k,
             self.max_det,
             output_boxes,
         )?;
@@ -221,6 +223,8 @@ impl Decoder {
                 self.score_threshold,
                 self.iou_threshold,
                 self.nms,
+                self.pre_nms_top_k,
+                self.max_det,
                 multi_label,
                 output_boxes,
             )?;
@@ -317,6 +321,8 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
+                    self.pre_nms_top_k,
+                    self.max_det,
                     multi_label,
                     output_boxes,
                 )?;
@@ -584,6 +590,7 @@ impl Decoder {
             self.iou_threshold,
             self.nms,
             multi_label,
+            self.pre_nms_top_k,
             self.max_det,
             output_boxes,
         )?;
@@ -646,6 +653,7 @@ impl Decoder {
             self.iou_threshold,
             self.nms,
             multi_label,
+            self.pre_nms_top_k,
             self.max_det,
             output_boxes,
         )?;
@@ -672,6 +680,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k,
+            self.max_det,
             multi_label,
             output_boxes,
         )?;
@@ -747,6 +757,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k,
+            self.max_det,
             multi_label,
             output_boxes,
         )?;
@@ -830,6 +842,7 @@ impl Decoder {
         crate::yolo::decode_yolo_end_to_end_det_float(
             det_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(())
@@ -874,6 +887,7 @@ impl Decoder {
             det_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -905,6 +919,7 @@ impl Decoder {
             crate::yolo::decode_yolo_end_to_end_det_float(
                 dequant.view(),
                 self.score_threshold,
+                self.max_det,
                 output_boxes,
             )?;
         });
@@ -942,6 +957,7 @@ impl Decoder {
             dequant_d.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -984,6 +1000,7 @@ impl Decoder {
             scores_tensor,
             classes_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(())
@@ -1043,6 +1060,7 @@ impl Decoder {
             mask_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -1091,6 +1109,7 @@ impl Decoder {
             dequant_s.view(),
             dequant_c.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(())
@@ -1159,6 +1178,7 @@ impl Decoder {
             dequant_m.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -1565,6 +1585,7 @@ impl Decoder {
             det_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )
     }
@@ -1597,6 +1618,7 @@ impl Decoder {
             dequant_d.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(proto)
@@ -1654,6 +1676,7 @@ impl Decoder {
             mask_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )
     }
@@ -1719,6 +1742,7 @@ impl Decoder {
             dequant_m.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )
     }

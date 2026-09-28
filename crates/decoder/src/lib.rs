@@ -775,6 +775,7 @@ mod decoder_tests {
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
             false,
+            0,
             300,
             &mut output_boxes,
         )
@@ -900,6 +901,7 @@ mod decoder_tests {
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
             false,
+            0,
             300,
             &mut output_boxes,
         )
@@ -1520,6 +1522,8 @@ mod decoder_tests {
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
+            0,
+            crate::yolo::cap_or_default(&output_boxes),
             false,
             &mut output_boxes,
         )
@@ -1945,6 +1949,8 @@ mod decoder_tests {
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
+            0,
+            crate::yolo::cap_or_default(&output_boxes_f32),
             false,
             &mut output_boxes_f32,
         )

@@ -1148,3 +1148,17 @@ def test_multi_label_kwarg_false_overrides_metadata():
 
 def test_nms_auto_resolves_class_aware():
     assert multi_label_decoder("init").nms == ef.Nms.ClassAware
+
+
+def test_max_boxes_limits_decode_output():
+    decoder = multi_label_decoder("init", multi_label=True)
+    boxes, scores, classes, _ = decoder.decode([multi_label_det_tensor()], max_boxes=1)
+    assert len(boxes) == len(scores) == len(classes) == 1
+    assert scores[0] == pytest.approx(0.9)
+
+
+def test_max_det_limits_decode_output():
+    decoder = multi_label_decoder("init", multi_label=True)
+    decoder.max_det = 2
+    _, _, classes, _ = decoder.decode([multi_label_det_tensor()])
+    assert len(classes) == 2
