@@ -105,7 +105,7 @@ pub extern "C" fn ef_decoder_params_new() -> *mut EfDecoderParams {
             iou_threshold: 0.5,
             nms: Some(configs::Nms::Auto),
             pre_nms_top_k: None,
-            max_det: 100,
+            max_det: 300,
             input_dims: None,
             multi_label: None,
         }))
@@ -205,7 +205,8 @@ pub unsafe extern "C" fn ef_decoder_params_set_pre_nms_top_k(
     }
 }
 
-/// Maximum detections returned per frame.
+/// Maximum detections returned per frame, on every decode path. Default 300,
+/// as in the Rust builder (Ultralytics' `max_det`).
 ///
 /// # Safety
 /// `p` must be `NULL` or a live parameter set.
@@ -1683,8 +1684,8 @@ mod tests {
     }
 
     #[test]
-    fn default_pre_nms_cap_matches_the_rust_builder() {
-        assert_eq!(built_caps(None, None, None).0, 300);
+    fn default_caps_match_the_rust_builder() {
+        assert_eq!(built_caps(None, None, None), (300, 300));
     }
 
     #[test]

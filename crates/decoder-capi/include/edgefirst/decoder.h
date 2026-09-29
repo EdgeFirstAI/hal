@@ -214,7 +214,8 @@ int ef_decoder_params_set_iou_threshold(ef_decoder_params *p, float v);
 int ef_decoder_params_set_pre_nms_top_k(ef_decoder_params *p, uintptr_t v);
 
 /**
- * Maximum detections returned per frame.
+ * Maximum detections returned per frame, on every decode path. Default 300,
+ * as in the Rust builder (Ultralytics' `max_det`).
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.
