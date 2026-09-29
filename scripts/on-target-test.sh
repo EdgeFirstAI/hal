@@ -54,7 +54,9 @@
 # host ran no tests at all, reported as NO-TESTS and distinct from FAIL: a run
 # that exercised nothing cannot exit zero. A host that is unreachable, or that
 # lacks the hardware a test needs, is reported separately and does NOT mask a
-# real failure elsewhere. Same rule for the deployed
+# real failure elsewhere. So is a host another run is using, as BUSY: two runs
+# against one host share REMOTE_DIR on it and the host's results directory
+# here, and would read back each other's results. Same rule for the deployed
 # check-single-home.sh: G5 (footprint) and G7 (Miri) only ever make sense on
 # the build host and are never deployed, so they correctly read
 # cannot_measure on every board -- a named, attributable gap for those two
@@ -161,12 +163,69 @@ done
 # ---------------------------------------------------------------------------
 overall=0
 
+# One run per host at a time, held for the whole deploy-run-fetch of that
+# host. mkdir is the lock because it is atomic in every shell, BusyBox's
+# included. The owner line (machine, pid, start time) is the lock's token: a
+# run releases the lock only while the owner file still holds its own token,
+# so it never removes a lock another run took, including one taken after the
+# stale-lock command below cleared this run's. A lock left by a killed run is
+# cleared by hand (the BUSY message says how) or by the board's next reboot,
+# since REMOTE_DIR is in /tmp.
+LOCK="${REMOTE_DIR}.lock"
+CURRENT_LOCK=""
+LOCK_OWNER=""
+
+# Take the lock on $1. Returns 0 when taken, 3 when another run holds it,
+# 4 when the owner file could not be written (the directory is removed
+# again), and ssh's 255 when the host could not be reached.
+acquire_lock() {
+  local host="$1" owner
+  owner="$(hostname) pid $$ since $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ssh_q "${host}" "mkdir '${LOCK}' 2>/dev/null || exit 3; echo '${owner}' > '${LOCK}/owner' || { rm -rf '${LOCK}'; exit 4; }"
+  local rc=$?
+  if [[ ${rc} -eq 0 ]]; then
+    CURRENT_LOCK="${host}"; LOCK_OWNER="${owner}"
+  fi
+  return ${rc}
+}
+
+release_lock() {
+  if [[ -n "${CURRENT_LOCK}" ]]; then
+    ssh_q "${CURRENT_LOCK}" "[ \"\$(cat '${LOCK}/owner' 2>/dev/null)\" = '${LOCK_OWNER}' ] && rm -rf '${LOCK}'" > /dev/null 2>&1
+    CURRENT_LOCK=""; LOCK_OWNER=""
+  fi
+  return 0
+}
+trap release_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 for i in "${!OK_HOSTS[@]}"; do
+  release_lock
   target="${OK_HOSTS[$i]}"; arch="${OK_ARCH[$i]}"
   echo
   echo "${RULE}"
   echo "==> ${target}   (${arch})"
   echo "${RULE}"
+
+  acquire_lock "${target}"
+  case $? in
+    0) ;;
+    3)
+      held="$(ssh_q "${target}" "cat '${LOCK}/owner' 2>/dev/null")"
+      echo "SKIP: another on-target run is using ${target}${held:+ (${held})}"
+      echo "      if that run is gone: ssh ${target} rm -rf '${LOCK}'"
+      SUMMARY+=("${target}|BUSY|${arch}|another run holds ${LOCK}${held:+: ${held}}")
+      continue ;;
+    255)
+      echo "SKIP: ${target} did not answer while taking the lock"
+      SUMMARY+=("${target}|UNREACHABLE|${arch}|lost while taking ${LOCK}")
+      continue ;;
+    *)
+      echo "SKIP: could not write ${LOCK}/owner on ${target}"
+      SUMMARY+=("${target}|SYNCFAIL|${arch}|could not write ${LOCK}/owner")
+      continue ;;
+  esac
 
   out_dir="${RESULTS}/${target//[^A-Za-z0-9._-]/_}"
   rm -rf "${out_dir}"; mkdir -p "${out_dir}"
@@ -217,6 +276,8 @@ for i in "${!OK_HOSTS[@]}"; do
   SUMMARY+=("${target}|${result}|${arch}|${totals:+${totals}; }${detail}")
   [[ "${result}" == PASS && ${rc} -eq 0 ]] || overall=1
 done
+
+release_lock
 
 # ---------------------------------------------------------------------------
 # Matrix

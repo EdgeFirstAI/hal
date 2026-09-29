@@ -126,9 +126,10 @@ jobs:
     name: Board ${{ matrix.runner }}
     needs: [plan, build]
     runs-on: ${{ matrix.labels }}
-    # Every case ran in 9 minutes on the IQ-9075 (8x Cortex-A78C); a
-    # Cortex-A53 board takes several times that.
-    timeout-minutes: 90
+    # Every case, measured: Orin Nano 5 min, IQ-9075 8 min, i.MX 95 22 min,
+    # RPi5 31 min, i.MX 8M Plus (4x Cortex-A53) 60 min. 120 keeps the slowest
+    # board at half its budget.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
