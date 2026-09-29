@@ -82,10 +82,7 @@ group is kept and the rest are dropped. The enclosing-union merge measured about
 `ef_tiled_frame_accumulator_new` or `ef_merge_tiled_detections`.
 
 `mode` was added to `ef_merge_config` in the 4-byte tail pad it already had, so
-the struct is still 32 bytes and no other field moved. `ef_decoder_abi_version`
-is `2`: the layout did not change, but the default merge did, so the same call
-with the same struct returns different box geometry than version 1 -- gate on
-the probe rather than on a link succeeding.
+the struct is still 32 bytes and no other field moved. `ef_decoder_abi_version` is `2`: `sizeof` did not change, but a caller built against version 1 never writes `mode`, so gate on the probe rather than on a link succeeding.
 
 **This is a minor-version ABI break.** `ef_merge_config` shipped without `mode`
 in 0.29.x, and a caller built against that header never initialised the tail

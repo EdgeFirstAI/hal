@@ -277,27 +277,11 @@ so embedding a minor or patch would force a downstream relink on every
 release. That is why the loader can only ever police the major boundary —
 which is the right boundary post-1.0 and the wrong one before it, as above.
 
-**The `ef_*_abi_version()` probes are how that gap is meant to be closed.**
-Every C library exports one (`ef_tensor_abi_version`, `ef_image_abi_version`,
-`ef_codec_abi_version`, `ef_decoder_abi_version`, `ef_tracker_abi_version`).
-It returns a monotonic ABI generation for that library, hand-maintained and
-independent of the package version, and it **must be bumped whenever that
-library's C surface changes in a way that is not backward compatible** — a
-layout change, a removed or re-signatured symbol, or a change to *documented*
-semantics that an existing caller would experience as a different contract.
-The semantics-only case is the one most easily missed and the one that most
-needs the signal: if a call keeps its name, its signature and its struct
-layouts but computes something different, the consumer gets no link error, no
-size mismatch and no loader diagnostic. The probe is the only thing left that
-can tell them.
+**The `ef_*_abi_version()` probes are how that gap is meant to be closed.** Every C library exports one (`ef_tensor_abi_version`, `ef_image_abi_version`, `ef_codec_abi_version`, `ef_decoder_abi_version`, `ef_tracker_abi_version`). It returns a monotonic ABI generation for that library, hand-maintained and independent of the package version, and it **must be bumped whenever that library's C interface changes in a way that is not backward compatible**: a layout change, a removed or re-signatured symbol, or a change to what an existing argument, value or return means (an enum value reassigned, a return code reinterpreted, a field whose units change). The meaning case is the one most easily missed and the one that most needs the signal: if a call keeps its name, its signature and its struct layouts but reads its inputs differently, the consumer gets no link error, no size mismatch and no loader diagnostic. The probe is the only thing left that can tell them.
 
-**A bug fix is not a probe bump**, even though a caller can observe it.
-Bringing behaviour into line with the documented contract is what a patch
-release is for, and it stays inside the patch row of the table above.
-Advancing the generation for it would be actively harmful: a consumer doing
-an exact-equality probe check would start rejecting patch releases it should
-accept, which is the opposite of what the probe is for. The test is whether
-the *documented* contract changed, not whether any observable byte did.
+**A changed default is not a probe bump.** Defaults (thresholds, caps, what an automatic mode resolves to, which merge a default config selects) are library behaviour, not interface: every value a caller passes still means what it did, and a caller that depends on a particular value sets it explicitly through the same call. A default change is recorded in the CHANGELOG under Changed and follows the version table above, which pre-1.0 means a minor.
+
+**A bug fix is not a probe bump either**, even though a caller can observe it. Bringing behaviour into line with the documented contract is what a patch release is for, and it stays inside the patch row of the table above. That includes a C default that disagreed with the library default it is documented to take, such as `ef_decoder_params_new` defaulting `max_det` to 100 while the library default was 300. Advancing the generation for either would be actively harmful: a consumer doing an exact-equality probe check would start rejecting releases it should accept, which is the opposite of what the probe is for.
 
 > **Not yet enforced.** Nothing in this tree compares a probe to anything.
 > All five are defined, declared in their headers, and called only by the
@@ -446,17 +430,7 @@ size-safe — a caller built against any 0.29 header still allocates exactly the
 right number of bytes. It is *not* value-safe: that caller never wrote the
 pad, so a 0.30 library reading `mode` from it reads whatever was on the stack.
 
-Both facts together are why the change takes a **minor** bump to 0.30.0. The
-patch guarantee would have forbidden it outright, which is why none of 0.29.2,
-0.29.3 or 0.29.4 could have carried it; the minor is what licenses the break
-and what tells a consumer not to mix. `ef_decoder_abi_version` went to `2` as
-well, even though no layout changed, because the default tiled merge changed
-from the enclosing union to keep-best suppression — the semantics-only case
-above, where the probe is the consumer's only signal. Note which side of the
-bug-fix line that falls on: the union was the *documented* behaviour, so
-replacing it changes the contract rather than correcting a deviation from it.
-Had the union merely been a bug against a keep-best specification, the fix
-would have been a patch with no probe bump.
+Both facts together are why the change takes a **minor** bump to 0.30.0. The patch guarantee would have forbidden it outright, which is why none of 0.29.2, 0.29.3 or 0.29.4 could have carried it; the minor is what licenses the break and what tells a consumer not to mix. `ef_decoder_abi_version` went to `2` for the same reason, as the pre-1.0 in-place rule above requires: an older caller's `mode` is unwritten padding. The default tiled merge changed from the enclosing union to keep-best suppression in the same release; that change alone is a changed default, recorded in the CHANGELOG, and would not have moved the probe.
 
 Note what the mismatch does *not* do: `mode_from()` rejects any value that is
 not `0` or `1`, so a garbage pad usually yields a refused call. "Usually" is
