@@ -625,11 +625,7 @@ fn tracked_decode_ignores_metadata_multi_label() {
     use edgefirst_tracker::ByteTrackBuilder;
     let fx = yolo_det(Dtype::F32);
     let run = |nms_multi_label: bool| {
-        let mut schema = SchemaV2::from_v1(&ConfigOutputs {
-            outputs: fx.configs.clone(),
-            ..Default::default()
-        })
-        .unwrap();
+        let mut schema = SchemaV2::from_v1(&ConfigOutputs::new(fx.configs.clone())).unwrap();
         schema.nms_multi_label = Some(nms_multi_label);
         let d = DecoderBuilder::default()
             .with_schema(schema)
@@ -793,11 +789,8 @@ fn build_nms(fx: &Fixture, nms: configs::Nms, from_config: bool, multi_label: bo
         .with_iou_threshold(0.5)
         .with_multi_label(multi_label);
     if from_config {
-        let cfg = edgefirst_decoder::ConfigOutputs {
-            outputs: fx.configs.clone(),
-            nms: Some(nms),
-            ..Default::default()
-        };
+        let mut cfg = edgefirst_decoder::ConfigOutputs::new(fx.configs.clone());
+        cfg.nms = Some(nms);
         b = b.with_config(cfg).with_nms(Some(configs::Nms::Auto));
     } else {
         for c in &fx.configs {

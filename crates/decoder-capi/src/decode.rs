@@ -415,12 +415,10 @@ pub unsafe extern "C" fn ef_decoder_new(p: *const EfDecoderParams) -> *mut EfDec
             } else if let Some(y) = &p.config_yaml {
                 b = b.with_config_yaml_str(y.clone());
             } else if !p.outputs.is_empty() {
-                b = b.with_config(ConfigOutputs {
-                    outputs: p.outputs.clone(),
-                    nms: p.nms,
-                    nms_multi_label: None,
-                    decoder_version: p.decoder_version,
-                });
+                let mut config = ConfigOutputs::new(p.outputs.clone());
+                config.nms = p.nms;
+                config.decoder_version = p.decoder_version;
+                b = b.with_config(config);
             } else if let Some(f) = &p.config_file {
                 let Ok(content) = std::fs::read_to_string(f) else {
                     return std::ptr::null_mut();

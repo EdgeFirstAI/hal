@@ -57,7 +57,21 @@ pub const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
 /// All fields except [`SchemaV2::schema_version`] are optional, so
 /// third-party integrations can include only the sections relevant to
 /// their use case.
+///
+/// The struct is `#[non_exhaustive]` so new optional sections can be added
+/// without a breaking change. Outside this crate, start from
+/// [`SchemaV2::new`] (or [`Default`], or a parser) and assign fields:
+///
+/// ```rust
+/// use edgefirst_decoder::schema::{NmsMode, SchemaV2};
+///
+/// let mut schema = SchemaV2::new();
+/// schema.nms = Some(NmsMode::ClassAware);
+/// schema.nms_multi_label = Some(true);
+/// assert_eq!(schema.schema_version, 2);
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SchemaV2 {
     /// Schema version. Always 2 for v2 metadata.
     pub schema_version: u32,
@@ -90,6 +104,13 @@ pub struct SchemaV2 {
     /// end-to-end (embedded NMS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<DecoderVersion>,
+}
+
+impl SchemaV2 {
+    /// An empty v2 schema: `schema_version` 2 and every section unset.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl Default for SchemaV2 {

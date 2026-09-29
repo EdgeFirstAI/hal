@@ -67,11 +67,9 @@ fn builder() -> DecoderBuilder {
 }
 
 fn from_metadata(multi_label: bool) -> DecoderBuilder {
-    builder().with_config(ConfigOutputs {
-        outputs: vec![detection_cfg()],
-        nms_multi_label: Some(multi_label),
-        ..Default::default()
-    })
+    let mut cfg = ConfigOutputs::new(vec![detection_cfg()]);
+    cfg.nms_multi_label = Some(multi_label);
+    builder().with_config(cfg)
 }
 
 fn count(d: &Decoder) -> usize {

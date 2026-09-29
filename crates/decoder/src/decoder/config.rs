@@ -27,7 +27,20 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Ok(())
 /// # }
+/// ```
+///
+/// The struct is `#[non_exhaustive]` so new optional settings can be added
+/// without a breaking change. Outside this crate, start from
+/// [`ConfigOutputs::new`] (or [`Default`], or a parser) and assign fields:
+///
+/// ```rust
+/// # use edgefirst_decoder::{configs::Nms, ConfigOutputs};
+/// let mut config = ConfigOutputs::new(Vec::new());
+/// config.nms = Some(Nms::ClassAgnostic);
+/// assert!(config.nms_multi_label.is_none());
+/// ```
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Default)]
+#[non_exhaustive]
 pub struct ConfigOutputs {
     #[serde(default)]
     pub outputs: Vec<ConfigOutput>,
@@ -52,6 +65,16 @@ pub struct ConfigOutputs {
     /// - `None` — infer from other settings (legacy behavior)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<configs::DecoderVersion>,
+}
+
+impl ConfigOutputs {
+    /// A config with these outputs and every other setting unset.
+    pub fn new(outputs: Vec<ConfigOutput>) -> Self {
+        Self {
+            outputs,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
