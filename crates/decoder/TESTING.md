@@ -35,7 +35,12 @@ crates/decoder/
 │                                       #   DecoderBuilder
 │   ├── modelpack_coffeecup_parity.rs
 │   ├── modelpack_decoder_schemas.rs
+│   ├── multi_label_paths.rs            # Multi-label on every NMS decode path;
+│                                       #   tracked decode stays argmax;
+│                                       #   NMS mode and bypass max_det
 │   ├── per_scale_parity.rs
+│   ├── pre_nms_top_k.rs                # pre-NMS cap: 300 default, 0 unbounded,
+│                                       #   30 000 under multi-label
 │   └── common/                         # Shared fixture loaders
 └── benches/
     └── decoder_benchmark.rs
@@ -84,6 +89,8 @@ cargo test -p edgefirst-decoder --doc -- --test-threads=1
   suite validates that `Decoder::decode` and `Decoder::decode_proto`
   produce bit-identical detections for the same inputs (the key invariant
   for the GPU fused mask path).
+- **Multi-label coverage** — `multi_label_paths.rs` decodes one synthetic scene (one anchor above threshold for two classes) through every NMS model type in float and quantized form. It checks that argmax output is unchanged and that multi-label adds exactly the second class. With `--features tracker`, it also checks that `decode_tracked` returns the argmax result whether multi-label came from the builder or from `nms_multi_label` metadata. It also checks, per model type, that an explicit class-agnostic mode suppresses across the classes of one anchor under multi-label while class-aware keeps them, and that with NMS bypassed `max_det` keeps the highest-scoring boxes.
+- **Pre-NMS cap** — `pre_nms_top_k.rs` decodes 400 disjoint anchors (800 multi-label candidates) to show the default cap of 300 on a detection-only model, `0` as unbounded, and the 30 000 default when multi-label comes from the builder or metadata.
 
 ## Benchmarks
 

@@ -5,7 +5,7 @@
 
 use edgefirst_bench::{run_bench, BenchSuite};
 use edgefirst_decoder::{
-    byte::{nms_int, postprocess_boxes_quant},
+    byte::{nms_int, postprocess_boxes_multilabel_index_quant, postprocess_boxes_quant},
     configs, dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_float, postprocess_boxes_float},
     per_scale::DecodeDtype,
@@ -74,6 +74,36 @@ fn bench_quant_decode_boxes(suite: &mut BenchSuite) {
     });
     result.print_summary();
     suite.record(&result);
+}
+
+/// Multi-label candidate selection on the transposed score view a DMA-BUF
+/// output produces, at a deployment and a validation score threshold.
+fn bench_quant_decode_boxes_multilabel(suite: &mut BenchSuite) {
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
+    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    let out = ndarray::Array2::from_shape_vec((84, 8400), out.to_vec()).unwrap();
+    let quant = Quantization {
+        scale: 0.0040811873,
+        zero_point: -123,
+    };
+    let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
+    let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
+    for (name, score_threshold) in [
+        ("decoder/quant/decode_boxes_multilabel", 0.25f32),
+        ("decoder/quant/decode_boxes_multilabel_val", 0.001f32),
+    ] {
+        let threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = postprocess_boxes_multilabel_index_quant::<XYWH, _, _>(
+                threshold,
+                boxes_tensor,
+                scores_tensor,
+                quant,
+            );
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
 }
 
 fn bench_quant_nms(suite: &mut BenchSuite) {
@@ -778,6 +808,7 @@ fn main() {
 
     println!("\n== Quant ==\n");
     bench_quant_decode_boxes(&mut suite);
+    bench_quant_decode_boxes_multilabel(&mut suite);
     bench_quant_nms(&mut suite);
 
     println!("\n== Dequantize ==\n");

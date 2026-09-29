@@ -140,13 +140,10 @@ typedef struct ef_decoder_track {
 /**
  * ABI version of this library's C surface.
  *
- * Bumped to 2 for the tiled merge: `ef_merge_config` gained a `mode` field
- * in its old tail pad and the default merge became keep-best, so
- * `ef_merge_tiled_detections` and `ef_tiled_frame_accumulator_new` return
- * different box geometry than version 1 did. The struct layout is
- * unchanged, which is exactly why the probe has to carry the signal: a
- * caller that drops in this library gets no link error and no size
- * mismatch, only different boxes.
+ * Bumped to 2 when `ef_merge_config` gained a `mode` field in its old tail
+ * pad. `sizeof` is unchanged, so a caller built against version 1 gets no
+ * link error and no size mismatch, but never writes `mode`; the probe is
+ * the only signal. Changed defaults do not move it.
  */
 uint32_t ef_decoder_abi_version(void);
 
@@ -200,7 +197,13 @@ int ef_decoder_params_set_score_threshold(ef_decoder_params *p, float v);
 int ef_decoder_params_set_iou_threshold(ef_decoder_params *p, float v);
 
 /**
- * How many candidates survive into NMS. Bounds the worst case.
+ * How many candidates survive into NMS, ranked by score; 0 is unbounded.
+ * Bounds the worst-case NMS cost.
+ *
+ * Unset, the cap is 300, or 30 000 (Ultralytics' `max_nms`) when multi-label
+ * decode is on, from `ef_decoder_params_set_multi_label` or the model config's
+ * `nms_multi_label`. For validation and mAP runs at a low score threshold,
+ * pass 0 so every candidate reaches NMS.
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.
@@ -208,7 +211,8 @@ int ef_decoder_params_set_iou_threshold(ef_decoder_params *p, float v);
 int ef_decoder_params_set_pre_nms_top_k(ef_decoder_params *p, uintptr_t v);
 
 /**
- * Maximum detections returned per frame.
+ * Maximum detections returned per frame, on every decode path. Default 300,
+ * as in the Rust builder (Ultralytics' `max_det`).
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.
@@ -224,12 +228,26 @@ int ef_decoder_params_set_max_det(ef_decoder_params *p, uintptr_t v);
 int ef_decoder_params_set_input_dims(ef_decoder_params *p, uintptr_t width, uintptr_t height);
 
 /**
- * NMS mode: 0 = off, 1 = automatic, 2 = class-aware, 3 = class-agnostic.
+ * NMS mode: 0 = off, 1 = automatic (the model config's mode, else
+ * class-aware), 2 = class-aware, 3 = class-agnostic.
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.
  */
 int ef_decoder_params_set_nms(ef_decoder_params *p, uint32_t nms);
+
+/**
+ * Multi-label decode: 1 emits one box per class above the score threshold
+ * (validation decode), 0 one per anchor. Overrides the model config's
+ * `nms_multi_label`; unset, the config decides, else off. The candidates
+ * go through the NMS mode unchanged: class-aware keeps every class of an
+ * anchor, class-agnostic suppresses across them. Tracked decode always uses
+ * one label per box. Any other value is `EINVAL`.
+ *
+ * # Safety
+ * `p` must be `NULL` or a live parameter set.
+ */
+int ef_decoder_params_set_multi_label(ef_decoder_params *p, int32_t enabled);
 
 /**
  * Configure from a JSON string. `len` may be 0 for NUL-terminated.
@@ -296,6 +314,18 @@ int ef_decoder_input_dims(const ef_decoder *d, uintptr_t *width, uintptr_t *heig
  * `d` must be `NULL` or live.
  */
 int ef_decoder_normalized_boxes(const ef_decoder *d);
+
+/**
+ * Whether `ef_decoder_decode` emits one box per class above the score
+ * threshold instead of one per anchor. Tracked decode always uses one label
+ * per box.
+ *
+ * @return 1 yes, 0 no, -1 when `d` is `NULL`.
+ *
+ * # Safety
+ * `d` must be `NULL` or live.
+ */
+int ef_decoder_multi_label(const ef_decoder *d);
 
 /**
  * The model type as a NUL-terminated string the caller must free with

@@ -27,7 +27,20 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Ok(())
 /// # }
+/// ```
+///
+/// The struct is `#[non_exhaustive]` so new optional settings can be added
+/// without a breaking change. Outside this crate, start from
+/// [`ConfigOutputs::new`] (or [`Default`], or a parser) and assign fields:
+///
+/// ```rust
+/// # use edgefirst_decoder::{configs::Nms, ConfigOutputs};
+/// let mut config = ConfigOutputs::new(Vec::new());
+/// config.nms = Some(Nms::ClassAgnostic);
+/// assert!(config.nms_multi_label.is_none());
+/// ```
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Default)]
+#[non_exhaustive]
 pub struct ConfigOutputs {
     #[serde(default)]
     pub outputs: Vec<ConfigOutput>,
@@ -37,9 +50,13 @@ pub struct ConfigOutputs {
     ///   boxes regardless of class
     /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes with
     ///   the same class
-    /// - `None` — use builder default or skip NMS (user handles it externally)
+    /// - `None` — use the builder default (`Nms::Auto` resolves to class-aware)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nms: Option<configs::Nms>,
+    /// Emit one box per class above the score threshold (validation decode).
+    /// Tracked decode ignores it; an explicit decoder setting overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nms_multi_label: Option<bool>,
     /// Decoder version for Ultralytics models. Determines the decoding
     /// strategy.
     /// - `Some(Yolo26)` — end-to-end model with embedded NMS
@@ -48,6 +65,16 @@ pub struct ConfigOutputs {
     /// - `None` — infer from other settings (legacy behavior)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<configs::DecoderVersion>,
+}
+
+impl ConfigOutputs {
+    /// A config with these outputs and every other setting unset.
+    pub fn new(outputs: Vec<ConfigOutput>) -> Self {
+        Self {
+            outputs,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -334,8 +361,8 @@ impl ConfigOutput {
     ///   normalized: Some(true),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
-    /// assert_eq!(output.quantization(),
-    /// Some(configs::QuantTuple(0.012345,26))); ```
+    /// assert_eq!(output.quantization(), Some(configs::QuantTuple(0.012345, 26)));
+    /// ```
     pub fn quantization(&self) -> Option<QuantTuple> {
         match self {
             ConfigOutput::Detection(detection) => detection.quantization,

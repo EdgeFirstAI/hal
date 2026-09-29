@@ -154,6 +154,29 @@ pub fn postprocess_boxes_multilabel_index_float<
         .collect()
 }
 
+/// [`postprocess_boxes_multilabel_index_float`] without anchor indices.
+///
+/// # Errors
+/// [`crate::DecoderError::InvalidShape`] unless boxes are `[N, 4]` and scores
+/// `[N, C]`.
+pub fn postprocess_boxes_multilabel_float<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+) -> crate::DecoderResult<Vec<DetectBox>> {
+    crate::byte::check_candidate_shapes(boxes.dim(), scores.dim())?;
+    Ok(
+        postprocess_boxes_multilabel_index_float::<B, _, _>(threshold, boxes, scores)
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect(),
+    )
+}
+
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
 /// then greedily selects a subset of boxes in descending order of score.
 ///
@@ -589,6 +612,38 @@ unsafe fn jaccard_batch4_neon(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f3
 mod tests {
     use super::*;
     use crate::BoundingBox;
+
+    #[test]
+    fn multilabel_float_drops_indices_only() {
+        let boxes = ndarray::arr2(&[[0.1f32, 0.1, 0.2, 0.2], [0.3, 0.3, 0.4, 0.4]]);
+        let scores = ndarray::arr2(&[[0.6f32, 0.1, 0.7], [0.05, 0.9, 0.05]]);
+        let with_idx = postprocess_boxes_multilabel_index_float::<crate::XYXY, _, _>(
+            0.5,
+            boxes.view(),
+            scores.view(),
+        );
+        let without = postprocess_boxes_multilabel_float::<crate::XYXY, _, _>(
+            0.5,
+            boxes.view(),
+            scores.view(),
+        )
+        .unwrap();
+        let stripped: Vec<_> = with_idx.into_iter().map(|(b, _)| b).collect();
+        assert_eq!(stripped, without);
+        assert_eq!(without.len(), 3);
+    }
+
+    #[test]
+    fn multilabel_float_rejects_non_four_column_boxes() {
+        let boxes = ndarray::arr2(&[[0.1f32, 0.1, 0.2, 0.2, 0.0]]);
+        let scores = ndarray::arr2(&[[0.6f32]]);
+        let r = postprocess_boxes_multilabel_float::<crate::XYXY, _, _>(
+            0.5,
+            boxes.view(),
+            scores.view(),
+        );
+        assert!(matches!(r, Err(crate::DecoderError::InvalidShape(_))));
+    }
 
     /// Helper: create `n` non-overlapping boxes with descending f32 scores.
     fn make_nms_boxes_float(n: usize) -> Vec<DetectBox> {

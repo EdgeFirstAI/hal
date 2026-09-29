@@ -56,7 +56,7 @@ boxes, scores, classes, masks = decoder.decode([output])
 print(np.asarray(boxes), np.asarray(scores), np.asarray(classes))
 ```
 
-Boxes come back normalized. NMS runs by default in class-agnostic mode; pass `nms=Nms.ClassAware` or `nms=None` to change or bypass it.
+Boxes come back normalized. NMS runs class-aware by default (unless the model config sets a mode); pass `nms=Nms.ClassAgnostic` or `nms=None` to change or bypass it. For validation and mAP runs, pass `multi_label=True` to emit one box per class above the score threshold instead of one per anchor; `decode_tracked` ignores it. Multi-label candidates go through the NMS mode unchanged, so `nms=Nms.ClassAgnostic` suppresses across the classes of one anchor. Multi-label also raises the default `pre_nms_top_k` from 300 to 30000 (Ultralytics' `max_nms`); `decoder.pre_nms_top_k = 0` removes the cap.
 
 For a quantized model, attach the quantization parameters to the output description so the decoder dequantizes as it reads:
 
@@ -140,14 +140,7 @@ symbolic axis (`'batch'` from ONNX, `-1` from TFLite); those are refused
 with a `ValueError` naming the tensor and axis, because the layout rules
 need real sizes.
 
-The schema pins the NMS *mode* and leaves the *thresholds* to you.
-Ultralytics runs NMS class-aware (`agnostic=False`), so an inferred pre-NMS
-schema says so rather than inheriting `Decoder`'s class-agnostic default,
-which would suppress a box against an overlapping box of a different class.
-Passing `nms=` still overrides. Thresholds are not inferable, and
-`Decoder`'s defaults (`score_threshold=0.1`, `iou_threshold=0.7`) are not
-Ultralytics' (`0.25`/`0.45`) — pass them as shown above. YOLO26 end-to-end
-exports apply NMS in-graph and carry no mode at all.
+The schema pins the NMS *mode* and leaves the *thresholds* to you. Ultralytics runs NMS class-aware (`agnostic=False`), so an inferred pre-NMS schema says so explicitly. Passing `nms=` still overrides. Thresholds are not inferable, and `Decoder`'s defaults (`score_threshold=0.1`, `iou_threshold=0.7`) are not Ultralytics' (`0.25`/`0.45`) — pass them as shown above. YOLO26 end-to-end exports apply NMS in-graph and carry no mode at all.
 
 `ValueError` is raised for anything that is not a recognizable Ultralytics
 export — missing or unparsable metadata, an unsupported task (only `detect`

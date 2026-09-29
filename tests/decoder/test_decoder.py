@@ -1071,3 +1071,128 @@ def test_yolo_det_int8_numpy(benchmark):
     assert np.allclose(scores, [0.5591227, 0.33057618])
     assert np.allclose(classes, [0, 75])
     assert len(masks) == 0
+
+
+MULTI_LABEL_DET = {
+    "outputs": [
+        {
+            "decoder": "ultralytics",
+            "type": "detection",
+            "shape": [1, 7, 4],
+            "dshape": [["batch", 1], ["num_features", 7], ["num_boxes", 4]],
+            "normalized": True,
+        }
+    ]
+}
+
+
+def multi_label_det_tensor():
+    # Anchor 0 clears the threshold for classes 0 and 1, anchor 1 for class 2.
+    per_anchor = np.array(
+        [
+            [0.3, 0.3, 0.2, 0.2, 0.9, 0.8, 0.0],
+            [0.7, 0.7, 0.2, 0.2, 0.0, 0.0, 0.9],
+            [0.5, 0.5, 0.1, 0.1, 0.0, 0.0, 0.0],
+            [0.2, 0.8, 0.1, 0.1, 0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    return numpy_to_tensor(per_anchor.T.reshape(1, 7, 4).copy())
+
+
+def multi_label_decoder(ctor, **kwargs):
+    import json
+
+    if ctor == "init":
+        return ef.Decoder(MULTI_LABEL_DET, 0.5, 0.5, **kwargs)
+    if ctor == "json":
+        return ef.Decoder.new_from_json_str(
+            json.dumps(MULTI_LABEL_DET), 0.5, 0.5, **kwargs
+        )
+    if ctor == "yaml":
+        # JSON is valid YAML, so the YAML parser accepts it unchanged.
+        return ef.Decoder.new_from_yaml_str(
+            json.dumps(MULTI_LABEL_DET), 0.5, 0.5, **kwargs
+        )
+    output = ef.Output.detection(shape=[1, 7, 4]).with_normalized(True)
+    return ef.Decoder.new_from_outputs([output], 0.5, 0.5, **kwargs)
+
+
+def test_multi_label_defaults_off():
+    assert multi_label_decoder("init").multi_label is False
+
+
+@pytest.mark.parametrize("ctor", ["init", "json", "yaml", "outputs"])
+def test_multi_label_kwarg_on_every_constructor(ctor):
+    decoder = multi_label_decoder(ctor, multi_label=True)
+    assert decoder.multi_label is True
+    _, _, classes, _ = decoder.decode([multi_label_det_tensor()])
+    assert sorted(classes.tolist()) == [0, 1, 2]
+
+
+def test_multi_label_off_is_argmax():
+    decoder = multi_label_decoder("init", multi_label=False)
+    _, _, classes, _ = decoder.decode([multi_label_det_tensor()])
+    assert sorted(classes.tolist()) == [0, 2]
+
+
+def test_multi_label_read_from_metadata():
+    config = dict(MULTI_LABEL_DET, nms_multi_label=True)
+    assert ef.Decoder(config, 0.5, 0.5).multi_label is True
+
+
+def test_multi_label_kwarg_false_overrides_metadata():
+    config = dict(MULTI_LABEL_DET, nms_multi_label=True)
+    assert ef.Decoder(config, 0.5, 0.5, multi_label=False).multi_label is False
+
+
+def test_nms_auto_resolves_class_aware():
+    assert multi_label_decoder("init").nms == ef.Nms.ClassAware
+
+
+@pytest.mark.parametrize("ctor", ["init", "json", "yaml", "outputs"])
+def test_pre_nms_top_k_default_follows_multi_label(ctor):
+    assert multi_label_decoder(ctor).pre_nms_top_k == 300
+    assert multi_label_decoder(ctor, multi_label=True).pre_nms_top_k == 30000
+
+
+def test_pre_nms_top_k_multi_label_default_from_metadata():
+    config = dict(MULTI_LABEL_DET, nms_multi_label=True)
+    assert ef.Decoder(config, 0.5, 0.5).pre_nms_top_k == 30000
+
+
+def test_pre_nms_top_k_setter_is_explicit_and_none_resets():
+    decoder = multi_label_decoder("init", multi_label=True)
+    decoder.pre_nms_top_k = 30000
+    assert decoder.pre_nms_top_k == 30000
+    decoder.pre_nms_top_k = 0
+    assert decoder.pre_nms_top_k == 0
+    decoder.pre_nms_top_k = None
+    assert decoder.pre_nms_top_k == 30000
+    argmax = multi_label_decoder("init")
+    argmax.pre_nms_top_k = 30000
+    assert argmax.pre_nms_top_k == 30000
+    argmax.pre_nms_top_k = None
+    assert argmax.pre_nms_top_k == 300
+
+
+def test_multi_label_honours_class_agnostic_nms():
+    # Anchor 0's classes 0 and 1 share one bbox: agnostic NMS keeps one.
+    decoder = multi_label_decoder("init", multi_label=True, nms=ef.Nms.ClassAgnostic)
+    assert decoder.nms == ef.Nms.ClassAgnostic
+    _, _, classes, _ = decoder.decode([multi_label_det_tensor()])
+    assert sorted(classes.tolist()) == [0, 2]
+
+
+def test_max_boxes_limits_decode_output():
+    decoder = multi_label_decoder("init", multi_label=True)
+    boxes, scores, classes, _ = decoder.decode([multi_label_det_tensor()], max_boxes=1)
+    assert len(boxes) == len(scores) == len(classes) == 1
+    assert scores[0] == pytest.approx(0.9)
+
+
+def test_max_det_limits_decode_output():
+    decoder = multi_label_decoder("init", multi_label=True)
+    decoder.max_det = 2
+    _, _, classes, _ = decoder.decode([multi_label_det_tensor()])
+    assert len(classes) == 2

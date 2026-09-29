@@ -57,7 +57,21 @@ pub const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
 /// All fields except [`SchemaV2::schema_version`] are optional, so
 /// third-party integrations can include only the sections relevant to
 /// their use case.
+///
+/// The struct is `#[non_exhaustive]` so new optional sections can be added
+/// without a breaking change. Outside this crate, start from
+/// [`SchemaV2::new`] (or [`Default`], or a parser) and assign fields:
+///
+/// ```rust
+/// use edgefirst_decoder::schema::{NmsMode, SchemaV2};
+///
+/// let mut schema = SchemaV2::new();
+/// schema.nms = Some(NmsMode::ClassAware);
+/// schema.nms_multi_label = Some(true);
+/// assert_eq!(schema.schema_version, 2);
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SchemaV2 {
     /// Schema version. Always 2 for v2 metadata.
     pub schema_version: u32,
@@ -79,12 +93,24 @@ pub struct SchemaV2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nms: Option<NmsMode>,
 
+    /// Emit one box per class above the score threshold (validation decode).
+    /// Tracked decode ignores it; an explicit decoder setting overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nms_multi_label: Option<bool>,
+
     /// YOLO architecture version for Ultralytics decoders.
     ///
     /// Values: `yolov5`, `yolov8`, `yolo11`, `yolo26`. `yolo26` is
     /// end-to-end (embedded NMS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<DecoderVersion>,
+}
+
+impl SchemaV2 {
+    /// An empty v2 schema: `schema_version` 2 and every section unset.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl Default for SchemaV2 {
@@ -94,6 +120,7 @@ impl Default for SchemaV2 {
             input: None,
             outputs: Vec::new(),
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         }
     }
@@ -743,7 +770,8 @@ impl SchemaV2 {
             schema_version: 2,
             input: None,
             outputs,
-            nms: v1.nms.as_ref().map(NmsMode::from_v1),
+            nms: v1.nms.as_ref().and_then(NmsMode::from_v1),
+            nms_multi_label: v1.nms_multi_label,
             decoder_version: v1.decoder_version.as_ref().map(DecoderVersion::from_v1),
         })
     }
@@ -824,6 +852,7 @@ impl SchemaV2 {
         Ok(ConfigOutputs {
             outputs,
             nms: self.nms.map(NmsMode::to_v1),
+            nms_multi_label: self.nms_multi_label,
             decoder_version: self.decoder_version.map(|v| v.to_v1()),
         })
     }
@@ -1166,11 +1195,12 @@ impl DecoderVersion {
 }
 
 impl NmsMode {
-    /// Convert a legacy v1 [`configs::Nms`] to a v2 [`NmsMode`].
-    pub fn from_v1(v: &configs::Nms) -> Self {
+    /// Convert a legacy v1 [`configs::Nms`]; `Auto` defers to the builder default.
+    pub fn from_v1(v: &configs::Nms) -> Option<Self> {
         match v {
-            configs::Nms::Auto | configs::Nms::ClassAgnostic => NmsMode::ClassAgnostic,
-            configs::Nms::ClassAware => NmsMode::ClassAware,
+            configs::Nms::Auto => None,
+            configs::Nms::ClassAgnostic => Some(NmsMode::ClassAgnostic),
+            configs::Nms::ClassAware => Some(NmsMode::ClassAware),
         }
     }
 
@@ -1395,6 +1425,35 @@ fn detection_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nms_multi_label_true_round_trips_through_json() {
+        let json = r#"{
+            "schema_version": 2,
+            "nms": "class_aware",
+            "nms_multi_label": true,
+            "outputs": [{
+                "name": "output0", "type": "detection",
+                "shape": [1, 84, 8400],
+                "dshape": [{"batch": 1}, {"num_features": 84}, {"num_boxes": 8400}],
+                "dtype": "float32", "decoder": "ultralytics", "encoding": "direct",
+                "normalized": true
+            }]
+        }"#;
+        let schema = SchemaV2::parse_json(json).unwrap();
+        assert_eq!(schema.nms_multi_label, Some(true));
+
+        let text = serde_json::to_string(&schema).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["nms_multi_label"], serde_json::json!(true));
+        let again = SchemaV2::parse_json(&text).unwrap();
+        assert_eq!(again, schema);
+
+        let legacy = schema.to_legacy_config_outputs().unwrap();
+        assert_eq!(legacy.nms_multi_label, Some(true));
+        let back = SchemaV2::from_v1(&legacy).unwrap();
+        assert_eq!(back.nms_multi_label, Some(true));
+    }
 
     #[test]
     fn schema_default_is_v2() {
@@ -1984,6 +2043,7 @@ mod tests {
                 activation_required: None,
             }],
             nms: Some(NmsMode::ClassAgnostic),
+            nms_multi_label: None,
             decoder_version: Some(DecoderVersion::Yolov8),
         };
         let j = serde_json::to_string(&original).unwrap();
@@ -2093,6 +2153,7 @@ mod tests {
                 normalized: Some(true),
             })],
             nms: Some(crate::configs::Nms::ClassAware),
+            nms_multi_label: None,
             decoder_version: Some(crate::configs::DecoderVersion::Yolo11),
         };
         let v2 = SchemaV2::from_v1(&v1).unwrap();
@@ -2193,6 +2254,7 @@ mod tests {
                 },
             ],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
@@ -2234,6 +2296,7 @@ mod tests {
                 activation_required: None,
             }],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
@@ -2278,6 +2341,7 @@ mod tests {
             input: None,
             outputs: vec![lo],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         schema.validate().expect(
@@ -2315,6 +2379,7 @@ mod tests {
                 normalized: None,
             })],
             nms: None,
+            nms_multi_label: None,
             decoder_version: None,
         };
         let v2 = SchemaV2::from_v1(&v1).unwrap();

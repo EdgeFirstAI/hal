@@ -82,10 +82,7 @@ group is kept and the rest are dropped. The enclosing-union merge measured about
 `ef_tiled_frame_accumulator_new` or `ef_merge_tiled_detections`.
 
 `mode` was added to `ef_merge_config` in the 4-byte tail pad it already had, so
-the struct is still 32 bytes and no other field moved. `ef_decoder_abi_version`
-is `2`: the layout did not change, but the default merge did, so the same call
-with the same struct returns different box geometry than version 1 -- gate on
-the probe rather than on a link succeeding.
+the struct is still 32 bytes and no other field moved. `ef_decoder_abi_version` is `2`: `sizeof` did not change, but a caller built against version 1 never writes `mode`, so gate on the probe rather than on a link succeeding.
 
 **This is a minor-version ABI break.** `ef_merge_config` shipped without `mode`
 in 0.29.x, and a caller built against that header never initialised the tail
@@ -174,16 +171,11 @@ the wrong one into `EINVAL`. `source` is a plain integer with no macros:
 pixel-space or `[0, 1]` follows the exporter, is not derivable from shapes,
 and guessing scales every box by the input size.
 
-An inferred schema pins the NMS *mode* and leaves the *thresholds* to you.
-Ultralytics runs NMS class-aware (`agnostic=False`), so a pre-NMS YOLOv8/11
-schema says so — leaving it unset is not neutral, because
-`ef_decoder_params_new` defaults to mode `1` (automatic), which resolves an
-unset config to class-agnostic and would suppress a box against an
-overlapping box of a *different* class. `ef_decoder_params_set_nms` still
-overrides. Thresholds are not inferable from shapes, and the library's
-defaults (`0.5`/`0.5`) are not Ultralytics' (`0.25`/`0.45`), so set them
-explicitly as above. YOLO26 end-to-end exports apply their own NMS in-graph
-and carry no mode at all.
+An inferred schema pins the NMS *mode* and leaves the *thresholds* to you. Ultralytics runs NMS class-aware (`agnostic=False`), so a pre-NMS YOLOv8/11 schema says so explicitly. `ef_decoder_params_new` defaults to mode `1` (automatic), which takes the config's mode and otherwise resolves to class-aware; `ef_decoder_params_set_nms` still overrides. Thresholds are not inferable from shapes, and the library's defaults (`0.5`/`0.5`) are not Ultralytics' (`0.25`/`0.45`), so set them explicitly as above. YOLO26 end-to-end exports apply their own NMS in-graph and carry no mode at all.
+
+For validation and mAP runs, `ef_decoder_params_set_multi_label(p, 1)` emits one box per class above the score threshold instead of one per anchor. It overrides the model config's `nms_multi_label`; tracked decode ignores it and always keeps one label per box. `ef_decoder_multi_label(d)` reports the setting a built decoder ended up with, including one taken from metadata. Multi-label candidates go through the NMS mode unchanged, so mode `3` (class-agnostic) suppresses across the classes of one anchor.
+
+`ef_decoder_params_set_pre_nms_top_k` caps how many candidates reach NMS; `0` means no limit. Left unset, the cap is 300, or 30 000 (Ultralytics' `max_nms`) when multi-label decode is on; for validation at a low score threshold, pass `0`.
 
 Inference never guesses: metadata and shapes are cross-checked, and a
 disagreement — a class count that does not fit the output width, a `segment`

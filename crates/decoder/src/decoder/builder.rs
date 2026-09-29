@@ -123,6 +123,14 @@ mod input_dims_from_spec_tests {
     }
 }
 
+/// Default [`DecoderBuilder::with_pre_nms_top_k`] cap for argmax decode.
+pub const DEFAULT_PRE_NMS_TOP_K: usize = 300;
+
+/// Default [`DecoderBuilder::with_pre_nms_top_k`] cap when multi-label decode
+/// is on: Ultralytics' `max_nms`, since multi-label emits up to
+/// anchors × classes candidates.
+pub const MULTI_LABEL_PRE_NMS_TOP_K: usize = 30_000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
@@ -131,7 +139,7 @@ pub struct DecoderBuilder {
     /// NMS mode.
     ///
     /// - `Some(Nms::Auto)` — resolve from config or fallback to
-    ///   `ClassAgnostic` (builder default)
+    ///   `ClassAware` (builder default)
     /// - `Some(Nms::ClassAgnostic)` — explicit class-agnostic override
     /// - `Some(Nms::ClassAware)` — explicit class-aware override
     /// - `None` — bypass NMS entirely
@@ -140,17 +148,18 @@ pub struct DecoderBuilder {
     /// schemas without per-scale children (which use the legacy decode
     /// path).
     decode_dtype: DecodeDtype,
-    pre_nms_top_k: usize,
+    /// Explicit pre-NMS cap; `None` takes [`DEFAULT_PRE_NMS_TOP_K`], or
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] when multi-label decode is on.
+    pre_nms_top_k: Option<usize>,
     max_det: usize,
     /// Explicit override for the model input dimensions `(width, height)`,
     /// consumed by EDGEAI-1303 normalization. When set, takes precedence
     /// over schema-derived dims; when `None`, the value is read from the
     /// schema's `input.shape` / `input.dshape` at build time.
     input_dims: Option<(usize, usize)>,
-    /// Emit one candidate per (anchor, class) for every class above the score
-    /// threshold — matching Ultralytics `val` multi-label decode.
-    /// OFF by default.  Never read from schema/config (builder-only flag).
-    multi_label: bool,
+    /// Explicit multi-label override; `None` defers to the config's
+    /// `nms_multi_label`, then to off.
+    multi_label: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,10 +201,10 @@ impl Default for DecoderBuilder {
             score_threshold: 0.5,
             nms: Some(configs::Nms::Auto),
             decode_dtype: DecodeDtype::F32,
-            pre_nms_top_k: 300,
+            pre_nms_top_k: None,
             max_det: 300,
             input_dims: None,
-            multi_label: false,
+            multi_label: None,
         }
     }
 }
@@ -292,7 +301,7 @@ impl DecoderBuilder {
     /// Accepts a [`SchemaV2`] as produced by [`SchemaV2::parse_json`],
     /// [`SchemaV2::parse_yaml`], [`SchemaV2::parse_file`], or
     /// constructed programmatically. The builder validates the schema,
-    /// compiles a [`DecodeProgram`] for any split logical outputs
+    /// compiles a decode program for any split logical outputs
     /// (per-scale or channel sub-splits), and downconverts the
     /// logical-level semantics to the legacy [`ConfigOutputs`]
     /// representation consumed by the existing decoder dispatch.
@@ -904,7 +913,7 @@ impl DecoderBuilder {
     /// Sets the NMS mode for the decoder.
     ///
     /// - `Some(Nms::Auto)` — resolve from model config (e.g. `edgefirst.json`)
-    ///   or fall back to `ClassAgnostic` (this is the builder default)
+    ///   or fall back to `ClassAware` (this is the builder default)
     /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping
     ///   boxes regardless of class label
     /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
@@ -935,12 +944,22 @@ impl DecoderBuilder {
     /// for every class whose score meets the threshold — matching the
     /// Ultralytics `val` multi-label decode that drives COCO mAP evaluation.
     ///
-    /// **Default: `false`** (argmax: one class per anchor).  This flag is
-    /// intentionally builder-only: a deployed `edgefirst.json` can never
-    /// enable it, and `decode_tracked_*` entry points `debug_assert` it is off.
+    /// **Default:** the model config's `nms_multi_label`, else `false`
+    /// (argmax: one class per anchor). An explicit call overrides the config
+    /// either way; `build()` logs a warning when the config turns it on.
+    /// [`Decoder::decode_for_tracking`](crate::Decoder::decode_for_tracking),
+    /// and `Decoder::decode_tracked` / `Decoder::decode_proto_tracked` (behind
+    /// the `tracker` feature), ignore it and always decode one label per box.
     ///
-    /// Multi-label automatically forces class-aware NMS so per-class duplicates
-    /// are suppressed correctly without cross-class suppression.
+    /// The candidates go through the decoder's NMS mode unchanged. Class-aware
+    /// NMS (the default when neither the caller nor the config sets a mode)
+    /// keeps every class of an anchor; an explicit `Nms::ClassAgnostic`
+    /// suppresses across classes, as Ultralytics
+    /// `non_max_suppression(multi_label=True, agnostic=True)` does.
+    ///
+    /// Unless [`with_pre_nms_top_k`](Self::with_pre_nms_top_k) is called,
+    /// multi-label decode raises the pre-NMS cap to
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`].
     ///
     /// # Examples
     /// ```rust
@@ -955,16 +974,26 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn with_multi_label(mut self, v: bool) -> Self {
-        self.multi_label = v;
+        self.multi_label = Some(v);
         self
     }
 
     /// Sets the maximum number of candidate boxes fed into NMS after score
-    /// filtering.  Uses partial sort (O(N)) to select the top-K candidates,
-    /// dramatically reducing the O(N²) NMS cost when many low-confidence
-    /// proposals pass the threshold (common with mAP eval at 0.001).
+    /// filtering; `0` means unbounded. Uses partial sort (O(N)) to select the
+    /// top-K candidates, dramatically reducing the O(N²) NMS cost when many
+    /// low-confidence proposals pass the threshold (common with mAP eval at
+    /// 0.001). Equal scores at the cut keep the lower anchor index. Applies
+    /// to every NMS decode path; ignored when NMS is bypassed.
     ///
-    /// Default: 300.
+    /// Default: [`DEFAULT_PRE_NMS_TOP_K`] (300), or
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) when
+    /// multi-label decode is on, whether from
+    /// [`with_multi_label`](Self::with_multi_label) or the model's
+    /// `nms_multi_label`; argmax decodes of a multi-label decoder (the
+    /// tracking entry points) keep 300. Unset, the built decoder's
+    /// [`Decoder::pre_nms_top_k`](crate::Decoder::pre_nms_top_k) is `None` and
+    /// is resolved per decode; an explicit call stores `Some(n)`, which every
+    /// decode uses as given.
     ///
     /// # ⚠️ Validation vs Deployment
     ///
@@ -973,11 +1002,13 @@ impl DecoderBuilder {
     /// top-K is effectively a no-op.
     ///
     /// For **COCO mAP evaluation** (`score_threshold ≈ 0.001`), set this to
-    /// the total anchor count (8 400 for standard 640 × 640 YOLO models) or
-    /// to `0` (no limit) so that all score-passing candidates reach NMS.
-    /// Failing to do so causes **~9 pp box mAP loss** — the decoder math is
-    /// correct but the evaluation protocol requires full recall across the
-    /// confidence range.
+    /// `0` (unbounded) so that all score-passing candidates reach NMS.
+    /// Under argmax decode there is one candidate per anchor, so the anchor
+    /// count (8 400 for a 640 × 640 YOLO model) is also enough; under
+    /// multi-label decode there are up to anchors × classes candidates, so use
+    /// `0` or leave the multi-label default. Failing to raise the cap causes
+    /// **~9 pp box mAP loss** — the decoder math is correct but the
+    /// evaluation protocol requires full recall across the confidence range.
     ///
     /// Post-processing latency scales with candidate count. At deployment
     /// thresholds the cost difference is negligible; at validation thresholds
@@ -995,11 +1026,13 @@ impl DecoderBuilder {
     ///     .with_score_threshold(0.25)
     ///     // pre_nms_top_k defaults to 300 — appropriate here
     ///     .build()?;
+    /// assert_eq!(decoder.pre_nms_top_k, None);
+    /// assert_eq!(decoder.pre_nms_top_k_for(false), 300);
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// COCO mAP evaluation (pass all anchors to NMS):
+    /// COCO mAP evaluation (pass every candidate to NMS):
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
@@ -1007,15 +1040,15 @@ impl DecoderBuilder {
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_score_threshold(0.001)
-    ///     .with_pre_nms_top_k(8400)  // all YOLO anchors
+    ///     .with_pre_nms_top_k(0) // unbounded
     ///     .with_max_det(300)
     ///     .build()?;
-    /// assert_eq!(decoder.pre_nms_top_k, 8400);
+    /// assert_eq!(decoder.pre_nms_top_k, Some(0));
     /// # Ok(())
     /// # }
     /// ```
     pub fn with_pre_nms_top_k(mut self, pre_nms_top_k: usize) -> Self {
-        self.pre_nms_top_k = pre_nms_top_k;
+        self.pre_nms_top_k = Some(pre_nms_top_k);
         self
     }
 
@@ -1136,16 +1169,29 @@ impl DecoderBuilder {
             Self::get_normalized(&config.outputs)
         };
 
+        let (multi_label, multi_label_source) = match (self.multi_label, config.nms_multi_label) {
+            (Some(v), _) => (v, super::MultiLabelSource::Explicit),
+            (None, Some(v)) => (v, super::MultiLabelSource::Metadata),
+            (None, None) => (false, super::MultiLabelSource::Default),
+        };
+        if multi_label && multi_label_source == super::MultiLabelSource::Metadata {
+            tracing::warn!(
+                "model metadata sets nms_multi_label: decode emits one box per class above the \
+                 score threshold (validation decode); pass multi_label=false to override"
+            );
+        }
+        let pre_nms_top_k = self.pre_nms_top_k;
+
         // NMS precedence:
         //   Some(ClassAgnostic|ClassAware) → explicit user override
-        //   Some(Auto) → resolve from config, fallback to ClassAgnostic
+        //   Some(Auto) → resolve from config, fallback to ClassAware
         //   None → NMS disabled (explicit)
         //
         // `Auto` is always resolved to a concrete mode here — it never
         // persists into the built `Decoder`, even if the config itself
         // contains `Auto`.
         let resolve_auto = |nms: Option<configs::Nms>| match nms {
-            Some(configs::Nms::Auto) | None => Some(configs::Nms::ClassAgnostic),
+            Some(configs::Nms::Auto) | None => Some(configs::Nms::ClassAware),
             concrete => concrete,
         };
         let nms = match self.nms {
@@ -1182,11 +1228,13 @@ impl DecoderBuilder {
             iou_threshold: self.iou_threshold,
             score_threshold: self.score_threshold,
             nms,
-            pre_nms_top_k: self.pre_nms_top_k,
+            pre_nms_top_k,
             max_det: self.max_det,
             normalized,
             input_dims,
-            multi_label: self.multi_label,
+            multi_label,
+            multi_label_source,
+            tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
             decode_program,
             per_scale,
         })

@@ -14,13 +14,10 @@ pub mod tiling;
 
 /// ABI version of this library's C surface.
 ///
-/// Bumped to 2 for the tiled merge: `ef_merge_config` gained a `mode` field
-/// in its old tail pad and the default merge became keep-best, so
-/// `ef_merge_tiled_detections` and `ef_tiled_frame_accumulator_new` return
-/// different box geometry than version 1 did. The struct layout is
-/// unchanged, which is exactly why the probe has to carry the signal: a
-/// caller that drops in this library gets no link error and no size
-/// mismatch, only different boxes.
+/// Bumped to 2 when `ef_merge_config` gained a `mode` field in its old tail
+/// pad. `sizeof` is unchanged, so a caller built against version 1 gets no
+/// link error and no size mismatch, but never writes `mode`; the probe is
+/// the only signal. Changed defaults do not move it.
 #[no_mangle]
 pub extern "C" fn ef_decoder_abi_version() -> u32 {
     2

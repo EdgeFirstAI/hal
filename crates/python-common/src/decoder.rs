@@ -9,21 +9,21 @@ use edgefirst_tensor::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
 ///
 /// - `ClassAgnostic` — suppress overlapping boxes regardless of class label
-///   (default)
 /// - `ClassAware` — only suppress boxes that share the same class label AND
-///   overlap
+///   overlap (default)
+/// - `Auto` — take the mode from the model config, else `ClassAware`
 ///
 /// Pass `None` to bypass NMS entirely (for end-to-end models with embedded
 /// NMS).
 #[pyo3::pyclass(name = "Nms", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyNms {
-    /// Suppress overlapping boxes regardless of class label (default)
+    /// Suppress overlapping boxes regardless of class label
     ClassAgnostic = 0,
-    /// Only suppress boxes with the same class label that overlap
+    /// Only suppress boxes with the same class label that overlap (default)
     ClassAware = 1,
     /// Use the model config (e.g. ``edgefirst.json``) to decide NMS mode,
-    /// falling back to :attr:`ClassAgnostic` when no config specifies one.
+    /// falling back to :attr:`ClassAware` when no config specifies one.
     Auto = 2,
 }
 
@@ -486,7 +486,17 @@ fn decode_native(
     py: Python<'_>,
     model_output: Vec<Bound<'_, PyAny>>,
     max_boxes: usize,
+    for_tracking: bool,
 ) -> PyResult<(Vec<DetectBox>, Vec<Segmentation>)> {
+    let run = |refs: &[&edgefirst_tensor::TensorDyn],
+               boxes: &mut Vec<DetectBox>,
+               masks: &mut Vec<Segmentation>| {
+        if for_tracking {
+            decoder.decode_for_tracking(refs, boxes, masks)
+        } else {
+            decoder.decode(refs, boxes, masks)
+        }
+    };
     let model_output: Vec<crate::interop::TensorArg> = model_output
         .iter()
         .map(|o| crate::interop::TensorArg::extract(o, None))
@@ -504,8 +514,7 @@ fn decode_native(
                 raw_inputs.iter().map(|t| t.as_ref()).collect();
             let mut output_boxes = Vec::with_capacity(max_boxes);
             let mut output_masks = Vec::with_capacity(max_boxes);
-            decoder
-                .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
+            run(&tensor_refs, &mut output_boxes, &mut output_masks)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
             Ok::<_, PyErr>((output_boxes, output_masks))
         })?
@@ -514,8 +523,7 @@ fn decode_native(
             model_output.iter().map(|t| t.as_ref()).collect();
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
-        decoder
-            .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
+        run(&tensor_refs, &mut output_boxes, &mut output_masks)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
         (output_boxes, output_masks)
     };
@@ -712,21 +720,26 @@ impl PyDecoder {
     ///         ``0.1``).
     ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
     ///     nms: NMS mode - ``Nms.Auto`` (default, uses config or
-    ///         ``ClassAgnostic``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
+    ///         ``ClassAware``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
     ///         or ``None`` to bypass NMS.
     ///     input_dims: Optional ``(width, height)`` model input override
     ///         consumed by the EDGEAI-1303 normalization path. When set,
     ///         takes precedence over schema-derived dims; pass when building
     ///         from a config that does not declare an input shape but the
     ///         model emits pixel-space boxes (``Detection.normalized = False``).
+    ///     multi_label: Emit one box per class above ``score_threshold``
+    ///         instead of one per anchor (validation decode). ``None``
+    ///         (default) uses the config's ``nms_multi_label``, else ``False``.
+    ///         :meth:`decode_tracked` always uses one label per box.
     #[new]
-    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None))]
+    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None, multi_label=None))]
     pub fn new(
         config: Bound<PyAny>,
         score_threshold: f32,
         iou_threshold: f32,
         nms: Option<PyNms>,
         input_dims: Option<(usize, usize)>,
+        multi_label: Option<bool>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
@@ -735,6 +748,9 @@ impl PyDecoder {
             .with_nms(nms);
         if let Some((w, h)) = input_dims {
             builder = builder.with_input_dims(w, h);
+        }
+        if let Some(v) = multi_label {
+            builder = builder.with_multi_label(v);
         }
 
         // EDGEAI-1081: discriminate v2 vs legacy on the authoritative
@@ -779,13 +795,19 @@ impl PyDecoder {
     ///     score_threshold: Score threshold for filtering detections (default
     ///         ``0.25``).
     ///     iou_threshold: IoU threshold for NMS (default ``0.45``).
-    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
-    ///         or ``None`` to bypass NMS.
+    ///     nms: NMS mode - ``Nms.Auto`` (default, ``ClassAware``),
+    ///         ``Nms.ClassAgnostic``, ``Nms.ClassAware``, or ``None`` to bypass
+    ///         NMS.
     ///     decoder_version: Optional decoder version for Ultralytics models.
     ///     input_dims: Optional ``(width, height)`` model input override.
     ///         See :meth:`__init__` for semantics.
+    ///     multi_label: Emit one box per class above ``score_threshold``
+    ///         instead of one per anchor (validation decode). ``None``
+    ///         (default) leaves it off, since outputs carry no
+    ///         ``nms_multi_label``.
+    ///         :meth:`decode_tracked` always uses one label per box.
     #[staticmethod]
-    #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::Auto, decoder_version=None, input_dims=None))]
+    #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::Auto, decoder_version=None, input_dims=None, multi_label=None))]
     pub fn new_from_outputs(
         outputs: Vec<PyRef<PyOutput>>,
         score_threshold: f32,
@@ -793,6 +815,7 @@ impl PyDecoder {
         nms: Option<PyNms>,
         decoder_version: Option<PyDecoderVersion>,
         input_dims: Option<(usize, usize)>,
+        multi_label: Option<bool>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
@@ -808,6 +831,9 @@ impl PyDecoder {
         if let Some((w, h)) = input_dims {
             builder = builder.with_input_dims(w, h);
         }
+        if let Some(v) = multi_label {
+            builder = builder.with_multi_label(v);
+        }
         match builder.build() {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
@@ -822,18 +848,23 @@ impl PyDecoder {
     ///         ``0.1``).
     ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
     ///     nms: NMS mode - ``Nms.Auto`` (default, uses config or
-    ///         ``ClassAgnostic``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
+    ///         ``ClassAware``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
     ///         or ``None`` to bypass NMS.
     ///     input_dims: Optional ``(width, height)`` model input override.
     ///         See :meth:`__init__` for semantics.
+    ///     multi_label: Emit one box per class above ``score_threshold``
+    ///         instead of one per anchor (validation decode). ``None``
+    ///         (default) uses the config's ``nms_multi_label``, else ``False``.
+    ///         :meth:`decode_tracked` always uses one label per box.
     #[staticmethod]
-    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None))]
+    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None, multi_label=None))]
     pub fn new_from_json_str(
         json_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
         nms: Option<PyNms>,
         input_dims: Option<(usize, usize)>,
+        multi_label: Option<bool>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
@@ -843,6 +874,9 @@ impl PyDecoder {
             .with_config_json_str(json_str.to_string());
         if let Some((w, h)) = input_dims {
             builder = builder.with_input_dims(w, h);
+        }
+        if let Some(v) = multi_label {
+            builder = builder.with_multi_label(v);
         }
         match builder.build() {
             Ok(decoder) => Ok(Self { decoder }),
@@ -858,18 +892,23 @@ impl PyDecoder {
     ///         ``0.1``).
     ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
     ///     nms: NMS mode - ``Nms.Auto`` (default, uses config or
-    ///         ``ClassAgnostic``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
+    ///         ``ClassAware``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
     ///         or ``None`` to bypass NMS.
     ///     input_dims: Optional ``(width, height)`` model input override.
     ///         See :meth:`__init__` for semantics.
+    ///     multi_label: Emit one box per class above ``score_threshold``
+    ///         instead of one per anchor (validation decode). ``None``
+    ///         (default) uses the config's ``nms_multi_label``, else ``False``.
+    ///         :meth:`decode_tracked` always uses one label per box.
     #[staticmethod]
-    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None))]
+    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None, multi_label=None))]
     pub fn new_from_yaml_str(
         yaml_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
         nms: Option<PyNms>,
         input_dims: Option<(usize, usize)>,
+        multi_label: Option<bool>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(Into::into);
         let mut builder = DecoderBuilder::default()
@@ -879,6 +918,9 @@ impl PyDecoder {
             .with_config_yaml_str(yaml_str.to_string());
         if let Some((w, h)) = input_dims {
             builder = builder.with_input_dims(w, h);
+        }
+        if let Some(v) = multi_label {
+            builder = builder.with_multi_label(v);
         }
         match builder.build() {
             Ok(decoder) => Ok(Self { decoder }),
@@ -926,7 +968,7 @@ impl PyDecoder {
         // inside `decode_native` — a concurrent setter would otherwise
         // alias `&mut Decoder` (see `TensorArg::into_raw_access`).
         let (output_boxes, output_masks) =
-            decode_native(&self_.decoder, py, model_output, max_boxes)?;
+            decode_native(&self_.decoder, py, model_output, max_boxes, false)?;
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);
         Ok((boxes, scores, classes, masks))
@@ -942,7 +984,7 @@ impl PyDecoder {
     ) -> PyResult<PySegDetTrackedOutput<'py>> {
         let py = self_.py();
         let (output_boxes, output_masks) =
-            decode_native(&self_.decoder, py, model_output, max_boxes)?;
+            decode_native(&self_.decoder, py, model_output, max_boxes, true)?;
 
         // ByteTrack._associate_detections runs Kalman + the live/coasting
         // rewrite off the GIL. Duck-typed trackers without that method keep
@@ -1211,17 +1253,32 @@ impl PyDecoder {
         self.decoder.nms.map(|nms| nms.into())
     }
 
-    /// Maximum number of candidates fed into NMS after score filtering.
-    /// Uses O(N) partial sort to reduce O(N²) NMS cost. Default: 300.
+    /// Whether :meth:`decode` emits one box per class above the score
+    /// threshold instead of one per anchor. :meth:`decode_tracked` ignores
+    /// it and always uses one label per box.
+    #[getter(multi_label)]
+    fn get_multi_label(&self) -> bool {
+        self.decoder.multi_label()
+    }
+
+    /// Maximum number of candidates fed into NMS after score filtering;
+    /// ``0`` means no limit. Uses O(N) partial sort to reduce O(N²) NMS cost.
+    /// Reading it returns the cap :meth:`decode` uses. Unset, that is 300,
+    /// or 30000 (Ultralytics' ``max_nms``) when :attr:`multi_label` is on,
+    /// and :meth:`decode_tracked` (always argmax) uses 300. Assigning an
+    /// ``int`` makes the cap explicit: every decode, tracked included, uses
+    /// it as given, even if it equals a default. Assigning ``None`` returns
+    /// to the defaults.
     ///
     /// .. warning::
     ///
     ///    The default of 300 is tuned for **deployment** (``score_threshold >= 0.25``)
     ///    where few anchors pass the score filter. For **COCO mAP evaluation**
-    ///    (``score_threshold = 0.001``), set this to the total anchor count
-    ///    (8400 for 640×640 YOLO models) or to ``0`` (no limit) to avoid
+    ///    (``score_threshold = 0.001``), set this to ``0`` (no limit) to avoid
     ///    discarding ~74% of valid candidates before NMS, which causes
-    ///    **~9 pp box mAP loss**.
+    ///    **~9 pp box mAP loss**. Under argmax decode the anchor count (8400
+    ///    for 640×640 YOLO models) also suffices; multi-label decode emits up
+    ///    to anchors × classes candidates.
     ///
     ///    Deployment::
     ///
@@ -1231,7 +1288,7 @@ impl PyDecoder {
     ///    COCO mAP evaluation::
     ///
     ///        decoder.score_threshold = 0.001
-    ///        decoder.pre_nms_top_k = 8400   # all anchors
+    ///        decoder.pre_nms_top_k = 0      # no limit
     ///        decoder.max_det = 300
     ///
     ///    Post-processing latency scales with candidate count. At deployment
@@ -1239,11 +1296,11 @@ impl PyDecoder {
     ///    it is measurable but necessary for correct recall.
     #[getter(pre_nms_top_k)]
     fn get_pre_nms_top_k(&self) -> usize {
-        self.decoder.pre_nms_top_k
+        self.decoder.pre_nms_top_k_for(self.decoder.multi_label())
     }
 
     #[setter(pre_nms_top_k)]
-    fn set_pre_nms_top_k(&mut self, value: usize) -> PyResult<()> {
+    fn set_pre_nms_top_k(&mut self, value: Option<usize>) -> PyResult<()> {
         self.decoder.pre_nms_top_k = value;
         Ok(())
     }

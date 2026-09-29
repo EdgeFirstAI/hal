@@ -88,16 +88,33 @@ Decoders can be configured via JSON/YAML matching the model's output specificati
 
 ## NMS Modes
 
-- `ClassAgnostic` - Suppress overlapping boxes regardless of class (default)
-- `ClassAware` - Only suppress boxes with the same class label
+- `Auto` - Use the model config's `nms` mode, falling back to `ClassAware` (builder default)
+- `ClassAware` - Only suppress boxes with the same class label (the default concrete mode, matching trainers and COCO evaluation)
+- `ClassAgnostic` - Suppress overlapping boxes regardless of class
 - `None` - Bypass NMS (for models with built-in NMS)
+
+## Multi-Label Decode
+
+By default the decoder keeps one box per anchor, labelled with its highest-scoring class. Multi-label decode instead emits a box for every class whose score clears `score_threshold`, which is how trainer validators and COCO-style evaluation count detections. Use it for validation and mAP runs, not deployment.
+
+Enable it with `DecoderBuilder::with_multi_label(true)`, the Python `multi_label=True` constructor argument, or `ef_decoder_params_set_multi_label(p, 1)`. A model can also declare it with the optional top-level `nms_multi_label` key in `edgefirst.json`; an explicit API value overrides the key. Multi-label candidates go through the decoder's NMS mode: the class-aware default keeps every class of an anchor, while an explicit class-agnostic mode suppresses across classes, as Ultralytics does with `agnostic=True`.
+
+`decode_tracked` and `decode_proto_tracked` ignore multi-label and always decode one label per box: the tracker matches on IoU only, so per-class duplicates of one anchor would become phantom tracks. Callers that feed their own tracker should use `decode_for_tracking`, which applies the same rule. Each logs a warning once per decoder if the decoder has multi-label enabled. A decoder whose multi-label comes from `nms_multi_label` in the model metadata also logs a warning when it is built, since the model file then changes what `decode` returns.
 
 ## Pre-NMS Top-K: Validation vs Deployment
 
 The decoder's `pre_nms_top_k` parameter caps how many score-passing candidates
-enter NMS, bounding its O(N²) cost via an O(N) partial sort. The default of
+enter NMS, bounding its O(N²) cost via an O(N) partial sort; `0` means no
+limit. It applies to every NMS decode path, detection-only models included,
+and equal scores at the cut keep the lower anchor index. The default of
 **300** is tuned for deployment — but it **must** be raised (or set to `0` for
-no limit) for mAP evaluation.
+no limit) for mAP evaluation. With multi-label decode on (from the API or the
+model's `nms_multi_label`) and no explicit cap, the default is **30 000**,
+Ultralytics' `max_nms`, since multi-label emits up to anchors × classes
+candidates. `Decoder::pre_nms_top_k` is `None` until a cap is set; the
+default is then resolved per decode (`Decoder::pre_nms_top_k_for`), so the
+argmax tracking entry points of a multi-label decoder keep 300. A cap set
+on the builder or assigned as `Some(n)` after build applies to every decode.
 
 ### Why it matters
 
@@ -125,7 +142,7 @@ let decoder = DecoderBuilder::new()
 let decoder = DecoderBuilder::new()
     .with_config_json_str(config)
     .with_score_threshold(0.001)
-    .with_pre_nms_top_k(8400)   // pass all anchors to NMS (or 0 = no limit)
+    .with_pre_nms_top_k(0)      // no limit: every candidate reaches NMS
     .with_max_det(300)           // COCO detection cap applied post-NMS
     .build()?;
 ```
@@ -240,12 +257,7 @@ reason to serialize it. Nor does Python: its binding returns the schema as
 a dict, which `Decoder(schema)` takes directly. The JSON rendering exists
 for the C API alone, which has no dict to hand across the boundary.
 
-The inferred schema pins the NMS *mode* but not the thresholds. Ultralytics
-runs NMS class-aware (`agnostic=False`), and leaving the field unset is not
-neutral — the builder's `Nms::Auto` default resolves an unset config to
-class-agnostic, which suppresses a box against an overlapping box of a
-different class. `with_nms` still overrides. YOLO26 end-to-end exports
-perform NMS in-graph and carry no mode.
+The inferred schema pins the NMS *mode* but not the thresholds. Ultralytics runs NMS class-aware (`agnostic=False`), and the schema says so explicitly rather than relying on the builder's fallback. `with_nms` still overrides. YOLO26 end-to-end exports perform NMS in-graph and carry no mode.
 
 Box normalization follows the export format, not a fixed convention:
 Ultralytics ONNX exports report pixel-space boxes (`normalized: false`),

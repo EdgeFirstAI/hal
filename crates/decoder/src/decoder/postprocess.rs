@@ -55,6 +55,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
@@ -82,9 +83,12 @@ impl Decoder {
                     (scores_tensor, quant_scores),
                     self.score_threshold,
                     self.iou_threshold,
+                    self.nms,
+                    self.pre_nms_top_k_for(multi_label),
                     self.max_det,
+                    multi_label,
                     output_boxes,
-                );
+                )?;
             });
         });
 
@@ -142,6 +146,7 @@ impl Decoder {
         &self,
         outputs: &[ArrayViewDQuantized],
         detection: &[configs::Detection],
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError> {
         let new_detection = detection
@@ -187,9 +192,12 @@ impl Decoder {
             &new_detection,
             self.score_threshold,
             self.iou_threshold,
+            self.nms,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
+            multi_label,
             output_boxes,
-        );
+        )?;
         Ok(())
     }
 
@@ -197,6 +205,7 @@ impl Decoder {
         &self,
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Detection,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError> {
         let (boxes_tensor, _) =
@@ -214,8 +223,11 @@ impl Decoder {
                 self.score_threshold,
                 self.iou_threshold,
                 self.nms,
+                self.pre_nms_top_k_for(multi_label),
+                self.max_det,
+                multi_label,
                 output_boxes,
-            );
+            )?;
         });
 
         Ok(())
@@ -226,6 +238,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Detection,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
@@ -262,10 +275,11 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
-                    self.pre_nms_top_k,
+                    self.pre_nms_top_k_for(multi_label),
                     self.max_det,
                     self.normalized,
                     self.input_dims,
+                    multi_label,
                     output_boxes,
                     output_masks,
                 )
@@ -278,6 +292,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
@@ -306,8 +321,11 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
+                    self.pre_nms_top_k_for(multi_label),
+                    self.max_det,
+                    multi_label,
                     output_boxes,
-                );
+                )?;
             });
         });
 
@@ -322,6 +340,7 @@ impl Decoder {
         scores: &configs::Scores,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
@@ -375,9 +394,10 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
-                    self.pre_nms_top_k,
+                    self.pre_nms_top_k_for(multi_label),
                     self.max_det,
-                )
+                    multi_label,
+                )?
             })
         });
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
@@ -404,12 +424,14 @@ impl Decoder {
 
     /// Decode 2-way split: combined detection [1,nc+4,N] + separate
     /// mask_coeff [1,32,N] + protos [1,H,W,32].
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_yolo_segdet_2way_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
         detection: &configs::Detection,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
@@ -444,17 +466,18 @@ impl Decoder {
         let mut boxes = with_quantized!(det_tensor, d, {
             let det = Self::swap_axes_if_needed(d, detection.into());
             let det = det.slice(s![0, .., ..]);
-            let boxes_view = det.slice(s![..4, ..]);
-            let scores_view = det.slice(s![4.., ..]);
+            let boxes_view = det.slice(s![..4, ..]).reversed_axes();
+            let scores_view = det.slice(s![4.., ..]).reversed_axes();
             impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                 (boxes_view, quant_det),
                 (scores_view, quant_det),
                 self.score_threshold,
                 self.iou_threshold,
                 self.nms,
-                self.pre_nms_top_k,
+                self.pre_nms_top_k_for(multi_label),
                 self.max_det,
-            )
+                multi_label,
+            )?
         });
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
@@ -462,7 +485,7 @@ impl Decoder {
         with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
-                let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                let mask_tensor = mask_tensor.slice(s![0, .., ..]).reversed_axes();
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
@@ -479,12 +502,14 @@ impl Decoder {
 
     /// Decode 2-way split (float): combined detection + separate mask_coeff +
     /// protos.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_yolo_segdet_2way_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
         detection: &configs::Detection,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError>
@@ -519,10 +544,11 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
             self.normalized,
             self.input_dims,
+            multi_label,
             output_boxes,
             output_masks,
         )
@@ -532,6 +558,7 @@ impl Decoder {
         &self,
         outputs: &[ArrayViewD<D>],
         detection: &[configs::Detection],
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError>
     where
@@ -561,9 +588,12 @@ impl Decoder {
             &new_detection,
             self.score_threshold,
             self.iou_threshold,
+            self.nms,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
+            multi_label,
             output_boxes,
-        );
+        )?;
         Ok(())
     }
 
@@ -600,6 +630,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError>
     where
@@ -620,9 +651,12 @@ impl Decoder {
             scores_tensor,
             self.score_threshold,
             self.iou_threshold,
+            self.nms,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
+            multi_label,
             output_boxes,
-        );
+        )?;
         Ok(())
     }
 
@@ -630,6 +664,7 @@ impl Decoder {
         &self,
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Detection,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError>
     where
@@ -645,8 +680,11 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k_for(multi_label),
+            self.max_det,
+            multi_label,
             output_boxes,
-        );
+        )?;
         Ok(())
     }
 
@@ -655,6 +693,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Detection,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError>
@@ -681,11 +720,11 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
             self.normalized,
             self.input_dims,
-            self.multi_label,
+            multi_label,
             output_boxes,
             output_masks,
         )
@@ -696,6 +735,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError>
     where
@@ -717,8 +757,11 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k_for(multi_label),
+            self.max_det,
+            multi_label,
             output_boxes,
-        );
+        )?;
         Ok(())
     }
 
@@ -730,6 +773,7 @@ impl Decoder {
         scores: &configs::Scores,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError>
@@ -766,10 +810,11 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
             self.normalized,
             self.input_dims,
+            multi_label,
             output_boxes,
             output_masks,
         )
@@ -797,6 +842,7 @@ impl Decoder {
         crate::yolo::decode_yolo_end_to_end_det_float(
             det_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(())
@@ -841,6 +887,7 @@ impl Decoder {
             det_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -872,6 +919,7 @@ impl Decoder {
             crate::yolo::decode_yolo_end_to_end_det_float(
                 dequant.view(),
                 self.score_threshold,
+                self.max_det,
                 output_boxes,
             )?;
         });
@@ -909,6 +957,7 @@ impl Decoder {
             dequant_d.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -951,6 +1000,7 @@ impl Decoder {
             scores_tensor,
             classes_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(())
@@ -1010,6 +1060,7 @@ impl Decoder {
             mask_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -1058,6 +1109,7 @@ impl Decoder {
             dequant_s.view(),
             dequant_c.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(())
@@ -1126,6 +1178,7 @@ impl Decoder {
             dequant_m.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
             output_masks,
         )?;
@@ -1141,6 +1194,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Detection,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError> {
         let (boxes_tensor, ind) =
@@ -1170,12 +1224,13 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
-                    self.pre_nms_top_k,
+                    self.pre_nms_top_k_for(multi_label),
                     self.max_det,
                     self.normalized,
                     self.input_dims,
+                    multi_label,
                     output_boxes,
-                )
+                )?
             })
         });
         Ok(proto)
@@ -1186,6 +1241,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Detection,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
@@ -1200,19 +1256,19 @@ impl Decoder {
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
 
-        Ok(crate::yolo::impl_yolo_segdet_float_proto::<XYWH, _, _>(
+        crate::yolo::impl_yolo_segdet_float_proto::<XYWH, _, _>(
             boxes_tensor,
             protos_tensor,
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
             self.normalized,
             self.input_dims,
-            self.multi_label,
+            multi_label,
             output_boxes,
-        ))
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1223,6 +1279,7 @@ impl Decoder {
         scores: &configs::Scores,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError> {
         let quant_boxes = boxes
@@ -1276,9 +1333,10 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
-                    self.pre_nms_top_k,
+                    self.pre_nms_top_k_for(multi_label),
                     self.max_det,
-                )
+                    multi_label,
+                )?
             })
         });
         crate::yolo::maybe_normalize_boxes_in_place(
@@ -1318,6 +1376,7 @@ impl Decoder {
         scores: &configs::Scores,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
@@ -1344,13 +1403,7 @@ impl Decoder {
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
 
-        Ok(crate::yolo::impl_yolo_split_segdet_float_proto::<
-            XYWH,
-            _,
-            _,
-            _,
-            _,
-        >(
+        crate::yolo::impl_yolo_split_segdet_float_proto::<XYWH, _, _, _, _>(
             boxes_tensor,
             scores_tensor,
             mask_tensor,
@@ -1358,12 +1411,13 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
             self.normalized,
             self.input_dims,
+            multi_label,
             output_boxes,
-        ))
+        )
     }
 
     /// Decode 2-way split proto (quantized): combined detection + separate
@@ -1374,6 +1428,7 @@ impl Decoder {
         detection: &configs::Detection,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError> {
         let quant_det = detection
@@ -1406,17 +1461,18 @@ impl Decoder {
         let mut det_indices = with_quantized!(det_tensor, d, {
             let det = Self::swap_axes_if_needed(d, detection.into());
             let det = det.slice(s![0, .., ..]);
-            let boxes_view = det.slice(s![..4, ..]);
-            let scores_view = det.slice(s![4.., ..]);
+            let boxes_view = det.slice(s![..4, ..]).reversed_axes();
+            let scores_view = det.slice(s![4.., ..]).reversed_axes();
             impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                 (boxes_view, quant_det),
                 (scores_view, quant_det),
                 self.score_threshold,
                 self.iou_threshold,
                 self.nms,
-                self.pre_nms_top_k,
+                self.pre_nms_top_k_for(multi_label),
                 self.max_det,
-            )
+                multi_label,
+            )?
         });
         crate::yolo::maybe_normalize_boxes_in_place(
             &mut det_indices,
@@ -1455,6 +1511,7 @@ impl Decoder {
         detection: &configs::Detection,
         mask_coeff: &configs::MaskCoefficients,
         protos: &configs::Protos,
+        multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
@@ -1480,13 +1537,7 @@ impl Decoder {
         let boxes_view = det_tensor.slice(s![..4, ..]);
         let scores_view = det_tensor.slice(s![4.., ..]);
 
-        Ok(crate::yolo::impl_yolo_split_segdet_float_proto::<
-            XYWH,
-            _,
-            _,
-            _,
-            _,
-        >(
+        crate::yolo::impl_yolo_split_segdet_float_proto::<XYWH, _, _, _, _>(
             boxes_view,
             scores_view,
             mask_tensor,
@@ -1494,12 +1545,13 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(multi_label),
             self.max_det,
             self.normalized,
             self.input_dims,
+            multi_label,
             output_boxes,
-        ))
+        )
     }
 
     pub(super) fn decode_yolo_end_to_end_segdet_float_proto<T>(
@@ -1533,6 +1585,7 @@ impl Decoder {
             det_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )
     }
@@ -1565,6 +1618,7 @@ impl Decoder {
             dequant_d.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )?;
         Ok(proto)
@@ -1622,6 +1676,7 @@ impl Decoder {
             mask_tensor,
             protos_tensor,
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )
     }
@@ -1687,6 +1742,7 @@ impl Decoder {
             dequant_m.view(),
             dequant_p.view(),
             self.score_threshold,
+            self.max_det,
             output_boxes,
         )
     }
@@ -1739,9 +1795,10 @@ macro_rules! process_tracked_yolo_segmentation {
                     $self.score_threshold,
                     $self.iou_threshold,
                     $self.nms,
-                    $self.pre_nms_top_k,
+                    $self.pre_nms_top_k_for(false),
                     $self.max_det,
-                );
+                    false,
+                )?;
 
                 // Pull pixel-space boxes into `[0, 1]` before tracking so
                 // tracked locations, masks, and accessor-reported coords
@@ -1849,9 +1906,10 @@ macro_rules! process_tracked_yolo_segmentation_split {
                     $self.score_threshold,
                     $self.iou_threshold,
                     $self.nms,
-                    $self.pre_nms_top_k,
+                    $self.pre_nms_top_k_for(false),
                     $self.max_det,
-                )
+                    false,
+                )?
             })
         });
 
@@ -1942,17 +2000,18 @@ macro_rules! process_tracked_yolo_segmentation_2way {
         let mut boxes = with_quantized!(det_tensor, d, {
             let det = Decoder::swap_axes_if_needed(d, $detection.into());
             let det = det.slice(s![0, .., ..]);
-            let boxes_view = det.slice(s![..4, ..]);
-            let scores_view = det.slice(s![4.., ..]);
+            let boxes_view = det.slice(s![..4, ..]).reversed_axes();
+            let scores_view = det.slice(s![4.., ..]).reversed_axes();
             impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                 (boxes_view, quant_det),
                 (scores_view, quant_det),
                 $self.score_threshold,
                 $self.iou_threshold,
                 $self.nms,
-                $self.pre_nms_top_k,
+                $self.pre_nms_top_k_for(false),
                 $self.max_det,
-            )
+                false,
+            )?
         });
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
@@ -2120,10 +2179,10 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
-        );
+            false, // multi_label: tracked decode is always single-label
+        )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
         // locations, masks, and accessor-reported coords share a single
@@ -2235,10 +2294,10 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
-        );
+            false, // multi_label: tracked decode is always single-label
+        )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
         // locations, masks, and accessor-reported coords share a single
@@ -3046,10 +3105,10 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
-        );
+            false, // multi_label: tracked decode is always single-label
+        )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
         // locations, masks, and accessor-reported coords share a single
@@ -3173,10 +3232,10 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            self.pre_nms_top_k,
+            self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: must be off on tracked path (asserted by caller)
-        );
+            false, // multi_label: tracked decode is always single-label
+        )?;
 
         // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
         // locations, masks, and accessor-reported coords share a single

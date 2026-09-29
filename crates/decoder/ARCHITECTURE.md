@@ -35,7 +35,7 @@ based on the output tensor layout.
 - [`DetectBox`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.DetectBox.html) — output bounding box + score + class label.
 - [`Segmentation`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Segmentation.html) — per-detection mask matrix.
 - [`Quantization`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Quantization.html) — `(scale, zero_point)` for int8/uint8 outputs.
-- [`Nms`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/configs/enum.Nms.html) — `Auto` / `ClassAgnostic` / `ClassAware`. Bypass is expressed as `Option<Nms>::None` on the decoder configuration, not a variant of the enum.
+- [`Nms`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/configs/enum.Nms.html) — `Auto` / `ClassAgnostic` / `ClassAware`. Bypass is expressed as `Option<Nms>::None` on the decoder configuration, not a variant of the enum. `Auto` resolves at build time to the config's mode, else `ClassAware`; ModelPack and YOLO paths all honour the resolved mode.
 - [`SchemaV2`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.SchemaV2.html) — model metadata document (current schema version).
 
 ## Internal Architecture
@@ -103,6 +103,14 @@ flowchart TD
     style Det fill:#90ee90
     style Seg fill:#90ee90
 ```
+
+Every non-end-to-end path (flat, split, 2-way, fused, per-scale, ModelPack; float and quantized) ends in one shared tail, `yolo::nms_and_cap`, generic over `yolo::ScoredCandidate` (float or quantized box, with or without a payload such as the anchor index):
+
+1. With NMS enabled, `truncate_to_top_k_by_score` keeps the `pre_nms_top_k` highest-scoring candidates (`0` = unbounded). It preserves candidate order, and candidates arrive in anchor order, so equal scores at the cut keep the lower anchor index and the selection is reproducible against a reference decoder.
+2. `dispatch_nms_*` runs NMS in the decoder's resolved mode and stops once `max_det` survive. `Nms::Auto` never reaches it: the builder resolves it, and debug builds assert on it.
+3. With NMS bypassed (`nms = None`), the same selection keeps the `max_det` highest-scoring candidates, not the first anchors.
+
+The result is at most `max_det` boxes in descending score order, ties in anchor order (the NMS sort is stable).
 
 ### Model-type selection
 
@@ -442,11 +450,12 @@ decoder.per_scale_run                                   [the per-scale NEON hot 
     field: kind = "f32_borrow" | "f16_widen"
 
 decoder.nms_get_boxes                                   [post-NMS candidate selection]
-│ fields: n_candidates, n_after_topk, n_after_nms, n_detections
+│ fields: n_candidates, n_detections
 ├── decoder.nms_get_boxes.score_filter                  ← max-class score threshold filter
-├── decoder.nms_get_boxes.top_k                         ← partial sort, retain pre_nms_top_k
-│   field: k
+├── decoder.nms_get_boxes.top_k                         ← partial select, retain pre_nms_top_k
+│   fields: k, n (candidates in)
 ├── decoder.nms_get_boxes.suppress                      ← class-agnostic / class-aware IoU NMS
+│   field: n (candidates in)
 └── decoder.nms_get_boxes.dequant_boxes                 ← int8 → f32 on survivors only (quant path)
     field: n
 
@@ -479,10 +488,10 @@ fields: tiles, boxes_in, boxes_out
 | `decoder.per_scale_run.level.mask_coefs`        | Mask-coefficient dequant (no sigmoid)                   | 32-D coefficient stream per anchor. |
 | `decoder.per_scale_run.protos`                  | `protos` head dequant (NHWC or NCHW → NHWC)             | One-time per-frame proto-mask dequant; the GPU shader consumes the resulting f32/f16 array as a texture. |
 | `decoder.per_scale_run.widen_f32`               | n/a (HAL-specific)                                      | If the per-scale path produced f16 buffers, widen to f32 for the legacy NMS kernels. `kind = "f32_borrow"` means zero allocation. |
-| `decoder.nms_get_boxes`                         | `non_max_suppression`                                   | Composite span over score_filter + top_k + suppress + dequant_boxes. The `n_candidates → n_after_topk → n_after_nms → n_detections` fields tell you where candidates were dropped. Shared across detection paths. |
+| `decoder.nms_get_boxes`                         | `non_max_suppression`                                   | Composite span over score_filter + top_k + suppress + dequant_boxes on the segmentation and per-scale paths. `n_candidates` and `n_detections` bracket the step; the `n` field on the `top_k` and `suppress` sub-spans gives the count entering each. |
 | `decoder.nms_get_boxes.score_filter`            | `xc = candidates.amax(1) > conf`                        | Per-row max-class score threshold filter. |
-| `decoder.nms_get_boxes.top_k`                   | `x[x[:, 4].argsort(descending=True)[:max_nms]]`         | Partial sort to `pre_nms_top_k` candidates (default 300; raise to anchor count for COCO mAP at `conf=0.001`). |
-| `decoder.nms_get_boxes.suppress`                | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. |
+| `decoder.nms_get_boxes.top_k`                   | `x[x[:, 4].argsort(descending=True)[:max_nms]]`         | Partial select to `pre_nms_top_k` candidates (default 300, 30 000 under multi-label; `0` is unbounded). Emitted by `yolo::nms_and_cap` on every NMS path, detection-only included, under whichever decode span is active. |
+| `decoder.nms_get_boxes.suppress`                | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. Emitted on every NMS path, like `top_k`. |
 | `decoder.nms_get_boxes.dequant_boxes`           | (quant path only)                                       | Int8 → f32 dequant applied only to survivors of NMS — avoids dequantising filtered candidates. |
 | `decoder.tiled.lift`                            | `metrics/tiled.py::lift_tile_boxes` (partial)            | Per-tile-decoded normalized boxes → full-frame pixel xyxy (optional letterbox inversion). Called once per tile, either directly or via `TiledFrameAccumulator::push_tile`. The `boxes` field is the per-call detection count — sum across tiles to get total lift cost for a frame. |
 | `decoder.tiled.merge`                           | `metrics/tiled.py::merge_tiled_detections`                | Greedy IOS merge (keep-best by default, `MergeMode::Union` for GREEDYNMM) of one frame's accumulated lifted detections, called from `TiledFrameAccumulator::finalize`/`finalize_normalized`. `tiles` is the frame's total tile count (the fan-in fence), `boxes_in` the pre-merge detection count, `boxes_out` the post-merge count — the ratio is the seam-duplicate collapse rate. |
@@ -498,12 +507,26 @@ fields: tiles, boxes_in, boxes_out
 - **NEON FP16 hot paths on aarch64** — see [`per_scale/kernels/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/kernels/). Stable Rust lacks f16 intrinsics, so the kernels use inline `.arch_extension fp16` assembly. Tile-transpose plus 2^k injection (k ∈ [-14, 15]) keeps the GEMM in F16 throughout the inner loop.
 - **Tracing spans** — emitted via `tracing::trace_span!` at every public decode entry point. Near-zero cost when no subscriber is active. See [`README.md#performance-tracing`](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing).
 
+### Multi-label decode
+
+`Decoder.multi_label` comes from `DecoderBuilder::with_multi_label`, else the config's `nms_multi_label`, else `false`; `MultiLabelSource` records which, for the tracked-decode warning. `build()` logs a warning when the metadata turns multi-label on, because a model file then switches every untracked `decode` to validation decode; each `Decoder` logs the tracked-decode warning at most once (a per-decoder `AtomicBool`, not a process-wide `Once`).
+
+Candidate selection has an argmax and a multi-label variant for each score representation: `postprocess_boxes_{index_,}float` / `postprocess_boxes_multilabel_{index_,}float` and `postprocess_boxes_{index_,}quant` / `postprocess_boxes_multilabel_{index_,}quant`. The `index` forms keep the anchor index so seg-det paths reuse one mask-coefficient row for every class of an anchor. Like its argmax sibling, the quantized multi-label selector detects the transposed score view a DMA-BUF output produces and reads it one contiguous class column at a time (columns in parallel), then orders hits by `(anchor, class)` so both layouts give identical output. Every NMS decode path (flat, split, 2-way, fused, per-scale, ModelPack; float and quantized; `decode` and `decode_proto`) chooses between them from one `multi_label` flag. The candidates then go through the decoder's resolved NMS mode unchanged: class-aware NMS keeps every class of an anchor, and an explicit class-agnostic mode (builder or config) suppresses across the classes of the shared bbox, as Ultralytics `non_max_suppression(multi_label=True, agnostic=True)` does. `Nms::Auto` with no config mode already resolves to class-aware, so multi-label needs no mode of its own.
+
+The flag is an argument, not a field read, below the dispatchers: `decode` / `decode_proto` pass `self.multi_label` into `decode_impl` / `decode_proto_impl` and on to `decode_{float,quantized}{,_proto}_impl`. Every tracking entry point passes `false` on every branch, including the per-scale and fallback arms that reuse the untracked dispatch: `decode_tracked`, `decode_proto_tracked`, and `decode_for_tracking` (the entry point for external trackers, used by the Python `decode_tracked`). Tracking therefore always sees one box per anchor, whatever the decoder was built with. A new tracking entry point must route through one of these.
+
 ### `pre_nms_top_k` for deployment vs. mAP evaluation
 
-The default `pre_nms_top_k = 300` is tuned for deployment workloads where
+The default `pre_nms_top_k = 300` (`DEFAULT_PRE_NMS_TOP_K`) is tuned for deployment workloads where
 `score_threshold ≥ 0.25` already filters most candidates. For COCO-style mAP
-evaluation at `score_threshold = 0.001`, **raise this cap** (typically to the
-full anchor count, e.g. 8400 for 640×640 YOLO) or set it to `0` (no limit).
+evaluation at `score_threshold = 0.001`, **raise this cap** or set it to `0` (no limit). Under argmax
+decode the full anchor count (e.g. 8400 for 640×640 YOLO) is enough; multi-label decode emits up to
+anchors × classes candidates, so when multi-label is on and the caller set no cap, the builder
+defaults it to `MULTI_LABEL_PRE_NMS_TOP_K = 30_000`, Ultralytics' `max_nms`. The builder and the
+built `Decoder::pre_nms_top_k` keep the cap as `Option<usize>`: `None` is resolved per decode by
+`Decoder::pre_nms_top_k_for(multi_label)` (30 000 for multi-label, 300 for argmax, so the tracking
+entry points of a multi-label decoder use 300), and `Some(n)`, from the builder or assigned after
+build, is used by every decode as given.
 The default silently truncates ~74% of valid candidates at validation
 thresholds, costing ~9 pp box mAP — a measurement artifact, not a model
 quality issue. The decoder math is correct in both cases.
