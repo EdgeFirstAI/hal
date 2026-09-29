@@ -201,9 +201,9 @@ thread_local! {
     /// `Some(state)` on a GL worker thread, `None` everywhere else.
     ///
     /// This exists because a GL message handler can itself need a PBO map:
-    /// `handle_image_convert` -> `convert` -> `draw_src_texture` ->
-    /// `TensorTrait::map_read` on a PBO-backed source -> `PboHandle::acquire_map`
-    /// -> `GlPboOps::map_buffer`. Routing that through the channel would have the
+    /// a mask draw into a PBO destination the caller holds mapped reads it
+    /// back through `TensorTrait::map` -> `PboHandle::acquire_map` ->
+    /// `GlPboOps::map_buffer`. Routing that through the channel would have the
     /// worker `blocking_send` to the queue it is itself the only consumer of —
     /// a self-deadlock (observed: a 1-in-5 hang on the desktop NVIDIA PBO path).
     /// The worker already holds the context current on this thread, so it
@@ -284,8 +284,8 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
         size: usize,
     ) -> edgefirst_tensor::Result<edgefirst_tensor::PboMapping> {
         // Re-entrant call from inside a GL message handler on the worker that
-        // owns this context (e.g. `draw_src_texture` mapping a PBO-backed
-        // source mid-convert). The context is already current on this thread,
+        // owns this context (e.g. a mask draw reading back into a mapped PBO
+        // destination). The context is already current on this thread,
         // and sending would block on the queue this thread alone drains.
         if on_owning_gl_worker(self.worker_id) {
             return inline_gl_op("PboMap", || pbo_map_on_gl_thread(buffer_id, size)).map_err(|e| {
@@ -417,6 +417,9 @@ pub struct GLProcessorThreaded {
     /// Identity of this processor's worker thread, handed to every `GlPboOps`
     /// it creates so a re-entrant map can be matched to the owning context.
     worker_id: u64,
+    /// The PBOs this processor handed out, shared with its worker's
+    /// `GLProcessorST`: only these may be bound in the worker's context.
+    owned_pbos: std::sync::Arc<super::processor::OwnedPbos>,
     /// Immutable capability surface (transfer backend, float render
     /// support, serialization policy), captured once from the worker at
     /// construction. See `PlatformCaps` in `platform/mod.rs`.
@@ -526,6 +529,7 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
 
 fn run_gl_worker(
     worker_id: u64,
+    owned_pbos: std::sync::Arc<super::processor::OwnedPbos>,
     kind: Option<EglDisplayKind>,
     capacity: Option<usize>,
     mut recv: tokio::sync::mpsc::Receiver<GLProcessorMessage>,
@@ -566,6 +570,7 @@ fn run_gl_worker(
             return;
         }
     };
+    gl_converter.owned_pbos = owned_pbos;
     // Capability surface captured ONCE before the message loop —
     // immutable for the worker's life, never re-probed per message.
     let caps = gl_converter.platform_caps();
@@ -1141,8 +1146,17 @@ impl GLProcessorThreaded {
 
         let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
 
+        let owned_pbos = std::sync::Arc::<super::processor::OwnedPbos>::default();
+        let worker_owned = owned_pbos.clone();
         let handle = std::thread::spawn(move || {
-            run_gl_worker(worker_id, kind, capacity, recv, create_ctx_send);
+            run_gl_worker(
+                worker_id,
+                worker_owned,
+                kind,
+                capacity,
+                recv,
+                create_ctx_send,
+            );
         });
 
         let caps = match create_ctx_recv.blocking_recv() {
@@ -1159,6 +1173,7 @@ impl GLProcessorThreaded {
             handle: Some(handle),
             sender: Some(send),
             worker_id,
+            owned_pbos,
             caps,
         })
     }
@@ -1497,6 +1512,7 @@ impl GLProcessorThreaded {
             sender: sender.downgrade(),
             worker_id: self.worker_id,
         });
+        let owned_ops = ops.clone();
 
         let shape = pbo_shape(width, height, format);
 
@@ -1515,6 +1531,7 @@ impl GLProcessorThreaded {
         // consumer) could not use a `create_image`-allocated PBO destination.
         // The i8 transmute by the caller preserves the attached handle.
         register_pbo_cuda(&mut tensor, buffer_id, size, sender);
+        self.owned_pbos.insert(tensor.pbo_vtable_ptr(), &owned_ops);
         Ok(tensor)
     }
 
@@ -1556,6 +1573,7 @@ impl GLProcessorThreaded {
             sender: sender.downgrade(),
             worker_id: self.worker_id,
         });
+        let owned_ops = ops.clone();
 
         let shape = pbo_shape(width, height, format);
 
@@ -1566,7 +1584,7 @@ impl GLProcessorThreaded {
             Error::OpenGl(format!("Failed to set format on PBO tensor: {e:?}"))
         };
 
-        match dtype {
+        let tensor = match dtype {
             edgefirst_tensor::DType::U8 => {
                 let pbo =
                     edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
@@ -1574,7 +1592,7 @@ impl GLProcessorThreaded {
                 let mut t = edgefirst_tensor::Tensor::from_pbo(pbo).map_err(map_err)?;
                 t.set_format(format).map_err(set_err)?;
                 register_pbo_cuda(&mut t, buffer_id, size, sender);
-                Ok(TensorDyn::from(t))
+                TensorDyn::from(t)
             }
             edgefirst_tensor::DType::F16 => {
                 let pbo = edgefirst_tensor::PboTensor::<edgefirst_tensor::f16>::from_pbo(
@@ -1584,7 +1602,7 @@ impl GLProcessorThreaded {
                 let mut t = edgefirst_tensor::Tensor::from_pbo(pbo).map_err(map_err)?;
                 t.set_format(format).map_err(set_err)?;
                 register_pbo_cuda(&mut t, buffer_id, size, sender);
-                Ok(TensorDyn::from(t))
+                TensorDyn::from(t)
             }
             edgefirst_tensor::DType::F32 => {
                 let pbo = edgefirst_tensor::PboTensor::<f32>::from_pbo(
@@ -1594,10 +1612,12 @@ impl GLProcessorThreaded {
                 let mut t = edgefirst_tensor::Tensor::from_pbo(pbo).map_err(map_err)?;
                 t.set_format(format).map_err(set_err)?;
                 register_pbo_cuda(&mut t, buffer_id, size, sender);
-                Ok(TensorDyn::from(t))
+                TensorDyn::from(t)
             }
-            other => Err(Error::OpenGl(format!("unsupported PBO dtype {other:?}"))),
-        }
+            other => return Err(Error::OpenGl(format!("unsupported PBO dtype {other:?}"))),
+        };
+        self.owned_pbos.insert(tensor.pbo_vtable_ptr(), &owned_ops);
+        Ok(tensor)
     }
 
     /// Returns the active transfer backend.

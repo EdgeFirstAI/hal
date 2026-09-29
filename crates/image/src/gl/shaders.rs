@@ -1063,6 +1063,10 @@ mod tc_precision {
                 super::super::shaders_common::YUYV_RGBA_2D_FRAGMENT,
             ),
             (
+                "YUYV_RGBA_2D_INT8_FRAGMENT",
+                super::super::shaders_common::YUYV_RGBA_2D_INT8_FRAGMENT,
+            ),
+            (
                 "NV_RGBA_FRAGMENT",
                 super::super::shaders_common::NV_RGBA_FRAGMENT,
             ),
@@ -1265,7 +1269,22 @@ mod tc_precision {
             if n > 0 && name.ends_with("_FRAGMENT") {
                 let body = &common[at + n..];
                 let end = body.find("\npub(crate) const ").unwrap_or(body.len());
-                if body[..end].contains("vec2 tc;") {
+                // A constant assembled with `concat!` from `macro_rules!`
+                // literals declares its inputs in those macros.
+                let own = &body[..end];
+                let declares_tc = own.contains("vec2 tc;")
+                    || own.match_indices("!()").any(|(bang, _)| {
+                        let start = own[..bang]
+                            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                            .map_or(0, |p| p + 1);
+                        let def = format!("macro_rules! {} ", &own[start..bang]);
+                        common.find(&def).is_some_and(|at| {
+                            let text = &common[at + def.len()..];
+                            let len = text.find("\nmacro_rules! ").unwrap_or(text.len());
+                            text[..len].contains("vec2 tc;")
+                        })
+                    });
+                if declares_tc {
                     names.push(name.to_string());
                 }
             }

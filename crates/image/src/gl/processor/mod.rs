@@ -21,7 +21,7 @@ type PlatformDisplay = <Platform as GlPlatform>::Display;
 type PlatformImport = <Platform as GlPlatform>::Import;
 /// The `Copy` import handle (`egl::Image` / `egl::Surface`).
 type PlatformHandle = <Platform as GlPlatform>::ImportHandle;
-use super::resources::{Buffer, FrameBuffer, GlProgram, Texture};
+use super::resources::{Buffer, FrameBuffer, GlProgram, Texture, UploadSource};
 use super::shaders::{
     check_gl_error, generate_color_shader, generate_float_nhwc_packed_shader,
     generate_float_rgba_shader, generate_instanced_segmentation_shader,
@@ -399,15 +399,18 @@ pub struct GLProcessorST {
     texture_program_planar: Option<GlProgram>,
     /// Shader: existing planar RGB with int8 bias (XOR 0x80) applied to output.
     texture_program_planar_int8: Option<GlProgram>,
-    /// YUYV (RG-sampled) → RGBA, portable `sampler2D` — the zero-copy
-    /// IOSurface source path on macOS (and a future heap-YUYV upload).
+    /// YUYV (RG-sampled) → RGBA, portable `sampler2D`: an IOSurface attach
+    /// on macOS, and an upload from host memory or a PBO everywhere.
     yuyv_program_2d: GlProgram,
-    /// Link-time uniform locations for `yuyv_program_2d`
+    /// `yuyv_program_2d` plus the int8 XOR-0x80 bias.
+    yuyv_int8_program_2d: GlProgram,
+    /// Link-time uniform locations for `yuyv_program_2d` and
+    /// `yuyv_int8_program_2d`, in that order
     /// (src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub, src_extent).
-    yuyv_2d_locs: [i32; 8],
+    yuyv_2d_locs: [[i32; 8]; 2],
     /// Link-time `src_extent` locations for `texture_program` and
     /// `texture_int8_program`, the `sampler2D` source programs
-    /// `draw_src_texture` and `draw_src_texture_from_pbo` select between;
+    /// `draw_src_texture` selects between;
     /// see [`Self::texture_src_extent_loc`].
     texture_src_extent_locs: [i32; 2],
     /// Link-time `src_extent` locations for the four external-OES programs,
@@ -464,6 +467,10 @@ pub struct GLProcessorST {
     /// first occurrence warns, repeats log at debug — an import that fails
     /// once fails every frame, and a per-frame warn is log spam.
     nv_import_warned: std::collections::HashSet<u64>,
+    /// The PBOs this processor's context allocated; see [`OwnedPbos`].
+    /// Shared with the `GLProcessorThreaded` front end, which records each
+    /// PBO as it hands it out.
+    pub(super) owned_pbos: std::sync::Arc<OwnedPbos>,
     /// Uniform locations per float-path program (see [`FloatQuadLocs`]).
     pub(super) float_quad_locs: std::collections::HashMap<u32, FloatQuadLocs>,
     /// Static full-screen quad VBOs `(pos, uv)` for the float paths,
@@ -1161,6 +1168,120 @@ fn unpack_row_length(
     })
 }
 
+/// The PBOs one GL context allocated, recorded by the address of their
+/// `PboOpsVtable`.
+///
+/// GL buffer names belong to a context, and HAL's contexts share nothing, so
+/// a PBO allocated by another processor -- or wrapped from outside with
+/// `ef_tensor_wrap_pbo` -- names a different buffer here, or none. Neither
+/// the buffer name nor the `BufferIdentity` can tell them apart: a PBO's
+/// identity is derived from the name alone, and under the dynamic tensor
+/// backend every handle, including each `view()`, derives a fresh one. The
+/// vtable lives in the allocation's shared handle, so every view of it
+/// reports the same address on both backends. Each record also holds a
+/// `Weak` of the PBO's own ops, which only that allocation holds, so an
+/// address is matched only while the allocation that owned it is alive and
+/// cannot have been reused.
+#[derive(Default)]
+pub(crate) struct OwnedPbos(std::sync::Mutex<Vec<OwnedPbo>>);
+
+struct OwnedPbo {
+    vtable: usize,
+    ops: std::sync::Weak<dyn edgefirst_tensor::PboOps>,
+}
+
+impl std::fmt::Debug for OwnedPbos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let owned = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_tuple("OwnedPbos").field(&owned.len()).finish()
+    }
+}
+
+impl OwnedPbos {
+    /// Record a PBO this context allocated. `ops` must be the operations
+    /// created for that one allocation.
+    pub(crate) fn insert(
+        &self,
+        vtable: Option<*const std::ffi::c_void>,
+        ops: &std::sync::Arc<dyn edgefirst_tensor::PboOps>,
+    ) {
+        let Some(vtable) = vtable else { return };
+        let mut owned = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        owned.retain(|p| p.ops.strong_count() > 0);
+        owned.push(OwnedPbo {
+            vtable: vtable as usize,
+            ops: std::sync::Arc::downgrade(ops),
+        });
+    }
+
+    fn contains(&self, vtable: Option<*const std::ffi::c_void>) -> bool {
+        let Some(vtable) = vtable else { return false };
+        let owned = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        owned
+            .iter()
+            .any(|p| p.vtable == vtable as usize && p.ops.strong_count() > 0)
+    }
+}
+
+/// A source's pixels opened for a texture upload: its PBO when this context
+/// owns it, otherwise a CPU map held until the upload has read it.
+///
+/// An owned PBO is read through `PIXEL_UNPACK_BUFFER`, a copy the GPU makes,
+/// so the buffer is never mapped for it. Any other PBO is mapped through its
+/// own operations, which reach the context that owns it (see
+/// [`OwnedPbos`]). A `view()` of a PBO shares its parent's
+/// buffer id and names its own window with `plane_offset` (the parent's
+/// pitch arrives through `UNPACK_ROW_LENGTH`), so the offset is what makes
+/// each view read its own pixels rather than the parent's top-left corner.
+enum SrcPixels<'a> {
+    Pbo { buffer_id: u32, offset: usize },
+    Mapped(edgefirst_tensor::HostView<'a, u8>),
+}
+
+impl SrcPixels<'_> {
+    fn open(src: &Tensor<u8>, owned: &OwnedPbos) -> Result<Self, Error> {
+        match src.pbo_id() {
+            Some(buffer_id) if owned.contains(src.pbo_vtable_ptr()) => {
+                // GL refuses to read a buffer that is mapped.
+                if src.pbo_is_mapped() == Some(true) {
+                    return Err(Error::OpenGl(
+                        "Cannot convert from a mapped PBO tensor".to_string(),
+                    ));
+                }
+                Ok(Self::Pbo {
+                    buffer_id,
+                    offset: src.plane_offset().unwrap_or(0),
+                })
+            }
+            _ => Ok(Self::Mapped(src.map_read()?)),
+        }
+    }
+
+    fn source(&self) -> UploadSource<'_> {
+        match self {
+            Self::Pbo { buffer_id, offset } => UploadSource::Pbo {
+                buffer_id: *buffer_id,
+                offset: *offset,
+            },
+            Self::Mapped(map) => UploadSource::Bytes(map.as_slice()),
+        }
+    }
+
+    /// Count this source feed and name it on the convert's span.
+    fn record(&self, stats: &mut super::cache::ConvertStats, span: &tracing::Span) {
+        match self {
+            Self::Pbo { .. } => {
+                stats.src_pbo_uploads += 1;
+                span.record("src_feed", "pbo");
+            }
+            Self::Mapped(_) => {
+                stats.src_uploads += 1;
+                span.record("src_feed", "upload");
+            }
+        }
+    }
+}
+
 /// What a PBO readback has to know about its destination before it can issue
 /// the `glReadPixels`: the pitch to place the rows at, the bytes they will
 /// occupy, and the `GL_PACK_ROW_LENGTH` that expresses the pitch -- `None`
@@ -1739,22 +1860,30 @@ impl GLProcessorST {
             generate_vertex_shader(),
             super::shaders_common::YUYV_RGBA_2D_FRAGMENT,
         )?;
-        let yuyv_2d_locs = unsafe {
-            edgefirst_gl::gl::UseProgram(yuyv_program_2d.id);
+        let yuyv_int8_program_2d = GlProgram::new(
+            generate_vertex_shader(),
+            super::shaders_common::YUYV_RGBA_2D_INT8_FRAGMENT,
+        )?;
+        // SAFETY: both programs linked above on this thread's current
+        // context; each name is a `c"..."` literal, a live NUL-terminated
+        // string for the call.
+        let yuyv_2d_locs = [&yuyv_program_2d, &yuyv_int8_program_2d].map(|p| unsafe {
+            edgefirst_gl::gl::UseProgram(p.id);
             // Constant sampler binding resolved at link (B6 pattern).
-            let tex = edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"tex".as_ptr());
+            let tex = edgefirst_gl::gl::GetUniformLocation(p.id, c"tex".as_ptr());
             edgefirst_gl::gl::Uniform1i(tex, 0);
             [
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"src_size".as_ptr()),
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"y_offset".as_ptr()),
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"y_scale".as_ptr()),
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vr".as_ptr()),
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ug".as_ptr()),
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vg".as_ptr()),
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ub".as_ptr()),
-                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"src_extent".as_ptr()),
+                c"src_size",
+                c"y_offset",
+                c"y_scale",
+                c"c_vr",
+                c"c_ug",
+                c"c_vg",
+                c"c_ub",
+                c"src_extent",
             ]
-        };
+            .map(|name| edgefirst_gl::gl::GetUniformLocation(p.id, name.as_ptr()))
+        });
 
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
@@ -1955,6 +2084,7 @@ impl GLProcessorST {
             texture_program_planar,
             texture_program_planar_int8,
             yuyv_program_2d,
+            yuyv_int8_program_2d,
             yuyv_2d_locs,
             texture_src_extent_locs,
             external_src_extent_locs,
@@ -2029,6 +2159,7 @@ impl GLProcessorST {
             last_nv_convert_path: NvConvertPath::None,
             convert_stats: Default::default(),
             nv_import_warned: std::collections::HashSet::new(),
+            owned_pbos: Default::default(),
             float_quad_locs: std::collections::HashMap::new(),
             float_quad_pos_vbo: 0,
             float_quad_uv_vbo: 0,
@@ -2263,6 +2394,21 @@ impl GLProcessorST {
         }
     }
 
+    /// A tensor's memory as this context can use it: a PBO allocated by
+    /// another context counts as host memory, read and written through its
+    /// own map, because its buffer name means nothing here (see
+    /// [`OwnedPbos`]).
+    fn usable_memory(
+        &self,
+        memory: TensorMemory,
+        pbo_vtable: Option<*const std::ffi::c_void>,
+    ) -> TensorMemory {
+        match memory {
+            TensorMemory::Pbo if !self.owned_pbos.contains(pbo_vtable) => TensorMemory::Mem,
+            other => other,
+        }
+    }
+
     pub(crate) fn convert_stats(&self) -> super::cache::ConvertStats {
         self.convert_stats
     }
@@ -2337,7 +2483,7 @@ impl GLProcessorST {
                 if nv_src { PixelFormat::Rgba } else { src_fmt },
                 dst_fmt,
                 dst_dtype,
-                dst.memory(),
+                self.usable_memory(dst.memory(), dst.pbo_vtable_ptr()),
                 support,
                 <Platform as GlPlatform>::ZERO_COPY_FLOAT,
             );
@@ -2704,9 +2850,14 @@ impl GLProcessorST {
         let convert_span = tracing::Span::current();
         let mut lowering = super::render::lower_dst(
             self.gl_context.transfer_backend.is_zero_copy() && places,
-            dst.memory(),
+            self.usable_memory(dst.memory(), dst.pbo_vtable_ptr()),
         );
-        let src_host = matches!(src.memory(), TensorMemory::Mem | TensorMemory::Shm);
+        // A PBO counts as host here: it has no import either, and only the
+        // upload path can read it.
+        let src_host = matches!(
+            src.memory(),
+            TensorMemory::Mem | TensorMemory::Shm | TensorMemory::Pbo
+        );
         let mut plan = super::render::plan_convert(src_fmt, src_host, dst_fmt, lowering);
         // The packed-RGB plan imports the destination in its pass 2, AFTER
         // pass 1 has rendered, and a texture-lowered RGB destination is a
@@ -2827,43 +2978,18 @@ impl GLProcessorST {
         let crop = Self::int8_bias_clear(is_int8, crop);
 
         let start = Instant::now();
-        match src.pbo_id() {
-            Some(src_buffer_id) => {
-                // A PBO source uploads via its UNPACK binding — mapping it on
-                // the GL thread would deadlock on the Pbo message round-trip.
-                if src.pbo_is_mapped() == Some(true) {
-                    return Err(crate::Error::OpenGl(
-                        "Cannot convert from a mapped PBO tensor".to_string(),
-                    ));
-                }
-                self.draw_src_texture_from_pbo(
-                    src,
-                    src_fmt,
-                    src_buffer_id,
-                    dst,
-                    dst_fmt,
-                    is_int8,
-                    rotation,
-                    flip,
-                    crop,
-                    &convert_span,
-                )?;
-            }
-            None => {
-                self.render_packed_or_planar(
-                    src,
-                    src_fmt,
-                    dst,
-                    dst_fmt,
-                    band,
-                    is_int8,
-                    rotation,
-                    flip,
-                    crop,
-                    &convert_span,
-                )?;
-            }
-        }
+        self.render_packed_or_planar(
+            src,
+            src_fmt,
+            dst,
+            dst_fmt,
+            band,
+            is_int8,
+            rotation,
+            flip,
+            crop,
+            &convert_span,
+        )?;
         log::debug!("engine render ({plan:?}) takes {:?}", start.elapsed());
 
         if let DstTarget::Texture { readback } = target {
@@ -2900,7 +3026,7 @@ impl GLProcessorST {
 
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let memory = dst.memory();
+        let memory = self.usable_memory(dst.memory(), dst.pbo_vtable_ptr());
         // Trace logs are expensive to format (struct Debug, env reads). Gate
         // on the global level filter so they're a single integer compare
         // when trace logging is disabled.
@@ -3059,7 +3185,7 @@ impl GLProcessorST {
 
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let memory = dst.memory();
+        let memory = self.usable_memory(dst.memory(), dst.pbo_vtable_ptr());
         if log::log_enabled!(log::Level::Trace) {
             log::trace!(
                 "draw_proto_masks: dst.memory()={memory:?} {dst_w}x{dst_h} fmt={dst_fmt:?}"
@@ -3205,18 +3331,29 @@ impl GLProcessorST {
                     | PixelFormat::Nv24
             )
         } else {
-            // Non-DMA (PBO/Sync): packed RGB(A)/Grey upload via draw_src_texture,
-            // plus single-plane NV12/NV16/NV24 via the R8-upload ShaderR8 path
-            // (combined buffer uploaded as R8 + in-shader YUV — no DMA-BUF
-            // EGLImage needed; the GPU NV path on e.g. orin). Multiplane NV12
-            // can't be uploaded as one R8 texture and falls to CPU.
+            // Non-DMA (PBO/Sync): packed RGB(A)/Grey upload via
+            // draw_src_texture, plus single-plane NV12/NV16/NV24 via the
+            // R8-upload ShaderR8 path (combined buffer uploaded as R8 +
+            // in-shader YUV). Multiplane NV12 can't be uploaded as one R8
+            // texture and falls to CPU.
+            //
+            // YUYV (uploaded as RG for the YUYV program), and any NV source
+            // in a PBO, only where the platform has no zero-copy import: there
+            // the upload is the GPU route, and it beats the CPU several times
+            // over (Tegra). Where import exists, such a source is one the
+            // DMA-BUF heap could not place, and the upload is the slow road --
+            // Mesa V3D's PBO upload runs well behind the CPU converter -- so
+            // those stay on the CPU.
+            let uploads_yuv = !backend.is_zero_copy();
+            let nv_single_plane = matches!(
+                fmt,
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            ) && !img.is_multiplane();
             matches!(
                 fmt,
                 PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey
-            ) || (matches!(
-                fmt,
-                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-            ) && !img.is_multiplane())
+            ) || (fmt == PixelFormat::Yuyv && uploads_yuv)
+                || (nv_single_plane && (img.memory() != TensorMemory::Pbo || uploads_yuv))
         }
     }
 
@@ -4498,306 +4635,6 @@ impl GLProcessorST {
         )
     }
 
-    /// Upload source image from a PBO and render to the current framebuffer.
-    /// This is the PBO equivalent of draw_src_texture — instead of mapping
-    /// the tensor to CPU and calling glTexImage2D with a data pointer, we
-    /// bind the source PBO as GL_PIXEL_UNPACK_BUFFER and pass the source's
-    /// own byte offset into it, causing GL to read directly from the PBO
-    /// (zero CPU copy). With a buffer bound, that argument is an offset
-    /// rather than an address, so a `view()` -- which shares its parent's
-    /// buffer id -- names its own window there and nowhere else.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_src_texture_from_pbo(
-        &mut self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        src_buffer_id: u32,
-        dst: &Tensor<u8>,
-        _dst_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-        convert_span: &tracing::Span,
-    ) -> Result<(), Error> {
-        let src_w = src.width().ok_or(Error::NotAnImage)?;
-        let src_h = src.height().ok_or(Error::NotAnImage)?;
-        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
-        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let texture_target = edgefirst_gl::gl::TEXTURE_2D;
-        let texture_format = match src_fmt {
-            PixelFormat::Rgb => edgefirst_gl::gl::RGB,
-            PixelFormat::Rgba => edgefirst_gl::gl::RGBA,
-            PixelFormat::Grey => edgefirst_gl::gl::RED,
-            _ => {
-                return Err(Error::NotSupported(format!(
-                    "PBO upload not supported for {src_fmt:?}",
-                )));
-            }
-        };
-
-        self.convert_stats.src_pbo_uploads += 1;
-        convert_span.record("src_feed", "pbo");
-
-        let has_crop = crop
-            .dst_rect
-            .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
-
-        let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
-        } else {
-            RegionOfInterest {
-                left: 0.,
-                top: 1.,
-                right: 1.,
-                bottom: 0.,
-            }
-        };
-
-        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
-        let mut dst_roi = if let Some(crop) = crop.dst_rect {
-            RegionOfInterest {
-                left: cvt_screen_coord(crop.left as f32 / dst_w as f32),
-                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst_h as f32),
-                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst_w as f32),
-                bottom: cvt_screen_coord(crop.top as f32 / dst_h as f32),
-            }
-        } else {
-            RegionOfInterest {
-                left: -1.,
-                top: 1.,
-                right: 1.,
-                bottom: -1.,
-            }
-        };
-
-        let rotation_offset = match rotation {
-            crate::Rotation::None => 0,
-            crate::Rotation::Clockwise90 => 1,
-            crate::Rotation::Rotate180 => 2,
-            crate::Rotation::CounterClockwise90 => 3,
-        };
-
-        unsafe {
-            if has_crop {
-                if let Some(dst_color) = crop.dst_color {
-                    edgefirst_gl::gl::ClearColor(
-                        dst_color[0] as f32 / 255.0,
-                        dst_color[1] as f32 / 255.0,
-                        dst_color[2] as f32 / 255.0,
-                        dst_color[3] as f32 / 255.0,
-                    );
-                    edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
-                }
-            }
-
-            // Draw-time program selection (see draw_src_texture).
-            edgefirst_gl::gl::UseProgram(if is_int8 {
-                self.texture_int8_program.id
-            } else {
-                self.texture_program.id
-            });
-            // The uploaded texture is exactly the logical image, so the
-            // sample clamp is the texture's own half-texel inset.
-            let [u0, v0, u1, v1] =
-                super::render::sample_clamp_rect((src_w, src_h), super::render::ImportMap::WHOLE);
-            edgefirst_gl::gl::Uniform4f(self.texture_src_extent_loc(is_int8), u0, v0, u1, v1);
-            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
-            edgefirst_gl::gl::BindTexture(texture_target, self.camera_normal_texture.id);
-            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
-            if src_fmt == PixelFormat::Grey {
-                for swizzle in [
-                    edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
-                    edgefirst_gl::gl::TEXTURE_SWIZZLE_G,
-                    edgefirst_gl::gl::TEXTURE_SWIZZLE_B,
-                ] {
-                    edgefirst_gl::gl::TexParameteri(
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        swizzle,
-                        edgefirst_gl::gl::RED as i32,
-                    );
-                }
-            } else {
-                for (swizzle, src_component) in [
-                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_R, edgefirst_gl::gl::RED),
-                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_G, edgefirst_gl::gl::GREEN),
-                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_B, edgefirst_gl::gl::BLUE),
-                ] {
-                    edgefirst_gl::gl::TexParameteri(
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        swizzle,
-                        src_component as i32,
-                    );
-                }
-            }
-
-            // Honour a padded source row stride: a PBO written by the CPU JPEG
-            // decoder (or any producer) may have 64-byte-aligned rows, so the
-            // bytes between logical rows must be skipped on upload. Mirror the
-            // non-PBO `draw_src_texture` path (GL_UNPACK_ROW_LENGTH in pixels);
-            // 0 means "tightly packed = src_w". Without this a padded PBO source
-            // shears on every row after the first.
-            // `unpack_row_length`, not `stride / bpp`: that division
-            // TRUNCATES, and this state counts pixels. A 64-byte-aligned RGB
-            // pitch (1024 B) becomes 341 px = 1023 B and every row after the
-            // first lands a byte early -- right shape, right byte count,
-            // sheared image, no error. The CPU upload path below already
-            // refuses such a pitch; an externally wrapped PBO (`set_row_stride`
-            // takes any pitch at or above the minimum, and
-            // `ef_tensor_wrap_pbo` hands one straight in) reaches this arm
-            // instead, so the same rule has to hold here.
-            let src_bpp = src_fmt.channels();
-            let row_len_px = unpack_row_length(
-                src.effective_row_stride(),
-                src_w,
-                src_bpp,
-                &format!("{src_fmt:?}"),
-            )?;
-
-            // Where this source's first pixel sits inside the GL buffer. A
-            // `view()` of a PBO shares its parent's buffer id and names its
-            // sub-region with `plane_offset` + the parent's pitch (carried
-            // by `row_len_px` above), so an upload that always started at
-            // byte 0 converted the parent's top-left tile in place of the
-            // region the caller asked for -- silently, and identically for
-            // every view of one buffer. Issue #162's second half: Stage B
-            // made the view stay PBO-backed, and this is what makes it read
-            // its own pixels. With a buffer bound to `PIXEL_UNPACK_BUFFER`
-            // the `pixels` argument is a byte offset into that buffer, not
-            // an address, which is why this is the whole fix.
-            let src_offset = src.plane_offset().unwrap_or(0);
-
-            // Bind source PBO as UNPACK buffer — glTexImage2D reads from it
-            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
-            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, row_len_px);
-            edgefirst_gl::gl::TexImage2D(
-                texture_target,
-                0,
-                texture_format as i32,
-                src_w as i32,
-                src_h as i32,
-                0,
-                texture_format,
-                edgefirst_gl::gl::UNSIGNED_BYTE,
-                src_offset as *const c_void, // offset into the bound UNPACK buffer
-            );
-            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
-            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
-
-            // Force texture cache state to be rebuilt next call
-            self.camera_normal_texture.width = 0;
-
-            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
-
-            match flip {
-                crate::Flip::None => {}
-                crate::Flip::Vertical => {
-                    std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
-                }
-                crate::Flip::Horizontal => {
-                    std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
-                }
-            }
-
-            let camera_vertices: [f32; 12] = [
-                dst_roi.left,
-                dst_roi.top,
-                0., // left top
-                dst_roi.right,
-                dst_roi.top,
-                0., // right top
-                dst_roi.right,
-                dst_roi.bottom,
-                0., // right bottom
-                dst_roi.left,
-                dst_roi.bottom,
-                0., // left bottom
-            ];
-            edgefirst_gl::gl::BufferData(
-                edgefirst_gl::gl::ARRAY_BUFFER,
-                (camera_vertices.len() * std::mem::size_of::<f32>()) as isize,
-                camera_vertices.as_ptr() as *const c_void,
-                edgefirst_gl::gl::STATIC_DRAW,
-            );
-            edgefirst_gl::gl::VertexAttribPointer(
-                self.vertex_buffer.buffer_index,
-                3,
-                edgefirst_gl::gl::FLOAT,
-                edgefirst_gl::gl::FALSE,
-                0,
-                std::ptr::null(),
-            );
-
-            let texture_coords: [[f32; 8]; 4] = [
-                [
-                    src_roi.left,
-                    src_roi.top,
-                    src_roi.right,
-                    src_roi.top,
-                    src_roi.right,
-                    src_roi.bottom,
-                    src_roi.left,
-                    src_roi.bottom,
-                ],
-                [
-                    src_roi.left,
-                    src_roi.bottom,
-                    src_roi.left,
-                    src_roi.top,
-                    src_roi.right,
-                    src_roi.top,
-                    src_roi.right,
-                    src_roi.bottom,
-                ],
-                [
-                    src_roi.right,
-                    src_roi.bottom,
-                    src_roi.left,
-                    src_roi.bottom,
-                    src_roi.left,
-                    src_roi.top,
-                    src_roi.right,
-                    src_roi.top,
-                ],
-                [
-                    src_roi.right,
-                    src_roi.top,
-                    src_roi.right,
-                    src_roi.bottom,
-                    src_roi.left,
-                    src_roi.bottom,
-                    src_roi.left,
-                    src_roi.top,
-                ],
-            ];
-            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-            edgefirst_gl::gl::BufferData(
-                edgefirst_gl::gl::ARRAY_BUFFER,
-                (texture_coords[0].len() * std::mem::size_of::<f32>()) as isize,
-                texture_coords[rotation_offset].as_ptr() as *const c_void,
-                edgefirst_gl::gl::STATIC_DRAW,
-            );
-            edgefirst_gl::gl::VertexAttribPointer(
-                self.texture_buffer.buffer_index,
-                2,
-                edgefirst_gl::gl::FLOAT,
-                edgefirst_gl::gl::FALSE,
-                0,
-                std::ptr::null(),
-            );
-            edgefirst_gl::gl::DrawArrays(edgefirst_gl::gl::TRIANGLE_FAN, 0, 4);
-            edgefirst_gl::gl::DisableVertexAttribArray(self.vertex_buffer.buffer_index);
-            edgefirst_gl::gl::DisableVertexAttribArray(self.texture_buffer.buffer_index);
-
-            edgefirst_gl::gl::Finish();
-        }
-
-        check_gl_error(function!(), line!())?;
-        Ok(())
-    }
-
     /// Pick the NV* GPU conversion path for `src`/`src_fmt`, honoring the
     /// `EDGEFIRST_NV_CONVERT_PATH` preference. Returns the path to *attempt*;
     /// an EGLImage-creation error does not end the convert — the caller retries
@@ -5105,6 +4942,7 @@ impl GLProcessorST {
                             rotation_offset,
                             flip,
                             is_int8,
+                            convert_span,
                         ) {
                             Ok(()) => self.last_nv_convert_path = NvConvertPath::ShaderR8,
                             Err(e) => {
@@ -5141,12 +4979,7 @@ impl GLProcessorST {
                         // route the non-DMA NV branch below already takes.
                         // `draw_src_texture` has no NV arm and would have
                         // returned NotSupported, sending the whole convert to
-                        // the CPU (issue #166). `draw_nv_texture_2d(.., None,
-                        // ..)` cannot map a PBO source, and refuses one itself;
-                        // no PBO can reach here anyway, this arm being inside
-                        // the `TensorMemory::DmaBuf` branch.
-                        self.convert_stats.src_uploads += 1;
-                        convert_span.record("src_feed", "upload");
+                        // the CPU (issue #166).
                         let start = Instant::now();
                         // The R8 import declined (Mali's alignment rule, the
                         // ANGLE leaves' offset refusal, or a driver that cannot
@@ -5164,6 +4997,7 @@ impl GLProcessorST {
                             rotation_offset,
                             flip,
                             is_int8,
+                            convert_span,
                         ) {
                             Ok(()) => self.last_nv_convert_path = NvConvertPath::ShaderR8,
                             Err(e) => {
@@ -5246,12 +5080,7 @@ impl GLProcessorST {
                         let start = Instant::now();
                         if nv_upload_capable {
                             // Same shader, same in-shader matrix, source read
-                            // through `map()`. No PBO can reach here: this arm
-                            // is inside the `TensorMemory::DmaBuf` branch, and
-                            // `draw_nv_texture_2d(.., None, ..)` refuses a PBO
-                            // source itself in any case.
-                            self.convert_stats.src_uploads += 1;
-                            convert_span.record("src_feed", "upload");
+                            // through `map()`.
                             // Recorded from the result: a drawn upload is still
                             // a GPU convert (ShaderR8), a failed one records Cpu
                             // rather than keeping the previous convert's value.
@@ -5264,6 +5093,7 @@ impl GLProcessorST {
                                 rotation_offset,
                                 flip,
                                 is_int8,
+                                convert_span,
                             ) {
                                 Ok(()) => {
                                     if src_fmt == PixelFormat::Nv12 {
@@ -5307,15 +5137,13 @@ impl GLProcessorST {
             PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
         ) && !src.is_multiplane()
         {
-            // Non-DMA (PBO/Sync) single-plane NV*: GPU-convert via the SAME
-            // ShaderR8 in-shader path used for DMA, but with the combined buffer
-            // CPU-UPLOADED as R8 instead of EGLImage-imported. This enables the
-            // NV shaders on backends without DMA-BUF EGLImage import (e.g. orin),
-            // replacing the old CPU fallback. Multiplane NV12 (separate Y/UV
-            // buffers) cannot be uploaded as one R8 texture → CPU below.
+            // Non-DMA single-plane NV* (a host or PBO source, or any source
+            // on a backend without DMA-BUF import, e.g. orin): the SAME
+            // ShaderR8 in-shader path used for DMA, with the combined buffer
+            // UPLOADED as R8 instead of EGLImage-imported. Multiplane NV12
+            // (separate Y/UV buffers) cannot be uploaded as one R8 texture →
+            // CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
-            self.convert_stats.src_uploads += 1;
-            convert_span.record("src_feed", "upload");
             // Recorded from the draw's result, like the four DMA arms above: a
             // failed upload records Cpu rather than leaving a ShaderR8 claim or
             // the previous convert's value.
@@ -5328,6 +5156,7 @@ impl GLProcessorST {
                 rotation_offset,
                 flip,
                 is_int8,
+                convert_span,
             ) {
                 Ok(()) => self.last_nv_convert_path = NvConvertPath::ShaderR8,
                 Err(e) => {
@@ -5667,12 +5496,19 @@ impl GLProcessorST {
         // Draw full-viewport quad to pack RGBA→RGB
         self.draw_fullscreen_quad()?;
 
-        // Pass 2 bound the intermediate on TEXTURE1; restore unit 0 as the
-        // active unit. Draw/setup sites select their unit before binding, but
-        // the processor-wide invariant between operations is "unit 0 active" —
-        // leaking unit 1 here is what broke the second heap-source convert
-        // (GL_INVALID_VALUE upload into the wrong texture).
-        unsafe { edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0) };
+        // Pass 2 bound the intermediate on TEXTURE1: unbind it there and
+        // restore unit 0 as the active unit. Draw/setup sites select their
+        // unit before binding, but the processor-wide invariant between
+        // operations is "unit 0 active" — leaking unit 1 here is what broke
+        // the second heap-source convert (GL_INVALID_VALUE upload into the
+        // wrong texture). The unbind is for Vivante: while the intermediate
+        // stayed bound to unit 1, the planar pass 2 that samples it on unit 0
+        // through a per-plane TEXTURE_SWIZZLE_R wrote wrong second and third
+        // planes for every planar convert that followed a packed-RGB one.
+        unsafe {
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, 0);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+        };
 
         unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())?;
@@ -6290,9 +6126,10 @@ impl GLProcessorST {
             PixelFormat::Rgb => edgefirst_gl::gl::RGB,
             PixelFormat::Rgba => edgefirst_gl::gl::RGBA,
             PixelFormat::Grey => edgefirst_gl::gl::RED,
-            // YUYV samples as RG (R=Y, G=alternating chroma) — zero-copy
-            // attach only; there is deliberately no upload arm yet.
-            PixelFormat::Yuyv if zero_copy_attach.is_some() => edgefirst_gl::gl::RG,
+            // YUYV samples as RG, one texel per pixel: R is the pixel's Y,
+            // G alternates U (even column) and V (odd column). An attach and
+            // an upload of the raw bytes both give that layout.
+            PixelFormat::Yuyv => edgefirst_gl::gl::RG,
             _ => {
                 return Err(Error::NotSupported(format!(
                     "draw_src_texture does not support {src_fmt:?} (use DMA-BUF path for YUV)",
@@ -6304,11 +6141,10 @@ impl GLProcessorST {
         // around the render.
         let program_id = if src_fmt == PixelFormat::Yuyv {
             if is_int8 {
-                return Err(Error::NotSupported(
-                    "YUYV zero-copy source has no int8 program; CPU fallback handles it".into(),
-                ));
+                self.yuyv_int8_program_2d.id
+            } else {
+                self.yuyv_program_2d.id
             }
-            self.yuyv_program_2d.id
         } else if is_int8 {
             self.texture_int8_program.id
         } else {
@@ -6327,7 +6163,7 @@ impl GLProcessorST {
                     cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
                 );
                 let [src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub, src_extent] =
-                    self.yuyv_2d_locs;
+                    self.yuyv_2d_locs[usize::from(is_int8)];
                 // The shader rebuilds texel coordinates as `floor(tc * src_size)`,
                 // and `tc` was just scaled onto the imported texture, so this
                 // must be the texture's own texel grid — not the logical image's,
@@ -6396,7 +6232,7 @@ impl GLProcessorST {
                 // Poison the upload-tracking dims: a later upload on this
                 // texture must TexImage2D fresh storage, never
                 // TexSubImage2D into the attached client buffer.
-                self.camera_normal_texture.target = 0;
+                self.camera_normal_texture.forget_storage();
                 self.convert_stats.src_imports += 1;
                 convert_span.record("src_feed", "import");
             } else {
@@ -6414,11 +6250,10 @@ impl GLProcessorST {
                     src_bpp,
                     &format!("{src_fmt:?}"),
                 )?;
-                self.convert_stats.src_uploads += 1;
-                convert_span.record("src_feed", "upload");
-                // Map before touching pixel-store state: a `?` here must not
+                // Open before touching pixel-store state: a `?` here must not
                 // leave `UNPACK_ROW_LENGTH` set for the next upload.
-                let pixels = src.map_read()?;
+                let pixels = SrcPixels::open(src, &self.owned_pbos)?;
+                pixels.record(&mut self.convert_stats, convert_span);
                 edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, row_len_px);
                 // What GL will read: every row but the last at the stride
                 // `UNPACK_ROW_LENGTH` just set, plus the last row's own
@@ -6434,13 +6269,13 @@ impl GLProcessorST {
                 } else {
                     (src_h - 1) * row_stride_b + src_w * src_bpp
                 };
-                let uploaded = self.camera_normal_texture.update_texture(
+                let uploaded = self.camera_normal_texture.upload(
                     texture_target,
                     src_w,
                     src_h,
                     texture_format,
                     required,
-                    &pixels,
+                    pixels.source(),
                 );
                 // Reset on both outcomes; nothing between the set and here
                 // can return early now.
@@ -6687,6 +6522,7 @@ impl GLProcessorST {
         rotation_offset: usize,
         flip: Flip,
         is_int8: bool,
+        convert_span: &tracing::Span,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -6773,47 +6609,30 @@ impl GLProcessorST {
                     }
                 }
                 None => {
-                    // Non-DMA upload path: upload the combined semi-planar buffer
-                    // as an R8 texture (tex_width × combined_plane_height). The
-                    // shader addresses it identically to the EGLImage case, so
-                    // the in-shader YUV matrix is byte-for-byte the same as the
-                    // DMA ShaderR8 path. Used where DMA-BUF EGLImage import is
-                    // unavailable (e.g. orin) or the source is heap-backed.
-                    //
-                    // A PBO source MUST NOT reach here: `map()` on a PBO tensor on
-                    // the GL thread deadlocks (the buffer is GL-owned). PBO sources
-                    // go through `draw_src_texture_from_pbo`; guard the invariant
-                    // locally rather than relying solely on the dispatch call graph.
-                    if src.pbo_id().is_some() {
-                        return Err(Error::NotSupported(
-                            "NV R8 upload cannot map a PBO source on the GL thread; \
-                             route PBO sources through the PBO upload path"
-                                .into(),
-                        ));
-                    }
+                    // Upload path: the combined semi-planar buffer as an R8
+                    // texture (tex_width × combined_plane_height), from host
+                    // memory or straight from a PBO. The shader addresses it
+                    // identically to the EGLImage case, so the in-shader YUV
+                    // matrix is byte-for-byte the same as the DMA ShaderR8
+                    // path. Used where DMA-BUF EGLImage import is unavailable
+                    // (e.g. orin), declined, or the source is not a DMA-BUF.
                     let combined_h = src_fmt.combined_plane_height(src_h).ok_or_else(|| {
                         Error::NotSupported(format!(
                             "draw_nv_texture_2d upload: {src_fmt:?} is not semi-planar"
                         ))
                     })?;
                     let needed = tex_width as usize * combined_h;
-                    // `map()` already starts at the source's plane offset for
-                    // every backing that reaches here: `Mem` and each
-                    // platform's DMA variant write it through
-                    // `set_plane_offset`, and an Shm window only ever gets one
-                    // from its own `view()`. So the window is read from its
-                    // own start. Adding `plane_offset` on top of the map, as
-                    // this once did, read an offset frame at twice its offset
-                    // or refused it as too short -- pinned by
-                    // `offset_nv_source_upload.rs`.
-                    let map = src.map_read()?;
-                    let bytes = map.as_slice();
-                    if needed > bytes.len() {
-                        return Err(Error::InvalidShape(format!(
-                            "NV R8 upload: need {needed} bytes but the source maps {}",
-                            bytes.len()
-                        )));
-                    }
+                    // A map already starts at the source's plane offset for
+                    // every backing: `Mem` and each platform's DMA variant
+                    // write it through `set_plane_offset`, and an Shm window
+                    // only ever gets one from its own `view()`. So the window
+                    // is read from its own start. Adding `plane_offset` on top
+                    // of the map, as this once did, read an offset frame at
+                    // twice its offset or refused it as too short -- pinned by
+                    // `offset_nv_source_upload.rs`. A PBO has no map, so its
+                    // upload is the one that carries the offset.
+                    let pixels = SrcPixels::open(src, &self.owned_pbos)?;
+                    pixels.record(&mut self.convert_stats, convert_span);
                     // Adreno does not orphan an EGLImage sibling on TexImage2D:
                     // an upload into a texture that last held an imported R8
                     // plane samples partly from that import. A fresh texture
@@ -6829,26 +6648,20 @@ impl GLProcessorST {
                             edgefirst_gl::gl::NEAREST,
                         );
                     }
-                    // `UNPACK_ALIGNMENT` is 1 (set once in `new`), so any row width
-                    // is valid — no 4-aligned-pitch requirement on the upload.
-                    // (TODO/EDGEAI: reuse storage via glTexSubImage2D when dims are
-                    // unchanged instead of reallocating every frame — tracked
-                    // follow-up; needs EGLImage-vs-upload storage tracking to be safe.)
-                    edgefirst_gl::gl::TexImage2D(
+                    // Fresh storage every frame: this texture alternates between
+                    // imported planes and uploads, and only an attach knows when
+                    // it has replaced the storage. `UNPACK_ALIGNMENT` is 1 (set
+                    // once in `new`), so any row width is valid.
+                    self.nv_r8_texture.forget_storage();
+                    self.nv_r8_texture.upload(
                         edgefirst_gl::gl::TEXTURE_2D,
-                        0,
-                        edgefirst_gl::gl::R8 as i32,
-                        tex_width,
-                        combined_h as i32,
-                        0,
+                        tex_width as usize,
+                        combined_h,
                         edgefirst_gl::gl::RED,
-                        edgefirst_gl::gl::UNSIGNED_BYTE,
-                        bytes.as_ptr() as *const c_void,
-                    );
+                        needed,
+                        pixels.source(),
+                    )?;
                     check_gl_error(function!(), line!())?;
-                    // The texture now holds uploaded pixels, not an EGLImage —
-                    // clear the EGLImage binding key so a later DMA convert rebinds.
-                    self.nv_r8_texture.invalidate_egl_binding();
                     log::trace!("draw_nv_texture_2d: uploaded R8 ({tex_width}x{combined_h})");
                 }
             }
@@ -7261,8 +7074,7 @@ impl GLProcessorST {
     }
 
     /// The `src_extent` location of the `sampler2D` source program
-    /// `draw_src_texture` and `draw_src_texture_from_pbo` select for
-    /// `is_int8`.
+    /// `draw_src_texture` selects for `is_int8`.
     fn texture_src_extent_loc(&self, is_int8: bool) -> i32 {
         let [plain, int8] = self.texture_src_extent_locs;
         if is_int8 {

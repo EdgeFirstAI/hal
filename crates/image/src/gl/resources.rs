@@ -7,6 +7,16 @@ use super::shaders::check_gl_error;
 use std::ffi::{c_void, CStr};
 use std::ptr::null;
 
+/// Where [`Texture::upload`] reads its pixels from.
+#[derive(Clone, Copy)]
+pub(super) enum UploadSource<'a> {
+    /// CPU-visible bytes, starting at the image's first pixel.
+    Bytes(&'a [u8]),
+    /// A GL buffer object, read through `PIXEL_UNPACK_BUFFER` from `offset`
+    /// bytes in: a copy the GPU makes, with no CPU mapping.
+    Pbo { buffer_id: u32, offset: usize },
+}
+
 pub(super) struct Texture {
     pub(super) id: u32,
     pub(super) target: edgefirst_gl::gl::types::GLenum,
@@ -39,67 +49,88 @@ impl Texture {
         }
     }
 
-    /// Upload `data` as this texture's contents.
+    /// Upload `src` as this texture's contents, reallocating storage only
+    /// when the target, size or format changed since the last upload.
     ///
     /// `required` is how many bytes GL will read: `(height - 1)` row strides
     /// plus the last row's own pixels, where the stride is whatever
     /// `UNPACK_ROW_LENGTH` the caller has set (`UNPACK_ALIGNMENT` is 1 from
     /// `new`, so rows carry no extra padding). GL reads through a raw
-    /// pointer and cannot see the slice's length, so a `data` shorter than
-    /// that would have the driver read past the mapping -- which is not a
-    /// hypothetical: a tensor's map is clamped to what its window actually
-    /// covers (`HostView::len_elems`), so a plane offset restored from an
-    /// untrusted descriptor shortens the map while width and height stay
-    /// whole. Refusing here turns that into a fallback to the CPU converter
-    /// instead of an out-of-bounds read. See
+    /// pointer and cannot see a slice's length, so [`UploadSource::Bytes`]
+    /// shorter than that would have the driver read past the mapping --
+    /// which is not a hypothetical: a tensor's map is clamped to what its
+    /// window actually covers (`HostView::len_elems`), so a plane offset
+    /// restored from an untrusted descriptor shortens the map while width
+    /// and height stay whole. Refusing here turns that into a fallback to
+    /// the CPU converter instead of an out-of-bounds read. See
     /// `crates/tensor/src/d3d11/texture.rs::check_view_offset` and
     /// `IoSurfaceTensor::check_view_offset`, which refuse the same window at
     /// the source; this is the check that does not depend on which backing
-    /// produced the map.
-    pub(super) fn update_texture(
+    /// produced the map. An [`UploadSource::Pbo`] read past its buffer is
+    /// refused by GL itself (`GL_INVALID_OPERATION`), which the caller's
+    /// `check_gl_error` reports.
+    ///
+    /// `format` is also the internal format, except that `RED` and `RG` are
+    /// allocated as the sized `R8` and `RG8`: OpenGL ES 3.0 has no unsized
+    /// internal format for either.
+    pub(super) fn upload(
         &mut self,
         target: edgefirst_gl::gl::types::GLenum,
         width: usize,
         height: usize,
         format: edgefirst_gl::gl::types::GLenum,
         required: usize,
-        data: &[u8],
+        src: UploadSource<'_>,
     ) -> crate::Result<()> {
-        if data.len() < required {
-            return Err(crate::Error::NotSupported(format!(
-                "GL upload: {width}x{height} texture needs {required} B but the \
-                 source maps only {} B -- a window that does not cover its own \
-                 image (a restored plane offset past the buffer?); converting \
-                 on the CPU instead",
-                data.len()
-            )));
-        }
-        if target != self.target
-            || width != self.width
-            || height != self.height
-            || format != self.format
-        {
-            unsafe {
+        let (pixels, pbo) = match src {
+            UploadSource::Bytes(data) => {
+                if data.len() < required {
+                    return Err(crate::Error::NotSupported(format!(
+                        "GL upload: {width}x{height} texture needs {required} B but the \
+                         source maps only {} B -- a window that does not cover its own \
+                         image (a restored plane offset past the buffer?); converting \
+                         on the CPU instead",
+                        data.len()
+                    )));
+                }
+                (data.as_ptr() as *const c_void, None)
+            }
+            // With a buffer bound to `PIXEL_UNPACK_BUFFER`, the `pixels`
+            // argument is a byte offset into it rather than an address.
+            UploadSource::Pbo { buffer_id, offset } => (offset as *const c_void, Some(buffer_id)),
+        };
+        let internal_format = match format {
+            edgefirst_gl::gl::RED => edgefirst_gl::gl::R8,
+            edgefirst_gl::gl::RG => edgefirst_gl::gl::RG8,
+            other => other,
+        };
+        unsafe {
+            if let Some(buffer_id) = pbo {
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, buffer_id);
+            }
+            if target != self.target
+                || width != self.width
+                || height != self.height
+                || format != self.format
+            {
                 edgefirst_gl::gl::TexImage2D(
                     target,
                     0,
-                    format as i32,
+                    internal_format as i32,
                     width as i32,
                     height as i32,
                     0,
                     format,
                     edgefirst_gl::gl::UNSIGNED_BYTE,
-                    data.as_ptr() as *const c_void,
+                    pixels,
                 );
-            }
-            self.target = target;
-            self.format = format;
-            self.width = width;
-            self.height = height;
-            // TexImage2D reallocates the texture, invalidating any EGLImage binding.
-            self.bound_egl_key = None;
-        } else {
-            unsafe {
+                self.target = target;
+                self.format = format;
+                self.width = width;
+                self.height = height;
+                // TexImage2D reallocates the texture, invalidating any EGLImage binding.
+                self.bound_egl_key = None;
+            } else {
                 edgefirst_gl::gl::TexSubImage2D(
                     target,
                     0,
@@ -109,11 +140,21 @@ impl Texture {
                     height as i32,
                     format,
                     edgefirst_gl::gl::UNSIGNED_BYTE,
-                    data.as_ptr() as *const c_void,
+                    pixels,
                 );
+            }
+            if pbo.is_some() {
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
             }
         }
         Ok(())
+    }
+
+    /// Forget the recorded storage so the next [`Self::upload`] allocates
+    /// afresh with `TexImage2D` instead of writing into whatever the texture
+    /// holds now -- which, after an attach, is a client buffer.
+    pub(super) fn forget_storage(&mut self) {
+        self.target = 0;
     }
 
     /// Attach a platform import to this GL_TEXTURE_2D texture if the key

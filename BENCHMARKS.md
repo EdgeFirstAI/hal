@@ -342,7 +342,7 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **RAM** | 8 GB LPDDR4X |
 | **OS** | Raspberry Pi OS (Debian 12) |
 | **G2D** | No |
-| **DMA-buf** | Yes (system heap) |
+| **DMA-buf** | Yes (64 MB CMA; system heap when CMA is full) |
 | **Notes** | Mesa V3D driver; RGB/RGB_i8 packed GL via two-pass packing shader |
 
 ### x86-desktop
@@ -2319,7 +2319,7 @@ allocation.
 1. **maivin** — Primary production target (Torizon 7, same SoC as imx8mp-frdm).
    Pending Torizon image with benchmark tooling.
 
-2. **jetson-orin-nano** — CPU and GL (RGBA/BGRA/Grey) benchmarks collected. YUV EGL import not supported (YUYV/NV12 GL pipeline rows show "—"). DMA-buf allocation benchmarks show anomalous scaling (720p slower than 4K) — likely CMA fragmentation during collection, needs re-run.
+2. **jetson-orin-nano** — CPU and GL benchmarks collected. Tegra has no DMA-buf import, so YUYV/NV12 sources are PBOs; the GL backend now converts them on the GPU (4K YUYV→RGB pipeline to 640×640: 1.0 ms against 14.6 ms on the CPU), and tables captured before that show "—" in those rows until re-collected. DMA-buf allocation benchmarks show anomalous scaling (720p slower than 4K) — likely CMA fragmentation during collection, needs re-run.
 
 ### Missing Buffer Strategy Coverage
 
@@ -2327,9 +2327,9 @@ allocation.
 
 ### Known Performance Issues
 
-4. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160 for same-size conversion. OpenGL convert benchmarks at 4K produce GL errors on this platform.
+4. ~~**rpi5-hailo 4K DMA-buf allocation fails**~~ — Resolved: the board reserves 64 MB of CMA, and a DMA-buf allocation CMA could not fit used to fail instead of trying the system heap, so 4K frames (16.6 MB YUYV) fell back to a PBO, which the GL backend then refused for YUV. Allocation now takes the system heap when CMA is full, and V3D imports it zero-copy: the GL pipeline benchmark measures every cell the other boards do.
 
-5. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
+5. ~~**x86-desktop OpenGL cannot import YUV textures**~~ — Resolved for YUYV and NV12: on the NVIDIA PBO transfer backend they are uploaded from the PBO or host memory and converted by the same shaders as an import. VYUY remains CPU-only.
 
 6. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_proto_masks`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
 

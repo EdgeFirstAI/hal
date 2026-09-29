@@ -72,6 +72,45 @@ where
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+/// Allocate `size` bytes of DMA-BUF: from the CMA heap when there is one,
+/// and from the system heap when there is none or the CMA pool cannot fit
+/// the buffer.
+///
+/// CMA memory is physically contiguous, which some consumers need (G2D, and
+/// GPUs without an IOMMU); system-heap memory is not. Without the second
+/// fallback, a board whose CMA pool is small next to its frames -- a
+/// Raspberry Pi 5 reserves 64 MB, and one 4K YUYV frame is 16.6 MB -- loses
+/// DMA-BUF for exactly the large frames zero-copy matters most for, and the
+/// caller drops to a PBO or host memory. A consumer that cannot import a
+/// system-heap buffer declines it as it declines any other import. When both
+/// heaps fail, the CMA heap's error is the one reported.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn heap_allocate(size: usize) -> Result<std::os::fd::OwnedFd> {
+    let cma_error = match dma_heap::Heap::new(dma_heap::HeapKind::Cma) {
+        Ok(cma) => match cma.allocate(size) {
+            Ok(fd) => return Ok(fd),
+            Err(e) => Some(e),
+        },
+        Err(_) => None,
+    };
+    let system = dma_heap::Heap::new(dma_heap::HeapKind::System);
+    match (system, cma_error) {
+        (Ok(system), None) => Ok(system.allocate(size)?),
+        (Ok(system), Some(cma_error)) => match system.allocate(size) {
+            Ok(fd) => {
+                log::debug!(
+                    "CMA heap could not fit {size} bytes ({cma_error}); allocated from the \
+                     system heap, which is not physically contiguous"
+                );
+                Ok(fd)
+            }
+            Err(_) => Err(cma_error.into()),
+        },
+        (Err(e), None) => Err(e.into()),
+        (Err(_), Some(cma_error)) => Err(cma_error.into()),
+    }
+}
+
 unsafe impl<T> Sync for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 
 impl<T> TensorTrait<T> for DmaTensor<T>
@@ -100,12 +139,7 @@ where
             }
         };
 
-        let heap = match dma_heap::Heap::new(dma_heap::HeapKind::Cma) {
-            Ok(heap) => heap,
-            Err(_) => dma_heap::Heap::new(dma_heap::HeapKind::System)?,
-        };
-
-        let dma_fd = heap.allocate(logical_size)?;
+        let dma_fd = heap_allocate(logical_size)?;
         let stat = fstat(&dma_fd)?;
         debug!("DMA memory stat: {stat:?}");
         let buf_size = if stat.st_size > 0 {
@@ -406,12 +440,7 @@ where
             }
         };
 
-        let heap = match dma_heap::Heap::new(dma_heap::HeapKind::Cma) {
-            Ok(heap) => heap,
-            Err(_) => dma_heap::Heap::new(dma_heap::HeapKind::System)?,
-        };
-
-        let dma_fd = heap.allocate(byte_size)?;
+        let dma_fd = heap_allocate(byte_size)?;
         let stat = fstat(&dma_fd)?;
         debug!("DMA padded memory stat: {stat:?}");
         let buf_size = if stat.st_size > 0 {
@@ -937,6 +966,45 @@ mod tests {
             DmaTensor::<u8>::new_with_byte_size(&[usize::MAX, 2], 1, None),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    /// A buffer the whole CMA pool could not hold is still a DMA-BUF: it
+    /// comes from the system heap. Skipped without both heaps, and where the
+    /// pool is large enough that exceeding it means allocating a gigabyte.
+    #[test]
+    #[cfg(not(miri))]
+    fn a_buffer_larger_than_the_cma_pool_comes_from_the_system_heap() {
+        const NAME: &str = "a_buffer_larger_than_the_cma_pool_comes_from_the_system_heap";
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
+        let heaps = [dma_heap::HeapKind::Cma, dma_heap::HeapKind::System]
+            .map(|kind| dma_heap::Heap::new(kind).is_ok());
+        if heaps != [true, true] {
+            crate::test_support::report_skip(&format!(
+                "{NAME} - needs both the CMA and the system heap (CMA, system: {heaps:?})"
+            ));
+            return;
+        }
+        let cma_total = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| {
+                m.lines()
+                    .find_map(|l| l.strip_prefix("CmaTotal:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
+            })
+            .map_or(0, |kb| kb * 1024);
+        if cma_total == 0 || cma_total > 256 << 20 {
+            crate::test_support::report_skip(&format!(
+                "{NAME} - CMA pool is {} MB; the test exceeds pools of 1-256 MB",
+                cma_total >> 20
+            ));
+            return;
+        }
+        let size = cma_total + (4 << 20);
+        let t = DmaTensor::<u8>::new(&[size], None)
+            .unwrap_or_else(|e| panic!("{size} B, past the {cma_total} B CMA pool: {e}"));
+        assert!(fstat_size(&t.fd) >= size);
     }
 
     fn fstat_size(fd: &OwnedFd) -> usize {

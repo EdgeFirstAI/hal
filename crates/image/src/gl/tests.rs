@@ -3291,21 +3291,20 @@ mod gl_tests {
         }
     }
 
-    /// Regression test for the GL worker self-deadlock: a PBO-backed SOURCE
-    /// mapped from inside a GL message handler.
+    /// A PBO-backed SOURCE into a PLANAR destination: the route that once
+    /// hung the GL worker.
     ///
-    /// `convert_via_engine` sends PBO sources to `draw_src_texture_from_pbo`,
-    /// which binds the buffer and never maps it — which is why the RGBA→RGBA
-    /// `test_gl_convert_pbo_to_pbo_no_deadlock` above does not reach this. A
-    /// PLANAR destination returns earlier, into `convert_nv_to_planar_two_pass`
-    /// -> `convert_to` -> `convert_to_dims` -> `draw_src_texture`, whose upload
-    /// arm calls `src.map_read()`. On a PBO source that is
-    /// `GlPboOps::map_buffer` running on the worker thread that owns the queue;
-    /// before the fix it `blocking_send`-ed to the capacity-1 channel it is
-    /// itself the only consumer of and hung forever.
+    /// A planar destination takes `convert_nv_to_planar_two_pass` ->
+    /// `convert_to` -> `convert_to_dims` -> `draw_src_texture`. That upload
+    /// once read a PBO source through `src.map_read()`, which is
+    /// `GlPboOps::map_buffer` on the worker thread that owns the queue, and
+    /// `blocking_send`-ed to the capacity-1 channel it alone drains. The
+    /// upload now reads the buffer through `PIXEL_UNPACK_BUFFER` on every
+    /// route and never maps it.
     ///
-    /// `src_uploads` is asserted so this cannot pass by taking some other route
-    /// and never exercising the inline map it exists to guard.
+    /// `src_pbo_uploads` is asserted so this cannot pass by taking some other
+    /// route, and `src_uploads` so a regression to the map is caught even
+    /// when the inline map keeps it from hanging.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO sources: Linux + Windows
     fn test_gl_convert_pbo_src_to_planar_no_deadlock() {
@@ -3334,7 +3333,7 @@ mod gl_tests {
         )
         .expect("planar destination tensor");
 
-        let before = gl.convert_stats().map(|s| s.src_uploads).unwrap_or(0);
+        let before = gl.convert_stats().expect("convert stats before");
         let src_dyn = TensorDyn::from(pbo_src);
         let mut dst_dyn = TensorDyn::from(dst);
         let res = gl.convert(
@@ -3346,11 +3345,16 @@ mod gl_tests {
         );
         match res {
             Ok(()) => {
-                let after = gl.convert_stats().map(|s| s.src_uploads).unwrap_or(0);
-                assert!(
-                    after > before,
-                    "convert completed with no CPU source upload ({before} -> {after}); \
-                     this test no longer reaches the inline PBO map it guards"
+                let after = gl.convert_stats().expect("convert stats after");
+                assert_eq!(
+                    after.src_pbo_uploads - before.src_pbo_uploads,
+                    1,
+                    "the planar route did not feed its source from the PBO"
+                );
+                assert_eq!(
+                    after.src_uploads, before.src_uploads,
+                    "the planar route mapped its PBO source instead of reading \
+                     it through PIXEL_UNPACK_BUFFER"
                 );
             }
             Err(e) => {
@@ -3367,13 +3371,19 @@ mod gl_tests {
         }
     }
 
+    /// Sets `EDGEFIRST_GL_SERIALIZE` until dropped. The variable is process
+    /// state and tests run in parallel, so the guard also holds a lock: two
+    /// tests forcing different policies would otherwise each start their
+    /// processors under whichever value was written last.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    struct SerializeEnvGuard;
+    struct SerializeEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     impl SerializeEnvGuard {
         fn set(v: &str) -> Self {
+            static POLICY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let held = POLICY.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("EDGEFIRST_GL_SERIALIZE", v);
-            SerializeEnvGuard
+            SerializeEnvGuard(held)
         }
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -3442,6 +3452,128 @@ mod gl_tests {
         assert!(
             msg.contains("another GL context"),
             "must be refused by the cross-context guard, not some other error path: {msg}"
+        );
+    }
+
+    /// A PBO owned by ANOTHER processor's context converts correctly through
+    /// its owner's map instead of being bound here.
+    ///
+    /// GL buffer names belong to a context, and HAL's contexts share nothing:
+    /// binding the other processor's buffer id in this context names a
+    /// different buffer, or none. Only the processor that allocated a PBO
+    /// reads it through `PIXEL_UNPACK_BUFFER`; any other maps it, which the
+    /// owning worker serves when no process-wide lock is held.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_foreign_pbo_source_is_mapped_not_bound() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        // Must precede both processors: the policy is read at worker startup.
+        let _serialize = SerializeEnvGuard::set("lifecycle");
+        let mut gl_a = GLProcessorThreaded::new(None).unwrap();
+        let gl_b = GLProcessorThreaded::new(None).unwrap();
+        let (w, h) = (320usize, 240usize);
+        let foreign = rgba8_pbo(&gl_b, w, h);
+        stamp_rgba8_positionally(&foreign, w, h);
+        let rgba = || {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let want = rgba();
+        stamp_rgba8_positionally(&want, w, h);
+
+        let mut got = rgba();
+        let before = gl_a.convert_stats().expect("convert stats before");
+        gl_a.convert(
+            &foreign,
+            &mut got,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("a foreign PBO source converts through its owner's map");
+        let after = gl_a.convert_stats().expect("convert stats after");
+        assert_eq!(
+            after.src_pbo_uploads, before.src_pbo_uploads,
+            "another context's buffer id was bound in this context"
+        );
+        assert_eq!(after.src_uploads - before.src_uploads, 1);
+        let (worst, first) = image_max_diff(&got, &want, 1);
+        assert!(
+            first.is_none(),
+            "foreign PBO source differs from its own pixels by up to {worst} at {first:?}"
+        );
+    }
+
+    /// The destination twin of [`a_foreign_pbo_source_is_mapped_not_bound`]:
+    /// a PBO destination owned by another processor is written through its
+    /// owner's map, not read back into this context's buffer of the same
+    /// name.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_foreign_pbo_destination_is_mapped_not_bound() {
+        use crate::cpu::CPUProcessor;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let _serialize = SerializeEnvGuard::set("lifecycle");
+        let mut gl_a = GLProcessorThreaded::new(None).unwrap();
+        let gl_b = GLProcessorThreaded::new(None).unwrap();
+        let (w, h) = (320usize, 240usize);
+        let access = edgefirst_tensor::CpuAccess::ReadWrite;
+        let cm = edgefirst_tensor::Colorimetry::default()
+            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+            .with_range(edgefirst_tensor::ColorRange::Full);
+        let mut src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            access,
+        )
+        .unwrap();
+        stamp_yuv_gradient(&src, PixelFormat::Nv12, w, h);
+        src.set_colorimetry(Some(cm));
+        let mut want = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            access,
+        )
+        .unwrap();
+        CPUProcessor::new()
+            .convert(&src, &mut want, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        let mut foreign: TensorDyn = gl_b
+            .create_pbo_image(w, h, PixelFormat::Rgba)
+            .expect("allocate a PBO on the other processor")
+            .into();
+        gl_a.convert(
+            &src,
+            &mut foreign,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("a foreign PBO destination is written through its owner's map");
+        let (worst, first) = image_max_diff(&foreign, &want, 4);
+        assert!(
+            first.is_none(),
+            "foreign PBO destination differs from the CPU by up to {worst} at {first:?}"
         );
     }
 
@@ -12181,8 +12313,8 @@ mod gl_tests {
 
     /// The float engine's PBO source arm reads the view's own region.
     ///
-    /// `feed_float_src`'s PBO arm is the float sibling of
-    /// `draw_src_texture_from_pbo`, and it carried the identical pair of
+    /// `feed_float_src`'s PBO arm was the float sibling of the u8 engine's
+    /// PBO upload, and it carried the identical pair of
     /// defects: `TexImage2D`/`TexSubImage2D` were handed `NULL` with the
     /// source bound to `PIXEL_UNPACK_BUFFER`, and no `UNPACK_ROW_LENGTH` was
     /// set. The arm is taken on any `pbo_id()`, and a `view()` carries its
@@ -12982,5 +13114,282 @@ mod gl_tests {
         }
 
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Stamp a smooth YUYV or NV12 frame into `t` at its own pitch: luma
+    /// ramps with x and y, Cb with x, Cr with y. Smooth so that the GPU's
+    /// nearest chroma pair and the CPU converter's chroma upsampling cannot
+    /// differ by more than a code value or two, and inside the limited-range
+    /// band so neither side clips.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn stamp_yuv_gradient(t: &TensorDyn, fmt: PixelFormat, w: usize, h: usize) {
+        let luma = |x: usize, y: usize| (16 + x * 180 / w + y * 40 / h) as u8;
+        let cb = |x: usize| (64 + x * 128 / w) as u8;
+        let cr = |y: usize| (64 + y * 128 / h) as u8;
+        let mut m = t
+            .map_bytes(edgefirst_tensor::CpuAccess::ReadWrite)
+            .expect("map the source");
+        let s = m.as_mut_slice();
+        match fmt {
+            PixelFormat::Yuyv => {
+                let pitch = t.effective_row_stride().unwrap_or(w * 2);
+                for y in 0..h {
+                    for x in (0..w).step_by(2) {
+                        let i = y * pitch + x * 2;
+                        s[i] = luma(x, y);
+                        s[i + 1] = cb(x);
+                        s[i + 2] = luma(x + 1, y);
+                        s[i + 3] = cr(y);
+                    }
+                }
+            }
+            PixelFormat::Nv12 => {
+                let pitch = t.effective_row_stride().unwrap_or(w);
+                for y in 0..h {
+                    for x in 0..w {
+                        s[y * pitch + x] = luma(x, y);
+                    }
+                }
+                let uv = h * pitch;
+                for y in 0..h / 2 {
+                    for x in (0..w).step_by(2) {
+                        s[uv + y * pitch + x] = cb(x);
+                        s[uv + y * pitch + x + 1] = cr(y * 2);
+                    }
+                }
+            }
+            other => panic!("stamp_yuv_gradient: {other:?} is not YUYV or NV12"),
+        }
+    }
+
+    /// Largest per-byte difference between two images of one format, read at
+    /// each tensor's own pitch; int8 bytes compare as signed values. Returns
+    /// the difference and the first (x, row, byte) past `tolerance`.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn image_max_diff(
+        a: &TensorDyn,
+        b: &TensorDyn,
+        tolerance: u32,
+    ) -> (u32, Option<(usize, usize, usize)>) {
+        let fmt = a.format().expect("a formatted image");
+        let (w, h) = (a.width().unwrap(), a.height().unwrap());
+        let planar = fmt.layout() == edgefirst_tensor::PixelLayout::Planar;
+        let (rows, row_bytes) = if planar {
+            (h * fmt.channels(), w)
+        } else {
+            (h, w * fmt.channels())
+        };
+        let signed = a.dtype() == DType::I8;
+        let am = a.map_bytes(edgefirst_tensor::CpuAccess::Read).unwrap();
+        let bm = b.map_bytes(edgefirst_tensor::CpuAccess::Read).unwrap();
+        let (ap, bp) = (
+            a.effective_row_stride().unwrap_or(row_bytes),
+            b.effective_row_stride().unwrap_or(row_bytes),
+        );
+        let (mut worst, mut first) = (0u32, None);
+        for r in 0..rows {
+            for c in 0..row_bytes {
+                let (x, y) = (am.as_slice()[r * ap + c], bm.as_slice()[r * bp + c]);
+                let d = if signed {
+                    (x as i8 as i32 - y as i8 as i32).unsigned_abs()
+                } else {
+                    (x as i32 - y as i32).unsigned_abs()
+                };
+                worst = worst.max(d);
+                if d > tolerance && first.is_none() {
+                    first = Some((c, r, d as usize));
+                }
+            }
+        }
+        (worst, first)
+    }
+
+    /// A planar convert after a packed-RGB one on the same processor writes
+    /// every plane. The packed-RGB pass 2 samples the shared intermediate on
+    /// texture unit 1; left bound there, Vivante applied the planar pass 2's
+    /// per-plane swizzle to the first plane only.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_planar_convert_after_a_packed_rgb_one_writes_every_plane() {
+        use crate::cpu::CPUProcessor;
+        let Some(mut gl) = pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        if !edgefirst_tensor::is_dma_available() {
+            crate::test_support::report_skip(&format!("{} - no DMA heap", function!()));
+            return;
+        }
+        let (w, h) = (320usize, 240usize);
+        let access = edgefirst_tensor::CpuAccess::ReadWrite;
+        let mut src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            access,
+        )
+        .unwrap();
+        stamp_yuv_gradient(&src, PixelFormat::Nv12, w, h);
+        src.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
+        let image = |fmt, mem| TensorDyn::image(w, h, fmt, DType::U8, Some(mem), access).unwrap();
+        let mut want = image(PixelFormat::PlanarRgb, TensorMemory::Mem);
+        CPUProcessor::new()
+            .convert(&src, &mut want, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+        for dst_fmt in [PixelFormat::Rgb, PixelFormat::PlanarRgb] {
+            let mut got = image(dst_fmt, TensorMemory::DmaBuf);
+            gl.convert(&src, &mut got, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap_or_else(|e| panic!("{dst_fmt:?}: {e}"));
+            if dst_fmt == PixelFormat::PlanarRgb {
+                let (worst, first) = image_max_diff(&got, &want, 4);
+                assert!(
+                    first.is_none(),
+                    "planar after packed RGB differs from the CPU by up to {worst} at {first:?} \
+                     (byte, row, diff; rows {h}.. are the second plane)"
+                );
+            }
+        }
+    }
+
+    /// YUYV and NV12 sources reach the GPU whether they live in a PBO or in
+    /// host memory, on every destination route, and agree with the CPU
+    /// converter -- where the platform has no zero-copy import. Where it
+    /// does, YUYV from either and NV12 from a PBO are declined to the CPU,
+    /// which beats the upload there.
+    ///
+    /// A PBO is the only GPU-visible source where DMA-BUF import is
+    /// unavailable -- every frame on a Jetson -- and these are the formats
+    /// cameras deliver. The
+    /// destinations cover each route a source can take: single-pass packed
+    /// (Rgba), single-pass genuine RGB or the two-pass packed-RGB route
+    /// (Rgb, by destination memory), the planar two-pass route (PlanarRgb),
+    /// and the int8 twin of each. A DMA-BUF destination, where the host has
+    /// one, is the case that must plan a PBO source as a host source: the
+    /// single-pass planar shader can only import its source.
+    ///
+    /// The feed counters make this a statement about the GPU path: a convert
+    /// that fell back to the CPU would match the reference exactly.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn yuv_sources_from_pbo_and_host_memory_match_cpu() {
+        use crate::cpu::CPUProcessor;
+        let Some(mut gl) = pbo_gl_or_skip(function!()) else {
+            return;
+        };
+        let (w, h) = (320usize, 240usize);
+        // Tagged on both sides, so the comparison isolates the route rather
+        // than the untagged-colorimetry heuristic.
+        let cm = edgefirst_tensor::Colorimetry::default()
+            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+            .with_range(edgefirst_tensor::ColorRange::Full);
+        let dsts = [
+            (PixelFormat::Rgba, DType::U8),
+            (PixelFormat::Rgb, DType::U8),
+            (PixelFormat::PlanarRgb, DType::U8),
+            (PixelFormat::Rgba, DType::I8),
+            (PixelFormat::Rgb, DType::I8),
+            (PixelFormat::PlanarRgb, DType::I8),
+        ];
+        #[allow(unused_mut)]
+        let mut dst_mems = vec![TensorMemory::Mem];
+        #[cfg(target_os = "linux")]
+        if edgefirst_tensor::is_dma_available() {
+            dst_mems.push(TensorMemory::DmaBuf);
+        }
+        let access = edgefirst_tensor::CpuAccess::ReadWrite;
+        let uploads_yuv = !gl.transfer_backend().is_zero_copy();
+        let mut cpu = CPUProcessor::new();
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for src_fmt in [PixelFormat::Yuyv, PixelFormat::Nv12] {
+            let mut reference =
+                TensorDyn::image(w, h, src_fmt, DType::U8, Some(TensorMemory::Mem), access)
+                    .expect("host reference source");
+            stamp_yuv_gradient(&reference, src_fmt, w, h);
+            reference.set_colorimetry(Some(cm));
+            for src_mem in [TensorMemory::Pbo, TensorMemory::Mem] {
+                let mut src: TensorDyn = if src_mem == TensorMemory::Pbo {
+                    gl.create_pbo_image(w, h, src_fmt)
+                        .expect("allocate the source PBO")
+                        .into()
+                } else {
+                    TensorDyn::image(w, h, src_fmt, DType::U8, Some(src_mem), access)
+                        .expect("host source")
+                };
+                assert_eq!(src.memory(), src_mem);
+                stamp_yuv_gradient(&src, src_fmt, w, h);
+                src.set_colorimetry(Some(cm));
+                for &dst_mem in &dst_mems {
+                    for (dst_fmt, dtype) in dsts {
+                        let case =
+                            format!("{src_fmt:?}/{src_mem:?} -> {dst_fmt:?} {dtype:?}/{dst_mem:?}");
+                        let mut want =
+                            TensorDyn::image(w, h, dst_fmt, dtype, Some(TensorMemory::Mem), access)
+                                .unwrap();
+                        cpu.convert(
+                            &reference,
+                            &mut want,
+                            Rotation::None,
+                            Flip::None,
+                            Crop::no_crop(),
+                        )
+                        .unwrap_or_else(|e| panic!("{case}: CPU reference: {e}"));
+                        let mut got = TensorDyn::image(w, h, dst_fmt, dtype, Some(dst_mem), access)
+                            .unwrap_or_else(|e| panic!("{case}: destination: {e}"));
+                        let before = gl.convert_stats().expect("convert stats before");
+                        let result =
+                            gl.convert(&src, &mut got, Rotation::None, Flip::None, Crop::no_crop());
+                        let declined = !uploads_yuv
+                            && (src_fmt == PixelFormat::Yuyv || src_mem == TensorMemory::Pbo);
+                        if declined {
+                            if !matches!(result, Err(crate::Error::NotSupported(_))) {
+                                failures.push(format!(
+                                    "{case}: expected a NotSupported decline on a zero-copy \
+                                     platform, got {result:?}"
+                                ));
+                            }
+                            checked += 1;
+                            continue;
+                        }
+                        if let Err(e) = result {
+                            failures.push(format!("{case}: GL refused: {e}"));
+                            continue;
+                        }
+                        let after = gl.convert_stats().expect("convert stats after");
+                        let (pbo, upload, import) = (
+                            after.src_pbo_uploads - before.src_pbo_uploads,
+                            after.src_uploads - before.src_uploads,
+                            after.src_imports - before.src_imports,
+                        );
+                        let fed = match src_mem {
+                            TensorMemory::Pbo => pbo >= 1 && upload == 0,
+                            _ => upload >= 1 && pbo == 0,
+                        };
+                        if !fed || import != 0 {
+                            failures.push(format!(
+                                "{case}: source fed {pbo} time(s) from the PBO, {upload} by \
+                                 map + upload, {import} by import"
+                            ));
+                            continue;
+                        }
+                        let (worst, first) = image_max_diff(&got, &want, 4);
+                        if let Some((c, r, d)) = first {
+                            failures.push(format!(
+                                "{case}: byte {c} of row {r} differs from the CPU by {d} \
+                                 (worst {worst}, tolerance 4)"
+                            ));
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(checked, 2 * 2 * dst_mems.len() * dsts.len());
     }
 }

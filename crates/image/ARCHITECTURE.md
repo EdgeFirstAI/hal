@@ -696,7 +696,7 @@ that tells the engine what completes the convert.
 |----------|-------------|---------------|------------|
 | `ZeroCopy` | DMA (with EGL dma_buf import) | dst's own EGLImage (renderbuffer on Mali, texture-FBO elsewhere) | none — render writes the buffer |
 | `TexturePbo` | PBO | offscreen texture seeded from the PBO via UNPACK | `glReadPixels` into the PBO PACK binding |
-| `TextureMem` | Mem/Shm (or DMA without import) | offscreen texture seeded from the mapped tensor | `glReadPixels` into the mapped tensor |
+| `TextureMem` | Mem/Shm (or DMA without import, or a PBO another processor allocated) | offscreen texture seeded from the mapped tensor | `glReadPixels` into the mapped tensor |
 
 One `convert_via_engine` executes every u8/i8 convert: the pure plan table
 `render::plan_convert(src_fmt, dst_fmt, lowering)` picks one of three plans.
@@ -704,7 +704,7 @@ One `convert_via_engine` executes every u8/i8 convert: the pure plan table
 | Plan | Selected when | Why |
 |------|---------------|-----|
 | `TwoPassPackedRgb` | `dst_fmt == Rgb` on a `ZeroCopy` lowering | GL has no 3-byte render format, so pass 2 packs into the destination reinterpreted as RGBA8 at `W*3/4 × H`. Texture lowerings render genuine RGB in one pass and stay `SinglePass`. |
-| `TwoPassNvPlanar` | any planar `dst_fmt` on a texture lowering (`TextureMem`/`TexturePbo`), **or** an NV12/NV16/NV24 source into a planar destination on any lowering | Pass 1 is the ordinary `convert_to` packed path (which handles every source format, including a heap source, on every platform); pass 2 deinterleaves RGBA into the planes and reads back through the same `DstTarget` `SinglePass` uses. |
+| `TwoPassNvPlanar` | any planar `dst_fmt` on a texture lowering (`TextureMem`/`TexturePbo`), **or** a source with no import (Mem/Shm/PBO) or an NV12/NV16/NV24 source into a planar destination on any lowering | Pass 1 is the ordinary `convert_to` packed path (which handles every source format, including a heap source, on every platform); pass 2 deinterleaves RGBA into the planes and reads back through the same `DstTarget` `SinglePass` uses. |
 | `SinglePass` | everything else | One render pass into the bound target, then the lowering's readback. |
 
 The `TwoPassNvPlanar` gate is a *capability* fact, not a Vivante carve-out:
@@ -719,9 +719,37 @@ EXTERNAL_OES route. The Vivante GC7000UL single-pass GPU hang (EDGEAI-1180)
 is subsumed by the same plan rather than gated separately.
 
 Single-pass converts share the same `bind_dst → render → readback` body for
-every src/dst memory combination — the source side independently picks the
-PBO UNPACK upload or the CPU texture upload. The two-pass functions survive
-as render strategies, not duplicated dispatch. Both decision tables
+every src/dst memory combination. The two-pass functions survive as render
+strategies, not duplicated dispatch.
+
+**Source feeds.** Every draw feeds its source one of three ways, counted in
+`ConvertStats` and named by `src_feed`: `import` (a DMA-BUF attached as the
+texture's storage), `pbo` (a PBO read through `GL_PIXEL_UNPACK_BUFFER`, a
+copy the GPU makes), or `upload` (a CPU map uploaded with `TexImage2D`). The
+last two share one primitive, `Texture::upload` with an `UploadSource`, used
+by the packed arm of `draw_src_texture` (RGB, RGBA, Grey, and YUYV as an RG8
+texture for the YUYV program), the NV R8 combined-plane upload in
+`draw_nv_texture_2d`, and the float source feed. So a PBO or host source
+reaches the same shaders as an imported one on every plan: YUYV and NV12
+from a PBO are how a Jetson, which has no DMA-BUF import, converts camera
+formats on the GPU. Where the platform has zero-copy import,
+`check_src_format_supported` declines YUYV from host memory or a PBO, and NV
+from a PBO, to the CPU: such a source is one the DMA-BUF heap could not
+place, and uploading it is slower than the CPU converter (Mesa V3D's PBO
+upload measured 1.3-50x behind it). The DMA-BUF allocator takes the system
+heap when CMA is full, so that case is rare.
+
+A PBO is fed through the unpack binding only when this processor allocated
+it. GL buffer names belong to a context and each processor's context shares
+nothing, so another processor's PBO, or one wrapped with
+`ef_tensor_wrap_pbo`, names a different buffer here. `OwnedPbos` records the
+`PboOpsVtable` address of every PBO a `GLProcessorThreaded` hands out, with a
+`Weak` of that allocation's ops so a freed address is never matched. The
+vtable lives in the allocation's shared handle, so every `view()` reports it on
+both tensor backends; a `BufferIdentity` cannot serve, since its id is derived
+from the buffer name alone and the dynamic backend derives a fresh one per
+handle. Any other PBO is read, and as a destination
+written, through its own map, which the owning worker serves. Both decision tables
 (`lower_dst`, `plan_convert`) are host-tested in `render.rs` with no GL
 dependency, so a new platform changes capability *inputs*, never the
 tables.
