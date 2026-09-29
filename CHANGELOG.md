@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`scripts/on-target-test.sh` runs one invocation per host at a time.** Two runs against the same host shared its remote directory and its local results directory, so one could read back the other's results: a `PASS` with a fraction of the suite, as a filtered run's 31 tests were reported for another run's `rpi5-hailo`. Each host is now locked for the whole deploy, run and fetch, and a host another run holds is reported as `BUSY` with the holder's name instead.
+- **`hardware-bench.yml` gives each board 120 minutes**, up from 90: the i.MX 8M Plus (Cortex-A53) took 60 minutes for every case.
+
 - `TensorTrait::capacity_bytes` and `TensorTrait::set_logical_shape` no longer have default bodies; every implementor provides them.
 - `edgefirst_tensor::protocol::c_byte_strides` is public: the one stride convention shared by the descriptor, the blob and the C API.
 - **`scripts/on-target-test.sh` deploys one bundle and runs it on the board.** Its options and summary are unchanged; the summary now also gives each host's passed, failed and ignored test totals. It arms `HAL_TEST_REQUIRE_DMA` when the board's DMA heap allocates, as the CI board lane does, so a heap that should work and does not fails instead of skipping. `REQUIRE_GPU=1` fails a host with no render node (`NO-GPU`) instead of letting every GPU test skip. A host without `rsync` gets the bundle by tar over ssh instead of failing to sync.

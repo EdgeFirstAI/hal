@@ -752,7 +752,7 @@ without rsync), and runs the bundle's own
 there: each binary with the mandatory `--test-threads=1`, then the C-API
 gates. It prints a pass/fail/skip matrix with each host's passed, failed and
 ignored test totals. Logs, `capabilities.txt` and `summary.json` land in
-`target/on-target-results/<host>/`. It exits non-zero if any host reported a test failure, and also if a host ran no tests at all — reported as `NO-TESTS` rather than `PASS`, since a run that exercised nothing is not evidence. An unreachable host is reported as `UNREACHABLE` and does not mask a real failure elsewhere.
+`target/on-target-results/<host>/`. It exits non-zero if any host reported a test failure, and also if a host ran no tests at all — reported as `NO-TESTS` rather than `PASS`, since a run that exercised nothing is not evidence. An unreachable host is reported as `UNREACHABLE` and does not mask a real failure elsewhere. So is a host another run is already using, as `BUSY`: each run holds a lock on the host (`<REMOTE_DIR>.lock` on the board, with the holder's name) for the whole deploy, run and fetch, because two runs against one host share its remote directory and its local results directory and would read back each other's results. A run releases only a lock whose owner file still names it, so it never removes one another run took. A lock left by a killed run is removed with the command the `BUSY` line prints, or by the board's next reboot.
 
 A few details worth knowing:
 
