@@ -17,7 +17,7 @@ use crate::{
     dequant_detect_box,
     float::{postprocess_boxes_float, postprocess_boxes_multilabel_float},
     yolo::{
-        dispatch_nms_float, dispatch_nms_int, effective_nms, truncate_boxes_to_top_k,
+        dispatch_nms_float, dispatch_nms_int, truncate_boxes_to_top_k,
         truncate_boxes_to_top_k_quant,
     },
     BBoxTypeTrait, DecoderError, DecoderResult, DetectBox, Quantization, XYWH, XYXY,
@@ -263,15 +263,10 @@ where
         }
     };
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
     }
-    let boxes = dispatch_nms_int(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(max_det),
-        boxes,
-    );
+    let boxes = dispatch_nms_int(nms, iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(dequant_detect_box(&b, quant_scores));
@@ -320,15 +315,10 @@ where
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
     }
-    let boxes = dispatch_nms_float(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(max_det),
-        boxes,
-    );
+    let boxes = dispatch_nms_float(nms, iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
@@ -376,15 +366,10 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
         )
     };
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
     }
-    let boxes = dispatch_nms_float(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(max_det),
-        boxes,
-    );
+    let boxes = dispatch_nms_float(nms, iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
@@ -432,15 +417,10 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
         )
     };
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
     }
-    let boxes = dispatch_nms_float(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(max_det),
-        boxes,
-    );
+    let boxes = dispatch_nms_float(nms, iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
     for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
@@ -895,14 +875,14 @@ mod modelpack_tests {
             anchors: vec![[0.5, 0.5]],
             quantization: None,
         };
-        let run = |multi_label: bool| {
+        let run = |nms: Nms, multi_label: bool| {
             let mut out = Vec::with_capacity(8);
             decode_modelpack_split_float(
                 &[p.view()],
                 std::slice::from_ref(&cfg),
                 0.5,
                 0.5,
-                Some(Nms::ClassAgnostic),
+                Some(nms),
                 multi_label,
                 0,
                 8,
@@ -913,7 +893,10 @@ mod modelpack_tests {
             labels.sort_unstable();
             labels
         };
-        assert_eq!(run(false).len(), 1);
-        assert_eq!(run(true), vec![0, 1]);
+        assert_eq!(run(Nms::ClassAware, false).len(), 1);
+        assert_eq!(run(Nms::ClassAware, true), vec![0, 1]);
+        // Class-agnostic NMS runs over the multi-label candidates: the two
+        // classes share one bbox, so only one survives.
+        assert_eq!(run(Nms::ClassAgnostic, true).len(), 1);
     }
 }

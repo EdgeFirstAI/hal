@@ -940,8 +940,11 @@ impl DecoderBuilder {
     /// and `Decoder::decode_tracked` / `Decoder::decode_proto_tracked` (behind
     /// the `tracker` feature), ignore it and always decode one label per box.
     ///
-    /// When NMS is enabled, multi-label forces class-aware NMS so per-class
-    /// duplicates are not suppressed across classes.
+    /// The candidates go through the decoder's NMS mode unchanged. Class-aware
+    /// NMS (the default when neither the caller nor the config sets a mode)
+    /// keeps every class of an anchor; an explicit `Nms::ClassAgnostic`
+    /// suppresses across classes, as Ultralytics
+    /// `non_max_suppression(multi_label=True, agnostic=True)` does.
     ///
     /// # Examples
     /// ```rust

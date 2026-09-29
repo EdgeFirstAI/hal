@@ -97,7 +97,7 @@ Decoders can be configured via JSON/YAML matching the model's output specificati
 
 By default the decoder keeps one box per anchor, labelled with its highest-scoring class. Multi-label decode instead emits a box for every class whose score clears `score_threshold`, which is how trainer validators and COCO-style evaluation count detections. Use it for validation and mAP runs, not deployment.
 
-Enable it with `DecoderBuilder::with_multi_label(true)`, the Python `multi_label=True` constructor argument, or `ef_decoder_params_set_multi_label(p, 1)`. A model can also declare it with the optional top-level `nms_multi_label` key in `edgefirst.json`; an explicit API value overrides the key. When NMS is enabled, multi-label forces class-aware NMS.
+Enable it with `DecoderBuilder::with_multi_label(true)`, the Python `multi_label=True` constructor argument, or `ef_decoder_params_set_multi_label(p, 1)`. A model can also declare it with the optional top-level `nms_multi_label` key in `edgefirst.json`; an explicit API value overrides the key. Multi-label candidates go through the decoder's NMS mode: the class-aware default keeps every class of an anchor, while an explicit class-agnostic mode suppresses across classes, as Ultralytics does with `agnostic=True`.
 
 `decode_tracked` and `decode_proto_tracked` ignore multi-label and always decode one label per box: the tracker matches on IoU only, so per-class duplicates of one anchor would become phantom tracks. Callers that feed their own tracker should use `decode_for_tracking`, which applies the same rule. Each logs a warning once if the decoder has multi-label enabled.
 

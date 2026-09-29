@@ -235,8 +235,10 @@ int ef_decoder_params_set_nms(ef_decoder_params *p, uint32_t nms);
 /**
  * Multi-label decode: 1 emits one box per class above the score threshold
  * (validation decode), 0 one per anchor. Overrides the model config's
- * `nms_multi_label`; unset, the config decides, else off. Tracked decode
- * always uses one label per box. Any other value is `EINVAL`.
+ * `nms_multi_label`; unset, the config decides, else off. The candidates
+ * go through the NMS mode unchanged: class-aware keeps every class of an
+ * anchor, class-agnostic suppresses across them. Tracked decode always uses
+ * one label per box. Any other value is `EINVAL`.
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.

@@ -122,15 +122,6 @@ pub(crate) fn dispatch_nms_float(
     }
 }
 
-/// Multi-label candidates must not cross-suppress across classes, so enabled
-/// NMS becomes class-aware.
-pub(crate) fn effective_nms(nms: Option<Nms>, multi_label: bool) -> Option<Nms> {
-    match (nms, multi_label) {
-        (Some(_), true) => Some(Nms::ClassAware),
-        (other, _) => other,
-    }
-}
-
 /// Dispatches to the appropriate NMS function based on mode for float boxes
 /// with extra data.
 pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
@@ -845,16 +836,11 @@ where
     };
 
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
     }
     let cap = max_det;
-    let boxes = dispatch_nms_int(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(cap),
-        boxes,
-    );
+    let boxes = dispatch_nms_int(nms, iou_threshold, Some(cap), boxes);
     // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
@@ -898,16 +884,11 @@ where
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
     }
     let cap = max_det;
-    let boxes = dispatch_nms_float(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(cap),
-        boxes,
-    );
+    let boxes = dispatch_nms_float(nms, iou_threshold, Some(cap), boxes);
     // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
@@ -976,16 +957,11 @@ where
     };
 
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
     }
     let cap = max_det;
-    let boxes = dispatch_nms_int(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(cap),
-        boxes,
-    );
+    let boxes = dispatch_nms_int(nms, iou_threshold, Some(cap), boxes);
     // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
@@ -1039,16 +1015,11 @@ where
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
     let mut boxes = boxes;
-    if effective_nms(nms, multi_label).is_some() {
+    if nms.is_some() {
         truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
     }
     let cap = max_det;
-    let boxes = dispatch_nms_float(
-        effective_nms(nms, multi_label),
-        iou_threshold,
-        Some(cap),
-        boxes,
-    );
+    let boxes = dispatch_nms_float(nms, iou_threshold, Some(cap), boxes);
     // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
     let len = cap.min(boxes.len());
     output_boxes.clear();
@@ -1230,7 +1201,6 @@ where
 
     // Multi-label emits one candidate per (anchor, class) above threshold;
     // argmax emits one per anchor.
-    let effective_nms = effective_nms(nms, multi_label);
     let mut boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.score_filter").entered();
         if multi_label {
@@ -1249,7 +1219,7 @@ where
     };
     span.record("n_candidates", boxes.len());
 
-    if effective_nms.is_some() {
+    if nms.is_some() {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.top_k", k = pre_nms_top_k).entered();
         truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
     }
@@ -1257,7 +1227,7 @@ where
 
     let mut boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.suppress").entered();
-        dispatch_nms_extra_float(effective_nms, iou_threshold, Some(max_det), boxes)
+        dispatch_nms_extra_float(nms, iou_threshold, Some(max_det), boxes)
     };
     span.record("n_after_nms", boxes.len());
 
@@ -1354,7 +1324,6 @@ where
 {
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
-    let nms = effective_nms(nms, multi_label);
 
     let span = tracing::trace_span!(
         "decoder.nms_get_boxes",
@@ -2403,18 +2372,98 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
+    /// Labels a kernel keeps for one anchor whose two classes both clear the
+    /// threshold, decoded multi-label under `nms`.
+    fn multi_label_kernel_labels(nms: Nms) -> Vec<Vec<usize>> {
+        // Feature-major [4 + nc, N] with N = 1, nc = 2.
+        let flat = Array2::from_shape_vec((6, 1), vec![0.5f32, 0.5, 0.2, 0.2, 0.9, 0.8]).unwrap();
+        let flat_q = flat.mapv(|v| (v * 100.0).round() as i8);
+        let q = Quantization::new(0.01, 0);
+        let (boxes, scores) = (flat.slice(s![..4, ..]), flat.slice(s![4.., ..]));
+        let (boxes_q, scores_q) = (flat_q.slice(s![..4, ..]), flat_q.slice(s![4.., ..]));
+        let sorted = |mut v: Vec<usize>| {
+            v.sort_unstable();
+            v
+        };
+        let of = |b: &[DetectBox]| sorted(b.iter().map(|b| b.label).collect());
+        let of_idx = |b: &[(DetectBox, usize)]| sorted(b.iter().map(|b| b.0.label).collect());
+        let mut out = Vec::new();
+        let mut v = Vec::new();
+        impl_yolo_float::<XYWH, f32>(flat.view(), 0.5, 0.5, Some(nms), 0, 8, true, &mut v).unwrap();
+        out.push(of(&v));
+        impl_yolo_quant::<XYWH, i8>((flat_q.view(), q), 0.5, 0.5, Some(nms), 0, 8, true, &mut v)
+            .unwrap();
+        out.push(of(&v));
+        impl_yolo_split_float::<XYWH, f32, f32>(
+            boxes,
+            scores,
+            0.5,
+            0.5,
+            Some(nms),
+            0,
+            8,
+            true,
+            &mut v,
+        )
+        .unwrap();
+        out.push(of(&v));
+        impl_yolo_split_quant::<XYWH, i8, i8>(
+            (boxes_q, q),
+            (scores_q, q),
+            0.5,
+            0.5,
+            Some(nms),
+            0,
+            8,
+            true,
+            &mut v,
+        )
+        .unwrap();
+        out.push(of(&v));
+        let r = impl_yolo_segdet_get_boxes::<XYWH, f32, f32>(
+            boxes.reversed_axes(),
+            scores.reversed_axes(),
+            0.5,
+            0.5,
+            Some(nms),
+            0,
+            8,
+            true,
+        )
+        .unwrap();
+        out.push(of_idx(&r));
+        let r = impl_yolo_split_segdet_quant_get_boxes::<XYWH, i8, i8>(
+            (boxes_q.reversed_axes(), q),
+            (scores_q.reversed_axes(), q),
+            0.5,
+            0.5,
+            Some(nms),
+            0,
+            8,
+            true,
+        )
+        .unwrap();
+        out.push(of_idx(&r));
+        out
+    }
+
     #[test]
-    fn effective_nms_forces_class_aware_only_when_nms_enabled() {
-        assert_eq!(
-            effective_nms(Some(Nms::ClassAgnostic), true),
-            Some(Nms::ClassAware)
-        );
-        assert_eq!(
-            effective_nms(Some(Nms::ClassAgnostic), false),
-            Some(Nms::ClassAgnostic)
-        );
-        assert_eq!(effective_nms(None, true), None);
-        assert_eq!(effective_nms(None, false), None);
+    fn multi_label_honours_class_agnostic_nms_on_every_kernel() {
+        // Agnostic NMS runs over the multi-label candidates, as Ultralytics
+        // `non_max_suppression(multi_label=True, agnostic=True)` does: the
+        // lower-scoring class of the shared bbox is suppressed.
+        for (path, labels) in multi_label_kernel_labels(Nms::ClassAgnostic)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(labels, vec![0], "kernel {path}: class-agnostic");
+        }
+        for (path, labels) in multi_label_kernel_labels(Nms::ClassAware)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(labels, vec![0, 1], "kernel {path}: class-aware");
+        }
     }
 
     // ========================================================================

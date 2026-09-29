@@ -762,3 +762,98 @@ fn caps_yolo_end_to_end_det() {
     assert_eq!(run(Some(1), 0), 1, "max_det");
     assert_eq!(run(None, 1), 3, "capacity is a hint");
 }
+
+/// Build a decoder with an explicit NMS mode, optionally declared by the
+/// config (`nms` key) rather than the builder.
+fn build_nms(fx: &Fixture, nms: configs::Nms, from_config: bool, multi_label: bool) -> Decoder {
+    let mut b = DecoderBuilder::default()
+        .with_score_threshold(SCORE_THRESHOLD)
+        .with_iou_threshold(0.5)
+        .with_multi_label(multi_label);
+    if from_config {
+        let cfg = edgefirst_decoder::ConfigOutputs {
+            outputs: fx.configs.clone(),
+            nms: Some(nms),
+            ..Default::default()
+        };
+        b = b.with_config(cfg).with_nms(Some(configs::Nms::Auto));
+    } else {
+        for c in &fx.configs {
+            b = b.add_output(c.clone());
+        }
+        b = b.with_nms(Some(nms));
+    }
+    b.build().expect("fixture decoder must build")
+}
+
+/// Multi-label candidates go through the NMS mode the caller or config chose.
+/// Anchor 0's class-0 and class-1 candidates share one bbox, so class-agnostic
+/// NMS keeps only the higher-scoring class 0, as Ultralytics
+/// `non_max_suppression(multi_label=True, agnostic=True)` does, while
+/// class-aware NMS keeps both.
+fn check_nms_mode_under_multi_label(name: &str, fx: &Fixture) {
+    for from_config in [false, true] {
+        let run = |nms: configs::Nms| {
+            let d = build_nms(fx, nms, from_config, true);
+            assert_eq!(d.nms, Some(nms), "{name}: resolved NMS mode");
+            let inputs: Vec<&TensorDyn> = fx.tensors.iter().collect();
+            let (mut boxes, mut masks) = (Vec::with_capacity(16), Vec::with_capacity(16));
+            d.decode(&inputs, &mut boxes, &mut masks).expect("decode");
+            let decoded = labels(&boxes);
+            if fx.has_protos {
+                let mut pboxes = Vec::with_capacity(16);
+                d.decode_proto(&inputs, &mut pboxes)
+                    .expect("decode_proto")
+                    .expect("seg model returns proto data");
+                assert_eq!(labels(&pboxes), decoded, "{name}: decode_proto agrees");
+            }
+            decoded
+        };
+        assert_eq!(
+            run(configs::Nms::ClassAgnostic),
+            vec![0, 2],
+            "{name} (from_config={from_config}): class-agnostic suppresses across classes"
+        );
+        assert_eq!(
+            run(configs::Nms::ClassAware),
+            vec![0, 1, 2],
+            "{name} (from_config={from_config}): class-aware keeps every class"
+        );
+    }
+}
+
+#[test]
+fn nms_mode_under_multi_label_yolo_det() {
+    check_nms_mode_under_multi_label("yolo_det f32", &yolo_det(Dtype::F32));
+    check_nms_mode_under_multi_label("yolo_det i8", &yolo_det(Dtype::I8));
+}
+
+#[test]
+fn nms_mode_under_multi_label_yolo_split_det() {
+    check_nms_mode_under_multi_label("yolo_split_det f32", &yolo_split_det(Dtype::F32));
+    check_nms_mode_under_multi_label("yolo_split_det i8", &yolo_split_det(Dtype::I8));
+}
+
+#[test]
+fn nms_mode_under_multi_label_yolo_segdet() {
+    check_nms_mode_under_multi_label("yolo_segdet f32", &yolo_segdet(Dtype::F32));
+    check_nms_mode_under_multi_label("yolo_segdet i8", &yolo_segdet(Dtype::I8));
+}
+
+#[test]
+fn nms_mode_under_multi_label_yolo_split_segdet() {
+    check_nms_mode_under_multi_label("yolo_split_segdet f32", &yolo_split_segdet(Dtype::F32));
+    check_nms_mode_under_multi_label("yolo_split_segdet i8", &yolo_split_segdet(Dtype::I8));
+}
+
+#[test]
+fn nms_mode_under_multi_label_yolo_segdet_2way() {
+    check_nms_mode_under_multi_label("yolo_segdet_2way f32", &yolo_segdet_2way(Dtype::F32));
+    check_nms_mode_under_multi_label("yolo_segdet_2way i8", &yolo_segdet_2way(Dtype::I8));
+}
+
+#[test]
+fn nms_mode_under_multi_label_modelpack_det() {
+    check_nms_mode_under_multi_label("modelpack_det f32", &modelpack_det(Dtype::F32));
+    check_nms_mode_under_multi_label("modelpack_det u8", &modelpack_det(Dtype::U8));
+}
