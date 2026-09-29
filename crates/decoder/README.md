@@ -111,7 +111,10 @@ and equal scores at the cut keep the lower anchor index. The default of
 no limit) for mAP evaluation. With multi-label decode on (from the API or the
 model's `nms_multi_label`) and no explicit cap, the default is **30 000**,
 Ultralytics' `max_nms`, since multi-label emits up to anchors × classes
-candidates.
+candidates. `Decoder::pre_nms_top_k` is `None` until a cap is set; the
+default is then resolved per decode (`Decoder::pre_nms_top_k_for`), so the
+argmax tracking entry points of a multi-label decoder keep 300. A cap set
+on the builder or assigned as `Some(n)` after build applies to every decode.
 
 ### Why it matters
 

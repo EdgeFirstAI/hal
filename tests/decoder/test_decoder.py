@@ -1161,6 +1161,21 @@ def test_pre_nms_top_k_multi_label_default_from_metadata():
     assert ef.Decoder(config, 0.5, 0.5).pre_nms_top_k == 30000
 
 
+def test_pre_nms_top_k_setter_is_explicit_and_none_resets():
+    decoder = multi_label_decoder("init", multi_label=True)
+    decoder.pre_nms_top_k = 30000
+    assert decoder.pre_nms_top_k == 30000
+    decoder.pre_nms_top_k = 0
+    assert decoder.pre_nms_top_k == 0
+    decoder.pre_nms_top_k = None
+    assert decoder.pre_nms_top_k == 30000
+    argmax = multi_label_decoder("init")
+    argmax.pre_nms_top_k = 30000
+    assert argmax.pre_nms_top_k == 30000
+    argmax.pre_nms_top_k = None
+    assert argmax.pre_nms_top_k == 300
+
+
 def test_multi_label_honours_class_agnostic_nms():
     # Anchor 0's classes 0 and 1 share one bbox: agnostic NMS keeps one.
     decoder = multi_label_decoder("init", multi_label=True, nms=ef.Nms.ClassAgnostic)

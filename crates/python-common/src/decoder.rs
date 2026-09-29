@@ -1263,9 +1263,12 @@ impl PyDecoder {
 
     /// Maximum number of candidates fed into NMS after score filtering;
     /// ``0`` means no limit. Uses O(N) partial sort to reduce O(N²) NMS cost.
-    /// Default: 300, or 30000 (Ultralytics' ``max_nms``) when
-    /// :attr:`multi_label` is on; :meth:`decode_tracked` decodes argmax and
-    /// keeps 300 unless this was set.
+    /// Reading it returns the cap :meth:`decode` uses. Unset, that is 300,
+    /// or 30000 (Ultralytics' ``max_nms``) when :attr:`multi_label` is on,
+    /// and :meth:`decode_tracked` (always argmax) uses 300. Assigning an
+    /// ``int`` makes the cap explicit: every decode, tracked included, uses
+    /// it as given, even if it equals a default. Assigning ``None`` returns
+    /// to the defaults.
     ///
     /// .. warning::
     ///
@@ -1293,11 +1296,11 @@ impl PyDecoder {
     ///    it is measurable but necessary for correct recall.
     #[getter(pre_nms_top_k)]
     fn get_pre_nms_top_k(&self) -> usize {
-        self.decoder.pre_nms_top_k
+        self.decoder.pre_nms_top_k_for(self.decoder.multi_label())
     }
 
     #[setter(pre_nms_top_k)]
-    fn set_pre_nms_top_k(&mut self, value: usize) -> PyResult<()> {
+    fn set_pre_nms_top_k(&mut self, value: Option<usize>) -> PyResult<()> {
         self.decoder.pre_nms_top_k = value;
         Ok(())
     }

@@ -1674,7 +1674,10 @@ mod tests {
             }
             let d = ef_decoder_new(p);
             assert!(!d.is_null());
-            let caps = ((*d).inner.pre_nms_top_k, (*d).inner.max_det);
+            let caps = (
+                (*d).inner.pre_nms_top_k_for((*d).inner.multi_label()),
+                (*d).inner.max_det,
+            );
             ef_decoder_free(d);
             ef_decoder_params_free(p);
             caps

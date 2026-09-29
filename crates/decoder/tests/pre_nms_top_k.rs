@@ -82,7 +82,8 @@ fn count(d: &Decoder) -> usize {
 #[test]
 fn default_cap_limits_detection_only_candidates() {
     let d = builder().add_output(detection_cfg()).build().unwrap();
-    assert_eq!(d.pre_nms_top_k, DEFAULT_PRE_NMS_TOP_K);
+    assert_eq!(d.pre_nms_top_k, None, "unset: resolved per decode");
+    assert_eq!(d.pre_nms_top_k_for(d.multi_label()), DEFAULT_PRE_NMS_TOP_K);
     assert_eq!(DEFAULT_PRE_NMS_TOP_K, 300);
     assert_eq!(count(&d), 300, "400 candidates, capped to 300 before NMS");
 }
@@ -94,7 +95,7 @@ fn zero_is_unbounded() {
         .with_pre_nms_top_k(0)
         .build()
         .unwrap();
-    assert_eq!(d.pre_nms_top_k, 0);
+    assert_eq!(d.pre_nms_top_k_for(d.multi_label()), 0);
     assert_eq!(count(&d), N);
 
     let d = builder()
@@ -103,7 +104,7 @@ fn zero_is_unbounded() {
         .with_pre_nms_top_k(0)
         .build()
         .unwrap();
-    assert_eq!(d.pre_nms_top_k, 0);
+    assert_eq!(d.pre_nms_top_k_for(d.multi_label()), 0);
     assert_eq!(count(&d), N * NC);
 }
 
@@ -115,7 +116,10 @@ fn multi_label_defaults_to_ultralytics_max_nms() {
         .with_multi_label(true)
         .build()
         .unwrap();
-    assert_eq!(d.pre_nms_top_k, MULTI_LABEL_PRE_NMS_TOP_K);
+    assert_eq!(
+        d.pre_nms_top_k_for(d.multi_label()),
+        MULTI_LABEL_PRE_NMS_TOP_K
+    );
     assert_eq!(count(&d), N * NC, "every multi-label candidate reaches NMS");
 }
 
@@ -123,11 +127,14 @@ fn multi_label_defaults_to_ultralytics_max_nms() {
 fn metadata_multi_label_defaults_to_ultralytics_max_nms() {
     let d = from_metadata(true).build().unwrap();
     assert!(d.multi_label());
-    assert_eq!(d.pre_nms_top_k, MULTI_LABEL_PRE_NMS_TOP_K);
+    assert_eq!(
+        d.pre_nms_top_k_for(d.multi_label()),
+        MULTI_LABEL_PRE_NMS_TOP_K
+    );
     assert_eq!(count(&d), N * NC);
 
     let d = from_metadata(false).build().unwrap();
-    assert_eq!(d.pre_nms_top_k, DEFAULT_PRE_NMS_TOP_K);
+    assert_eq!(d.pre_nms_top_k_for(d.multi_label()), DEFAULT_PRE_NMS_TOP_K);
 }
 
 #[test]
@@ -138,12 +145,12 @@ fn explicit_cap_wins_over_the_multi_label_default() {
         .with_multi_label(true)
         .build()
         .unwrap();
-    assert_eq!(d.pre_nms_top_k, 300);
+    assert_eq!(d.pre_nms_top_k_for(d.multi_label()), 300);
     assert_eq!(count(&d), 300);
 
     // An explicit multi_label(false) over metadata `true` keeps the argmax default.
     let d = from_metadata(true).with_multi_label(false).build().unwrap();
-    assert_eq!(d.pre_nms_top_k, DEFAULT_PRE_NMS_TOP_K);
+    assert_eq!(d.pre_nms_top_k_for(d.multi_label()), DEFAULT_PRE_NMS_TOP_K);
 }
 
 fn count_for_tracking(d: &Decoder) -> usize {
@@ -163,7 +170,10 @@ fn tracking_decode_uses_the_argmax_default_cap() {
         .with_multi_label(true)
         .build()
         .unwrap();
-    assert_eq!(d.pre_nms_top_k, MULTI_LABEL_PRE_NMS_TOP_K);
+    assert_eq!(
+        d.pre_nms_top_k_for(d.multi_label()),
+        MULTI_LABEL_PRE_NMS_TOP_K
+    );
     assert_eq!(count(&d), N * NC);
     assert_eq!(count_for_tracking(&d), DEFAULT_PRE_NMS_TOP_K);
 
@@ -186,6 +196,18 @@ fn tracking_decode_honours_an_explicit_cap() {
         .with_multi_label(true)
         .build()
         .unwrap();
-    d.pre_nms_top_k = 0;
+    d.pre_nms_top_k = Some(0);
+    assert_eq!(count_for_tracking(&d), N);
+}
+
+#[test]
+fn tracking_decode_honours_the_multi_label_value_assigned_after_build() {
+    // Assigning exactly the multi-label default is still an explicit choice.
+    let mut d = builder()
+        .add_output(detection_cfg())
+        .with_multi_label(true)
+        .build()
+        .unwrap();
+    d.pre_nms_top_k = Some(MULTI_LABEL_PRE_NMS_TOP_K);
     assert_eq!(count_for_tracking(&d), N);
 }

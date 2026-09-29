@@ -678,9 +678,14 @@ class Decoder:
     def pre_nms_top_k(self) -> int:
         """
         Maximum candidates fed into NMS after score filtering; ``0`` means
-        no limit. Uses O(N) partial sort to cap O(N²) NMS cost. Default: 300,
-        or 30000 (Ultralytics' ``max_nms``) when `multi_label` is on;
-        `decode_tracked` decodes argmax and keeps 300 unless this was set.
+        no limit. Uses O(N) partial sort to cap O(N²) NMS cost.
+
+        Reading it returns the cap `decode` uses. Unset, that is 300, or
+        30000 (Ultralytics' ``max_nms``) when `multi_label` is on, and
+        `decode_tracked` (always argmax) uses 300. Assigning an ``int`` makes
+        the cap explicit: every decode, tracked included, uses it as given,
+        even if it equals a default. Assigning ``None`` returns to the
+        defaults.
 
         .. warning::
 
@@ -710,7 +715,7 @@ class Decoder:
         """
 
     @pre_nms_top_k.setter
-    def pre_nms_top_k(self, value: int): ...
+    def pre_nms_top_k(self, value: int | None): ...
     @property
     def max_det(self) -> int:
         """

@@ -989,7 +989,11 @@ impl DecoderBuilder {
     /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) when
     /// multi-label decode is on, whether from
     /// [`with_multi_label`](Self::with_multi_label) or the model's
-    /// `nms_multi_label`. An explicit call always wins.
+    /// `nms_multi_label`; argmax decodes of a multi-label decoder (the
+    /// tracking entry points) keep 300. Unset, the built decoder's
+    /// [`Decoder::pre_nms_top_k`](crate::Decoder::pre_nms_top_k) is `None` and
+    /// is resolved per decode; an explicit call stores `Some(n)`, which every
+    /// decode uses as given.
     ///
     /// # ⚠️ Validation vs Deployment
     ///
@@ -1022,7 +1026,8 @@ impl DecoderBuilder {
     ///     .with_score_threshold(0.25)
     ///     // pre_nms_top_k defaults to 300 — appropriate here
     ///     .build()?;
-    /// assert_eq!(decoder.pre_nms_top_k, 300);
+    /// assert_eq!(decoder.pre_nms_top_k, None);
+    /// assert_eq!(decoder.pre_nms_top_k_for(false), 300);
     /// # Ok(())
     /// # }
     /// ```
@@ -1038,7 +1043,7 @@ impl DecoderBuilder {
     ///     .with_pre_nms_top_k(0) // unbounded
     ///     .with_max_det(300)
     ///     .build()?;
-    /// assert_eq!(decoder.pre_nms_top_k, 0);
+    /// assert_eq!(decoder.pre_nms_top_k, Some(0));
     /// # Ok(())
     /// # }
     /// ```
@@ -1175,11 +1180,7 @@ impl DecoderBuilder {
                  score threshold (validation decode); pass multi_label=false to override"
             );
         }
-        let pre_nms_top_k = self.pre_nms_top_k.unwrap_or(if multi_label {
-            MULTI_LABEL_PRE_NMS_TOP_K
-        } else {
-            DEFAULT_PRE_NMS_TOP_K
-        });
+        let pre_nms_top_k = self.pre_nms_top_k;
 
         // NMS precedence:
         //   Some(ClassAgnostic|ClassAware) → explicit user override
@@ -1234,7 +1235,6 @@ impl DecoderBuilder {
             multi_label,
             multi_label_source,
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
-            pre_nms_top_k_defaulted: self.pre_nms_top_k.is_none(),
             decode_program,
             per_scale,
         })

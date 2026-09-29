@@ -28,19 +28,21 @@ pub struct Decoder {
     /// panic on it at decode (a `debug_assert!` in NMS dispatch); release
     /// builds treat it as class-aware without consulting the config.
     pub nms: Option<configs::Nms>,
-    /// Maximum number of candidate boxes fed into NMS after score filtering;
-    /// `0` means unbounded. Reduces O(N²) NMS cost when many low-confidence
-    /// proposals pass the threshold (common during COCO mAP evaluation with
-    /// threshold ≈ 0.001). Candidates are ranked by score, equal scores by
-    /// anchor index; only the top `pre_nms_top_k` proceed to NMS. Applies to
-    /// every NMS decode path; ignored when `nms` is `None`.
+    /// Maximum number of candidate boxes fed into NMS after score filtering.
+    /// Reduces O(N²) NMS cost when many low-confidence proposals pass the
+    /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
+    /// Candidates are ranked by score, equal scores by anchor index; only the
+    /// top `pre_nms_top_k` proceed to NMS. Applies to every NMS decode path;
+    /// ignored when `nms` is `None`.
     ///
-    /// Default: [`DEFAULT_PRE_NMS_TOP_K`] (300), or
-    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) when the
-    /// builder enabled multi-label decode and was not given an explicit cap.
-    /// The tracking entry points decode argmax, so in that case they use
-    /// [`DEFAULT_PRE_NMS_TOP_K`]; any other value, including one assigned
-    /// here after build, applies to them unchanged.
+    /// - `None` (the default unless the builder was given a cap): resolved
+    ///   per decode by [`Decoder::pre_nms_top_k_for`] —
+    ///   [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) for a
+    ///   multi-label decode, [`DEFAULT_PRE_NMS_TOP_K`] (300) for an argmax
+    ///   decode, including the tracking entry points of a multi-label decoder.
+    /// - `Some(n)`: an explicit cap used by every decode as given; `Some(0)`
+    ///   is unbounded. Assigning it after build is as explicit as
+    ///   [`DecoderBuilder::with_pre_nms_top_k`](crate::DecoderBuilder::with_pre_nms_top_k).
     ///
     /// # ⚠️ Validation vs Deployment
     ///
@@ -56,15 +58,15 @@ pub struct Decoder {
     ///
     /// | Use case | `pre_nms_top_k` | `score_threshold` |
     /// |----------|----------------:|------------------:|
-    /// | Deployment | 300 (default) | ≥ 0.25 |
-    /// | COCO mAP evaluation, argmax | 0, or ≥ the anchor count (8 400) | 0.001 |
-    /// | COCO mAP evaluation, multi-label | 0, or 30 000 (multi-label default) | 0.001 |
+    /// | Deployment | `None` (300) | ≥ 0.25 |
+    /// | COCO mAP evaluation, argmax | `Some(0)`, or ≥ the anchor count (8 400) | 0.001 |
+    /// | COCO mAP evaluation, multi-label | `Some(0)`, or `None` (30 000) | 0.001 |
     ///
     /// Post-processing latency scales with the number of candidates entering
     /// NMS. At deployment thresholds the candidate count is already small, so
     /// raising `pre_nms_top_k` has negligible cost. At validation thresholds
     /// the increase is measurable but necessary for correct recall.
-    pub pre_nms_top_k: usize,
+    pub pre_nms_top_k: Option<usize>,
     /// Maximum number of detections returned after NMS. Matches the
     /// Ultralytics `max_det` parameter.  Default: 300.
     ///
@@ -106,9 +108,6 @@ pub struct Decoder {
     /// Set once this decoder has logged that tracked decode ignores
     /// multi-label, so each decoder warns once.
     tracked_multi_label_warned: std::sync::atomic::AtomicBool,
-    /// Whether `pre_nms_top_k` took a builder default rather than an
-    /// explicit value.
-    pre_nms_top_k_defaulted: bool,
     /// Per-scale fast path. Constructed at build time from a schema-v2
     /// document with per-scale children. Wrapped in `Mutex` because
     /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
@@ -166,7 +165,6 @@ impl Clone for Decoder {
             multi_label: self.multi_label,
             multi_label_source: self.multi_label_source,
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
-            pre_nms_top_k_defaulted: self.pre_nms_top_k_defaulted,
             decode_program: self.decode_program.clone(),
             per_scale: None,
         }
@@ -340,20 +338,37 @@ impl Decoder {
         self.multi_label
     }
 
-    /// Pre-NMS cap for a decode that is (`multi_label`) or is not
-    /// multi-label. When the builder raised the cap to
-    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] only because multi-label was on, an
-    /// argmax decode of the same decoder (the tracking entry points) uses
-    /// [`DEFAULT_PRE_NMS_TOP_K`] instead. An explicit cap, set on the builder
-    /// or assigned to [`Decoder::pre_nms_top_k`] later, is always used.
-    pub(crate) fn pre_nms_top_k_for(&self, multi_label: bool) -> usize {
-        if !multi_label
-            && self.pre_nms_top_k_defaulted
-            && self.pre_nms_top_k == MULTI_LABEL_PRE_NMS_TOP_K
-        {
-            DEFAULT_PRE_NMS_TOP_K
-        } else {
-            self.pre_nms_top_k
+    /// The pre-NMS cap a decode uses: the explicit
+    /// [`pre_nms_top_k`](Self::pre_nms_top_k) when set, else
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] for a multi-label decode and
+    /// [`DEFAULT_PRE_NMS_TOP_K`] for an argmax one. `0` means unbounded.
+    ///
+    /// Pass [`multi_label()`](Self::multi_label) for what `decode` /
+    /// `decode_proto` use, and `false` for the tracking entry points, which
+    /// always decode argmax.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
+    /// let mut decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_multi_label(true)
+    ///     .build()?;
+    /// assert_eq!(decoder.pre_nms_top_k, None);
+    /// assert_eq!(decoder.pre_nms_top_k_for(true), 30_000);
+    /// assert_eq!(decoder.pre_nms_top_k_for(false), 300);
+    /// decoder.pre_nms_top_k = Some(30_000);
+    /// assert_eq!(decoder.pre_nms_top_k_for(false), 30_000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn pre_nms_top_k_for(&self, multi_label: bool) -> usize {
+        match self.pre_nms_top_k {
+            Some(k) => k,
+            None if multi_label => MULTI_LABEL_PRE_NMS_TOP_K,
+            None => DEFAULT_PRE_NMS_TOP_K,
         }
     }
 
