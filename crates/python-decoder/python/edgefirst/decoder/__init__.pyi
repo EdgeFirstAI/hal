@@ -623,7 +623,7 @@ class Decoder:
 
         Always decodes one label per box, regardless of :attr:`multi_label`:
         the tracker matches on IoU only, so per-class duplicates of one anchor
-        would become phantom tracks. Logs a warning once per process when the
+        would become phantom tracks. Logs a warning once per decoder when the
         decoder has multi-label enabled.
 
         Masks are returned at prototype resolution as 3D arrays of shape

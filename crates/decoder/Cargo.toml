@@ -61,6 +61,7 @@ image = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 safetensors = { workspace = true }
+tracing-subscriber = { workspace = true }
 zip = { workspace = true }
 
 [[bench]]

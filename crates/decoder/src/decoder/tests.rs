@@ -2389,6 +2389,109 @@ outputs:
         assert!(decoder.multi_label());
     }
 
+    /// Warning messages logged while `f` runs on this thread.
+    fn captured_warnings(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        struct Message<'a>(&'a mut String);
+        impl tracing::field::Visit for Message<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{v:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut m = String::new();
+                    event.record(&mut Message(&mut m));
+                    self.0.lock().unwrap().push(m);
+                }
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(seen.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+
+    fn count_containing(msgs: &[String], needle: &str) -> usize {
+        msgs.iter().filter(|m| m.contains(needle)).count()
+    }
+
+    #[test]
+    fn test_metadata_multi_label_logs_once_per_build() {
+        let json = v2_modelpack_det_json(Some(true));
+        let msgs = captured_warnings(|| {
+            for _ in 0..2 {
+                let d = DecoderBuilder::new()
+                    .with_config_json_str(json.clone())
+                    .build()
+                    .unwrap();
+                assert!(d.multi_label());
+            }
+        });
+        assert_eq!(count_containing(&msgs, "nms_multi_label"), 2, "{msgs:?}");
+    }
+
+    #[test]
+    fn test_multi_label_from_api_or_off_does_not_log_metadata_notice() {
+        let msgs = captured_warnings(|| {
+            DecoderBuilder::new()
+                .with_config_json_str(v2_modelpack_det_json(Some(true)))
+                .with_multi_label(true)
+                .build()
+                .unwrap();
+            DecoderBuilder::new()
+                .with_config_json_str(v2_modelpack_det_json(Some(false)))
+                .build()
+                .unwrap();
+            DecoderBuilder::new()
+                .with_config_json_str(v2_modelpack_det_json(Some(true)))
+                .with_multi_label(false)
+                .build()
+                .unwrap();
+        });
+        assert_eq!(count_containing(&msgs, "nms_multi_label"), 0, "{msgs:?}");
+    }
+
+    #[test]
+    fn test_tracked_multi_label_warning_is_once_per_decoder() {
+        let build = || {
+            DecoderBuilder::new()
+                .with_config_json_str(v2_modelpack_det_json(None))
+                .with_multi_label(true)
+                .build()
+                .unwrap()
+        };
+        let (a, b) = (build(), build());
+        let msgs = captured_warnings(|| {
+            assert!(a.warn_once_tracked_multi_label());
+            assert!(!a.warn_once_tracked_multi_label());
+            assert!(b.warn_once_tracked_multi_label());
+            assert!(!b.warn_once_tracked_multi_label());
+        });
+        assert_eq!(
+            count_containing(&msgs, "decoding for tracking"),
+            2,
+            "{msgs:?}"
+        );
+
+        let off = DecoderBuilder::new()
+            .with_config_json_str(v2_modelpack_det_json(None))
+            .build()
+            .unwrap();
+        assert!(!off.warn_once_tracked_multi_label());
+    }
+
     #[test]
     fn test_schema_v2_round_trips_nms_multi_label() {
         let schema: crate::schema::SchemaV2 =

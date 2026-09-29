@@ -1406,6 +1406,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nms_multi_label_true_round_trips_through_json() {
+        let json = r#"{
+            "schema_version": 2,
+            "nms": "class_aware",
+            "nms_multi_label": true,
+            "outputs": [{
+                "name": "output0", "type": "detection",
+                "shape": [1, 84, 8400],
+                "dshape": [{"batch": 1}, {"num_features": 84}, {"num_boxes": 8400}],
+                "dtype": "float32", "decoder": "ultralytics", "encoding": "direct",
+                "normalized": true
+            }]
+        }"#;
+        let schema = SchemaV2::parse_json(json).unwrap();
+        assert_eq!(schema.nms_multi_label, Some(true));
+
+        let text = serde_json::to_string(&schema).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["nms_multi_label"], serde_json::json!(true));
+        let again = SchemaV2::parse_json(&text).unwrap();
+        assert_eq!(again, schema);
+
+        let legacy = schema.to_legacy_config_outputs().unwrap();
+        assert_eq!(legacy.nms_multi_label, Some(true));
+        let back = SchemaV2::from_v1(&legacy).unwrap();
+        assert_eq!(back.nms_multi_label, Some(true));
+    }
+
+    #[test]
     fn schema_default_is_v2() {
         let s = SchemaV2::default();
         assert_eq!(s.schema_version, 2);

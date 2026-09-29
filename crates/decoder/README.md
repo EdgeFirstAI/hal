@@ -99,7 +99,7 @@ By default the decoder keeps one box per anchor, labelled with its highest-scori
 
 Enable it with `DecoderBuilder::with_multi_label(true)`, the Python `multi_label=True` constructor argument, or `ef_decoder_params_set_multi_label(p, 1)`. A model can also declare it with the optional top-level `nms_multi_label` key in `edgefirst.json`; an explicit API value overrides the key. Multi-label candidates go through the decoder's NMS mode: the class-aware default keeps every class of an anchor, while an explicit class-agnostic mode suppresses across classes, as Ultralytics does with `agnostic=True`.
 
-`decode_tracked` and `decode_proto_tracked` ignore multi-label and always decode one label per box: the tracker matches on IoU only, so per-class duplicates of one anchor would become phantom tracks. Callers that feed their own tracker should use `decode_for_tracking`, which applies the same rule. Each logs a warning once if the decoder has multi-label enabled.
+`decode_tracked` and `decode_proto_tracked` ignore multi-label and always decode one label per box: the tracker matches on IoU only, so per-class duplicates of one anchor would become phantom tracks. Callers that feed their own tracker should use `decode_for_tracking`, which applies the same rule. Each logs a warning once per decoder if the decoder has multi-label enabled. A decoder whose multi-label comes from `nms_multi_label` in the model metadata also logs a warning when it is built, since the model file then changes what `decode` returns.
 
 ## Pre-NMS Top-K: Validation vs Deployment
 

@@ -946,7 +946,8 @@ impl DecoderBuilder {
     ///
     /// **Default:** the model config's `nms_multi_label`, else `false`
     /// (argmax: one class per anchor). An explicit call overrides the config
-    /// either way. [`Decoder::decode_for_tracking`](crate::Decoder::decode_for_tracking),
+    /// either way; `build()` logs a warning when the config turns it on.
+    /// [`Decoder::decode_for_tracking`](crate::Decoder::decode_for_tracking),
     /// and `Decoder::decode_tracked` / `Decoder::decode_proto_tracked` (behind
     /// the `tracker` feature), ignore it and always decode one label per box.
     ///
@@ -1168,6 +1169,12 @@ impl DecoderBuilder {
             (None, Some(v)) => (v, super::MultiLabelSource::Metadata),
             (None, None) => (false, super::MultiLabelSource::Default),
         };
+        if multi_label && multi_label_source == super::MultiLabelSource::Metadata {
+            tracing::warn!(
+                "model metadata sets nms_multi_label: decode emits one box per class above the \
+                 score threshold (validation decode); pass multi_label=false to override"
+            );
+        }
         let pre_nms_top_k = self.pre_nms_top_k.unwrap_or(if multi_label {
             MULTI_LABEL_PRE_NMS_TOP_K
         } else {
@@ -1226,6 +1233,7 @@ impl DecoderBuilder {
             input_dims,
             multi_label,
             multi_label_source,
+            tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
             decode_program,
             per_scale,
         })

@@ -97,6 +97,9 @@ pub struct Decoder {
     pub(crate) multi_label: bool,
     /// Where `multi_label` came from; named in the tracked-decode warning.
     pub(crate) multi_label_source: MultiLabelSource,
+    /// Set once this decoder has logged that tracked decode ignores
+    /// multi-label, so each decoder warns once.
+    tracked_multi_label_warned: std::sync::atomic::AtomicBool,
     /// Per-scale fast path. Constructed at build time from a schema-v2
     /// document with per-scale children. Wrapped in `Mutex` because
     /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
@@ -114,16 +117,6 @@ pub(crate) enum MultiLabelSource {
     Metadata,
     /// Set by the caller through [`DecoderBuilder::with_multi_label`].
     Explicit,
-}
-
-fn warn_once_tracked_multi_label(source: MultiLabelSource) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::warn!(
-            ?source,
-            "multi_label is ignored when decoding for tracking; one label per box"
-        );
-    });
 }
 
 impl PartialEq for Decoder {
@@ -163,6 +156,7 @@ impl Clone for Decoder {
             input_dims: self.input_dims,
             multi_label: self.multi_label,
             multi_label_source: self.multi_label_source,
+            tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
             decode_program: self.decode_program.clone(),
             per_scale: None,
         }
@@ -334,6 +328,24 @@ impl Decoder {
     /// ```
     pub fn multi_label(&self) -> bool {
         self.multi_label
+    }
+
+    /// Log, the first time this decoder decodes for tracking with
+    /// multi-label enabled, that tracking ignores it. Returns whether this
+    /// call logged.
+    pub(crate) fn warn_once_tracked_multi_label(&self) -> bool {
+        if !self.multi_label
+            || self
+                .tracked_multi_label_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        tracing::warn!(
+            source = ?self.multi_label_source,
+            "multi_label is ignored when decoding for tracking; one label per box"
+        );
+        true
     }
 
     /// This function returns the parsed model type of the decoder.
@@ -1250,7 +1262,7 @@ impl Decoder {
     ///
     /// Use this when the boxes feed an external tracker: trackers match on
     /// IoU only, so per-class duplicates of one anchor become phantom tracks.
-    /// Logs a warning once per process when the decoder has multi-label
+    /// Logs a warning once per decoder when the decoder has multi-label
     /// enabled. `Decoder::decode_tracked` and `Decoder::decode_proto_tracked`
     /// (behind the `tracker` feature) apply the same rule.
     ///
@@ -1263,9 +1275,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
-        if self.multi_label {
-            warn_once_tracked_multi_label(self.multi_label_source);
-        }
+        self.warn_once_tracked_multi_label();
         self.decode_impl(outputs, output_boxes, output_masks, false)
     }
 
@@ -1913,7 +1923,7 @@ impl Decoder {
     ///
     /// Always decodes one label per box, regardless of [`Self::multi_label`]:
     /// trackers match on IoU only, so per-class duplicates of one anchor would
-    /// spawn phantom tracks. Logs a warning once per process when the decoder
+    /// spawn phantom tracks. Logs a warning once per decoder when the decoder
     /// has multi-label enabled.
     ///
     /// # Arguments
@@ -1938,9 +1948,7 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<(), DecoderError> {
-        if self.multi_label {
-            warn_once_tracked_multi_label(self.multi_label_source);
-        }
+        self.warn_once_tracked_multi_label();
         // Per-scale fast path: route via the basic decode then update the
         // tracker. The current implementation keeps the tracker integration simple; per-frame
         // decoupling between detection and tracking is preserved.
@@ -2009,7 +2017,7 @@ impl Decoder {
     ///
     /// Always decodes one label per box, regardless of [`Self::multi_label`]:
     /// trackers match on IoU only, so per-class duplicates of one anchor would
-    /// spawn phantom tracks. Logs a warning once per process when the decoder
+    /// spawn phantom tracks. Logs a warning once per decoder when the decoder
     /// has multi-label enabled.
     ///
     /// # Arguments
@@ -2032,9 +2040,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError> {
-        if self.multi_label {
-            warn_once_tracked_multi_label(self.multi_label_source);
-        }
+        self.warn_once_tracked_multi_label();
         // Per-scale fast path: route via the basic decode_proto then
         // update the tracker on the resulting boxes.
         if self.per_scale.is_some() {
