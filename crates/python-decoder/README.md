@@ -56,7 +56,7 @@ boxes, scores, classes, masks = decoder.decode([output])
 print(np.asarray(boxes), np.asarray(scores), np.asarray(classes))
 ```
 
-Boxes come back normalized. NMS runs class-aware by default (unless the model config sets a mode); pass `nms=Nms.ClassAgnostic` or `nms=None` to change or bypass it. For validation and mAP runs, pass `multi_label=True` to emit one box per class above the score threshold instead of one per anchor; `decode_tracked` ignores it.
+Boxes come back normalized. NMS runs class-aware by default (unless the model config sets a mode); pass `nms=Nms.ClassAgnostic` or `nms=None` to change or bypass it. For validation and mAP runs, pass `multi_label=True` to emit one box per class above the score threshold instead of one per anchor; `decode_tracked` ignores it. Multi-label candidates go through the NMS mode unchanged, so `nms=Nms.ClassAgnostic` suppresses across the classes of one anchor. Multi-label also raises the default `pre_nms_top_k` from 300 to 30000 (Ultralytics' `max_nms`); `decoder.pre_nms_top_k = 0` removes the cap.
 
 For a quantized model, attach the quantization parameters to the output description so the decoder dequantizes as it reads:
 

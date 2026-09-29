@@ -1150,6 +1150,25 @@ def test_nms_auto_resolves_class_aware():
     assert multi_label_decoder("init").nms == ef.Nms.ClassAware
 
 
+@pytest.mark.parametrize("ctor", ["init", "json", "yaml", "outputs"])
+def test_pre_nms_top_k_default_follows_multi_label(ctor):
+    assert multi_label_decoder(ctor).pre_nms_top_k == 300
+    assert multi_label_decoder(ctor, multi_label=True).pre_nms_top_k == 30000
+
+
+def test_pre_nms_top_k_multi_label_default_from_metadata():
+    config = dict(MULTI_LABEL_DET, nms_multi_label=True)
+    assert ef.Decoder(config, 0.5, 0.5).pre_nms_top_k == 30000
+
+
+def test_multi_label_honours_class_agnostic_nms():
+    # Anchor 0's classes 0 and 1 share one bbox: agnostic NMS keeps one.
+    decoder = multi_label_decoder("init", multi_label=True, nms=ef.Nms.ClassAgnostic)
+    assert decoder.nms == ef.Nms.ClassAgnostic
+    _, _, classes, _ = decoder.decode([multi_label_det_tensor()])
+    assert sorted(classes.tolist()) == [0, 2]
+
+
 def test_max_boxes_limits_decode_output():
     decoder = multi_label_decoder("init", multi_label=True)
     boxes, scores, classes, _ = decoder.decode([multi_label_det_tensor()], max_boxes=1)

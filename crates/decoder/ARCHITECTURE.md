@@ -516,10 +516,13 @@ The flag is an argument, not a field read, below the dispatchers: `decode` / `de
 
 ### `pre_nms_top_k` for deployment vs. mAP evaluation
 
-The default `pre_nms_top_k = 300` is tuned for deployment workloads where
+The default `pre_nms_top_k = 300` (`DEFAULT_PRE_NMS_TOP_K`) is tuned for deployment workloads where
 `score_threshold ≥ 0.25` already filters most candidates. For COCO-style mAP
-evaluation at `score_threshold = 0.001`, **raise this cap** (typically to the
-full anchor count, e.g. 8400 for 640×640 YOLO) or set it to `0` (no limit).
+evaluation at `score_threshold = 0.001`, **raise this cap** or set it to `0` (no limit). Under argmax
+decode the full anchor count (e.g. 8400 for 640×640 YOLO) is enough; multi-label decode emits up to
+anchors × classes candidates, so when multi-label is on and the caller set no cap, the builder
+defaults it to `MULTI_LABEL_PRE_NMS_TOP_K = 30_000`, Ultralytics' `max_nms`. The builder keeps the
+cap as `Option<usize>` so that it can tell "not set" from an explicit value.
 The default silently truncates ~74% of valid candidates at validation
 thresholds, costing ~9 pp box mAP — a measurement artifact, not a model
 quality issue. The decoder math is correct in both cases.

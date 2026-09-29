@@ -200,7 +200,13 @@ int ef_decoder_params_set_score_threshold(ef_decoder_params *p, float v);
 int ef_decoder_params_set_iou_threshold(ef_decoder_params *p, float v);
 
 /**
- * How many candidates survive into NMS. Bounds the worst case.
+ * How many candidates survive into NMS, ranked by score; 0 is unbounded.
+ * Bounds the worst-case NMS cost.
+ *
+ * Unset, the cap is 300, or 30 000 (Ultralytics' `max_nms`) when multi-label
+ * decode is on, from `ef_decoder_params_set_multi_label` or the model config's
+ * `nms_multi_label`. For validation and mAP runs at a low score threshold,
+ * pass 0 so every candidate reaches NMS.
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.

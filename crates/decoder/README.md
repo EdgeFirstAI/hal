@@ -104,9 +104,14 @@ Enable it with `DecoderBuilder::with_multi_label(true)`, the Python `multi_label
 ## Pre-NMS Top-K: Validation vs Deployment
 
 The decoder's `pre_nms_top_k` parameter caps how many score-passing candidates
-enter NMS, bounding its O(N²) cost via an O(N) partial sort. The default of
+enter NMS, bounding its O(N²) cost via an O(N) partial sort; `0` means no
+limit. It applies to every NMS decode path, detection-only models included,
+and equal scores at the cut keep the lower anchor index. The default of
 **300** is tuned for deployment — but it **must** be raised (or set to `0` for
-no limit) for mAP evaluation.
+no limit) for mAP evaluation. With multi-label decode on (from the API or the
+model's `nms_multi_label`) and no explicit cap, the default is **30 000**,
+Ultralytics' `max_nms`, since multi-label emits up to anchors × classes
+candidates.
 
 ### Why it matters
 
@@ -134,7 +139,7 @@ let decoder = DecoderBuilder::new()
 let decoder = DecoderBuilder::new()
     .with_config_json_str(config)
     .with_score_threshold(0.001)
-    .with_pre_nms_top_k(8400)   // pass all anchors to NMS (or 0 = no limit)
+    .with_pre_nms_top_k(0)      // no limit: every candidate reaches NMS
     .with_max_det(300)           // COCO detection cap applied post-NMS
     .build()?;
 ```

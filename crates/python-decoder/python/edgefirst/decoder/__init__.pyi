@@ -677,17 +677,20 @@ class Decoder:
     @property
     def pre_nms_top_k(self) -> int:
         """
-        Maximum candidates fed into NMS after score filtering.
-        Uses O(N) partial sort to cap O(N²) NMS cost. Default: 300.
+        Maximum candidates fed into NMS after score filtering; ``0`` means
+        no limit. Uses O(N) partial sort to cap O(N²) NMS cost. Default: 300,
+        or 30000 (Ultralytics' ``max_nms``) when `multi_label` is on.
 
         .. warning::
 
            The default of 300 is tuned for **deployment**
            (``score_threshold >= 0.25``) where few anchors pass the score
            filter.  For **COCO mAP evaluation** (``score_threshold = 0.001``),
-           set this to the total anchor count (8400 for 640×640 YOLO models)
-           or to ``0`` (no limit) to avoid discarding ~74% of valid
-           candidates before NMS, which causes **~9 pp box mAP loss**.
+           set this to ``0`` (no limit) to avoid discarding ~74% of valid
+           candidates before NMS, which causes **~9 pp box mAP loss**. Under
+           argmax decode the anchor count (8400 for 640×640 YOLO models)
+           also suffices; multi-label decode emits up to anchors × classes
+           candidates.
 
            Deployment::
 
@@ -697,7 +700,7 @@ class Decoder:
            COCO mAP evaluation::
 
                decoder.score_threshold = 0.001
-               decoder.pre_nms_top_k = 8400   # all anchors
+               decoder.pre_nms_top_k = 0      # no limit
                decoder.max_det = 300
 
            Post-processing latency scales with candidate count.  At deployment

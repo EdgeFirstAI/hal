@@ -21,12 +21,20 @@ pub struct Decoder {
     /// - `Some(ClassAgnostic)` — class-agnostic NMS
     /// - `Some(ClassAware)` — class-aware NMS
     /// - `None` — NMS bypassed (end-to-end models)
+    ///
+    /// Do not assign `Some(Nms::Auto)`: debug builds assert on it, and
+    /// release builds treat it as class-aware.
     pub nms: Option<configs::Nms>,
-    /// Maximum number of candidate boxes fed into NMS after score filtering.
-    /// Reduces O(N²) NMS cost when many low-confidence proposals pass the
-    /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
-    /// Candidates are ranked by score; only the top `pre_nms_top_k` proceed
-    /// to NMS.  Default: 300.  Ignored when `nms` is `None`.
+    /// Maximum number of candidate boxes fed into NMS after score filtering;
+    /// `0` means unbounded. Reduces O(N²) NMS cost when many low-confidence
+    /// proposals pass the threshold (common during COCO mAP evaluation with
+    /// threshold ≈ 0.001). Candidates are ranked by score, equal scores by
+    /// anchor index; only the top `pre_nms_top_k` proceed to NMS. Applies to
+    /// every NMS decode path; ignored when `nms` is `None`.
+    ///
+    /// Default: [`DEFAULT_PRE_NMS_TOP_K`] (300), or
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) when the
+    /// builder enabled multi-label decode and was not given an explicit cap.
     ///
     /// # ⚠️ Validation vs Deployment
     ///
@@ -43,8 +51,8 @@ pub struct Decoder {
     /// | Use case | `pre_nms_top_k` | `score_threshold` |
     /// |----------|----------------:|------------------:|
     /// | Deployment | 300 (default) | ≥ 0.25 |
-    /// | COCO mAP evaluation | 8 400 (all anchors) | 0.001 |
-    /// | Unbounded | 0 (no limit) | any |
+    /// | COCO mAP evaluation, argmax | 0, or ≥ the anchor count (8 400) | 0.001 |
+    /// | COCO mAP evaluation, multi-label | 0, or 30 000 (multi-label default) | 0.001 |
     ///
     /// Post-processing latency scales with the number of candidates entering
     /// NMS. At deployment thresholds the candidate count is already small, so
@@ -284,7 +292,7 @@ mod postprocess;
 mod tensor_bridge;
 mod tests;
 
-pub use builder::DecoderBuilder;
+pub use builder::{DecoderBuilder, DEFAULT_PRE_NMS_TOP_K, MULTI_LABEL_PRE_NMS_TOP_K};
 pub use config::{ConfigOutput, ConfigOutputRef, ConfigOutputs};
 
 impl Decoder {

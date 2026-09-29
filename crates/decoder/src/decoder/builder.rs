@@ -123,6 +123,14 @@ mod input_dims_from_spec_tests {
     }
 }
 
+/// Default [`DecoderBuilder::with_pre_nms_top_k`] cap for argmax decode.
+pub const DEFAULT_PRE_NMS_TOP_K: usize = 300;
+
+/// Default [`DecoderBuilder::with_pre_nms_top_k`] cap when multi-label decode
+/// is on: Ultralytics' `max_nms`, since multi-label emits up to
+/// anchors × classes candidates.
+pub const MULTI_LABEL_PRE_NMS_TOP_K: usize = 30_000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
@@ -140,7 +148,9 @@ pub struct DecoderBuilder {
     /// schemas without per-scale children (which use the legacy decode
     /// path).
     decode_dtype: DecodeDtype,
-    pre_nms_top_k: usize,
+    /// Explicit pre-NMS cap; `None` takes [`DEFAULT_PRE_NMS_TOP_K`], or
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] when multi-label decode is on.
+    pre_nms_top_k: Option<usize>,
     max_det: usize,
     /// Explicit override for the model input dimensions `(width, height)`,
     /// consumed by EDGEAI-1303 normalization. When set, takes precedence
@@ -191,7 +201,7 @@ impl Default for DecoderBuilder {
             score_threshold: 0.5,
             nms: Some(configs::Nms::Auto),
             decode_dtype: DecodeDtype::F32,
-            pre_nms_top_k: 300,
+            pre_nms_top_k: None,
             max_det: 300,
             input_dims: None,
             multi_label: None,
@@ -946,6 +956,10 @@ impl DecoderBuilder {
     /// suppresses across classes, as Ultralytics
     /// `non_max_suppression(multi_label=True, agnostic=True)` does.
     ///
+    /// Unless [`with_pre_nms_top_k`](Self::with_pre_nms_top_k) is called,
+    /// multi-label decode raises the pre-NMS cap to
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`].
+    ///
     /// # Examples
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
@@ -964,11 +978,17 @@ impl DecoderBuilder {
     }
 
     /// Sets the maximum number of candidate boxes fed into NMS after score
-    /// filtering.  Uses partial sort (O(N)) to select the top-K candidates,
-    /// dramatically reducing the O(N²) NMS cost when many low-confidence
-    /// proposals pass the threshold (common with mAP eval at 0.001).
+    /// filtering; `0` means unbounded. Uses partial sort (O(N)) to select the
+    /// top-K candidates, dramatically reducing the O(N²) NMS cost when many
+    /// low-confidence proposals pass the threshold (common with mAP eval at
+    /// 0.001). Equal scores at the cut keep the lower anchor index. Applies
+    /// to every NMS decode path; ignored when NMS is bypassed.
     ///
-    /// Default: 300.
+    /// Default: [`DEFAULT_PRE_NMS_TOP_K`] (300), or
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) when
+    /// multi-label decode is on, whether from
+    /// [`with_multi_label`](Self::with_multi_label) or the model's
+    /// `nms_multi_label`. An explicit call always wins.
     ///
     /// # ⚠️ Validation vs Deployment
     ///
@@ -977,11 +997,13 @@ impl DecoderBuilder {
     /// top-K is effectively a no-op.
     ///
     /// For **COCO mAP evaluation** (`score_threshold ≈ 0.001`), set this to
-    /// the total anchor count (8 400 for standard 640 × 640 YOLO models) or
-    /// to `0` (no limit) so that all score-passing candidates reach NMS.
-    /// Failing to do so causes **~9 pp box mAP loss** — the decoder math is
-    /// correct but the evaluation protocol requires full recall across the
-    /// confidence range.
+    /// `0` (unbounded) so that all score-passing candidates reach NMS.
+    /// Under argmax decode there is one candidate per anchor, so the anchor
+    /// count (8 400 for a 640 × 640 YOLO model) is also enough; under
+    /// multi-label decode there are up to anchors × classes candidates, so use
+    /// `0` or leave the multi-label default. Failing to raise the cap causes
+    /// **~9 pp box mAP loss** — the decoder math is correct but the
+    /// evaluation protocol requires full recall across the confidence range.
     ///
     /// Post-processing latency scales with candidate count. At deployment
     /// thresholds the cost difference is negligible; at validation thresholds
@@ -999,11 +1021,12 @@ impl DecoderBuilder {
     ///     .with_score_threshold(0.25)
     ///     // pre_nms_top_k defaults to 300 — appropriate here
     ///     .build()?;
+    /// assert_eq!(decoder.pre_nms_top_k, 300);
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// COCO mAP evaluation (pass all anchors to NMS):
+    /// COCO mAP evaluation (pass every candidate to NMS):
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
@@ -1011,15 +1034,15 @@ impl DecoderBuilder {
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_score_threshold(0.001)
-    ///     .with_pre_nms_top_k(8400)  // all YOLO anchors
+    ///     .with_pre_nms_top_k(0) // unbounded
     ///     .with_max_det(300)
     ///     .build()?;
-    /// assert_eq!(decoder.pre_nms_top_k, 8400);
+    /// assert_eq!(decoder.pre_nms_top_k, 0);
     /// # Ok(())
     /// # }
     /// ```
     pub fn with_pre_nms_top_k(mut self, pre_nms_top_k: usize) -> Self {
-        self.pre_nms_top_k = pre_nms_top_k;
+        self.pre_nms_top_k = Some(pre_nms_top_k);
         self
     }
 
@@ -1145,6 +1168,11 @@ impl DecoderBuilder {
             (None, Some(v)) => (v, super::MultiLabelSource::Metadata),
             (None, None) => (false, super::MultiLabelSource::Default),
         };
+        let pre_nms_top_k = self.pre_nms_top_k.unwrap_or(if multi_label {
+            MULTI_LABEL_PRE_NMS_TOP_K
+        } else {
+            DEFAULT_PRE_NMS_TOP_K
+        });
 
         // NMS precedence:
         //   Some(ClassAgnostic|ClassAware) → explicit user override
@@ -1192,7 +1220,7 @@ impl DecoderBuilder {
             iou_threshold: self.iou_threshold,
             score_threshold: self.score_threshold,
             nms,
-            pre_nms_top_k: self.pre_nms_top_k,
+            pre_nms_top_k,
             max_det: self.max_det,
             normalized,
             input_dims,
