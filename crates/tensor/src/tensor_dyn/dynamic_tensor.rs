@@ -634,6 +634,13 @@ impl<T: Element> Tensor<T> {
         self.inner.pbo_is_mapped()
     }
 
+    /// The C-ABI `PboOpsVtable` address backing this tensor; `None` when the
+    /// tensor is not PBO-backed. Every `view()` of one PBO reports the same
+    /// address. See [`TensorDyn::pbo_vtable_ptr`].
+    pub fn pbo_vtable_ptr(&self) -> Option<*const std::ffi::c_void> {
+        self.inner.pbo_vtable_ptr()
+    }
+
     /// Allocate an image tensor with the given geometry, memory backing,
     /// and CPU access declaration. Same signature as `static`'s
     /// `Tensor::image` (`lib.rs`), which real production code calls

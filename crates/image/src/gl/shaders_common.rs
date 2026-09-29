@@ -304,7 +304,10 @@ macro_rules! nv_rgba_body_divfree {
 /// the import covers more of the texture than the logical image.
 /// Portable `sampler2D` — shared by the IOSurface zero-copy source path
 /// and any future heap-YUYV upload path.
-pub(crate) const YUYV_RGBA_2D_FRAGMENT: &str = r#"#version 300 es
+/// Declarations shared by the YUYV->RGBA program and its int8 twin.
+macro_rules! yuyv_rgba_2d_header {
+    () => {
+        r#"#version 300 es
 precision highp float;
 uniform highp sampler2D tex;
 uniform vec2 src_size;
@@ -319,8 +322,15 @@ in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
 
-void main() {
-    vec2 texel = vec2(1.0) / src_size;
+"#
+    };
+}
+
+/// `main()` statements shared by the YUYV->RGBA program and its int8 twin:
+/// reads `tc` and the uniforms above, leaves the pixel in `r`, `g`, `b`.
+macro_rules! yuyv_rgb_body {
+    () => {
+        r#"    vec2 texel = vec2(1.0) / src_size;
     // `src_extent` keeps the texel index inside the logical image when the
     // texture is larger than it; `src_size` is the texture's own grid.
     vec2 col = floor(clamp(tc, src_extent.xy, src_extent.zw) * src_size);
@@ -351,9 +361,30 @@ void main() {
     float r = clamp(yp + c_vr * vp, 0.0, 1.0);
     float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
     float b = clamp(yp + c_ub * up, 0.0, 1.0);
-    color = vec4(r, g, b, 1.0);
+"#
+    };
 }
-"#;
+
+pub(crate) const YUYV_RGBA_2D_FRAGMENT: &str = concat!(
+    yuyv_rgba_2d_header!(),
+    "void main() {\n",
+    yuyv_rgb_body!(),
+    "    color = vec4(r, g, b, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`YUYV_RGBA_2D_FRAGMENT`]: the same pixel, with the XOR
+/// 0x80 bias every int8 program applies (`(q + 128) mod 256`, matching the
+/// CPU `byte ^ 0x80`).
+pub(crate) const YUYV_RGBA_2D_INT8_FRAGMENT: &str = concat!(
+    yuyv_rgba_2d_header!(),
+    "vec3 int8_bias(vec3 v) {\n",
+    "    vec3 q = floor(v * 255.0 + 0.5);\n",
+    "    return mod(q + 128.0, 256.0) / 255.0;\n",
+    "}\n\n",
+    "void main() {\n",
+    yuyv_rgb_body!(),
+    "    color = vec4(int8_bias(vec3(r, g, b)), 1.0);\n}\n"
+);
 
 pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
     "\

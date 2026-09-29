@@ -2213,6 +2213,14 @@ fn a_pbo_view_reads_its_own_region_and_outlives_its_parent() {
         Some(51),
         "the view shares the parent's GL buffer"
     );
+    // `edgefirst-image` recognises the PBOs its own context allocated by this
+    // address; the view's handle derives a fresh `BufferIdentity`, so the
+    // vtable is the only key a view shares with its parent.
+    assert_eq!(
+        view.pbo_vtable_ptr(),
+        parent_dyn.pbo_vtable_ptr(),
+        "a view reports its parent's PBO vtable"
+    );
 
     // The parent goes away first: the case the external-keepalive design
     // could not express at all.
