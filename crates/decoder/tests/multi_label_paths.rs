@@ -127,6 +127,8 @@ fn score_rows(a: usize) -> Vec<f32> {
     SCORES[a].to_vec()
 }
 
+type Scores = [[f32; NC]; N];
+
 fn coef_rows(a: usize) -> Vec<f32> {
     (0..NM).map(|k| mask_coef(a, k)).collect()
 }
@@ -210,8 +212,12 @@ struct Fixture {
 }
 
 fn yolo_det(dtype: Dtype) -> Fixture {
+    yolo_det_scored(dtype, &SCORES)
+}
+
+fn yolo_det_scored(dtype: Dtype, scores: &Scores) -> Fixture {
     let rows = 4 + NC;
-    let data = feature_major(|a| [box_rows(a), score_rows(a)].concat(), rows);
+    let data = feature_major(|a| [box_rows(a), scores[a].to_vec()].concat(), rows);
     Fixture {
         configs: vec![detection_cfg(rows, dtype, DecoderType::Ultralytics)],
         tensors: vec![tensor(&[1, rows, N], &data, dtype)],
@@ -220,20 +226,32 @@ fn yolo_det(dtype: Dtype) -> Fixture {
 }
 
 fn yolo_split_det(dtype: Dtype) -> Fixture {
+    yolo_split_det_scored(dtype, &SCORES)
+}
+
+fn yolo_split_det_scored(dtype: Dtype, scores: &Scores) -> Fixture {
     Fixture {
         configs: vec![boxes_cfg(dtype), scores_cfg(dtype)],
         tensors: vec![
             tensor(&[1, 4, N], &feature_major(box_rows, 4), dtype),
-            tensor(&[1, NC, N], &feature_major(score_rows, NC), dtype),
+            tensor(
+                &[1, NC, N],
+                &feature_major(|a| scores[a].to_vec(), NC),
+                dtype,
+            ),
         ],
         has_protos: false,
     }
 }
 
 fn yolo_segdet(dtype: Dtype) -> Fixture {
+    yolo_segdet_scored(dtype, &SCORES)
+}
+
+fn yolo_segdet_scored(dtype: Dtype, scores: &Scores) -> Fixture {
     let rows = 4 + NC + NM;
     let data = feature_major(
-        |a| [box_rows(a), score_rows(a), coef_rows(a)].concat(),
+        |a| [box_rows(a), scores[a].to_vec(), coef_rows(a)].concat(),
         rows,
     );
     let (pcfg, pt) = protos_tensor(dtype);
@@ -278,8 +296,12 @@ fn yolo_segdet_2way(dtype: Dtype) -> Fixture {
 }
 
 fn modelpack_det(dtype: Dtype) -> Fixture {
+    modelpack_det_scored(dtype, &SCORES)
+}
+
+fn modelpack_det_scored(dtype: Dtype, table: &Scores) -> Fixture {
     let boxes: Vec<f32> = (0..N).flat_map(|a| xyxy(BOXES_XYWH[a])).collect();
-    let scores: Vec<f32> = (0..N).flat_map(|a| SCORES[a]).collect();
+    let scores: Vec<f32> = (0..N).flat_map(|a| table[a]).collect();
     Fixture {
         configs: vec![
             ConfigOutput::Boxes(configs::Boxes {
@@ -856,4 +878,61 @@ fn nms_mode_under_multi_label_yolo_segdet_2way() {
 fn nms_mode_under_multi_label_modelpack_det() {
     check_nms_mode_under_multi_label("modelpack_det f32", &modelpack_det(Dtype::F32));
     check_nms_mode_under_multi_label("modelpack_det u8", &modelpack_det(Dtype::U8));
+}
+
+/// Scores rising with the anchor index, one class per anchor; the boxes do
+/// not overlap.
+const RISING: Scores = [
+    [0.6, 0.0, 0.0],
+    [0.0, 0.7, 0.0],
+    [0.0, 0.0, 0.8],
+    [0.9, 0.0, 0.0],
+];
+
+/// Decode with NMS bypassed and `max_det` below the candidate count.
+fn bypass_top(fx: &Fixture, max_det: usize) -> Vec<f32> {
+    let mut b = DecoderBuilder::default()
+        .with_score_threshold(SCORE_THRESHOLD)
+        .with_nms(None)
+        .with_max_det(max_det);
+    for c in &fx.configs {
+        b = b.add_output(c.clone());
+    }
+    let d = b.build().unwrap();
+    let inputs: Vec<&TensorDyn> = fx.tensors.iter().collect();
+    let (mut boxes, mut masks) = (Vec::with_capacity(16), Vec::with_capacity(16));
+    d.decode(&inputs, &mut boxes, &mut masks).unwrap();
+    boxes
+        .iter()
+        .map(|b| (b.score * 100.0).round() / 100.0)
+        .collect()
+}
+
+/// With NMS bypassed, `max_det` keeps the highest-scoring boxes, not the
+/// first anchors, in descending score order.
+#[test]
+fn nms_bypass_max_det_keeps_highest_scores() {
+    let fixtures = [
+        ("yolo_det f32", yolo_det_scored(Dtype::F32, &RISING)),
+        ("yolo_det i8", yolo_det_scored(Dtype::I8, &RISING)),
+        (
+            "yolo_split_det f32",
+            yolo_split_det_scored(Dtype::F32, &RISING),
+        ),
+        (
+            "yolo_split_det i8",
+            yolo_split_det_scored(Dtype::I8, &RISING),
+        ),
+        ("yolo_segdet f32", yolo_segdet_scored(Dtype::F32, &RISING)),
+        ("yolo_segdet i8", yolo_segdet_scored(Dtype::I8, &RISING)),
+        (
+            "modelpack_det f32",
+            modelpack_det_scored(Dtype::F32, &RISING),
+        ),
+        ("modelpack_det u8", modelpack_det_scored(Dtype::U8, &RISING)),
+    ];
+    for (name, fx) in &fixtures {
+        assert_eq!(bypass_top(fx, 2), vec![0.9, 0.8], "{name}");
+        assert_eq!(bypass_top(fx, 300), vec![0.9, 0.8, 0.7, 0.6], "{name}");
+    }
 }

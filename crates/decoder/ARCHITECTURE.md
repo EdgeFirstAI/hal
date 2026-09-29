@@ -104,6 +104,14 @@ flowchart TD
     style Seg fill:#90ee90
 ```
 
+Every non-end-to-end path (flat, split, 2-way, fused, per-scale, ModelPack; float and quantized) ends in one shared tail, `yolo::nms_and_cap`, generic over `yolo::ScoredCandidate` (float or quantized box, with or without a payload such as the anchor index):
+
+1. With NMS enabled, `truncate_to_top_k_by_score` keeps the `pre_nms_top_k` highest-scoring candidates (`0` = unbounded). It preserves candidate order, and candidates arrive in anchor order, so equal scores at the cut keep the lower anchor index and the selection is reproducible against a reference decoder.
+2. `dispatch_nms_*` runs NMS in the decoder's resolved mode and stops once `max_det` survive. `Nms::Auto` never reaches it: the builder resolves it, and debug builds assert on it.
+3. With NMS bypassed (`nms = None`), the same selection keeps the `max_det` highest-scoring candidates, not the first anchors.
+
+The result is at most `max_det` boxes in descending score order, ties in anchor order (the NMS sort is stable).
+
 ### Model-type selection
 
 The builder classifies a model's output topology by **shape alone**, not by

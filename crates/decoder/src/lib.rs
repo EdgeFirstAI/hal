@@ -774,9 +774,9 @@ mod decoder_tests {
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
-            false,
             0,
             300,
+            false,
             &mut output_boxes,
         )
         .unwrap();
@@ -900,9 +900,9 @@ mod decoder_tests {
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
-            false,
             0,
             300,
+            false,
             &mut output_boxes,
         )
         .unwrap();

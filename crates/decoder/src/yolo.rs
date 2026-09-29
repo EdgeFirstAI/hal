@@ -59,48 +59,144 @@ pub(crate) const MAX_NMS_CANDIDATES: usize = 30_000;
 #[cfg(test)]
 pub(crate) const DEFAULT_MAX_DETECTIONS: usize = 300;
 
-/// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
-/// input exceeds the cap. Uses partial sort (O(N)) via `select_nth_unstable_by`
-/// to avoid full O(N log N) sort. No-op when `top_k` is 0 (unbounded) or
-/// when the input length ≤ `top_k`.
-fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>, top_k: usize) {
-    if top_k > 0 && boxes.len() > top_k {
-        boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.total_cmp(&a.0.score));
-        boxes.truncate(top_k);
+/// A decode candidate the pre-NMS cap, NMS and the `max_det` cap rank by
+/// score: a float or quantized box, alone or with a payload (anchor index,
+/// mask coefficients).
+pub(crate) trait ScoredCandidate: Sized + Send + Sync {
+    /// Score used for ranking. Quantized boxes rank on the raw quantized
+    /// score, which preserves order under monotonic dequantization.
+    type Score: Copy;
+
+    fn score_key(&self) -> Self::Score;
+
+    /// Ascending comparison of two scores.
+    fn cmp_score(a: &Self::Score, b: &Self::Score) -> std::cmp::Ordering;
+
+    /// Run NMS in `mode` over `boxes`, stopping once `max_det` survive.
+    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self>;
+}
+
+impl ScoredCandidate for DetectBox {
+    type Score = f32;
+    fn score_key(&self) -> f32 {
+        self.score
+    }
+    fn cmp_score(a: &f32, b: &f32) -> std::cmp::Ordering {
+        a.total_cmp(b)
+    }
+    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_float(Some(mode), iou, Some(max_det), boxes)
     }
 }
 
-/// Quantized counterpart of [`truncate_to_top_k_by_score`]. Sorts on
-/// the raw quantized score (which preserves order under monotonic
-/// dequantization). Uses partial sort (O(N)) via `select_nth_unstable_by`.
-/// No-op when `top_k` is 0 (unbounded) or when the input length ≤ `top_k`.
-fn truncate_to_top_k_by_score_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send>(
-    boxes: &mut Vec<(DetectBoxQuantized<S>, E)>,
-    top_k: usize,
-) {
-    if top_k > 0 && boxes.len() > top_k {
-        boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.cmp(&a.0.score));
-        boxes.truncate(top_k);
+impl<S: PrimInt + AsPrimitive<f32> + Send + Sync> ScoredCandidate for DetectBoxQuantized<S> {
+    type Score = S;
+    fn score_key(&self) -> S {
+        self.score
+    }
+    fn cmp_score(a: &S, b: &S) -> std::cmp::Ordering {
+        a.cmp(b)
+    }
+    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_int(Some(mode), iou, Some(max_det), boxes)
     }
 }
 
-/// [`truncate_to_top_k_by_score`] for boxes without a payload.
-pub(crate) fn truncate_boxes_to_top_k(boxes: &mut Vec<DetectBox>, top_k: usize) {
-    if top_k > 0 && boxes.len() > top_k {
-        boxes.select_nth_unstable_by(top_k, |a, b| b.score.total_cmp(&a.score));
-        boxes.truncate(top_k);
+impl<E: Send + Sync> ScoredCandidate for (DetectBox, E) {
+    type Score = f32;
+    fn score_key(&self) -> f32 {
+        self.0.score
+    }
+    fn cmp_score(a: &f32, b: &f32) -> std::cmp::Ordering {
+        a.total_cmp(b)
+    }
+    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_extra_float(Some(mode), iou, Some(max_det), boxes)
     }
 }
 
-/// [`truncate_to_top_k_by_score_quant`] for boxes without a payload.
-pub(crate) fn truncate_boxes_to_top_k_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync>(
-    boxes: &mut Vec<DetectBoxQuantized<S>>,
-    top_k: usize,
-) {
-    if top_k > 0 && boxes.len() > top_k {
-        boxes.select_nth_unstable_by(top_k, |a, b| b.score.cmp(&a.score));
-        boxes.truncate(top_k);
+impl<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync> ScoredCandidate
+    for (DetectBoxQuantized<S>, E)
+{
+    type Score = S;
+    fn score_key(&self) -> S {
+        self.0.score
     }
+    fn cmp_score(a: &S, b: &S) -> std::cmp::Ordering {
+        a.cmp(b)
+    }
+    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_extra_int(Some(mode), iou, Some(max_det), boxes)
+    }
+}
+
+/// Keep the `top_k` highest-scoring candidates in place, in their original
+/// order. No-op when `top_k` is 0 (unbounded) or when `boxes.len() <= top_k`.
+///
+/// Candidates arrive in anchor order (then class order under multi-label),
+/// so equal scores at the cut keep the lower anchor index, which makes the
+/// selection reproducible against a reference decoder. Runs in O(N): one
+/// partial select over a copy of the scores, then one `retain` pass.
+pub(crate) fn truncate_to_top_k_by_score<T: ScoredCandidate>(boxes: &mut Vec<T>, top_k: usize) {
+    use std::cmp::Ordering;
+    if top_k == 0 || boxes.len() <= top_k {
+        return;
+    }
+    let mut scores: Vec<T::Score> = boxes.iter().map(T::score_key).collect();
+    let (higher, kth, _) = scores.select_nth_unstable_by(top_k - 1, |a, b| T::cmp_score(b, a));
+    let kth = *kth;
+    let above = higher
+        .iter()
+        .filter(|s| T::cmp_score(s, &kth) == Ordering::Greater)
+        .count();
+    let mut ties = top_k - above;
+    boxes.retain(|b| match T::cmp_score(&b.score_key(), &kth) {
+        Ordering::Greater => true,
+        Ordering::Equal if ties > 0 => {
+            ties -= 1;
+            true
+        }
+        _ => false,
+    });
+}
+
+/// Cap, suppress and cap again: the shared tail of every NMS decode path.
+///
+/// With NMS enabled, keeps the `pre_nms_top_k` highest-scoring candidates
+/// (0 = unbounded), runs NMS in `nms`'s mode, and returns at most `max_det`
+/// survivors in descending score order. With NMS bypassed (`nms = None`),
+/// returns the `max_det` highest-scoring candidates in descending score
+/// order. Equal scores keep candidate (anchor) order throughout.
+pub(crate) fn nms_and_cap<T: ScoredCandidate>(
+    mut boxes: Vec<T>,
+    nms: Option<Nms>,
+    iou_threshold: f32,
+    pre_nms_top_k: usize,
+    max_det: usize,
+) -> Vec<T> {
+    let mut boxes = match nms {
+        Some(mode) => {
+            {
+                let _s = tracing::trace_span!(
+                    "decoder.nms_get_boxes.top_k",
+                    k = pre_nms_top_k,
+                    n = boxes.len()
+                )
+                .entered();
+                truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
+            }
+            let _s =
+                tracing::trace_span!("decoder.nms_get_boxes.suppress", n = boxes.len()).entered();
+            T::suppress(mode, iou_threshold, max_det, boxes)
+        }
+        None => {
+            truncate_to_top_k_by_score(&mut boxes, max_det);
+            boxes.sort_by(|a, b| T::cmp_score(&b.score_key(), &a.score_key()));
+            boxes
+        }
+    };
+    boxes.truncate(max_det);
+    boxes
 }
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes.
@@ -109,12 +205,20 @@ pub(crate) fn truncate_boxes_to_top_k_quant<S: PrimInt + AsPrimitive<f32> + Send
 /// inner loop break as soon as that many survivors are confirmed (the survivors
 /// are guaranteed to be the top-`max_det` by score because the input is sorted
 /// descending). Pass `None` to run the full O(N²) suppression.
+///
+/// `nms` must be a concrete mode: the builder resolves `Nms::Auto` before a
+/// `Decoder` exists.
 pub(crate) fn dispatch_nms_float(
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
     boxes: Vec<DetectBox>,
 ) -> Vec<DetectBox> {
+    debug_assert_ne!(
+        nms,
+        Some(Nms::Auto),
+        "Nms::Auto must be resolved by the builder"
+    );
     match nms {
         Some(Nms::ClassAgnostic) => nms_float(iou, max_det, boxes),
         Some(Nms::ClassAware | Nms::Auto) => nms_class_aware_float(iou, max_det, boxes),
@@ -123,13 +227,18 @@ pub(crate) fn dispatch_nms_float(
 }
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes
-/// with extra data.
+/// with extra data. `nms` must be a concrete mode (see [`dispatch_nms_float`]).
 pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
     boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
+    debug_assert_ne!(
+        nms,
+        Some(Nms::Auto),
+        "Nms::Auto must be resolved by the builder"
+    );
     match nms {
         Some(Nms::ClassAgnostic) => nms_extra_float(iou, max_det, boxes),
         Some(Nms::ClassAware | Nms::Auto) => nms_extra_class_aware_float(iou, max_det, boxes),
@@ -138,13 +247,18 @@ pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
 }
 
 /// Dispatches to the appropriate NMS function based on mode for quantized
-/// boxes.
+/// boxes. `nms` must be a concrete mode (see [`dispatch_nms_float`]).
 pub(crate) fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
     boxes: Vec<DetectBoxQuantized<SCORE>>,
 ) -> Vec<DetectBoxQuantized<SCORE>> {
+    debug_assert_ne!(
+        nms,
+        Some(Nms::Auto),
+        "Nms::Auto must be resolved by the builder"
+    );
     match nms {
         Some(Nms::ClassAgnostic) => nms_int(iou, max_det, boxes),
         Some(Nms::ClassAware | Nms::Auto) => nms_class_aware_int(iou, max_det, boxes),
@@ -153,13 +267,18 @@ pub(crate) fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 }
 
 /// Dispatches to the appropriate NMS function based on mode for quantized boxes
-/// with extra data.
+/// with extra data. `nms` must be a concrete mode (see [`dispatch_nms_float`]).
 fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
     boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
+    debug_assert_ne!(
+        nms,
+        Some(Nms::Auto),
+        "Nms::Auto must be resolved by the builder"
+    );
     match nms {
         Some(Nms::ClassAgnostic) => nms_extra_int(iou, max_det, boxes),
         Some(Nms::ClassAware | Nms::Auto) => nms_extra_class_aware_int(iou, max_det, boxes),
@@ -835,18 +954,9 @@ where
         }
     };
 
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
-    }
-    let cap = max_det;
-    let boxes = dispatch_nms_int(nms, iou_threshold, Some(cap), boxes);
-    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
-    let len = cap.min(boxes.len());
+    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     output_boxes.clear();
-    for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant_boxes));
-    }
+    output_boxes.extend(boxes.iter().map(|b| dequant_detect_box(b, quant_boxes)));
     Ok(())
 }
 
@@ -883,18 +993,14 @@ where
     } else {
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
-    }
-    let cap = max_det;
-    let boxes = dispatch_nms_float(nms, iou_threshold, Some(cap), boxes);
-    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
-    let len = cap.min(boxes.len());
     output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
-        output_boxes.push(b);
-    }
+    output_boxes.extend(nms_and_cap(
+        boxes,
+        nms,
+        iou_threshold,
+        pre_nms_top_k,
+        max_det,
+    ));
     Ok(())
 }
 
@@ -956,18 +1062,9 @@ where
         }
     };
 
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
-    }
-    let cap = max_det;
-    let boxes = dispatch_nms_int(nms, iou_threshold, Some(cap), boxes);
-    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
-    let len = cap.min(boxes.len());
+    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     output_boxes.clear();
-    for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant_scores));
-    }
+    output_boxes.extend(boxes.iter().map(|b| dequant_detect_box(b, quant_scores)));
     Ok(())
 }
 
@@ -1014,18 +1111,14 @@ where
     } else {
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
-    }
-    let cap = max_det;
-    let boxes = dispatch_nms_float(nms, iou_threshold, Some(cap), boxes);
-    // NMS already capped to `max_det`; the `min` guards the bypass-NMS path.
-    let len = cap.min(boxes.len());
     output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
-        output_boxes.push(b);
-    }
+    output_boxes.extend(nms_and_cap(
+        boxes,
+        nms,
+        iou_threshold,
+        pre_nms_top_k,
+        max_det,
+    ));
     Ok(())
 }
 
@@ -1193,15 +1286,13 @@ where
     let span = tracing::trace_span!(
         "decoder.nms_get_boxes",
         n_candidates = tracing::field::Empty,
-        n_after_topk = tracing::field::Empty,
-        n_after_nms = tracing::field::Empty,
         n_detections = tracing::field::Empty,
     );
     let _guard = span.enter();
 
     // Multi-label emits one candidate per (anchor, class) above threshold;
     // argmax emits one per anchor.
-    let mut boxes = {
+    let boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.score_filter").entered();
         if multi_label {
             postprocess_boxes_multilabel_index_float::<B, _, _>(
@@ -1219,22 +1310,7 @@ where
     };
     span.record("n_candidates", boxes.len());
 
-    if nms.is_some() {
-        let _s = tracing::trace_span!("decoder.nms_get_boxes.top_k", k = pre_nms_top_k).entered();
-        truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
-    }
-    span.record("n_after_topk", boxes.len());
-
-    let mut boxes = {
-        let _s = tracing::trace_span!("decoder.nms_get_boxes.suppress").entered();
-        dispatch_nms_extra_float(nms, iou_threshold, Some(max_det), boxes)
-    };
-    span.record("n_after_nms", boxes.len());
-
-    // NMS already capped to `max_det`; the trailing sort+truncate is a
-    // redundant guard for the bypass-NMS path (`nms = None`).
-    boxes.sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
-    boxes.truncate(max_det);
+    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     span.record("n_detections", boxes.len());
 
     Ok(boxes)
@@ -1328,13 +1404,11 @@ where
     let span = tracing::trace_span!(
         "decoder.nms_get_boxes",
         n_candidates = tracing::field::Empty,
-        n_after_topk = tracing::field::Empty,
-        n_after_nms = tracing::field::Empty,
         n_detections = tracing::field::Empty,
     );
     let _guard = span.enter();
 
-    let mut boxes = {
+    let boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.score_filter").entered();
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         if multi_label {
@@ -1356,22 +1430,7 @@ where
     };
     span.record("n_candidates", boxes.len());
 
-    if nms.is_some() {
-        let _s = tracing::trace_span!("decoder.nms_get_boxes.top_k", k = pre_nms_top_k).entered();
-        truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
-    }
-    span.record("n_after_topk", boxes.len());
-
-    let mut boxes = {
-        let _s = tracing::trace_span!("decoder.nms_get_boxes.suppress").entered();
-        dispatch_nms_extra_int(nms, iou_threshold, Some(max_det), boxes)
-    };
-    span.record("n_after_nms", boxes.len());
-
-    // NMS already capped to `max_det`; the trailing sort+truncate is a
-    // redundant guard for the bypass-NMS path (`nms = None`).
-    boxes.sort_unstable_by_key(|b| std::cmp::Reverse(b.0.score));
-    boxes.truncate(max_det);
+    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     let result: Vec<_> = {
         let _s =
             tracing::trace_span!("decoder.nms_get_boxes.dequant_boxes", n = boxes.len()).entered();
@@ -3292,7 +3351,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Tests for truncate_to_top_k_by_score / truncate_to_top_k_by_score_quant
+    // Tests for truncate_to_top_k_by_score (float and quantized)
     // ========================================================================
 
     /// Helper: build a Vec of (DetectBox, ()) with the given scores.
@@ -3375,7 +3434,7 @@ mod tests {
     fn truncate_quant_top_k_zero_is_unbounded() {
         let mut boxes = make_quant_boxes(&[120, -50, 30, -10, 80]);
         let original_len = boxes.len();
-        truncate_to_top_k_by_score_quant(&mut boxes, 0);
+        truncate_to_top_k_by_score(&mut boxes, 0);
         assert_eq!(
             boxes.len(),
             original_len,
@@ -3386,7 +3445,7 @@ mod tests {
     #[test]
     fn truncate_quant_top_k_normal() {
         let mut boxes = make_quant_boxes(&[120, -50, 30, -10, 80]);
-        truncate_to_top_k_by_score_quant(&mut boxes, 3);
+        truncate_to_top_k_by_score(&mut boxes, 3);
         assert_eq!(boxes.len(), 3);
         let mut retained: Vec<i8> = boxes.iter().map(|(b, _)| b.score).collect();
         retained.sort_by(|a, b| b.cmp(a));
@@ -3396,7 +3455,116 @@ mod tests {
     #[test]
     fn truncate_quant_top_k_noop_when_under_cap() {
         let mut boxes = make_quant_boxes(&[120, 80]);
-        truncate_to_top_k_by_score_quant(&mut boxes, 10);
+        truncate_to_top_k_by_score(&mut boxes, 10);
         assert_eq!(boxes.len(), 2, "should be no-op when len <= top_k");
+    }
+
+    /// 200 candidates scoring 0.5 except five at 0.9 near the end: a cap of
+    /// 10 keeps the five 0.9s and the five lowest-index 0.5s, in candidate
+    /// order.
+    fn tie_scene() -> (Vec<f32>, Vec<usize>) {
+        let scores: Vec<f32> = (0..200)
+            .map(|i| if (150..155).contains(&i) { 0.9 } else { 0.5 })
+            .collect();
+        let expected = (0..5).chain(150..155).collect();
+        (scores, expected)
+    }
+
+    #[test]
+    fn truncate_breaks_boundary_ties_by_candidate_order() {
+        let (scores, expected) = tie_scene();
+        let mut boxes = make_float_boxes(&scores);
+        truncate_to_top_k_by_score(&mut boxes, 10);
+        let kept: Vec<usize> = boxes.iter().map(|(b, _)| b.label).collect();
+        assert_eq!(kept, expected);
+
+        let q: Vec<i8> = scores.iter().map(|&s| (s * 100.0) as i8).collect();
+        let mut boxes = make_quant_boxes(&q);
+        truncate_to_top_k_by_score(&mut boxes, 10);
+        let kept: Vec<usize> = boxes.iter().map(|(b, _)| b.label).collect();
+        assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn nms_and_cap_ties_at_pre_nms_cap_keep_lowest_anchors() {
+        // Every candidate shares one bbox and label, so NMS keeps exactly one:
+        // the first of the equal-score survivors of the pre-NMS cap.
+        let (scores, _) = tie_scene();
+        let boxes: Vec<(DetectBox, usize)> = make_float_boxes(&scores)
+            .into_iter()
+            .map(|(mut b, ())| {
+                let anchor = b.label;
+                b.label = 0;
+                (b, anchor)
+            })
+            .collect();
+        let mut low = boxes.clone();
+        for (b, _) in &mut low {
+            b.score = 0.5;
+        }
+        let kept = nms_and_cap(low, Some(Nms::ClassAware), 0.5, 10, 300);
+        assert_eq!(kept.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![0]);
+        let kept = nms_and_cap(boxes, Some(Nms::ClassAware), 0.5, 10, 300);
+        assert_eq!(kept.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![150]);
+    }
+
+    #[test]
+    fn nms_and_cap_bypass_keeps_highest_scores() {
+        // Anchor order is not score order: the cap must keep scores, not the
+        // first anchors, and return them in descending score order.
+        let boxes = make_float_boxes(&[0.1, 0.2, 0.9, 0.3, 0.8, 0.8]);
+        let kept = nms_and_cap(boxes.clone(), None, 0.5, 0, 3);
+        let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
+        assert_eq!(labels, vec![2, 4, 5]);
+        // Without truncation every candidate stays, still in score order.
+        let kept = nms_and_cap(boxes, None, 0.5, 0, 300);
+        let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
+        assert_eq!(labels, vec![2, 4, 5, 3, 1, 0]);
+
+        let q = make_quant_boxes(&[10, 20, 90, 30, 80, 80]);
+        let kept = nms_and_cap(q, None, 0.5, 0, 2);
+        let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
+        assert_eq!(labels, vec![2, 4]);
+    }
+
+    #[test]
+    fn nms_and_cap_pre_nms_top_k_zero_is_unbounded() {
+        // 400 disjoint boxes: a cap of 300 drops 100 before NMS, 0 keeps all.
+        let boxes: Vec<(DetectBox, usize)> = (0..400)
+            .map(|i| {
+                let x = i as f32;
+                (
+                    DetectBox {
+                        bbox: BoundingBox {
+                            xmin: x,
+                            ymin: 0.0,
+                            xmax: x + 0.5,
+                            ymax: 0.5,
+                        },
+                        score: 0.5 + (i % 7) as f32 * 0.01,
+                        label: 0,
+                    },
+                    i,
+                )
+            })
+            .collect();
+        let capped = nms_and_cap(boxes.clone(), Some(Nms::ClassAware), 0.5, 300, 1000);
+        assert_eq!(capped.len(), 300);
+        let all = nms_and_cap(boxes, Some(Nms::ClassAware), 0.5, 0, 1000);
+        assert_eq!(all.len(), 400);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Nms::Auto must be resolved by the builder")]
+    fn dispatch_nms_float_rejects_unresolved_auto() {
+        dispatch_nms_float(Some(Nms::Auto), 0.5, None, Vec::new());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Nms::Auto must be resolved by the builder")]
+    fn dispatch_nms_int_rejects_unresolved_auto() {
+        dispatch_nms_int::<i8>(Some(Nms::Auto), 0.5, None, Vec::new());
     }
 }

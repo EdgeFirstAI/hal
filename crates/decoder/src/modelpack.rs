@@ -16,10 +16,7 @@ use crate::{
     configs::{Detection, Nms},
     dequant_detect_box,
     float::{postprocess_boxes_float, postprocess_boxes_multilabel_float},
-    yolo::{
-        dispatch_nms_float, dispatch_nms_int, truncate_boxes_to_top_k,
-        truncate_boxes_to_top_k_quant,
-    },
+    yolo::nms_and_cap,
     BBoxTypeTrait, DecoderError, DecoderResult, DetectBox, Quantization, XYWH, XYXY,
 };
 
@@ -68,9 +65,9 @@ pub(crate) fn decode_modelpack_det<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()>
 where
@@ -82,9 +79,9 @@ where
         score_threshold,
         iou_threshold,
         nms,
-        multi_label,
         pre_nms_top_k,
         max_det,
+        multi_label,
         output_boxes,
     )
 }
@@ -112,9 +109,9 @@ pub(crate) fn decode_modelpack_float<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()>
 where
@@ -126,9 +123,9 @@ where
         score_threshold,
         iou_threshold,
         nms,
-        multi_label,
         pre_nms_top_k,
         max_det,
+        multi_label,
         output_boxes,
     )
 }
@@ -155,9 +152,9 @@ pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()> {
     impl_modelpack_split_quant::<XYWH, D>(
@@ -166,9 +163,9 @@ pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
         score_threshold,
         iou_threshold,
         nms,
-        multi_label,
         pre_nms_top_k,
         max_det,
+        multi_label,
         output_boxes,
     )
 }
@@ -194,9 +191,9 @@ pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()> {
     impl_modelpack_split_float::<XYWH, D>(
@@ -205,9 +202,9 @@ pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
         score_threshold,
         iou_threshold,
         nms,
-        multi_label,
         pre_nms_top_k,
         max_det,
+        multi_label,
         output_boxes,
     )
 }
@@ -234,9 +231,9 @@ pub(crate) fn impl_modelpack_quant<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()>
 where
@@ -262,15 +259,9 @@ where
             )
         }
     };
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k_quant(&mut boxes, pre_nms_top_k);
-    }
-    let boxes = dispatch_nms_int(nms, iou_threshold, Some(max_det), boxes);
+    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     output_boxes.clear();
-    for b in boxes.into_iter().take(max_det) {
-        output_boxes.push(dequant_detect_box(&b, quant_scores));
-    }
+    output_boxes.extend(boxes.iter().map(|b| dequant_detect_box(b, quant_scores)));
     Ok(())
 }
 
@@ -297,9 +288,9 @@ pub(crate) fn impl_modelpack_float<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()>
 where
@@ -314,15 +305,14 @@ where
     } else {
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
     };
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
-    }
-    let boxes = dispatch_nms_float(nms, iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
-    for b in boxes.into_iter().take(max_det) {
-        output_boxes.push(b);
-    }
+    output_boxes.extend(nms_and_cap(
+        boxes,
+        nms,
+        iou_threshold,
+        pre_nms_top_k,
+        max_det,
+    ));
     Ok(())
 }
 
@@ -346,9 +336,9 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()> {
     let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_quant(outputs, configs);
@@ -365,15 +355,14 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
             scores_tensor.view(),
         )
     };
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
-    }
-    let boxes = dispatch_nms_float(nms, iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
-    for b in boxes.into_iter().take(max_det) {
-        output_boxes.push(b);
-    }
+    output_boxes.extend(nms_and_cap(
+        boxes,
+        nms,
+        iou_threshold,
+        pre_nms_top_k,
+        max_det,
+    ));
     Ok(())
 }
 
@@ -397,9 +386,9 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    multi_label: bool,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()> {
     let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_float(outputs, configs);
@@ -416,15 +405,14 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
             scores_tensor.view(),
         )
     };
-    let mut boxes = boxes;
-    if nms.is_some() {
-        truncate_boxes_to_top_k(&mut boxes, pre_nms_top_k);
-    }
-    let boxes = dispatch_nms_float(nms, iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
-    for b in boxes.into_iter().take(max_det) {
-        output_boxes.push(b);
-    }
+    output_boxes.extend(nms_and_cap(
+        boxes,
+        nms,
+        iou_threshold,
+        pre_nms_top_k,
+        max_det,
+    ));
     Ok(())
 }
 
@@ -883,9 +871,9 @@ mod modelpack_tests {
                 0.5,
                 0.5,
                 Some(nms),
-                multi_label,
                 0,
                 8,
+                multi_label,
                 &mut out,
             )
             .unwrap();

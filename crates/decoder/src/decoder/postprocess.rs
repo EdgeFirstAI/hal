@@ -84,9 +84,9 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
-                    multi_label,
                     self.pre_nms_top_k,
                     self.max_det,
+                    multi_label,
                     output_boxes,
                 )?;
             });
@@ -193,9 +193,9 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            multi_label,
             self.pre_nms_top_k,
             self.max_det,
+            multi_label,
             output_boxes,
         )?;
         Ok(())
@@ -589,9 +589,9 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            multi_label,
             self.pre_nms_top_k,
             self.max_det,
+            multi_label,
             output_boxes,
         )?;
         Ok(())
@@ -652,9 +652,9 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            multi_label,
             self.pre_nms_top_k,
             self.max_det,
+            multi_label,
             output_boxes,
         )?;
         Ok(())
