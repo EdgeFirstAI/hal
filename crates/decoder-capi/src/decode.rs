@@ -1644,8 +1644,6 @@ mod tests {
         }
     }
 
-    /// Build from a one-output detection config, with optional metadata key
-    /// and optional explicit setter value; report the decoder's setting.
     /// `(pre_nms_top_k, max_det)` of a decoder built from default params plus
     /// the given overrides.
     fn built_caps(
@@ -1702,6 +1700,8 @@ mod tests {
         assert_eq!(built_caps(None, None, Some(0)).0, 0);
     }
 
+    /// Build from a one-output detection config, with optional metadata key
+    /// and optional explicit setter value; report the decoder's setting.
     fn built_multi_label(metadata: Option<bool>, explicit: Option<i32>) -> bool {
         let mut cfg = serde_json::json!({
             "outputs": [{

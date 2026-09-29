@@ -22,8 +22,11 @@ pub struct Decoder {
     /// - `Some(ClassAware)` — class-aware NMS
     /// - `None` — NMS bypassed (end-to-end models)
     ///
-    /// Do not assign `Some(Nms::Auto)`: debug builds assert on it, and
-    /// release builds treat it as class-aware.
+    /// Assigning `Some(Nms::Auto)` to this field directly violates that
+    /// invariant: `Nms::Auto` must be resolved by
+    /// [`DecoderBuilder::build`](crate::DecoderBuilder::build). Debug builds
+    /// panic on it at decode (a `debug_assert!` in NMS dispatch); release
+    /// builds treat it as class-aware without consulting the config.
     pub nms: Option<configs::Nms>,
     /// Maximum number of candidate boxes fed into NMS after score filtering;
     /// `0` means unbounded. Reduces O(N²) NMS cost when many low-confidence
@@ -35,6 +38,9 @@ pub struct Decoder {
     /// Default: [`DEFAULT_PRE_NMS_TOP_K`] (300), or
     /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) when the
     /// builder enabled multi-label decode and was not given an explicit cap.
+    /// The tracking entry points decode argmax, so in that case they use
+    /// [`DEFAULT_PRE_NMS_TOP_K`]; any other value, including one assigned
+    /// here after build, applies to them unchanged.
     ///
     /// # ⚠️ Validation vs Deployment
     ///
@@ -100,6 +106,9 @@ pub struct Decoder {
     /// Set once this decoder has logged that tracked decode ignores
     /// multi-label, so each decoder warns once.
     tracked_multi_label_warned: std::sync::atomic::AtomicBool,
+    /// Whether `pre_nms_top_k` took a builder default rather than an
+    /// explicit value.
+    pre_nms_top_k_defaulted: bool,
     /// Per-scale fast path. Constructed at build time from a schema-v2
     /// document with per-scale children. Wrapped in `Mutex` because
     /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
@@ -157,6 +166,7 @@ impl Clone for Decoder {
             multi_label: self.multi_label,
             multi_label_source: self.multi_label_source,
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
+            pre_nms_top_k_defaulted: self.pre_nms_top_k_defaulted,
             decode_program: self.decode_program.clone(),
             per_scale: None,
         }
@@ -328,6 +338,23 @@ impl Decoder {
     /// ```
     pub fn multi_label(&self) -> bool {
         self.multi_label
+    }
+
+    /// Pre-NMS cap for a decode that is (`multi_label`) or is not
+    /// multi-label. When the builder raised the cap to
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] only because multi-label was on, an
+    /// argmax decode of the same decoder (the tracking entry points) uses
+    /// [`DEFAULT_PRE_NMS_TOP_K`] instead. An explicit cap, set on the builder
+    /// or assigned to [`Decoder::pre_nms_top_k`] later, is always used.
+    pub(crate) fn pre_nms_top_k_for(&self, multi_label: bool) -> usize {
+        if !multi_label
+            && self.pre_nms_top_k_defaulted
+            && self.pre_nms_top_k == MULTI_LABEL_PRE_NMS_TOP_K
+        {
+            DEFAULT_PRE_NMS_TOP_K
+        } else {
+            self.pre_nms_top_k
+        }
     }
 
     /// Log, the first time this decoder decodes for tracking with
@@ -1264,7 +1291,10 @@ impl Decoder {
     /// IoU only, so per-class duplicates of one anchor become phantom tracks.
     /// Logs a warning once per decoder when the decoder has multi-label
     /// enabled. `Decoder::decode_tracked` and `Decoder::decode_proto_tracked`
-    /// (behind the `tracker` feature) apply the same rule.
+    /// (behind the `tracker` feature) apply the same rule. When the builder
+    /// raised [`Self::pre_nms_top_k`] to [`MULTI_LABEL_PRE_NMS_TOP_K`] only
+    /// because multi-label was on, this argmax decode uses
+    /// [`DEFAULT_PRE_NMS_TOP_K`]; an explicit cap is used as given.
     ///
     /// # Errors
     ///
@@ -1304,7 +1334,7 @@ impl Decoder {
                 self.iou_threshold,
                 self.score_threshold,
                 self.nms,
-                self.pre_nms_top_k,
+                self.pre_nms_top_k_for(multi_label),
                 self.max_det,
                 self.normalized,
                 self.input_dims,
@@ -1401,7 +1431,7 @@ impl Decoder {
                 self.iou_threshold,
                 self.score_threshold,
                 self.nms,
-                self.pre_nms_top_k,
+                self.pre_nms_top_k_for(multi_label),
                 self.max_det,
                 self.normalized,
                 self.input_dims,
@@ -1924,7 +1954,8 @@ impl Decoder {
     /// Always decodes one label per box, regardless of [`Self::multi_label`]:
     /// trackers match on IoU only, so per-class duplicates of one anchor would
     /// spawn phantom tracks. Logs a warning once per decoder when the decoder
-    /// has multi-label enabled.
+    /// has multi-label enabled. Like [`Self::decode_for_tracking`], it uses
+    /// the argmax default pre-NMS cap unless the cap was set explicitly.
     ///
     /// # Arguments
     ///
@@ -2018,7 +2049,8 @@ impl Decoder {
     /// Always decodes one label per box, regardless of [`Self::multi_label`]:
     /// trackers match on IoU only, so per-class duplicates of one anchor would
     /// spawn phantom tracks. Logs a warning once per decoder when the decoder
-    /// has multi-label enabled.
+    /// has multi-label enabled. Like [`Self::decode_for_tracking`], it uses
+    /// the argmax default pre-NMS cap unless the cap was set explicitly.
     ///
     /// # Arguments
     ///

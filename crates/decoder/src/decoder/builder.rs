@@ -1234,6 +1234,7 @@ impl DecoderBuilder {
             multi_label,
             multi_label_source,
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
+            pre_nms_top_k_defaulted: self.pre_nms_top_k.is_none(),
             decode_program,
             per_scale,
         })

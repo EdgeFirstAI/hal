@@ -1264,7 +1264,8 @@ impl PyDecoder {
     /// Maximum number of candidates fed into NMS after score filtering;
     /// ``0`` means no limit. Uses O(N) partial sort to reduce O(N²) NMS cost.
     /// Default: 300, or 30000 (Ultralytics' ``max_nms``) when
-    /// :attr:`multi_label` is on.
+    /// :attr:`multi_label` is on; :meth:`decode_tracked` decodes argmax and
+    /// keeps 300 unless this was set.
     ///
     /// .. warning::
     ///

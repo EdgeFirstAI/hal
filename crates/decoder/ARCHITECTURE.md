@@ -450,11 +450,12 @@ decoder.per_scale_run                                   [the per-scale NEON hot 
     field: kind = "f32_borrow" | "f16_widen"
 
 decoder.nms_get_boxes                                   [post-NMS candidate selection]
-│ fields: n_candidates, n_after_topk, n_after_nms, n_detections
+│ fields: n_candidates, n_detections
 ├── decoder.nms_get_boxes.score_filter                  ← max-class score threshold filter
-├── decoder.nms_get_boxes.top_k                         ← partial sort, retain pre_nms_top_k
-│   field: k
+├── decoder.nms_get_boxes.top_k                         ← partial select, retain pre_nms_top_k
+│   fields: k, n (candidates in)
 ├── decoder.nms_get_boxes.suppress                      ← class-agnostic / class-aware IoU NMS
+│   field: n (candidates in)
 └── decoder.nms_get_boxes.dequant_boxes                 ← int8 → f32 on survivors only (quant path)
     field: n
 
@@ -487,10 +488,10 @@ fields: tiles, boxes_in, boxes_out
 | `decoder.per_scale_run.level.mask_coefs`        | Mask-coefficient dequant (no sigmoid)                   | 32-D coefficient stream per anchor. |
 | `decoder.per_scale_run.protos`                  | `protos` head dequant (NHWC or NCHW → NHWC)             | One-time per-frame proto-mask dequant; the GPU shader consumes the resulting f32/f16 array as a texture. |
 | `decoder.per_scale_run.widen_f32`               | n/a (HAL-specific)                                      | If the per-scale path produced f16 buffers, widen to f32 for the legacy NMS kernels. `kind = "f32_borrow"` means zero allocation. |
-| `decoder.nms_get_boxes`                         | `non_max_suppression`                                   | Composite span over score_filter + top_k + suppress + dequant_boxes. The `n_candidates → n_after_topk → n_after_nms → n_detections` fields tell you where candidates were dropped. Shared across detection paths. |
+| `decoder.nms_get_boxes`                         | `non_max_suppression`                                   | Composite span over score_filter + top_k + suppress + dequant_boxes on the segmentation and per-scale paths. `n_candidates` and `n_detections` bracket the step; the `n` field on the `top_k` and `suppress` sub-spans gives the count entering each. |
 | `decoder.nms_get_boxes.score_filter`            | `xc = candidates.amax(1) > conf`                        | Per-row max-class score threshold filter. |
-| `decoder.nms_get_boxes.top_k`                   | `x[x[:, 4].argsort(descending=True)[:max_nms]]`         | Partial sort to `pre_nms_top_k` candidates (default 300; raise to anchor count for COCO mAP at `conf=0.001`). |
-| `decoder.nms_get_boxes.suppress`                | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. |
+| `decoder.nms_get_boxes.top_k`                   | `x[x[:, 4].argsort(descending=True)[:max_nms]]`         | Partial select to `pre_nms_top_k` candidates (default 300, 30 000 under multi-label; `0` is unbounded). Emitted by `yolo::nms_and_cap` on every NMS path, detection-only included, under whichever decode span is active. |
+| `decoder.nms_get_boxes.suppress`                | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. Emitted on every NMS path, like `top_k`. |
 | `decoder.nms_get_boxes.dequant_boxes`           | (quant path only)                                       | Int8 → f32 dequant applied only to survivors of NMS — avoids dequantising filtered candidates. |
 | `decoder.tiled.lift`                            | `metrics/tiled.py::lift_tile_boxes` (partial)            | Per-tile-decoded normalized boxes → full-frame pixel xyxy (optional letterbox inversion). Called once per tile, either directly or via `TiledFrameAccumulator::push_tile`. The `boxes` field is the per-call detection count — sum across tiles to get total lift cost for a frame. |
 | `decoder.tiled.merge`                           | `metrics/tiled.py::merge_tiled_detections`                | Greedy IOS merge (keep-best by default, `MergeMode::Union` for GREEDYNMM) of one frame's accumulated lifted detections, called from `TiledFrameAccumulator::finalize`/`finalize_normalized`. `tiles` is the frame's total tile count (the fan-in fence), `boxes_in` the pre-merge detection count, `boxes_out` the post-merge count — the ratio is the seam-duplicate collapse rate. |

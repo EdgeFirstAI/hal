@@ -145,3 +145,47 @@ fn explicit_cap_wins_over_the_multi_label_default() {
     let d = from_metadata(true).with_multi_label(false).build().unwrap();
     assert_eq!(d.pre_nms_top_k, DEFAULT_PRE_NMS_TOP_K);
 }
+
+fn count_for_tracking(d: &Decoder) -> usize {
+    let t = detection_tensor();
+    let (mut boxes, mut masks) = (Vec::new(), Vec::new());
+    d.decode_for_tracking(&[&t], &mut boxes, &mut masks)
+        .unwrap();
+    boxes.len()
+}
+
+#[test]
+fn tracking_decode_uses_the_argmax_default_cap() {
+    // The multi-label default only exists for multi-label candidates;
+    // tracking decodes argmax, so it keeps the 300 default.
+    let d = builder()
+        .add_output(detection_cfg())
+        .with_multi_label(true)
+        .build()
+        .unwrap();
+    assert_eq!(d.pre_nms_top_k, MULTI_LABEL_PRE_NMS_TOP_K);
+    assert_eq!(count(&d), N * NC);
+    assert_eq!(count_for_tracking(&d), DEFAULT_PRE_NMS_TOP_K);
+
+    let d = from_metadata(true).build().unwrap();
+    assert_eq!(count_for_tracking(&d), DEFAULT_PRE_NMS_TOP_K);
+}
+
+#[test]
+fn tracking_decode_honours_an_explicit_cap() {
+    let d = builder()
+        .add_output(detection_cfg())
+        .with_multi_label(true)
+        .with_pre_nms_top_k(MULTI_LABEL_PRE_NMS_TOP_K)
+        .build()
+        .unwrap();
+    assert_eq!(count_for_tracking(&d), N);
+
+    let mut d = builder()
+        .add_output(detection_cfg())
+        .with_multi_label(true)
+        .build()
+        .unwrap();
+    d.pre_nms_top_k = 0;
+    assert_eq!(count_for_tracking(&d), N);
+}
