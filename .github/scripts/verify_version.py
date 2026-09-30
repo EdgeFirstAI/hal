@@ -8,6 +8,8 @@
 #   1. Cargo.toml workspace version
 #   2. Cargo.toml internal dependency versions
 #   3. Cargo.lock versions for all workspace crates
+#   3a. Standalone C-API leaves: internal path-dependency requirements and the
+#       path crates in each leaf's own Cargo.lock
 #   4. pyproject.toml Python package version
 #   5. CHANGELOG.md has an entry for the version
 #   6. NOTICE has correct versions for internal crates (no stale entries)
@@ -153,6 +155,54 @@ def check_cargo_lock(version: str) -> list[str]:
                         f"{lock_path}: {crate} version is '{found_version}', "
                         f"expected '{version}'"
                     )
+
+    return errors
+
+
+def check_standalone_leaves(version: str) -> list[str]:
+    """Check the standalone C-API leaves' pins on the crates they build from.
+
+    The leaves sit outside the workspace, so nothing moves their
+    `version = "..."` requirements on internal path dependencies or the
+    path crates recorded in their own Cargo.lock. A 0.x requirement only
+    matches its own minor series: a `"0.32.0"` pin left behind by a 0.33.0
+    bump makes the leaf unresolvable, and a stale lock fails `--locked`.
+    """
+    errors = []
+    dep_pattern = re.compile(r'^([A-Za-z0-9_-]+)\s*=\s*\{([^\n]*)', re.MULTILINE)
+
+    for crate in STANDALONE_LEAF_CRATES:
+        crate_dir = f"crates/{crate.removeprefix('edgefirst-')}"
+
+        manifest = f"{crate_dir}/Cargo.toml"
+        for m in dep_pattern.finditer(read_file(manifest)):
+            spec = m.group(2)
+            if not re.search(r'path\s*=\s*"\.\./', spec):
+                continue
+            req = re.search(r'version\s*=\s*"([^"]+)"', spec)
+            if req and req.group(1) != version:
+                errors.append(
+                    f"{manifest}: {m.group(1)} requires '{req.group(1)}', "
+                    f"expected '{version}'"
+                )
+
+        # Path packages are the lock entries without a `source` line.
+        lock_path = f"{crate_dir}/Cargo.lock"
+        for block in read_file(lock_path).split("[[package]]")[1:]:
+            name = re.search(r'^name = "([^"]+)"', block, re.MULTILINE)
+            found = re.search(r'^version = "([^"]+)"', block, re.MULTILINE)
+            if not name or not found or name.group(1) == crate:
+                continue
+            if not name.group(1).startswith("edgefirst-"):
+                continue
+            if re.search(r'^source = ', block, re.MULTILINE):
+                continue
+            if found.group(1) != version:
+                errors.append(
+                    f"{lock_path}: {name.group(1)} version is '{found.group(1)}', "
+                    f"expected '{version}' (re-lock with `cargo metadata "
+                    f"--format-version 1` in {crate_dir})"
+                )
 
     return errors
 
@@ -363,6 +413,7 @@ def main():
     checks = [
         ("Cargo.toml (workspace)", check_cargo_toml),
         ("Cargo.lock", check_cargo_lock),
+        ("Standalone C-API leaves", check_standalone_leaves),
         ("Crate Cargo.toml files", check_crate_cargo_tomls),
         ("pyproject.toml", check_pyproject_toml),
         ("CHANGELOG.md", check_changelog),

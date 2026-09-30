@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-30
+
 ### Added
 
 - **Multi-label decode on every NMS decode path** (`edgefirst-decoder`). `DecoderBuilder::with_multi_label(true)` now applies to split, quantized, 2-way, detection-only and ModelPack detection models, for both `decode` and `decode_proto`, not only fused float and per-scale models. With NMS disabled, multi-label no longer turns NMS back on. Quantized multi-label candidate selection reads the transposed score layout of a DMA-BUF output one contiguous class column at a time.
@@ -64,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `edgefirst_tensor::protocol::c_byte_strides` is public: the one stride convention shared by the descriptor, the blob and the C API.
 - **`scripts/on-target-test.sh` deploys one bundle and runs it on the board.** Its options and summary are unchanged; the summary now also gives each host's passed, failed and ignored test totals. It arms `HAL_TEST_REQUIRE_DMA` when the board's DMA heap allocates, as the CI board lane does, so a heap that should work and does not fails instead of skipping. `REQUIRE_GPU=1` fails a host with no render node (`NO-GPU`) instead of letting every GPU test skip. A host without `rsync` gets the bundle by tar over ssh instead of failing to sync.
 - **CI on-target lane runs on four boards**: `imx8mp-evk` (Vivante), `imx95-evk` (Mali), `rpi5` (V3D) and `orin-nano` (Tegra). It replaces the retired `nxp-imx8mp-latest` label, which no runner answers any more. The board archive is linked against glibc 2.35 so it loads on Ubuntu 22.04 (JetPack 6). Board jobs now fail when a board with a render node cannot bring up GL (`HAL_TEST_REQUIRE_GL`), as `scripts/on-target-test.sh` already did. Tests that need a zero-copy buffer treat its absence as a failure only where one must exist: under `HAL_TEST_REQUIRE_DMA`, or under `HAL_TEST_REQUIRE_GL` on a Linux host with a DMA heap. The Jetson has no heap, so they skip there.
+- **`make verify-version` runs the check `release.yml` and `publish.yml` gate on** (`.github/scripts/verify_version.py`) instead of a separate, weaker shell check. The script now also checks the standalone C API crates' version requirements on the internal crates they build from, and the internal crate versions in their own `Cargo.lock`. A 0.x requirement matches only its own minor series, so a `"0.32.0"` requirement left behind by a 0.33.0 bump makes the crate unresolvable, and nothing flagged it.
+- **Dependencies updated.** `opencv` moves from 0.99 to 0.101 (the optional `opencv` feature, used only by the `opencv_benchmark` comparison benchmark). Every lockfile, including the standalone C API crates', takes the latest semver-compatible releases.
 
 ### Removed
 
