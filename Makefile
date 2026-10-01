@@ -909,29 +909,11 @@ notice:
 # VERSION VERIFICATION
 # ===========================================================================
 
+# The same script gates release.yml and publish.yml, so a local pass means
+# the release branch passes the check CI runs.
 .PHONY: verify-version
 verify-version:
-	@echo "Verifying version consistency..."
-	@CARGO_VERSION=$$(grep -A10 '^\[workspace.package\]' Cargo.toml | grep 'version = ' | sed 's/.*version = "\(.*\)"/\1/'); \
-	echo "Workspace version: $$CARGO_VERSION"; \
-	MM=$$(echo "$$CARGO_VERSION" | cut -d. -f1,2); \
-	fail=0; \
-	for c in $(PYTHON_CRATES); do \
-		[ -f "$$c/pyproject.toml" ] || continue; \
-		if grep -q 'dynamic = \["version"\]' "$$c/pyproject.toml"; then \
-			echo "  $$c/pyproject.toml: ✓ (dynamic, from Cargo)"; \
-		else \
-			echo "  $$c/pyproject.toml: ✗ expected dynamic version"; fail=1; \
-		fi; \
-		pin=$$(grep -o 'edgefirst-tensor ~= [0-9.]*' "$$c/pyproject.toml" || true); \
-		if [ -n "$$pin" ]; then \
-			case "$$pin" in \
-				*"$$MM"*) echo "  $$c sibling pin: ✓ ($$pin)";; \
-				*) echo "  $$c sibling pin: ✗ ($$pin vs $$CARGO_VERSION)"; fail=1;; \
-			esac; \
-		fi; \
-	done; \
-	[ "$$fail" -eq 0 ] || exit 1
+	@$(PYTHON) .github/scripts/verify_version.py
 
 # ===========================================================================
 # PRE-RELEASE CHECKS
