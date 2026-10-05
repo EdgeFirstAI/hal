@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@c2aa96dd21c7ccf0934304aa033bea62ac9a2e2c
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@55bc02295af9878e74007b5f9e00fffbffcff62e
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -129,7 +129,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           lfs: false
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172  # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0  # v2.87.22
         with:
           tool: cargo-cyclonedx
       # No toolchain action: rust-toolchain.toml pins the compiler, and letting
@@ -140,7 +140,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@c2aa96dd21c7ccf0934304aa033bea62ac9a2e2c
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@55bc02295af9878e74007b5f9e00fffbffcff62e
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       # One job per board identity, each run on that specific board: the NXP

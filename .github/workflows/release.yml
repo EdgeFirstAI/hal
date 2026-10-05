@@ -114,7 +114,7 @@ jobs:
     needs: [verify-version]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           # rust-toolchain.toml pins these components, so rustup installs them
@@ -214,7 +214,7 @@ jobs:
         run: git lfs checkout
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           # rust-toolchain.toml pins these components, so rustup installs them
@@ -273,7 +273,7 @@ jobs:
       # checks below have passed -- so provenance is generated once, after
       # them, rather than for a wheel an assertion is about to reject.
       - name: Build wheels (Python 3.11+ — zero-copy buffer protocol)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@c2aa96dd21c7ccf0934304aa033bea62ac9a2e2c
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@55bc02295af9878e74007b5f9e00fffbffcff62e
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:
@@ -288,7 +288,7 @@ jobs:
           attest: false
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@c2aa96dd21c7ccf0934304aa033bea62ac9a2e2c
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@55bc02295af9878e74007b5f9e00fffbffcff62e
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:
@@ -431,7 +431,7 @@ jobs:
         run: git lfs checkout
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           # rust-toolchain.toml pins these components, so rustup installs them

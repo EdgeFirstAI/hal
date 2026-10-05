@@ -94,7 +94,7 @@ jobs:
       publishing: ${{ steps.resolve.outputs.publishing }}
     steps:
       - id: resolve
-        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@c2aa96dd21c7ccf0934304aa033bea62ac9a2e2c
+        uses: EdgeFirstAI/.github/.github/actions/resolve-release-build@55bc02295af9878e74007b5f9e00fffbffcff62e
         with:
           build-workflow: release.yml
           tag: ${{ inputs.tag }}
@@ -370,7 +370,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           # rust-toolchain.toml pins these components, so rustup installs them
