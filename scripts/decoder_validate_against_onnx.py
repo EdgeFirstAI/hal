@@ -24,11 +24,11 @@ USAGE
         testdata/decoder/yolo26n-seg.safetensors \\
         ~/software/hailo-converter/workdir/t-2686/yolo26n-seg-t-2686.onnx \\
         --image testdata/zidane.jpg \\
-        --out-dir /tmp/yolo26_compare
+        --out-dir target/yolo26_compare
 
-The output directory receives ``fixture.png``, ``onnx.png``, and
-``side_by_side.png`` overlays plus the textual stats are printed to
-stdout.
+The output directory (by default a new temporary directory) receives
+``fixture.png``, ``onnx.png``, and ``side_by_side.png`` overlays plus
+the textual stats are printed to stdout.
 
 ASSUMPTIONS
 -----------
@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -246,8 +247,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Source image. Default: testdata/zidane.jpg next to the fixture root.",
     )
     p.add_argument(
-        "--out-dir", type=Path, default=Path("/tmp/decoder_validate_onnx"),
-        help="Directory for rendered overlays.",
+        "--out-dir", type=Path, default=None,
+        help="Directory for rendered overlays. Default: a new temporary directory.",
     )
     p.add_argument(
         "--score-threshold", type=float, default=0.001,
@@ -290,7 +291,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: image not found: {image_path}", file=sys.stderr)
         return 1
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    if args.out_dir is None:
+        args.out_dir = Path(tempfile.mkdtemp(prefix="decoder_validate_onnx_"))
+    else:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------------------------------------------------
     # Load fixture
