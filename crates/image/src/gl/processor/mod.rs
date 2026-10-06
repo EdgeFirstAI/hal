@@ -535,6 +535,9 @@ pub struct GLProcessorST {
     nv_uv_texture: Texture,
     /// Chroma-plane imports for `nv_uv_texture`, keyed like `nv_r8_egl_cache`.
     nv_uv_egl_cache: ImportCache<PlatformImport>,
+    /// Set once the driver refuses a chroma-plane import, so later resizes
+    /// take the shader-filtered program instead of retrying it every frame.
+    nv_uv_import_refused: bool,
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
@@ -2263,6 +2266,7 @@ impl GLProcessorST {
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
             nv_uv_texture: Texture::new(),
             nv_uv_egl_cache: ImportCache::new(egl_cache_capacity),
+            nv_uv_import_refused: false,
             last_nv_convert_path: NvConvertPath::None,
             last_nv_sampling: None,
             convert_stats: Default::default(),
@@ -7126,6 +7130,11 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
     ) -> Result<PlatformHandle, crate::Error> {
+        if !Platform::NV_CHROMA_IMPORT || self.nv_uv_import_refused {
+            return Err(crate::Error::NotSupported(
+                "no chroma-plane import on this platform or driver".into(),
+            ));
+        }
         Platform::validate_import_identity(img, "NV chroma source")?;
         let height = img.height().ok_or(Error::NotAnImage)?;
         let stride = img
@@ -7145,9 +7154,15 @@ impl GLProcessorST {
                 cached.last_used = ts;
                 return Ok(Platform::import_handle(&cached.import));
             }
-            self.nv_uv_egl_cache.misses += 1;
         }
-        let egl_image_obj = Platform::import_buffer_nv_chroma(&self.gl_context, img, img_fmt)?;
+        // A miss counts an import made: a refusal imports nothing, and is
+        // remembered so the next resize does not repeat the attempt.
+        let egl_image_obj = Platform::import_buffer_nv_chroma(&self.gl_context, img, img_fmt)
+            .inspect_err(|e| {
+                log::info!("NV chroma-plane import refused ({e}); resizing with the shader filter");
+                self.nv_uv_import_refused = true;
+            })?;
+        self.nv_uv_egl_cache.misses += 1;
         self.nv_uv_texture.invalidate_egl_binding();
         let handle = Platform::import_handle(&egl_image_obj);
         self.nv_uv_egl_cache.insert(id, egl_image_obj, None);
