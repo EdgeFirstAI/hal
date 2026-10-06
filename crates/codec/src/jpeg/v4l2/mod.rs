@@ -1944,4 +1944,94 @@ mod tests {
             eprintln!("{contexts} contexts, depth 1: {fps:7.1} FPS aggregate");
         }
     }
+
+    /// Leaves `ctx` as a rebuild does when it fails after `STREAMON OUTPUT`:
+    /// OUTPUT streaming with the JPEG queued, optionally a CAPTURE buffer
+    /// requested, and no [`Stream`].
+    fn leave_partial_setup(ctx: &mut V4l2Context, jpeg: &[u8], w: u32, h: u32, capture: bool) {
+        let mut ofmt = uapi::v4l2_format {
+            type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            ..Default::default()
+        };
+        // SAFETY: type_ selects the multi-planar variant.
+        {
+            let p = unsafe { ofmt.pix_mp() };
+            p.width = w;
+            p.height = h;
+            p.pixelformat = uapi::V4L2_PIX_FMT_JPEG;
+            p.field = uapi::V4L2_FIELD_NONE;
+            p.num_planes = 1;
+            p.plane_fmt[0].sizeimage = OUT_SIZE_FLOOR;
+        }
+        ctx.device.dev.set_format(&mut ofmt).expect("S_FMT OUTPUT");
+        ctx.m2m
+            .output_mut()
+            .request(Memory::Mmap, 1)
+            .expect("REQBUFS OUTPUT");
+        let out_map = ctx.m2m.output().map(0).expect("mmap OUTPUT").remove(0);
+        ctx.m2m.output().stream_on().expect("STREAMON OUTPUT");
+        // SAFETY: the buffer was just allocated and has never been queued.
+        let staged = stage_jpeg(unsafe { out_map.as_mut_slice() }, jpeg);
+        assert!(ctx.queue_output(staged, "QBUF OUTPUT").is_ok());
+        if capture {
+            ctx.m2m
+                .capture_mut()
+                .request(Memory::DmaBuf, 1)
+                .expect("REQBUFS CAPTURE");
+        }
+        assert!(ctx.stream.is_none());
+    }
+
+    /// A rebuild that fails after starting the OUTPUT queue leaves the queues
+    /// active without a [`Stream`]. The reset must stop and free both, and
+    /// the next decode must succeed on the hardware. `V4l2Context::decode` is
+    /// called directly because the public path would hide a failure behind
+    /// the CPU fallback.
+    #[test]
+    fn v4l2_recovers_from_partial_setup() {
+        let Some(jpeg) = testdata_file("zidane.jpg") else {
+            crate::test_support::report_skip("testdata not found (set EDGEFIRST_TESTDATA_DIR)");
+            return;
+        };
+        let info = crate::peek_info(&jpeg).expect("peek zidane.jpg");
+        let (w, h) = (info.width, info.height);
+
+        for capture in [false, true] {
+            let Some(dev) = device::probe() else {
+                crate::test_support::report_skip("no v4l2 jpeg decoder on this host");
+                return;
+            };
+            if dev.api != ApiVariant::MultiPlanar {
+                crate::test_support::report_skip("v4l2 jpeg decoder is not multi-planar");
+                return;
+            }
+            let mut ctx = V4l2Context::new(dev).expect("v4l2 context");
+            leave_partial_setup(&mut ctx, &jpeg, w as u32, h as u32, capture);
+
+            ctx.fail_reset();
+            for (name, q) in [("OUTPUT", ctx.m2m.output()), ("CAPTURE", ctx.m2m.capture())] {
+                assert!(
+                    !q.is_streaming(),
+                    "{name} still streaming (capture={capture})"
+                );
+                assert!(q.is_empty(), "{name} buffers not freed (capture={capture})");
+            }
+
+            let mut dst = Tensor::<u8>::image(
+                w,
+                h,
+                PixelFormat::Nv12,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("destination tensor");
+            match ctx.decode::<u8>(&jpeg, &mut dst, PixelFormat::Nv12, w, h, w) {
+                Ok(got) => assert_eq!((got.width, got.height), (w, h)),
+                Err(DecodeErr::Reset(why) | DecodeErr::Unsupported(why)) => {
+                    panic!("hardware decode after reset failed (capture={capture}): {why}")
+                }
+                Err(DecodeErr::Fatal(e)) => panic!("decode after reset (capture={capture}): {e}"),
+            }
+        }
+    }
 }
