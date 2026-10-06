@@ -34,30 +34,26 @@
 //! allocation (dma_heap). Platforms without it use the CPU decoder, as do
 //! single-planar M2M devices for now.
 
-mod buffers;
 mod device;
 mod format;
 
-use std::os::fd::{BorrowedFd, RawFd};
-use std::os::raw::c_int;
-
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use std::time::Duration;
 
 use crate::error::CodecError;
 use crate::jpeg::markers::JpegHeaders;
 use crate::options::ImageInfo;
 use crate::pixel::ImagePixel;
-use buffers::Mmap;
 use device::{ApiVariant, ProbedDevice};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
-use edgefirst_v4l2::{ioctl, uapi};
+use edgefirst_v4l2::m2m::M2m;
+use edgefirst_v4l2::queue::{BufType, Dequeued, Mapping, Memory, Plane, Queue};
+use edgefirst_v4l2::{events, uapi};
 use format::CapKind;
-use std::os::fd::AsRawFd;
 
-/// Timeout waiting for the `SOURCE_CHANGE` event after queuing the JPEG (ms).
-const SOURCE_CHANGE_TIMEOUT_MS: i32 = 200;
-/// Timeout waiting for the hardware to finish a decode (ms).
-const DECODE_TIMEOUT_MS: i32 = 2000;
+/// Timeout waiting for the `SOURCE_CHANGE` event after queuing the JPEG.
+const SOURCE_CHANGE_TIMEOUT: Duration = Duration::from_millis(200);
+/// Timeout waiting for the hardware to finish a decode.
+const DECODE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Hard cap on the `DQEVENT` drain loop (an unbounded loop hangs — the driver
 /// re-returns the same event repeatedly).
 const MAX_EVENTS: usize = 16;
@@ -119,8 +115,8 @@ pub(crate) enum V4l2Probe {
 impl V4l2Probe {
     fn ensure_probed(&mut self) -> Option<&mut V4l2Context> {
         if matches!(self, V4l2Probe::Unprobed) {
-            *self = match device::probe() {
-                Some(dev) => V4l2Probe::Ready(V4l2Context::new(dev)),
+            *self = match device::probe().and_then(V4l2Context::new) {
+                Some(ctx) => V4l2Probe::Ready(ctx),
                 None => V4l2Probe::Unavailable,
             };
         }
@@ -201,6 +197,8 @@ impl V4l2Probe {
 /// ~110 ms MMAP buffer reallocation. A hardware failure drops the session.
 pub(crate) struct V4l2Context {
     device: ProbedDevice,
+    /// The OUTPUT (coded) and CAPTURE (raw) queues of the device.
+    m2m: M2m,
     /// The live streaming session (both queues `STREAMON` with buffers
     /// attached), or `None` before the first decode / after a reset.
     stream: Option<Stream>,
@@ -236,7 +234,7 @@ struct Stream {
     /// Allocated OUTPUT plane size; a larger JPEG forces a full rebuild.
     out_sizeimage: u32,
     /// Mapped OUTPUT (coded) buffer — the JPEG is copied in here each frame.
-    out_map: Mmap,
+    out_map: Mapping,
     /// Driver-chosen CAPTURE (raw) format and where the decode lands.
     cap: Capture,
 }
@@ -260,14 +258,19 @@ enum CaptureTarget {
 }
 
 impl V4l2Context {
-    fn new(device: ProbedDevice) -> Self {
-        Self {
+    fn new(device: ProbedDevice) -> Option<Self> {
+        let multiplanar = device.api == ApiVariant::MultiPlanar;
+        let m2m = M2m::new(&device.dev, multiplanar)
+            .map_err(|e| log::debug!("v4l2: cannot create queues: {e}"))
+            .ok()?;
+        Some(Self {
             device,
+            m2m,
             stream: None,
             scratch: None,
             scratch_failed: false,
             failures: 0,
-        }
+        })
     }
 
     /// Decode one image through a three-tier path:
@@ -369,13 +372,54 @@ impl V4l2Context {
     /// Fast path: copy the JPEG into the already-mapped OUTPUT buffer and queue
     /// it. Both queues are already streaming from a prior decode.
     fn requeue_output(&mut self, data: &[u8]) -> Result<(), DecodeErr> {
-        let fd = self.device.fd();
+        let staged = self.stage_output(data)?;
+        self.queue_output(staged, "QBUF OUTPUT")
+    }
+
+    /// Copy the JPEG into the mapped OUTPUT buffer, refusing while the driver
+    /// still holds it (a previous decode that failed before dequeueing it).
+    fn stage_output(&mut self, data: &[u8]) -> Result<usize, DecodeErr> {
+        if self.m2m.output().is_queued(0) {
+            return Err(DecodeErr::Reset("OUTPUT buffer still queued".into()));
+        }
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
-        let staged = stage_jpeg(stream.out_map.as_mut_slice(), data);
-        qbuf_output(fd, staged).map_err(|e| DecodeErr::Reset(format!("QBUF OUTPUT: {e}")))
+        // SAFETY: OUTPUT buffer 0 is not queued (checked above), so the driver
+        // does not access it, and `self` is borrowed mutably.
+        Ok(stage_jpeg(unsafe { stream.out_map.as_mut_slice() }, data))
+    }
+
+    fn queue_output(&self, staged: usize, what: &str) -> Result<(), DecodeErr> {
+        self.m2m
+            .output()
+            .enqueue(
+                0,
+                &[Plane::Mmap {
+                    bytesused: staged as u32,
+                }],
+                None,
+            )
+            .map_err(|e| DecodeErr::Reset(format!("{what}: {e}")))
+    }
+
+    /// Wait (best-effort) for the driver to parse the queued JPEG header and
+    /// raise `SOURCE_CHANGE`, then drain the pending events.
+    fn await_source_change(&self) {
+        let _ = events::wait(&self.device.dev, Some(SOURCE_CHANGE_TIMEOUT));
+        let _ = events::drain(&self.device.dev, MAX_EVENTS);
+    }
+
+    /// The driver's current CAPTURE format (`G_FMT`).
+    fn capture_format(&self, what: &str) -> Result<uapi::v4l2_pix_format_mplane, DecodeErr> {
+        let mut fmt = self
+            .device
+            .dev
+            .format(BufType::VideoCaptureMplane)
+            .map_err(|e| DecodeErr::Reset(format!("{what}: {e}")))?;
+        // SAFETY: the multi-planar type selects the `pix_mp` payload.
+        Ok(*unsafe { fmt.pix_mp() })
     }
 
     /// Tear down any existing stream, then set up the OUTPUT + CAPTURE queues
@@ -398,16 +442,9 @@ impl V4l2Context {
             tracing::trace_span!("codec.decode_jpeg.v4l2_rebuild", w = final_w, h = final_h)
                 .entered();
         self.drop_stream();
-        let fd = self.device.fd();
-        const OUT: u32 = uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 
         // Subscribe to source-change events (harmless if already subscribed).
-        let sub = uapi::v4l2_event_subscription {
-            type_: uapi::V4L2_EVENT_SOURCE_CHANGE,
-            ..Default::default()
-        };
-        // SAFETY: valid subscription struct.
-        unsafe { ioctl::vidioc_subscribe_event(fd, &sub) }
+        events::subscribe(&self.device.dev, uapi::V4L2_EVENT_SOURCE_CHANGE, 0, 0)
             .map_err(|e| DecodeErr::Reset(format!("SUBSCRIBE_EVENT: {e}")))?;
 
         // OUTPUT: JPEG format with headroom (so a later, larger image avoids a
@@ -415,7 +452,7 @@ impl V4l2Context {
         // it survives every geometry change until OUTPUT overflow or reset.
         let out_request = needed.max(OUT_SIZE_FLOOR);
         let mut ofmt = uapi::v4l2_format {
-            type_: OUT,
+            type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
             ..Default::default()
         };
         // SAFETY: type_ selects the multi-planar variant.
@@ -428,26 +465,37 @@ impl V4l2Context {
             p.num_planes = 1;
             p.plane_fmt[0].sizeimage = out_request;
         }
-        // SAFETY: valid v4l2_format; kernel reads/writes it.
-        unsafe { ioctl::vidioc_s_fmt(fd, &mut ofmt) }
+        self.device
+            .dev
+            .set_format(&mut ofmt)
             .map_err(|e| DecodeErr::Reset(format!("S_FMT OUTPUT: {e}")))?;
 
-        reqbufs(fd, OUT, 1, uapi::V4L2_MEMORY_MMAP)
+        self.m2m
+            .output_mut()
+            .request(Memory::Mmap, 1)
             .map_err(|e| DecodeErr::Reset(format!("REQBUFS OUTPUT: {e}")))?;
-        let (olen, ooff) =
-            querybuf(fd, OUT, 1).map_err(|e| DecodeErr::Reset(format!("QUERYBUF OUTPUT: {e}")))?;
-        let mut out_map = Mmap::new(borrow(fd), olen, ooff)
-            .map_err(|e| DecodeErr::Reset(format!("mmap OUTPUT: {e}")))?;
+        let out_map = self
+            .m2m
+            .output()
+            .map(0)
+            .map_err(|e| DecodeErr::Reset(format!("mmap OUTPUT: {e}")))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| DecodeErr::Reset("mmap OUTPUT: no plane".into()))?;
+        let olen = out_map.len();
 
-        streamon(fd, OUT).map_err(|e| DecodeErr::Reset(format!("STREAMON OUTPUT: {e}")))?;
+        self.m2m
+            .output()
+            .stream_on()
+            .map_err(|e| DecodeErr::Reset(format!("STREAMON OUTPUT: {e}")))?;
 
         // Queue the first JPEG so the driver can parse the header.
-        let staged = stage_jpeg(out_map.as_mut_slice(), data);
-        qbuf_output(fd, staged).map_err(|e| DecodeErr::Reset(format!("QBUF OUTPUT: {e}")))?;
+        // SAFETY: the buffer was just allocated and has never been queued.
+        let staged = stage_jpeg(unsafe { out_map.as_mut_slice() }, data);
+        self.queue_output(staged, "QBUF OUTPUT")?;
 
         // Wait for the driver to determine the CAPTURE format (best-effort).
-        poll_ready(fd, PollFlags::POLLPRI, SOURCE_CHANGE_TIMEOUT_MS);
-        drain_events(fd);
+        self.await_source_change();
 
         let cap = self.configure_capture(
             output_fmt,
@@ -494,33 +542,22 @@ impl V4l2Context {
             h = final_h
         )
         .entered();
-        let fd = self.device.fd();
-        const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-
         // Stop and free only the CAPTURE queue — DMABUF buffers are ours, so
         // this releases no memory, just vb2 bookkeeping. The OUTPUT queue
         // keeps streaming with its buffer allocated.
         if self.stream.is_none() {
             return Err(DecodeErr::Reset("no stream to reconfigure".into()));
         }
-        streamoff(fd, CAP)
-            .map_err(|e| DecodeErr::Reset(format!("STREAMOFF CAPTURE (reconf): {e}")))?;
-        reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF)
-            .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE 0 (reconf): {e}")))?;
+        self.m2m
+            .capture_mut()
+            .free()
+            .map_err(|e| DecodeErr::Reset(format!("free CAPTURE (reconf): {e}")))?;
 
         // Queue the new JPEG; the driver parses the header and retargets the
         // CAPTURE format (raising SOURCE_CHANGE) while OUTPUT keeps streaming.
-        let staged = {
-            let stream = self
-                .stream
-                .as_mut()
-                .ok_or_else(|| DecodeErr::Reset("no stream to reconfigure".into()))?;
-            stage_jpeg(stream.out_map.as_mut_slice(), data)
-        };
-        qbuf_output(fd, staged)
-            .map_err(|e| DecodeErr::Reset(format!("QBUF OUTPUT (reconf): {e}")))?;
-        poll_ready(fd, PollFlags::POLLPRI, SOURCE_CHANGE_TIMEOUT_MS);
-        drain_events(fd);
+        let staged = self.stage_output(data)?;
+        self.queue_output(staged, "QBUF OUTPUT (reconf)")?;
+        self.await_source_change();
 
         let cap = self.configure_capture(
             output_fmt,
@@ -557,19 +594,10 @@ impl V4l2Context {
         dst_capacity: usize,
         dma_capable: bool,
     ) -> Result<Capture, DecodeErr> {
-        let fd = self.device.fd();
         const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         // CAPTURE: query the driver-chosen format for the queued JPEG.
-        let mut cfmt = uapi::v4l2_format {
-            type_: CAP,
-            ..Default::default()
-        };
-        // SAFETY: valid v4l2_format for G_FMT.
-        unsafe { ioctl::vidioc_g_fmt(fd, &mut cfmt) }
-            .map_err(|e| DecodeErr::Reset(format!("G_FMT CAPTURE: {e}")))?;
-        // SAFETY: type_ selects the multi-planar variant.
-        let mut cap = *unsafe { cfmt.pix_mp() };
+        let mut cap = self.capture_format("G_FMT CAPTURE")?;
 
         // The driver reports MCU-padded dimensions, so they must cover the
         // logical image. Smaller means the SOURCE_CHANGE never landed and the
@@ -621,17 +649,10 @@ impl V4l2Context {
                 p.xfer_func = cap.xfer_func;
                 p.num_planes = 1;
             }
-            // SAFETY: valid format; best-effort — if refused, cap/kind stay YUV3
-            // and the scratch path deinterleaves to NV24 instead.
-            let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut nfmt) };
-            let mut gfmt = uapi::v4l2_format {
-                type_: CAP,
-                ..Default::default()
-            };
-            // SAFETY: valid format for G_FMT.
-            if unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }.is_ok() {
-                // SAFETY: mplane variant.
-                let got = *unsafe { gfmt.pix_mp() };
+            // Best-effort — if refused, cap/kind stay YUV3 and the scratch
+            // path deinterleaves to NV24 instead.
+            let _ = self.device.dev.set_format(&mut nfmt);
+            if let Ok(got) = self.capture_format("G_FMT CAPTURE (nv12)") {
                 if let Some(new_kind) = format::classify(got.pixelformat) {
                     if matches!(new_kind, CapKind::Nv12) {
                         log::debug!(
@@ -702,17 +723,9 @@ impl V4l2Context {
                 p.plane_fmt[0].bytesperline = dst_stride as u32;
                 p.plane_fmt[0].sizeimage = (dst_stride * total_h) as u32;
             }
-            // SAFETY: valid format. Best-effort; read back what the driver kept.
-            let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) };
-            let mut gfmt = uapi::v4l2_format {
-                type_: CAP,
-                ..Default::default()
-            };
-            // SAFETY: valid format for G_FMT.
-            unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }
-                .map_err(|e| DecodeErr::Reset(format!("G_FMT CAPTURE (zc): {e}")))?;
-            // SAFETY: mplane variant.
-            let cap_zc = *unsafe { gfmt.pix_mp() };
+            // Best-effort; read back what the driver kept.
+            let _ = self.device.dev.set_format(&mut sfmt);
+            let cap_zc = self.capture_format("G_FMT CAPTURE (zc)")?;
             let ok = cap_zc.pixelformat == target_fourcc
                 && cap_zc.num_planes == 1
                 && cap_zc.width as usize == final_w
@@ -734,8 +747,8 @@ impl V4l2Context {
                     let p = unsafe { rfmt.pix_mp() };
                     *p = cap0;
                 }
-                // SAFETY: valid format; best-effort restore.
-                let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut rfmt) };
+                // Best-effort restore.
+                let _ = self.device.dev.set_format(&mut rfmt);
                 cap = cap0;
             }
         }
@@ -743,9 +756,7 @@ impl V4l2Context {
         if dst_dma {
             // Zero-copy: no driver buffers; the tensor fd is imported per
             // frame in `collect`. REQBUFS(DMABUF) is bookkeeping only.
-            reqbufs(fd, CAP, 1, uapi::V4L2_MEMORY_DMABUF)
-                .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE (dmabuf): {e}")))?;
-            streamon(fd, CAP).map_err(|e| DecodeErr::Reset(format!("STREAMON CAPTURE: {e}")))?;
+            self.start_capture("dmabuf")?;
             return Ok(Capture {
                 kind,
                 cap_h: cap.height as usize,
@@ -777,17 +788,9 @@ impl V4l2Context {
                 p.xfer_func = cap.xfer_func;
                 p.num_planes = 1;
             }
-            // SAFETY: valid format; best-effort — read back the result.
-            let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) };
-            let mut gfmt = uapi::v4l2_format {
-                type_: CAP,
-                ..Default::default()
-            };
-            // SAFETY: valid format for G_FMT.
-            unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }
-                .map_err(|e| DecodeErr::Reset(format!("G_FMT CAPTURE (scratch): {e}")))?;
-            // SAFETY: mplane variant.
-            single = *unsafe { gfmt.pix_mp() };
+            // Best-effort — read back the result.
+            let _ = self.device.dev.set_format(&mut sfmt);
+            single = self.capture_format("G_FMT CAPTURE (scratch)")?;
             if single.num_planes != 1 {
                 return Err(DecodeErr::Unsupported(format!(
                     "driver insists on a {}-plane CAPTURE; single-plane DMABUF required",
@@ -807,15 +810,59 @@ impl V4l2Context {
                 "hardware decode requires DMA buffers (dma_heap unavailable)".into(),
             ));
         }
-        reqbufs(fd, CAP, 1, uapi::V4L2_MEMORY_DMABUF)
-            .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE (scratch): {e}")))?;
-        streamon(fd, CAP).map_err(|e| DecodeErr::Reset(format!("STREAMON CAPTURE: {e}")))?;
+        self.start_capture("scratch")?;
         Ok(Capture {
             kind,
             cap_h: single.height as usize,
             luma_stride: single.plane_fmt[0].bytesperline as usize,
             target: CaptureTarget::Scratch,
         })
+    }
+
+    /// Request the single DMABUF CAPTURE buffer (bookkeeping only; the memory
+    /// is imported per frame) and start the CAPTURE queue.
+    fn start_capture(&mut self, target: &str) -> Result<(), DecodeErr> {
+        self.m2m
+            .capture_mut()
+            .request(Memory::DmaBuf, 1)
+            .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE ({target}): {e}")))?;
+        self.m2m
+            .capture()
+            .stream_on()
+            .map_err(|e| DecodeErr::Reset(format!("STREAMON CAPTURE: {e}")))
+    }
+
+    /// Queue `fd` as the CAPTURE buffer, wait for the decode, and dequeue both
+    /// the decoded CAPTURE buffer and the consumed OUTPUT buffer.
+    fn decode_into(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        length: usize,
+        target: &str,
+    ) -> Result<(), DecodeErr> {
+        self.m2m
+            .capture()
+            .enqueue(
+                0,
+                &[Plane::DmaBuf {
+                    fd,
+                    length: length as u32,
+                    bytesused: 0,
+                    data_offset: 0,
+                }],
+                None,
+            )
+            .map_err(|e| DecodeErr::Reset(format!("QBUF CAPTURE ({target}): {e}")))?;
+        match dequeue_within(self.m2m.capture(), DECODE_TIMEOUT) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(DecodeErr::Reset("CAPTURE decode timeout".into())),
+            Err(e) => return Err(DecodeErr::Reset(format!("DQBUF CAPTURE ({target}): {e}"))),
+        }
+        match dequeue_within(self.m2m.output(), DECODE_TIMEOUT) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(DecodeErr::Reset("OUTPUT not returned".into())),
+            Err(e) => Err(DecodeErr::Reset(format!("DQBUF OUTPUT: {e}"))),
+        }
     }
 
     /// Ensure the persistent scratch dmabuf holds at least `sizeimage` bytes,
@@ -873,7 +920,6 @@ impl V4l2Context {
         final_h: usize,
         dst_stride: usize,
     ) -> Result<ImageInfo, DecodeErr> {
-        let fd = self.device.fd();
         let is_dst_dma = {
             let s = self
                 .stream
@@ -893,19 +939,9 @@ impl V4l2Context {
             // image (Y, then CbCr for NV12) is one contiguous plane at offset
             // 0; layout matches because dims are MCU-aligned and the CAPTURE
             // stride was forced to the tensor pitch.
-            let dmabuf_fd = dst
-                .dmabuf()
-                .map_err(|e| DecodeErr::Fatal(e.into()))?
-                .as_raw_fd();
             let capacity = dst.capacity_bytes();
-            qbuf_capture_dmabuf(fd, dmabuf_fd, capacity)
-                .map_err(|e| DecodeErr::Reset(format!("QBUF CAPTURE (dmabuf): {e}")))?;
-            if !poll_ready(fd, PollFlags::POLLIN, DECODE_TIMEOUT_MS) {
-                return Err(DecodeErr::Reset("CAPTURE decode timeout".into()));
-            }
-            dqbuf_capture(fd)
-                .map_err(|e| DecodeErr::Reset(format!("DQBUF CAPTURE (dmabuf): {e}")))?;
-            dqbuf_output(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF OUTPUT: {e}")))?;
+            let dmabuf = dst.dmabuf().map_err(|e| DecodeErr::Fatal(e.into()))?;
+            self.decode_into(dmabuf, capacity, "dmabuf")?;
             // Decoded pixels are in the tensor's DMA buffer; the consumer's
             // `Tensor::map()` issues the cache sync on read.
             // DstDma only fires when output_fmt is Nv12|Grey (want_zc check),
@@ -923,25 +959,14 @@ impl V4l2Context {
         // Persistent-scratch: the hardware decodes into the codec-owned DMA
         // buffer (single plane; QBUF length may exceed the format's
         // sizeimage — the import is by capacity), then planes copy out.
-        let (scratch_fd, capacity) = {
+        {
             let t = self
                 .scratch
                 .as_ref()
                 .ok_or_else(|| DecodeErr::Reset("capture scratch missing".into()))?;
-            (
-                t.dmabuf()
-                    .map_err(|e| DecodeErr::Fatal(e.into()))?
-                    .as_raw_fd(),
-                t.capacity_bytes(),
-            )
-        };
-        qbuf_capture_dmabuf(fd, scratch_fd, capacity)
-            .map_err(|e| DecodeErr::Reset(format!("QBUF CAPTURE (scratch): {e}")))?;
-        if !poll_ready(fd, PollFlags::POLLIN, DECODE_TIMEOUT_MS) {
-            return Err(DecodeErr::Reset("CAPTURE decode timeout".into()));
+            let dmabuf = t.dmabuf().map_err(|e| DecodeErr::Fatal(e.into()))?;
+            self.decode_into(dmabuf, t.capacity_bytes(), "scratch")?;
         }
-        dqbuf_capture(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF CAPTURE (scratch): {e}")))?;
-        dqbuf_output(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF OUTPUT: {e}")))?;
 
         let stream = self
             .stream
@@ -968,28 +993,21 @@ impl V4l2Context {
     /// Stop both queues and release their buffer pools, dropping the stream.
     /// The CAPTURE scratch is *kept* — it is plain memory, not driver state,
     /// and survives resets so recovery never re-pays the DMA allocation.
-    /// Best-effort: errors are ignored (this is also the failure-recovery path).
+    /// Also cleans up queues a failed rebuild left active before it created
+    /// the stream. Best-effort: errors are ignored (this is also the
+    /// failure-recovery path).
     fn drop_stream(&mut self) {
-        let Some(stream) = self.stream.take() else {
+        let stream = self.stream.take();
+        let active = |q: &Queue| q.is_streaming() || !q.is_empty();
+        if stream.is_none() && !active(self.m2m.output()) && !active(self.m2m.capture()) {
             return;
-        };
-        let fd = self.device.fd();
-        let _ = streamoff(fd, uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-        let _ = streamoff(fd, uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+        }
+        // STREAMOFF capture, then output.
+        let _ = self.m2m.stream_off();
         // Drop the OUTPUT mapping (munmap) before REQBUFS 0 frees its buffer.
         drop(stream);
-        let _ = reqbufs(
-            fd,
-            uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-            0,
-            uapi::V4L2_MEMORY_DMABUF,
-        );
-        let _ = reqbufs(
-            fd,
-            uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-            0,
-            uapi::V4L2_MEMORY_MMAP,
-        );
+        let _ = self.m2m.capture_mut().free();
+        let _ = self.m2m.output_mut().free();
     }
 
     /// Record a hardware failure and reset the device for the next attempt.
@@ -1324,155 +1342,13 @@ fn colorimetry_ok(colorspace: u32, ycbcr_enc: u8, quantization: u8) -> bool {
     enc_ok && quant_ok
 }
 
-// --- thin ioctl helpers -----------------------------------------------------
-
-fn borrow(fd: RawFd) -> BorrowedFd<'static> {
-    // SAFETY: callers hold the owning File alive for the duration of use.
-    unsafe { BorrowedFd::borrow_raw(fd) }
-}
-
-fn reqbufs(fd: RawFd, buf_type: u32, count: u32, memory: u32) -> nix::Result<()> {
-    let mut rb = uapi::v4l2_requestbuffers {
-        count,
-        type_: buf_type,
-        memory,
-        ..Default::default()
-    };
-    // SAFETY: valid requestbuffers struct.
-    unsafe { ioctl::vidioc_reqbufs(fd, &mut rb) }.map(|_| ())
-}
-
-fn streamon(fd: RawFd, buf_type: u32) -> nix::Result<()> {
-    let t: c_int = buf_type as c_int;
-    // SAFETY: pointer to a valid c_int buffer type.
-    unsafe { ioctl::vidioc_streamon(fd, &t) }.map(|_| ())
-}
-
-fn streamoff(fd: RawFd, buf_type: u32) -> nix::Result<()> {
-    let t: c_int = buf_type as c_int;
-    // SAFETY: pointer to a valid c_int buffer type.
-    unsafe { ioctl::vidioc_streamoff(fd, &t) }.map(|_| ())
-}
-
-/// `VIDIOC_QUERYBUF` for index 0; returns plane 0's `(length, mem_offset)`.
-fn querybuf(fd: RawFd, buf_type: u32, num_planes: usize) -> nix::Result<(usize, i64)> {
-    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-    let mut b = uapi::v4l2_buffer {
-        type_: buf_type,
-        memory: uapi::V4L2_MEMORY_MMAP,
-        index: 0,
-        length: num_planes as u32,
-        ..Default::default()
-    };
-    b.set_planes(planes.as_mut_ptr());
-    // SAFETY: valid buffer + plane array for QUERYBUF.
-    unsafe { ioctl::vidioc_querybuf(fd, &mut b) }?;
-    Ok((planes[0].length as usize, planes[0].mem_offset() as i64))
-}
-
-/// `VIDIOC_QBUF` the OUTPUT (coded) buffer with `bytesused` JPEG bytes.
-fn qbuf_output(fd: RawFd, bytesused: usize) -> nix::Result<()> {
-    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-    planes[0].bytesused = bytesused as u32;
-    let mut b = uapi::v4l2_buffer {
-        type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-        memory: uapi::V4L2_MEMORY_MMAP,
-        index: 0,
-        length: 1,
-        ..Default::default()
-    };
-    b.set_planes(planes.as_mut_ptr());
-    // SAFETY: valid buffer referencing the local plane array.
-    unsafe { ioctl::vidioc_qbuf(fd, &mut b) }.map(|_| ())
-}
-
-/// `VIDIOC_DQBUF` the consumed OUTPUT buffer to recycle it.
-fn dqbuf_output(fd: RawFd) -> nix::Result<()> {
-    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-    let mut b = uapi::v4l2_buffer {
-        type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-        memory: uapi::V4L2_MEMORY_MMAP,
-        length: 1,
-        ..Default::default()
-    };
-    b.set_planes(planes.as_mut_ptr());
-    // SAFETY: valid buffer + plane array for DQBUF.
-    unsafe { ioctl::vidioc_dqbuf(fd, &mut b) }.map(|_| ())
-}
-
-/// `VIDIOC_QBUF` the single-plane CAPTURE queue in DMABUF mode, importing
-/// `dmabuf_fd` as the backing; `length` is the dmabuf size (may exceed the
-/// format's `sizeimage`). The hardware decodes straight into the import.
-fn qbuf_capture_dmabuf(fd: RawFd, dmabuf_fd: RawFd, length: usize) -> nix::Result<()> {
-    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-    planes[0].set_fd(dmabuf_fd);
-    planes[0].length = length as u32;
-    let mut b = uapi::v4l2_buffer {
-        type_: uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-        memory: uapi::V4L2_MEMORY_DMABUF,
-        index: 0,
-        length: 1,
-        ..Default::default()
-    };
-    b.set_planes(planes.as_mut_ptr());
-    // SAFETY: valid buffer + plane array; `dmabuf_fd` outlives the call.
-    unsafe { ioctl::vidioc_qbuf(fd, &mut b) }.map(|_| ())
-}
-
-/// `VIDIOC_DQBUF` the decoded single-plane DMABUF CAPTURE buffer.
-fn dqbuf_capture(fd: RawFd) -> nix::Result<()> {
-    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-    let mut b = uapi::v4l2_buffer {
-        type_: uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-        memory: uapi::V4L2_MEMORY_DMABUF,
-        length: 1,
-        ..Default::default()
-    };
-    b.set_planes(planes.as_mut_ptr());
-    // SAFETY: valid buffer + plane array for DQBUF.
-    unsafe { ioctl::vidioc_dqbuf(fd, &mut b) }.map(|_| ())
-}
-
-/// Drain pending events after `SOURCE_CHANGE`, bounded to avoid the
-/// driver-re-returns-the-same-event hang.
-///
-/// The device fd is opened blocking (no `O_NONBLOCK`), and on the i.MX95
-/// `mxc-jpeg` driver `VIDIOC_DQEVENT` *blocks* when no event is pending instead
-/// of returning `EINVAL`. So whenever the best-effort `SOURCE_CHANGE` poll above
-/// times out — no event arrived in the window — an unconditional dequeue wedges
-/// the process, and the device, forever. (The driver itself decodes fine; this
-/// is purely an event-dequeue protocol hazard.) Gate every dequeue on a
-/// zero-timeout poll: no `POLLPRI` ⇒ no pending event ⇒ stop instead of block.
-fn drain_events(fd: RawFd) {
-    for _ in 0..MAX_EVENTS {
-        if !poll_ready(fd, PollFlags::POLLPRI, 0) {
-            break;
-        }
-        let mut ev = uapi::v4l2_event::default();
-        // SAFETY: valid event struct; best-effort, errors end the drain.
-        if unsafe { ioctl::vidioc_dqevent(fd, &mut ev) }.is_err() {
-            break;
-        }
-        if ev.pending == 0 {
-            break;
-        }
+/// Waits up to `timeout` for a finished buffer on `queue` and dequeues it;
+/// `None` on timeout.
+fn dequeue_within(queue: &Queue, timeout: Duration) -> edgefirst_v4l2::Result<Option<Dequeued>> {
+    if !queue.wait(Some(timeout))? {
+        return Ok(None);
     }
-}
-
-/// Poll a single fd for `flags`, returning whether the event fired before the
-/// timeout. Used best-effort for the source-change event and to wait for the
-/// decode to complete.
-fn poll_ready(fd: RawFd, flags: PollFlags, ms: i32) -> bool {
-    let bfd = borrow(fd);
-    let mut pfd = [PollFd::new(bfd, flags)];
-    let timeout = PollTimeout::try_from(ms).unwrap_or(PollTimeout::ZERO);
-    match poll(&mut pfd, timeout) {
-        Ok(n) if n > 0 => pfd[0]
-            .revents()
-            .map(|r| r.intersects(flags))
-            .unwrap_or(false),
-        _ => false,
-    }
+    queue.dequeue()
 }
 
 #[cfg(test)]
@@ -1698,7 +1574,6 @@ mod tests {
     #[ignore = "on-target hardware probe; run with --ignored --nocapture on a JPEG M2M device"]
     fn probe_dmabuf_reconfigure() {
         use std::time::Instant;
-        const OUT: u32 = uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         let Some(dev) = device::probe() else {
@@ -1731,20 +1606,15 @@ mod tests {
                 return;
             }
         };
-        let scratch_fd = scratch.dmabuf().unwrap().as_raw_fd();
+        let scratch_fd = scratch.dmabuf().unwrap();
         let scratch_cap = scratch.capacity_bytes();
 
-        let fd = dev.fd();
-        let sub = uapi::v4l2_event_subscription {
-            type_: uapi::V4L2_EVENT_SOURCE_CHANGE,
-            ..Default::default()
-        };
-        // SAFETY: valid subscription struct.
-        unsafe { ioctl::vidioc_subscribe_event(fd, &sub) }.expect("SUBSCRIBE_EVENT");
+        let mut m2m = M2m::new(&dev.dev, true).expect("queues");
+        events::subscribe(&dev.dev, uapi::V4L2_EVENT_SOURCE_CHANGE, 0, 0).expect("SUBSCRIBE_EVENT");
 
         // OUTPUT: one persistent 2 MiB coded buffer, set up once, streamed once.
         let mut ofmt = uapi::v4l2_format {
-            type_: OUT,
+            type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
             ..Default::default()
         };
         // SAFETY: type_ selects the multi-planar variant.
@@ -1757,32 +1627,41 @@ mod tests {
             p.num_planes = 1;
             p.plane_fmt[0].sizeimage = 2 * 1024 * 1024;
         }
-        // SAFETY: valid v4l2_format.
-        unsafe { ioctl::vidioc_s_fmt(fd, &mut ofmt) }.expect("S_FMT OUTPUT");
-        reqbufs(fd, OUT, 1, uapi::V4L2_MEMORY_MMAP).expect("REQBUFS OUTPUT");
-        let (olen, ooff) = querybuf(fd, OUT, 1).expect("QUERYBUF OUTPUT");
-        let mut out_map = Mmap::new(borrow(fd), olen, ooff).expect("mmap OUTPUT");
-        streamon(fd, OUT).expect("STREAMON OUTPUT");
+        dev.dev.set_format(&mut ofmt).expect("S_FMT OUTPUT");
+        m2m.output_mut()
+            .request(Memory::Mmap, 1)
+            .expect("REQBUFS OUTPUT");
+        let out_map = m2m.output().map(0).expect("mmap OUTPUT").remove(0);
+        m2m.output().stream_on().expect("STREAMON OUTPUT");
 
-        let mut cap_live = false;
         for round in 0..10 {
             for (name, jpeg) in [("zidane 1280x720", &jpeg_a), ("giraffe 640x640", &jpeg_b)] {
                 let t0 = Instant::now();
-                if cap_live {
-                    streamoff(fd, CAP).expect("STREAMOFF CAPTURE");
-                    reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF).expect("REQBUFS CAPTURE 0");
+                if m2m.capture().is_streaming() {
+                    m2m.capture_mut()
+                        .free()
+                        .expect("STREAMOFF + REQBUFS CAPTURE 0");
                 }
-                out_map.as_mut_slice()[..jpeg.len()].copy_from_slice(jpeg);
-                qbuf_output(fd, jpeg.len()).expect("QBUF OUTPUT");
-                poll_ready(fd, PollFlags::POLLPRI, SOURCE_CHANGE_TIMEOUT_MS);
-                drain_events(fd);
+                // SAFETY: the OUTPUT buffer was dequeued at the end of the
+                // previous round (or never queued), so the driver is not using it.
+                let coded = unsafe { out_map.as_mut_slice() };
+                coded[..jpeg.len()].copy_from_slice(jpeg);
+                m2m.output()
+                    .enqueue(
+                        0,
+                        &[Plane::Mmap {
+                            bytesused: jpeg.len() as u32,
+                        }],
+                        None,
+                    )
+                    .expect("QBUF OUTPUT");
+                let _ = events::wait(&dev.dev, Some(SOURCE_CHANGE_TIMEOUT));
+                let _ = events::drain(&dev.dev, MAX_EVENTS);
 
-                let mut gfmt = uapi::v4l2_format {
-                    type_: CAP,
-                    ..Default::default()
-                };
-                // SAFETY: valid v4l2_format for G_FMT.
-                unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }.expect("G_FMT CAPTURE");
+                let mut gfmt = dev
+                    .dev
+                    .format(BufType::VideoCaptureMplane)
+                    .expect("G_FMT CAPTURE");
                 // SAFETY: mplane variant.
                 let got = *unsafe { gfmt.pix_mp() };
                 let t_gfmt = t0.elapsed();
@@ -1802,14 +1681,11 @@ mod tests {
                     p.colorspace = got.colorspace;
                     p.num_planes = 1;
                 }
-                // SAFETY: valid v4l2_format.
-                let sfmt_res = unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) };
-                let mut gfmt2 = uapi::v4l2_format {
-                    type_: CAP,
-                    ..Default::default()
-                };
-                // SAFETY: valid v4l2_format for G_FMT.
-                unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt2) }.expect("G_FMT CAPTURE (post S_FMT)");
+                let sfmt_res = dev.dev.set_format(&mut sfmt);
+                let mut gfmt2 = dev
+                    .dev
+                    .format(BufType::VideoCaptureMplane)
+                    .expect("G_FMT CAPTURE (post S_FMT)");
                 // SAFETY: mplane variant.
                 let cap_fmt = *unsafe { gfmt2.pix_mp() };
                 assert_eq!(
@@ -1824,23 +1700,35 @@ mod tests {
 
                 // Question 1: REQBUFS(DMABUF) cost in isolation.
                 let t1 = Instant::now();
-                reqbufs(fd, CAP, 1, uapi::V4L2_MEMORY_DMABUF).expect("REQBUFS CAPTURE dmabuf");
+                m2m.capture_mut()
+                    .request(Memory::DmaBuf, 1)
+                    .expect("REQBUFS CAPTURE dmabuf");
                 let t_reqbufs = t1.elapsed();
-                streamon(fd, CAP).expect("STREAMON CAPTURE");
-                cap_live = true;
+                m2m.capture().stream_on().expect("STREAMON CAPTURE");
 
                 // Question 3: plane.length = 4 MiB scratch capacity > sizeimage.
-                qbuf_capture_dmabuf(fd, scratch_fd, scratch_cap).expect("QBUF CAPTURE dmabuf");
-                assert!(
-                    poll_ready(fd, PollFlags::POLLIN, DECODE_TIMEOUT_MS),
-                    "decode timeout"
-                );
-                dqbuf_capture(fd).expect("DQBUF CAPTURE");
-                dqbuf_output(fd).expect("DQBUF OUTPUT");
+                m2m.capture()
+                    .enqueue(
+                        0,
+                        &[Plane::DmaBuf {
+                            fd: scratch_fd,
+                            length: scratch_cap as u32,
+                            bytesused: 0,
+                            data_offset: 0,
+                        }],
+                        None,
+                    )
+                    .expect("QBUF CAPTURE dmabuf");
+                dequeue_within(m2m.capture(), DECODE_TIMEOUT)
+                    .expect("DQBUF CAPTURE")
+                    .expect("decode timeout");
+                dequeue_within(m2m.output(), DECODE_TIMEOUT)
+                    .expect("DQBUF OUTPUT")
+                    .expect("OUTPUT not returned");
                 let total = t0.elapsed();
 
                 let sfmt_str = match &sfmt_res {
-                    Ok(_) => "ok".to_string(),
+                    Ok(()) => "ok".to_string(),
                     Err(e) => format!("ERR({e})"),
                 };
                 eprintln!(
@@ -1854,83 +1742,10 @@ mod tests {
             }
         }
 
-        let _ = streamoff(fd, CAP);
-        let _ = streamoff(fd, OUT);
-        let _ = reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF);
-        let _ = reqbufs(fd, OUT, 0, uapi::V4L2_MEMORY_MMAP);
-    }
-
-    // --- raw-throughput probe helpers (index-aware variants of the thin
-    // ioctl wrappers, which all hardcode buffer index 0) ------------------
-
-    fn reqbufs_n(fd: RawFd, buf_type: u32, count: u32, memory: u32) -> nix::Result<u32> {
-        let mut rb = uapi::v4l2_requestbuffers {
-            count,
-            type_: buf_type,
-            memory,
-            ..Default::default()
-        };
-        // SAFETY: valid requestbuffers struct.
-        unsafe { ioctl::vidioc_reqbufs(fd, &mut rb) }.map(|_| rb.count)
-    }
-
-    fn querybuf_idx(fd: RawFd, buf_type: u32, index: u32) -> nix::Result<(usize, i64)> {
-        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-        let mut b = uapi::v4l2_buffer {
-            type_: buf_type,
-            memory: uapi::V4L2_MEMORY_MMAP,
-            index,
-            length: 1,
-            ..Default::default()
-        };
-        b.set_planes(planes.as_mut_ptr());
-        // SAFETY: valid buffer + plane array for QUERYBUF.
-        unsafe { ioctl::vidioc_querybuf(fd, &mut b) }?;
-        Ok((planes[0].length as usize, planes[0].mem_offset() as i64))
-    }
-
-    fn qbuf_out_idx(fd: RawFd, index: u32, bytesused: usize) -> nix::Result<()> {
-        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-        planes[0].bytesused = bytesused as u32;
-        let mut b = uapi::v4l2_buffer {
-            type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-            memory: uapi::V4L2_MEMORY_MMAP,
-            index,
-            length: 1,
-            ..Default::default()
-        };
-        b.set_planes(planes.as_mut_ptr());
-        // SAFETY: valid buffer + plane array for QBUF.
-        unsafe { ioctl::vidioc_qbuf(fd, &mut b) }.map(|_| ())
-    }
-
-    fn qbuf_cap_fd_idx(fd: RawFd, index: u32, dmabuf_fd: RawFd, len: usize) -> nix::Result<()> {
-        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-        planes[0].set_fd(dmabuf_fd);
-        planes[0].length = len as u32;
-        let mut b = uapi::v4l2_buffer {
-            type_: uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-            memory: uapi::V4L2_MEMORY_DMABUF,
-            index,
-            length: 1,
-            ..Default::default()
-        };
-        b.set_planes(planes.as_mut_ptr());
-        // SAFETY: valid buffer + plane array for QBUF.
-        unsafe { ioctl::vidioc_qbuf(fd, &mut b) }.map(|_| ())
-    }
-
-    fn dqbuf_idx(fd: RawFd, buf_type: u32, memory: u32) -> nix::Result<u32> {
-        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
-        let mut b = uapi::v4l2_buffer {
-            type_: buf_type,
-            memory,
-            length: 1,
-            ..Default::default()
-        };
-        b.set_planes(planes.as_mut_ptr());
-        // SAFETY: valid buffer + plane array for DQBUF.
-        unsafe { ioctl::vidioc_dqbuf(fd, &mut b) }.map(|_| b.index)
+        let _ = m2m.stream_off();
+        drop(out_map);
+        let _ = m2m.capture_mut().free();
+        let _ = m2m.output_mut().free();
     }
 
     /// Drive one M2M context at the given queue depth on a fixed JPEG and
@@ -1939,20 +1754,14 @@ mod tests {
     /// measures the pure driver + hardware pipeline rate.
     fn run_throughput(dev: &ProbedDevice, jpeg: &[u8], depth: u32, frames: usize) -> Option<f64> {
         use std::time::Instant;
-        const OUT: u32 = uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        let fd = dev.fd();
 
-        let sub = uapi::v4l2_event_subscription {
-            type_: uapi::V4L2_EVENT_SOURCE_CHANGE,
-            ..Default::default()
-        };
-        // SAFETY: valid subscription struct.
-        unsafe { ioctl::vidioc_subscribe_event(fd, &sub) }.ok()?;
+        let mut m2m = M2m::new(&dev.dev, true).ok()?;
+        events::subscribe(&dev.dev, uapi::V4L2_EVENT_SOURCE_CHANGE, 0, 0).ok()?;
 
         // OUTPUT: depth buffers, all prefilled with the same JPEG.
         let mut ofmt = uapi::v4l2_format {
-            type_: OUT,
+            type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
             ..Default::default()
         };
         // SAFETY: mplane variant.
@@ -1965,31 +1774,29 @@ mod tests {
             p.num_planes = 1;
             p.plane_fmt[0].sizeimage = ((jpeg.len() + 4095) & !4095) as u32;
         }
-        // SAFETY: valid v4l2_format.
-        unsafe { ioctl::vidioc_s_fmt(fd, &mut ofmt) }.ok()?;
-        let got_out = reqbufs_n(fd, OUT, depth, uapi::V4L2_MEMORY_MMAP).ok()?;
+        dev.dev.set_format(&mut ofmt).ok()?;
+        let got_out = m2m.output_mut().request(Memory::Mmap, depth).ok()?;
         if got_out < depth {
             eprintln!("  driver clamped OUTPUT buffers: {depth} -> {got_out}");
         }
         let mut out_maps = Vec::new();
         for i in 0..got_out {
-            let (len, off) = querybuf_idx(fd, OUT, i).ok()?;
-            let mut m = Mmap::new(borrow(fd), len, off).ok()?;
-            m.as_mut_slice()[..jpeg.len()].copy_from_slice(jpeg);
+            let m = m2m.output().map(i).ok()?.remove(0);
+            // SAFETY: the buffer was just allocated and is not queued.
+            let staging = unsafe { m.as_mut_slice() };
+            staging[..jpeg.len()].copy_from_slice(jpeg);
             out_maps.push(m);
         }
-        streamon(fd, OUT).ok()?;
-        qbuf_out_idx(fd, 0, jpeg.len()).ok()?;
-        poll_ready(fd, PollFlags::POLLPRI, SOURCE_CHANGE_TIMEOUT_MS);
-        drain_events(fd);
+        let coded = [Plane::Mmap {
+            bytesused: jpeg.len() as u32,
+        }];
+        m2m.output().stream_on().ok()?;
+        m2m.output().enqueue(0, &coded, None).ok()?;
+        let _ = events::wait(&dev.dev, Some(SOURCE_CHANGE_TIMEOUT));
+        let _ = events::drain(&dev.dev, MAX_EVENTS);
 
         // CAPTURE: single-plane NV12, depth scratch dmabufs.
-        let mut gfmt = uapi::v4l2_format {
-            type_: CAP,
-            ..Default::default()
-        };
-        // SAFETY: valid v4l2_format for G_FMT.
-        unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }.ok()?;
+        let mut gfmt = dev.dev.format(BufType::VideoCaptureMplane).ok()?;
         // SAFETY: mplane variant.
         let got = *unsafe { gfmt.pix_mp() };
         let mut sfmt = uapi::v4l2_format {
@@ -2006,10 +1813,8 @@ mod tests {
             p.colorspace = got.colorspace;
             p.num_planes = 1;
         }
-        // SAFETY: valid v4l2_format.
-        unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) }.ok()?;
-        // SAFETY: valid v4l2_format for G_FMT.
-        unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }.ok()?;
+        dev.dev.set_format(&mut sfmt).ok()?;
+        let mut gfmt = dev.dev.format(BufType::VideoCaptureMplane).ok()?;
         // SAFETY: mplane variant.
         let cap_fmt = *unsafe { gfmt.pix_mp() };
         if cap_fmt.num_planes != 1 {
@@ -2031,30 +1836,32 @@ mod tests {
             .ok()?;
             scratches.push(t);
         }
-        let scratch_fds: Vec<RawFd> = scratches
-            .iter()
-            .map(|t| t.dmabuf().unwrap().as_raw_fd())
-            .collect();
-
-        let got_cap = reqbufs_n(fd, CAP, depth, uapi::V4L2_MEMORY_DMABUF).ok()?;
+        let got_cap = m2m.capture_mut().request(Memory::DmaBuf, depth).ok()?;
         if got_cap < depth {
             eprintln!("  driver clamped CAPTURE buffers: {depth} -> {got_cap}");
         }
-        streamon(fd, CAP).ok()?;
+        m2m.capture().stream_on().ok()?;
+        let queue_capture = |i: u32| {
+            let t = &scratches[i as usize];
+            m2m.capture().enqueue(
+                i,
+                &[Plane::DmaBuf {
+                    fd: t.dmabuf().unwrap(),
+                    length: t.capacity_bytes() as u32,
+                    bytesused: 0,
+                    data_offset: 0,
+                }],
+                None,
+            )
+        };
 
         // Fill both queues to the working depth.
         let live = depth.min(got_out).min(got_cap);
         for i in 0..live {
-            qbuf_cap_fd_idx(
-                fd,
-                i,
-                scratch_fds[i as usize],
-                scratches[i as usize].capacity_bytes(),
-            )
-            .ok()?;
+            queue_capture(i).ok()?;
         }
         for i in 1..live {
-            qbuf_out_idx(fd, i, jpeg.len()).ok()?;
+            m2m.output().enqueue(i, &coded, None).ok()?;
         }
 
         // Warmup, then measure: each completion immediately requeues the same
@@ -2065,27 +1872,20 @@ mod tests {
             if n == warmup {
                 t0 = Instant::now();
             }
-            if !poll_ready(fd, PollFlags::POLLIN, DECODE_TIMEOUT_MS) {
+            let Some(c) = dequeue_within(m2m.capture(), DECODE_TIMEOUT).ok()? else {
                 eprintln!("  decode timeout at frame {n}");
                 return None;
-            }
-            let ci = dqbuf_idx(fd, CAP, uapi::V4L2_MEMORY_DMABUF).ok()?;
-            let oi = dqbuf_idx(fd, OUT, uapi::V4L2_MEMORY_MMAP).ok()?;
-            qbuf_out_idx(fd, oi, jpeg.len()).ok()?;
-            qbuf_cap_fd_idx(
-                fd,
-                ci,
-                scratch_fds[ci as usize],
-                scratches[ci as usize].capacity_bytes(),
-            )
-            .ok()?;
+            };
+            let o = dequeue_within(m2m.output(), DECODE_TIMEOUT).ok()??;
+            m2m.output().enqueue(o.index, &coded, None).ok()?;
+            queue_capture(c.index).ok()?;
         }
         let fps = frames as f64 / t0.elapsed().as_secs_f64();
 
-        let _ = streamoff(fd, CAP);
-        let _ = streamoff(fd, OUT);
-        let _ = reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF);
-        let _ = reqbufs(fd, OUT, 0, uapi::V4L2_MEMORY_MMAP);
+        let _ = m2m.stream_off();
+        drop(out_maps);
+        let _ = m2m.capture_mut().free();
+        let _ = m2m.output_mut().free();
         Some(fps)
     }
 

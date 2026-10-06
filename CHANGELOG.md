@@ -9,7 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`edgefirst-codec` uses `edgefirst-v4l2` for V4L2.** The V4L2 JPEG backend takes its UAPI structs, constants and ioctl wrappers from the shared `edgefirst-v4l2` 0.1.0 crate instead of a private copy. No behaviour change.
+- **`edgefirst-codec` uses `edgefirst-v4l2` for V4L2.** The V4L2 JPEG backend uses the shared `edgefirst-v4l2` crate for device discovery, its buffer queues, events and UAPI definitions. Its private copies of these are gone, and `edgefirst-codec` no longer depends on `nix` or `libc` directly. Decoding is unchanged.
+  - The decoder opens the device non-blocking.
+  - It refuses to stage a JPEG into an OUTPUT buffer the driver still holds.
+  - After a failed setup it also releases queues it had started, so the next decode starts clean instead of failing until the circuit breaker trips.
 
 ## [0.33.0] - 2026-09-30
 

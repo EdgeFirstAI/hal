@@ -105,11 +105,10 @@ reconfigures the destination to `Rgb` itself.
 | Module        | Purpose                                                |
 |---------------|--------------------------------------------------------|
 | `mod.rs`      | `V4l2Probe` lifecycle, persistent streaming session, `try_decode()` orchestration, DMABUF capture targets (zero-copy + scratch), JPEG metadata stripping, NEON YUV24→NV24 deinterleave |
-| `device.rs`   | Capability-based probe: env overrides, enumerate `/dev/video*`, `QUERYCAP` + `ENUM_FMT` (require JPEG on OUTPUT) |
-| `buffers.rs`  | RAII `Mmap` wrapper for the persistent OUTPUT (coded) buffer |
+| `device.rs`   | Capability-based probe: env overrides, streaming M2M nodes from `/dev/video*`, JPEG on the OUTPUT queue |
 | `format.rs`   | `classify()` the driver-chosen CAPTURE FourCC → `CapKind` (`Nv12` / `Grey` / 4:4:4-packed) |
 
-The UAPI structs, constants and ioctl wrappers come from the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v4l2-rs) crate (`uapi` and `ioctl` modules), shared with the EdgeFirst camera SDK.
+V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v4l2-rs) crate, shared with the EdgeFirst camera SDK: `device` for discovery and formats, `m2m` for the OUTPUT and CAPTURE queues (allocation, the mapped OUTPUT buffer, DMABUF import, waits), `events` for the source-change wait and drain, and `uapi` for the format structs. The crate's queues track which buffers the driver holds, so the decoder refuses to stage a JPEG into an OUTPUT buffer that is still queued.
 
 ## Key Design Decisions
 
@@ -552,9 +551,10 @@ hardcoded.
 
 1. Honours `EDGEFIRST_DISABLE_V4L2=1` (skip → CPU) and
    `EDGEFIRST_CODEC_V4L2_DEVICE=<path>` (probe only that node); otherwise
-   enumerates `/dev/video*`.
-2. `VIDIOC_QUERYCAP` requires `V4L2_CAP_STREAMING` and a multi-planar M2M
-   capability. (Single-planar-only M2M devices currently fall back to CPU.)
+   enumerates `/dev/video*` in numeric order and keeps the streaming M2M nodes.
+2. `VIDIOC_QUERYCAP` (honouring `V4L2_CAP_DEVICE_CAPS`) requires
+   `V4L2_CAP_STREAMING` and an M2M capability; the node is opened
+   non-blocking. (Single-planar-only M2M devices currently fall back to CPU.)
 3. `VIDIOC_ENUM_FMT` on the OUTPUT (coded) queue must advertise
    `V4L2_PIX_FMT_JPEG` — this, not the device name, is the "is this a JPEG
    decoder" test. Nodes without JPEG are skipped (so camera, HEVC/H264, and
