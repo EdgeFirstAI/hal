@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-10-06
+
+### Fixed
+
+- **GL conversion from NV12, NV16 and NV24 used nearest-neighbour sampling when it resized.** The in-shader YUV path read one source texel per output pixel. It is the default on NVIDIA, Mali, V3D, Tegra and Adreno, and Vivante takes it in `ColorimetryMode::Exact`. Letterbox, upscale and downscale converts therefore came out aliased: on VisDrone, YOLOv8n scored 0.012–0.026 mAP50-95 below the CPU backend. These converts now resample bilinearly with half-pixel centres, which matches OpenCV `INTER_LINEAR`. Converts that do not resize are unchanged.
+
 ## [0.33.0] - 2026-09-30
 
 ### Added

@@ -8713,6 +8713,152 @@ mod gl_tests {
         compare_images(&cpu_dst, &dst, 0.95, "nv12_to_planar_rgb_shader");
     }
 
+    /// `ShaderR8` must resample bilinearly when the convert rescales. The 1:1
+    /// parity tests above cannot tell nearest from bilinear (both read the
+    /// texel centre exactly), so this resizes a detailed NV12 frame up and down
+    /// and checks the result against OpenCV `INTER_LINEAR` (2×2 taps, half-pixel
+    /// centres, clamped edges) applied to the CPU backend's native-resolution
+    /// RGB. A letterboxed upscale is also checked against the CPU backend
+    /// itself, which agrees with `INTER_LINEAR` when enlarging.
+    ///
+    /// On this pattern nearest-neighbour sampling is 16-24 grey levels from
+    /// `INTER_LINEAR` and bilinear is under 0.8 on NVIDIA, Mali, Adreno, Tegra
+    /// and V3D. Vivante GC7000UL reaches 1.7: its interpolated coordinates are
+    /// less precise, which the pattern's steep slopes amplify (0.5 on natural
+    /// content). `MAX_MEAN_ERROR` sits between the two.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_shader_rescale_is_bilinear() {
+        const MAX_MEAN_ERROR: f64 = 3.0;
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = match GLProcessorST::new(None, None) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        // Exact keeps Vivante on ShaderR8 instead of the driver sampler.
+        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
+        // Luma and chroma with periods of a few pixels (dense small objects),
+        // where nearest and bilinear resampling differ by ~15 grey levels.
+        let (sw, sh) = (1280usize, 720usize);
+        let mut nv12 = Vec::with_capacity(sw * sh * 3 / 2);
+        for y in 0..sh {
+            for x in 0..sw {
+                let v = 128.0 + 100.0 * (x as f32 * 0.9).sin() * (y as f32 * 0.7).cos();
+                nv12.push(v as u8);
+            }
+        }
+        for y in 0..sh / 2 {
+            for x in 0..sw / 2 {
+                nv12.push((128.0 + 60.0 * (x as f32 * 1.3).sin()) as u8);
+                nv12.push((128.0 + 60.0 * (y as f32 * 1.1).cos()) as u8);
+            }
+        }
+        let src =
+            load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
+
+        let image = |w: usize, h: usize, dtype: DType, mem: Option<TensorMemory>| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::PlanarRgb,
+                dtype,
+                mem,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let bytes = |t: &TensorDyn| -> Vec<u8> {
+            match t.dtype() {
+                DType::I8 => {
+                    let map = t.as_i8().unwrap().map().unwrap();
+                    map.as_slice().iter().map(|&v| v as u8 ^ 0x80).collect()
+                }
+                _ => t.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+            }
+        };
+        let mean_abs_diff = |a: &[u8], b: &[u8]| -> f64 {
+            assert_eq!(a.len(), b.len());
+            let sum: u64 = a.iter().zip(b).map(|(&x, &y)| x.abs_diff(y) as u64).sum();
+            sum as f64 / a.len() as f64
+        };
+
+        let mut native = image(sw, sh, DType::U8, None);
+        crate::cpu::CPUProcessor::new()
+            .convert(
+                &src,
+                &mut native,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        let native = bytes(&native);
+        let inter_linear = |dw: usize, dh: usize| -> Vec<u8> {
+            let (sx, sy) = (sw as f32 / dw as f32, sh as f32 / dh as f32);
+            let mut out = Vec::with_capacity(3 * dw * dh);
+            for plane in native.chunks_exact(sw * sh) {
+                let at = |x: isize, y: isize| {
+                    let x = x.clamp(0, sw as isize - 1) as usize;
+                    let y = y.clamp(0, sh as isize - 1) as usize;
+                    plane[y * sw + x] as f32
+                };
+                for dy in 0..dh {
+                    let py = (dy as f32 + 0.5) * sy - 0.5;
+                    let (y0, fy) = (py.floor() as isize, py - py.floor());
+                    for dx in 0..dw {
+                        let px = (dx as f32 + 0.5) * sx - 0.5;
+                        let (x0, fx) = (px.floor() as isize, px - px.floor());
+                        let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+                        let bot = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+                        out.push((top * (1.0 - fy) + bot * fy).round() as u8);
+                    }
+                }
+            }
+            out
+        };
+
+        for (dw, dh, dtype) in [
+            (1792usize, 1008usize, DType::U8),
+            (896, 504, DType::U8),
+            (640, 360, DType::U8),
+            (1792, 1008, DType::I8),
+        ] {
+            let mut gpu = image(dw, dh, dtype, Some(TensorMemory::Mem));
+            gl.convert(&src, &mut gpu, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            assert_eq!(gl.last_nv_convert_path, NvConvertPath::ShaderR8);
+            let mad = mean_abs_diff(&bytes(&gpu), &inter_linear(dw, dh));
+            assert!(
+                mad < MAX_MEAN_ERROR,
+                "{dw}x{dh} {dtype:?}: GL resize is {mad:.3} grey levels from INTER_LINEAR"
+            );
+        }
+
+        let crop = letterbox_crop(sw, sh, 1792, 1024);
+        let mut gpu = image(1792, 1024, DType::U8, Some(TensorMemory::Mem));
+        gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
+            .unwrap();
+        let mut cpu = image(1792, 1024, DType::U8, None);
+        crate::cpu::CPUProcessor::new()
+            .convert(&src, &mut cpu, Rotation::None, Flip::None, crop)
+            .unwrap();
+        let mad = mean_abs_diff(&bytes(&gpu), &bytes(&cpu));
+        assert!(
+            mad < MAX_MEAN_ERROR,
+            "letterbox upscale: GL is {mad:.3} grey levels from the CPU backend"
+        );
+    }
+
     /// Phase 4b coverage: NV16/NV24 (not just NV12) on a non-DMA (heap) source
     /// must also GPU-convert via the R8-upload `ShaderR8` path and match CPU ≤2.
     #[test]
