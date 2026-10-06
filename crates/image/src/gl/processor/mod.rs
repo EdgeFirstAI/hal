@@ -6798,7 +6798,7 @@ impl GLProcessorST {
         // with the width unchanged -- makes the shader address luma at
         // `y * tex_width + x + shift`, which wraps rows and so needs a
         // per-texel integer divide and modulo. That is exactly the
-        // arithmetic `nv_rgba_body_divfree` exists to avoid (3.3x on
+        // arithmetic the NV shader's divide-free addressing exists to avoid (3.3x on
         // Vivante), and it would also leave the last `shift` bytes of the
         // final chroma row outside the import, which for NV24 are pixels.
         // So the NV path keeps the decline and uploads the combined plane,
