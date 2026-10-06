@@ -4911,7 +4911,7 @@ impl GLProcessorST {
         }
 
         let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
+            RegionOfInterest::from_crop(&crop, src_w, src_h)
         } else {
             RegionOfInterest {
                 left: 0.,
@@ -5305,7 +5305,7 @@ impl GLProcessorST {
         );
 
         let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
+            RegionOfInterest::from_crop(&crop, src_w, src_h)
         } else {
             RegionOfInterest {
                 left: 0.,
@@ -5371,8 +5371,9 @@ impl GLProcessorST {
         // than the logical image, and may start it partway in. One cache
         // lookup feeds both the source rectangle and the sampling clamp.
         let src_map = self.cached_src_import_map(src, src_fmt);
+        let src_extent =
+            super::render::sample_clamp_rect_within((src_w, src_h), src_map, src_roi.uv_bounds());
         let src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), src_map);
-        let src_extent = super::render::sample_clamp_rect((src_w, src_h), src_map);
 
         self.draw_camera_texture_to_rgb_planar(
             src_key,
@@ -6170,11 +6171,16 @@ impl GLProcessorST {
         } else {
             super::render::ImportMap::WHOLE
         };
+        // The shader clamps every sample to the crop's (or else the logical
+        // image's) half-texel-inset rectangle on the texture, so an upscale's
+        // last row or column cannot blend the texel beyond the crop or a
+        // narrowed or shifted image.
+        let [u0, v0, u1, v1] = super::render::sample_clamp_rect_within(
+            (src_w, src_h),
+            import_map,
+            src_roi.uv_bounds(),
+        );
         src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), import_map);
-        // The shader clamps every sample to the logical image's
-        // half-texel-inset rectangle on the texture, so an upscale's last row
-        // or column cannot blend the texel beyond a narrowed or shifted image.
-        let [u0, v0, u1, v1] = super::render::sample_clamp_rect((src_w, src_h), import_map);
         let texture_format = match src_fmt {
             PixelFormat::Rgb => edgefirst_gl::gl::RGB,
             PixelFormat::Rgba => edgefirst_gl::gl::RGBA,
@@ -6423,20 +6429,23 @@ impl GLProcessorST {
     ) -> Result<(), Error> {
         let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
+        let crop_uv = src_roi.uv_bounds();
         // As in `draw_src_texture`: the import may cover more of the texture
         // than the logical image, and may start it partway in.
         let src_roi = self.scale_src_roi(src_roi, src, src_fmt);
         // The external-OES programs sample through the same mapping, so they
         // clamp through it too: a rebased source (issue #170) has real texels
         // in front of its first column and behind its last, and a LINEAR
-        // kernel at either edge would otherwise blend them.
+        // kernel at either edge would otherwise blend them, or the pixels
+        // beyond a source crop.
         let (src_w, src_h) = (
             src.width().ok_or(Error::NotAnImage)?,
             src.height().ok_or(Error::NotAnImage)?,
         );
-        let [e0, e1, e2, e3] = super::render::sample_clamp_rect(
+        let [e0, e1, e2, e3] = super::render::sample_clamp_rect_within(
             (src_w, src_h),
             self.cached_src_import_map(src, src_fmt),
+            crop_uv,
         );
         let extent_loc = self.external_src_extent_loc(is_int8, false);
 
