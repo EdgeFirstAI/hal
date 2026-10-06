@@ -1145,7 +1145,10 @@ that measured its own pool.
 The bound is **per `ImageProcessor`, times three caches** (source,
 destination, and the NV R8 source cache) — not per process and not per
 library. Two `ImageProcessor`s in one process have six independent
-caches and six independent capacities.
+caches and six independent capacities. A fourth cache, the chroma-plane
+views behind hardware-filtered NV resizes (`GlCacheStats::nv_uv`), shares
+the capacity but imports only buffers the NV R8 cache also holds, so it
+adds entries without pinning more memory.
 
 It is a buffer **count**, not a size, and because a retained import pins
 its buffer the memory it holds depends entirely on how big the caller's

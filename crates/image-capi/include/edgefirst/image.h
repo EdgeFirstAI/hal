@@ -349,7 +349,8 @@ int ef_image_processor_set_class_colors(ef_image_processor *p,
  * holds; the `EDGEFIRST_INTERPOLATION` environment variable (`nearest` |
  * `bilinear`) overrides it.
  *
- * @return 0 on success, `EINVAL` for a null processor or unknown mode.
+ * @return 0 on success, `EINVAL` for a null processor or unknown mode,
+ * `EIO` when a backend cannot apply the mode.
  *
  * # Safety
  * `p` must be a live processor.

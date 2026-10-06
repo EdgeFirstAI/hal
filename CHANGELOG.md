@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`Interpolation` control for `convert()`.** `ImageProcessorConfig::interpolation` takes `Interpolation::Bilinear` (default) or `Interpolation::Nearest`; `ImageProcessor::set_interpolation` changes it, and `EDGEFIRST_INTERPOLATION=nearest|bilinear` overrides both. It is also exposed in Python (`ImageProcessor(interpolation=...)`, `set_interpolation`) and the C API (`ef_image_processor_set_interpolation`). The CPU backend switches its resizer and the GL backend its source filtering. G2D's scaling filter is fixed, so under `Nearest` G2D declines converts that resize and leaves them to GL or the CPU backend. Converts that do not resize read each source pixel exactly in either mode.
+- **`Interpolation` control for `convert()`.** `ImageProcessorConfig::interpolation` takes `Interpolation::Bilinear` (default) or `Interpolation::Nearest`; `ImageProcessor::set_interpolation` changes it, and `EDGEFIRST_INTERPOLATION=nearest|bilinear` overrides both. It is also exposed in Python (`ImageProcessor(interpolation=...)`, `set_interpolation`) and the C API (`ef_image_processor_set_interpolation`). The CPU backend switches its resizer and the GL backend its source filtering. G2D's scaling filter is fixed, so under `Nearest` G2D declines converts that resize and leaves them to GL or the CPU backend. Converts that do not resize read each source pixel exactly in either mode. `GlCacheStats::nv_uv` reports the new cache of chroma-plane imports used by hardware-filtered NV resizes, and its totals include it.
 
 ### Changed
 

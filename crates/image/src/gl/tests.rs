@@ -454,9 +454,10 @@ mod gl_tests {
     }
 
     /// Steady-state import gate: an N-frame convert loop over a fixed pool of
-    /// DMA source buffers into one DMA destination must perform ZERO new
-    /// EGLImage imports after the pool has been seen once — every later
-    /// convert is a cache hit on all caches (src/dst/NV R8). The import
+    /// DMA source buffers into a same-size and a resized DMA destination must
+    /// perform ZERO new EGLImage imports after the pool has been seen once —
+    /// every later convert is a cache hit on all caches (src/dst/NV R8, and
+    /// the NV chroma view the bilinear resize binds). The import
     /// count, not latency, is the regression signal that pins EGLImage cache
     /// behavior across GL refactors: a refactor that re-imports per frame
     /// passes every pixel-equality test but fails this one.
@@ -501,19 +502,31 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
+        let mut scaled = TensorDyn::image(
+            w * 3 / 2,
+            h * 3 / 2,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut frame = |renderer: &mut GLProcessorThreaded, src: &TensorDyn| {
+            for dst in [&mut dst, &mut scaled] {
+                renderer
+                    .convert(src, dst, Rotation::None, Flip::None, Crop::no_crop())
+                    .unwrap();
+            }
+        };
 
         // Warmup: two passes over the pool import every buffer once.
         for src in pool.iter().cycle().take(POOL * 2) {
-            renderer
-                .convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            frame(&mut renderer, src);
         }
         let warm = renderer.egl_cache_stats().unwrap();
 
         for src in pool.iter().cycle().take(FRAMES) {
-            renderer
-                .convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            frame(&mut renderer, src);
         }
         let steady = renderer.egl_cache_stats().unwrap();
 
@@ -523,7 +536,7 @@ mod gl_tests {
             "steady-state loop performed new EGLImage imports: warm={warm:?} steady={steady:?}"
         );
         let hits = |s: &crate::opengl_headless::cache::GlCacheStats| {
-            s.src.hits + s.dst.hits + s.nv_r8.hits
+            s.src.hits + s.dst.hits + s.nv_r8.hits + s.nv_uv.hits
         };
         let gained = hits(&steady) - hits(&warm);
         assert!(
@@ -640,7 +653,7 @@ mod gl_tests {
                  warm={warm:?} steady={steady:?}"
             );
             let hits = |s: &crate::opengl_headless::cache::GlCacheStats| {
-                s.src.hits + s.dst.hits + s.nv_r8.hits
+                s.src.hits + s.dst.hits + s.nv_r8.hits + s.nv_uv.hits
             };
             let gained = hits(&steady) - hits(&warm);
             assert!(

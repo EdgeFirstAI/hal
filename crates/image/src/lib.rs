@@ -1202,7 +1202,10 @@ pub struct ImageProcessorConfig {
     /// The bound is **per [`ImageProcessor`], times three caches** (source,
     /// destination, and the NV R8 source cache) — not per process and not
     /// per library. Two `ImageProcessor`s in one process have six
-    /// independent caches and six independent capacities.
+    /// independent caches and six independent capacities. A fourth cache,
+    /// the chroma-plane views of hardware-filtered NV resizes, has the same
+    /// capacity but imports only buffers the NV R8 cache also holds, so it
+    /// adds entries without pinning more memory.
     ///
     /// Whether the worst case is ever approached is up to the caller. A
     /// pooled producer — V4L2 capture, typically 4–8 buffers over one or two
@@ -1264,9 +1267,10 @@ pub enum Interpolation {
     /// fastest mode, at the cost of aliasing that lowers detection accuracy
     /// on resized inputs.
     Nearest,
-    /// Bilinear with half-pixel centres, the convention of OpenCV
-    /// `INTER_LINEAR` and of the preprocessing most detectors are trained
-    /// with (default).
+    /// Bilinear with half-pixel centres (default). The GL backend matches
+    /// OpenCV `INTER_LINEAR`, the preprocessing most detectors are trained
+    /// with; the CPU backend's bilinear widens its kernel when downscaling,
+    /// which smooths more than `INTER_LINEAR` below 1×.
     #[default]
     Bilinear,
 }
@@ -9276,7 +9280,7 @@ mod image_tests {
             steady.total_misses(),
             "steady-state loop created new imports (warm {warm:?}, steady {steady:?})"
         );
-        let hits = |s: &GlCacheStats| s.src.hits + s.dst.hits + s.nv_r8.hits;
+        let hits = |s: &GlCacheStats| s.src.hits + s.dst.hits + s.nv_r8.hits + s.nv_uv.hits;
         assert!(
             hits(&steady) - hits(&warm) >= FRAMES as u64,
             "expected at least {FRAMES} import-cache hits over the loop, got {}",

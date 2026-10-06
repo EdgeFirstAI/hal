@@ -2126,7 +2126,7 @@ impl GLProcessorST {
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
 
-        // EGLImage cache capacity (per cache: src / dst / nv_r8). What the
+        // EGLImage cache capacity (per cache: src / dst / nv_r8 / nv_uv). What the
         // number MEANS -- a buffer count and not a size, its scope, and the
         // pinned-memory formula -- is documented once, on
         // `ImageProcessorConfig::egl_cache_capacity`, which is what a caller
@@ -2523,6 +2523,7 @@ impl GLProcessorST {
             src: self.src_egl_cache.stats(),
             dst: self.dst_egl_cache.stats(),
             nv_r8: self.nv_r8_egl_cache.stats(),
+            nv_uv: self.nv_uv_egl_cache.stats(),
         }
     }
 
