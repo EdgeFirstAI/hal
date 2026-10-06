@@ -8718,8 +8718,9 @@ mod gl_tests {
     /// texel centre exactly), so this resizes a detailed NV12 frame up and down
     /// and checks the result against OpenCV `INTER_LINEAR` (2×2 taps, half-pixel
     /// centres, clamped edges) applied to the CPU backend's native-resolution
-    /// RGB. A letterboxed upscale is also checked against the CPU backend
-    /// itself, which agrees with `INTER_LINEAR` when enlarging.
+    /// RGB, for the whole frame and for a source crop drawn 1:1 and rescaled.
+    /// A letterboxed upscale is also checked against the CPU backend itself,
+    /// which agrees with `INTER_LINEAR` when enlarging.
     ///
     /// On this pattern nearest-neighbour sampling is 16-24 grey levels from
     /// `INTER_LINEAR` and bilinear is under 0.8 on NVIDIA, Mali, Adreno, Tegra
@@ -8803,29 +8804,31 @@ mod gl_tests {
             )
             .unwrap();
         let native = bytes(&native);
-        let inter_linear = |dw: usize, dh: usize| -> Vec<u8> {
-            let (sx, sy) = (sw as f32 / dw as f32, sh as f32 / dh as f32);
-            let mut out = Vec::with_capacity(3 * dw * dh);
-            for plane in native.chunks_exact(sw * sh) {
-                let at = |x: isize, y: isize| {
-                    let x = x.clamp(0, sw as isize - 1) as usize;
-                    let y = y.clamp(0, sh as isize - 1) as usize;
-                    plane[y * sw + x] as f32
-                };
-                for dy in 0..dh {
-                    let py = (dy as f32 + 0.5) * sy - 0.5;
-                    let (y0, fy) = (py.floor() as isize, py - py.floor());
-                    for dx in 0..dw {
-                        let px = (dx as f32 + 0.5) * sx - 0.5;
-                        let (x0, fx) = (px.floor() as isize, px - px.floor());
-                        let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
-                        let bot = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
-                        out.push((top * (1.0 - fy) + bot * fy).round() as u8);
+        // `INTER_LINEAR` of the source crop (x, y, w, h), taps clamped to it.
+        let inter_linear =
+            |(cx, cy, cw, ch): (usize, usize, usize, usize), dw: usize, dh: usize| -> Vec<u8> {
+                let (sx, sy) = (cw as f32 / dw as f32, ch as f32 / dh as f32);
+                let mut out = Vec::with_capacity(3 * dw * dh);
+                for plane in native.chunks_exact(sw * sh) {
+                    let at = |x: isize, y: isize| {
+                        let x = cx + x.clamp(0, cw as isize - 1) as usize;
+                        let y = cy + y.clamp(0, ch as isize - 1) as usize;
+                        plane[y * sw + x] as f32
+                    };
+                    for dy in 0..dh {
+                        let py = (dy as f32 + 0.5) * sy - 0.5;
+                        let (y0, fy) = (py.floor() as isize, py - py.floor());
+                        for dx in 0..dw {
+                            let px = (dx as f32 + 0.5) * sx - 0.5;
+                            let (x0, fx) = (px.floor() as isize, px - px.floor());
+                            let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+                            let bot = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+                            out.push((top * (1.0 - fy) + bot * fy).round() as u8);
+                        }
                     }
                 }
-            }
-            out
-        };
+                out
+            };
 
         for (dw, dh, dtype) in [
             (1792usize, 1008usize, DType::U8),
@@ -8837,11 +8840,31 @@ mod gl_tests {
             gl.convert(&src, &mut gpu, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
             assert_eq!(gl.last_nv_convert_path, NvConvertPath::ShaderR8);
-            let mad = mean_abs_diff(&bytes(&gpu), &inter_linear(dw, dh));
+            let mad = mean_abs_diff(&bytes(&gpu), &inter_linear((0, 0, sw, sh), dw, dh));
             assert!(
                 mad < MAX_MEAN_ERROR,
                 "{dw}x{dh} {dtype:?}: GL resize is {mad:.3} grey levels from INTER_LINEAR"
             );
+        }
+
+        // A source crop (SAHI tiles) drawn 1:1 must read each crop pixel
+        // exactly, and a rescaled crop must not blend pixels outside it.
+        let (cx, cy, cw, ch) = (101usize, 53usize, 320usize, 180usize);
+        let crop = Crop::new().with_source(Some(crate::Region::new(cx, cy, cw, ch)));
+        for (dw, dh, max_mean) in [(cw, ch, 1.0), (448, 252, MAX_MEAN_ERROR)] {
+            let mut gpu = image(dw, dh, DType::U8, Some(TensorMemory::Mem));
+            gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
+                .unwrap();
+            let (g, want) = (bytes(&gpu), inter_linear((cx, cy, cw, ch), dw, dh));
+            let mad = mean_abs_diff(&g, &want);
+            assert!(
+                mad < max_mean,
+                "crop to {dw}x{dh}: GL is {mad:.3} grey levels from INTER_LINEAR"
+            );
+            if (dw, dh) == (cw, ch) {
+                let max = g.iter().zip(&want).map(|(&a, &b)| a.abs_diff(b)).max();
+                assert!(max <= Some(2), "1:1 crop: max deviation {max:?}");
+            }
         }
 
         let crop = letterbox_crop(sw, sh, 1792, 1024);
