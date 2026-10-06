@@ -262,6 +262,15 @@ impl GlPlatform for LinuxEgl {
         let attrs = DmaImportAttrs::from_tensor_nv_r8(img, fmt)?;
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
     }
+
+    fn import_buffer_nv_chroma(
+        display: &GlContext,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> crate::Result<EglImage> {
+        let attrs = DmaImportAttrs::from_tensor_nv_chroma_gr88(img, fmt)?;
+        new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
+    }
 }
 
 /// Create an owned EGLImage from raw EGL import attributes.

@@ -62,12 +62,9 @@ vec3 nv_rgb(int x, int y) {
 }
 
 void main() {
-    vec2 p = tc * vec2(img_size) - 0.5;
-    vec2 p0 = floor(p);
-    vec2 f = p - p0;
-    ivec2 i0 = clamp(ivec2(p0), src_rect.xy, src_rect.zw);
-    ivec2 i1 = clamp(ivec2(p0) + 1, src_rect.xy, src_rect.zw);
-    vec3 rgb = mix(mix(nv_rgb(i0.x, i0.y), nv_rgb(i1.x, i0.y), f.x),
-                   mix(nv_rgb(i0.x, i1.y), nv_rgb(i1.x, i1.y), f.x), f.y);
+    vec2 luv = clamp(tc * luma_scale, luma_clamp.xy, luma_clamp.zw);
+    vec2 cuv = clamp(tc * chroma_scale, chroma_clamp.xy, chroma_clamp.zw);
+    vec2 c = texture(uv_tex, cuv).rg;
+    vec3 rgb = nv_yuv_to_rgb(texture(src, luv).r, c.r, c.g);
     color = vec4(rgb, 1.0);
 }

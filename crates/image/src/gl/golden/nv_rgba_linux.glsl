@@ -9,6 +9,15 @@ uniform int chroma_lines;
 // Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
 // clamped to them, so a crop never reads pixels from outside itself.
 uniform ivec4 src_rect;
+// Hardware-filtered program only: the chroma plane as (U, V) texels on unit 1,
+// the image's share of each texture (`*_scale`), and the crop's half-texel-
+// inset rectangle on each (`*_clamp`), which keeps the LINEAR kernel inside
+// the crop and the luma rows.
+uniform highp sampler2D uv_tex;
+uniform vec2 luma_scale;
+uniform vec4 luma_clamp;
+uniform vec2 chroma_scale;
+uniform vec4 chroma_clamp;
 // Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
 // from the source tensor's resolved colorimetry. Path B applies the matrix in
 // the shader, so it is correct regardless of driver EGL color-hint support.
@@ -21,6 +30,17 @@ uniform float c_ub;
 in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
+
+// Floor expanded luma at 0 to match the CPU `yuv` crate's saturating (Y-16)
+// term (limited footroom Y<16 → 0). The top is left uncapped — the crate lets
+// headroom exceed 1.0 and relies on the final RGB clamp, so the GL path must
+// too. No-op for full range (y_offset=0, y_scale=1).
+vec3 nv_yuv_to_rgb(float yv, float u, float v) {
+    float yp = max((yv - y_offset) * y_scale, 0.0);
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    return clamp(vec3(yp + c_vr * vp, yp - c_ug * up - c_vg * vp, yp + c_ub * up), 0.0, 1.0);
+}
 
 vec3 nv_rgb(int x, int y) {
     // Luma: direct 2D texel — no per-pixel integer divide/modulo (very slow on
@@ -38,15 +58,7 @@ vec3 nv_rgb(int x, int y) {
     int cx = ccol2 - carry * tex_width;
     float u = texelFetch(src, ivec2(cx, cy), 0).r;
     float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
-
-    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
-    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
-    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
-    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
-    float yp = max((yv - y_offset) * y_scale, 0.0);
-    float up = u - 128.0 / 255.0;
-    float vp = v - 128.0 / 255.0;
-    return clamp(vec3(yp + c_vr * vp, yp - c_ug * up - c_vg * vp, yp + c_ub * up), 0.0, 1.0);
+    return nv_yuv_to_rgb(yv, u, v);
 }
 
 void main() {

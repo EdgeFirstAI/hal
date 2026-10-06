@@ -50,7 +50,7 @@ let info = peek_info(&image).expect("peek");
 // hardware pipelines allocate their convert destinations with
 // `CpuAccess::None` instead.
 let mut src = Tensor::<u8>::image(info.width, info.height, info.format,
-                                   Some(TensorMemory::Mem), CpuAccess::ReadWrite)?;
+                                   Some(TensorMemory::Mem), edgefirst_tensor::CpuAccess::ReadWrite)?;
 let mut decoder = ImageDecoder::new();
 src.load_image(&mut decoder, &image).expect("decode");
 // Convert the native NV12 frame to packed RGB for downstream processing.
@@ -809,6 +809,29 @@ impl ResolvedCrop {
         Self::default()
     }
 
+    /// Whether a convert from a `src`-sized source to a `dst`-sized
+    /// destination with this crop changes the size of the sampled region. A
+    /// quarter-turn rotation swaps the source region's axes.
+    #[allow(dead_code)] // unused when no resampling backend is compiled in
+    pub(crate) fn resizes(
+        &self,
+        (src_w, src_h): (usize, usize),
+        (dst_w, dst_h): (usize, usize),
+        rotation: Rotation,
+    ) -> bool {
+        let (sw, sh) = self
+            .src_rect
+            .map_or((src_w, src_h), |r| (r.width, r.height));
+        let (dw, dh) = self
+            .dst_rect
+            .map_or((dst_w, dst_h), |r| (r.width, r.height));
+        let (sw, sh) = match rotation {
+            Rotation::Clockwise90 | Rotation::CounterClockwise90 => (sh, sw),
+            Rotation::None | Rotation::Rotate180 => (sw, sh),
+        };
+        (sw, sh) != (dw, dh)
+    }
+
     /// Validate the resolved rects against explicit dimensions.
     pub(crate) fn check_crop_dims(
         &self,
@@ -1133,6 +1156,12 @@ pub struct ImageProcessorConfig {
     /// overrides this setting when present.
     pub colorimetry: ColorimetryMode,
 
+    /// How `convert()` resamples when the source (or source crop) and the
+    /// destination differ in size (see [`Interpolation`]). Defaults to
+    /// [`Interpolation::Bilinear`]. The `EDGEFIRST_INTERPOLATION` environment
+    /// variable (`nearest` | `bilinear`) overrides this setting when present.
+    pub interpolation: Interpolation,
+
     /// How many buffer imports the OpenGL backend keeps cached, per cache.
     ///
     /// `None` (the default) uses `EDGEFIRST_EGL_CACHE_CAPACITY` if set, and
@@ -1215,6 +1244,51 @@ pub enum ColorimetryMode {
     /// Prefer bit-exact colorimetry everywhere: the fast path is used only
     /// when it matches the source's resolved (encoding, range) exactly.
     Exact,
+}
+
+/// How `convert()` resamples when it resizes.
+///
+/// Every backend honours it: the CPU backend through its resizer, the
+/// OpenGL backend through its texture filtering and NV shader choice, and
+/// G2D, which has a fixed hardware filter, by declining resizing converts
+/// under [`Interpolation::Nearest`] so another backend runs them. Converts
+/// that do not resize read each source pixel exactly in either mode.
+///
+/// Override at runtime with `EDGEFIRST_INTERPOLATION=nearest|bilinear`,
+/// which takes precedence over [`ImageProcessorConfig::interpolation`] and
+/// [`ImageProcessor::set_interpolation`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Interpolation {
+    /// Nearest-neighbour: each output pixel copies one source pixel. The
+    /// fastest mode, at the cost of aliasing that lowers detection accuracy
+    /// on resized inputs.
+    Nearest,
+    /// Bilinear with half-pixel centres, the convention of OpenCV
+    /// `INTER_LINEAR` and of the preprocessing most detectors are trained
+    /// with (default).
+    #[default]
+    Bilinear,
+}
+
+impl Interpolation {
+    /// The mode selected by `EDGEFIRST_INTERPOLATION`, if it is set to a
+    /// recognised value. An unrecognised value is logged and ignored.
+    pub(crate) fn from_env() -> Option<Self> {
+        let value = std::env::var("EDGEFIRST_INTERPOLATION").ok()?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "nearest" => Some(Self::Nearest),
+            "bilinear" => Some(Self::Bilinear),
+            "" => None,
+            other => {
+                log::warn!(
+                    "EDGEFIRST_INTERPOLATION={other:?} is not recognised \
+                     (expected nearest or bilinear); ignoring it"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Compute backend selection for [`ImageProcessor`].
@@ -1389,7 +1463,7 @@ impl ImageProcessor {
     /// // NV12) and configures the destination tensor during the decode.
     /// let info = peek_info(&image).expect("peek");
     /// let mut src = Tensor::<u8>::image(info.width, info.height, info.format,
-    ///                                    Some(TensorMemory::Mem), CpuAccess::ReadWrite)?;
+    ///                                    Some(TensorMemory::Mem), edgefirst_tensor::CpuAccess::ReadWrite)?;
     /// let mut decoder = ImageDecoder::new();
     /// src.load_image(&mut decoder, &image).expect("decode");
     /// let mut converter = ImageProcessor::new()?;
@@ -1535,8 +1609,16 @@ impl ImageProcessor {
     ///
     /// When `Auto`, the existing `EDGEFIRST_FORCE_BACKEND` and
     /// `EDGEFIRST_DISABLE_*` environment variables apply.
-    #[allow(unused_variables)]
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
+        let interpolation = config.interpolation;
+        let mut processor = Self::with_config_backends(config)?;
+        processor.set_interpolation(interpolation)?;
+        Ok(processor)
+    }
+
+    /// The backend selection half of [`Self::with_config`].
+    #[allow(unused_variables)]
+    fn with_config_backends(config: ImageProcessorConfig) -> Result<Self> {
         // ── Config-driven backend selection ──────────────────────────
         // When the caller explicitly requests a backend via the config,
         // skip all environment variable logic.
@@ -2041,6 +2123,46 @@ impl ImageProcessor {
     pub fn set_colorimetry_mode(&mut self, mode: ColorimetryMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
             gl.set_colorimetry_mode(mode)?;
+        }
+        Ok(())
+    }
+
+    /// Sets how `convert()` resamples when it resizes (see [`Interpolation`])
+    /// on every backend this processor holds. The `EDGEFIRST_INTERPOLATION`
+    /// environment variable takes precedence: when it is set, this call logs
+    /// and keeps the env-selected mode.
+    pub fn set_interpolation(&mut self, mode: Interpolation) -> Result<()> {
+        let mode = match Interpolation::from_env() {
+            Some(env) => {
+                if env != mode {
+                    log::info!(
+                        "EDGEFIRST_INTERPOLATION pins Interpolation::{env:?}; \
+                         ignoring Interpolation::{mode:?}"
+                    );
+                }
+                env
+            }
+            None => mode,
+        };
+        if let Some(cpu) = self.cpu.as_mut() {
+            cpu.set_interpolation(mode);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(g2d) = self.g2d.as_mut() {
+            g2d.set_interpolation(mode);
+        }
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ),
+            feature = "opengl"
+        ))]
+        if let Some(gl) = self.opengl.as_mut() {
+            gl.set_interpolation(mode)?;
         }
         Ok(())
     }
@@ -11623,6 +11745,104 @@ mod image_tests {
                 }
             }
         }
+    }
+
+    /// `EDGEFIRST_INTERPOLATION` accepts `nearest` and `bilinear` in any
+    /// case and ignores anything else.
+    #[test]
+    fn test_interpolation_env_parse() {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
+        for (value, want) in [
+            (Some("nearest"), Some(Interpolation::Nearest)),
+            (Some(" BILINEAR "), Some(Interpolation::Bilinear)),
+            (Some("lanczos"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            match value {
+                Some(v) => unsafe { std::env::set_var("EDGEFIRST_INTERPOLATION", v) },
+                None => unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") },
+            }
+            assert_eq!(
+                Interpolation::from_env(),
+                want,
+                "EDGEFIRST_INTERPOLATION={value:?}"
+            );
+        }
+    }
+
+    /// `ImageProcessorConfig::interpolation` reaches the CPU backend, and
+    /// `EDGEFIRST_INTERPOLATION` overrides it.
+    #[test]
+    fn test_interpolation_config_and_env_reach_cpu() {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
+        let mut checker = Vec::with_capacity(8 * 8 * 4);
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = if (x + y) % 2 == 0 { 0u8 } else { 255 };
+                checker.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let resize = |processor: &mut dyn ImageProcessorTrait| {
+            let mut src = TensorDyn::image(
+                8,
+                8,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            src.as_u8_mut()
+                .unwrap()
+                .map_mut()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(&checker);
+            let mut dst = TensorDyn::image(
+                12,
+                12,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            processor
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        let nearest = resize(&mut CPUProcessor::new_nearest());
+        let bilinear = resize(&mut CPUProcessor::new());
+        assert_ne!(nearest, bilinear, "the checker must tell the filters apart");
+        let config = |interpolation| ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            interpolation,
+            ..Default::default()
+        };
+
+        unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") };
+        let mut p = ImageProcessor::with_config(config(Interpolation::Nearest)).unwrap();
+        assert_eq!(resize(&mut p), nearest, "config Nearest");
+        p.set_interpolation(Interpolation::Bilinear).unwrap();
+        assert_eq!(resize(&mut p), bilinear, "set_interpolation(Bilinear)");
+
+        unsafe { std::env::set_var("EDGEFIRST_INTERPOLATION", "nearest") };
+        let mut p = ImageProcessor::with_config(config(Interpolation::Bilinear)).unwrap();
+        assert_eq!(
+            resize(&mut p),
+            nearest,
+            "EDGEFIRST_INTERPOLATION pins Nearest"
+        );
+        p.set_interpolation(Interpolation::Bilinear).unwrap();
+        assert_eq!(
+            resize(&mut p),
+            nearest,
+            "the env pin outlives set_interpolation"
+        );
     }
 
     /// Run `body` with `EDGEFIRST_FORCE_BACKEND` temporarily set (or

@@ -606,6 +606,25 @@ YUV→RGB on every backend is driven by the source tensor's per-tensor
 
 See the [Colorimetry](#colorimetry-1) section for the full design.
 
+### Resampling and source crops
+
+`ImageProcessorConfig::interpolation` (`Interpolation::{Nearest, Bilinear}`, default `Bilinear`; env `EDGEFIRST_INTERPOLATION` overrides it) selects how a convert resamples when the source region and the destination differ in size. Bilinear uses half-pixel centres, the OpenCV `INTER_LINEAR` convention that detectors are trained with. A convert that does not resize reads each source pixel exactly in either mode.
+
+- **GL texture paths** (packed sources, the external sampler, the float path) set the source texture's `MIN`/`MAG` filter to `LINEAR` or `NEAREST`.
+- **GL NV Path B** picks one of three program families per draw, on the CPU from the draw geometry. There is no uniform branch: Vivante GC7000UL does not reliably honour one, and on V3D and Adreno the untaken half slows every draw.
+
+  | `NvSampling` | When | Fetches per pixel |
+  |---|---|---|
+  | `Single` | No resize, or `Interpolation::Nearest` | 3 (`texelFetch` of Y, U, V) |
+  | `Hardware` | Bilinear resize, chroma plane bindable | 2 `LINEAR` samples: Y from the combined R8 plane, (U, V) from a GR88 import of the chroma plane or an RG8 upload |
+  | `Shader` | Bilinear resize, chroma view refused (unaligned chroma offset on Mali/Adreno, non-Linux platforms), or `EDGEFIRST_GL_NO_NV_HW_FILTER=1` | 12: four `Single` conversions blended in RGB |
+
+  `Hardware` interpolates chroma on its own grid, centred on the luma pixels each sample covers (JPEG siting). `Shader` and the CPU backend instead replicate each chroma sample across its luma pixels before blending. The two agree closely on natural content and part on chroma that changes every one or two samples.
+- **G2D** scales with a fixed hardware filter. Under `Nearest` it declines converts that resize, so GL or the CPU backend runs them.
+- **CPU** uses `fast_image_resize`: `Nearest`, or `Convolution(Bilinear)` for `Bilinear`. The convolution widens its kernel on downscale (anti-aliased), so below 1× it is smoother than `INTER_LINEAR` and the GL paths.
+
+**Source crops.** A crop's texture coordinates span its true edges, so a crop drawn 1:1 (a SAHI tile) samples exactly on its texels. What keeps a `LINEAR` kernel inside the crop is a clamp of each sample point to the crop's half-texel-inset rectangle (`render::sample_clamp_rect_within`, the `src_extent` uniform), not an inset of the coordinates. An inset changes the crop's scale: it shifts every sample of a 1:1 crop by up to half a texel and stretches a resized one. The NV programs clamp each tap to the crop in the same way.
+
 ### ANGLE constant gotchas
 
 The `EGL_ANGLE_iosurface_client_buffer` extension uses these

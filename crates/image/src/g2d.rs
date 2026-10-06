@@ -59,6 +59,7 @@ fn pixelfmt_to_fourcc(fmt: PixelFormat) -> FourCharCode {
 #[derive(Debug)]
 pub struct G2DProcessor {
     g2d: G2D,
+    interpolation: crate::Interpolation,
 }
 
 unsafe impl Send for G2DProcessor {}
@@ -82,7 +83,18 @@ impl G2DProcessor {
         g2d.set_bt601_colorspace()?;
 
         log::debug!("G2DConverter created with version {:?}", g2d.version());
-        Ok(Self { g2d })
+        Ok(Self {
+            g2d,
+            interpolation: crate::Interpolation::default(),
+        })
+    }
+
+    /// Sets how resizing converts resample (see [`crate::Interpolation`]).
+    /// G2D scales with a fixed hardware filter, so under
+    /// [`crate::Interpolation::Nearest`] it declines converts that resize and
+    /// leaves them to a backend that can sample nearest-neighbour.
+    pub fn set_interpolation(&mut self, mode: crate::Interpolation) {
+        self.interpolation = mode;
     }
 
     /// Returns the G2D library version as defined by _G2D_VERSION in the shared
@@ -387,6 +399,17 @@ impl ImageProcessorTrait for G2DProcessor {
             dst.width().unwrap_or(0),
             dst.height().unwrap_or(0),
         )?;
+        if self.interpolation == crate::Interpolation::Nearest
+            && crop.resizes(
+                (src.width().unwrap_or(0), src.height().unwrap_or(0)),
+                (dst.width().unwrap_or(0), dst.height().unwrap_or(0)),
+                rotation,
+            )
+        {
+            return Err(Error::NotSupported(
+                "G2D scales with a fixed filter; Interpolation::Nearest resizes elsewhere".into(),
+            ));
+        }
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 

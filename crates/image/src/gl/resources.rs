@@ -17,6 +17,20 @@ pub(super) enum UploadSource<'a> {
     Pbo { buffer_id: u32, offset: usize },
 }
 
+impl<'a> UploadSource<'a> {
+    /// The same source, starting `bytes` further in. Bytes past the end
+    /// leave an empty window, which [`Texture::upload`] refuses.
+    pub(super) fn offset_by(self, bytes: usize) -> Self {
+        match self {
+            Self::Bytes(data) => Self::Bytes(data.get(bytes..).unwrap_or(&[])),
+            Self::Pbo { buffer_id, offset } => Self::Pbo {
+                buffer_id,
+                offset: offset + bytes,
+            },
+        }
+    }
+}
+
 pub(super) struct Texture {
     pub(super) id: u32,
     pub(super) target: edgefirst_gl::gl::types::GLenum,

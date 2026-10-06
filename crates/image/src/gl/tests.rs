@@ -8713,175 +8713,445 @@ mod gl_tests {
         compare_images(&cpu_dst, &dst, 0.95, "nv12_to_planar_rgb_shader");
     }
 
-    /// `ShaderR8` must resample bilinearly when the convert rescales. The 1:1
-    /// parity tests above cannot tell nearest from bilinear (both read the
-    /// texel centre exactly), so this resizes a detailed NV12 frame up and down
-    /// and checks the result against OpenCV `INTER_LINEAR` (2×2 taps, half-pixel
-    /// centres, clamped edges) applied to the CPU backend's native-resolution
-    /// RGB, for the whole frame and for a source crop drawn 1:1 and rescaled.
-    /// A letterboxed upscale is also checked against the CPU backend itself,
-    /// which agrees with `INTER_LINEAR` when enlarging.
-    ///
-    /// On this pattern nearest-neighbour sampling is 16-24 grey levels from
-    /// `INTER_LINEAR` and bilinear is under 0.8 on NVIDIA, Mali, Adreno, Tegra
-    /// and V3D. Vivante GC7000UL reaches 1.7: its interpolated coordinates are
-    /// less precise, which the pattern's steep slopes amplify (0.5 on natural
-    /// content). `MAX_MEAN_ERROR` sits between the two.
-    #[test]
+    /// A 1280x720 NV12 frame whose luma and chroma vary over a few pixels,
+    /// like dense small objects: nearest and bilinear resampling differ by
+    /// 16-24 grey levels on it.
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
-    fn test_nv12_shader_rescale_is_bilinear() {
-        const MAX_MEAN_ERROR: f64 = 3.0;
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_opengl_available() {
-            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
-            return;
-        }
-        let mut gl = match GLProcessorST::new(None, None) {
-            Ok(g) => g,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - GL not available: {e}",
-                    function!()
-                ));
-                return;
-            }
-        };
-        // Exact keeps Vivante on ShaderR8 instead of the driver sampler.
-        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
-        // Luma and chroma with periods of a few pixels (dense small objects),
-        // where nearest and bilinear resampling differ by ~15 grey levels.
-        let (sw, sh) = (1280usize, 720usize);
-        let mut nv12 = Vec::with_capacity(sw * sh * 3 / 2);
-        for y in 0..sh {
-            for x in 0..sw {
-                let v = 128.0 + 100.0 * (x as f32 * 0.9).sin() * (y as f32 * 0.7).cos();
-                nv12.push(v as u8);
+    fn detailed_nv12() -> (usize, usize, Vec<u8>) {
+        let (w, h) = (1280usize, 720usize);
+        let mut nv12 = Vec::with_capacity(w * h * 3 / 2);
+        for y in 0..h {
+            for x in 0..w {
+                nv12.push((128.0 + 100.0 * (x as f32 * 0.9).sin() * (y as f32 * 0.7).cos()) as u8);
             }
         }
-        for y in 0..sh / 2 {
-            for x in 0..sw / 2 {
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
                 nv12.push((128.0 + 60.0 * (x as f32 * 1.3).sin()) as u8);
                 nv12.push((128.0 + 60.0 * (y as f32 * 1.1).cos()) as u8);
             }
         }
+        (w, h, nv12)
+    }
+
+    /// Float reference for the GL NV programs on a tight NV12 frame, sampling
+    /// a source crop `(x, y, w, h)` into `dw`x`dh` planar RGB bytes.
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    struct NvOracle<'a> {
+        nv12: &'a [u8],
+        w: usize,
+        h: usize,
+        k: crate::colorimetry::YuvToRgbCoeffs,
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    impl<'a> NvOracle<'a> {
+        fn new(nv12: &'a [u8], w: usize, h: usize, src: &TensorDyn) -> Self {
+            let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
+            let k = crate::colorimetry::yuv_to_rgb_coeffs(
+                cm.encoding
+                    .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+                cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+            );
+            NvOracle { nv12, w, h, k }
+        }
+
+        /// Luma, U or V (`plane` 0, 1, 2) at a clamped grid position.
+        fn sample(&self, plane: usize, x: isize, y: isize, r: (usize, usize, usize, usize)) -> f32 {
+            let (cx, cy, cw, ch) = r;
+            let byte = if plane == 0 {
+                let x = x.clamp(cx as isize, (cx + cw) as isize - 1) as usize;
+                let y = y.clamp(cy as isize, (cy + ch) as isize - 1) as usize;
+                self.nv12[y * self.w + x]
+            } else {
+                let x = x.clamp((cx / 2) as isize, (cx + cw).div_ceil(2) as isize - 1) as usize;
+                let y = y.clamp((cy / 2) as isize, (cy + ch).div_ceil(2) as isize - 1) as usize;
+                self.nv12[self.w * self.h + y * self.w + 2 * x + plane - 1]
+            };
+            byte as f32 / 255.0
+        }
+
+        fn rgb(&self, y: f32, u: f32, v: f32) -> [f32; 3] {
+            let k = &self.k;
+            let y = ((y - k.y_offset) * k.y_scale).max(0.0);
+            let (u, v) = (u - 128.0 / 255.0, v - 128.0 / 255.0);
+            [y + k.c_vr * v, y - k.c_ug * u - k.c_vg * v, y + k.c_ub * u].map(|c| c.clamp(0.0, 1.0))
+        }
+
+        /// The converted pixel at luma texel (x, y), with its co-sited chroma.
+        fn texel(&self, x: isize, y: isize, r: (usize, usize, usize, usize)) -> [f32; 3] {
+            let (cx, cy, cw, ch) = r;
+            let x = x.clamp(cx as isize, (cx + cw) as isize - 1);
+            let y = y.clamp(cy as isize, (cy + ch) as isize - 1);
+            self.rgb(
+                self.sample(0, x, y, r),
+                self.sample(1, x >> 1, y >> 1, r),
+                self.sample(2, x >> 1, y >> 1, r),
+            )
+        }
+
+        /// `NvSampling::Hardware`, `NvSampling::Shader` or nearest: the
+        /// source position of output pixel (dx, dy) is `(d + 0.5) * scale`.
+        fn render(
+            &self,
+            r: (usize, usize, usize, usize),
+            dw: usize,
+            dh: usize,
+            mode: &str,
+        ) -> Vec<u8> {
+            let (cx, cy, cw, ch) = r;
+            let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+            let mut out = vec![0u8; 3 * dw * dh];
+            for dy in 0..dh {
+                for dx in 0..dw {
+                    let lx = cx as f32 + (dx as f32 + 0.5) * cw as f32 / dw as f32;
+                    let ly = cy as f32 + (dy as f32 + 0.5) * ch as f32 / dh as f32;
+                    let rgb = match mode {
+                        "nearest" => self.texel(lx.floor() as isize, ly.floor() as isize, r),
+                        "shader" => {
+                            let (px, py) = (lx - 0.5, ly - 0.5);
+                            let (x0, y0) = (px.floor() as isize, py.floor() as isize);
+                            let (fx, fy) = (px - px.floor(), py - py.floor());
+                            let t = |x, y| self.texel(x, y, r);
+                            let (a, b, c, d) =
+                                (t(x0, y0), t(x0 + 1, y0), t(x0, y0 + 1), t(x0 + 1, y0 + 1));
+                            [0, 1, 2].map(|i| lerp(lerp(a[i], b[i], fx), lerp(c[i], d[i], fx), fy))
+                        }
+                        _ => {
+                            let bil = |plane: usize, px: f32, py: f32| {
+                                let (x0, y0) = (px.floor() as isize, py.floor() as isize);
+                                let (fx, fy) = (px - px.floor(), py - py.floor());
+                                let s = |x, y| self.sample(plane, x, y, r);
+                                lerp(
+                                    lerp(s(x0, y0), s(x0 + 1, y0), fx),
+                                    lerp(s(x0, y0 + 1), s(x0 + 1, y0 + 1), fx),
+                                    fy,
+                                )
+                            };
+                            let (cxp, cyp) = (lx / 2.0 - 0.5, ly / 2.0 - 0.5);
+                            self.rgb(
+                                bil(0, lx - 0.5, ly - 0.5),
+                                bil(1, cxp, cyp),
+                                bil(2, cxp, cyp),
+                            )
+                        }
+                    };
+                    for (c, v) in rgb.iter().enumerate() {
+                        out[c * dw * dh + dy * dw + dx] = (v * 255.0).round() as u8;
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn planar_bytes(t: &TensorDyn) -> Vec<u8> {
+        match t.dtype() {
+            DType::I8 => t
+                .as_i8()
+                .unwrap()
+                .map()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .map(|&v| v as u8 ^ 0x80)
+                .collect(),
+            _ => t.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| x.abs_diff(y) as u64)
+            .sum::<u64>() as f64
+            / a.len() as f64
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn nv_test_processor() -> Option<crate::opengl_headless::processor::GLProcessorST> {
+        if !is_opengl_available() {
+            return None;
+        }
+        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).ok()?;
+        // Exact keeps Vivante on the NV shader programs instead of the driver sampler.
+        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
+        Some(gl)
+    }
+
+    /// A resizing NV12 convert must match the reference for the sampling it
+    /// took: `Hardware` filters luma and chroma on their own grids, `Shader`
+    /// blends four single-texel conversions, both with half-pixel centres
+    /// (OpenCV `INTER_LINEAR`) and every tap clamped to the crop. Covers host
+    /// and DMA sources, whole frames and crops, up and down, u8 and int8, and
+    /// both samplings via the hardware-filter switch.
+    ///
+    /// Nearest sampling is 16-24 grey levels off on this frame. Bilinear is
+    /// under 0.8 on NVIDIA, Mali, Adreno, Tegra and V3D; Vivante's in-shader
+    /// YUV arithmetic adds about 1.7 on its saturated chroma, at 1:1 too.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_resize_matches_its_sampling() {
+        use crate::opengl_headless::processor::NvSampling;
+        const MAX_MEAN_ERROR: f64 = 3.0;
+        let Some(mut gl) = nv_test_processor() else {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        };
+        let (sw, sh, nv12) = detailed_nv12();
+        let mut memories = vec![TensorMemory::Mem];
+        if is_dma_available() {
+            memories.push(TensorMemory::DmaBuf);
+        }
+        let whole = (0, 0, sw, sh);
+        let tile = (101usize, 53usize, 320usize, 180usize);
+        for mem in memories {
+            let src = load_raw_image(sw, sh, PixelFormat::Nv12, Some(mem), &nv12).unwrap();
+            let oracle = NvOracle::new(&nv12, sw, sh, &src);
+            for hw in [true, false] {
+                gl.set_nv_hw_filter(hw);
+                for (r, dw, dh, dtype) in [
+                    (whole, 1792usize, 1008usize, DType::U8),
+                    (whole, 896, 504, DType::U8),
+                    (whole, 640, 360, DType::U8),
+                    (whole, 1792, 1008, DType::I8),
+                    (tile, 448, 252, DType::U8),
+                ] {
+                    let crop = if r == whole {
+                        Crop::no_crop()
+                    } else {
+                        Crop::new().with_source(Some(crate::Region::new(r.0, r.1, r.2, r.3)))
+                    };
+                    let mut gpu = TensorDyn::image(
+                        dw,
+                        dh,
+                        PixelFormat::PlanarRgb,
+                        dtype,
+                        Some(TensorMemory::Mem),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap();
+                    gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
+                        .unwrap();
+                    let sampling = gl.last_nv_sampling.expect("an NV draw ran");
+                    if !hw {
+                        assert_eq!(
+                            sampling,
+                            NvSampling::Shader,
+                            "hardware filtering is switched off"
+                        );
+                    } else if mem == TensorMemory::Mem {
+                        assert_eq!(
+                            sampling,
+                            NvSampling::Hardware,
+                            "an upload can always bind its chroma"
+                        );
+                    }
+                    let mode = if sampling == NvSampling::Hardware {
+                        "hardware"
+                    } else {
+                        "shader"
+                    };
+                    let mad = mean_abs_diff(&planar_bytes(&gpu), &oracle.render(r, dw, dh, mode));
+                    assert!(
+                        mad < MAX_MEAN_ERROR,
+                        "{mem:?} {r:?}->{dw}x{dh} {dtype:?} {sampling:?}: {mad:.3} grey levels from the reference"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A source crop drawn 1:1 (a SAHI tile) must reproduce the crop's
+    /// pixels exactly: the same bytes the whole frame converts to there.
+    /// Comparing against the GL whole frame isolates geometry from each GPU's
+    /// YUV arithmetic, so this holds bit-exactly on every driver.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_crop_1to1_matches_whole_frame() {
+        use crate::opengl_headless::processor::NvSampling;
+        let Some(mut gl) = nv_test_processor() else {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        };
+        let (sw, sh, nv12) = detailed_nv12();
         let src =
             load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
-
-        let image = |w: usize, h: usize, dtype: DType, mem: Option<TensorMemory>| {
+        let image = |w, h| {
             TensorDyn::image(
                 w,
                 h,
                 PixelFormat::PlanarRgb,
-                dtype,
-                mem,
+                DType::U8,
+                Some(TensorMemory::Mem),
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap()
         };
-        let bytes = |t: &TensorDyn| -> Vec<u8> {
-            match t.dtype() {
-                DType::I8 => {
-                    let map = t.as_i8().unwrap().map().unwrap();
-                    map.as_slice().iter().map(|&v| v as u8 ^ 0x80).collect()
+        let mut whole = image(sw, sh);
+        gl.convert(
+            &src,
+            &mut whole,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+        let whole = planar_bytes(&whole);
+        for (cx, cy) in [(101usize, 53usize), (100, 52)] {
+            let (cw, ch) = (320usize, 180usize);
+            let mut tile = image(cw, ch);
+            let crop = Crop::new().with_source(Some(crate::Region::new(cx, cy, cw, ch)));
+            gl.convert(&src, &mut tile, Rotation::None, Flip::None, crop)
+                .unwrap();
+            assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
+            let tile = planar_bytes(&tile);
+            for c in 0..3 {
+                for y in 0..ch {
+                    let got = &tile[c * cw * ch + y * cw..][..cw];
+                    let want = &whole[c * sw * sh + (cy + y) * sw + cx..][..cw];
+                    assert_eq!(got, want, "crop ({cx}, {cy}) channel {c} row {y} differs");
                 }
-                _ => t.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
             }
-        };
-        let mean_abs_diff = |a: &[u8], b: &[u8]| -> f64 {
-            assert_eq!(a.len(), b.len());
-            let sum: u64 = a.iter().zip(b).map(|(&x, &y)| x.abs_diff(y) as u64).sum();
-            sum as f64 / a.len() as f64
-        };
+        }
+    }
 
-        let mut native = image(sw, sh, DType::U8, None);
-        crate::cpu::CPUProcessor::new()
-            .convert(
-                &src,
-                &mut native,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
+    /// `Interpolation::Nearest` resizes NV12 through the single-tap program,
+    /// copying the source pixel under each output pixel's centre. The scales
+    /// (7/5 up, 3/5 down, odd numerators in lowest terms) keep every centre off
+    /// the boundary between two source pixels, where nearest has no unique
+    /// answer and GPU rounding may take either side.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_nearest_interpolation() {
+        use crate::opengl_headless::processor::NvSampling;
+        let Some(mut gl) = nv_test_processor() else {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        };
+        gl.set_interpolation(crate::Interpolation::Nearest);
+        let (sw, sh, nv12) = detailed_nv12();
+        let src =
+            load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
+        let oracle = NvOracle::new(&nv12, sw, sh, &src);
+        for (dw, dh) in [(1792usize, 1008usize), (768, 432)] {
+            let mut gpu = TensorDyn::image(
+                dw,
+                dh,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-        let native = bytes(&native);
-        // `INTER_LINEAR` of the source crop (x, y, w, h), taps clamped to it.
-        let inter_linear =
-            |(cx, cy, cw, ch): (usize, usize, usize, usize), dw: usize, dh: usize| -> Vec<u8> {
-                let (sx, sy) = (cw as f32 / dw as f32, ch as f32 / dh as f32);
-                let mut out = Vec::with_capacity(3 * dw * dh);
-                for plane in native.chunks_exact(sw * sh) {
-                    let at = |x: isize, y: isize| {
-                        let x = cx + x.clamp(0, cw as isize - 1) as usize;
-                        let y = cy + y.clamp(0, ch as isize - 1) as usize;
-                        plane[y * sw + x] as f32
-                    };
-                    for dy in 0..dh {
-                        let py = (dy as f32 + 0.5) * sy - 0.5;
-                        let (y0, fy) = (py.floor() as isize, py - py.floor());
-                        for dx in 0..dw {
-                            let px = (dx as f32 + 0.5) * sx - 0.5;
-                            let (x0, fx) = (px.floor() as isize, px - px.floor());
-                            let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
-                            let bot = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
-                            out.push((top * (1.0 - fy) + bot * fy).round() as u8);
-                        }
-                    }
-                }
-                out
-            };
-
-        for (dw, dh, dtype) in [
-            (1792usize, 1008usize, DType::U8),
-            (896, 504, DType::U8),
-            (640, 360, DType::U8),
-            (1792, 1008, DType::I8),
-        ] {
-            let mut gpu = image(dw, dh, dtype, Some(TensorMemory::Mem));
             gl.convert(&src, &mut gpu, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
-            assert_eq!(gl.last_nv_convert_path, NvConvertPath::ShaderR8);
-            let mad = mean_abs_diff(&bytes(&gpu), &inter_linear((0, 0, sw, sh), dw, dh));
+            assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
+            let mad = mean_abs_diff(
+                &planar_bytes(&gpu),
+                &oracle.render((0, 0, sw, sh), dw, dh, "nearest"),
+            );
             assert!(
-                mad < MAX_MEAN_ERROR,
-                "{dw}x{dh} {dtype:?}: GL resize is {mad:.3} grey levels from INTER_LINEAR"
+                mad < 3.0,
+                "{dw}x{dh}: nearest GL is {mad:.3} grey levels from the reference"
             );
         }
+    }
 
-        // A source crop (SAHI tiles) drawn 1:1 must read each crop pixel
-        // exactly, and a rescaled crop must not blend pixels outside it.
-        let (cx, cy, cw, ch) = (101usize, 53usize, 320usize, 180usize);
-        let crop = Crop::new().with_source(Some(crate::Region::new(cx, cy, cw, ch)));
-        for (dw, dh, max_mean) in [(cw, ch, 1.0), (448, 252, MAX_MEAN_ERROR)] {
-            let mut gpu = image(dw, dh, DType::U8, Some(TensorMemory::Mem));
-            gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
-                .unwrap();
-            let (g, want) = (bytes(&gpu), inter_linear((cx, cy, cw, ch), dw, dh));
-            let mad = mean_abs_diff(&g, &want);
-            assert!(
-                mad < max_mean,
-                "crop to {dw}x{dh}: GL is {mad:.3} grey levels from INTER_LINEAR"
-            );
-            if (dw, dh) == (cw, ch) {
-                let max = g.iter().zip(&want).map(|(&a, &b)| a.abs_diff(b)).max();
-                // GPU float vs CPU fixed-point YUV->RGB rounding on this
-                // saturated pattern reaches 3 on V3D and Adreno.
-                assert!(max <= Some(3), "1:1 crop: max deviation {max:?}");
-            }
-        }
-
-        let crop = letterbox_crop(sw, sh, 1792, 1024);
-        let mut gpu = image(1792, 1024, DType::U8, Some(TensorMemory::Mem));
+    /// The profiler's letterbox on natural content: the GL bilinear resize
+    /// stays close to the CPU backend's (they differ only in how chroma is
+    /// upsampled, which natural chroma barely shows).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_letterbox_close_to_cpu_on_camera_frame() {
+        let Some(mut gl) = nv_test_processor() else {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        };
+        let nv12: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
+        let src =
+            load_raw_image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem), nv12).unwrap();
+        let crop = letterbox_crop(1280, 720, 1792, 1024);
+        let image = |m| {
+            TensorDyn::image(
+                1792,
+                1024,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                m,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let mut gpu = image(Some(TensorMemory::Mem));
         gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
             .unwrap();
-        let mut cpu = image(1792, 1024, DType::U8, None);
+        let mut cpu = image(None);
         crate::cpu::CPUProcessor::new()
             .convert(&src, &mut cpu, Rotation::None, Flip::None, crop)
             .unwrap();
-        let mad = mean_abs_diff(&bytes(&gpu), &bytes(&cpu));
+        let mad = mean_abs_diff(&planar_bytes(&gpu), &planar_bytes(&cpu));
         assert!(
-            mad < MAX_MEAN_ERROR,
+            mad < 1.5,
             "letterbox upscale: GL is {mad:.3} grey levels from the CPU backend"
         );
+    }
+
+    /// `Interpolation::Nearest` switches the packed texture path to
+    /// `GL_NEAREST`: a resized checkerboard copies the source pixel under
+    /// each output centre (a 7/5 upscale keeps every centre off a pixel
+    /// boundary), where `Bilinear` blends.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gl_texture_nearest_interpolation() {
+        let Some(mut gl) = nv_test_processor() else {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        };
+        let (sw, sh, dw, dh) = (40usize, 30usize, 56usize, 42usize);
+        let pixel = |x: usize, y: usize| if (x + y).is_multiple_of(2) { 16u8 } else { 235 };
+        let mut rgba = Vec::with_capacity(sw * sh * 4);
+        for y in 0..sh {
+            for x in 0..sw {
+                rgba.extend_from_slice(&[pixel(x, y), 128, 255 - pixel(x, y), 255]);
+            }
+        }
+        let src =
+            load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &rgba).unwrap();
+        let mut want = Vec::with_capacity(dw * dh * 4);
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let x = (dx * 2 + 1) * sw / (dw * 2);
+                let y = (dy * 2 + 1) * sh / (dh * 2);
+                want.extend_from_slice(&rgba[(y * sw + x) * 4..][..4]);
+            }
+        }
+        for (mode, exact) in [
+            (crate::Interpolation::Nearest, true),
+            (crate::Interpolation::Bilinear, false),
+        ] {
+            gl.set_interpolation(mode);
+            let mut dst = TensorDyn::image(
+                dw,
+                dh,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            let got = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            assert_eq!(
+                got == want,
+                exact,
+                "{mode:?}: nearest copy expected = {exact}"
+            );
+        }
     }
 
     /// A source crop drawn 1:1 must read each crop pixel exactly on the

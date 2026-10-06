@@ -795,13 +795,13 @@ impl GLProcessorST {
         let render_tex_id = self.float_render_texture.id;
         let src_tex_id = self.camera_normal_texture.id;
 
-        // Source sampling filter. Both float shaders sample at output-pixel
-        // centers (they add +0.5 to the integer output index before mapping to
-        // the source UV), so LINEAR gives a correct bilinear resize on both
-        // paths. LINEAR on the RGBA8 source is unconditionally supported —
+        // Source sampling filter, from `Interpolation`. Both float shaders
+        // sample at output-pixel centers (they add +0.5 to the integer output
+        // index before mapping to the source UV), so LINEAR gives a correct
+        // bilinear resize and NEAREST a correct nearest one on both paths. LINEAR on the RGBA8 source is unconditionally supported —
         // GL_OES_texture_float_linear is irrelevant here because we filter the
         // u8 source texture, not the float render target.
-        let src_filter = edgefirst_gl::gl::LINEAR as i32;
+        let src_filter = self.source_filter() as i32;
 
         // ── Source RGBA8 feed (shared with the DMA F16 path): zero-copy
         // import when the source is Dma-backed, PBO upload, or CPU upload —
@@ -963,7 +963,7 @@ impl GLProcessorST {
             float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
 
         let src_tex_id = self.camera_normal_texture.id;
-        let src_filter = edgefirst_gl::gl::LINEAR as i32;
+        let src_filter = self.source_filter() as i32;
 
         // ── Source RGBA8 feed (shared with the PBO F16 path): zero-copy
         // import when the source is Dma-backed, else PBO/CPU upload — see
