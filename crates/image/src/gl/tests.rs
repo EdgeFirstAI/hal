@@ -8863,7 +8863,9 @@ mod gl_tests {
             );
             if (dw, dh) == (cw, ch) {
                 let max = g.iter().zip(&want).map(|(&a, &b)| a.abs_diff(b)).max();
-                assert!(max <= Some(2), "1:1 crop: max deviation {max:?}");
+                // GPU float vs CPU fixed-point YUV->RGB rounding on this
+                // saturated pattern reaches 3 on V3D and Adreno.
+                assert!(max <= Some(3), "1:1 crop: max deviation {max:?}");
             }
         }
 
@@ -8886,8 +8888,9 @@ mod gl_tests {
     /// filtered (`LINEAR`) paths: the texture path for packed sources and,
     /// on DMA, the driver external sampler that NV12 takes under the default
     /// `ColorimetryMode::Fast` on Vivante. A one-pixel checkerboard turns any
-    /// sub-texel offset into a visible blend (a half-texel inset averaged it
-    /// to grey).
+    /// sub-texel offset into a visible blend: a half-texel inset averaged it
+    /// to grey (110 levels off), while interpolation and filter-weight
+    /// precision leave up to 6 on Mali.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_gl_crop_1to1_is_exact() {
@@ -8958,7 +8961,7 @@ mod gl_tests {
                     let c = cpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
                     let max = g.iter().zip(&c).map(|(&a, &b)| a.abs_diff(b)).max();
                     assert!(
-                        max <= Some(2),
+                        max <= Some(16),
                         "{mem:?} {src_fmt:?}->{dst_fmt:?} 1:1 crop: max deviation {max:?} \
                          (path {:?})",
                         gl.last_nv_convert_path

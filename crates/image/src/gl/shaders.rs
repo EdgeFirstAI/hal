@@ -839,6 +839,17 @@ pub(super) fn generate_nv_to_rgba_int8_shader_2d() -> &'static str {
     super::shaders_common::NV_RGBA_INT8_FRAGMENT
 }
 
+/// Bilinear variant of [`generate_nv_to_rgba_shader_2d`], used when the draw
+/// rescales the source crop.
+pub(super) fn generate_nv_to_rgba_bilinear_shader_2d() -> &'static str {
+    super::shaders_common::NV_RGBA_BILINEAR_FRAGMENT
+}
+
+/// Int8 variant of [`generate_nv_to_rgba_bilinear_shader_2d`].
+pub(super) fn generate_nv_to_rgba_bilinear_int8_shader_2d() -> &'static str {
+    super::shaders_common::NV_RGBA_BILINEAR_INT8_FRAGMENT
+}
+
 /// HWC → layer-first (CHW) repack compute shader for int8 protos.
 ///
 /// Reads proto data from an SSBO in row-major HWC layout `(H, W, num_protos)`.
@@ -996,6 +1007,14 @@ mod tc_precision {
                 super::generate_nv_to_rgba_int8_shader_2d(),
             ),
             (
+                "generate_nv_to_rgba_bilinear_shader_2d",
+                super::generate_nv_to_rgba_bilinear_shader_2d(),
+            ),
+            (
+                "generate_nv_to_rgba_bilinear_int8_shader_2d",
+                super::generate_nv_to_rgba_bilinear_int8_shader_2d(),
+            ),
+            (
                 "generate_proto_repack_compute_shader",
                 super::generate_proto_repack_compute_shader(),
             ),
@@ -1015,6 +1034,14 @@ mod tc_precision {
             (
                 "NV_RGBA_INT8_FRAGMENT",
                 super::super::shaders_common::NV_RGBA_INT8_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_BILINEAR_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_BILINEAR_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_BILINEAR_INT8_FRAGMENT,
             ),
         ]
     }

@@ -266,11 +266,8 @@ uniform int tex_width;
 uniform ivec2 chroma_shift;
 uniform int chroma_lines;
 // Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
-// clamped to them, so a crop never blends pixels from outside itself.
+// clamped to them, so a crop never reads pixels from outside itself.
 uniform ivec4 src_rect;
-// False when the draw maps the crop 1:1 onto the destination (chosen from the
-// draw geometry on the CPU): one sample per pixel, no blend.
-uniform bool resample;
 // Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
 // from the source tensor's resolved colorimetry. Path B applies the matrix in
 // the shader, so it is correct regardless of driver EGL color-hint support.
@@ -315,29 +312,44 @@ vec3 nv_rgb(int x, int y) {
     };
 }
 
-/// `main()` statements shared by the NV->RGBA program and its int8 twin:
-/// samples `nv_rgb` at `tc` and leaves the pixel in `rgb`. `tc` spans the
-/// crop's outer edges, so `tc * size` is this fragment's source position.
-macro_rules! nv_rgb_sample_body {
+/// `main()` statements of the single-tap NV programs, for draws that map the
+/// crop 1:1: reads the texel under the fragment and leaves it in `rgb`. `tc`
+/// spans the crop's outer edges, so `tc * size` is the source position.
+macro_rules! nv_rgb_nearest_body {
     () => {
-        "    vec2 p = tc * vec2(img_size);
-    vec3 rgb;
-    if (!resample) {
-        ivec2 i = clamp(ivec2(floor(p)), src_rect.xy, src_rect.zw);
-        rgb = nv_rgb(i.x, i.y);
-    } else {
-        // Half-pixel-centred bilinear, the GL_LINEAR / OpenCV INTER_LINEAR
-        // convention. Blending the four texels' converted RGB equals
-        // converting at native resolution and then resizing, as the CPU
-        // backend does.
-        p -= 0.5;
-        vec2 p0 = floor(p);
-        vec2 f = p - p0;
-        ivec2 i0 = clamp(ivec2(p0), src_rect.xy, src_rect.zw);
-        ivec2 i1 = clamp(ivec2(p0) + 1, src_rect.xy, src_rect.zw);
-        rgb = mix(mix(nv_rgb(i0.x, i0.y), nv_rgb(i1.x, i0.y), f.x),
-                  mix(nv_rgb(i0.x, i1.y), nv_rgb(i1.x, i1.y), f.x), f.y);
-    }
+        "    ivec2 i = clamp(ivec2(tc * vec2(img_size)), src_rect.xy, src_rect.zw);
+    vec3 rgb = nv_rgb(i.x, i.y);
+"
+    };
+}
+
+/// `main()` statements of the bilinear NV programs, for draws that rescale
+/// the crop: half-pixel-centred bilinear, the GL_LINEAR / OpenCV INTER_LINEAR
+/// convention, with every tap clamped to the crop. Blending the four texels'
+/// converted RGB equals converting at native resolution and then resizing, as
+/// the CPU backend does.
+macro_rules! nv_rgb_bilinear_body {
+    () => {
+        "    vec2 p = tc * vec2(img_size) - 0.5;
+    vec2 p0 = floor(p);
+    vec2 f = p - p0;
+    ivec2 i0 = clamp(ivec2(p0), src_rect.xy, src_rect.zw);
+    ivec2 i1 = clamp(ivec2(p0) + 1, src_rect.xy, src_rect.zw);
+    vec3 rgb = mix(mix(nv_rgb(i0.x, i0.y), nv_rgb(i1.x, i0.y), f.x),
+                   mix(nv_rgb(i0.x, i1.y), nv_rgb(i1.x, i1.y), f.x), f.y);
+"
+    };
+}
+
+/// The XOR 0x80 bias (`(q + 128) mod 256`) the int8 NV programs apply to
+/// their output, as the other int8 shaders do.
+macro_rules! nv_int8_bias {
+    () => {
+        "vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
 "
     };
 }
@@ -433,26 +445,42 @@ pub(crate) const YUYV_RGBA_2D_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(int8_bias(vec3(r, g, b)), 1.0);\n}\n"
 );
 
-/// NV->RGBA fragment shader (Path B), shared verbatim by both backends. Vertex
+/// NV->RGBA fragment shader (Path B) for draws that do not rescale. Vertex
 /// stage ([`VERTEX_SHADER`]) provides `fragPos`/`tc`; output is `color`. The
 /// bytes are validated on-target (Linux) and frozen by the golden test below.
 pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
     "void main() {\n",
-    nv_rgb_sample_body!(),
+    nv_rgb_nearest_body!(),
     "    color = vec4(rgb, 1.0);\n}\n"
 );
 
-/// Int8 variant of [`NV_RGBA_FRAGMENT`]: the same pixel with the XOR 0x80
-/// bias (`(q + 128) mod 256`) the other int8 shaders apply.
+/// Int8 variant of [`NV_RGBA_FRAGMENT`].
 pub(crate) const NV_RGBA_INT8_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
-    "vec3 int8_bias(vec3 v) {\n",
-    "    vec3 q = floor(v * 255.0 + 0.5);\n",
-    "    return mod(q + 128.0, 256.0) / 255.0;\n",
-    "}\n\n",
+    nv_int8_bias!(),
     "void main() {\n",
-    nv_rgb_sample_body!(),
+    nv_rgb_nearest_body!(),
+    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+);
+
+/// NV->RGBA fragment shader (Path B) for draws that rescale: bilinear. A
+/// separate program rather than a uniform branch in [`NV_RGBA_FRAGMENT`]:
+/// Vivante GC7000UL does not reliably honour that branch, and on V3D and
+/// Adreno the untaken half still slows 1:1 draws.
+pub(crate) const NV_RGBA_BILINEAR_FRAGMENT: &str = concat!(
+    nv_rgba_header!(),
+    "void main() {\n",
+    nv_rgb_bilinear_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`NV_RGBA_BILINEAR_FRAGMENT`].
+pub(crate) const NV_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
+    nv_rgba_header!(),
+    nv_int8_bias!(),
+    "void main() {\n",
+    nv_rgb_bilinear_body!(),
     "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
 );
 
@@ -478,6 +506,11 @@ mod nv_shader_golden {
             super::NV_RGBA_FRAGMENT,
             golden(include_str!("golden/nv_rgba_linux.glsl")).as_str(),
             "NV->RGBA shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::NV_RGBA_BILINEAR_FRAGMENT,
+            golden(include_str!("golden/nv_rgba_bilinear_linux.glsl")).as_str(),
+            "bilinear NV->RGBA shader bytes drifted from the on-target-validated golden"
         );
     }
 

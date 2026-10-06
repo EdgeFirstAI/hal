@@ -25,6 +25,7 @@ use super::resources::{Buffer, FrameBuffer, GlProgram, Texture, UploadSource};
 use super::shaders::{
     check_gl_error, generate_color_shader, generate_float_nhwc_packed_shader,
     generate_float_rgba_shader, generate_instanced_segmentation_shader,
+    generate_nv_to_rgba_bilinear_int8_shader_2d, generate_nv_to_rgba_bilinear_shader_2d,
     generate_nv_to_rgba_int8_shader_2d, generate_nv_to_rgba_shader_2d,
     generate_packed_f32_nhwc_shader, generate_packed_rgba8_int8_shader_2d,
     generate_packed_rgba8_shader_2d, generate_planar_rgb_f16_packed_shader,
@@ -167,7 +168,6 @@ struct NvUniformLocs {
     chroma_shift: i32,
     chroma_lines: i32,
     src_rect: i32,
-    resample: i32,
     y_offset: i32,
     y_scale: i32,
     c_vr: i32,
@@ -220,7 +220,6 @@ impl NvUniformState {
                     chroma_shift: loc(c"chroma_shift"),
                     chroma_lines: loc(c"chroma_lines"),
                     src_rect: loc(c"src_rect"),
-                    resample: loc(c"resample"),
                     y_offset: loc(c"y_offset"),
                     y_scale: loc(c"y_scale"),
                     c_vr: loc(c"c_vr"),
@@ -273,6 +272,12 @@ impl NvSampleRect {
             bottom: src.top + src.height,
             resample: (w, h) != (dst.width, dst.height),
         }
+    }
+
+    /// Index into the `nv_r8_programs` family: bilinear when the draw
+    /// rescales, int8 when the destination is.
+    fn program(&self, is_int8: bool) -> usize {
+        usize::from(is_int8) | usize::from(self.resample) << 1
     }
 }
 
@@ -492,14 +497,12 @@ pub struct GLProcessorST {
     /// existing storage (skip the per-frame reallocation on the fixed-size
     /// video path). `(0, 0, 0)` means unallocated.
     float_render_tex_dims: (usize, usize, u32),
-    /// Path B shader: NV12/NV16/NV24 R8 → RGBA8 (u8 output).
-    nv_r8_program: GlProgram,
-    /// Path B shader: NV12/NV16/NV24 R8 → RGBA8 with int8 XOR 0x80 bias.
-    nv_r8_int8_program: GlProgram,
-    /// Link-time uniform locations + colorimetry-upload skip for `nv_r8_program`.
-    nv_r8_uniforms: NvUniformState,
-    /// Same for `nv_r8_int8_program`.
-    nv_r8_int8_uniforms: NvUniformState,
+    /// Path B shaders: NV12/NV16/NV24 R8 → RGBA8, indexed by
+    /// [`NvSampleRect::program`]: single-tap or bilinear, u8 or int8 (XOR 0x80
+    /// bias) output.
+    nv_r8_programs: [GlProgram; 4],
+    /// Link-time uniform locations + colorimetry-upload skip, per program.
+    nv_r8_uniforms: [NvUniformState; 4],
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
@@ -2039,17 +2042,25 @@ impl GLProcessorST {
             GlProgram::new(generate_vertex_shader(), generate_float_rgba_shader())?;
 
         // Path B: NV12/NV16/NV24 → RGBA via R8 texelFetch shader (ES 3.0 core, no extension).
-        let nv_r8_program =
-            GlProgram::new(generate_vertex_shader(), generate_nv_to_rgba_shader_2d())?;
-        let nv_r8_int8_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_nv_to_rgba_int8_shader_2d(),
-        )?;
+        let nv_r8_programs = [
+            GlProgram::new(generate_vertex_shader(), generate_nv_to_rgba_shader_2d())?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_int8_shader_2d(),
+            )?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_bilinear_shader_2d(),
+            )?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_bilinear_int8_shader_2d(),
+            )?,
+        ];
         // Resolve uniform locations once at link time (the NV draw is per-frame)
         // and upload the constant sampler bindings while the programs are fresh:
         // pass-2 packing samples the intermediate on unit 1, planar-2d on unit 0.
-        let nv_r8_uniforms = NvUniformState::resolve(&nv_r8_program);
-        let nv_r8_int8_uniforms = NvUniformState::resolve(&nv_r8_int8_program);
+        let nv_r8_uniforms = nv_r8_programs.each_ref().map(NvUniformState::resolve);
         packed_rgba8_program_2d.load_uniform_1i(c"tex", 1)?;
         packed_rgba8_int8_program_2d.load_uniform_1i(c"tex", 1)?;
         texture_program_planar_2d.load_uniform_1i(c"tex", 0)?;
@@ -2196,10 +2207,8 @@ impl GLProcessorST {
             proto_compute_locs: (-1, -1, -1),
             proto_ssbo: 0,
             proto_ssbo_size: 0,
-            nv_r8_program,
-            nv_r8_int8_program,
+            nv_r8_programs,
             nv_r8_uniforms,
-            nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
@@ -6613,15 +6622,11 @@ impl GLProcessorST {
         // reads them with `texelFetch`, so the logical plane is already
         // addressed from the texture origin however large the texture is.
 
-        // Draw-time program selection: the int8 NV program is the same shader
-        // plus the XOR-0x80 bias. Selected here for EVERY destination lowering
-        // (the old swap scheme only covered DMA destinations, leaving the
-        // heap-source int8 NV output un-biased on texture destinations).
-        let prog_id = if is_int8 {
-            self.nv_r8_int8_program.id
-        } else {
-            self.nv_r8_program.id
-        };
+        // Draw-time program selection, for EVERY destination lowering: the
+        // int8 programs add the XOR-0x80 bias, and a draw that rescales takes
+        // the bilinear program.
+        let program = src_rect.program(is_int8);
+        let prog_id = self.nv_r8_programs[program].id;
 
         // YUV→RGB matrix + range, resolved from the source tensor's
         // colorimetry (missing axes filled by the SD/HD height heuristic).
@@ -6633,11 +6638,7 @@ impl GLProcessorST {
                 .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
             cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
         );
-        let state = if is_int8 {
-            &mut self.nv_r8_int8_uniforms
-        } else {
-            &mut self.nv_r8_uniforms
-        };
+        let state = &mut self.nv_r8_uniforms[program];
         let locs = state.locs;
         // Uniform values persist per program: re-upload the six matrix floats
         // only when this program's (encoding, range) actually changed. The
@@ -6741,7 +6742,6 @@ impl GLProcessorST {
                 src_rect.right as i32 - 1,
                 src_rect.bottom as i32 - 1,
             );
-            edgefirst_gl::gl::Uniform1i(locs.resample, i32::from(src_rect.resample));
 
             if upload_colorimetry {
                 let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(colorimetry.0, colorimetry.1);
@@ -6833,12 +6833,7 @@ impl GLProcessorST {
         // The draw (and its colorimetry upload, when taken) succeeded — only
         // now record the program's uploaded (encoding, range).
         if upload_colorimetry {
-            let state = if is_int8 {
-                &mut self.nv_r8_int8_uniforms
-            } else {
-                &mut self.nv_r8_uniforms
-            };
-            state.last_colorimetry = Some(colorimetry);
+            self.nv_r8_uniforms[program].last_colorimetry = Some(colorimetry);
         }
         Ok(())
     }
