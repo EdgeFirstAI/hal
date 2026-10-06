@@ -87,7 +87,7 @@ pruned by whether a component reaches a released binary.
   * edgefirst-tensor-ffi 0.33.0 (Apache-2.0)
   * edgefirst-tracker 0.33.0 (Apache-2.0)
   * edgefirst-tracker-capi 0.33.0 (Apache-2.0)
-  * edgefirst-v4l2 0.1.0 (Apache-2.0)
+  * edgefirst-v4l2 0.2.1 (Apache-2.0)
   * either 1.18.0 (Apache-2.0, MIT)
   * enum_dispatch 0.3.13 (Apache-2.0, MIT)
   * env_filter 2.0.0 (Apache-2.0, MIT)

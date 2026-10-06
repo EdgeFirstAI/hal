@@ -179,11 +179,15 @@ jobs:
       #
       # The selection is the routing test.yml used: the image and tensor lib
       # binaries filtered to the hardware tests, plus the integration binaries
-      # that are whole-binary GPU/DMA tests. Everything else is CPU-only and
-      # already covered by the aarch64 host lane.
+      # that are whole-binary GPU/DMA tests, plus the codec's V4L2 JPEG tests,
+      # which need a mem2mem decoder (i.MX 95 mxc-jpeg) and fall back to the
+      # CPU or skip elsewhere. Everything else is CPU-only and already covered
+      # by the aarch64 host lane.
       board-binaries: |
         edgefirst_image=g2d,opengl
         edgefirst_tensor=dma
+        edgefirst_codec=v4l2
+        v4l2_jpeg
         dst_view_stride
         offset_nv_source_upload
         offset_source_view_alignment
@@ -208,7 +212,7 @@ jobs:
       # what kept the on-target payload shippable before the migration; the
       # dev profile's full debug info fills the disk.
       archive-profile: profiling
-      archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
+      archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor --package edgefirst-codec
     secrets: inherit
 
   hal-full:

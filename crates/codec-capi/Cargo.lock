@@ -157,10 +157,8 @@ dependencies = [
  "edgefirst-tensor",
  "edgefirst-v4l2",
  "kamadak-exif",
- "libc",
  "libloading",
  "log",
- "nix",
  "num-traits",
  "tracing",
  "zune-png",
@@ -215,9 +213,9 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-v4l2"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c6a48662f2aeb8fab228e149e98247fff5ee5062b920853ed473154803b146c"
+checksum = "b3cbfafbad776ecf3df5357ceb945d7f39bb67cf65a3aa92d3b48db722ded028"
 dependencies = [
  "libc",
  "nix",

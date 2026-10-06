@@ -19,7 +19,7 @@ documentation = "https://docs.rs/edgefirst-codec"
 # to nothing. nvjpeg is pure dlopen (no link-time CUDA dependency) — it loads
 # libnvjpeg.so.12 at runtime and degrades to the V4L2/CPU decoders when absent.
 default = ["v4l2", "nvjpeg", "png", "static"]
-v4l2 = ["dep:nix", "dep:libc", "dep:edgefirst-v4l2"]
+v4l2 = ["dep:edgefirst-v4l2"]
 png = ["dep:zune-png"]
 nvjpeg = ["dep:libloading"]
 opencv = ["dep:opencv"]
@@ -43,12 +43,9 @@ turbojpeg = { version = "1.4", optional = true }
 zune-png = { workspace = true, optional = true }
 
 # Hardware JPEG decode (v4l2 feature). Linux-only: edgefirst-v4l2 provides
-# the V4L2 UAPI and ioctls, nix the poll, libc the open flags / mmap.
+# device discovery, the buffer queues and events.
 [target.'cfg(target_os = "linux")'.dependencies]
 edgefirst-v4l2 = { workspace = true, optional = true }
-# `poll` adds to the workspace-declared nix features (fs/ioctl/mman).
-nix = { workspace = true, optional = true, features = ["poll"] }
-libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
