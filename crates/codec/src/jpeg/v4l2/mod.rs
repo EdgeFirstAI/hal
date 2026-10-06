@@ -37,7 +37,6 @@
 mod buffers;
 mod device;
 mod format;
-mod ioctl;
 
 use std::os::fd::{BorrowedFd, RawFd};
 use std::os::raw::c_int;
@@ -51,6 +50,7 @@ use crate::pixel::ImagePixel;
 use buffers::Mmap;
 use device::{ApiVariant, ProbedDevice};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
+use edgefirst_v4l2::{ioctl, uapi};
 use format::CapKind;
 use std::os::fd::AsRawFd;
 
@@ -399,11 +399,11 @@ impl V4l2Context {
                 .entered();
         self.drop_stream();
         let fd = self.device.fd();
-        const OUT: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        const OUT: u32 = uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 
         // Subscribe to source-change events (harmless if already subscribed).
-        let sub = ioctl::v4l2_event_subscription {
-            type_: ioctl::V4L2_EVENT_SOURCE_CHANGE,
+        let sub = uapi::v4l2_event_subscription {
+            type_: uapi::V4L2_EVENT_SOURCE_CHANGE,
             ..Default::default()
         };
         // SAFETY: valid subscription struct.
@@ -414,7 +414,7 @@ impl V4l2Context {
         // full rebuild), allocate, map, stream. The allocation is persistent —
         // it survives every geometry change until OUTPUT overflow or reset.
         let out_request = needed.max(OUT_SIZE_FLOOR);
-        let mut ofmt = ioctl::v4l2_format {
+        let mut ofmt = uapi::v4l2_format {
             type_: OUT,
             ..Default::default()
         };
@@ -423,8 +423,8 @@ impl V4l2Context {
             let p = unsafe { ofmt.pix_mp() };
             p.width = final_w as u32;
             p.height = final_h as u32;
-            p.pixelformat = ioctl::V4L2_PIX_FMT_JPEG;
-            p.field = ioctl::V4L2_FIELD_NONE;
+            p.pixelformat = uapi::V4L2_PIX_FMT_JPEG;
+            p.field = uapi::V4L2_FIELD_NONE;
             p.num_planes = 1;
             p.plane_fmt[0].sizeimage = out_request;
         }
@@ -432,7 +432,7 @@ impl V4l2Context {
         unsafe { ioctl::vidioc_s_fmt(fd, &mut ofmt) }
             .map_err(|e| DecodeErr::Reset(format!("S_FMT OUTPUT: {e}")))?;
 
-        reqbufs(fd, OUT, 1, ioctl::V4L2_MEMORY_MMAP)
+        reqbufs(fd, OUT, 1, uapi::V4L2_MEMORY_MMAP)
             .map_err(|e| DecodeErr::Reset(format!("REQBUFS OUTPUT: {e}")))?;
         let (olen, ooff) =
             querybuf(fd, OUT, 1).map_err(|e| DecodeErr::Reset(format!("QUERYBUF OUTPUT: {e}")))?;
@@ -495,7 +495,7 @@ impl V4l2Context {
         )
         .entered();
         let fd = self.device.fd();
-        const CAP: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         // Stop and free only the CAPTURE queue — DMABUF buffers are ours, so
         // this releases no memory, just vb2 bookkeeping. The OUTPUT queue
@@ -505,7 +505,7 @@ impl V4l2Context {
         }
         streamoff(fd, CAP)
             .map_err(|e| DecodeErr::Reset(format!("STREAMOFF CAPTURE (reconf): {e}")))?;
-        reqbufs(fd, CAP, 0, ioctl::V4L2_MEMORY_DMABUF)
+        reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF)
             .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE 0 (reconf): {e}")))?;
 
         // Queue the new JPEG; the driver parses the header and retargets the
@@ -558,10 +558,10 @@ impl V4l2Context {
         dma_capable: bool,
     ) -> Result<Capture, DecodeErr> {
         let fd = self.device.fd();
-        const CAP: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         // CAPTURE: query the driver-chosen format for the queued JPEG.
-        let mut cfmt = ioctl::v4l2_format {
+        let mut cfmt = uapi::v4l2_format {
             type_: CAP,
             ..Default::default()
         };
@@ -584,7 +584,7 @@ impl V4l2Context {
         let mut kind = format::classify(cap.pixelformat).ok_or_else(|| {
             DecodeErr::Unsupported(format!(
                 "capture format {} unsupported",
-                ioctl::fourcc_str(cap.pixelformat)
+                uapi::fourcc_str(cap.pixelformat)
             ))
         })?;
         if !colorimetry_ok(cap.colorspace, cap.ycbcr_enc, cap.quantization) {
@@ -604,7 +604,7 @@ impl V4l2Context {
         // decoder (4:4:4 → Nv24). S_FMT must happen before REQBUFS CAPTURE;
         // this is the only safe window (after G_FMT, before REQBUFS).
         if matches!(kind, CapKind::Yuv444Packed) && matches!(output_fmt, PixelFormat::Nv12) {
-            let mut nfmt = ioctl::v4l2_format {
+            let mut nfmt = uapi::v4l2_format {
                 type_: CAP,
                 ..Default::default()
             };
@@ -613,8 +613,8 @@ impl V4l2Context {
                 let p = unsafe { nfmt.pix_mp() };
                 p.width = cap.width;
                 p.height = cap.height;
-                p.pixelformat = ioctl::V4L2_PIX_FMT_NV12;
-                p.field = ioctl::V4L2_FIELD_NONE;
+                p.pixelformat = uapi::V4L2_PIX_FMT_NV12;
+                p.field = uapi::V4L2_FIELD_NONE;
                 p.colorspace = cap.colorspace;
                 p.ycbcr_enc = cap.ycbcr_enc;
                 p.quantization = cap.quantization;
@@ -624,7 +624,7 @@ impl V4l2Context {
             // SAFETY: valid format; best-effort — if refused, cap/kind stay YUV3
             // and the scratch path deinterleaves to NV24 instead.
             let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut nfmt) };
-            let mut gfmt = ioctl::v4l2_format {
+            let mut gfmt = uapi::v4l2_format {
                 type_: CAP,
                 ..Default::default()
             };
@@ -642,7 +642,7 @@ impl V4l2Context {
                     } else {
                         log::debug!(
                             "v4l2: driver kept {} for 4:4:4 JPEG — will deinterleave to NV24",
-                            ioctl::fourcc_str(got.pixelformat)
+                            uapi::fourcc_str(got.pixelformat)
                         );
                     }
                 }
@@ -680,10 +680,10 @@ impl V4l2Context {
             // The driver's default NV12M is two *non-contiguous* planes, which
             // do not compose into a single tensor buffer via data_offset.
             let (target_fourcc, total_h) = match output_fmt {
-                PixelFormat::Nv12 => (ioctl::V4L2_PIX_FMT_NV12, cap0.height as usize * 3 / 2),
-                _ => (ioctl::V4L2_PIX_FMT_GREY, cap0.height as usize),
+                PixelFormat::Nv12 => (uapi::V4L2_PIX_FMT_NV12, cap0.height as usize * 3 / 2),
+                _ => (uapi::V4L2_PIX_FMT_GREY, cap0.height as usize),
             };
-            let mut sfmt = ioctl::v4l2_format {
+            let mut sfmt = uapi::v4l2_format {
                 type_: CAP,
                 ..Default::default()
             };
@@ -693,7 +693,7 @@ impl V4l2Context {
                 p.width = cap0.width;
                 p.height = cap0.height;
                 p.pixelformat = target_fourcc;
-                p.field = ioctl::V4L2_FIELD_NONE;
+                p.field = uapi::V4L2_FIELD_NONE;
                 p.colorspace = cap0.colorspace;
                 p.ycbcr_enc = cap0.ycbcr_enc;
                 p.quantization = cap0.quantization;
@@ -704,7 +704,7 @@ impl V4l2Context {
             }
             // SAFETY: valid format. Best-effort; read back what the driver kept.
             let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) };
-            let mut gfmt = ioctl::v4l2_format {
+            let mut gfmt = uapi::v4l2_format {
                 type_: CAP,
                 ..Default::default()
             };
@@ -725,7 +725,7 @@ impl V4l2Context {
             } else {
                 // Driver refused single-plane contiguous output — restore its
                 // natural format for the copy paths.
-                let mut rfmt = ioctl::v4l2_format {
+                let mut rfmt = uapi::v4l2_format {
                     type_: CAP,
                     ..Default::default()
                 };
@@ -743,7 +743,7 @@ impl V4l2Context {
         if dst_dma {
             // Zero-copy: no driver buffers; the tensor fd is imported per
             // frame in `collect`. REQBUFS(DMABUF) is bookkeeping only.
-            reqbufs(fd, CAP, 1, ioctl::V4L2_MEMORY_DMABUF)
+            reqbufs(fd, CAP, 1, uapi::V4L2_MEMORY_DMABUF)
                 .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE (dmabuf): {e}")))?;
             streamon(fd, CAP).map_err(|e| DecodeErr::Reset(format!("STREAMON CAPTURE: {e}")))?;
             return Ok(Capture {
@@ -760,7 +760,7 @@ impl V4l2Context {
         // YUV3/GREY are naturally single-plane, NV12M is renegotiated.
         let mut single = cap;
         if cap.num_planes != 1 {
-            let mut sfmt = ioctl::v4l2_format {
+            let mut sfmt = uapi::v4l2_format {
                 type_: CAP,
                 ..Default::default()
             };
@@ -769,8 +769,8 @@ impl V4l2Context {
                 let p = unsafe { sfmt.pix_mp() };
                 p.width = cap.width;
                 p.height = cap.height;
-                p.pixelformat = ioctl::V4L2_PIX_FMT_NV12;
-                p.field = ioctl::V4L2_FIELD_NONE;
+                p.pixelformat = uapi::V4L2_PIX_FMT_NV12;
+                p.field = uapi::V4L2_FIELD_NONE;
                 p.colorspace = cap.colorspace;
                 p.ycbcr_enc = cap.ycbcr_enc;
                 p.quantization = cap.quantization;
@@ -779,7 +779,7 @@ impl V4l2Context {
             }
             // SAFETY: valid format; best-effort — read back the result.
             let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) };
-            let mut gfmt = ioctl::v4l2_format {
+            let mut gfmt = uapi::v4l2_format {
                 type_: CAP,
                 ..Default::default()
             };
@@ -798,7 +798,7 @@ impl V4l2Context {
         let kind = format::classify(single.pixelformat).ok_or_else(|| {
             DecodeErr::Unsupported(format!(
                 "capture format {} unsupported",
-                ioctl::fourcc_str(single.pixelformat)
+                uapi::fourcc_str(single.pixelformat)
             ))
         })?;
         let sizeimage = single.plane_fmt[0].sizeimage as usize;
@@ -807,7 +807,7 @@ impl V4l2Context {
                 "hardware decode requires DMA buffers (dma_heap unavailable)".into(),
             ));
         }
-        reqbufs(fd, CAP, 1, ioctl::V4L2_MEMORY_DMABUF)
+        reqbufs(fd, CAP, 1, uapi::V4L2_MEMORY_DMABUF)
             .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE (scratch): {e}")))?;
         streamon(fd, CAP).map_err(|e| DecodeErr::Reset(format!("STREAMON CAPTURE: {e}")))?;
         Ok(Capture {
@@ -974,21 +974,21 @@ impl V4l2Context {
             return;
         };
         let fd = self.device.fd();
-        let _ = streamoff(fd, ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-        let _ = streamoff(fd, ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+        let _ = streamoff(fd, uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+        let _ = streamoff(fd, uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
         // Drop the OUTPUT mapping (munmap) before REQBUFS 0 frees its buffer.
         drop(stream);
         let _ = reqbufs(
             fd,
-            ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
             0,
-            ioctl::V4L2_MEMORY_DMABUF,
+            uapi::V4L2_MEMORY_DMABUF,
         );
         let _ = reqbufs(
             fd,
-            ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
             0,
-            ioctl::V4L2_MEMORY_MMAP,
+            uapi::V4L2_MEMORY_MMAP,
         );
     }
 
@@ -1315,12 +1315,12 @@ fn copy_nv12_chroma(
 /// colorspace is accepted; anything explicitly limited-range or non-601 is
 /// rejected so we never emit mis-scaled colour.
 fn colorimetry_ok(colorspace: u32, ycbcr_enc: u8, quantization: u8) -> bool {
-    if colorspace == ioctl::V4L2_COLORSPACE_JPEG {
+    if colorspace == uapi::V4L2_COLORSPACE_JPEG {
         return true;
     }
-    let enc_ok = ycbcr_enc == 0 || ycbcr_enc == ioctl::V4L2_YCBCR_ENC_601;
-    let quant_ok = quantization == ioctl::V4L2_QUANTIZATION_DEFAULT
-        || quantization == ioctl::V4L2_QUANTIZATION_FULL_RANGE;
+    let enc_ok = ycbcr_enc == 0 || ycbcr_enc == uapi::V4L2_YCBCR_ENC_601;
+    let quant_ok = quantization == uapi::V4L2_QUANTIZATION_DEFAULT
+        || quantization == uapi::V4L2_QUANTIZATION_FULL_RANGE;
     enc_ok && quant_ok
 }
 
@@ -1332,7 +1332,7 @@ fn borrow(fd: RawFd) -> BorrowedFd<'static> {
 }
 
 fn reqbufs(fd: RawFd, buf_type: u32, count: u32, memory: u32) -> nix::Result<()> {
-    let mut rb = ioctl::v4l2_requestbuffers {
+    let mut rb = uapi::v4l2_requestbuffers {
         count,
         type_: buf_type,
         memory,
@@ -1356,10 +1356,10 @@ fn streamoff(fd: RawFd, buf_type: u32) -> nix::Result<()> {
 
 /// `VIDIOC_QUERYBUF` for index 0; returns plane 0's `(length, mem_offset)`.
 fn querybuf(fd: RawFd, buf_type: u32, num_planes: usize) -> nix::Result<(usize, i64)> {
-    let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
-    let mut b = ioctl::v4l2_buffer {
+    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
+    let mut b = uapi::v4l2_buffer {
         type_: buf_type,
-        memory: ioctl::V4L2_MEMORY_MMAP,
+        memory: uapi::V4L2_MEMORY_MMAP,
         index: 0,
         length: num_planes as u32,
         ..Default::default()
@@ -1372,11 +1372,11 @@ fn querybuf(fd: RawFd, buf_type: u32, num_planes: usize) -> nix::Result<(usize, 
 
 /// `VIDIOC_QBUF` the OUTPUT (coded) buffer with `bytesused` JPEG bytes.
 fn qbuf_output(fd: RawFd, bytesused: usize) -> nix::Result<()> {
-    let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
+    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
     planes[0].bytesused = bytesused as u32;
-    let mut b = ioctl::v4l2_buffer {
-        type_: ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-        memory: ioctl::V4L2_MEMORY_MMAP,
+    let mut b = uapi::v4l2_buffer {
+        type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+        memory: uapi::V4L2_MEMORY_MMAP,
         index: 0,
         length: 1,
         ..Default::default()
@@ -1388,10 +1388,10 @@ fn qbuf_output(fd: RawFd, bytesused: usize) -> nix::Result<()> {
 
 /// `VIDIOC_DQBUF` the consumed OUTPUT buffer to recycle it.
 fn dqbuf_output(fd: RawFd) -> nix::Result<()> {
-    let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
-    let mut b = ioctl::v4l2_buffer {
-        type_: ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-        memory: ioctl::V4L2_MEMORY_MMAP,
+    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
+    let mut b = uapi::v4l2_buffer {
+        type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+        memory: uapi::V4L2_MEMORY_MMAP,
         length: 1,
         ..Default::default()
     };
@@ -1404,12 +1404,12 @@ fn dqbuf_output(fd: RawFd) -> nix::Result<()> {
 /// `dmabuf_fd` as the backing; `length` is the dmabuf size (may exceed the
 /// format's `sizeimage`). The hardware decodes straight into the import.
 fn qbuf_capture_dmabuf(fd: RawFd, dmabuf_fd: RawFd, length: usize) -> nix::Result<()> {
-    let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
+    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
     planes[0].set_fd(dmabuf_fd);
     planes[0].length = length as u32;
-    let mut b = ioctl::v4l2_buffer {
-        type_: ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-        memory: ioctl::V4L2_MEMORY_DMABUF,
+    let mut b = uapi::v4l2_buffer {
+        type_: uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+        memory: uapi::V4L2_MEMORY_DMABUF,
         index: 0,
         length: 1,
         ..Default::default()
@@ -1421,10 +1421,10 @@ fn qbuf_capture_dmabuf(fd: RawFd, dmabuf_fd: RawFd, length: usize) -> nix::Resul
 
 /// `VIDIOC_DQBUF` the decoded single-plane DMABUF CAPTURE buffer.
 fn dqbuf_capture(fd: RawFd) -> nix::Result<()> {
-    let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
-    let mut b = ioctl::v4l2_buffer {
-        type_: ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-        memory: ioctl::V4L2_MEMORY_DMABUF,
+    let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
+    let mut b = uapi::v4l2_buffer {
+        type_: uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+        memory: uapi::V4L2_MEMORY_DMABUF,
         length: 1,
         ..Default::default()
     };
@@ -1448,7 +1448,7 @@ fn drain_events(fd: RawFd) {
         if !poll_ready(fd, PollFlags::POLLPRI, 0) {
             break;
         }
-        let mut ev = ioctl::v4l2_event::default();
+        let mut ev = uapi::v4l2_event::default();
         // SAFETY: valid event struct; best-effort, errors end the drain.
         if unsafe { ioctl::vidioc_dqevent(fd, &mut ev) }.is_err() {
             break;
@@ -1488,32 +1488,32 @@ mod tests {
     fn colorimetry_accepts_jpeg_and_full_range_601() {
         // JPEG colorspace is the shorthand and is always accepted.
         assert!(colorimetry_ok(
-            ioctl::V4L2_COLORSPACE_JPEG,
+            uapi::V4L2_COLORSPACE_JPEG,
             ENC_709,
             QUANT_LIMITED
         ));
         // Explicit 601 + full range.
         assert!(colorimetry_ok(
-            ioctl::V4L2_COLORSPACE_SRGB,
-            ioctl::V4L2_YCBCR_ENC_601,
-            ioctl::V4L2_QUANTIZATION_FULL_RANGE
+            uapi::V4L2_COLORSPACE_SRGB,
+            uapi::V4L2_YCBCR_ENC_601,
+            uapi::V4L2_QUANTIZATION_FULL_RANGE
         ));
         // Driver "default" (0) fields defer to the colorspace and are accepted.
-        assert!(colorimetry_ok(ioctl::V4L2_COLORSPACE_SRGB, 0, 0));
+        assert!(colorimetry_ok(uapi::V4L2_COLORSPACE_SRGB, 0, 0));
     }
 
     #[test]
     fn colorimetry_rejects_non_601_or_limited_range() {
         // 709 encoding → reject.
         assert!(!colorimetry_ok(
-            ioctl::V4L2_COLORSPACE_SRGB,
+            uapi::V4L2_COLORSPACE_SRGB,
             ENC_709,
-            ioctl::V4L2_QUANTIZATION_FULL_RANGE
+            uapi::V4L2_QUANTIZATION_FULL_RANGE
         ));
         // Limited-range quantization → reject.
         assert!(!colorimetry_ok(
-            ioctl::V4L2_COLORSPACE_SRGB,
-            ioctl::V4L2_YCBCR_ENC_601,
+            uapi::V4L2_COLORSPACE_SRGB,
+            uapi::V4L2_YCBCR_ENC_601,
             QUANT_LIMITED
         ));
     }
@@ -1698,8 +1698,8 @@ mod tests {
     #[ignore = "on-target hardware probe; run with --ignored --nocapture on a JPEG M2M device"]
     fn probe_dmabuf_reconfigure() {
         use std::time::Instant;
-        const OUT: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        const CAP: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        const OUT: u32 = uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         let Some(dev) = device::probe() else {
             log::warn!("skip: no v4l2 jpeg decoder on this host");
@@ -1735,15 +1735,15 @@ mod tests {
         let scratch_cap = scratch.capacity_bytes();
 
         let fd = dev.fd();
-        let sub = ioctl::v4l2_event_subscription {
-            type_: ioctl::V4L2_EVENT_SOURCE_CHANGE,
+        let sub = uapi::v4l2_event_subscription {
+            type_: uapi::V4L2_EVENT_SOURCE_CHANGE,
             ..Default::default()
         };
         // SAFETY: valid subscription struct.
         unsafe { ioctl::vidioc_subscribe_event(fd, &sub) }.expect("SUBSCRIBE_EVENT");
 
         // OUTPUT: one persistent 2 MiB coded buffer, set up once, streamed once.
-        let mut ofmt = ioctl::v4l2_format {
+        let mut ofmt = uapi::v4l2_format {
             type_: OUT,
             ..Default::default()
         };
@@ -1752,14 +1752,14 @@ mod tests {
             let p = unsafe { ofmt.pix_mp() };
             p.width = 1280;
             p.height = 720;
-            p.pixelformat = ioctl::V4L2_PIX_FMT_JPEG;
-            p.field = ioctl::V4L2_FIELD_NONE;
+            p.pixelformat = uapi::V4L2_PIX_FMT_JPEG;
+            p.field = uapi::V4L2_FIELD_NONE;
             p.num_planes = 1;
             p.plane_fmt[0].sizeimage = 2 * 1024 * 1024;
         }
         // SAFETY: valid v4l2_format.
         unsafe { ioctl::vidioc_s_fmt(fd, &mut ofmt) }.expect("S_FMT OUTPUT");
-        reqbufs(fd, OUT, 1, ioctl::V4L2_MEMORY_MMAP).expect("REQBUFS OUTPUT");
+        reqbufs(fd, OUT, 1, uapi::V4L2_MEMORY_MMAP).expect("REQBUFS OUTPUT");
         let (olen, ooff) = querybuf(fd, OUT, 1).expect("QUERYBUF OUTPUT");
         let mut out_map = Mmap::new(borrow(fd), olen, ooff).expect("mmap OUTPUT");
         streamon(fd, OUT).expect("STREAMON OUTPUT");
@@ -1770,14 +1770,14 @@ mod tests {
                 let t0 = Instant::now();
                 if cap_live {
                     streamoff(fd, CAP).expect("STREAMOFF CAPTURE");
-                    reqbufs(fd, CAP, 0, ioctl::V4L2_MEMORY_DMABUF).expect("REQBUFS CAPTURE 0");
+                    reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF).expect("REQBUFS CAPTURE 0");
                 }
                 out_map.as_mut_slice()[..jpeg.len()].copy_from_slice(jpeg);
                 qbuf_output(fd, jpeg.len()).expect("QBUF OUTPUT");
                 poll_ready(fd, PollFlags::POLLPRI, SOURCE_CHANGE_TIMEOUT_MS);
                 drain_events(fd);
 
-                let mut gfmt = ioctl::v4l2_format {
+                let mut gfmt = uapi::v4l2_format {
                     type_: CAP,
                     ..Default::default()
                 };
@@ -1788,7 +1788,7 @@ mod tests {
                 let t_gfmt = t0.elapsed();
 
                 // Question 2: S_FMT(CAP) single-plane NV12 while OUTPUT streams.
-                let mut sfmt = ioctl::v4l2_format {
+                let mut sfmt = uapi::v4l2_format {
                     type_: CAP,
                     ..Default::default()
                 };
@@ -1797,14 +1797,14 @@ mod tests {
                     let p = unsafe { sfmt.pix_mp() };
                     p.width = got.width;
                     p.height = got.height;
-                    p.pixelformat = ioctl::V4L2_PIX_FMT_NV12;
-                    p.field = ioctl::V4L2_FIELD_NONE;
+                    p.pixelformat = uapi::V4L2_PIX_FMT_NV12;
+                    p.field = uapi::V4L2_FIELD_NONE;
                     p.colorspace = got.colorspace;
                     p.num_planes = 1;
                 }
                 // SAFETY: valid v4l2_format.
                 let sfmt_res = unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) };
-                let mut gfmt2 = ioctl::v4l2_format {
+                let mut gfmt2 = uapi::v4l2_format {
                     type_: CAP,
                     ..Default::default()
                 };
@@ -1824,7 +1824,7 @@ mod tests {
 
                 // Question 1: REQBUFS(DMABUF) cost in isolation.
                 let t1 = Instant::now();
-                reqbufs(fd, CAP, 1, ioctl::V4L2_MEMORY_DMABUF).expect("REQBUFS CAPTURE dmabuf");
+                reqbufs(fd, CAP, 1, uapi::V4L2_MEMORY_DMABUF).expect("REQBUFS CAPTURE dmabuf");
                 let t_reqbufs = t1.elapsed();
                 streamon(fd, CAP).expect("STREAMON CAPTURE");
                 cap_live = true;
@@ -1846,7 +1846,7 @@ mod tests {
                 eprintln!(
                     "round {round:2} {name:18} total={total:9.2?} hdr+gfmt={t_gfmt:9.2?} \
                      reqbufs={t_reqbufs:9.2?} s_fmt={sfmt_str} fmt={} {}x{} sizeimage={}",
-                    ioctl::fourcc_str(cap_fmt.pixelformat),
+                    uapi::fourcc_str(cap_fmt.pixelformat),
                     cap_fmt.width,
                     cap_fmt.height,
                     sizeimage,
@@ -1856,15 +1856,15 @@ mod tests {
 
         let _ = streamoff(fd, CAP);
         let _ = streamoff(fd, OUT);
-        let _ = reqbufs(fd, CAP, 0, ioctl::V4L2_MEMORY_DMABUF);
-        let _ = reqbufs(fd, OUT, 0, ioctl::V4L2_MEMORY_MMAP);
+        let _ = reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF);
+        let _ = reqbufs(fd, OUT, 0, uapi::V4L2_MEMORY_MMAP);
     }
 
     // --- raw-throughput probe helpers (index-aware variants of the thin
     // ioctl wrappers, which all hardcode buffer index 0) ------------------
 
     fn reqbufs_n(fd: RawFd, buf_type: u32, count: u32, memory: u32) -> nix::Result<u32> {
-        let mut rb = ioctl::v4l2_requestbuffers {
+        let mut rb = uapi::v4l2_requestbuffers {
             count,
             type_: buf_type,
             memory,
@@ -1875,10 +1875,10 @@ mod tests {
     }
 
     fn querybuf_idx(fd: RawFd, buf_type: u32, index: u32) -> nix::Result<(usize, i64)> {
-        let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
-        let mut b = ioctl::v4l2_buffer {
+        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
+        let mut b = uapi::v4l2_buffer {
             type_: buf_type,
-            memory: ioctl::V4L2_MEMORY_MMAP,
+            memory: uapi::V4L2_MEMORY_MMAP,
             index,
             length: 1,
             ..Default::default()
@@ -1890,11 +1890,11 @@ mod tests {
     }
 
     fn qbuf_out_idx(fd: RawFd, index: u32, bytesused: usize) -> nix::Result<()> {
-        let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
+        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
         planes[0].bytesused = bytesused as u32;
-        let mut b = ioctl::v4l2_buffer {
-            type_: ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-            memory: ioctl::V4L2_MEMORY_MMAP,
+        let mut b = uapi::v4l2_buffer {
+            type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            memory: uapi::V4L2_MEMORY_MMAP,
             index,
             length: 1,
             ..Default::default()
@@ -1905,12 +1905,12 @@ mod tests {
     }
 
     fn qbuf_cap_fd_idx(fd: RawFd, index: u32, dmabuf_fd: RawFd, len: usize) -> nix::Result<()> {
-        let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
+        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
         planes[0].set_fd(dmabuf_fd);
         planes[0].length = len as u32;
-        let mut b = ioctl::v4l2_buffer {
-            type_: ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-            memory: ioctl::V4L2_MEMORY_DMABUF,
+        let mut b = uapi::v4l2_buffer {
+            type_: uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            memory: uapi::V4L2_MEMORY_DMABUF,
             index,
             length: 1,
             ..Default::default()
@@ -1921,8 +1921,8 @@ mod tests {
     }
 
     fn dqbuf_idx(fd: RawFd, buf_type: u32, memory: u32) -> nix::Result<u32> {
-        let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
-        let mut b = ioctl::v4l2_buffer {
+        let mut planes = [uapi::v4l2_plane::default(); uapi::VIDEO_MAX_PLANES];
+        let mut b = uapi::v4l2_buffer {
             type_: buf_type,
             memory,
             length: 1,
@@ -1939,19 +1939,19 @@ mod tests {
     /// measures the pure driver + hardware pipeline rate.
     fn run_throughput(dev: &ProbedDevice, jpeg: &[u8], depth: u32, frames: usize) -> Option<f64> {
         use std::time::Instant;
-        const OUT: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        const CAP: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        const OUT: u32 = uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         let fd = dev.fd();
 
-        let sub = ioctl::v4l2_event_subscription {
-            type_: ioctl::V4L2_EVENT_SOURCE_CHANGE,
+        let sub = uapi::v4l2_event_subscription {
+            type_: uapi::V4L2_EVENT_SOURCE_CHANGE,
             ..Default::default()
         };
         // SAFETY: valid subscription struct.
         unsafe { ioctl::vidioc_subscribe_event(fd, &sub) }.ok()?;
 
         // OUTPUT: depth buffers, all prefilled with the same JPEG.
-        let mut ofmt = ioctl::v4l2_format {
+        let mut ofmt = uapi::v4l2_format {
             type_: OUT,
             ..Default::default()
         };
@@ -1960,14 +1960,14 @@ mod tests {
             let p = unsafe { ofmt.pix_mp() };
             p.width = 1280;
             p.height = 720;
-            p.pixelformat = ioctl::V4L2_PIX_FMT_JPEG;
-            p.field = ioctl::V4L2_FIELD_NONE;
+            p.pixelformat = uapi::V4L2_PIX_FMT_JPEG;
+            p.field = uapi::V4L2_FIELD_NONE;
             p.num_planes = 1;
             p.plane_fmt[0].sizeimage = ((jpeg.len() + 4095) & !4095) as u32;
         }
         // SAFETY: valid v4l2_format.
         unsafe { ioctl::vidioc_s_fmt(fd, &mut ofmt) }.ok()?;
-        let got_out = reqbufs_n(fd, OUT, depth, ioctl::V4L2_MEMORY_MMAP).ok()?;
+        let got_out = reqbufs_n(fd, OUT, depth, uapi::V4L2_MEMORY_MMAP).ok()?;
         if got_out < depth {
             eprintln!("  driver clamped OUTPUT buffers: {depth} -> {got_out}");
         }
@@ -1984,7 +1984,7 @@ mod tests {
         drain_events(fd);
 
         // CAPTURE: single-plane NV12, depth scratch dmabufs.
-        let mut gfmt = ioctl::v4l2_format {
+        let mut gfmt = uapi::v4l2_format {
             type_: CAP,
             ..Default::default()
         };
@@ -1992,7 +1992,7 @@ mod tests {
         unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }.ok()?;
         // SAFETY: mplane variant.
         let got = *unsafe { gfmt.pix_mp() };
-        let mut sfmt = ioctl::v4l2_format {
+        let mut sfmt = uapi::v4l2_format {
             type_: CAP,
             ..Default::default()
         };
@@ -2001,8 +2001,8 @@ mod tests {
             let p = unsafe { sfmt.pix_mp() };
             p.width = got.width;
             p.height = got.height;
-            p.pixelformat = ioctl::V4L2_PIX_FMT_NV12;
-            p.field = ioctl::V4L2_FIELD_NONE;
+            p.pixelformat = uapi::V4L2_PIX_FMT_NV12;
+            p.field = uapi::V4L2_FIELD_NONE;
             p.colorspace = got.colorspace;
             p.num_planes = 1;
         }
@@ -2036,7 +2036,7 @@ mod tests {
             .map(|t| t.dmabuf().unwrap().as_raw_fd())
             .collect();
 
-        let got_cap = reqbufs_n(fd, CAP, depth, ioctl::V4L2_MEMORY_DMABUF).ok()?;
+        let got_cap = reqbufs_n(fd, CAP, depth, uapi::V4L2_MEMORY_DMABUF).ok()?;
         if got_cap < depth {
             eprintln!("  driver clamped CAPTURE buffers: {depth} -> {got_cap}");
         }
@@ -2069,8 +2069,8 @@ mod tests {
                 eprintln!("  decode timeout at frame {n}");
                 return None;
             }
-            let ci = dqbuf_idx(fd, CAP, ioctl::V4L2_MEMORY_DMABUF).ok()?;
-            let oi = dqbuf_idx(fd, OUT, ioctl::V4L2_MEMORY_MMAP).ok()?;
+            let ci = dqbuf_idx(fd, CAP, uapi::V4L2_MEMORY_DMABUF).ok()?;
+            let oi = dqbuf_idx(fd, OUT, uapi::V4L2_MEMORY_MMAP).ok()?;
             qbuf_out_idx(fd, oi, jpeg.len()).ok()?;
             qbuf_cap_fd_idx(
                 fd,
@@ -2084,8 +2084,8 @@ mod tests {
 
         let _ = streamoff(fd, CAP);
         let _ = streamoff(fd, OUT);
-        let _ = reqbufs(fd, CAP, 0, ioctl::V4L2_MEMORY_DMABUF);
-        let _ = reqbufs(fd, OUT, 0, ioctl::V4L2_MEMORY_MMAP);
+        let _ = reqbufs(fd, CAP, 0, uapi::V4L2_MEMORY_DMABUF);
+        let _ = reqbufs(fd, OUT, 0, uapi::V4L2_MEMORY_MMAP);
         Some(fps)
     }
 

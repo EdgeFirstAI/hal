@@ -526,6 +526,7 @@ version = "0.33.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor",
+ "edgefirst-v4l2",
  "env_logger",
  "image",
  "kamadak-exif",
@@ -794,6 +795,16 @@ dependencies = [
  "num-traits",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "edgefirst-v4l2"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c6a48662f2aeb8fab228e149e98247fff5ee5062b920853ed473154803b146c"
+dependencies = [
+ "libc",
+ "nix",
 ]
 
 [[package]]

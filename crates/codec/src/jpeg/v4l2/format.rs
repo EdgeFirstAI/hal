@@ -9,7 +9,7 @@
 //! and 4:4:4 JPEGs (`YUV3`) are deinterleaved to `NV24` in the scratch
 //! copy-out step (zero-copy is NV12/GREY only).
 
-use super::ioctl;
+use edgefirst_v4l2::uapi;
 
 /// A CAPTURE pixel layout the hardware may produce.
 pub(crate) enum CapKind {
@@ -24,9 +24,9 @@ pub(crate) enum CapKind {
 /// Classify a CAPTURE FourCC, or `None` if we cannot consume it.
 pub(crate) fn classify(fourcc: u32) -> Option<CapKind> {
     match fourcc {
-        ioctl::V4L2_PIX_FMT_YUV24 => Some(CapKind::Yuv444Packed),
-        ioctl::V4L2_PIX_FMT_GREY => Some(CapKind::Grey),
-        ioctl::V4L2_PIX_FMT_NV12 | ioctl::V4L2_PIX_FMT_NV12M => Some(CapKind::Nv12),
+        uapi::V4L2_PIX_FMT_YUV24 => Some(CapKind::Yuv444Packed),
+        uapi::V4L2_PIX_FMT_GREY => Some(CapKind::Grey),
+        uapi::V4L2_PIX_FMT_NV12 | uapi::V4L2_PIX_FMT_NV12M => Some(CapKind::Nv12),
         _ => None,
     }
 }
@@ -38,21 +38,21 @@ mod tests {
     #[test]
     fn classify_maps_known_capture_formats() {
         assert!(matches!(
-            classify(ioctl::V4L2_PIX_FMT_YUV24),
+            classify(uapi::V4L2_PIX_FMT_YUV24),
             Some(CapKind::Yuv444Packed)
         ));
         assert!(matches!(
-            classify(ioctl::V4L2_PIX_FMT_GREY),
+            classify(uapi::V4L2_PIX_FMT_GREY),
             Some(CapKind::Grey)
         ));
         assert!(matches!(
-            classify(ioctl::V4L2_PIX_FMT_NV12),
+            classify(uapi::V4L2_PIX_FMT_NV12),
             Some(CapKind::Nv12)
         ));
         assert!(matches!(
-            classify(ioctl::V4L2_PIX_FMT_NV12M),
+            classify(uapi::V4L2_PIX_FMT_NV12M),
             Some(CapKind::Nv12)
         ));
-        assert!(classify(ioctl::V4L2_PIX_FMT_YUYV).is_none());
+        assert!(classify(uapi::V4L2_PIX_FMT_YUYV).is_none());
     }
 }

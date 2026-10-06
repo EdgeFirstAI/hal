@@ -155,6 +155,7 @@ name = "edgefirst-codec"
 version = "0.33.0"
 dependencies = [
  "edgefirst-tensor",
+ "edgefirst-v4l2",
  "kamadak-exif",
  "libc",
  "libloading",
@@ -210,6 +211,16 @@ name = "edgefirst-tensor-ffi"
 version = "0.33.0"
 dependencies = [
  "edgefirst-tensor-abi",
+]
+
+[[package]]
+name = "edgefirst-v4l2"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c6a48662f2aeb8fab228e149e98247fff5ee5062b920853ed473154803b146c"
+dependencies = [
+ "libc",
+ "nix",
 ]
 
 [[package]]
