@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use super::ioctl;
+use edgefirst_v4l2::{ioctl, uapi};
 
 /// Environment variable forcing the CPU decoder (skip all V4L2 probing).
 const ENV_DISABLE: &str = "EDGEFIRST_DISABLE_V4L2";
@@ -109,18 +109,18 @@ fn probe_node(path: &Path) -> Option<ProbedDevice> {
     let fd = file.as_raw_fd();
 
     // VIDIOC_QUERYCAP — must stream and be a mem2mem device.
-    let mut cap = ioctl::v4l2_capability::default();
+    let mut cap = uapi::v4l2_capability::default();
     // SAFETY: `cap` is a valid, correctly-sized v4l2_capability; the kernel
     // only writes into it.
     unsafe { ioctl::vidioc_querycap(fd, &mut cap) }.ok()?;
     let caps = cap.effective_caps();
 
-    if caps & ioctl::V4L2_CAP_STREAMING == 0 {
+    if caps & uapi::V4L2_CAP_STREAMING == 0 {
         return None;
     }
-    let api = if caps & ioctl::V4L2_CAP_VIDEO_M2M_MPLANE != 0 {
+    let api = if caps & uapi::V4L2_CAP_VIDEO_M2M_MPLANE != 0 {
         ApiVariant::MultiPlanar
-    } else if caps & ioctl::V4L2_CAP_VIDEO_M2M != 0 {
+    } else if caps & uapi::V4L2_CAP_VIDEO_M2M != 0 {
         ApiVariant::SinglePlanar
     } else {
         return None;
@@ -143,12 +143,12 @@ fn probe_node(path: &Path) -> Option<ProbedDevice> {
 /// is offered.
 fn output_queue_has_jpeg(fd: std::os::fd::RawFd, api: ApiVariant) -> bool {
     let buf_type = match api {
-        ApiVariant::MultiPlanar => ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-        ApiVariant::SinglePlanar => ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT,
+        ApiVariant::MultiPlanar => uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+        ApiVariant::SinglePlanar => uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT,
     };
 
     for index in 0..64u32 {
-        let mut desc = ioctl::v4l2_fmtdesc {
+        let mut desc = uapi::v4l2_fmtdesc {
             index,
             type_: buf_type,
             ..Default::default()
@@ -159,8 +159,8 @@ fn output_queue_has_jpeg(fd: std::os::fd::RawFd, api: ApiVariant) -> bool {
         if unsafe { ioctl::vidioc_enum_fmt(fd, &mut desc) }.is_err() {
             break;
         }
-        if desc.pixelformat == ioctl::V4L2_PIX_FMT_JPEG
-            || desc.pixelformat == ioctl::V4L2_PIX_FMT_MJPEG
+        if desc.pixelformat == uapi::V4L2_PIX_FMT_JPEG
+            || desc.pixelformat == uapi::V4L2_PIX_FMT_MJPEG
         {
             return true;
         }

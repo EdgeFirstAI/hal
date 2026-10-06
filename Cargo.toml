@@ -95,6 +95,7 @@ edgefirst-tensor-ffi = { version = "0.33.0", path = "crates/tensor-ffi" }
 # whose own `default = ["static"]` (its Cargo.toml) supplies it regardless
 # of this dependency-edge default.
 edgefirst-tracker = { version = "0.33.0", path = "crates/tracker", default-features = false }
+edgefirst-v4l2 = "0.1.0"
 enum_dispatch = "0.3.13"
 # `regex` (a default feature, via env_filter) pulls regex + regex_syntax +
 # aho_corasick -- ~530 KB of every published wheel, to support regex RUST_LOG

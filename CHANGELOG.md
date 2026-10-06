@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`edgefirst-codec` uses `edgefirst-v4l2` for V4L2.** The V4L2 JPEG backend takes its UAPI structs, constants and ioctl wrappers from the shared `edgefirst-v4l2` 0.1.0 crate instead of a private copy. No behaviour change.
+
 ## [0.33.0] - 2026-09-30
 
 ### Added

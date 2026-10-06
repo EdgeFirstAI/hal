@@ -106,9 +106,10 @@ reconfigures the destination to `Rgb` itself.
 |---------------|--------------------------------------------------------|
 | `mod.rs`      | `V4l2Probe` lifecycle, persistent streaming session, `try_decode()` orchestration, DMABUF capture targets (zero-copy + scratch), JPEG metadata stripping, NEON YUV24→NV24 deinterleave |
 | `device.rs`   | Capability-based probe: env overrides, enumerate `/dev/video*`, `QUERYCAP` + `ENUM_FMT` (require JPEG on OUTPUT) |
-| `ioctl.rs`    | All raw `#[repr(C)]` UAPI structs, FourCC + buffer-type/memory constants, `nix` ioctl macro defs |
 | `buffers.rs`  | RAII `Mmap` wrapper for the persistent OUTPUT (coded) buffer |
 | `format.rs`   | `classify()` the driver-chosen CAPTURE FourCC → `CapKind` (`Nv12` / `Grey` / 4:4:4-packed) |
+
+The UAPI structs, constants and ioctl wrappers come from the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v4l2-rs) crate (`uapi` and `ioctl` modules), shared with the EdgeFirst camera SDK.
 
 ## Key Design Decisions
 
@@ -633,13 +634,7 @@ session (circuit breaker).
 
 ### ABI note
 
-The raw UAPI structs in `ioctl.rs` must match the kernel's `sizeof`, which a
-compile-time `size_of` assert checks against our arithmetic, **not** the
-kernel's. `v4l2_format` is **208 bytes** (its union contains `v4l2_window`,
-whose pointers force 8-byte alignment and 4 bytes of padding after `type`); a
-wrong size yields the wrong ioctl request number → `ENOTTY` → a silent CPU
-fallback that makes parity tests pass trivially. On-target `strace` is the only
-reliable verification of the raw ioctl ABI — see `TESTING.md`.
+The UAPI structs must match the kernel's `sizeof`: a wrong size yields the wrong ioctl request number → `ENOTTY` → a silent CPU fallback that makes parity tests pass trivially. `edgefirst-v4l2` checks every struct's size and union offsets at compile time against values generated from the kernel headers on x86_64 and aarch64, and tests each ioctl request number against `videodev2.h`. On-target `strace` remains the end-to-end check of the ioctl sequence — see `TESTING.md`.
 
 ## nvJPEG GPU Backend
 
