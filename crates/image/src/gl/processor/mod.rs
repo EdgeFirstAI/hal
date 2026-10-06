@@ -6103,7 +6103,11 @@ impl GLProcessorST {
             edgefirst_gl::gl::UseProgram(program.id);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
-            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
+            // NEAREST: a 1:1 copy of pass 1's output, which already resampled.
+            // LINEAR would blend a sliver of the neighbouring texel wherever
+            // the interpolated coordinate misses the texel centre (±1 on V3D
+            // and Adreno).
+            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::NEAREST);
 
             // (`tex` = unit 0 is constant per program, uploaded at link time.)
             check_gl_error(function!(), line!())?;
