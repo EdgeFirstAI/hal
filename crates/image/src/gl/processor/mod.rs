@@ -166,6 +166,8 @@ struct NvUniformLocs {
     tex_width: i32,
     chroma_shift: i32,
     chroma_lines: i32,
+    src_rect: i32,
+    resample: i32,
     y_offset: i32,
     y_scale: i32,
     c_vr: i32,
@@ -217,6 +219,8 @@ impl NvUniformState {
                     tex_width: loc(c"tex_width"),
                     chroma_shift: loc(c"chroma_shift"),
                     chroma_lines: loc(c"chroma_lines"),
+                    src_rect: loc(c"src_rect"),
+                    resample: loc(c"resample"),
                     y_offset: loc(c"y_offset"),
                     y_scale: loc(c"y_scale"),
                     c_vr: loc(c"c_vr"),
@@ -226,6 +230,48 @@ impl NvUniformState {
                 },
                 last_colorimetry: None,
             }
+        }
+    }
+}
+
+/// The source pixels an `nv_r8` draw samples: the crop rectangle in source
+/// pixels (`right`/`bottom` exclusive) and whether the draw rescales it.
+/// Built from the convert's geometry rather than from the half-texel-inset
+/// [`RegionOfInterest`] the filtered-sampler paths use, because the NV shader
+/// computes texel positions itself and needs the crop's true edges.
+#[derive(Clone, Copy, Debug)]
+struct NvSampleRect {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+    resample: bool,
+}
+
+impl NvSampleRect {
+    /// `src_crop` and `dst_crop` default to the whole source and destination.
+    /// A quarter-turn rotation swaps the crop's axes on the destination.
+    fn new(
+        src_crop: Option<crate::Rect>,
+        dst_crop: Option<crate::Rect>,
+        (src_w, src_h): (usize, usize),
+        (dst_w, dst_h): (usize, usize),
+        rotation: crate::Rotation,
+    ) -> Self {
+        let src = src_crop.unwrap_or(crate::Rect::new(0, 0, src_w, src_h));
+        let dst = dst_crop.unwrap_or(crate::Rect::new(0, 0, dst_w, dst_h));
+        let (w, h) = match rotation {
+            crate::Rotation::Clockwise90 | crate::Rotation::CounterClockwise90 => {
+                (src.height, src.width)
+            }
+            _ => (src.width, src.height),
+        };
+        NvSampleRect {
+            left: src.left,
+            top: src.top,
+            right: src.left + src.width,
+            bottom: src.top + src.height,
+            resample: (w, h) != (dst.width, dst.height),
         }
     }
 }
@@ -4897,6 +4943,13 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
+        let nv_rect = NvSampleRect::new(
+            crop.src_rect,
+            crop.dst_rect,
+            (src_w, src_h),
+            (dst_w, dst_h),
+            rotation,
+        );
         if self.gl_context.transfer_backend.is_zero_copy() && src.memory() == TensorMemory::DmaBuf {
             // Choose the NV* path (ShaderR8 vs ExternalSampler) honoring the
             // EDGEFIRST_NV_CONVERT_PATH preference. See `select_nv_path`: Auto
@@ -4937,7 +4990,7 @@ impl GLProcessorST {
                             src,
                             src_fmt,
                             Some(r8_egl),
-                            src_roi,
+                            nv_rect,
                             dst_roi,
                             rotation_offset,
                             flip,
@@ -4992,7 +5045,7 @@ impl GLProcessorST {
                             src,
                             src_fmt,
                             None,
-                            src_roi,
+                            nv_rect,
                             dst_roi,
                             rotation_offset,
                             flip,
@@ -5088,7 +5141,7 @@ impl GLProcessorST {
                                 src,
                                 src_fmt,
                                 None,
-                                src_roi,
+                                nv_rect,
                                 dst_roi,
                                 rotation_offset,
                                 flip,
@@ -5151,7 +5204,7 @@ impl GLProcessorST {
                 src,
                 src_fmt,
                 None,
-                src_roi,
+                nv_rect,
                 dst_roi,
                 rotation_offset,
                 flip,
@@ -6517,7 +6570,7 @@ impl GLProcessorST {
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
         r8_src: Option<PlatformHandle>,
-        src_roi: RegionOfInterest,
+        src_rect: NvSampleRect,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
@@ -6672,6 +6725,14 @@ impl GLProcessorST {
             edgefirst_gl::gl::Uniform1i(locs.tex_width, tex_width);
             edgefirst_gl::gl::Uniform2i(locs.chroma_shift, chroma_shift_x, chroma_shift_y);
             edgefirst_gl::gl::Uniform1i(locs.chroma_lines, chroma_lines);
+            edgefirst_gl::gl::Uniform4i(
+                locs.src_rect,
+                src_rect.left as i32,
+                src_rect.top as i32,
+                src_rect.right as i32 - 1,
+                src_rect.bottom as i32 - 1,
+            );
+            edgefirst_gl::gl::Uniform1i(locs.resample, i32::from(src_rect.resample));
 
             if upload_colorimetry {
                 let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(colorimetry.0, colorimetry.1);
@@ -6720,6 +6781,12 @@ impl GLProcessorST {
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
             edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
+            let src_roi = RegionOfInterest {
+                left: src_rect.left as f32 / src_w as f32,
+                top: src_rect.bottom as f32 / src_h as f32,
+                right: src_rect.right as f32 / src_w as f32,
+                bottom: src_rect.top as f32 / src_h as f32,
+            };
             let texture_vertices: [f32; 16] = [
                 src_roi.left,
                 src_roi.top,

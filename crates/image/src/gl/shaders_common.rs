@@ -265,6 +265,12 @@ uniform ivec2 img_size;
 uniform int tex_width;
 uniform ivec2 chroma_shift;
 uniform int chroma_lines;
+// Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
+// clamped to them, so a crop never blends pixels from outside itself.
+uniform ivec4 src_rect;
+// False when the draw maps the crop 1:1 onto the destination (chosen from the
+// draw geometry on the CPU): one sample per pixel, no blend.
+uniform bool resample;
 // Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
 // from the source tensor's resolved colorimetry. Path B applies the matrix in
 // the shader, so it is correct regardless of driver EGL color-hint support.
@@ -310,23 +316,28 @@ vec3 nv_rgb(int x, int y) {
 }
 
 /// `main()` statements shared by the NV->RGBA program and its int8 twin:
-/// resamples `nv_rgb` at `tc` and leaves the pixel in `rgb`.
-macro_rules! nv_rgb_bilinear_body {
+/// samples `nv_rgb` at `tc` and leaves the pixel in `rgb`. `tc` spans the
+/// crop's outer edges, so `tc * size` is this fragment's source position.
+macro_rules! nv_rgb_sample_body {
     () => {
-        "    // Half-pixel-centred bilinear, the GL_LINEAR / OpenCV INTER_LINEAR
-    // convention: this fragment's source position is tc * size - 0.5, with
-    // edges clamped. `texelFetch` alone would be nearest-neighbour whenever
-    // the convert rescales. Blending the four texels' converted RGB equals
-    // converting at native resolution and then resizing, as the CPU backend
-    // does; at 1:1 the fraction is zero and only one texel contributes.
-    ivec2 last = img_size - 1;
-    vec2 p = tc * vec2(img_size) - 0.5;
-    vec2 p0 = floor(p);
-    vec2 f = p - p0;
-    ivec2 i0 = clamp(ivec2(p0), ivec2(0), last);
-    ivec2 i1 = clamp(ivec2(p0) + 1, ivec2(0), last);
-    vec3 rgb = mix(mix(nv_rgb(i0.x, i0.y), nv_rgb(i1.x, i0.y), f.x),
-                   mix(nv_rgb(i0.x, i1.y), nv_rgb(i1.x, i1.y), f.x), f.y);
+        "    vec2 p = tc * vec2(img_size);
+    vec3 rgb;
+    if (!resample) {
+        ivec2 i = clamp(ivec2(floor(p)), src_rect.xy, src_rect.zw);
+        rgb = nv_rgb(i.x, i.y);
+    } else {
+        // Half-pixel-centred bilinear, the GL_LINEAR / OpenCV INTER_LINEAR
+        // convention. Blending the four texels' converted RGB equals
+        // converting at native resolution and then resizing, as the CPU
+        // backend does.
+        p -= 0.5;
+        vec2 p0 = floor(p);
+        vec2 f = p - p0;
+        ivec2 i0 = clamp(ivec2(p0), src_rect.xy, src_rect.zw);
+        ivec2 i1 = clamp(ivec2(p0) + 1, src_rect.xy, src_rect.zw);
+        rgb = mix(mix(nv_rgb(i0.x, i0.y), nv_rgb(i1.x, i0.y), f.x),
+                  mix(nv_rgb(i0.x, i1.y), nv_rgb(i1.x, i1.y), f.x), f.y);
+    }
 "
     };
 }
@@ -428,7 +439,7 @@ pub(crate) const YUYV_RGBA_2D_INT8_FRAGMENT: &str = concat!(
 pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
     "void main() {\n",
-    nv_rgb_bilinear_body!(),
+    nv_rgb_sample_body!(),
     "    color = vec4(rgb, 1.0);\n}\n"
 );
 
@@ -441,7 +452,7 @@ pub(crate) const NV_RGBA_INT8_FRAGMENT: &str = concat!(
     "    return mod(q + 128.0, 256.0) / 255.0;\n",
     "}\n\n",
     "void main() {\n",
-    nv_rgb_bilinear_body!(),
+    nv_rgb_sample_body!(),
     "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
 );
 
