@@ -8882,6 +8882,92 @@ mod gl_tests {
         );
     }
 
+    /// A source crop drawn 1:1 must read each crop pixel exactly on the
+    /// filtered (`LINEAR`) paths: the texture path for packed sources and,
+    /// on DMA, the driver external sampler that NV12 takes under the default
+    /// `ColorimetryMode::Fast` on Vivante. A one-pixel checkerboard turns any
+    /// sub-texel offset into a visible blend (a half-texel inset averaged it
+    /// to grey).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gl_crop_1to1_is_exact() {
+        use crate::opengl_headless::processor::GLProcessorST;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = match GLProcessorST::new(None, None) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (sw, sh) = (640usize, 360usize);
+        let checker = |x: usize, y: usize| if (x + y).is_multiple_of(2) { 16u8 } else { 235 };
+        let mut rgba = Vec::with_capacity(sw * sh * 4);
+        let mut nv12 = Vec::with_capacity(sw * sh * 3 / 2);
+        for y in 0..sh {
+            for x in 0..sw {
+                let v = checker(x, y);
+                rgba.extend_from_slice(&[v, 255 - v, v, 255]);
+                nv12.push(v);
+            }
+        }
+        nv12.resize(sw * sh * 3 / 2, 128);
+        let crop = Crop::new().with_source(Some(crate::Region::new(101, 53, 64, 48)));
+
+        let mut memories = vec![TensorMemory::Mem];
+        if is_dma_available() {
+            memories.push(TensorMemory::DmaBuf);
+        }
+        for mem in memories {
+            for (src_fmt, bytes) in [(PixelFormat::Rgba, &rgba), (PixelFormat::Nv12, &nv12)] {
+                if src_fmt == PixelFormat::Nv12 && mem != TensorMemory::DmaBuf {
+                    continue; // host NV12 takes ShaderR8, covered elsewhere
+                }
+                let mut src = load_raw_image(sw, sh, src_fmt, Some(mem), bytes).unwrap();
+                src.set_colorimetry(Some(
+                    edgefirst_tensor::Colorimetry::default()
+                        .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                        .with_range(edgefirst_tensor::ColorRange::Limited),
+                ));
+                for dst_fmt in [PixelFormat::Rgba, PixelFormat::PlanarRgb] {
+                    let image = |m| {
+                        TensorDyn::image(
+                            64,
+                            48,
+                            dst_fmt,
+                            DType::U8,
+                            m,
+                            edgefirst_tensor::CpuAccess::ReadWrite,
+                        )
+                        .unwrap()
+                    };
+                    let mut gpu = image(Some(mem));
+                    gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
+                        .unwrap();
+                    let mut cpu = image(None);
+                    crate::cpu::CPUProcessor::new()
+                        .convert(&src, &mut cpu, Rotation::None, Flip::None, crop)
+                        .unwrap();
+                    let g = gpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+                    let c = cpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+                    let max = g.iter().zip(&c).map(|(&a, &b)| a.abs_diff(b)).max();
+                    assert!(
+                        max <= Some(2),
+                        "{mem:?} {src_fmt:?}->{dst_fmt:?} 1:1 crop: max deviation {max:?} \
+                         (path {:?})",
+                        gl.last_nv_convert_path
+                    );
+                }
+            }
+        }
+    }
+
     /// Phase 4b coverage: NV16/NV24 (not just NV12) on a non-DMA (heap) source
     /// must also GPU-convert via the R8-upload `ShaderR8` path and match CPU ≤2.
     #[test]

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **GL conversion from NV12, NV16 and NV24 used nearest-neighbour sampling when it resized.** The in-shader YUV path read one source texel per output pixel. It is the default on NVIDIA, Mali, V3D, Tegra and Adreno, and Vivante takes it in `ColorimetryMode::Exact`. Letterbox, upscale and downscale converts therefore came out aliased: on VisDrone, YOLOv8n scored 0.012–0.026 mAP50-95 below the CPU backend. These converts now resample bilinearly with half-pixel centres, which matches OpenCV `INTER_LINEAR`. Converts that do not resize are unchanged.
+- **GL converts of a source crop were shifted and blurred.** The filtered GL paths mapped a crop's edges half a texel inward, to keep sampling inside the crop. This changed the crop's scale. A crop drawn at its own size, such as a SAHI tile, was sampled up to half a pixel off and blurred: a one-pixel checkerboard came out grey. Resized crops were stretched by the same amount. Crops now map from their true edges, and each sample is clamped to the crop instead. 1:1 crops are exact, and resized crops resample with OpenCV `INTER_LINEAR` geometry. This applies to every GL source path, including the i.MX 8M Plus NV12 default.
 
 ## [0.33.0] - 2026-09-30
 
