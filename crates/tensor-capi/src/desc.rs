@@ -168,6 +168,46 @@ pub unsafe extern "C" fn ef_tensor_image_desc_set_compression(
     }
 }
 
+/// Require physically contiguous memory: 0 = no, 1 = yes.
+///
+/// A contiguous request is allocated from the Linux CMA DMA heap only, and
+/// `ef_tensor_image_desc_alloc` fails, naming the heap, instead of falling
+/// back to the system heap or another kind of memory.
+///
+/// # Safety
+/// `d` must be `NULL` or a live request.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_image_desc_set_contiguous(
+    d: *mut EfTensorImageDesc,
+    contiguous: c_int,
+) -> c_int {
+    unsafe {
+        with_desc(d, |desc| match contiguous {
+            0 => Some(desc.with_contiguous(false)),
+            1 => Some(desc.with_contiguous(true)),
+            _ => None,
+        })
+    }
+}
+
+/// Whether the request requires physically contiguous memory: 1 if it does,
+/// 0 if not or `d` is `NULL`.
+///
+/// A separate getter rather than a field of `EfImageDescView`, whose size
+/// is fixed between independently versioned libraries.
+///
+/// # Safety
+/// `d` must be `NULL` or a live request.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_image_desc_contiguous(d: *const EfTensorImageDesc) -> c_int {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            d.as_ref().map_or(0, |d| c_int::from(d.inner.contiguous()))
+        }))
+        .unwrap_or(0)
+    }
+}
+
 /// The single place an `ImageDesc` becomes the flattened, `#[repr(C)]` view a
 /// foreign library reads instead of dereferencing this crate's opaque
 /// handle -- see `EfImageDescView`'s doc for why a handle is never crossed by
@@ -337,6 +377,26 @@ mod tests {
             assert_eq!(ef_tensor_image_desc_set_memory(n, 0), libc::EINVAL);
             assert_eq!(ef_tensor_image_desc_set_access(n, 0), libc::EINVAL);
             assert_eq!(ef_tensor_image_desc_set_compression(n, 0), libc::EINVAL);
+            ef_tensor_image_desc_free(d);
+        }
+    }
+
+    #[test]
+    fn the_contiguous_request_round_trips_and_rejects_bad_input() {
+        unsafe {
+            let d = desc();
+            assert_eq!(ef_tensor_image_desc_contiguous(d), 0);
+            assert_eq!(ef_tensor_image_desc_set_contiguous(d, 1), 0);
+            assert_eq!(ef_tensor_image_desc_contiguous(d), 1);
+            assert!((*d).inner.contiguous());
+            assert_eq!(ef_tensor_image_desc_set_contiguous(d, 0), 0);
+            assert_eq!(ef_tensor_image_desc_contiguous(d), 0);
+            assert_eq!(ef_tensor_image_desc_set_contiguous(d, 2), libc::EINVAL);
+            assert_eq!(
+                ef_tensor_image_desc_set_contiguous(std::ptr::null_mut(), 1),
+                libc::EINVAL
+            );
+            assert_eq!(ef_tensor_image_desc_contiguous(std::ptr::null()), 0);
             ef_tensor_image_desc_free(d);
         }
     }

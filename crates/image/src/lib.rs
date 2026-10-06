@@ -2194,14 +2194,17 @@ impl ImageProcessor {
     /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request — the
     /// full-featured variant of [`create_image`](Self::create_image).
     ///
-    /// Without a compression request this is exactly `create_image` (the
-    /// processor's memory negotiation applies). With one, the allocation
-    /// rides the tensor desc path un-negotiated: the layout decision
-    /// belongs to the platform allocator, and the request's guards and
-    /// fallback counting live there (see
-    /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)).
+    /// Without a compression or contiguous request this is exactly
+    /// `create_image` (the processor's memory negotiation applies). With
+    /// one, the allocation rides the tensor desc path un-negotiated: the
+    /// layout decision belongs to the platform allocator, and the request's
+    /// guards and fallback counting live there (see
+    /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)). A
+    /// contiguous request is a CMA DMA-BUF at the same 64-byte GPU pitch
+    /// `create_image` uses, or an error; it never falls back to a PBO or
+    /// host memory.
     pub fn create_image_desc(&self, desc: &edgefirst_tensor::ImageDesc) -> Result<TensorDyn> {
-        if desc.compression().is_none() {
+        if desc.compression().is_none() && !desc.contiguous() {
             return self.create_image(
                 desc.width(),
                 desc.height(),
@@ -13501,6 +13504,23 @@ mod image_tests {
                 proc.compression_fallback_count() > before,
                 "Any resolving linear must count"
             );
+        }
+    }
+
+    /// A contiguous request through `create_image_desc` is a CMA DMA-BUF,
+    /// or an error where there is no CMA heap; never a PBO or host memory.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn create_image_desc_contiguous_is_cma_dma_or_an_error() {
+        use edgefirst_tensor::{Contiguity, ImageDesc, TensorMemory};
+        let proc = ImageProcessor::new().unwrap();
+        let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8).with_contiguous(true);
+        match proc.create_image_desc(&desc) {
+            Ok(t) => {
+                assert_eq!(t.memory(), TensorMemory::DmaBuf);
+                assert_eq!(t.contiguity(), Contiguity::Contiguous);
+            }
+            Err(e) => assert!(e.to_string().contains("linux,cma"), "{e}"),
         }
     }
 

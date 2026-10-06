@@ -9,6 +9,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #include "edgefirst/image.h"
 
@@ -75,6 +78,34 @@ int main(void) {
     }
     ef_tensor_free(pooled);
   }
+
+  // A contiguous request crosses the boundary through its own getter, not
+  // the fixed-size view: with a CMA heap it is served from CMA, and without
+  // one it fails where the same request without the flag would succeed.
+  ef_tensor_image_desc *cd =
+      ef_tensor_image_desc_new(64, 48, "NV12", /* U8 */ 0);
+  if (cd == NULL || ef_tensor_image_desc_set_contiguous(cd, 1) != 0) {
+    fprintf(stderr, "building a contiguous request failed\n");
+    failures++;
+  } else {
+#ifdef __linux__
+    int has_cma = access("/dev/dma_heap/linux,cma", F_OK) == 0;
+#else
+    int has_cma = 0; /* contiguous memory is Linux-only */
+#endif
+    ef_tensor *ct = ef_image_processor_create_image_desc(p, cd);
+    if (has_cma && (ct == NULL ||
+                    ef_tensor_contiguity(ct) != EF_CONTIGUITY_CONTIGUOUS)) {
+      fprintf(stderr, "a contiguous request must come from the CMA heap\n");
+      failures++;
+    }
+    if (!has_cma && ct != NULL) {
+      fprintf(stderr, "a contiguous request without a CMA heap must fail\n");
+      failures++;
+    }
+    ef_tensor_free(ct);
+  }
+  ef_tensor_image_desc_free(cd);
 
   // NULL handling on both sides of the boundary.
   if (ef_image_processor_create_image_desc(NULL, d) != NULL) {

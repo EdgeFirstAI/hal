@@ -44,6 +44,13 @@ exist while the process lacks permission on it — and a request for a backing
 this build cannot serve returns an error rather than panicking. `IoSurface`
 and `Cuda` are defined as codes but no backend reports them yet.
 
+On Linux a DMA-BUF comes from the CMA heap, which is physically contiguous,
+or from the system heap, which is not, when there is no CMA heap or it is
+full. `Tensor::contiguity()` reports which (`Unknown` for an imported fd).
+An image that a device without an IOMMU will write into, such as a camera
+capture buffer, can require CMA with `ImageDesc::with_contiguous(true)`;
+the allocation then fails instead of falling back.
+
 ## Features
 
 - **Automatic memory selection** — `new()` tries DMA → SHM → Mem; the image

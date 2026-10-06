@@ -953,6 +953,9 @@ impl TensorDyn {
                 };
                 edgefirst_tensor_ffi::ef_tensor_image_desc_set_compression(d, code);
             }
+            if desc.contiguous() {
+                edgefirst_tensor_ffi::ef_tensor_image_desc_set_contiguous(d, 1);
+            }
             let handle = edgefirst_tensor_ffi::ef_tensor_image_desc_alloc(d);
             let result = match NonNull::new(handle) {
                 Some(h) => Ok(Self::from_handle(h)),
@@ -1452,6 +1455,15 @@ impl TensorDyn {
             );
         }
         scheme
+    }
+
+    /// Whether the memory is known to be physically contiguous (see
+    /// [`crate::Tensor::contiguity`]). Drives `ef_tensor_contiguity`; a code
+    /// this build does not recognise, from a newer library, is `Unknown`.
+    pub fn contiguity(&self) -> crate::Contiguity {
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        let code = unsafe { edgefirst_tensor_ffi::ef_tensor_contiguity(self.handle.as_ptr()) };
+        crate::Contiguity::from_code(code).unwrap_or(crate::Contiguity::Unknown)
     }
 
     /// Acquire the buffer for CPU access -- the standalone cache-maintenance

@@ -69,40 +69,74 @@ where
     /// layout and HAL cannot validate what the caller expects.
     #[cfg(target_os = "linux")]
     pub(crate) is_imported: bool,
+    /// Which heap the memory came from, as far as this crate knows: CMA,
+    /// the system heap, or `Unknown` for an imported fd.
+    pub(crate) contiguity: crate::Contiguity,
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+/// Path of the CMA heap, the only physically contiguous DMA heap used.
+#[cfg(all(target_os = "linux", not(miri)))]
+const CMA_HEAP_PATH: &str = "/dev/dma_heap/linux,cma";
+
 /// Allocate `size` bytes of DMA-BUF: from the CMA heap when there is one,
 /// and from the system heap when there is none or the CMA pool cannot fit
-/// the buffer.
+/// the buffer. With `contiguous`, from the CMA heap only.
 ///
-/// CMA memory is physically contiguous, which some consumers need (G2D, and
-/// GPUs without an IOMMU); system-heap memory is not. Without the second
-/// fallback, a board whose CMA pool is small next to its frames -- a
-/// Raspberry Pi 5 reserves 64 MB, and one 4K YUYV frame is 16.6 MB -- loses
-/// DMA-BUF for exactly the large frames zero-copy matters most for, and the
-/// caller drops to a PBO or host memory. A consumer that cannot import a
-/// system-heap buffer declines it as it declines any other import. When both
-/// heaps fail, the CMA heap's error is the one reported.
+/// CMA memory is physically contiguous, which some consumers need (G2D,
+/// GPUs and capture engines without an IOMMU); system-heap memory is not.
+/// Without the second fallback, a board whose CMA pool is small next to its
+/// frames -- a Raspberry Pi 5 reserves 64 MB, and one 4K YUYV frame is
+/// 16.6 MB -- loses DMA-BUF for exactly the large frames zero-copy matters
+/// most for, and the caller drops to a PBO or host memory. A consumer that
+/// cannot import a system-heap buffer declines it as it declines any other
+/// import, unless the allocation asked for `contiguous`. When both heaps
+/// fail, the CMA heap's error is the one reported.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn heap_allocate(size: usize) -> Result<std::os::fd::OwnedFd> {
+fn heap_allocate(
+    size: usize,
+    contiguous: bool,
+) -> Result<(std::os::fd::OwnedFd, crate::Contiguity)> {
+    use crate::Contiguity;
+
     let cma_error = match dma_heap::Heap::new(dma_heap::HeapKind::Cma) {
         Ok(cma) => match cma.allocate(size) {
-            Ok(fd) => return Ok(fd),
+            Ok(fd) => return Ok((fd, Contiguity::Contiguous)),
             Err(e) => Some(e),
         },
+        Err(e) if contiguous => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "physically contiguous memory requires the CMA heap {CMA_HEAP_PATH}, \
+                     which cannot be opened: {e}"
+                ),
+            )
+            .into())
+        }
         Err(_) => None,
     };
+    if contiguous {
+        let e = cma_error.expect("the CMA heap opened, so its allocation failed");
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "the CMA heap {CMA_HEAP_PATH} cannot allocate {size} bytes of physically \
+                 contiguous memory: {e}"
+            ),
+        )
+        .into());
+    }
     let system = dma_heap::Heap::new(dma_heap::HeapKind::System);
     match (system, cma_error) {
-        (Ok(system), None) => Ok(system.allocate(size)?),
+        (Ok(system), None) => Ok((system.allocate(size)?, Contiguity::NonContiguous)),
         (Ok(system), Some(cma_error)) => match system.allocate(size) {
             Ok(fd) => {
                 log::debug!(
                     "CMA heap could not fit {size} bytes ({cma_error}); allocated from the \
                      system heap, which is not physically contiguous"
                 );
-                Ok(fd)
+                Ok((fd, Contiguity::NonContiguous))
             }
             Err(_) => Err(cma_error.into()),
         },
@@ -139,7 +173,7 @@ where
             }
         };
 
-        let dma_fd = heap_allocate(logical_size)?;
+        let (dma_fd, contiguity) = heap_allocate(logical_size, false)?;
         let stat = fstat(&dma_fd)?;
         debug!("DMA memory stat: {stat:?}");
         let buf_size = if stat.st_size > 0 {
@@ -160,6 +194,7 @@ where
             buf_size,
             mmap_offset: 0,
             is_imported: false,
+            contiguity,
         })
     }
 
@@ -220,6 +255,7 @@ where
             mmap_offset: 0,
             #[cfg(target_os = "linux")]
             is_imported: true,
+            contiguity: crate::Contiguity::Unknown,
         })
     }
 
@@ -398,6 +434,7 @@ where
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
+        contiguous: bool,
     ) -> Result<Self> {
         use log::debug;
         use nix::sys::stat::fstat;
@@ -440,7 +477,7 @@ where
             }
         };
 
-        let dma_fd = heap_allocate(byte_size)?;
+        let (dma_fd, contiguity) = heap_allocate(byte_size, contiguous)?;
         let stat = fstat(&dma_fd)?;
         debug!("DMA padded memory stat: {stat:?}");
         let buf_size = if stat.st_size > 0 {
@@ -461,6 +498,7 @@ where
             buf_size,
             mmap_offset: 0,
             is_imported: false,
+            contiguity,
         })
     }
 
@@ -469,6 +507,7 @@ where
         _shape: &[usize],
         _byte_size: usize,
         _name: Option<&str>,
+        _contiguous: bool,
     ) -> Result<Self> {
         Err(Error::NotImplemented(
             "DMA tensor allocation is unavailable (not Linux, or running \
@@ -521,6 +560,7 @@ where
             mmap_offset: self.mmap_offset,
             #[cfg(target_os = "linux")]
             is_imported: self.is_imported,
+            contiguity: self.contiguity,
         })
     }
 }
@@ -959,11 +999,11 @@ mod tests {
     #[cfg(not(miri))]
     fn new_with_byte_size_refuses_a_byte_size_below_the_shape() {
         assert!(matches!(
-            DmaTensor::<u32>::new_with_byte_size(&[10], 39, None),
+            DmaTensor::<u32>::new_with_byte_size(&[10], 39, None, false),
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(
-            DmaTensor::<u8>::new_with_byte_size(&[usize::MAX, 2], 1, None),
+            DmaTensor::<u8>::new_with_byte_size(&[usize::MAX, 2], 1, None, false),
             Err(Error::InvalidArgument(_))
         ));
     }
@@ -986,6 +1026,19 @@ mod tests {
             ));
             return;
         }
+        let Some(cma_total) = small_cma_pool(NAME) else {
+            return;
+        };
+        let size = cma_total + (4 << 20);
+        let t = DmaTensor::<u8>::new(&[size], None)
+            .unwrap_or_else(|e| panic!("{size} B, past the {cma_total} B CMA pool: {e}"));
+        assert!(fstat_size(&t.fd) >= size);
+        assert_eq!(t.contiguity, crate::Contiguity::NonContiguous);
+    }
+
+    /// The CMA pool size from `/proc/meminfo`, when it is between 1 and
+    /// 256 MB so a test can allocate past it; otherwise reports a skip.
+    fn small_cma_pool(name: &str) -> Option<usize> {
         let cma_total = std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|m| {
@@ -996,15 +1049,121 @@ mod tests {
             .map_or(0, |kb| kb * 1024);
         if cma_total == 0 || cma_total > 256 << 20 {
             crate::test_support::report_skip(&format!(
-                "{NAME} - CMA pool is {} MB; the test exceeds pools of 1-256 MB",
+                "{name} - CMA pool is {} MB; the test exceeds pools of 1-256 MB",
                 cma_total >> 20
             ));
+            return None;
+        }
+        Some(cma_total)
+    }
+
+    fn cma_heap_present() -> bool {
+        dma_heap::Heap::new(dma_heap::HeapKind::Cma).is_ok()
+    }
+
+    /// A contiguous request never falls back to the system heap: past the
+    /// CMA pool it fails, and the error names the CMA heap.
+    #[test]
+    #[cfg(not(miri))]
+    fn a_contiguous_buffer_larger_than_the_cma_pool_fails() {
+        const NAME: &str = "a_contiguous_buffer_larger_than_the_cma_pool_fails";
+        if !crate::test_support::dma_or_skip(NAME) {
             return;
         }
+        if !cma_heap_present() {
+            crate::test_support::report_skip(&format!("{NAME} - no CMA heap"));
+            return;
+        }
+        let Some(cma_total) = small_cma_pool(NAME) else {
+            return;
+        };
         let size = cma_total + (4 << 20);
-        let t = DmaTensor::<u8>::new(&[size], None)
-            .unwrap_or_else(|e| panic!("{size} B, past the {cma_total} B CMA pool: {e}"));
-        assert!(fstat_size(&t.fd) >= size);
+        let err = DmaTensor::<u8>::new_with_byte_size(&[size], size, None, true)
+            .expect_err("a contiguous buffer past the CMA pool must not be allocated");
+        assert!(
+            err.to_string().contains(CMA_HEAP_PATH),
+            "error does not name the CMA heap: {err}"
+        );
+    }
+
+    /// A contiguous request is served by the CMA heap, or fails naming it
+    /// where there is none (the hosted CI runners have only the system heap).
+    #[test]
+    #[cfg(not(miri))]
+    fn a_contiguous_request_comes_from_the_cma_heap_or_fails() {
+        const NAME: &str = "a_contiguous_request_comes_from_the_cma_heap_or_fails";
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
+        let result = DmaTensor::<u8>::new_with_byte_size(&[4096], 4096, None, true);
+        if cma_heap_present() {
+            let t = result.unwrap_or_else(|e| panic!("4 KiB from the CMA heap: {e}"));
+            assert_eq!(t.contiguity, crate::Contiguity::Contiguous);
+        } else {
+            let err = result.expect_err("no CMA heap, so no contiguous memory");
+            assert!(
+                err.to_string().contains(CMA_HEAP_PATH),
+                "error does not name the CMA heap: {err}"
+            );
+        }
+    }
+
+    /// Self-allocated memory reports the heap that served it, a clone keeps
+    /// it, and the same buffer imported through its fd is `Unknown`.
+    #[test]
+    #[cfg(not(miri))]
+    fn dma_allocations_report_their_heap_and_imports_are_unknown() {
+        const NAME: &str = "dma_allocations_report_their_heap_and_imports_are_unknown";
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
+        let t = DmaTensor::<u8>::new(&[4096], None).expect("alloc");
+        let expected = if cma_heap_present() {
+            crate::Contiguity::Contiguous
+        } else {
+            crate::Contiguity::NonContiguous
+        };
+        assert_eq!(t.contiguity, expected);
+        assert_eq!(t.try_clone().expect("clone").contiguity, expected);
+        let imported = DmaTensor::<u8>::from_fd(t.clone_fd().expect("clone_fd"), &[4096], None)
+            .expect("import");
+        assert_eq!(imported.contiguity, crate::Contiguity::Unknown);
+    }
+
+    /// The public request: `ImageDesc::with_contiguous` through
+    /// `Tensor::image_desc`, and its rejection with non-DMA memory.
+    #[test]
+    #[cfg(not(miri))]
+    fn dma_image_desc_contiguous_request() {
+        use crate::{DType, ImageDesc, PixelFormat, Tensor, TensorMemory};
+        const NAME: &str = "dma_image_desc_contiguous_request";
+
+        let host = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_contiguous(true);
+        assert!(matches!(
+            Tensor::<u8>::image_desc(&host),
+            Err(Error::InvalidArgument(_))
+        ));
+
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
+        let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8).with_contiguous(true);
+        match Tensor::<u8>::image_desc(&desc) {
+            Ok(t) => {
+                assert!(cma_heap_present(), "contiguous memory without a CMA heap");
+                assert_eq!(t.memory(), TensorMemory::DmaBuf);
+                assert_eq!(t.contiguity(), crate::Contiguity::Contiguous);
+            }
+            Err(e) => {
+                assert!(
+                    !cma_heap_present(),
+                    "the CMA heap is present but failed: {e}"
+                );
+                assert!(e.to_string().contains(CMA_HEAP_PATH), "{e}");
+            }
+        }
     }
 
     fn fstat_size(fd: &OwnedFd) -> usize {
@@ -1024,7 +1183,8 @@ mod tests {
         assert_eq!(t.capacity_bytes(), fstat_size(&t.fd));
         assert!(t.capacity_bytes() >= 1000);
 
-        let padded = DmaTensor::<u32>::new_with_byte_size(&[10, 25], 1000, None).expect("alloc");
+        let padded =
+            DmaTensor::<u32>::new_with_byte_size(&[10, 25], 1000, None, false).expect("alloc");
         assert_eq!(padded.shape(), &[10, 25]);
         assert_eq!(padded.capacity_bytes(), fstat_size(&padded.fd));
         assert!(padded.capacity_bytes() > 1000, "page rounding");

@@ -318,6 +318,15 @@ class Tensor:
         """
 
     @property
+    def contiguity(self) -> str:
+        """Whether the memory is known to be physically contiguous.
+
+        ``"contiguous"`` for a DMA-BUF allocated from the CMA heap,
+        ``"non_contiguous"`` for one from the system heap, and ``"unknown"``
+        for an imported fd and every other kind of memory.
+        """
+
+    @property
     def memory(self) -> TensorMemory:
         """The memory type of the tensor."""
 
@@ -788,6 +797,7 @@ class Tensor:
         format: PixelFormat,
         mem: TensorMemory | None = None,
         access: str = "none",
+        contiguous: bool = False,
     ) -> Tensor:
         """Create an image tensor with the given dimensions and pixel format.
 
@@ -801,6 +811,9 @@ class Tensor:
                 ``"write"``, or ``"readwrite"``. Hardware access is always
                 implied; pass ``"readwrite"`` (or the precise direction) when
                 the script will ``map()`` or ``numpy()`` the tensor.
+            contiguous: Require physically contiguous memory: a DMA-BUF from
+                the Linux CMA heap, or an error naming the heap, never a
+                fallback. ``mem`` must be ``None`` or ``TensorMemory.DMABUF``.
         """
 
     # `save_jpeg` and `normalize_to_numpy` are NOT on this class. They were

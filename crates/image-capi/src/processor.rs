@@ -16,7 +16,9 @@ use edgefirst_tensor::{
     Compression, CpuAccess, DType, ImageDesc, PixelFormat, TensorDyn, TensorMemory,
 };
 use edgefirst_tensor_ffi::EfTensor;
-use edgefirst_tensor_ffi::{ef_tensor_image_desc_get, EfImageDescView, EfTensorImageDesc};
+use edgefirst_tensor_ffi::{
+    ef_tensor_image_desc_contiguous, ef_tensor_image_desc_get, EfImageDescView, EfTensorImageDesc,
+};
 
 /// An opaque image processor.
 pub struct EfImageProcessor {
@@ -166,9 +168,13 @@ pub unsafe extern "C" fn ef_image_processor_create_image_desc(
             if ef_tensor_image_desc_get(d, &mut view) != 0 {
                 return std::ptr::null_mut();
             }
-            let Some(desc) = image_desc_from_view(&view) else {
+            let Some(mut desc) = image_desc_from_view(&view) else {
                 return std::ptr::null_mut();
             };
+            // Not part of the fixed-size view; read through its own getter.
+            if ef_tensor_image_desc_contiguous(d) == 1 {
+                desc = desc.with_contiguous(true);
+            }
             match (*p).inner.create_image_desc(&desc) {
                 Ok(t) => t.into_raw(),
                 Err(_) => std::ptr::null_mut(),

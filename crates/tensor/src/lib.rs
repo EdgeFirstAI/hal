@@ -1342,6 +1342,28 @@ crate::ef_vocabulary! {
     pub mod compression_wire;
 }
 
+crate::ef_vocabulary! {
+    /// Whether a tensor's memory is known to be physically contiguous
+    /// ([`Tensor::contiguity`]).
+    ///
+    /// Capture and other DMA engines without an IOMMU (the i.MX 8M Plus ISI,
+    /// the vvcam ISP) can only write into physically contiguous memory.
+    /// Only memory this crate allocated from a Linux DMA heap is known
+    /// either way: the CMA heap is contiguous and the system heap is not.
+    /// An imported fd, and every other kind of memory, is `Unknown`.
+    #[non_exhaustive]
+    pub enum Contiguity {
+        /// Not known: an imported fd, or memory not allocated from a DMA heap.
+        Unknown = 0, "unknown", UNKNOWN,
+        /// Allocated from the CMA heap.
+        Contiguous = 1, "contiguous", CONTIGUOUS,
+        /// Allocated from the system heap.
+        NonContiguous = 2, "non_contiguous", NON_CONTIGUOUS,
+    }
+    #[doc(hidden)]
+    pub mod contiguity_wire;
+}
+
 /// Count of image allocations that requested [`Compression::Any`] but
 /// resolved to a linear layout (ineligible format/dtype, unrecognized
 /// vendor, or a platform without vendor tile compression). Read via
@@ -1411,6 +1433,7 @@ pub struct ImageDesc {
     memory: Option<TensorMemory>,
     access: CpuAccess,
     compression: Option<Compression>,
+    contiguous: bool,
 }
 
 impl ImageDesc {
@@ -1425,6 +1448,7 @@ impl ImageDesc {
             memory: None,
             access: CpuAccess::None,
             compression: None,
+            contiguous: false,
         }
     }
 
@@ -1444,6 +1468,19 @@ impl ImageDesc {
     /// Request a tile-compressed layout (see [`Compression`]).
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = Some(compression);
+        self
+    }
+
+    /// Require physically contiguous memory (see [`Contiguity`]).
+    ///
+    /// The image is allocated from the Linux CMA DMA heap only. Allocation
+    /// fails, naming the heap, when there is no CMA heap or it cannot fit
+    /// the image, instead of falling back to the system heap or to another
+    /// kind of memory. Memory must be auto-selected or
+    /// [`TensorMemory::DmaBuf`]. Other platforms return
+    /// [`Error::NotImplemented`].
+    pub fn with_contiguous(mut self, contiguous: bool) -> Self {
+        self.contiguous = contiguous;
         self
     }
 
@@ -1480,6 +1517,11 @@ impl ImageDesc {
     /// The compression request, if any.
     pub fn compression(&self) -> Option<Compression> {
         self.compression
+    }
+
+    /// Whether physically contiguous memory is required.
+    pub fn contiguous(&self) -> bool {
+        self.contiguous
     }
 }
 
@@ -2455,13 +2497,17 @@ where
     /// buffers that will be imported as GPU textures via EGLImage. PBO,
     /// Shm, and Mem storage doesn't benefit from pitch alignment and
     /// shouldn't pay the memory cost.
+    /// With `contiguous`, the memory comes from the CMA heap only (see
+    /// [`ImageDesc::with_contiguous`]).
     #[cfg(target_os = "linux")]
     pub(crate) fn new_dma_with_byte_size(
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
+        contiguous: bool,
     ) -> Result<Self> {
-        DmaTensor::<T>::new_with_byte_size(shape, byte_size, name).map(TensorStorage::Dma)
+        DmaTensor::<T>::new_with_byte_size(shape, byte_size, name, contiguous)
+            .map(TensorStorage::Dma)
     }
 
     // No non-Linux stub: the only caller (`Tensor::image_with_stride`)
@@ -3347,6 +3393,10 @@ where
     ///   [`compression_fallback_count`].
     ///
     /// The recorded outcome is readable via [`Tensor::compression`].
+    ///
+    /// A [`ImageDesc::with_contiguous`] request allocates from the CMA heap
+    /// only, and fails instead of falling back; [`Tensor::contiguity`]
+    /// reports the heap.
     pub fn image_desc(desc: &ImageDesc) -> Result<Self>
     where
         T: 'static,
@@ -3361,6 +3411,25 @@ where
                 "image_desc: desc.dtype is {:?} but the tensor element type is {t_dtype:?}",
                 desc.dtype
             )));
+        }
+
+        // A contiguous request is a CMA DMA-BUF or an error: no fallback to
+        // another heap or another kind of memory.
+        if desc.contiguous {
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(Error::NotImplemented(
+                    "image_desc: physically contiguous memory needs the Linux CMA DMA heap".into(),
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            if !matches!(desc.memory, None | Some(TensorMemory::DmaBuf)) {
+                return Err(Error::InvalidArgument(format!(
+                    "image_desc: physically contiguous memory is DMA-BUF from the CMA heap, \
+                     but {:?} was requested",
+                    desc.memory
+                )));
+            }
         }
 
         // Compression-request guards. CPU access pins the layout linear,
@@ -3412,21 +3481,36 @@ where
         // failure — the caller demanded a layout only that allocator can
         // produce; `Any` falls back to plain auto-select.
         #[allow(unused_mut)]
-        let mut t = match (desc.memory, desc.compression) {
-            (None, Some(request)) => {
-                match Self::image(
-                    desc.width,
-                    desc.height,
-                    desc.format,
-                    Some(TensorMemory::DmaBuf),
-                    desc.access,
-                ) {
-                    Ok(t) => t,
-                    Err(e) if matches!(request, Compression::Scheme(_)) => return Err(e),
-                    Err(_) => Self::image(desc.width, desc.height, desc.format, None, desc.access)?,
+        let mut t = if desc.contiguous {
+            Self::image_impl(
+                desc.width,
+                desc.height,
+                desc.format,
+                Some(TensorMemory::DmaBuf),
+                desc.access,
+                true,
+            )?
+        } else {
+            match (desc.memory, desc.compression) {
+                (None, Some(request)) => {
+                    match Self::image(
+                        desc.width,
+                        desc.height,
+                        desc.format,
+                        Some(TensorMemory::DmaBuf),
+                        desc.access,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) if matches!(request, Compression::Scheme(_)) => return Err(e),
+                        Err(_) => {
+                            Self::image(desc.width, desc.height, desc.format, None, desc.access)?
+                        }
+                    }
+                }
+                (memory, _) => {
+                    Self::image(desc.width, desc.height, desc.format, memory, desc.access)?
                 }
             }
-            (memory, _) => Self::image(desc.width, desc.height, desc.format, memory, desc.access)?,
         };
 
         // Record best knowledge / count fallbacks. Only an Android
@@ -3539,6 +3623,26 @@ where
     where
         T: 'static,
     {
+        Self::image_impl(width, height, format, memory, access, false)
+    }
+
+    /// [`Tensor::image`], plus the [`ImageDesc::with_contiguous`] request.
+    /// `contiguous` is only honoured with `Some(TensorMemory::DmaBuf)` on
+    /// Linux; [`Tensor::image_desc`] checks that before calling.
+    fn image_impl(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        memory: Option<TensorMemory>,
+        access: CpuAccess,
+        contiguous: bool,
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
+        debug_assert!(!contiguous || memory == Some(TensorMemory::DmaBuf));
+        #[cfg(not(target_os = "linux"))]
+        let _ = contiguous;
         // Shape comes from the shared `PixelFormat::allocation_shape` helper (packed /
         // planar / semi-planar NV12·NV16). NV12 supports odd dimensions via the
         // `H + ceil(H/2)` combined-plane height.
@@ -3882,7 +3986,12 @@ where
         let (storage, used_stride) = match memory {
             #[cfg(target_os = "linux")]
             Some(TensorMemory::DmaBuf) => (
-                TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None)?,
+                TensorStorage::<T>::new_dma_with_byte_size(
+                    &shape,
+                    dma_byte_size,
+                    None,
+                    contiguous,
+                )?,
                 aligned_stride,
             ),
             #[cfg(unix)]
@@ -3913,7 +4022,12 @@ where
                 // and is reached only via an explicit `TensorMemory::Shm`.
                 #[cfg(target_os = "linux")]
                 {
-                    match TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None) {
+                    match TensorStorage::<T>::new_dma_with_byte_size(
+                        &shape,
+                        dma_byte_size,
+                        None,
+                        false,
+                    ) {
                         Ok(s) => (s, aligned_stride),
                         Err(_) => (
                             TensorStorage::<T>::new_mem_with_byte_size(
@@ -4053,9 +4167,12 @@ where
             let shape = vec![height, width, format.channels()];
 
             let storage = match memory {
-                Some(TensorMemory::DmaBuf) | None => {
-                    TensorStorage::<T>::new_dma_with_byte_size(&shape, total_byte_size, None)?
-                }
+                Some(TensorMemory::DmaBuf) | None => TensorStorage::<T>::new_dma_with_byte_size(
+                    &shape,
+                    total_byte_size,
+                    None,
+                    false,
+                )?,
                 Some(other) => {
                     return Err(Error::NotImplemented(format!(
                         "image_with_stride: only TensorMemory::DmaBuf is supported, got {other:?}"
@@ -4803,6 +4920,19 @@ where
     /// requested compression record a scheme.
     pub fn compression(&self) -> Option<CompressionScheme> {
         self.compression
+    }
+
+    /// Whether this tensor's memory is known to be physically contiguous:
+    /// [`Contiguity::Contiguous`] for a DMA-BUF this crate allocated from
+    /// the CMA heap, [`Contiguity::NonContiguous`] for one from the system
+    /// heap, and [`Contiguity::Unknown`] for an imported fd and every other
+    /// kind of memory.
+    pub fn contiguity(&self) -> Contiguity {
+        match &self.storage {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(d) => d.contiguity,
+            _ => Contiguity::Unknown,
+        }
     }
 
     /// Record the compression scheme — crate-private: recording is an
@@ -6806,6 +6936,7 @@ mod image_tests {
                 &[usize::MAX, 2, 2],
                 usize::MAX,
                 None,
+                false,
             );
             assert!(
                 matches!(err, Err(Error::InvalidArgument(_))),

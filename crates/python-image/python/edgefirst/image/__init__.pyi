@@ -426,6 +426,7 @@ class ImageProcessor:
         dtype: DType = "uint8",
         access: str = "none",
         compression: str | None = None,
+        contiguous: bool = False,
     ) -> Tensor:
         """Create an image tensor with the processor's optimal memory backend.
 
@@ -461,6 +462,10 @@ class ImageProcessor:
                 the device's native scheme matches). Requires
                 ``access="none"``. Read the outcome via
                 ``Tensor.compression``.
+            contiguous: Require physically contiguous memory: a DMA-BUF from
+                the Linux CMA heap, or an error naming the heap, never a
+                fallback to the system heap, a PBO or system memory. Read
+                the outcome via ``Tensor.contiguity``.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.

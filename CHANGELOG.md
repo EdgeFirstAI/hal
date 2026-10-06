@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Physically contiguous DMA-BUF on request, and a query for it (`edgefirst-tensor`, `edgefirst-image`).** Capture engines without an IOMMU, such as the i.MX 8M Plus ISI, can only write into physically contiguous memory, and since 0.33 a DMA-BUF allocation silently falls back to the non-contiguous system heap when the CMA heap is full.
+  - `ImageDesc::with_contiguous(true)` allocates from the CMA heap only, through `Tensor::image_desc`, `TensorDyn::image_desc` and `ImageProcessor::create_image_desc`. When there is no CMA heap or it cannot fit the image, allocation fails with an error naming `/dev/dma_heap/linux,cma` instead of falling back to the system heap, a PBO or host memory. Default allocations are unchanged.
+  - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
+  - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
+  - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
+
 ## [0.34.1] - 2026-10-07
 
 ### Fixed
