@@ -468,6 +468,18 @@ impl CPUProcessor {
         }
     }
 
+    /// Sets how resizing converts resample (see [`crate::Interpolation`]):
+    /// nearest-neighbour, or the bilinear filter of [`Self::new`].
+    pub fn set_interpolation(&mut self, mode: crate::Interpolation) {
+        let alg = match mode {
+            crate::Interpolation::Nearest => fast_image_resize::ResizeAlg::Nearest,
+            crate::Interpolation::Bilinear => {
+                fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Bilinear)
+            }
+        };
+        self.options = self.options.clone().resize_alg(alg);
+    }
+
     /// Creates a new CPUConverter with nearest neighbor resizing.
     pub fn new_nearest() -> Self {
         let resizer = fast_image_resize::Resizer::new();

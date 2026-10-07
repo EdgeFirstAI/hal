@@ -405,7 +405,20 @@ pub(super) fn scale_uv_rect_to_import(
 ///
 /// A degenerate logical size yields the whole texture, `[0, 0, 1, 1]`.
 pub(super) fn sample_clamp_rect(logical: (usize, usize), map: ImportMap) -> [f32; 4] {
-    fn axis(logical: usize, origin: u32, extent: Option<u32>) -> (f32, f32) {
+    sample_clamp_rect_within(logical, map, [0.0, 0.0, 1.0, 1.0])
+}
+
+/// [`sample_clamp_rect`] narrowed to a source crop: `crop` is
+/// `[u_min, v_min, u_max, v_max]` normalized to the logical image, and the
+/// result brackets the crop's texels instead of the whole image's. A source
+/// crop's texture coordinates span its true edges, so this clamp is what keeps
+/// a `LINEAR` kernel at those edges from blending the pixels beyond them.
+pub(super) fn sample_clamp_rect_within(
+    logical: (usize, usize),
+    map: ImportMap,
+    crop: [f32; 4],
+) -> [f32; 4] {
+    fn axis(logical: usize, origin: u32, extent: Option<u32>, lo: f32, hi: f32) -> (f32, f32) {
         if logical == 0 {
             return (0.0, 1.0);
         }
@@ -416,13 +429,31 @@ pub(super) fn sample_clamp_rect(logical: (usize, usize), map: ImportMap) -> [f32
             // contradictory shift: the texture is the image at its origin.
             _ => (logical as f32, 0.0),
         };
-        (
-            (first + 0.5) / texture,
-            (first + logical as f32 - 0.5) / texture,
-        )
+        let lo = (lo * logical as f32).clamp(0.0, logical as f32);
+        let hi = (hi * logical as f32).clamp(lo, logical as f32);
+        // A crop narrower than one texel collapses to its centre.
+        let (lo, hi) = if hi - lo < 1.0 {
+            let c = (lo + hi) * 0.5;
+            (c, c)
+        } else {
+            (lo + 0.5, hi - 0.5)
+        };
+        ((first + lo) / texture, (first + hi) / texture)
     }
-    let (u_min, u_max) = axis(logical.0, map.origin.0, map.extent.map(|e| e.0));
-    let (v_min, v_max) = axis(logical.1, map.origin.1, map.extent.map(|e| e.1));
+    let (u_min, u_max) = axis(
+        logical.0,
+        map.origin.0,
+        map.extent.map(|e| e.0),
+        crop[0],
+        crop[2],
+    );
+    let (v_min, v_max) = axis(
+        logical.1,
+        map.origin.1,
+        map.extent.map(|e| e.1),
+        crop[1],
+        crop[3],
+    );
     [u_min, v_min, u_max, v_max]
 }
 
@@ -898,6 +929,26 @@ mod import_extent_tests {
         let [u0, v0, u1, v1] = sample_clamp_rect((64, 64), ImportMap::WHOLE);
         assert!((u0 - 0.5 / 64.0).abs() < 1e-9 && (v0 - 0.5 / 64.0).abs() < 1e-9);
         assert!((u1 - 63.5 / 64.0).abs() < 1e-9 && (v1 - 63.5 / 64.0).abs() < 1e-9);
+    }
+
+    /// A source crop narrows the clamp to its own texels, half a texel inside
+    /// its edges, on a whole texture and on a shifted import alike.
+    #[test]
+    fn sample_clamp_rect_within_brackets_a_crop() {
+        let crop = [16.0 / 64.0, 8.0 / 32.0, 48.0 / 64.0, 24.0 / 32.0];
+        let [u0, v0, u1, v1] = sample_clamp_rect_within((64, 32), ImportMap::WHOLE, crop);
+        assert!((u0 - 16.5 / 64.0).abs() < 1e-6 && (u1 - 47.5 / 64.0).abs() < 1e-6);
+        assert!((v0 - 8.5 / 32.0).abs() < 1e-6 && (v1 - 23.5 / 32.0).abs() < 1e-6);
+        let map = ImportMap {
+            extent: Some((80, 32)),
+            origin: (8, 0),
+        };
+        let [u0, _, u1, _] = sample_clamp_rect_within((64, 32), map, crop);
+        assert!((u0 - 24.5 / 80.0).abs() < 1e-6 && (u1 - 55.5 / 80.0).abs() < 1e-6);
+        assert_eq!(
+            sample_clamp_rect_within((64, 32), map, [0.0, 0.0, 1.0, 1.0]),
+            sample_clamp_rect((64, 32), map)
+        );
     }
 
     /// The clamp rectangle must bracket the LOGICAL image's texels on a

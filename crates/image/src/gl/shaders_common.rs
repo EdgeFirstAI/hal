@@ -250,16 +250,58 @@ void main() {
 // byte-identical on both — ONE source string. The bytes are validated on-target
 // (Linux) and frozen by `nv_fragment_byte_identical` below.
 
-/// Shared `main()` body (statements + closing brace) for the NV->RGBA shader.
-/// References `tc` (vertex UV), the `chroma_shift`/`chroma_lines`/`tex_width`
-/// layout uniforms, and the six colorimetry uniforms; writes `color`.
-macro_rules! nv_rgba_body_divfree {
+/// Declarations shared by the NV->RGBA program and its int8 twin, ending with
+/// `nv_rgb(x, y)`: the exact YUV->RGB conversion of the luma texel at (x, y)
+/// and its co-sited chroma. References the `chroma_shift`/`chroma_lines`/
+/// `tex_width` layout uniforms and the six colorimetry uniforms.
+macro_rules! nv_rgba_header {
     () => {
-        "    int w = img_size.x;
-    int h = img_size.y;
-    int x = clamp(int(tc.x * float(w)), 0, w - 1);
-    int y = clamp(int(tc.y * float(h)), 0, h - 1);
+        "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D src;
+uniform ivec2 img_size;
+uniform int tex_width;
+uniform ivec2 chroma_shift;
+uniform int chroma_lines;
+// Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
+// clamped to them, so a crop never reads pixels from outside itself.
+uniform ivec4 src_rect;
+// Hardware-filtered program only: the chroma plane as (U, V) texels on unit 1,
+// the image's share of each texture (`*_scale`), and the crop's half-texel-
+// inset rectangle on each (`*_clamp`), which keeps the LINEAR kernel inside
+// the crop and the luma rows.
+uniform highp sampler2D uv_tex;
+uniform vec2 luma_scale;
+uniform vec4 luma_clamp;
+uniform vec2 chroma_scale;
+uniform vec4 chroma_clamp;
+// Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
+// from the source tensor's resolved colorimetry. Path B applies the matrix in
+// the shader, so it is correct regardless of driver EGL color-hint support.
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
 
+// Floor expanded luma at 0 to match the CPU `yuv` crate's saturating (Y-16)
+// term (limited footroom Y<16 → 0). The top is left uncapped — the crate lets
+// headroom exceed 1.0 and relies on the final RGB clamp, so the GL path must
+// too. No-op for full range (y_offset=0, y_scale=1).
+vec3 nv_yuv_to_rgb(float yv, float u, float v) {
+    float yp = max((yv - y_offset) * y_scale, 0.0);
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    return clamp(vec3(yp + c_vr * vp, yp - c_ug * up - c_vg * vp, yp + c_ub * up), 0.0, 1.0);
+}
+
+vec3 nv_rgb(int x, int y) {
     // Luma: direct 2D texel — no per-pixel integer divide/modulo (very slow on
     // some embedded GPUs, e.g. Vivante GC7000UL).
     float yv = texelFetch(src, ivec2(x, y), 0).r;
@@ -271,30 +313,74 @@ macro_rules! nv_rgba_body_divfree {
     int crow = y >> chroma_shift.y;
     int ccol2 = ccol * 2;
     int carry = ccol2 >= tex_width ? 1 : 0;
-    int cy = h + crow * chroma_lines + carry;
+    int cy = img_size.y + crow * chroma_lines + carry;
     int cx = ccol2 - carry * tex_width;
     float u = texelFetch(src, ivec2(cx, cy), 0).r;
     float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
-
-    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
-    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
-    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
-    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
-    float yp = max((yv - y_offset) * y_scale, 0.0);
-    float up = u - 128.0 / 255.0;
-    float vp = v - 128.0 / 255.0;
-    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
-    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
-    float b = clamp(yp + c_ub * up, 0.0, 1.0);
-    color = vec4(r, g, b, 1.0);
+    return nv_yuv_to_rgb(yv, u, v);
 }
+
 "
     };
 }
 
-/// NV->RGBA fragment shader (Path B), shared verbatim by both backends. Vertex
-/// stage ([`VERTEX_SHADER`]) provides `fragPos`/`tc`; output is `color`. The
-/// bytes are validated on-target (Linux) and frozen by the golden test below.
+/// `main()` statements of the single-tap NV programs, for draws that map the
+/// crop 1:1: reads the texel under the fragment and leaves it in `rgb`. `tc`
+/// spans the crop's outer edges, so `tc * size` is the source position.
+macro_rules! nv_rgb_nearest_body {
+    () => {
+        "    ivec2 i = clamp(ivec2(tc * vec2(img_size)), src_rect.xy, src_rect.zw);
+    vec3 rgb = nv_rgb(i.x, i.y);
+"
+    };
+}
+
+/// `main()` statements of the bilinear NV programs, for draws that rescale
+/// the crop: half-pixel-centred bilinear, the GL_LINEAR / OpenCV INTER_LINEAR
+/// convention, with every tap clamped to the crop. Blending the four texels'
+/// converted RGB equals converting at native resolution and then resizing, as
+/// the CPU backend does.
+macro_rules! nv_rgb_bilinear_body {
+    () => {
+        "    vec2 p = tc * vec2(img_size) - 0.5;
+    vec2 p0 = floor(p);
+    vec2 f = p - p0;
+    ivec2 i0 = clamp(ivec2(p0), src_rect.xy, src_rect.zw);
+    ivec2 i1 = clamp(ivec2(p0) + 1, src_rect.xy, src_rect.zw);
+    vec3 rgb = mix(mix(nv_rgb(i0.x, i0.y), nv_rgb(i1.x, i0.y), f.x),
+                   mix(nv_rgb(i0.x, i1.y), nv_rgb(i1.x, i1.y), f.x), f.y);
+"
+    };
+}
+
+/// `main()` statements of the hardware-filtered bilinear NV programs: luma
+/// from the combined plane and chroma from its (U, V) view, each through the
+/// texture unit's LINEAR filter, then the exact YUV->RGB matrix. Filtering
+/// chroma on its own grid centres each chroma sample on the luma pixels it
+/// covers, as JPEG sites it.
+macro_rules! nv_rgb_hw_bilinear_body {
+    () => {
+        "    vec2 luv = clamp(tc * luma_scale, luma_clamp.xy, luma_clamp.zw);
+    vec2 cuv = clamp(tc * chroma_scale, chroma_clamp.xy, chroma_clamp.zw);
+    vec2 c = texture(uv_tex, cuv).rg;
+    vec3 rgb = nv_yuv_to_rgb(texture(src, luv).r, c.r, c.g);
+"
+    };
+}
+
+/// The XOR 0x80 bias (`(q + 128) mod 256`) the int8 NV programs apply to
+/// their output, as the other int8 shaders do.
+macro_rules! nv_int8_bias {
+    () => {
+        "vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+"
+    };
+}
+
 /// YUYV (sampled as a GL_RG texture: R=Y, G=alternating U/V) → RGBA.
 /// Each output pixel samples its own texel and the horizontal partner to
 /// recover both chroma components; the YUV→RGB matrix + range come from
@@ -386,32 +472,63 @@ pub(crate) const YUYV_RGBA_2D_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(int8_bias(vec3(r, g, b)), 1.0);\n}\n"
 );
 
+/// NV->RGBA fragment shader (Path B) for draws that do not rescale. Vertex
+/// stage ([`VERTEX_SHADER`]) provides `fragPos`/`tc`; output is `color`. The
+/// bytes are validated on-target (Linux) and frozen by the golden test below.
 pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
-    "\
-#version 300 es
-precision highp float;
-precision highp int;
-uniform highp sampler2D src;
-uniform ivec2 img_size;
-uniform int tex_width;
-uniform ivec2 chroma_shift;
-uniform int chroma_lines;
-// Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
-// from the source tensor's resolved colorimetry. Path B applies the matrix in
-// the shader, so it is correct regardless of driver EGL color-hint support.
-uniform float y_offset;
-uniform float y_scale;
-uniform float c_vr;
-uniform float c_ug;
-uniform float c_vg;
-uniform float c_ub;
-in vec3 fragPos;
-in vec2 tc;
-out vec4 color;
+    nv_rgba_header!(),
+    "void main() {\n",
+    nv_rgb_nearest_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
 
-void main() {
-",
-    nv_rgba_body_divfree!()
+/// Int8 variant of [`NV_RGBA_FRAGMENT`].
+pub(crate) const NV_RGBA_INT8_FRAGMENT: &str = concat!(
+    nv_rgba_header!(),
+    nv_int8_bias!(),
+    "void main() {\n",
+    nv_rgb_nearest_body!(),
+    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+);
+
+/// NV->RGBA fragment shader (Path B) for draws that rescale: bilinear. A
+/// separate program rather than a uniform branch in [`NV_RGBA_FRAGMENT`]:
+/// Vivante GC7000UL does not reliably honour that branch, and on V3D and
+/// Adreno the untaken half still slows 1:1 draws.
+pub(crate) const NV_RGBA_BILINEAR_FRAGMENT: &str = concat!(
+    nv_rgba_header!(),
+    "void main() {\n",
+    nv_rgb_bilinear_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// NV->RGBA fragment shader (Path B) for draws that rescale, where the chroma
+/// plane can be bound as its own texture: bilinear through the texture unit,
+/// two filtered fetches per pixel instead of the twelve of
+/// [`NV_RGBA_BILINEAR_FRAGMENT`], which remains the fallback.
+pub(crate) const NV_RGBA_HW_BILINEAR_FRAGMENT: &str = concat!(
+    nv_rgba_header!(),
+    "void main() {\n",
+    nv_rgb_hw_bilinear_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`NV_RGBA_HW_BILINEAR_FRAGMENT`].
+pub(crate) const NV_RGBA_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
+    nv_rgba_header!(),
+    nv_int8_bias!(),
+    "void main() {\n",
+    nv_rgb_hw_bilinear_body!(),
+    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+);
+
+/// Int8 variant of [`NV_RGBA_BILINEAR_FRAGMENT`].
+pub(crate) const NV_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
+    nv_rgba_header!(),
+    nv_int8_bias!(),
+    "void main() {\n",
+    nv_rgb_bilinear_body!(),
+    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
 );
 
 #[cfg(test)]
@@ -436,6 +553,16 @@ mod nv_shader_golden {
             super::NV_RGBA_FRAGMENT,
             golden(include_str!("golden/nv_rgba_linux.glsl")).as_str(),
             "NV->RGBA shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::NV_RGBA_BILINEAR_FRAGMENT,
+            golden(include_str!("golden/nv_rgba_bilinear_linux.glsl")).as_str(),
+            "bilinear NV->RGBA shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::NV_RGBA_HW_BILINEAR_FRAGMENT,
+            golden(include_str!("golden/nv_rgba_hw_bilinear_linux.glsl")).as_str(),
+            "hardware-bilinear NV->RGBA shader bytes drifted from the on-target-validated golden"
         );
     }
 

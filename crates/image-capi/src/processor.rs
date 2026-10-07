@@ -481,6 +481,42 @@ pub unsafe extern "C" fn ef_image_processor_set_class_colors(
     }
 }
 
+/// Set how `ef_image_processor_convert` resamples when it resizes.
+///
+/// `mode`: 0 = bilinear (the default; half-pixel centres, as OpenCV
+/// `INTER_LINEAR`), 1 = nearest. Applies to every backend the processor
+/// holds; the `EDGEFIRST_INTERPOLATION` environment variable (`nearest` |
+/// `bilinear`) overrides it.
+///
+/// @return 0 on success, `EINVAL` for a null processor or unknown mode,
+/// `EIO` when a backend cannot apply the mode.
+///
+/// # Safety
+/// `p` must be a live processor.
+#[no_mangle]
+pub unsafe extern "C" fn ef_image_processor_set_interpolation(
+    p: *mut EfImageProcessor,
+    mode: u32,
+) -> c_int {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            if p.is_null() {
+                return libc::EINVAL;
+            }
+            let mode = match mode {
+                0 => edgefirst_image::Interpolation::Bilinear,
+                1 => edgefirst_image::Interpolation::Nearest,
+                _ => return libc::EINVAL,
+            };
+            match (*p).inner.set_interpolation(mode) {
+                Ok(()) => 0,
+                Err(_) => libc::EIO,
+            }
+        }))
+        .unwrap_or(libc::EINVAL)
+    }
+}
+
 /// Flush any queued GPU work and wait for it.
 ///
 /// @return 0 on success, otherwise an errno.
@@ -673,6 +709,21 @@ mod tests {
         let p = ef_image_processor_new_with_backend(0);
         assert!(!p.is_null());
         unsafe { ef_image_processor_free(p) };
+    }
+
+    #[test]
+    fn interpolation_accepts_the_two_modes_and_refuses_others() {
+        let p = processor();
+        unsafe {
+            assert_eq!(ef_image_processor_set_interpolation(p, 1), 0, "nearest");
+            assert_eq!(ef_image_processor_set_interpolation(p, 0), 0, "bilinear");
+            assert_eq!(ef_image_processor_set_interpolation(p, 2), libc::EINVAL);
+            assert_eq!(
+                ef_image_processor_set_interpolation(std::ptr::null_mut(), 0),
+                libc::EINVAL
+            );
+            ef_image_processor_free(p);
+        }
     }
 
     #[test]

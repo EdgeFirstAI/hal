@@ -25,6 +25,8 @@ use super::resources::{Buffer, FrameBuffer, GlProgram, Texture, UploadSource};
 use super::shaders::{
     check_gl_error, generate_color_shader, generate_float_nhwc_packed_shader,
     generate_float_rgba_shader, generate_instanced_segmentation_shader,
+    generate_nv_to_rgba_bilinear_int8_shader_2d, generate_nv_to_rgba_bilinear_shader_2d,
+    generate_nv_to_rgba_hw_bilinear_int8_shader_2d, generate_nv_to_rgba_hw_bilinear_shader_2d,
     generate_nv_to_rgba_int8_shader_2d, generate_nv_to_rgba_shader_2d,
     generate_packed_f32_nhwc_shader, generate_packed_rgba8_int8_shader_2d,
     generate_packed_rgba8_shader_2d, generate_planar_rgb_f16_packed_shader,
@@ -166,6 +168,11 @@ struct NvUniformLocs {
     tex_width: i32,
     chroma_shift: i32,
     chroma_lines: i32,
+    src_rect: i32,
+    luma_scale: i32,
+    luma_clamp: i32,
+    chroma_scale: i32,
+    chroma_clamp: i32,
     y_offset: i32,
     y_scale: i32,
     c_vr: i32,
@@ -209,14 +216,21 @@ impl NvUniformState {
             let loc = |name: &std::ffi::CStr| {
                 edgefirst_gl::gl::GetUniformLocation(program.id, name.as_ptr())
             };
-            // Constant: the NV shaders always sample `src` from unit 0.
+            // Constant: the NV shaders always sample `src` from unit 0, and
+            // the hardware-filtered program its chroma view from unit 1.
             edgefirst_gl::gl::Uniform1i(loc(c"src"), 0);
+            edgefirst_gl::gl::Uniform1i(loc(c"uv_tex"), 1);
             NvUniformState {
                 locs: NvUniformLocs {
                     img_size: loc(c"img_size"),
                     tex_width: loc(c"tex_width"),
                     chroma_shift: loc(c"chroma_shift"),
                     chroma_lines: loc(c"chroma_lines"),
+                    src_rect: loc(c"src_rect"),
+                    luma_scale: loc(c"luma_scale"),
+                    luma_clamp: loc(c"luma_clamp"),
+                    chroma_scale: loc(c"chroma_scale"),
+                    chroma_clamp: loc(c"chroma_clamp"),
                     y_offset: loc(c"y_offset"),
                     y_scale: loc(c"y_scale"),
                     c_vr: loc(c"c_vr"),
@@ -227,6 +241,69 @@ impl NvUniformState {
                 last_colorimetry: None,
             }
         }
+    }
+}
+
+/// The source pixels an `nv_r8` draw samples: the crop rectangle in source
+/// pixels (`right`/`bottom` exclusive) and whether the draw rescales it.
+/// Built from the convert's geometry rather than from the half-texel-inset
+/// [`RegionOfInterest`] the filtered-sampler paths use, because the NV shader
+/// computes texel positions itself and needs the crop's true edges.
+#[derive(Clone, Copy, Debug)]
+struct NvSampleRect {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+    resample: bool,
+}
+
+impl NvSampleRect {
+    /// `src_crop` and `dst_crop` default to the whole source and destination.
+    /// A quarter-turn rotation swaps the crop's axes on the destination.
+    fn new(
+        src_crop: Option<crate::Rect>,
+        dst_crop: Option<crate::Rect>,
+        (src_w, src_h): (usize, usize),
+        (dst_w, dst_h): (usize, usize),
+        rotation: crate::Rotation,
+    ) -> Self {
+        let src = src_crop.unwrap_or(crate::Rect::new(0, 0, src_w, src_h));
+        let dst = dst_crop.unwrap_or(crate::Rect::new(0, 0, dst_w, dst_h));
+        let (w, h) = match rotation {
+            crate::Rotation::Clockwise90 | crate::Rotation::CounterClockwise90 => {
+                (src.height, src.width)
+            }
+            _ => (src.width, src.height),
+        };
+        NvSampleRect {
+            left: src.left,
+            top: src.top,
+            right: src.left + src.width,
+            bottom: src.top + src.height,
+            resample: (w, h) != (dst.width, dst.height),
+        }
+    }
+}
+
+/// How an `nv_r8` draw samples the source, which selects its program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NvSampling {
+    /// One texel per pixel: a draw that does not rescale, or
+    /// [`crate::Interpolation::Nearest`].
+    Single = 0,
+    /// Bilinear blended in the shader from four single-texel conversions:
+    /// the fallback when the chroma plane cannot be bound on its own.
+    Shader = 1,
+    /// Bilinear through the texture units' LINEAR filter, on the combined
+    /// plane for luma and a (U, V) view of the chroma plane.
+    Hardware = 2,
+}
+
+impl NvSampling {
+    /// Index into `nv_r8_programs`: two programs (u8, int8) per sampling.
+    fn program(self, is_int8: bool) -> usize {
+        self as usize * 2 + usize::from(is_int8)
     }
 }
 
@@ -446,20 +523,29 @@ pub struct GLProcessorST {
     /// existing storage (skip the per-frame reallocation on the fixed-size
     /// video path). `(0, 0, 0)` means unallocated.
     float_render_tex_dims: (usize, usize, u32),
-    /// Path B shader: NV12/NV16/NV24 R8 → RGBA8 (u8 output).
-    nv_r8_program: GlProgram,
-    /// Path B shader: NV12/NV16/NV24 R8 → RGBA8 with int8 XOR 0x80 bias.
-    nv_r8_int8_program: GlProgram,
-    /// Link-time uniform locations + colorimetry-upload skip for `nv_r8_program`.
-    nv_r8_uniforms: NvUniformState,
-    /// Same for `nv_r8_int8_program`.
-    nv_r8_int8_uniforms: NvUniformState,
+    /// Path B shaders: NV12/NV16/NV24 R8 → RGBA8, indexed by
+    /// [`NvSampling::program`]: one per sampling, u8 or int8 (XOR 0x80 bias)
+    /// output.
+    nv_r8_programs: [GlProgram; 6],
+    /// Link-time uniform locations + colorimetry-upload skip, per program.
+    nv_r8_uniforms: [NvUniformState; 6],
+    /// The chroma plane of an NV source as (U, V) texels, for
+    /// [`NvSampling::Hardware`]: an upload, or a view of the source's
+    /// DMA-BUF.
+    nv_uv_texture: Texture,
+    /// Chroma-plane imports for `nv_uv_texture`, keyed like `nv_r8_egl_cache`.
+    nv_uv_egl_cache: ImportCache<PlatformImport>,
+    /// Set once the driver refuses a chroma-plane import, so later resizes
+    /// take the shader-filtered program instead of retrying it every frame.
+    nv_uv_import_refused: bool,
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
     nv_r8_egl_cache: ImportCache<PlatformImport>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
+    /// How the last `nv_r8` draw sampled its source (test observable).
+    pub(super) last_nv_sampling: Option<NvSampling>,
     /// Zero-copy feed telemetry (see `ConvertStats`). Plain fields — this
     /// struct lives on the single-threaded GL worker.
     pub(super) convert_stats: super::cache::ConvertStats,
@@ -486,6 +572,14 @@ pub struct GLProcessorST {
     /// `true` when `EDGEFIRST_COLORIMETRY` pinned the mode for this
     /// processor's lifetime — `set_colorimetry_mode` then logs and keeps it.
     colorimetry_env_pinned: bool,
+    /// How resizing converts resample (see [`crate::Interpolation`]): the
+    /// source textures' filter and the NV program family.
+    interpolation: crate::Interpolation,
+    /// Whether a bilinear NV resize may filter through the texture units
+    /// ([`NvSampling::Hardware`]). `EDGEFIRST_GL_NO_NV_HW_FILTER=1` clears
+    /// it, leaving the shader-filtered program: a diagnostic switch, and the
+    /// way tests reach that program on GPUs that accept every chroma view.
+    nv_hw_filter: bool,
     /// When `true`, a convert's terminal `glFinish` is skipped so a batch of
     /// tiles rendered into one shared destination import syncs only once, via a
     /// single `finish_via_fence` at [`flush`](Self::flush). Set for the duration
@@ -1993,17 +2087,33 @@ impl GLProcessorST {
             GlProgram::new(generate_vertex_shader(), generate_float_rgba_shader())?;
 
         // Path B: NV12/NV16/NV24 → RGBA via R8 texelFetch shader (ES 3.0 core, no extension).
-        let nv_r8_program =
-            GlProgram::new(generate_vertex_shader(), generate_nv_to_rgba_shader_2d())?;
-        let nv_r8_int8_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_nv_to_rgba_int8_shader_2d(),
-        )?;
+        let nv_r8_programs = [
+            GlProgram::new(generate_vertex_shader(), generate_nv_to_rgba_shader_2d())?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_int8_shader_2d(),
+            )?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_bilinear_shader_2d(),
+            )?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_bilinear_int8_shader_2d(),
+            )?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_hw_bilinear_shader_2d(),
+            )?,
+            GlProgram::new(
+                generate_vertex_shader(),
+                generate_nv_to_rgba_hw_bilinear_int8_shader_2d(),
+            )?,
+        ];
         // Resolve uniform locations once at link time (the NV draw is per-frame)
         // and upload the constant sampler bindings while the programs are fresh:
         // pass-2 packing samples the intermediate on unit 1, planar-2d on unit 0.
-        let nv_r8_uniforms = NvUniformState::resolve(&nv_r8_program);
-        let nv_r8_int8_uniforms = NvUniformState::resolve(&nv_r8_int8_program);
+        let nv_r8_uniforms = nv_r8_programs.each_ref().map(NvUniformState::resolve);
         packed_rgba8_program_2d.load_uniform_1i(c"tex", 1)?;
         packed_rgba8_int8_program_2d.load_uniform_1i(c"tex", 1)?;
         texture_program_planar_2d.load_uniform_1i(c"tex", 0)?;
@@ -2019,7 +2129,7 @@ impl GLProcessorST {
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
 
-        // EGLImage cache capacity (per cache: src / dst / nv_r8). What the
+        // EGLImage cache capacity (per cache: src / dst / nv_r8 / nv_uv). What the
         // number MEANS -- a buffer count and not a size, its scope, and the
         // pinned-memory formula -- is documented once, on
         // `ImageProcessorConfig::egl_cache_capacity`, which is what a caller
@@ -2150,13 +2260,15 @@ impl GLProcessorST {
             proto_compute_locs: (-1, -1, -1),
             proto_ssbo: 0,
             proto_ssbo_size: 0,
-            nv_r8_program,
-            nv_r8_int8_program,
+            nv_r8_programs,
             nv_r8_uniforms,
-            nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
+            nv_uv_texture: Texture::new(),
+            nv_uv_egl_cache: ImportCache::new(egl_cache_capacity),
+            nv_uv_import_refused: false,
             last_nv_convert_path: NvConvertPath::None,
+            last_nv_sampling: None,
             convert_stats: Default::default(),
             nv_import_warned: std::collections::HashSet::new(),
             owned_pbos: Default::default(),
@@ -2166,6 +2278,8 @@ impl GLProcessorST {
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
             colorimetry_env_pinned: colorimetry_env.is_some(),
+            interpolation: crate::Interpolation::default(),
+            nv_hw_filter: std::env::var("EDGEFIRST_GL_NO_NV_HW_FILTER").map_or(true, |v| v != "1"),
             defer_finish: false,
             pending_flush: false,
             pending_submit: false,
@@ -2381,6 +2495,28 @@ impl GLProcessorST {
         log::debug!("Colorimetry mode set to {:?}", mode);
     }
 
+    /// Sets how resizing converts resample (see [`crate::Interpolation`]).
+    /// `ImageProcessor::set_interpolation` resolves the
+    /// `EDGEFIRST_INTERPOLATION` override before it reaches here.
+    pub fn set_interpolation(&mut self, mode: crate::Interpolation) {
+        self.interpolation = mode;
+        log::debug!("Interpolation set to {mode:?}");
+    }
+
+    /// Allow or forbid [`NvSampling::Hardware`] (see `nv_hw_filter`).
+    #[cfg(all(test, feature = "dma_test_formats"))]
+    pub(super) fn set_nv_hw_filter(&mut self, enabled: bool) {
+        self.nv_hw_filter = enabled;
+    }
+
+    /// `MIN`/`MAG` filter for a source texture that a draw resamples.
+    pub(super) fn source_filter(&self) -> u32 {
+        match self.interpolation {
+            crate::Interpolation::Nearest => edgefirst_gl::gl::NEAREST,
+            crate::Interpolation::Bilinear => edgefirst_gl::gl::LINEAR,
+        }
+    }
+
     /// Snapshot the EGLImage cache counters (src, dst, NV R8).
     ///
     /// Steady-state tests capture this after warmup and after an N-frame
@@ -2391,6 +2527,7 @@ impl GLProcessorST {
             src: self.src_egl_cache.stats(),
             dst: self.dst_egl_cache.stats(),
             nv_r8: self.nv_r8_egl_cache.stats(),
+            nv_uv: self.nv_uv_egl_cache.stats(),
         }
     }
 
@@ -3557,6 +3694,7 @@ impl GLProcessorST {
     fn invalidate_src_textures(&mut self) {
         self.camera_eglimage_texture.invalidate_egl_binding();
         self.nv_r8_texture.invalidate_egl_binding();
+        self.nv_uv_texture.invalidate_egl_binding();
         self.camera_normal_texture.invalidate_egl_binding();
     }
 
@@ -4865,7 +5003,7 @@ impl GLProcessorST {
         }
 
         let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
+            RegionOfInterest::from_crop(&crop, src_w, src_h)
         } else {
             RegionOfInterest {
                 left: 0.,
@@ -4897,6 +5035,13 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
+        let nv_rect = NvSampleRect::new(
+            crop.src_rect,
+            crop.dst_rect,
+            (src_w, src_h),
+            (dst_w, dst_h),
+            rotation,
+        );
         if self.gl_context.transfer_backend.is_zero_copy() && src.memory() == TensorMemory::DmaBuf {
             // Choose the NV* path (ShaderR8 vs ExternalSampler) honoring the
             // EDGEFIRST_NV_CONVERT_PATH preference. See `select_nv_path`: Auto
@@ -4937,7 +5082,7 @@ impl GLProcessorST {
                             src,
                             src_fmt,
                             Some(r8_egl),
-                            src_roi,
+                            nv_rect,
                             dst_roi,
                             rotation_offset,
                             flip,
@@ -4992,7 +5137,7 @@ impl GLProcessorST {
                             src,
                             src_fmt,
                             None,
-                            src_roi,
+                            nv_rect,
                             dst_roi,
                             rotation_offset,
                             flip,
@@ -5088,7 +5233,7 @@ impl GLProcessorST {
                                 src,
                                 src_fmt,
                                 None,
-                                src_roi,
+                                nv_rect,
                                 dst_roi,
                                 rotation_offset,
                                 flip,
@@ -5151,7 +5296,7 @@ impl GLProcessorST {
                 src,
                 src_fmt,
                 None,
-                src_roi,
+                nv_rect,
                 dst_roi,
                 rotation_offset,
                 flip,
@@ -5252,7 +5397,7 @@ impl GLProcessorST {
         );
 
         let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
+            RegionOfInterest::from_crop(&crop, src_w, src_h)
         } else {
             RegionOfInterest {
                 left: 0.,
@@ -5318,8 +5463,9 @@ impl GLProcessorST {
         // than the logical image, and may start it partway in. One cache
         // lookup feeds both the source rectangle and the sampling clamp.
         let src_map = self.cached_src_import_map(src, src_fmt);
+        let src_extent =
+            super::render::sample_clamp_rect_within((src_w, src_h), src_map, src_roi.uv_bounds());
         let src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), src_map);
-        let src_extent = super::render::sample_clamp_rect((src_w, src_h), src_map);
 
         self.draw_camera_texture_to_rgb_planar(
             src_key,
@@ -5808,7 +5954,7 @@ impl GLProcessorST {
             edgefirst_gl::gl::Uniform4f(self.external_src_extent_loc(int8, true), e0, e1, e2, e3);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
-            super::core::set_tex_filter(texture_target, edgefirst_gl::gl::LINEAR);
+            super::core::set_tex_filter(texture_target, self.source_filter());
             edgefirst_gl::gl::TexParameteri(
                 texture_target,
                 edgefirst_gl::gl::TEXTURE_WRAP_S,
@@ -5962,7 +6108,11 @@ impl GLProcessorST {
             edgefirst_gl::gl::UseProgram(program.id);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
-            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
+            // NEAREST: a 1:1 copy of pass 1's output, which already resampled.
+            // LINEAR would blend a sliver of the neighbouring texel wherever
+            // the interpolated coordinate misses the texel centre (±1 on V3D
+            // and Adreno).
+            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::NEAREST);
 
             // (`tex` = unit 0 is constant per program, uploaded at link time.)
             check_gl_error(function!(), line!())?;
@@ -6117,11 +6267,16 @@ impl GLProcessorST {
         } else {
             super::render::ImportMap::WHOLE
         };
+        // The shader clamps every sample to the crop's (or else the logical
+        // image's) half-texel-inset rectangle on the texture, so an upscale's
+        // last row or column cannot blend the texel beyond the crop or a
+        // narrowed or shifted image.
+        let [u0, v0, u1, v1] = super::render::sample_clamp_rect_within(
+            (src_w, src_h),
+            import_map,
+            src_roi.uv_bounds(),
+        );
         src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), import_map);
-        // The shader clamps every sample to the logical image's
-        // half-texel-inset rectangle on the texture, so an upscale's last row
-        // or column cannot blend the texel beyond a narrowed or shifted image.
-        let [u0, v0, u1, v1] = super::render::sample_clamp_rect((src_w, src_h), import_map);
         let texture_format = match src_fmt {
             PixelFormat::Rgb => edgefirst_gl::gl::RGB,
             PixelFormat::Rgba => edgefirst_gl::gl::RGBA,
@@ -6193,7 +6348,7 @@ impl GLProcessorST {
             }
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_normal_texture.id);
-            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
+            super::core::set_tex_filter_clamp(texture_target, self.source_filter());
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
                     edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
@@ -6370,20 +6525,23 @@ impl GLProcessorST {
     ) -> Result<(), Error> {
         let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
+        let crop_uv = src_roi.uv_bounds();
         // As in `draw_src_texture`: the import may cover more of the texture
         // than the logical image, and may start it partway in.
         let src_roi = self.scale_src_roi(src_roi, src, src_fmt);
         // The external-OES programs sample through the same mapping, so they
         // clamp through it too: a rebased source (issue #170) has real texels
         // in front of its first column and behind its last, and a LINEAR
-        // kernel at either edge would otherwise blend them.
+        // kernel at either edge would otherwise blend them, or the pixels
+        // beyond a source crop.
         let (src_w, src_h) = (
             src.width().ok_or(Error::NotAnImage)?,
             src.height().ok_or(Error::NotAnImage)?,
         );
-        let [e0, e1, e2, e3] = super::render::sample_clamp_rect(
+        let [e0, e1, e2, e3] = super::render::sample_clamp_rect_within(
             (src_w, src_h),
             self.cached_src_import_map(src, src_fmt),
+            crop_uv,
         );
         let extent_loc = self.external_src_extent_loc(is_int8, false);
 
@@ -6404,7 +6562,7 @@ impl GLProcessorST {
             edgefirst_gl::gl::Uniform4f(extent_loc, e0, e1, e2, e3);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
-            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
+            super::core::set_tex_filter_clamp(texture_target, self.source_filter());
 
             // Note: GL_TEXTURE_SWIZZLE_* is not supported for
             // GL_TEXTURE_EXTERNAL_OES in GLES. YUV→RGB conversion is
@@ -6517,7 +6675,7 @@ impl GLProcessorST {
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
         r8_src: Option<PlatformHandle>,
-        src_roi: RegionOfInterest,
+        src_rect: NvSampleRect,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
@@ -6551,15 +6709,41 @@ impl GLProcessorST {
         // reads them with `texelFetch`, so the logical plane is already
         // addressed from the texture origin however large the texture is.
 
-        // Draw-time program selection: the int8 NV program is the same shader
-        // plus the XOR-0x80 bias. Selected here for EVERY destination lowering
-        // (the old swap scheme only covered DMA destinations, leaving the
-        // heap-source int8 NV output un-biased on texture destinations).
-        let prog_id = if is_int8 {
-            self.nv_r8_int8_program.id
+        // Draw-time program selection, for EVERY destination lowering: the
+        // int8 programs add the XOR-0x80 bias, and a draw that rescales
+        // bilinearly filters through the texture units when the chroma plane
+        // can be bound on its own. An upload always can be; an import only
+        // where the GPU takes the chroma plane's offset.
+        let bilinear = src_rect.resample && self.interpolation == crate::Interpolation::Bilinear;
+        let uv_import = if bilinear && self.nv_hw_filter && r8_src.is_some() {
+            self.get_or_create_nv_uv_egl_image(src, src_fmt)
+                .inspect_err(|e| log::debug!("NV chroma view unavailable ({e}); shader-filtered"))
+                .ok()
         } else {
-            self.nv_r8_program.id
+            None
         };
+        let sampling = if !bilinear {
+            NvSampling::Single
+        } else if self.nv_hw_filter && (r8_src.is_none() || uv_import.is_some()) {
+            NvSampling::Hardware
+        } else {
+            NvSampling::Shader
+        };
+        let program = sampling.program(is_int8);
+        let r8_filter = if sampling == NvSampling::Hardware {
+            edgefirst_gl::gl::LINEAR
+        } else {
+            edgefirst_gl::gl::NEAREST
+        };
+        let (shift_x, shift_y) = (layout.shift_x, layout.shift_y);
+        let chroma_w = src_w.div_ceil(1 << shift_x);
+        let chroma_h = src_h.div_ceil(1 << shift_y);
+        let combined_h = src_fmt.combined_plane_height(src_h).ok_or_else(|| {
+            Error::NotSupported(format!(
+                "draw_nv_texture_2d: {src_fmt:?} is not semi-planar"
+            ))
+        })?;
+        let prog_id = self.nv_r8_programs[program].id;
 
         // YUV→RGB matrix + range, resolved from the source tensor's
         // colorimetry (missing axes filled by the SD/HD height heuristic).
@@ -6571,11 +6755,7 @@ impl GLProcessorST {
                 .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
             cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
         );
-        let state = if is_int8 {
-            &mut self.nv_r8_int8_uniforms
-        } else {
-            &mut self.nv_r8_uniforms
-        };
+        let state = &mut self.nv_r8_uniforms[program];
         let locs = state.locs;
         // Uniform values persist per program: re-upload the six matrix floats
         // only when this program's (encoding, range) actually changed. The
@@ -6588,11 +6768,9 @@ impl GLProcessorST {
             edgefirst_gl::gl::UseProgram(prog_id);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.nv_r8_texture.id);
-            // NEAREST — we address by integer texel; no interpolation wanted.
-            super::core::set_tex_filter_clamp(
-                edgefirst_gl::gl::TEXTURE_2D,
-                edgefirst_gl::gl::NEAREST,
-            );
+            // NEAREST for the texelFetch programs (which ignore it anyway);
+            // LINEAR where the hardware filters luma.
+            super::core::set_tex_filter_clamp(edgefirst_gl::gl::TEXTURE_2D, r8_filter);
 
             match r8_src {
                 Some(egl_img) => {
@@ -6643,10 +6821,7 @@ impl GLProcessorST {
                             edgefirst_gl::gl::TEXTURE_2D,
                             self.nv_r8_texture.id,
                         );
-                        super::core::set_tex_filter_clamp(
-                            edgefirst_gl::gl::TEXTURE_2D,
-                            edgefirst_gl::gl::NEAREST,
-                        );
+                        super::core::set_tex_filter_clamp(edgefirst_gl::gl::TEXTURE_2D, r8_filter);
                     }
                     // Fresh storage every frame: this texture alternates between
                     // imported planes and uploads, and only an attach knows when
@@ -6666,12 +6841,53 @@ impl GLProcessorST {
                 }
             }
 
+            if sampling == NvSampling::Hardware {
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE1);
+                let bound = self.bind_nv_chroma(src, src_key, uv_import, chroma_w, chroma_h);
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+                bound?;
+            }
+
             // Per-source uniforms through link-time-cached locations (the
             // `src` sampler binding is constant and uploaded at resolve time).
             edgefirst_gl::gl::Uniform2i(locs.img_size, src_w as i32, src_h as i32);
             edgefirst_gl::gl::Uniform1i(locs.tex_width, tex_width);
             edgefirst_gl::gl::Uniform2i(locs.chroma_shift, chroma_shift_x, chroma_shift_y);
             edgefirst_gl::gl::Uniform1i(locs.chroma_lines, chroma_lines);
+            if sampling == NvSampling::Hardware {
+                // The crop's half-texel-inset rectangle on each texture, so
+                // the LINEAR kernel never reaches past the crop (or, for luma,
+                // into the chroma rows below the image).
+                let (tw, th) = (tex_width as f32, combined_h as f32);
+                edgefirst_gl::gl::Uniform2f(locs.luma_scale, src_w as f32 / tw, src_h as f32 / th);
+                edgefirst_gl::gl::Uniform4f(
+                    locs.luma_clamp,
+                    (src_rect.left as f32 + 0.5) / tw,
+                    (src_rect.top as f32 + 0.5) / th,
+                    (src_rect.right as f32 - 0.5) / tw,
+                    (src_rect.bottom as f32 - 0.5) / th,
+                );
+                let (cw, ch) = (chroma_w as f32, chroma_h as f32);
+                edgefirst_gl::gl::Uniform2f(
+                    locs.chroma_scale,
+                    src_w as f32 / (chroma_w << shift_x) as f32,
+                    src_h as f32 / (chroma_h << shift_y) as f32,
+                );
+                edgefirst_gl::gl::Uniform4f(
+                    locs.chroma_clamp,
+                    ((src_rect.left >> shift_x) as f32 + 0.5) / cw,
+                    ((src_rect.top >> shift_y) as f32 + 0.5) / ch,
+                    (src_rect.right.div_ceil(1 << shift_x) as f32 - 0.5) / cw,
+                    (src_rect.bottom.div_ceil(1 << shift_y) as f32 - 0.5) / ch,
+                );
+            }
+            edgefirst_gl::gl::Uniform4i(
+                locs.src_rect,
+                src_rect.left as i32,
+                src_rect.top as i32,
+                src_rect.right as i32 - 1,
+                src_rect.bottom as i32 - 1,
+            );
 
             if upload_colorimetry {
                 let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(colorimetry.0, colorimetry.1);
@@ -6720,6 +6936,12 @@ impl GLProcessorST {
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
             edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
+            let src_roi = RegionOfInterest {
+                left: src_rect.left as f32 / src_w as f32,
+                top: src_rect.bottom as f32 / src_h as f32,
+                right: src_rect.right as f32 / src_w as f32,
+                bottom: src_rect.top as f32 / src_h as f32,
+            };
             let texture_vertices: [f32; 16] = [
                 src_roi.left,
                 src_roi.top,
@@ -6752,17 +6974,18 @@ impl GLProcessorST {
                 edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
+            if sampling == NvSampling::Hardware {
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE1);
+                edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, 0);
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            }
         }
+        self.last_nv_sampling = Some(sampling);
         check_gl_error(function!(), line!())?;
         // The draw (and its colorimetry upload, when taken) succeeded — only
         // now record the program's uploaded (encoding, range).
         if upload_colorimetry {
-            let state = if is_int8 {
-                &mut self.nv_r8_int8_uniforms
-            } else {
-                &mut self.nv_r8_uniforms
-            };
-            state.last_colorimetry = Some(colorimetry);
+            self.nv_r8_uniforms[program].last_colorimetry = Some(colorimetry);
         }
         Ok(())
     }
@@ -6798,7 +7021,7 @@ impl GLProcessorST {
         // with the width unchanged -- makes the shader address luma at
         // `y * tex_width + x + shift`, which wraps rows and so needs a
         // per-texel integer divide and modulo. That is exactly the
-        // arithmetic `nv_rgba_body_divfree` exists to avoid (3.3x on
+        // arithmetic the NV shader's divide-free addressing exists to avoid (3.3x on
         // Vivante), and it would also leave the last `shift` bytes of the
         // final chroma row outside the import, which for NV24 are pixels.
         // So the NV path keeps the decline and uploads the combined plane,
@@ -6834,6 +7057,115 @@ impl GLProcessorST {
 
         let handle = Platform::import_handle(&egl_image_obj);
         self.nv_r8_egl_cache.insert(id, egl_image_obj, None);
+        Ok(handle)
+    }
+
+    /// Bind the chroma plane of `src` as (U, V) texels to `nv_uv_texture` on
+    /// the active texture unit, with LINEAR filtering: the `import` when there
+    /// is one, else an upload of the plane from the source's pixels.
+    fn bind_nv_chroma(
+        &mut self,
+        src: &Tensor<u8>,
+        src_key: BufferImportKey,
+        import: Option<PlatformHandle>,
+        chroma_w: usize,
+        chroma_h: usize,
+    ) -> Result<(), Error> {
+        if self.is_adreno && import.is_none() {
+            // As for the R8 plane: a texture that held an import keeps
+            // sampling it after an upload on Adreno.
+            self.nv_uv_texture = Texture::new();
+        }
+        unsafe {
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.nv_uv_texture.id);
+            super::core::set_tex_filter_clamp(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::LINEAR,
+            );
+        }
+        if let Some(handle) = import {
+            // SAFETY: `handle` comes from `nv_uv_egl_cache`, which owns the
+            // import for at least as long as this draw; the texture is bound
+            // to the active unit above.
+            unsafe {
+                self.nv_uv_texture
+                    .bind_egl_image(&self.gl_context, src_key, handle)?;
+            }
+            return check_gl_error(function!(), line!());
+        }
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let layout = src
+            .format()
+            .and_then(|f| f.chroma_layout())
+            .ok_or_else(|| Error::NotSupported("NV chroma upload: not semi-planar".into()))?;
+        let stride = src.effective_row_stride().unwrap_or(src_w);
+        let pitch = stride * layout.uv_rows_per_luma;
+        let pixels = SrcPixels::open(src, &self.owned_pbos)?;
+        self.nv_uv_texture.forget_storage();
+        unsafe {
+            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, (pitch / 2) as i32);
+        }
+        let uploaded = self.nv_uv_texture.upload(
+            edgefirst_gl::gl::TEXTURE_2D,
+            chroma_w,
+            chroma_h,
+            edgefirst_gl::gl::RG,
+            pitch * (chroma_h - 1) + chroma_w * 2,
+            pixels.source().offset_by(stride * src_h),
+        );
+        unsafe {
+            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
+        }
+        uploaded?;
+        check_gl_error(function!(), line!())
+    }
+
+    /// Look up or create the chroma-plane (U, V) EGLImage of a single-plane
+    /// NV* source for [`NvSampling::Hardware`], cached in `nv_uv_egl_cache`.
+    /// The plane sits `row_stride * height` bytes past the luma plane, so it
+    /// needs its own offset check on GPUs that misread unaligned offsets.
+    fn get_or_create_nv_uv_egl_image(
+        &mut self,
+        img: &Tensor<u8>,
+        img_fmt: PixelFormat,
+    ) -> Result<PlatformHandle, crate::Error> {
+        if !Platform::NV_CHROMA_IMPORT || self.nv_uv_import_refused {
+            return Err(crate::Error::NotSupported(
+                "no chroma-plane import on this platform or driver".into(),
+            ));
+        }
+        Platform::validate_import_identity(img, "NV chroma source")?;
+        let height = img.height().ok_or(Error::NotAnImage)?;
+        let stride = img
+            .effective_row_stride()
+            .unwrap_or(img.width().ok_or(Error::NotAnImage)?);
+        let offset = img.plane_offset().unwrap_or(0) + stride * height;
+        if rejects_unaligned_import_offset(self.misplaces_unaligned_offsets(), offset) {
+            return Err(crate::Error::NotSupported(format!(
+                "chroma plane offset {offset} is not {DMA_IMPORT_OFFSET_ALIGN}-byte aligned"
+            )));
+        }
+        let id = BufferImportKey::from_tensor(img, img_fmt, false);
+        {
+            let ts = self.nv_uv_egl_cache.next_timestamp();
+            if let Some(cached) = self.nv_uv_egl_cache.entries.get_mut(&id) {
+                self.nv_uv_egl_cache.hits += 1;
+                cached.last_used = ts;
+                return Ok(Platform::import_handle(&cached.import));
+            }
+        }
+        // A miss counts an import made: a refusal imports nothing, and is
+        // remembered so the next resize does not repeat the attempt.
+        let egl_image_obj = Platform::import_buffer_nv_chroma(&self.gl_context, img, img_fmt)
+            .inspect_err(|e| {
+                log::info!("NV chroma-plane import refused ({e}); resizing with the shader filter");
+                self.nv_uv_import_refused = true;
+            })?;
+        self.nv_uv_egl_cache.misses += 1;
+        self.nv_uv_texture.invalidate_egl_binding();
+        let handle = Platform::import_handle(&egl_image_obj);
+        self.nv_uv_egl_cache.insert(id, egl_image_obj, None);
         Ok(handle)
     }
 

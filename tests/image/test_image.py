@@ -179,6 +179,37 @@ def test_rgb_resize(monkeypatch):
         assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
+def test_interpolation(monkeypatch):
+    # A resized checkerboard: "nearest" copies source pixels, "bilinear"
+    # blends them, and EDGEFIRST_INTERPOLATION overrides the constructor.
+    monkeypatch.delenv("EDGEFIRST_INTERPOLATION", raising=False)
+    checker = np.indices((30, 40)).sum(axis=0) % 2 * 255
+    rgba = np.stack([checker] * 3 + [np.full_like(checker, 255)], axis=-1).astype(
+        np.uint8
+    )
+
+    def resize(processor):
+        src = Tensor.image(40, 30, format=PixelFormat.Rgba, access="readwrite")
+        with src.map() as m:
+            np.asarray(m.numpy())[:] = rgba
+        dst = processor.create_image(56, 42, PixelFormat.Rgba, access="readwrite")
+        processor.convert(src, dst)
+        with dst.map() as m:
+            return np.array(m.numpy())
+
+    blended = lambda img: np.count_nonzero((img[..., 0] > 0) & (img[..., 0] < 255))
+    assert blended(resize(ImageProcessor(interpolation="nearest"))) == 0
+    assert blended(resize(ImageProcessor(interpolation="bilinear"))) > 0
+    processor = ImageProcessor()
+    processor.set_interpolation("nearest")
+    assert blended(resize(processor)) == 0
+    with pytest.raises(RuntimeError, match="Unknown interpolation"):
+        ImageProcessor(interpolation="lanczos")
+
+    monkeypatch.setenv("EDGEFIRST_INTERPOLATION", "nearest")
+    assert blended(resize(ImageProcessor(interpolation="bilinear"))) == 0
+
+
 def test_rgba_to_rgb(monkeypatch):
     # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")

@@ -600,6 +600,54 @@ impl DmaImportAttrs {
         })
     }
 
+    /// Import attributes for the chroma plane of a single-plane NV12/NV16/NV24
+    /// tensor as its own `GR88` image: one texel per chroma sample, with the
+    /// U byte in R and the V byte in G, so the GPU can filter chroma like
+    /// any two-channel texture. The plane starts `row_stride * height`
+    /// bytes after the luma plane and keeps the luma pitch per R8 row, which
+    /// is `uv_rows_per_luma` rows per chroma row (two for NV24, whose CbCr
+    /// row is `2W` bytes).
+    pub fn from_tensor_nv_chroma_gr88(
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+    ) -> Result<Self, Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let layout = src_fmt.chroma_layout().ok_or_else(|| {
+            Error::NotSupported(format!("NV chroma import: {src_fmt:?} is not semi-planar"))
+        })?;
+        if src.is_multiplane() {
+            return Err(Error::NotSupported(
+                "NV chroma import: multiplane tensor not supported".into(),
+            ));
+        }
+        let tex_width = src.effective_row_stride().unwrap_or(src_w);
+        let fd = src
+            .dmabuf()
+            .map_err(|e| {
+                Error::NotImplemented(format!(
+                    "NV chroma import requires a DMA tensor, got {:?} ({e})",
+                    src.memory()
+                ))
+            })?
+            .as_raw_fd();
+        let (sx, sy) = (layout.shift_x, layout.shift_y);
+        Ok(DmaImportAttrs {
+            width: src_w.div_ceil(1 << sx),
+            height: src_h.div_ceil(1 << sy),
+            drm_fourcc: DrmFourcc::Gr88,
+            plane0_fd: fd,
+            plane0_pitch: tex_width * layout.uv_rows_per_luma,
+            plane0_offset: src.plane_offset().unwrap_or(0) + tex_width * src_h,
+            x_shift_px: 0,
+            plane1: None,
+            is_yuv: false,
+            // The shader applies the YUV->RGB matrix; GR88 carries raw bytes.
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
+        })
+    }
+
     /// Build the EGL attribute list for `eglCreateImage`.
     pub fn to_egl_attribs(&self) -> Vec<Attrib> {
         let mut attrs = vec![

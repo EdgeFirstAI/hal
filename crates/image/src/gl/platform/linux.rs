@@ -74,6 +74,7 @@ impl GlPlatform for LinuxEgl {
     const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = true;
+    const NV_CHROMA_IMPORT: bool = true;
 
     fn init_display(kind: Option<EglDisplayKind>) -> crate::Result<GlContext> {
         GlContext::new(kind)
@@ -260,6 +261,15 @@ impl GlPlatform for LinuxEgl {
         fmt: PixelFormat,
     ) -> crate::Result<EglImage> {
         let attrs = DmaImportAttrs::from_tensor_nv_r8(img, fmt)?;
+        new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
+    }
+
+    fn import_buffer_nv_chroma(
+        display: &GlContext,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> crate::Result<EglImage> {
+        let attrs = DmaImportAttrs::from_tensor_nv_chroma_gr88(img, fmt)?;
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
     }
 }

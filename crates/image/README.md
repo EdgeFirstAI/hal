@@ -120,6 +120,7 @@ Memory and transfer:
 
 Conversion behaviour:
 
+- `EDGEFIRST_INTERPOLATION` — `bilinear` (default) or `nearest`: how `convert()` resamples when it resizes, overriding `ImageProcessorConfig::interpolation`. See [ARCHITECTURE.md § Resampling and source crops](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#resampling-and-source-crops).
 - `EDGEFIRST_COLORIMETRY` — `fast` (default) or `exact`. `fast` keeps single-plane NV12 on the driver's YUV sampler even when its colorimetry does not match; `exact` forces the in-shader matrix. See [ARCHITECTURE.md § Colorimetry](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#colorimetry-1).
 - `EDGEFIRST_NV_CONVERT_PATH` — `auto` (default), `sampler`, or `shader`. Pins the NV12 GPU conversion path for A/B measurement.
 - `EDGEFIRST_GL_SERIALIZE` — `full` or `lifecycle`. Overrides the per-driver GL serialization policy.

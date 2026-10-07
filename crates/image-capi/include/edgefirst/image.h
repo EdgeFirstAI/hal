@@ -342,6 +342,22 @@ int ef_image_processor_set_class_colors(ef_image_processor *p,
                                         uintptr_t count);
 
 /**
+ * Set how `ef_image_processor_convert` resamples when it resizes.
+ *
+ * `mode`: 0 = bilinear (the default; half-pixel centres, as OpenCV
+ * `INTER_LINEAR`), 1 = nearest. Applies to every backend the processor
+ * holds; the `EDGEFIRST_INTERPOLATION` environment variable (`nearest` |
+ * `bilinear`) overrides it.
+ *
+ * @return 0 on success, `EINVAL` for a null processor or unknown mode,
+ * `EIO` when a backend cannot apply the mode.
+ *
+ * # Safety
+ * `p` must be a live processor.
+ */
+int ef_image_processor_set_interpolation(ef_image_processor *p, uint32_t mode);
+
+/**
  * Flush any queued GPU work and wait for it.
  *
  * @return 0 on success, otherwise an errno.

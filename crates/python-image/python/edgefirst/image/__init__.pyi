@@ -250,13 +250,20 @@ def gpu_dma_buf_pitch_alignment_bytes() -> int:
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 
-    def __init__(self, egl_display: EglDisplayKind | None = None) -> None:
+    def __init__(
+        self,
+        egl_display: EglDisplayKind | None = None,
+        interpolation: str | None = None,
+    ) -> None:
         """Create an ImageProcessor with optional EGL display override.
 
         Args:
             egl_display: Force OpenGL to use this display type instead of
                 auto-detecting. Use probe_egl_displays() to discover
                 available displays. Ignored if EDGEFIRST_DISABLE_GL=1.
+            interpolation: How convert() resamples when it resizes:
+                "nearest" or "bilinear" (the default). The
+                EDGEFIRST_INTERPOLATION environment variable overrides it.
         """
 
     def draw_decoded_masks(
@@ -709,6 +716,17 @@ class ImageProcessor:
 
         Raises:
             RuntimeError: If the backend rejects the palette.
+        """
+
+    def set_interpolation(self, mode: str) -> None:
+        """Sets how convert() resamples when it resizes.
+
+        Accepts "nearest" or "bilinear" (the default). Applies to every
+        backend; the EDGEFIRST_INTERPOLATION environment variable overrides
+        it.
+
+        Args:
+            mode: Interpolation mode string.
         """
 
     def set_int8_interpolation(self, mode: str) -> None:

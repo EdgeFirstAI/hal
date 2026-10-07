@@ -913,6 +913,17 @@ pub fn gpu_dma_buf_pitch_alignment_bytes() -> usize {
     image::GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES
 }
 
+/// `"nearest"` or `"bilinear"` as an [`image::Interpolation`].
+fn parse_interpolation(mode: &str) -> Result<image::Interpolation> {
+    match mode {
+        "nearest" => Ok(image::Interpolation::Nearest),
+        "bilinear" => Ok(image::Interpolation::Bilinear),
+        _ => Err(Error::InvalidArg(format!(
+            "Unknown interpolation '{mode}'. Expected 'nearest' or 'bilinear'"
+        ))),
+    }
+}
+
 #[pyclass(name = "ImageProcessor", module = "edgefirst.image")]
 pub struct PyImageProcessor(pub(crate) Mutex<image::ImageProcessor>);
 
@@ -922,9 +933,12 @@ unsafe impl Sync for PyImageProcessor {}
 #[pymethods]
 impl PyImageProcessor {
     #[new]
-    #[pyo3(signature = (egl_display=None))]
-    pub fn new(egl_display: Option<PyEglDisplayKind>) -> Result<Self> {
+    #[pyo3(signature = (egl_display=None, interpolation=None))]
+    pub fn new(egl_display: Option<PyEglDisplayKind>, interpolation: Option<&str>) -> Result<Self> {
         let mut _config = ImageProcessorConfig::default();
+        if let Some(mode) = interpolation {
+            _config.interpolation = parse_interpolation(mode)?;
+        }
         #[cfg(target_os = "linux")]
         {
             _config.egl_display = egl_display.map(Into::into);
@@ -1803,6 +1817,18 @@ impl PyImageProcessor {
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
             .set_int8_interpolation_mode(mode)?;
+        Ok(())
+    }
+
+    /// Set how ``convert`` resamples when it resizes: ``"nearest"`` or
+    /// ``"bilinear"`` (the default). ``EDGEFIRST_INTERPOLATION`` overrides it.
+    #[pyo3(signature = (mode))]
+    pub fn set_interpolation(&mut self, mode: &str) -> Result<()> {
+        let mode = parse_interpolation(mode)?;
+        self.0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .set_interpolation(mode)?;
         Ok(())
     }
 }

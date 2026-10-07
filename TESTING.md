@@ -630,6 +630,7 @@ Use environment variables to isolate tests to specific backends:
 | `EDGEFIRST_ALLOW_SOFTWARE_GL=1` | Accept a software renderer (llvmpipe/swrast) instead of rejecting it. The `software-gl-coverage` CI lane sets this; on a board it means the hardware GL stack failed to come up |
 | `EDGEFIRST_GL_SERIALIZE=full` / `=lifecycle` | Pin the GL serialization policy instead of letting the driver probe choose |
 | `EDGEFIRST_NV_CONVERT_PATH=sampler` / `=shader` / `=auto` | Force the NV12/16/24 GPU conversion path |
+| `EDGEFIRST_GL_NO_NV_HW_FILTER=1` | Resize NV12/16/24 with the shader-filtered program instead of the hardware-filtered one (diagnostic; tests reach it per processor) |
 | `EDGEFIRST_COLORIMETRY=exact` | Opt into colorimetry-exact conversion where the default trades exactness for speed |
 
 Example — run tests without any GPU backend:

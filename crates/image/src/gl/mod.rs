@@ -291,26 +291,33 @@ pub(super) struct RegionOfInterest {
 }
 
 impl RegionOfInterest {
-    /// Build a source ROI from a pixel-space crop rectangle with a half-texel
-    /// inset. The inset ensures that `GL_LINEAR` filtering never samples
-    /// outside the crop boundary — at the extreme texture coordinates the
-    /// bilinear kernel is centred on the boundary texel and cannot reach
-    /// adjacent padding pixels.
-    ///
-    /// The result is clamped to [0, 1] so an out-of-bounds crop rectangle
-    /// cannot produce invalid texture coordinates.
+    /// Build a source ROI spanning a pixel-space crop rectangle's true edges,
+    /// clamped to [0, 1]. The `LINEAR` paths keep their kernel inside the crop
+    /// by clamping each sample to
+    /// [`render::sample_clamp_rect_within`](super::render::sample_clamp_rect_within)
+    /// of [`Self::uv_bounds`], not by insetting these coordinates: an inset
+    /// maps the crop's edge pixels to the edge texels' centres, which shifts
+    /// every sample of a 1:1 crop by up to half a texel and blurs it.
     ///
     /// `crop`: pixel-space rectangle (left, top, width, height).
     /// `tex_w`, `tex_h`: full texture dimensions in pixels.
-    pub(super) fn from_crop_clamped(crop: &crate::Rect, tex_w: usize, tex_h: usize) -> Self {
-        let half_x = 0.5 / tex_w as f32;
-        let half_y = 0.5 / tex_h as f32;
+    pub(super) fn from_crop(crop: &crate::Rect, tex_w: usize, tex_h: usize) -> Self {
         RegionOfInterest {
-            left: (crop.left as f32 / tex_w as f32 + half_x).clamp(0.0, 1.0),
-            top: ((crop.top + crop.height) as f32 / tex_h as f32 - half_y).clamp(0.0, 1.0),
-            right: ((crop.left + crop.width) as f32 / tex_w as f32 - half_x).clamp(0.0, 1.0),
-            bottom: (crop.top as f32 / tex_h as f32 + half_y).clamp(0.0, 1.0),
+            left: (crop.left as f32 / tex_w as f32).clamp(0.0, 1.0),
+            top: ((crop.top + crop.height) as f32 / tex_h as f32).clamp(0.0, 1.0),
+            right: ((crop.left + crop.width) as f32 / tex_w as f32).clamp(0.0, 1.0),
+            bottom: (crop.top as f32 / tex_h as f32).clamp(0.0, 1.0),
         }
+    }
+
+    /// `[u_min, v_min, u_max, v_max]` of this ROI, whichever way it is flipped.
+    pub(super) fn uv_bounds(&self) -> [f32; 4] {
+        [
+            self.left.min(self.right),
+            self.top.min(self.bottom),
+            self.left.max(self.right),
+            self.top.max(self.bottom),
+        ]
     }
 }
 

@@ -70,6 +70,11 @@ enum GLProcessorMessage {
         crate::ColorimetryMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    /// Set how resizing converts resample (`Interpolation`).
+    SetInterpolation(
+        crate::Interpolation,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
     /// Test hook (issue #175): make every zero-copy destination import fail.
     #[cfg(test)]
     SetFailDstImport(bool, tokio::sync::oneshot::Sender<Result<(), Error>>),
@@ -493,6 +498,9 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
         GLProcessorMessage::SetColorimetryMode(_, resp) => {
             let _ = resp.send(Err(poison_err));
         }
+        GLProcessorMessage::SetInterpolation(_, resp) => {
+            let _ = resp.send(Err(poison_err));
+        }
         #[cfg(test)]
         GLProcessorMessage::SetFailDstImport(_, resp) => {
             let _ = resp.send(Err(poison_err));
@@ -813,6 +821,13 @@ fn handle_gl_message(
                 Ok(())
             }));
             reply_caught(result, resp, poisoned, "SetColorimetryMode");
+        }
+        GLProcessorMessage::SetInterpolation(mode, resp) => {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                gl_converter.set_interpolation(mode);
+                Ok(())
+            }));
+            reply_caught(result, resp, poisoned, "SetInterpolation");
         }
         GLProcessorMessage::SetInt8Interpolation(mode, resp) => {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1360,6 +1375,19 @@ impl GLProcessorThreaded {
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::SetColorimetryMode(mode, err_send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Sets how resizing converts resample (see [`crate::Interpolation`]).
+    pub fn set_interpolation(&mut self, mode: crate::Interpolation) -> Result<(), Error> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::SetInterpolation(mode, err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())

@@ -833,68 +833,32 @@ pub(super) fn generate_nv_to_rgba_shader_2d() -> &'static str {
     super::shaders_common::NV_RGBA_FRAGMENT
 }
 
-/// Int8 variant of [`generate_nv_to_rgba_shader_2d`].
-///
-/// Applies the same XOR 0x80 bias (`(q + 128) mod 256`) to each output RGB
-/// channel as [`generate_texture_int8_shader`] and the other int8 shaders.
-/// Used when the destination dtype is i8 so no CPU post-processing is needed.
+/// Int8 variant of [`generate_nv_to_rgba_shader_2d`], used when the
+/// destination dtype is i8 so no CPU post-processing is needed.
 pub(super) fn generate_nv_to_rgba_int8_shader_2d() -> &'static str {
-    "\
-#version 300 es
-precision highp float;
-precision highp int;
-uniform highp sampler2D src;
-uniform ivec2 img_size;
-uniform int tex_width;
-uniform ivec2 chroma_shift;
-uniform int chroma_lines;
-// Per-tensor colorimetry (YUV→RGB matrix + range); see the non-int8 variant.
-uniform float y_offset;
-uniform float y_scale;
-uniform float c_vr;
-uniform float c_ug;
-uniform float c_vg;
-uniform float c_ub;
-in vec3 fragPos;
-in vec2 tc;
-out vec4 color;
-
-vec3 int8_bias(vec3 v) {
-    vec3 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
+    super::shaders_common::NV_RGBA_INT8_FRAGMENT
 }
 
-void main() {
-    int w = img_size.x;
-    int h = img_size.y;
-    int x = clamp(int(tc.x * float(w)), 0, w - 1);
-    int y = clamp(int(tc.y * float(h)), 0, h - 1);
-
-    // Luma: direct 2D texel — no per-pixel integer divide/modulo.
-    float yv = texelFetch(src, ivec2(x, y), 0).r;
-
-    int ccol = x >> chroma_shift.x;
-    int crow = y >> chroma_shift.y;
-    int ccol2 = ccol * 2;
-    int carry = ccol2 >= tex_width ? 1 : 0;
-    int cy = h + crow * chroma_lines + carry;
-    int cx = ccol2 - carry * tex_width;
-    float u = texelFetch(src, ivec2(cx, cy), 0).r;
-    float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
-
-    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
-    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
-    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
-    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
-    float yp = max((yv - y_offset) * y_scale, 0.0);
-    float up = u - 128.0 / 255.0;
-    float vp = v - 128.0 / 255.0;
-    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
-    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
-    float b = clamp(yp + c_ub * up, 0.0, 1.0);
-    color = vec4(int8_bias(vec3(r, g, b)), 1.0);
+/// Bilinear variant of [`generate_nv_to_rgba_shader_2d`], used when the draw
+/// rescales the source crop.
+pub(super) fn generate_nv_to_rgba_bilinear_shader_2d() -> &'static str {
+    super::shaders_common::NV_RGBA_BILINEAR_FRAGMENT
 }
-"
+
+/// Int8 variant of [`generate_nv_to_rgba_bilinear_shader_2d`].
+pub(super) fn generate_nv_to_rgba_bilinear_int8_shader_2d() -> &'static str {
+    super::shaders_common::NV_RGBA_BILINEAR_INT8_FRAGMENT
+}
+
+/// Hardware-filtered variant of [`generate_nv_to_rgba_bilinear_shader_2d`],
+/// used when the chroma plane is bound as its own texture.
+pub(super) fn generate_nv_to_rgba_hw_bilinear_shader_2d() -> &'static str {
+    super::shaders_common::NV_RGBA_HW_BILINEAR_FRAGMENT
+}
+
+/// Int8 variant of [`generate_nv_to_rgba_hw_bilinear_shader_2d`].
+pub(super) fn generate_nv_to_rgba_hw_bilinear_int8_shader_2d() -> &'static str {
+    super::shaders_common::NV_RGBA_HW_BILINEAR_INT8_FRAGMENT
 }
 
 /// HWC → layer-first (CHW) repack compute shader for int8 protos.
@@ -1054,6 +1018,22 @@ mod tc_precision {
                 super::generate_nv_to_rgba_int8_shader_2d(),
             ),
             (
+                "generate_nv_to_rgba_bilinear_shader_2d",
+                super::generate_nv_to_rgba_bilinear_shader_2d(),
+            ),
+            (
+                "generate_nv_to_rgba_bilinear_int8_shader_2d",
+                super::generate_nv_to_rgba_bilinear_int8_shader_2d(),
+            ),
+            (
+                "generate_nv_to_rgba_hw_bilinear_shader_2d",
+                super::generate_nv_to_rgba_hw_bilinear_shader_2d(),
+            ),
+            (
+                "generate_nv_to_rgba_hw_bilinear_int8_shader_2d",
+                super::generate_nv_to_rgba_hw_bilinear_int8_shader_2d(),
+            ),
+            (
                 "generate_proto_repack_compute_shader",
                 super::generate_proto_repack_compute_shader(),
             ),
@@ -1069,6 +1049,26 @@ mod tc_precision {
             (
                 "NV_RGBA_FRAGMENT",
                 super::super::shaders_common::NV_RGBA_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_INT8_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_INT8_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_BILINEAR_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_BILINEAR_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_HW_BILINEAR_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_HW_BILINEAR_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_HW_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_HW_BILINEAR_INT8_FRAGMENT,
             ),
         ]
     }

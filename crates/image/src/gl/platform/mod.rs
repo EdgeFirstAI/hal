@@ -316,6 +316,25 @@ pub(super) trait GlPlatform {
         fmt: PixelFormat,
     ) -> crate::Result<Self::Import>;
 
+    /// Whether [`Self::import_buffer_nv_chroma`] is implemented. Where it is
+    /// not, bilinear NV resizes of imported sources take the shader-filtered
+    /// program without attempting the import.
+    const NV_CHROMA_IMPORT: bool = false;
+
+    /// Import the chroma plane of a single-plane NV12/NV16/NV24 tensor as a
+    /// two-channel (U, V) texture of one texel per chroma sample, for the
+    /// hardware-filtered bilinear NV program. Platforms without it return
+    /// `NotSupported` and resize through the shader-filtered program.
+    fn import_buffer_nv_chroma(
+        _display: &Self::Display,
+        _img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> crate::Result<Self::Import> {
+        Err(crate::Error::NotSupported(format!(
+            "no {fmt:?} chroma-plane import on this platform"
+        )))
+    }
+
     /// Import a tensor's zero-copy buffer as a packed RGBA-shaped render
     /// surface of `width`×`height` pixels (see [`PackedImportFormat`] —
     /// the float paths' RGB/planar byte streams rendered through RGBA

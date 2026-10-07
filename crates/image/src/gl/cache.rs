@@ -238,33 +238,38 @@ pub struct CacheStats {
 }
 
 /// Combined snapshot of every EGLImage cache on the GL processor
-/// (source, destination, and the Path-B NV R8 source cache).
+/// (source, destination, the Path-B NV R8 source cache, and its chroma-plane
+/// view for hardware-filtered NV resizes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlCacheStats {
     pub src: CacheStats,
     pub dst: CacheStats,
     pub nv_r8: CacheStats,
+    pub nv_uv: CacheStats,
 }
 
 impl GlCacheStats {
     /// Total imports performed (cache misses) across all caches — the number
     /// steady-state loops assert stays flat.
     pub fn total_misses(&self) -> u64 {
-        self.src.misses + self.dst.misses + self.nv_r8.misses
+        self.src.misses + self.dst.misses + self.nv_r8.misses + self.nv_uv.misses
     }
 
     /// Peak entries summed across all caches — an UPPER bound on how many
-    /// buffers were pinned at once, not an exact count: `src` and `nv_r8`
-    /// routinely name the *same* source buffer (one NV12 tensor imported
-    /// two ways), and two entries over one buffer pin that buffer once.
+    /// buffers were pinned at once, not an exact count: `src`, `nv_r8` and
+    /// `nv_uv` routinely name the *same* source buffer (one NV12 tensor
+    /// imported several ways), and entries over one buffer pin it once.
     /// Use the per-cache peaks to size capacity; use this to bound memory.
     pub fn total_peak_entries(&self) -> usize {
-        self.src.peak_entries + self.dst.peak_entries + self.nv_r8.peak_entries
+        self.src.peak_entries
+            + self.dst.peak_entries
+            + self.nv_r8.peak_entries
+            + self.nv_uv.peak_entries
     }
 
     /// Evictions across all caches — zero in a correctly sized steady state.
     pub fn total_evictions(&self) -> u64 {
-        self.src.evictions + self.dst.evictions + self.nv_r8.evictions
+        self.src.evictions + self.dst.evictions + self.nv_r8.evictions + self.nv_uv.evictions
     }
 }
 
