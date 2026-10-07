@@ -209,12 +209,15 @@ zero-copy shader pipeline used on DMA platforms.
 `CpuAccess` declaration (hardware access is implied; see
 [`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#cpu-access-declaration-cpuaccess)).
 `create_image_desc(&ImageDesc)` is the full-featured variant: without a
-compression request it is exactly `create_image` (the negotiation above
-applies); with `Compression::{Any, Scheme(..)}` the allocation goes
-straight to the platform allocator — the layout decision belongs to
-gralloc, and the request's guards and fallback counting live in
+compression or contiguous request it is exactly `create_image` (the
+negotiation above applies). With `Compression::{Any, Scheme(..)}` the
+allocation goes straight to the platform allocator — the layout decision
+belongs to gralloc, and the request's guards and fallback counting live in
 `Tensor::image_desc`. A compression request with auto memory promotes to
-the platform's zero-copy allocation first.
+the platform's zero-copy allocation first. A contiguous request
+(`ImageDesc::with_contiguous`) also skips the negotiation: it is a DMA-BUF
+from the Linux CMA heap at the same 64-byte pitch, or an error naming the
+heap, with no fallback to the system heap, a PBO or host memory.
 
 ### Zero-copy telemetry
 

@@ -18,11 +18,11 @@
 use std::ffi::{c_char, c_int};
 
 pub use edgefirst_tensor_abi::{
-    EfClientRefFn, EfClientState, EfCompression, EfCpuAccess, EfCudaMapFn, EfCudaMapFnNullable,
-    EfCudaUnmapFn, EfCudaUnmapFnNullable, EfCudaUnregisterFn, EfCudaUnregisterFnNullable,
-    EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView, EfPboMapFn, EfPboMapFnNullable,
-    EfPboUnmapFn, EfPboUnmapFnNullable, EfQuantizationInfo, EfStorageKind, EfTensorPlane,
-    EfTensorView, EfViewOrigin,
+    EfClientRefFn, EfClientState, EfCompression, EfContiguity, EfCpuAccess, EfCudaMapFn,
+    EfCudaMapFnNullable, EfCudaUnmapFn, EfCudaUnmapFnNullable, EfCudaUnregisterFn,
+    EfCudaUnregisterFnNullable, EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView, EfPboMapFn,
+    EfPboMapFnNullable, EfPboUnmapFn, EfPboUnmapFnNullable, EfQuantizationInfo, EfStorageKind,
+    EfTensorPlane, EfTensorView, EfViewOrigin,
 };
 
 /// Opaque tensor handle (never dereferenced, sized, or copied).
