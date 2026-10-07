@@ -625,7 +625,7 @@ DIFFERENTIAL_DYNAMIC_VENV := $(CURDIR)/target/differential-dynamic-venv
 # of this list, caught by p2a-dynamic-surface (G13's own author) before
 # this lane ran for real -- would have produced import-skip cannot_measure
 # on both venvs identically, silently narrowing what G13 actually compares.
-DIFFERENTIAL_TEST_DEPS := numpy==2.4.6 opencv-python-headless==5.0.0.93 pillow==12.2.0 \
+DIFFERENTIAL_TEST_DEPS := numpy==2.4.6 pillow==12.2.0 \
 	pytest==9.0.3 pyyaml==6.0.3 safetensors==0.8.0 psutil==7.2.2
 
 # NOT a dedicated --target-dir per venv, unlike the wheel output directory

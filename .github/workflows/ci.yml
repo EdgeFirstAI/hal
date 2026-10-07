@@ -101,13 +101,10 @@ jobs:
       # coverage entirely, on a repository whose products are aarch64. With
       # `cross-clippy-args` the pass narrows instead of switching off.
       #
-      # No `opencv` feature here, unlike the host pass: opencv-sys probes for a
-      # target-native OpenCV that is not installed, and this pass is check-only
-      # by design -- native sysroots are Full-tier work.
       cross-clippy-args: --workspace --all-targets --locked --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
       pre-command: bash .github/scripts/ci-setup.sh
-      clippy-args: --workspace --all-targets --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
-      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      clippy-args: --workspace --all-targets --locked --features default --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
+      nextest-args: --workspace --locked --features default --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       cache-key: quick-x86_64
 
   # `make sbom` resolves the dependency graph for every target that reaches a
@@ -171,8 +168,6 @@ jobs:
       runner-class-linux-arm: larger
       pre-command: bash .github/scripts/ci-setup.sh
       board-pre-command: BOARD=1 SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
-      # The archive builds without the optional `opencv` feature.
-      archive-pre-command: SKIP_OPENCV=1 bash .github/scripts/ci-setup.sh
       # One process per binary, not per test. nextest's process-per-test model
       # costs a full EGL init/teardown per test on a board -- 6 to 22s each,
       # measured -- and writes one profraw per process, which exhausted the
@@ -208,7 +203,7 @@ jobs:
       # A floor, not a target. Guards against a selection that matches nothing
       # and reports success; tighten once a green run reports the real count.
       board-min-tests: "100"
-      nextest-args: --workspace --locked --features default,opencv --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      nextest-args: --workspace --locked --features default --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       # The boards are storage-constrained (the smallest root filesystem is
       # 12 GB). profiling is thin-LTO with debug = "line-tables-only", which is
       # what kept the on-target payload shippable before the migration; the
