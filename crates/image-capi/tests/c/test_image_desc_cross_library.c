@@ -80,8 +80,9 @@ int main(void) {
   }
 
   // A contiguous request crosses the boundary through its own getter, not
-  // the fixed-size view: with a CMA heap it is served from CMA, and without
-  // one it fails where the same request without the flag would succeed.
+  // the fixed-size view: a tensor it yields is from CMA, and without a CMA
+  // heap it fails where the same request without the flag would succeed.
+  // A CMA heap whose pool is full fails it too, so NULL is valid there.
   ef_tensor_image_desc *cd =
       ef_tensor_image_desc_new(64, 48, "NV12", /* U8 */ 0);
   if (cd == NULL || ef_tensor_image_desc_set_contiguous(cd, 1) != 0) {
@@ -94,8 +95,7 @@ int main(void) {
     int has_cma = 0; /* contiguous memory is Linux-only */
 #endif
     ef_tensor *ct = ef_image_processor_create_image_desc(p, cd);
-    if (has_cma && (ct == NULL ||
-                    ef_tensor_contiguity(ct) != EF_CONTIGUITY_CONTIGUOUS)) {
+    if (ct != NULL && ef_tensor_contiguity(ct) != EF_CONTIGUITY_CONTIGUOUS) {
       fprintf(stderr, "a contiguous request must come from the CMA heap\n");
       failures++;
     }

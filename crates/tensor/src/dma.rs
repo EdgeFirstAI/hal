@@ -1086,8 +1086,9 @@ mod tests {
         );
     }
 
-    /// A contiguous request is served by the CMA heap, or fails naming it
-    /// where there is none (the hosted CI runners have only the system heap).
+    /// A contiguous request is served by the CMA heap, or fails naming it:
+    /// where there is none (the hosted CI runners have only the system
+    /// heap), and where its pool is full.
     #[test]
     #[cfg(not(miri))]
     fn a_contiguous_request_comes_from_the_cma_heap_or_fails() {
@@ -1095,16 +1096,15 @@ mod tests {
         if !crate::test_support::dma_or_skip(NAME) {
             return;
         }
-        let result = DmaTensor::<u8>::new_with_byte_size(&[4096], 4096, None, true);
-        if cma_heap_present() {
-            let t = result.unwrap_or_else(|e| panic!("4 KiB from the CMA heap: {e}"));
-            assert_eq!(t.contiguity, crate::Contiguity::Contiguous);
-        } else {
-            let err = result.expect_err("no CMA heap, so no contiguous memory");
-            assert!(
-                err.to_string().contains(CMA_HEAP_PATH),
-                "error does not name the CMA heap: {err}"
-            );
+        match DmaTensor::<u8>::new_with_byte_size(&[4096], 4096, None, true) {
+            Ok(t) => {
+                assert!(cma_heap_present(), "contiguous memory without a CMA heap");
+                assert_eq!(t.contiguity, crate::Contiguity::Contiguous);
+            }
+            Err(e) => assert!(
+                e.to_string().contains(CMA_HEAP_PATH),
+                "error does not name the CMA heap: {e}"
+            ),
         }
     }
 
@@ -1118,13 +1118,15 @@ mod tests {
             return;
         }
         let t = DmaTensor::<u8>::new(&[4096], None).expect("alloc");
-        let expected = if cma_heap_present() {
-            crate::Contiguity::Contiguous
+        // With a CMA heap, a full pool makes the system heap serve even this
+        // buffer, so either known answer is valid; without one, only the
+        // system heap can.
+        if cma_heap_present() {
+            assert_ne!(t.contiguity, crate::Contiguity::Unknown);
         } else {
-            crate::Contiguity::NonContiguous
-        };
-        assert_eq!(t.contiguity, expected);
-        assert_eq!(t.try_clone().expect("clone").contiguity, expected);
+            assert_eq!(t.contiguity, crate::Contiguity::NonContiguous);
+        }
+        assert_eq!(t.try_clone().expect("clone").contiguity, t.contiguity);
         let imported = DmaTensor::<u8>::from_fd(t.clone_fd().expect("clone_fd"), &[4096], None)
             .expect("import");
         assert_eq!(imported.contiguity, crate::Contiguity::Unknown);
@@ -1156,13 +1158,7 @@ mod tests {
                 assert_eq!(t.memory(), TensorMemory::DmaBuf);
                 assert_eq!(t.contiguity(), crate::Contiguity::Contiguous);
             }
-            Err(e) => {
-                assert!(
-                    !cma_heap_present(),
-                    "the CMA heap is present but failed: {e}"
-                );
-                assert!(e.to_string().contains(CMA_HEAP_PATH), "{e}");
-            }
+            Err(e) => assert!(e.to_string().contains(CMA_HEAP_PATH), "{e}"),
         }
     }
 

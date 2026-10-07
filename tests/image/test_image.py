@@ -1293,10 +1293,12 @@ def test_convert_publishes_its_completion_on_the_destination():
 @pytest.mark.skipif(sys.platform != "linux", reason="CMA DMA heap is Linux-only")
 def test_create_image_contiguous_is_cma_dma_or_an_error():
     proc = ImageProcessor()
-    if os.path.exists("/dev/dma_heap/linux,cma"):
+    # Without a CMA heap, or with its pool full, the request fails naming it.
+    try:
         t = proc.create_image(64, 64, PixelFormat.Rgba, contiguous=True)
-        assert t.memory == TensorMemory.DMABUF
-        assert t.contiguity == "contiguous"
-    else:
-        with pytest.raises(RuntimeError, match="linux,cma"):
-            proc.create_image(64, 64, PixelFormat.Rgba, contiguous=True)
+    except RuntimeError as exc:
+        assert "linux,cma" in str(exc)
+        return
+    assert os.path.exists("/dev/dma_heap/linux,cma")
+    assert t.memory == TensorMemory.DMABUF
+    assert t.contiguity == "contiguous"
