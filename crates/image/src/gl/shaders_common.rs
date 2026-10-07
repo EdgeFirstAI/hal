@@ -541,7 +541,7 @@ pub(crate) const NV_RGBA_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
 );
 
-/// Header of the Y2Y NV programs: `GL_EXT_YUV_target` samples an NV12/NV16
+/// Header of the Y2Y NV programs: `GL_EXT_YUV_target` samples an NV12
 /// import as raw (Y, U, V), filtered by the texture unit but not converted by
 /// the driver, so the exact matrix still applies. `src_extent` is the
 /// rectangle a sample may reach, as in the external-sampler programs.
@@ -577,7 +577,7 @@ macro_rules! nv_rgb_y2y_body {
 /// NV->RGBA fragment shader for draws that rescale, on GPUs with
 /// `GL_EXT_YUV_target` that cannot bind the chroma plane as its own texture
 /// (Mali lists no two-channel 8-bit import format): bilinear through the
-/// texture unit from a single NV12/NV16 import, one fetch per pixel.
+/// texture unit from a single NV12 import, one fetch per pixel.
 pub(crate) const NV_RGBA_Y2Y_FRAGMENT: &str = concat!(
     nv_y2y_header!(),
     "void main() {\n",

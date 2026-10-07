@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Resizing NV12 and NV16 DMA-BUF sources on Mali (i.MX 95) was up to 2.4x slower in 0.34.0.** Mali imports no two-channel 8-bit format, so the hardware-filtered bilinear resize could not bind the chroma plane and fell back to the shader blend. On GPUs with `GL_EXT_YUV_target`, these resizes now sample one NV12/NV16 import as raw YUV through the texture unit and apply the exact colour matrix in the shader.
+- **Resizing NV12 DMA-BUF sources on Mali (i.MX 95) was up to 2.4x slower in 0.34.0.** Mali imports no two-channel 8-bit format, so the hardware-filtered bilinear resize could not bind the chroma plane and fell back to the shader blend. On GPUs with `GL_EXT_YUV_target`, these resizes now sample one NV12 import as raw YUV through the texture unit and apply the exact colour matrix in the shader.
 
 ## [0.34.0] - 2026-10-06
 

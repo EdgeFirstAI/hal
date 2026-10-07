@@ -861,7 +861,7 @@ pub(super) fn generate_nv_to_rgba_hw_bilinear_int8_shader_2d() -> &'static str {
     super::shaders_common::NV_RGBA_HW_BILINEAR_INT8_FRAGMENT
 }
 
-/// Y2Y variant of the bilinear NV shader, sampling an NV12/NV16 import
+/// Y2Y variant of the bilinear NV shader, sampling an NV12 import
 /// through `GL_EXT_YUV_target`.
 pub(super) fn generate_nv_to_rgba_y2y_shader() -> &'static str {
     super::shaders_common::NV_RGBA_Y2Y_FRAGMENT
