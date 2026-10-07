@@ -861,6 +861,17 @@ pub(super) fn generate_nv_to_rgba_hw_bilinear_int8_shader_2d() -> &'static str {
     super::shaders_common::NV_RGBA_HW_BILINEAR_INT8_FRAGMENT
 }
 
+/// Y2Y variant of the bilinear NV shader, sampling an NV12 import
+/// through `GL_EXT_YUV_target`.
+pub(super) fn generate_nv_to_rgba_y2y_shader() -> &'static str {
+    super::shaders_common::NV_RGBA_Y2Y_FRAGMENT
+}
+
+/// Int8 variant of [`generate_nv_to_rgba_y2y_shader`].
+pub(super) fn generate_nv_to_rgba_y2y_int8_shader() -> &'static str {
+    super::shaders_common::NV_RGBA_Y2Y_INT8_FRAGMENT
+}
+
 /// HWC → layer-first (CHW) repack compute shader for int8 protos.
 ///
 /// Reads proto data from an SSBO in row-major HWC layout `(H, W, num_protos)`.
@@ -1034,6 +1045,14 @@ mod tc_precision {
                 super::generate_nv_to_rgba_hw_bilinear_int8_shader_2d(),
             ),
             (
+                "generate_nv_to_rgba_y2y_shader",
+                super::generate_nv_to_rgba_y2y_shader(),
+            ),
+            (
+                "generate_nv_to_rgba_y2y_int8_shader",
+                super::generate_nv_to_rgba_y2y_int8_shader(),
+            ),
+            (
                 "generate_proto_repack_compute_shader",
                 super::generate_proto_repack_compute_shader(),
             ),
@@ -1069,6 +1088,14 @@ mod tc_precision {
             (
                 "NV_RGBA_HW_BILINEAR_INT8_FRAGMENT",
                 super::super::shaders_common::NV_RGBA_HW_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_Y2Y_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_Y2Y_FRAGMENT,
+            ),
+            (
+                "NV_RGBA_Y2Y_INT8_FRAGMENT",
+                super::super::shaders_common::NV_RGBA_Y2Y_INT8_FRAGMENT,
             ),
         ]
     }

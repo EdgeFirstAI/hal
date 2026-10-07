@@ -28,6 +28,7 @@ use super::shaders::{
     generate_nv_to_rgba_bilinear_int8_shader_2d, generate_nv_to_rgba_bilinear_shader_2d,
     generate_nv_to_rgba_hw_bilinear_int8_shader_2d, generate_nv_to_rgba_hw_bilinear_shader_2d,
     generate_nv_to_rgba_int8_shader_2d, generate_nv_to_rgba_shader_2d,
+    generate_nv_to_rgba_y2y_int8_shader, generate_nv_to_rgba_y2y_shader,
     generate_packed_f32_nhwc_shader, generate_packed_rgba8_int8_shader_2d,
     generate_packed_rgba8_shader_2d, generate_planar_rgb_f16_packed_shader,
     generate_planar_rgb_int8_shader, generate_planar_rgb_int8_shader_2d,
@@ -173,6 +174,7 @@ struct NvUniformLocs {
     luma_clamp: i32,
     chroma_scale: i32,
     chroma_clamp: i32,
+    src_extent: i32,
     y_offset: i32,
     y_scale: i32,
     c_vr: i32,
@@ -231,6 +233,7 @@ impl NvUniformState {
                     luma_clamp: loc(c"luma_clamp"),
                     chroma_scale: loc(c"chroma_scale"),
                     chroma_clamp: loc(c"chroma_clamp"),
+                    src_extent: loc(c"src_extent"),
                     y_offset: loc(c"y_offset"),
                     y_scale: loc(c"y_scale"),
                     c_vr: loc(c"c_vr"),
@@ -256,6 +259,8 @@ struct NvSampleRect {
     right: usize,
     bottom: usize,
     resample: bool,
+    /// Pixels the draw covers on the destination.
+    dst_pixels: usize,
 }
 
 impl NvSampleRect {
@@ -282,8 +287,53 @@ impl NvSampleRect {
             right: src.left + src.width,
             bottom: src.top + src.height,
             resample: (w, h) != (dst.width, dst.height),
+            dst_pixels: dst.width * dst.height,
         }
     }
+
+    /// The rectangle as the [`RegionOfInterest`] of a `src_w`x`src_h` source,
+    /// for the draws that sample through a filtered sampler.
+    fn roi(&self, src_w: usize, src_h: usize) -> RegionOfInterest {
+        let crop = crate::Rect::new(
+            self.left,
+            self.top,
+            self.right - self.left,
+            self.bottom - self.top,
+        );
+        RegionOfInterest::from_crop(&crop, src_w, src_h)
+    }
+}
+
+/// The (encoding, range) an NV draw's in-shader matrix applies: the source's
+/// own colorimetry, with missing axes filled by the SD/HD height heuristic.
+fn nv_colorimetry(
+    colorimetry: Option<edgefirst_tensor::Colorimetry>,
+    height: Option<usize>,
+) -> (
+    edgefirst_tensor::ColorEncoding,
+    edgefirst_tensor::ColorRange,
+) {
+    let cm = crate::colorimetry::resolve_colorimetry(colorimetry, height);
+    (
+        cm.encoding
+            .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+        cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+    )
+}
+
+/// Largest source-to-output pixel ratio at which a bilinear NV resize takes
+/// [`NvSampling::HardwareYuv`]. Sampling an external YUV import costs in
+/// proportion to the whole source on Mali-G310 (about 0.3 ms per megapixel at
+/// i.MX 95 clocks), while the shader-filtered program costs in proportion to
+/// the output, so a strong downscale is cheaper in the shader. Measured there
+/// into 640x640: 720p 1.0 ms vs 2.2 ms, 1080p 1.4 vs 2.1, 4K 3.2 vs 1.8,
+/// crossing near ten source pixels per output pixel.
+const Y2Y_MAX_SOURCE_PER_OUTPUT_PIXEL: usize = 10;
+
+/// Whether a bilinear resize of a `src_pixels` source into `dst_pixels`
+/// output pixels is cheaper through [`NvSampling::HardwareYuv`].
+fn y2y_pays_off(src_pixels: usize, dst_pixels: usize) -> bool {
+    src_pixels <= Y2Y_MAX_SOURCE_PER_OUTPUT_PIXEL * dst_pixels
 }
 
 /// How an `nv_r8` draw samples the source, which selects its program.
@@ -298,9 +348,50 @@ pub(super) enum NvSampling {
     /// Bilinear through the texture units' LINEAR filter, on the combined
     /// plane for luma and a (U, V) view of the chroma plane.
     Hardware = 2,
+    /// Bilinear through the texture unit from one NV12 import sampled as raw
+    /// YUV (`GL_EXT_YUV_target`), where the chroma plane cannot be bound on
+    /// its own. Drawn by the Y2Y programs, not `nv_r8_programs`.
+    HardwareYuv = 3,
+}
+
+/// What an `nv_r8` draw can bind, which decides its [`NvSampling`].
+#[derive(Clone, Copy, Debug)]
+struct NvSamplingInputs {
+    /// The draw rescales and the interpolation is bilinear.
+    bilinear: bool,
+    /// The texture units may filter (`nv_hw_filter`).
+    hw_filter: bool,
+    /// The source is a DMA-BUF import rather than an upload.
+    imported: bool,
+    /// The import's chroma plane is bound as its own (U, V) texture.
+    chroma_view: bool,
+    /// The Y2Y programs built, the source is NV12, and [`y2y_pays_off`].
+    y2y: bool,
 }
 
 impl NvSampling {
+    /// An upload's chroma plane can always be bound on its own, an import's
+    /// only where the GPU takes the chroma plane's offset. Where it cannot,
+    /// a GPU with the Y2Y programs still filters in hardware.
+    fn choose(inputs: NvSamplingInputs) -> Self {
+        let NvSamplingInputs {
+            bilinear,
+            hw_filter,
+            imported,
+            chroma_view,
+            y2y,
+        } = inputs;
+        if !bilinear {
+            NvSampling::Single
+        } else if hw_filter && (!imported || chroma_view) {
+            NvSampling::Hardware
+        } else if hw_filter && y2y {
+            NvSampling::HardwareYuv
+        } else {
+            NvSampling::Shader
+        }
+    }
+
     /// Index into `nv_r8_programs`: two programs (u8, int8) per sampling.
     fn program(self, is_int8: bool) -> usize {
         self as usize * 2 + usize::from(is_int8)
@@ -535,6 +626,9 @@ pub struct GLProcessorST {
     nv_uv_texture: Texture,
     /// Chroma-plane imports for `nv_uv_texture`, keyed like `nv_r8_egl_cache`.
     nv_uv_egl_cache: ImportCache<PlatformImport>,
+    /// Y2Y NV programs (u8, int8) and their uniforms, where
+    /// `GL_EXT_YUV_target` is available ([`NvSampling::HardwareYuv`]).
+    nv_y2y_programs: Option<([GlProgram; 2], [NvUniformState; 2])>,
     /// Set once the driver refuses a chroma-plane import, so later resizes
     /// take the shader-filtered program instead of retrying it every frame.
     nv_uv_import_refused: bool,
@@ -1119,6 +1213,9 @@ fn requires_full_serialization(t: RendererTraits) -> bool {
 /// GL_RENDERER-derived driver traits.
 struct GlSupport {
     has_float_linear: bool,
+    /// `GL_EXT_YUV_target` on a platform with external-OES imports: the Y2Y
+    /// NV programs can sample raw, filtered YUV from an NV12 import.
+    has_yuv_target: bool,
     has_bgra: bool,
     renderer: RendererTraits,
     supports_f32_color: bool,
@@ -1861,6 +1958,7 @@ impl GLProcessorST {
 
         let GlSupport {
             has_float_linear,
+            has_yuv_target,
             has_bgra,
             renderer:
                 RendererTraits {
@@ -2114,6 +2212,32 @@ impl GLProcessorST {
         // and upload the constant sampler bindings while the programs are fresh:
         // pass-2 packing samples the intermediate on unit 1, planar-2d on unit 0.
         let nv_r8_uniforms = nv_r8_programs.each_ref().map(NvUniformState::resolve);
+        let nv_y2y_programs = if has_yuv_target {
+            let programs = [
+                GlProgram::new(generate_vertex_shader(), generate_nv_to_rgba_y2y_shader()),
+                GlProgram::new(
+                    generate_vertex_shader(),
+                    generate_nv_to_rgba_y2y_int8_shader(),
+                ),
+            ];
+            match programs {
+                [Ok(u8_program), Ok(int8_program)] => {
+                    let programs = [u8_program, int8_program];
+                    let uniforms = programs.each_ref().map(NvUniformState::resolve);
+                    Some((programs, uniforms))
+                }
+                [a, b] => {
+                    log::info!(
+                        "GL_EXT_YUV_target present but the Y2Y NV programs did not build \
+                         ({:?}); bilinear NV resizes of imports filter in the shader",
+                        a.err().or(b.err())
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         packed_rgba8_program_2d.load_uniform_1i(c"tex", 1)?;
         packed_rgba8_int8_program_2d.load_uniform_1i(c"tex", 1)?;
         texture_program_planar_2d.load_uniform_1i(c"tex", 0)?;
@@ -2267,6 +2391,7 @@ impl GLProcessorST {
             nv_uv_texture: Texture::new(),
             nv_uv_egl_cache: ImportCache::new(egl_cache_capacity),
             nv_uv_import_refused: false,
+            nv_y2y_programs,
             last_nv_convert_path: NvConvertPath::None,
             last_nv_sampling: None,
             convert_stats: Default::default(),
@@ -2501,6 +2626,12 @@ impl GLProcessorST {
     pub fn set_interpolation(&mut self, mode: crate::Interpolation) {
         self.interpolation = mode;
         log::debug!("Interpolation set to {mode:?}");
+    }
+
+    /// Whether the Y2Y NV programs ([`NvSampling::HardwareYuv`]) built.
+    #[cfg(all(test, feature = "dma_test_formats"))]
+    pub(super) fn has_y2y(&self) -> bool {
+        self.nv_y2y_programs.is_some()
     }
 
     /// Allow or forbid [`NvSampling::Hardware`] (see `nv_hw_filter`).
@@ -3673,8 +3804,12 @@ impl GLProcessorST {
         log::debug!("GL_EXT_color_buffer_float: {supports_f32_color}");
         log::debug!("GL_EXT_color_buffer_half_float: {supports_f16_color}");
 
+        let has_yuv_target = Platform::EXTERNAL_OES && extensions.contains("GL_EXT_YUV_target");
+        log::debug!("GL_EXT_YUV_target: {has_yuv_target}");
+
         Ok(GlSupport {
             has_float_linear,
+            has_yuv_target,
             has_bgra,
             renderer: traits,
             supports_f32_color,
@@ -4525,6 +4660,7 @@ impl GLProcessorST {
                 0,
                 crate::Flip::None,
                 false,
+                None,
             )
         } else {
             // An overlay background, not a convert: there is no
@@ -5176,6 +5312,7 @@ impl GLProcessorST {
                             rotation_offset,
                             flip,
                             is_int8,
+                            None,
                         ) {
                             Ok(()) => {
                                 if src_fmt == PixelFormat::Nv12 {
@@ -6512,6 +6649,10 @@ impl GLProcessorST {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `y2y` selects the Y2Y NV programs instead of the driver's YUV->RGB
+    /// sampler, with the source's resolved (encoding, range) for their
+    /// in-shader matrix ([`NvSampling::HardwareYuv`]).
+    #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_eglimage(
         &mut self,
         src: &Tensor<u8>,
@@ -6522,6 +6663,10 @@ impl GLProcessorST {
         rotation_offset: usize,
         flip: Flip,
         is_int8: bool,
+        y2y: Option<(
+            edgefirst_tensor::ColorEncoding,
+            edgefirst_tensor::ColorRange,
+        )>,
     ) -> Result<(), Error> {
         let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
@@ -6543,23 +6688,53 @@ impl GLProcessorST {
             self.cached_src_import_map(src, src_fmt),
             crop_uv,
         );
-        let extent_loc = self.external_src_extent_loc(is_int8, false);
-
         // Draw-time program selection (see draw_src_texture).
-        let program_id = if is_int8 {
-            &self.texture_int8_program_yuv
-        } else {
-            &self.texture_program_yuv
-        }
-        .as_ref()
-        .ok_or_else(|| {
-            Error::NotSupported("external-OES sampler program unavailable on this platform".into())
-        })?
-        .id;
+        let (program_id, extent_loc, y2y_upload) = match y2y {
+            Some(colorimetry) => {
+                let (programs, uniforms) = self.nv_y2y_programs.as_ref().ok_or_else(|| {
+                    Error::NotSupported("Y2Y NV programs unavailable on this GPU".into())
+                })?;
+                let state = &uniforms[usize::from(is_int8)];
+                let upload = (state.last_colorimetry != Some(colorimetry))
+                    .then_some((state.locs, colorimetry));
+                (
+                    programs[usize::from(is_int8)].id,
+                    state.locs.src_extent,
+                    upload,
+                )
+            }
+            None => {
+                let program = if is_int8 {
+                    &self.texture_int8_program_yuv
+                } else {
+                    &self.texture_program_yuv
+                }
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::NotSupported(
+                        "external-OES sampler program unavailable on this platform".into(),
+                    )
+                })?;
+                (
+                    program.id,
+                    self.external_src_extent_loc(is_int8, false),
+                    None,
+                )
+            }
+        };
         let texture_target = edgefirst_gl::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             edgefirst_gl::gl::UseProgram(program_id);
             edgefirst_gl::gl::Uniform4f(extent_loc, e0, e1, e2, e3);
+            if let Some((locs, (encoding, range))) = y2y_upload {
+                let k = crate::colorimetry::yuv_to_rgb_coeffs(encoding, range);
+                edgefirst_gl::gl::Uniform1f(locs.y_offset, k.y_offset);
+                edgefirst_gl::gl::Uniform1f(locs.y_scale, k.y_scale);
+                edgefirst_gl::gl::Uniform1f(locs.c_vr, k.c_vr);
+                edgefirst_gl::gl::Uniform1f(locs.c_ug, k.c_ug);
+                edgefirst_gl::gl::Uniform1f(locs.c_vg, k.c_vg);
+                edgefirst_gl::gl::Uniform1f(locs.c_ub, k.c_ub);
+            }
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter_clamp(texture_target, self.source_filter());
@@ -6651,6 +6826,9 @@ impl GLProcessorST {
             );
         }
         check_gl_error(function!(), line!())?;
+        if let (Some(colorimetry), Some((_, uniforms))) = (y2y, self.nv_y2y_programs.as_mut()) {
+            uniforms[usize::from(is_int8)].last_colorimetry = Some(colorimetry);
+        }
         Ok(())
     }
 
@@ -6722,13 +6900,40 @@ impl GLProcessorST {
         } else {
             None
         };
-        let sampling = if !bilinear {
-            NvSampling::Single
-        } else if self.nv_hw_filter && (r8_src.is_none() || uv_import.is_some()) {
-            NvSampling::Hardware
-        } else {
-            NvSampling::Shader
-        };
+        // Only NV12 has a full-image DMA-BUF import for the Y2Y programs.
+        let mut sampling = NvSampling::choose(NvSamplingInputs {
+            bilinear,
+            hw_filter: self.nv_hw_filter,
+            imported: r8_src.is_some(),
+            chroma_view: uv_import.is_some(),
+            y2y: self.nv_y2y_programs.is_some()
+                && src_fmt == PixelFormat::Nv12
+                && y2y_pays_off(src_w * src_h, src_rect.dst_pixels),
+        });
+        let colorimetry = nv_colorimetry(src.colorimetry(), src.height());
+        if sampling == NvSampling::HardwareYuv {
+            match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
+                Ok(img) => {
+                    self.draw_camera_texture_eglimage(
+                        src,
+                        src_fmt,
+                        img,
+                        src_rect.roi(src_w, src_h),
+                        dst_roi,
+                        rotation_offset,
+                        flip,
+                        is_int8,
+                        Some(colorimetry),
+                    )?;
+                    self.last_nv_sampling = Some(sampling);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::debug!("NV12 import for Y2Y unavailable ({e}); shader-filtered");
+                    sampling = NvSampling::Shader;
+                }
+            }
+        }
         let program = sampling.program(is_int8);
         let r8_filter = if sampling == NvSampling::Hardware {
             edgefirst_gl::gl::LINEAR
@@ -6745,16 +6950,9 @@ impl GLProcessorST {
         })?;
         let prog_id = self.nv_r8_programs[program].id;
 
-        // YUV→RGB matrix + range, resolved from the source tensor's
-        // colorimetry (missing axes filled by the SD/HD height heuristic).
-        // Path B applies the matrix in-shader, so it is colorimetry-correct
-        // on every GPU regardless of EGL color-hint support.
-        let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
-        let colorimetry = (
-            cm.encoding
-                .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
-            cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
-        );
+        // Path B applies the `nv_colorimetry` matrix in-shader, so it is
+        // colorimetry-correct on every GPU regardless of EGL color-hint
+        // support.
         let state = &mut self.nv_r8_uniforms[program];
         let locs = state.locs;
         // Uniform values persist per program: re-upload the six matrix floats
@@ -9167,6 +9365,122 @@ mod tests {
         should_reject_software_gl, spread_rows, unpack_row_length, Error,
         DEFAULT_EGL_CACHE_CAPACITY,
     };
+
+    /// The measured Mali-G310 crossover: Y2Y for 720p and 1080p into 640x640,
+    /// the shader-filtered program for 4K into 640x640.
+    #[test]
+    fn y2y_pays_off_below_ten_source_pixels_per_output_pixel() {
+        let out = 640 * 640;
+        assert!(super::y2y_pays_off(1280 * 720, out));
+        assert!(super::y2y_pays_off(1920 * 1080, out));
+        assert!(!super::y2y_pays_off(3840 * 2160, out));
+        assert!(super::y2y_pays_off(3840 * 2160, 1280 * 1280));
+    }
+
+    /// Every combination of what a draw can bind maps to one sampling: an
+    /// upload or a bound chroma view filters in hardware, an import without
+    /// one takes Y2Y where it is available, and the shader blend otherwise.
+    #[test]
+    fn nv_sampling_choice_covers_every_binding() {
+        use super::{NvSampling, NvSamplingInputs};
+        for bits in 0u8..32 {
+            let inputs = NvSamplingInputs {
+                bilinear: bits & 1 != 0,
+                hw_filter: bits & 2 != 0,
+                imported: bits & 4 != 0,
+                chroma_view: bits & 8 != 0,
+                y2y: bits & 16 != 0,
+            };
+            let expected = if !inputs.bilinear {
+                NvSampling::Single
+            } else if !inputs.hw_filter {
+                NvSampling::Shader
+            } else if !inputs.imported || inputs.chroma_view {
+                NvSampling::Hardware
+            } else if inputs.y2y {
+                NvSampling::HardwareYuv
+            } else {
+                NvSampling::Shader
+            };
+            assert_eq!(NvSampling::choose(inputs), expected, "{inputs:?}");
+        }
+    }
+
+    /// The Mali case: an NV12 import whose chroma plane Mali refuses to bind.
+    #[test]
+    fn nv_sampling_takes_y2y_only_for_an_import_without_a_chroma_view() {
+        use super::{NvSampling, NvSamplingInputs};
+        let mali = NvSamplingInputs {
+            bilinear: true,
+            hw_filter: true,
+            imported: true,
+            chroma_view: false,
+            y2y: true,
+        };
+        assert_eq!(NvSampling::choose(mali), NvSampling::HardwareYuv);
+        let chroma_view = NvSamplingInputs {
+            chroma_view: true,
+            ..mali
+        };
+        assert_eq!(NvSampling::choose(chroma_view), NvSampling::Hardware);
+        let opted_out = NvSamplingInputs {
+            hw_filter: false,
+            ..mali
+        };
+        assert_eq!(NvSampling::choose(opted_out), NvSampling::Shader);
+        let nearest = NvSamplingInputs {
+            bilinear: false,
+            ..mali
+        };
+        assert_eq!(NvSampling::choose(nearest), NvSampling::Single);
+    }
+
+    /// The Y2Y draw's ROI is the crop's true edges in texture coordinates,
+    /// flipped vertically like every other external-sampler ROI.
+    #[test]
+    fn nv_sample_rect_roi_maps_the_crop_edges() {
+        let rect = super::NvSampleRect::new(
+            Some(crate::Rect::new(160, 90, 960, 540)),
+            None,
+            (1280, 720),
+            (640, 640),
+            crate::Rotation::None,
+        );
+        let roi = rect.roi(1280, 720);
+        assert_eq!(roi.left, 0.125);
+        assert_eq!(roi.right, 0.875);
+        assert_eq!(roi.top, 0.875);
+        assert_eq!(roi.bottom, 0.125);
+
+        let whole =
+            super::NvSampleRect::new(None, None, (1280, 720), (640, 640), crate::Rotation::None)
+                .roi(1280, 720);
+        assert_eq!(whole.uv_bounds(), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// The NV matrix follows the tensor's colorimetry and fills a missing axis
+    /// from the SD/HD height heuristic.
+    #[test]
+    fn nv_colorimetry_resolves_missing_axes_by_height() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        assert_eq!(
+            super::nv_colorimetry(None, Some(720)),
+            (ColorEncoding::Bt709, ColorRange::Limited)
+        );
+        assert_eq!(
+            super::nv_colorimetry(None, Some(480)),
+            (ColorEncoding::Bt601, ColorRange::Limited)
+        );
+        let full_601 = Colorimetry {
+            encoding: Some(ColorEncoding::Bt601),
+            range: Some(ColorRange::Full),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::nv_colorimetry(Some(full_601), Some(1080)),
+            (ColorEncoding::Bt601, ColorRange::Full)
+        );
+    }
 
     /// A tight destination is the common case and must not be touched: the
     /// read already landed each row where it belongs.

@@ -254,10 +254,44 @@ void main() {
 /// `nv_rgb(x, y)`: the exact YUV->RGB conversion of the luma texel at (x, y)
 /// and its co-sited chroma. References the `chroma_shift`/`chroma_lines`/
 /// `tex_width` layout uniforms and the six colorimetry uniforms.
+/// The colorimetry uniforms every NV program reads (see `nv_yuv_to_rgb_fn`).
+macro_rules! nv_colorimetry {
+    () => {
+        "// Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
+// from the source tensor's resolved colorimetry. Path B applies the matrix in
+// the shader, so it is correct regardless of driver EGL color-hint support.
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
+"
+    };
+}
+
+/// `nv_yuv_to_rgb`: the exact YUV->RGB matrix every NV program applies.
+macro_rules! nv_yuv_to_rgb_fn {
+    () => {
+        "// Floor expanded luma at 0 to match the CPU `yuv` crate's saturating (Y-16)
+// term (limited footroom Y<16 → 0). The top is left uncapped — the crate lets
+// headroom exceed 1.0 and relies on the final RGB clamp, so the GL path must
+// too. No-op for full range (y_offset=0, y_scale=1).
+vec3 nv_yuv_to_rgb(float yv, float u, float v) {
+    float yp = max((yv - y_offset) * y_scale, 0.0);
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    return clamp(vec3(yp + c_vr * vp, yp - c_ug * up - c_vg * vp, yp + c_ub * up), 0.0, 1.0);
+}
+
+"
+    };
+}
+
 macro_rules! nv_rgba_header {
     () => {
-        "\
-#version 300 es
+        concat!(
+            "#version 300 es
 precision highp float;
 precision highp int;
 uniform highp sampler2D src;
@@ -277,31 +311,15 @@ uniform vec2 luma_scale;
 uniform vec4 luma_clamp;
 uniform vec2 chroma_scale;
 uniform vec4 chroma_clamp;
-// Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
-// from the source tensor's resolved colorimetry. Path B applies the matrix in
-// the shader, so it is correct regardless of driver EGL color-hint support.
-uniform float y_offset;
-uniform float y_scale;
-uniform float c_vr;
-uniform float c_ug;
-uniform float c_vg;
-uniform float c_ub;
-in vec3 fragPos;
+",
+            nv_colorimetry!(),
+            "in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
 
-// Floor expanded luma at 0 to match the CPU `yuv` crate's saturating (Y-16)
-// term (limited footroom Y<16 → 0). The top is left uncapped — the crate lets
-// headroom exceed 1.0 and relies on the final RGB clamp, so the GL path must
-// too. No-op for full range (y_offset=0, y_scale=1).
-vec3 nv_yuv_to_rgb(float yv, float u, float v) {
-    float yp = max((yv - y_offset) * y_scale, 0.0);
-    float up = u - 128.0 / 255.0;
-    float vp = v - 128.0 / 255.0;
-    return clamp(vec3(yp + c_vr * vp, yp - c_ug * up - c_vg * vp, yp + c_ub * up), 0.0, 1.0);
-}
-
-vec3 nv_rgb(int x, int y) {
+",
+            nv_yuv_to_rgb_fn!(),
+            "vec3 nv_rgb(int x, int y) {
     // Luma: direct 2D texel — no per-pixel integer divide/modulo (very slow on
     // some embedded GPUs, e.g. Vivante GC7000UL).
     float yv = texelFetch(src, ivec2(x, y), 0).r;
@@ -321,6 +339,7 @@ vec3 nv_rgb(int x, int y) {
 }
 
 "
+        )
     };
 }
 
@@ -522,6 +541,59 @@ pub(crate) const NV_RGBA_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
 );
 
+/// Header of the Y2Y NV programs: `GL_EXT_YUV_target` samples an NV12
+/// import as raw (Y, U, V), filtered by the texture unit but not converted by
+/// the driver, so the exact matrix still applies. `src_extent` is the
+/// rectangle a sample may reach, as in the external-sampler programs.
+macro_rules! nv_y2y_header {
+    () => {
+        concat!(
+            "#version 300 es
+#extension GL_EXT_YUV_target : require
+precision highp float;
+uniform __samplerExternal2DY2YEXT src;
+uniform highp vec4 src_extent;
+",
+            nv_colorimetry!(),
+            "in vec3 fragPos;
+in highp vec2 tc;
+out vec4 color;
+
+",
+            nv_yuv_to_rgb_fn!()
+        )
+    };
+}
+
+/// `main()` statements of the Y2Y NV programs: one filtered fetch.
+macro_rules! nv_rgb_y2y_body {
+    () => {
+        "    vec3 yuv = texture(src, clamp(tc, src_extent.xy, src_extent.zw)).rgb;
+    vec3 rgb = nv_yuv_to_rgb(yuv.r, yuv.g, yuv.b);
+"
+    };
+}
+
+/// NV->RGBA fragment shader for draws that rescale, on GPUs with
+/// `GL_EXT_YUV_target` that cannot bind the chroma plane as its own texture
+/// (Mali lists no two-channel 8-bit import format): bilinear through the
+/// texture unit from a single NV12 import, one fetch per pixel.
+pub(crate) const NV_RGBA_Y2Y_FRAGMENT: &str = concat!(
+    nv_y2y_header!(),
+    "void main() {\n",
+    nv_rgb_y2y_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`NV_RGBA_Y2Y_FRAGMENT`].
+pub(crate) const NV_RGBA_Y2Y_INT8_FRAGMENT: &str = concat!(
+    nv_y2y_header!(),
+    nv_int8_bias!(),
+    "void main() {\n",
+    nv_rgb_y2y_body!(),
+    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+);
+
 /// Int8 variant of [`NV_RGBA_BILINEAR_FRAGMENT`].
 pub(crate) const NV_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
@@ -558,6 +630,11 @@ mod nv_shader_golden {
             super::NV_RGBA_BILINEAR_FRAGMENT,
             golden(include_str!("golden/nv_rgba_bilinear_linux.glsl")).as_str(),
             "bilinear NV->RGBA shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::NV_RGBA_Y2Y_FRAGMENT,
+            golden(include_str!("golden/nv_rgba_y2y_linux.glsl")).as_str(),
+            "Y2Y NV->RGBA shader bytes drifted from the on-target-validated golden"
         );
         assert_eq!(
             super::NV_RGBA_HW_BILINEAR_FRAGMENT,
