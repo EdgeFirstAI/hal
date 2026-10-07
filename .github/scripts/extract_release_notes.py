@@ -11,7 +11,7 @@
 # shipped empty notes: v0.32.0's GitHub Release body is zero characters.
 #
 # Usage:
-#   python3 .github/scripts/extract_release_notes.py CHANGELOG.md 0.34.0
+#   python3 .github/scripts/extract_release_notes.py CHANGELOG.md 0.34.1
 
 from __future__ import annotations
 
