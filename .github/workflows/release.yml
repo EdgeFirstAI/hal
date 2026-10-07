@@ -273,7 +273,7 @@ jobs:
       # checks below have passed -- so provenance is generated once, after
       # them, rather than for a wheel an assertion is about to reject.
       - name: Build wheels (Python 3.11+ — zero-copy buffer protocol)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@55bc02295af9878e74007b5f9e00fffbffcff62e
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@002777f34bb28fa359bfe1aa04302b1913c44182
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:
@@ -288,7 +288,7 @@ jobs:
           attest: false
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@55bc02295af9878e74007b5f9e00fffbffcff62e
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@002777f34bb28fa359bfe1aa04302b1913c44182
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:

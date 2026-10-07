@@ -55,7 +55,7 @@ jobs:
       has_boards: ${{ steps.boards.outputs.has_boards }}
     steps:
       - id: boards
-        uses: EdgeFirstAI/.github/.github/actions/resolve-boards@55bc02295af9878e74007b5f9e00fffbffcff62e
+        uses: EdgeFirstAI/.github/.github/actions/resolve-boards@002777f34bb28fa359bfe1aa04302b1913c44182
         with:
           boards: ${{ inputs.boards }}
           token: ${{ secrets.FLEET_RUNNERS_TOKEN }}
