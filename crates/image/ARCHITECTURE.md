@@ -617,6 +617,7 @@ See the [Colorimetry](#colorimetry-1) section for the full design.
   |---|---|---|
   | `Single` | No resize, or `Interpolation::Nearest` | 3 (`texelFetch` of Y, U, V) |
   | `Hardware` | Bilinear resize, chroma plane bindable | 2 `LINEAR` samples: Y from the combined R8 plane, (U, V) from a GR88 import of the chroma plane or an RG8 upload |
+  | `HardwareYuv` | Bilinear resize of an NV12/NV16 import where the chroma view is refused and the GPU has `GL_EXT_YUV_target` (Mali-G310, whose import formats include no two-channel 8-bit format), and the source has at most ten pixels per output pixel: the import's cost grows with the whole source, so a stronger downscale is cheaper in `Shader` | 1 `LINEAR` sample of the NV12/NV16 import through `__samplerExternal2DY2YEXT`, which returns raw (Y, U, V) for the in-shader matrix |
   | `Shader` | Bilinear resize, chroma view refused (unaligned chroma offset on Mali/Adreno, non-Linux platforms), or `EDGEFIRST_GL_NO_NV_HW_FILTER=1` | 12: four `Single` conversions blended in RGB |
 
   `Hardware` interpolates chroma on its own grid, centred on the luma pixels each sample covers (JPEG siting). `Shader` and the CPU backend instead replicate each chroma sample across its luma pixels before blending. The two agree closely on natural content and part on chroma that changes every one or two samples.

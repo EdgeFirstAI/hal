@@ -8962,11 +8962,16 @@ mod gl_tests {
                             NvSampling::Hardware,
                             "an upload can always bind its chroma"
                         );
+                    } else if gl.has_y2y() {
+                        assert_ne!(
+                            sampling,
+                            NvSampling::Shader,
+                            "a GPU with GL_EXT_YUV_target must filter an NV12 import in hardware"
+                        );
                     }
-                    let mode = if sampling == NvSampling::Hardware {
-                        "hardware"
-                    } else {
-                        "shader"
+                    let mode = match sampling {
+                        NvSampling::Hardware | NvSampling::HardwareYuv => "hardware",
+                        _ => "shader",
                     };
                     let mad = mean_abs_diff(&planar_bytes(&gpu), &oracle.render(r, dw, dh, mode));
                     assert!(
