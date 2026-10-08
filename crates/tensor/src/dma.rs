@@ -61,12 +61,10 @@ where
     pub(crate) mmap_offset: usize,
     /// Whether this tensor was created via `from_fd()` (imported from an
     /// external allocator).  Propagated through `try_clone()` so that DRM
-    /// PRIME import failures are logged at DEBUG rather than WARN, and
-    /// used to gate CPU mapping of strided tensors: self-allocated DMA
-    /// tensors with pitch padding (via `new_with_byte_size`) are
-    /// mappable because HAL owns the layout, but foreign V4L2/GStreamer
-    /// strided imports are not — the external allocator defines the
-    /// layout and HAL cannot validate what the caller expects.
+    /// PRIME import failures are logged at DEBUG rather than WARN. It does
+    /// not gate CPU mapping: a strided map of an imported buffer succeeds
+    /// when `stride × rows` fits `buf_size − mmap_offset`, the same rule
+    /// as for a buffer allocated here.
     #[cfg(target_os = "linux")]
     pub(crate) is_imported: bool,
     /// Which heap the memory came from, as far as this crate knows: CMA,
