@@ -419,6 +419,8 @@ A DMA test that finds no usable heap skips and reports `ok`, so a lane that lost
 
 CI sets it through `.github/scripts/dma-heap-setup.sh`, which opens `/dev/dma_heap/system` to the job user (`sudo chmod a+rw` where it can), allocates and maps one page through the heap ioctl, and exports `HAL_TEST_REQUIRE_DMA=1` only when that probe succeeds. The step summary says which: `DMA: required (system heap, host-coherent)` or `DMA: unavailable — DMA tests skipped (<reason>)`. It runs on the Linux mutation legs and, through `.github/scripts/ci-setup.sh`, on the hosted Linux Quick/Full lanes and the board pre-command.
 
+The V4L2 capture-import tests (`crates/tensor/tests/vivid_capture_import.rs`) need the kernel's virtual capture driver, vivid. `.github/scripts/vivid-setup.sh`, also run from `ci-setup.sh`, installs `linux-modules-extra` for the hosted runner's kernel, loads vivid, opens its nodes and exports `HAL_TEST_REQUIRE_VIVID=1` only when they appear. When the archive has no modules package for the runner's kernel the tests skip and the step summary says why. It does nothing on boards and other self-hosted machines. Locally: `sudo modprobe vivid n_devs=2 node_types=0x1,0x1 multiplanar=1,2`.
+
 A hosted-runner pass is **not** hardware validation. That heap is cached, cache-coherent system memory with no `/dev/dri` behind it, so it proves the DMA code paths run but says nothing about coherency (a missing end-of-access sync), CMA contiguity or GPU import. Only the board lanes cover those.
 
 ---
@@ -621,6 +623,7 @@ Use environment variables to isolate tests to specific backends:
 |----------|--------|
 | `EDGEFIRST_TENSOR_FORCE_MEM=1` | Force heap (`MemTensor`) allocation; skips DMA-heap and shared memory |
 | `HAL_TEST_REQUIRE_DMA=1` | Fail, rather than skip, any DMA test that finds no usable heap. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
+| `HAL_TEST_REQUIRE_VIVID=1` | Fail, rather than skip, the vivid capture-import tests when no vivid node is found. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
 | `EDGEFIRST_FORCE_BACKEND=cpu` | Force CPU-only image processing |
 | `EDGEFIRST_FORCE_BACKEND=opengl` | Force OpenGL backend |
 | `EDGEFIRST_FORCE_BACKEND=g2d` | Force G2D backend |

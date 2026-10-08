@@ -2,7 +2,7 @@
 # Caller pre-command for shared rust-quick / rust-full jobs.
 # Installs host deps, merges crate LFS testdata, fetches ANGLE on Apple/Windows,
 # and on Linux arms the DMA require gate when the heap allocates
-# (dma-heap-setup.sh).
+# (dma-heap-setup.sh) and the vivid gate when vivid loads (vivid-setup.sh).
 #
 # Environment the shared workflows guarantee to a pre-command: the caller
 # checkout as working directory, GH_TOKEN / GITHUB_TOKEN, and GITHUB_ENV /
@@ -64,6 +64,11 @@ case "${os}" in
         # exports do not reach later steps. Never fails this script.
         bash "$(dirname "${BASH_SOURCE[0]}")/dma-heap-setup.sh" \
             || echo "::warning::dma-heap-setup.sh failed; DMA tests may skip"
+        # Loads vivid on hosted runners for the V4L2 capture-import tests and,
+        # only when its nodes appear, exports HAL_TEST_REQUIRE_VIVID=1. Never
+        # fails this script; a no-op on boards and other self-hosted machines.
+        bash "$(dirname "${BASH_SOURCE[0]}")/vivid-setup.sh" \
+            || echo "::warning::vivid-setup.sh failed; vivid tests may skip"
         if [[ "${BOARD:-0}" == "1" ]]; then
             # A board with a render node has a GPU, so a GL backend that does
             # not come up is a defect there, not a fact of the machine; without

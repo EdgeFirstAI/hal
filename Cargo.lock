@@ -749,6 +749,7 @@ dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor-abi",
  "edgefirst-tensor-ffi",
+ "edgefirst-v4l2",
  "env_logger",
  "half",
  "libc",
