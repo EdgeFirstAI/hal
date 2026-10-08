@@ -343,7 +343,18 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           python -m venv /tmp/v-codec-only
-          /tmp/v-codec-only/bin/pip install --quiet "edgefirst-codec==$VERSION"
+          # Retried like the step above: PyPI's index replicas can still answer
+          # with the previous release after another install has succeeded.
+          ok=0
+          for attempt in 1 2 3 4 5 6; do
+            if /tmp/v-codec-only/bin/pip install --quiet "edgefirst-codec==$VERSION"; then ok=1; break; fi
+            echo "attempt $attempt: edgefirst-codec==$VERSION not installable yet; waiting"
+            sleep 20
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::edgefirst-codec==$VERSION never became installable."
+            exit 1
+          fi
           if /tmp/v-codec-only/bin/pip list --format=freeze | grep -q '^edgefirst-image='; then
             echo "::error::edgefirst-codec pulled in edgefirst-image; the split is not doing its job"
             exit 1
