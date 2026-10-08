@@ -36,6 +36,7 @@ Per-backend unit tests live in the source files alongside the implementation. `t
 | `dma_require_policy.rs`, `cuda_require_policy.rs` | The `HAL_TEST_REQUIRE_DMA` / `HAL_TEST_REQUIRE_CUDA` decision functions in `support/` |
 | `cuda_runtime_loader.rs` | libcudart loading; under `HAL_TEST_REQUIRE_CUDA=1` a loaded runtime must also create and synchronize a stream |
 | `d3d11_tensor.rs` | Windows D3D11 texture tensors (Windows only) |
+| `vivid_capture_import.rs` | A padded V4L2 capture buffer from the kernel's vivid driver, exported with `EXPBUF` and imported through `from_fd`, maps at its row stride (Linux; needs vivid loaded, skips without it, fails instead under `HAL_TEST_REQUIRE_VIVID=1`) |
 | `dynamic_primitives.rs` | The `dynamic` backend (`--no-default-features --features dynamic`) |
 
 ## Running Tests

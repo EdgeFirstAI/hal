@@ -83,6 +83,9 @@ edgefirst-tensor-ffi = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 procfs = { workspace = true }
+# `tests/vivid_capture_import.rs` captures from the kernel's vivid driver to
+# import a real padded V4L2 capture buffer.
+edgefirst-v4l2 = { workspace = true }
 
 [[bench]]
 name = "tensor_benchmark"

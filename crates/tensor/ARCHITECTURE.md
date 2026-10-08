@@ -839,6 +839,28 @@ handles:
 mirrors `from_fd()` — the receiver retains the surface for the
 tensor's lifetime; the producer keeps its own retain count.
 
+### Strided CPU maps of imported buffers
+
+A tensor with a row stride maps `stride × rows` bytes, and every
+`TensorMemory::DmaBuf` backing applies the same rule to it whether the buffer
+was allocated here or imported: the map succeeds when the span fits the
+buffer's real size and is refused otherwise. No backend refuses a strided map
+because the buffer is imported, and the `is_imported` flags gate no map.
+
+| Backing | Size the span is checked against | Error when it does not fit |
+|---|---|---|
+| DMA-BUF (Linux) | `buf_size − mmap_offset`; `buf_size` is `fstat`-derived for an imported fd | `InvalidOperation` |
+| IOSurface (Apple) | `buf_size − view_offset` | `InsufficientCapacity` |
+| AHardwareBuffer (Android) | `buf_size − view_offset` | `InsufficientCapacity` |
+| D3D11 texture (Windows) | `backing_bytes − view_offset` (the staging copy at the driver pitch) | `InsufficientCapacity` |
+
+The only difference is the error variant: the DMA-BUF arm predates the
+others and keeps `InvalidOperation`. `tests/vivid_capture_import.rs` covers
+the DMA-BUF rule with a real V4L2 capture buffer: vivid captures YUYV at a
+padded `bytesperline`, the buffer is exported with `EXPBUF` and imported
+through `Tensor::from_fd`, and every row of the strided map matches the
+driver's own mapping.
+
 ### AHardwareBuffer (Android)
 
 Android's `TensorMemory::DmaBuf` is
