@@ -14,9 +14,6 @@
 #                     artifact instead; their checkout has LFS pointers, not
 #                     content, so merging there would stage stub files that the
 #                     artifact then has to overwrite.
-#   SKIP_OPENCV=1     install the build dependencies without OpenCV, for jobs
-#                     that do not build the optional `opencv` feature (the
-#                     on-target archive).
 #   BOARD=1           arm the on-target gates from what the board has, as
 #                     scripts/on-target-test.sh does: HAL_TEST_REQUIRE_GL=1
 #                     with a DRM render node, EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1
@@ -57,10 +54,8 @@ case "${os}" in
         if [[ "${SKIP_PACKAGES:-0}" == "1" || "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
             echo "ci-setup: skipping apt (SKIP_PACKAGES or self-hosted board)"
         else
-            pkgs=(clang libclang-dev pkg-config nasm)
-            [[ "${SKIP_OPENCV:-0}" == "1" ]] || pkgs+=(libopencv-dev)
             sudo apt-get update
-            sudo apt-get install -y "${pkgs[@]}"
+            sudo apt-get install -y clang libclang-dev pkg-config nasm
         fi
         merge_testdata
         # Opens the DMA heap to the job user and, only when a probe allocation

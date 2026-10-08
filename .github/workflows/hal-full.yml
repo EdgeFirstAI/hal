@@ -72,7 +72,7 @@ jobs:
         with:
           name: testdata-lfs
           path: testdata/
-      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libopencv-dev pkg-config nasm
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config nasm
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -81,7 +81,7 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> "$GITHUB_PATH"
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout pytest-benchmark numpy pillow opencv-python-headless pyyaml safetensors psutil tensorflow
+          venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout pytest-benchmark numpy pillow pyyaml safetensors psutil tensorflow
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
@@ -153,7 +153,7 @@ jobs:
           # --exclude the python-* crates: --workspace unions features, which
           # would activate edgefirst-tensor's static and dynamic at once and
           # trip its mutual-exclusion guard.
-          cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
+          cargo llvm-cov nextest --cargo-profile profiling --features default --workspace \
             --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
             --no-report -j 1 \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
@@ -213,7 +213,7 @@ jobs:
           path: testdata/
       - run: |
           sudo apt-get update
-          sudo apt-get install -y libgl1-mesa-dri libegl1 libegl-mesa0 libgles2 mesa-utils-extra clang libclang-dev libopencv-dev
+          sudo apt-get install -y libgl1-mesa-dri libegl1 libegl-mesa0 libgles2 mesa-utils-extra clang libclang-dev
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
@@ -602,7 +602,7 @@ jobs:
         # Narrowed to `tensor` on purpose: it is the package that bundles
         # libedgefirst_tensor, so it is the one that reproduces the failure,
         # and one wheel keeps this to a couple of minutes instead of pulling
-        # in the full suite's dependency tail (tensorflow, opencv, ...) for a
+        # in the full suite's dependency tail (tensorflow, ...) for a
         # packaging check. The import is the point -- a wheel that builds but
         # will not load is the alignment failure, so this covers both at once.
         run: |
