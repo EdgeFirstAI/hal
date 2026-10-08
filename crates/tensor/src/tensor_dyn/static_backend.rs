@@ -1820,6 +1820,12 @@ impl TensorDyn {
         dispatch!(self, compression)
     }
 
+    /// Whether the memory is known to be physically contiguous (see
+    /// [`Tensor::contiguity`]).
+    pub fn contiguity(&self) -> crate::Contiguity {
+        dispatch!(self, contiguity)
+    }
+
     /// Create a DMA-backed image tensor with an explicit row stride that
     /// may exceed the natural `width * channels * sizeof(T)` pitch.
     ///

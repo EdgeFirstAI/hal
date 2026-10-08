@@ -18,11 +18,11 @@
 use std::ffi::{c_char, c_int};
 
 pub use edgefirst_tensor_abi::{
-    EfClientRefFn, EfClientState, EfCompression, EfCpuAccess, EfCudaMapFn, EfCudaMapFnNullable,
-    EfCudaUnmapFn, EfCudaUnmapFnNullable, EfCudaUnregisterFn, EfCudaUnregisterFnNullable,
-    EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView, EfPboMapFn, EfPboMapFnNullable,
-    EfPboUnmapFn, EfPboUnmapFnNullable, EfQuantizationInfo, EfStorageKind, EfTensorPlane,
-    EfTensorView, EfViewOrigin,
+    EfClientRefFn, EfClientState, EfCompression, EfContiguity, EfCpuAccess, EfCudaMapFn,
+    EfCudaMapFnNullable, EfCudaUnmapFn, EfCudaUnmapFnNullable, EfCudaUnregisterFn,
+    EfCudaUnregisterFnNullable, EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView, EfPboMapFn,
+    EfPboMapFnNullable, EfPboUnmapFn, EfPboUnmapFnNullable, EfQuantizationInfo, EfStorageKind,
+    EfTensorPlane, EfTensorView, EfViewOrigin,
 };
 
 /// Opaque tensor handle (never dereferenced, sized, or copied).
@@ -114,6 +114,9 @@ declare_abi! {
         d: *mut EfTensorImageDesc,
         compression: u32,
     ) -> c_int;
+    pub fn ef_tensor_image_desc_set_contiguous(d: *mut EfTensorImageDesc, contiguous: c_int)
+        -> c_int;
+    pub fn ef_tensor_image_desc_contiguous(d: *const EfTensorImageDesc) -> c_int;
     pub fn ef_tensor_image_desc_get(
         d: *const EfTensorImageDesc,
         out: *mut EfImageDescView,
@@ -264,6 +267,7 @@ declare_abi! {
     pub fn ef_tensor_capacity_bytes(t: *const EfTensor) -> i64;
     pub fn ef_tensor_row_stride(t: *const EfTensor) -> i64;
     pub fn ef_tensor_compression(t: *const EfTensor) -> u32;
+    pub fn ef_tensor_contiguity(t: *const EfTensor) -> u32;
     pub fn ef_tensor_colorimetry(t: *const EfTensor) -> u32;
     pub fn ef_tensor_set_colorimetry(t: *mut EfTensor, packed: u32) -> c_int;
     pub fn ef_tensor_view_origin(t: *const EfTensor, out: *mut EfViewOrigin) -> c_int;
@@ -551,7 +555,12 @@ mod tests {
     /// callback while no tensor CPU mapping can be created, so the image
     /// crate can hold that exclusion across Adreno's `eglDestroyImage`,
     /// which unmaps its driver mapping twice.
-    const HEADER_DECLARATION_COUNT: usize = 111;
+    /// **Now 114** with `ef_tensor_contiguity`,
+    /// `ef_tensor_image_desc_set_contiguous` and
+    /// `ef_tensor_image_desc_contiguous`: the physically contiguous (CMA
+    /// only) allocation request and the query of which heap a DMA-BUF
+    /// tensor came from.
+    const HEADER_DECLARATION_COUNT: usize = 114;
 
     #[test]
     fn declared_matches_the_header_derived_count() {

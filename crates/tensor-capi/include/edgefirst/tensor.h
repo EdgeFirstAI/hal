@@ -225,6 +225,38 @@ typedef uint32_t ef_compression;
 #endif // __cplusplus
 
 /**
+ * Whether a tensor's memory is known to be physically contiguous
+ * (`ef_tensor_contiguity`).
+ *
+ * Mirrors `edgefirst_tensor::Contiguity`.
+ */
+enum ef_contiguity
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Not known: an imported fd, or memory not allocated from a DMA heap.
+   */
+  EF_CONTIGUITY_UNKNOWN = 0,
+  /**
+   * Allocated from the CMA heap.
+   */
+  EF_CONTIGUITY_CONTIGUOUS = 1,
+  /**
+   * Allocated from the system heap.
+   */
+  EF_CONTIGUITY_NON_CONTIGUOUS = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_contiguity ef_contiguity;
+#else
+typedef uint32_t ef_contiguity;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * Which *kind* of failure the calling thread's last failing
  * `ef_tensor_*` call was.
  *
@@ -1324,6 +1356,30 @@ int ef_tensor_image_desc_set_access(struct ef_tensor_image_desc *d, uint32_t acc
 int ef_tensor_image_desc_set_compression(struct ef_tensor_image_desc *d, uint32_t compression);
 
 /**
+ * Require physically contiguous memory: 0 = no, 1 = yes.
+ *
+ * A contiguous request is allocated from the Linux CMA DMA heap only, and
+ * `ef_tensor_image_desc_alloc` fails, naming the heap, instead of falling
+ * back to the system heap or another kind of memory.
+ *
+ * # Safety
+ * `d` must be `NULL` or a live request.
+ */
+int ef_tensor_image_desc_set_contiguous(struct ef_tensor_image_desc *d, int contiguous);
+
+/**
+ * Whether the request requires physically contiguous memory: 1 if it does,
+ * 0 if not or `d` is `NULL`.
+ *
+ * A separate getter rather than a field of `EfImageDescView`, whose size
+ * is fixed between independently versioned libraries.
+ *
+ * # Safety
+ * `d` must be `NULL` or a live request.
+ */
+int ef_tensor_image_desc_contiguous(const struct ef_tensor_image_desc *d);
+
+/**
  * Read a request's fields into `out`, mirroring `ef_tensor_plane_at`'s
  * shape: a scalar block a foreign library copies rather than a pointer it
  * would have to dereference into this library's private layout.
@@ -1511,6 +1567,20 @@ int64_t ef_tensor_row_stride(const ef_tensor *t);
  * `t` must be `NULL` or a live handle.
  */
 uint32_t ef_tensor_compression(const ef_tensor *t);
+
+/**
+ * Whether this tensor's memory is known to be physically contiguous, as an
+ * `ef_contiguity` code: contiguous for DMA-BUF allocated from the CMA heap,
+ * non-contiguous for the system heap, unknown for an imported fd and every
+ * other kind of memory.
+ *
+ * Returns unknown (0) for a `NULL`/invalid handle, which a caller checking
+ * for known non-contiguous memory treats as "cannot tell".
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+uint32_t ef_tensor_contiguity(const ef_tensor *t);
 
 /**
  * Describe this tensor's parent-region snapshot, if it is a `view`/`batch`

@@ -963,3 +963,29 @@ def test_setitem_on_a_readwrite_map_still_works(mem):
     m = t.map("readwrite")
     m[0] = 7
     assert m[0] == 7
+
+
+CMA_HEAP = "/dev/dma_heap/linux,cma"
+
+
+def test_host_memory_contiguity_is_unknown():
+    t = Tensor([4, 4], dtype="uint8", mem=TensorMemory.MEM)
+    assert t.contiguity == "unknown"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="CMA DMA heap is Linux-only")
+def test_contiguous_image_is_cma_dma_or_an_error():
+    # Without a CMA heap, or with its pool full, the request fails naming it.
+    try:
+        t = Tensor.image(64, 64, PixelFormat.Rgba, contiguous=True)
+    except RuntimeError as exc:
+        assert "linux,cma" in str(exc)
+        return
+    assert os.path.exists(CMA_HEAP)
+    assert t.memory == TensorMemory.DMABUF
+    assert t.contiguity == "contiguous"
+
+
+def test_contiguous_image_rejects_host_memory():
+    with pytest.raises(RuntimeError):
+        Tensor.image(64, 64, PixelFormat.Rgba, mem=TensorMemory.MEM, contiguous=True)

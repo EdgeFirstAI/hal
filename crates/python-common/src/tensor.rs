@@ -1576,6 +1576,15 @@ impl PyTensor {
         }
     }
 
+    /// Whether the memory is known to be physically contiguous:
+    /// ``"contiguous"`` for a DMA-BUF allocated from the CMA heap,
+    /// ``"non_contiguous"`` for one from the system heap, and ``"unknown"``
+    /// for an imported fd and every other kind of memory.
+    #[getter]
+    fn contiguity(&self) -> &'static str {
+        self.0.contiguity().as_str()
+    }
+
     #[getter]
     fn name(&self) -> String {
         self.0.name()
@@ -2233,18 +2242,30 @@ impl PyTensor {
     /// `access` declares CPU access (`"none"`, `"read"`, `"write"`,
     /// `"readwrite"`); hardware access is always implied. Scripts that
     /// `map()` or `numpy()` the tensor should pass `access="readwrite"`.
+    ///
+    /// `contiguous=True` requires physically contiguous memory: a DMA-BUF
+    /// from the Linux CMA heap, or an error naming the heap, never a
+    /// fallback (see :attr:`contiguity`).
     #[staticmethod]
-    #[pyo3(signature = (width, height, format, mem = None, access = "none"))]
+    #[pyo3(signature = (width, height, format, mem = None, access = "none", contiguous = false))]
     fn image(
         width: usize,
         height: usize,
         format: PyPixelFormat,
         mem: Option<PyTensorMemory>,
         access: &str,
+        contiguous: bool,
     ) -> Result<Self> {
         use edgefirst_tensor::PixelFormat;
         let fmt: PixelFormat = format.into();
         let memory = mem.map(Into::into);
+        if contiguous {
+            let desc = edgefirst_tensor::ImageDesc::new(width, height, fmt, DType::U8)
+                .with_memory(memory)
+                .with_access(parse_cpu_access(access)?)
+                .with_contiguous(true);
+            return Ok(PyTensor(TensorDyn::image_desc(&desc)?));
+        }
         let tensor = TensorDyn::image(
             width,
             height,

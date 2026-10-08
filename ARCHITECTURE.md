@@ -57,7 +57,7 @@ the underlying storage and the GL transfer backend differ.
 |------------|--------------------------------------|------------------------|------------------------|--------------------|-------------------|
 | `TensorMemory::Mem` | Heap | Heap | Heap | Heap | Heap |
 | `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | Import-only — bionic has no `shm_open`, so allocation reports `NotImplemented`; `from_fd` works | — |
-| `TensorMemory::DmaBuf` | DMA-BUF heap (`/dev/dma_heap/*`): CMA, or the system heap when CMA is absent or full | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) | D3D11 texture (`ID3D11Texture2D`, shared NT handle) |
+| `TensorMemory::DmaBuf` | DMA-BUF heap (`/dev/dma_heap/*`): CMA, or the system heap when CMA is absent or full (CMA only with `ImageDesc::with_contiguous`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) | D3D11 texture (`ID3D11Texture2D`, shared NT handle) |
 | `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) | GLES PBO (still allocatable; textures are the default GPU destination) |
 | GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) | `D3d11Texture` via ANGLE |
 | GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal | Native EGL → driver (Adreno/Mali/PowerVR/Xclipse) | ANGLE EGL → Direct3D 11 |

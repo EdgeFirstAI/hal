@@ -808,7 +808,12 @@ value, same `EF_STORAGE_KIND_DMA_BUF=2` over the C ABI — but the underlying
 storage type differs:
 
 - **Linux**: `TensorStorage::Dma(DmaTensor<T>)` backed by a DMA-BUF fd
-  from `/dev/dma_heap/*`.
+  from `/dev/dma_heap/*`. `heap_allocate` tries the CMA heap and falls
+  back to the system heap, and records which one served the buffer as the
+  tensor's `Contiguity` (`Unknown` for `from_fd` imports, where the heap
+  cannot be known). A `contiguous` request, from
+  `ImageDesc::with_contiguous`, skips the fallback and fails with an
+  `IoError` naming the CMA heap.
 - **macOS**: `TensorStorage::Dma(IoSurfaceTensor<T>)` backed by an
   `IOSurfaceRef` from the IOSurface framework.
 - **Windows**: `TensorStorage::Dma(D3d11TextureTensor<T>)` backed by an

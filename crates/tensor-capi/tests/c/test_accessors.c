@@ -34,6 +34,9 @@ int main(void) {
     assert(ef_tensor_set_colorimetry(t, 0) == 0);
     assert(ef_tensor_colorimetry(t) == 0);
 
+    /* Contiguity: only DMA-heap allocations are known; host memory is not. */
+    assert(ef_tensor_contiguity(t) == EF_CONTIGUITY_UNKNOWN);
+
     /* view_origin: a whole tensor (never viewed/batched) has none. */
     struct EfViewOrigin origin;
     memset(&origin, 0xAA, sizeof(origin));
@@ -43,6 +46,7 @@ int main(void) {
     /* Null-safety: documented benign results, not crashes. */
     assert(ef_tensor_ndim(NULL) == 0);
     assert(ef_tensor_colorimetry(NULL) == 0);
+    assert(ef_tensor_contiguity(NULL) == EF_CONTIGUITY_UNKNOWN);
     assert(ef_tensor_set_colorimetry(NULL, packed) != 0);
     assert(ef_tensor_view_origin(NULL, &origin) != 0);
     ef_tensor_free(NULL);

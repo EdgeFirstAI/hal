@@ -27,7 +27,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_tensor::{DType, TensorDyn, TensorMemory};
 use edgefirst_tensor_abi::EfErrorClass;
-pub use edgefirst_tensor_abi::{EfCompression, EfTensorPlane, EfViewOrigin};
+pub use edgefirst_tensor_abi::{EfCompression, EfContiguity, EfTensorPlane, EfViewOrigin};
 
 use crate::last_error::{set_errno, set_last_error_classified};
 
@@ -473,6 +473,29 @@ pub unsafe extern "C" fn ef_tensor_compression(t: *const EfTensor) -> u32 {
             crate::codes::compression_code(i.inner.compression())
         }))
         .unwrap_or(EfCompression::None as u32)
+    }
+}
+
+/// Whether this tensor's memory is known to be physically contiguous, as an
+/// `ef_contiguity` code: contiguous for DMA-BUF allocated from the CMA heap,
+/// non-contiguous for the system heap, unknown for an imported fd and every
+/// other kind of memory.
+///
+/// Returns unknown (0) for a `NULL`/invalid handle, which a caller checking
+/// for known non-contiguous memory treats as "cannot tell".
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_contiguity(t: *const EfTensor) -> u32 {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(i) = imp(t) else {
+                return EfContiguity::Unknown as u32;
+            };
+            i.inner.contiguity().code()
+        }))
+        .unwrap_or(EfContiguity::Unknown as u32)
     }
 }
 

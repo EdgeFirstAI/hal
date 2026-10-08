@@ -1529,7 +1529,13 @@ impl PyImageProcessor {
     /// (``"ubwc"``/``"afbc"``/``"pvric"``/``"dcc"`` — allocation fails
     /// unless the device's native scheme matches). Requires
     /// ``access="none"``. Read the outcome via ``Tensor.compression``.
-    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "none", compression = None))]
+    ///
+    /// ``contiguous=True`` requires physically contiguous memory: a
+    /// DMA-BUF from the Linux CMA heap, or an error naming the heap,
+    /// never a fallback to the system heap, a PBO or host memory. Read
+    /// what any tensor got via ``Tensor.contiguity``.
+    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "none", compression = None, contiguous = false))]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_image(
         &self,
         width: usize,
@@ -1538,6 +1544,7 @@ impl PyImageProcessor {
         dtype: &str,
         access: &str,
         compression: Option<&str>,
+        contiguous: bool,
     ) -> Result<PyTensor> {
         let fmt: PixelFormat = format.into();
         let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
@@ -1547,16 +1554,18 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        let dyn_tensor = match crate::tensor::parse_compression(compression)
-            .map_err(|e| Error::InvalidArg(e.to_string()))?
-        {
-            Some(request) => {
-                let desc = tensor::ImageDesc::new(width, height, fmt, dt)
-                    .with_access(acc)
-                    .with_compression(request);
-                proc.create_image_desc(&desc)?
+        let compression = crate::tensor::parse_compression(compression)
+            .map_err(|e| Error::InvalidArg(e.to_string()))?;
+        let dyn_tensor = if compression.is_some() || contiguous {
+            let mut desc = tensor::ImageDesc::new(width, height, fmt, dt)
+                .with_access(acc)
+                .with_contiguous(contiguous);
+            if let Some(request) = compression {
+                desc = desc.with_compression(request);
             }
-            None => proc.create_image(width, height, fmt, dt, None, acc)?,
+            proc.create_image_desc(&desc)?
+        } else {
+            proc.create_image(width, height, fmt, dt, None, acc)?
         };
         Ok(PyTensor(dyn_tensor))
     }

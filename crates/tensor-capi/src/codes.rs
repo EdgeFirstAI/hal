@@ -14,8 +14,8 @@
 //! silent misinterpretation at a library boundary. This is the same mechanism
 //! used for the Python bindings' discriminants.
 
-use edgefirst_tensor::{CompressionScheme, DType, TensorMemory};
-pub use edgefirst_tensor_abi::{EfCompression, EfCpuAccess, EfDtype, EfStorageKind};
+use edgefirst_tensor::{CompressionScheme, Contiguity, DType, TensorMemory};
+pub use edgefirst_tensor_abi::{EfCompression, EfContiguity, EfCpuAccess, EfDtype, EfStorageKind};
 
 /// Wire code -> validated *map direction*. `None` (0) and unknown codes are
 /// not mappable directions: the wire rule says validate the integer, never
@@ -97,6 +97,10 @@ const _: () = {
     // `zero_is_reserved_for_linear_on_both_sides` -- `from_code` is not a
     // `const fn`, so it cannot be checked here.
     assert!(EfCompression::None as u32 == 0);
+
+    assert!(EfContiguity::Unknown as u32 == Contiguity::Unknown.code());
+    assert!(EfContiguity::Contiguous as u32 == Contiguity::Contiguous.code());
+    assert!(EfContiguity::NonContiguous as u32 == Contiguity::NonContiguous.code());
 
     assert!(EfCpuAccess::None as u32 == 0);
     assert!(EfCpuAccess::Read as u32 == 1);

@@ -113,6 +113,22 @@ pub enum EfCompression {
     Dcc = 4,
 }
 
+/// Whether a tensor's memory is known to be physically contiguous
+/// (`ef_tensor_contiguity`).
+///
+/// Mirrors `edgefirst_tensor::Contiguity`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EfContiguity {
+    /// Not known: an imported fd, or memory not allocated from a DMA heap.
+    #[default]
+    Unknown = 0,
+    /// Allocated from the CMA heap.
+    Contiguous = 1,
+    /// Allocated from the system heap.
+    NonContiguous = 2,
+}
+
 /// Which *kind* of failure the calling thread's last failing
 /// `ef_tensor_*` call was.
 ///
@@ -532,6 +548,7 @@ mod tests {
     #[test]
     fn compression_is_u32_and_none_is_zero() {
         assert_eq!(std::mem::size_of::<EfCompression>(), 4);
+        assert_eq!(std::mem::size_of::<EfContiguity>(), 4);
         // `ef_tensor_compression` returns this by value, and a zeroed/failed
         // read must read as "linear", never as a scheme.
         assert_eq!(EfCompression::None as u32, 0);
