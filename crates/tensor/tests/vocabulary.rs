@@ -9,7 +9,10 @@
 //! assignment this vocabulary establishes.
 
 use edgefirst_tensor::vocabulary_demo::{demo_code, Demo};
-use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Tensor, TensorMemory};
+use edgefirst_tensor::{
+    ColorEncoding, ColorRange, ColorSpace, ColorTransfer, CpuAccess, DType, PixelFormat, Tensor,
+    TensorMemory,
+};
 
 #[test]
 fn code_and_from_code_round_trip_every_variant() {
@@ -291,6 +294,41 @@ fn every_vocabulary_variant_round_trips_through_its_wire_string() {
         TensorMemory::from_code,
         TensorMemory::as_str,
         TensorMemory::from_str_code,
+    );
+    check(
+        CpuAccess::all(),
+        CpuAccess::code,
+        CpuAccess::from_code,
+        CpuAccess::as_str,
+        CpuAccess::from_str_code,
+    );
+    check(
+        ColorSpace::all(),
+        ColorSpace::code,
+        ColorSpace::from_code,
+        ColorSpace::as_str,
+        ColorSpace::from_str_code,
+    );
+    check(
+        ColorTransfer::all(),
+        ColorTransfer::code,
+        ColorTransfer::from_code,
+        ColorTransfer::as_str,
+        ColorTransfer::from_str_code,
+    );
+    check(
+        ColorEncoding::all(),
+        ColorEncoding::code,
+        ColorEncoding::from_code,
+        ColorEncoding::as_str,
+        ColorEncoding::from_str_code,
+    );
+    check(
+        ColorRange::all(),
+        ColorRange::code,
+        ColorRange::from_code,
+        ColorRange::as_str,
+        ColorRange::from_str_code,
     );
 }
 

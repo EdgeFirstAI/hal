@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
 - **`TensorMemory::D3d11Texture` (code 6).** Names a Windows D3D11 texture specifically, as `IoSurface` does for IOSurface. No backend allocates or reports it; Windows still allocates and reports `DmaBuf`, and requesting it fails with `NotImplemented`. C: `EF_STORAGE_KIND_D3D11_TEXTURE`. Python: `TensorMemory.D3D11_TEXTURE`.
 - **`CpuAccess::code()`, `from_code()`, `as_str()` and `from_str_code()`.** `CpuAccess` is declared through the shared vocabulary like `TensorMemory`, so its codes (`None`=0, `Read`=1, `Write`=2, `ReadWrite`=3) and strings (`none`, `read`, `write`, `readwrite`) have one declaration. The C `ef_cpu_access` enumerators are checked against it at build time.
+- **`code()`, `from_code()` and `all()` on `ColorSpace`, `ColorTransfer`, `ColorEncoding` and `ColorRange`.** The four colorimetry axes are declared through the shared vocabulary, so each axis's code is the byte `Colorimetry::pack` writes and `ef_tensor_colorimetry` returns. The codes and the schema strings are unchanged.
 - **C: `ef_compression_request`.** Names the values `ef_tensor_image_desc_set_compression` takes and `ef_image_desc_view.compression` reports: `EF_COMPRESSION_REQUEST_NONE` (0), `_ANY` (1) and `_SCHEME` (2). The values are unchanged.
 
 ### Changed

@@ -579,16 +579,12 @@ impl TensorDyn {
         access: CpuAccess,
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'static>> {
-        let code = match access {
-            CpuAccess::None => {
-                return Err(Error::InvalidArgument(
-                    "map: CpuAccess::None is not a mappable direction".into(),
-                ))
-            }
-            CpuAccess::Read => 1,
-            CpuAccess::Write => 2,
-            CpuAccess::ReadWrite => 3,
-        };
+        if access == CpuAccess::None {
+            return Err(Error::InvalidArgument(
+                "map: CpuAccess::None is not a mappable direction".into(),
+            ));
+        }
+        let code = access.code();
         let mut view = edgefirst_tensor_ffi::EfTensorView {
             ptr: std::ptr::null_mut(),
             len: 0,
@@ -902,7 +898,7 @@ impl TensorDyn {
                 dtype.code(),
                 has_memory,
                 memory_code,
-                access_code(access),
+                access.code(),
             )
         };
         match NonNull::new(handle) {
@@ -939,19 +935,18 @@ impl TensorDyn {
             if let Some(m) = desc.memory() {
                 edgefirst_tensor_ffi::ef_tensor_image_desc_set_memory(d, m.code());
             }
-            edgefirst_tensor_ffi::ef_tensor_image_desc_set_access(d, access_code(desc.access()));
-            if let Some(c) = desc.compression() {
-                let code = match c {
-                    crate::Compression::Any => 1,
-                    // `Compression::Scheme(_)` has no C setter (see
-                    // `ef_tensor_image_desc_set_compression`'s own doc) --
-                    // request the closest expressible thing, "any scheme",
-                    // rather than silently dropping the request. A caller
-                    // that specifically needs a named scheme has no ABI
-                    // path to it today.
-                    crate::Compression::Scheme(_) => 1,
-                };
-                edgefirst_tensor_ffi::ef_tensor_image_desc_set_compression(d, code);
+            edgefirst_tensor_ffi::ef_tensor_image_desc_set_access(d, desc.access().code());
+            if desc.compression().is_some() {
+                // Both `Compression::Any` and `Compression::Scheme(_)` request
+                // "any scheme": `Scheme` has no C setter (see
+                // `ef_tensor_image_desc_set_compression`'s own doc), so this
+                // is the closest expressible request rather than silently
+                // dropping it. A caller that specifically needs a named
+                // scheme has no ABI path to it today.
+                edgefirst_tensor_ffi::ef_tensor_image_desc_set_compression(
+                    d,
+                    edgefirst_tensor_ffi::EfCompressionRequest::Any as u32,
+                );
             }
             if desc.contiguous() {
                 edgefirst_tensor_ffi::ef_tensor_image_desc_set_contiguous(d, 1);
@@ -990,7 +985,7 @@ impl TensorDyn {
                 row_stride_bytes,
                 has_memory,
                 memory_code,
-                access_code(access),
+                access.code(),
             )
         };
         match NonNull::new(handle) {
@@ -1447,7 +1442,7 @@ impl TensorDyn {
         // unrecognised one, so it must not warn -- it is what almost every
         // allocation on almost every platform reports.
         let scheme = crate::CompressionScheme::from_code(code);
-        if scheme.is_none() && code != 0 {
+        if scheme.is_none() && code != edgefirst_tensor_ffi::EfCompression::None as u32 {
             log::warn!(
                 "ef_tensor_compression returned scheme code {code}, which this build of \
                  edgefirst-tensor does not recognise; reporting a linear layout. The \
@@ -1503,16 +1498,12 @@ impl TensorDyn {
         // and its message -- which names "PBO" -- travels back through
         // `ffi_last_error` as a `NotImplemented`, the same error kind the
         // static backend raises.
-        let code = match access {
-            CpuAccess::None => {
-                return Err(Error::InvalidArgument(format!(
-                    "{what}: CpuAccess::None is not a sync direction"
-                )))
-            }
-            CpuAccess::Read => 1,
-            CpuAccess::Write => 2,
-            CpuAccess::ReadWrite => 3,
-        };
+        if access == CpuAccess::None {
+            return Err(Error::InvalidArgument(format!(
+                "{what}: CpuAccess::None is not a sync direction"
+            )));
+        }
+        let code = access.code();
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let rc = unsafe {
             if to_cpu {
@@ -2022,7 +2013,7 @@ impl TensorDyn {
                 dims.as_ptr(),
                 dims.len() as u32,
                 format.as_ptr(),
-                access_code(access),
+                access.code(),
                 name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
             )
         };
@@ -2070,7 +2061,7 @@ impl TensorDyn {
                 dims.as_ptr(),
                 dims.len() as u32,
                 format.as_ptr(),
-                access_code(access),
+                access.code(),
                 fence,
                 fence_value,
                 name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
@@ -2468,19 +2459,6 @@ fn memory_code(memory: Option<TensorMemory>) -> (std::ffi::c_int, u32) {
     }
 }
 
-/// Encode [`CpuAccess`] as the `ef_cpu_access` wire code, `None` included
-/// (0) -- unlike [`TensorDyn::map_pin`]'s access decode, which rejects 0 as
-/// "not a mappable direction", image allocation legitimately wants
-/// `CpuAccess::None` (e.g. a GPU-only render target).
-fn access_code(access: CpuAccess) -> u32 {
-    match access {
-        CpuAccess::None => 0,
-        CpuAccess::Read => 1,
-        CpuAccess::Write => 2,
-        CpuAccess::ReadWrite => 3,
-    }
-}
-
 /// Read the calling thread's most recent `tensor-capi` failure detail, for
 /// enriching the `Error` this backend returns on a constructor/mutator
 /// failure -- see `ef_tensor_last_error_message`'s own doc comment for the
@@ -2511,21 +2489,24 @@ fn ffi_last_error_class() -> edgefirst_tensor_ffi::EfErrorClass {
     use edgefirst_tensor_ffi::EfErrorClass as C;
     // SAFETY: a plain thread-local read on the producing side; no pointers.
     let code = unsafe { edgefirst_tensor_ffi::ef_tensor_last_error_class() };
-    match code {
-        1 => C::InvalidArgument,
-        2 => C::InvalidShape,
-        3 => C::InsufficientCapacity,
-        4 => C::BatchIndexOutOfBounds,
-        5 => C::RegionOutOfBounds,
-        6 => C::NotSupported,
-        7 => C::InvalidOperation,
-        8 => C::AllocationFailed,
-        9 => C::QuantizationInvalid,
-        // 0, and anything a newer library added that this build does not
-        // know: "no class recorded", which is exactly how an unclassified
-        // failure already reads. Never a guess at the nearest neighbour.
-        _ => C::Unspecified,
-    }
+    const CLASSES: [C; 9] = [
+        C::InvalidArgument,
+        C::InvalidShape,
+        C::InsufficientCapacity,
+        C::BatchIndexOutOfBounds,
+        C::RegionOutOfBounds,
+        C::NotSupported,
+        C::InvalidOperation,
+        C::AllocationFailed,
+        C::QuantizationInvalid,
+    ];
+    // Unspecified, and anything a newer library added that this build does
+    // not know: "no class recorded", which is exactly how an unclassified
+    // failure already reads. Never a guess at the nearest neighbour.
+    CLASSES
+        .into_iter()
+        .find(|c| *c as u32 == code)
+        .unwrap_or(C::Unspecified)
 }
 
 /// Rebuild a typed [`Error`] from the class and message the last failing
