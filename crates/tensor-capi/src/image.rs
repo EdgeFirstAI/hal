@@ -49,13 +49,7 @@ unsafe fn parse_format(f: *const c_char) -> Option<PixelFormat> {
 /// mappable direction" -- image allocation legitimately wants
 /// `CpuAccess::None`, e.g. a GPU-only render target).
 fn parse_access(access: u32) -> Option<CpuAccess> {
-    match access {
-        0 => Some(CpuAccess::None),
-        1 => Some(CpuAccess::Read),
-        2 => Some(CpuAccess::Write),
-        3 => Some(CpuAccess::ReadWrite),
-        _ => None,
-    }
+    CpuAccess::from_code(access)
 }
 
 /// Decode the `(has_memory, memory)` pair every `EfImageDescView`-adjacent

@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
   - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
   - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
+- **`TensorMemory::D3d11Texture` (code 6).** Names a Windows D3D11 texture specifically, as `IoSurface` does for IOSurface. No backend allocates or reports it; Windows still allocates and reports `DmaBuf`, and requesting it fails with `NotImplemented`. C: `EF_STORAGE_KIND_D3D11_TEXTURE`. Python: `TensorMemory.D3D11_TEXTURE`.
+- **`CpuAccess::code()`, `from_code()`, `as_str()` and `from_str_code()`.** `CpuAccess` is declared through the shared vocabulary like `TensorMemory`, so its codes (`None`=0, `Read`=1, `Write`=2, `ReadWrite`=3) and strings (`none`, `read`, `write`, `readwrite`) have one declaration. The C `ef_cpu_access` enumerators are checked against it at build time.
+- **C: `ef_compression_request`.** Names the values `ef_tensor_image_desc_set_compression` takes and `ef_image_desc_view.compression` reports: `EF_COMPRESSION_REQUEST_NONE` (0), `_ANY` (1) and `_SCHEME` (2). The values are unchanged.
+
+### Changed
+
+- **Breaking: the cross-package tensor descriptor's `kind` uses the `TensorMemory` codes, and `ABI_VERSION` is 2.** `TensorDesc::kind` had its own numbering, in which 1 meant DMA-BUF while `TensorMemory` code 1 is `Shm`. `protocol::kind` now re-exports the `TensorMemory` wire constants: `MEM`=0, `SHM`=1, `DMABUF`=2, `IOSURFACE`=3, `PBO`=4, `CUDA`=5, `D3D11_TEXTURE`=6. `kind::HOST` is replaced by `kind::MEM` and `kind::SHM`, which a producer now reports separately, and `TensorDesc::is_host()` tests for either. `kind::CUDA_DEVICE` is renamed `kind::CUDA`. A `DmaBuf` tensor still reports the concrete backing: `DMABUF` on Linux and Android, `IOSURFACE` on macOS and iOS, `D3D11_TEXTURE` on Windows. An importer refuses a version-1 descriptor, so `edgefirst.*` Python packages from this release do not exchange tensors with packages from 0.34.x or earlier. The capsule name (`edgefirst_tensor_v2`) and layout are unchanged.
+- **Breaking: `PixelFormat::to_fourcc()` returns V4L2 pixel format codes.** `Rgb` is now `RGB3` (was `RGB `), `Rgba` is `AB24` (was `RGBA`), `Bgra` is `AR24` (was `BGRA`) and `Grey` is `GREY` (was `Y800`); the YUV formats are unchanged. `from_fourcc()` accepts the new codes only. The descriptor's `fourcc` field carries the same codes. `PixelFormat`'s `Display` text is unchanged.
+- **Breaking (`edgefirst-tensor-abi`): `EfStorageKind::D3d11Texture` and `EfCompressionRequest`.** `EfStorageKind` gains a variant, which breaks an exhaustive `match` on it.
 
 ## [0.34.1] - 2026-10-07
 

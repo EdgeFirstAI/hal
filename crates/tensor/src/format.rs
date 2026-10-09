@@ -146,11 +146,19 @@ pub struct PlaneGeometry {
     pub size: u64,
 }
 
-/// FourCC code constants (V4L2/DRM compatible).
-const FOURCC_RGB: u32 = u32::from_le_bytes(*b"RGB ");
-const FOURCC_RGBA: u32 = u32::from_le_bytes(*b"RGBA");
-const FOURCC_BGRA: u32 = u32::from_le_bytes(*b"BGRA");
-const FOURCC_GREY: u32 = u32::from_le_bytes(*b"Y800");
+// V4L2 pixel format codes (`V4L2_PIX_FMT_*` from <linux/videodev2.h>),
+// stable kernel UAPI. Declared here rather than imported because this crate
+// builds on every platform and `edgefirst-v4l2` is Linux-only; the Linux
+// test `to_fourcc_matches_edgefirst_v4l2` asserts each against
+// `edgefirst_v4l2::uapi`.
+/// `V4L2_PIX_FMT_RGB24`.
+const FOURCC_RGB: u32 = u32::from_le_bytes(*b"RGB3");
+/// `V4L2_PIX_FMT_RGBA32` (bytes R, G, B, A; also DRM `ABGR8888`).
+const FOURCC_RGBA: u32 = u32::from_le_bytes(*b"AB24");
+/// `V4L2_PIX_FMT_ABGR32` (bytes B, G, R, A; also DRM `ARGB8888`).
+const FOURCC_BGRA: u32 = u32::from_le_bytes(*b"AR24");
+/// `V4L2_PIX_FMT_GREY`.
+const FOURCC_GREY: u32 = u32::from_le_bytes(*b"GREY");
 const FOURCC_YUYV: u32 = u32::from_le_bytes(*b"YUYV");
 const FOURCC_VYUY: u32 = u32::from_le_bytes(*b"VYUY");
 const FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
@@ -444,8 +452,13 @@ impl PixelFormat {
         matches!(self, Self::Rgba | Self::Bgra | Self::PlanarRgba)
     }
 
-    /// Returns the V4L2/DRM FourCC code for this format, or `0` for formats
-    /// that have no standard FourCC representation (e.g., `PlanarRgb`).
+    /// Returns the V4L2 pixel format code (`V4L2_PIX_FMT_*`) for this
+    /// format, or `0` for formats that have no V4L2 code (e.g., `PlanarRgb`).
+    ///
+    /// The codes for the four-channel and YUV formats coincide with the DRM
+    /// FourCC for the same memory layout; `Rgb` (`RGB3`) and `Grey` (`GREY`)
+    /// are V4L2-only spellings. This is not the [`PixelFormat::as_str`] wire
+    /// name, nor the [`Display`](fmt::Display) text.
     pub const fn to_fourcc(&self) -> u32 {
         match self {
             Self::Rgb => FOURCC_RGB,
@@ -461,8 +474,8 @@ impl PixelFormat {
         }
     }
 
-    /// Converts a V4L2/DRM FourCC code to a `PixelFormat`, returning `None`
-    /// for unrecognized or zero codes.
+    /// Converts a V4L2 pixel format code (see [`Self::to_fourcc`]) to a
+    /// `PixelFormat`, returning `None` for unrecognized or zero codes.
     pub const fn from_fourcc(fourcc: u32) -> Option<Self> {
         match fourcc {
             FOURCC_RGB => Some(Self::Rgb),
@@ -479,21 +492,24 @@ impl PixelFormat {
     }
 }
 
+/// Human-readable name for messages and logs. Neither the wire name
+/// ([`PixelFormat::as_str`]) nor the V4L2 code ([`PixelFormat::to_fourcc`]).
 impl fmt::Display for PixelFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let fcc = self.to_fourcc();
-        if fcc != 0 {
-            let bytes = fcc.to_le_bytes();
-            for &b in &bytes {
-                if b == b' ' {
-                    break;
-                }
-                write!(f, "{}", b as char)?;
-            }
-            Ok(())
-        } else {
-            write!(f, "{self:?}")
-        }
+        let name = match self {
+            Self::Rgb => "RGB",
+            Self::Rgba => "RGBA",
+            Self::Bgra => "BGRA",
+            Self::Grey => "Y800",
+            Self::Yuyv => "YUYV",
+            Self::Vyuy => "VYUY",
+            Self::Nv12 => "NV12",
+            Self::Nv16 => "NV16",
+            Self::Nv24 => "NV24",
+            Self::PlanarRgb => "PlanarRgb",
+            Self::PlanarRgba => "PlanarRgba",
+        };
+        f.write_str(name)
     }
 }
 
@@ -843,6 +859,34 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn to_fourcc_matches_edgefirst_v4l2() {
+        use edgefirst_v4l2::uapi;
+        let expect = [
+            (PixelFormat::Rgb, uapi::V4L2_PIX_FMT_RGB24),
+            // `edgefirst-v4l2` 0.2.1 does not declare `V4L2_PIX_FMT_RGBA32`;
+            // built with its own `fourcc` packer from the kernel's spelling.
+            (PixelFormat::Rgba, uapi::fourcc(b'A', b'B', b'2', b'4')),
+            (PixelFormat::Bgra, uapi::V4L2_PIX_FMT_ABGR32),
+            (PixelFormat::Grey, uapi::V4L2_PIX_FMT_GREY),
+            (PixelFormat::Yuyv, uapi::V4L2_PIX_FMT_YUYV),
+            (PixelFormat::Vyuy, uapi::V4L2_PIX_FMT_VYUY),
+            (PixelFormat::Nv12, uapi::V4L2_PIX_FMT_NV12),
+            (PixelFormat::Nv16, uapi::V4L2_PIX_FMT_NV16),
+            (PixelFormat::Nv24, uapi::V4L2_PIX_FMT_NV24),
+        ];
+        for (fmt, code) in expect {
+            assert_eq!(
+                fmt.to_fourcc(),
+                code,
+                "{fmt:?}: {} vs {}",
+                uapi::fourcc_str(fmt.to_fourcc()),
+                uapi::fourcc_str(code)
+            );
+        }
+    }
+
     #[test]
     fn fourcc_planar_returns_zero() {
         assert_eq!(PixelFormat::PlanarRgb.to_fourcc(), 0);
@@ -860,7 +904,8 @@ mod tests {
         assert_eq!(format!("{}", PixelFormat::Rgba), "RGBA");
         assert_eq!(format!("{}", PixelFormat::Nv12), "NV12");
         assert_eq!(format!("{}", PixelFormat::Yuyv), "YUYV");
-        // Grey uses V4L2 FourCC "Y800", not "GREY"
+        assert_eq!(format!("{}", PixelFormat::Rgb), "RGB");
+        assert_eq!(format!("{}", PixelFormat::Bgra), "BGRA");
         assert_eq!(format!("{}", PixelFormat::Grey), "Y800");
     }
 

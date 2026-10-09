@@ -36,10 +36,12 @@
 /// added both a version field *and* a new capsule name, because the field
 /// alone is unreadable until the layout is already known.
 ///
-/// This field stays useful for the case the name rule does not cover on its
-/// own: a future change to what a *same-sized, same-layout* `TensorDesc`'s
-/// fields mean. It has not needed to move past `1`.
-pub const ABI_VERSION: u32 = 1;
+/// This field covers the case the name rule does not: a change to what a
+/// *same-sized, same-layout* `TensorDesc`'s fields mean. Version `2`
+/// renumbered [`TensorDesc::kind`] onto the [`crate::TensorMemory`] codes
+/// (version `1` had its own numbering, in which `1` meant dma-buf), so a
+/// version-1 descriptor is refused rather than read with the wrong kinds.
+pub const ABI_VERSION: u32 = 2;
 
 /// Element type, as reported in [`TensorDesc::dtype`].
 ///
@@ -90,7 +92,7 @@ pub fn dtype_to_dtype(code: u32) -> Option<crate::DType> {
 /// format: `PlanarRgb`/`PlanarRgba` have no standard FourCC and both encode
 /// as `fourcc = 0`, the same sentinel a non-image tensor uses, so `fourcc`
 /// alone cannot tell "Planar RGB" apart from "no format". `fourcc` stays for
-/// third-party/DRM interop; a HAL-aware consumer prefers `format` and
+/// third-party interop; a HAL-aware consumer prefers `format` and
 /// falls back to `fourcc` only when `format` is `0`.
 ///
 /// `protocol::format` is the canonical, documented path -- the source
@@ -146,24 +148,29 @@ pub mod flags {
 }
 
 /// Backing store kind, as reported in [`TensorDesc::kind`].
-pub mod kind {
-    /// Host memory: `Mem` or `Shm`. `ptr` is valid; `handle` is -1.
-    pub const HOST: u32 = 0;
-    /// Linux dma-buf. `handle` is the fd.
-    pub const DMABUF: u32 = 1;
-    /// Apple IOSurface. `handle` is the surface id.
-    pub const IOSURFACE: u32 = 2;
-    /// OpenGL pixel buffer object. `handle` is the buffer id.
-    pub const PBO: u32 = 3;
-    /// CUDA device memory. `ptr` is a device pointer, not host-addressable.
-    pub const CUDA_DEVICE: u32 = 4;
-    /// Windows D3D11 texture. `handle` is the texture's NT shared handle and
-    /// `ptr` the device fence's NT shared handle, both valid in the producing
-    /// process (other modules of the same process included); `sync` is the
-    /// fence value of the last recorded GPU write when `SYNC_PRESENT` is set.
-    /// The `ptr` reuse follows `PBO`'s vtable precedent.
-    pub const D3D11_TEXTURE: u32 = 5;
-}
+///
+/// These are the [`crate::TensorMemory`] codes, re-exported from the wire
+/// module that `TensorMemory` itself generates (via `ef_vocabulary!`, see
+/// `vocabulary.rs`), so a descriptor's `kind` and
+/// [`crate::TensorMemory::code`] are one numbering: `DMABUF` is `2` on every
+/// surface. What each kind means for the descriptor's fields:
+///
+/// * `MEM`, `SHM` -- host memory. `ptr` is valid; `handle` is -1. An
+///   importer treats both the same way (see [`TensorDesc::is_host`]).
+/// * `DMABUF` -- Linux dma-buf. `handle` is the fd.
+/// * `IOSURFACE` -- Apple IOSurface. `handle` is the surface id. A macOS/iOS
+///   producer reports this for its `DmaBuf`-spelled tensors.
+/// * `PBO` -- OpenGL pixel buffer object. `handle` is the buffer id.
+/// * `CUDA` -- CUDA device memory. `ptr` is a device pointer, not
+///   host-addressable.
+/// * `D3D11_TEXTURE` -- Windows D3D11 texture. `handle` is the texture's NT
+///   shared handle and `ptr` the device fence's NT shared handle, both valid
+///   in the producing process (other modules of the same process included);
+///   `sync` is the fence value of the last recorded GPU write when
+///   `SYNC_PRESENT` is set. The `ptr` reuse follows `PBO`'s vtable
+///   precedent. A Windows producer reports this for its `DmaBuf`-spelled
+///   tensors.
+pub use crate::tensor_memory_wire as kind;
 
 /// A raw pointer that may cross a `PyCapsule`.
 ///
@@ -198,7 +205,8 @@ impl SendPtr {
 pub struct TensorDesc {
     /// [`ABI_VERSION`]. Checked, never assumed.
     pub version: u32,
-    /// One of the [`kind`] constants.
+    /// One of the [`mod@kind`] codes, which are the [`crate::TensorMemory`]
+    /// codes.
     pub kind: u32,
     /// dma-buf fd, IOSurface id, GL buffer id or D3D11 texture NT handle
     /// value; `-1` when unused.
@@ -238,8 +246,9 @@ pub struct TensorDesc {
     /// (and a sub-byte dtype has no element size to divide by). Multiply a
     /// coordinate by the stride directly; do not scale by `dtype` size.
     pub strides: [i64; 8],
-    /// DRM FourCC of the pixel format, or 0 for a non-image tensor. Kept for
-    /// third-party/DRM interop; a HAL-aware consumer should prefer
+    /// V4L2 pixel format code ([`crate::PixelFormat::to_fourcc`]) of the
+    /// pixel format, or 0 for a non-image tensor or a format with no V4L2
+    /// code. Kept for third-party interop; a HAL-aware consumer should prefer
     /// [`Self::format`] and fall back to this only when `format` is 0
     /// (see [`mod@format`]'s doc for why `fourcc` alone is insufficient).
     pub fourcc: u32,
@@ -258,7 +267,7 @@ pub struct TensorDesc {
     /// `shape`/`strides` imply when the producer over-allocated: a pool
     /// tensor sized for its largest expected image but holding a smaller
     /// one today, or row-pitch/MCU-alignment padding a decoder needs beyond
-    /// the logical width. Without this, a consumer importing a `HOST`
+    /// the logical width. Without this, a consumer importing a host-memory
     /// descriptor has no way to learn that headroom exists and must treat
     /// the declared shape as the allocation's exact size -- which starves a
     /// later `configure_image`/`set_logical_shape` of capacity the producer
@@ -286,18 +295,24 @@ pub struct TensorDesc {
     ///   close it.
     /// * [`kind::PBO`] -- a `GLsync` from `glFenceSync`, valid only in the
     ///   producer's share group.
-    /// * [`kind::CUDA_DEVICE`] -- a `cudaEvent_t`.
+    /// * [`kind::CUDA`] -- a `cudaEvent_t`.
     /// * [`kind::D3D11_TEXTURE`] -- a value on the timeline of the
     ///   `ID3D11Fence` [`Self::ptr`] names, not a handle of its own: the
     ///   handle and the value together are what a consumer waits on.
-    /// * [`kind::HOST`], [`kind::IOSURFACE`] -- no fence flavour defined;
-    ///   `SYNC_PRESENT` must be clear.
+    /// * [`kind::MEM`], [`kind::SHM`], [`kind::IOSURFACE`] -- no fence
+    ///   flavour defined; `SYNC_PRESENT` must be clear.
     pub sync: u64,
 }
 
 impl TensorDesc {
     /// Maximum rank the fixed-size `shape`/`strides` arrays can carry.
     pub const MAX_NDIM: usize = 8;
+
+    /// True when [`Self::kind`] is a host-memory kind ([`kind::MEM`] or
+    /// [`kind::SHM`]): `ptr` is a host address and `handle` is unused.
+    pub fn is_host(&self) -> bool {
+        matches!(self.kind, kind::MEM | kind::SHM)
+    }
 
     /// The logical shape as a slice.
     pub fn shape(&self) -> &[u64] {
@@ -326,31 +341,19 @@ impl TensorDesc {
 
 use crate::TensorMemory;
 
-/// Map a backing store to its [`kind`] constant.
+/// Map a backing store to its [`kind`] code.
 ///
-/// `TensorMemory::DmaBuf` is a deliberately shared discriminant covering DMA-BUF,
-/// IOSurface and AHardwareBuffer (it is ABI-stable across platforms), so the
-/// platform decides which protocol kind it reports.
+/// The identity on [`TensorMemory::code`] except for `DmaBuf`, which is the
+/// portable spelling of "platform-native zero-copy GPU buffer": the
+/// descriptor names the concrete backing, because its `handle` field means
+/// something different for each (an fd, an IOSurface id, an NT handle).
 pub(crate) fn kind_of(memory: TensorMemory) -> u32 {
     match memory {
-        // Both are a host-addressable pointer with no handle, which is all
-        // `kind` records -- it is a narrower vocabulary than `TensorMemory`
-        // on purpose, not a copy of it that lost a variant.
-        TensorMemory::Mem | TensorMemory::Shm => kind::HOST,
-        TensorMemory::Pbo => kind::PBO,
-        TensorMemory::Cuda => kind::CUDA_DEVICE,
-        // Named specifically rather than through `DmaBuf`. Unreachable
-        // today (no backend reports it) but correct the day one does, which
-        // is cheaper than the panic the obvious `unreachable!()` becomes.
-        TensorMemory::IoSurface => kind::IOSURFACE,
         TensorMemory::DmaBuf => {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 kind::IOSURFACE
             }
-            // Windows has no dma-buf: the shared `DmaBuf` discriminant is a
-            // D3D11 texture there, whose handle field means something else
-            // again (an NT handle, not an fd).
             #[cfg(target_os = "windows")]
             {
                 kind::D3D11_TEXTURE
@@ -360,6 +363,7 @@ pub(crate) fn kind_of(memory: TensorMemory) -> u32 {
                 kind::DMABUF
             }
         }
+        other => other.code(),
     }
 }
 
@@ -430,7 +434,7 @@ pub(crate) fn descriptor_surface_id(desc: &TensorDesc) -> crate::Result<u32> {
     })
 }
 
-/// Refuse a `kind::HOST` descriptor that carries no address.
+/// Refuse a host-memory (`kind::MEM`/`kind::SHM`) descriptor that carries no address.
 ///
 /// # Errors
 ///
@@ -675,7 +679,8 @@ pub(crate) struct DescParts<'a, 'p> {
     pub dims: &'a [usize],
     pub memory: TensorMemory,
     pub dtype: crate::DType,
-    /// DRM FourCC for [`TensorDesc::fourcc`]; 0 when the format has none.
+    /// V4L2 pixel format code for [`TensorDesc::fourcc`]; 0 when the format
+    /// has none.
     pub fourcc: u32,
     /// The HAL format, source for both the row-dimension decision below and
     /// [`TensorDesc::format`] (via [`format_of`]).

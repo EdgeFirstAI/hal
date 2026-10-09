@@ -1237,31 +1237,40 @@ pub(crate) fn assert_map_writable(writable: bool, backend: &str) {
     );
 }
 
-/// Declared CPU involvement for an image tensor, chosen at allocation.
-///
-/// The HAL assumes buffers are produced and consumed by hardware (ISP,
-/// codec, GPU, NPU) — hardware access needs no declaration. CPU access is
-/// the opt-in: it selects the CPU usage/mapping mode at allocation
-/// (write-combined for `Write`, cached for `Read`) and, on Android, pins
-/// the layout linear (vendor tile compression requires `None`).
-///
-/// Mapping beyond the declared access is best-effort, never silent: it
-/// may be refused ([`Error::NotImplemented`]) or take a slow path, and it
-/// always increments [`unplanned_cpu_access_count`] with a once-per-buffer
-/// warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CpuAccess {
-    /// Hardware-only buffer (the default): no CPU mapping declared.
-    /// Compression-eligible on platforms with vendor tile layouts.
-    #[default]
-    None,
-    /// CPU reads (verification, CPU consumers) — cached mapping.
-    Read,
-    /// CPU writes (decode targets) — write-combined mapping where the
-    /// platform supports it; reading through a `Write` map is undeclared.
-    Write,
-    /// CPU reads and writes — the pre-CpuAccess implicit behavior.
-    ReadWrite,
+crate::ef_vocabulary! {
+    /// Declared CPU involvement for an image tensor, chosen at allocation.
+    ///
+    /// The HAL assumes buffers are produced and consumed by hardware (ISP,
+    /// codec, GPU, NPU) — hardware access needs no declaration. CPU access is
+    /// the opt-in: it selects the CPU usage/mapping mode at allocation
+    /// (write-combined for `Write`, cached for `Read`) and, on Android, pins
+    /// the layout linear (vendor tile compression requires `None`).
+    ///
+    /// Mapping beyond the declared access is best-effort, never silent: it
+    /// may be refused ([`Error::NotImplemented`]) or take a slow path, and it
+    /// always increments [`unplanned_cpu_access_count`] with a once-per-buffer
+    /// warning.
+    ///
+    /// [`CpuAccess::code`] is the wire code the C header's `ef_cpu_access`
+    /// enumerators are asserted against.
+    #[derive(Default)]
+    pub enum CpuAccess {
+        /// Hardware-only buffer (the default): no CPU mapping declared.
+        /// Compression-eligible on platforms with vendor tile layouts.
+        #[default]
+        None = 0, "none", NONE,
+        /// CPU reads (verification, CPU consumers) — cached mapping.
+        Read = 1, "read", READ,
+        /// CPU writes (decode targets) — write-combined mapping where the
+        /// platform supports it; reading through a `Write` map is undeclared.
+        Write = 2, "write", WRITE,
+        /// CPU reads and writes — the pre-CpuAccess implicit behavior.
+        ReadWrite = 3, "readwrite", READ_WRITE,
+    }
+    // `#[doc(hidden)]` for the same reason `dtype_wire` is: emission
+    // plumbing for `const`-only consumers, not a second documented API.
+    #[doc(hidden)]
+    pub mod cpu_access_wire;
 }
 
 impl CpuAccess {
@@ -2052,24 +2061,12 @@ where
     }
 }
 
-// Declared through `ef_vocabulary!` (see `vocabulary.rs`). Before this, the
-// same four backings were numbered three different ways -- Rust's implicit
-// discriminants (`Dma=0, Shm=1, Mem=2, Pbo=3`), the C ABI's
-// `hal_tensor_memory` (`MEM=0, DMA=1, SHM=2, PBO=3`), and Python's
-// `PyTensorMemory`, which had no explicit discriminants at all and a
-// `#[cfg(unix)]` variant in the middle of the list, so its numbering
-// depended on the target OS. The canonical assignment below is the one all
-// of them converge on; `hal_tensor_memory` is the single explicitly-mapped
-// outlier that keeps its own released values (see `to_hal_tensor_memory` in
-// the capi crate).
-//
-// Note this is NOT `protocol::kind`, which is a genuinely different
-// vocabulary and stays so: `kind` describes what a `TensorDesc`'s `handle`
-// and `ptr` fields MEAN to an importer, and both `Mem` and `Shm` mean the
-// same thing there (`kind::HOST`, host-addressable pointer, no handle). A
-// vocabulary that collapses two variants into one cannot also be the
-// vocabulary that distinguishes them. `kind_of()` in `protocol.rs` is the
-// mapping between them.
+// Declared through `ef_vocabulary!` (see `vocabulary.rs`). These codes are
+// the single numbering of backing stores across the stack: `code()`, the
+// `tensor_memory_wire` constants, the C header's `ef_storage_kind`, the
+// Python `TensorMemory` enum and the cross-package descriptor's
+// `TensorDesc::kind` (`protocol::kind` re-exports `tensor_memory_wire`) all
+// read the same declared literal per variant.
 crate::ef_vocabulary! {
     /// Which memory backend a tensor is (or should be) allocated from.
     ///
@@ -2122,10 +2119,10 @@ crate::ef_vocabulary! {
         /// `crates/tensor/src/dma.rs`) allocated via the DRM/dma-heap
         /// subsystem. On macOS/iOS it is currently also this variant that
         /// yields an IOSurface, and on Android an AHardwareBuffer: they
-        /// share the `TensorStorage::Dma` slot at the trait level, and the
-        /// public C API discriminant (`HAL_TENSOR_MEMORY_DMA = 1`) covers
-        /// all three with no ABI break. `IoSurface` below is the code for
-        /// naming that backing specifically; no backend reports it yet.
+        /// share the `TensorStorage::Dma` slot at the trait level, so the
+        /// one code covers all of them. `IoSurface` and `D3d11Texture`
+        /// below are the codes for naming those backings specifically; no
+        /// backend reports either as its `memory()` yet.
         ///
         /// Allows hardware-accelerated paths (OpenGL backend on Linux via
         /// `EGL_EXT_image_dma_buf_import`; macOS via
@@ -2159,6 +2156,17 @@ crate::ef_vocabulary! {
         /// backend produces or accepts it yet**; pinning a request to it
         /// fails with `NotImplemented`.
         Cuda = 5, "cuda", CUDA,
+        /// Windows `ID3D11Texture2D`, named specifically rather than through
+        /// the portable `DmaBuf` spelling.
+        ///
+        /// This is the code a Windows producer writes into
+        /// [`TensorDesc::kind`](crate::TensorDesc::kind), where the handle
+        /// field means an NT shared handle rather than an fd. As a
+        /// [`TensorMemory`] it is defined for the same reason as
+        /// `IoSurface`: **no backend allocates or reports it** -- Windows
+        /// allocates and reports `DmaBuf` -- and pinning a request to it
+        /// fails with `NotImplemented`.
+        D3d11Texture = 6, "d3d11", D3D11_TEXTURE,
     }
     // `#[doc(hidden)]`: `pub` so the const-only form is reachable by an FFI
     // or cbindgen consumer, but it is emission plumbing rather than a second
@@ -2184,7 +2192,7 @@ impl TensorMemory {
     /// point of the vocabulary), and the ones this build cannot serve say so
     /// here rather than by being absent from the enum.
     ///
-    /// Three variants answer `false` unconditionally today, for reasons
+    /// Four variants answer `false` unconditionally today, for reasons
     /// worth stating rather than hiding behind a probe that cannot fail:
     ///
     /// * `IoSurface` -- no backend produces or accepts it yet; macOS/iOS
@@ -2197,6 +2205,8 @@ impl TensorMemory {
     /// * `Cuda` -- there is no CUDA backing in this crate at all. Probing
     ///   for `libcuda` would answer `true` on a Jetson while every
     ///   allocation still failed, which is worse than answering `false`.
+    /// * `D3d11Texture` -- same as `IoSurface`: Windows serves D3D11
+    ///   textures under the `DmaBuf` spelling.
     ///
     /// One variant answers `true` for a narrower constructor than the rest:
     /// on Windows `DmaBuf` is an `ID3D11Texture2D`, which is image-formatted,
@@ -2215,7 +2225,10 @@ impl TensorMemory {
             // answers for it -- true on macOS/iOS (IOSurface) and Android
             // (AHardwareBuffer) as well as Linux.
             TensorMemory::DmaBuf => is_gpu_buffer_available(),
-            TensorMemory::IoSurface | TensorMemory::Pbo | TensorMemory::Cuda => false,
+            TensorMemory::IoSurface
+            | TensorMemory::Pbo
+            | TensorMemory::Cuda
+            | TensorMemory::D3d11Texture => false,
         }
     }
 
@@ -2252,6 +2265,10 @@ impl TensorMemory {
                  context current, never by Tensor::new"
             }
             TensorMemory::Cuda => "there is no CUDA backing in this build",
+            TensorMemory::D3d11Texture => {
+                "no backend produces or accepts a D3D11 texture under its own code yet -- \
+                 Windows allocates and reports TensorMemory::DmaBuf"
+            }
         };
         Error::NotImplemented(format!(
             "TensorMemory::{self:?} is not supported by this build: {reason}"
@@ -2419,7 +2436,9 @@ where
             )),
             // Defined codes with no backing behind them yet. An error, not
             // an `unreachable!()` -- see `unsupported_here`.
-            Some(m @ (TensorMemory::IoSurface | TensorMemory::Cuda)) => Err(m.unsupported_here()),
+            Some(
+                m @ (TensorMemory::IoSurface | TensorMemory::Cuda | TensorMemory::D3d11Texture),
+            ) => Err(m.unsupported_here()),
             None => {
                 if std::env::var("EDGEFIRST_TENSOR_FORCE_MEM")
                     .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
@@ -7225,6 +7244,7 @@ mod vocabulary_and_probe_tests {
         assert!(!TensorMemory::IoSurface.is_available());
         assert!(!TensorMemory::Pbo.is_available());
         assert!(!TensorMemory::Cuda.is_available());
+        assert!(!TensorMemory::D3d11Texture.is_available());
         #[cfg(unix)]
         assert_eq!(
             TensorMemory::Shm.is_available(),

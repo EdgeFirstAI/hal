@@ -75,8 +75,8 @@ quantization makes a consumer *refuse* the tensor, whereas a dropped plane
 offset makes it silently convert the parent buffer's origin instead of the
 requested sub-region.
 
-The consumer applies it only to a **handle-based** import. Under
-`kind::HOST` the descriptor's `ptr` is the producer's pinned address for the
+The consumer applies it only to a **handle-based** import. Under the host
+kinds (`kind::MEM`, `kind::SHM`) the descriptor's `ptr` is the producer's pinned address for the
 view itself, so the offset is already in it and re-applying it would advance
 past the sub-region a second time. `DMABUF` (dup's the fd), `IOSURFACE`
 (looks the surface up by id), `D3D11_TEXTURE` (opens the NT handle) and
@@ -132,7 +132,7 @@ is still in the pitch, so dividing by that stride would name a different
 row.
 
 The other backings are not silently affected: `Mem`/`Shm` report
-`kind::HOST` and take the pinned-pointer path; Android reports
+`kind::MEM`/`kind::SHM` and take the pinned-pointer path; Android reports
 `kind::DMABUF` whose import arm is Linux-only, so it fails loudly instead of
 reconstructing; and a `view()` of a PBO-backed image now stays PBO-backed,
 so it does reach the PBO arm and carries its own offset (it used to demote
@@ -218,17 +218,24 @@ The descriptor's `kind` says what backs the tensor, and it is what decides how
 to read `handle`, `ptr` and `sync`. A consumer that does not recognize a kind
 must refuse the tensor rather than guess.
 
+The kind codes are the `TensorMemory` codes (`TensorMemory::code()`, the C
+header's `ef_storage_kind`), re-exported as `protocol::kind`, so one integer
+names one backing on every surface. A producer reports the concrete backing:
+a `TensorMemory::DmaBuf` tensor is `DMABUF` on Linux and Android, `IOSURFACE`
+on macOS/iOS and `D3D11_TEXTURE` on Windows.
+
 `sync` is meaningful only when the `SYNC_PRESENT` flag is set, and its
 flavour is keyed by kind as well.
 
 | `kind` | Backing | `handle` | `ptr` | `sync` flavour |
 |---|---|---|---|---|
-| `HOST` (0) | `Mem` or `Shm` | `-1` | host address when pinned, else null | none defined; `SYNC_PRESENT` must be clear |
-| `DMABUF` (1) | Linux dma-buf | the fd | host address when pinned, else null | a `sync_file` fd the consumer closes |
-| `IOSURFACE` (2) | Apple IOSurface | the surface id | host address when pinned, else null | none defined; `SYNC_PRESENT` must be clear |
-| `PBO` (3) | OpenGL pixel buffer object | the buffer id | `*const PboOpsVtable`, or null | a `GLsync`, valid only in the producer's share group |
-| `CUDA_DEVICE` (4) | CUDA device memory | `-1` | device pointer, not host-addressable | a `cudaEvent_t` |
-| `D3D11_TEXTURE` (5) | Windows `ID3D11Texture2D` | the texture's NT shared handle | the device fence's NT shared handle, or null | a fence value, the last recorded GPU write |
+| `MEM` (0) | heap memory | `-1` | host address when pinned, else null | none defined; `SYNC_PRESENT` must be clear |
+| `SHM` (1) | POSIX shared memory | `-1` | host address when pinned, else null | none defined; `SYNC_PRESENT` must be clear |
+| `DMABUF` (2) | Linux dma-buf | the fd | host address when pinned, else null | a `sync_file` fd the consumer closes |
+| `IOSURFACE` (3) | Apple IOSurface | the surface id | host address when pinned, else null | none defined; `SYNC_PRESENT` must be clear |
+| `PBO` (4) | OpenGL pixel buffer object | the buffer id | `*const PboOpsVtable`, or null | a `GLsync`, valid only in the producer's share group |
+| `CUDA` (5) | CUDA device memory | `-1` | device pointer, not host-addressable | a `cudaEvent_t` |
+| `D3D11_TEXTURE` (6) | Windows `ID3D11Texture2D` | the texture's NT shared handle | the device fence's NT shared handle, or null | a fence value, the last recorded GPU write |
 
 `D3D11_TEXTURE` is the first kind anything actually produces `sync` for, and it
 produces a **value on a timeline** rather than a handle: the fence it names is
@@ -418,14 +425,18 @@ capsule name with it (`edgefirst_tensor_v3`). That retirement is **out of
 0.32.0**: 0.31.0 already shipped `_v2`, and 0.32.0 must not grow
 `PboOpsVtable` or drop `pbo_keepalive`.
 
-The descriptor's own `version` field is `ABI_VERSION` (currently `1`,
+The descriptor's own `version` field is `ABI_VERSION` (currently `2`,
 checked by `TensorDyn::import_descriptor` in
 `crates/tensor/src/tensor_dyn.rs`), and it is the second line of defense,
 not the first: it covers a hypothetical future change to what a same-sized
 `TensorDesc`'s fields *mean*, which a name bump does not imply by itself.
 Any change to the layout — a new field, a reordering, a size change — goes
 to `edgefirst_tensor_v3` in the same commit that makes it, not as a
-follow-up. `TensorCapsulePayload`'s `#[repr(C)]` prefix
+follow-up. Version `2` is such a change of meaning: it renumbered `kind` onto
+the `TensorMemory` codes (version `1` numbered `HOST=0, DMABUF=1,
+IOSURFACE=2, PBO=3, CUDA_DEVICE=4, D3D11_TEXTURE=5`). The layout did not move,
+so the capsule name stays `edgefirst_tensor_v2`, and a consumer refuses a
+version-1 descriptor instead of reading its kinds with the new numbering. `TensorCapsulePayload`'s `#[repr(C)]` prefix
 (`desc` + `quant` + `plane_offset`) is pinned by a `const` assertion in
 `interop.rs` so the rename is not left to memory;
 `crates/tensor/tests/protocol.rs` pins `TensorDesc` alone, which is only

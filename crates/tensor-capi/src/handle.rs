@@ -711,7 +711,7 @@ pub unsafe extern "C" fn ef_tensor_name(t: *const EfTensor) -> *mut c_char {
 
 /// Wrap a caller-owned host allocation as a tensor, aliasing it rather than
 /// copying or owning it -- the consumer half of the cross-package capsule
-/// protocol's `HOST` kind.
+/// protocol's host-memory kinds (`MEM`, `SHM`).
 ///
 /// `capacity` is the producer's real allocation size, which is `>=` the
 /// tight footprint `dims` implies: a pool tensor, or one padded to a

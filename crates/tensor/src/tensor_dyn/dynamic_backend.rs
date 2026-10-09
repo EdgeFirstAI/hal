@@ -1866,7 +1866,8 @@ impl TensorDyn {
 
     /// Wrap a producer's host pointer as a type-erased tensor without
     /// copying, aliasing rather than owning it -- the consumer half of the
-    /// capsule protocol's [`crate::protocol::kind::HOST`].
+    /// capsule protocol's host-memory kinds ([`crate::protocol::kind::MEM`],
+    /// [`crate::protocol::kind::SHM`]).
     ///
     /// Drives `ef_tensor_wrap_host`. Not expressible over the builder the
     /// way [`Self::from_fd`] is: `ef_tensor_builder_add_plane` takes a
@@ -2159,7 +2160,7 @@ impl TensorDyn {
             crate::protocol::kind::IOSURFACE => Err(Error::NotImplemented(
                 "IOSurface import off Apple platforms".into(),
             )),
-            crate::protocol::kind::HOST => {
+            crate::protocol::kind::MEM | crate::protocol::kind::SHM => {
                 crate::protocol::check_descriptor_host_ptr(desc)?;
                 // SAFETY: the caller guarantees the producer's keepalive
                 // outlives the returned tensor -- that is the capsule
@@ -2459,7 +2460,7 @@ fn allocation_dims(
 /// Encode `Option<TensorMemory>` as the `(has_memory, memory)` pair every
 /// `ef_tensor_image_*` constructor takes -- 0/0 for "auto-select", matching
 /// `ef_tensor_image_desc_view`'s own `has_memory` convention rather than a
-/// sentinel code (every `ef_storage_kind` value 0..=5 is real).
+/// sentinel code (every `ef_storage_kind` value 0..=6 is real).
 fn memory_code(memory: Option<TensorMemory>) -> (std::ffi::c_int, u32) {
     match memory {
         Some(m) => (1, m.code()),

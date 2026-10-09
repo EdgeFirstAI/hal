@@ -11,7 +11,10 @@
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
-// V4L2 UAPI constants (stable kernel ABI) — mirrored from <linux/videodev2.h>.
+// V4L2 UAPI constants (stable kernel ABI) from <linux/videodev2.h>. Declared
+// here because this crate builds on every platform and `edgefirst-v4l2` is
+// Linux-only; `v4l2_uapi_tests` below asserts each against
+// `edgefirst_v4l2::uapi` on Linux.
 const V4L2_COLORSPACE_SMPTE170M: u32 = 1;
 const V4L2_COLORSPACE_REC709: u32 = 3;
 const V4L2_COLORSPACE_470_SYSTEM_M: u32 = 5;
@@ -898,5 +901,77 @@ mod tests {
                 "colorspace {colorspace}"
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod v4l2_uapi_tests {
+    use edgefirst_v4l2::uapi;
+
+    #[test]
+    fn colorimetry_constants_match_edgefirst_v4l2() {
+        assert_eq!(
+            super::V4L2_COLORSPACE_SMPTE170M,
+            uapi::V4L2_COLORSPACE_SMPTE170M
+        );
+        assert_eq!(super::V4L2_COLORSPACE_REC709, uapi::V4L2_COLORSPACE_REC709);
+        assert_eq!(
+            super::V4L2_COLORSPACE_470_SYSTEM_M,
+            uapi::V4L2_COLORSPACE_470_SYSTEM_M
+        );
+        assert_eq!(
+            super::V4L2_COLORSPACE_470_SYSTEM_BG,
+            uapi::V4L2_COLORSPACE_470_SYSTEM_BG
+        );
+        assert_eq!(super::V4L2_COLORSPACE_JPEG, uapi::V4L2_COLORSPACE_JPEG);
+        assert_eq!(super::V4L2_COLORSPACE_SRGB, uapi::V4L2_COLORSPACE_SRGB);
+        assert_eq!(super::V4L2_COLORSPACE_BT2020, uapi::V4L2_COLORSPACE_BT2020);
+
+        assert_eq!(
+            super::V4L2_XFER_FUNC_709,
+            u32::from(uapi::V4L2_XFER_FUNC_709)
+        );
+        assert_eq!(
+            super::V4L2_XFER_FUNC_SRGB,
+            u32::from(uapi::V4L2_XFER_FUNC_SRGB)
+        );
+        assert_eq!(
+            super::V4L2_XFER_FUNC_NONE,
+            u32::from(uapi::V4L2_XFER_FUNC_NONE)
+        );
+        assert_eq!(
+            super::V4L2_XFER_FUNC_SMPTE2084,
+            u32::from(uapi::V4L2_XFER_FUNC_SMPTE2084)
+        );
+
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_DEFAULT,
+            u32::from(uapi::V4L2_YCBCR_ENC_DEFAULT)
+        );
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_601,
+            u32::from(uapi::V4L2_YCBCR_ENC_601)
+        );
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_709,
+            u32::from(uapi::V4L2_YCBCR_ENC_709)
+        );
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_BT2020,
+            u32::from(uapi::V4L2_YCBCR_ENC_BT2020)
+        );
+
+        assert_eq!(
+            super::V4L2_QUANTIZATION_DEFAULT,
+            u32::from(uapi::V4L2_QUANTIZATION_DEFAULT)
+        );
+        assert_eq!(
+            super::V4L2_QUANTIZATION_FULL_RANGE,
+            u32::from(uapi::V4L2_QUANTIZATION_FULL_RANGE)
+        );
+        assert_eq!(
+            super::V4L2_QUANTIZATION_LIM_RANGE,
+            u32::from(uapi::V4L2_QUANTIZATION_LIM_RANGE)
+        );
     }
 }

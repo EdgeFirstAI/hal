@@ -17,7 +17,8 @@ use edgefirst_tensor::{
 };
 use edgefirst_tensor_ffi::EfTensor;
 use edgefirst_tensor_ffi::{
-    ef_tensor_image_desc_contiguous, ef_tensor_image_desc_get, EfImageDescView, EfTensorImageDesc,
+    ef_tensor_image_desc_contiguous, ef_tensor_image_desc_get, EfCompressionRequest,
+    EfImageDescView, EfTensorImageDesc,
 };
 
 /// An opaque image processor.
@@ -130,14 +131,14 @@ fn image_desc_from_view(v: &EfImageDescView) -> Option<ImageDesc> {
         desc = desc.with_memory(Some(TensorMemory::from_code(v.memory)?));
     }
     if v.has_compression != 0 {
-        // 1 = `Any`, the only compression request any `ef_tensor_image_desc_set_*`
-        // entry point can create; 2 ("a specific vendor scheme") has no
+        // `Any` is the only compression request any `ef_tensor_image_desc_set_*`
+        // entry point can create; `Scheme` ("a specific vendor scheme") has no
         // decodable detail behind it here, so it is refused rather than
         // silently downgraded to `Any` or dropped.
-        match v.compression {
-            1 => desc = desc.with_compression(Compression::Any),
-            _ => return None,
+        if v.compression != EfCompressionRequest::Any as u32 {
+            return None;
         }
+        desc = desc.with_compression(Compression::Any);
     }
     Some(desc)
 }
@@ -184,19 +185,9 @@ pub unsafe extern "C" fn ef_image_processor_create_image_desc(
     }
 }
 
-/// Map a `CpuAccess` code.
-///
-/// Hand-mapped rather than derived: `CpuAccess` has no shared `code()` in the
-/// vocabulary macro, so this is the one place the numbering is asserted. The
-/// test below pins it.
+/// Map a `CpuAccess` code, `None` (0) included.
 pub(crate) fn cpu_access_from_code(code: u32) -> Option<CpuAccess> {
-    match code {
-        0 => Some(CpuAccess::None),
-        1 => Some(CpuAccess::Read),
-        2 => Some(CpuAccess::Write),
-        3 => Some(CpuAccess::ReadWrite),
-        _ => None,
-    }
+    CpuAccess::from_code(code)
 }
 
 /// Borrow the `TensorDyn` behind a handle without taking ownership of it.
@@ -877,13 +868,10 @@ mod tests {
 
     #[test]
     fn the_cpu_access_codes_match_the_rust_enum() {
-        // The one vocabulary here without a shared `code()`, so it is the one
-        // that can silently drift. Ordering is the enum's declaration order.
-        assert_eq!(cpu_access_from_code(0), Some(CpuAccess::None));
-        assert_eq!(cpu_access_from_code(1), Some(CpuAccess::Read));
-        assert_eq!(cpu_access_from_code(2), Some(CpuAccess::Write));
-        assert_eq!(cpu_access_from_code(3), Some(CpuAccess::ReadWrite));
-        assert_eq!(cpu_access_from_code(4), None);
+        for &a in CpuAccess::all() {
+            assert_eq!(cpu_access_from_code(a.code()), Some(a));
+        }
+        assert_eq!(cpu_access_from_code(CpuAccess::all().len() as u32), None);
     }
 
     /// A view with every field away from its default -- 64x48 NV12 U8,
@@ -894,10 +882,10 @@ mod tests {
             height: 48,
             format: PixelFormat::Nv12.code(),
             dtype: DType::U8.code(),
-            access: 3, // ReadWrite
-            memory: 1, // Shm
+            access: CpuAccess::ReadWrite.code(),
+            memory: TensorMemory::Shm.code(),
             has_memory: 1,
-            compression: 1, // Any
+            compression: EfCompressionRequest::Any as u32,
             has_compression: 1,
         }
     }
@@ -960,12 +948,12 @@ mod tests {
 
     #[test]
     fn a_specific_compression_scheme_is_refused_here_too() {
-        // Code 2 ("a specific vendor scheme") is a real state
+        // `Scheme` ("a specific vendor scheme") is a real state
         // `ef_tensor_image_desc_get` can report, but no C setter can ever
         // request one, so there is nothing to reconstruct -- refused, same
         // as an unrecognized code, not silently treated as `Any`.
         let mut v = full_view();
-        v.compression = 2;
+        v.compression = EfCompressionRequest::Scheme as u32;
         assert!(image_desc_from_view(&v).is_none());
     }
 

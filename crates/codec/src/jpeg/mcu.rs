@@ -1698,7 +1698,7 @@ mod tests {
     /// (coco_420_odd.jpg, 500×375 NV12) is what the reported bug panicked
     /// on: `dst[504..500]` (`cols` underflowed, then wrapped back into a
     /// deceptively small-looking but inverted range) -- reachable from
-    /// Python via `decode_into` on a `HOST` import whose capacity/stride
+    /// Python via `decode_into` on a host-memory import whose capacity/stride
     /// didn't survive the cross-package round trip (the other half of
     /// defect B, fixed in `edgefirst_tensor::protocol`/`import_descriptor`).
     ///

@@ -1635,7 +1635,7 @@ fn cuda_map_is_none_without_a_handle_and_maps_with_one() {
 /// instead understates the allocation, which clamps a `kind::PBO`
 /// descriptor's `capacity` and leaves a consumer's re-import mapping only
 /// part of the buffer -- the same pool-reuse breakage already fixed for
-/// `kind::HOST`.
+/// the host kinds (`kind::MEM`, `kind::SHM`).
 ///
 /// Every production caller happens to size a PBO to match its shape today
 /// (`edgefirst-image`'s `gl/threaded.rs`), so nothing else in the tree can

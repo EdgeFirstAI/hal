@@ -453,11 +453,9 @@ pub fn region_offsets(h: &BlobHeader) -> Result<Regions, BlobError> {
 
 /// The blob's five strings, borrowed from the buffer.
 ///
-/// Strings rather than enum codes, matching `Tensor.msg` exactly. This
-/// permanently avoids the mirrored-enum bug class already seen in this repo,
-/// where `TensorMemory.MEM == 3` in Python collided with
-/// `HAL_TENSOR_MEMORY_PBO == 3` in C: a string cannot be silently reinterpreted
-/// by a consumer that disagrees about numbering.
+/// Strings rather than enum codes, matching `Tensor.msg` exactly: a string
+/// cannot be silently reinterpreted by a consumer that disagrees about
+/// numbering.
 ///
 /// `edgefirst-tensor` *carries* these; it never parses `"NV12"`.
 /// `edgefirst-image` interprets them.
