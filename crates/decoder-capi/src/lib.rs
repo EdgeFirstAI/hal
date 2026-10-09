@@ -15,13 +15,19 @@ pub mod tiling;
 
 /// ABI version of this library's C surface.
 ///
-/// Bumped to 2 when `ef_merge_config` gained a `mode` field in its old tail
-/// pad. `sizeof` is unchanged, so a caller built against version 1 gets no
-/// link error and no size mismatch, but never writes `mode`; the probe is
+/// 3: the `dtype` argument of `ef_infer_signals_add_input` and
+/// `ef_infer_signals_add_output` is an `EF_DTYPE_*` code (it was a
+/// `0x100`-based `EF_INFER_DTYPE_*` code), and `ef_decoder_params_add_output`
+/// refuses an unknown `dims` code.
+///
+/// 2: `ef_merge_config` gained a `mode` field in its old tail pad.
+///
+/// Neither change alters a symbol or a layout, so a caller built against an
+/// older generation gets no link error and no size mismatch; the probe is
 /// the only signal. Changed defaults do not move it.
 #[no_mangle]
 pub extern "C" fn ef_decoder_abi_version() -> u32 {
-    2
+    3
 }
 
 #[cfg(test)]
@@ -99,6 +105,11 @@ mod tests {
     #[test]
     fn the_generated_header_exists_and_declares_the_abi_probe() {
         assert!(header_text().contains("ef_decoder_abi_version"));
+    }
+
+    #[test]
+    fn the_abi_probe_is_generation_3() {
+        assert_eq!(super::ef_decoder_abi_version(), 3);
     }
 
     #[test]

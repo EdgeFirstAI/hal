@@ -259,6 +259,13 @@ extern "C" {
 
 /**
  * ABI version of this library's C surface.
+ *
+ * 2: an unknown `color_mode` passed to `ef_image_processor_draw_decoded_masks`
+ * or `ef_image_processor_draw_proto_masks` returns `EINVAL` (it was drawn as
+ * `EF_COLOR_MODE_CLASS`), and an unknown `ef_tiling_config.fit` fails the
+ * tiling functions (any non-zero value meant letterbox). No symbol or layout
+ * changed, so a caller built against generation 1 gets no link error; the
+ * probe is the only signal.
  */
 uint32_t ef_image_abi_version(void);
 
