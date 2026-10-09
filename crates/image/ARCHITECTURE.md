@@ -1734,11 +1734,14 @@ tensor layer — that invariant is strict.
 Helper constructors:
 - `Colorimetry::jfif()` — sRGB primaries + sRGB transfer + BT.601 encoding +
   full range (standard JPEG/JFIF).
-- `Colorimetry::from_v4l2(colorspace, xfer, ycbcr_enc, quantization)` — converts
-  the four V4L2 kernel constants to the HAL's decoupled enum values. A V4L2
-  `DEFAULT` (0) `ycbcr_enc`/`quantization` is resolved from the colorspace
-  (e.g. `V4L2_COLORSPACE_JPEG` → BT.601 full-range), matching the kernel's
-  `V4L2_MAP_*_DEFAULT` rules, rather than being left undefined.
+- `Colorimetry::from_v4l2(colorspace, xfer, ycbcr_enc, quantization, is_rgb_or_hsv)`
+  — converts the four V4L2 kernel constants to the HAL's decoupled enum values.
+  A V4L2 `DEFAULT` (0) `ycbcr_enc`/`quantization` is resolved, matching the
+  kernel's `V4L2_MAP_*_DEFAULT` rules, rather than being left undefined:
+  `quantization` is full range for an RGB/HSV format or
+  `V4L2_COLORSPACE_JPEG` and limited otherwise, and `ycbcr_enc` follows the
+  colorspace (e.g. `V4L2_COLORSPACE_JPEG` → BT.601).
+  `Colorimetry::is_rgb_or_hsv(PixelFormat)` gives the flag for a HAL format.
 
 #### Producers
 

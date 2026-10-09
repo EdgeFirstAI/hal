@@ -757,7 +757,7 @@ def test_colorimetry_roundtrip():
     assert t.colorimetry is None
 
     # V4L2: colorspace=REC709(3), xfer=709(1), ycbcr_enc=709(2), quant=FULL(1)
-    c = hal.Colorimetry.from_v4l2(3, 1, 2, 1)
+    c = hal.Colorimetry.from_v4l2(3, 1, 2, 1, False)
     assert c.encoding == hal.ColorEncoding.Bt709
     assert c.range == hal.ColorRange.Full
     assert c.space == hal.ColorSpace.Bt709
@@ -772,6 +772,17 @@ def test_colorimetry_roundtrip():
     # Clearing roundtrips back to None.
     t.colorimetry = None
     assert t.colorimetry is None
+
+
+def test_colorimetry_from_v4l2_default_quantization_follows_pixel_encoding():
+    """A DEFAULT quantization is full range for RGB, limited for YUV (sRGB)."""
+    import edgefirst.tensor as hal
+
+    # V4L2: colorspace=SRGB(8), every other field DEFAULT(0)
+    assert hal.Colorimetry.from_v4l2(8, 0, 0, 0, True).range == hal.ColorRange.Full
+    assert hal.Colorimetry.from_v4l2(8, 0, 0, 0, False).range == hal.ColorRange.Limited
+    # colorspace=JPEG(7) is full range for YUV too
+    assert hal.Colorimetry.from_v4l2(7, 0, 0, 0, False).range == hal.ColorRange.Full
 
 
 def test_colorimetry_construct_and_repr():

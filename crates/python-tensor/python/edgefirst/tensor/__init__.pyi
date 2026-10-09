@@ -1148,13 +1148,16 @@ class Colorimetry:
     ) -> None: ...
     @staticmethod
     def from_v4l2(
-        colorspace: int, xfer: int, ycbcr_enc: int, quant: int
+        colorspace: int, xfer: int, ycbcr_enc: int, quant: int, is_rgb_or_hsv: bool
     ) -> Colorimetry:
         """Build from the four raw V4L2 colorimetry integers.
 
-        A ``DEFAULT`` (0) ``ycbcr_enc``/``quant`` is resolved from the
-        colorspace (e.g. ``V4L2_COLORSPACE_JPEG`` → BT.601 full-range) per the
-        kernel ``V4L2_MAP_*_DEFAULT`` rules; an unrecognised value maps to
+        ``is_rgb_or_hsv`` is whether the negotiated format's pixel encoding
+        is RGB or HSV. A ``DEFAULT`` (0) ``ycbcr_enc``/``quant`` is resolved
+        per the kernel ``V4L2_MAP_*_DEFAULT`` rules: ``quant`` is full range
+        for an RGB/HSV format or ``V4L2_COLORSPACE_JPEG`` and limited
+        otherwise, and ``ycbcr_enc`` follows the colorspace (e.g.
+        ``V4L2_COLORSPACE_JPEG`` → BT.601). An unrecognised value maps to
         ``None``.
         """
 

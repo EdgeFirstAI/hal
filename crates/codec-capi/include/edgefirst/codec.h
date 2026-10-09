@@ -47,6 +47,9 @@ typedef struct ef_image_decoder ef_image_decoder;
 
 /**
  * ABI version of this library's C surface.
+ *
+ * 2: `ef_codec_colorimetry_from_v4l2` takes an `is_rgb_or_hsv` argument
+ * before `out`.
  */
 uint32_t ef_codec_abi_version(void);
 
@@ -127,6 +130,11 @@ int ef_image_decoder_reset_output_format(ef_image_decoder *d);
 /**
  * Map raw V4L2 colorimetry integers to the packed `ef_tensor_colorimetry` form.
  *
+ * `is_rgb_or_hsv` is non-zero when the negotiated format's pixel encoding
+ * is RGB or HSV. A `DEFAULT` (0) `quant` is then full range, as it is for
+ * `V4L2_COLORSPACE_JPEG`; otherwise it is limited
+ * (`V4L2_MAP_QUANTIZATION_DEFAULT`).
+ *
  * # Safety
  * `out` must be writable.
  */
@@ -134,6 +142,7 @@ int ef_codec_colorimetry_from_v4l2(uint32_t colorspace,
                                    uint32_t xfer,
                                    uint32_t ycbcr_enc,
                                    uint32_t quant,
+                                   int is_rgb_or_hsv,
                                    uint32_t *out);
 
 /**
