@@ -1738,9 +1738,12 @@ Helper constructors:
   — converts the four V4L2 kernel constants to the HAL's decoupled enum values.
   A V4L2 `DEFAULT` (0) `ycbcr_enc`/`quantization` is resolved, matching the
   kernel's `V4L2_MAP_*_DEFAULT` rules, rather than being left undefined:
-  `quantization` is full range for an RGB/HSV format or
-  `V4L2_COLORSPACE_JPEG` and limited otherwise, and `ycbcr_enc` follows the
-  colorspace (e.g. `V4L2_COLORSPACE_JPEG` → BT.601).
+  `quantization` is full range for an RGB/HSV format, whatever the
+  colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any
+  other recognised colorspace; and unset (`None`) for a YUV format in a
+  `DEFAULT` or unrecognised colorspace, so the at-use height heuristic
+  decides. `ycbcr_enc` follows the colorspace (e.g. `V4L2_COLORSPACE_JPEG` →
+  BT.601) and is likewise unset for a `DEFAULT` or unrecognised one.
   `PixelFormat::is_rgb_or_hsv()` gives the flag for a HAL format.
 
 #### Producers

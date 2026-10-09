@@ -210,9 +210,12 @@ pub unsafe extern "C" fn ef_image_decoder_reset_output_format(d: *mut EfImageDec
 /// Map raw V4L2 colorimetry integers to the packed `ef_tensor_colorimetry` form.
 ///
 /// `is_rgb_or_hsv` is non-zero when the negotiated format's pixel encoding
-/// is RGB or HSV. A `DEFAULT` (0) `quant` is then full range, as it is for
-/// `V4L2_COLORSPACE_JPEG`; otherwise it is limited
-/// (`V4L2_MAP_QUANTIZATION_DEFAULT`).
+/// is RGB or HSV. Per `V4L2_MAP_QUANTIZATION_DEFAULT`, a `DEFAULT` (0)
+/// `quant` is full range for an RGB/HSV format, whatever the colorspace, and
+/// for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other
+/// recognised colorspace; and unset (range byte 0) for a YUV format in a
+/// `DEFAULT` or unrecognised colorspace, so the at-use height heuristic
+/// decides.
 ///
 /// # Safety
 /// `out` must be writable.

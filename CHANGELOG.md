@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **An RGB V4L2 format with `quantization = DEFAULT` is full range.** `Colorimetry::from_v4l2` resolved a `DEFAULT` quantization from the colorspace alone, so an RGB camera reporting sRGB was published as limited range. It now follows the kernel's `V4L2_MAP_QUANTIZATION_DEFAULT`: an RGB/HSV format is full range whatever the colorspace, `V4L2_COLORSPACE_JPEG` is full range, and a YUV format in any other recognised colorspace is limited range.
+- **An RGB V4L2 format with `quantization = DEFAULT` is full range.** `Colorimetry::from_v4l2` resolved a `DEFAULT` quantization from the colorspace alone, so an RGB camera reporting sRGB was published as limited range. It now follows the kernel's `V4L2_MAP_QUANTIZATION_DEFAULT`: a `DEFAULT` quantization is full range for an RGB/HSV format, whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other recognised colorspace; and unset for a YUV format in a `DEFAULT` or unrecognised colorspace, so the at-use height heuristic decides.
 
 ## [0.34.1] - 2026-10-07
 

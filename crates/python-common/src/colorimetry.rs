@@ -190,9 +190,12 @@ impl PyColorimetry {
     /// pixel encoding is RGB or HSV when ``is_rgb_or_hsv`` is true. A
     /// ``DEFAULT`` (0) ``ycbcr_enc``/``quant`` is resolved per the kernel
     /// ``V4L2_MAP_*_DEFAULT`` rules: ``quant`` is full range for an RGB/HSV
-    /// format or ``V4L2_COLORSPACE_JPEG`` and limited otherwise, and
-    /// ``ycbcr_enc`` follows the colorspace. An unrecognised value maps to
-    /// ``None``.
+    /// format, whatever the colorspace, and for ``V4L2_COLORSPACE_JPEG``;
+    /// limited for a YUV format in any other recognised colorspace; and
+    /// ``None`` for a YUV format in a ``DEFAULT`` or unrecognised colorspace,
+    /// so the at-use height heuristic decides. ``ycbcr_enc`` follows the
+    /// colorspace and is likewise ``None`` for a ``DEFAULT`` or unrecognised
+    /// one. An unrecognised value maps to ``None``.
     #[staticmethod]
     fn from_v4l2(
         colorspace: u32,

@@ -367,12 +367,13 @@ impl Colorimetry {
     ///
     /// - `quantization = DEFAULT` is full range for an RGB/HSV format,
     ///   whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for
-    ///   a YUV format in any other recognised colorspace.
-    /// - `ycbcr_enc = DEFAULT` is the encoding the colorspace implies.
+    ///   a YUV format in any other recognised colorspace; and unset (`None`)
+    ///   for a YUV format in a `DEFAULT` or unrecognised colorspace, so the
+    ///   at-use height heuristic decides.
+    /// - `ycbcr_enc = DEFAULT` is the encoding the colorspace implies, and
+    ///   unset (`None`) for a `DEFAULT` or unrecognised colorspace.
     ///
-    /// A YUV format in a `DEFAULT`/unrecognised colorspace still yields
-    /// `None` on both axes (deferred to the heuristic); unrecognised
-    /// non-default values also map to `None`.
+    /// Unrecognised non-default values also map to `None`.
     pub fn from_v4l2(
         colorspace: u32,
         xfer: u32,
