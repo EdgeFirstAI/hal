@@ -182,6 +182,13 @@ class TensorMemory(enum.Enum):
     CUDA: TensorMemory
     """CUDA device memory. No backend produces or accepts it yet."""
 
+    D3D11_TEXTURE: TensorMemory
+    """
+    Windows D3D11 texture, named specifically rather than through the
+    portable ``DMABUF`` spelling. No backend produces or accepts it yet --
+    Windows allocates and reports ``DMABUF``.
+    """
+
 class EdgeFirstTensorExportable(Protocol):
     """Structural type for anything that can hand a tensor across an
     ``edgefirst.*`` package boundary via the ``__edgefirst_tensor__``

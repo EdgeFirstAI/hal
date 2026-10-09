@@ -173,9 +173,10 @@ const _: () = {
 /// the sub-region's byte offset with `set_plane_offset`, and
 /// [`TensorDesc`] has nowhere to carry it.
 ///
-/// **Only for a handle-based import.** Under `kind::HOST` the descriptor's
-/// `ptr` is the producer's pinned address *for the view itself*, so the
-/// offset is already baked into it and applying it again would advance past
+/// **Only for a handle-based import.** Under a host kind (`kind::MEM`,
+/// `kind::SHM`) the descriptor's `ptr` is the producer's pinned address *for
+/// the view itself*, so the offset is already baked into it and applying it
+/// again would advance past
 /// the sub-region a second time. Every other kind re-derives the base from
 /// a handle naming the whole parent buffer -- `DMABUF` dup's the fd,
 /// `IOSURFACE` looks the surface up by id, `D3D11_TEXTURE` opens the NT
@@ -238,7 +239,7 @@ const _: () = {
 ///   `crates/tensor/tests/d3d11_tensor.rs` and by
 ///   `crates/image/tests/reconstructed_view_convert.rs`, which the Windows
 ///   CI lanes run (the latter on WARP).
-/// * **`Mem`/`Shm`** -- never affected. Both report `kind::HOST`, so this
+/// * **`Mem`/`Shm`** -- never affected. Both report a host kind, so this
 ///   function skips them and the pinned `desc.ptr` already addresses the
 ///   view.
 /// * **Android** -- not silently wrong: it reports `kind::DMABUF`, and
@@ -281,7 +282,7 @@ const _: () = {
 /// * `Tensor::subview` -- does reach them, and writes the same absolute
 ///   value the storage's own `view()` already computed, so the write is
 ///   idempotent rather than a double-apply -- the failure this protocol
-///   produced once on `MEM` (see the `HOST` arm above).
+///   produced once on `MEM` (see the host-memory arm above).
 ///
 /// **D3D11 applies the offset verbatim, and the descriptor's stride is not
 /// a pitch to translate it by.** A texture tensor's `map()` goes through a
@@ -297,7 +298,7 @@ const _: () = {
 /// different row. The offset is bounded on the consumer's side instead:
 /// `D3d11TextureTensor`'s pins refuse one past the backing.
 fn apply_plane_offset(tensor: &mut TensorDyn, desc: &TensorDesc, plane_offset: u64) {
-    if plane_offset == 0 || desc.kind == edgefirst_tensor::tensor_kind::HOST {
+    if plane_offset == 0 || desc.is_host() {
         return;
     }
     tensor.set_plane_offset(plane_offset as usize);
@@ -349,7 +350,7 @@ pub struct TensorCapsulePayload {
     ///
     /// Carried for the same reason [`Self::quant`] is, and lost the same
     /// way without it: see [`apply_plane_offset`], which also explains why
-    /// a `HOST` descriptor must *not* have it re-applied.
+    /// a host-memory descriptor must *not* have it re-applied.
     pub plane_offset: u64,
     pub pin: Option<HostPin<'static>>,
     /// Owns the arrays [`Self::quant`] points at, for the capsule's life.
@@ -365,7 +366,7 @@ pub struct TensorCapsulePayload {
     pub quant_keepalive: Option<Arc<Quantization>>,
     /// Keepalive for a PBO-backed `desc`'s `ptr` (a `PboOpsVtable` address
     /// under `kind::PBO` -- see [`edgefirst_tensor::TensorDesc::ptr`]'s own
-    /// doc comment). Mirrors `pin`'s role for the `HOST` kind exactly:
+    /// doc comment). Mirrors `pin`'s role for the host-memory kinds exactly:
     /// without this, nothing keeps the producer's `PboHandle` (and the
     /// `OnceLock<PboOpsVtable>` field `ptr` addresses) alive between
     /// `__edgefirst_tensor__()` returning the capsule and a consumer
@@ -413,7 +414,7 @@ impl<'py> TensorArg<'py> {
     /// genuinely needs the host address, e.g. reading model-output tensors
     /// on the CPU.
     ///
-    /// A `None` request that comes back `HOST`-kind with no address (a
+    /// A `None` request that comes back host-kind with no address (a
     /// Mem/Shm-backed producer — a JPEG decode is the common case, since
     /// software decoding writes to host memory) is retried once with
     /// `access="read"` rather than failing outright: those backends always
@@ -437,7 +438,7 @@ impl<'py> TensorArg<'py> {
     /// A heap-backed (`Mem`/`Shm`) destination is a legitimate target — the
     /// CPU fallback path exists precisely for tensors with no GPU backing —
     /// so this mirrors [`Self::extract`]'s retry: a `None` request that
-    /// comes back `HOST`-kind with no address is retried once with
+    /// comes back host-kind with no address is retried once with
     /// `access="readwrite"` (not `"read"` — the destination is written, and
     /// a decode may read-modify-write into a strided destination too).
     /// `DMABUF`/`IOSURFACE`/`PBO`-kind descriptors never hit this arm — they
@@ -489,7 +490,7 @@ impl<'py> TensorArg<'py> {
     /// same-module downcast has been ruled out.
     ///
     /// `retry_access`, when `Some`, is the access string to retry with if
-    /// the first (`access`) call comes back `HOST`-kind with a null `ptr` —
+    /// the first (`access`) call comes back host-kind with a null `ptr` —
     /// `"read"` for [`Self::extract`], `"readwrite"` for
     /// [`Self::extract_mut`]. The first call always requests no pin
     /// (`access` is `None` whenever a retry is armed), so there is no
@@ -516,7 +517,7 @@ impl<'py> TensorArg<'py> {
 
         let (mut capsule_obj, mut parts) = Self::call_protocol(&method, access)?;
         if let Some(retry_access) = retry_access {
-            if parts.desc.kind == edgefirst_tensor::tensor_kind::HOST && parts.desc.ptr.is_null() {
+            if parts.desc.is_host() && parts.desc.ptr.is_null() {
                 (capsule_obj, parts) = Self::call_protocol(&method, Some(retry_access))?;
             }
         }
@@ -743,7 +744,7 @@ impl<'py> TensorArg<'py> {
 
 /// Build an independent `TensorDyn` aliasing the same backing memory as
 /// `tensor`, for [`TensorArg::into_raw_access`]'s native path. Requests no
-/// pin unless the descriptor comes back `HOST`-kind with a null `ptr` (a
+/// pin unless the descriptor comes back host-kind with a null `ptr` (a
 /// `Mem`/`Shm` producer -- same retry condition `TensorArg::extract`/
 /// `extract_mut` already apply to the cross-package path), so the common
 /// GPU/DMA case pays only a descriptor read plus whatever `import_descriptor`
@@ -762,7 +763,7 @@ pub(crate) fn reconstruct(
     access: edgefirst_tensor::CpuAccess,
 ) -> PyResult<(TensorDyn, Option<HostPin<'static>>)> {
     let desc = tensor.descriptor_pinned(None);
-    let (desc, pin) = if desc.kind == edgefirst_tensor::tensor_kind::HOST && desc.ptr.is_null() {
+    let (desc, pin) = if desc.is_host() && desc.ptr.is_null() {
         let pin = tensor.pin_host(access).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to resolve a tensor for a detached region: {e}"

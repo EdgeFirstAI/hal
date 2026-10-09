@@ -141,6 +141,12 @@ enum ef_storage_kind
   EF_STORAGE_KIND_IO_SURFACE = 3,
   EF_STORAGE_KIND_PBO = 4,
   EF_STORAGE_KIND_CUDA = 5,
+  /**
+   * Windows `ID3D11Texture2D`, named specifically. A tensor's own
+   * storage kind reports `DmaBuf` on Windows; this is the code the
+   * cross-package descriptor carries for that backing.
+   */
+  EF_STORAGE_KIND_D3D11_TEXTURE = 6,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -221,6 +227,40 @@ enum ef_compression
 typedef enum ef_compression ef_compression;
 #else
 typedef uint32_t ef_compression;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Compression *request*, as `ef_tensor_image_desc_set_compression` takes it
+ * and [`EfImageDescView::compression`] reports it.
+ *
+ * Distinct from [`EfCompression`], which names the scheme an allocation
+ * resolved to. No C setter can request `Scheme`; the view reports it so a
+ * request made through the Rust API is not folded into `Any` or dropped.
+ */
+enum ef_compression_request
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * No compression request: allocate linear.
+   */
+  EF_COMPRESSION_REQUEST_NONE = 0,
+  /**
+   * Any scheme the platform offers, linear when the format is not eligible.
+   */
+  EF_COMPRESSION_REQUEST_ANY = 1,
+  /**
+   * A specific vendor scheme, not further decodable through the view.
+   */
+  EF_COMPRESSION_REQUEST_SCHEME = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_compression_request ef_compression_request;
+#else
+typedef uint32_t ef_compression_request;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -482,13 +522,13 @@ typedef struct ef_d3d11_layout {
  * without touching the other's private layout.
  *
  * `memory` and `compression` are each a value plus an explicit presence
- * flag rather than a sentinel: every code in `ef_storage_kind` (0..=5) is a
+ * flag rather than a sentinel: every code in `ef_storage_kind` (0..=6) is a
  * real value, so there is no unused number to repurpose as "no request"
- * without colliding with `ef_storage_kind`'s `MEM == 0`. `compression` is 1
- * for "any scheme" and 2 for "a specific vendor scheme", the latter not
- * further decodable through this view -- no `ef_tensor_image_desc_set_*`
- * entry point can request one, so this view has never needed to carry more
- * detail than "present, and it's a specific one."
+ * without colliding with `ef_storage_kind`'s `MEM == 0`. `compression` is an
+ * [`EfCompressionRequest`]: `Any`, or `Scheme` for "a specific vendor
+ * scheme", the latter not further decodable through this view -- no
+ * `ef_tensor_image_desc_set_*` entry point can request one, so this view has
+ * never needed to carry more detail than "present, and it's a specific one."
  */
 typedef struct ef_image_desc_view {
   /**
@@ -521,8 +561,7 @@ typedef struct ef_image_desc_view {
    */
   uint32_t has_memory;
   /**
-   * 1 = any scheme the platform offers; 2 = a specific vendor scheme.
-   * Meaningful only when `has_compression != 0`.
+   * `ef_compression_request`, meaningful only when `has_compression != 0`.
    */
   uint32_t compression;
   /**
@@ -1333,7 +1372,7 @@ void ef_tensor_image_desc_free(struct ef_tensor_image_desc *d);
 int ef_tensor_image_desc_set_memory(struct ef_tensor_image_desc *d, uint32_t kind);
 
 /**
- * Declare CPU access: 0 none, 1 read, 2 write, 3 read-write.
+ * Declare CPU access, by `ef_cpu_access` code (`EF_CPU_ACCESS_*`).
  *
  * # Safety
  * `d` must be `NULL` or a live request.
@@ -1341,7 +1380,9 @@ int ef_tensor_image_desc_set_memory(struct ef_tensor_image_desc *d, uint32_t kin
 int ef_tensor_image_desc_set_access(struct ef_tensor_image_desc *d, uint32_t access);
 
 /**
- * Request compression: 0 = none, 1 = any scheme the platform offers.
+ * Request compression, by `ef_compression_request` code:
+ * `EF_COMPRESSION_REQUEST_NONE` or `EF_COMPRESSION_REQUEST_ANY` (any scheme
+ * the platform offers).
  *
  * `Any` allocates linear when the format is not eligible and counts the
  * fallback, which is the right default for a pipeline that wants the
@@ -1617,7 +1658,7 @@ char *ef_tensor_name(const ef_tensor *t);
 /**
  * Wrap a caller-owned host allocation as a tensor, aliasing it rather than
  * copying or owning it -- the consumer half of the cross-package capsule
- * protocol's `HOST` kind.
+ * protocol's host-memory kinds (`MEM`, `SHM`).
  *
  * `capacity` is the producer's real allocation size, which is `>=` the
  * tight footprint `dims` implies: a pool tensor, or one padded to a

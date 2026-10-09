@@ -306,7 +306,7 @@ def test_access_negotiation_retries_mem_backed_destination():
     for no real reason.
 
     `TensorArg::extract_mut`'s first `access=None` call takes no pin; when
-    the resulting descriptor comes back HOST-kind with a null `ptr`, it now
+    the resulting descriptor comes back host-kind with a null `ptr`, it now
     retries once with `access="readwrite"` -- mirroring `extract()`'s
     `access="read"` retry for read-only sources, just with the stronger
     access a write destination (and a decode that may read-modify-write a
@@ -339,7 +339,7 @@ def test_access_negotiation_retries_mem_backed_destination():
 
 @pytest.mark.gpu
 def test_gpu_backed_destination_skips_the_retry():
-    """The retry added above must stay conditional on a HOST-kind
+    """The retry added above must stay conditional on a host-kind
     descriptor with no address -- a GPU-importable destination
     (DMA/IOSurface/PBO) carries a usable native handle regardless of
     `ptr`, so it must never hit that branch and must stay on the original
@@ -350,7 +350,7 @@ def test_gpu_backed_destination_skips_the_retry():
     reported memory kind instead: `create_image()`'s tensor is never
     Mem/Shm-backed, and `TensorDyn::descriptor_pinned` derives the
     descriptor's `kind` directly from that field
-    (`protocol::kind_of`). That proves the retry's `kind == HOST`
+    (`protocol::kind_of`). That proves the retry's `desc.is_host()`
     precondition is structurally false on this path. It does **not**
     directly observe that zero pins were taken at runtime -- proving that
     would need the same consumer-side introspection hook this file already
@@ -444,7 +444,7 @@ def test_d3d11_texture_crosses_packages_through_the_capsule():
     and a texture from one was unreachable from the other -- the convert
     either failed to import the destination or rendered into a texture the
     consumer's device could not open. It also needs the `D3D11_TEXTURE`
-    descriptor kind: without it the destination arrives as a HOST
+    descriptor kind: without it the destination arrives as a host-memory
     descriptor with no address and the convert falls back to (or fails on)
     host memory, which is not the zero-copy path this exists for.
 
@@ -552,7 +552,7 @@ def test_decode_into_mem_backed_destination_from_another_package():
     too, not just convert(): a Mem-backed destination allocated by a
     different package is a legitimate decode target. The first
     `access=None` `__edgefirst_tensor__` call takes no pin; when it comes
-    back HOST-kind with a null `ptr`, `decode_into`/`decode_file_into`
+    back host-kind with a null `ptr`, `decode_into`/`decode_file_into`
     retry once with `access="readwrite"` via the same `TensorArg::
     extract_mut` path `convert()`'s destination uses, rather than raising
     "host descriptor has no address" as it did before this fix.

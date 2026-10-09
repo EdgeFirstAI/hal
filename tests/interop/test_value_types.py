@@ -124,6 +124,7 @@ def test_python_discriminants_equal_the_shared_codes():
     assert int(TensorMemory.IOSURFACE) == 3
     assert int(TensorMemory.PBO) == 4
     assert int(TensorMemory.CUDA) == 5
+    assert int(TensorMemory.D3D11_TEXTURE) == 6
 
 
 def test_every_variant_exists_on_every_platform():
@@ -138,7 +139,7 @@ def test_every_variant_exists_on_every_platform():
     """
     from edgefirst.tensor import TensorMemory
 
-    for name in ("MEM", "SHM", "DMABUF", "IOSURFACE", "PBO", "CUDA"):
+    for name in ("MEM", "SHM", "DMABUF", "IOSURFACE", "PBO", "CUDA", "D3D11_TEXTURE"):
         assert hasattr(TensorMemory, name), f"{name} must exist on every platform"
 
 

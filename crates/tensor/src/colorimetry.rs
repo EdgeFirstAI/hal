@@ -11,7 +11,10 @@
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
-// V4L2 UAPI constants (stable kernel ABI) — mirrored from <linux/videodev2.h>.
+// V4L2 UAPI constants (stable kernel ABI) from <linux/videodev2.h>. Declared
+// here because this crate builds on every platform and `edgefirst-v4l2` is
+// Linux-only; `v4l2_uapi_tests` below asserts each against
+// `edgefirst_v4l2::uapi` on Linux.
 const V4L2_COLORSPACE_SMPTE170M: u32 = 1;
 const V4L2_COLORSPACE_REC709: u32 = 3;
 const V4L2_COLORSPACE_470_SYSTEM_M: u32 = 5;
@@ -31,82 +34,78 @@ const V4L2_QUANTIZATION_DEFAULT: u32 = 0;
 const V4L2_QUANTIZATION_FULL_RANGE: u32 = 1;
 const V4L2_QUANTIZATION_LIM_RANGE: u32 = 2;
 
-/// Color primaries (`color_space` in the EdgeFirst schema).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ColorSpace {
-    Bt709,
-    Bt2020,
-    Srgb,
-    Smpte170m,
+// Each axis is declared through `ef_vocabulary!` (see `vocabulary.rs`):
+// `.code()` is the per-axis byte `Colorimetry::pack` writes and `from_code`
+// the one `unpack` reads; `as_str` is the EdgeFirst schema label. Code 0 is
+// reserved on every axis for "unspecified", which this crate spells
+// `Option::None`. The codes cross a package boundary inside
+// `TensorDesc::colorimetry`: append, never renumber.
+crate::ef_vocabulary! {
+    /// Color primaries (`color_space` in the EdgeFirst schema).
+    #[non_exhaustive]
+    #[derive(Serialize, Deserialize)]
+    pub enum ColorSpace {
+        Bt709 = 1, "bt709", BT709,
+        Bt2020 = 2, "bt2020", BT2020,
+        Srgb = 3, "srgb", SRGB,
+        Smpte170m = 4, "smpte170m", SMPTE170M,
+    }
+    #[doc(hidden)]
+    pub mod color_space_wire;
 }
 
-/// Transfer function (`color_transfer` in the EdgeFirst schema).
-///
-/// **Limitation:** this axis is stored, propagated, and round-tripped, but it is
-/// **not applied** by any conversion backend. All YUV↔RGB paths operate only on
-/// the matrix ([`ColorEncoding`]) and range ([`ColorRange`]); the transfer
-/// function (gamma / TRC) is assumed to be the platform-native curve and is left
-/// unchanged. HDR transfer curves ([`Self::Pq`] / [`Self::Hlg`]) are therefore
-/// *not* tone-mapped — consumers needing linear-light or HDR handling must apply
-/// the curve themselves.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ColorTransfer {
-    Bt709,
-    Srgb,
-    Pq,
-    /// Hybrid Log-Gamma. Present for EdgeFirst-schema / libcamera parity; the
-    /// V4L2 UAPI defines no `V4L2_XFER_FUNC_HLG`, so `from_v4l2` never yields
-    /// this variant.
-    Hlg,
-    Linear,
+crate::ef_vocabulary! {
+    /// Transfer function (`color_transfer` in the EdgeFirst schema).
+    ///
+    /// **Limitation:** this axis is stored, propagated, and round-tripped, but it is
+    /// **not applied** by any conversion backend. All YUV↔RGB paths operate only on
+    /// the matrix ([`ColorEncoding`]) and range ([`ColorRange`]); the transfer
+    /// function (gamma / TRC) is assumed to be the platform-native curve and is left
+    /// unchanged. HDR transfer curves ([`Self::Pq`] / [`Self::Hlg`]) are therefore
+    /// *not* tone-mapped — consumers needing linear-light or HDR handling must apply
+    /// the curve themselves.
+    #[non_exhaustive]
+    #[derive(Serialize, Deserialize)]
+    pub enum ColorTransfer {
+        Bt709 = 1, "bt709", BT709,
+        Srgb = 2, "srgb", SRGB,
+        Pq = 3, "pq", PQ,
+        /// Hybrid Log-Gamma. Present for EdgeFirst-schema / libcamera parity; the
+        /// V4L2 UAPI defines no `V4L2_XFER_FUNC_HLG`, so `from_v4l2` never yields
+        /// this variant.
+        Hlg = 4, "hlg", HLG,
+        Linear = 5, "linear", LINEAR,
+    }
+    #[doc(hidden)]
+    pub mod color_transfer_wire;
 }
 
-/// YCbCr encoding matrix (`color_encoding` in the EdgeFirst schema).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ColorEncoding {
-    Bt601,
-    Bt709,
-    Bt2020,
+crate::ef_vocabulary! {
+    /// YCbCr encoding matrix (`color_encoding` in the EdgeFirst schema).
+    #[non_exhaustive]
+    #[derive(Serialize, Deserialize)]
+    pub enum ColorEncoding {
+        Bt601 = 1, "bt601", BT601,
+        Bt709 = 2, "bt709", BT709,
+        Bt2020 = 3, "bt2020", BT2020,
+    }
+    #[doc(hidden)]
+    pub mod color_encoding_wire;
 }
 
-/// Quantization range (`color_range` in the EdgeFirst schema).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ColorRange {
-    Full,
-    Limited,
+crate::ef_vocabulary! {
+    /// Quantization range (`color_range` in the EdgeFirst schema).
+    #[non_exhaustive]
+    #[derive(Serialize, Deserialize)]
+    pub enum ColorRange {
+        Full = 1, "full", FULL,
+        Limited = 2, "limited", LIMITED,
+    }
+    #[doc(hidden)]
+    pub mod color_range_wire;
 }
 
 impl ColorSpace {
-    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
-    ///
-    /// Returns `None` for `""` and for any label this build does not know.
-    /// Colorimetry is descriptive metadata: a consumer that cannot name one
-    /// axis can still use the pixels, so an unknown label degrades to
-    /// "unspecified" rather than failing the whole import.
-    pub fn from_str_code(s: &str) -> Option<Self> {
-        match s {
-            "bt709" => Some(Self::Bt709),
-            "bt2020" => Some(Self::Bt2020),
-            "srgb" => Some(Self::Srgb),
-            "smpte170m" => Some(Self::Smpte170m),
-            _ => None,
-        }
-    }
-
-    /// Short string label matching the EdgeFirst schema.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bt709 => "bt709",
-            Self::Bt2020 => "bt2020",
-            Self::Srgb => "srgb",
-            Self::Smpte170m => "smpte170m",
-        }
-    }
-
     /// Map a raw V4L2 `colorspace` field to a [`ColorSpace`].
     ///
     /// Returns `None` for `V4L2_COLORSPACE_DEFAULT` (0) and any
@@ -125,34 +124,6 @@ impl ColorSpace {
 }
 
 impl ColorTransfer {
-    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
-    ///
-    /// Returns `None` for `""` and for any label this build does not know.
-    /// Colorimetry is descriptive metadata: a consumer that cannot name one
-    /// axis can still use the pixels, so an unknown label degrades to
-    /// "unspecified" rather than failing the whole import.
-    pub fn from_str_code(s: &str) -> Option<Self> {
-        match s {
-            "bt709" => Some(Self::Bt709),
-            "srgb" => Some(Self::Srgb),
-            "pq" => Some(Self::Pq),
-            "hlg" => Some(Self::Hlg),
-            "linear" => Some(Self::Linear),
-            _ => None,
-        }
-    }
-
-    /// Short string label matching the EdgeFirst schema.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bt709 => "bt709",
-            Self::Srgb => "srgb",
-            Self::Pq => "pq",
-            Self::Hlg => "hlg",
-            Self::Linear => "linear",
-        }
-    }
-
     /// Map a raw V4L2 `xfer_func` field to a [`ColorTransfer`].
     ///
     /// Returns `None` for `V4L2_XFER_FUNC_DEFAULT` (0) and any
@@ -173,30 +144,6 @@ impl ColorTransfer {
 }
 
 impl ColorEncoding {
-    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
-    ///
-    /// Returns `None` for `""` and for any label this build does not know.
-    /// Colorimetry is descriptive metadata: a consumer that cannot name one
-    /// axis can still use the pixels, so an unknown label degrades to
-    /// "unspecified" rather than failing the whole import.
-    pub fn from_str_code(s: &str) -> Option<Self> {
-        match s {
-            "bt601" => Some(Self::Bt601),
-            "bt709" => Some(Self::Bt709),
-            "bt2020" => Some(Self::Bt2020),
-            _ => None,
-        }
-    }
-
-    /// Short string label matching the EdgeFirst schema.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bt601 => "bt601",
-            Self::Bt709 => "bt709",
-            Self::Bt2020 => "bt2020",
-        }
-    }
-
     /// Map a raw V4L2 `ycbcr_enc` field to a [`ColorEncoding`].
     ///
     /// Returns `None` for `V4L2_YCBCR_ENC_DEFAULT` (0) and any
@@ -212,28 +159,6 @@ impl ColorEncoding {
 }
 
 impl ColorRange {
-    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
-    ///
-    /// Returns `None` for `""` and for any label this build does not know.
-    /// Colorimetry is descriptive metadata: a consumer that cannot name one
-    /// axis can still use the pixels, so an unknown label degrades to
-    /// "unspecified" rather than failing the whole import.
-    pub fn from_str_code(s: &str) -> Option<Self> {
-        match s {
-            "full" => Some(Self::Full),
-            "limited" => Some(Self::Limited),
-            _ => None,
-        }
-    }
-
-    /// Short string label matching the EdgeFirst schema.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Limited => "limited",
-        }
-    }
-
     /// Map a raw V4L2 `quantization` field to a [`ColorRange`].
     ///
     /// Returns `None` for `V4L2_QUANTIZATION_DEFAULT` (0) and any
@@ -449,40 +374,15 @@ impl Colorimetry {
     ///
     /// One byte per axis, `space` in the low byte through `range` in the
     /// high byte; `0` on an axis means "undefined", so an all-`None`
-    /// `Colorimetry` packs to `0`. The per-axis codes are the same "stable
-    /// HAL constants" the C API's `ef_colorimetry` documents
-    /// — duplicated rather than shared
-    /// because the C leaves depend on this crate, not the reverse, but kept in
-    /// sync deliberately so a value means the same thing on both
-    /// boundaries. This crosses a package boundary like `TensorDesc`
-    /// itself: codes are appended, never renumbered.
+    /// `Colorimetry` packs to `0`. Each byte is that axis's `code()`, the
+    /// same word the C API's `ef_tensor_colorimetry` returns. This crosses a
+    /// package boundary like `TensorDesc` itself: codes are appended, never
+    /// renumbered.
     pub fn pack(&self) -> u32 {
-        let space: u32 = match self.space {
-            None => 0,
-            Some(ColorSpace::Bt709) => 1,
-            Some(ColorSpace::Bt2020) => 2,
-            Some(ColorSpace::Srgb) => 3,
-            Some(ColorSpace::Smpte170m) => 4,
-        };
-        let transfer: u32 = match self.transfer {
-            None => 0,
-            Some(ColorTransfer::Bt709) => 1,
-            Some(ColorTransfer::Srgb) => 2,
-            Some(ColorTransfer::Pq) => 3,
-            Some(ColorTransfer::Hlg) => 4,
-            Some(ColorTransfer::Linear) => 5,
-        };
-        let encoding: u32 = match self.encoding {
-            None => 0,
-            Some(ColorEncoding::Bt601) => 1,
-            Some(ColorEncoding::Bt709) => 2,
-            Some(ColorEncoding::Bt2020) => 3,
-        };
-        let range: u32 = match self.range {
-            None => 0,
-            Some(ColorRange::Full) => 1,
-            Some(ColorRange::Limited) => 2,
-        };
+        let space = self.space.map_or(0, ColorSpace::code);
+        let transfer = self.transfer.map_or(0, ColorTransfer::code);
+        let encoding = self.encoding.map_or(0, ColorEncoding::code);
+        let range = self.range.map_or(0, ColorRange::code);
         space | (transfer << 8) | (encoding << 16) | (range << 24)
     }
 
@@ -495,32 +395,10 @@ impl Colorimetry {
     /// recognise (e.g. one a newer producer added) also maps to `None`
     /// instead of guessing.
     pub fn unpack(bits: u32) -> Self {
-        let space = match bits & 0xFF {
-            1 => Some(ColorSpace::Bt709),
-            2 => Some(ColorSpace::Bt2020),
-            3 => Some(ColorSpace::Srgb),
-            4 => Some(ColorSpace::Smpte170m),
-            _ => None,
-        };
-        let transfer = match (bits >> 8) & 0xFF {
-            1 => Some(ColorTransfer::Bt709),
-            2 => Some(ColorTransfer::Srgb),
-            3 => Some(ColorTransfer::Pq),
-            4 => Some(ColorTransfer::Hlg),
-            5 => Some(ColorTransfer::Linear),
-            _ => None,
-        };
-        let encoding = match (bits >> 16) & 0xFF {
-            1 => Some(ColorEncoding::Bt601),
-            2 => Some(ColorEncoding::Bt709),
-            3 => Some(ColorEncoding::Bt2020),
-            _ => None,
-        };
-        let range = match (bits >> 24) & 0xFF {
-            1 => Some(ColorRange::Full),
-            2 => Some(ColorRange::Limited),
-            _ => None,
-        };
+        let space = ColorSpace::from_code(bits & 0xFF);
+        let transfer = ColorTransfer::from_code((bits >> 8) & 0xFF);
+        let encoding = ColorEncoding::from_code((bits >> 16) & 0xFF);
+        let range = ColorRange::from_code((bits >> 24) & 0xFF);
         Colorimetry {
             space,
             transfer,
@@ -768,7 +646,12 @@ mod tests {
 
     #[test]
     fn pack_places_each_axis_code_in_its_own_byte() {
-        // The per-axis codes are a cross-package wire contract: pin them.
+        // The per-axis codes are a cross-package wire contract: pin them,
+        // for every variant.
+        assert_eq!(SPACES.len(), ColorSpace::all().len());
+        assert_eq!(TRANSFERS.len(), ColorTransfer::all().len());
+        assert_eq!(ENCODINGS.len(), ColorEncoding::all().len());
+        assert_eq!(RANGES.len(), ColorRange::all().len());
         for (s, code) in SPACES {
             let c = Colorimetry::default().with_space(s);
             assert_eq!(c.pack(), code, "{s:?}");
@@ -898,5 +781,77 @@ mod tests {
                 "colorspace {colorspace}"
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod v4l2_uapi_tests {
+    use edgefirst_v4l2::uapi;
+
+    #[test]
+    fn colorimetry_constants_match_edgefirst_v4l2() {
+        assert_eq!(
+            super::V4L2_COLORSPACE_SMPTE170M,
+            uapi::V4L2_COLORSPACE_SMPTE170M
+        );
+        assert_eq!(super::V4L2_COLORSPACE_REC709, uapi::V4L2_COLORSPACE_REC709);
+        assert_eq!(
+            super::V4L2_COLORSPACE_470_SYSTEM_M,
+            uapi::V4L2_COLORSPACE_470_SYSTEM_M
+        );
+        assert_eq!(
+            super::V4L2_COLORSPACE_470_SYSTEM_BG,
+            uapi::V4L2_COLORSPACE_470_SYSTEM_BG
+        );
+        assert_eq!(super::V4L2_COLORSPACE_JPEG, uapi::V4L2_COLORSPACE_JPEG);
+        assert_eq!(super::V4L2_COLORSPACE_SRGB, uapi::V4L2_COLORSPACE_SRGB);
+        assert_eq!(super::V4L2_COLORSPACE_BT2020, uapi::V4L2_COLORSPACE_BT2020);
+
+        assert_eq!(
+            super::V4L2_XFER_FUNC_709,
+            u32::from(uapi::V4L2_XFER_FUNC_709)
+        );
+        assert_eq!(
+            super::V4L2_XFER_FUNC_SRGB,
+            u32::from(uapi::V4L2_XFER_FUNC_SRGB)
+        );
+        assert_eq!(
+            super::V4L2_XFER_FUNC_NONE,
+            u32::from(uapi::V4L2_XFER_FUNC_NONE)
+        );
+        assert_eq!(
+            super::V4L2_XFER_FUNC_SMPTE2084,
+            u32::from(uapi::V4L2_XFER_FUNC_SMPTE2084)
+        );
+
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_DEFAULT,
+            u32::from(uapi::V4L2_YCBCR_ENC_DEFAULT)
+        );
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_601,
+            u32::from(uapi::V4L2_YCBCR_ENC_601)
+        );
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_709,
+            u32::from(uapi::V4L2_YCBCR_ENC_709)
+        );
+        assert_eq!(
+            super::V4L2_YCBCR_ENC_BT2020,
+            u32::from(uapi::V4L2_YCBCR_ENC_BT2020)
+        );
+
+        assert_eq!(
+            super::V4L2_QUANTIZATION_DEFAULT,
+            u32::from(uapi::V4L2_QUANTIZATION_DEFAULT)
+        );
+        assert_eq!(
+            super::V4L2_QUANTIZATION_FULL_RANGE,
+            u32::from(uapi::V4L2_QUANTIZATION_FULL_RANGE)
+        );
+        assert_eq!(
+            super::V4L2_QUANTIZATION_LIM_RANGE,
+            u32::from(uapi::V4L2_QUANTIZATION_LIM_RANGE)
+        );
     }
 }

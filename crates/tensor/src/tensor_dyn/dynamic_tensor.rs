@@ -950,7 +950,7 @@ impl<T: Element> TensorTrait<T> for Tensor<T> {
     /// pitch-aligned or pool-sized tensor really does have headroom past
     /// its shape, and reporting the tight size discards it. Concretely, a
     /// `Mem`-backed NV12 image at an odd width pads its rows to a 64-byte
-    /// pitch -- so a `HOST` descriptor minted from it carried a `capacity`
+    /// pitch -- so a host-memory descriptor minted from it carried a `capacity`
     /// equal to its shape, and a consumer importing that alias could not
     /// `configure_image` back into memory the producer actually has. That
     /// is `host_import_inherits_the_producers_capacity_headroom`

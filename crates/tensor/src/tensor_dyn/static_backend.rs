@@ -1035,8 +1035,8 @@ impl TensorDyn {
     /// copying, aliasing rather than owning it.
     ///
     /// This is [`Self::from_foreign_ptr`] with `owner: None` — the consumer
-    /// half of the capsule protocol's `HOST` kind
-    /// ([`crate::protocol::kind::HOST`]). The descriptor's `ptr` is only
+    /// half of the capsule protocol's host-memory kinds
+    /// ([`crate::protocol::kind::MEM`] and [`crate::protocol::kind::SHM`]). The descriptor's `ptr` is only
     /// meaningful while the producer's capsule keepalive is alive; nothing
     /// here takes a reference to extend that lifetime, so the caller (the
     /// capsule machinery) is responsible for it. See
@@ -1135,7 +1135,7 @@ impl TensorDyn {
             crate::protocol::kind::IOSURFACE => Err(crate::Error::NotImplemented(
                 "IOSurface import off Apple platforms".into(),
             )),
-            crate::protocol::kind::HOST => {
+            crate::protocol::kind::MEM | crate::protocol::kind::SHM => {
                 crate::protocol::check_descriptor_host_ptr(desc)?;
                 // SAFETY: the caller guarantees the producer's keepalive
                 // outlives the returned tensor -- that is the capsule
@@ -1162,7 +1162,7 @@ impl TensorDyn {
                 // `kind::PBO` (see `TensorDesc::ptr`'s own doc comment).
                 // `desc.ptr.0` came from the same trusted producer as
                 // `desc.handle`, so interpreting it as a `PboOpsVtable*` is
-                // not a new hazard relative to the `HOST` arm's own use of
+                // not a new hazard relative to the host-memory arm's own use of
                 // `desc.ptr`.
                 let parts = unsafe { crate::read_pbo_vtable_parts(desc.ptr.0 as *const _) }?;
                 // SAFETY: the parts came from a table this crate built, read
