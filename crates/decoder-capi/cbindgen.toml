@@ -15,6 +15,9 @@
 # hand-written `trailer` below, not in generated output.
 
 language = "C"
+# The option vocabularies are `#[repr(u32)]` enums; see tensor-capi's
+# cbindgen.toml for why that needs `cpp_compat` to compile as C++.
+cpp_compat = true
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
 include_version = true
 documentation = true
@@ -81,34 +84,22 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
 
 /**
  * @name EF_INFER_DTYPE_*
- * @brief Numeric dtype codes for `ef_infer_signals_add_input`/
+ * @brief Model I/O dtype names for `ef_infer_signals_add_input`/
  * `ef_infer_signals_add_output`.
  *
- * Mirrors `edgefirst_decoder::schema::DType`'s declaration order. This is a
- * distinct vocabulary from `edgefirst/tensor.h`'s `EF_DTYPE_*` (a wider,
- * differently-ordered enum for physical tensor storage) -- schema dtype is
- * the narrower quantized/float set a model's logical I/O carries. As with
- * `EF_DTYPE_*`, the functions that take one keep a plain `uint32_t`
- * parameter rather than this enum: an out-of-range code is rejected with
- * `EINVAL` rather than transmuted into a Rust enum, which would be
- * undefined behaviour for a value no variant names.
- *
- * The codes start at `0x100` so the two vocabularies cannot overlap. Both
- * cross as bare `uint32_t`, so had these numbered from `0` every value
- * would have been a valid code in BOTH enums meaning something different
- * -- `7` is FLOAT32 here and `EF_DTYPE_I64` there, and `0`/`1` invert
- * signedness. A caller passing the tensor dtype code it already holds
- * would have been silently misread rather than rejected. Disjoint ranges
- * make that mistake an `EINVAL`.
+ * Aliases of `edgefirst/tensor.h`'s `EF_DTYPE_*`: dtype has one numbering
+ * across the stack, so a caller may pass the `EF_DTYPE_*` it already holds.
+ * A model's logical I/O carries no 64-bit dtypes, so `EF_DTYPE_U64`,
+ * `EF_DTYPE_I64` and `EF_DTYPE_F64` are refused with `EINVAL`.
  */
-#define EF_INFER_DTYPE_INT8 0x100
-#define EF_INFER_DTYPE_UINT8 0x101
-#define EF_INFER_DTYPE_INT16 0x102
-#define EF_INFER_DTYPE_UINT16 0x103
-#define EF_INFER_DTYPE_INT32 0x104
-#define EF_INFER_DTYPE_UINT32 0x105
-#define EF_INFER_DTYPE_FLOAT16 0x106
-#define EF_INFER_DTYPE_FLOAT32 0x107
+#define EF_INFER_DTYPE_INT8 EF_DTYPE_I8
+#define EF_INFER_DTYPE_UINT8 EF_DTYPE_U8
+#define EF_INFER_DTYPE_INT16 EF_DTYPE_I16
+#define EF_INFER_DTYPE_UINT16 EF_DTYPE_U16
+#define EF_INFER_DTYPE_INT32 EF_DTYPE_I32
+#define EF_INFER_DTYPE_UINT32 EF_DTYPE_U32
+#define EF_INFER_DTYPE_FLOAT16 EF_DTYPE_F16
+#define EF_INFER_DTYPE_FLOAT32 EF_DTYPE_F32
 """
 
 trailer = """
@@ -126,6 +117,9 @@ prefix = ""
 # conflicting definition. `EfDetectBox` and `EfDetectBoxList` are NOT excluded:
 # this library is their one implementation home, so this header is where they
 # get declared.
+# The option vocabularies are not reachable from any signature (the
+# functions and fields take `uint32_t`), so they are named here.
+include = ["EfNms", "EfDecoderType", "EfDecoderVersion", "EfOutputType", "EfDimName", "EfMatchMetric", "EfMergeMode", "EfModelSource"]
 exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderParams", "EfSegmentationList", "EfDetectBox", "EfSegmentation", "EfMergeConfig", "TilePlacement", "EfTilePlacement", "EfProtoData", "EfDecoderTracker", "EfDecoderTrackList"]
 
 
@@ -146,6 +140,14 @@ exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderP
 "EfDecoderTrack" = "ef_decoder_track"
 "EfInferSignals" = "ef_infer_signals"
 "EfInferredSchema" = "ef_inferred_schema"
+"EfNms" = "ef_nms"
+"EfDecoderType" = "ef_decoder_type"
+"EfDimName" = "ef_dim_name"
+"EfDecoderVersion" = "ef_decoder_version"
+"EfOutputType" = "ef_output_type"
+"EfMatchMetric" = "ef_match_metric"
+"EfMergeMode" = "ef_merge_mode"
+"EfModelSource" = "ef_model_source"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

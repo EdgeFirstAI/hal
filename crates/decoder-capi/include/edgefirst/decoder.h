@@ -57,34 +57,22 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
 
 /**
  * @name EF_INFER_DTYPE_*
- * @brief Numeric dtype codes for `ef_infer_signals_add_input`/
+ * @brief Model I/O dtype names for `ef_infer_signals_add_input`/
  * `ef_infer_signals_add_output`.
  *
- * Mirrors `edgefirst_decoder::schema::DType`'s declaration order. This is a
- * distinct vocabulary from `edgefirst/tensor.h`'s `EF_DTYPE_*` (a wider,
- * differently-ordered enum for physical tensor storage) -- schema dtype is
- * the narrower quantized/float set a model's logical I/O carries. As with
- * `EF_DTYPE_*`, the functions that take one keep a plain `uint32_t`
- * parameter rather than this enum: an out-of-range code is rejected with
- * `EINVAL` rather than transmuted into a Rust enum, which would be
- * undefined behaviour for a value no variant names.
- *
- * The codes start at `0x100` so the two vocabularies cannot overlap. Both
- * cross as bare `uint32_t`, so had these numbered from `0` every value
- * would have been a valid code in BOTH enums meaning something different
- * -- `7` is FLOAT32 here and `EF_DTYPE_I64` there, and `0`/`1` invert
- * signedness. A caller passing the tensor dtype code it already holds
- * would have been silently misread rather than rejected. Disjoint ranges
- * make that mistake an `EINVAL`.
+ * Aliases of `edgefirst/tensor.h`'s `EF_DTYPE_*`: dtype has one numbering
+ * across the stack, so a caller may pass the `EF_DTYPE_*` it already holds.
+ * A model's logical I/O carries no 64-bit dtypes, so `EF_DTYPE_U64`,
+ * `EF_DTYPE_I64` and `EF_DTYPE_F64` are refused with `EINVAL`.
  */
-#define EF_INFER_DTYPE_INT8 0x100
-#define EF_INFER_DTYPE_UINT8 0x101
-#define EF_INFER_DTYPE_INT16 0x102
-#define EF_INFER_DTYPE_UINT16 0x103
-#define EF_INFER_DTYPE_INT32 0x104
-#define EF_INFER_DTYPE_UINT32 0x105
-#define EF_INFER_DTYPE_FLOAT16 0x106
-#define EF_INFER_DTYPE_FLOAT32 0x107
+#define EF_INFER_DTYPE_INT8 EF_DTYPE_I8
+#define EF_INFER_DTYPE_UINT8 EF_DTYPE_U8
+#define EF_INFER_DTYPE_INT16 EF_DTYPE_I16
+#define EF_INFER_DTYPE_UINT16 EF_DTYPE_U16
+#define EF_INFER_DTYPE_INT32 EF_DTYPE_I32
+#define EF_INFER_DTYPE_UINT32 EF_DTYPE_U32
+#define EF_INFER_DTYPE_FLOAT16 EF_DTYPE_F16
+#define EF_INFER_DTYPE_FLOAT32 EF_DTYPE_F32
 
 
 /* Generated with cbindgen:0.29.4 */
@@ -95,6 +83,213 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+/**
+ * NMS mode, for `ef_decoder_params_set_nms`.
+ */
+enum ef_nms
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * No NMS (end-to-end models with NMS in the graph).
+   */
+  EF_NMS_OFF = 0,
+  /**
+   * The model config's mode, else class-aware.
+   */
+  EF_NMS_AUTO = 1,
+  /**
+   * Suppress only boxes that share a class label.
+   */
+  EF_NMS_CLASS_AWARE = 2,
+  /**
+   * Suppress overlapping boxes regardless of class label.
+   */
+  EF_NMS_CLASS_AGNOSTIC = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_nms ef_nms;
+#else
+typedef uint32_t ef_nms;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Post-processing family, for `ef_decoder_params_add_output`.
+ */
+enum ef_decoder_type
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  EF_DECODER_TYPE_ULTRALYTICS = 0,
+  EF_DECODER_TYPE_MODEL_PACK = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_decoder_type ef_decoder_type;
+#else
+typedef uint32_t ef_decoder_type;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Ultralytics architecture, for `ef_decoder_params_set_decoder_version`.
+ */
+enum ef_decoder_version
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  EF_DECODER_VERSION_YOLOV5 = 0,
+  EF_DECODER_VERSION_YOLOV8 = 1,
+  EF_DECODER_VERSION_YOLO11 = 2,
+  /**
+   * End-to-end, with NMS in the model.
+   */
+  EF_DECODER_VERSION_YOLO26 = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_decoder_version ef_decoder_version;
+#else
+typedef uint32_t ef_decoder_version;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Kind of a model output, for `ef_decoder_params_add_output`.
+ */
+enum ef_output_type
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  EF_OUTPUT_TYPE_DETECTION = 0,
+  EF_OUTPUT_TYPE_BOXES = 1,
+  EF_OUTPUT_TYPE_SCORES = 2,
+  EF_OUTPUT_TYPE_PROTOS = 3,
+  EF_OUTPUT_TYPE_SEGMENTATION = 4,
+  EF_OUTPUT_TYPE_MASK_COEFFICIENTS = 5,
+  EF_OUTPUT_TYPE_MASK = 6,
+  EF_OUTPUT_TYPE_CLASSES = 7,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_output_type ef_output_type;
+#else
+typedef uint32_t ef_output_type;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A named tensor axis, for the `dims` of `ef_decoder_params_add_output`.
+ */
+enum ef_dim_name
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  EF_DIM_NAME_BATCH = 0,
+  EF_DIM_NAME_HEIGHT = 1,
+  EF_DIM_NAME_WIDTH = 2,
+  EF_DIM_NAME_NUM_CLASSES = 3,
+  EF_DIM_NAME_NUM_FEATURES = 4,
+  EF_DIM_NAME_NUM_BOXES = 5,
+  EF_DIM_NAME_NUM_PROTOS = 6,
+  EF_DIM_NAME_NUM_ANCHORS_X_FEATURES = 7,
+  EF_DIM_NAME_PADDING = 8,
+  EF_DIM_NAME_BOX_COORDS = 9,
+  /**
+   * An axis the decoder does not interpret. It never satisfies a
+   * required dimension.
+   */
+  EF_DIM_NAME_UNKNOWN = 10,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_dim_name ef_dim_name;
+#else
+typedef uint32_t ef_dim_name;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Overlap metric, for `ef_merge_config.metric`.
+ */
+enum ef_match_metric
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Intersection-over-Union.
+   */
+  EF_MATCH_METRIC_IOU = 0,
+  /**
+   * Intersection-over-Smaller (default).
+   */
+  EF_MATCH_METRIC_IOS = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_match_metric ef_match_metric;
+#else
+typedef uint32_t ef_match_metric;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * What a tiled merge emits per matched group, for `ef_merge_config.mode`.
+ */
+enum ef_merge_mode
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Keep the highest-scoring box (default).
+   */
+  EF_MERGE_MODE_KEEP_BEST = 0,
+  /**
+   * Replace the group with its enclosing union.
+   */
+  EF_MERGE_MODE_UNION = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_merge_mode ef_merge_mode;
+#else
+typedef uint32_t ef_merge_mode;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Container format the model was read from, for `ef_infer_signals_new`.
+ */
+enum ef_model_source
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  EF_MODEL_SOURCE_ONNX = 0,
+  EF_MODEL_SOURCE_TF_LITE = 1,
+  /**
+   * Accepted, but inference refuses it: the box convention is unknown.
+   */
+  EF_MODEL_SOURCE_OTHER = 2,
+  EF_MODEL_SOURCE_CORE_ML = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_model_source ef_model_source;
+#else
+typedef uint32_t ef_model_source;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * An owned list of detections.
@@ -137,12 +332,22 @@ typedef struct ef_decoder_track {
   uint64_t last_updated;
 } ef_decoder_track;
 
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
 /**
  * ABI version of this library's C surface.
  *
- * Bumped to 2 when `ef_merge_config` gained a `mode` field in its old tail
- * pad. `sizeof` is unchanged, so a caller built against version 1 gets no
- * link error and no size mismatch, but never writes `mode`; the probe is
+ * 3: the `dtype` argument of `ef_infer_signals_add_input` and
+ * `ef_infer_signals_add_output` is an `EF_DTYPE_*` code (it was a
+ * `0x100`-based `EF_INFER_DTYPE_*` code), and `ef_decoder_params_add_output`
+ * refuses an unknown `dims` code.
+ *
+ * 2: `ef_merge_config` gained a `mode` field in its old tail pad.
+ *
+ * Neither change alters a symbol or a layout, so a caller built against an
+ * older generation gets no link error and no size mismatch; the probe is
  * the only signal. Changed defaults do not move it.
  */
 uint32_t ef_decoder_abi_version(void);
@@ -228,8 +433,9 @@ int ef_decoder_params_set_max_det(ef_decoder_params *p, uintptr_t v);
 int ef_decoder_params_set_input_dims(ef_decoder_params *p, uintptr_t width, uintptr_t height);
 
 /**
- * NMS mode: 0 = off, 1 = automatic (the model config's mode, else
- * class-aware), 2 = class-aware, 3 = class-agnostic.
+ * NMS mode, an `EF_NMS_*` code: `EF_NMS_OFF`, `EF_NMS_AUTO` (the model
+ * config's mode, else class-aware), `EF_NMS_CLASS_AWARE` or
+ * `EF_NMS_CLASS_AGNOSTIC`. Any other value is `EINVAL`.
  *
  * # Safety
  * `p` must be `NULL` or a live parameter set.
@@ -455,9 +661,10 @@ const ef_segmentation *ef_segmentation_list_data(ef_segmentation_list *l);
 /**
  * Append a programmatic output spec. Returns the new index, or `-1`.
  *
- * `type_`: 0 detection, 1 boxes, 2 scores, 3 protos, 4 segmentation,
- * 5 mask coefficients, 6 mask, 7 classes.
- * `decoder`: 0 ultralytics, 1 modelpack.
+ * `type_`: an `EF_OUTPUT_TYPE_*` code.
+ * `decoder`: an `EF_DECODER_TYPE_*` code.
+ * `dims`, when not NULL, holds `ndim` `EF_DIM_NAME_*` codes.
+ * An unknown `type_`, `decoder` or `dims` code returns `-1`.
  *
  * # Safety
  * `shape` must point to `ndim` sizes; `dims` may be NULL.
@@ -500,7 +707,8 @@ int ef_decoder_params_output_set_anchors(ef_decoder_params *p,
 int ef_decoder_params_output_set_normalized(ef_decoder_params *p, int index, int normalized);
 
 /**
- * Decoder version: 0 Yolov5, 1 Yolov8, 2 Yolo11, 3 Yolo26.
+ * Decoder version, an `EF_DECODER_VERSION_*` code. Any other value is
+ * `EINVAL`.
  *
  * # Safety
  * `p` must be `NULL` or a live handle from this library.
@@ -626,8 +834,8 @@ int ef_decoder_decode_tracked(const ef_decoder *d,
 void ef_segmentation_list_free(ef_segmentation_list *l);
 
 /**
- * Create empty signals for a model read from `source` (`0` onnx, `1`
- * tflite, `2` other, `3` coreml). `NULL` for an unrecognized source or
+ * Create empty signals for a model read from `source`, an
+ * `EF_MODEL_SOURCE_*` code. `NULL` for an unrecognized source or
  * allocation failure.
  */
 struct ef_infer_signals *ef_infer_signals_new(uint32_t source);
@@ -641,7 +849,9 @@ struct ef_infer_signals *ef_infer_signals_new(uint32_t source);
 void ef_infer_signals_free(struct ef_infer_signals *s);
 
 /**
- * Append an input tensor. `dtype` is an `EF_INFER_DTYPE_*` code.
+ * Append an input tensor. `dtype` is an `EF_DTYPE_*` code from
+ * `edgefirst/tensor.h` (`EF_INFER_DTYPE_*` are aliases of them); the
+ * 64-bit dtypes and unknown codes are `EINVAL`.
  *
  * @return 0 on success, `EINVAL` for a null/invalid argument.
  *
@@ -884,6 +1094,10 @@ struct ef_detect_box_list *ef_lift_tile_boxes(const ef_detect_box *boxes,
 struct ef_detect_box_list *ef_merge_tiled_detections(const ef_detect_box *boxes,
                                                      uintptr_t count,
                                                      const ef_merge_config *cfg);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
 #ifdef __cplusplus
 } /* extern "C" */

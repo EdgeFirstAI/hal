@@ -21,44 +21,14 @@ use edgefirst_tensor::{BoundingBox, DetectBox};
 
 use crate::decode::{EfDetectBox, EfDetectBoxList};
 
-fn metric_from(v: u32) -> Option<MatchMetric> {
-    match v {
-        0 => Some(MatchMetric::Iou),
-        1 => Some(MatchMetric::Ios),
-        _ => None,
-    }
-}
-
-fn metric_to(m: MatchMetric) -> u32 {
-    match m {
-        MatchMetric::Iou => 0,
-        MatchMetric::Ios => 1,
-    }
-}
-
-fn mode_from(v: u32) -> Option<MergeMode> {
-    match v {
-        0 => Some(MergeMode::KeepBest),
-        1 => Some(MergeMode::Union),
-        _ => None,
-    }
-}
-
-fn mode_to(m: MergeMode) -> u32 {
-    match m {
-        MergeMode::KeepBest => 0,
-        MergeMode::Union => 1,
-    }
-}
-
 fn merge_config_from(c: &EfMergeConfig) -> Option<MergeConfig> {
     Some(MergeConfig {
-        metric: metric_from(c.metric)?,
+        metric: MatchMetric::from_code(c.metric)?,
         threshold: c.threshold,
         class_agnostic: c.class_agnostic != 0,
         max_det: c.max_det,
         score_threshold: c.score_threshold,
-        mode: mode_from(c.mode)?,
+        mode: MergeMode::from_code(c.mode)?,
     })
 }
 
@@ -104,12 +74,12 @@ pub unsafe extern "C" fn ef_merge_config_default(out: *mut EfMergeConfig) -> c_i
         catch_unwind(AssertUnwindSafe(|| {
             let d = MergeConfig::default();
             *out = EfMergeConfig {
-                metric: metric_to(d.metric),
+                metric: d.metric.code(),
                 threshold: d.threshold,
                 class_agnostic: i32::from(d.class_agnostic),
                 max_det: d.max_det,
                 score_threshold: d.score_threshold,
-                mode: mode_to(d.mode),
+                mode: d.mode.code(),
             };
             0
         }))

@@ -28,52 +28,18 @@ pub struct EfInferredSchema {
     inner: InferredSchema,
 }
 
-/// Maps the `source` code documented on [`ef_infer_signals_new`].
-fn source_from(code: u32) -> Option<ModelSource> {
-    match code {
-        0 => Some(ModelSource::Onnx),
-        1 => Some(ModelSource::TfLite),
-        2 => Some(ModelSource::Other),
-        3 => Some(ModelSource::CoreMl),
-        _ => None,
-    }
-}
-
-/// Maps an `EF_INFER_DTYPE_*` code to `schema::DType`. This is a distinct
-/// vocabulary from `tensor.h`'s `EF_DTYPE_*` (which numbers
-/// `edgefirst_tensor::DType`, a different, wider enum used for physical
-/// tensor storage) -- `schema::DType` is the narrower quantized/float set a
-/// model's logical I/O carries, so it gets its own codes rather than
-/// reusing `EF_DTYPE_*` positions that would silently misalign.
-///
-/// The codes start at `EF_INFER_DTYPE_BASE` rather than `0` so the two
-/// vocabularies occupy disjoint ranges: both cross the boundary as bare
-/// `u32`, so overlapping ranges would have made every `EF_DTYPE_*` value a
-/// valid -- and differently-meaning -- code here, silently misreading a
-/// caller that passed the tensor dtype it already had. See the parity test
-/// `the_header_infer_dtype_codes_match_dtype_from`.
-pub(crate) const EF_INFER_DTYPE_BASE: u32 = 0x100;
-
+/// Maps an `EF_DTYPE_*` code (`edgefirst/tensor.h`) to the model I/O dtype.
+/// The 64-bit tensor dtypes are not model I/O dtypes and map to `None`.
 pub(crate) fn dtype_from(code: u32) -> Option<DType> {
-    match code.checked_sub(EF_INFER_DTYPE_BASE)? {
-        0 => Some(DType::Int8),
-        1 => Some(DType::Uint8),
-        2 => Some(DType::Int16),
-        3 => Some(DType::Uint16),
-        4 => Some(DType::Int32),
-        5 => Some(DType::Uint32),
-        6 => Some(DType::Float16),
-        7 => Some(DType::Float32),
-        _ => None,
-    }
+    DType::from_code(code)
 }
 
-/// Create empty signals for a model read from `source` (`0` onnx, `1`
-/// tflite, `2` other, `3` coreml). `NULL` for an unrecognized source or
+/// Create empty signals for a model read from `source`, an
+/// `EF_MODEL_SOURCE_*` code. `NULL` for an unrecognized source or
 /// allocation failure.
 #[no_mangle]
 pub extern "C" fn ef_infer_signals_new(source: u32) -> *mut EfInferSignals {
-    let Some(source) = source_from(source) else {
+    let Some(source) = ModelSource::from_code(source) else {
         return std::ptr::null_mut();
     };
     catch_unwind(|| {
@@ -117,7 +83,9 @@ where
     }
 }
 
-/// Append an input tensor. `dtype` is an `EF_INFER_DTYPE_*` code.
+/// Append an input tensor. `dtype` is an `EF_DTYPE_*` code from
+/// `edgefirst/tensor.h` (`EF_INFER_DTYPE_*` are aliases of them); the
+/// 64-bit dtypes and unknown codes are `EINVAL`.
 ///
 /// @return 0 on success, `EINVAL` for a null/invalid argument.
 ///
@@ -423,6 +391,7 @@ mod tests {
     use std::ffi::CStr;
 
     use super::*;
+    use crate::codes::EfModelSource;
 
     /// Builds a synthetic 80-class Ultralytics `names` dict-repr string,
     /// matching the format real ONNX/TFLite exports carry (see
@@ -452,7 +421,7 @@ mod tests {
                     images.as_ptr(),
                     input_shape.as_ptr(),
                     input_shape.len(),
-                    EF_INFER_DTYPE_BASE + 7, // float32
+                    edgefirst_tensor::DType::F32.code(),
                 ),
                 0
             );
@@ -465,7 +434,7 @@ mod tests {
                     output0.as_ptr(),
                     output_shape.as_ptr(),
                     output_shape.len(),
-                    EF_INFER_DTYPE_BASE + 7, // float32
+                    edgefirst_tensor::DType::F32.code(),
                     std::ptr::null(),
                     std::ptr::null(),
                     0, // unquantized
@@ -567,12 +536,12 @@ mod tests {
     }
 
     #[test]
-    fn source_from_maps_coreml_and_rejects_out_of_range() {
-        // `3` was appended for CoreML; `0`-`2` (onnx, tflite, other) are
-        // covered by the surrounding tests and must not be renumbered --
-        // these codes are ABI.
-        assert_eq!(source_from(3), Some(ModelSource::CoreMl));
-        assert_eq!(source_from(4), None);
+    fn the_source_code_maps_coreml_and_rejects_out_of_range() {
+        assert_eq!(
+            ModelSource::from_code(EfModelSource::CoreMl as u32),
+            Some(ModelSource::CoreMl)
+        );
+        assert!(ef_infer_signals_new(4).is_null());
     }
 
     #[test]
@@ -620,35 +589,27 @@ mod tests {
     }
 
     #[test]
-    fn a_tensor_dtype_code_is_refused_not_silently_misread() {
-        // `EF_DTYPE_*` (tensor.h) numbers 0..=10 over a different, wider
-        // vocabulary. Had `EF_INFER_DTYPE_*` also started at 0, a caller
-        // passing the tensor dtype it already held would have been accepted
-        // as a *different* dtype -- `EF_DTYPE_I64` (7) read as FLOAT32.
-        // Disjoint ranges turn that mistake into an error.
+    fn the_dtype_code_is_the_tensor_dtype_code() {
+        // One numbering for dtype across the stack: a caller passes the
+        // `EF_DTYPE_*` it already holds. Model I/O carries no 64-bit
+        // dtypes, so those are refused rather than narrowed.
         unsafe {
-            let s = ef_infer_signals_new(0);
+            let s = ef_infer_signals_new(EfModelSource::Onnx as u32);
             let name = CString::new("x").unwrap();
             let shape: [usize; 1] = [1];
-            for tensor_code in 0..=10u32 {
-                assert_eq!(
-                    ef_infer_signals_add_input(s, name.as_ptr(), shape.as_ptr(), 1, tensor_code),
-                    libc::EINVAL,
-                    "EF_DTYPE_* code {tensor_code} must not be a valid EF_INFER_DTYPE_* code"
-                );
+            for &t in edgefirst_tensor::DType::all() {
+                let want = DType::from_tensor_dtype(t);
+                assert_eq!(dtype_from(t.code()), want, "{t:?}");
+                let rc = ef_infer_signals_add_input(s, name.as_ptr(), shape.as_ptr(), 1, t.code());
+                let expected = if want.is_some() { 0 } else { libc::EINVAL };
+                assert_eq!(rc, expected, "EF_DTYPE code {} ({t:?})", t.code());
             }
             ef_infer_signals_free(s);
         }
     }
 
     #[test]
-    fn the_header_infer_dtype_codes_match_dtype_from() {
-        // Name-level checks prove a spelling exists; they say nothing about
-        // which integer sits next to it. These macros are hand-written into
-        // cbindgen.toml's header block and `dtype_from` is a separately
-        // hand-written match, so nothing but this test links the two. Same
-        // approach as tensor-capi's
-        // `the_header_enumerator_values_match_the_rust_vocabulary`.
+    fn the_header_infer_dtype_names_alias_the_tensor_dtype_codes() {
         let header = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/include/edgefirst/decoder.h"
@@ -665,33 +626,24 @@ mod tests {
             ("EF_INFER_DTYPE_FLOAT16", DType::Float16),
             ("EF_INFER_DTYPE_FLOAT32", DType::Float32),
         ];
-
-        let mut seen = 0;
+        assert_eq!(expected.len(), DType::all().len(), "name every model dtype");
         for (name, want) in expected {
             let line = header
                 .lines()
                 .find(|l| l.starts_with(&format!("#define {name} ")))
                 .unwrap_or_else(|| panic!("decoder.h does not define {name}"));
-            let literal = line.rsplit(' ').next().expect("a value after the name");
-            let code = u32::from_str_radix(literal.trim_start_matches("0x"), 16)
-                .unwrap_or_else(|e| panic!("{name} value `{literal}` is not hex: {e}"));
+            let target = line.rsplit(' ').next().expect("a value after the name");
+            let tensor_name = target.strip_prefix("EF_DTYPE_").unwrap_or_else(|| {
+                panic!("{name} must alias an EF_DTYPE_* enumerator, not `{target}`")
+            });
+            let tensor = edgefirst_tensor::DType::from_str_code(&tensor_name.to_lowercase())
+                .unwrap_or_else(|| panic!("{target} is not a tensor dtype"));
             assert_eq!(
-                dtype_from(code),
+                DType::from_tensor_dtype(tensor),
                 Some(want),
-                "{name} is {literal} in decoder.h, which dtype_from maps elsewhere"
+                "{name} aliases {target}, which is not {want:?}"
             );
-            seen += 1;
         }
-
-        // Exhaustiveness: a new `schema::DType` variant must not silently
-        // go unnamed by the header. This count is the only thing that
-        // fails the build when one is added.
-        assert_eq!(seen, 8, "decoder.h must name every schema::DType variant");
-        assert_eq!(
-            dtype_from(EF_INFER_DTYPE_BASE + 8),
-            None,
-            "an unnamed code past the last variant must not map"
-        );
     }
 
     #[test]

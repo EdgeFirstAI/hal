@@ -1857,6 +1857,14 @@ pub enum PyRotation {
     CounterClockwise90 = 3,
 }
 
+// PyO3 requires literal discriminants; pin each to the shared code.
+const _: () = {
+    assert!(PyRotation::Rotate0 as u32 == Rotation::None.code());
+    assert!(PyRotation::Clockwise90 as u32 == Rotation::Clockwise90.code());
+    assert!(PyRotation::Rotate180 as u32 == Rotation::Rotate180.code());
+    assert!(PyRotation::CounterClockwise90 as u32 == Rotation::CounterClockwise90.code());
+};
+
 #[pymethods]
 impl PyRotation {
     #[staticmethod]
@@ -1891,9 +1899,17 @@ impl From<PyRotation> for Rotation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyFlip {
     NoFlip = 0,
-    Horizontal = 1,
-    Vertical = 2,
+    /// Mirror top to bottom.
+    Vertical = 1,
+    /// Mirror left to right.
+    Horizontal = 2,
 }
+
+const _: () = {
+    assert!(PyFlip::NoFlip as u32 == Flip::None.code());
+    assert!(PyFlip::Vertical as u32 == Flip::Vertical.code());
+    assert!(PyFlip::Horizontal as u32 == Flip::Horizontal.code());
+};
 
 /// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
 #[pymethods]
@@ -1933,6 +1949,12 @@ pub enum PyColorMode {
     Instance = 1,
     Track = 2,
 }
+
+const _: () = {
+    assert!(PyColorMode::Class as u32 == image::ColorMode::Class.code());
+    assert!(PyColorMode::Instance as u32 == image::ColorMode::Instance.code());
+    assert!(PyColorMode::Track as u32 == image::ColorMode::Track.code());
+};
 
 /// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
 #[pymethods]

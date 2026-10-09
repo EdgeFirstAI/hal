@@ -594,27 +594,47 @@ pub enum Activation {
 }
 
 /// Decoder framework for a logical output.
+///
+/// Numbered by [`configs::DecoderType`], the declaration of this
+/// vocabulary; see [`DecoderKind::code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
 pub enum DecoderKind {
     /// Au-Zone ModelPack anchor-based YOLO decoder.
     #[serde(rename = "modelpack")]
-    ModelPack,
+    ModelPack = configs::decoder_type_code::MODELPACK,
     /// Ultralytics anchor-free DFL decoder (YOLOv5/v8/v11/v26).
     #[serde(rename = "ultralytics")]
-    Ultralytics,
+    Ultralytics = configs::decoder_type_code::ULTRALYTICS,
+}
+
+impl DecoderKind {
+    /// The shared code, identical to [`configs::DecoderType::code`].
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
 }
 
 /// YOLO architecture version for Ultralytics decoders.
+///
+/// Numbered by [`configs::DecoderVersion`], the declaration of this
+/// vocabulary; see [`DecoderVersion::code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u32)]
 pub enum DecoderVersion {
-    Yolov5,
-    Yolov8,
-    Yolo11,
-    Yolo26,
+    Yolov5 = configs::decoder_version_code::YOLOV5,
+    Yolov8 = configs::decoder_version_code::YOLOV8,
+    Yolo11 = configs::decoder_version_code::YOLO11,
+    Yolo26 = configs::decoder_version_code::YOLO26,
 }
 
 impl DecoderVersion {
+    /// The shared code, identical to [`configs::DecoderVersion::code`].
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
     /// Returns `true` for architectures with embedded NMS (YOLO26).
     pub fn is_end_to_end(self) -> bool {
         matches!(self, DecoderVersion::Yolo26)
@@ -622,28 +642,145 @@ impl DecoderVersion {
 }
 
 /// HAL NMS mode.
+///
+/// Numbered by [`configs::Nms`], the declaration of this vocabulary; see
+/// [`NmsMode::code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u32)]
 pub enum NmsMode {
     /// Suppress overlapping boxes regardless of class label.
-    ClassAgnostic,
+    ClassAgnostic = configs::nms_code::CLASS_AGNOSTIC,
     /// Only suppress boxes sharing a class label and overlapping above
     /// the IoU threshold.
-    ClassAware,
+    ClassAware = configs::nms_code::CLASS_AWARE,
 }
 
-/// Quantized or floating-point data type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Quantized or floating-point data type of a model's logical I/O.
+///
+/// A subset of [`edgefirst_tensor::DType`], numbered and named by it: the
+/// discriminant is that enum's code and the serialized string is its
+/// [`as_str`](edgefirst_tensor::DType::as_str) (`"i8"`, `"u8"`, ...,
+/// `"f32"`). The older spellings (`"int8"`, `"uint8"`, ..., `"float32"`)
+/// are still accepted on input; see [`DType::from_str_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
 pub enum DType {
-    Int8,
-    Uint8,
-    Int16,
-    Uint16,
-    Int32,
-    Uint32,
-    Float16,
-    Float32,
+    Int8 = edgefirst_tensor::protocol::dtype::I8,
+    Uint8 = edgefirst_tensor::protocol::dtype::U8,
+    Int16 = edgefirst_tensor::protocol::dtype::I16,
+    Uint16 = edgefirst_tensor::protocol::dtype::U16,
+    Int32 = edgefirst_tensor::protocol::dtype::I32,
+    Uint32 = edgefirst_tensor::protocol::dtype::U32,
+    Float16 = edgefirst_tensor::protocol::dtype::F16,
+    Float32 = edgefirst_tensor::protocol::dtype::F32,
+}
+
+/// The pre-`edgefirst_tensor::DType` spellings, accepted on input only.
+const DTYPE_LEGACY_NAMES: [(&str, DType); 8] = [
+    ("int8", DType::Int8),
+    ("uint8", DType::Uint8),
+    ("int16", DType::Int16),
+    ("uint16", DType::Uint16),
+    ("int32", DType::Int32),
+    ("uint32", DType::Uint32),
+    ("float16", DType::Float16),
+    ("float32", DType::Float32),
+];
+
+impl DType {
+    /// Every variant, for exhaustive cross-surface tests.
+    pub fn all() -> &'static [DType] {
+        &[
+            DType::Int8,
+            DType::Uint8,
+            DType::Int16,
+            DType::Uint16,
+            DType::Int32,
+            DType::Uint32,
+            DType::Float16,
+            DType::Float32,
+        ]
+    }
+
+    /// The shared code, identical to [`edgefirst_tensor::DType::code`].
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// The tensor dtype with the same code.
+    pub fn to_tensor_dtype(self) -> edgefirst_tensor::DType {
+        match self {
+            DType::Int8 => edgefirst_tensor::DType::I8,
+            DType::Uint8 => edgefirst_tensor::DType::U8,
+            DType::Int16 => edgefirst_tensor::DType::I16,
+            DType::Uint16 => edgefirst_tensor::DType::U16,
+            DType::Int32 => edgefirst_tensor::DType::I32,
+            DType::Uint32 => edgefirst_tensor::DType::U32,
+            DType::Float16 => edgefirst_tensor::DType::F16,
+            DType::Float32 => edgefirst_tensor::DType::F32,
+        }
+    }
+
+    /// The model I/O dtype for a tensor dtype; `None` for one a model's
+    /// logical I/O does not carry (64-bit types).
+    pub fn from_tensor_dtype(dtype: edgefirst_tensor::DType) -> Option<Self> {
+        Self::all()
+            .iter()
+            .copied()
+            .find(|d| d.code() == dtype.code())
+    }
+
+    /// Decode a shared code; `None` for an unknown code or a tensor dtype a
+    /// model's logical I/O does not carry.
+    pub fn from_code(code: u32) -> Option<Self> {
+        edgefirst_tensor::DType::from_code(code).and_then(Self::from_tensor_dtype)
+    }
+
+    /// The string form, identical to [`edgefirst_tensor::DType::as_str`].
+    pub fn as_str(self) -> &'static str {
+        self.to_tensor_dtype().as_str()
+    }
+
+    /// Parse the string form, also accepting the older `"int8"`, `"uint8"`,
+    /// ..., `"float32"` spellings.
+    pub fn from_str_code(s: &str) -> Option<Self> {
+        edgefirst_tensor::DType::from_str_code(s)
+            .and_then(Self::from_tensor_dtype)
+            .or_else(|| {
+                DTYPE_LEGACY_NAMES
+                    .iter()
+                    .find(|(name, _)| *name == s)
+                    .map(|(_, d)| *d)
+            })
+    }
+
+    /// Every accepted input spelling, current and legacy.
+    pub fn accepted_names() -> impl Iterator<Item = &'static str> {
+        Self::all()
+            .iter()
+            .map(|d| d.as_str())
+            .chain(DTYPE_LEGACY_NAMES.iter().map(|(name, _)| *name))
+    }
+}
+
+impl Serialize for DType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
+        DType::from_str_code(&s).ok_or_else(|| {
+            let expected: Vec<&str> = DType::accepted_names().collect();
+            serde::de::Error::custom(format!(
+                "unknown dtype `{s}`, expected one of: {}",
+                expected.join(", ")
+            ))
+        })
+    }
 }
 
 impl DType {
@@ -1195,6 +1332,11 @@ impl DecoderVersion {
 }
 
 impl NmsMode {
+    /// The shared code, identical to [`configs::Nms::code`].
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+
     /// Convert a legacy v1 [`configs::Nms`]; `Auto` defers to the builder default.
     pub fn from_v1(v: &configs::Nms) -> Option<Self> {
         match v {
@@ -1492,17 +1634,79 @@ mod tests {
 
     #[test]
     fn dtype_roundtrip() {
-        for d in [
-            DType::Int8,
-            DType::Uint8,
-            DType::Int16,
-            DType::Uint16,
-            DType::Float16,
-            DType::Float32,
-        ] {
+        for &d in DType::all() {
             let j = serde_json::to_string(&d).unwrap();
             let back: DType = serde_json::from_str(&j).unwrap();
             assert_eq!(back, d);
+        }
+    }
+
+    #[test]
+    fn dtype_is_numbered_and_named_by_the_tensor_dtype() {
+        for &d in DType::all() {
+            let t = d.to_tensor_dtype();
+            assert_eq!(d.code(), t.code(), "{d:?}");
+            assert_eq!(d.as_str(), t.as_str(), "{d:?}");
+            assert_eq!(DType::from_code(t.code()), Some(d));
+            assert_eq!(DType::from_tensor_dtype(t), Some(d));
+            assert_eq!(
+                serde_json::to_string(&d).unwrap(),
+                format!("\"{}\"", t.as_str())
+            );
+        }
+        // The 64-bit tensor dtypes are not model I/O dtypes.
+        for t in [
+            edgefirst_tensor::DType::U64,
+            edgefirst_tensor::DType::I64,
+            edgefirst_tensor::DType::F64,
+        ] {
+            assert_eq!(DType::from_tensor_dtype(t), None);
+            assert_eq!(DType::from_code(t.code()), None);
+            assert_eq!(DType::from_str_code(t.as_str()), None);
+        }
+        assert_eq!(DType::from_code(u32::MAX), None);
+    }
+
+    #[test]
+    fn dtype_accepts_every_legacy_name() {
+        let legacy = [
+            ("int8", DType::Int8),
+            ("uint8", DType::Uint8),
+            ("int16", DType::Int16),
+            ("uint16", DType::Uint16),
+            ("int32", DType::Int32),
+            ("uint32", DType::Uint32),
+            ("float16", DType::Float16),
+            ("float32", DType::Float32),
+        ];
+        assert_eq!(legacy.len(), DType::all().len());
+        for (name, d) in legacy {
+            assert_eq!(DType::from_str_code(name), Some(d), "{name}");
+            let back: DType = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(back, d, "{name}");
+            // Accepted on input, never produced on output.
+            assert_ne!(d.as_str(), name);
+        }
+        assert_eq!(DType::accepted_names().count(), 2 * DType::all().len());
+        assert!(serde_json::from_str::<DType>("\"float64\"").is_err());
+        assert!(serde_json::from_str::<DType>("\"Int8\"").is_err());
+    }
+
+    #[test]
+    fn schema_enums_take_their_codes_from_the_config_vocabularies() {
+        for v in [
+            DecoderVersion::Yolov5,
+            DecoderVersion::Yolov8,
+            DecoderVersion::Yolo11,
+            DecoderVersion::Yolo26,
+        ] {
+            assert_eq!(v.code(), v.to_v1().code(), "{v:?}");
+        }
+        for m in [NmsMode::ClassAgnostic, NmsMode::ClassAware] {
+            assert_eq!(m.code(), m.to_v1().code(), "{m:?}");
+        }
+        for k in [DecoderKind::ModelPack, DecoderKind::Ultralytics] {
+            assert_eq!(k.code(), k.to_v1().code(), "{k:?}");
         }
     }
 
