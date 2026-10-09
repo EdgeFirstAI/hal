@@ -281,33 +281,15 @@ fn crop_from(c: *const EfCrop) -> edgefirst_image::Crop {
     out
 }
 
-/// Map the rotation code, rejecting anything not a quarter turn.
-fn rotation_from(code: u32) -> Option<edgefirst_image::Rotation> {
-    match code {
-        0 => Some(edgefirst_image::Rotation::None),
-        1 => Some(edgefirst_image::Rotation::Clockwise90),
-        2 => Some(edgefirst_image::Rotation::Rotate180),
-        3 => Some(edgefirst_image::Rotation::CounterClockwise90),
-        _ => None,
-    }
-}
-
-/// Map the flip code.
-fn flip_from(code: u32) -> Option<edgefirst_image::Flip> {
-    match code {
-        0 => Some(edgefirst_image::Flip::None),
-        1 => Some(edgefirst_image::Flip::Vertical),
-        2 => Some(edgefirst_image::Flip::Horizontal),
-        _ => None,
-    }
-}
-
 /// Convert `src` into `dst`, scaling, converting colour and rotating as needed.
 ///
 /// `src`/`dst` may have been minted by any EdgeFirst library -- every library
 /// links the same shared tensor implementation, so both are read the same
 /// way regardless of which one minted them. `crop` may be `NULL` for the
 /// whole source.
+///
+/// `rotation` is an `EF_ROTATION_*` code and `flip` an `EF_FLIP_*` code; any
+/// other value is `EINVAL`, checked before any work.
 ///
 /// @return 0 on success, otherwise an errno.
 ///
@@ -329,7 +311,10 @@ pub unsafe extern "C" fn ef_image_processor_convert(
             }
             // Validated before any work: an unknown code silently treated as
             // "none" would rotate nothing and look like a backend failure.
-            let (Some(rot), Some(fl)) = (rotation_from(rotation), flip_from(flip)) else {
+            let (Some(rot), Some(fl)) = (
+                edgefirst_image::Rotation::from_code(rotation),
+                edgefirst_image::Flip::from_code(flip),
+            ) else {
                 return libc::EINVAL;
             };
             use edgefirst_image::ImageProcessorTrait as _;
@@ -347,6 +332,7 @@ pub unsafe extern "C" fn ef_image_processor_convert(
 }
 
 /// Like [`ef_image_processor_convert`], but does not wait for the GPU.
+/// `rotation` and `flip` are validated the same way.
 ///
 /// # Safety
 /// `p`, `src` and `dst` must be live handles.
@@ -364,7 +350,10 @@ pub unsafe extern "C" fn ef_image_processor_convert_deferred(
             if p.is_null() {
                 return libc::EINVAL;
             }
-            let (Some(rot), Some(fl)) = (rotation_from(rotation), flip_from(flip)) else {
+            let (Some(rot), Some(fl)) = (
+                edgefirst_image::Rotation::from_code(rotation),
+                edgefirst_image::Flip::from_code(flip),
+            ) else {
                 return libc::EINVAL;
             };
             use edgefirst_image::ImageProcessorTrait as _;
@@ -427,7 +416,7 @@ pub unsafe extern "C" fn ef_align_width_for_pixel_format(
 
 /// Create a processor forced to one backend.
 ///
-/// `backend`: 0 = auto, 1 = CPU, 2 = G2D, 3 = OpenGL. A forced backend
+/// `backend` is an `EF_COMPUTE_BACKEND_*` code. A forced backend
 /// disables the fallback chain entirely — if it is unavailable the call fails
 /// rather than quietly using another, which is the point of forcing one.
 ///
@@ -435,12 +424,8 @@ pub unsafe extern "C" fn ef_align_width_for_pixel_format(
 #[no_mangle]
 pub extern "C" fn ef_image_processor_new_with_backend(backend: u32) -> *mut EfImageProcessor {
     catch_unwind(|| {
-        let b = match backend {
-            0 => edgefirst_image::ComputeBackend::Auto,
-            1 => edgefirst_image::ComputeBackend::Cpu,
-            2 => edgefirst_image::ComputeBackend::G2d,
-            3 => edgefirst_image::ComputeBackend::OpenGl,
-            _ => return std::ptr::null_mut(),
+        let Some(b) = edgefirst_image::ComputeBackend::from_code(backend) else {
+            return std::ptr::null_mut();
         };
         // `needless_update` fires on macOS, where the config has only
         // `backend`; on Linux it also has a cfg-gated `egl_display`.
@@ -555,6 +540,8 @@ pub unsafe extern "C" fn ef_image_processor_flush(p: *mut EfImageProcessor) -> c
 /// therefore completed synchronously — in which case the destination is already
 /// safe to read.
 ///
+/// `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
+///
 /// @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
 ///
 /// # Safety
@@ -579,7 +566,10 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
             // flip code included, which is where this used to leave `*fence_fd`
             // untouched while the handle sibling below cleared it.
             *fence_fd = -1;
-            let (Some(rot), Some(fl)) = (rotation_from(rotation), flip_from(flip)) else {
+            let (Some(rot), Some(fl)) = (
+                edgefirst_image::Rotation::from_code(rotation),
+                edgefirst_image::Flip::from_code(flip),
+            ) else {
                 return libc::EINVAL;
             };
             #[cfg(not(unix))]
@@ -620,6 +610,8 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
 /// closes it with `CloseHandle`. `*fence` is `NULL` when the convert
 /// completed synchronously (no fence on this display).
 ///
+/// `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
+///
 /// @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
 ///
 /// # Safety
@@ -644,7 +636,10 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
             // failure -- a bad code included -- never sees an uninitialised
             // pointer.
             *fence = std::ptr::null_mut();
-            let (Some(rot), Some(fl)) = (rotation_from(rotation), flip_from(flip)) else {
+            let (Some(rot), Some(fl)) = (
+                edgefirst_image::Rotation::from_code(rotation),
+                edgefirst_image::Flip::from_code(flip),
+            ) else {
                 return libc::EINVAL;
             };
             #[cfg(not(target_os = "windows"))]
@@ -801,17 +796,25 @@ mod tests {
             (2, edgefirst_image::Rotation::Rotate180),
             (3, edgefirst_image::Rotation::CounterClockwise90),
         ] {
-            assert_eq!(rotation_from(c), Some(r), "rotation code {c}");
+            assert_eq!(
+                edgefirst_image::Rotation::from_code(c),
+                Some(r),
+                "rotation code {c}"
+            );
         }
-        assert_eq!(rotation_from(4), None);
+        assert_eq!(edgefirst_image::Rotation::from_code(4), None);
         for (c, f) in [
             (0, edgefirst_image::Flip::None),
             (1, edgefirst_image::Flip::Vertical),
             (2, edgefirst_image::Flip::Horizontal),
         ] {
-            assert_eq!(flip_from(c), Some(f), "flip code {c}");
+            assert_eq!(
+                edgefirst_image::Flip::from_code(c),
+                Some(f),
+                "flip code {c}"
+            );
         }
-        assert_eq!(flip_from(3), None);
+        assert_eq!(edgefirst_image::Flip::from_code(3), None);
     }
 
     #[test]

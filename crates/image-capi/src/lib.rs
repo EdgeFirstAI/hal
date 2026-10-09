@@ -41,6 +41,7 @@
 //! handle through `ef_tensor_image_desc_get`'s scalar view rather than a
 //! dereference of tensor-capi's private layout.
 
+pub mod codes;
 pub mod draw;
 pub mod processor;
 pub mod tiling;

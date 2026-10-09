@@ -7,7 +7,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_decoder_abi::{EfTilePlacement, TilePlacement};
-use edgefirst_image::{tile_grid, Fit, TileSpec, TilingConfig};
+use edgefirst_image::{tile_grid, Fit, FitMode, TileSpec, TilingConfig};
 use edgefirst_tensor::{DType, PixelFormat, TensorMemory};
 use edgefirst_tensor_ffi::EfTensor;
 
@@ -21,24 +21,21 @@ pub struct EfTilingConfig {
     pub tile_h: usize,
     pub overlap_ratio: f32,
     pub pad: [u8; 4],
-    /// 0 = stretch, 1 = letterbox.
+    /// An `EF_FIT_*` code. Any other value makes the functions taking this
+    /// config fail (`EINVAL`, or `NULL` where they return a pointer).
     pub fit: c_int,
 }
 
-impl From<EfTilingConfig> for TilingConfig {
-    fn from(c: EfTilingConfig) -> Self {
-        TilingConfig {
-            tile_w: c.tile_w,
-            tile_h: c.tile_h,
-            overlap_ratio: c.overlap_ratio,
-            pad: c.pad,
-            fit: if c.fit != 0 {
-                Fit::Letterbox { pad: c.pad }
-            } else {
-                Fit::Stretch
-            },
-        }
-    }
+/// The Rust config, or `None` for an unknown `fit` code.
+fn tiling_config_from(c: &EfTilingConfig) -> Option<TilingConfig> {
+    let mode = u32::try_from(c.fit).ok().and_then(FitMode::from_code)?;
+    Some(TilingConfig {
+        tile_w: c.tile_w,
+        tile_h: c.tile_h,
+        overlap_ratio: c.overlap_ratio,
+        pad: c.pad,
+        fit: Fit::from_mode(mode, c.pad),
+    })
 }
 
 /// One tile's native-frame crop and grid coordinates.
@@ -87,7 +84,7 @@ pub extern "C" fn ef_tiling_config_default(tile_w: usize, tile_h: usize) -> EfTi
         tile_h: cfg.tile_h,
         overlap_ratio: cfg.overlap_ratio,
         pad: cfg.pad,
-        fit: 0,
+        fit: cfg.fit.mode().code() as c_int,
     }
 }
 
@@ -268,7 +265,9 @@ pub unsafe extern "C" fn ef_image_processor_alloc_tile_batch(
             let Some(acc) = cpu_access_from_code(access) else {
                 return std::ptr::null_mut();
             };
-            let cfg: TilingConfig = (*config).into();
+            let Some(cfg) = tiling_config_from(&*config) else {
+                return std::ptr::null_mut();
+            };
             let mem = TensorMemory::from_code(storage);
             match (*p).inner.alloc_tile_batch(n, &cfg, fmt, dt, mem, acc) {
                 Ok(t) => t.into_raw(),
@@ -295,7 +294,9 @@ pub unsafe extern "C" fn ef_image_processor_plan_tiles(
             if p.is_null() || config.is_null() {
                 return std::ptr::null_mut();
             }
-            let cfg: TilingConfig = (*config).into();
+            let Some(cfg) = tiling_config_from(&*config) else {
+                return std::ptr::null_mut();
+            };
             match (*p).inner.plan_tiles(src_w, src_h, &cfg) {
                 Ok(placements) => Box::into_raw(Box::new(EfTilePlacementList { placements })),
                 Err(_) => std::ptr::null_mut(),
@@ -321,7 +322,9 @@ pub unsafe extern "C" fn ef_image_processor_tile_into(
             if p.is_null() || config.is_null() {
                 return std::ptr::null_mut();
             }
-            let cfg: TilingConfig = (*config).into();
+            let Some(cfg) = tiling_config_from(&*config) else {
+                return std::ptr::null_mut();
+            };
             let result = with_tensor(src, |s| {
                 with_tensor_mut(dst, |d| (*p).inner.tile_into(s, d, &cfg))
             });
@@ -353,7 +356,9 @@ pub unsafe extern "C" fn ef_image_processor_tile_one(
             if p.is_null() || placement.is_null() || config.is_null() {
                 return libc::EINVAL;
             }
-            let cfg: TilingConfig = (*config).into();
+            let Some(cfg) = tiling_config_from(&*config) else {
+                return libc::EINVAL;
+            };
             let place: TilePlacement = (&*placement).into();
             let result = with_tensor(src, |s| {
                 with_tensor_mut(dst, |d| (*p).inner.tile_one(s, d, &place, &cfg))
@@ -365,5 +370,28 @@ pub unsafe extern "C" fn ef_image_processor_tile_one(
             }
         }))
         .unwrap_or(libc::EINVAL)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_fit_code_maps_and_the_rest_are_refused() {
+        let mut c = ef_tiling_config_default(640, 640);
+        assert_eq!(c.fit, FitMode::Stretch.code() as c_int);
+        for &mode in FitMode::all() {
+            c.fit = mode.code() as c_int;
+            let cfg = tiling_config_from(&c).expect("a declared fit code maps");
+            assert_eq!(cfg.fit.mode(), mode);
+        }
+        for bad in [2, 7, -1, c_int::MAX] {
+            c.fit = bad;
+            assert!(
+                tiling_config_from(&c).is_none(),
+                "fit {bad} must be refused"
+            );
+        }
     }
 }

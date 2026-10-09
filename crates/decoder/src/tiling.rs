@@ -79,16 +79,23 @@ use crate::{BoundingBox, DetectBox};
 pub use edgefirst_decoder_abi::TilePlacement;
 use edgefirst_tensor::unletter_norm;
 
-/// Overlap metric used by the tiled-detection merge to decide whether two boxes
-/// belong to the same object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MatchMetric {
-    /// Intersection-over-Union (standard NMS metric).
-    Iou,
-    /// Intersection-over-Smaller (default): `inter / min(area_a, area_b)`. A
-    /// seam-split object has low IoU but high IoS, so IoS merges the fragment.
-    #[default]
-    Ios,
+edgefirst_tensor::ef_vocabulary! {
+    /// Overlap metric used by the tiled-detection merge to decide whether two boxes
+    /// belong to the same object.
+    ///
+    /// The code is the one the C `EF_MATCH_METRIC_*` enumerators and the
+    /// Python `MatchMetric` enum use.
+    #[derive(Default)]
+    pub enum MatchMetric {
+        /// Intersection-over-Union (standard NMS metric).
+        Iou = 0, "iou", IOU,
+        /// Intersection-over-Smaller (default): `inter / min(area_a, area_b)`. A
+        /// seam-split object has low IoU but high IoS, so IoS merges the fragment.
+        #[default]
+        Ios = 1, "ios", IOS,
+    }
+    #[doc(hidden)]
+    pub mod match_metric_code;
 }
 
 impl MatchMetric {
@@ -102,30 +109,37 @@ impl MatchMetric {
     }
 }
 
-/// What the tiled-detection merge emits for a group of boxes the match
-/// metric has joined.
-///
-/// Measured on the Ocean Cleanup ADIS 4K validation set (TOP2-836), the
-/// enclosing union cost about 0.05 AP50 on every frame (whole frame: 0.491
-/// AP50 with plain NMS, 0.437 after the union merge, 0.490 with keep-best;
-/// 28-tile pipeline: 0.500 keep-best vs 0.442 union), so [`Self::KeepBest`]
-/// is the default. See the [module docs](self#merge-mode-affects-map).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MergeMode {
-    /// Keep the group's highest-scoring box — its coordinates and its score
-    /// — and drop the boxes it matched. Greedy NMS under the configured
-    /// metric. Default.
+edgefirst_tensor::ef_vocabulary! {
+    /// What the tiled-detection merge emits for a group of boxes the match
+    /// metric has joined.
     ///
-    /// The kept box is never grown, rescored or relabelled. It is emitted
-    /// [canonicalized](crate::BoundingBox::to_canonical), which every box
-    /// entering the merge is, so it differs from the input only for a
-    /// degenerate input box whose `min` exceeded its `max`.
-    #[default]
-    KeepBest,
-    /// Replace the group with its enclosing union carrying the group's max
-    /// score: the original GREEDYNMM merge (ModelPack `metrics/tiled.py`
-    /// before `merge_mode`). Opt-in; inflates boxes and costs mAP.
-    Union,
+    /// Measured on the Ocean Cleanup ADIS 4K validation set (TOP2-836), the
+    /// enclosing union cost about 0.05 AP50 on every frame (whole frame: 0.491
+    /// AP50 with plain NMS, 0.437 after the union merge, 0.490 with keep-best;
+    /// 28-tile pipeline: 0.500 keep-best vs 0.442 union), so [`Self::KeepBest`]
+    /// is the default. See the [module docs](self#merge-mode-affects-map).
+    ///
+    /// The code is the one the C `EF_MERGE_MODE_*` enumerators and the
+    /// Python `MergeMode` enum use.
+    #[derive(Default)]
+    pub enum MergeMode {
+        /// Keep the group's highest-scoring box — its coordinates and its score
+        /// — and drop the boxes it matched. Greedy NMS under the configured
+        /// metric. Default.
+        ///
+        /// The kept box is never grown, rescored or relabelled. It is emitted
+        /// [canonicalized](crate::BoundingBox::to_canonical), which every box
+        /// entering the merge is, so it differs from the input only for a
+        /// degenerate input box whose `min` exceeded its `max`.
+        #[default]
+        KeepBest = 0, "keep_best", KEEP_BEST,
+        /// Replace the group with its enclosing union carrying the group's max
+        /// score: the original GREEDYNMM merge (ModelPack `metrics/tiled.py`
+        /// before `merge_mode`). Opt-in; inflates boxes and costs mAP.
+        Union = 1, "union", UNION,
+    }
+    #[doc(hidden)]
+    pub mod merge_mode_code;
 }
 
 /// Configuration for the tiled-detection merge.

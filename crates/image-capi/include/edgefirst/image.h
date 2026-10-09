@@ -68,6 +68,140 @@ typedef struct ef_tile_placement_list ef_tile_placement_list;
 #include <stdlib.h>
 
 /**
+ * A quarter-turn rotation, for `ef_image_processor_convert` and friends.
+ */
+enum ef_rotation
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  EF_ROTATION_NONE = 0,
+  EF_ROTATION_CLOCKWISE90 = 1,
+  EF_ROTATION_ROTATE180 = 2,
+  EF_ROTATION_COUNTER_CLOCKWISE90 = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_rotation ef_rotation;
+#else
+typedef uint32_t ef_rotation;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A mirror, for `ef_image_processor_convert` and friends.
+ */
+enum ef_flip
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  EF_FLIP_NONE = 0,
+  /**
+   * Mirror top to bottom.
+   */
+  EF_FLIP_VERTICAL = 1,
+  /**
+   * Mirror left to right.
+   */
+  EF_FLIP_HORIZONTAL = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_flip ef_flip;
+#else
+typedef uint32_t ef_flip;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * How a mask's palette colour is chosen, for the draw functions.
+ */
+enum ef_color_mode
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * By class label.
+   */
+  EF_COLOR_MODE_CLASS = 0,
+  /**
+   * By detection index.
+   */
+  EF_COLOR_MODE_INSTANCE = 1,
+  /**
+   * By track ID.
+   */
+  EF_COLOR_MODE_TRACK = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_color_mode ef_color_mode;
+#else
+typedef uint32_t ef_color_mode;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * How a tile crop is fit into the model input, for `ef_tiling_config.fit`.
+ */
+enum ef_fit
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Stretch the crop to fill the model input.
+   */
+  EF_FIT_STRETCH = 0,
+  /**
+   * Preserve aspect ratio and pad with `ef_tiling_config.pad`.
+   */
+  EF_FIT_LETTERBOX = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_fit ef_fit;
+#else
+typedef uint32_t ef_fit;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * The backend `ef_image_processor_new_with_backend` forces.
+ */
+enum ef_compute_backend
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Auto-detect, with the fallback chain.
+   */
+  EF_COMPUTE_BACKEND_AUTO = 0,
+  /**
+   * CPU only.
+   */
+  EF_COMPUTE_BACKEND_CPU = 1,
+  /**
+   * G2D only.
+   */
+  EF_COMPUTE_BACKEND_G2D = 2,
+  /**
+   * OpenGL only.
+   */
+  EF_COMPUTE_BACKEND_OPEN_GL = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_compute_backend ef_compute_backend;
+#else
+typedef uint32_t ef_compute_backend;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * Geometry for a convert: source rectangle and letterbox padding.
  *
  * `NULL` anywhere one is accepted means the whole source, stretched to fill.
@@ -100,7 +234,8 @@ typedef struct ef_tiling_config {
   float overlap_ratio;
   uint8_t pad[4];
   /**
-   * 0 = stretch, 1 = letterbox.
+   * An `EF_FIT_*` code. Any other value makes the functions taking this
+   * config fail (`EINVAL`, or `NULL` where they return a pointer).
    */
   int fit;
 } ef_tiling_config;
@@ -118,6 +253,10 @@ typedef struct ef_tile_spec {
   uintptr_t col;
 } ef_tile_spec;
 
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
 /**
  * ABI version of this library's C surface.
  */
@@ -134,6 +273,8 @@ uint32_t ef_image_abi_version(void);
  * IOSurface, a dma-buf) returns `EIO`: the GL base-layer draw has no `BGRA`
  * arm and the CPU backend renders only `RGBA`/`RGB`. It previously returned
  * 0 with the destination unwritten.
+ *
+ * `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
  *
  * # Safety
  * Pointers must be live or NULL as documented.
@@ -155,7 +296,7 @@ int ef_image_processor_draw_decoded_masks(ef_image_processor *p,
  * On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
  * afterwards, as it does after a convert.
  *
- * The same `BGRA` background restriction as
+ * The same `BGRA` background restriction and `color_mode` validation as
  * `ef_image_processor_draw_decoded_masks`.
  *
  * # Safety
@@ -273,6 +414,9 @@ ef_tensor *ef_image_processor_create_image_desc(ef_image_processor *p,
  * way regardless of which one minted them. `crop` may be `NULL` for the
  * whole source.
  *
+ * `rotation` is an `EF_ROTATION_*` code and `flip` an `EF_FLIP_*` code; any
+ * other value is `EINVAL`, checked before any work.
+ *
  * @return 0 on success, otherwise an errno.
  *
  * # Safety
@@ -287,6 +431,7 @@ int ef_image_processor_convert(ef_image_processor *p,
 
 /**
  * Like [`ef_image_processor_convert`], but does not wait for the GPU.
+ * `rotation` and `flip` are validated the same way.
  *
  * # Safety
  * `p`, `src` and `dst` must be live handles.
@@ -319,7 +464,7 @@ uintptr_t ef_align_width_for_pixel_format(uintptr_t width, const char *format, u
 /**
  * Create a processor forced to one backend.
  *
- * `backend`: 0 = auto, 1 = CPU, 2 = G2D, 3 = OpenGL. A forced backend
+ * `backend` is an `EF_COMPUTE_BACKEND_*` code. A forced backend
  * disables the fallback chain entirely — if it is unavailable the call fails
  * rather than quietly using another, which is the point of forcing one.
  *
@@ -377,6 +522,8 @@ int ef_image_processor_flush(ef_image_processor *p);
  * therefore completed synchronously — in which case the destination is already
  * safe to read.
  *
+ * `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
+ *
  * @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
  *
  * # Safety
@@ -397,6 +544,8 @@ int ef_image_processor_convert_fence(ef_image_processor *p,
  * event is set when the destination is complete; the caller owns it and
  * closes it with `CloseHandle`. `*fence` is `NULL` when the convert
  * completed synchronously (no fence on this display).
+ *
+ * `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
  *
  * @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
  *
@@ -522,6 +671,10 @@ int ef_image_processor_tile_one(ef_image_processor *p,
                                 ef_tensor *dst,
                                 const ef_tile_placement *placement,
                                 const struct ef_tiling_config *config);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
 #ifdef __cplusplus
 } /* extern "C" */

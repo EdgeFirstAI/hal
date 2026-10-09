@@ -18,14 +18,22 @@ use edgefirst_tensor::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 #[pyo3::pyclass(name = "Nms", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyNms {
-    /// Suppress overlapping boxes regardless of class label
-    ClassAgnostic = 0,
-    /// Only suppress boxes with the same class label that overlap (default)
-    ClassAware = 1,
     /// Use the model config (e.g. ``edgefirst.json``) to decide NMS mode,
     /// falling back to :attr:`ClassAware` when no config specifies one.
-    Auto = 2,
+    Auto = 1,
+    /// Only suppress boxes with the same class label that overlap (default)
+    ClassAware = 2,
+    /// Suppress overlapping boxes regardless of class label
+    ClassAgnostic = 3,
 }
+
+// PyO3 requires literal discriminants; pin each to the shared code. 0 is
+// NMS off, which Python spells `None`.
+const _: () = {
+    assert!(PyNms::Auto as u32 == Nms::Auto.code());
+    assert!(PyNms::ClassAware as u32 == Nms::ClassAware.code());
+    assert!(PyNms::ClassAgnostic as u32 == Nms::ClassAgnostic.code());
+};
 
 // Single-package (only `edgefirst.decoder` registers this type -- see its
 // `lib.rs`), so `eq_int`'s native-or-bare-int richcmp above has no
@@ -70,6 +78,11 @@ pub enum PyDecoderType {
     /// ModelPack models
     ModelPack = 1,
 }
+
+const _: () = {
+    assert!(PyDecoderType::Ultralytics as u32 == configs::DecoderType::Ultralytics.code());
+    assert!(PyDecoderType::ModelPack as u32 == configs::DecoderType::ModelPack.code());
+};
 
 /// Single-package; see `PyNms`'s `__hash__` comment for why this is still
 /// worth fixing despite no cross-package equality problem.
@@ -116,6 +129,13 @@ pub enum PyDecoderVersion {
     /// YOLO26 - end-to-end model with embedded NMS
     Yolo26 = 3,
 }
+
+const _: () = {
+    assert!(PyDecoderVersion::Yolov5 as u32 == configs::DecoderVersion::Yolov5.code());
+    assert!(PyDecoderVersion::Yolov8 as u32 == configs::DecoderVersion::Yolov8.code());
+    assert!(PyDecoderVersion::Yolo11 as u32 == configs::DecoderVersion::Yolo11.code());
+    assert!(PyDecoderVersion::Yolo26 as u32 == configs::DecoderVersion::Yolo26.code());
+};
 
 /// Single-package; see `PyNms`'s `__hash__` comment.
 #[pyo3::pymethods]
@@ -175,6 +195,22 @@ pub enum PyDimName {
     /// Box coordinate dimension (typically 4)
     BoxCoords = 9,
 }
+
+// `DimName.Unknown` (code 10) is not exposed: Python callers name only the
+// axes the decoder interprets.
+const _: () = {
+    use configs::DimName;
+    assert!(PyDimName::Batch as u32 == DimName::Batch.code());
+    assert!(PyDimName::Height as u32 == DimName::Height.code());
+    assert!(PyDimName::Width as u32 == DimName::Width.code());
+    assert!(PyDimName::NumClasses as u32 == DimName::NumClasses.code());
+    assert!(PyDimName::NumFeatures as u32 == DimName::NumFeatures.code());
+    assert!(PyDimName::NumBoxes as u32 == DimName::NumBoxes.code());
+    assert!(PyDimName::NumProtos as u32 == DimName::NumProtos.code());
+    assert!(PyDimName::NumAnchorsXFeatures as u32 == DimName::NumAnchorsXFeatures.code());
+    assert!(PyDimName::Padding as u32 == DimName::Padding.code());
+    assert!(PyDimName::BoxCoords as u32 == DimName::BoxCoords.code());
+};
 
 /// Single-package; see `PyNms`'s `__hash__` comment.
 #[pyo3::pymethods]

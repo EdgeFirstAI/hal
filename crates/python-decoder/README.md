@@ -128,8 +128,11 @@ CoreML export produces Apple's own NMS-pipeline artifact instead, which is
 refused rather than resolved. `"other"` is accepted but refused by
 inference rather than defaulted — that convention follows the exporter, is
 not derivable from shapes, and guessing it scales every box by the input
-size. Supported dtype strings are `"int8"`, `"uint8"`, `"int16"`,
-`"uint16"`, `"int32"`, `"uint32"`, `"float16"` and `"float32"`.
+size. Supported dtype strings are the tensor dtype names `"i8"`, `"u8"`,
+`"i16"`, `"u16"`, `"i32"`, `"u32"`, `"f16"` and `"f32"`; the older
+`"int8"`, `"uint8"`, `"int16"`, `"uint16"`, `"int32"`, `"uint32"`,
+`"float16"` and `"float32"` are still accepted. The schema reports dtypes
+with the tensor names.
 
 `schema` is a plain dict, ready for `Decoder(schema)` — there is no JSON
 string to parse back. `labels` is the class names in index order, which is

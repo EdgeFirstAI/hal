@@ -8,6 +8,7 @@
 //! the exported `ef_detect_box_list_data()`/`_len()` without linking this
 //! library: those give back a plain `(ef_detect_box *, size_t)` view.
 
+pub mod codes;
 pub mod decode;
 pub mod infer;
 pub mod tiling;
