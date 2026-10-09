@@ -1741,7 +1741,7 @@ Helper constructors:
   `quantization` is full range for an RGB/HSV format or
   `V4L2_COLORSPACE_JPEG` and limited otherwise, and `ycbcr_enc` follows the
   colorspace (e.g. `V4L2_COLORSPACE_JPEG` → BT.601).
-  `Colorimetry::is_rgb_or_hsv(PixelFormat)` gives the flag for a HAL format.
+  `PixelFormat::is_rgb_or_hsv()` gives the flag for a HAL format.
 
 #### Producers
 

@@ -8,7 +8,6 @@
 //! `CameraFrame.msg` schema so values round-trip through the ROS layer.
 //! Each enum is `#[non_exhaustive]`; unknown/`_DEFAULT` values map to `None`.
 
-use crate::PixelFormat;
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
@@ -357,7 +356,7 @@ impl Colorimetry {
 
     /// Build from the four raw V4L2 colorimetry integers of a negotiated
     /// format whose pixel encoding is RGB or HSV when `is_rgb_or_hsv` is
-    /// `true` (see [`Self::is_rgb_or_hsv`]).
+    /// `true` (see [`PixelFormat::is_rgb_or_hsv`]).
     ///
     /// Explicit values map directly. For `ycbcr_enc`/`quantization`, the V4L2
     /// `DEFAULT` (0) sentinel does NOT mean "unknown" — it means "derive"
@@ -417,26 +416,6 @@ impl Colorimetry {
             | V4L2_COLORSPACE_JPEG
             | V4L2_COLORSPACE_SRGB => Some(ColorEncoding::Bt601),
             _ => None,
-        }
-    }
-
-    /// Whether `format`'s pixel encoding is RGB or HSV in the kernel's
-    /// classification (`v4l2_format_info::pixel_enc`), the `is_rgb_or_hsv`
-    /// argument [`Self::from_v4l2`] takes. Luma-only `Grey` is a YUV format
-    /// there, as are the packed and semi-planar YUV formats.
-    pub const fn is_rgb_or_hsv(format: PixelFormat) -> bool {
-        match format {
-            PixelFormat::Rgb
-            | PixelFormat::Rgba
-            | PixelFormat::Bgra
-            | PixelFormat::PlanarRgb
-            | PixelFormat::PlanarRgba => true,
-            PixelFormat::Grey
-            | PixelFormat::Yuyv
-            | PixelFormat::Vyuy
-            | PixelFormat::Nv12
-            | PixelFormat::Nv16
-            | PixelFormat::Nv24 => false,
         }
     }
 
@@ -1017,17 +996,6 @@ mod tests {
                 });
                 assert_eq!(encoding, expected, "colorspace {colorspace}");
             }
-        }
-    }
-
-    #[test]
-    fn is_rgb_or_hsv_follows_the_kernel_pixel_encoding() {
-        for &format in PixelFormat::all() {
-            assert_eq!(
-                Colorimetry::is_rgb_or_hsv(format),
-                !format.is_yuv() && format != PixelFormat::Grey,
-                "{format:?}"
-            );
         }
     }
 }

@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
   - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
   - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
-- **`Colorimetry::is_rgb_or_hsv(PixelFormat)`.** Reports whether a format's pixel encoding is RGB or HSV in the kernel's classification, which is the flag `Colorimetry::from_v4l2` now takes. `Grey` counts as YUV, as it does in the kernel.
+- **`PixelFormat::is_rgb_or_hsv()`.** Reports whether a format is RGB or HSV, the flag `Colorimetry::from_v4l2` now takes. `Rgb`, `Rgba`, `Bgra`, `PlanarRgb` and `PlanarRgba` are; `Grey` and the YUV formats are not.
 
 ### Changed
 
