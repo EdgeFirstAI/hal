@@ -192,3 +192,5 @@ debug = "line-tables-only"
 unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
 
+[patch.crates-io]
+edgefirst-v4l2 = { git = "https://github.com/EdgeFirstAI/v4l2-rs", rev = "3fbd5cf" }

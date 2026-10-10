@@ -9,11 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hardware H.264 encoding (`edgefirst-codec`, new `video` module).** `VideoEncoder` compresses image tensors with any V4L2 stateful memory-to-memory encoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). `EDGEFIRST_CODEC_V4L2_ENCODER` names the device node to use.
+  - DMA-BUF sources are imported without a copy. NV12 goes through the two-plane `NV12M` layout where the device offers it, so `FrameOptions::crop` encodes a region of a larger source and separately allocated chroma planes work. `encode()` returns once the device has read the source.
+  - `EncoderConfig` sets the size, input format, frame rate, bitrate, GOP, profile and level. `repeat_headers` puts the SPS and PPS on every IDR, including forced key frames (`FrameOptions::keyframe`) on devices that repeat them only at the start of a GOP.
+  - `EncodedFrame` carries the Annex B access unit, a key-frame flag and the caller's PTS, which is returned unchanged even though V4L2 keeps timestamps at microsecond resolution.
+  - `flush()` drains the encoder with `V4L2_ENC_CMD_STOP` and returns every pending access unit; the next frame starts a new stream with an IDR.
+  - Example `video-encode`, and device-gated tests in `crates/codec/tests/video_encode.rs`.
+
 - **Physically contiguous DMA-BUF on request, and a query for it (`edgefirst-tensor`, `edgefirst-image`).** Capture engines without an IOMMU, such as the i.MX 8M Plus ISI, can only write into physically contiguous memory, and since 0.33 a DMA-BUF allocation silently falls back to the non-contiguous system heap when the CMA heap is full.
   - `ImageDesc::with_contiguous(true)` allocates from the CMA heap only, through `Tensor::image_desc`, `TensorDyn::image_desc` and `ImageProcessor::create_image_desc`. When there is no CMA heap or it cannot fit the image, allocation fails with an error naming `/dev/dma_heap/linux,cma` instead of falling back to the system heap, a PBO or host memory. Default allocations are unchanged.
   - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
   - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
   - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
+
+### Changed
+
+- **Breaking (`edgefirst-codec`):** `CodecError` gains `NoDevice`, `InvalidConfig`, `InvalidInput`, `Device` and `Timeout` for video encoding. Exhaustive `match`es on `CodecError` need new arms.
 
 ## [0.34.1] - 2026-10-07
 
