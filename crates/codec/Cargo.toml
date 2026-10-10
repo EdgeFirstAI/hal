@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "Image codec for decoding JPEG/PNG into pre-allocated EdgeFirst tensors"
+description = "Image and video codecs for EdgeFirst tensors: JPEG/PNG decode into pre-allocated tensors and hardware H.264 encode"
 homepage.workspace = true
 repository.workspace = true
 readme = "README.md"
@@ -60,6 +60,10 @@ zune-png = { workspace = true }
 [[bench]]
 name = "codec_benchmark"
 harness = false
+
+[[example]]
+name = "video-encode"
+path = "examples/video_encode.rs"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

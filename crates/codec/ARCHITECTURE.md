@@ -636,6 +636,46 @@ session (circuit breaker).
 
 The UAPI structs must match the kernel's `sizeof`: a wrong size yields the wrong ioctl request number → `ENOTTY` → a silent CPU fallback that makes parity tests pass trivially. `edgefirst-v4l2` checks every struct's size and union offsets at compile time against values generated from the kernel headers on x86_64 and aarch64, and tests each ioctl request number against `videodev2.h`. On-target `strace` remains the end-to-end check of the ioctl sequence — see `TESTING.md`.
 
+## Video Encoder (`video`)
+
+`video::VideoEncoder` is a thin front over an internal `EncoderBackend` trait,
+so VideoToolbox and Media Foundation backends can follow. The Linux backend
+(`video/v4l2/encoder.rs`) drives a V4L2 stateful encoder
+(`dev-encoder.rst`) through `edgefirst-v4l2`.
+
+- **Discovery is by capability.** Any streaming M2M node whose CAPTURE queue
+  lists H.264 and whose OUTPUT queue lists the input format qualifies. Names are
+  never used: `vsi_v4l2` on the i.MX 8M Plus leaves its sysfs name empty.
+- **Configuration happens at `new()`** (coded format, size check by `TRY_FMT`,
+  frame interval, controls); **buffers wait for the first frame**, because the
+  OUTPUT `bytesperline` must equal the source's row stride for a zero-copy
+  import. A source with another stride is rejected rather than copied.
+- **NV12 uses `NV12M` (two V4L2 planes) where offered.** Each plane is a
+  DMA-BUF with its own `data_offset`, so a crop moves the luma and chroma start
+  independently, and a chroma plane in its own allocation works. The one-plane
+  `NV12` layout cannot crop: the driver places chroma at
+  `bytesperline × height` after the luma start.
+- **`encode()` waits until the device has read the source** (its OUTPUT buffer
+  is dequeued), because it only borrows the tensor; then it waits briefly for
+  the access unit so latency stays at one frame.
+- **PTS.** vb2 stores timestamps as nanoseconds but hands them back as a
+  `timeval`, so only microseconds survive. Each source is tagged with a
+  sequence number as its timestamp and the caller's `u64` PTS is looked up when
+  the access unit returns.
+- **Headers.** `HEADER_MODE` is set to join headers with the first frame where
+  the device has it. Header repeat uses `REPEAT_SEQ_HEADER` (`vsi_v4l2`) or
+  `PREPEND_SPSPPS_TO_IDR` (Wave6), whichever exists. `vsi_v4l2` repeats them
+  only at GOP starts, so the backend keeps the last SPS/PPS it saw and prepends
+  them to any IDR without them. Picture-less buffers are folded into the right
+  access unit by NAL type (§7.4.1.2.3): parameter sets, SEI and delimiters into
+  the next, end of sequence/stream and filler into the previous (`vsi_v4l2`
+  sends an end-of-sequence buffer when drained).
+- **Drain.** `flush()` sends `V4L2_ENC_CMD_STOP` and collects until a buffer
+  carries `V4L2_BUF_FLAG_LAST` or `DQBUF` returns `EPIPE`. Drivers differ on how
+  a drained encoder resumes (Wave6 ignores `V4L2_ENC_CMD_START`), so the
+  backend tears the queues down and the next frame starts a new stream, which
+  also opens it with an IDR.
+
 ## nvJPEG GPU Backend
 
 `jpeg/nvjpeg/` offloads JPEG decode to the CUDA nvJPEG library on NVIDIA

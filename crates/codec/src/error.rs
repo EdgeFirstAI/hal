@@ -76,7 +76,7 @@ impl fmt::Display for UnsupportedFeature {
     }
 }
 
-/// Errors that can occur during image decoding.
+/// Errors from image decoding and video encoding.
 #[derive(Debug)]
 pub enum CodecError {
     /// Image dimensions exceed the tensor's capacity.
@@ -101,6 +101,22 @@ pub enum CodecError {
     Io(std::io::Error),
     /// An error from the tensor subsystem.
     Tensor(edgefirst_tensor::Error),
+    /// No device can do what was asked, for example no hardware video
+    /// encoder.
+    NoDevice(String),
+    /// A configuration the codec or the device rejects.
+    InvalidConfig(String),
+    /// A source frame that does not match the configuration.
+    InvalidInput(String),
+    /// A device operation failed.
+    Device {
+        /// The operation, for example `VIDIOC_QBUF`.
+        op: String,
+        /// The operating system error.
+        source: std::io::Error,
+    },
+    /// The device did not finish an operation in time.
+    Timeout(String),
 }
 
 impl fmt::Display for CodecError {
@@ -121,6 +137,11 @@ impl fmt::Display for CodecError {
             Self::InvalidData(msg) => write!(f, "invalid image data: {msg}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Tensor(e) => write!(f, "tensor error: {e}"),
+            Self::NoDevice(what) => write!(f, "no device: {what}"),
+            Self::InvalidConfig(what) => write!(f, "invalid configuration: {what}"),
+            Self::InvalidInput(what) => write!(f, "invalid input: {what}"),
+            Self::Device { op, source } => write!(f, "{op} failed: {source}"),
+            Self::Timeout(what) => write!(f, "timed out: {what}"),
         }
     }
 }
@@ -130,6 +151,7 @@ impl std::error::Error for CodecError {
         match self {
             Self::Io(e) => Some(e),
             Self::Tensor(e) => Some(e),
+            Self::Device { source, .. } => Some(source),
             _ => None,
         }
     }
