@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
   - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
   - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
+- **`PixelFormat::is_rgb_or_hsv()`.** Reports whether a format is RGB or HSV, the flag `Colorimetry::from_v4l2` now takes. `Rgb`, `Rgba`, `Bgra`, `PlanarRgb` and `PlanarRgba` are; `Grey` and the YUV formats are not.
+
+### Changed
+
+- **Breaking: `Colorimetry::from_v4l2` takes `is_rgb_or_hsv`.** The flag says whether the negotiated format's pixel encoding is RGB or HSV. It is the fifth argument in Rust and Python (`Colorimetry.from_v4l2`). In C it comes before `out` in `ef_codec_colorimetry_from_v4l2`, and `ef_codec_abi_version` is now 2.
+
+### Fixed
+
+- **An RGB V4L2 format with `quantization = DEFAULT` is full range.** `Colorimetry::from_v4l2` resolved a `DEFAULT` quantization from the colorspace alone, so an RGB camera reporting sRGB was published as limited range. It now follows the kernel's `V4L2_MAP_QUANTIZATION_DEFAULT`: a `DEFAULT` quantization is full range for an RGB/HSV format, whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other recognised colorspace; and unset for a YUV format in a `DEFAULT` or unrecognised colorspace, so the at-use height heuristic decides.
 
 ## [0.34.1] - 2026-10-07
 

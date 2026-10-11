@@ -209,6 +209,14 @@ pub unsafe extern "C" fn ef_image_decoder_reset_output_format(d: *mut EfImageDec
 
 /// Map raw V4L2 colorimetry integers to the packed `ef_tensor_colorimetry` form.
 ///
+/// `is_rgb_or_hsv` is non-zero when the negotiated format's pixel encoding
+/// is RGB or HSV. Per `V4L2_MAP_QUANTIZATION_DEFAULT`, a `DEFAULT` (0)
+/// `quant` is full range for an RGB/HSV format, whatever the colorspace, and
+/// for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other
+/// recognised colorspace; and unset (range byte 0) for a YUV format in a
+/// `DEFAULT` or unrecognised colorspace, so the at-use height heuristic
+/// decides.
+///
 /// # Safety
 /// `out` must be writable.
 #[no_mangle]
@@ -217,6 +225,7 @@ pub unsafe extern "C" fn ef_codec_colorimetry_from_v4l2(
     xfer: u32,
     ycbcr_enc: u32,
     quant: u32,
+    is_rgb_or_hsv: c_int,
     out: *mut u32,
 ) -> c_int {
     unsafe {
@@ -224,8 +233,14 @@ pub unsafe extern "C" fn ef_codec_colorimetry_from_v4l2(
             if out.is_null() {
                 return libc::EINVAL;
             }
-            *out =
-                edgefirst_tensor::Colorimetry::from_v4l2(colorspace, xfer, ycbcr_enc, quant).pack();
+            *out = edgefirst_tensor::Colorimetry::from_v4l2(
+                colorspace,
+                xfer,
+                ycbcr_enc,
+                quant,
+                is_rgb_or_hsv != 0,
+            )
+            .pack();
             0
         }))
         .unwrap_or(libc::EINVAL)

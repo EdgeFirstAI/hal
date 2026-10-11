@@ -186,13 +186,31 @@ impl PyColorimetry {
         })
     }
 
-    /// Build from the four raw V4L2 colorimetry integers. A ``DEFAULT`` (0)
-    /// ``ycbcr_enc``/``quant`` is resolved from the colorspace (e.g.
-    /// ``V4L2_COLORSPACE_JPEG`` → BT.601 full-range) per the kernel
-    /// ``V4L2_MAP_*_DEFAULT`` rules; an unrecognised value maps to ``None``.
+    /// Build from the four raw V4L2 colorimetry integers of a format whose
+    /// pixel encoding is RGB or HSV when ``is_rgb_or_hsv`` is true. A
+    /// ``DEFAULT`` (0) ``ycbcr_enc``/``quant`` is resolved per the kernel
+    /// ``V4L2_MAP_*_DEFAULT`` rules: ``quant`` is full range for an RGB/HSV
+    /// format, whatever the colorspace, and for ``V4L2_COLORSPACE_JPEG``;
+    /// limited for a YUV format in any other recognised colorspace; and
+    /// ``None`` for a YUV format in a ``DEFAULT`` or unrecognised colorspace,
+    /// so the at-use height heuristic decides. ``ycbcr_enc`` follows the
+    /// colorspace and is likewise ``None`` for a ``DEFAULT`` or unrecognised
+    /// one. An unrecognised value maps to ``None``.
     #[staticmethod]
-    fn from_v4l2(colorspace: u32, xfer: u32, ycbcr_enc: u32, quant: u32) -> Self {
-        PyColorimetry(RsColorimetry::from_v4l2(colorspace, xfer, ycbcr_enc, quant))
+    fn from_v4l2(
+        colorspace: u32,
+        xfer: u32,
+        ycbcr_enc: u32,
+        quant: u32,
+        is_rgb_or_hsv: bool,
+    ) -> Self {
+        PyColorimetry(RsColorimetry::from_v4l2(
+            colorspace,
+            xfer,
+            ycbcr_enc,
+            quant,
+            is_rgb_or_hsv,
+        ))
     }
 
     /// Color primaries, or ``None`` if undefined (or a variant with no Python
