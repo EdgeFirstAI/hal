@@ -1829,12 +1829,14 @@ pub(super) fn extract_proto_data_float<
 
 /// Helper: extract ProtoData from quantized mask coefficients + protos.
 ///
-/// Dequantizes mask coefficients to f32 at extraction (one-time cost on a
-/// `num_detections * num_protos` slice) and keeps protos in raw i8,
-/// attaching the dequantization params as
+/// Keeps i8 protos raw, attaching the dequantization params as
 /// [`edgefirst_tensor::Quantization::per_tensor`] metadata on the proto
-/// tensor. The GPU shader / CPU kernel reads `protos.quantization()` and
-/// dequantizes per-texel.
+/// tensor; the GPU shader / CPU kernel reads `protos.quantization()` and
+/// dequantizes per-texel. Protos of any other integer type (u8, i16, u16)
+/// are dequantized to f32 NHWC here, since narrowing them to i8 would
+/// discard their range. Mask coefficients stay raw for i8 and i16 and are
+/// dequantized to f32 otherwise. The dtypes do not depend on whether any
+/// detection survived.
 pub(crate) fn extract_proto_data_quant<
     MASK: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
     PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
@@ -1860,51 +1862,6 @@ pub(crate) fn extract_proto_data_quant<
     let num_protos = mask_tensor.ncols();
     let n = det_indices.len();
     span.record("num_protos", num_protos);
-
-    // Fast path: when no detections survive NMS, skip the expensive proto
-    // tensor copy (819KB for 160×160×32). Allocate with the correct shape
-    // (preserving the documented ProtoData.protos shape contract) but skip
-    // copying from the source tensor — the zeroed allocation is sufficient
-    // since materialize_masks early-returns on empty detect slices.
-    if n == 0 {
-        output_boxes.clear();
-        let (h, w, k) = protos.dim();
-
-        // Detect physical layout (same logic as the normal path).
-        let (proto_shape, proto_layout) = if std::any::TypeId::of::<PROTO>()
-            == std::any::TypeId::of::<i8>()
-        {
-            if protos.is_standard_layout() {
-                (&[h, w, k][..], ProtoLayout::Nhwc)
-            } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
-                (&[k, h, w][..], ProtoLayout::Nchw)
-            } else {
-                (&[h, w, k][..], ProtoLayout::Nhwc)
-            }
-        } else {
-            (&[h, w, k][..], ProtoLayout::Nhwc)
-        };
-
-        let coeff_tensor = Tensor::<i8>::new(&[0, num_protos], Some(TensorMemory::Mem), None)
-            .expect("allocating empty mask_coefficients tensor");
-        let coeff_quant =
-            edgefirst_tensor::Quantization::per_tensor(quant_masks.scale, quant_masks.zero_point);
-        let coeff_tensor = coeff_tensor
-            .with_quantization(coeff_quant)
-            .expect("per-tensor quantization on mask coefficients");
-        let protos_tensor = Tensor::<i8>::new(proto_shape, Some(TensorMemory::Mem), None)
-            .expect("allocating protos tensor");
-        let tensor_quant =
-            edgefirst_tensor::Quantization::per_tensor(quant_protos.scale, quant_protos.zero_point);
-        let protos_tensor = protos_tensor
-            .with_quantization(tensor_quant)
-            .expect("per-tensor quantization on protos tensor");
-        return ProtoData {
-            mask_coefficients: coeff_tensor.into(),
-            protos: protos_tensor.into(),
-            layout: proto_layout,
-        };
-    }
 
     // Mask coefficients: keep i8 losslessly when MASK == i8 (preserves
     // the fast i8×i8→i32 integer kernel in materialize_masks). Preserve
@@ -1990,59 +1947,73 @@ pub(crate) fn extract_proto_data_quant<
         coeff_tensor.into()
     };
 
-    // Keep protos in raw i8 — consumers dequantize via protos.quantization().
-    // When PROTO is already i8, detect layout and copy efficiently without
-    // transposing. The mask materialisation kernels dispatch on the layout.
     let (h, w, k) = protos.dim();
 
-    // Determine physical layout and copy strategy.
-    let (proto_shape, proto_layout) =
-        if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
-            if protos.is_standard_layout() {
-                // Already NHWC [H, W, K] in contiguous memory.
-                (&[h, w, k][..], ProtoLayout::Nhwc)
-            } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
-                // NCHW reinterpreted as NHWC via stride swap. Physical storage
-                // is [K, H, W] contiguous. Keep in NCHW — eliminates the costly
-                // 3.1ms transpose entirely.
-                (&[k, h, w][..], ProtoLayout::Nchw)
-            } else {
-                // Unknown layout — fall back to iter copy as NHWC.
-                (&[h, w, k][..], ProtoLayout::Nhwc)
+    // With no detections the protos are never read (`materialize_masks`
+    // returns early on an empty slice), so the tensors below keep their
+    // shape and dtype but skip the copy (819 KB for 160×160×32).
+
+    // Protos of any other integer type (u8, i16, u16, …) cannot be narrowed
+    // to i8 without discarding their range, so dequantize them to f32 NHWC.
+    // `protos.iter()` walks the logical [H, W, K] order whatever the
+    // physical strides, so the copy also normalizes NCHW sources.
+    if std::any::TypeId::of::<PROTO>() != std::any::TypeId::of::<i8>() {
+        let scale = quant_protos.scale;
+        let zp = quant_protos.zero_point as f32;
+        let protos_tensor = Tensor::<f32>::new(&[h, w, k], Some(TensorMemory::Mem), None)
+            .expect("allocating protos tensor");
+        if n > 0 {
+            let mut m = protos_tensor.map().expect("mapping protos tensor");
+            for (d, s) in m.as_mut_slice().iter_mut().zip(protos.iter()) {
+                let v: f32 = s.as_();
+                *d = (v - zp) * scale;
             }
-        } else {
-            (&[h, w, k][..], ProtoLayout::Nhwc)
+        }
+        span.record("layout", tracing::field::debug(&ProtoLayout::Nhwc));
+        return ProtoData {
+            mask_coefficients,
+            protos: protos_tensor.into(),
+            layout: ProtoLayout::Nhwc,
         };
+    }
+
+    // Keep i8 protos raw — consumers dequantize via protos.quantization().
+    // Detect the physical layout and copy without transposing; the mask
+    // materialisation kernels dispatch on the layout.
+    let (proto_shape, proto_layout) = if protos.is_standard_layout() {
+        // Already NHWC [H, W, K] in contiguous memory.
+        (&[h, w, k][..], ProtoLayout::Nhwc)
+    } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
+        // NCHW reinterpreted as NHWC via stride swap. Physical storage
+        // is [K, H, W] contiguous. Keep in NCHW — eliminates the costly
+        // 3.1ms transpose entirely.
+        (&[k, h, w][..], ProtoLayout::Nchw)
+    } else {
+        // Unknown layout — fall back to iter copy as NHWC.
+        (&[h, w, k][..], ProtoLayout::Nhwc)
+    };
 
     let protos_tensor = Tensor::<i8>::new(proto_shape, Some(TensorMemory::Mem), None)
         .expect("allocating protos tensor");
-    {
+    if n > 0 {
         let mut m = protos_tensor.map().expect("mapping protos tensor");
         let dst = m.as_mut_slice();
-        if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
-            // SAFETY: PROTO == i8 checked via TypeId; cast slice view is
-            // size/alignment-compatible by construction.
-            if protos.is_standard_layout() {
-                let src: &[i8] = unsafe {
-                    std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len())
-                };
-                dst.copy_from_slice(src);
-            } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
-                // NCHW physical layout — sequential copy WITHOUT transpose.
-                // This saves ~3.1ms on A53/A55 by avoiding the tiled
-                // NCHW→NHWC transpose of the 819KB proto buffer.
-                let total = h * w * k;
-                // SAFETY: ArrayView was constructed from a contiguous slice of
-                // `total` elements. as_ptr() points to the base of that slice.
-                let src: &[i8] =
-                    unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, total) };
-                dst.copy_from_slice(src);
-            } else {
-                for (d, s) in dst.iter_mut().zip(protos.iter()) {
-                    let v_i8: i8 = s.as_();
-                    *d = v_i8;
-                }
-            }
+        // SAFETY: PROTO == i8 checked via TypeId above; the cast slice view
+        // is size/alignment-compatible by construction.
+        if protos.is_standard_layout() {
+            let src: &[i8] =
+                unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+            dst.copy_from_slice(src);
+        } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
+            // NCHW physical layout — sequential copy WITHOUT transpose.
+            // This saves ~3.1ms on A53/A55 by avoiding the tiled
+            // NCHW→NHWC transpose of the 819KB proto buffer.
+            let total = h * w * k;
+            // SAFETY: ArrayView was constructed from a contiguous slice of
+            // `total` elements. as_ptr() points to the base of that slice.
+            let src: &[i8] =
+                unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, total) };
+            dst.copy_from_slice(src);
         } else {
             for (d, s) in dst.iter_mut().zip(protos.iter()) {
                 let v_i8: i8 = s.as_();
