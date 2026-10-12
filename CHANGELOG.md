@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Segmentation masks from models with uint8 or uint16 prototype outputs are no longer noise.** The decoder narrowed every non-int8 prototype tensor to int8 by keeping the low byte, while still applying the tensor's own scale and zero point. QNN models converted with the logical split, which output uint16 (w8a16) or uint8 (w8a8) prototypes, lost most of their mask accuracy: yolov8n-seg on the IQ-9075 scored 11.2 mask mAP50-95 instead of 29.3. Such prototypes are now dequantized exactly. Models with int8 or float prototypes, including every TFLite model, are unaffected.
 - **An RGB V4L2 format with `quantization = DEFAULT` is full range.** `Colorimetry::from_v4l2` resolved a `DEFAULT` quantization from the colorspace alone, so an RGB camera reporting sRGB was published as limited range. It now follows the kernel's `V4L2_MAP_QUANTIZATION_DEFAULT`: a `DEFAULT` quantization is full range for an RGB/HSV format, whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other recognised colorspace; and unset for a YUV format in a `DEFAULT` or unrecognised colorspace, so the at-use height heuristic decides.
 
 ## [0.34.1] - 2026-10-07

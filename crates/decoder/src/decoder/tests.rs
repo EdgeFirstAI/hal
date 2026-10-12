@@ -3491,6 +3491,84 @@ outputs:
     }
 
     #[test]
+    fn test_extract_proto_data_quant_dequantizes_non_i8_protos() {
+        use crate::yolo::extract_proto_data_quant;
+        use crate::{DetectBox, ProtoLayout, Quantization};
+        use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
+
+        let det = || {
+            vec![(
+                DetectBox {
+                    bbox: crate::BoundingBox {
+                        xmin: 0.1,
+                        ymin: 0.1,
+                        xmax: 0.6,
+                        ymax: 0.6,
+                    },
+                    score: 0.9,
+                    label: 0,
+                },
+                0usize,
+            )]
+        };
+        let coeffs = ndarray::Array2::from_shape_vec((1, 2), vec![40_000_u16, 41_000]).unwrap();
+        let coeff_quant = Quantization::new(1e-4, 40_568);
+
+        // u16 protos stored NCHW [K=2, H=2, W=3] and viewed as [H, W, K],
+        // as a QNN `[1, 32, 160, 160]` output is. Values above 255 lose
+        // their high byte if narrowed to i8.
+        let nchw: Vec<u16> = vec![
+            2_383, 2_400, 3_000, 10_000, 65_535, 0, // channel 0
+            100, 2_383, 60_000, 512, 256, 1_024, // channel 1
+        ];
+        let protos = ndarray::Array3::from_shape_vec((2, 2, 3), nchw.clone()).unwrap();
+        let protos_hwk = protos.view().permuted_axes([1, 2, 0]);
+        let (scale, zp) = (1.168e-4_f32, 2_383);
+        let mut output_boxes = Vec::new();
+        let proto_data = extract_proto_data_quant(
+            det(),
+            coeffs.view(),
+            coeff_quant,
+            protos_hwk,
+            Quantization::new(scale, zp),
+            &mut output_boxes,
+        );
+
+        assert_eq!(proto_data.layout, ProtoLayout::Nhwc);
+        assert_eq!(proto_data.protos.dtype(), DType::F32);
+        assert_eq!(proto_data.mask_coefficients.dtype(), DType::F32);
+        let protos_t = proto_data.protos.as_f32().expect("F32 protos");
+        assert_eq!(protos_t.shape(), &[2, 3, 2]);
+        let got = protos_t.map().expect("map protos");
+        for y in 0..2 {
+            for x in 0..3 {
+                for c in 0..2 {
+                    let raw = nchw[c * 6 + y * 3 + x] as f32;
+                    let want = (raw - zp as f32) * scale;
+                    assert_eq!(
+                        got.as_slice()[(y * 3 + x) * 2 + c],
+                        want,
+                        "y={y} x={x} c={c}"
+                    );
+                }
+            }
+        }
+
+        // u8 protos with a non-zero zero point: 200 must not wrap to -56.
+        let protos_u8 = ndarray::Array3::from_shape_vec((1, 1, 2), vec![200_u8, 10]).unwrap();
+        let proto_data = extract_proto_data_quant(
+            det(),
+            coeffs.view(),
+            coeff_quant,
+            protos_u8.view(),
+            Quantization::new(0.5, 128),
+            &mut Vec::new(),
+        );
+        let protos_t = proto_data.protos.as_f32().expect("F32 protos");
+        assert_eq!(protos_t.map().unwrap().as_slice(), &[36.0, -59.0]);
+    }
+
+    #[test]
     fn test_extract_proto_data_quant_with_cached_model() {
         use crate::yolo::impl_yolo_segdet_quant_proto;
         use crate::{Nms, ProtoData, Quantization, XYWH};
