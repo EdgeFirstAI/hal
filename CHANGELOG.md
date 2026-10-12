@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-10-12
+
 ### Added
 
 - **Physically contiguous DMA-BUF on request, and a query for it (`edgefirst-tensor`, `edgefirst-image`).** Capture engines without an IOMMU, such as the i.MX 8M Plus ISI, can only write into physically contiguous memory, and since 0.33 a DMA-BUF allocation silently falls back to the non-contiguous system heap when the CMA heap is full.
