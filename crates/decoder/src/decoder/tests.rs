@@ -3566,6 +3566,23 @@ outputs:
         );
         let protos_t = proto_data.protos.as_f32().expect("F32 protos");
         assert_eq!(protos_t.map().unwrap().as_slice(), &[36.0, -59.0]);
+
+        // A frame with no detections keeps the same dtypes and shapes.
+        let mut output_boxes = vec![det()[0].0];
+        let empty = extract_proto_data_quant(
+            Vec::new(),
+            coeffs.view(),
+            coeff_quant,
+            protos_hwk,
+            Quantization::new(scale, zp),
+            &mut output_boxes,
+        );
+        assert!(output_boxes.is_empty());
+        assert_eq!(empty.layout, ProtoLayout::Nhwc);
+        assert_eq!(empty.protos.dtype(), DType::F32);
+        assert_eq!(empty.protos.shape(), &[2, 3, 2]);
+        assert_eq!(empty.mask_coefficients.dtype(), DType::F32);
+        assert_eq!(empty.mask_coefficients.shape(), &[0, 2]);
     }
 
     #[test]
