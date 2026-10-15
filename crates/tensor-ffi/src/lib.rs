@@ -18,8 +18,8 @@
 use std::ffi::{c_char, c_int};
 
 pub use edgefirst_tensor_abi::{
-    EfClientRefFn, EfClientState, EfCompression, EfContiguity, EfCpuAccess, EfCudaMapFn,
-    EfCudaMapFnNullable, EfCudaUnmapFn, EfCudaUnmapFnNullable, EfCudaUnregisterFn,
+    EfClientRefFn, EfClientState, EfCompression, EfCompressionRequest, EfContiguity, EfCpuAccess,
+    EfCudaMapFn, EfCudaMapFnNullable, EfCudaUnmapFn, EfCudaUnmapFnNullable, EfCudaUnregisterFn,
     EfCudaUnregisterFnNullable, EfD3d11Layout, EfDtype, EfErrorClass, EfImageDescView, EfPboMapFn,
     EfPboMapFnNullable, EfPboUnmapFn, EfPboUnmapFnNullable, EfQuantizationInfo, EfStorageKind,
     EfTensorPlane, EfTensorView, EfViewOrigin,
@@ -456,7 +456,7 @@ mod tests {
     /// `.superpowers/sdd/2026-08-25-python-single-tensor-home/
     /// task-P2a-report.md`. The last two are `TensorDyn::
     /// import_descriptor`'s remaining two arms: `ef_tensor_wrap_host`
-    /// (`kind::HOST` -- alias a producer's host pointer, carrying its real
+    /// (`kind::MEM`/`SHM` -- alias a producer's host pointer, carrying its real
     /// capacity so the import is not clamped to today's shape) and
     /// `ef_tensor_from_iosurface_id` (`kind::IOSURFACE`, declared on every
     /// platform and refused at runtime off Apple, so this library's symbol

@@ -18,7 +18,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_tensor::{Compression, CpuAccess, DType, ImageDesc, PixelFormat, TensorMemory};
-use edgefirst_tensor_abi::EfImageDescView;
+use edgefirst_tensor_abi::{EfCompressionRequest, EfImageDescView};
 
 /// An image request, built up field by field.
 pub struct EfTensorImageDesc {
@@ -120,7 +120,7 @@ pub unsafe extern "C" fn ef_tensor_image_desc_set_memory(
     }
 }
 
-/// Declare CPU access: 0 none, 1 read, 2 write, 3 read-write.
+/// Declare CPU access, by `ef_cpu_access` code (`EF_CPU_ACCESS_*`).
 ///
 /// # Safety
 /// `d` must be `NULL` or a live request.
@@ -131,19 +131,14 @@ pub unsafe extern "C" fn ef_tensor_image_desc_set_access(
 ) -> c_int {
     unsafe {
         with_desc(d, |desc| {
-            let a = match access {
-                0 => CpuAccess::None,
-                1 => CpuAccess::Read,
-                2 => CpuAccess::Write,
-                3 => CpuAccess::ReadWrite,
-                _ => return None,
-            };
-            Some(desc.with_access(a))
+            Some(desc.with_access(CpuAccess::from_code(access)?))
         })
     }
 }
 
-/// Request compression: 0 = none, 1 = any scheme the platform offers.
+/// Request compression, by `ef_compression_request` code:
+/// `EF_COMPRESSION_REQUEST_NONE` or `EF_COMPRESSION_REQUEST_ANY` (any scheme
+/// the platform offers).
 ///
 /// `Any` allocates linear when the format is not eligible and counts the
 /// fallback, which is the right default for a pipeline that wants the
@@ -160,10 +155,14 @@ pub unsafe extern "C" fn ef_tensor_image_desc_set_compression(
     compression: u32,
 ) -> c_int {
     unsafe {
-        with_desc(d, |desc| match compression {
-            0 => Some(desc),
-            1 => Some(desc.with_compression(Compression::Any)),
-            _ => None,
+        with_desc(d, |desc| {
+            if compression == EfCompressionRequest::None as u32 {
+                Some(desc)
+            } else if compression == EfCompressionRequest::Any as u32 {
+                Some(desc.with_compression(Compression::Any))
+            } else {
+                None
+            }
         })
     }
 }
@@ -220,29 +219,21 @@ fn view_of(d: &ImageDesc) -> EfImageDescView {
         None => (0, 0),
     };
     // `Compression` has no shared `code()` in the vocabulary macro (it
-    // carries a payload on `Scheme`, unlike the plain vocabularies). 1/2
-    // mirrors `ef_tensor_image_desc_set_compression`'s own 0/1 wire values,
-    // extended by one: `Scheme` is a real state the type can hold even
-    // though no C setter can create one, so it gets a code rather than
-    // being folded into "any" or silently dropped.
+    // carries a payload on `Scheme`, unlike the plain vocabularies), so the
+    // request is encoded as an `EfCompressionRequest`. `Scheme` is a real
+    // state the type can hold even though no C setter can create one, so it
+    // gets a code rather than being folded into "any" or silently dropped.
     let (compression, has_compression) = match d.compression() {
-        None => (0, 0),
-        Some(Compression::Any) => (1, 1),
+        None => (EfCompressionRequest::None as u32, 0),
+        Some(Compression::Any) => (EfCompressionRequest::Any as u32, 1),
         // `Compression` is `#[non_exhaustive]`: `Scheme(_)` is the only other
         // variant today, but a wildcard is required here regardless, and any
         // future variant falls into the same "present, and it's a specific
         // one" code rather than failing to compile at the call site that
         // adds it.
-        Some(_) => (2, 1),
+        Some(_) => (EfCompressionRequest::Scheme as u32, 1),
     };
-    // `CpuAccess` has no shared `code()` either (see `ef_tensor_image_desc_set_access`'s
-    // own doc); this is the same 0..3 numbering, decoded the same way.
-    let access = match d.access() {
-        CpuAccess::None => 0,
-        CpuAccess::Read => 1,
-        CpuAccess::Write => 2,
-        CpuAccess::ReadWrite => 3,
-    };
+    let access = d.access().code();
     EfImageDescView {
         width: d.width() as u64,
         height: d.height() as u64,
@@ -345,9 +336,18 @@ mod tests {
     fn a_request_can_be_built_and_freed() {
         unsafe {
             let d = desc();
-            assert_eq!(ef_tensor_image_desc_set_memory(d, 0), 0);
-            assert_eq!(ef_tensor_image_desc_set_access(d, 3), 0);
-            assert_eq!(ef_tensor_image_desc_set_compression(d, 0), 0);
+            assert_eq!(
+                ef_tensor_image_desc_set_memory(d, TensorMemory::Mem.code()),
+                0
+            );
+            assert_eq!(
+                ef_tensor_image_desc_set_access(d, CpuAccess::ReadWrite.code()),
+                0
+            );
+            assert_eq!(
+                ef_tensor_image_desc_set_compression(d, EfCompressionRequest::None as u32),
+                0
+            );
             ef_tensor_image_desc_free(d);
             ef_tensor_image_desc_free(std::ptr::null_mut());
         }
@@ -431,9 +431,18 @@ mod tests {
         // exactly one conversion site.
         unsafe {
             let d = desc(); // 64x48 rgb8 u8, no memory/compression request
-            assert_eq!(ef_tensor_image_desc_set_memory(d, 1), 0); // Shm
-            assert_eq!(ef_tensor_image_desc_set_access(d, 3), 0); // ReadWrite
-            assert_eq!(ef_tensor_image_desc_set_compression(d, 1), 0); // Any
+            assert_eq!(
+                ef_tensor_image_desc_set_memory(d, TensorMemory::Shm.code()),
+                0
+            );
+            assert_eq!(
+                ef_tensor_image_desc_set_access(d, CpuAccess::ReadWrite.code()),
+                0
+            );
+            assert_eq!(
+                ef_tensor_image_desc_set_compression(d, EfCompressionRequest::Any as u32),
+                0
+            );
 
             let mut view = EfImageDescView::default();
             assert_eq!(ef_tensor_image_desc_get(d, &mut view), 0);
@@ -442,14 +451,17 @@ mod tests {
             assert_eq!(view.height, 48);
             assert_eq!(PixelFormat::from_code(view.format), Some(PixelFormat::Rgb));
             assert_eq!(DType::from_code(view.dtype), Some(DType::U8));
-            assert_eq!(view.access, 3);
+            assert_eq!(
+                CpuAccess::from_code(view.access),
+                Some(CpuAccess::ReadWrite)
+            );
             assert_eq!(view.has_memory, 1);
             assert_eq!(
                 TensorMemory::from_code(view.memory),
                 Some(TensorMemory::Shm)
             );
             assert_eq!(view.has_compression, 1);
-            assert_eq!(view.compression, 1);
+            assert_eq!(view.compression, EfCompressionRequest::Any as u32);
 
             ef_tensor_image_desc_free(d);
         }

@@ -68,6 +68,10 @@ pub enum EfStorageKind {
     IoSurface = 3,
     Pbo = 4,
     Cuda = 5,
+    /// Windows `ID3D11Texture2D`, named specifically. A tensor's own
+    /// storage kind reports `DmaBuf` on Windows; this is the code the
+    /// cross-package descriptor carries for that backing.
+    D3d11Texture = 6,
 }
 
 /// CPU access direction for a map window.
@@ -82,6 +86,24 @@ pub enum EfCpuAccess {
     Read = 1,
     Write = 2,
     ReadWrite = 3,
+}
+
+/// Compression *request*, as `ef_tensor_image_desc_set_compression` takes it
+/// and [`EfImageDescView::compression`] reports it.
+///
+/// Distinct from [`EfCompression`], which names the scheme an allocation
+/// resolved to. No C setter can request `Scheme`; the view reports it so a
+/// request made through the Rust API is not folded into `Any` or dropped.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EfCompressionRequest {
+    /// No compression request: allocate linear.
+    #[default]
+    None = 0,
+    /// Any scheme the platform offers, linear when the format is not eligible.
+    Any = 1,
+    /// A specific vendor scheme, not further decodable through the view.
+    Scheme = 2,
 }
 
 /// Vendor tile-compression scheme actually in force for a tensor's
@@ -186,13 +208,13 @@ pub enum EfErrorClass {
 /// without touching the other's private layout.
 ///
 /// `memory` and `compression` are each a value plus an explicit presence
-/// flag rather than a sentinel: every code in `ef_storage_kind` (0..=5) is a
+/// flag rather than a sentinel: every code in `ef_storage_kind` (0..=6) is a
 /// real value, so there is no unused number to repurpose as "no request"
-/// without colliding with `ef_storage_kind`'s `MEM == 0`. `compression` is 1
-/// for "any scheme" and 2 for "a specific vendor scheme", the latter not
-/// further decodable through this view -- no `ef_tensor_image_desc_set_*`
-/// entry point can request one, so this view has never needed to carry more
-/// detail than "present, and it's a specific one."
+/// without colliding with `ef_storage_kind`'s `MEM == 0`. `compression` is an
+/// [`EfCompressionRequest`]: `Any`, or `Scheme` for "a specific vendor
+/// scheme", the latter not further decodable through this view -- no
+/// `ef_tensor_image_desc_set_*` entry point can request one, so this view has
+/// never needed to carry more detail than "present, and it's a specific one."
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EfImageDescView {
@@ -211,8 +233,7 @@ pub struct EfImageDescView {
     /// Non-zero when a specific memory backing was requested (`None` on the
     /// Rust side auto-selects).
     pub has_memory: u32,
-    /// 1 = any scheme the platform offers; 2 = a specific vendor scheme.
-    /// Meaningful only when `has_compression != 0`.
+    /// `ef_compression_request`, meaningful only when `has_compression != 0`.
     pub compression: u32,
     /// Non-zero when a compression request was made.
     pub has_compression: u32,
@@ -510,6 +531,7 @@ mod tests {
     fn vocabulary_enums_are_u32() {
         assert_eq!(std::mem::size_of::<EfDtype>(), 4);
         assert_eq!(std::mem::size_of::<EfStorageKind>(), 4);
+        assert_eq!(std::mem::size_of::<EfCompressionRequest>(), 4);
     }
 
     #[test]

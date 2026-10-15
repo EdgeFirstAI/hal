@@ -26,7 +26,7 @@ impl TensorDyn {
     /// **Borrow semantics.** The result *aliases* the producer's memory; it
     /// is valid only while the producer keeps that memory alive. For the
     /// capsule protocol, that is the capsule's own lifetime: the capsule's
-    /// keepalive holds the producing tensor (and, for a `HOST` descriptor,
+    /// keepalive holds the producing tensor (and, for a host-memory descriptor,
     /// its pin) for as long as the capsule itself is alive. A `DMABUF`
     /// import is the one exception with its own, narrower guarantee — this
     /// function `dup`s the fd, so the imported tensor's fd stays valid even
@@ -214,7 +214,7 @@ fn restore_d3d11_logical_shape(
 /// stride when one is recorded, so a fresh import with no stride
 /// still picks a freshly-computed (and possibly narrower) pitch.
 ///
-/// `HOST` and `DMABUF`. Historical note: restoring a stride for an
+/// `MEM`, `SHM` and `DMABUF`. Historical note: restoring a stride for an
 /// imported `DMABUF` used to be actively harmful -- `Tensor::map`'s
 /// strided path rejected any imported (non-self-allocated) DMA-BUF
 /// outright, so recording one here would have made a foreign
@@ -265,7 +265,7 @@ fn restore_d3d11_logical_shape(
 /// then: `import_descriptor` had no `kind::PBO` arm at all, so no PBO
 /// descriptor ever reached this function.
 ///
-/// `CUDA_DEVICE` is excluded because that import does not reconstruct a
+/// `CUDA` is excluded because that import does not reconstruct a
 /// strided image today.
 fn restore_imported_row_stride(
     t: &mut TensorDyn,
@@ -275,7 +275,8 @@ fn restore_imported_row_stride(
 ) {
     if !matches!(
         desc.kind,
-        crate::protocol::kind::HOST
+        crate::protocol::kind::MEM
+            | crate::protocol::kind::SHM
             | crate::protocol::kind::DMABUF
             | crate::protocol::kind::IOSURFACE
             | crate::protocol::kind::PBO

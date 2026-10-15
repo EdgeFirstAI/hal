@@ -843,7 +843,7 @@ Field conventions:
 - `n` or `n_*` — counts (detections, candidates, tracks)
 - `mode` — algorithm variant (float / quant, proto / scaled)
 - `*_fmt` — pixel format enum value
-- `*_memory` — tensor memory backend, recorded as the `TensorMemory` variant: `Mem` / `Shm` / `DmaBuf` / `IoSurface` / `Pbo` / `Cuda`
+- `*_memory` — tensor memory backend, recorded as the `TensorMemory` variant: `Mem` / `Shm` / `DmaBuf` / `IoSurface` / `Pbo` / `Cuda` / `D3d11Texture`
 - `memory` — on `tensor.map`, recorded twice in two nested spans. The outer one is opened by the generic `Tensor::map_impl`, so **every** map has it, and carries the `TensorMemory` variant like the fields above. The platform-native backings then open their own inner `tensor.map` before touching the surface, where `memory` is instead a string naming the primitive — `"iosurface"`, `"ahardwarebuffer"`, `"d3d11_texture"`. A trace filtered to the string values sees only those three backings; filter on the enum to see all of them.
 - `layout` — data layout (`nhwc` / `nchw`)
 - `pass` — multi-pass identifier (`pre_resize` / `post_resize` / `direct`)

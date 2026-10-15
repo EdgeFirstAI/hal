@@ -9,7 +9,10 @@
 //! assignment this vocabulary establishes.
 
 use edgefirst_tensor::vocabulary_demo::{demo_code, Demo};
-use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorMemory};
+use edgefirst_tensor::{
+    ColorEncoding, ColorRange, ColorSpace, ColorTransfer, CpuAccess, DType, PixelFormat, Tensor,
+    TensorMemory,
+};
 
 #[test]
 fn code_and_from_code_round_trip_every_variant() {
@@ -166,26 +169,27 @@ fn tensor_memory_defines_every_variant_on_every_platform() {
         (TensorMemory::IoSurface, 3),
         (TensorMemory::Pbo, 4),
         (TensorMemory::Cuda, 5),
+        (TensorMemory::D3d11Texture, 6),
     ];
     for (v, c) in expect {
         assert_eq!(v.code(), c, "{v:?}");
     }
     assert_eq!(
         TensorMemory::all().len(),
-        6,
+        7,
         "no variant may be cfg-gated away, and none added without pinning it"
     );
 }
 
 #[test]
 fn every_tensor_memory_code_parses_on_every_platform() {
-    for c in 0..6u32 {
+    for c in 0..7u32 {
         assert!(
             TensorMemory::from_code(c).is_some(),
             "code {c} must parse everywhere, whether or not it can be allocated here"
         );
     }
-    assert_eq!(TensorMemory::from_code(6), None, "6 is not assigned");
+    assert_eq!(TensorMemory::from_code(7), None, "7 is not assigned");
 }
 
 #[test]
@@ -197,6 +201,7 @@ fn tensor_memory_wire_strings_round_trip() {
         (TensorMemory::IoSurface, "iosurface"),
         (TensorMemory::Pbo, "pbo"),
         (TensorMemory::Cuda, "cuda"),
+        (TensorMemory::D3d11Texture, "d3d11"),
     ];
     for (v, s) in expect {
         assert_eq!(v.as_str(), s, "{v:?}");
@@ -233,6 +238,7 @@ fn tensor_memory_wire_constants_match_code_for_every_variant() {
     assert_eq!(TensorMemory::IoSurface.code(), w::IOSURFACE);
     assert_eq!(TensorMemory::Pbo.code(), w::PBO);
     assert_eq!(TensorMemory::Cuda.code(), w::CUDA);
+    assert_eq!(TensorMemory::D3d11Texture.code(), w::D3D11_TEXTURE);
 }
 
 #[test]
@@ -289,23 +295,85 @@ fn every_vocabulary_variant_round_trips_through_its_wire_string() {
         TensorMemory::as_str,
         TensorMemory::from_str_code,
     );
+    check(
+        CpuAccess::all(),
+        CpuAccess::code,
+        CpuAccess::from_code,
+        CpuAccess::as_str,
+        CpuAccess::from_str_code,
+    );
+    check(
+        ColorSpace::all(),
+        ColorSpace::code,
+        ColorSpace::from_code,
+        ColorSpace::as_str,
+        ColorSpace::from_str_code,
+    );
+    check(
+        ColorTransfer::all(),
+        ColorTransfer::code,
+        ColorTransfer::from_code,
+        ColorTransfer::as_str,
+        ColorTransfer::from_str_code,
+    );
+    check(
+        ColorEncoding::all(),
+        ColorEncoding::code,
+        ColorEncoding::from_code,
+        ColorEncoding::as_str,
+        ColorEncoding::from_str_code,
+    );
+    check(
+        ColorRange::all(),
+        ColorRange::code,
+        ColorRange::from_code,
+        ColorRange::as_str,
+        ColorRange::from_str_code,
+    );
 }
 
 #[test]
-fn tensor_memory_is_not_protocol_kind() {
-    // Two vocabularies that describe overlapping things and must not be
-    // bridged by integer. `kind` records what a `TensorDesc`'s `ptr` and
-    // `handle` MEAN, so it collapses Mem and Shm into one code; passing a
-    // `TensorMemory::code()` where a `kind` is expected would read Shm(1)
-    // as DMABUF(1). `protocol::kind_of` is the only legitimate bridge.
+fn cpu_access_codes_and_strings_are_pinned() {
+    // The C header's `ef_cpu_access` enumerators and the Python `access=`
+    // strings both read these.
+    use edgefirst_tensor::cpu_access_wire as w;
+    let expect = [
+        (CpuAccess::None, 0, w::NONE, "none"),
+        (CpuAccess::Read, 1, w::READ, "read"),
+        (CpuAccess::Write, 2, w::WRITE, "write"),
+        (CpuAccess::ReadWrite, 3, w::READ_WRITE, "readwrite"),
+    ];
+    for (v, c, wire, s) in expect {
+        assert_eq!(v.code(), c, "{v:?}");
+        assert_eq!(wire, c, "{v:?}");
+        assert_eq!(v.as_str(), s, "{v:?}");
+        assert_eq!(CpuAccess::from_code(c), Some(v));
+        assert_eq!(CpuAccess::from_str_code(s), Some(v));
+    }
+    assert_eq!(CpuAccess::all().len(), expect.len());
+    assert_eq!(CpuAccess::from_code(4), None);
+    assert_eq!(CpuAccess::default(), CpuAccess::None);
+}
+
+#[test]
+fn protocol_kind_is_the_tensor_memory_numbering() {
+    // A descriptor's `kind` and `TensorMemory::code()` are one numbering:
+    // every `TensorMemory` code is the descriptor kind for that backing,
+    // and `protocol::kind` adds no code of its own.
     use edgefirst_tensor::protocol::kind;
-    assert_ne!(TensorMemory::DmaBuf.code(), kind::DMABUF);
-    assert_ne!(TensorMemory::Pbo.code(), kind::PBO);
-    assert_eq!(
-        TensorMemory::Shm.code(),
-        kind::DMABUF,
-        "the collision this test exists to document: Shm's code equals the DMABUF kind"
-    );
+    let expect = [
+        (TensorMemory::Mem, kind::MEM),
+        (TensorMemory::Shm, kind::SHM),
+        (TensorMemory::DmaBuf, kind::DMABUF),
+        (TensorMemory::IoSurface, kind::IOSURFACE),
+        (TensorMemory::Pbo, kind::PBO),
+        (TensorMemory::Cuda, kind::CUDA),
+        (TensorMemory::D3d11Texture, kind::D3D11_TEXTURE),
+    ];
+    for (v, k) in expect {
+        assert_eq!(v.code(), k, "{v:?}");
+    }
+    assert_eq!(TensorMemory::all().len(), expect.len());
 }
 
 #[test]
@@ -315,7 +383,11 @@ fn a_defined_but_unbacked_code_errors_instead_of_panicking() {
     // exactly when `unreachable!()` reads as correct and becomes a panic in
     // library code the day Plan 3 makes a backend report one. Pinning a
     // request to them must come back as an error a caller can handle.
-    for v in [TensorMemory::IoSurface, TensorMemory::Cuda] {
+    for v in [
+        TensorMemory::IoSurface,
+        TensorMemory::Cuda,
+        TensorMemory::D3d11Texture,
+    ] {
         let err = Tensor::<u8>::new(&[64], Some(v), None)
             .expect_err("no backend produces this code yet, so allocation cannot succeed");
         let msg = err.to_string();

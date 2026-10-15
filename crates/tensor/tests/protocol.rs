@@ -27,7 +27,9 @@ fn descriptor_describes_the_tensor() {
     .expect("alloc");
     let d = TensorDyn::from(t).descriptor();
     assert_eq!(d.version, ABI_VERSION);
-    assert_eq!(d.kind, tensor_kind::HOST, "Mem backend reports HOST");
+    assert_eq!(d.kind, tensor_kind::MEM, "Mem backend reports MEM");
+    assert_eq!(d.kind, TensorMemory::Mem.code());
+    assert!(d.is_host());
     assert_eq!(d.ndim, 3);
     assert_eq!(d.shape(), &[32u64, 64, 3]);
     assert_eq!(d.len(), 32 * 64 * 3);
@@ -238,17 +240,35 @@ fn dtype_codes_are_abi() {
 #[test]
 fn kind_codes_are_abi() {
     // Same ABI concern as dtype_codes_are_abi, for the backing-store kind.
+    // These are the `TensorMemory` codes (ABI version 2); version 1 had its
+    // own numbering, in which 1 meant dma-buf.
     assert_eq!(
         [
-            tensor_kind::HOST,
+            tensor_kind::MEM,
+            tensor_kind::SHM,
             tensor_kind::DMABUF,
             tensor_kind::IOSURFACE,
             tensor_kind::PBO,
-            tensor_kind::CUDA_DEVICE,
+            tensor_kind::CUDA,
             tensor_kind::D3D11_TEXTURE,
         ],
-        [0, 1, 2, 3, 4, 5]
+        [0, 1, 2, 3, 4, 5, 6]
     );
+    assert_eq!(ABI_VERSION, 2);
+}
+
+#[test]
+fn only_mem_and_shm_kinds_are_host() {
+    let t = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).expect("alloc");
+    let mut d = TensorDyn::from(t).descriptor();
+    for &m in TensorMemory::all() {
+        d.kind = m.code();
+        assert_eq!(
+            d.is_host(),
+            matches!(m, TensorMemory::Mem | TensorMemory::Shm),
+            "{m:?}"
+        );
+    }
 }
 
 #[test]

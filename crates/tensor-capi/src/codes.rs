@@ -3,19 +3,19 @@
 
 //! The integer vocabularies, as named C enumerators.
 //!
-//! Without these a C caller writes `ef_tensor_builder_dtype(b, 0)` and hopes.
-//! Worse, the bare integer is exactly how this repo previously ended up with
-//! `TensorMemory.MEM == 3` in Python colliding with
-//! `HAL_TENSOR_MEMORY_PBO == 3` in C — three surfaces each numbering the same
-//! vocabulary independently.
+//! Without these a C caller writes `ef_tensor_builder_dtype(b, 0)` and hopes,
+//! and a surface that numbers a vocabulary on its own can silently disagree
+//! with the others.
 //!
 //! So each enumerator's value is asserted against the Rust vocabulary **at
 //! compile time**. A renumbering on either side is a build failure here, not a
 //! silent misinterpretation at a library boundary. This is the same mechanism
 //! used for the Python bindings' discriminants.
 
-use edgefirst_tensor::{CompressionScheme, Contiguity, DType, TensorMemory};
-pub use edgefirst_tensor_abi::{EfCompression, EfContiguity, EfCpuAccess, EfDtype, EfStorageKind};
+use edgefirst_tensor::{CompressionScheme, Contiguity, CpuAccess, DType, TensorMemory};
+pub use edgefirst_tensor_abi::{
+    EfCompression, EfCompressionRequest, EfContiguity, EfCpuAccess, EfDtype, EfStorageKind,
+};
 
 /// Wire code -> validated *map direction*. `None` (0) and unknown codes are
 /// not mappable directions: the wire rule says validate the integer, never
@@ -26,12 +26,7 @@ pub use edgefirst_tensor_abi::{EfCompression, EfContiguity, EfCpuAccess, EfDtype
 /// [`declared_cpu_access_from_code`]: `EF_CPU_ACCESS_NONE` is a legitimate
 /// answer there and a nonsensical one here.
 pub fn cpu_access_from_code(code: u32) -> Option<edgefirst_tensor::CpuAccess> {
-    match code {
-        1 => Some(edgefirst_tensor::CpuAccess::Read),
-        2 => Some(edgefirst_tensor::CpuAccess::Write),
-        3 => Some(edgefirst_tensor::CpuAccess::ReadWrite),
-        _ => None,
-    }
+    CpuAccess::from_code(code).filter(|a| *a != CpuAccess::None)
 }
 
 /// Wire code -> validated Rust access, for an allocation or wrap request.
@@ -42,10 +37,7 @@ pub fn cpu_access_from_code(code: u32) -> Option<edgefirst_tensor::CpuAccess> {
 /// constructors default to. Refusing it would cost that caller a staging
 /// texture it never reads.
 pub fn declared_cpu_access_from_code(code: u32) -> Option<edgefirst_tensor::CpuAccess> {
-    match code {
-        0 => Some(edgefirst_tensor::CpuAccess::None),
-        _ => cpu_access_from_code(code),
-    }
+    CpuAccess::from_code(code)
 }
 
 /// Rust scheme -> wire code, with `None` (linear) as code 0.
@@ -86,6 +78,7 @@ const _: () = {
     assert!(EfStorageKind::IoSurface as u32 == TensorMemory::IoSurface.code());
     assert!(EfStorageKind::Pbo as u32 == TensorMemory::Pbo.code());
     assert!(EfStorageKind::Cuda as u32 == TensorMemory::Cuda.code());
+    assert!(EfStorageKind::D3d11Texture as u32 == TensorMemory::D3d11Texture.code());
 
     assert!(EfCompression::Ubwc as u32 == CompressionScheme::Ubwc.code());
     assert!(EfCompression::Afbc as u32 == CompressionScheme::Afbc.code());
@@ -102,10 +95,10 @@ const _: () = {
     assert!(EfContiguity::Contiguous as u32 == Contiguity::Contiguous.code());
     assert!(EfContiguity::NonContiguous as u32 == Contiguity::NonContiguous.code());
 
-    assert!(EfCpuAccess::None as u32 == 0);
-    assert!(EfCpuAccess::Read as u32 == 1);
-    assert!(EfCpuAccess::Write as u32 == 2);
-    assert!(EfCpuAccess::ReadWrite as u32 == 3);
+    assert!(EfCpuAccess::None as u32 == CpuAccess::None.code());
+    assert!(EfCpuAccess::Read as u32 == CpuAccess::Read.code());
+    assert!(EfCpuAccess::Write as u32 == CpuAccess::Write.code());
+    assert!(EfCpuAccess::ReadWrite as u32 == CpuAccess::ReadWrite.code());
 };
 
 #[cfg(test)]
@@ -125,10 +118,24 @@ mod tests {
         );
         assert_eq!(
             TensorMemory::all().len(),
-            6,
+            7,
             "a TensorMemory was added or removed; add the matching \
              EfStorageKind enumerator and its compile-time assertion"
         );
+    }
+
+    #[test]
+    fn every_cpu_access_has_a_c_enumerator() {
+        assert_eq!(
+            CpuAccess::all().len(),
+            4,
+            "a CpuAccess was added or removed; add the matching EfCpuAccess \
+             enumerator and its compile-time assertion"
+        );
+        for &a in CpuAccess::all() {
+            assert_eq!(declared_cpu_access_from_code(a.code()), Some(a));
+        }
+        assert_eq!(cpu_access_from_code(CpuAccess::None.code()), None);
     }
 
     #[test]
@@ -182,8 +189,6 @@ mod tests {
 
     #[test]
     fn cpu_access_from_code_round_trips_the_mappable_codes() {
-        use edgefirst_tensor::CpuAccess;
-
         let read = cpu_access_from_code(1).expect("1 is Read");
         assert_eq!(read, CpuAccess::Read);
         assert!(read.reads() && !read.writes());

@@ -1815,7 +1815,7 @@ mod tests {
     /// IOSurface view import. Regression test for the second half of issue
     /// #161's IOSurface fix.
     ///
-    /// `restore_imported_row_stride` was `HOST | DMABUF` only, on the
+    /// `restore_imported_row_stride` was host and `DMABUF` only, on the
     /// grounds that nothing had reported the gap for IOSurface. A view of a
     /// pitched surface reports its parent's pitch in `strides[0]`; the import
     /// reopened the whole surface at the window's shape and, dropping that

@@ -19,14 +19,15 @@ pub enum EfLogLevel {
 
 impl EfLogLevel {
     fn from_code(code: u32) -> Option<Self> {
-        match code {
-            1 => Some(Self::Error),
-            2 => Some(Self::Warn),
-            3 => Some(Self::Info),
-            4 => Some(Self::Debug),
-            5 => Some(Self::Trace),
-            _ => None,
-        }
+        [
+            Self::Error,
+            Self::Warn,
+            Self::Info,
+            Self::Debug,
+            Self::Trace,
+        ]
+        .into_iter()
+        .find(|l| *l as u32 == code)
     }
 
     fn from_log_level(level: log::Level) -> Self {
