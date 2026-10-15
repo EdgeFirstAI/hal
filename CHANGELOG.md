@@ -9,11 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Physically contiguous DMA-BUF on request, and a query for it (`edgefirst-tensor`, `edgefirst-image`).** Capture engines without an IOMMU, such as the i.MX 8M Plus ISI, can only write into physically contiguous memory, and since 0.33 a DMA-BUF allocation silently falls back to the non-contiguous system heap when the CMA heap is full.
-  - `ImageDesc::with_contiguous(true)` allocates from the CMA heap only, through `Tensor::image_desc`, `TensorDyn::image_desc` and `ImageProcessor::create_image_desc`. When there is no CMA heap or it cannot fit the image, allocation fails with an error naming `/dev/dma_heap/linux,cma` instead of falling back to the system heap, a PBO or host memory. Default allocations are unchanged.
-  - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
-  - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
-  - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
 - **Named C codes for every image and decoder option.** `edgefirst/image.h` declares `ef_rotation`, `ef_flip`, `ef_color_mode`, `ef_fit` and `ef_compute_backend`; `edgefirst/decoder.h` declares `ef_nms`, `ef_decoder_type`, `ef_decoder_version`, `ef_output_type`, `ef_dim_name`, `ef_match_metric`, `ef_merge_mode` and `ef_model_source`. The functions keep their `uint32_t` parameters.
 - **One numbering per option vocabulary (`edgefirst-image`, `edgefirst-decoder`).** `Rotation`, `Flip`, `ColorMode`, `ComputeBackend`, the new `FitMode` (with `Fit::mode` and `Fit::from_mode`), `Nms`, `DecoderType`, `DecoderVersion`, the new `configs::OutputType` (with `ConfigOutput::output_type`), `DimName`, `MatchMetric`, `MergeMode` and `ModelSource` now carry `code()`, `from_code()`, `as_str()`, `from_str_code()` and `all()`. The C enumerators and the Python enum values are checked against `code()` when the bindings are built. `configs::NMS_OFF_CODE` (0) is the code for no NMS, and `Nms::option_code` / `Nms::from_option_code` convert `Option<Nms>`. `schema::DType`, `schema::NmsMode`, `schema::DecoderVersion` and `schema::DecoderKind` take their codes from the same declarations.
 
@@ -23,6 +18,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (C ABI): model I/O dtype codes are the tensor dtype codes.** `ef_infer_signals_add_input` and `ef_infer_signals_add_output` take an `EF_DTYPE_*` code. `EF_INFER_DTYPE_*` are now aliases of `EF_DTYPE_*` instead of `0x100`–`0x107`; code compiled against the old header passes values that are now `EINVAL` and must be rebuilt. `EF_DTYPE_U64`, `EF_DTYPE_I64` and `EF_DTYPE_F64` are `EINVAL`. `ef_decoder_abi_version` is now 3.
 - **Breaking (C API): unknown option codes are refused.** An unknown `color_mode` passed to `ef_image_processor_draw_decoded_masks` or `ef_image_processor_draw_proto_masks` returns `EINVAL`; it was drawn as `EF_COLOR_MODE_CLASS`. An unknown `ef_tiling_config.fit` makes the tiling functions fail; any non-zero value used to mean letterbox. An unknown `dims` code passed to `ef_decoder_params_add_output` returns `-1`; it was read as an unrecognised axis. `EF_DIM_NAME_UNKNOWN` (10) still names one. `ef_image_abi_version` is now 2; the decoder change is covered by `ef_decoder_abi_version` 3.
 - **Breaking (schema JSON): model dtypes are written with the tensor dtype names.** `schema::DType` serializes as `"i8"`, `"u8"`, `"i16"`, `"u16"`, `"i32"`, `"u32"`, `"f16"` and `"f32"`, the strings `edgefirst_tensor::DType::as_str` uses; it wrote `"int8"`, `"uint8"`, ... `"float32"`. Both spellings are accepted when reading a schema and by the Python `infer_ultralytics_schema`, so existing `edgefirst.json` files still load. A consumer that reads JSON produced by the HAL, such as the inferred schema, sees the new names.
+
+## [0.35.0] - 2026-10-12
+
+### Added
+
+- **Physically contiguous DMA-BUF on request, and a query for it (`edgefirst-tensor`, `edgefirst-image`).** Capture engines without an IOMMU, such as the i.MX 8M Plus ISI, can only write into physically contiguous memory, and since 0.33 a DMA-BUF allocation silently falls back to the non-contiguous system heap when the CMA heap is full.
+  - `ImageDesc::with_contiguous(true)` allocates from the CMA heap only, through `Tensor::image_desc`, `TensorDyn::image_desc` and `ImageProcessor::create_image_desc`. When there is no CMA heap or it cannot fit the image, allocation fails with an error naming `/dev/dma_heap/linux,cma` instead of falling back to the system heap, a PBO or host memory. Default allocations are unchanged.
+  - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
+  - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
+  - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
+- **`PixelFormat::is_rgb_or_hsv()`.** Reports whether a format is RGB or HSV, the flag `Colorimetry::from_v4l2` now takes. `Rgb`, `Rgba`, `Bgra`, `PlanarRgb` and `PlanarRgba` are; `Grey` and the YUV formats are not.
+
+### Changed
+
+- **Breaking: `Colorimetry::from_v4l2` takes `is_rgb_or_hsv`.** The flag says whether the negotiated format's pixel encoding is RGB or HSV. It is the fifth argument in Rust and Python (`Colorimetry.from_v4l2`). In C it comes before `out` in `ef_codec_colorimetry_from_v4l2`, and `ef_codec_abi_version` is now 2.
+
+### Fixed
+
+- **Segmentation masks from models with uint8 or uint16 prototype outputs are no longer noise.** The decoder narrowed every non-int8 prototype tensor to int8 by keeping the low byte, while still applying the tensor's own scale and zero point. QNN models converted with the logical split, which output uint16 (w8a16) or uint8 (w8a8) prototypes, lost most of their mask accuracy: yolov8n-seg on the IQ-9075 scored 11.2 mask mAP50-95 instead of 29.3. Such prototypes are now dequantized exactly. Models with int8 or float prototypes, including every TFLite model, are unaffected.
+- **An RGB V4L2 format with `quantization = DEFAULT` is full range.** `Colorimetry::from_v4l2` resolved a `DEFAULT` quantization from the colorspace alone, so an RGB camera reporting sRGB was published as limited range. It now follows the kernel's `V4L2_MAP_QUANTIZATION_DEFAULT`: a `DEFAULT` quantization is full range for an RGB/HSV format, whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other recognised colorspace; and unset for a YUV format in a `DEFAULT` or unrecognised colorspace, so the at-use height heuristic decides.
 
 ## [0.34.1] - 2026-10-07
 

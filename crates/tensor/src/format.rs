@@ -439,6 +439,32 @@ impl PixelFormat {
         )
     }
 
+    /// Returns `true` if this is an RGB or HSV pixel format.
+    ///
+    /// This is the `is_rgb_or_hsv` input of the kernel's
+    /// `V4L2_MAP_QUANTIZATION_DEFAULT()` macro, which
+    /// [`Colorimetry::from_v4l2`](crate::Colorimetry::from_v4l2) takes to
+    /// resolve a `DEFAULT` quantization: these formats default to full range.
+    ///
+    /// `Rgb`, `Rgba`, `Bgra`, `PlanarRgb` and `PlanarRgba` return `true`.
+    /// The YUV formats and `Grey` return `false`; the kernel lists greyscale
+    /// as a YUV encoding. `PixelFormat` has no Bayer or HSV formats, which a
+    /// V4L2 classifier by fourcc also counts as RGB.
+    ///
+    /// ```
+    /// use edgefirst_tensor::PixelFormat;
+    ///
+    /// assert!(PixelFormat::Rgb.is_rgb_or_hsv());
+    /// assert!(!PixelFormat::Yuyv.is_rgb_or_hsv());
+    /// assert!(!PixelFormat::Grey.is_rgb_or_hsv());
+    /// ```
+    pub const fn is_rgb_or_hsv(&self) -> bool {
+        match self {
+            Self::Rgb | Self::Rgba | Self::Bgra | Self::PlanarRgb | Self::PlanarRgba => true,
+            Self::Grey | Self::Yuyv | Self::Vyuy | Self::Nv12 | Self::Nv16 | Self::Nv24 => false,
+        }
+    }
+
     /// Returns `true` if this format includes an alpha channel.
     pub const fn has_alpha(&self) -> bool {
         matches!(self, Self::Rgba | Self::Bgra | Self::PlanarRgba)
@@ -770,6 +796,17 @@ mod tests {
         assert!(PixelFormat::Nv16.is_yuv());
         assert!(PixelFormat::Nv24.is_yuv());
         assert!(!PixelFormat::PlanarRgb.is_yuv());
+    }
+
+    #[test]
+    fn is_rgb_or_hsv_is_every_format_but_yuv_and_grey() {
+        for &format in PixelFormat::all() {
+            assert_eq!(
+                format.is_rgb_or_hsv(),
+                !format.is_yuv() && format != PixelFormat::Grey,
+                "{format:?}"
+            );
+        }
     }
 
     #[test]
