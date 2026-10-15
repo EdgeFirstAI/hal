@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Hardware H.264 encoding. Each test skips (prints `SKIPPED` and passes)
-//! where there is no encoder or no DMA-BUF heap.
+//! where there is no encoder or no DMA-BUF heap; under
+//! `HAL_TEST_REQUIRE_DMA=1` a missing heap fails instead.
 //!
 //! Setting `EDGEFIRST_VIDEO_OUT` to a directory writes each test's stream
 //! there as `<test>.h264`, with the source pictures of the first frame as
@@ -14,21 +15,24 @@ use edgefirst_codec::video::{EncodedFrame, EncoderConfig, FrameOptions, VideoEnc
 use edgefirst_codec::CodecError;
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
-fn skip(why: &str) {
-    eprintln!("SKIPPED: {why}");
+fn skip(test: &str, why: &str) {
+    eprintln!("SKIPPED: {test} - {why}");
 }
+
+/// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
+#[path = "../../tensor/tests/support/dma_require.rs"]
+mod dma_require;
 
 /// Opens an encoder, or `None` (after printing why) when the platform has
 /// none.
-fn open(config: EncoderConfig) -> Option<VideoEncoder> {
-    if !edgefirst_tensor::is_dma_available() {
-        skip("no DMA-BUF heap");
+fn open(test: &str, config: EncoderConfig) -> Option<VideoEncoder> {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), test) {
         return None;
     }
     match VideoEncoder::new(config) {
         Ok(e) => Some(e),
         Err(CodecError::NoDevice(why)) => {
-            skip(&why);
+            skip(test, &why);
             None
         }
         Err(e) => panic!("encoder open failed: {e}"),
@@ -108,7 +112,10 @@ fn parameter_sets_and_idr(au: &[u8]) -> (bool, bool) {
 fn encodes_1080p_nv12_at_30_fps_with_forced_keyframe_and_drain() {
     const FRAMES: usize = 60;
     const FORCED: usize = 37;
-    let Some(mut enc) = open(EncoderConfig::h264(1920, 1080, PixelFormat::Nv12, 30.0)) else {
+    let Some(mut enc) = open(
+        "encodes_1080p_nv12_at_30_fps_with_forced_keyframe_and_drain",
+        EncoderConfig::h264(1920, 1080, PixelFormat::Nv12, 30.0),
+    ) else {
         return;
     };
     eprintln!("encoder {}", enc.device());
@@ -167,7 +174,10 @@ fn encodes_1080p_nv12_at_30_fps_with_forced_keyframe_and_drain() {
 #[test]
 fn encodes_a_crop_of_a_larger_source() {
     let crop = Region::new(320, 180, 1280, 720);
-    let Some(mut enc) = open(EncoderConfig::h264(1280, 720, PixelFormat::Nv12, 30.0)) else {
+    let Some(mut enc) = open(
+        "encodes_a_crop_of_a_larger_source",
+        EncoderConfig::h264(1280, 720, PixelFormat::Nv12, 30.0),
+    ) else {
         return;
     };
     let src = nv12(1920, 1080);
@@ -193,7 +203,10 @@ fn encodes_a_crop_of_a_larger_source() {
 
 #[test]
 fn encoder_is_reusable_after_flush() {
-    let Some(mut enc) = open(EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0)) else {
+    let Some(mut enc) = open(
+        "encoder_is_reusable_after_flush",
+        EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),
+    ) else {
         return;
     };
     let src = nv12(640, 480);
@@ -217,10 +230,34 @@ fn encoder_is_reusable_after_flush() {
 
 #[test]
 fn rejects_a_source_of_the_wrong_size() {
-    let Some(mut enc) = open(EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0)) else {
+    let Some(mut enc) = open(
+        "rejects_a_source_of_the_wrong_size",
+        EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),
+    ) else {
         return;
     };
     let src = nv12(320, 240);
+    let err = enc.encode(&src, &FrameOptions::default()).unwrap_err();
+    assert!(matches!(err, CodecError::InvalidInput(_)), "{err}");
+}
+
+#[test]
+fn rejects_a_16_bit_source() {
+    let Some(mut enc) = open(
+        "rejects_a_16_bit_source",
+        EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),
+    ) else {
+        return;
+    };
+    let src = TensorDyn::image(
+        640,
+        480,
+        PixelFormat::Nv12,
+        DType::U16,
+        Some(TensorMemory::DmaBuf),
+        CpuAccess::ReadWrite,
+    )
+    .expect("DMA-BUF 16-bit NV12 image");
     let err = enc.encode(&src, &FrameOptions::default()).unwrap_err();
     assert!(matches!(err, CodecError::InvalidInput(_)), "{err}");
 }

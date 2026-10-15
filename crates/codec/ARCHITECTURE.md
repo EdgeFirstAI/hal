@@ -50,7 +50,7 @@ dependency graph clean.
 | Module       | Purpose                                         |
 |--------------|-------------------------------------------------|
 | `lib.rs`     | Crate root, public re-exports                   |
-| `error.rs`   | `CodecError` enum (capacity / dtype / unsupported / IO / V4L2) |
+| `error.rs`   | `CodecError` enum (capacity / dtype / unsupported / IO / V4L2 / no device / invalid config or input / device / timeout) |
 | `pixel.rs`   | `ImagePixel` trait (u8, u16, i8, i16, f32)      |
 | `options.rs` | `ImageInfo` struct (decoded metadata + reported EXIF orientation) |
 | `exif.rs`    | EXIF orientation parsing → `(rotation_degrees, flip_horizontal)`; never applied |
@@ -109,6 +109,15 @@ reconfigures the destination to `Rgb` itself.
 | `format.rs`   | `classify()` the driver-chosen CAPTURE FourCC → `CapKind` (`Nv12` / `Grey` / 4:4:4-packed) |
 
 V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v4l2-rs) crate, shared with the EdgeFirst camera SDK: `device` for discovery and formats, `m2m` for the OUTPUT and CAPTURE queues (allocation, the mapped OUTPUT buffer, DMABUF import, waits), `events` for the source-change wait and drain, and `uapi` for the format structs. The crate's queues track which buffers the driver holds, so the decoder refuses to stage a JPEG into an OUTPUT buffer that is still queued.
+
+### Video Module Map (`video/`)
+
+| Module          | Purpose                                              |
+|-----------------|------------------------------------------------------|
+| `mod.rs`        | `VideoEncoder`, `EncoderConfig` and its H.264 profile, level and bitrate types, `FrameOptions`, `EncodedFrame`, the `EncoderBackend` seam |
+| `h264.rs`       | Annex B framing: NAL unit types, SPS/PPS extraction, `AccessUnit` classification (IDR, parameter sets, trailing NAL units that belong to the previous access unit) |
+| `v4l2/mod.rs`   | Capability-based discovery of stateful M2M nodes (env override, then `/dev/video*`), `M2mDevice` |
+| `v4l2/encoder.rs` | `V4l2Encoder` (Linux + `v4l2` feature): format and control setup, DMA-BUF import of the source planes and crops, PTS mapping, header caching, `ENCODER_CMD` drain and stream reset |
 
 ## Key Design Decisions
 

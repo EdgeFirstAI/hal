@@ -19,7 +19,7 @@ use std::io::{Seek, SeekFrom};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::time::{Duration, Instant};
 
-use edgefirst_tensor::{PixelFormat, TensorDyn, TensorMemory};
+use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use edgefirst_v4l2::controls::{self, ControlInfo, ControlType, ControlValue};
 use edgefirst_v4l2::device::Fraction;
 use edgefirst_v4l2::m2m::M2m;
@@ -515,6 +515,13 @@ impl V4l2Encoder {
             return invalid(format!(
                 "source format {:?} is not the configured {}",
                 src.format(),
+                cfg.input_format
+            ));
+        }
+        if src.dtype() != DType::U8 {
+            return invalid(format!(
+                "source elements are {:?}; {} is 8-bit",
+                src.dtype(),
                 cfg.input_format
             ));
         }
