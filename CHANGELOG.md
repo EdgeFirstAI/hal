@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`TensorMemory::D3d11Texture` (code 6).** Names a Windows D3D11 texture specifically, as `IoSurface` does for IOSurface. No backend allocates or reports it; Windows still allocates and reports `DmaBuf`, and requesting it fails with `NotImplemented`. C: `EF_STORAGE_KIND_D3D11_TEXTURE`. Python: `TensorMemory.D3D11_TEXTURE`.
+- **`CpuAccess::code()`, `from_code()`, `as_str()` and `from_str_code()`.** `CpuAccess` is declared through the shared vocabulary like `TensorMemory`, so its codes (`None`=0, `Read`=1, `Write`=2, `ReadWrite`=3) and strings (`none`, `read`, `write`, `readwrite`) have one declaration. The C `ef_cpu_access` enumerators are checked against it at build time.
+- **`code()`, `from_code()` and `all()` on `ColorSpace`, `ColorTransfer`, `ColorEncoding` and `ColorRange`.** The four colorimetry axes are declared through the shared vocabulary, so each axis's code is the byte `Colorimetry::pack` writes and `ef_tensor_colorimetry` returns. The codes and the schema strings are unchanged.
+- **C: `ef_compression_request`.** Names the values `ef_tensor_image_desc_set_compression` takes and `ef_image_desc_view.compression` reports: `EF_COMPRESSION_REQUEST_NONE` (0), `_ANY` (1) and `_SCHEME` (2). The values are unchanged.
 - **Hardware H.264 encoding (`edgefirst-codec`, new `video` module).** `VideoEncoder` compresses image tensors with any V4L2 stateful memory-to-memory encoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). `EDGEFIRST_CODEC_V4L2_ENCODER` names the device node to use.
   - DMA-BUF sources are imported without a copy. NV12 goes through the two-plane `NV12M` layout where the device offers it, so `FrameOptions::crop` encodes a region of a larger source and separately allocated chroma planes work. `encode()` returns once the device has read the source.
   - `EncoderConfig` sets the size, input format, frame rate, bitrate, GOP, profile and level. `repeat_headers` puts the SPS and PPS on every IDR, including forced key frames (`FrameOptions::keyframe`) on devices that repeat them only at the start of a GOP.
@@ -18,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: the cross-package tensor descriptor's `kind` uses the `TensorMemory` codes, and `ABI_VERSION` is 2.** `TensorDesc::kind` had its own numbering, in which 1 meant DMA-BUF while `TensorMemory` code 1 is `Shm`. `protocol::kind` now re-exports the `TensorMemory` wire constants: `MEM`=0, `SHM`=1, `DMABUF`=2, `IOSURFACE`=3, `PBO`=4, `CUDA`=5, `D3D11_TEXTURE`=6. `kind::HOST` is replaced by `kind::MEM` and `kind::SHM`, which a producer now reports separately, and `TensorDesc::is_host()` tests for either. `kind::CUDA_DEVICE` is renamed `kind::CUDA`. A `DmaBuf` tensor still reports the concrete backing: `DMABUF` on Linux and Android, `IOSURFACE` on macOS and iOS, `D3D11_TEXTURE` on Windows. An importer refuses a version-1 descriptor, so `edgefirst.*` Python packages from this release do not exchange tensors with packages from 0.35.x or earlier. The capsule name (`edgefirst_tensor_v2`) and layout are unchanged.
+- **Breaking: `PixelFormat::to_fourcc()` returns V4L2 pixel format codes.** `Rgb` is now `RGB3` (was `RGB `), `Rgba` is `AB24` (was `RGBA`), `Bgra` is `AR24` (was `BGRA`) and `Grey` is `GREY` (was `Y800`); the YUV formats are unchanged. `from_fourcc()` accepts the new codes only. The descriptor's `fourcc` field carries the same codes. `PixelFormat`'s `Display` text is unchanged.
+- **Breaking (`edgefirst-tensor-abi`): `EfStorageKind::D3d11Texture` and `EfCompressionRequest`.** `EfStorageKind` gains a variant, which breaks an exhaustive `match` on it.
 - **Breaking (`edgefirst-codec`):** `CodecError` gains `NoDevice`, `InvalidConfig`, `InvalidInput`, `Device` and `Timeout` for video encoding. Exhaustive `match`es on `CodecError` need new arms.
 
 ## [0.35.0] - 2026-10-12

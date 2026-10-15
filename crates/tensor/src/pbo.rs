@@ -820,7 +820,7 @@ where
     /// only thing standing between a consumer and freed memory. Cloning this
     /// `Arc` (not the `PboHandle`'s *contents*) is what a cross-package
     /// capsule holds alongside the descriptor, exactly the way `pin` already
-    /// does for the `HOST` kind -- see `TensorCapsulePayload`
+    /// does for the host-memory kinds -- see `TensorCapsulePayload`
     /// (`edgefirst-python-common`). Type-erased so this crate's public
     /// surface never has to name `PboHandle`, which stays private.
     ///

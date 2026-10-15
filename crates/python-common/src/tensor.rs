@@ -302,7 +302,7 @@ pub fn decode_into(tensor: &Bound<'_, PyAny>, data: &[u8]) -> PyResult<PyImageIn
     // harmless, and simpler than special-casing it away.)
     //
     // Best-effort: the pixels are already written zero-copy into the real
-    // allocation by this point (a `HOST`-kind reconstruction aliases the
+    // allocation by this point (a host-kind reconstruction aliases the
     // producer's own pinned address; `DMABUF`/`IOSURFACE` alias the same
     // fd/surface), regardless of what happens below -- that part cannot
     // fail here. INTEROP.md's `EdgeFirstTensorExportable` requires only
@@ -419,7 +419,7 @@ impl PyImageInfo {
     module = "edgefirst.tensor"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(clippy::upper_case_acronyms)]
+#[allow(clippy::upper_case_acronyms, non_camel_case_types)]
 pub enum PyTensorMemory {
     /// Regular system memory allocation. Available everywhere.
     MEM = 0,
@@ -439,6 +439,10 @@ pub enum PyTensorMemory {
     PBO = 4,
     /// CUDA device memory. No backend produces or accepts it yet.
     CUDA = 5,
+    /// Windows D3D11 texture, named specifically rather than through the
+    /// portable `DMABUF` spelling. No backend produces or accepts it yet --
+    /// Windows allocates and reports `DMABUF`.
+    D3D11_TEXTURE = 6,
 }
 
 // The literals above are copied from `TensorMemory::code()`, not computed
@@ -456,6 +460,7 @@ const _: () = assert!(PyTensorMemory::DMABUF as u32 == TensorMemory::DmaBuf.code
 const _: () = assert!(PyTensorMemory::IOSURFACE as u32 == TensorMemory::IoSurface.code());
 const _: () = assert!(PyTensorMemory::PBO as u32 == TensorMemory::Pbo.code());
 const _: () = assert!(PyTensorMemory::CUDA as u32 == TensorMemory::Cuda.code());
+const _: () = assert!(PyTensorMemory::D3D11_TEXTURE as u32 == TensorMemory::D3d11Texture.code());
 
 impl PyTensorMemory {
     /// Reconstruct from the `__int__()` discriminant of a sibling package's
@@ -519,6 +524,7 @@ impl From<PyTensorMemory> for TensorMemory {
             PyTensorMemory::IOSURFACE => TensorMemory::IoSurface,
             PyTensorMemory::PBO => TensorMemory::Pbo,
             PyTensorMemory::CUDA => TensorMemory::Cuda,
+            PyTensorMemory::D3D11_TEXTURE => TensorMemory::D3d11Texture,
         }
     }
 }
@@ -537,6 +543,7 @@ impl From<TensorMemory> for PyTensorMemory {
             TensorMemory::IoSurface => PyTensorMemory::IOSURFACE,
             TensorMemory::Pbo => PyTensorMemory::PBO,
             TensorMemory::Cuda => PyTensorMemory::CUDA,
+            TensorMemory::D3d11Texture => PyTensorMemory::D3D11_TEXTURE,
             // `TensorMemory` is `#[non_exhaustive]`, so rustc requires this
             // arm outside its defining crate. Reached only by a variant
             // added upstream without a decision made here -- which is what
@@ -665,15 +672,11 @@ pub(crate) fn parse_dtype(dtype: &str) -> Result<DType> {
 
 /// Parse a Python CPU-access string into a `CpuAccess` declaration.
 pub(crate) fn parse_cpu_access(access: &str) -> Result<tensor::CpuAccess> {
-    match access {
-        "none" => Ok(tensor::CpuAccess::None),
-        "read" => Ok(tensor::CpuAccess::Read),
-        "write" => Ok(tensor::CpuAccess::Write),
-        "readwrite" => Ok(tensor::CpuAccess::ReadWrite),
-        _ => Err(Error::Format(format!(
+    tensor::CpuAccess::from_str_code(access).ok_or_else(|| {
+        Error::Format(format!(
             "access must be one of none|read|write|readwrite, got {access:?}"
-        ))),
-    }
+        ))
+    })
 }
 
 /// Parse a Python compression-request string into a [`Compression`]
@@ -1979,15 +1982,16 @@ impl PyTensor {
         // dst)` needs just the dma-buf handle from `access=None` on both
         // sides, and a read-only source must not be silently upgraded to
         // ReadWrite.
-        let pin = match access {
+        let pin = match access.map(|s| (s, CpuAccess::from_str_code(s))) {
             None => None,
-            Some("read") => Some(self.0.pin_host(CpuAccess::Read).map_err(Error::from)?),
-            Some("write") => Some(self.0.pin_host(CpuAccess::Write).map_err(Error::from)?),
-            Some("readwrite") => Some(self.0.pin_host(CpuAccess::ReadWrite).map_err(Error::from)?),
+            Some((_, Some(a))) if a != CpuAccess::None => {
+                Some(self.0.pin_host(a).map_err(Error::from)?)
+            }
             // A bad access string is an invalid argument value, not a tensor
             // error, so raise ValueError directly instead of routing through
-            // Error's blanket PyRuntimeError conversion.
-            Some(other) => {
+            // Error's blanket PyRuntimeError conversion. "none" is refused
+            // too: the absence of a pin is spelled `None`.
+            Some((other, _)) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "access must be None, \"read\", \"write\" or \"readwrite\", got {other:?}"
                 )));
