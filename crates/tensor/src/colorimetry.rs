@@ -354,18 +354,33 @@ impl Colorimetry {
         }
     }
 
-    /// Build from the four raw V4L2 colorimetry integers.
+    /// Build from the four raw V4L2 colorimetry integers of a negotiated
+    /// format whose pixel encoding is RGB or HSV when `is_rgb_or_hsv` is
+    /// `true` (see [`PixelFormat::is_rgb_or_hsv`]).
     ///
     /// Explicit values map directly. For `ycbcr_enc`/`quantization`, the V4L2
-    /// `DEFAULT` (0) sentinel does NOT mean "unknown" — it means "derive from
-    /// the colorspace" (kernel `V4L2_MAP_YCBCR_ENC_DEFAULT` /
-    /// `V4L2_MAP_QUANTIZATION_DEFAULT`). So a recognised colorspace resolves
-    /// those axes here (e.g. `V4L2_COLORSPACE_JPEG` → BT.601 full-range) rather
-    /// than leaving them `None` and falling through to the at-use height
-    /// heuristic (which would wrongly pick BT.709/limited for an HD JPEG frame).
-    /// A `DEFAULT`/unrecognised colorspace still yields `None` (deferred to the
-    /// heuristic); unrecognised non-default values also map to `None`.
-    pub fn from_v4l2(colorspace: u32, xfer: u32, ycbcr_enc: u32, quant: u32) -> Self {
+    /// `DEFAULT` (0) sentinel does NOT mean "unknown" — it means "derive"
+    /// (kernel `V4L2_MAP_YCBCR_ENC_DEFAULT` / `V4L2_MAP_QUANTIZATION_DEFAULT`),
+    /// and those axes are resolved here rather than left `None` for the
+    /// at-use height heuristic (which would wrongly pick BT.709/limited for an
+    /// HD JPEG frame):
+    ///
+    /// - `quantization = DEFAULT` is full range for an RGB/HSV format,
+    ///   whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for
+    ///   a YUV format in any other recognised colorspace; and unset (`None`)
+    ///   for a YUV format in a `DEFAULT` or unrecognised colorspace, so the
+    ///   at-use height heuristic decides.
+    /// - `ycbcr_enc = DEFAULT` is the encoding the colorspace implies, and
+    ///   unset (`None`) for a `DEFAULT` or unrecognised colorspace.
+    ///
+    /// Unrecognised non-default values also map to `None`.
+    pub fn from_v4l2(
+        colorspace: u32,
+        xfer: u32,
+        ycbcr_enc: u32,
+        quant: u32,
+        is_rgb_or_hsv: bool,
+    ) -> Self {
         let encoding = ColorEncoding::from_v4l2(ycbcr_enc).or_else(|| {
             if ycbcr_enc == V4L2_YCBCR_ENC_DEFAULT {
                 Self::default_encoding_for_colorspace(colorspace)
@@ -375,7 +390,7 @@ impl Colorimetry {
         });
         let range = ColorRange::from_v4l2(quant).or_else(|| {
             if quant == V4L2_QUANTIZATION_DEFAULT {
-                Self::default_range_for_colorspace(colorspace)
+                Self::default_range(is_rgb_or_hsv, colorspace)
             } else {
                 None
             }
@@ -388,8 +403,10 @@ impl Colorimetry {
         }
     }
 
-    /// V4L2 `ycbcr_enc=DEFAULT` → encoding implied by the colorspace
-    /// (`V4L2_MAP_YCBCR_ENC_DEFAULT`). `None` for default/unrecognised.
+    /// V4L2 `ycbcr_enc=DEFAULT` → encoding implied by the colorspace, per
+    /// `V4L2_MAP_YCBCR_ENC_DEFAULT` for every colorspace [`ColorSpace`]
+    /// recognises: BT.709 for REC709, BT.2020 for BT2020, BT.601 otherwise.
+    /// `None` for default/unrecognised.
     fn default_encoding_for_colorspace(colorspace: u32) -> Option<ColorEncoding> {
         match colorspace {
             V4L2_COLORSPACE_REC709 => Some(ColorEncoding::Bt709),
@@ -403,11 +420,15 @@ impl Colorimetry {
         }
     }
 
-    /// V4L2 `quantization=DEFAULT` → range implied by the colorspace
-    /// (`V4L2_MAP_QUANTIZATION_DEFAULT` for the YUV case: only JPEG is full,
-    /// every other recognised colorspace is limited). `None` for
-    /// default/unrecognised.
-    fn default_range_for_colorspace(colorspace: u32) -> Option<ColorRange> {
+    /// V4L2 `quantization=DEFAULT` → range, per
+    /// `V4L2_MAP_QUANTIZATION_DEFAULT`: full for an RGB/HSV format whatever
+    /// the colorspace, full for JPEG, limited for every other recognised
+    /// colorspace. `None` for a YUV format in a default/unrecognised
+    /// colorspace.
+    fn default_range(is_rgb_or_hsv: bool, colorspace: u32) -> Option<ColorRange> {
+        if is_rgb_or_hsv {
+            return Some(ColorRange::Full);
+        }
         match colorspace {
             V4L2_COLORSPACE_JPEG => Some(ColorRange::Full),
             V4L2_COLORSPACE_SMPTE170M
@@ -577,12 +598,12 @@ mod tests {
 
     #[test]
     fn from_v4l2_struct_maps_all_axes_and_unknown_to_none() {
-        let c = Colorimetry::from_v4l2(3, 1, 2, 1); // REC709, XFER709, ENC709, FULL
+        let c = Colorimetry::from_v4l2(3, 1, 2, 1, false); // REC709, XFER709, ENC709, FULL
         assert_eq!(c.space, Some(ColorSpace::Bt709));
         assert_eq!(c.transfer, Some(ColorTransfer::Bt709));
         assert_eq!(c.encoding, Some(ColorEncoding::Bt709));
         assert_eq!(c.range, Some(ColorRange::Full));
-        let d = Colorimetry::from_v4l2(0, 0, 0, 0); // all DEFAULT
+        let d = Colorimetry::from_v4l2(0, 0, 0, 0, false); // all DEFAULT, YUV
         assert_eq!(d, Colorimetry::default()); // all None
     }
 
@@ -591,22 +612,22 @@ mod tests {
         // COLORSPACE_JPEG (7) with DEFAULT ycbcr_enc/quant must resolve to
         // BT.601 full-range per V4L2_MAP_*_DEFAULT — NOT be left None (which
         // would let the height heuristic wrongly pick BT.709/limited for HD).
-        let jpeg = Colorimetry::from_v4l2(7, 0, 0, 0);
+        let jpeg = Colorimetry::from_v4l2(7, 0, 0, 0, false);
         assert_eq!(jpeg.encoding, Some(ColorEncoding::Bt601));
         assert_eq!(jpeg.range, Some(ColorRange::Full));
 
         // REC709 colorspace, DEFAULT enc/quant → BT.709 limited.
-        let rec709 = Colorimetry::from_v4l2(3, 0, 0, 0);
+        let rec709 = Colorimetry::from_v4l2(3, 0, 0, 0, false);
         assert_eq!(rec709.encoding, Some(ColorEncoding::Bt709));
         assert_eq!(rec709.range, Some(ColorRange::Limited));
 
         // Explicit ycbcr_enc/quant still win over the colorspace default.
-        let explicit = Colorimetry::from_v4l2(7, 0, 2, 2); // JPEG but enc=709, quant=limited
+        let explicit = Colorimetry::from_v4l2(7, 0, 2, 2, false); // JPEG but enc=709, quant=limited
         assert_eq!(explicit.encoding, Some(ColorEncoding::Bt709));
         assert_eq!(explicit.range, Some(ColorRange::Limited));
 
         // Unrecognised non-default values stay None (not derived).
-        let unknown_enc = Colorimetry::from_v4l2(7, 0, 99, 0);
+        let unknown_enc = Colorimetry::from_v4l2(7, 0, 99, 0, false);
         assert_eq!(unknown_enc.encoding, None);
         assert_eq!(unknown_enc.range, Some(ColorRange::Full)); // quant still defaulted from JPEG
     }
@@ -872,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn from_v4l2_derives_encoding_and_range_for_every_recognised_colorspace() {
+    fn from_v4l2_derives_encoding_and_range_for_every_recognised_yuv_colorspace() {
         use ColorEncoding as E;
         use ColorRange as R;
         let table = [
@@ -885,18 +906,97 @@ mod tests {
             (V4L2_COLORSPACE_BT2020, E::Bt2020, R::Limited),
         ];
         for (colorspace, encoding, range) in table {
-            let c = Colorimetry::from_v4l2(colorspace, 0, 0, 0);
+            let c = Colorimetry::from_v4l2(colorspace, 0, 0, 0, false);
             assert_eq!(c.encoding, Some(encoding), "colorspace {colorspace}");
             assert_eq!(c.range, Some(range), "colorspace {colorspace}");
         }
         // Unrecognised colorspaces leave both axes to the at-use heuristic.
         for colorspace in [0, 2, 4, 9, 11, 99] {
-            let c = Colorimetry::from_v4l2(colorspace, 0, 0, 0);
+            let c = Colorimetry::from_v4l2(colorspace, 0, 0, 0, false);
             assert_eq!(
                 (c.encoding, c.range),
                 (None, None),
                 "colorspace {colorspace}"
             );
+        }
+    }
+
+    /// Every V4L2 colorspace code `videodev2.h` defines, plus an
+    /// unassigned one.
+    const ALL_V4L2_COLORSPACES: [u32; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 99];
+
+    /// `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, _)`, restated
+    /// from the header for the colorspaces this crate recognises.
+    fn kernel_default_range(is_rgb_or_hsv: bool, colorspace: u32) -> ColorRange {
+        if is_rgb_or_hsv || colorspace == V4L2_COLORSPACE_JPEG {
+            ColorRange::Full
+        } else {
+            ColorRange::Limited
+        }
+    }
+
+    #[test]
+    fn from_v4l2_quantization_matches_the_kernel_for_every_colorspace_format_and_quant() {
+        for colorspace in ALL_V4L2_COLORSPACES {
+            let recognised = ColorSpace::from_v4l2(colorspace).is_some();
+            for is_rgb_or_hsv in [false, true] {
+                for quant in [
+                    V4L2_QUANTIZATION_DEFAULT,
+                    V4L2_QUANTIZATION_FULL_RANGE,
+                    V4L2_QUANTIZATION_LIM_RANGE,
+                    99,
+                ] {
+                    let range =
+                        Colorimetry::from_v4l2(colorspace, 0, 0, quant, is_rgb_or_hsv).range;
+                    let expected = match quant {
+                        V4L2_QUANTIZATION_FULL_RANGE => Some(ColorRange::Full),
+                        V4L2_QUANTIZATION_LIM_RANGE => Some(ColorRange::Limited),
+                        V4L2_QUANTIZATION_DEFAULT if is_rgb_or_hsv || recognised => {
+                            Some(kernel_default_range(is_rgb_or_hsv, colorspace))
+                        }
+                        _ => None,
+                    };
+                    assert_eq!(
+                        range, expected,
+                        "colorspace {colorspace}, rgb/hsv {is_rgb_or_hsv}, quant {quant}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_default_quantization_is_full_and_yuv_follows_the_colorspace() {
+        let range = |colorspace, is_rgb_or_hsv| {
+            Colorimetry::from_v4l2(colorspace, 0, 0, V4L2_QUANTIZATION_DEFAULT, is_rgb_or_hsv).range
+        };
+        assert_eq!(range(V4L2_COLORSPACE_SRGB, true), Some(ColorRange::Full));
+        assert_eq!(
+            range(V4L2_COLORSPACE_SRGB, false),
+            Some(ColorRange::Limited)
+        );
+        assert_eq!(range(V4L2_COLORSPACE_JPEG, false), Some(ColorRange::Full));
+        // The kernel ignores the colorspace for an RGB/HSV format, so an
+        // unrecognised or DEFAULT one is still full range.
+        assert_eq!(range(0, true), Some(ColorRange::Full));
+        assert_eq!(range(V4L2_COLORSPACE_REC709, true), Some(ColorRange::Full));
+    }
+
+    #[test]
+    fn from_v4l2_encoding_matches_the_kernel_for_every_recognised_colorspace() {
+        // `V4L2_MAP_YCBCR_ENC_DEFAULT`: REC709 and DCI_P3 → 709, BT2020 →
+        // BT2020, SMPTE240M → SMPTE240M, else 601. DCI_P3 and SMPTE240M are
+        // not colorspaces `ColorSpace` recognises, so they stay `None`.
+        for colorspace in ALL_V4L2_COLORSPACES {
+            for is_rgb_or_hsv in [false, true] {
+                let encoding = Colorimetry::from_v4l2(colorspace, 0, 0, 0, is_rgb_or_hsv).encoding;
+                let expected = ColorSpace::from_v4l2(colorspace).map(|_| match colorspace {
+                    V4L2_COLORSPACE_REC709 => ColorEncoding::Bt709,
+                    V4L2_COLORSPACE_BT2020 => ColorEncoding::Bt2020,
+                    _ => ColorEncoding::Bt601,
+                });
+                assert_eq!(encoding, expected, "colorspace {colorspace}");
+            }
         }
     }
 }

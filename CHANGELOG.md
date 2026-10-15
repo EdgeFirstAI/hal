@@ -16,15 +16,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `flush()` drains the encoder with `V4L2_ENC_CMD_STOP` and returns every pending access unit; the next frame starts a new stream with an IDR.
   - Example `video-encode`, and device-gated tests in `crates/codec/tests/video_encode.rs`.
 
+### Changed
+
+- **Breaking (`edgefirst-codec`):** `CodecError` gains `NoDevice`, `InvalidConfig`, `InvalidInput`, `Device` and `Timeout` for video encoding. Exhaustive `match`es on `CodecError` need new arms.
+
+## [0.35.0] - 2026-10-12
+
+### Added
+
 - **Physically contiguous DMA-BUF on request, and a query for it (`edgefirst-tensor`, `edgefirst-image`).** Capture engines without an IOMMU, such as the i.MX 8M Plus ISI, can only write into physically contiguous memory, and since 0.33 a DMA-BUF allocation silently falls back to the non-contiguous system heap when the CMA heap is full.
   - `ImageDesc::with_contiguous(true)` allocates from the CMA heap only, through `Tensor::image_desc`, `TensorDyn::image_desc` and `ImageProcessor::create_image_desc`. When there is no CMA heap or it cannot fit the image, allocation fails with an error naming `/dev/dma_heap/linux,cma` instead of falling back to the system heap, a PBO or host memory. Default allocations are unchanged.
   - `Tensor::contiguity()` and `TensorDyn::contiguity()` return the new `Contiguity`: `Contiguous` for CMA, `NonContiguous` for the system heap, and `Unknown` for an imported fd and every other kind of memory.
   - C: `ef_tensor_image_desc_set_contiguous`, `ef_tensor_image_desc_contiguous`, `ef_tensor_contiguity` and the `ef_contiguity` enum.
   - Python: `Tensor.contiguity`, and `contiguous=True` on `Tensor.image` and `ImageProcessor.create_image`.
+- **`PixelFormat::is_rgb_or_hsv()`.** Reports whether a format is RGB or HSV, the flag `Colorimetry::from_v4l2` now takes. `Rgb`, `Rgba`, `Bgra`, `PlanarRgb` and `PlanarRgba` are; `Grey` and the YUV formats are not.
 
 ### Changed
 
-- **Breaking (`edgefirst-codec`):** `CodecError` gains `NoDevice`, `InvalidConfig`, `InvalidInput`, `Device` and `Timeout` for video encoding. Exhaustive `match`es on `CodecError` need new arms.
+- **Breaking: `Colorimetry::from_v4l2` takes `is_rgb_or_hsv`.** The flag says whether the negotiated format's pixel encoding is RGB or HSV. It is the fifth argument in Rust and Python (`Colorimetry.from_v4l2`). In C it comes before `out` in `ef_codec_colorimetry_from_v4l2`, and `ef_codec_abi_version` is now 2.
+
+### Fixed
+
+- **Segmentation masks from models with uint8 or uint16 prototype outputs are no longer noise.** The decoder narrowed every non-int8 prototype tensor to int8 by keeping the low byte, while still applying the tensor's own scale and zero point. QNN models converted with the logical split, which output uint16 (w8a16) or uint8 (w8a8) prototypes, lost most of their mask accuracy: yolov8n-seg on the IQ-9075 scored 11.2 mask mAP50-95 instead of 29.3. Such prototypes are now dequantized exactly. Models with int8 or float prototypes, including every TFLite model, are unaffected.
+- **An RGB V4L2 format with `quantization = DEFAULT` is full range.** `Colorimetry::from_v4l2` resolved a `DEFAULT` quantization from the colorspace alone, so an RGB camera reporting sRGB was published as limited range. It now follows the kernel's `V4L2_MAP_QUANTIZATION_DEFAULT`: a `DEFAULT` quantization is full range for an RGB/HSV format, whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other recognised colorspace; and unset for a YUV format in a `DEFAULT` or unrecognised colorspace, so the at-use height heuristic decides.
 
 ## [0.34.1] - 2026-10-07
 

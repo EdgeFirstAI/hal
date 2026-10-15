@@ -6,7 +6,8 @@
 outputs from object-detection and segmentation models into typed
 `DetectBox` and `Segmentation` values. It supports both floating-point and
 quantized (int8 / uint8) inputs without an intermediate dequantization
-buffer, configurable NMS modes, end-to-end YOLOv26 models with embedded NMS,
+buffer for boxes and scores (int8 segmentation protos also stay raw; other
+integer protos are dequantized once to f32), configurable NMS modes, end-to-end YOLOv26 models with embedded NMS,
 and a fused proto-mask GPU rendering path that bypasses CPU mask
 materialization. The crate is configured through a single
 [`DecoderBuilder`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.DecoderBuilder.html)
@@ -500,7 +501,7 @@ fields: tiles, boxes_in, boxes_out
 
 ## Performance Considerations
 
-- **Quantized integer math** — `decode_quantized` and `decode_quantized_proto` operate directly on int8/uint8 buffers, avoiding the cost of producing an intermediate dequantized `f32` tensor.
+- **Quantized integer math** — `decode_quantized` and `decode_quantized_proto` operate directly on int8/uint8 buffers, avoiding the cost of producing an intermediate dequantized `f32` tensor. The exception is segmentation protos of an integer type other than int8 (uint8, int16, uint16), which `decode_quantized_proto` dequantizes once to an f32 NHWC tensor because narrowing them to int8 would discard their range; int8 protos stay raw and are dequantized per texel by the mask kernels.
 - **Vectorized operations via ndarray** — bulk box and score arithmetic uses ndarray's iterator-fused operations.
 - **Parallel processing with Rayon** — per-detection mask matmul is parallelized when the candidate pool is large enough to amortize the rayon overhead.
 - **Early termination in NMS loops** — once the partial score-sort top-K is reached, NMS exits without examining lower-confidence anchors.

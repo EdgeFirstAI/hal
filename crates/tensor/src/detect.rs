@@ -191,6 +191,8 @@ pub enum ProtoLayout {
 /// | Source model | protos dtype | mask_coefficients dtype | protos.quantization |
 /// |---|---|---|---|
 /// | int8 quantized | [`TensorDyn::I8`] | [`TensorDyn::I8`] (raw + quantization) | `Some(q)` |
+/// | int16 quantized coefficients, int8 protos | [`TensorDyn::I8`] | [`TensorDyn::I16`] (raw + quantization) | `Some(q)` |
+/// | other integer protos (u8, i16, u16; dequantized) | [`TensorDyn::F32`] | per the coefficients' type: I8, I16 or F32 | `None` |
 /// | f32 | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
 /// | f16 (TensorRT fp16) | [`TensorDyn::F16`] | [`TensorDyn::F16`] | `None` |
 /// | f64 (narrowed) | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |

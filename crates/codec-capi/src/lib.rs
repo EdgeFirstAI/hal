@@ -11,9 +11,12 @@
 pub mod decoder;
 
 /// ABI version of this library's C surface.
+///
+/// 2: `ef_codec_colorimetry_from_v4l2` takes an `is_rgb_or_hsv` argument
+/// before `out`.
 #[no_mangle]
 pub extern "C" fn ef_codec_abi_version() -> u32 {
-    1
+    2
 }
 
 #[cfg(test)]
@@ -145,6 +148,11 @@ mod tests {
     #[test]
     fn the_generated_header_exists_and_declares_the_abi_probe() {
         assert!(header_text().contains("ef_codec_abi_version"));
+    }
+
+    #[test]
+    fn the_abi_probe_is_generation_2() {
+        assert_eq!(super::ef_codec_abi_version(), 2);
     }
 
     #[test]
