@@ -102,6 +102,21 @@ fn rejects_unknown_version() {
     );
 }
 
+/// Version 1 numbered `kind` differently (1 was dma-buf, where the
+/// `TensorMemory` numbering has `Shm`), so a version-1 descriptor must be
+/// refused rather than read with the version-2 kinds.
+#[test]
+fn rejects_a_version_1_descriptor() {
+    let t = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
+    let mut desc = TensorDyn::from(t).descriptor();
+    desc.version = 1;
+    let err = TensorDyn::import_descriptor(&desc).unwrap_err();
+    assert!(
+        matches!(err, Error::NotImplemented(_)),
+        "expected NotImplemented, got {err:?}"
+    );
+}
+
 #[test]
 fn rejects_unknown_dtype_code() {
     let t = Tensor::<u8>::new(&[4], None, None).unwrap();
@@ -164,7 +179,7 @@ fn host_import_inherits_the_producers_capacity_headroom() {
     // Task 10b, defect B. NV12 at an odd width pads the row stride (even,
     // then 64-byte aligned) beyond shape.product(): a real allocation gap
     // between `capacity_bytes()` and the logical shape's byte size, exactly
-    // like a decoder's MCU-aligned write headroom. Before the fix, a `HOST`
+    // like a decoder's MCU-aligned write headroom. Before the fix, a host-memory
     // import had no way to learn about that gap -- the reconstructed tensor's
     // capacity was clamped to exactly the declared shape, so writing the
     // producer's own padded stride into it would have run out of bounds.
@@ -317,6 +332,27 @@ fn dmabuf_import_has_no_coverage_off_linux() {
     );
 }
 
+/// A `Shm` producer reports its own code, `kind::SHM` (1), not dma-buf: the
+/// descriptor kind is the `TensorMemory` numbering. The import treats it as
+/// host memory and aliases the pinned address.
+#[cfg(unix)]
+#[test]
+fn shm_descriptor_reports_shm_and_imports_as_host_memory() {
+    let t = Tensor::<u8>::new(&[16, 16], Some(TensorMemory::Shm), None).expect("shm allocation");
+    t.map_write().unwrap().as_mut_slice()[0] = 0x3C;
+    let pin = t.pin_host(CpuAccess::ReadWrite).unwrap();
+    let dyn_t = TensorDyn::from(t);
+    let desc = dyn_t.descriptor_pinned(Some(&pin));
+    assert_eq!(desc.kind, edgefirst_tensor::tensor_kind::SHM);
+    assert_eq!(desc.kind, TensorMemory::Shm.code());
+    assert_ne!(desc.kind, edgefirst_tensor::tensor_kind::DMABUF);
+    assert!(desc.is_host());
+
+    let imported = TensorDyn::import_descriptor(&desc).unwrap();
+    let m = imported.as_u8().unwrap().map_read().unwrap();
+    assert_eq!(m.as_slice()[0], 0x3C, "import must alias, not copy");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn dmabuf_roundtrip_sees_the_same_bytes() {
@@ -338,6 +374,8 @@ fn dmabuf_roundtrip_sees_the_same_bytes() {
     let dyn_t = TensorDyn::from(t);
     let desc = dyn_t.descriptor(); // handle carries the dma-buf fd; no pin needed
     assert_eq!(desc.kind, edgefirst_tensor::tensor_kind::DMABUF);
+    assert_eq!(desc.kind, TensorMemory::DmaBuf.code());
+    assert_eq!(desc.kind, 2, "dma-buf is code 2 on every surface");
 
     let imported = TensorDyn::import_descriptor(&desc).unwrap();
     assert_eq!(imported.shape(), dyn_t.shape());
@@ -412,14 +450,14 @@ fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
 fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
     // Task 10b follow-up (confirmed on rpi5-hailo, not just anticipated):
     // `Tensor::image()` auto-selects `Dma` when a DMA-BUF heap is available
-    // (the common case on Linux), so the exact `HOST` pool-reuse scenario
+    // (the common case on Linux), so the exact host-memory pool-reuse scenario
     // `host_import_preserves_the_producers_row_stride_for_pool_reuse` covers
     // also happens routinely on `Dma`. Before extending the stride-restore
-    // gate past `HOST`, a decode into an oversized DMA-BUF-backed
+    // gate past host memory, a decode into an oversized DMA-BUF-backed
     // destination crossing the capsule protocol recomputed a tighter stride
     // for the smaller decoded image instead of keeping the pool's true
     // (wider) pitch -- silent misalignment for any GPU consumer reading at
-    // the buffer's real physical stride. Mirrors the `HOST` test exactly,
+    // the buffer's real physical stride. Mirrors the host-memory test exactly,
     // for `TensorMemory::DmaBuf`.
     if !dma_or_skip("dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse") {
         return;

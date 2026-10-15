@@ -123,6 +123,7 @@ include = [
   "EfStorageKind",
   "EfCpuAccess",
   "EfCompression",
+  "EfCompressionRequest",
   "EfContiguity",
   "EfErrorClass",
   "EfLogLevel",
@@ -140,6 +141,7 @@ include = [
 "EfTensorView" = "ef_tensor_view"
 "EfQuantizationInfo" = "ef_quantization_info"
 "EfCompression" = "ef_compression"
+"EfCompressionRequest" = "ef_compression_request"
 "EfContiguity" = "ef_contiguity"
 "EfErrorClass" = "ef_error_class"
 "EfLogLevel" = "ef_log_level"

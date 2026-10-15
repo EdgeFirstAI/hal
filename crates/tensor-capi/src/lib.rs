@@ -772,8 +772,8 @@ mod tests {
         // artifact a C caller actually links against. This test closes that
         // last link: the text cbindgen wrote into tensor.h, parsed back out,
         // against the same authorities codes.rs uses.
-        use edgefirst_tensor::{DType, TensorMemory};
-        use edgefirst_tensor_abi::EfCpuAccess;
+        use edgefirst_tensor::{CpuAccess, DType, TensorMemory};
+        use edgefirst_tensor_abi::EfCompressionRequest;
 
         let h = header_text();
         let values = parse_enumerator_values(&h);
@@ -806,10 +806,27 @@ mod tests {
         expect("EF_STORAGE_KIND_IO_SURFACE", TensorMemory::IoSurface.code());
         expect("EF_STORAGE_KIND_PBO", TensorMemory::Pbo.code());
         expect("EF_STORAGE_KIND_CUDA", TensorMemory::Cuda.code());
+        expect(
+            "EF_STORAGE_KIND_D3D11_TEXTURE",
+            TensorMemory::D3d11Texture.code(),
+        );
 
-        expect("EF_CPU_ACCESS_NONE", EfCpuAccess::None as u32);
-        expect("EF_CPU_ACCESS_READ", EfCpuAccess::Read as u32);
-        expect("EF_CPU_ACCESS_WRITE", EfCpuAccess::Write as u32);
-        expect("EF_CPU_ACCESS_READ_WRITE", EfCpuAccess::ReadWrite as u32);
+        expect("EF_CPU_ACCESS_NONE", CpuAccess::None.code());
+        expect("EF_CPU_ACCESS_READ", CpuAccess::Read.code());
+        expect("EF_CPU_ACCESS_WRITE", CpuAccess::Write.code());
+        expect("EF_CPU_ACCESS_READ_WRITE", CpuAccess::ReadWrite.code());
+
+        expect(
+            "EF_COMPRESSION_REQUEST_NONE",
+            EfCompressionRequest::None as u32,
+        );
+        expect(
+            "EF_COMPRESSION_REQUEST_ANY",
+            EfCompressionRequest::Any as u32,
+        );
+        expect(
+            "EF_COMPRESSION_REQUEST_SCHEME",
+            EfCompressionRequest::Scheme as u32,
+        );
     }
 }
