@@ -114,7 +114,7 @@ jobs:
     needs: [verify-version]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           # rust-toolchain.toml pins these components, so rustup installs them
@@ -144,7 +144,7 @@ jobs:
       # publish` packages from source and cannot consume them -- so they are
       # the record of exactly what this release packaged.
       - name: Upload the packaged crates
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: crates
           path: target/package/*.crate
@@ -214,7 +214,7 @@ jobs:
         run: git lfs checkout
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           # rust-toolchain.toml pins these components, so rustup installs them
@@ -273,7 +273,7 @@ jobs:
       # checks below have passed -- so provenance is generated once, after
       # them, rather than for a wheel an assertion is about to reject.
       - name: Build wheels (Python 3.11+ — zero-copy buffer protocol)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@002777f34bb28fa359bfe1aa04302b1913c44182
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@9e296f92996b38683c684b9091ed59cb27562770
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:
@@ -288,7 +288,7 @@ jobs:
           attest: false
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@002777f34bb28fa359bfe1aa04302b1913c44182
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@9e296f92996b38683c684b9091ed59cb27562770
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:
@@ -349,23 +349,23 @@ jobs:
           subject-path: staged/*/*
 
       - name: Upload tensor wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with: {retention-days: 30, name: "wheels-${{ matrix.name }}-tensor", path: staged/tensor/*}
 
       - name: Upload codec wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with: {retention-days: 30, name: "wheels-${{ matrix.name }}-codec", path: staged/codec/*}
 
       - name: Upload image wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with: {retention-days: 30, name: "wheels-${{ matrix.name }}-image", path: staged/image/*}
 
       - name: Upload decoder wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with: {retention-days: 30, name: "wheels-${{ matrix.name }}-decoder", path: staged/decoder/*}
 
       - name: Upload tracker wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with: {retention-days: 30, name: "wheels-${{ matrix.name }}-tracker", path: staged/tracker/*}
 
   # THE C RELEASE PATH SHIPS ONE ARCHIVE PER TARGET.
@@ -431,7 +431,7 @@ jobs:
         run: git lfs checkout
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067  # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           # rust-toolchain.toml pins these components, so rustup installs them
@@ -547,7 +547,7 @@ jobs:
           subject-path: staged/${{ steps.ver.outputs.archive }}
 
       - name: Upload C API artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: capi-${{ matrix.target }}
           path: staged/${{ steps.ver.outputs.archive }}

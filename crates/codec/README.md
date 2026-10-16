@@ -5,7 +5,8 @@ in real-time vision pipelines.
 
 ## Overview
 
-`edgefirst-codec` decodes JPEG and PNG images directly into pre-allocated
+`edgefirst-codec` encodes video with the platform's hardware H.264 encoder
+(see [Video Encoding](#video-encoding-h264)) and decodes JPEG and PNG images directly into pre-allocated
 `Tensor<T>` or `TensorDyn` buffers, supporting strided memory layouts
 (GPU pitch-aligned DMA-BUF, PBO). This eliminates per-frame allocations
 in the hot loop — the primary design goal.
@@ -170,6 +171,41 @@ the driver accepts a single-plane contiguous capture at the tensor pitch, the
 hardware decodes straight into the tensor's dmabuf — a true zero-copy path.
 Otherwise the driver buffers are mapped and the decoded planes are copied
 (cropped to the logical image) into the destination.
+
+## Video Encoding (H.264)
+
+`edgefirst_codec::video::VideoEncoder` encodes image tensors to an H.264 Annex B
+stream with the platform's hardware encoder. On Linux that is any V4L2 stateful
+memory-to-memory encoder, found by capability: i.MX 8M Plus `vsi_v4l2`, i.MX 95
+Wave6, and others. It needs the `v4l2` feature (on by default).
+
+```rust,no_run
+use edgefirst_codec::video::{Bitrate, EncoderConfig, FrameOptions, VideoEncoder};
+use edgefirst_tensor::PixelFormat;
+
+let mut config = EncoderConfig::h264(1920, 1080, PixelFormat::Nv12, 30.0);
+config.bitrate = Bitrate::Bps(8_000_000);
+let mut encoder = VideoEncoder::new(config)?;
+# let frame: edgefirst_tensor::TensorDyn = unimplemented!();
+let opts = FrameOptions { pts: 0, keyframe: true, ..FrameOptions::default() };
+if let Some(au) = encoder.encode(&frame, &opts)? {
+    // au.data is one access unit; au.keyframe, au.pts
+}
+let rest = encoder.flush()?; // every access unit still in the encoder
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+- **Sources** must be DMA-BUF tensors in the configured format. They are imported without a copy, and `encode()` returns once the device has read them, so the caller can reuse the buffer straight away. Every source of a stream must have the same row stride.
+- **Crops:** `FrameOptions::crop` encodes a region of a larger source. The region must be the configured size and start on a chroma sample. NV12 crops need a device that takes the two-plane `NV12M` layout (both i.MX encoders do).
+- **Headers:** with `EncoderConfig::repeat_headers` (the default), every IDR, forced or not, starts with the SPS and PPS, so a receiver can join at any key frame.
+- **PTS:** `FrameOptions::pts` comes back unchanged on the matching `EncodedFrame`, in any unit.
+- **Input formats** are whatever the device lists for HAL's V4L2 code of the format (`PixelFormat::to_fourcc`); NV12 and YUYV on both i.MX encoders.
+
+| Environment variable           | Effect                                     |
+|--------------------------------|--------------------------------------------|
+| `EDGEFIRST_CODEC_V4L2_ENCODER` | Use only this encoder node (e.g. `/dev/video0`) instead of searching `/dev/video*` |
+
+Run `cargo run --release -p edgefirst-codec --example video-encode -- out.h264 --frames 300` to encode a test pattern (or `--input frames.nv12`) and print the per-frame encode time.
 
 ## GPU Acceleration (nvJPEG)
 

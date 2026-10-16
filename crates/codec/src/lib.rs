@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Image codec for decoding JPEG/PNG into pre-allocated EdgeFirst tensors.
+//! Image codec for decoding JPEG/PNG into pre-allocated EdgeFirst tensors,
+//! and hardware video encoding in [`video`].
 //!
 //! This crate provides the [`ImageDecoder`] struct and [`ImageLoad`] extension
 //! trait for decoding image files directly into existing tensor buffers —
@@ -57,6 +58,7 @@ mod png;
 #[cfg(test)]
 mod test_support;
 mod traits;
+pub mod video;
 
 pub use decoder::{peek_info, ChromaUpsample, DctMethod, ImageDecoder};
 pub use error::{CodecError, UnsupportedFeature};
