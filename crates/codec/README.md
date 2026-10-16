@@ -5,8 +5,8 @@ in real-time vision pipelines.
 
 ## Overview
 
-`edgefirst-codec` encodes video with the platform's hardware H.264 encoder
-(see [Video Encoding](#video-encoding-h264)) and decodes JPEG and PNG images directly into pre-allocated
+`edgefirst-codec` encodes and decodes video with the platform's hardware H.264 codecs
+(see [Video Encoding](#video-encoding-h264) and [Video Decoding](#video-decoding-h264)) and decodes JPEG and PNG images directly into pre-allocated
 `Tensor<T>` or `TensorDyn` buffers, supporting strided memory layouts
 (GPU pitch-aligned DMA-BUF, PBO). This eliminates per-frame allocations
 in the hot loop — the primary design goal.
@@ -206,6 +206,40 @@ let rest = encoder.flush()?; // every access unit still in the encoder
 | `EDGEFIRST_CODEC_V4L2_ENCODER` | Use only this encoder node (e.g. `/dev/video0`) instead of searching `/dev/video*` |
 
 Run `cargo run --release -p edgefirst-codec --example video-encode -- out.h264 --frames 300` to encode a test pattern (or `--input frames.nv12`) and print the per-frame encode time.
+
+## Video Decoding (H.264)
+
+`edgefirst_codec::video::VideoDecoder` decodes an H.264 Annex B stream into NV12 image tensors with the platform's hardware decoder: on Linux any V4L2 stateful memory-to-memory decoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). It needs the `v4l2` feature (on by default).
+
+```rust,no_run
+use edgefirst_codec::video::{access_units, DecodeEvent, DecoderConfig, OutputPool, VideoDecoder};
+
+let stream = std::fs::read("clip.h264")?;
+let config = DecoderConfig::h264().with_output(OutputPool::Allocate { count: 4 });
+let mut decoder = VideoDecoder::new(config)?;
+for (pts, au) in access_units(&stream).enumerate() {
+    for event in decoder.decode(au, pts as u64)? {
+        match event {
+            DecodeEvent::Frame(frame) => { /* frame.tensor(), frame.pts() */ }
+            DecodeEvent::Reconfigured(info) => { /* info.width, info.height, info.crop */ }
+        }
+    }
+}
+let rest = decoder.flush()?; // every event still in the decoder
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+- **Input** is one access unit per call, in decode order; `access_units()` splits a byte stream. `decode()` returns everything that is ready, which may be nothing, and frames come back in presentation order with the `pts` passed for their access unit.
+- **Frames are lent, not copied.** Each `DecodedFrame` is an NV12 DMA-BUF tensor of the visible picture over the device's buffer (whose coded height may be larger: 1088 rows for 1080p). The buffer goes back to the device when the frame is dropped, so the tensor is only reachable through the frame; share a picture by sharing the frame (`Arc<DecodedFrame>`). Frames import into the image crate's GPU paths without a copy.
+- **The pool:** `OutputPool::Allocate { count }` lets the caller hold `count` frames at once; the decoder adds the device's minimum and one buffer for it to decode into. `OutputPool::Provided(tensors)` decodes into the caller's DMA-BUFs. When the caller holds every buffer, `decode()` fails with `CodecError::PoolExhausted` without taking the access unit: drop frames and pass it again. `StreamInfo::memory` says whether the device imports the pool or, where it will not, writes its own buffers exported as DMA-BUFs.
+- **Size changes** mid-stream (a new SPS) drain the old pictures and rebuild the pool; `DecodeEvent::Reconfigured` carries the new `StreamInfo`. Frames already returned keep their memory.
+- **`flush()`** returns the remaining pictures. The decoder then starts a new sequence, so the next access unit must be an IDR with its SPS and PPS, as after a seek.
+
+| Environment variable           | Effect                                     |
+|--------------------------------|--------------------------------------------|
+| `EDGEFIRST_CODEC_V4L2_DECODER` | Use only this decoder node (e.g. `/dev/video1`) instead of searching `/dev/video*` |
+
+Run `cargo run --release -p edgefirst-codec --example video-decode -- clip.h264 --out frames.nv12` to decode a file, write the visible pictures and print the per-access-unit decode time.
 
 ## GPU Acceleration (nvJPEG)
 

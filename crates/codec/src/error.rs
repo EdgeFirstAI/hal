@@ -76,7 +76,7 @@ impl fmt::Display for UnsupportedFeature {
     }
 }
 
-/// Errors from image decoding and video encoding.
+/// Errors from image decoding and video encoding and decoding.
 #[derive(Debug)]
 pub enum CodecError {
     /// Image dimensions exceed the tensor's capacity.
@@ -117,6 +117,15 @@ pub enum CodecError {
     },
     /// The device did not finish an operation in time.
     Timeout(String),
+    /// A video decoder has nowhere to decode to: the caller holds the
+    /// frames in its output buffers. Dropping decoded frames gives their
+    /// buffers back; a larger pool lets the caller hold more at once.
+    PoolExhausted {
+        /// Output buffers held by frames the caller has not dropped.
+        held: usize,
+        /// Output buffers in the pool.
+        pool: usize,
+    },
 }
 
 impl fmt::Display for CodecError {
@@ -142,6 +151,10 @@ impl fmt::Display for CodecError {
             Self::InvalidInput(what) => write!(f, "invalid input: {what}"),
             Self::Device { op, source } => write!(f, "{op} failed: {source}"),
             Self::Timeout(what) => write!(f, "timed out: {what}"),
+            Self::PoolExhausted { held, pool } => write!(
+                f,
+                "{held} of {pool} decoder output buffers are held by frames not yet dropped"
+            ),
         }
     }
 }

@@ -73,6 +73,76 @@ fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
         .map(|p| from + p + 3)
 }
 
+/// Splits an H.264 Annex B byte stream into access units, the input
+/// [`VideoDecoder::decode`](super::VideoDecoder::decode) takes.
+///
+/// An access unit starts at the first NAL unit after a picture that may only
+/// precede one (access unit delimiter, SEI, SPS, PPS; §7.4.1.2.3), or at a
+/// slice that starts a new picture (`first_mb_in_slice` is 0). Streams that
+/// send a picture's slices out of order (arbitrary slice order) are split at
+/// each slice that starts at macroblock 0, which such streams do not
+/// guarantee. Bytes before the first start code are skipped.
+pub fn access_units(stream: &[u8]) -> AccessUnits<'_> {
+    AccessUnits {
+        data: stream,
+        next: next_start_code(stream, 0),
+    }
+}
+
+/// Iterator over the access units of a byte stream, from [`access_units`].
+#[derive(Debug, Clone)]
+pub struct AccessUnits<'a> {
+    data: &'a [u8],
+    /// First byte of the next access unit's first NAL unit header.
+    next: Option<usize>,
+}
+
+impl<'a> Iterator for AccessUnits<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let data = self.data;
+        let first = self.next?;
+        let start = start_code_begin(data, first);
+        let mut picture = false;
+        let mut nal = first;
+        loop {
+            let Some(&header) = data.get(nal) else {
+                self.next = None;
+                return Some(&data[start..]);
+            };
+            let kind = header & 0x1f;
+            let slice = matches!(kind, 1 | 5);
+            // ue(v) first_mb_in_slice is 0 exactly when its first bit is 1.
+            let new_picture = slice && data.get(nal + 1).is_some_and(|b| b & 0x80 != 0);
+            let leads = matches!(kind, 6..=9 | 14..=18);
+            if picture && (leads || new_picture) {
+                self.next = Some(nal);
+                return Some(&data[start..start_code_begin(data, nal)]);
+            }
+            picture |= slice;
+            match next_start_code(data, nal) {
+                Some(n) => nal = n,
+                None => {
+                    self.next = None;
+                    return Some(&data[start..]);
+                }
+            }
+        }
+    }
+}
+
+/// Where the start code before the NAL unit header at `nal` begins,
+/// including the zero byte of a 4-byte code.
+fn start_code_begin(data: &[u8], nal: usize) -> usize {
+    let begin = nal - 3;
+    if begin > 0 && data[begin - 1] == 0 {
+        begin - 1
+    } else {
+        begin
+    }
+}
+
 /// What an encoded buffer contains, by its NAL units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct AccessUnit {
@@ -186,6 +256,44 @@ mod tests {
         );
         assert!(parameter_sets(&cat(&[P_SLICE, SEI])).is_empty());
         assert_eq!(parameter_sets(&cat(&[IDR, PPS])), PPS.to_vec(), "last NAL");
+    }
+
+    #[test]
+    fn splits_access_units_at_headers_and_new_pictures() {
+        // A second slice of the same picture: first_mb_in_slice = 1 (ue "010").
+        let p_slice2: &[u8] = &[0, 0, 1, 0x41, 0x40, 0x11];
+        let aud: &[u8] = &[0, 0, 0, 1, 0x09, 0xf0];
+        let stream = cat(&[SPS, PPS, IDR, P_SLICE, p_slice2, aud, SEI, P_SLICE]);
+        let aus: Vec<&[u8]> = access_units(&stream).collect();
+        assert_eq!(aus.len(), 3);
+        assert_eq!(aus[0], cat(&[SPS, PPS, IDR]).as_slice());
+        assert_eq!(aus[1], cat(&[P_SLICE, p_slice2]).as_slice());
+        assert_eq!(aus[2], cat(&[aud, SEI, P_SLICE]).as_slice());
+        assert_eq!(aus.concat(), stream, "nothing is lost or duplicated");
+    }
+
+    #[test]
+    fn end_of_sequence_stays_with_its_picture() {
+        let eos: &[u8] = &[0, 0, 0, 1, 0x0a];
+        let stream = cat(&[IDR, eos, SPS, PPS, IDR]);
+        let aus: Vec<&[u8]> = access_units(&stream).collect();
+        assert_eq!(aus, vec![cat(&[IDR, eos]), cat(&[SPS, PPS, IDR])]);
+    }
+
+    #[test]
+    fn access_units_of_degenerate_input() {
+        assert_eq!(access_units(&[]).count(), 0);
+        assert_eq!(access_units(&[1, 2, 3]).count(), 0);
+        assert_eq!(
+            access_units(&cat(&[&[0xaa], SPS])).collect::<Vec<_>>(),
+            vec![SPS]
+        );
+        // A start code with no NAL header after it ends the last unit.
+        let tail = cat(&[IDR, &[0, 0, 1]]);
+        assert_eq!(
+            access_units(&tail).collect::<Vec<_>>(),
+            vec![tail.as_slice()]
+        );
     }
 
     #[test]

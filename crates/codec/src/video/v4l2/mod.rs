@@ -6,6 +6,7 @@
 //! Devices are found by capability, never by node or driver name: some
 //! drivers (i.MX 8M Plus `vsi_v4l2`) leave the sysfs name empty.
 
+pub(crate) mod decoder;
 pub(crate) mod encoder;
 
 use std::path::PathBuf;
