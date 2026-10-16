@@ -155,6 +155,44 @@ pub struct InputSpec {
     pub preprocessing: Option<Preprocessing>,
 }
 
+impl InputSpec {
+    /// Channel count of the model input, when the layout can be resolved.
+    ///
+    /// With a `dshape`, it is the size of the single axis not named
+    /// `batch`, `height` or `width`. Without one, a rank-4 `shape` resolves
+    /// only when exactly one of axis 1 (NCHW) and axis 3 (NHWC) holds 1 to
+    /// 4 channels.
+    ///
+    /// ```
+    /// use edgefirst_decoder::schema::InputSpec;
+    ///
+    /// let nchw: InputSpec = serde_json::from_str(r#"{"shape": [1, 3, 512, 512]}"#).unwrap();
+    /// assert_eq!(nchw.channels(), Some(3));
+    /// let ambiguous: InputSpec = serde_json::from_str(r#"{"shape": [1, 3, 4, 3]}"#).unwrap();
+    /// assert_eq!(ambiguous.channels(), None);
+    /// ```
+    pub fn channels(&self) -> Option<usize> {
+        if !self.dshape.is_empty() {
+            let mut rest = self.dshape.iter().enumerate().filter(|(_, (name, _))| {
+                !matches!(name, DimName::Batch | DimName::Height | DimName::Width)
+            });
+            return match (rest.next(), rest.next()) {
+                (Some((i, _)), None) => self.shape.get(i).copied(),
+                _ => None,
+            };
+        }
+        let [_, c1, _, c3] = self.shape.as_slice() else {
+            return None;
+        };
+        let is_channels = |c: usize| (1..=4).contains(&c);
+        match (is_channels(*c1), is_channels(*c3)) {
+            (true, false) => Some(*c1),
+            (false, true) => Some(*c3),
+            _ => None,
+        }
+    }
+}
+
 /// Input pre-processing declared by the model producer.
 ///
 /// Every field is optional; an absent field means "not declared" rather
@@ -267,6 +305,11 @@ impl Normalization {
         };
         let mean = broadcast_channels("mean", mean, channels)?;
         let std = broadcast_channels("std", std, channels)?;
+        if let Some(bad) = mean.iter().find(|m| !m.is_finite()) {
+            return Err(DecoderError::InvalidConfig(format!(
+                "normalization mean must be finite, got {bad}"
+            )));
+        }
         if let Some(bad) = std.iter().find(|s| **s == 0.0 || !s.is_finite()) {
             return Err(DecoderError::InvalidConfig(format!(
                 "normalization std must be finite and non-zero, got {bad}"
@@ -1182,8 +1225,10 @@ impl SchemaV2 {
             )));
         }
 
-        if let Some(pre) = self.input.as_ref().and_then(|i| i.preprocessing.as_ref()) {
-            validate_preprocessing(pre)?;
+        if let Some(input) = &self.input {
+            if let Some(pre) = &input.preprocessing {
+                validate_preprocessing(input, pre)?;
+            }
         }
 
         for logical in &self.outputs {
@@ -1194,32 +1239,50 @@ impl SchemaV2 {
     }
 }
 
-fn validate_preprocessing(pre: &Preprocessing) -> DecoderResult<()> {
-    let mut channels = None;
+fn validate_preprocessing(input: &InputSpec, pre: &Preprocessing) -> DecoderResult<()> {
+    let channels = input.channels();
+    let mut vectors: Vec<(&str, &[f32])> = Vec::new();
     if let Some(Normalization::MeanStd { mean, std }) = &pre.normalization {
-        let n = mean.len().max(std.len());
-        if n == 0 {
-            return Err(DecoderError::InvalidConfig(
-                "normalization mean/std must not be empty".into(),
-            ));
-        }
-        channels = Some(n);
-    }
-    if let Some(norm) = &pre.normalization {
-        // Presets are channel-agnostic except imagenet; check with 3.
-        norm.mean_std(channels.unwrap_or(3))?;
+        vectors.push(("normalization mean", mean));
+        vectors.push(("normalization std", std));
     }
     if let Some(pad) = pre.letterbox.as_ref().and_then(|l| l.pad.as_ref()) {
-        let ok = match channels {
-            Some(n) => pad.len() == 1 || pad.len() == n,
-            None => !pad.is_empty(),
-        };
-        if !ok || pad.iter().any(|v| !v.is_finite()) {
+        vectors.push(("letterbox pad", pad));
+    }
+
+    // A single value broadcasts; longer vectors must match the input
+    // channels, or each other when the channel count is unknown.
+    let mut expected = channels;
+    for (field, values) in &vectors {
+        if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
             return Err(DecoderError::InvalidConfig(format!(
-                "letterbox pad {pad:?} must hold finite values, one per \
-                 channel or a single shared value"
+                "{field} {values:?} must hold one or more finite values"
             )));
         }
+        if values.len() == 1 {
+            continue;
+        }
+        match expected {
+            Some(n) if n != values.len() => {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "{field} has {} values; expected 1 or {n} (one per input channel)",
+                    values.len()
+                )));
+            }
+            Some(_) => {}
+            None => expected = Some(values.len()),
+        }
+    }
+
+    if let Some(norm) = &pre.normalization {
+        let n = match (norm, expected) {
+            (_, Some(n)) => n,
+            // Presets other than imagenet and scalar coefficients are
+            // channel-agnostic; imagenet is RGB.
+            (Normalization::Preset(NormalizationPreset::Imagenet), None) => 3,
+            (_, None) => 1,
+        };
+        norm.mean_std(n)?;
     }
     Ok(())
 }
@@ -3302,6 +3365,80 @@ outputs:
           }}
         }"#;
         assert!(SchemaV2::parse_json(zero_std).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn non_finite_mean_is_rejected() {
+        for bad in [f32::NAN, f32::INFINITY] {
+            let norm = Normalization::MeanStd {
+                mean: vec![bad],
+                std: vec![1.0],
+            };
+            assert!(norm.mean_std(3).is_err(), "{bad}");
+
+            let mut schema =
+                SchemaV2::parse_json(r#"{"schema_version": 2, "input": {"shape": [1, 3, 8, 8]}}"#)
+                    .unwrap();
+            schema.input.as_mut().unwrap().preprocessing = Some(Preprocessing {
+                normalization: Some(norm),
+                ..Default::default()
+            });
+            assert!(schema.validate().is_err(), "{bad}");
+        }
+    }
+
+    fn validate_input(shape: &str, preprocessing: &str) -> DecoderResult<()> {
+        let j = format!(
+            r#"{{"schema_version": 2, "input": {{{shape}, "preprocessing": {preprocessing}}}}}"#
+        );
+        SchemaV2::parse_json(&j).unwrap().validate()
+    }
+
+    #[test]
+    fn scalar_coefficients_broadcast_with_per_channel_pad() {
+        let pre = r#"{"normalization": {"mean": [0], "std": [255]},
+                      "letterbox": {"pad": [114, 114, 114]}}"#;
+        validate_input(r#""shape": [1, 3, 512, 512]"#, pre).unwrap();
+        validate_input(r#""shape": [1, 512, 512, 3]"#, pre).unwrap();
+        // Unknown layout: the per-channel pad sets the channel count.
+        validate_input(r#""shape": [1, 3, 4, 3]"#, pre).unwrap();
+    }
+
+    #[test]
+    fn coefficients_must_match_input_channels() {
+        let two = r#"{"normalization": {"mean": [0, 0], "std": [1, 1]}}"#;
+        let nchw = r#""shape": [1, 3, 512, 512]"#;
+        let named = r#""shape": [1, 512, 512, 3],
+            "dshape": [{"batch": 1}, {"height": 512}, {"width": 512}, {"channels": 3}]"#;
+        assert!(validate_input(nchw, two).is_err());
+        assert!(validate_input(named, two).is_err());
+
+        let pad_two = r#"{"normalization": "unsigned", "letterbox": {"pad": [0, 0]}}"#;
+        assert!(validate_input(nchw, pad_two).is_err());
+
+        let imagenet = r#"{"normalization": "imagenet"}"#;
+        assert!(validate_input(r#""shape": [1, 1, 64, 64]"#, imagenet).is_err());
+        validate_input(nchw, imagenet).unwrap();
+
+        // Unknown layout: non-scalar vectors must agree with each other.
+        let mixed = r#"{"normalization": {"mean": [0, 0, 0], "std": [1, 1]}}"#;
+        assert!(validate_input(r#""shape": [1, 3, 4, 3]"#, mixed).is_err());
+    }
+
+    #[test]
+    fn input_channels_resolve_from_dshape_or_shape() {
+        let spec = |j: &str| serde_json::from_str::<InputSpec>(j).unwrap().channels();
+        assert_eq!(spec(r#"{"shape": [1, 3, 512, 512]}"#), Some(3));
+        assert_eq!(spec(r#"{"shape": [1, 512, 512, 4]}"#), Some(4));
+        assert_eq!(spec(r#"{"shape": [1, 3, 4, 3]}"#), None);
+        assert_eq!(spec(r#"{"shape": [1, 512, 512]}"#), None);
+        assert_eq!(
+            spec(
+                r#"{"shape": [1, 3, 4, 3],
+                    "dshape": [{"batch": 1}, {"channels": 3}, {"height": 4}, {"width": 3}]}"#
+            ),
+            Some(3)
+        );
     }
 
     #[test]
