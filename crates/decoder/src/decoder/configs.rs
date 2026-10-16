@@ -204,6 +204,10 @@ pub enum DimName {
     Padding,
     #[serde(rename = "box_coords")]
     BoxCoords,
+    /// Query axis of mask-classification outputs (`class_logits`,
+    /// `mask_logits`).
+    #[serde(rename = "num_queries")]
+    NumQueries,
     /// Any axis name the HAL does not recognise (e.g. a producer's
     /// `channels` on the input dshape). Preserved so the dshape length still
     /// matches the shape and the axis sorts to the canonical tail in
@@ -236,6 +240,7 @@ impl Display for DimName {
             DimName::NumAnchorsXFeatures => write!(f, "num_anchors_x_features"),
             DimName::Padding => write!(f, "padding"),
             DimName::BoxCoords => write!(f, "box_coords"),
+            DimName::NumQueries => write!(f, "num_queries"),
             DimName::Unknown => write!(f, "unknown"),
         }
     }

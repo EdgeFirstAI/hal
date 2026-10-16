@@ -146,6 +146,206 @@ pub struct InputSpec {
     /// formats can appear without breaking parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cameraadaptor: Option<String>,
+
+    /// Pre-processing the model expects: normalization, resize policy and
+    /// letterbox geometry. `None` means the producer did not declare it;
+    /// consumers fall back to `validation.normalization` /
+    /// `validation.preprocessing`, then to unsigned + centred letterbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocessing: Option<Preprocessing>,
+}
+
+/// Input pre-processing declared by the model producer.
+///
+/// Every field is optional; an absent field means "not declared" rather
+/// than a specific default, so consumers can apply their own fallback.
+///
+/// ```
+/// use edgefirst_decoder::schema::{InputSpec, NormalizationPreset, Normalization};
+///
+/// let input: InputSpec = serde_json::from_str(r#"{
+///   "shape": [1, 3, 512, 512],
+///   "preprocessing": {
+///     "normalization": "imagenet",
+///     "resize": "letterbox",
+///     "letterbox": {"placement": "top_left", "pad": [0, 0, 0], "pad_space": "normalized"}
+///   }
+/// }"#).unwrap();
+/// let pre = input.preprocessing.unwrap();
+/// assert_eq!(pre.normalization, Some(Normalization::Preset(NormalizationPreset::Imagenet)));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Preprocessing {
+    /// Per-channel normalization applied to 0–255 input values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization: Option<Normalization>,
+
+    /// How a frame is fitted to the fixed model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<ResizeMode>,
+
+    /// Resampling filter of the reference pipeline. Informational: a
+    /// runtime may use a different filter and should report the deviation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<Interpolation>,
+
+    /// Letterbox geometry; meaningful when `resize` is `letterbox`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub letterbox: Option<Letterbox>,
+}
+
+/// Input normalization: a named preset or explicit per-channel
+/// `mean`/`std`, both defined as `(x - mean) / std` on 0–255 values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Normalization {
+    /// Named preset shared with `validation.normalization`.
+    Preset(NormalizationPreset),
+    /// Explicit coefficients on the 0–255 scale. A single element applies
+    /// to every channel.
+    MeanStd {
+        /// Per-channel mean on the 0–255 scale.
+        mean: Vec<f32>,
+        /// Per-channel standard deviation on the 0–255 scale.
+        std: Vec<f32>,
+    },
+}
+
+/// Named normalization presets, matching the `validation.normalization`
+/// vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum NormalizationPreset {
+    /// `x / 255` → `[0, 1]`.
+    Unsigned,
+    /// `x / 127.5 - 1` → `[-1, 1]`.
+    Signed,
+    /// Identity: 0–255 values, or normalization performed in the graph.
+    Raw,
+    /// ImageNet RGB mean/std (0.485/0.456/0.406, 0.229/0.224/0.225).
+    Imagenet,
+}
+
+const IMAGENET_MEAN: [f32; 3] = [123.675, 116.28, 103.53];
+const IMAGENET_STD: [f32; 3] = [58.395, 57.12, 57.375];
+
+impl Normalization {
+    /// Resolve to per-channel `(mean, std)` vectors on the 0–255 scale,
+    /// each of length `channels`.
+    ///
+    /// # Errors
+    ///
+    /// [`DecoderError::InvalidConfig`] when the coefficient count is neither
+    /// 1 nor `channels`, when any `std` is zero or non-finite, or when the
+    /// `imagenet` preset is used with a channel count other than 3.
+    ///
+    /// ```
+    /// use edgefirst_decoder::schema::{Normalization, NormalizationPreset};
+    ///
+    /// let (mean, std) = Normalization::Preset(NormalizationPreset::Signed)
+    ///     .mean_std(3)
+    ///     .unwrap();
+    /// assert_eq!(mean, vec![127.5; 3]);
+    /// assert_eq!(std, vec![127.5; 3]);
+    /// ```
+    pub fn mean_std(&self, channels: usize) -> DecoderResult<(Vec<f32>, Vec<f32>)> {
+        let (mean, std): (&[f32], &[f32]) = match self {
+            Normalization::Preset(NormalizationPreset::Unsigned) => (&[0.0], &[255.0]),
+            Normalization::Preset(NormalizationPreset::Signed) => (&[127.5], &[127.5]),
+            Normalization::Preset(NormalizationPreset::Raw) => (&[0.0], &[1.0]),
+            Normalization::Preset(NormalizationPreset::Imagenet) => {
+                if channels != 3 {
+                    return Err(DecoderError::InvalidConfig(format!(
+                        "imagenet normalization needs 3 channels, got {channels}"
+                    )));
+                }
+                (&IMAGENET_MEAN, &IMAGENET_STD)
+            }
+            Normalization::MeanStd { mean, std } => (mean, std),
+        };
+        let mean = broadcast_channels("mean", mean, channels)?;
+        let std = broadcast_channels("std", std, channels)?;
+        if let Some(bad) = std.iter().find(|s| **s == 0.0 || !s.is_finite()) {
+            return Err(DecoderError::InvalidConfig(format!(
+                "normalization std must be finite and non-zero, got {bad}"
+            )));
+        }
+        Ok((mean, std))
+    }
+}
+
+fn broadcast_channels(field: &str, values: &[f32], channels: usize) -> DecoderResult<Vec<f32>> {
+    match values.len() {
+        1 => Ok(vec![values[0]; channels]),
+        n if n == channels => Ok(values.to_vec()),
+        n => Err(DecoderError::InvalidConfig(format!(
+            "normalization {field} has {n} values; expected 1 or {channels}"
+        ))),
+    }
+}
+
+/// How a frame is fitted to the fixed model input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ResizeMode {
+    /// Scale each axis independently to the input size.
+    Stretch,
+    /// Preserve aspect ratio and pad to the input size.
+    Letterbox,
+}
+
+/// Resampling filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Interpolation {
+    Bilinear,
+    Nearest,
+    Bicubic,
+    Area,
+}
+
+/// Letterbox geometry for `resize: letterbox`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Letterbox {
+    /// Where the scaled image sits inside the input. Absent means centred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<LetterboxPlacement>,
+
+    /// Per-channel pad value, in the space named by `pad_space`. Absent
+    /// means 114 per channel in pixel space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad: Option<Vec<f32>>,
+
+    /// Space `pad` is expressed in. Absent means pixel space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_space: Option<PadSpace>,
+}
+
+/// Letterbox placement of the scaled image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LetterboxPlacement {
+    /// Centred; padding split between both sides of each axis.
+    Center,
+    /// Anchored top-left; padding on the bottom and right only.
+    TopLeft,
+}
+
+/// Space a letterbox pad value is expressed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PadSpace {
+    /// 0–255 pixel value, normalized like image content.
+    Pixel,
+    /// Value written as-is into the normalized model input.
+    Normalized,
 }
 
 /// Logical output: the semantic contract the model exposes.
@@ -249,6 +449,88 @@ pub struct LogicalOutput {
     /// inherit the parent's declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_required: Option<Activation>,
+
+    /// Semantic segmentation decode fields (`decoder: semantic` and the
+    /// mask-classification types). Serialized flat on the logical output.
+    #[serde(flatten)]
+    pub semantic: SemanticParams,
+}
+
+/// Semantic segmentation decode fields of a logical output.
+///
+/// Serialized flat alongside the other logical-output fields. All fields
+/// are optional; absent means the decoder default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SemanticParams {
+    /// Upsampling of the score map to the requested resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upsample: Option<Upsample>,
+
+    /// Default decode mode; callers may override it at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_mode: Option<DecodeMode>,
+
+    /// Foreground threshold for single-channel outputs, in the space of
+    /// the tensor after `activation_applied` (probability for sigmoid,
+    /// logit otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+
+    /// Channel index of the background class, when the model has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_index: Option<u32>,
+
+    /// `class_logits` only: index of the "no object" class. Absent means
+    /// the last class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_object_index: Option<u32>,
+
+    /// `mask_logits` only: activation applied across the mask logits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_activation: Option<MaskActivation>,
+}
+
+/// Score-map upsampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Upsample {
+    /// Resampling filter.
+    pub method: UpsampleMethod,
+    /// PyTorch `align_corners` semantics for bilinear and bicubic.
+    #[serde(default)]
+    pub align_corners: bool,
+}
+
+/// Score-map upsampling filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UpsampleMethod {
+    Bilinear,
+    Nearest,
+    Bicubic,
+}
+
+/// Semantic decode mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DecodeMode {
+    /// Upsample class scores, then argmax (reference).
+    Accurate,
+    /// Argmax at output resolution, then nearest upsample of the class map.
+    Fast,
+}
+
+/// Activation over mask-classification mask logits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MaskActivation {
+    /// Independent sigmoid per query (MaskFormer, Mask2Former, OneFormer).
+    Sigmoid,
+    /// Softmax across the query axis (kMaX-DeepLab).
+    SoftmaxOverQueries,
 }
 
 impl LogicalOutput {
@@ -522,12 +804,20 @@ pub enum LogicalType {
     Landmarks,
     /// Fully decoded post-NMS detections (end-to-end models).
     Detections,
-    /// Semantic segmentation output (ModelPack).
+    /// Semantic segmentation per-pixel class scores (ModelPack, or any
+    /// per-pixel model with `decoder: semantic`).
     Segmentation,
-    /// Semantic segmentation masks (ModelPack).
+    /// Semantic segmentation class map: argmax already applied in the
+    /// graph, one class index per pixel.
     Masks,
     /// ModelPack anchor-grid raw output requiring anchor decode.
     Detection,
+    /// Mask-classification per-query class logits `[1, Q, K+1]`.
+    /// Reserved: described by the schema, not yet decoded by the HAL.
+    ClassLogits,
+    /// Mask-classification per-query mask logits `[1, Q, H, W]`.
+    /// Reserved: described by the schema, not yet decoded by the HAL.
+    MaskLogits,
 }
 
 /// Semantic type of a physical output.
@@ -549,6 +839,8 @@ pub enum PhysicalType {
     Segmentation,
     Masks,
     Detection,
+    ClassLogits,
+    MaskLogits,
     /// ARA-2 xy channel sub-split.
     BoxesXy,
     /// ARA-2 wh channel sub-split.
@@ -602,6 +894,10 @@ pub enum DecoderKind {
     /// Ultralytics anchor-free DFL decoder (YOLOv5/v8/v11/v26).
     #[serde(rename = "ultralytics")]
     Ultralytics,
+    /// Generic semantic segmentation decoder (per-pixel scores or class
+    /// map). Not expressible as a v1 decoder type.
+    #[serde(rename = "semantic")]
+    Semantic,
 }
 
 /// YOLO architecture version for Ultralytics decoders.
@@ -644,6 +940,8 @@ pub enum DType {
     Uint32,
     Float16,
     Float32,
+    /// Class maps from an in-graph argmax (TensorFlow/TFLite exports).
+    Int64,
 }
 
 impl DType {
@@ -653,6 +951,7 @@ impl DType {
             DType::Int8 | DType::Uint8 => 1,
             DType::Int16 | DType::Uint16 | DType::Float16 => 2,
             DType::Int32 | DType::Uint32 | DType::Float32 => 4,
+            DType::Int64 => 8,
         }
     }
 
@@ -666,6 +965,7 @@ impl DType {
                 | DType::Uint16
                 | DType::Int32
                 | DType::Uint32
+                | DType::Int64
         )
     }
 
@@ -882,12 +1182,46 @@ impl SchemaV2 {
             )));
         }
 
+        if let Some(pre) = self.input.as_ref().and_then(|i| i.preprocessing.as_ref()) {
+            validate_preprocessing(pre)?;
+        }
+
         for logical in &self.outputs {
             validate_logical(logical)?;
         }
 
         Ok(())
     }
+}
+
+fn validate_preprocessing(pre: &Preprocessing) -> DecoderResult<()> {
+    let mut channels = None;
+    if let Some(Normalization::MeanStd { mean, std }) = &pre.normalization {
+        let n = mean.len().max(std.len());
+        if n == 0 {
+            return Err(DecoderError::InvalidConfig(
+                "normalization mean/std must not be empty".into(),
+            ));
+        }
+        channels = Some(n);
+    }
+    if let Some(norm) = &pre.normalization {
+        // Presets are channel-agnostic except imagenet; check with 3.
+        norm.mean_std(channels.unwrap_or(3))?;
+    }
+    if let Some(pad) = pre.letterbox.as_ref().and_then(|l| l.pad.as_ref()) {
+        let ok = match channels {
+            Some(n) => pad.len() == 1 || pad.len() == n,
+            None => !pad.is_empty(),
+        };
+        if !ok || pad.iter().any(|v| !v.is_finite()) {
+            return Err(DecoderError::InvalidConfig(format!(
+                "letterbox pad {pad:?} must hold finite values, one per \
+                 channel or a single shared value"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
@@ -1023,6 +1357,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
                 outputs: Vec::new(),
                 activation_applied: None,
                 activation_required: None,
+                semantic: Default::default(),
             })
         }
         ConfigOutput::Boxes(b) => Ok(LogicalOutput {
@@ -1044,6 +1379,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             outputs: Vec::new(),
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }),
         ConfigOutput::Scores(s) => Ok(LogicalOutput {
             name: None,
@@ -1064,6 +1400,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             outputs: Vec::new(),
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }),
         ConfigOutput::Protos(p) => Ok(LogicalOutput {
             name: None,
@@ -1082,6 +1419,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             outputs: Vec::new(),
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }),
         ConfigOutput::MaskCoefficients(m) => Ok(LogicalOutput {
             name: None,
@@ -1099,6 +1437,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             outputs: Vec::new(),
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }),
         ConfigOutput::Segmentation(seg) => Ok(LogicalOutput {
             name: None,
@@ -1116,6 +1455,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             outputs: Vec::new(),
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }),
         ConfigOutput::Mask(m) => Ok(LogicalOutput {
             name: None,
@@ -1133,6 +1473,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             outputs: Vec::new(),
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }),
         ConfigOutput::Classes(c) => Ok(LogicalOutput {
             name: None,
@@ -1150,6 +1491,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             outputs: Vec::new(),
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }),
     }
 }
@@ -1163,11 +1505,13 @@ impl DecoderKind {
         }
     }
 
-    /// Convert back to the legacy v1 [`configs::DecoderType`].
-    pub fn to_v1(self) -> configs::DecoderType {
+    /// Convert back to the legacy v1 [`configs::DecoderType`]. `None` for
+    /// decoders v1 cannot express ([`DecoderKind::Semantic`]).
+    pub fn to_v1(self) -> Option<configs::DecoderType> {
         match self {
-            DecoderKind::ModelPack => configs::DecoderType::ModelPack,
-            DecoderKind::Ultralytics => configs::DecoderType::Ultralytics,
+            DecoderKind::ModelPack => Some(configs::DecoderType::ModelPack),
+            DecoderKind::Ultralytics => Some(configs::DecoderType::Ultralytics),
+            DecoderKind::Semantic => None,
         }
     }
 }
@@ -1273,10 +1617,16 @@ pub(crate) fn padding_axes(dshape: &[(DimName, usize)]) -> Vec<usize> {
 }
 
 fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<ConfigOutput> {
-    let decoder = logical
-        .decoder
-        .map(|d| d.to_v1())
-        .unwrap_or(configs::DecoderType::Ultralytics);
+    let decoder = match logical.decoder {
+        None => configs::DecoderType::Ultralytics,
+        Some(kind) => kind.to_v1().ok_or_else(|| {
+            DecoderError::NotSupported(format!(
+                "logical `{}` uses decoder `{kind:?}`, which this HAL \
+                 version does not decode",
+                logical.name.as_deref().unwrap_or("<anonymous>")
+            ))
+        })?,
+    };
     let quantization = logical
         .quantization
         .as_ref()
@@ -1323,13 +1673,14 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
         LogicalType::Detection | LogicalType::Detections => Ok(detection_to_legacy(&ctx)),
         // Objectness / Landmarks have no direct v1 equivalent; the v1
         // YOLOv5 path embedded objectness in the combined Detection.
-        LogicalType::Objectness | LogicalType::Landmarks => {
-            Err(DecoderError::NotSupported(format!(
-                "logical type {:?} has no legacy v1 equivalent; use the \
+        LogicalType::Objectness
+        | LogicalType::Landmarks
+        | LogicalType::ClassLogits
+        | LogicalType::MaskLogits => Err(DecoderError::NotSupported(format!(
+            "logical type {:?} has no legacy v1 equivalent; use the \
                  native v2 decoder path",
-                ty
-            )))
-        }
+            ty
+        ))),
     }
 }
 
@@ -2024,6 +2375,7 @@ mod tests {
                 shape: vec![1, 3, 640, 640],
                 dshape: vec![],
                 cameraadaptor: Some("rgb".into()),
+                preprocessing: None,
             }),
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
@@ -2041,6 +2393,7 @@ mod tests {
                 outputs: vec![],
                 activation_applied: None,
                 activation_required: None,
+                semantic: Default::default(),
             }],
             nms: Some(NmsMode::ClassAgnostic),
             nms_multi_label: None,
@@ -2234,6 +2587,7 @@ mod tests {
                     outputs: vec![],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
                 LogicalOutput {
                     name: Some("boxes".into()),
@@ -2251,6 +2605,7 @@ mod tests {
                     outputs: vec![],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
             ],
             nms: None,
@@ -2294,6 +2649,7 @@ mod tests {
                 outputs: vec![],
                 activation_applied: None,
                 activation_required: None,
+                semantic: Default::default(),
             }],
             nms: None,
             nms_multi_label: None,
@@ -2662,6 +3018,7 @@ outputs:
             outputs: vec![],
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         }
     }
 
@@ -2774,5 +3131,276 @@ outputs:
             other => panic!("expected Scores, got {other:?}"),
         };
         assert_eq!(scores.shape, vec![1, 80, 8400]);
+    }
+
+    const SEGFORMER_B1: &str = r#"{
+      "schema_version": 2,
+      "input": {
+        "shape": [1, 3, 512, 672],
+        "dshape": [{"batch": 1}, {"channels": 3}, {"height": 512}, {"width": 672}],
+        "cameraadaptor": "rgb",
+        "preprocessing": {
+          "normalization": {"mean": [123.675, 116.28, 103.53], "std": [58.395, 57.12, 57.375]},
+          "resize": "letterbox",
+          "interpolation": "bilinear",
+          "letterbox": {"placement": "top_left", "pad": [0.0, 0.0, 0.0], "pad_space": "normalized"}
+        }
+      },
+      "outputs": [{
+        "name": "logits", "type": "segmentation", "decoder": "semantic",
+        "shape": [1, 150, 128, 168],
+        "dshape": [{"batch": 1}, {"num_classes": 150}, {"height": 128}, {"width": 168}],
+        "dtype": "float32", "stride": 4,
+        "upsample": {"method": "bilinear", "align_corners": false},
+        "decode_mode": "accurate"
+      }]
+    }"#;
+
+    #[test]
+    fn semantic_segformer_parses_and_validates() {
+        let schema = SchemaV2::parse_json(SEGFORMER_B1).unwrap();
+        schema.validate().unwrap();
+
+        let pre = schema
+            .input
+            .as_ref()
+            .unwrap()
+            .preprocessing
+            .as_ref()
+            .unwrap();
+        assert_eq!(pre.resize, Some(ResizeMode::Letterbox));
+        assert_eq!(pre.interpolation, Some(Interpolation::Bilinear));
+        let lb = pre.letterbox.as_ref().unwrap();
+        assert_eq!(lb.placement, Some(LetterboxPlacement::TopLeft));
+        assert_eq!(lb.pad_space, Some(PadSpace::Normalized));
+        let (mean, std) = pre.normalization.as_ref().unwrap().mean_std(3).unwrap();
+        assert_eq!(mean, IMAGENET_MEAN.to_vec());
+        assert_eq!(std, IMAGENET_STD.to_vec());
+
+        let out = &schema.outputs[0];
+        assert_eq!(out.decoder, Some(DecoderKind::Semantic));
+        assert_eq!(out.stride, Some(Stride::Square(4)));
+        assert_eq!(
+            out.semantic.upsample,
+            Some(Upsample {
+                method: UpsampleMethod::Bilinear,
+                align_corners: false
+            })
+        );
+        assert_eq!(out.semantic.decode_mode, Some(DecodeMode::Accurate));
+    }
+
+    #[test]
+    fn semantic_round_trips_with_flat_fields() {
+        let schema = SchemaV2::parse_json(SEGFORMER_B1).unwrap();
+        let value = serde_json::to_value(&schema).unwrap();
+        let out = &value["outputs"][0];
+        assert_eq!(out["decode_mode"], "accurate");
+        assert_eq!(out["upsample"]["method"], "bilinear");
+        assert!(out.get("semantic").is_none(), "fields must serialize flat");
+        assert!(out.get("threshold").is_none(), "unset fields are omitted");
+        let back: SchemaV2 = serde_json::from_value(value).unwrap();
+        assert_eq!(back, schema);
+    }
+
+    #[test]
+    fn semantic_decoder_is_not_lowered_to_legacy() {
+        let schema = SchemaV2::parse_json(SEGFORMER_B1).unwrap();
+        let err = schema.to_legacy_config_outputs().unwrap_err();
+        assert!(matches!(err, DecoderError::NotSupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn modelpack_segmentation_still_lowers_to_legacy() {
+        let j = r#"{
+          "schema_version": 2,
+          "outputs": [{
+            "name": "segmentation_output", "type": "segmentation",
+            "shape": [1, 480, 640, 5],
+            "dshape": [{"batch": 1}, {"height": 480}, {"width": 640}, {"num_classes": 5}],
+            "dtype": "uint8",
+            "quantization": {"scale": 0.00392, "zero_point": 0, "dtype": "uint8"},
+            "decoder": "modelpack"
+          }]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+        assert_eq!(schema.outputs[0].semantic, SemanticParams::default());
+        let legacy = schema.to_legacy_config_outputs().unwrap();
+        assert!(matches!(
+            legacy.outputs[0],
+            crate::ConfigOutput::Segmentation(_)
+        ));
+    }
+
+    #[test]
+    fn normalization_presets_resolve() {
+        let cases = [
+            (NormalizationPreset::Unsigned, 0.0, 255.0),
+            (NormalizationPreset::Signed, 127.5, 127.5),
+            (NormalizationPreset::Raw, 0.0, 1.0),
+        ];
+        for (preset, m, s) in cases {
+            let (mean, std) = Normalization::Preset(preset).mean_std(4).unwrap();
+            assert_eq!(mean, vec![m; 4], "{preset:?}");
+            assert_eq!(std, vec![s; 4], "{preset:?}");
+        }
+        let imagenet = Normalization::Preset(NormalizationPreset::Imagenet);
+        assert!(imagenet.mean_std(3).is_ok());
+        assert!(imagenet.mean_std(1).is_err());
+    }
+
+    #[test]
+    fn normalization_preset_parses_from_string() {
+        for (text, preset) in [
+            ("unsigned", NormalizationPreset::Unsigned),
+            ("signed", NormalizationPreset::Signed),
+            ("raw", NormalizationPreset::Raw),
+            ("imagenet", NormalizationPreset::Imagenet),
+        ] {
+            let norm: Normalization = serde_json::from_value(serde_json::json!(text)).unwrap();
+            assert_eq!(norm, Normalization::Preset(preset));
+        }
+        assert!(serde_json::from_value::<Normalization>(serde_json::json!("zscore")).is_err());
+    }
+
+    #[test]
+    fn mean_std_broadcasts_and_rejects_bad_input() {
+        let one = Normalization::MeanStd {
+            mean: vec![127.5],
+            std: vec![127.5],
+        };
+        assert_eq!(one.mean_std(3).unwrap().0, vec![127.5; 3]);
+
+        let mismatched = Normalization::MeanStd {
+            mean: vec![0.0, 0.0],
+            std: vec![1.0; 3],
+        };
+        assert!(mismatched.mean_std(3).is_err());
+
+        let zero_std = Normalization::MeanStd {
+            mean: vec![0.0; 3],
+            std: vec![1.0, 0.0, 1.0],
+        };
+        assert!(zero_std.mean_std(3).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_preprocessing() {
+        let bad_pad = r#"{
+          "schema_version": 2,
+          "input": {"shape": [1, 3, 8, 8], "preprocessing": {
+            "normalization": {"mean": [0, 0, 0], "std": [1, 1, 1]},
+            "letterbox": {"pad": [0, 0]}
+          }}
+        }"#;
+        assert!(SchemaV2::parse_json(bad_pad).unwrap().validate().is_err());
+
+        let zero_std = r#"{
+          "schema_version": 2,
+          "input": {"shape": [1, 3, 8, 8], "preprocessing": {
+            "normalization": {"mean": [0], "std": [0]}
+          }}
+        }"#;
+        assert!(SchemaV2::parse_json(zero_std).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn preprocessing_parses_from_yaml() {
+        let y = r#"
+schema_version: 2
+input:
+  shape: [1, 256, 256, 3]
+  preprocessing:
+    normalization: unsigned
+    resize: stretch
+"#;
+        let schema = SchemaV2::parse_yaml(y).unwrap();
+        let pre = schema.input.unwrap().preprocessing.unwrap();
+        assert_eq!(
+            pre.normalization,
+            Some(Normalization::Preset(NormalizationPreset::Unsigned))
+        );
+        assert_eq!(pre.resize, Some(ResizeMode::Stretch));
+        assert!(pre.letterbox.is_none());
+    }
+
+    #[test]
+    fn class_map_masks_accept_int64() {
+        let j = r#"{
+          "schema_version": 2,
+          "outputs": [{
+            "name": "ArgMax", "type": "masks", "decoder": "semantic",
+            "shape": [1, 513, 513],
+            "dshape": [{"batch": 1}, {"height": 513}, {"width": 513}],
+            "dtype": "int64"
+          }]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+        schema.validate().unwrap();
+        assert_eq!(schema.outputs[0].dtype, Some(DType::Int64));
+        assert_eq!(DType::Int64.size_bytes(), 8);
+        assert!(DType::Int64.is_integer());
+    }
+
+    #[test]
+    fn single_channel_threshold_and_background_parse() {
+        let j = r#"{
+          "schema_version": 2,
+          "outputs": [{
+            "name": "segment", "type": "segmentation", "decoder": "semantic",
+            "shape": [1, 256, 256, 1],
+            "dshape": [{"batch": 1}, {"height": 256}, {"width": 256}, {"num_classes": 1}],
+            "dtype": "float32", "activation_applied": "sigmoid",
+            "threshold": 0.5, "background_index": 0
+          }]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+        let out = &schema.outputs[0];
+        assert_eq!(out.activation_applied, Some(Activation::Sigmoid));
+        assert_eq!(out.semantic.threshold, Some(0.5));
+        assert_eq!(out.semantic.background_index, Some(0));
+    }
+
+    #[test]
+    fn reserved_mask_classification_parses_but_does_not_lower() {
+        let j = r#"{
+          "schema_version": 2,
+          "outputs": [
+            {"name": "class_queries_logits", "type": "class_logits",
+             "shape": [1, 100, 151],
+             "dshape": [{"batch": 1}, {"num_queries": 100}, {"num_classes": 151}],
+             "dtype": "float32", "no_object_index": 150},
+            {"name": "masks_queries_logits", "type": "mask_logits",
+             "shape": [1, 100, 128, 128],
+             "dshape": [{"batch": 1}, {"num_queries": 100}, {"height": 128}, {"width": 128}],
+             "dtype": "float32", "stride": 4, "mask_activation": "sigmoid"}
+          ]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+        schema.validate().unwrap();
+        assert_eq!(schema.outputs[0].type_, Some(LogicalType::ClassLogits));
+        assert_eq!(schema.outputs[0].dshape[1].0, DimName::NumQueries);
+        assert_eq!(schema.outputs[0].semantic.no_object_index, Some(150));
+        assert_eq!(
+            schema.outputs[1].semantic.mask_activation,
+            Some(MaskActivation::Sigmoid)
+        );
+        assert!(matches!(
+            schema.to_legacy_config_outputs(),
+            Err(DecoderError::NotSupported(_))
+        ));
+    }
+
+    #[test]
+    fn decoder_kind_to_v1_covers_only_legacy_decoders() {
+        assert_eq!(
+            DecoderKind::ModelPack.to_v1(),
+            Some(configs::DecoderType::ModelPack)
+        );
+        assert_eq!(
+            DecoderKind::Ultralytics.to_v1(),
+            Some(configs::DecoderType::Ultralytics)
+        );
+        assert_eq!(DecoderKind::Semantic.to_v1(), None);
     }
 }

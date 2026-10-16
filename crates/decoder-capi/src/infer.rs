@@ -64,6 +64,7 @@ pub(crate) fn dtype_from(code: u32) -> Option<DType> {
         5 => Some(DType::Uint32),
         6 => Some(DType::Float16),
         7 => Some(DType::Float32),
+        8 => Some(DType::Int64),
         _ => None,
     }
 }
@@ -664,6 +665,7 @@ mod tests {
             ("EF_INFER_DTYPE_UINT32", DType::Uint32),
             ("EF_INFER_DTYPE_FLOAT16", DType::Float16),
             ("EF_INFER_DTYPE_FLOAT32", DType::Float32),
+            ("EF_INFER_DTYPE_INT64", DType::Int64),
         ];
 
         let mut seen = 0;
@@ -686,9 +688,9 @@ mod tests {
         // Exhaustiveness: a new `schema::DType` variant must not silently
         // go unnamed by the header. This count is the only thing that
         // fails the build when one is added.
-        assert_eq!(seen, 8, "decoder.h must name every schema::DType variant");
+        assert_eq!(seen, 9, "decoder.h must name every schema::DType variant");
         assert_eq!(
-            dtype_from(EF_INFER_DTYPE_BASE + 8),
+            dtype_from(EF_INFER_DTYPE_BASE + 9),
             None,
             "an unnamed code past the last variant must not map"
         );

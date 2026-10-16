@@ -405,6 +405,7 @@ fn schema_dtype_to_tensor_dtype(d: crate::schema::DType) -> DecoderResult<edgefi
         S::Uint32 => T::U32,
         S::Float16 => T::F16,
         S::Float32 => T::F32,
+        S::Int64 => T::I64,
     })
 }
 
