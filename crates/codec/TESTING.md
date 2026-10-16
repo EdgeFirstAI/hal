@@ -241,6 +241,41 @@ Persistence is proven by a single CAPTURE `REQBUFS` versus N `DQBUF`s across a
 multi-frame loop; zero-copy by `QBUF` with `V4L2_MEMORY_DMABUF` and a
 byte-match against the MMAP path.
 
+## Video Encoder Verification
+
+`tests/video_encode.rs` needs a V4L2 H.264 encoder and a DMA-BUF heap, and
+prints `SKIPPED` and passes without them (every x86 CI host). On a board it
+encodes 60 frames of moving 1080p NV12 with a forced key frame, checks that
+every frame comes back once with its PTS, that the first and the forced frame
+are IDRs with SPS/PPS, and that `encode()` keeps up with 30 fps; it also checks
+a 720p crop of a 1080p source, reuse after `flush()` and a size mismatch.
+
+```bash
+# Cross-compile (release, so the 30 fps check measures the encoder)
+cargo zigbuild --release -p edgefirst-codec --test video_encode \
+    --example video-encode --target aarch64-unknown-linux-gnu.2.35
+
+# On the target, with its CI runner taken offline first:
+EDGEFIRST_VIDEO_OUT=$HOME/video-out ./video_encode-* --test-threads=1 --nocapture
+```
+
+`EDGEFIRST_VIDEO_OUT` keeps each stream (`<test>.h264`) and the first source
+picture (`<test>.nv12`). Decoding them on a workstation proves the stream and
+the crop offsets:
+
+```bash
+ffprobe -v error -count_frames -show_entries stream=profile,width,height,nb_read_frames nv12_1080p.h264
+ffmpeg -i nv12_crop_720p.h264 -f rawvideo -pix_fmt nv12 -s 1280x720 -i nv12_crop_720p.nv12 \
+    -lavfi psnr -frames:v 1 -f null -
+```
+
+A correct crop gives a PSNR above 35 dB; a wrong plane offset falls to about 10 dB.
+
+| Board | Driver | 1080p NV12 per frame | First-frame PSNR (1080p / crop) |
+|-------|--------|----------------------|---------------------------------|
+| imx95-evk | Wave6 (`/dev/video10`) | 3.6 ms | 45.1 / 48.1 dB |
+| imx8mpevk-06 | `vsi_v4l2` (`/dev/video0`) | 5.9 ms | 37.7 / 44.2 dB |
+
 ## Benchmarks
 
 See `crates/codec/benches/codec_benchmark.rs` for performance benchmarks.
