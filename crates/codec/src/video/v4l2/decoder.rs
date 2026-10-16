@@ -20,7 +20,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use edgefirst_tensor::{
@@ -169,6 +169,9 @@ pub(crate) struct V4l2Decoder {
     generation: u64,
     returns: Arc<Returns>,
     pending: VecDeque<DecodeEvent>,
+    /// Provided buffers, by pool index, still shown by a frame of an
+    /// earlier pool. A buffer is queued again only once that frame drops.
+    leases: Vec<Option<Weak<TensorDyn>>>,
     next_seq: u64,
     /// The caller's PTS by the sequence number queued with its access unit.
     timestamps: BTreeMap<u64, u64>,
@@ -218,6 +221,7 @@ impl V4l2Decoder {
                 generation: 0,
                 returns: Arc::default(),
                 pending: VecDeque::new(),
+                leases: Vec::new(),
                 next_seq: 1,
                 timestamps: BTreeMap::new(),
                 parameter_sets: Vec::new(),
@@ -292,7 +296,7 @@ impl V4l2Decoder {
         if let Some(mut stream) = self.stream.take() {
             drop(std::mem::take(&mut stream.bitstream));
             if let Some(capture) = stream.capture.take() {
-                drop(capture);
+                self.retire(capture);
                 let _ = stream.m2m.capture_mut().free();
             }
             let _ = stream.m2m.output_mut().free();
@@ -462,12 +466,13 @@ impl V4l2Decoder {
             // stalls at the end of a stream without it.
             OutputPool::Allocate { count } => min + count + 1,
             OutputPool::Provided(pool) => {
-                if pool.len() < min {
-                    log::warn!(
-                        "{}: {} provided buffers, the device wants at least {min}",
+                if pool.len() < min + 1 {
+                    return Err(CodecError::InvalidConfig(format!(
+                        "{} provided buffers; {} needs at least {} for this stream",
+                        pool.len(),
                         self.path,
-                        pool.len()
-                    );
+                        min + 1
+                    )));
                 }
                 pool.len()
             }
@@ -496,11 +501,18 @@ impl V4l2Decoder {
             }
             Err(e) => return Err(e),
         };
+        // An allocated pool is new memory and never leased.
+        let free: Vec<u32> = (0..capture.slots.len() as u32)
+            .filter(|&i| !self.leased(i))
+            .collect();
         let stream = self
             .stream
             .as_mut()
             .expect("setup_capture runs while streaming");
-        if let Err(e) = enqueue_capture(&stream.m2m, &capture, 0) {
+        let first = free
+            .first()
+            .map(|&i| enqueue_capture(&stream.m2m, &capture, i));
+        if let Some(Err(e)) = first {
             // A device can list DMA-BUF import and still refuse the buffers.
             if !(allocate && matches!(capture.slots[0].backing, Backing::Import(_))) {
                 return Err(e);
@@ -512,10 +524,10 @@ impl V4l2Decoder {
             stream.m2m.capture_mut().free().map_err(device_error)?;
             capture.slots = self.export(&layout, colorimetry, want)?;
             let stream = self.stream.as_mut().expect("streaming");
-            enqueue_capture(&stream.m2m, &capture, 0)?;
+            enqueue_capture(&stream.m2m, &capture, free[0])?;
         }
         let stream = self.stream.as_mut().expect("streaming");
-        for index in 1..capture.slots.len() as u32 {
+        for &index in free.iter().skip(1) {
             enqueue_capture(&stream.m2m, &capture, index)?;
         }
         stream.m2m.capture().stream_on().map_err(device_error)?;
@@ -654,7 +666,8 @@ impl V4l2Decoder {
         Ok(slots)
     }
 
-    /// Gives the buffers of dropped frames back to the device.
+    /// Gives the buffers of dropped frames back to the device, with the
+    /// provided buffers whose frames of an earlier pool have dropped.
     fn give_back(&mut self) -> Result<()> {
         let Some(stream) = self.stream.as_ref() else {
             return Ok(());
@@ -662,12 +675,44 @@ impl V4l2Decoder {
         let Some(capture) = stream.capture.as_ref() else {
             return Ok(());
         };
-        for index in self.returns.take(capture.generation) {
+        let released = self.leases.iter_mut().enumerate().filter_map(|(i, lease)| {
+            let free = lease.as_ref().is_some_and(|w| w.strong_count() == 0);
+            free.then(|| {
+                *lease = None;
+                i as u32
+            })
+        });
+        let mut returned = self.returns.take(capture.generation);
+        returned.extend(released);
+        for index in returned {
             if (index as usize) < capture.slots.len() && !stream.m2m.capture().is_queued(index) {
                 enqueue_capture(&stream.m2m, capture, index)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether provided buffer `index` is still shown by a frame of an
+    /// earlier pool.
+    fn leased(&self, index: u32) -> bool {
+        self.leases
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|w| w.strong_count() > 0)
+    }
+
+    /// Drops a CAPTURE pool, recording the provided buffers that frames
+    /// still show, which a later pool over the same memory must not queue.
+    fn retire(&mut self, capture: Capture) {
+        let OutputPool::Provided(pool) = &self.pool else {
+            return;
+        };
+        self.leases.resize(pool.len(), None);
+        for (lease, slot) in self.leases.iter_mut().zip(&capture.slots) {
+            if Arc::strong_count(&slot.tensor) > 1 {
+                *lease = Some(Arc::downgrade(&slot.tensor));
+            }
+        }
     }
 
     /// Waits up to `timeout` for the device, handling what it reports,
@@ -717,14 +762,17 @@ impl V4l2Decoder {
         stream.m2m.output().stream_off().map_err(device_error)?;
         stream.free = (0..stream.bitstream.len() as u32).collect();
         stream.m2m.output().stream_on().map_err(device_error)?;
-        let Some(capture) = stream.capture.as_ref() else {
+        if stream.capture.is_none() {
             return Ok(());
-        };
+        }
         stream.m2m.capture().stream_off().map_err(device_error)?;
         stream.m2m.capture().stream_on().map_err(device_error)?;
+        let stream = self.stream.as_ref().expect("streaming");
+        let capture = stream.capture.as_ref().expect("checked above");
         for (index, slot) in capture.slots.iter().enumerate() {
-            if Arc::strong_count(&slot.tensor) == 1 {
-                enqueue_capture(&stream.m2m, capture, index as u32)?;
+            let index = index as u32;
+            if Arc::strong_count(&slot.tensor) == 1 && !self.leased(index) {
+                enqueue_capture(&stream.m2m, capture, index)?;
             }
         }
         Ok(())
@@ -822,20 +870,19 @@ impl V4l2Decoder {
         let stream = self.stream.as_mut().expect("streaming");
         if stream.changing {
             stream.changing = false;
-            stream.capture = None;
+            let old = stream.capture.take();
             stream.m2m.capture_mut().free().map_err(device_error)?;
+            if let Some(old) = old {
+                self.retire(old);
+            }
             self.setup_capture()?;
         }
         Ok(true)
     }
 
-    /// The caller's PTS for sequence number `seq`, dropping older entries
-    /// whose pictures the device skipped.
+    /// The caller's PTS for sequence number `seq`.
     fn take_pts(&mut self, seq: u64) -> u64 {
         if let Some(pts) = self.timestamps.remove(&seq) {
-            while self.timestamps.len() > MAX_TIMESTAMPS {
-                self.timestamps.pop_first();
-            }
             return pts;
         }
         log::warn!("{}: picture with unknown timestamp {seq}", self.path);
@@ -910,17 +957,27 @@ impl V4l2Decoder {
             )
             .map_err(device_error)?;
         self.timestamps.insert(seq, pts);
+        // The oldest entries belong to pictures the device skipped.
+        while self.timestamps.len() > MAX_TIMESTAMPS {
+            self.timestamps.pop_first();
+        }
         self.needs_headers = false;
         Ok(())
     }
 
     /// Output buffers the caller holds, and the pool size, once the CAPTURE
-    /// side is set up. Results are returned on every call, so every buffer
-    /// not queued to the device is in a frame the caller has.
+    /// side is set up: those neither queued to the device nor in a frame
+    /// not yet returned.
     fn held(&self) -> Option<(usize, usize)> {
         let stream = self.stream.as_ref()?;
         let pool = stream.capture.as_ref()?.slots.len();
-        Some((pool - stream.m2m.capture().queued_count().min(pool), pool))
+        let unreturned = self
+            .pending
+            .iter()
+            .filter(|e| matches!(e, DecodeEvent::Frame(_)))
+            .count();
+        let out = pool - stream.m2m.capture().queued_count().min(pool);
+        Some((out.saturating_sub(unreturned), pool))
     }
 
     /// The error for a device that stopped making progress: the caller's
@@ -1023,30 +1080,20 @@ impl DecoderBackend for V4l2Decoder {
         if self.stream.is_none() {
             return Ok(self.pending.drain(..).collect());
         }
-        if self.can_stop && self.stream.as_ref().is_some_and(|s| s.capture.is_some()) {
-            let stream = self.stream.as_mut().expect("checked above");
-            if !stream.draining {
-                decoder_cmd(&self.device.dev, uapi::V4L2_DEC_CMD_STOP)?;
-                stream.draining = true;
-            }
-            let deadline = Instant::now() + DRAIN_TIMEOUT;
-            loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    let err = self.stalled("finish draining", DRAIN_TIMEOUT);
-                    // Frames the caller holds block the drain; it resumes on
-                    // the next flush once they are dropped.
-                    if !matches!(err, CodecError::PoolExhausted { .. }) {
-                        self.reset();
-                    }
-                    return Err(err);
+        let capturing = |s: &Self| s.stream.as_ref().is_some_and(|st| st.capture.is_some());
+        if self.can_stop && !capturing(self) {
+            // `decode` can return before the device has parsed the first
+            // headers; the drain needs the CAPTURE side they set up.
+            self.service(DRAIN_TIMEOUT, capturing)?;
+        }
+        if self.can_stop && capturing(self) {
+            if let Err(e) = self.drain() {
+                // Frames the caller holds block the drain; it resumes on the
+                // next flush once they are dropped.
+                if !matches!(e, CodecError::PoolExhausted { .. }) {
+                    self.reset();
                 }
-                if self.drain_step(left)? {
-                    break;
-                }
-            }
-            if let Some(stream) = self.stream.as_mut() {
-                stream.draining = false;
+                return Err(e);
             }
             if let Err(e) = self.restart() {
                 log::debug!("{}: restarting after the drain: {e}", self.path);
@@ -1071,16 +1118,44 @@ impl DecoderBackend for V4l2Decoder {
 }
 
 impl V4l2Decoder {
+    /// Issues `V4L2_DEC_CMD_STOP`, once per drain, and waits for the buffer
+    /// flagged last.
+    fn drain(&mut self) -> Result<()> {
+        let stream = self.stream.as_mut().expect("streaming");
+        if !stream.draining {
+            decoder_cmd(&self.device.dev, uapi::V4L2_DEC_CMD_STOP)?;
+            stream.draining = true;
+        }
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(self.stalled("finish draining", DRAIN_TIMEOUT));
+            }
+            if self.drain_step(left)? {
+                break;
+            }
+        }
+        if let Some(stream) = self.stream.as_mut() {
+            stream.draining = false;
+        }
+        Ok(())
+    }
+
     /// Waits for drain progress; returns whether the buffer flagged last
     /// arrived with no source change pending.
     fn drain_step(&mut self, timeout: Duration) -> Result<bool> {
+        self.give_back()?;
         let stream = self.stream.as_ref().expect("streaming");
         let ready = match stream.m2m.wait(Some(timeout)) {
             Ok(ready) => ready,
-            Err(e) if e.kind() == ErrorKind::InvalidState => return Ok(true),
+            // Nothing is queued on either side: the caller holds every
+            // output buffer, and the device has nowhere to drain into.
+            Err(e) if e.kind() == ErrorKind::InvalidState => {
+                return Err(self.stalled("finish draining", Duration::ZERO));
+            }
             Err(e) => return Err(device_error(e)),
         };
-        self.give_back()?;
         if ready.output {
             self.reclaim_bitstream()?;
         }

@@ -8,7 +8,8 @@
 //! 1088 for a 1080 stream), so this also pins the plane offsets the decoder
 //! describes against what the GPU reads.
 //!
-//! Skips (prints `SKIPPED`) without a decoder, DMA-BUF heap or GL.
+//! Skips (prints `SKIPPED`) without a decoder or GL, and without a DMA-BUF
+//! heap unless `HAL_TEST_REQUIRE_DMA=1`.
 
 #![cfg(all(target_os = "linux", feature = "opengl", feature = "codec"))]
 
@@ -21,8 +22,13 @@ use edgefirst_codec::CodecError;
 use edgefirst_image::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
+#[path = "../../tensor/tests/support/dma_require.rs"]
+mod dma_require;
+
+const TEST: &str = "decoded_frames_convert_on_the_gpu_without_new_imports";
+
 fn skip(why: &str) {
-    eprintln!("SKIPPED: decoded_frames_convert_on_the_gpu_without_new_imports - {why}");
+    eprintln!("SKIPPED: {TEST} - {why}");
 }
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -43,7 +49,7 @@ fn testdata(name: &str) -> Vec<u8> {
 /// The visible picture of an NV12 frame in a new contiguous DMA-BUF image.
 fn contiguous_copy(src: &TensorDyn) -> TensorDyn {
     let (w, h) = (src.width().unwrap(), src.height().unwrap());
-    let dst = TensorDyn::image(
+    let mut dst = TensorDyn::image(
         w,
         h,
         PixelFormat::Nv12,
@@ -52,6 +58,7 @@ fn contiguous_copy(src: &TensorDyn) -> TensorDyn {
         CpuAccess::ReadWrite,
     )
     .unwrap();
+    dst.set_colorimetry(src.colorimetry());
     let ds = dst.effective_row_stride().unwrap();
     let mut out = dst.map_bytes(CpuAccess::Write).unwrap();
     let ss = src.effective_row_stride().unwrap();
@@ -149,8 +156,8 @@ impl Check {
 
 #[test]
 fn decoded_frames_convert_on_the_gpu_without_new_imports() {
-    if !edgefirst_tensor::is_dma_available() {
-        return skip("no DMA-BUF heap");
+    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), TEST) {
+        return;
     }
     let mut decoder = match VideoDecoder::new(DecoderConfig::h264()) {
         Ok(d) => d,

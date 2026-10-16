@@ -323,12 +323,15 @@ pub enum OutputPool {
         /// decode into are added to this.
         count: usize,
     },
-    /// Pictures are decoded into these DMA-BUF tensors, one buffer each. Each
-    /// must be large enough for the stream's coded picture at the row stride
-    /// the device asks for, otherwise [`VideoDecoder::decode`] fails with
-    /// [`CodecError::InvalidConfig`] when the stream's size becomes known.
-    /// A tensor's own shape and format are not used: the decoded frames
-    /// describe the device's layout over the same memory.
+    /// Pictures are decoded into these DMA-BUF tensors, one buffer each.
+    /// There must be at least one more than the device keeps for reference
+    /// pictures, and each must be large enough for the stream's coded
+    /// picture at the row stride the device asks for; otherwise
+    /// [`VideoDecoder::decode`] fails with [`CodecError::InvalidConfig`] when
+    /// the stream's size becomes known. A tensor's own shape and format are
+    /// not used: the decoded frames describe the device's layout over the
+    /// same memory. Across a change of stream format the same tensors are
+    /// used again, each once the frames still showing it have dropped.
     Provided(Vec<TensorDyn>),
 }
 
@@ -579,7 +582,8 @@ impl VideoDecoder {
     /// and decode the same access unit again. [`CodecError::Timeout`] when
     /// the device makes no progress otherwise. [`CodecError::InvalidInput`]
     /// when the access unit is empty or larger than the device's bitstream
-    /// buffers.
+    /// buffers. Events that became ready before an error are returned by
+    /// the next call.
     pub fn decode(&mut self, access_unit: &[u8], pts: u64) -> Result<Vec<DecodeEvent>> {
         self.backend.decode(access_unit, pts)
     }
@@ -590,6 +594,12 @@ impl VideoDecoder {
     /// sequence: the next access unit must be decodable on its own, an IDR
     /// picture with its SPS and PPS, as at the start of a stream or after a
     /// seek.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::PoolExhausted`] when the caller holds the frames in
+    /// every output buffer the drain needs; drop frames and flush again.
+    /// [`CodecError::Timeout`] when the device does not finish draining.
     pub fn flush(&mut self) -> Result<Vec<DecodeEvent>> {
         self.backend.flush()
     }

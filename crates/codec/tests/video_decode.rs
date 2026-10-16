@@ -9,7 +9,7 @@
 //! each frame as FFmpeg decodes the fixture, in presentation order: H.264
 //! decoding is exact, so a hardware decoder must produce the same bytes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use edgefirst_codec::video::{
     access_units, DecodeEvent, DecodedFrame, DecoderConfig, EncoderConfig, FrameOptions,
@@ -282,6 +282,58 @@ fn decodes_into_a_provided_pool() {
     assert_eq!(run.hashes, MAIN_BFRAMES);
     assert_eq!(run.infos[0].buffers, 12);
     assert_eq!(run.infos[0].memory, OutputMemory::Imported);
+}
+
+#[test]
+fn frames_held_across_a_resolution_change_keep_their_provided_buffers() {
+    let test = "frames_held_across_a_resolution_change_keep_their_provided_buffers";
+    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), test) {
+        return;
+    }
+    let size = 2048 * 1088 * 2;
+    let pool: Vec<TensorDyn> = (0..14)
+        .map(|_| TensorDyn::new(&[size], DType::U8, Some(TensorMemory::DmaBuf), None).unwrap())
+        .collect();
+    let config = DecoderConfig::h264().with_output(OutputPool::Provided(pool));
+    let Some(mut decoder) = open(test, config) else {
+        return;
+    };
+    // The new format's pool is over the same tensors: the last pictures of
+    // the old one, still held, must not be decoded over.
+    const HOLD: usize = 3;
+    let mut held: VecDeque<(DecodedFrame, u64)> = VecDeque::new();
+    let mut changed = false;
+    let mut frames = 0;
+    let mut take = |events: Vec<DecodeEvent>| {
+        for e in events {
+            let DecodeEvent::Frame(f) = e else { continue };
+            frames += 1;
+            changed |= f.tensor().width() != Some(640);
+            if !changed {
+                let hash = picture_hash(f.tensor());
+                held.push_back((f, hash));
+                if held.len() > HOLD {
+                    held.pop_front();
+                }
+            }
+        }
+    };
+    let stream = testdata(RESOLUTION_CHANGE_FILE);
+    for (i, au) in access_units(&stream).enumerate() {
+        take(decoder.decode(au, i as u64).expect("decode"));
+    }
+    take(decoder.flush().expect("flush"));
+    assert_eq!(frames, RESOLUTION_CHANGE.len());
+    assert_eq!(held.len(), HOLD);
+    for (f, hash) in &held {
+        assert_eq!(f.tensor().width(), Some(640));
+        assert_eq!(
+            picture_hash(f.tensor()),
+            *hash,
+            "picture {} was overwritten",
+            f.pts()
+        );
+    }
 }
 
 #[test]
