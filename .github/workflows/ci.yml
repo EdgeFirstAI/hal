@@ -84,7 +84,7 @@ jobs:
   quick:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@002777f34bb28fa359bfe1aa04302b1913c44182
+    uses: EdgeFirstAI/.github/.github/workflows/rust-quick.yml@9e296f92996b38683c684b9091ed59cb27562770
     with:
       runner: ubuntu-24.04
       timeout-minutes: 20
@@ -137,7 +137,7 @@ jobs:
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
-    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@002777f34bb28fa359bfe1aa04302b1913c44182
+    uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@9e296f92996b38683c684b9091ed59cb27562770
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
       # One job per board identity, each run on that specific board: the NXP
