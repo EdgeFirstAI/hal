@@ -114,10 +114,11 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 
 | Module          | Purpose                                              |
 |-----------------|------------------------------------------------------|
-| `mod.rs`        | `VideoEncoder`, `EncoderConfig` and its H.264 profile, level and bitrate types, `FrameOptions`, `EncodedFrame`, the `EncoderBackend` seam |
-| `h264.rs`       | Annex B framing: NAL unit types, SPS/PPS extraction, `AccessUnit` classification (IDR, parameter sets, trailing NAL units that belong to the previous access unit) |
+| `mod.rs`        | `VideoEncoder`, `EncoderConfig` and its H.264 profile, level and bitrate types, `FrameOptions`, `EncodedFrame`, the `EncoderBackend` seam; `VideoDecoder`, `DecoderConfig`, `OutputPool`, `StreamInfo`, `DecodeEvent`, `DecodedFrame` (returns its buffer on drop), the `DecoderBackend` seam |
+| `h264.rs`       | Annex B framing: NAL unit types, SPS/PPS extraction, `AccessUnit` classification (IDR, parameter sets, trailing NAL units that belong to the previous access unit), `access_units()` splitting |
 | `v4l2/mod.rs`   | Capability-based discovery of stateful M2M nodes (env override, then `/dev/video*`), `M2mDevice` |
 | `v4l2/encoder.rs` | `V4l2Encoder` (Linux + `v4l2` feature): format and control setup, DMA-BUF import of the source planes and crops, PTS mapping, header caching, `ENCODER_CMD` drain and stream reset |
+| `v4l2/decoder.rs` | `V4l2Decoder` (Linux + `v4l2` feature): bitstream queue, `SOURCE_CHANGE` handling, CAPTURE pool by DMA-BUF import or export, NV12 frame tensors over the padded buffers, one access unit in flight, `DECODER_CMD` drain and queue restart, reopen on reset |
 
 ## Key Design Decisions
 

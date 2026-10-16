@@ -65,5 +65,9 @@ harness = false
 name = "video-encode"
 path = "examples/video_encode.rs"
 
+[[example]]
+name = "video-decode"
+path = "examples/video_decode.rs"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

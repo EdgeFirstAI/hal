@@ -19,13 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `EncodedFrame` carries the Annex B access unit, a key-frame flag and the caller's PTS, which is returned unchanged even though V4L2 keeps timestamps at microsecond resolution.
   - `flush()` drains the encoder with `V4L2_ENC_CMD_STOP` and returns every pending access unit; the next frame starts a new stream with an IDR.
   - Example `video-encode`, and device-gated tests in `crates/codec/tests/video_encode.rs`.
+- **Hardware H.264 decoding (`edgefirst-codec` `video` module).** `VideoDecoder` decodes access units with any V4L2 stateful memory-to-memory decoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). `EDGEFIRST_CODEC_V4L2_DECODER` names the device node to use, and `access_units()` splits an Annex B byte stream.
+  - `decode()` returns every `DecodeEvent` that is ready: decoded pictures in presentation order with the caller's PTS, and `Reconfigured` with the `StreamInfo` (visible size, crop in the coded picture, colorimetry, pool) when the stream's format becomes known or changes mid-stream.
+  - A `DecodedFrame` lends an NV12 DMA-BUF tensor of the visible picture over the device's buffer, without a copy; the buffer goes back to the device when the frame is dropped. Frames import into the image crate's GPU paths without a copy.
+  - `OutputPool::Allocate { count }` sizes the pool for the frames the caller holds, plus the device's minimum and one buffer to decode into; `OutputPool::Provided` decodes into the caller's DMA-BUFs. Where a device will not import DMA-BUFs, its own buffers are exported instead (`StreamInfo::memory`).
+  - `flush()` drains with `V4L2_DEC_CMD_STOP` and restarts both queues; the next access unit starts a new sequence.
+  - Example `video-decode`, device-gated tests in `crates/codec/tests/video_decode.rs` that compare every picture with a reference decode, and `crates/image/tests/decoded_video_import.rs` for the GPU import.
 
 ### Changed
 
 - **Breaking: the cross-package tensor descriptor's `kind` uses the `TensorMemory` codes, and `ABI_VERSION` is 2.** `TensorDesc::kind` had its own numbering, in which 1 meant DMA-BUF while `TensorMemory` code 1 is `Shm`. `protocol::kind` now re-exports the `TensorMemory` wire constants: `MEM`=0, `SHM`=1, `DMABUF`=2, `IOSURFACE`=3, `PBO`=4, `CUDA`=5, `D3D11_TEXTURE`=6. `kind::HOST` is replaced by `kind::MEM` and `kind::SHM`, which a producer now reports separately, and `TensorDesc::is_host()` tests for either. `kind::CUDA_DEVICE` is renamed `kind::CUDA`. A `DmaBuf` tensor still reports the concrete backing: `DMABUF` on Linux and Android, `IOSURFACE` on macOS and iOS, `D3D11_TEXTURE` on Windows. An importer refuses a version-1 descriptor, so `edgefirst.*` Python packages from this release do not exchange tensors with packages from 0.35.x or earlier. The capsule name (`edgefirst_tensor_v2`) and layout are unchanged.
 - **Breaking: `PixelFormat::to_fourcc()` returns V4L2 pixel format codes.** `Rgb` is now `RGB3` (was `RGB `), `Rgba` is `AB24` (was `RGBA`), `Bgra` is `AR24` (was `BGRA`) and `Grey` is `GREY` (was `Y800`); the YUV formats are unchanged. `from_fourcc()` accepts the new codes only. The descriptor's `fourcc` field carries the same codes. `PixelFormat`'s `Display` text is unchanged.
 - **Breaking (`edgefirst-tensor-abi`): `EfStorageKind::D3d11Texture` and `EfCompressionRequest`.** `EfStorageKind` gains a variant, which breaks an exhaustive `match` on it.
-- **Breaking (`edgefirst-codec`):** `CodecError` gains `NoDevice`, `InvalidConfig`, `InvalidInput`, `Device` and `Timeout` for video encoding. Exhaustive `match`es on `CodecError` need new arms.
+- **Breaking (`edgefirst-codec`):** `CodecError` gains `NoDevice`, `InvalidConfig`, `InvalidInput`, `Device` and `Timeout` for video encoding, and `PoolExhausted` for video decoding. Exhaustive `match`es on `CodecError` need new arms.
 
 ## [0.35.0] - 2026-10-12
 
