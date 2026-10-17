@@ -430,7 +430,7 @@ CI does not have. This one is lifted from `ImageProcessor::new` in
 /// let mut converter = ImageProcessor::new()?;
 /// let mut dst =
 ///     converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
-/// converter.convert(&src.into(), &mut dst, Rotation::None, Flip::None, Crop::default())?;
+/// converter.convert(&src.into(), &mut dst, None)?;
 /// # Ok(())
 /// # }
 /// ```

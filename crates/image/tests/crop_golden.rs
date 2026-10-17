@@ -30,7 +30,7 @@
 //! references computed in the same run. Within one kernel path the frozen
 //! bytes are the byte-exactness arbiter; neither file is ever regenerated.
 
-use edgefirst_image::{CPUProcessor, Crop, Fit, Flip, ImageProcessorTrait, Region, Rotation};
+use edgefirst_image::{CPUProcessor, Crop, Fit, ImageProcessorTrait, Region};
 use edgefirst_tensor::{
     CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -155,7 +155,11 @@ fn run_case(
         .with_fit(Fit::Stretch);
 
     proc_
-        .convert(src, &mut dst, Rotation::None, Flip::None, crop)
+        .convert(
+            src,
+            &mut dst,
+            Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+        )
         .ok()?;
 
     let u8t = dst.as_u8().unwrap();

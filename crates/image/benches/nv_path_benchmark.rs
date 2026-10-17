@@ -20,7 +20,7 @@ mod common;
 
 use common::{run_bench, BenchSuite};
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorTrait};
 
 const WARMUP: usize = 10;
@@ -100,14 +100,11 @@ fn main() {
             edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             let name = format!("{path}/{fmt:?}/convert_720p_rgba").to_lowercase();
-            if let Err(e) =
-                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            {
+            if let Err(e) = proc.convert(&src, &mut dst, None) {
                 println!("  {name:50} [unsupported: {e}]");
             } else {
                 let r = run_bench(&name, WARMUP, ITERATIONS, || {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                        .unwrap();
+                    proc.convert(&src, &mut dst, None).unwrap();
                 });
                 r.print_summary_with_throughput(src_bytes);
                 suite.record(&r);
@@ -124,12 +121,20 @@ fn main() {
             edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             let name = format!("{path}/{fmt:?}/letterbox_720p_to_640_rgb").to_lowercase();
-            if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop) {
+            if let Err(e) = proc.convert(
+                &src,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+            ) {
                 println!("  {name:50} [unsupported: {e}]");
             } else {
                 let r = run_bench(&name, WARMUP, ITERATIONS, || {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop)
-                        .unwrap();
+                    proc.convert(
+                        &src,
+                        &mut dst,
+                        Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+                    )
+                    .unwrap();
                 });
                 r.print_summary_with_throughput(src_bytes);
                 suite.record(&r);

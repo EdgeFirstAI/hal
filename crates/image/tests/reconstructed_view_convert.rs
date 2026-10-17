@@ -72,7 +72,7 @@
 //! `test_view_converts_its_own_sub_region_not_the_parents_origin` in
 //! `tests/interop/test_cross_package.py`.
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{
     CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMapTrait, TensorMemory,
 };
@@ -220,14 +220,8 @@ fn reconstructed_view_converts_its_own_sub_region_not_the_parents_origin() {
         .view(Region::new(X0, Y0, SIDE, SIDE))
         .expect("fresh view");
     let mut dst_a = dst();
-    proc.convert(
-        &fresh,
-        &mut dst_a,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .expect("convert fresh view");
+    proc.convert(&fresh, &mut dst_a, None)
+        .expect("convert fresh view");
     assert_tile("fresh view", &read_all(&dst_a));
 
     // B–E: rebuilt through the descriptor itself, on the platforms whose
@@ -263,14 +257,8 @@ fn reconstructed_view_converts_its_own_sub_region_not_the_parents_origin() {
         rebuilt.set_plane_offset(fresh.plane_offset().expect("a view carries its offset"));
 
         let mut dst_b = dst();
-        proc.convert(
-            &rebuilt,
-            &mut dst_b,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .expect("convert reconstructed view");
+        proc.convert(&rebuilt, &mut dst_b, None)
+            .expect("convert reconstructed view");
         assert_tile("reconstructed view", &read_all(&dst_b));
 
         // C — the whole image narrowed by one row and offset by one row.
@@ -290,14 +278,8 @@ fn reconstructed_view_converts_its_own_sub_region_not_the_parents_origin() {
             .expect("dst_c alloc")
             .with_format(PixelFormat::Rgba)
             .expect("dst_c format");
-        proc.convert(
-            &whole,
-            &mut dst_c,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .expect("convert whole image at a foreign offset");
+        proc.convert(&whole, &mut dst_c, None)
+            .expect("convert whole image at a foreign offset");
         let out = read_all(&dst_c);
         assert_eq!(
             &out[..BPP],
@@ -317,14 +299,8 @@ fn reconstructed_view_converts_its_own_sub_region_not_the_parents_origin() {
             .expect("dst_d alloc")
             .with_format(PixelFormat::Rgba)
             .expect("dst_d format");
-        proc.convert(
-            &rebuilt_row,
-            &mut dst_d,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .expect("convert one-row reconstructed view");
+        proc.convert(&rebuilt_row, &mut dst_d, None)
+            .expect("convert one-row reconstructed view");
         let expected_row: Vec<u8> = (X0..X0 + SIDE).flat_map(|x| want(x, Y0)).collect();
         assert_eq!(
             read_all(&dst_d),
@@ -355,14 +331,8 @@ fn reconstructed_view_converts_its_own_sub_region_not_the_parents_origin() {
             "a rebuilt destination keeps the canvas's pitch"
         );
         rebuilt_dst.set_plane_offset(fresh_dst.plane_offset().expect("a view carries its offset"));
-        proc.convert(
-            &fresh,
-            &mut rebuilt_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .expect("convert into a reconstructed destination view");
+        proc.convert(&fresh, &mut rebuilt_dst, None)
+            .expect("convert into a reconstructed destination view");
         let out = read_all(&canvas);
         let px = |x: usize, y: usize| &out[y * canvas_pitch + x * BPP..][..BPP];
         assert_eq!(

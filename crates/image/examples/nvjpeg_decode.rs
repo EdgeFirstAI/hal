@@ -18,7 +18,7 @@
 //! ```
 
 use edgefirst_codec::{nvjpeg_available, peek_info, ImageDecoder, ImageLoad};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory, TensorTrait};
 use std::time::Instant;
 
@@ -130,9 +130,7 @@ fn main() {
     match processor.convert(
         &tensor,
         &mut dst,
-        Rotation::None,
-        Flip::None,
-        Crop::letterbox([0, 0, 0, 255]),
+        Some(edgefirst_image::ConvertOptions::new().crop(Crop::letterbox([0, 0, 0, 255]))),
     ) {
         Ok(()) => {
             if let TensorDyn::U8(t) = &dst {

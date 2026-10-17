@@ -21,7 +21,7 @@ mod common;
 use common::{run_bench, BenchSuite};
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
 
 const WARMUP: usize = 10;
@@ -143,8 +143,12 @@ fn bench_decode_convert(
         // Warmup all paths
         for _ in 0..WARMUP {
             input.load_image(&mut decoder, &data).unwrap();
-            proc.convert(&input, &mut output, Rotation::None, Flip::None, crop)
-                .unwrap();
+            proc.convert(
+                &input,
+                &mut output,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
         }
 
         // Decode only
@@ -157,8 +161,12 @@ fn bench_decode_convert(
         input.load_image(&mut decoder, &data).unwrap();
         let convert_name = format!("pipeline_convert/{}/{}", layout_name, img.name);
         let convert_result = run_bench(&convert_name, 0, ITERATIONS, || {
-            proc.convert(&input, &mut output, Rotation::None, Flip::None, crop)
-                .unwrap();
+            proc.convert(
+                &input,
+                &mut output,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
         });
 
         // Full pipeline
@@ -166,8 +174,12 @@ fn bench_decode_convert(
         let throughput = (img.width * img.height * 3) as u64;
         let pipeline_result = run_bench(&pipeline_name, 0, ITERATIONS, || {
             input.load_image(&mut decoder, &data).unwrap();
-            proc.convert(&input, &mut output, Rotation::None, Flip::None, crop)
-                .unwrap();
+            proc.convert(
+                &input,
+                &mut output,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
         });
 
         decode_result.print_summary();

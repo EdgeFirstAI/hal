@@ -10,7 +10,9 @@
 //! `EINVAL` rather than transmuted into a Rust enum, which would be
 //! undefined behaviour for a value no variant names.
 
-use edgefirst_image::{ColorMode, ComputeBackend, FitMode, Flip, Rotation};
+use edgefirst_image::{
+    ColorMode, ComputeBackend, FitMode, Flip, LetterboxPlacement, NormalizationPreset, Rotation,
+};
 
 /// A quarter-turn rotation, for `ef_image_processor_convert` and friends.
 #[repr(u32)]
@@ -69,6 +71,31 @@ pub enum EfComputeBackend {
     OpenGl = 3,
 }
 
+/// Where a letterboxed image sits, for `ef_convert_options_set_letterbox_placement`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfLetterboxPlacement {
+    /// Centred, padding split between both sides.
+    Center = 0,
+    /// Anchored at the top-left corner, padding on the right and bottom.
+    TopLeft = 1,
+}
+
+/// A named normalization, `(x - mean) / std` on 0-255 values, for
+/// `ef_convert_options_set_normalization_preset`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfNormalization {
+    /// `x / 255`, giving `[0, 1]`.
+    Unsigned = 0,
+    /// `x / 127.5 - 1`, giving `[-1, 1]`.
+    Signed = 1,
+    /// `x`, giving `[0, 255]`.
+    Raw = 2,
+    /// ImageNet mean and standard deviation.
+    Imagenet = 3,
+}
+
 const _: () = {
     assert!(EfRotation::None as u32 == Rotation::None.code());
     assert!(EfRotation::Clockwise90 as u32 == Rotation::Clockwise90.code());
@@ -90,6 +117,14 @@ const _: () = {
     assert!(EfComputeBackend::Cpu as u32 == ComputeBackend::Cpu.code());
     assert!(EfComputeBackend::G2d as u32 == ComputeBackend::G2d.code());
     assert!(EfComputeBackend::OpenGl as u32 == ComputeBackend::OpenGl.code());
+
+    assert!(EfLetterboxPlacement::Center as u32 == LetterboxPlacement::Center.code());
+    assert!(EfLetterboxPlacement::TopLeft as u32 == LetterboxPlacement::TopLeft.code());
+
+    assert!(EfNormalization::Unsigned as u32 == NormalizationPreset::Unsigned.code());
+    assert!(EfNormalization::Signed as u32 == NormalizationPreset::Signed.code());
+    assert!(EfNormalization::Raw as u32 == NormalizationPreset::Raw.code());
+    assert!(EfNormalization::Imagenet as u32 == NormalizationPreset::Imagenet.code());
 };
 
 #[cfg(test)]
@@ -140,6 +175,16 @@ mod tests {
                 .iter()
                 .map(|&v| (enumerator("EF_COMPUTE_BACKEND", v), v.code())),
         );
+        out.extend(
+            LetterboxPlacement::all()
+                .iter()
+                .map(|&v| (enumerator("EF_LETTERBOX_PLACEMENT", v), v.code())),
+        );
+        out.extend(
+            NormalizationPreset::all()
+                .iter()
+                .map(|&v| (enumerator("EF_NORMALIZATION", v), v.code())),
+        );
         out
     }
 
@@ -155,6 +200,16 @@ mod tests {
             ComputeBackend::all().len(),
             4,
             "add the EfComputeBackend enumerator"
+        );
+        assert_eq!(
+            LetterboxPlacement::all().len(),
+            2,
+            "add the EfLetterboxPlacement enumerator"
+        );
+        assert_eq!(
+            NormalizationPreset::all().len(),
+            4,
+            "add the EfNormalization enumerator"
         );
     }
 
@@ -175,6 +230,8 @@ mod tests {
             "ef_color_mode",
             "ef_fit",
             "ef_compute_backend",
+            "ef_letterbox_placement",
+            "ef_normalization",
         ] {
             assert!(
                 header.contains(&format!("enum {ty}")),
@@ -190,6 +247,8 @@ mod tests {
         assert_eq!(ColorMode::from_code(3), None);
         assert_eq!(FitMode::from_code(2), None);
         assert_eq!(ComputeBackend::from_code(4), None);
+        assert_eq!(LetterboxPlacement::from_code(2), None);
+        assert_eq!(NormalizationPreset::from_code(4), None);
         assert_eq!(Rotation::from_code(u32::MAX), None);
     }
 }

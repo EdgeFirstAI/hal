@@ -30,7 +30,7 @@ mod common;
 
 use common::{run_bench, BenchSuite};
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 use std::collections::HashSet;
 
@@ -218,7 +218,11 @@ fn main() {
                         // single-shot probe would misclassify them as a panic
                         // inside the timing loop.
                         if let Err(e) = (0..2).try_for_each(|_| {
-                            proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop)
+                            proc.convert(
+                                &src,
+                                &mut dst,
+                                Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+                            )
                         }) {
                             println!("  {name:55} [unsupported: {e}]");
                             continue;
@@ -228,8 +232,12 @@ fn main() {
                         // one broken cell must not cost the whole baseline.
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             run_bench(&name, WARMUP, ITERATIONS, || {
-                                proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop)
-                                    .unwrap();
+                                proc.convert(
+                                    &src,
+                                    &mut dst,
+                                    Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+                                )
+                                .unwrap();
                             })
                         }));
                         match r {

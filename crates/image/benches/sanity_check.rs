@@ -40,8 +40,7 @@ fn main() {
 mod unix_impl {
     use super::common::{format_name, get_test_data, BenchConfig};
     use edgefirst_image::{
-        ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait,
-        Rotation,
+        ComputeBackend, Crop, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait,
     };
     use edgefirst_tensor::{DType, PixelFormat};
     use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -117,7 +116,11 @@ mod unix_impl {
 
         // Stage 1: single iteration
         let start = Instant::now();
-        if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+        if let Err(e) = proc.convert(
+            &src,
+            &mut dst,
+            Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+        ) {
             write_result(result_fd, &format!("FAILED:convert:{e}:0:0:0"));
             return;
         }
@@ -137,7 +140,11 @@ mod unix_impl {
         let mut times = Vec::with_capacity(10);
         for i in 0..10 {
             let start = Instant::now();
-            if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+            if let Err(e) = proc.convert(
+                &src,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            ) {
                 write_result(
                     result_fd,
                     &format!("FAILED:iter_{i}:{e}:{single_ms:.1}:0:{}", i + 1),

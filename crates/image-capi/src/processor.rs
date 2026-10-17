@@ -11,7 +11,10 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use edgefirst_image::ImageProcessor;
+use edgefirst_image::{
+    ConvertOptions, Crop, Fit, Flip, ImageProcessor, LetterboxPlacement, Normalization,
+    NormalizationPreset, Rotation,
+};
 use edgefirst_tensor::{
     Compression, CpuAccess, DType, ImageDesc, PixelFormat, TensorDyn, TensorMemory,
 };
@@ -231,58 +234,249 @@ pub(crate) unsafe fn with_tensor_mut<R>(
     }
 }
 
-/// Geometry for a convert: source rectangle and letterbox padding.
-///
-/// `NULL` anywhere one is accepted means the whole source, stretched to fill.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EfCrop {
-    /// Source rectangle in pixels. A zero `width` or `height` means the whole
-    /// source, so a zeroed struct is the same as passing `NULL`.
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    /// Non-zero to preserve aspect ratio, padding the remainder.
-    pub letterbox: c_int,
-    /// Letterbox fill colour, RGBA. Ignored unless `letterbox` is set.
-    pub pad: [u8; 4],
+/// Options for a convert, built with the `ef_convert_options_*` setters.
+/// `NULL` anywhere one is accepted means the defaults: the whole source,
+/// stretched, no rotation or flip, and float outputs mapped as `x / 255`.
+pub struct EfConvertOptions {
+    inner: ConvertOptions,
 }
 
-/// Build a `Crop` from the C description.
-fn crop_from(c: *const EfCrop) -> edgefirst_image::Crop {
-    if c.is_null() {
-        return edgefirst_image::Crop::default();
+/// The options to use for a convert: `o`'s, or the defaults for `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+unsafe fn options_from(o: *const EfConvertOptions) -> Option<ConvertOptions> {
+    // SAFETY: the caller's contract.
+    unsafe { o.as_ref() }.map(|o| o.inner)
+}
+
+/// Apply `f` to a live options handle; `EINVAL` for `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+unsafe fn update(
+    o: *mut EfConvertOptions,
+    f: impl FnOnce(ConvertOptions) -> Option<ConvertOptions>,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the caller's contract.
+        let Some(o) = (unsafe { o.as_mut() }) else {
+            return libc::EINVAL;
+        };
+        match f(o.inner) {
+            Some(next) => {
+                o.inner = next;
+                0
+            }
+            None => libc::EINVAL,
+        }
+    }))
+    .unwrap_or(libc::EINVAL)
+}
+
+/// New default convert options. `NULL` on allocation failure. Free with
+/// [`ef_convert_options_free`].
+#[no_mangle]
+pub extern "C" fn ef_convert_options_new() -> *mut EfConvertOptions {
+    catch_unwind(|| {
+        Box::into_raw(Box::new(EfConvertOptions {
+            inner: ConvertOptions::new(),
+        }))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Free options from [`ef_convert_options_new`]. `NULL` is a no-op.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle, not used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_free(o: *mut EfConvertOptions) {
+    if !o.is_null() {
+        // SAFETY: the caller's contract; the handle came from `Box::into_raw`.
+        drop(unsafe { Box::from_raw(o) });
     }
-    // SAFETY: checked non-null; `EfCrop` is a plain value.
-    let c = unsafe { *c };
-    let mut out = if c.letterbox != 0 {
-        edgefirst_image::Crop::letterbox(c.pad)
-    } else {
-        edgefirst_image::Crop::no_crop()
+}
+
+/// Rotate the output: an `EF_ROTATION_*` code.
+///
+/// @return 0, or `EINVAL` for an unknown code or `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_rotation(
+    o: *mut EfConvertOptions,
+    rotation: u32,
+) -> c_int {
+    unsafe { update(o, |c| Some(c.rotation(Rotation::from_code(rotation)?))) }
+}
+
+/// Flip the output: an `EF_FLIP_*` code.
+///
+/// @return 0, or `EINVAL` for an unknown code or `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_flip(o: *mut EfConvertOptions, flip: u32) -> c_int {
+    unsafe { update(o, |c| Some(c.flip(Flip::from_code(flip)?))) }
+}
+
+/// Sample only this rectangle of the source, in pixels. A zero `width` or
+/// `height` samples the whole source.
+///
+/// @return 0, or `EINVAL` for `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_source(
+    o: *mut EfConvertOptions,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> c_int {
+    let region = (width != 0 && height != 0).then(|| {
+        edgefirst_tensor::Region::new(x as usize, y as usize, width as usize, height as usize)
+    });
+    unsafe { update(o, |c| Some(c.source(region))) }
+}
+
+/// Letterbox: keep the source aspect ratio and pad the rest with the RGBA
+/// pixel `pad`, mapped like the image. `NULL` stretches instead.
+///
+/// @return 0, or `EINVAL` for a `NULL` handle.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle; `pad` `NULL` or four bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_letterbox(
+    o: *mut EfConvertOptions,
+    pad: *const u8,
+) -> c_int {
+    // SAFETY: the caller's contract.
+    let pad = unsafe { pad.cast::<[u8; 4]>().as_ref() }.copied();
+    unsafe {
+        update(o, |c| {
+            Some(match pad {
+                Some(pad) => c.letterbox(pad),
+                None => c.crop(Crop {
+                    fit: Fit::Stretch,
+                    ..c.get_crop()
+                }),
+            })
+        })
+    }
+}
+
+/// Where a letterboxed image sits: an `EF_LETTERBOX_PLACEMENT_*` code.
+///
+/// @return 0, or `EINVAL` for an unknown code or `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_letterbox_placement(
+    o: *mut EfConvertOptions,
+    placement: u32,
+) -> c_int {
+    unsafe {
+        update(o, |c| {
+            Some(c.placement(LetterboxPlacement::from_code(placement)?))
+        })
+    }
+}
+
+/// Pad a letterbox with these four values as written to the destination
+/// (after normalization; quantized for integer destinations) instead of
+/// mapping the pixel pad.
+///
+/// @return 0, or `EINVAL` for `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle; `pad` must be four floats.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_pad_output(
+    o: *mut EfConvertOptions,
+    pad: *const f32,
+) -> c_int {
+    // SAFETY: the caller's contract.
+    let Some(pad) = (unsafe { pad.cast::<[f32; 4]>().as_ref() }).copied() else {
+        return libc::EINVAL;
     };
-    if c.width != 0 && c.height != 0 {
-        out = out.with_source(Some(edgefirst_tensor::Region::new(
-            c.x as usize,
-            c.y as usize,
-            c.width as usize,
-            c.height as usize,
-        )));
+    unsafe { update(o, |c| Some(c.pad_output(pad))) }
+}
+
+/// Normalize with a preset: an `EF_NORMALIZATION_*` code.
+///
+/// @return 0, or `EINVAL` for an unknown code or `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_normalization_preset(
+    o: *mut EfConvertOptions,
+    preset: u32,
+) -> c_int {
+    unsafe {
+        update(o, |c| {
+            Some(c.normalization(NormalizationPreset::from_code(preset)?))
+        })
     }
-    out
+}
+
+/// Normalize as `(x - mean) / std` on 0-255 values, `n` values each: 1 for
+/// every channel or 3 for RGB.
+///
+/// @return 0, or `EINVAL` for `NULL`, another `n`, a non-finite mean or a
+/// zero or non-finite std.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle; `mean` and `std` must hold `n` floats.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_normalization(
+    o: *mut EfConvertOptions,
+    mean: *const f32,
+    std: *const f32,
+    n: usize,
+) -> c_int {
+    if mean.is_null() || std.is_null() {
+        return libc::EINVAL;
+    }
+    // SAFETY: the caller's contract; both checked non-null.
+    let (mean, std) = unsafe {
+        (
+            std::slice::from_raw_parts(mean, n),
+            std::slice::from_raw_parts(std, n),
+        )
+    };
+    let Ok(norm) = Normalization::mean_std(mean, std) else {
+        return libc::EINVAL;
+    };
+    unsafe { update(o, |c| Some(c.normalization(norm))) }
+}
+
+/// The errno for a failed convert: `EINVAL` for options that cannot apply to
+/// the destination, `EIO` otherwise.
+fn convert_errno(e: &edgefirst_image::Error) -> c_int {
+    match e {
+        edgefirst_image::Error::InvalidOptions(_) => libc::EINVAL,
+        _ => libc::EIO,
+    }
 }
 
 /// Convert `src` into `dst`, scaling, converting colour and rotating as needed.
 ///
 /// `src`/`dst` may have been minted by any EdgeFirst library -- every library
 /// links the same shared tensor implementation, so both are read the same
-/// way regardless of which one minted them. `crop` may be `NULL` for the
-/// whole source.
+/// way regardless of which one minted them. `options` may be `NULL` for the
+/// defaults.
 ///
-/// `rotation` is an `EF_ROTATION_*` code and `flip` an `EF_FLIP_*` code; any
-/// other value is `EINVAL`, checked before any work.
-///
-/// @return 0 on success, otherwise an errno.
+/// @return 0 on success, `EINVAL` for options that cannot apply to `dst`
+/// (such as a normalization on an integer destination without quantization),
+/// otherwise an errno.
 ///
 /// # Safety
 /// `p`, `src` and `dst` must be live handles.
@@ -291,30 +485,20 @@ pub unsafe extern "C" fn ef_image_processor_convert(
     p: *mut EfImageProcessor,
     src: *const EfTensor,
     dst: *mut EfTensor,
-    rotation: u32,
-    flip: u32,
-    crop: *const EfCrop,
+    options: *const EfConvertOptions,
 ) -> c_int {
     unsafe {
         catch_unwind(AssertUnwindSafe(|| {
             if p.is_null() {
                 return libc::EINVAL;
             }
-            // Validated before any work: an unknown code silently treated as
-            // "none" would rotate nothing and look like a backend failure.
-            let (Some(rot), Some(fl)) = (
-                edgefirst_image::Rotation::from_code(rotation),
-                edgefirst_image::Flip::from_code(flip),
-            ) else {
-                return libc::EINVAL;
-            };
             use edgefirst_image::ImageProcessorTrait as _;
             let result = with_tensor(src, |s| {
-                with_tensor_mut(dst, |d| (*p).inner.convert(s, d, rot, fl, crop_from(crop)))
+                with_tensor_mut(dst, |d| (*p).inner.convert(s, d, options_from(options)))
             });
             match result {
                 Ok(Ok(Ok(()))) => 0,
-                Ok(Ok(Err(_))) => libc::EIO,
+                Ok(Ok(Err(e))) => convert_errno(&e),
                 Ok(Err(e)) | Err(e) => e,
             }
         }))
@@ -323,7 +507,6 @@ pub unsafe extern "C" fn ef_image_processor_convert(
 }
 
 /// Like [`ef_image_processor_convert`], but does not wait for the GPU.
-/// `rotation` and `flip` are validated the same way.
 ///
 /// # Safety
 /// `p`, `src` and `dst` must be live handles.
@@ -332,30 +515,22 @@ pub unsafe extern "C" fn ef_image_processor_convert_deferred(
     p: *mut EfImageProcessor,
     src: *const EfTensor,
     dst: *mut EfTensor,
-    rotation: u32,
-    flip: u32,
-    crop: *const EfCrop,
+    options: *const EfConvertOptions,
 ) -> c_int {
     unsafe {
         catch_unwind(AssertUnwindSafe(|| {
             if p.is_null() {
                 return libc::EINVAL;
             }
-            let (Some(rot), Some(fl)) = (
-                edgefirst_image::Rotation::from_code(rotation),
-                edgefirst_image::Flip::from_code(flip),
-            ) else {
-                return libc::EINVAL;
-            };
             use edgefirst_image::ImageProcessorTrait as _;
             let result = with_tensor(src, |s| {
                 with_tensor_mut(dst, |d| {
-                    (*p).inner.convert_deferred(s, d, rot, fl, crop_from(crop))
+                    (*p).inner.convert_deferred(s, d, options_from(options))
                 })
             });
             match result {
                 Ok(Ok(Ok(()))) => 0,
-                Ok(Ok(Err(_))) => libc::EIO,
+                Ok(Ok(Err(e))) => convert_errno(&e),
                 Ok(Err(e)) | Err(e) => e,
             }
         }))
@@ -531,7 +706,7 @@ pub unsafe extern "C" fn ef_image_processor_flush(p: *mut EfImageProcessor) -> c
 /// therefore completed synchronously — in which case the destination is already
 /// safe to read.
 ///
-/// `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
+/// `options` as for [`ef_image_processor_convert`].
 ///
 /// @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
 ///
@@ -542,9 +717,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
     p: *mut EfImageProcessor,
     src: *const EfTensor,
     dst: *mut EfTensor,
-    rotation: u32,
-    flip: u32,
-    crop: *const EfCrop,
+    options: *const EfConvertOptions,
     fence_fd: *mut c_int,
 ) -> c_int {
     unsafe {
@@ -553,27 +726,18 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
                 return libc::EINVAL;
             }
             // Written before any early return, so a caller never reads an
-            // uninitialised descriptor after a failure -- a bad rotation or
-            // flip code included, which is where this used to leave `*fence_fd`
-            // untouched while the handle sibling below cleared it.
+            // uninitialised descriptor after a failure.
             *fence_fd = -1;
-            let (Some(rot), Some(fl)) = (
-                edgefirst_image::Rotation::from_code(rotation),
-                edgefirst_image::Flip::from_code(flip),
-            ) else {
-                return libc::EINVAL;
-            };
             #[cfg(not(unix))]
             {
-                let _ = (p, src, dst, rot, fl, crop);
+                let _ = (p, src, dst, options);
                 libc::ENOTSUP
             }
             #[cfg(unix)]
             {
                 let result = with_tensor(src, |s| {
                     with_tensor_mut(dst, |d| {
-                        (*p).inner
-                            .convert_with_fence(s, d, rot, fl, crop_from(crop))
+                        (*p).inner.convert_with_fence(s, d, options_from(options))
                     })
                 });
                 match result {
@@ -585,7 +749,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
                     // No native fence here: the convert already completed, which the
                     // -1 reports. Not an error.
                     Ok(Ok(Ok(None))) => 0,
-                    Ok(Ok(Err(_))) => libc::EIO,
+                    Ok(Ok(Err(e))) => convert_errno(&e),
                     Ok(Err(e)) | Err(e) => e,
                 }
             }
@@ -601,7 +765,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
 /// closes it with `CloseHandle`. `*fence` is `NULL` when the convert
 /// completed synchronously (no fence on this display).
 ///
-/// `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
+/// `options` as for [`ef_image_processor_convert`].
 ///
 /// @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
 ///
@@ -612,9 +776,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
     p: *mut EfImageProcessor,
     src: *const EfTensor,
     dst: *mut EfTensor,
-    rotation: u32,
-    flip: u32,
-    crop: *const EfCrop,
+    options: *const EfConvertOptions,
     fence: *mut *mut c_void,
 ) -> c_int {
     unsafe {
@@ -622,20 +784,13 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
             if p.is_null() || fence.is_null() {
                 return libc::EINVAL;
             }
-            // Written before the rotation/flip check below, as the fd
-            // sibling above does, so a caller reading `*fence` after any
-            // failure -- a bad code included -- never sees an uninitialised
-            // pointer.
+            // Written before any early return, as the fd sibling above does,
+            // so a caller reading `*fence` after a failure never sees an
+            // uninitialised pointer.
             *fence = std::ptr::null_mut();
-            let (Some(rot), Some(fl)) = (
-                edgefirst_image::Rotation::from_code(rotation),
-                edgefirst_image::Flip::from_code(flip),
-            ) else {
-                return libc::EINVAL;
-            };
             #[cfg(not(target_os = "windows"))]
             {
-                let _ = (src, dst, rot, fl, crop);
+                let _ = (src, dst, options);
                 libc::ENOTSUP
             }
             #[cfg(target_os = "windows")]
@@ -643,8 +798,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
                 use std::os::windows::io::IntoRawHandle;
                 let result = with_tensor(src, |s| {
                     with_tensor_mut(dst, |d| {
-                        (*p).inner
-                            .convert_with_fence(s, d, rot, fl, crop_from(crop))
+                        (*p).inner.convert_with_fence(s, d, options_from(options))
                     })
                 });
                 match result {
@@ -656,7 +810,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
                     // completed, which the NULL `*fence` reports. Not an
                     // error.
                     Ok(Ok(Ok(None))) => 0,
-                    Ok(Ok(Err(_))) => libc::EIO,
+                    Ok(Ok(Err(e))) => convert_errno(&e),
                     Ok(Err(e)) | Err(e) => e,
                 }
             }
@@ -684,7 +838,7 @@ mod tests {
             let src = ef_image_processor_create_image(p, 64, 48, nv12.as_ptr(), 0, 0, 3);
             let dst = ef_image_processor_create_image(p, 64, 48, rgb.as_ptr(), 0, 0, 3);
             assert!(!src.is_null() && !dst.is_null());
-            let rc = ef_image_processor_convert(p, src, dst, 0, 0, std::ptr::null());
+            let rc = ef_image_processor_convert(p, src, dst, std::ptr::null());
             assert_eq!(rc, 0, "a same-library convert must succeed");
             edgefirst_tensor_ffi::ef_tensor_free(src);
             edgefirst_tensor_ffi::ef_tensor_free(dst);
@@ -748,35 +902,98 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_rotation_or_flip_code_is_refused() {
+    fn an_unknown_option_code_is_refused() {
         // Treating an unknown code as "none" would rotate nothing and read as
         // a backend failure rather than a caller mistake.
-        let p = processor();
-        let nv12 = std::ffi::CString::new("NV12").unwrap();
         unsafe {
-            let src = ef_image_processor_create_image(p, 64, 48, nv12.as_ptr(), 0, 0, 3);
-            let dst = ef_image_processor_create_image(p, 64, 48, nv12.as_ptr(), 0, 0, 3);
+            let o = ef_convert_options_new();
+            assert_eq!(ef_convert_options_set_rotation(o, 99), libc::EINVAL);
+            assert_eq!(ef_convert_options_set_flip(o, 99), libc::EINVAL);
             assert_eq!(
-                ef_image_processor_convert(p, src, dst, 99, 0, std::ptr::null()),
+                ef_convert_options_set_letterbox_placement(o, 2),
                 libc::EINVAL
             );
             assert_eq!(
-                ef_image_processor_convert(p, src, dst, 0, 99, std::ptr::null()),
+                ef_convert_options_set_normalization_preset(o, 4),
                 libc::EINVAL
             );
-            edgefirst_tensor_ffi::ef_tensor_free(src);
-            edgefirst_tensor_ffi::ef_tensor_free(dst);
-            ef_image_processor_free(p);
+            assert_eq!(
+                ef_convert_options_set_rotation(std::ptr::null_mut(), 0),
+                libc::EINVAL
+            );
+            assert_eq!(
+                (*o).inner,
+                ConvertOptions::new(),
+                "a refused code changes nothing"
+            );
+            assert_eq!(ef_convert_options_set_rotation(o, 1), 0);
+            assert_eq!((*o).inner.get_rotation(), Rotation::Clockwise90);
+            ef_convert_options_free(o);
+            ef_convert_options_free(std::ptr::null_mut());
         }
     }
 
     #[test]
-    fn a_zeroed_crop_means_the_whole_source() {
-        // A caller who memsets the struct must get what NULL gives, or
-        // zero-initialisation becomes a trap.
-        let whole = format!("{:?}", crop_from(std::ptr::null()));
-        let zeroed = format!("{:?}", crop_from(&EfCrop::default()));
-        assert_eq!(whole, zeroed, "a zeroed crop must equal no crop");
+    fn options_setters_build_the_rust_options() {
+        unsafe {
+            let o = ef_convert_options_new();
+            assert_eq!(ef_convert_options_set_source(o, 1, 2, 0, 9), 0);
+            assert_eq!(
+                (*o).inner.get_crop().source,
+                None,
+                "a zero width is the whole source"
+            );
+            assert_eq!(ef_convert_options_set_source(o, 1, 2, 3, 4), 0);
+            assert_eq!(
+                ef_convert_options_set_letterbox(o, [0u8, 0, 0, 255].as_ptr()),
+                0
+            );
+            assert_eq!(ef_convert_options_set_letterbox_placement(o, 1), 0);
+            assert_eq!(
+                ef_convert_options_set_pad_output(o, [0.0f32; 4].as_ptr()),
+                0
+            );
+            assert_eq!(ef_convert_options_set_normalization_preset(o, 3), 0);
+            let want = ConvertOptions::new()
+                .source(Some(edgefirst_tensor::Region::new(1, 2, 3, 4)))
+                .letterbox([0, 0, 0, 255])
+                .placement(LetterboxPlacement::TopLeft)
+                .pad_output([0.0; 4])
+                .normalization(Normalization::imagenet());
+            assert_eq!((*o).inner, want);
+            let (mean, std) = ([0.0f32, 1.0], [1.0f32, 1.0]);
+            assert_eq!(
+                ef_convert_options_set_normalization(o, mean.as_ptr(), std.as_ptr(), 2),
+                libc::EINVAL
+            );
+            assert_eq!(
+                ef_convert_options_set_normalization(o, mean.as_ptr(), [0.0f32].as_ptr(), 1),
+                libc::EINVAL
+            );
+            assert_eq!(ef_convert_options_set_letterbox(o, std::ptr::null()), 0);
+            assert_eq!((*o).inner.get_crop().fit, Fit::Stretch);
+            ef_convert_options_free(o);
+        }
+    }
+
+    #[test]
+    fn integer_normalization_without_quantization_is_einval() {
+        let p = processor();
+        let rgba = std::ffi::CString::new("rgba8").unwrap();
+        let rgb = std::ffi::CString::new("rgb8").unwrap();
+        unsafe {
+            let src = ef_image_processor_create_image(p, 16, 16, rgba.as_ptr(), 0, 0, 3);
+            // dtype 1 is EF_DTYPE_I8.
+            let dst = ef_image_processor_create_image(p, 16, 16, rgb.as_ptr(), 1, 0, 3);
+            assert!(!src.is_null() && !dst.is_null());
+            let o = ef_convert_options_new();
+            assert_eq!(ef_convert_options_set_normalization_preset(o, 3), 0);
+            assert_eq!(ef_image_processor_convert(p, src, dst, o), libc::EINVAL);
+            ef_convert_options_free(o);
+            edgefirst_tensor_ffi::ef_tensor_free(src);
+            edgefirst_tensor_ffi::ef_tensor_free(dst);
+            ef_image_processor_free(p);
+        }
     }
 
     #[test]
@@ -973,8 +1190,6 @@ mod tests {
                     std::ptr::null_mut(),
                     std::ptr::null(),
                     std::ptr::null_mut(),
-                    0,
-                    0,
                     std::ptr::null(),
                     &mut fence,
                 ),
@@ -986,8 +1201,6 @@ mod tests {
                     p,
                     std::ptr::null(),
                     std::ptr::null_mut(),
-                    0,
-                    0,
                     std::ptr::null(),
                     std::ptr::null_mut(),
                 ),
@@ -1031,15 +1244,8 @@ mod tests {
             assert!(!src.is_null() && !dst.is_null());
 
             let mut fence: *mut c_void = std::ptr::dangling_mut();
-            let rc = ef_image_processor_convert_fence_handle(
-                p,
-                src,
-                dst,
-                0,
-                0,
-                std::ptr::null(),
-                &mut fence,
-            );
+            let rc =
+                ef_image_processor_convert_fence_handle(p, src, dst, std::ptr::null(), &mut fence);
             assert_eq!(rc, 0, "a same-library fenced convert must succeed");
             assert!(
                 !fence.is_null(),

@@ -32,9 +32,7 @@
     feature = "opengl"
 ))]
 
-use edgefirst_image::{
-    CPUProcessor, Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation,
-};
+use edgefirst_image::{CPUProcessor, GLProcessorThreaded, ImageProcessorTrait};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory};
 
 const W: usize = 32;
@@ -127,13 +125,7 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
 
     let mut reference = rgba_dst();
     CPUProcessor::new()
-        .convert(
-            &src,
-            &mut reference,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
+        .convert(&src, &mut reference, None)
         .expect("CPU reference convert");
     let want = bytes(&reference);
     // Both converters read through `map()`, so agreement alone cannot tell
@@ -148,7 +140,7 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
     );
 
     let mut dst = rgba_dst();
-    gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+    gl.convert(&src, &mut dst, None)
         .expect("GL convert of an offset NV12 frame");
     let got = bytes(&dst);
 

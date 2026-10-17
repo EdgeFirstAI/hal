@@ -61,7 +61,7 @@
 //! Page faults during the hot loop indicate unexpected allocations.
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use std::time::Instant;
 
@@ -158,8 +158,12 @@ fn bench_pipeline(
         let _ = (info.width, info.height);
         let crop = Crop::letterbox([114, 114, 114, 255]);
 
-        proc.convert(input, output, Rotation::None, Flip::None, crop)
-            .unwrap();
+        proc.convert(
+            input,
+            output,
+            Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+        )
+        .unwrap();
         let t2 = Instant::now();
 
         decode_times.push(t1.duration_since(t0).as_micros() as u64);
@@ -308,8 +312,12 @@ fn main() {
             let info = input.load_image(&mut decoder, &image.data).unwrap();
             let _ = (info.width, info.height);
             let crop = Crop::letterbox([114, 114, 114, 255]);
-            proc.convert(&input, &mut output_packed, Rotation::None, Flip::None, crop)
-                .unwrap();
+            proc.convert(
+                &input,
+                &mut output_packed,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
         }
     }
     for image in &images {
@@ -317,8 +325,12 @@ fn main() {
             let info = input.load_image(&mut decoder, &image.data).unwrap();
             let _ = (info.width, info.height);
             let crop = Crop::letterbox([114, 114, 114, 255]);
-            proc.convert(&input, &mut output_planar, Rotation::None, Flip::None, crop)
-                .unwrap();
+            proc.convert(
+                &input,
+                &mut output_planar,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
         }
     }
     eprintln!("  Warmup complete — all buffers sized\n");

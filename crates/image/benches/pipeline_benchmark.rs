@@ -68,14 +68,22 @@ fn bench_letterbox(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &m
         };
 
         // Pre-flight: skip unsupported format combos for this backend
-        if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+        if let Err(e) = proc.convert(
+            &src,
+            &mut dst,
+            Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+        ) {
             println!("  {:50} [unsupported: {}]", name, e);
             continue;
         }
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                .unwrap();
+            proc.convert(
+                &src,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
         });
         result.print_summary_with_throughput(throughput);
         suite.record(&result);
@@ -119,14 +127,13 @@ fn bench_convert(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &mut
         };
 
         // Pre-flight: skip unsupported format combos for this backend
-        if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()) {
+        if let Err(e) = proc.convert(&src, &mut dst, None) {
             println!("  {:50} [unsupported: {}]", name, e);
             continue;
         }
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            proc.convert(&src, &mut dst, None).unwrap();
         });
         result.print_summary_with_throughput(throughput);
         suite.record(&result);
@@ -170,14 +177,13 @@ fn bench_resize(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &mut 
         };
 
         // Pre-flight: skip unsupported format combos for this backend
-        if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()) {
+        if let Err(e) = proc.convert(&src, &mut dst, None) {
             println!("  {:50} [unsupported: {}]", name, e);
             continue;
         }
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            proc.convert(&src, &mut dst, None).unwrap();
         });
         result.print_summary_with_throughput(throughput);
         suite.record(&result);
@@ -236,15 +242,23 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: us
                 continue;
             };
 
-            if let Err(e) = proc.convert(&src, &mut dst, *rotation, Flip::None, Crop::no_crop()) {
+            if let Err(e) = proc.convert(
+                &src,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().rotation(*rotation)),
+            ) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
 
             let throughput = (w * h * 2) as u64; // PixelFormat::Yuyv = 2 bytes/pixel
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                proc.convert(&src, &mut dst, *rotation, Flip::None, Crop::no_crop())
-                    .unwrap();
+                proc.convert(
+                    &src,
+                    &mut dst,
+                    Some(edgefirst_image::ConvertOptions::new().rotation(*rotation)),
+                )
+                .unwrap();
             });
             result.print_summary_with_throughput(throughput);
             suite.record(&result);
@@ -297,15 +311,23 @@ fn bench_flip(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: usiz
                 continue;
             };
 
-            if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, *flip, Crop::no_crop()) {
+            if let Err(e) = proc.convert(
+                &src,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().flip(*flip)),
+            ) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
 
             let throughput = (w * h * 2) as u64; // PixelFormat::Yuyv = 2 bytes/pixel
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                proc.convert(&src, &mut dst, Rotation::None, *flip, Crop::no_crop())
-                    .unwrap();
+                proc.convert(
+                    &src,
+                    &mut dst,
+                    Some(edgefirst_image::ConvertOptions::new().flip(*flip)),
+                )
+                .unwrap();
             });
             result.print_summary_with_throughput(throughput);
             suite.record(&result);
@@ -394,7 +416,11 @@ fn bench_letterbox_pipeline(
                 continue;
             };
 
-            if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+            if let Err(e) = proc.convert(
+                &src,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            ) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
@@ -402,8 +428,12 @@ fn bench_letterbox_pipeline(
             // Calculate correct throughput based on actual input format bytes
             let throughput = BenchConfig::new(w, h, 640, 640, *in_fmt, *out_fmt).throughput();
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                    .unwrap();
+                proc.convert(
+                    &src,
+                    &mut dst,
+                    Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+                )
+                .unwrap();
             });
             result.print_summary_with_throughput(throughput);
             suite.record(&result);

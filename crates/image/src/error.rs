@@ -37,6 +37,9 @@ pub enum Error {
     OpenGl(String),
     Internal(String),
     CropInvalid(String),
+    /// Convert options that cannot apply to the destination (normalization
+    /// coefficients, quantization).
+    InvalidOptions(String),
     ForcedBackendUnavailable(String),
     NoConverter,
     NotAnImage,

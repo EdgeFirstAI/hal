@@ -322,6 +322,11 @@ tests. All skip gracefully when the required hardware or capability is absent.
 | `convert_rgba_to_f16_cpu` / `*_falls_back` | GL absent or Vivante | CPU fallback engaged when GPU float unavailable |
 | `supported_render_dtypes_linux_smoke` | GL available (Linux) | `supported_render_dtypes()` reports real values on Linux |
 | `create_image_f32_dma_rejected` | Linux | `create_image(F32, Some(Dma))` → `NotSupported` |
+| `gl_norm_tests::gl_float_normalization_matches_cpu` | GL available | ImageNet / signed normalization, top-left letterbox and output-domain pad on F32 and F16 × NHWC and NCHW, GL against the CPU converter; fails if GL declines and the CPU converts |
+| `gl_norm_tests::gl_int_quantized_normalization_matches_cpu` | GL available | Quantized normalization into u8 and i8 (`Rgb`, `Rgba`, `PlanarRgb`), GL against the CPU converter; a pad whose channels differ on `PlanarRgb`; the plain i8 bias |
+| `gl_norm_tests::gl_nv12_float_output_pad_matches_cpu` | GL F16 NV→planar route (DMA-BUF boards) | NV12 → F16 `PlanarRgb` two-pass with top-left placement: the output-domain pad is exactly 0.0 |
+| `cpu::normalize::tests::*` | none (CPU) | NEON/scalar kernels against a scalar reference for every row length; every dtype × layout against an f64 reference; top-left placement with output pad; refusal without quantization |
+| `options::tests::*` | none | Output map resolution: default float and integer maps are the plain ones, channel order, quantization, presets |
 
 **Capability probe tool:** `crates/gpu-probe` (`cargo run -p gpu-probe --
 --probe-only`) measures per-target float render capability (texture FBO
