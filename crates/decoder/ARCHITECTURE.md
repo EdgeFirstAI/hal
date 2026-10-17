@@ -38,6 +38,9 @@ based on the output tensor layout.
 - [`Quantization`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Quantization.html) — `(scale, zero_point)` for int8/uint8 outputs.
 - [`Nms`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/configs/enum.Nms.html) — `Auto` / `ClassAgnostic` / `ClassAware`. Bypass is expressed as `Option<Nms>::None` on the decoder configuration, not a variant of the enum. `Auto` resolves at build time to the config's mode, else `ClassAware`; ModelPack and YOLO paths all honour the resolved mode.
 - [`SchemaV2`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.SchemaV2.html) — model metadata document (current schema version).
+  - `InputSpec::preprocessing` ([`Preprocessing`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.Preprocessing.html)) declares the input normalization (a `validation.normalization` preset or per-channel mean/std on 0–255), the resize mode and the letterbox placement and pad. `Normalization::mean_std` resolves either form to per-channel coefficients; the image crate applies them.
+  - `LogicalOutput::semantic` ([`SemanticParams`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.SemanticParams.html)) carries the `decoder: semantic` fields (`upsample`, `decode_mode`, `threshold`, `background_index`) and the reserved mask-classification fields. It is `#[serde(flatten)]`, so the JSON keys sit directly on the output.
+  - `DecoderKind::Semantic`, `LogicalType::ClassLogits`/`MaskLogits` and `DimName::NumQueries` parse and validate but have no legacy v1 lowering: `to_legacy_config_outputs` returns `NotSupported` for them, and `DecoderKind::to_v1` returns `None` for `Semantic`.
 
 ## Internal Architecture
 

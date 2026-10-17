@@ -85,6 +85,7 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
 #define EF_INFER_DTYPE_UINT32 0x105
 #define EF_INFER_DTYPE_FLOAT16 0x106
 #define EF_INFER_DTYPE_FLOAT32 0x107
+#define EF_INFER_DTYPE_INT64 0x108
 
 
 /* Generated with cbindgen:0.29.4 */

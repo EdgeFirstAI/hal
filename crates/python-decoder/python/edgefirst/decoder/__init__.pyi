@@ -913,8 +913,8 @@ def infer_ultralytics_schema(
 
     Note:
         Supported dtype strings are ``"int8"``, ``"uint8"``, ``"int16"``,
-        ``"uint16"``, ``"int32"``, ``"uint32"``, ``"float16"`` and
-        ``"float32"``.
+        ``"uint16"``, ``"int32"``, ``"uint32"``, ``"float16"``,
+        ``"float32"`` and ``"int64"``.
 
         Shapes must be concrete. A model exported with ``dynamic=True``
         reports a symbolic dimension (``'batch'`` from ONNX, ``-1`` from

@@ -71,6 +71,7 @@ mod input_dims_from_spec_tests {
                 (DimName::NumFeatures, 3),
             ],
             cameraadaptor: None,
+            preprocessing: None,
         };
         assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
     }
@@ -81,6 +82,7 @@ mod input_dims_from_spec_tests {
             shape: vec![1, 480, 640, 3],
             dshape: vec![],
             cameraadaptor: None,
+            preprocessing: None,
         };
         assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
     }
@@ -99,6 +101,7 @@ mod input_dims_from_spec_tests {
                 (DimName::NumFeatures, 3), // overflow — index 2 ≥ shape.len()
             ],
             cameraadaptor: None,
+            preprocessing: None,
         };
         // First two dshape entries resolve via `shape.get()`; the third
         // is a no-op. Width/Height both resolved, so we expect Some.
@@ -118,6 +121,7 @@ mod input_dims_from_spec_tests {
                 (DimName::Width, 640),
             ],
             cameraadaptor: None,
+            preprocessing: None,
         };
         assert_eq!(input_dims_from_spec(&spec), None);
     }

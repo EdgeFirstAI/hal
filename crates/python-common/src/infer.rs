@@ -25,9 +25,10 @@ fn dtype_from_str(s: &str) -> PyResult<DType> {
         "uint32" => Ok(DType::Uint32),
         "float16" => Ok(DType::Float16),
         "float32" => Ok(DType::Float32),
+        "int64" => Ok(DType::Int64),
         other => Err(PyValueError::new_err(format!(
             "unknown dtype `{other}` (expected one of: int8, uint8, int16, \
-             uint16, int32, uint32, float16, float32)"
+             uint16, int32, uint32, float16, float32, int64)"
         ))),
     }
 }
