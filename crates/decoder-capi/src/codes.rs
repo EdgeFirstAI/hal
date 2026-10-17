@@ -36,6 +36,8 @@ pub enum EfNms {
 pub enum EfDecoderType {
     Ultralytics = 0,
     ModelPack = 1,
+    /// Generic semantic segmentation; not decoded by this HAL version.
+    Semantic = 2,
 }
 
 /// Ultralytics architecture, for `ef_decoder_params_set_decoder_version`.
@@ -80,6 +82,8 @@ pub enum EfDimName {
     /// An axis the decoder does not interpret. It never satisfies a
     /// required dimension.
     Unknown = 10,
+    /// Query axis of mask-classification outputs.
+    NumQueries = 11,
 }
 
 /// Overlap metric, for `ef_merge_config.metric`.
@@ -121,6 +125,7 @@ const _: () = {
 
     assert!(EfDecoderType::Ultralytics as u32 == DecoderType::Ultralytics.code());
     assert!(EfDecoderType::ModelPack as u32 == DecoderType::ModelPack.code());
+    assert!(EfDecoderType::Semantic as u32 == DecoderType::Semantic.code());
 
     assert!(EfDecoderVersion::Yolov5 as u32 == DecoderVersion::Yolov5.code());
     assert!(EfDecoderVersion::Yolov8 as u32 == DecoderVersion::Yolov8.code());
@@ -147,6 +152,7 @@ const _: () = {
     assert!(EfDimName::Padding as u32 == DimName::Padding.code());
     assert!(EfDimName::BoxCoords as u32 == DimName::BoxCoords.code());
     assert!(EfDimName::Unknown as u32 == DimName::Unknown.code());
+    assert!(EfDimName::NumQueries as u32 == DimName::NumQueries.code());
 
     assert!(EfMatchMetric::Iou as u32 == MatchMetric::Iou.code());
     assert!(EfMatchMetric::Ios as u32 == MatchMetric::Ios.code());
@@ -194,7 +200,7 @@ mod tests {
         assert_eq!(Nms::all().len(), 3, "add the EfNms enumerator");
         assert_eq!(
             DecoderType::all().len(),
-            2,
+            3,
             "add the EfDecoderType enumerator"
         );
         assert_eq!(
@@ -207,7 +213,7 @@ mod tests {
             8,
             "add the EfOutputType enumerator"
         );
-        assert_eq!(DimName::all().len(), 11, "add the EfDimName enumerator");
+        assert_eq!(DimName::all().len(), 12, "add the EfDimName enumerator");
         assert_eq!(
             MatchMetric::all().len(),
             2,
@@ -277,8 +283,8 @@ mod tests {
     #[test]
     fn unknown_option_codes_decode_to_nothing() {
         assert_eq!(Nms::from_option_code(4), None);
-        assert_eq!(DecoderType::from_code(2), None);
-        assert_eq!(DimName::from_code(11), None);
+        assert_eq!(DecoderType::from_code(3), None);
+        assert_eq!(DimName::from_code(12), None);
         assert_eq!(DecoderVersion::from_code(4), None);
         assert_eq!(OutputType::from_code(8), None);
         assert_eq!(MatchMetric::from_code(2), None);

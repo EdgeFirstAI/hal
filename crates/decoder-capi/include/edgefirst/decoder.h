@@ -62,8 +62,8 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
  *
  * Aliases of `edgefirst/tensor.h`'s `EF_DTYPE_*`: dtype has one numbering
  * across the stack, so a caller may pass the `EF_DTYPE_*` it already holds.
- * A model's logical I/O carries no 64-bit dtypes, so `EF_DTYPE_U64`,
- * `EF_DTYPE_I64` and `EF_DTYPE_F64` are refused with `EINVAL`.
+ * A model's logical I/O carries no `u64` or `f64`, so `EF_DTYPE_U64` and
+ * `EF_DTYPE_F64` are refused with `EINVAL`.
  */
 #define EF_INFER_DTYPE_INT8 EF_DTYPE_I8
 #define EF_INFER_DTYPE_UINT8 EF_DTYPE_U8
@@ -73,6 +73,7 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
 #define EF_INFER_DTYPE_UINT32 EF_DTYPE_U32
 #define EF_INFER_DTYPE_FLOAT16 EF_DTYPE_F16
 #define EF_INFER_DTYPE_FLOAT32 EF_DTYPE_F32
+#define EF_INFER_DTYPE_INT64 EF_DTYPE_I64
 
 
 /* Generated with cbindgen:0.29.4 */
@@ -127,6 +128,10 @@ enum ef_decoder_type
  {
   EF_DECODER_TYPE_ULTRALYTICS = 0,
   EF_DECODER_TYPE_MODEL_PACK = 1,
+  /**
+   * Generic semantic segmentation; not decoded by this HAL version.
+   */
+  EF_DECODER_TYPE_SEMANTIC = 2,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -208,6 +213,10 @@ enum ef_dim_name
    * required dimension.
    */
   EF_DIM_NAME_UNKNOWN = 10,
+  /**
+   * Query axis of mask-classification outputs.
+   */
+  EF_DIM_NAME_NUM_QUERIES = 11,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -850,8 +859,8 @@ void ef_infer_signals_free(struct ef_infer_signals *s);
 
 /**
  * Append an input tensor. `dtype` is an `EF_DTYPE_*` code from
- * `edgefirst/tensor.h` (`EF_INFER_DTYPE_*` are aliases of them); the
- * 64-bit dtypes and unknown codes are `EINVAL`.
+ * `edgefirst/tensor.h` (`EF_INFER_DTYPE_*` are aliases of them); `u64`,
+ * `f64` and unknown codes are `EINVAL`.
  *
  * @return 0 on success, `EINVAL` for a null/invalid argument.
  *

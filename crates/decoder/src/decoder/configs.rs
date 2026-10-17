@@ -207,6 +207,10 @@ edgefirst_tensor::ef_vocabulary! {
         Padding = 8, "padding", PADDING,
         #[serde(rename = "box_coords")]
         BoxCoords = 9, "box_coords", BOX_COORDS,
+        /// Query axis of mask-classification outputs (`class_logits`,
+        /// `mask_logits`).
+        #[serde(rename = "num_queries")]
+        NumQueries = 11, "num_queries", NUM_QUERIES,
         /// Any axis name the HAL does not recognise (e.g. a producer's
         /// `channels` on the input dshape). Preserved so the dshape length still
         /// matches the shape and the axis sorts to the canonical tail in
@@ -245,6 +249,9 @@ edgefirst_tensor::ef_vocabulary! {
         Ultralytics = 0, "ultralytics", ULTRALYTICS,
         #[serde(rename = "modelpack")]
         ModelPack = 1, "modelpack", MODELPACK,
+        /// Generic semantic segmentation (per-pixel scores or class map).
+        #[serde(rename = "semantic")]
+        Semantic = 2, "semantic", SEMANTIC,
     }
     #[doc(hidden)]
     pub mod decoder_type_code;

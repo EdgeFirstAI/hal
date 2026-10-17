@@ -89,8 +89,8 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
  *
  * Aliases of `edgefirst/tensor.h`'s `EF_DTYPE_*`: dtype has one numbering
  * across the stack, so a caller may pass the `EF_DTYPE_*` it already holds.
- * A model's logical I/O carries no 64-bit dtypes, so `EF_DTYPE_U64`,
- * `EF_DTYPE_I64` and `EF_DTYPE_F64` are refused with `EINVAL`.
+ * A model's logical I/O carries no `u64` or `f64`, so `EF_DTYPE_U64` and
+ * `EF_DTYPE_F64` are refused with `EINVAL`.
  */
 #define EF_INFER_DTYPE_INT8 EF_DTYPE_I8
 #define EF_INFER_DTYPE_UINT8 EF_DTYPE_U8
@@ -100,6 +100,7 @@ typedef struct ef_decoder_track_list ef_decoder_track_list;
 #define EF_INFER_DTYPE_UINT32 EF_DTYPE_U32
 #define EF_INFER_DTYPE_FLOAT16 EF_DTYPE_F16
 #define EF_INFER_DTYPE_FLOAT32 EF_DTYPE_F32
+#define EF_INFER_DTYPE_INT64 EF_DTYPE_I64
 """
 
 trailer = """

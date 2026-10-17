@@ -726,6 +726,7 @@ fn default_logical() -> LogicalOutput {
         outputs: Vec::new(),
         activation_applied: None,
         activation_required: None,
+        semantic: Default::default(),
     }
 }
 
@@ -1025,6 +1026,7 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
         outputs: Vec::new(),
         activation_applied: None,
         activation_required: None,
+        semantic: Default::default(),
     };
 
     let mut outputs = vec![det];
@@ -1047,6 +1049,7 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
             shape: input.shape.clone(),
             dshape: input_dshape,
             cameraadaptor: Some("rgb".into()),
+            preprocessing: None,
         }),
         outputs,
         // Ultralytics runs NMS with `agnostic=False`, i.e. class-aware; stated

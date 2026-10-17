@@ -77,11 +77,14 @@ pub enum PyDecoderType {
     Ultralytics = 0,
     /// ModelPack models
     ModelPack = 1,
+    /// Generic semantic segmentation (not decoded by this HAL version)
+    Semantic = 2,
 }
 
 const _: () = {
     assert!(PyDecoderType::Ultralytics as u32 == configs::DecoderType::Ultralytics.code());
     assert!(PyDecoderType::ModelPack as u32 == configs::DecoderType::ModelPack.code());
+    assert!(PyDecoderType::Semantic as u32 == configs::DecoderType::Semantic.code());
 };
 
 /// Single-package; see `PyNms`'s `__hash__` comment for why this is still
@@ -98,6 +101,7 @@ impl From<PyDecoderType> for configs::DecoderType {
         match py {
             PyDecoderType::Ultralytics => configs::DecoderType::Ultralytics,
             PyDecoderType::ModelPack => configs::DecoderType::ModelPack,
+            PyDecoderType::Semantic => configs::DecoderType::Semantic,
         }
     }
 }
@@ -107,6 +111,7 @@ impl From<configs::DecoderType> for PyDecoderType {
         match dt {
             configs::DecoderType::Ultralytics => PyDecoderType::Ultralytics,
             configs::DecoderType::ModelPack => PyDecoderType::ModelPack,
+            configs::DecoderType::Semantic => PyDecoderType::Semantic,
         }
     }
 }
@@ -194,6 +199,8 @@ pub enum PyDimName {
     Padding = 8,
     /// Box coordinate dimension (typically 4)
     BoxCoords = 9,
+    /// Query axis of mask-classification outputs
+    NumQueries = 11,
 }
 
 // `DimName.Unknown` (code 10) is not exposed: Python callers name only the
@@ -210,6 +217,7 @@ const _: () = {
     assert!(PyDimName::NumAnchorsXFeatures as u32 == DimName::NumAnchorsXFeatures.code());
     assert!(PyDimName::Padding as u32 == DimName::Padding.code());
     assert!(PyDimName::BoxCoords as u32 == DimName::BoxCoords.code());
+    assert!(PyDimName::NumQueries as u32 == DimName::NumQueries.code());
 };
 
 /// Single-package; see `PyNms`'s `__hash__` comment.
@@ -233,6 +241,7 @@ impl From<PyDimName> for configs::DimName {
             PyDimName::NumAnchorsXFeatures => configs::DimName::NumAnchorsXFeatures,
             PyDimName::Padding => configs::DimName::Padding,
             PyDimName::BoxCoords => configs::DimName::BoxCoords,
+            PyDimName::NumQueries => configs::DimName::NumQueries,
         }
     }
 }

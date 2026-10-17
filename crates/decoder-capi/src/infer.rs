@@ -29,7 +29,7 @@ pub struct EfInferredSchema {
 }
 
 /// Maps an `EF_DTYPE_*` code (`edgefirst/tensor.h`) to the model I/O dtype.
-/// The 64-bit tensor dtypes are not model I/O dtypes and map to `None`.
+/// `u64` and `f64` are not model I/O dtypes and map to `None`.
 pub(crate) fn dtype_from(code: u32) -> Option<DType> {
     DType::from_code(code)
 }
@@ -84,8 +84,8 @@ where
 }
 
 /// Append an input tensor. `dtype` is an `EF_DTYPE_*` code from
-/// `edgefirst/tensor.h` (`EF_INFER_DTYPE_*` are aliases of them); the
-/// 64-bit dtypes and unknown codes are `EINVAL`.
+/// `edgefirst/tensor.h` (`EF_INFER_DTYPE_*` are aliases of them); `u64`,
+/// `f64` and unknown codes are `EINVAL`.
 ///
 /// @return 0 on success, `EINVAL` for a null/invalid argument.
 ///
@@ -591,8 +591,8 @@ mod tests {
     #[test]
     fn the_dtype_code_is_the_tensor_dtype_code() {
         // One numbering for dtype across the stack: a caller passes the
-        // `EF_DTYPE_*` it already holds. Model I/O carries no 64-bit
-        // dtypes, so those are refused rather than narrowed.
+        // `EF_DTYPE_*` it already holds. Model I/O carries no `u64` or
+        // `f64`, so those are refused rather than narrowed.
         unsafe {
             let s = ef_infer_signals_new(EfModelSource::Onnx as u32);
             let name = CString::new("x").unwrap();
@@ -625,6 +625,7 @@ mod tests {
             ("EF_INFER_DTYPE_UINT32", DType::Uint32),
             ("EF_INFER_DTYPE_FLOAT16", DType::Float16),
             ("EF_INFER_DTYPE_FLOAT32", DType::Float32),
+            ("EF_INFER_DTYPE_INT64", DType::Int64),
         ];
         assert_eq!(expected.len(), DType::all().len(), "name every model dtype");
         for (name, want) in expected {
