@@ -48,6 +48,15 @@ extern "C" {
  */
 typedef struct ef_image_processor ef_image_processor;
 
+/**
+ * @brief Opaque convert options.
+ *
+ * Built with `ef_convert_options_new` and the `ef_convert_options_set_*`
+ * setters, freed with `ef_convert_options_free`. `NULL` where options are
+ * accepted means the defaults.
+ */
+typedef struct ef_convert_options ef_convert_options;
+
 /** @brief An owned list of materialized masks. */
 typedef struct ef_mask_list ef_mask_list;
 
@@ -202,28 +211,63 @@ typedef uint32_t ef_compute_backend;
 #endif // __cplusplus
 
 /**
- * Geometry for a convert: source rectangle and letterbox padding.
- *
- * `NULL` anywhere one is accepted means the whole source, stretched to fill.
+ * Where a letterboxed image sits, for `ef_convert_options_set_letterbox_placement`.
  */
-typedef struct ef_crop {
+enum ef_letterbox_placement
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
   /**
-   * Source rectangle in pixels. A zero `width` or `height` means the whole
-   * source, so a zeroed struct is the same as passing `NULL`.
+   * Centred, padding split between both sides.
    */
-  uint32_t x;
-  uint32_t y;
-  uint32_t width;
-  uint32_t height;
+  EF_LETTERBOX_PLACEMENT_CENTER = 0,
   /**
-   * Non-zero to preserve aspect ratio, padding the remainder.
+   * Anchored at the top-left corner, padding on the right and bottom.
    */
-  int letterbox;
+  EF_LETTERBOX_PLACEMENT_TOP_LEFT = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_letterbox_placement ef_letterbox_placement;
+#else
+typedef uint32_t ef_letterbox_placement;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A named normalization, `(x - mean) / std` on 0-255 values, for
+ * `ef_convert_options_set_normalization_preset`.
+ */
+enum ef_normalization
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
   /**
-   * Letterbox fill colour, RGBA. Ignored unless `letterbox` is set.
+   * `x / 255`, giving `[0, 1]`.
    */
-  uint8_t pad[4];
-} ef_crop;
+  EF_NORMALIZATION_UNSIGNED = 0,
+  /**
+   * `x / 127.5 - 1`, giving `[-1, 1]`.
+   */
+  EF_NORMALIZATION_SIGNED = 1,
+  /**
+   * `x`, giving `[0, 255]`.
+   */
+  EF_NORMALIZATION_RAW = 2,
+  /**
+   * ImageNet mean and standard deviation.
+   */
+  EF_NORMALIZATION_IMAGENET = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_normalization ef_normalization;
+#else
+typedef uint32_t ef_normalization;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * Static tiling configuration. Seed with [`ef_tiling_config_default`].
@@ -259,6 +303,12 @@ extern "C" {
 
 /**
  * ABI version of this library's C surface.
+ *
+ * 3: the convert functions take a `const ef_convert_options *` (built with
+ * the `ef_convert_options_*` setters) in place of `rotation`, `flip` and a
+ * `const ef_crop *`, and `ef_crop` is gone. A caller built against
+ * generation 2 fails to compile; one linked against it passes arguments the
+ * functions no longer read the same way.
  *
  * 2: an unknown `color_mode` passed to `ef_image_processor_draw_decoded_masks`
  * or `ef_image_processor_draw_proto_masks` returns `EINVAL` (it was drawn as
@@ -414,17 +464,123 @@ ef_tensor *ef_image_processor_create_image_desc(ef_image_processor *p,
                                                 const ef_tensor_image_desc *d);
 
 /**
+ * New default convert options. `NULL` on allocation failure. Free with
+ * [`ef_convert_options_free`].
+ */
+ef_convert_options *ef_convert_options_new(void);
+
+/**
+ * Free options from [`ef_convert_options_new`]. `NULL` is a no-op.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle, not used afterwards.
+ */
+void ef_convert_options_free(ef_convert_options *o);
+
+/**
+ * Rotate the output: an `EF_ROTATION_*` code.
+ *
+ * @return 0, or `EINVAL` for an unknown code or `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle.
+ */
+int ef_convert_options_set_rotation(ef_convert_options *o, uint32_t rotation);
+
+/**
+ * Flip the output: an `EF_FLIP_*` code.
+ *
+ * @return 0, or `EINVAL` for an unknown code or `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle.
+ */
+int ef_convert_options_set_flip(ef_convert_options *o, uint32_t flip);
+
+/**
+ * Sample only this rectangle of the source, in pixels. A zero `width` or
+ * `height` samples the whole source.
+ *
+ * @return 0, or `EINVAL` for `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle.
+ */
+int ef_convert_options_set_source(ef_convert_options *o,
+                                  uint32_t x,
+                                  uint32_t y,
+                                  uint32_t width,
+                                  uint32_t height);
+
+/**
+ * Letterbox: keep the source aspect ratio and pad the rest with the RGBA
+ * pixel `pad`, mapped like the image. `NULL` stretches instead.
+ *
+ * @return 0, or `EINVAL` for a `NULL` handle.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle; `pad` `NULL` or four bytes.
+ */
+int ef_convert_options_set_letterbox(ef_convert_options *o, const uint8_t *pad);
+
+/**
+ * Where a letterboxed image sits: an `EF_LETTERBOX_PLACEMENT_*` code.
+ *
+ * @return 0, or `EINVAL` for an unknown code or `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle.
+ */
+int ef_convert_options_set_letterbox_placement(ef_convert_options *o, uint32_t placement);
+
+/**
+ * Pad a letterbox with these four values as written to the destination
+ * (after normalization; quantized for integer destinations) instead of
+ * mapping the pixel pad.
+ *
+ * @return 0, or `EINVAL` for `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle; `pad` must be four floats.
+ */
+int ef_convert_options_set_pad_output(ef_convert_options *o, const float *pad);
+
+/**
+ * Normalize with a preset: an `EF_NORMALIZATION_*` code.
+ *
+ * @return 0, or `EINVAL` for an unknown code or `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle.
+ */
+int ef_convert_options_set_normalization_preset(ef_convert_options *o, uint32_t preset);
+
+/**
+ * Normalize as `(x - mean) / std` on 0-255 values, `n` values each: 1 for
+ * every channel or 3 for RGB.
+ *
+ * @return 0, or `EINVAL` for `NULL`, another `n`, a non-finite mean or a
+ * zero or non-finite std.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle; `mean` and `std` must hold `n` floats.
+ */
+int ef_convert_options_set_normalization(ef_convert_options *o,
+                                         const float *mean,
+                                         const float *std,
+                                         uintptr_t n);
+
+/**
  * Convert `src` into `dst`, scaling, converting colour and rotating as needed.
  *
  * `src`/`dst` may have been minted by any EdgeFirst library -- every library
  * links the same shared tensor implementation, so both are read the same
- * way regardless of which one minted them. `crop` may be `NULL` for the
- * whole source.
+ * way regardless of which one minted them. `options` may be `NULL` for the
+ * defaults.
  *
- * `rotation` is an `EF_ROTATION_*` code and `flip` an `EF_FLIP_*` code; any
- * other value is `EINVAL`, checked before any work.
- *
- * @return 0 on success, otherwise an errno.
+ * @return 0 on success, `EINVAL` for options that cannot apply to `dst`
+ * (such as a normalization on an integer destination without quantization),
+ * otherwise an errno.
  *
  * # Safety
  * `p`, `src` and `dst` must be live handles.
@@ -432,13 +588,10 @@ ef_tensor *ef_image_processor_create_image_desc(ef_image_processor *p,
 int ef_image_processor_convert(ef_image_processor *p,
                                const ef_tensor *src,
                                ef_tensor *dst,
-                               uint32_t rotation,
-                               uint32_t flip,
-                               const struct ef_crop *crop);
+                               const ef_convert_options *options);
 
 /**
  * Like [`ef_image_processor_convert`], but does not wait for the GPU.
- * `rotation` and `flip` are validated the same way.
  *
  * # Safety
  * `p`, `src` and `dst` must be live handles.
@@ -446,9 +599,7 @@ int ef_image_processor_convert(ef_image_processor *p,
 int ef_image_processor_convert_deferred(ef_image_processor *p,
                                         const ef_tensor *src,
                                         ef_tensor *dst,
-                                        uint32_t rotation,
-                                        uint32_t flip,
-                                        const struct ef_crop *crop);
+                                        const ef_convert_options *options);
 
 /**
  * DMA-BUF row pitch alignment the GL backend requires, in bytes.
@@ -529,7 +680,7 @@ int ef_image_processor_flush(ef_image_processor *p);
  * therefore completed synchronously — in which case the destination is already
  * safe to read.
  *
- * `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
+ * `options` as for [`ef_image_processor_convert`].
  *
  * @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
  *
@@ -539,9 +690,7 @@ int ef_image_processor_flush(ef_image_processor *p);
 int ef_image_processor_convert_fence(ef_image_processor *p,
                                      const ef_tensor *src,
                                      ef_tensor *dst,
-                                     uint32_t rotation,
-                                     uint32_t flip,
-                                     const struct ef_crop *crop,
+                                     const ef_convert_options *options,
                                      int *fence_fd);
 
 /**
@@ -552,7 +701,7 @@ int ef_image_processor_convert_fence(ef_image_processor *p,
  * closes it with `CloseHandle`. `*fence` is `NULL` when the convert
  * completed synchronously (no fence on this display).
  *
- * `rotation` and `flip` are validated as by [`ef_image_processor_convert`].
+ * `options` as for [`ef_image_processor_convert`].
  *
  * @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
  *
@@ -562,9 +711,7 @@ int ef_image_processor_convert_fence(ef_image_processor *p,
 int ef_image_processor_convert_fence_handle(ef_image_processor *p,
                                             const ef_tensor *src,
                                             ef_tensor *dst,
-                                            uint32_t rotation,
-                                            uint32_t flip,
-                                            const struct ef_crop *crop,
+                                            const ef_convert_options *options,
                                             void **fence);
 
 /**

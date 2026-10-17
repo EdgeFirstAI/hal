@@ -99,6 +99,7 @@ mod shaders_common;
 //   cfg(all(linux, dma_test_formats)) — DMA-BUF import/pool specifics
 // Per-item cfg gates inside the module select the tier; the mount
 // itself is unconditional so the macOS lane runs the portable tier.
+mod norm_tests;
 mod tests;
 mod threaded;
 

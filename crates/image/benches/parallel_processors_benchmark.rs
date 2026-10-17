@@ -31,7 +31,7 @@
 mod common;
 
 use edgefirst_bench::{BenchResult, BenchSuite};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{DType, PixelFormat, TensorMemory, TensorTrait};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -199,8 +199,12 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                     )
                     .map_err(|e| format!("dst alloc failed: {e}"))?;
                 let convert_once = |proc: &mut ImageProcessor, dst: &mut _| -> Result<(), String> {
-                    proc.convert(&src, dst, Rotation::None, Flip::None, crop)
-                        .map_err(|e| format!("convert failed: {e}"))?;
+                    proc.convert(
+                        &src,
+                        dst,
+                        Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+                    )
+                    .map_err(|e| format!("convert failed: {e}"))?;
                     Ok(())
                 };
 

@@ -14,8 +14,8 @@
 //! coordinates and merged by `edgefirst_decoder::tiling`; the shared
 //! [`TilePlacement`] is produced here and consumed there.
 
+use crate::Error;
 use crate::{Crop, Fit, ImageProcessor, ImageProcessorTrait, Result};
-use crate::{Error, Flip, Rotation};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
 pub use edgefirst_decoder_abi::TilePlacement;
@@ -170,7 +170,15 @@ fn placement_letterbox(
     tile_w: usize,
     tile_h: usize,
 ) -> Option<[f32; 4]> {
-    let resolved = crop.resolve(src_w, src_h, tile_w, tile_h).ok()?;
+    let resolved = crop
+        .resolve(
+            src_w,
+            src_h,
+            tile_w,
+            tile_h,
+            crate::LetterboxPlacement::Center,
+        )
+        .ok()?;
     resolved.dst_rect.map(|r| {
         let (dw, dh) = (tile_w as f32, tile_h as f32);
         [
@@ -397,9 +405,13 @@ impl ImageProcessor {
                 cfg.tile_w,
                 cfg.tile_h,
             ))?;
-            self.convert_deferred(src, &mut band, Rotation::None, Flip::None, crop)?;
+            self.convert_deferred(
+                src,
+                &mut band,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )?;
         } else {
-            self.convert_deferred(src, dst, Rotation::None, Flip::None, crop)?;
+            self.convert_deferred(src, dst, Some(crate::ConvertOptions::new().crop(crop)))?;
         }
         Ok(())
     }

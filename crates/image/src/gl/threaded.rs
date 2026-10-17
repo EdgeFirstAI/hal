@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{Sender, WeakSender};
 use super::processor::GLProcessorST;
 use super::shaders::check_gl_error;
 use super::{EglDisplayKind, Int8InterpolationMode, TransferBackend};
-use crate::{Crop, Error, Flip, ImageProcessorTrait, Rotation};
+use crate::{ConvertOptions, Error, ImageProcessorTrait};
 use edgefirst_tensor::TensorDyn;
 
 #[allow(clippy::type_complexity)]
@@ -18,9 +18,7 @@ enum GLProcessorMessage {
     ImageConvert(
         SendablePtr<TensorDyn>,
         SendablePtr<TensorDyn>,
-        Rotation,
-        Flip,
-        Crop,
+        ConvertOptions,
         bool, // defer: skip the per-tile glFinish (batch); flush syncs once
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
@@ -30,9 +28,7 @@ enum GLProcessorMessage {
     ImageConvertFenced(
         SendablePtr<TensorDyn>,
         SendablePtr<TensorDyn>,
-        Rotation,
-        Flip,
-        Crop,
+        ConvertOptions,
         tokio::sync::oneshot::Sender<Result<Option<super::CompletionFence>, Error>>,
     ),
     /// Complete any deferred batch render with a single GPU sync.
@@ -745,25 +741,11 @@ fn handle_gl_message(
     poisoned: &mut bool,
 ) {
     match msg {
-        GLProcessorMessage::ImageConvert(src, dst, rotation, flip, crop, defer, resp) => {
-            handle_image_convert(
-                src,
-                dst,
-                (rotation, flip, crop, defer),
-                resp,
-                gl_converter,
-                poisoned,
-            );
+        GLProcessorMessage::ImageConvert(src, dst, options, defer, resp) => {
+            handle_image_convert(src, dst, (options, defer), resp, gl_converter, poisoned);
         }
-        GLProcessorMessage::ImageConvertFenced(src, dst, rotation, flip, crop, resp) => {
-            handle_image_convert_fenced(
-                src,
-                dst,
-                (rotation, flip, crop),
-                resp,
-                gl_converter,
-                poisoned,
-            );
+        GLProcessorMessage::ImageConvertFenced(src, dst, options, resp) => {
+            handle_image_convert_fenced(src, dst, options, resp, gl_converter, poisoned);
         }
         GLProcessorMessage::Flush(resp) => {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| gl_converter.flush()));
@@ -892,12 +874,12 @@ fn handle_gl_message(
 fn handle_image_convert(
     src: SendablePtr<TensorDyn>,
     mut dst: SendablePtr<TensorDyn>,
-    geom: (Rotation, Flip, Crop, bool),
+    geom: (ConvertOptions, bool),
     resp: tokio::sync::oneshot::Sender<Result<(), Error>>,
     gl_converter: &mut GLProcessorST,
     poisoned: &mut bool,
 ) {
-    let (rotation, flip, crop, defer) = geom;
+    let (options, defer) = geom;
     // SAFETY: This is safe because the convert() function waits for the resp to
     // be sent before dropping the borrow for src and dst
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -907,9 +889,9 @@ fn handle_image_convert(
         // leaves a single sync owed at Flush; an eager convert
         // finishes as usual.
         if defer {
-            gl_converter.convert_deferred(src, dst, rotation, flip, crop)
+            gl_converter.convert_deferred(src, dst, Some(options))
         } else {
-            gl_converter.convert(src, dst, rotation, flip, crop)
+            gl_converter.convert(src, dst, Some(options))
         }
     }));
     reply_caught(result, resp, poisoned, "ImageConvert");
@@ -918,18 +900,17 @@ fn handle_image_convert(
 fn handle_image_convert_fenced(
     src: SendablePtr<TensorDyn>,
     mut dst: SendablePtr<TensorDyn>,
-    geom: (Rotation, Flip, Crop),
+    options: ConvertOptions,
     resp: tokio::sync::oneshot::Sender<Result<Option<super::CompletionFence>, Error>>,
     gl_converter: &mut GLProcessorST,
     poisoned: &mut bool,
 ) {
-    let (rotation, flip, crop) = geom;
     // SAFETY: as ImageConvert — convert_with_fence()
     // blocks on the reply before the borrows drop.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let src = unsafe { src.ptr.as_ref() };
         let dst = unsafe { dst.ptr.as_mut() };
-        gl_converter.convert_fenced(src, dst, rotation, flip, crop)
+        gl_converter.convert_fenced(src, dst, options)
     }));
     reply_caught(result, resp, poisoned, "ImageConvertFenced");
 }
@@ -1199,10 +1180,9 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: Option<ConvertOptions>,
     ) -> crate::Result<()> {
+        let options = options.unwrap_or_default();
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
@@ -1216,9 +1196,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::from(dst),
                     len: 1,
                 },
-                rotation,
-                flip,
-                crop,
+                options,
                 false, // eager: finish per convert
                 err_send,
             ))
@@ -1232,10 +1210,9 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: Option<ConvertOptions>,
     ) -> crate::Result<()> {
+        let options = options.unwrap_or_default();
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
@@ -1249,9 +1226,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::from(dst),
                     len: 1,
                 },
-                rotation,
-                flip,
-                crop,
+                options,
                 true, // defer: skip glFinish; flush() syncs the batch once
                 err_send,
             ))
@@ -1460,15 +1435,14 @@ impl GLProcessorThreaded {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: Option<ConvertOptions>,
     ) -> Result<Option<super::CompletionFence>, Error> {
+        let options = options.unwrap_or_default();
         use crate::ImageProcessorTrait as _;
         if !self.caps.native_fence_sync {
             // No fence on this display: the plain blocking convert IS the
             // fenced contract with `None` — skip the special round-trip.
-            self.convert(src, dst, rotation, flip, crop)?;
+            self.convert(src, dst, Some(options))?;
             return Ok(None);
         }
         let (send, recv) = tokio::sync::oneshot::channel();
@@ -1484,9 +1458,7 @@ impl GLProcessorThreaded {
                     ptr: NonNull::from(dst),
                     len: 1,
                 },
-                rotation,
-                flip,
-                crop,
+                options,
                 send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;

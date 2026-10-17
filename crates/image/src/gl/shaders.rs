@@ -189,16 +189,20 @@ in vec2 tc;
 
 out vec4 color;
 
-// XOR 0x80 bias: quantize to uint8, add 128 mod 256, normalize back.
-// This matches the CPU `byte ^ 0x80` operation exactly.
-vec3 int8_bias(vec3 v) {
-    vec3 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
+uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
+uniform highp vec3 q_offset;
+uniform highp vec3 q_lo;
+uniform highp vec3 q_hi;
+uniform highp vec3 q_zero;    // zero point / 255; q_wrap marks a negative stored value
+uniform highp vec3 q_wrap;
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
+    return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
 
 void main(){
     vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
-    color = vec4(int8_bias(c.rgb), c.a);
+    color = vec4(quantize(c.rgb), c.a);
 }
 "
 }
@@ -219,14 +223,20 @@ in vec2 tc;
 
 out vec4 color;
 
-vec3 int8_bias(vec3 v) {
-    vec3 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
+uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
+uniform highp vec3 q_offset;
+uniform highp vec3 q_lo;
+uniform highp vec3 q_hi;
+uniform highp vec3 q_zero;    // zero point / 255; q_wrap marks a negative stored value
+uniform highp vec3 q_wrap;
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
+    return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
 
 void main(){
     vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
-    color = vec4(int8_bias(c.rgb), c.a);
+    color = vec4(quantize(c.rgb), c.a);
 }
 "
 }
@@ -247,14 +257,20 @@ in vec2 tc;
 
 out vec4 color;
 
-vec3 int8_bias(vec3 v) {
-    vec3 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
+uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
+uniform highp vec3 q_offset;
+uniform highp vec3 q_lo;
+uniform highp vec3 q_hi;
+uniform highp vec3 q_zero;    // zero point / 255; q_wrap marks a negative stored value
+uniform highp vec3 q_wrap;
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
+    return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
 
 void main(){
     vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
-    color = vec4(int8_bias(c.rgb), c.a);
+    color = vec4(quantize(c.rgb), c.a);
 }
 "
 }
@@ -291,14 +307,20 @@ in vec2 tc;
 
 out vec4 color;
 
-vec3 int8_bias(vec3 v) {
-    vec3 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
+uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
+uniform highp vec3 q_offset;
+uniform highp vec3 q_lo;
+uniform highp vec3 q_hi;
+uniform highp vec3 q_zero;    // zero point / 255; q_wrap marks a negative stored value
+uniform highp vec3 q_wrap;
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
+    return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
 
 void main(){
     vec4 c = texture(tex, tc);
-    color = vec4(int8_bias(c.rgb), c.a);
+    color = vec4(quantize(c.rgb), c.a);
 }
 "
 }
@@ -631,7 +653,9 @@ uniform sampler2D u_tex;        // RGBA8 source, normalized fetch -> [0,1]
 uniform vec4 src_rect_uv;       // (origin_u, origin_v, size_u, size_v)
 uniform vec4 src_extent;        // (u_min, v_min, u_max, v_max) a sample may reach
 uniform vec4 dst_rect_px;       // (origin_x, origin_y, w, h) in pixel space
-uniform vec4 pad_color;         // per-channel normalized pad value (RGBA)
+uniform vec4 pad_color;         // per-channel pad value as written (RGBA)
+uniform vec4 norm_scale;        // output = sample * norm_scale + norm_offset
+uniform vec4 norm_offset;
 out float frag_value;
 void main() {
     int ox = int(gl_FragCoord.x);
@@ -652,7 +676,7 @@ void main() {
     float v = (float(py) + 0.5 - dst_rect_px.y) / dst_rect_px.w;
     vec2 src_uv = clamp(src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw,
                         src_extent.xy, src_extent.zw);
-    vec4 rgba = texture(u_tex, src_uv);
+    vec4 rgba = texture(u_tex, src_uv) * norm_scale + norm_offset;
     frag_value = (channel == 0) ? rgba.r
                : (channel == 1) ? rgba.g : rgba.b;
 }
@@ -768,9 +792,15 @@ precision highp int;
 uniform sampler2D tex;
 out vec4 color;
 
-vec4 int8_bias(vec4 v) {
-    vec4 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
+uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
+uniform highp vec3 q_offset;
+uniform highp vec3 q_lo;
+uniform highp vec3 q_hi;
+uniform highp vec3 q_zero;    // zero point / 255; q_wrap marks a negative stored value
+uniform highp vec3 q_wrap;
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
+    return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
 
 void main() {
@@ -786,12 +816,15 @@ void main() {
     vec4 s1 = (px1 != px0) ? texelFetch(tex, ivec2(px1, out_y), 0) : s0;
     // Extract channels based on phase (base % 3), then apply int8 bias
     int phase = base - px0 * 3;
+    // Quantize per pixel: a packed texel mixes channels by phase.
+    vec3 q0 = quantize(s0.rgb);
+    vec3 q1 = quantize(s1.rgb);
     if (phase == 0) {
-        color = int8_bias(vec4(s0.r, s0.g, s0.b, s1.r));
+        color = vec4(q0.r, q0.g, q0.b, q1.r);
     } else if (phase == 1) {
-        color = int8_bias(vec4(s0.g, s0.b, s1.r, s1.g));
+        color = vec4(q0.g, q0.b, q1.r, q1.g);
     } else {
-        color = int8_bias(vec4(s0.b, s1.r, s1.g, s1.b));
+        color = vec4(q0.b, q1.r, q1.g, q1.b);
     }
 }
 "

@@ -25,7 +25,7 @@ use edgefirst_bench::BenchSuite;
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 
 use edgefirst_image::{
-    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rotation,
+    ComputeBackend, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rotation,
 };
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
@@ -76,13 +76,7 @@ fn load_image_bench(
                 backend: ComputeBackend::Cpu,
                 ..Default::default()
             })?;
-            proc.convert(
-                &native_src,
-                &mut dst,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )?;
+            proc.convert(&native_src, &mut dst, None)?;
             Ok(dst)
         }
         _ => Ok(native_src),
@@ -207,26 +201,13 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
             };
 
             // Pre-flight
-            if let Err(e) = proc.convert(
-                &src_dyn,
-                &mut dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            ) {
+            if let Err(e) = proc.convert(&src_dyn, &mut dst, None) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
 
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                proc.convert(
-                    &src_dyn,
-                    &mut dst,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::no_crop(),
-                )
-                .unwrap();
+                proc.convert(&src_dyn, &mut dst, None).unwrap();
             });
             result.print_summary_with_throughput(throughput);
             suite.record(&result);
@@ -255,26 +236,13 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
             };
 
             // Pre-flight
-            if let Err(e) = proc.convert(
-                &src_dyn,
-                &mut dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            ) {
+            if let Err(e) = proc.convert(&src_dyn, &mut dst, None) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
 
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                proc.convert(
-                    &src_dyn,
-                    &mut dst,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::no_crop(),
-                )
-                .unwrap();
+                proc.convert(&src_dyn, &mut dst, None).unwrap();
             });
             result.print_summary_with_throughput(throughput);
             suite.record(&result);
@@ -393,14 +361,13 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         };
 
         // Pre-flight: skip unsupported conversions
-        if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()) {
+        if let Err(e) = proc.convert(&src, &mut dst, None) {
             println!("  {:50} [unsupported: {}]", name, e);
             continue;
         }
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            proc.convert(&src, &mut dst, None).unwrap();
         });
         result.print_summary_with_throughput(throughput);
         suite.record(&result);
@@ -449,14 +416,22 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         };
 
         // Pre-flight
-        if let Err(e) = proc.convert(&src_dyn, &mut dst, rot, Flip::None, Crop::no_crop()) {
+        if let Err(e) = proc.convert(
+            &src_dyn,
+            &mut dst,
+            Some(edgefirst_image::ConvertOptions::new().rotation(rot)),
+        ) {
             println!("  {:50} [unsupported: {}]", name, e);
             continue;
         }
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            proc.convert(&src_dyn, &mut dst, rot, Flip::None, Crop::no_crop())
-                .unwrap();
+            proc.convert(
+                &src_dyn,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().rotation(rot)),
+            )
+            .unwrap();
         });
         result.print_summary_with_throughput(throughput);
         suite.record(&result);
@@ -601,13 +576,7 @@ fn run_hires_configs(
             );
             return;
         };
-        if let Err(e) = proc.convert(
-            &rgba_src,
-            &mut rgb,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        ) {
+        if let Err(e) = proc.convert(&rgba_src, &mut rgb, None) {
             println!("  [skipped: RGBA->RGB conversion failed for source: {}]", e);
             return;
         }
@@ -638,14 +607,13 @@ fn run_hires_configs(
         };
 
         // Pre-flight
-        if let Err(e) = proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()) {
+        if let Err(e) = proc.convert(src, &mut dst, None) {
             println!("  {:50} [unsupported: {}]", name, e);
             continue;
         }
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            proc.convert(src, &mut dst, None).unwrap();
         });
         result.print_summary_with_throughput(throughput);
         suite.record(&result);

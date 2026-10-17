@@ -196,13 +196,7 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
             }
         };
         let err = gl
-            .convert(
-                &src,
-                &mut rebuilt,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )
+            .convert(&src, &mut rebuilt, None)
             .expect_err("the GL float path must refuse a destination it cannot place");
         assert!(
             matches!(err, edgefirst_image::Error::NotSupported(_)),
@@ -221,14 +215,8 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
     // Second half: `ImageProcessor`'s CPU fallback on that same refusal must
     // still land the convert at the reconstructed tensor's own offset.
     let mut proc = ImageProcessor::new().expect("ImageProcessor::new");
-    proc.convert(
-        &src,
-        &mut rebuilt,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .expect("convert into the reconstructed planar destination");
+    proc.convert(&src, &mut rebuilt, None)
+        .expect("convert into the reconstructed planar destination");
 
     let out = canvas.map_bytes(CpuAccess::Read).expect("map canvas");
     let bytes = out.as_slice();

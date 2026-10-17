@@ -43,6 +43,8 @@ CASES = [
     (img.Flip, IMAGE_H, "EF_FLIP", {"NoFlip": "NONE"}, set()),
     (img.ColorMode, IMAGE_H, "EF_COLOR_MODE", {}, set()),
     (img.Fit, IMAGE_H, "EF_FIT", {}, set()),
+    (img.LetterboxPlacement, IMAGE_H, "EF_LETTERBOX_PLACEMENT", {}, set()),
+    (img.NormalizationPreset, IMAGE_H, "EF_NORMALIZATION", {}, set()),
     (dec.Nms, DECODER_H, "EF_NMS", {}, {"OFF"}),
     (dec.DecoderType, DECODER_H, "EF_DECODER_TYPE", {}, set()),
     (dec.DecoderVersion, DECODER_H, "EF_DECODER_VERSION", {}, set()),

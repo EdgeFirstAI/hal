@@ -40,7 +40,7 @@
 //! not a failing one, so the fallback count is reported rather than asserted —
 //! a vacuous pass is visible in the log instead of silent.
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Flip, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{
     CpuAccess, DType, HostPin, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -197,7 +197,7 @@ fn pin_survives_convert_into_the_pinned_destination() {
 
     // ── Frame 1 ──────────────────────────────────────────────────────────
     processor
-        .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+        .convert(&src, &mut dst, None)
         .expect("convert frame 1");
 
     assert_eq!(
@@ -225,9 +225,7 @@ fn pin_survives_convert_into_the_pinned_destination() {
         .convert(
             &src,
             &mut dst,
-            Rotation::None,
-            Flip::Horizontal,
-            Crop::default(),
+            Some(edgefirst_image::ConvertOptions::new().flip(Flip::Horizontal)),
         )
         .expect("convert frame 2");
 
@@ -271,7 +269,7 @@ fn pin_taken_after_convert_sees_the_converted_frame() {
     let mut processor = ImageProcessor::new().expect("create ImageProcessor");
 
     processor
-        .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+        .convert(&src, &mut dst, None)
         .expect("convert before pinning");
 
     let pin = dst

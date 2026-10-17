@@ -25,7 +25,9 @@ mod common;
 
 use common::{run_bench, BenchSuite};
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{
+    ConvertOptions, ImageProcessor, ImageProcessorTrait, LetterboxPlacement, Normalization,
+};
 use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorTrait};
 
 const WARMUP: usize = 10;
@@ -102,7 +104,15 @@ fn main() {
         }
     };
 
-    let lb_crop = Crop::letterbox([114, 114, 114, 255]);
+    let lb_crop = ConvertOptions::new().letterbox([114, 114, 114, 255]);
+    let plain = ConvertOptions::new();
+    // SegFormer-style input: ImageNet normalization, top-left letterbox, pad
+    // 0.0 after normalization.
+    let segformer = ConvertOptions::new()
+        .letterbox([0, 0, 0, 255])
+        .placement(LetterboxPlacement::TopLeft)
+        .pad_output([0.0; 4])
+        .normalization(Normalization::imagenet());
 
     for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
         let src = match proc.create_image(
@@ -126,8 +136,17 @@ fn main() {
         }
         let src_bytes = nv_len(fmt, IN_W, IN_H) as u64;
 
-        // Each cell: (suffix, out dims, out fmt, out dtype, crop).
-        let cells: &[(&str, usize, usize, PixelFormat, DType, Crop)] = &[
+        // Each cell: (suffix, out dims, out fmt, out dtype, options, quantization).
+        #[allow(clippy::type_complexity)]
+        let cells: &[(
+            &str,
+            usize,
+            usize,
+            PixelFormat,
+            DType,
+            ConvertOptions,
+            Option<(f32, i32)>,
+        )] = &[
             // Pure convert (no resize) — isolates NV→RGB decode + planar scatter.
             (
                 "convert_720p_to_rgb",
@@ -135,7 +154,8 @@ fn main() {
                 IN_H,
                 PixelFormat::Rgb,
                 DType::U8,
-                Crop::no_crop(),
+                plain,
+                None,
             ),
             (
                 "convert_720p_to_planar_rgb",
@@ -143,7 +163,8 @@ fn main() {
                 IN_H,
                 PixelFormat::PlanarRgb,
                 DType::U8,
-                Crop::no_crop(),
+                plain,
+                None,
             ),
             // Letterbox (convert + resize) — the real pipeline op.
             (
@@ -153,6 +174,7 @@ fn main() {
                 PixelFormat::PlanarRgb,
                 DType::U8,
                 lb_crop,
+                None,
             ),
             // Full preprocess: planar RGB widened to F32 (model input dtype).
             (
@@ -162,6 +184,7 @@ fn main() {
                 PixelFormat::PlanarRgb,
                 DType::F32,
                 lb_crop,
+                None,
             ),
             // Full preprocess to F16 (native-FP16 widen on capable CPUs).
             (
@@ -171,10 +194,41 @@ fn main() {
                 PixelFormat::PlanarRgb,
                 DType::F16,
                 lb_crop,
+                None,
+            ),
+            // Plain i8 (the XOR bias), the baseline for the quantized cell.
+            (
+                "letterbox_720p_to_640_planar_rgb_i8",
+                OUT_W,
+                OUT_H,
+                PixelFormat::PlanarRgb,
+                DType::I8,
+                lb_crop,
+                None,
+            ),
+            // Normalized F32 model input (per-channel affine on top of the widen).
+            (
+                "segformer_720p_to_640_planar_rgb_f32",
+                OUT_W,
+                OUT_H,
+                PixelFormat::PlanarRgb,
+                DType::F32,
+                segformer,
+                None,
+            ),
+            // Normalization fused with the NPU input quantization.
+            (
+                "segformer_720p_to_640_planar_rgb_i8_quant",
+                OUT_W,
+                OUT_H,
+                PixelFormat::PlanarRgb,
+                DType::I8,
+                segformer,
+                Some((0.0187, -14)),
             ),
         ];
 
-        for &(suffix, ow, oh, ofmt, odt, crop) in cells {
+        for &(suffix, ow, oh, ofmt, odt, opts, quant) in cells {
             let name = format!("{}/{}", fmt_name(fmt), suffix);
             if !only.is_empty() && !name.contains(&only) {
                 continue;
@@ -193,15 +247,18 @@ fn main() {
                     continue;
                 }
             };
+            if let Some((scale, zp)) = quant {
+                dst.set_quantization(edgefirst_tensor::Quantization::per_tensor(scale, zp))
+                    .unwrap();
+            }
             // Probe once: an unsupported cell is reported and skipped instead of
             // panicking inside the timing loop.
-            if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+            if let Err(e) = proc.convert(&src, &mut dst, Some(opts)) {
                 println!("  {name:50} [unsupported: {e}]");
                 continue;
             }
             let r = run_bench(&name, WARMUP, iters, || {
-                proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                    .unwrap();
+                proc.convert(&src, &mut dst, Some(opts)).unwrap();
             });
             // Throughput is reported against source bytes; the f32/f16 cells
             // share the same source so the numbers are comparable across dtypes.

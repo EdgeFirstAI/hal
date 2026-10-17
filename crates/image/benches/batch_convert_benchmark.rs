@@ -27,7 +27,7 @@ mod common;
 
 use common::{run_bench, BenchSuite};
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{
     DType, PixelFormat, Region, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -152,7 +152,11 @@ fn main() {
                     let mut tile = parent
                         .view(Region::new(0, i * TILE_H, TILE_W, TILE_H))
                         .unwrap();
-                    proc.convert_deferred(&src, &mut tile, Rotation::None, Flip::None, lb_crop)
+                    proc.convert_deferred(
+                        &src,
+                        &mut tile,
+                        Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+                    )
                 })
                 .and_then(|_| proc.flush());
             if let Err(e) = probe {
@@ -163,8 +167,12 @@ fn main() {
                         let mut tile = parent
                             .view(Region::new(0, i * TILE_H, TILE_W, TILE_H))
                             .unwrap();
-                        proc.convert_deferred(&src, &mut tile, Rotation::None, Flip::None, lb_crop)
-                            .unwrap();
+                        proc.convert_deferred(
+                            &src,
+                            &mut tile,
+                            Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+                        )
+                        .unwrap();
                     }
                     proc.flush().unwrap();
                 });
@@ -205,15 +213,23 @@ fn main() {
             let eager_mem = mem_name(dsts[0].memory());
             let name = format!("batch/eager@{eager_mem}/n{n}");
             let probe = (0..n).try_for_each(|i| {
-                proc.convert(&src, &mut dsts[i], Rotation::None, Flip::None, lb_crop)
+                proc.convert(
+                    &src,
+                    &mut dsts[i],
+                    Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+                )
             });
             if let Err(e) = probe {
                 println!("  {name:45} [unsupported: {e}]");
             } else {
                 let r = run_bench(&name, WARMUP, ITERATIONS, || {
                     for dst in dsts.iter_mut() {
-                        proc.convert(&src, dst, Rotation::None, Flip::None, lb_crop)
-                            .unwrap();
+                        proc.convert(
+                            &src,
+                            dst,
+                            Some(edgefirst_image::ConvertOptions::new().crop(lb_crop)),
+                        )
+                        .unwrap();
                     }
                 });
                 r.print_summary();

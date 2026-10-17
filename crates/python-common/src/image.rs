@@ -5,8 +5,7 @@ use crate::detect_boxes::{convert_seg_mask, numpy_to_detect_boxes};
 use crate::tensor::PyTensor;
 pub use crate::tensor::{PyPixelFormat, PyRegion};
 use edgefirst_image::{
-    self as image, Crop, Fit, Flip, ImageProcessorConfig, ImageProcessorTrait, MaskResolution,
-    Rotation,
+    self as image, Flip, ImageProcessorConfig, ImageProcessorTrait, MaskResolution, Rotation,
 };
 use edgefirst_tensor::Segmentation;
 use edgefirst_tensor::{self as tensor, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
@@ -980,16 +979,20 @@ impl PyImageProcessor {
     // as the only serialization point, so a second concurrent call blocks
     // (or proceeds, once GL/CPU backends allow it) instead of erroring.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
+    #[pyo3(signature = (src, dst, rotation = None, flip = None, source = None, letterbox = None, *, options = None, letterbox_placement = None, pad_output = None, normalization = None))]
     pub fn convert<'py>(
         &self,
         py: Python<'py>,
         src: &Bound<'py, PyAny>,
         dst: &Bound<'py, PyAny>,
-        rotation: PyRotation,
-        flip: PyFlip,
+        rotation: Option<PyRotation>,
+        flip: Option<PyFlip>,
         source: Option<PyRegion>,
         letterbox: Option<[u8; 4]>,
+        options: Option<PyConvertOptions>,
+        letterbox_placement: Option<PyLetterboxPlacement>,
+        pad_output: Option<[f32; 4]>,
+        normalization: Option<NormalizationArg>,
     ) -> Result<()> {
         let _span = tracing::trace_span!("python.convert").entered();
         // `access=None`: this runs on the GPU/DMA path and must not force a
@@ -997,18 +1000,18 @@ impl PyImageProcessor {
         // consumer needs.
         let src = crate::interop::TensorArg::extract(src, None)?;
         let dst_arg = crate::interop::TensorArg::extract_mut(dst, None)?;
-        let rotation = rotation.into();
-        let flip = flip.into();
         // Destination placement is the destination tensor (use `tensor.view`/
-        // `tensor.batch` for a sub-region); `letterbox` is the pad colour for an
-        // aspect-preserving fit.
-        let crop = Crop {
-            source: source.map(|x| x.into()),
-            fit: match letterbox {
-                Some(pad) => Fit::Letterbox { pad },
-                None => Fit::Stretch,
-            },
-        };
+        // `tensor.batch` for a sub-region).
+        let options = resolve_convert_options(
+            options,
+            rotation,
+            flip,
+            source,
+            letterbox,
+            letterbox_placement,
+            pad_output,
+            normalization,
+        )?;
         if src.can_detach() && dst_arg.can_detach() {
             // Every Python guard is released by `into_raw_access` before
             // this point -- `src` and the reconstructed destination are now
@@ -1025,7 +1028,7 @@ impl PyImageProcessor {
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                l.convert(src.as_ref(), target.as_mut(), rotation, flip, crop)?;
+                l.convert(src.as_ref(), target.as_mut(), Some(options))?;
                 Ok(())
             })?;
             // Read before the reconstructed tensor is dropped, published
@@ -1046,7 +1049,7 @@ impl PyImageProcessor {
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                l.convert(src.as_ref(), dst_arg.as_mut(), rotation, flip, crop)?;
+                l.convert(src.as_ref(), dst_arg.as_mut(), Some(options))?;
             }
             // `dst_arg` holds a `PyRefMut` of a native destination, and
             // `set_gpu_write` takes `&self`: the borrow has to end before
@@ -1076,30 +1079,37 @@ impl PyImageProcessor {
     /// convert afterwards, so a device consumer can be handed the fence
     /// value instead of this event.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
+    #[pyo3(signature = (src, dst, rotation = None, flip = None, source = None, letterbox = None, *, options = None, letterbox_placement = None, pad_output = None, normalization = None))]
     pub fn convert_with_fence<'py>(
         &self,
         py: Python<'py>,
         src: &Bound<'py, PyAny>,
         dst: &Bound<'py, PyAny>,
-        rotation: PyRotation,
-        flip: PyFlip,
+        rotation: Option<PyRotation>,
+        flip: Option<PyFlip>,
         source: Option<PyRegion>,
         letterbox: Option<[u8; 4]>,
+        options: Option<PyConvertOptions>,
+        letterbox_placement: Option<PyLetterboxPlacement>,
+        pad_output: Option<[f32; 4]>,
+        normalization: Option<NormalizationArg>,
     ) -> Result<Option<usize>> {
         let _span = tracing::trace_span!("python.convert_with_fence").entered();
         // See `convert`: GPU/DMA path, no host pin forced.
         let src = crate::interop::TensorArg::extract(src, None)?;
         let dst_arg = crate::interop::TensorArg::extract_mut(dst, None)?;
-        let rotation = rotation.into();
-        let flip = flip.into();
-        let crop = Crop {
-            source: source.map(|x| x.into()),
-            fit: match letterbox {
-                Some(pad) => Fit::Letterbox { pad },
-                None => Fit::Stretch,
-            },
-        };
+        // Destination placement is the destination tensor (use `tensor.view`/
+        // `tensor.batch` for a sub-region).
+        let options = resolve_convert_options(
+            options,
+            rotation,
+            flip,
+            source,
+            letterbox,
+            letterbox_placement,
+            pad_output,
+            normalization,
+        )?;
         // Assigned in both arms below: the publish has to run inside each
         // arm, where the tensor the convert wrote is still in scope.
         let fence;
@@ -1116,7 +1126,7 @@ impl PyImageProcessor {
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                Ok(l.convert_with_fence(src.as_ref(), target.as_mut(), rotation, flip, crop)?)
+                Ok(l.convert_with_fence(src.as_ref(), target.as_mut(), Some(options))?)
             })?;
             // Read before the reconstructed tensor is dropped, published
             // after: `publish_gpu_write` calls into Python, which must not
@@ -1132,8 +1142,7 @@ impl PyImageProcessor {
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                fence =
-                    l.convert_with_fence(src.as_ref(), dst_arg.as_mut(), rotation, flip, crop)?;
+                fence = l.convert_with_fence(src.as_ref(), dst_arg.as_mut(), Some(options))?;
             }
             // `dst_arg` holds a `PyRefMut` of a native destination, and
             // `set_gpu_write` takes `&self`: the borrow has to end before
@@ -1174,30 +1183,37 @@ impl PyImageProcessor {
     /// consumer waits on that fence rather than on :meth:`flush`.
     // `&self`: see `convert`'s comment on the same choice.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
+    #[pyo3(signature = (src, dst, rotation = None, flip = None, source = None, letterbox = None, *, options = None, letterbox_placement = None, pad_output = None, normalization = None))]
     pub fn convert_deferred<'py>(
         &self,
         py: Python<'py>,
         src: &Bound<'py, PyAny>,
         dst: &Bound<'py, PyAny>,
-        rotation: PyRotation,
-        flip: PyFlip,
+        rotation: Option<PyRotation>,
+        flip: Option<PyFlip>,
         source: Option<PyRegion>,
         letterbox: Option<[u8; 4]>,
+        options: Option<PyConvertOptions>,
+        letterbox_placement: Option<PyLetterboxPlacement>,
+        pad_output: Option<[f32; 4]>,
+        normalization: Option<NormalizationArg>,
     ) -> Result<()> {
         let _span = tracing::trace_span!("python.convert_deferred").entered();
         // See `convert`: GPU/DMA path, no host pin forced.
         let src = crate::interop::TensorArg::extract(src, None)?;
         let dst_arg = crate::interop::TensorArg::extract_mut(dst, None)?;
-        let rotation = rotation.into();
-        let flip = flip.into();
-        let crop = Crop {
-            source: source.map(|x| x.into()),
-            fit: match letterbox {
-                Some(pad) => Fit::Letterbox { pad },
-                None => Fit::Stretch,
-            },
-        };
+        // Destination placement is the destination tensor (use `tensor.view`/
+        // `tensor.batch` for a sub-region).
+        let options = resolve_convert_options(
+            options,
+            rotation,
+            flip,
+            source,
+            letterbox,
+            letterbox_placement,
+            pad_output,
+            normalization,
+        )?;
         if src.can_detach() && dst_arg.can_detach() {
             // See `convert`: every Python guard is gone by this point.
             let src = src.into_raw_access()?;
@@ -1212,7 +1228,7 @@ impl PyImageProcessor {
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                l.convert_deferred(src.as_ref(), target.as_mut(), rotation, flip, crop)?;
+                l.convert_deferred(src.as_ref(), target.as_mut(), Some(options))?;
                 Ok(())
             })?;
             // Read before the reconstructed tensor is dropped, published
@@ -1229,7 +1245,7 @@ impl PyImageProcessor {
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                l.convert_deferred(src.as_ref(), dst_arg.as_mut(), rotation, flip, crop)?;
+                l.convert_deferred(src.as_ref(), dst_arg.as_mut(), Some(options))?;
             }
             // `dst_arg` holds a `PyRefMut` of a native destination, and
             // `set_gpu_write` takes `&self`: the borrow has to end before
@@ -1927,6 +1943,243 @@ impl From<PyFlip> for Flip {
             PyFlip::Vertical => Flip::Vertical,
         }
     }
+}
+
+/// Where a letterboxed image sits inside the destination.
+#[pyclass(
+    name = "LetterboxPlacement",
+    eq,
+    eq_int,
+    from_py_object,
+    module = "edgefirst.image"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyLetterboxPlacement {
+    /// Centred, padding split between both sides (the default).
+    Center = 0,
+    /// Anchored at the top-left corner, padding on the right and bottom.
+    TopLeft = 1,
+}
+
+const _: () = {
+    assert!(PyLetterboxPlacement::Center as u32 == image::LetterboxPlacement::Center.code());
+    assert!(PyLetterboxPlacement::TopLeft as u32 == image::LetterboxPlacement::TopLeft.code());
+};
+
+/// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
+#[pymethods]
+impl PyLetterboxPlacement {
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
+impl From<PyLetterboxPlacement> for image::LetterboxPlacement {
+    fn from(val: PyLetterboxPlacement) -> Self {
+        match val {
+            PyLetterboxPlacement::Center => image::LetterboxPlacement::Center,
+            PyLetterboxPlacement::TopLeft => image::LetterboxPlacement::TopLeft,
+        }
+    }
+}
+
+/// A named convert normalization, `(x - mean) / std` on 0-255 values.
+#[pyclass(
+    name = "NormalizationPreset",
+    eq,
+    eq_int,
+    from_py_object,
+    module = "edgefirst.image"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyNormalizationPreset {
+    /// `x / 255`, giving `[0, 1]` (the default).
+    Unsigned = 0,
+    /// `x / 127.5 - 1`, giving `[-1, 1]`.
+    Signed = 1,
+    /// `x`, giving `[0, 255]`.
+    Raw = 2,
+    /// ImageNet mean and standard deviation.
+    Imagenet = 3,
+}
+
+const _: () = {
+    use image::NormalizationPreset as N;
+    assert!(PyNormalizationPreset::Unsigned as u32 == N::Unsigned.code());
+    assert!(PyNormalizationPreset::Signed as u32 == N::Signed.code());
+    assert!(PyNormalizationPreset::Raw as u32 == N::Raw.code());
+    assert!(PyNormalizationPreset::Imagenet as u32 == N::Imagenet.code());
+};
+
+/// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
+#[pymethods]
+impl PyNormalizationPreset {
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
+impl From<PyNormalizationPreset> for image::NormalizationPreset {
+    fn from(val: PyNormalizationPreset) -> Self {
+        match val {
+            PyNormalizationPreset::Unsigned => image::NormalizationPreset::Unsigned,
+            PyNormalizationPreset::Signed => image::NormalizationPreset::Signed,
+            PyNormalizationPreset::Raw => image::NormalizationPreset::Raw,
+            PyNormalizationPreset::Imagenet => image::NormalizationPreset::Imagenet,
+        }
+    }
+}
+
+/// A normalization argument: a preset, a preset name, or `(mean, std)`.
+#[derive(FromPyObject)]
+pub enum NormalizationArg {
+    Preset(PyNormalizationPreset),
+    Name(String),
+    MeanStd(Vec<f32>, Vec<f32>),
+}
+
+impl NormalizationArg {
+    fn resolve(self) -> Result<image::Normalization> {
+        match self {
+            NormalizationArg::Preset(p) => Ok(image::NormalizationPreset::from(p).into()),
+            NormalizationArg::Name(name) => image::NormalizationPreset::from_str_code(&name)
+                .map(Into::into)
+                .ok_or_else(|| {
+                    let names: Vec<&str> = image::NormalizationPreset::all()
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect();
+                    Error::InvalidArg(format!(
+                        "unknown normalization `{name}`, expected one of: {}",
+                        names.join(", ")
+                    ))
+                }),
+            NormalizationArg::MeanStd(mean, std) => {
+                Ok(image::Normalization::mean_std(&mean, &std)?)
+            }
+        }
+    }
+}
+
+/// Options for `ImageProcessor.convert`. Every method returns a new object,
+/// so options can be built once and reused.
+///
+/// ```python
+/// opts = (ConvertOptions()
+///         .letterbox((0, 0, 0, 255))
+///         .placement(LetterboxPlacement.TopLeft)
+///         .pad_output((0.0, 0.0, 0.0, 0.0))
+///         .normalization(NormalizationPreset.Imagenet))
+/// proc.convert(src, dst, options=opts)
+/// ```
+#[pyclass(name = "ConvertOptions", from_py_object, module = "edgefirst.image")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PyConvertOptions(pub image::ConvertOptions);
+
+#[pymethods]
+impl PyConvertOptions {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (rotation = None, flip = None, source = None, letterbox = None, placement = None, pad_output = None, normalization = None))]
+    fn new(
+        rotation: Option<PyRotation>,
+        flip: Option<PyFlip>,
+        source: Option<PyRegion>,
+        letterbox: Option<[u8; 4]>,
+        placement: Option<PyLetterboxPlacement>,
+        pad_output: Option<[f32; 4]>,
+        normalization: Option<NormalizationArg>,
+    ) -> Result<Self> {
+        Ok(Self(resolve_convert_options(
+            None,
+            rotation,
+            flip,
+            source,
+            letterbox,
+            placement,
+            pad_output,
+            normalization,
+        )?))
+    }
+
+    /// Rotate the output, in 90° steps.
+    fn rotation(&self, rotation: PyRotation) -> Self {
+        Self(self.0.rotation(rotation.into()))
+    }
+
+    /// Flip the output.
+    fn flip(&self, flip: PyFlip) -> Self {
+        Self(self.0.flip(flip.into()))
+    }
+
+    /// Sample only `source` of the input; `None` samples all of it.
+    #[pyo3(signature = (source))]
+    fn source(&self, source: Option<PyRegion>) -> Self {
+        Self(self.0.source(source.map(Into::into)))
+    }
+
+    /// Letterbox, padding with the RGBA pixel `pad`, mapped like the image.
+    fn letterbox(&self, pad: [u8; 4]) -> Self {
+        Self(self.0.letterbox(pad))
+    }
+
+    /// Where a letterboxed image sits.
+    fn placement(&self, placement: PyLetterboxPlacement) -> Self {
+        Self(self.0.placement(placement.into()))
+    }
+
+    /// Pad with these values as written to the destination, after
+    /// normalization (quantized for integer destinations).
+    fn pad_output(&self, pad: [f32; 4]) -> Self {
+        Self(self.0.pad_output(pad))
+    }
+
+    /// How pixel values map to the destination: a `NormalizationPreset`, a
+    /// preset name, or `(mean, std)` with one or three values each.
+    fn normalization(&self, normalization: NormalizationArg) -> Result<Self> {
+        Ok(Self(self.0.normalization(normalization.resolve()?)))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.0)
+    }
+}
+
+/// `options` (or the defaults) with each given argument applied on top.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_convert_options(
+    options: Option<PyConvertOptions>,
+    rotation: Option<PyRotation>,
+    flip: Option<PyFlip>,
+    source: Option<PyRegion>,
+    letterbox: Option<[u8; 4]>,
+    placement: Option<PyLetterboxPlacement>,
+    pad_output: Option<[f32; 4]>,
+    normalization: Option<NormalizationArg>,
+) -> Result<image::ConvertOptions> {
+    let mut o = options.map(|o| o.0).unwrap_or_default();
+    if let Some(r) = rotation {
+        o = o.rotation(r.into());
+    }
+    if let Some(f) = flip {
+        o = o.flip(f.into());
+    }
+    if let Some(s) = source {
+        o = o.source(Some(s.into()));
+    }
+    if let Some(pad) = letterbox {
+        o = o.letterbox(pad);
+    }
+    if let Some(p) = placement {
+        o = o.placement(p.into());
+    }
+    if let Some(pad) = pad_output {
+        o = o.pad_output(pad);
+    }
+    if let Some(n) = normalization {
+        o = o.normalization(n.resolve()?);
+    }
+    Ok(o)
 }
 
 /// Controls how mask colors are assigned to detections.

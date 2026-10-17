@@ -41,8 +41,7 @@ mod common;
 use common::{run_bench, BenchSuite};
 
 use edgefirst_image::{
-    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Region,
-    Rotation,
+    ComputeBackend, Crop, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Region,
 };
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
 
@@ -223,13 +222,21 @@ fn run_group(
         };
         // Probe once: an unsupported cell is reported and skipped instead of
         // panicking inside the timing loop.
-        if let Err(e) = proc.convert(src, &mut dst, Rotation::None, Flip::None, crop) {
+        if let Err(e) = proc.convert(
+            src,
+            &mut dst,
+            Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+        ) {
             println!("  {name:50} [unsupported: {e}]");
             continue;
         }
         let r = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.convert(src, &mut dst, Rotation::None, Flip::None, crop)
-                .unwrap();
+            proc.convert(
+                src,
+                &mut dst,
+                Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
         });
         r.print_summary_with_throughput(throughput);
         suite.record(&r);
