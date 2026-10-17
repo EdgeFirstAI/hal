@@ -16,14 +16,6 @@ use edgefirst_tensor_ffi::EfTensor;
 
 use crate::processor::{with_tensor, with_tensor_mut, EfImageProcessor};
 
-fn color_mode_from(code: u32) -> ColorMode {
-    match code {
-        1 => ColorMode::Instance,
-        2 => ColorMode::Track,
-        _ => ColorMode::Class,
-    }
-}
-
 unsafe fn letterbox_from(ptr: *const f32) -> Option<[f32; 4]> {
     if ptr.is_null() {
         None
@@ -168,6 +160,8 @@ fn draw_err(e: &edgefirst_image::Error) -> c_int {
 /// arm and the CPU backend renders only `RGBA`/`RGB`. It previously returned
 /// 0 with the destination unwritten.
 ///
+/// `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
+///
 /// # Safety
 /// Pointers must be live or NULL as documented.
 #[no_mangle]
@@ -197,7 +191,9 @@ pub unsafe extern "C" fn ef_image_processor_draw_decoded_masks(
                 Err(e) => return e,
             };
             let lb = letterbox_from(letterbox);
-            let mode = color_mode_from(color_mode);
+            let Some(mode) = ColorMode::from_code(color_mode) else {
+                return libc::EINVAL;
+            };
             draw_with_overlay(p, dst, background, opacity, lb, mode, |proc, d, overlay| {
                 proc.draw_decoded_masks(d, &detect, &segs, overlay)
             })
@@ -211,7 +207,7 @@ pub unsafe extern "C" fn ef_image_processor_draw_decoded_masks(
 /// On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
 /// afterwards, as it does after a convert.
 ///
-/// The same `BGRA` background restriction as
+/// The same `BGRA` background restriction and `color_mode` validation as
 /// `ef_image_processor_draw_decoded_masks`.
 ///
 /// # Safety
@@ -244,7 +240,9 @@ pub unsafe extern "C" fn ef_image_processor_draw_proto_masks(
                 Err(e) => return e,
             };
             let lb = letterbox_from(letterbox);
-            let mode = color_mode_from(color_mode);
+            let Some(mode) = ColorMode::from_code(color_mode) else {
+                return libc::EINVAL;
+            };
             draw_with_overlay(p, dst, background, opacity, lb, mode, |proc, d, overlay| {
                 proc.draw_proto_masks(d, &detect, &proto, overlay)
             })
@@ -372,5 +370,33 @@ pub unsafe extern "C" fn ef_mask_list_free(l: *mut EfMaskList) {
             return;
         }
         let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(l))));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_color_mode_is_einval() {
+        // Both handles are non-null but never dereferenced: the colour
+        // mode is validated before either is used.
+        let p = std::ptr::NonNull::<EfImageProcessor>::dangling().as_ptr();
+        let dst = std::ptr::NonNull::<EfTensor>::dangling().as_ptr();
+        let rc = unsafe {
+            ef_image_processor_draw_decoded_masks(
+                p,
+                dst,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1.0,
+                std::ptr::null(),
+                ColorMode::all().len() as u32,
+            )
+        };
+        assert_eq!(rc, libc::EINVAL);
     }
 }

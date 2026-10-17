@@ -241,8 +241,9 @@ pub unsafe extern "C" fn ef_decoder_params_set_input_dims(
     }
 }
 
-/// NMS mode: 0 = off, 1 = automatic (the model config's mode, else
-/// class-aware), 2 = class-aware, 3 = class-agnostic.
+/// NMS mode, an `EF_NMS_*` code: `EF_NMS_OFF`, `EF_NMS_AUTO` (the model
+/// config's mode, else class-aware), `EF_NMS_CLASS_AWARE` or
+/// `EF_NMS_CLASS_AGNOSTIC`. Any other value is `EINVAL`.
 ///
 /// # Safety
 /// `p` must be `NULL` or a live parameter set.
@@ -250,13 +251,10 @@ pub unsafe extern "C" fn ef_decoder_params_set_input_dims(
 pub unsafe extern "C" fn ef_decoder_params_set_nms(p: *mut EfDecoderParams, nms: u32) -> c_int {
     unsafe {
         with_params(p, |p| {
-            p.nms = match nms {
-                0 => None,
-                1 => Some(configs::Nms::Auto),
-                2 => Some(configs::Nms::ClassAware),
-                3 => Some(configs::Nms::ClassAgnostic),
-                _ => return libc::EINVAL,
+            let Some(nms) = configs::Nms::from_option_code(nms) else {
+                return libc::EINVAL;
             };
+            p.nms = nms;
             0
         })
     }
@@ -859,35 +857,12 @@ pub unsafe extern "C" fn ef_segmentation_list_data(
     }
 }
 
-fn dim_name_from(code: u32) -> configs::DimName {
-    match code {
-        0 => configs::DimName::Batch,
-        1 => configs::DimName::Height,
-        2 => configs::DimName::Width,
-        3 => configs::DimName::NumClasses,
-        4 => configs::DimName::NumFeatures,
-        5 => configs::DimName::NumBoxes,
-        6 => configs::DimName::NumProtos,
-        7 => configs::DimName::NumAnchorsXFeatures,
-        8 => configs::DimName::Padding,
-        9 => configs::DimName::BoxCoords,
-        _ => configs::DimName::Unknown,
-    }
-}
-
-fn decoder_type_from(code: u32) -> Option<configs::DecoderType> {
-    match code {
-        0 => Some(configs::DecoderType::Ultralytics),
-        1 => Some(configs::DecoderType::ModelPack),
-        _ => None,
-    }
-}
-
 /// Append a programmatic output spec. Returns the new index, or `-1`.
 ///
-/// `type_`: 0 detection, 1 boxes, 2 scores, 3 protos, 4 segmentation,
-/// 5 mask coefficients, 6 mask, 7 classes.
-/// `decoder`: 0 ultralytics, 1 modelpack.
+/// `type_`: an `EF_OUTPUT_TYPE_*` code.
+/// `decoder`: an `EF_DECODER_TYPE_*` code.
+/// `dims`, when not NULL, holds `ndim` `EF_DIM_NAME_*` codes.
+/// An unknown `type_`, `decoder` or `dims` code returns `-1`.
 ///
 /// # Safety
 /// `shape` must point to `ndim` sizes; `dims` may be NULL.
@@ -905,7 +880,7 @@ pub unsafe extern "C" fn ef_decoder_params_add_output(
             if p.is_null() || shape.is_null() || ndim == 0 {
                 return -1;
             }
-            let Some(decoder_type) = decoder_type_from(decoder) else {
+            let Some(decoder_type) = configs::DecoderType::from_code(decoder) else {
                 return -1;
             };
             let shape_slice = std::slice::from_raw_parts(shape, ndim);
@@ -913,62 +888,72 @@ pub unsafe extern "C" fn ef_decoder_params_add_output(
             let dshape: Vec<(configs::DimName, usize)> = if dims.is_null() {
                 Vec::new()
             } else {
-                std::slice::from_raw_parts(dims, ndim)
+                let named: Option<Vec<_>> = std::slice::from_raw_parts(dims, ndim)
                     .iter()
                     .zip(shape_slice.iter())
-                    .map(|(d, s)| (dim_name_from(*d), *s))
-                    .collect()
+                    .map(|(d, s)| configs::DimName::from_code(*d).map(|d| (d, *s)))
+                    .collect();
+                let Some(named) = named else {
+                    return -1;
+                };
+                named
             };
-            let output = match type_ {
-                0 => ConfigOutput::Detection(configs::Detection {
+            let Some(output_type) = configs::OutputType::from_code(type_) else {
+                return -1;
+            };
+            let output = match output_type {
+                configs::OutputType::Detection => ConfigOutput::Detection(configs::Detection {
                     decoder: decoder_type,
                     shape: shape_vec,
                     dshape,
                     ..Default::default()
                 }),
-                1 => ConfigOutput::Boxes(configs::Boxes {
+                configs::OutputType::Boxes => ConfigOutput::Boxes(configs::Boxes {
                     decoder: decoder_type,
                     shape: shape_vec,
                     dshape,
                     ..Default::default()
                 }),
-                2 => ConfigOutput::Scores(configs::Scores {
+                configs::OutputType::Scores => ConfigOutput::Scores(configs::Scores {
                     decoder: decoder_type,
                     shape: shape_vec,
                     dshape,
                     ..Default::default()
                 }),
-                3 => ConfigOutput::Protos(configs::Protos {
+                configs::OutputType::Protos => ConfigOutput::Protos(configs::Protos {
                     decoder: decoder_type,
                     shape: shape_vec,
                     dshape,
                     ..Default::default()
                 }),
-                4 => ConfigOutput::Segmentation(configs::Segmentation {
+                configs::OutputType::Segmentation => {
+                    ConfigOutput::Segmentation(configs::Segmentation {
+                        decoder: decoder_type,
+                        shape: shape_vec,
+                        dshape,
+                        ..Default::default()
+                    })
+                }
+                configs::OutputType::MaskCoefficients => {
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: decoder_type,
+                        shape: shape_vec,
+                        dshape,
+                        ..Default::default()
+                    })
+                }
+                configs::OutputType::Mask => ConfigOutput::Mask(configs::Mask {
                     decoder: decoder_type,
                     shape: shape_vec,
                     dshape,
                     ..Default::default()
                 }),
-                5 => ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                configs::OutputType::Classes => ConfigOutput::Classes(configs::Classes {
                     decoder: decoder_type,
                     shape: shape_vec,
                     dshape,
                     ..Default::default()
                 }),
-                6 => ConfigOutput::Mask(configs::Mask {
-                    decoder: decoder_type,
-                    shape: shape_vec,
-                    dshape,
-                    ..Default::default()
-                }),
-                7 => ConfigOutput::Classes(configs::Classes {
-                    decoder: decoder_type,
-                    shape: shape_vec,
-                    dshape,
-                    ..Default::default()
-                }),
-                _ => return -1,
             };
             (*p).outputs.push(output);
             ((*p).outputs.len() - 1) as c_int
@@ -1069,7 +1054,8 @@ pub unsafe extern "C" fn ef_decoder_params_output_set_normalized(
     }
 }
 
-/// Decoder version: 0 Yolov5, 1 Yolov8, 2 Yolo11, 3 Yolo26.
+/// Decoder version, an `EF_DECODER_VERSION_*` code. Any other value is
+/// `EINVAL`.
 ///
 /// # Safety
 /// `p` must be `NULL` or a live handle from this library.
@@ -1080,13 +1066,10 @@ pub unsafe extern "C" fn ef_decoder_params_set_decoder_version(
 ) -> c_int {
     unsafe {
         with_params(p, |params| {
-            params.decoder_version = Some(match version {
-                0 => configs::DecoderVersion::Yolov5,
-                1 => configs::DecoderVersion::Yolov8,
-                2 => configs::DecoderVersion::Yolo11,
-                3 => configs::DecoderVersion::Yolo26,
-                _ => return libc::EINVAL,
-            });
+            let Some(version) = configs::DecoderVersion::from_code(version) else {
+                return libc::EINVAL;
+            };
+            params.decoder_version = Some(version);
             0
         })
     }

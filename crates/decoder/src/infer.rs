@@ -31,44 +31,50 @@ pub struct TensorInfo {
     pub quantization: Option<Quantization>,
 }
 
-/// Container format of the model the signals were read from. Drives
-/// Ultralytics per-format conventions (box normalization, tensor order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelSource {
-    /// An ONNX export. Ultralytics emits pixel-space box coordinates here,
-    /// so the inferred schema sets `normalized: false`.
-    Onnx,
-    /// A TFLite/LiteRT export. Ultralytics emits boxes normalized to
-    /// `[0, 1]` here, so the inferred schema sets `normalized: true`.
-    TfLite,
-    /// A CoreML export (`.mlpackage` / `.mlmodelc`). Ultralytics' CoreML
-    /// converter traces the same graph the ONNX exporter traces — the
-    /// `1/w` normalize lives only in `IOSDetectModel`, which is used
-    /// solely on the `nms=True` pipeline path — so a no-NMS export emits
-    /// pixel-space box coordinates and the inferred schema sets
-    /// `normalized: false`, matching [`ModelSource::Onnx`].
+edgefirst_tensor::ef_vocabulary! {
+    /// Container format of the model the signals were read from. Drives
+    /// Ultralytics per-format conventions (box normalization, tensor order).
     ///
-    /// Established by source-tracing the Ultralytics exporter and
-    /// confirmed by runtime magnitude measurement against a matched fp16
-    /// ONNX pair; `testdata/infer/NOTES.md` records the reasoning, the
-    /// measurement and the captured fixture.
-    ///
-    /// This resolution covers the no-NMS export only. A `nms=True` export
-    /// runs Apple's NMS pipeline (`image`/`iouThreshold`/
-    /// `confidenceThreshold` inputs, dynamically-shaped `confidence`/
-    /// `coordinates` outputs) — a different artifact entirely, not the
-    /// anchor-grid tensor this resolution reasons about. Inference does
-    /// not classify it as a schema: neither output's shape can match the
-    /// `[1, 4+nc, A]` anchor-grid layout this module looks for.
-    CoreMl,
-    /// Any other container. Inference **refuses** this with
-    /// [`InferError::UnknownBoxConvention`] rather than assuming a box
-    /// convention: whether coordinates are pixel-space or `[0, 1]` follows
-    /// the exporter, is not derivable from tensor shapes, and getting it
-    /// wrong scales every box by the input size. The variant exists so a
-    /// signal collector can report honestly what it read; add a measured
-    /// container here rather than routing it through `Other`.
-    Other,
+    /// The code is the one the C `EF_MODEL_SOURCE_*` enumerators use; the
+    /// string form is the one the Python bindings accept.
+    pub enum ModelSource {
+        /// An ONNX export. Ultralytics emits pixel-space box coordinates here,
+        /// so the inferred schema sets `normalized: false`.
+        Onnx = 0, "onnx", ONNX,
+        /// A TFLite/LiteRT export. Ultralytics emits boxes normalized to
+        /// `[0, 1]` here, so the inferred schema sets `normalized: true`.
+        TfLite = 1, "tflite", TFLITE,
+        /// A CoreML export (`.mlpackage` / `.mlmodelc`). Ultralytics' CoreML
+        /// converter traces the same graph the ONNX exporter traces — the
+        /// `1/w` normalize lives only in `IOSDetectModel`, which is used
+        /// solely on the `nms=True` pipeline path — so a no-NMS export emits
+        /// pixel-space box coordinates and the inferred schema sets
+        /// `normalized: false`, matching [`ModelSource::Onnx`].
+        ///
+        /// Established by source-tracing the Ultralytics exporter and
+        /// confirmed by runtime magnitude measurement against a matched fp16
+        /// ONNX pair; `testdata/infer/NOTES.md` records the reasoning, the
+        /// measurement and the captured fixture.
+        ///
+        /// This resolution covers the no-NMS export only. A `nms=True` export
+        /// runs Apple's NMS pipeline (`image`/`iouThreshold`/
+        /// `confidenceThreshold` inputs, dynamically-shaped `confidence`/
+        /// `coordinates` outputs) — a different artifact entirely, not the
+        /// anchor-grid tensor this resolution reasons about. Inference does
+        /// not classify it as a schema: neither output's shape can match the
+        /// `[1, 4+nc, A]` anchor-grid layout this module looks for.
+        CoreMl = 3, "coreml", COREML,
+        /// Any other container. Inference **refuses** this with
+        /// [`InferError::UnknownBoxConvention`] rather than assuming a box
+        /// convention: whether coordinates are pixel-space or `[0, 1]` follows
+        /// the exporter, is not derivable from tensor shapes, and getting it
+        /// wrong scales every box by the input size. The variant exists so a
+        /// signal collector can report honestly what it read; add a measured
+        /// container here rather than routing it through `Other`.
+        Other = 2, "other", OTHER,
+    }
+    #[doc(hidden)]
+    pub mod model_source_code;
 }
 
 /// Raw model I/O signals: tensor shapes/dtypes plus unparsed metadata, as

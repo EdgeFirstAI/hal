@@ -1314,6 +1314,11 @@ impl DecoderBuilder {
             match c.decoder() {
                 DecoderType::ModelPack => modelpack = true,
                 DecoderType::Ultralytics => yolo = true,
+                DecoderType::Semantic => {
+                    return Err(DecoderError::NotSupported(
+                        "the semantic decoder is not available in this HAL version".to_string(),
+                    ))
+                }
             }
         }
         match (modelpack, yolo) {
@@ -2261,11 +2266,17 @@ impl DecoderBuilder {
                     }
                     Ok(anchors_x_features / num_anchors - 5)
                 }
+                DecoderType::Semantic => Err(DecoderError::NotSupported(
+                    "the semantic decoder has no class count".to_string(),
+                )),
             },
 
             ConfigOutputRef::Scores(scores) => match scores.decoder {
                 DecoderType::Ultralytics => Ok(scores.shape[1]),
                 DecoderType::ModelPack => Ok(scores.shape[2]),
+                DecoderType::Semantic => Err(DecoderError::NotSupported(
+                    "the semantic decoder has no class count".to_string(),
+                )),
             },
             _ => Err(DecoderError::Internal(
                 "Attempted to get class count from unsupported config output".to_owned(),

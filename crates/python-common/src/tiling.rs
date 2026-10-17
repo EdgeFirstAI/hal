@@ -6,7 +6,7 @@
 
 use crate::image::Result;
 use crate::tensor::PyRegion;
-use edgefirst_image::{tile_grid, Fit, TilePlacement, TileSpec, TilingConfig};
+use edgefirst_image::{tile_grid, Fit, FitMode, TilePlacement, TileSpec, TilingConfig};
 use pyo3::prelude::*;
 
 /// How a tile crop is fit into the model input.
@@ -18,8 +18,22 @@ use pyo3::prelude::*;
 #[pyclass(name = "Fit", eq, eq_int, from_py_object, module = "edgefirst.image")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyFit {
-    Stretch,
-    Letterbox,
+    Stretch = 0,
+    Letterbox = 1,
+}
+
+const _: () = {
+    assert!(PyFit::Stretch as u32 == FitMode::Stretch.code());
+    assert!(PyFit::Letterbox as u32 == FitMode::Letterbox.code());
+};
+
+impl From<PyFit> for FitMode {
+    fn from(val: PyFit) -> Self {
+        match val {
+            PyFit::Stretch => FitMode::Stretch,
+            PyFit::Letterbox => FitMode::Letterbox,
+        }
+    }
 }
 
 #[pymethods]
@@ -46,10 +60,7 @@ impl PyTilingConfig {
         pad: (u8, u8, u8, u8),
     ) -> Self {
         let pad = [pad.0, pad.1, pad.2, pad.3];
-        let fit = match fit {
-            PyFit::Stretch => Fit::Stretch,
-            PyFit::Letterbox => Fit::Letterbox { pad },
-        };
+        let fit = Fit::from_mode(fit.into(), pad);
         let cfg = TilingConfig {
             pad,
             ..TilingConfig::new(tile_w, tile_h)

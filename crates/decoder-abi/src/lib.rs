@@ -59,7 +59,7 @@ pub struct EfSegmentation {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EfMergeConfig {
-    /// 0 = IoU, 1 = Intersection-over-Smaller.
+    /// An `EF_MATCH_METRIC_*` code: IoU, or Intersection-over-Smaller.
     ///
     /// IoS is the default for a reason: an object split across a tile seam has
     /// *low* IoU with its own fragment but high IoS, so IoU would keep both
@@ -70,13 +70,14 @@ pub struct EfMergeConfig {
     pub class_agnostic: c_int,
     pub max_det: usize,
     pub score_threshold: f32,
-    /// 0 = keep-best (default): the highest-scoring box of each matched
-    /// group is kept and the boxes it matched are dropped. 1 = union: the
-    /// group becomes its enclosing union carrying the max score.
+    /// An `EF_MERGE_MODE_*` code. `EF_MERGE_MODE_KEEP_BEST` (default): the
+    /// highest-scoring box of each matched group is kept and the boxes it
+    /// matched are dropped. `EF_MERGE_MODE_UNION`: the group becomes its
+    /// enclosing union carrying the max score.
     ///
     /// Keep-best is `0`, but note that a zero-initialised struct is still
-    /// not the library default: `metric` defaults to `1` (IoS), so an
-    /// all-zero struct selects IoU. Fill with `ef_merge_config_default`.
+    /// not the library default: `metric` defaults to `EF_MATCH_METRIC_IOS`,
+    /// so an all-zero struct selects IoU. Fill with `ef_merge_config_default`.
     /// The union measured about 0.05 AP50 worse on every frame of the Ocean
     /// Cleanup ADIS 4K validation (TOP2-836), which is why it is opt-in.
     ///

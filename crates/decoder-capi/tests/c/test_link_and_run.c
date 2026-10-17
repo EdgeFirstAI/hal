@@ -109,6 +109,12 @@ static int infer_reports_failure(void) {
 }
 
 int main(void) {
+    if (ef_decoder_abi_version() != 3) {
+        fprintf(stderr, "FAIL: ef_decoder_abi_version() = %u, expected 3\n",
+                (unsigned) ef_decoder_abi_version());
+        return 1;
+    }
+
     struct ef_decoder_params *p = ef_decoder_params_new();
     if (!p) { fprintf(stderr, "FAIL: ef_decoder_params_new returned NULL\n"); return 1; }
     ef_decoder_params_free(p);

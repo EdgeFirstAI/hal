@@ -98,6 +98,23 @@ pub enum ConfigOutput {
     Classes(configs::Classes),
 }
 
+impl ConfigOutput {
+    /// The kind of this output.
+    pub fn output_type(&self) -> configs::OutputType {
+        use configs::OutputType;
+        match self {
+            ConfigOutput::Detection(_) => OutputType::Detection,
+            ConfigOutput::Mask(_) => OutputType::Mask,
+            ConfigOutput::Segmentation(_) => OutputType::Segmentation,
+            ConfigOutput::Protos(_) => OutputType::Protos,
+            ConfigOutput::Scores(_) => OutputType::Scores,
+            ConfigOutput::Boxes(_) => OutputType::Boxes,
+            ConfigOutput::MaskCoefficients(_) => OutputType::MaskCoefficients,
+            ConfigOutput::Classes(_) => OutputType::Classes,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum ConfigOutputRef<'a> {
     Detection(&'a configs::Detection),
@@ -373,6 +390,32 @@ impl ConfigOutput {
             ConfigOutput::Protos(protos) => protos.quantization,
             ConfigOutput::MaskCoefficients(mask_coefficients) => mask_coefficients.quantization,
             ConfigOutput::Classes(classes) => classes.quantization,
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_type_tests {
+    use super::*;
+    use configs::OutputType;
+
+    #[test]
+    fn output_type_strings_are_the_serialized_tags() {
+        let outputs = [
+            ConfigOutput::Detection(Default::default()),
+            ConfigOutput::Boxes(Default::default()),
+            ConfigOutput::Scores(Default::default()),
+            ConfigOutput::Protos(Default::default()),
+            ConfigOutput::Segmentation(Default::default()),
+            ConfigOutput::MaskCoefficients(Default::default()),
+            ConfigOutput::Mask(Default::default()),
+            ConfigOutput::Classes(Default::default()),
+        ];
+        assert_eq!(outputs.len(), OutputType::all().len());
+        for (output, &want) in outputs.iter().zip(OutputType::all()) {
+            assert_eq!(output.output_type(), want);
+            let json = serde_json::to_value(output).unwrap();
+            assert_eq!(json["type"], want.as_str(), "{want:?}");
         }
     }
 }

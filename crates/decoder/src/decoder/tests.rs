@@ -4248,6 +4248,24 @@ outputs:
         }
 
         #[test]
+        fn v1_semantic_decoder_is_not_supported() {
+            let yaml = r#"
+outputs:
+  - decoder: semantic
+    type: segmentation
+    shape: [1, 128, 128, 150]
+"#;
+            let err = DecoderBuilder::new()
+                .with_config_yaml_str(yaml.to_string())
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, DecoderError::NotSupported(_)),
+                "expected NotSupported, got {err:?}"
+            );
+        }
+
+        #[test]
         fn with_schema_rejects_future_version() {
             let j = r#"{"schema_version": 99, "outputs": []}"#;
             let err = SchemaV2::parse_json(j).unwrap_err();

@@ -139,7 +139,29 @@ def test_quantized_output_tuple_is_accepted():
     # Scales cross as f32, so a Python float does not survive exactly.
     assert quant["scale"] == pytest.approx([0.02], rel=1e-6)
     assert quant["zero_point"] == [-5]
-    assert quant["dtype"] == "int8"
+    # Emitted with the tensor dtype name, whichever spelling came in.
+    assert quant["dtype"] == "i8"
+
+
+@pytest.mark.parametrize("legacy,name", [("int8", "i8"), ("uint8", "u8")])
+def test_dtype_accepts_tensor_names_and_legacy_spellings(legacy, name):
+    metadata = {"names": "{0: 'a', 1: 'b'}", "task": "detect", "end2end": "False"}
+    for spelling in (legacy, name):
+        inputs = [("images", [1, 640, 640, 3], "f32")]
+        outputs = [("output0", [1, 6, 8400], spelling, ([0.02], [-5]))]
+        schema = ef.infer_ultralytics_schema("tflite", inputs, outputs, metadata).schema
+        assert schema["outputs"][0]["quantization"]["dtype"] == name
+
+
+def test_unknown_dtype_names_every_accepted_spelling():
+    metadata = {"names": "{0: 'a', 1: 'b'}", "task": "detect", "end2end": "False"}
+    with pytest.raises(ValueError, match="u8.*uint8"):
+        ef.infer_ultralytics_schema(
+            "onnx",
+            [("images", [1, 3, 640, 640], "f64")],
+            [("output0", [1, 6, 8400], "f32")],
+            metadata,
+        )
 
 
 def test_bare_and_explicit_none_quantization_agree():

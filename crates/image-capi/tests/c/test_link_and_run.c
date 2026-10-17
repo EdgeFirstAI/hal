@@ -7,6 +7,12 @@
 #include <stdio.h>
 
 int main(void) {
+    if (ef_image_abi_version() != 2) {
+        fprintf(stderr, "FAIL: ef_image_abi_version() = %u, expected 2\n",
+                (unsigned) ef_image_abi_version());
+        return 1;
+    }
+
     struct ef_image_processor *p = ef_image_processor_new();
     if (!p) { fprintf(stderr, "FAIL: ef_image_processor_new returned NULL\n"); return 1; }
     printf("PASS: image links and runs\n");
