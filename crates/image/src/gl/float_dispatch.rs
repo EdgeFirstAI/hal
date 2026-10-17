@@ -45,6 +45,12 @@ pub(super) enum FloatRenderPath {
     PboF16Nchw,
     /// RGBA → Rgb F32, PBO destination (R32F-wide shader). Linux.
     PboF32Nhwc,
+    /// RGBA → PlanarRgb F32, PBO destination (the planar packer into an
+    /// RGBA32F surface).
+    PboF32Nchw,
+    /// RGBA → Rgb F16, PBO destination (the interleaved packer into an
+    /// RGBA16F surface).
+    PboF16Nhwc,
     /// RGBA → PlanarRgb F16 into a zero-copy GPU buffer destination via
     /// `convert_float_to_zero_copy` — a DMA-BUF on Linux, an IOSurface on
     /// macOS (both report `TensorMemory::DmaBuf`).
@@ -133,6 +139,10 @@ pub(super) fn classify_float_render(
             FloatRenderPath::ZeroCopyFloatRgba
         }
         (Rgba, Rgb, DType::F32, TensorMemory::Pbo) if support.f32 => FloatRenderPath::PboF32Nhwc,
+        (Rgba, PlanarRgb, DType::F32, TensorMemory::Pbo) if support.f32 => {
+            FloatRenderPath::PboF32Nchw
+        }
+        (Rgba, Rgb, DType::F16, TensorMemory::Pbo) if support.f16 => FloatRenderPath::PboF16Nhwc,
         _ => FloatRenderPath::None,
     }
 }

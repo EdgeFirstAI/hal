@@ -96,7 +96,7 @@ your pipeline needs:
 
 ```rust,ignore
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{ConvertOptions, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat};
 
 let mut processor = ImageProcessor::new()?;
@@ -115,7 +115,7 @@ loop {
     // reports EXIF orientation in `info` but does not apply it, so pass it on.
     let rot = Rotation::from_degrees_clockwise(info.rotation_degrees as usize);
     let flip = if info.flip_horizontal { Flip::Horizontal } else { Flip::None };
-    processor.convert(&src, &mut dst, rot, flip, Crop::new())?;
+    processor.convert(&src, &mut dst, Some(ConvertOptions::new().rotation(rot).flip(flip)))?;
 }
 ```
 

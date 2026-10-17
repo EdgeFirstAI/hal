@@ -7,8 +7,8 @@
 #include <stdio.h>
 
 int main(void) {
-    if (ef_image_abi_version() != 2) {
-        fprintf(stderr, "FAIL: ef_image_abi_version() = %u, expected 2\n",
+    if (ef_image_abi_version() != 3) {
+        fprintf(stderr, "FAIL: ef_image_abi_version() = %u, expected 3\n",
                 (unsigned) ef_image_abi_version());
         return 1;
     }

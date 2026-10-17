@@ -44,7 +44,9 @@ uniform vec2 dst_image_size;  // (W, H) — destination plane size
 uniform vec4 src_rect_uv;     // (origin_u, origin_v, size_u, size_v)
 uniform vec4 src_extent;      // (u_min, v_min, u_max, v_max) a sample may reach
 uniform vec4 dst_rect_px;     // (origin_x, origin_y, w, h) within one plane
-uniform vec4 pad_color;       // per-channel normalized pad value (RGBA)
+uniform vec4 pad_color;       // per-channel pad value as written (RGBA)
+uniform vec4 norm_scale;      // output = sample * norm_scale + norm_offset
+uniform vec4 norm_offset;
 out vec4 frag;
 
 // Sample one planar element. Returns the per-channel value at
@@ -61,7 +63,7 @@ float sample_planar_element(float in_plane_x, float in_plane_y, float plane) {
         float v = (in_plane_y - dst_rect_px.y) / dst_rect_px.w;
         vec2 src_uv = clamp(src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw,
                             src_extent.xy, src_extent.zw);
-        vec4 rgba = texture(src, src_uv);
+        vec4 rgba = texture(src, src_uv) * norm_scale + norm_offset;
         if (plane < 0.5) {
             return rgba.r;
         } else if (plane < 1.5) {
@@ -131,7 +133,9 @@ uniform sampler2D src;
 uniform vec4 src_rect_uv;     // (origin_u, origin_v, size_u, size_v)
 uniform vec4 src_extent;      // (u_min, v_min, u_max, v_max) a sample may reach
 uniform vec4 dst_rect_px;     // (origin_x, origin_y, w, h) in pixel space
-uniform vec4 pad_color;       // per-channel normalized pad value (RGBA)
+uniform vec4 pad_color;       // per-channel pad value as written (RGBA)
+uniform vec4 norm_scale;      // output = sample * norm_scale + norm_offset
+uniform vec4 norm_offset;
 out vec4 frag;
 
 // Sample one element of the interleaved [H, W, 3] stream. `element` is the
@@ -156,7 +160,7 @@ float sample_interleaved_element(int element, int oy) {
     float v = (fy + 0.5 - dst_rect_px.y) / dst_rect_px.w;
     vec2 src_uv = clamp(src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw,
                         src_extent.xy, src_extent.zw);
-    vec4 rgba = texture(src, src_uv);
+    vec4 rgba = texture(src, src_uv) * norm_scale + norm_offset;
     return (channel == 0) ? rgba.r
          : (channel == 1) ? rgba.g : rgba.b;
 }
@@ -192,7 +196,9 @@ uniform sampler2D src;
 uniform vec4 src_rect_uv;     // (origin_u, origin_v, size_u, size_v)
 uniform vec4 src_extent;      // (u_min, v_min, u_max, v_max) a sample may reach
 uniform vec4 dst_rect_px;     // (origin_x, origin_y, w, h) in pixel space
-uniform vec4 pad_color;       // per-channel normalized pad value (RGBA)
+uniform vec4 pad_color;       // per-channel pad value as written (RGBA)
+uniform vec4 norm_scale;      // output = sample * norm_scale + norm_offset
+uniform vec4 norm_offset;
 out vec4 color;
 
 void main() {
@@ -211,7 +217,7 @@ void main() {
     float v = (py + 0.5 - dst_rect_px.y) / dst_rect_px.w;
     vec2 src_uv = clamp(src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw,
                         src_extent.xy, src_extent.zw);
-    color = texture(src, src_uv);
+    color = texture(src, src_uv) * norm_scale + norm_offset;
 }
 "#;
 
@@ -387,13 +393,20 @@ macro_rules! nv_rgb_hw_bilinear_body {
     };
 }
 
-/// The XOR 0x80 bias (`(q + 128) mod 256`) the int8 NV programs apply to
-/// their output, as the other int8 shaders do.
-macro_rules! nv_int8_bias {
+/// The integer output mapping every int8 program applies to its RGB output:
+/// normalization and quantization as uniforms, stored as the low byte. The
+/// default uniforms (scale 255, zero point -128) are the `x ^ 0x80` bias.
+macro_rules! int_quantize {
     () => {
-        "vec3 int8_bias(vec3 v) {
-    vec3 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
+        "uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
+uniform highp vec3 q_offset;
+uniform highp vec3 q_lo;
+uniform highp vec3 q_hi;
+uniform highp vec3 q_zero;    // zero point / 255; q_wrap marks a negative stored value
+uniform highp vec3 q_wrap;
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
+    return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
 
 "
@@ -482,13 +495,10 @@ pub(crate) const YUYV_RGBA_2D_FRAGMENT: &str = concat!(
 /// CPU `byte ^ 0x80`).
 pub(crate) const YUYV_RGBA_2D_INT8_FRAGMENT: &str = concat!(
     yuyv_rgba_2d_header!(),
-    "vec3 int8_bias(vec3 v) {\n",
-    "    vec3 q = floor(v * 255.0 + 0.5);\n",
-    "    return mod(q + 128.0, 256.0) / 255.0;\n",
-    "}\n\n",
+    int_quantize!(),
     "void main() {\n",
     yuyv_rgb_body!(),
-    "    color = vec4(int8_bias(vec3(r, g, b)), 1.0);\n}\n"
+    "    color = vec4(quantize(vec3(r, g, b)), 1.0);\n}\n"
 );
 
 /// NV->RGBA fragment shader (Path B) for draws that do not rescale. Vertex
@@ -504,10 +514,10 @@ pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
 /// Int8 variant of [`NV_RGBA_FRAGMENT`].
 pub(crate) const NV_RGBA_INT8_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
-    nv_int8_bias!(),
+    int_quantize!(),
     "void main() {\n",
     nv_rgb_nearest_body!(),
-    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
 /// NV->RGBA fragment shader (Path B) for draws that rescale: bilinear. A
@@ -535,10 +545,10 @@ pub(crate) const NV_RGBA_HW_BILINEAR_FRAGMENT: &str = concat!(
 /// Int8 variant of [`NV_RGBA_HW_BILINEAR_FRAGMENT`].
 pub(crate) const NV_RGBA_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
-    nv_int8_bias!(),
+    int_quantize!(),
     "void main() {\n",
     nv_rgb_hw_bilinear_body!(),
-    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
 /// Header of the Y2Y NV programs: `GL_EXT_YUV_target` samples an NV12
@@ -588,19 +598,19 @@ pub(crate) const NV_RGBA_Y2Y_FRAGMENT: &str = concat!(
 /// Int8 variant of [`NV_RGBA_Y2Y_FRAGMENT`].
 pub(crate) const NV_RGBA_Y2Y_INT8_FRAGMENT: &str = concat!(
     nv_y2y_header!(),
-    nv_int8_bias!(),
+    int_quantize!(),
     "void main() {\n",
     nv_rgb_y2y_body!(),
-    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
 /// Int8 variant of [`NV_RGBA_BILINEAR_FRAGMENT`].
 pub(crate) const NV_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
-    nv_int8_bias!(),
+    int_quantize!(),
     "void main() {\n",
     nv_rgb_bilinear_body!(),
-    "    color = vec4(int8_bias(rgb), 1.0);\n}\n"
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
 #[cfg(test)]

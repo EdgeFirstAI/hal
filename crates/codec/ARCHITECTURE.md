@@ -320,7 +320,7 @@ let rot = Rotation::from_degrees_clockwise(info.rotation_degrees as usize);
 let flip = if info.flip_horizontal { Flip::Horizontal } else { Flip::None };
 // The decode reconfigured the tensor's logical shape to the decoded
 // dimensions, so a whole-source crop covers exactly the decoded region.
-processor.convert(&tensor, &mut dst, rot, flip, Crop::new())?;
+processor.convert(&tensor, &mut dst, Some(ConvertOptions::new().rotation(rot).flip(flip)))?;
 ```
 
 ## Decode Pipeline

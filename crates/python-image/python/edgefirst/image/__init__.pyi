@@ -14,7 +14,7 @@ import sys
 # crates/python-image/src/lib.rs), so an image tensor with an explicit memory
 # backend or colorimetry override can be built using only edgefirst.image
 # imports.
-from typing import Protocol
+from typing import Protocol, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -35,6 +35,7 @@ from edgefirst.tensor import PixelFormat as PixelFormat
 from edgefirst.tensor import Region as Region
 from edgefirst.tensor import Tensor as Tensor
 from edgefirst.tensor import TensorMemory as TensorMemory
+from typing_extensions import TypeAlias
 
 class EdgeFirstProtoDataExportable(Protocol):
     """Structural type for mask-prototype data via ``__edgefirst_protodata__``."""
@@ -252,6 +253,73 @@ def gpu_dma_buf_pitch_alignment_bytes() -> int:
     (currently 64). External callers that need to allocate their own
     DMA-BUFs should size them so each row pitch is a multiple of this value.
     """
+
+class LetterboxPlacement(enum.Enum):
+    """Where a letterboxed image sits. The integer values are the C
+    ``EF_LETTERBOX_PLACEMENT_*`` codes."""
+
+    Center: LetterboxPlacement
+    """Centred, padding split between both sides (the default)."""
+    TopLeft: LetterboxPlacement
+    """Anchored at the top-left corner, padding on the right and bottom."""
+
+class NormalizationPreset(enum.Enum):
+    """A named convert normalization, ``(x - mean) / std`` on 0-255 values.
+    The integer values are the C ``EF_NORMALIZATION_*`` codes; the names match
+    the ``edgefirst.json`` presets."""
+
+    Unsigned: NormalizationPreset
+    """``x / 255``, giving ``[0, 1]`` (the default)."""
+    Signed: NormalizationPreset
+    """``x / 127.5 - 1``, giving ``[-1, 1]``."""
+    Raw: NormalizationPreset
+    """``x``, giving ``[0, 255]``."""
+    Imagenet: NormalizationPreset
+    """ImageNet mean ``(123.675, 116.28, 103.53)`` and std ``(58.395, 57.12, 57.375)``."""
+
+NormalizationArg: TypeAlias = (
+    NormalizationPreset | str | tuple[Sequence[float], Sequence[float]]
+)
+"""A :class:`NormalizationPreset`, its name, or ``(mean, std)``."""
+
+class ConvertOptions:
+    """Options for :meth:`ImageProcessor.convert`. Every method returns a new
+    object, so one can be built once and reused.
+
+    Example::
+
+        opts = (ConvertOptions()
+                .letterbox((0, 0, 0, 255))
+                .placement(LetterboxPlacement.TopLeft)
+                .pad_output((0.0, 0.0, 0.0, 0.0))
+                .normalization(NormalizationPreset.Imagenet))
+        proc.convert(src, dst, options=opts)
+    """
+
+    def __init__(
+        self,
+        rotation: Rotation | None = None,
+        flip: Flip | None = None,
+        source: Region | None = None,
+        letterbox: tuple[int, int, int, int] | None = None,
+        placement: LetterboxPlacement | None = None,
+        pad_output: tuple[float, float, float, float] | None = None,
+        normalization: NormalizationArg | None = None,
+    ) -> None: ...
+    def rotation(self, rotation: Rotation) -> ConvertOptions:
+        """Rotate the output, in 90° steps."""
+    def flip(self, flip: Flip) -> ConvertOptions:
+        """Flip the output."""
+    def source(self, source: Region | None) -> ConvertOptions:
+        """Sample only ``source`` of the input; ``None`` samples all of it."""
+    def letterbox(self, pad: tuple[int, int, int, int]) -> ConvertOptions:
+        """Letterbox, padding with the RGBA pixel ``pad``, mapped like the image."""
+    def placement(self, placement: LetterboxPlacement) -> ConvertOptions:
+        """Where a letterboxed image sits."""
+    def pad_output(self, pad: tuple[float, float, float, float]) -> ConvertOptions:
+        """Pad with these values as written to the destination."""
+    def normalization(self, normalization: NormalizationArg) -> ConvertOptions:
+        """How pixel values map to the destination."""
 
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
@@ -481,10 +549,15 @@ class ImageProcessor:
         self,
         src: EdgeFirstTensorExportable,
         dst: EdgeFirstTensorExportable,
-        rotation: Rotation = Rotation.Rotate0,
-        flip: Flip = Flip.NoFlip,
+        rotation: Rotation | None = None,
+        flip: Flip | None = None,
         source: Region | None = None,
         letterbox: tuple[int, int, int, int] | None = None,
+        *,
+        options: ConvertOptions | None = None,
+        letterbox_placement: LetterboxPlacement | None = None,
+        pad_output: tuple[float, float, float, float] | None = None,
+        normalization: NormalizationArg | None = None,
     ) -> None:
         """Convert ``src`` into ``dst``, scaling, converting colour, rotating
         and flipping as needed, and wait for the GPU before returning.
@@ -500,6 +573,19 @@ class ImageProcessor:
             letterbox: ``(r, g, b, a)`` pad colour. Given, the source is
                 fitted into the destination preserving aspect ratio and the
                 remainder is padded; ``None`` stretches.
+            options: A :class:`ConvertOptions` to start from; every other
+                argument given here is applied on top of it.
+            letterbox_placement: Where a letterboxed image sits.
+            pad_output: Pad with these values as written to ``dst`` (after
+                normalization, quantized for integer destinations) instead of
+                mapping ``letterbox`` like the image.
+            normalization: How pixel values map to ``dst``: a
+                :class:`NormalizationPreset`, its name, or ``(mean, std)`` with
+                one or three values each, as ``(x - mean) / std`` on 0-255
+                values. Float destinations default to ``x / 255``. An integer
+                destination with a non-default normalization must carry
+                quantization (``Tensor.set_quantization``), which the result
+                is quantized with.
 
         On Windows the destination's ``gpu_completion()`` reflects this
         convert afterwards.
@@ -509,10 +595,15 @@ class ImageProcessor:
         self,
         src: EdgeFirstTensorExportable,
         dst: EdgeFirstTensorExportable,
-        rotation: Rotation = Rotation.Rotate0,
-        flip: Flip = Flip.NoFlip,
+        rotation: Rotation | None = None,
+        flip: Flip | None = None,
         source: Region | None = None,
         letterbox: tuple[int, int, int, int] | None = None,
+        *,
+        options: ConvertOptions | None = None,
+        letterbox_placement: LetterboxPlacement | None = None,
+        pad_output: tuple[float, float, float, float] | None = None,
+        normalization: NormalizationArg | None = None,
     ) -> None:
         """Convert without waiting for the GPU — the batch-preprocessing
         primitive.
@@ -544,10 +635,15 @@ class ImageProcessor:
         self,
         src: EdgeFirstTensorExportable,
         dst: EdgeFirstTensorExportable,
-        rotation: Rotation = Rotation.Rotate0,
-        flip: Flip = Flip.NoFlip,
+        rotation: Rotation | None = None,
+        flip: Flip | None = None,
         source: Region | None = None,
         letterbox: tuple[int, int, int, int] | None = None,
+        *,
+        options: ConvertOptions | None = None,
+        letterbox_placement: LetterboxPlacement | None = None,
+        pad_output: tuple[float, float, float, float] | None = None,
+        normalization: NormalizationArg | None = None,
     ) -> int | None:
         """Convert without blocking on the GPU; returns a completion handle.
 

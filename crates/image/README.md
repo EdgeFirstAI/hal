@@ -32,7 +32,7 @@ neighbours:
 ## Quick Start
 
 ```rust
-use edgefirst_image::{save_jpeg, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_image::{save_jpeg, ConvertOptions, ImageProcessor, ImageProcessorTrait};
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{CpuAccess, PixelFormat, DType, Tensor, TensorDyn, TensorMemory};
 
@@ -55,18 +55,38 @@ let mut processor = ImageProcessor::new()?;
 let mut dst =
     processor.create_image(640, 640, PixelFormat::Rgba, DType::U8, None, CpuAccess::ReadWrite)?;
 
-// Convert with resize, rotation, letterboxing
+// Convert with resize and letterboxing (preserve aspect ratio, grey pad);
+// `None` instead of options converts the whole source, stretched
 processor.convert(
     &src,
     &mut dst,
-    Rotation::None,
-    Flip::None,
-    Crop::letterbox([114, 114, 114, 255]),  // preserve aspect ratio, grey pad
+    Some(ConvertOptions::new().letterbox([114, 114, 114, 255])),
 )?;
 
 // Save result
 save_jpeg(&dst, "output.jpg", 90)?;
 ```
+
+## Normalization and quantized inputs
+
+`ConvertOptions` also carries the pixel value mapping, so a model input is written in the form the model expects in the same pass. Normalization is `(x - mean) / std` on 0-255 values, with the `edgefirst.json` presets (`unsigned`, the default `x / 255`; `signed`; `raw`; `imagenet`) or explicit coefficients:
+
+```rust,ignore
+use edgefirst_image::{ConvertOptions, LetterboxPlacement, Normalization};
+
+// SegFormer: ImageNet normalization, image at the top-left, pad 0.0 after
+// normalization.
+let opts = ConvertOptions::new()
+    .letterbox([0, 0, 0, 255])
+    .placement(LetterboxPlacement::TopLeft)
+    .pad_output([0.0; 4])
+    .normalization(Normalization::imagenet());
+processor.convert(&src, &mut model_input, Some(opts))?;
+```
+
+Float destinations (F32, F16; NHWC `Rgb` or NCHW `PlanarRgb`) receive the normalized values. A u8 or i8 destination with a non-default normalization must carry quantization (`set_quantization`); the result is quantized with it as `clamp(floor(y / scale + 0.5) + zero_point)`, so normalization and the NPU input quantization happen in one pass. Without normalization an i8 destination keeps the plain `x - 128` mapping. The pad is the RGBA pixel given to `letterbox` mapped like the image, or the `pad_output` values as written. With the `decode` feature, `ConvertOptions::with_preprocessing` reads all of this from a model's `input.preprocessing`.
+
+The CPU path (NEON on aarch64) and the GL path apply the mapping; G2D does not, and declines such converts.
 
 ## Backends
 
@@ -151,7 +171,7 @@ let overlay = MaskOverlay {
 Fields:
 - `background: Option<&TensorDyn>` — Optional tensor to blit into `dst` before drawing masks. Must match `dst`'s shape and format, and must not alias `dst` (an aliased pair returns `Error::AliasedBuffers`). `None` clears `dst` instead.
 - `opacity: f32` — Scales mask alpha in the range `0.0` (invisible) to `1.0` (fully opaque, default).
-- `letterbox: Option<[f32; 4]>` — `[xmin, ymin, xmax, ymax]` in model-input normalized space. When set, decoder output is mapped back to the original image's coordinates. Build it from the same `Crop` you gave `convert()` with `MaskOverlay::with_letterbox_crop`.
+- `letterbox: Option<[f32; 4]>` — `[xmin, ymin, xmax, ymax]` in model-input normalized space. When set, decoder output is mapped back to the original image's coordinates. Build it from the same `ConvertOptions` you gave `convert()` with `MaskOverlay::with_convert_options`.
 - `color_mode: ColorMode` — `Class` (default, colour per class label), `Instance` (colour per detection index), or `Track` (reserved for track IDs; behaves like `Instance` today).
 
 ### draw_masks()
@@ -240,7 +260,7 @@ zero-copy GPU paths that direct `Tensor::new()` allocation cannot achieve:
 ```rust,ignore
 let mut dst =
     processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
-processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox([114, 114, 114, 255]))?;
+processor.convert(&src, &mut dst, Some(ConvertOptions::new().letterbox([114, 114, 114, 255])))?;
 ```
 
 If you need to write into a pre-allocated buffer with a specific memory type
@@ -250,7 +270,7 @@ If you need to write into a pre-allocated buffer with a specific memory type
 let mut model_input = Tensor::<u8>::new(&[640, 640, 3], None, None)?;
 model_input.set_format(PixelFormat::Rgb)?;
 let mut dst = TensorDyn::from(model_input);
-processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox([114, 114, 114, 255]))?;
+processor.convert(&src, &mut dst, Some(ConvertOptions::new().letterbox([114, 114, 114, 255])))?;
 ```
 
 ## Tiled Preprocessing (SAHI)
@@ -339,7 +359,7 @@ let mut dst = processor.import_image(
     DType::U8,
     None,               // colorimetry: supply the producer's signalling for YUV sources
 )?;
-processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox([114, 114, 114, 255]))?;
+processor.convert(&src, &mut dst, Some(ConvertOptions::new().letterbox([114, 114, 114, 255])))?;
 // dst's backing memory IS vx_fd — no memcpy needed
 ```
 
@@ -363,7 +383,7 @@ For V4L2 multi-planar DMA-BUF buffers (separate Y and UV file descriptors):
 ```rust,ignore
 let img = Tensor::from_planes(y_tensor, uv_tensor, PixelFormat::Nv12)?;
 let src = TensorDyn::from(img);
-processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+processor.convert(&src, &mut dst, None)?;
 ```
 
 The OpenGL backend imports each plane's DMA-BUF fd separately for zero-copy GPU access.

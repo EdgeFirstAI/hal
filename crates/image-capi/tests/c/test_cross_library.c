@@ -137,8 +137,8 @@ int main(void) {
     failures++;
   } else {
     void *fence = NULL;
-    int rc = ef_image_processor_convert_fence_handle(p, fsrc, fdst, 0, 0,
-                                                      NULL, &fence);
+    int rc = ef_image_processor_convert_fence_handle(p, fsrc, fdst, NULL,
+                                                      &fence);
 #ifdef _WIN32
     if (rc != 0) {
       fprintf(stderr, "convert_fence_handle: expected 0 on Windows, got %d\n",
@@ -217,7 +217,7 @@ int main(void) {
     // off-Windows arm of the plain convert belongs to the fenced section
     // above, not here.
     void *cevent = NULL;
-    if (ef_image_processor_convert_fence_handle(p, bsrc, bdst, 0, 0, NULL,
+    if (ef_image_processor_convert_fence_handle(p, bsrc, bdst, NULL,
                                                 &cevent) != 0) {
       fprintf(stderr, "export/import: convert failed\n");
       failures++;

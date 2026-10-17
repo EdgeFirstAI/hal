@@ -41,7 +41,7 @@
 
 #![cfg(all(feature = "opengl", any(target_os = "linux", target_os = "windows")))]
 
-use edgefirst_image::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};
+use edgefirst_image::{GLProcessorThreaded, ImageProcessorTrait};
 use edgefirst_tensor::{
     CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMapTrait, TensorMemory,
 };
@@ -166,7 +166,7 @@ fn the_convert_span_records_the_feed_fields() {
         m.as_mut_slice().fill(0x5A);
     }
     let mut dst = image(W, H, TensorMemory::Mem).expect("host destination");
-    gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+    gl.convert(&src, &mut dst, None)
         .expect("host-memory convert");
 
     let seen = records.lock().unwrap().clone();
@@ -194,13 +194,7 @@ fn the_convert_span_records_the_feed_fields() {
             let mut m = dma_src.map_bytes(CpuAccess::Write).expect("map dma source");
             m.as_mut_slice().fill(0x33);
         }
-        let _ = gl.convert(
-            &dma_src,
-            &mut dst,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        );
+        let _ = gl.convert(&dma_src, &mut dst, None);
     }
     let src_feeds = values_for(&records.lock().unwrap().clone(), "src_feed");
     eprintln!("CAPTURE src_feed on image.convert.gl: {src_feeds:?}");
@@ -233,7 +227,7 @@ fn the_convert_span_records_the_feed_fields() {
     // against the vocabulary on every host either way, which is what catches a
     // missing or misspelled record.
     if let Some(mut zc) = image(W, H, TensorMemory::DmaBuf) {
-        let _ = gl.convert(&src, &mut zc, Rotation::None, Flip::None, Crop::default());
+        let _ = gl.convert(&src, &mut zc, None);
     }
     let feeds = values_for(&records.lock().unwrap().clone(), "dst_feed");
     assert!(
@@ -277,13 +271,7 @@ fn the_convert_span_records_the_feed_fields() {
             // feed records can satisfy the assertions even when the float
             // dispatch never enters or records `image.convert.gl`.
             records.lock().unwrap().clear();
-            match gl.convert(
-                &float_src,
-                &mut float_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            ) {
+            match gl.convert(&float_src, &mut float_dst, None) {
                 Ok(()) => {
                     let seen = records.lock().unwrap().clone();
                     let src_feeds = values_for(&seen, "src_feed");
@@ -352,13 +340,7 @@ fn the_convert_span_records_the_feed_fields() {
         .convert_stats()
         .expect("convert stats")
         .dst_import_fallbacks;
-    let _ = gl.convert(
-        &tile_src,
-        &mut tile,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    );
+    let _ = gl.convert(&tile_src, &mut tile, None);
     let refused = gl
         .convert_stats()
         .expect("convert stats")
