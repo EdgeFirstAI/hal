@@ -148,6 +148,8 @@ impl Decoder {
                 NumClasses => Some(2),
                 _ => None,
             },
+            // The semantic decoder has no box-family layout.
+            (Detection(_) | Boxes(_) | Scores(_) | Classes(_), Semantic) => None,
             // Segmentation (decoder-agnostic): [batch, height, width, num_classes]
             (Segmentation(_), _) => match name {
                 Batch => Some(0),

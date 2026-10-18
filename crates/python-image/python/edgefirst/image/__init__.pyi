@@ -130,12 +130,18 @@ class MaskResolution:
         """Per-detection tile at ``(width, height)`` pixel resolution."""
 
 class Flip(enum.Enum):
+    """A mirror applied during a convert.
+
+    The integer values are the C ``EF_FLIP_*`` codes: ``NoFlip`` is 0,
+    ``Vertical`` 1 and ``Horizontal`` 2.
+    """
+
     NoFlip: Flip
     """No flip"""
-    Horizontal: Flip
-    """Flip the image horizontally"""
     Vertical: Flip
-    """Flip the image vertically"""
+    """Flip the image vertically (top to bottom)"""
+    Horizontal: Flip
+    """Flip the image horizontally (left to right)"""
 
 class Rotation(enum.Enum):
     Rotate0: Rotation

@@ -15,6 +15,9 @@
 # hand-written `trailer` below, not in generated output.
 
 language = "C"
+# The option vocabularies are `#[repr(u32)]` enums; see tensor-capi's
+# cbindgen.toml for why that needs `cpp_compat` to compile as C++.
+cpp_compat = true
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
 include_version = true
 documentation = true
@@ -108,6 +111,15 @@ exclude = [
   "EfDetectBox",
   "EfSegmentation",
 ]
+# The option vocabularies are not reachable from any signature (the
+# functions take `uint32_t`), so they are named here.
+include = [
+  "EfRotation",
+  "EfFlip",
+  "EfColorMode",
+  "EfFit",
+  "EfComputeBackend",
+]
 
 
 [export.rename]
@@ -123,6 +135,11 @@ exclude = [
 "EfTilePlacementList" = "ef_tile_placement_list"
 "EfDetectBox" = "ef_detect_box"
 "EfSegmentation" = "ef_segmentation"
+"EfRotation" = "ef_rotation"
+"EfFlip" = "ef_flip"
+"EfColorMode" = "ef_color_mode"
+"EfFit" = "ef_fit"
+"EfComputeBackend" = "ef_compute_backend"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

@@ -12,37 +12,27 @@ use edgefirst_decoder::{infer_ultralytics_schema, ModelSignals, ModelSource, Ten
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-/// Maps a Python dtype string to `schema::DType`. A distinct, narrower
-/// vocabulary from `edgefirst_tensor::DType` -- see `decoder-capi`'s
-/// `dtype_from` for the same split at the C boundary.
+/// Maps a Python dtype string to `schema::DType`: the tensor dtype names
+/// (`"u8"`, `"f32"`, ...) or the older `"uint8"`, `"float32"`, ... spellings.
 fn dtype_from_str(s: &str) -> PyResult<DType> {
-    match s {
-        "int8" => Ok(DType::Int8),
-        "uint8" => Ok(DType::Uint8),
-        "int16" => Ok(DType::Int16),
-        "uint16" => Ok(DType::Uint16),
-        "int32" => Ok(DType::Int32),
-        "uint32" => Ok(DType::Uint32),
-        "float16" => Ok(DType::Float16),
-        "float32" => Ok(DType::Float32),
-        other => Err(PyValueError::new_err(format!(
-            "unknown dtype `{other}` (expected one of: int8, uint8, int16, \
-             uint16, int32, uint32, float16, float32)"
-        ))),
-    }
+    DType::from_str_code(s).ok_or_else(|| {
+        let expected: Vec<&str> = DType::accepted_names().collect();
+        PyValueError::new_err(format!(
+            "unknown dtype `{s}` (expected one of: {})",
+            expected.join(", ")
+        ))
+    })
 }
 
 /// Maps a Python source string to `ModelSource`.
 fn source_from_str(s: &str) -> PyResult<ModelSource> {
-    match s {
-        "onnx" => Ok(ModelSource::Onnx),
-        "tflite" => Ok(ModelSource::TfLite),
-        "coreml" => Ok(ModelSource::CoreMl),
-        "other" => Ok(ModelSource::Other),
-        other => Err(PyValueError::new_err(format!(
-            "unknown source `{other}` (expected one of: onnx, tflite, coreml, other)"
-        ))),
-    }
+    ModelSource::from_str_code(s).ok_or_else(|| {
+        let expected: Vec<&str> = ModelSource::all().iter().map(|m| m.as_str()).collect();
+        PyValueError::new_err(format!(
+            "unknown source `{s}` (expected one of: {})",
+            expected.join(", ")
+        ))
+    })
 }
 
 /// An output tensor's optional per-tensor quantization, `(scales,

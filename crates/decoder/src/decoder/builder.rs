@@ -71,6 +71,7 @@ mod input_dims_from_spec_tests {
                 (DimName::NumFeatures, 3),
             ],
             cameraadaptor: None,
+            preprocessing: None,
         };
         assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
     }
@@ -81,6 +82,7 @@ mod input_dims_from_spec_tests {
             shape: vec![1, 480, 640, 3],
             dshape: vec![],
             cameraadaptor: None,
+            preprocessing: None,
         };
         assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
     }
@@ -99,6 +101,7 @@ mod input_dims_from_spec_tests {
                 (DimName::NumFeatures, 3), // overflow — index 2 ≥ shape.len()
             ],
             cameraadaptor: None,
+            preprocessing: None,
         };
         // First two dshape entries resolve via `shape.get()`; the third
         // is a no-op. Width/Height both resolved, so we expect Some.
@@ -118,6 +121,7 @@ mod input_dims_from_spec_tests {
                 (DimName::Width, 640),
             ],
             cameraadaptor: None,
+            preprocessing: None,
         };
         assert_eq!(input_dims_from_spec(&spec), None);
     }
@@ -1310,6 +1314,11 @@ impl DecoderBuilder {
             match c.decoder() {
                 DecoderType::ModelPack => modelpack = true,
                 DecoderType::Ultralytics => yolo = true,
+                DecoderType::Semantic => {
+                    return Err(DecoderError::NotSupported(
+                        "the semantic decoder is not available in this HAL version".to_string(),
+                    ))
+                }
             }
         }
         match (modelpack, yolo) {
@@ -2257,11 +2266,17 @@ impl DecoderBuilder {
                     }
                     Ok(anchors_x_features / num_anchors - 5)
                 }
+                DecoderType::Semantic => Err(DecoderError::NotSupported(
+                    "the semantic decoder has no class count".to_string(),
+                )),
             },
 
             ConfigOutputRef::Scores(scores) => match scores.decoder {
                 DecoderType::Ultralytics => Ok(scores.shape[1]),
                 DecoderType::ModelPack => Ok(scores.shape[2]),
+                DecoderType::Semantic => Err(DecoderError::NotSupported(
+                    "the semantic decoder has no class count".to_string(),
+                )),
             },
             _ => Err(DecoderError::Internal(
                 "Attempted to get class count from unsupported config output".to_owned(),

@@ -418,13 +418,23 @@ pub use tiling::{tile_grid, TilePlacement, TileSpec, TilingConfig};
 // Use `edgefirst_tensor::PixelFormat` variants (Rgb, Rgba, Grey, etc.) and
 // `TensorDyn` / `Tensor<u8>` with `.format()` metadata instead.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rotation {
-    None = 0,
-    Clockwise90 = 1,
-    Rotate180 = 2,
-    CounterClockwise90 = 3,
+// The image option vocabularies are declared through
+// `edgefirst_tensor::ef_vocabulary!`: the discriminant written here is the
+// code every surface uses (`code()`, the `EF_ROTATION_*` / `EF_FLIP_*` /
+// `EF_COLOR_MODE_*` / `EF_FIT_*` C enumerators, and the Python enum values).
+// The C and Python enums assert against `code()` at compile time.
+edgefirst_tensor::ef_vocabulary! {
+    /// A quarter-turn rotation applied during [`ImageProcessorTrait::convert`].
+    pub enum Rotation {
+        None = 0, "none", NONE,
+        Clockwise90 = 1, "clockwise90", CLOCKWISE90,
+        Rotate180 = 2, "rotate180", ROTATE180,
+        CounterClockwise90 = 3, "counter_clockwise90", COUNTER_CLOCKWISE90,
+    }
+    #[doc(hidden)]
+    pub mod rotation_code;
 }
+
 impl Rotation {
     /// Creates a Rotation enum from an angle in degrees. The angle must be a
     /// multiple of 90.
@@ -449,30 +459,40 @@ impl Rotation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Flip {
-    None = 0,
-    Vertical = 1,
-    Horizontal = 2,
+edgefirst_tensor::ef_vocabulary! {
+    /// A mirror applied during [`ImageProcessorTrait::convert`].
+    pub enum Flip {
+        None = 0, "none", NONE,
+        /// Mirror top to bottom.
+        Vertical = 1, "vertical", VERTICAL,
+        /// Mirror left to right.
+        Horizontal = 2, "horizontal", HORIZONTAL,
+    }
+    #[doc(hidden)]
+    pub mod flip_code;
 }
 
-/// Controls how the color palette index is chosen for each detected object.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ColorMode {
-    /// Color is chosen by object class label (`det.label`). Default.
-    ///
-    /// Preserves backward compatibility and is correct for semantic
-    /// segmentation where colors carry class meaning.
-    #[default]
-    Class,
-    /// Color is chosen by instance order (loop index, zero-based).
-    ///
-    /// Each detected object gets a unique color regardless of class,
-    /// useful for instance segmentation.
-    Instance,
-    /// Color is chosen by track ID (future use; currently behaves like
-    /// [`Instance`](Self::Instance)).
-    Track,
+edgefirst_tensor::ef_vocabulary! {
+    /// Controls how the color palette index is chosen for each detected object.
+    #[derive(Default)]
+    pub enum ColorMode {
+        /// Color is chosen by object class label (`det.label`). Default.
+        ///
+        /// Preserves backward compatibility and is correct for semantic
+        /// segmentation where colors carry class meaning.
+        #[default]
+        Class = 0, "class", CLASS,
+        /// Color is chosen by instance order (loop index, zero-based).
+        ///
+        /// Each detected object gets a unique color regardless of class,
+        /// useful for instance segmentation.
+        Instance = 1, "instance", INSTANCE,
+        /// Color is chosen by track ID (future use; currently behaves like
+        /// [`Instance`](Self::Instance)).
+        Track = 2, "track", TRACK,
+    }
+    #[doc(hidden)]
+    pub mod color_mode_code;
 }
 
 impl ColorMode {
@@ -685,6 +705,19 @@ fn unletter_bbox(bbox: DetectBox, lb: [f32; 4]) -> DetectBox {
     }
 }
 
+edgefirst_tensor::ef_vocabulary! {
+    /// The kind of a [`Fit`], without its letterbox pad colour.
+    ///
+    /// [`Fit`] carries data, so it cannot carry a code itself; this is the
+    /// code the C `ef_tiling_config.fit` field and the Python `Fit` enum use.
+    pub enum FitMode {
+        Stretch = 0, "stretch", STRETCH,
+        Letterbox = 1, "letterbox", LETTERBOX,
+    }
+    #[doc(hidden)]
+    pub mod fit_code;
+}
+
 /// How a source is fit into the requested destination shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fit {
@@ -695,6 +728,25 @@ pub enum Fit {
     /// padding the remainder with `pad` (RGBA — e.g. `[114, 114, 114, 255]` for
     /// YOLO-style preprocessing).
     Letterbox { pad: [u8; 4] },
+}
+
+impl Fit {
+    /// The kind of this fit, as a shared code-carrying [`FitMode`].
+    pub fn mode(&self) -> FitMode {
+        match self {
+            Fit::Stretch => FitMode::Stretch,
+            Fit::Letterbox { .. } => FitMode::Letterbox,
+        }
+    }
+
+    /// Build a fit from its kind. `pad` is used only by
+    /// [`FitMode::Letterbox`].
+    pub fn from_mode(mode: FitMode, pad: [u8; 4]) -> Self {
+        match mode {
+            FitMode::Stretch => Fit::Stretch,
+            FitMode::Letterbox => Fit::Letterbox { pad },
+        }
+    }
 }
 
 /// Source-side convert geometry: which sub-rectangle of the source to sample
@@ -1295,23 +1347,29 @@ impl Interpolation {
     }
 }
 
-/// Compute backend selection for [`ImageProcessor`].
-///
-/// Use with [`ImageProcessorConfig::backend`] to select which backend the
-/// processor should prefer. When a specific backend is selected, the
-/// processor initializes that backend plus CPU as a fallback. When `Auto`
-/// is used, the existing environment-variable-driven selection applies.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ComputeBackend {
-    /// Auto-detect based on available hardware and environment variables.
-    #[default]
-    Auto,
-    /// CPU-only processing (no hardware acceleration).
-    Cpu,
-    /// Prefer G2D hardware blitter (+ CPU fallback).
-    G2d,
-    /// Prefer OpenGL ES (+ CPU fallback).
-    OpenGl,
+edgefirst_tensor::ef_vocabulary! {
+    /// Compute backend selection for [`ImageProcessor`].
+    ///
+    /// Use with [`ImageProcessorConfig::backend`] to select which backend the
+    /// processor should prefer. When a specific backend is selected, the
+    /// processor initializes that backend plus CPU as a fallback. When `Auto`
+    /// is used, the existing environment-variable-driven selection applies.
+    ///
+    /// The code is the one the C `EF_COMPUTE_BACKEND_*` enumerators use.
+    #[derive(Default)]
+    pub enum ComputeBackend {
+        /// Auto-detect based on available hardware and environment variables.
+        #[default]
+        Auto = 0, "auto", AUTO,
+        /// CPU-only processing (no hardware acceleration).
+        Cpu = 1, "cpu", CPU,
+        /// Prefer G2D hardware blitter (+ CPU fallback).
+        G2d = 2, "g2d", G2D,
+        /// Prefer OpenGL ES (+ CPU fallback).
+        OpenGl = 3, "opengl", OPENGL,
+    }
+    #[doc(hidden)]
+    pub mod compute_backend_code;
 }
 
 /// Backend forced via the `EDGEFIRST_FORCE_BACKEND` environment variable

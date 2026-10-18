@@ -30,10 +30,15 @@ use pyo3::prelude::*;
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PyMatchMetric {
-    Iou,
+    Iou = 0,
     #[default]
-    Ios,
+    Ios = 1,
 }
+
+const _: () = {
+    assert!(PyMatchMetric::Iou as u32 == MatchMetric::Iou.code());
+    assert!(PyMatchMetric::Ios as u32 == MatchMetric::Ios.code());
+};
 
 #[pymethods]
 impl PyMatchMetric {
@@ -79,9 +84,14 @@ impl From<MatchMetric> for PyMatchMetric {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PyMergeMode {
     #[default]
-    KeepBest,
-    Union,
+    KeepBest = 0,
+    Union = 1,
 }
+
+const _: () = {
+    assert!(PyMergeMode::KeepBest as u32 == MergeMode::KeepBest.code());
+    assert!(PyMergeMode::Union as u32 == MergeMode::Union.code());
+};
 
 #[pymethods]
 impl PyMergeMode {

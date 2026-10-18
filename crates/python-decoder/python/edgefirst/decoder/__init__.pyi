@@ -58,14 +58,18 @@ class EdgeFirstProtoDataExportable(Protocol):
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
-    ClassAgnostic: Suppresses all boxes based on IoU regardless of class.
-    ClassAware: Only suppresses boxes of the same class (default).
     Auto: Uses the model config's mode, falling back to ClassAware.
+    ClassAware: Only suppresses boxes of the same class (default).
+    ClassAgnostic: Suppresses all boxes based on IoU regardless of class.
+
+    The integer values are the C ``EF_NMS_*`` codes: ``Auto`` is 1,
+    ``ClassAware`` 2 and ``ClassAgnostic`` 3. Code 0 is NMS off, which Python
+    spells ``None``.
     """
 
-    ClassAgnostic: Nms
-    ClassAware: Nms
     Auto: Nms
+    ClassAware: Nms
+    ClassAgnostic: Nms
 
 DetectionOutput: TypeAlias = tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
@@ -122,10 +126,13 @@ class DecoderType(enum.Enum):
 
     - ``Ultralytics``: Ultralytics YOLO models (YOLOv5, YOLOv8, YOLO11, YOLO26)
     - ``ModelPack``: ModelPack models
+    - ``Semantic``: generic semantic segmentation (not decoded by this HAL
+      version; building a decoder returns an error)
     """
 
     Ultralytics: DecoderType
     ModelPack: DecoderType
+    Semantic: DecoderType
 
 class DecoderVersion(enum.Enum):
     """Decoder version for Ultralytics models.
@@ -173,6 +180,8 @@ class DimName(enum.Enum):
     """Padding dimension."""
     BoxCoords: DimName
     """Box coordinate dimension (typically 4)."""
+    NumQueries: DimName
+    """Query axis of mask-classification outputs."""
 
 class Output:
     """A model output configuration for programmatic decoder setup.
@@ -912,9 +921,11 @@ def infer_ultralytics_schema(
             metadata alongside Ultralytics' props).
 
     Note:
-        Supported dtype strings are ``"int8"``, ``"uint8"``, ``"int16"``,
-        ``"uint16"``, ``"int32"``, ``"uint32"``, ``"float16"`` and
-        ``"float32"``.
+        Supported dtype strings are the tensor dtype names ``"i8"``,
+        ``"u8"``, ``"i16"``, ``"u16"``, ``"i32"``, ``"u32"``, ``"f16"``,
+        ``"f32"`` and ``"i64"``. The older spellings ``"int8"``, ``"uint8"``,
+        ``"int16"``, ``"uint16"``, ``"int32"``, ``"uint32"``, ``"float16"``,
+        ``"float32"`` and ``"int64"`` are still accepted.
 
         Shapes must be concrete. A model exported with ``dynamic=True``
         reports a symbolic dimension (``'batch'`` from ONNX, ``-1`` from

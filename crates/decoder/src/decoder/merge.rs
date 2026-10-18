@@ -620,6 +620,7 @@ mod tests {
                     outputs: vec![],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
                 // Typed boxes with a single merged child (triggers program).
                 LogicalOutput {
@@ -657,6 +658,7 @@ mod tests {
                     }],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
             ],
             ..Default::default()
@@ -710,6 +712,7 @@ mod tests {
                 outputs: vec![],
                 activation_applied: None,
                 activation_required: None,
+                semantic: Default::default(),
             }],
             ..Default::default()
         };
@@ -773,6 +776,7 @@ mod tests {
             ],
             activation_applied: None,
             activation_required: None,
+            semantic: Default::default(),
         };
         // Two i16 tensors with the same shape: the merge path binds by
         // shape, so the first match is used for the first child. To keep
@@ -875,6 +879,7 @@ mod tests {
                     outputs: vec![],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
                 // Force at least one split to enable DecodeProgram
                 LogicalOutput {
@@ -930,6 +935,7 @@ mod tests {
                     ],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
             ],
             ..Default::default()
@@ -988,6 +994,7 @@ mod tests {
                     outputs: vec![],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
                 LogicalOutput {
                     // Second logical forces a DecodeProgram so the Direct
@@ -1045,6 +1052,7 @@ mod tests {
                     ],
                     activation_applied: None,
                     activation_required: None,
+                    semantic: Default::default(),
                 },
             ],
             ..Default::default()
