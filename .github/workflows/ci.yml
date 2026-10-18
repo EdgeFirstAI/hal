@@ -8,6 +8,7 @@
 # Action Versions (hash-pinned):
 # - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
 # - dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d (v4.0.3)
+# - Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 (v2.9.2)
 
 name: CI
 
@@ -134,6 +135,32 @@ jobs:
       - name: Resolve every shipped target and check NOTICE names each component
         run: make sbom
 
+  # The C-API crates build the library crates over the dynamic tensor backend,
+  # whose `TensorDyn` differs from the static one that every Quick clippy pass
+  # uses. On the Quick trigger for the reason NOTICE is: hal-full runs only
+  # with the ci:full label, and a PR without it otherwise merges code that
+  # does not build into the C-API libraries.
+  capi-lint:
+    name: C-API lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          lfs: false
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config nasm
+      # No toolchain action: rust-toolchain.toml pins the compiler and clippy.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: rust-x86_64-capi-lint
+          cache-on-failure: true
+      - name: Clippy on each modular C-API crate
+        run: make lint-capi-modular
+
   full:
     needs: changes
     if: needs.changes.outputs.full == 'true' || needs.changes.outputs.hardware == 'true'
@@ -194,6 +221,9 @@ jobs:
         crop_golden
         mask_golden
         odd_dim_cpu
+        video_encode
+        video_decode
+        decoded_video_import
         pin
         protocol
         protocol_roundtrip
@@ -232,7 +262,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [changes, quick, notice, full, hal-full, sonar]
+    needs: [changes, quick, notice, capi-lint, full, hal-full, sonar]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
