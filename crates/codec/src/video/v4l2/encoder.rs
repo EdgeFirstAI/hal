@@ -26,7 +26,7 @@ use edgefirst_v4l2::m2m::M2m;
 use edgefirst_v4l2::queue::{Mapping, Memory, Plane};
 use edgefirst_v4l2::uapi;
 
-use super::{candidates, device_error, M2mDevice};
+use super::{candidates, chroma, device_error, dmabuf, M2mDevice};
 use crate::video::h264::{self, AccessUnit};
 use crate::video::{
     chroma_subsampling, Bitrate, EncodedFrame, EncoderBackend, EncoderConfig, FrameOptions,
@@ -588,14 +588,15 @@ impl V4l2Encoder {
             .ok_or_else(|| CodecError::InvalidInput("source has no row stride".into()))?;
         let format = self.config.input_format;
         let sh = src.height().unwrap_or(0);
-        let luma_fd = src.dmabuf().map_err(CodecError::Tensor)?;
+        let luma = dmabuf(src)?;
+        let luma_fd = luma.as_fd();
         let base = src.plane_offset().unwrap_or(0);
 
         // A separately allocated chroma plane brings its own DMA-BUF.
         let chroma_tensor = if self.layout == Layout::Packed {
             None
         } else if src.is_multiplane() {
-            let c = src.chroma_dyn().ok_or_else(|| {
+            let c = chroma(src).ok_or_else(|| {
                 CodecError::InvalidInput("multi-plane source has no chroma plane".into())
             })?;
             if c.effective_row_stride() != Some(stride) {
@@ -649,10 +650,8 @@ impl V4l2Encoder {
             origin,
             self.config.height as usize,
         );
-        let chroma_fd = chroma_tensor
-            .as_ref()
-            .map(|c| c.dmabuf().map_err(CodecError::Tensor))
-            .transpose()?;
+        let chroma_buf = chroma_tensor.as_deref().map(dmabuf).transpose()?;
+        let chroma_fd = chroma_buf.as_ref().map(AsFd::as_fd);
         let fds: Vec<BorrowedFd<'_>> = match self.layout {
             Layout::Split => vec![luma_fd, chroma_fd.unwrap_or(luma_fd)],
             _ => vec![luma_fd],

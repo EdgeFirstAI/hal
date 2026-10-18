@@ -9,8 +9,11 @@
 pub(crate) mod decoder;
 pub(crate) mod encoder;
 
+use std::ops::Deref;
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 
+use edgefirst_tensor::TensorDyn;
 use edgefirst_v4l2::device::{self, Device};
 use edgefirst_v4l2::queue::BufType;
 
@@ -26,6 +29,34 @@ pub(crate) fn device_error(e: edgefirst_v4l2::Error) -> CodecError {
         op: e.op().to_owned(),
         source,
     }
+}
+
+/// The chroma plane of a two-allocation tensor: owned under the static
+/// tensor backend, a lens into `t` under the dynamic one.
+#[cfg(feature = "static")]
+pub(crate) fn chroma(t: &TensorDyn) -> Option<impl Deref<Target = TensorDyn> + '_> {
+    t.chroma_dyn().map(Box::new)
+}
+
+/// The chroma plane of a two-allocation tensor: owned under the static
+/// tensor backend, a lens into `t` under the dynamic one.
+#[cfg(not(feature = "static"))]
+pub(crate) fn chroma(t: &TensorDyn) -> Option<impl Deref<Target = TensorDyn> + '_> {
+    t.chroma()
+}
+
+/// The DMA-BUF behind `t`: borrowed under the static tensor backend, a
+/// duplicate under the dynamic one, which has no borrowing accessor.
+#[cfg(feature = "static")]
+pub(crate) fn dmabuf(t: &TensorDyn) -> Result<impl AsFd + '_, CodecError> {
+    t.dmabuf().map_err(CodecError::Tensor)
+}
+
+/// The DMA-BUF behind `t`: borrowed under the static tensor backend, a
+/// duplicate under the dynamic one, which has no borrowing accessor.
+#[cfg(not(feature = "static"))]
+pub(crate) fn dmabuf(t: &TensorDyn) -> Result<impl AsFd + '_, CodecError> {
+    t.dmabuf_clone().map_err(CodecError::Tensor)
 }
 
 /// An open memory-to-memory device and its queue types.

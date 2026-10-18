@@ -23,16 +23,18 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use edgefirst_tensor::{
-    Colorimetry, DType, PixelFormat, Region, Tensor, TensorDyn, TensorMemory, TensorTrait,
-};
+// `Tensor::from_fd` is a trait method under the static tensor backend and
+// inherent under the dynamic one.
+#[cfg(feature = "static")]
+use edgefirst_tensor::TensorTrait;
+use edgefirst_tensor::{Colorimetry, DType, PixelFormat, Region, Tensor, TensorDyn, TensorMemory};
 use edgefirst_v4l2::controls::{self, ControlInfo, ControlValue};
 use edgefirst_v4l2::events;
 use edgefirst_v4l2::m2m::{M2m, Ready};
 use edgefirst_v4l2::queue::{BufType, Mapping, Memory, Plane};
 use edgefirst_v4l2::{uapi, ErrorKind};
 
-use super::{candidates, device_error, M2mDevice};
+use super::{candidates, chroma, device_error, M2mDevice};
 use crate::video::h264::{self, AccessUnit};
 use crate::video::{
     DecodeEvent, DecodedFrame, DecoderBackend, DecoderConfig, OutputMemory, OutputPool, Returns,
@@ -606,7 +608,7 @@ impl V4l2Decoder {
                 return invalid(format!("provided tensor {i} starts inside its DMA-BUF"));
             }
             let chroma = if layout.two_buffers {
-                Some(t.chroma_dyn().ok_or_else(|| {
+                Some(chroma(t).ok_or_else(|| {
                     CodecError::InvalidConfig(format!(
                         "{} writes chroma to a second buffer; provided tensor {i} has one plane",
                         self.path
@@ -615,7 +617,7 @@ impl V4l2Decoder {
             } else {
                 None
             };
-            let planes: Vec<&TensorDyn> = std::iter::once(t).chain(chroma.as_ref()).collect();
+            let planes: Vec<&TensorDyn> = std::iter::once(t).chain(chroma.as_deref()).collect();
             for (p, (plane, &size)) in planes.iter().zip(&layout.sizes).enumerate() {
                 if plane.capacity_bytes() < size {
                     return invalid(format!(

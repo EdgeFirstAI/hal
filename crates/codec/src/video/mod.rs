@@ -50,6 +50,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#[cfg_attr(not(all(target_os = "linux", feature = "v4l2")), allow(dead_code))] // backend use only
 pub(crate) mod h264;
 #[cfg(all(target_os = "linux", feature = "v4l2"))]
 mod v4l2;
@@ -424,6 +425,7 @@ pub(crate) struct Returns(Mutex<Vec<(u64, u32)>>);
 impl Returns {
     /// Takes the buffer indexes returned for pool `generation`, dropping
     /// those of earlier pools.
+    #[cfg_attr(not(all(target_os = "linux", feature = "v4l2")), allow(dead_code))] // backend use only
     pub(crate) fn take(&self, generation: u64) -> Vec<u32> {
         let mut returned = self.0.lock().unwrap_or_else(|e| e.into_inner());
         returned
@@ -453,6 +455,7 @@ pub struct DecodedFrame {
 }
 
 impl DecodedFrame {
+    #[cfg_attr(not(all(target_os = "linux", feature = "v4l2")), allow(dead_code))] // backend use only
     pub(crate) fn new(
         tensor: Arc<TensorDyn>,
         pts: u64,
