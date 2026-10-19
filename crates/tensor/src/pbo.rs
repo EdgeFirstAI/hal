@@ -21,7 +21,7 @@ use std::{
 use std::os::raw::c_int;
 // `PboHandle::abi_vtable`'s cell, and so `static`-only with it: under
 // `dynamic` the library owns the table (`ef_tensor_pbo_vtable`).
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 use std::sync::OnceLock;
 // The frozen client-state vocabulary the table is expressed over. Re-exported
 // (`crate::EfClientState` and friends) so a C entry point assembling the same
@@ -188,7 +188,7 @@ impl PboOpsVtable {
     /// see the field's own doc comment for why that would leak.
     ///
     /// `static`-only: under `dynamic` the library builds and owns the table.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     fn new(handle: &Arc<PboHandle>) -> Self {
         PboOpsVtable {
             state: EfClientState {
@@ -489,7 +489,7 @@ struct PboHandle {
     /// inside `libedgefirst_tensor.so`, which builds and owns the table
     /// itself, and `TensorDyn::pbo_vtable_ptr` asks it through
     /// `ef_tensor_pbo_vtable` rather than building one here.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     abi_vtable: OnceLock<PboOpsVtable>,
 }
 
@@ -778,7 +778,7 @@ where
                 size,
                 map_state: Mutex::new(MapState::Unmapped),
                 map_cv: Condvar::new(),
-                #[cfg(feature = "static")]
+                #[cfg(not(edgefirst_tensor_dynamic))]
                 abi_vtable: OnceLock::new(),
             }),
             // A GL buffer name is meaningful only inside its creating
@@ -802,7 +802,7 @@ where
     /// (`lib.rs`/`static_backend.rs`); `dynamic` reads the library's own
     /// table through `ef_tensor_pbo_vtable` instead, so this is
     /// `static`-only.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn pbo_vtable(&self) -> &PboOpsVtable {
         self.handle
             .abi_vtable
@@ -828,7 +828,7 @@ where
     /// (`lib.rs`/`static_backend.rs`); `dynamic` holds a retained reference
     /// on the handle that owns the library-side `PboTensor` instead, so this
     /// is `static`-only.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn pbo_keepalive(&self) -> Arc<dyn Send + Sync> {
         self.handle.clone()
     }
@@ -1071,12 +1071,12 @@ where
     /// `Tensor::map()`, which already checks `byte_size <= capacity_bytes()`.
     ///
     /// `static`-only: `Tensor::map()` (`impl<T> TensorMapTrait<T> for
-    /// Tensor<T>` in `lib.rs`) is itself `#[cfg(feature = "static")]`. Only
+    /// Tensor<T>` in `lib.rs`) is itself `#[cfg(not(edgefirst_tensor_dynamic))]`. Only
     /// this one accessor gates -- `PboTensor` and the rest of its API stay
     /// available under `dynamic` too, since `PboOps`/`PboMapping` are a
     /// backend-agnostic GL extension point `edgefirst-image` implements
     /// regardless of which tensor backend it links.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,

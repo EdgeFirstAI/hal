@@ -45,7 +45,7 @@ element! {
     u64 => U64, i64 => I64, f16 => F16, f32 => F32, f64 => F64,
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 mod static_lens {
     //! The lens accessors, for the backend where `TensorDyn` really is an
     //! enum over eleven `Tensor<T>` values.
@@ -106,7 +106,7 @@ mod static_lens {
     }
 }
 
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 mod dynamic_lens {
     //! The lens accessors, for the backend where `TensorDyn` really is one
     //! handle.
@@ -157,7 +157,7 @@ mod dynamic_lens {
     }
 }
 
-#[cfg(all(test, feature = "static"))]
+#[cfg(all(test, not(edgefirst_tensor_dynamic)))]
 mod tests {
     use crate::{DType, Tensor, TensorDyn};
 

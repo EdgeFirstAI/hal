@@ -8,6 +8,12 @@
 //! will read next, with no copy in between — and it is why the tensor may have
 //! been minted by any EdgeFirst library, not only this one.
 
+#[cfg(not(edgefirst_tensor_dynamic))]
+compile_error!(
+    "edgefirst-codec-capi links libedgefirst_tensor and must be built with the dynamic tensor backend: \
+     `cargo build --config .cargo/tensor-dynamic.toml` (or `make capi-libs`)."
+);
+
 pub mod decoder;
 
 /// ABI version of this library's C surface.

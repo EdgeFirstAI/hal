@@ -2764,13 +2764,13 @@ impl GLProcessorST {
     }
 
     /// Whether the Y2Y NV programs ([`NvSampling::HardwareYuv`]) built.
-    #[cfg(all(test, feature = "dma_test_formats"))]
+    #[cfg(test)]
     pub(super) fn has_y2y(&self) -> bool {
         self.nv_y2y_programs.is_some()
     }
 
     /// Allow or forbid [`NvSampling::Hardware`] (see `nv_hw_filter`).
-    #[cfg(all(test, feature = "dma_test_formats"))]
+    #[cfg(test)]
     pub(super) fn set_nv_hw_filter(&mut self, enabled: bool) {
         self.nv_hw_filter = enabled;
     }

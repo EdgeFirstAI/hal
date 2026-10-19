@@ -781,18 +781,14 @@ A few details worth knowing:
   stack or heap that should work and does not fails the run instead of
   skipping. `REQUIRE_GPU=1` also fails a host with no render node at all, as
   `NO-GPU`, where every GPU test would otherwise skip.
-- **Feature-gated tests need `FEATURES`.** The script builds the test crates
-  with their default features, so a test behind a cargo feature never runs on
-  a board unless you ask for it. `FEATURES=edgefirst-image/dma_test_formats`
-  reaches the DMA-BUF import suite, which CI's hardware lane builds and this
-  script did not; spell a feature that is not shared by every selected package
-  as `<pkg>/<feature>`, which is what cargo requires with more than one `-p`.
-  It applies to the test build only, not to the C-API leaves.
-  `edgefirst-image/g2d_test_formats` adds the G2D format tests. G2D exists
-  only on the NXP boards, but the tests take that into account where
-  `libg2d.so.2` does not load, so the feature is safe on a mixed set of
-  boards: with it on, the G2D tests pass on V3D and Adreno boards too, and
-  the hardware-test workflow builds with both features by default.
+- **The DMA-BUF and G2D suites always build.** They probe for the hardware at
+  run time and report `SKIPPED` without it; on a board the require gates turn
+  that skip into a failure: `HAL_TEST_REQUIRE_DMA=1` when the DMA heap
+  allocates, `HAL_TEST_REQUIRE_G2D=1` when `libg2d.so.2` is installed. Both are
+  armed automatically by `scripts/on-target-run.sh` and the CI board lane.
+  `FEATURES` still reaches any other feature-gated test; spell a feature that
+  is not shared by every selected package as `<pkg>/<feature>`. It applies to
+  the test build only, not to the C-API leaves.
 - **`FILTER` matches the test function, not the file.** It is handed to each test binary as a test-*name* filter, so a filter named after the source file — `FILTER=convert_span_feed_fields` for a test declared `fn the_convert_span_records_the_feed_fields()` — matches nothing, and every binary runs zero tests while exiting zero. That is reported as `NO-TESTS` with a non-zero exit rather than `PASS`. Check the executed count, not just the result column.
 
 ### On-demand fleet runs
@@ -800,7 +796,7 @@ A few details worth knowing:
 Two `workflow_dispatch` workflows run on the self-hosted board fleet, one
 job per board entry:
 
-- [`hardware-test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-test.yml) — the whole on-target suite plus the C-API gates, built with `dma_test_formats` and `g2d_test_formats` by default, with `require-gpu` failing a board that has no render node.
+- [`hardware-test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-test.yml) — the whole on-target suite plus the C-API gates, with the DMA/G2D require gates armed from what each board has and `require-gpu` failing a board that has no render node.
 - [`hardware-bench.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-bench.yml) — every benchmark case of [`scripts/on-target-bench.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-bench.sh); see [BENCHMARKS.md § Running Benchmarks](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md#running-benchmarks).
 
 A board entry is a runner label, or labels joined by `+` that one runner must
@@ -880,12 +876,12 @@ ssh imx95-frdm 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./<b
 The `python-*` crates are excluded from cross-builds — PyO3 requires a
 target Python installation.
 
-**Cross-compiling the `dynamic` backend's tests** (`dynamic_primitives`,
+**Cross-compiling the dynamic backend's tests** (`dynamic_primitives`,
 `protocol_roundtrip`, and the rest of `make test-tensor-dynamic`'s
 `DYNAMIC_TEST_TARGETS`) needs one more step: these link against
 `libedgefirst_tensor.so`, cross-built from `crates/tensor-capi`, not the
-plain `edgefirst-tensor` rlib. `crates/tensor/build.rs`'s
-`dynamic-test-link` feature honours `EDGEFIRST_TENSOR_LIB_DIR` when set,
+plain `edgefirst-tensor` rlib. Under the dynamic cfg, `crates/tensor/build.rs`
+links the crate's test binaries against it, honouring `EDGEFIRST_TENSOR_LIB_DIR` when set,
 otherwise it derives the search path from `OUT_DIR` (the
 `target/<target-triple>/<profile>` layout `cargo-zigbuild` itself produces)
 — so cross-building this lane no longer needs a hand-rolled `RUSTFLAGS`:
@@ -894,7 +890,7 @@ otherwise it derives the search path from `OUT_DIR` (the
 cargo-zigbuild build --target aarch64-unknown-linux-gnu.2.35 \
   --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
 cargo-zigbuild test --target aarch64-unknown-linux-gnu.2.35 --no-run \
-  -p edgefirst-tensor --no-default-features --features dynamic,dynamic-test-link,ndarray \
+  --config .cargo/tensor-dynamic.toml -p edgefirst-tensor \
   --test dynamic_primitives
 ```
 

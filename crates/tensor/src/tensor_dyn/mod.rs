@@ -20,32 +20,32 @@
 //! only — the technique that keeps the ABI near a dozen entry points instead
 //! of eighty.
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 mod static_backend;
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub use static_backend::{Raw, TensorDyn};
 
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 mod dynamic_backend;
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub use dynamic_backend::{Raw, TensorDyn};
 // `dynamic_tensor.rs` (a sibling module, not a child of `dynamic_backend`)
 // needs this to enrich its own `ef_tensor_from_planes` error with the C
 // side's advisory detail, the same way `dynamic_backend.rs`'s own
 // constructors already do.
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub(crate) use dynamic_backend::ffi_last_error;
 // `crate::d3d11`'s backend-routed module functions rebuild their `Error` the
 // same way every other `ef_*` call in this backend does.
-#[cfg(all(feature = "dynamic", target_os = "windows"))]
+#[cfg(all(edgefirst_tensor_dynamic, target_os = "windows"))]
 pub(crate) use dynamic_backend::ffi_error;
 
 // `dynamic`'s `Tensor<T>` -- the typed lens with no storage of its own.
 // `static`'s `Tensor<T>` lives directly in `lib.rs` (it predates this
 // module and owns real per-backend storage, unlike this one).
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub(crate) mod dynamic_tensor;
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub use dynamic_tensor::Tensor;
 
 mod derived;

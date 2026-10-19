@@ -42,7 +42,7 @@ on:
       features:
         description: Cargo features for the test build (`<pkg>/<feature>`, space-separated)
         type: string
-        default: edgefirst-image/dma_test_formats edgefirst-image/g2d_test_formats
+        default: ""
       filter:
         description: Test-name filter passed to every binary (empty runs everything)
         type: string

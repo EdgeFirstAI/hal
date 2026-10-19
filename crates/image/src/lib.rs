@@ -341,17 +341,12 @@ pub use error::{Error, Result};
 pub use g2d::G2DProcessor;
 /// Handle returned by `convert_with_fence`: a sync_file fd on Unix, an
 /// event handle on Windows that is set when the GPU work completes.
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "android",
-        target_os = "windows"
-    ),
-    feature = "opengl"
-))]
-pub use opengl_headless::CompletionFence;
+#[cfg(unix)]
+pub type CompletionFence = std::os::fd::OwnedFd;
+/// Handle returned by `convert_with_fence`: a sync_file fd on Unix, an
+/// event handle on Windows that is set when the GPU work completes.
+#[cfg(windows)]
+pub type CompletionFence = std::os::windows::io::OwnedHandle;
 #[cfg(all(
     any(
         target_os = "linux",
@@ -3889,9 +3884,9 @@ mod alignment_tests {
 #[allow(deprecated)]
 mod image_tests {
     use super::*;
-    use crate::{CPUProcessor, Rotation};
     #[cfg(target_os = "linux")]
-    use edgefirst_tensor::is_dma_available;
+    use crate::test_support::is_dma_available;
+    use crate::{CPUProcessor, Rotation};
     use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
     use image::buffer::ConvertBuffer;
 
@@ -4980,7 +4975,9 @@ mod image_tests {
 
     #[cfg(target_os = "linux")]
     fn is_g2d_available() -> bool {
-        *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
+        crate::test_support::g2d_required_or(
+            *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok()),
+        )
     }
 
     // Every GL platform: Linux EGL, ANGLE/Metal (macOS, iOS), Android EGL,
@@ -5232,7 +5229,7 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_convert_rgba_non_4_aligned_width_end_to_end() {
-        use edgefirst_tensor::is_dma_available;
+        use crate::test_support::is_dma_available;
         if !is_dma_available() {
             crate::test_support::report_skip(
                 "test_convert_rgba_non_4_aligned_width_end_to_end — DMA not available",
@@ -5317,7 +5314,7 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_load_jpeg_rgba_non_aligned_pitch_padded_dma() {
-        use edgefirst_tensor::is_dma_available;
+        use crate::test_support::is_dma_available;
         if !is_dma_available() {
             crate::test_support::report_skip(
                 "test_load_jpeg_rgba_non_aligned_pitch_padded_dma — DMA not available",
@@ -5366,7 +5363,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_padded_dma_pitch_for_respects_memory_choice() {
-        use edgefirst_tensor::{is_dma_available, TensorMemory};
+        use crate::test_support::is_dma_available;
+        use edgefirst_tensor::TensorMemory;
 
         // 500×4 = 2000 → padded to 2048 by GPU alignment. Use it for
         // every case so any "no padding" answer is unambiguous.
@@ -5442,7 +5440,7 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_load_png_grey_misaligned_width_dma() {
-        use edgefirst_tensor::is_dma_available;
+        use crate::test_support::is_dma_available;
         if !is_dma_available() {
             crate::test_support::report_skip(
                 "test_load_png_grey_misaligned_width_dma — DMA not available",
@@ -6386,7 +6384,7 @@ mod image_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6478,7 +6476,7 @@ mod image_tests {
     fn windows_deferred_batch_records_one_value_per_tile_and_submits_once() {
         use edgefirst_tensor::CpuAccess;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6583,7 +6581,7 @@ mod image_tests {
     fn windows_dropping_a_processor_submits_an_open_batch() {
         use edgefirst_tensor::CpuAccess;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6649,7 +6647,7 @@ mod image_tests {
         use edgefirst_tensor::CpuAccess;
         use std::os::windows::io::AsRawHandle;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6783,7 +6781,7 @@ mod image_tests {
         use edgefirst_tensor::{CpuAccess, Segmentation};
         use ndarray::Array3;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6850,7 +6848,7 @@ mod image_tests {
     fn windows_draw_proto_masks_into_a_texture_records_a_completion() {
         use edgefirst_tensor::{CpuAccess, Tensor};
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6913,7 +6911,7 @@ mod image_tests {
     fn windows_draw_decoded_masks_composites_a_host_background_onto_a_texture() {
         use edgefirst_tensor::CpuAccess;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6941,7 +6939,7 @@ mod image_tests {
     fn windows_draw_decoded_masks_composites_a_texture_background_onto_a_texture() {
         use edgefirst_tensor::CpuAccess;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -6984,7 +6982,7 @@ mod image_tests {
     fn windows_draw_decoded_masks_into_a_texture_view_fills_only_its_band() {
         use edgefirst_tensor::CpuAccess;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -7062,7 +7060,7 @@ mod image_tests {
         use edgefirst_tensor::{CpuAccess, Segmentation};
         use ndarray::Array3;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -7153,7 +7151,7 @@ mod image_tests {
     fn two_processors_alternate_on_texture_destinations_without_state_bleed() {
         use edgefirst_tensor::CpuAccess;
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
                 function!()
@@ -7247,7 +7245,7 @@ mod image_tests {
         if edgefirst_tensor::is_shm_available() {
             mem.push(Some(TensorMemory::Shm));
         }
-        if edgefirst_tensor::is_gpu_buffer_available() {
+        if crate::test_support::is_gpu_buffer_available() {
             mem.push(Some(TensorMemory::DmaBuf));
         }
         let crop = Crop::new().with_source(Some(Region::new(50, 120, 1024, 576)));
@@ -7445,7 +7443,7 @@ mod image_tests {
         if edgefirst_tensor::is_shm_available() {
             mem.push(Some(TensorMemory::Shm));
         }
-        if edgefirst_tensor::is_gpu_buffer_available() {
+        if crate::test_support::is_gpu_buffer_available() {
             mem.push(Some(TensorMemory::DmaBuf));
         }
         for m in mem {
@@ -7710,7 +7708,7 @@ mod image_tests {
             return;
         }
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
@@ -8079,7 +8077,7 @@ mod image_tests {
         }
         // Zero-copy YUYV source: DMA-BUF on Linux, IOSurface on macOS, a
         // D3D11 texture on Windows; skips where no such backing exists.
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
@@ -9408,7 +9406,7 @@ mod image_tests {
             crate::test_support::report_skip(&format!("{} — no F16 render support", function!()));
             return;
         }
-        let mem = if edgefirst_tensor::is_gpu_buffer_available() {
+        let mem = if crate::test_support::is_gpu_buffer_available() {
             TensorMemory::DmaBuf
         } else {
             crate::test_support::report_skip(&format!("{} — no zero-copy buffers", function!()));
@@ -9560,7 +9558,7 @@ mod image_tests {
                 return;
             }
         };
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!("{} — no zero-copy buffers", function!()));
             return;
         }
@@ -9949,7 +9947,7 @@ mod image_tests {
             return;
         }
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
@@ -10326,7 +10324,7 @@ mod image_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        if !edgefirst_tensor::is_gpu_buffer_available() {
+        if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
                 function!()
@@ -12075,7 +12073,7 @@ mod image_tests {
         case: &'static str,
         require_dma_for_bg: bool,
     ) {
-        if require_dma_for_bg && !edgefirst_tensor::is_dma_available() {
+        if require_dma_for_bg && !crate::test_support::is_dma_available() {
             crate::test_support::report_skip(&format!("{case} — DMA not available on this host"));
             return;
         }
@@ -12123,7 +12121,7 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_draw_masks_zero_detection_g2d_forced() {
-        if !edgefirst_tensor::is_dma_available() {
+        if !crate::test_support::is_dma_available() {
             crate::test_support::report_skip("g2d forced — DMA not available on this host");
             return;
         }
@@ -12497,6 +12495,8 @@ mod image_tests {
         }
 
         let _lock = acquire_env_lock();
+        // Probed here, where the policy can name the test; worker threads are unnamed.
+        let use_dma = crate::test_support::is_dma_available();
         let (tx, rx) = mpsc::channel::<()>();
 
         std::thread::spawn(move || {
@@ -12510,7 +12510,7 @@ mod image_tests {
                         });
                         // CI-weight geometry (llvmpipe renders on the CPU).
                         let (w, h) = (640usize, 480usize);
-                        let mem = if edgefirst_tensor::is_dma_available() {
+                        let mem = if use_dma {
                             Some(TensorMemory::DmaBuf)
                         } else {
                             Some(TensorMemory::Mem)
@@ -12607,6 +12607,8 @@ mod image_tests {
         const TIMEOUT: Duration = Duration::from_secs(600);
 
         let _lock = acquire_env_lock();
+        // Probed here, where the policy can name the test; worker threads are unnamed.
+        let use_dma = crate::test_support::is_dma_available();
         let (tx, rx) = mpsc::channel::<()>();
 
         std::thread::spawn(move || {
@@ -12619,7 +12621,7 @@ mod image_tests {
                             panic!("ImageProcessor::new() failed on thread {i}: {e}")
                         });
                         let (w, h) = (1280usize, 720usize);
-                        let mem = if edgefirst_tensor::is_dma_available() {
+                        let mem = if use_dma {
                             Some(TensorMemory::DmaBuf)
                         } else {
                             Some(TensorMemory::Mem)

@@ -14,6 +14,7 @@ isolation for those is measured on the built ``.so`` / ``.dylib``.
 from __future__ import annotations
 
 import importlib
+import os
 import shutil
 import subprocess
 import sys
@@ -221,16 +222,10 @@ def _embedded_sibling_c_libs(so: Path) -> list[str]:
 
 
 def _tensor_backend_is_dynamic() -> bool:
-    """Whether the installed edgefirst-tensor wheel links libedgefirst_tensor
-    (the `dynamic` backend) rather than embedding the implementation
-    (`static`) -- measured off the actual installed wheel, not assumed.
+    """The backend the installed edgefirst-tensor declares; G13 installs a static build, so it is not assumed."""
+    import edgefirst.tensor
 
-    Every real release ships `dynamic` (each python-* crate's own default),
-    but G13 (the differential gate, `make test-differential`) deliberately
-    installs a genuine `static` build in one of its two comparison venvs, so
-    this test cannot assume the backend it is running against.
-    """
-    return _links_libedgefirst_tensor(_wheel_extension("tensor"))
+    return edgefirst.tensor.__tensor_backend__ == "dynamic"
 
 
 @pytest.mark.parametrize("leaf", ["tensor", "codec", "image", "decoder"])
@@ -270,47 +265,65 @@ def test_tracker_wheel_does_not_link_tensor():
     assert not siblings, f"{so} dynamically links sibling C libraries {siblings}"
 
 
-# `edgefirst-tensor`'s feature set, from its own Cargo.toml: `static` and
-# `dynamic` are the backend choice -- mutually exclusive and one of them is
-# REQUIRED (see the `compile_error!` guards in `crates/tensor/src/lib.rs`,
-# gated on `not(any(static, dynamic))` and on `all(static, dynamic)`). Every
-# entry below therefore names exactly one backend. `--all-features` is never
-# legal against this crate for the same reason: it would enable both
-# backends at once and hit the second guard. `dynamic-test-link` is
-# deliberately left out of every entry too -- per its own doc comment in
-# Cargo.toml it is "opt-in only, never enabled by a production consumer",
-# and it links `libedgefirst_tensor.so` at build-script time, which requires
-# `edgefirst-tensor-capi` to already be built; that precondition is exercised
-# by `make test-capi-modular`, not by a general compile-across-features check.
-#
-# `["--features", "static,ndarray,tracing"]` and
-# `["--features", "dynamic,ndarray,tracing"]` are what "every feature except
-# the other backend" becomes once `--all-features` is off the table -- one
-# maximal combination per backend, since a single `--all-features` run can no
-# longer stand in for exhausting the legal combinations.
-FEATURE_SETS = [
-    ["--features", "static"],
-    ["--features", "static,ndarray"],
-    ["--features", "static,tracing"],
-    ["--features", "static,ndarray,tracing"],
-    ["--features", "dynamic,ndarray,tracing"],
-]
+# `edgefirst-tensor`'s optional features.
+FEATURE_SETS = ["", "ndarray", "tracing", "ndarray,tracing"]
+
+# The backend is a build cfg, not a feature: static unless the dynamic config is passed.
+TENSOR_DYNAMIC = Path(__file__).resolve().parents[2] / ".cargo" / "tensor-dynamic.toml"
+BACKENDS = {"static": [], "dynamic": ["--config", str(TENSOR_DYNAMIC)]}
+
+
+def _cargo_env():
+    """The caller's environment minus RUSTFLAGS, which would hide the dynamic config's cfg."""
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")
+    }
 
 
 @needs_cargo
-@pytest.mark.parametrize("extra", FEATURE_SETS, ids=lambda e: e[1])
-def test_tensor_compiles_across_feature_sets(extra):
-    """edgefirst-tensor must build under any *legal* combination of its
-    features.
+def test_dynamic_config_selects_the_ffi_backend():
+    """Only the dynamic backend pulls in edgefirst-tensor-ffi, so its presence proves the cfg took effect."""
+    trees = {
+        backend: subprocess.run(
+            ["cargo", "tree", *args, "-p", "edgefirst-tensor", "-e", "normal"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=_cargo_env(),
+        ).stdout
+        for backend, args in BACKENDS.items()
+    }
+    assert "edgefirst-tensor-ffi" in trees["dynamic"]
+    assert "edgefirst-tensor-ffi" not in trees["static"]
+
+
+@needs_cargo
+@pytest.mark.parametrize("backend", sorted(BACKENDS))
+@pytest.mark.parametrize("features", FEATURE_SETS, ids=lambda f: f or "none")
+def test_tensor_compiles_across_feature_sets(features, backend):
+    """edgefirst-tensor must build under any combination of its features, on both backends.
 
     A crate that only compiles with its defaults cannot be trimmed by a
     consumer, and the breakage is invisible until someone tries. Checked here
     rather than left to CI's default-features-only build.
     """
-    cmd = ["cargo", "check", "-p", "edgefirst-tensor", "--no-default-features", *extra]
+    cmd = [
+        "cargo",
+        "check",
+        *BACKENDS[backend],
+        "-p",
+        "edgefirst-tensor",
+        "--no-default-features",
+    ]
+    if features:
+        cmd += ["--features", features]
     # check=False: a non-zero exit IS the finding here, and the assertion below
     # reports cargo's own diagnostics. CalledProcessError would hide them.
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    r = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, env=_cargo_env()
+    )
     assert r.returncode == 0, r.stderr[-2000:]
 
 

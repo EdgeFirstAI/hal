@@ -20,22 +20,20 @@ publish = false # C library - distributed via GitHub Releases, not crates.io
 # `rlib` is deliberately absent: it would collide with the edgefirst-image
 # crate's own libedgefirst_image.rlib, and nothing needs it.
 crate-type = ["staticlib", "cdylib"]
+# Shares its lib name with the library crate it wraps; rustdoc output would collide.
+doc = false
 name = "edgefirst_image"
 
 [features]
 default = ["tracing"]
 tracing = ["edgefirst-tensor/tracing"]
 
-# `edgefirst-image` (opengl) plus `edgefirst-tensor/dynamic` so this
-# library mints tensors via libedgefirst_tensor.so instead of embedding a
-# private copy. `edgefirst-tensor-ffi` is declarations-only.
 [dependencies]
 edgefirst-image = { version = "0.35.0", path = "../image", default-features = false, features = [
     "opengl",
 ] }
-edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false, features = [
-    "dynamic",
-] }
+# Built with `--cfg edgefirst_tensor_dynamic` (.cargo/tensor-dynamic.toml): calls into libedgefirst_tensor.
+edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
 edgefirst-tensor-ffi = { path = "../tensor-ffi" }
 edgefirst-decoder-abi = { path = "../decoder-abi" }
@@ -45,6 +43,7 @@ log = "0.4.33"
 
 [build-dependencies]
 cbindgen = "0.29"
+edgefirst-build-support = { path = "../build-support" }
 
 # Excluded from the workspace (see the root Cargo.toml's [workspace.exclude]
 # comment), so this crate inherits NEITHER the root's [workspace.lints] NOR
@@ -52,7 +51,7 @@ cbindgen = "0.29"
 # documents why and says to keep this in sync with the root manually.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(edgefirst_tensor_dynamic)'] }
 
 [profile.release]
 opt-level = 3

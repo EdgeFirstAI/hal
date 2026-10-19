@@ -54,7 +54,7 @@ Direct3D 11 on Windows), which ships with none of them.
   Homebrew tap instead (`brew install startergo/angle/angle`, then re-sign
   the dylibs — see README). On **iOS** there is no Homebrew equivalent, so
   use `scripts/fetch-angle.sh` (or build the CPU-only path:
-  `cargo build --target aarch64-apple-ios --no-default-features --features static,ndarray,tracing`).
+  `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`).
 - On **Windows** the same helper fetches the `angle-windows-x64-<tag>.zip`
   DLLs from that release (`bash scripts/fetch-angle.sh` from Git Bash; the
   `--windows` flag is implied on a Windows host). See
@@ -62,11 +62,7 @@ Direct3D 11 on Windows), which ships with none of them.
   and [TESTING.md § Windows Setup](TESTING.md#windows-setup).
 - Either way, you can contribute to the Linux/CPU paths without any ANGLE
   at all — just disable the `opengl` feature
-  (`--no-default-features --features static,ndarray,tracing`). `static` is
-  required: `edgefirst-tensor`'s `static`/`dynamic` backend features are
-  mutually exclusive and one of them must be named explicitly whenever
-  `--no-default-features` is passed — omitting both is a compile error, not
-  a fallback to a default.
+  (`--no-default-features --features ndarray,tracing`).
 
 ### Clone and Build
 
@@ -75,24 +71,30 @@ Direct3D 11 on Windows), which ships with none of them.
 git clone https://github.com/EdgeFirstAI/hal.git
 cd hal
 
-# Build all Rust crates
-cargo build --workspace
+# Build all Rust crates. The PyO3 crates build as wheels instead (below).
+cargo build --workspace --exclude 'edgefirst-python-*'
 
 # Run tests — single-threaded, always (see below)
-cargo test --workspace -- --test-threads=1
+cargo test --workspace --exclude 'edgefirst-python-*' -- --test-threads=1
 
 # The five C-API leaves (tensor-capi, image-capi, codec-capi, decoder-capi,
 # tracker-capi) are excluded from the workspace and untouched by the two
-# commands above — each resolves its own static/dynamic feature set. Build
-# and test them per crate, sharing the workspace's target directory:
+# commands above — each library resolves its own features and lockfile.
+# Build and test them per crate, sharing the workspace's target directory.
+# tensor-capi goes first; image/codec/decoder-capi link the library it builds
+# and take the dynamic tensor backend's config (ARCHITECTURE.md, Tensor
+# Backend Selection):
 cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
+cargo build --config .cargo/tensor-dynamic.toml \
+  --manifest-path crates/image-capi/Cargo.toml --target-dir target
 EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --manifest-path crates/tensor-capi/Cargo.toml \
   --target-dir target -- --test-threads=1
-# ...or `make test-capi-modular` to run all five at once, as CI does.
+# ...or `make capi-libs` / `make test-capi-modular` to cover all five, as CI does.
 
-# Build Python bindings (optional)
+# Build Python bindings (optional). The tensor-linked wheels need the dynamic
+# tensor backend's config; `make wheel` and `make install-python` pass it.
 pip install maturin
-maturin develop -m crates/python-tensor/Cargo.toml
+maturin develop --config .cargo/tensor-dynamic.toml -m crates/python-tensor/Cargo.toml
 
 # Run Python tests (requires Python bindings)
 python -m pytest tests/
@@ -235,7 +237,7 @@ We follow standard Rust conventions:
 **Before committing:**
 ```bash
 cargo fmt --all
-cargo clippy --workspace
+cargo clippy --workspace --exclude 'edgefirst-python-*'
 ```
 
 The five excluded C-API leaves (`tensor-capi`, `image-capi`, `codec-capi`,

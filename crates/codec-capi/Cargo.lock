@@ -151,6 +151,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefirst-build-support"
+version = "0.35.0"
+
+[[package]]
 name = "edgefirst-codec"
 version = "0.35.0"
 dependencies = [
@@ -169,6 +173,7 @@ name = "edgefirst-codec-capi"
 version = "0.35.0"
 dependencies = [
  "cbindgen",
+ "edgefirst-build-support",
  "edgefirst-codec",
  "edgefirst-tensor",
  "edgefirst-tensor-abi",

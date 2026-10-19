@@ -136,10 +136,8 @@ jobs:
         run: make sbom
 
   # The C-API crates build the library crates over the dynamic tensor backend,
-  # whose `TensorDyn` differs from the static one that every Quick clippy pass
-  # uses. On the Quick trigger for the reason NOTICE is: hal-full runs only
-  # with the ci:full label, and a PR without it otherwise merges code that
-  # does not build into the C-API libraries.
+  # which every other Quick pass leaves uncompiled. On the Quick trigger for
+  # the reason NOTICE is: hal-full runs only with the ci:full label.
   capi-lint:
     name: C-API lint
     needs: changes
@@ -160,8 +158,12 @@ jobs:
           cache-on-failure: true
       - name: Clippy on each modular C-API crate
         run: make lint-capi-modular
-      - name: Check each published crate on its own
+      - name: Check each published crate on its own, and every library against both tensor backends
         run: make check-standalone
+      - name: Only edgefirst-tensor and the leaves name the tensor backend
+        run: make lint-backend-scope
+      - name: Each leaf rejects the wrong tensor backend
+        run: make check-backend-guards
 
   full:
     needs: changes
@@ -229,7 +231,6 @@ jobs:
         pin
         protocol
         protocol_roundtrip
-        dynamic_primitives
         identity
         vocabulary
       # A floor, not a target. Guards against a selection that matches nothing
@@ -241,7 +242,7 @@ jobs:
       # what kept the on-target payload shippable before the migration; the
       # dev profile's full debug info fills the disk.
       archive-profile: profiling
-      archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor --package edgefirst-codec
+      archive-args: --locked --package edgefirst-image --features opengl --package edgefirst-tensor --package edgefirst-codec
     secrets: inherit
 
   hal-full:

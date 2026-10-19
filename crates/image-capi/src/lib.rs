@@ -41,6 +41,12 @@
 //! handle through `ef_tensor_image_desc_get`'s scalar view rather than a
 //! dereference of tensor-capi's private layout.
 
+#[cfg(not(edgefirst_tensor_dynamic))]
+compile_error!(
+    "edgefirst-image-capi links libedgefirst_tensor and must be built with the dynamic tensor backend: \
+     `cargo build --config .cargo/tensor-dynamic.toml` (or `make capi-libs`)."
+);
+
 pub mod codes;
 pub mod draw;
 pub mod processor;

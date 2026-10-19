@@ -122,9 +122,8 @@ build_tests() {
 build_benches() {
   echo "==> building benchmarks for ${TRIPLE}"
   local json="${LOGS}/bench-${ARCH}.json"
-  # The Makefile's `bench` feature set. The python crates are excluded because
-  # they default to edgefirst-tensor's `dynamic` backend while everything else
-  # defaults to `static`, and one invocation selecting both cannot compile.
+  # The Makefile's `bench` feature set. The python crates are excluded: PyO3
+  # cannot cross-compile without a target interpreter.
   if ! cargo-zigbuild zigbuild --release --benches --target "${TRIPLE}" \
         --features opengl,ndarray --workspace \
         --exclude edgefirst-python-common --exclude edgefirst-python-tensor \
@@ -171,7 +170,9 @@ build_libs() {
   local c
   for c in ${CAPI_CRATES}; do
     local blog="${LOGS}/libbuild-${c}-${ARCH}.log"
-    if ! cargo-zigbuild build --target "${TRIPLE}" \
+    local cfg=()
+    case "${c}" in image-capi|codec-capi|decoder-capi) cfg=(--config "${ROOT}/.cargo/tensor-dynamic.toml") ;; esac
+    if ! cargo-zigbuild build --target "${TRIPLE}" ${cfg[@]+"${cfg[@]}"} \
           --manifest-path "crates/${c}/Cargo.toml" --target-dir target \
           > "${blog}" 2>&1; then
       echo "BUILD FAILED for ${c} (${TRIPLE}); last lines of ${blog}:" >&2

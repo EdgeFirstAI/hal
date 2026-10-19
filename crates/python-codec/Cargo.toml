@@ -15,17 +15,10 @@ name = "_codec"
 crate-type = ["cdylib"]
 
 [features]
-default = ["tracing", "dynamic"]
+default = ["tracing"]
 tracing = ["edgefirst-tensor/tracing"]
 abi3-py38 = ["pyo3/abi3-py38", "edgefirst-python-common/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311", "edgefirst-python-common/abi3-py311"]
-# Forwards to edgefirst-tensor's own static/dynamic features (single-
-# tensor-home, task P2), same pattern as edgefirst-tracker/-image/
-# -decoder and python-common. `dynamic` is the real default; `static`
-# exists so G13 (the differential gate) can build a genuine comparison
-# venv from the same commit as the dynamic one.
-static = ["edgefirst-tensor/static", "edgefirst-python-common/static"]
-dynamic = ["edgefirst-tensor/dynamic", "edgefirst-python-common/dynamic"]
 
 [dependencies]
 edgefirst-python-common = { path = "../python-common", default-features = false, features = ["codec"] }
@@ -34,5 +27,5 @@ numpy = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
 
 [build-dependencies]
+edgefirst-build-support = { workspace = true }
 pyo3-build-config = { workspace = true, features = ["resolve-config"] }
-rustc_version = { workspace = true }

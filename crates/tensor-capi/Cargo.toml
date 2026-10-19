@@ -20,6 +20,8 @@ publish = false # C library - distributed via GitHub Releases, not crates.io
 # `rlib` is deliberately absent: it would collide with the edgefirst-tensor
 # crate's own libedgefirst_tensor.rlib, and nothing needs it.
 crate-type = ["staticlib", "cdylib"]
+# Shares its lib name with the library crate it wraps; rustdoc output would collide.
+doc = false
 name = "edgefirst_tensor"
 
 [features]
@@ -37,6 +39,7 @@ log = "0.4.33"
 
 [build-dependencies]
 cbindgen = "0.29"
+edgefirst-build-support = { path = "../build-support" }
 
 [dev-dependencies]
 edgefirst-tensor-ffi = { path = "../tensor-ffi" }
@@ -47,7 +50,7 @@ edgefirst-tensor-ffi = { path = "../tensor-ffi" }
 # documents why and says to keep this in sync with the root manually.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(edgefirst_tensor_dynamic)'] }
 
 [profile.release]
 opt-level = 3

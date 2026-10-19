@@ -21,9 +21,9 @@
 #                               otherwise skip and the run would pass
 #
 # Gates are armed from what the board has, as the CI board lane arms them:
-# HAL_TEST_REQUIRE_GL with a render node, EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS
-# with /dev/galcore, and HAL_TEST_REQUIRE_DMA when dma-heap-setup.sh's probe
-# allocation succeeds.
+# HAL_TEST_REQUIRE_GL with a render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2,
+# EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS with /dev/galcore, and HAL_TEST_REQUIRE_DMA
+# when dma-heap-setup.sh's probe allocation succeeds.
 #
 # Writes one log per binary, check-single-home.log, test_two_library_user.log,
 # capabilities.txt, summary.txt (`RESULT|detail`, one line) and summary.json
@@ -59,6 +59,10 @@ extra_env=()
 # require-gated test -- the `gl_backend_available_canary` most visibly --
 # skips on every board and the run stays green through a broken GL stack.
 [[ "${render}" -gt 0 ]] && extra_env+=(HAL_TEST_REQUIRE_GL=1)
+# A board that ships libg2d must be able to use it.
+if compgen -G "/usr/lib/libg2d.so.2*" >/dev/null || compgen -G "/usr/lib/*/libg2d.so.2*" >/dev/null; then
+  extra_env+=(HAL_TEST_REQUIRE_G2D=1)
+fi
 
 # dma-heap-setup.sh exports through $GITHUB_ENV when it is set, so point it at
 # a file of our own and read the gate back. It never changes permissions on a

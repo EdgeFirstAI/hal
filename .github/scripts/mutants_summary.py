@@ -171,7 +171,15 @@ class Leg:
 # --------------------------------------------------------------------------
 
 # Predicates that are false in every build this lane makes.
-FALSE_FLAGS = {"coverage", "coverage_nightly", "miri", "docsrs", "doc", "doctest"}
+FALSE_FLAGS = {
+    "coverage",
+    "coverage_nightly",
+    "miri",
+    "docsrs",
+    "doc",
+    "doctest",
+    "edgefirst_tensor_dynamic",
+}
 TRUE_FLAGS = {"test", "debug_assertions"}
 
 CFG_TOKEN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*|"(?:[^"\\]|\\.)*"|[(),=]')

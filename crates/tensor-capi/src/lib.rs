@@ -25,6 +25,12 @@
 //! **constructors**, which is correct: "who allocated this" is the one
 //! question where library identity matters.
 
+#[cfg(edgefirst_tensor_dynamic)]
+compile_error!(
+    "edgefirst-tensor-capi is the tensor implementation behind libedgefirst_tensor and \
+     cannot be built with `--cfg edgefirst_tensor_dynamic`; build it without .cargo/tensor-dynamic.toml."
+);
+
 pub mod builder;
 pub mod codes;
 pub mod cuda;

@@ -32,11 +32,9 @@
 #                      see README "Toolchain and Platform Floors")
 #   FEATURES           cargo features for the TEST build, space- or
 #                      comma-separated (default: none, so the crates build
-#                      with their own defaults). Use it to reach tests that
-#                      are behind a feature and would otherwise never run on
-#                      a board -- `FEATURES=dma_test_formats` is the DMA-BUF
-#                      import suite, which CI's hardware lane builds and this
-#                      script did not. With more than one package selected,
+#                      with their own defaults). The DMA-BUF and G2D suites
+#                      need no feature: they always build and are enforced on
+#                      the board by HAL_TEST_REQUIRE_DMA/_G2D. With more than one package selected,
 #                      cargo wants a feature that is not shared spelled
 #                      `<pkg>/<feature>`. Applied to the test build only, not
 #                      to the C-API leaves.

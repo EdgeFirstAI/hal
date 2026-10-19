@@ -33,6 +33,17 @@ The `_codec`, `_image`, `_decoder` and `_tracker` extensions locate `libedgefirs
 
 Packages install under the [PEP 420](https://peps.python.org/pep-0420/) `edgefirst.*` namespace, so imports are `edgefirst.tensor`, `edgefirst.codec`, and so on. No package ships an `edgefirst/__init__.py` — a single one would shadow the namespace and hide its siblings.
 
+### Building from source
+
+`edgefirst-tensor` carries the shared `libedgefirst_tensor` the `codec`, `image` and `decoder` wheels link against, so these four are built with the dynamic tensor backend:
+
+```bash
+make wheel            # or, per package:
+maturin build --release --config .cargo/tensor-dynamic.toml -m crates/python-tensor/Cargo.toml
+```
+
+A build without the config fails with a message naming it. `edgefirst.tensor.__tensor_backend__` reports `"dynamic"` for every wheel built this way.
+
 ## Quick start
 
 Allocate an image tensor, fill it through a mapped host view, and read it back as NumPy:

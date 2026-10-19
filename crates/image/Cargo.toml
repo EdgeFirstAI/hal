@@ -17,14 +17,8 @@ documentation = "https://docs.rs/edgefirst-image"
 workspace = true
 
 [features]
-default = ["opengl", "static", "codec"]
+default = ["opengl", "codec"]
 opengl = ["dep:edgefirst-egl", "dep:gbm", "dep:drm-fourcc"]
-# Forwards to edgefirst-tensor's own `static` feature instead of hard-coding
-# `features = ["static"]` on the dependency line below, so
-# `--no-default-features --features edgefirst-tensor/dynamic` still reaches
-# a real dynamic-backend build rather than tripping the static+dynamic
-# mutex guard against this crate's own request.
-static = ["edgefirst-tensor/static"]
 # JPEG/PNG decode helpers used by tests, benches, and examples. Off in
 # image-capi and python-image so those artifacts do not embed the codec.
 codec = ["dep:edgefirst-codec"]
@@ -39,18 +33,8 @@ decode = ["dep:edgefirst-decoder"]
 # otherwise off.
 tracker = ["decode", "edgefirst-decoder/tracker", "dep:edgefirst-tracker", "edgefirst-tracker/tensor-boxes"]
 opencv = ["dep:opencv"]
-g2d_test_formats = []
-dma_test_formats = []
 
 [dependencies]
-# `default-features = false` plus this crate's own non-tensor defaults
-# spelled out explicitly: edgefirst-codec's default feature list now also
-# forwards `static` to edgefirst-tensor (mirroring this crate's own
-# pattern above), which would collide with `--features
-# edgefirst-tensor/dynamic` if left on here. Whichever crate in the build
-# graph turns a backend on does so for the single shared edgefirst-tensor
-# instance, so this crate's own `static` feature (or an explicit
-# `--features edgefirst-tensor/dynamic`) still supplies codec's backend.
 edgefirst-codec = { workspace = true, optional = true, default-features = false, features = [
     "v4l2",
     "nvjpeg",
@@ -77,25 +61,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 yuv = { workspace = true }
 edgefirst-decoder = { workspace = true, optional = true }
-# `default-features = false` (single-tensor-home, Python side, task P2;
-# reversed from `true`). It used to be `true` deliberately, so this
-# crate's own `tracker` feature would still get edgefirst-tracker's
-# `static` default when enabled standalone (outside a full `--workspace`
-# build, where `static` would otherwise still arrive via edgefirst-
-# tracker's own package-level default) -- see task 9's original reasoning
-# in the branch history. That assumed every build wants `static`. It
-# stopped holding once a consumer wants this crate's `tracker` feature
-# (for drawing tracked masks) AND `edgefirst-tensor/dynamic` at the same
-# time (e.g. `edgefirst-python-image`): `true` here unconditionally
-# reactivated edgefirst-tracker's own `static` default regardless of what
-# the real, top-level consumer asked for, landing `static` on the same
-# edgefirst-tensor unit as `dynamic` and tripping the mutual-exclusion
-# guard. `false` costs nothing here -- edgefirst-tracker's `static`
-# feature is a pure forwarding alias with no local effect of its own, and
-# this crate already forwards to edgefirst-tensor independently through
-# its own `static = ["edgefirst-tensor/static"]` feature above, so a
-# default (non-Python) build loses nothing by not also getting it via
-# edgefirst-tracker.
 edgefirst-tracker = { workspace = true, optional = true, default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]

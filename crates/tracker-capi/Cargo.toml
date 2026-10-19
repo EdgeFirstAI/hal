@@ -20,6 +20,8 @@ publish = false # C library - distributed via GitHub Releases, not crates.io
 # `rlib` is deliberately absent: it would collide with the edgefirst-tracker
 # crate's own libedgefirst_tracker.rlib, and nothing needs it.
 crate-type = ["staticlib", "cdylib"]
+# Shares its lib name with the library crate it wraps; rustdoc output would collide.
+doc = false
 name = "edgefirst_tracker"
 
 [features]

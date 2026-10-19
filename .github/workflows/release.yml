@@ -280,10 +280,10 @@ jobs:
           features: abi3-py311
           args: --auditwheel skip ${{ matrix.maturin-args }}
           builds: |
-            [{"manifest": "crates/python-tensor/Cargo.toml"},
-             {"manifest": "crates/python-codec/Cargo.toml"},
-             {"manifest": "crates/python-image/Cargo.toml"},
-             {"manifest": "crates/python-decoder/Cargo.toml"},
+            [{"manifest": "crates/python-tensor/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
+             {"manifest": "crates/python-codec/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
+             {"manifest": "crates/python-image/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
+             {"manifest": "crates/python-decoder/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
              {"manifest": "crates/python-tracker/Cargo.toml", "args": "${{ matrix.sdist }}"}]
           attest: false
 
@@ -296,10 +296,10 @@ jobs:
           # No --sdist: the sdists were generated in the pass above.
           args: --auditwheel skip ${{ matrix.maturin-args }}
           builds: |
-            [{"manifest": "crates/python-tensor/Cargo.toml"},
-             {"manifest": "crates/python-codec/Cargo.toml"},
-             {"manifest": "crates/python-image/Cargo.toml"},
-             {"manifest": "crates/python-decoder/Cargo.toml"},
+            [{"manifest": "crates/python-tensor/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
+             {"manifest": "crates/python-codec/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
+             {"manifest": "crates/python-image/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
+             {"manifest": "crates/python-decoder/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
              {"manifest": "crates/python-tracker/Cargo.toml"}]
           attest: false
 
@@ -466,7 +466,11 @@ jobs:
           fi
           for leaf in tensor image codec decoder tracker; do
             echo "==> ${leaf}"
+            # Relative: the step runs from the repo root, and Git Bash paths need no conversion.
+            CFG=()
+            case "${leaf}" in image|codec|decoder) CFG=(--config .cargo/tensor-dynamic.toml) ;; esac
             cargo build --release \
+              "${CFG[@]}" \
               --manifest-path "crates/${leaf}-capi/Cargo.toml" \
               --target-dir target \
               "${EXTRA[@]}"

@@ -20,6 +20,8 @@ publish = false # C library - distributed via GitHub Releases, not crates.io
 # `rlib` is deliberately absent: it would collide with the edgefirst-decoder
 # crate's own libedgefirst_decoder.rlib, and nothing needs it.
 crate-type = ["staticlib", "cdylib"]
+# Shares its lib name with the library crate it wraps; rustdoc output would collide.
+doc = false
 name = "edgefirst_decoder"
 
 [features]
@@ -29,16 +31,12 @@ tracing = ["edgefirst-tensor/tracing"]
 # Links libedgefirst_tensor.so (dynamic backend + tensor-ffi declarations)
 # rather than embedding a private tensor copy.
 [dependencies]
-# `default-features = false` drops decoder's own `static` default so it does
-# not collide with `edgefirst-tensor/dynamic`. `tracker` is this leaf's
-# real requirement, spelled out explicitly.
 edgefirst-decoder = { version = "0.35.0", path = "../decoder", default-features = false, features = [
     "tracker",
 ] }
 uuid = { version = "1.23.3", features = ["v4"] }
-edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false, features = [
-    "dynamic",
-] }
+# Built with `--cfg edgefirst_tensor_dynamic` (.cargo/tensor-dynamic.toml): calls into libedgefirst_tensor.
+edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
 edgefirst-tensor-ffi = { path = "../tensor-ffi" }
 edgefirst-decoder-abi = { path = "../decoder-abi" }
@@ -53,6 +51,7 @@ serde_json = "1.0"
 
 [build-dependencies]
 cbindgen = "0.29"
+edgefirst-build-support = { path = "../build-support" }
 
 # Excluded from the workspace (see the root Cargo.toml's [workspace.exclude]
 # comment), so this crate inherits NEITHER the root's [workspace.lints] NOR
@@ -60,7 +59,7 @@ cbindgen = "0.29"
 # documents why and says to keep this in sync with the root manually.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(edgefirst_tensor_dynamic)'] }
 
 [profile.release]
 opt-level = 3

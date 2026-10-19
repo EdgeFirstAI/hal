@@ -9,7 +9,7 @@
 //! `static` backend produces the telemetry; under `dynamic` the count is
 //! always zero by design.
 
-#![cfg(feature = "static")]
+#![cfg(not(edgefirst_tensor_dynamic))]
 
 use edgefirst_tensor::{
     unplanned_cpu_access_count, CpuAccess, PixelFormat, Tensor, TensorMemory, TensorTrait,

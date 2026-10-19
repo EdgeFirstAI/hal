@@ -16,12 +16,8 @@ fn main() {
         println!("cargo:rustc-cfg=nightly");
     }
 
-    // Coverage-capture resilience: detect -Cinstrument-coverage and set
-    // the `coverage` cfg so the SIGABRT handler ctor is compiled in.
-    println!("cargo::rustc-check-cfg=cfg(coverage)");
-    let rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
-    if rustflags.contains("instrument-coverage") {
+    // Coverage-capture resilience: the SIGABRT handler ctor is compiled in under `coverage`.
+    if edgefirst_build_support::coverage_instrumented() {
         println!("cargo::rustc-cfg=coverage");
     }
-    println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
 }

@@ -1794,31 +1794,7 @@ impl PyImageProcessor {
     ///
     /// Accepts "nearest", "bilinear", or "twopass". Default is "bilinear".
     /// Only affects rendering of quantized (int8) proto segmentation masks.
-    // Mirrors the cfg on `ImageProcessor::set_int8_interpolation_mode` in
-    // crates/image/src/lib.rs, which is every OS with a GL backend — NOT
-    // Linux. This binding was gated to Linux alone, matching the EGL-probe
-    // and DMA-BUF-import neighbours above rather than the API it wraps, which
-    // silently removed a working method from macOS, iOS and Android callers
-    // (macOS reaches the same GL path through ANGLE). `feature = "opengl"` is
-    // still a default feature of edgefirst-image itself (its own `default =
-    // ["opengl", "static"]` is unchanged) -- but that no longer guarantees it
-    // is active HERE. Two different lines, two different jobs: the root
-    // Cargo.toml's edgefirst-image entry is what sets `default-features =
-    // false` for real (single-tensor-home, Python side, task P2) and stops
-    // image's defaults reaching this edge at all -- this crate's OWN
-    // `default-features = false` on the same edge (its Cargo.toml) is
-    // redundant with root's and does nothing by itself: for an inherited
-    // `workspace = true` dependency, a member's `default-features = false`
-    // is silently ignored unless the workspace entry sets one too, which is
-    // exactly the mechanic that let this default keep reaching every
-    // consumer unnoticed before task P2. Because the suppression is
-    // workspace-wide, `"opengl"` had to be restored explicitly in this
-    // crate's own feature list, and THAT explicit entry -- not either
-    // `default-features = false` -- is the sole reason it is active here.
-    // Still not re-exported as a feature of this crate itself, so there is
-    // still no feature to test at this layer -- but if that explicit
-    // `"opengl"` is ever trimmed back out of python-common's Cargo.toml,
-    // this layer DOES need a gate, and none exists.
+    // Mirrors the cfg on `ImageProcessor::set_int8_interpolation_mode`.
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",

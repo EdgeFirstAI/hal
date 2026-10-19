@@ -15,7 +15,7 @@ use libloading::Library;
 use std::ffi::c_char;
 use std::ffi::c_void;
 use std::os::raw::{c_int, c_uint};
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 use std::sync::{Arc, OnceLock};
 #[cfg(target_os = "windows")]
@@ -356,7 +356,7 @@ fn load_table(lib: Library, runtime_path: std::path::PathBuf) -> Option<CudaTabl
 /// `cudaGetErrorString(rc)` with the numeric code kept alongside it, for the
 /// D3D11 arm's diagnostics. Falls back to the bare code if the runtime hands
 /// back no string.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 fn err_str(t: &CudaTable, rc: CudaError) -> String {
     // SAFETY: `cudaGetErrorString` returns a pointer to a NUL-terminated
     // string the runtime owns for the life of the process, or null for a code
@@ -593,11 +593,11 @@ pub(crate) struct CudaExternalMemoryBufferDesc {
 /// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
 /// by gpu-probe O5 on Orin. Best-effort: returns `None` on failure.
 // `static`-only: the sole caller, `Tensor::try_init_dma_cuda` (`lib.rs`), is
-// itself `#[cfg(feature = "static")]` (it reads `self.storage:
+// itself `#[cfg(not(edgefirst_tensor_dynamic))]` (it reads `self.storage:
 // TensorStorage`, a `static`-only field). The rest of this module
 // (`CudaHandle`, `CudaMap`, `gl_register_buffer`, ...) stays available under
 // `dynamic` -- `dynamic_tensor::Tensor::cuda`/`cuda_map` return their types.
-#[cfg(all(target_os = "linux", feature = "static"))]
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mut c_void)> {
     use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
     let t = table()?;
@@ -823,7 +823,7 @@ pub(crate) struct CudaExternalSemaphoreWaitParams {
 /// `static`-only for the same reason `d3d11::texture` is: `dynamic` forwards
 /// every tensor call to the C ABI and never constructs a texture storage, so
 /// nothing there can produce this backing.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 struct D3d11External {
     ext_mem: ExternalMemory,
     mipmapped: MipmappedArray,
@@ -868,7 +868,7 @@ struct D3d11External {
 /// Returns `None` on any failure (no CUDA device for the adapter, as on WARP;
 /// a DXGI format with no channel description; a driver error), releasing
 /// everything it had already created. The tensor is then simply CUDA-less.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 pub(crate) fn import_d3d11_texture(
     handle: RawHandle,
     layout: crate::d3d11_layout::D3d11ImageLayout,
@@ -992,7 +992,7 @@ pub(crate) fn import_d3d11_texture(
 
 /// The process fence imported as a CUDA external semaphore, with the
 /// duplicate of its NT handle CUDA needs kept open beside it.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 struct SharedSemaphore {
     sem: ExternalSemaphore,
     /// CUDA duplicates a Win32 handle it imports rather than taking it over,
@@ -1005,9 +1005,9 @@ struct SharedSemaphore {
 // to a device, not to a thread, and every use here passes it to a runtime call
 // that is itself thread-safe. `OwnedHandle` is `Send + Sync`. The struct is
 // written once inside a `OnceLock` initialiser and only read afterwards.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 unsafe impl Send for SharedSemaphore {}
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 unsafe impl Sync for SharedSemaphore {}
 
 /// Imports the process D3D11 fence as an external semaphore, once.
@@ -1023,7 +1023,7 @@ unsafe impl Sync for SharedSemaphore {}
 /// so a map never waits behind another consumer's unrelated work.
 ///
 /// `fence_handle` is consumed by the first caller and dropped by the rest.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 fn shared_semaphore(t: &CudaTable, fence_handle: OwnedHandle) -> Option<&'static SharedSemaphore> {
     static IMPORTED: OnceLock<Option<SharedSemaphore>> = OnceLock::new();
     IMPORTED
@@ -1066,7 +1066,7 @@ fn shared_semaphore(t: &CudaTable, fence_handle: OwnedHandle) -> Option<&'static
 /// the hazard `validate_descriptor` refuses a descriptor for, so a map declines
 /// here for the same reason: the documented fallback is the host map, which
 /// goes through the D3D11 immediate context and *is* ordered.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 fn d3d11_copy_is_ordered(recorded: u64, wait_queued: bool) -> bool {
     recorded == 0 || wait_queued
 }
@@ -1075,7 +1075,7 @@ fn d3d11_copy_is_ordered(recorded: u64, wait_queued: bool) -> bool {
 /// textures past their padding-free size, so later imports skip the tight rung
 /// of [`import_and_map_array`]'s ladder instead of paying a doomed import each
 /// time.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 static CUDA_IMPORT_SIZE_PADDED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1109,7 +1109,7 @@ static CUDA_IMPORT_SIZE_PADDED: std::sync::atomic::AtomicBool =
 /// Whether the tight rung works is a property of the adapter, not of the
 /// texture, so the first allocation that has to climb records it in
 /// [`CUDA_IMPORT_SIZE_PADDED`] and later ones start one rung up.
-#[cfg(all(target_os = "windows", feature = "static"))]
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 fn import_and_map_array(
     t: &CudaTable,
     handle: RawHandle,
@@ -1193,7 +1193,7 @@ enum CudaBacking {
         ext_mem: ExternalMemory,
         dptr: *mut c_void,
     },
-    #[cfg(all(target_os = "windows", feature = "static"))]
+    #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
     D3d11(D3d11External),
     /// After [`CudaHandle::into_client_parts`] moved a GL registration across
     /// the ABI; Drop must not unregister a resource the library now owns.
@@ -1217,7 +1217,7 @@ impl std::fmt::Debug for CudaHandle {
             CudaBacking::GlBuffer { .. } => "GlBuffer",
             CudaBacking::ExternalMem { .. } => "ExternalMem",
             CudaBacking::Detached => "Detached",
-            #[cfg(all(target_os = "windows", feature = "static"))]
+            #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
             CudaBacking::D3d11(_) => "D3d11",
         };
         f.debug_struct("CudaHandle")
@@ -1326,7 +1326,7 @@ impl CudaHandle {
                 release: Release::None,
                 _marker: std::marker::PhantomData,
             }),
-            #[cfg(all(target_os = "windows", feature = "static"))]
+            #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
             CudaBacking::D3d11(x) => Some(CudaMap {
                 ptr: self.d3d11_copy_in(x)?,
                 len: x.bytes,
@@ -1361,7 +1361,7 @@ impl CudaHandle {
     /// `row_stride() x combined_height` bytes and striding by `row_stride()`
     /// is exactly right.
     pub fn map_mut(&self) -> Option<CudaMap<'_>> {
-        #[cfg(all(target_os = "windows", feature = "static"))]
+        #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
         if let CudaBacking::D3d11(x) = &self.kind {
             return Some(CudaMap {
                 ptr: self.d3d11_copy_in(x)?,
@@ -1395,7 +1395,7 @@ impl CudaHandle {
     ///
     /// Answers `None` when the wait cannot be issued at all
     /// ([`d3d11_copy_is_ordered`]), like every other failure here.
-    #[cfg(all(target_os = "windows", feature = "static"))]
+    #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
     fn d3d11_copy_in(&self, x: &D3d11External) -> Option<*mut c_void> {
         let t = table()?;
         // Per-thread state: a consumer thread that last used another GPU would
@@ -1518,7 +1518,7 @@ impl Drop for CudaHandle {
             // then the array before the external memory it was mapped from.
             // The external semaphore is not here: it is the process import
             // (`shared_semaphore`) and outlives every handle.
-            #[cfg(all(target_os = "windows", feature = "static"))]
+            #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
             CudaBacking::D3d11(x) => {
                 let Some(t) = table() else { return };
                 // The handle can be dropped on any thread; the objects below
@@ -1682,9 +1682,9 @@ pub unsafe fn client_state_cuda_ops(
 enum Release {
     None,
     GlUnmap(Arc<dyn CudaGlOps>, GraphicsResource),
-    #[cfg(feature = "dynamic")]
+    #[cfg(edgefirst_tensor_dynamic)]
     FfiUnmap(*mut c_void),
-    #[cfg(all(target_os = "windows", feature = "static"))]
+    #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
     D3d11Writeback {
         level0: CudaArray,
         row_bytes: usize,
@@ -1758,7 +1758,7 @@ impl CudaMap<'_> {
     /// on it exactly once -- immediately when there is no device pointer,
     /// otherwise on drop. A second release is a double free of the map and of
     /// the tensor retain it holds.
-    #[cfg(feature = "dynamic")]
+    #[cfg(edgefirst_tensor_dynamic)]
     pub(crate) unsafe fn from_ffi(raw: *mut c_void) -> Option<Self> {
         let mut len = 0usize;
         // SAFETY: `raw` is a live map by this function's contract, and `len`
@@ -1788,13 +1788,13 @@ impl Drop for CudaMap<'_> {
             Release::GlUnmap(ops, r) => ops.unmap(r),
             // The write-back a writable D3D11 map owes happens inside the C
             // library, on the `CudaMap` this handle wraps there.
-            #[cfg(feature = "dynamic")]
+            #[cfg(edgefirst_tensor_dynamic)]
             Release::FfiUnmap(h) => {
                 // SAFETY: the handle came from `ef_tensor_cuda_map`/`_map_mut`
                 // and is released exactly once -- `replace` above took it.
                 unsafe { edgefirst_tensor_ffi::ef_tensor_cuda_unmap(h) }
             }
-            #[cfg(all(target_os = "windows", feature = "static"))]
+            #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
             Release::D3d11Writeback {
                 level0,
                 row_bytes,
@@ -1873,7 +1873,7 @@ mod ext_mem_layout {
     }
 }
 
-#[cfg(all(test, target_os = "windows", feature = "static"))]
+#[cfg(all(test, target_os = "windows", not(edgefirst_tensor_dynamic)))]
 mod d3d11_ordering {
     use super::d3d11_copy_is_ordered;
 

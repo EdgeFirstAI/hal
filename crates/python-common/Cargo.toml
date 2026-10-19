@@ -38,38 +38,12 @@ decoder = ["tensor", "dep:edgefirst-decoder", "dep:edgefirst-decoder-abi"]
 tracker = ["dep:edgefirst-tracker"]
 abi3-py38 = ["pyo3/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311"]
-# Forwards to edgefirst-tensor's own static/dynamic features instead of
-# pinning one on the dependency line below (single-tensor-home, Python side,
-# task P2), the same pattern edgefirst-tracker/-image/-decoder/-codec
-# already use: a pinned `features = ["static"]` here would mean any consumer
-# that asks python-common for `dynamic` still activates `edgefirst-tensor/
-# static` too (Cargo unifies features per crate across one build graph), and
-# `static`+`dynamic` together trip the mutual-exclusion guard at
-# crates/tensor/src/lib.rs:47 on THIS crate's own manifest request, not on a
-# deliberate choice by whoever is actually building.
-static = ["edgefirst-tensor?/static"]
-dynamic = ["edgefirst-tensor?/dynamic"]
 
 [dependencies]
 edgefirst-tensor = { workspace = true, default-features = false, optional = true }
-# `default-features = false` on all four below, for the same reason as
-# `edgefirst-tensor` above: each of these crates' own default feature set
-# includes ITS OWN `static` (a forwarding feature identical in shape to the
-# one this crate now has), which would activate `edgefirst-tensor/static`
-# the same way the old hardcoded pin did, just one hop further out --
-# reachable the moment any of `codec`/`image`/`decoder`'s features above
-# pull one of these in. None of these crates' `static`/`dynamic` features do
-# anything beyond that one forward, so simply not selecting either is
-# correct: whichever the actual top-level consumer (python-tensor et al.)
-# requests directly settles it for the whole unified build.
+# Each extension states exactly the library features it ships.
 edgefirst-codec = { workspace = true, optional = true, default-features = false, features = ["v4l2", "nvjpeg", "png"] }
-# `opengl` here for a different reason than `tracker`: `tracker` is this
-# crate's own real requirement (drawing tracked masks); `opengl` used to
-# reach this crate through edgefirst-image's own default (`["opengl",
-# "static"]`), now suppressed workspace-wide (see the root Cargo.toml's
-# edgefirst-image entry) -- spelled out explicitly so the Python image
-# bindings' GPU convert path does not silently fall back to CPU with
-# nothing failing to compile or import.
+# `opengl` is explicit because the workspace entry disables image's defaults; without it the GPU path silently falls back to CPU.
 edgefirst-image = { workspace = true, optional = true, default-features = false, features = [
     "opengl",
 ] }
@@ -91,5 +65,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [build-dependencies]
+edgefirst-build-support = { workspace = true }
 pyo3-build-config = { workspace = true, features = ["resolve-config"] }
 rustc_version = { workspace = true }

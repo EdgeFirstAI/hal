@@ -4,8 +4,8 @@ Process, CI tiers, release chain, and runner policy live in the canonical
 [EdgeFirstAI/.github copilot-instructions](https://github.com/EdgeFirstAI/.github/blob/main/.github/copilot-instructions.md).
 This file keeps only HAL-specific workspace, testing, and platform notes.
 
-**Version:** 1.7
-**Last Updated:** September 2026
+**Version:** 1.8
+**Last Updated:** October 2026
 
 ---
 
@@ -35,6 +35,7 @@ crates/
 ├── tensor-abi/     # Layout-only C types for tensors
 ├── decoder-abi/    # Layout-only C types for detections (detect.h)
 ├── tensor-ffi/     # Declarations-only extern "C" to libedgefirst_tensor.so
+├── build-support/  # Build-script helpers: link/rpath libedgefirst_tensor for the leaves
 ├── tensor-capi/    # cdylib: libedgefirst_tensor.so (workspace-excluded)
 ├── codec-capi/     # cdylib: libedgefirst_codec.so (workspace-excluded)
 ├── image-capi/     # cdylib: libedgefirst_image.so (workspace-excluded)
@@ -222,19 +223,20 @@ This runs, in order:
    ```
 
    **The excludes are load-bearing — do not "simplify" them away.** The
-   `python-*` crates default to `edgefirst-tensor/dynamic` while
-   decoder/image/codec/tensor default to `static`, and cargo unifies features
-   across everything one invocation selects. A single `--workspace` run
-   therefore turns both backends on at once for `edgefirst-tensor`, which is
-   permanently illegal for that crate (see below) — on a clean tree the bare
-   command fails with hundreds of errors rather than checking anything. The
-   same applies to `cargo build`, `cargo test` and `cargo clippy`: run them
-   through `make`, which carries the excludes, rather than by hand.
+   tensor-linked `python-*` crates must be built with the dynamic tensor
+   backend (`--config .cargo/tensor-dynamic.toml`) and refuse to build
+   without it, and PyO3 cannot cross-compile without a target interpreter.
+   `--exclude 'edgefirst-python-*'` is the short form. The same applies to
+   `cargo build`, `cargo test` and `cargo clippy`; `make` carries the excludes.
 
-   Also never `--all-features`: `edgefirst-tensor`'s `static`/`dynamic`
-   backend features are mutually exclusive by design, so enabling every
-   feature at once is permanently illegal for this crate, not merely unusual.
-   The excludes above exist to avoid reaching that same state by accident.
+   **Tensor backend:** Rust is always static. The dynamic backend exists only
+   for the C libraries and wheels, selected by `--config
+   .cargo/tensor-dynamic.toml` — never by `RUSTFLAGS`, which would replace
+   `.cargo/config.toml`'s per-target flags. No library crate may name the
+   backend (`make lint-backend-scope`). See ARCHITECTURE.md § Tensor Backend
+   Selection.
+
+   Avoid `--all-features`: `opencv` needs libclang/OpenCV installed.
 4. **test** — Rust tests with coverage (`cargo llvm-cov nextest`) and Python tests
 5. **sbom** — SBOM generation and license policy validation
 
@@ -248,8 +250,8 @@ failures. This mirrors what CI/CD runs and prevents broken pipelines.
 make format lint check test sbom
 
 # Build all crates (native, for local development). Go through make: a bare
-# `cargo build --workspace` unifies the static and dynamic tensor backends
-# and cannot compile (see the check step above).
+# `cargo build --workspace` reaches the python-* crates, which refuse to
+# build without the dynamic backend (see the check step above).
 make build
 
 # Test all Rust code (native)

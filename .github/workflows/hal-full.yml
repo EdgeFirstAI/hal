@@ -137,6 +137,7 @@ jobs:
           # object carrying its lines.
           for pkg in tensor codec image decoder tracker; do
             venv/bin/maturin build \
+              --config "$PWD/.cargo/tensor-dynamic.toml" \
               --manifest-path "crates/python-$pkg/Cargo.toml" \
               --out target/wheels \
               --profile profiling \
@@ -150,9 +151,7 @@ jobs:
       - name: Run Rust tests with coverage
         run: |
           # No source here: cargo llvm-cov manages its own environment.
-          # --exclude the python-* crates: --workspace unions features, which
-          # would activate edgefirst-tensor's static and dynamic at once and
-          # trip its mutual-exclusion guard.
+          # --exclude the python-* crates: they are built and measured as wheels above.
           cargo llvm-cov nextest --cargo-profile profiling --features default --workspace \
             --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
             --no-report -j 1 \
@@ -512,8 +511,10 @@ jobs:
       - name: Build modular C-API leaves
         shell: pwsh
         run: |
+          $dynamic = @('--config', "$PWD/.cargo/tensor-dynamic.toml")
           foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
-            cargo build --release --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
+            $cfg = if (@('image','codec','decoder') -contains $leaf) { $dynamic } else { @() }
+            cargo build --release @cfg --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Package and smoke
@@ -571,6 +572,7 @@ jobs:
           venv/bin/pip install maturin pytest numpy pillow
           for pkg in tensor codec image decoder tracker; do
             venv/bin/maturin build \
+              --config "$PWD/.cargo/tensor-dynamic.toml" \
               --manifest-path "crates/python-$pkg/Cargo.toml" \
               --out target/wheels \
               --release \

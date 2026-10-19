@@ -671,14 +671,14 @@ mod g2d_predicate_tests {
     }
 }
 
-#[cfg(feature = "g2d_test_formats")]
 #[cfg(test)]
 #[allow(deprecated)]
 mod g2d_tests {
     use super::*;
+    use crate::test_support::is_dma_available;
     use crate::{CPUProcessor, G2DProcessor, ImageProcessorTrait};
     use edgefirst_tensor::{
-        is_dma_available, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+        DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
     use image::buffer::ConvertBuffer;
 
@@ -690,7 +690,7 @@ mod g2d_tests {
     /// non-G2D hardware instead of skipping.
     #[cfg(target_os = "linux")]
     fn is_g2d_available() -> bool {
-        G2DProcessor::new().is_ok()
+        crate::test_support::g2d_required_or(G2DProcessor::new().is_ok())
     }
 
     #[test]
@@ -1917,6 +1917,7 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
+                crate::test_support::g2d_required_or(false);
                 crate::test_support::report_skip(&format!(
                     "d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}"
                 ));
@@ -2031,6 +2032,7 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
+                crate::test_support::g2d_required_or(false);
                 crate::test_support::report_skip(&format!(
                     "d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}"
                 ));

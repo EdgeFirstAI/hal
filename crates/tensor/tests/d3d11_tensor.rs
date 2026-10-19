@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `Tensor::image(.., TensorMemory::DmaBuf, ..)` on Windows: the public
 //! surface wired onto the D3D11 texture storage.
-#![cfg(all(target_os = "windows", feature = "static"))]
+#![cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 
 use edgefirst_tensor::blob::TransportMode;
 use edgefirst_tensor::{

@@ -466,6 +466,7 @@ impl OutputMap {
     /// The 8-bit sample that maps to exactly `target` on integer channel `c`,
     /// preferring the one whose unrounded value sits farthest from a rounding
     /// tie; `None` when no sample reaches it.
+    #[cfg_attr(not(feature = "opengl"), allow(dead_code))]
     pub(crate) fn sample_for(&self, c: usize, target: f32) -> Option<u8> {
         self.bounds?;
         (0..=255u8)

@@ -43,35 +43,8 @@ than [`Tensor::new`]. Two things set them apart:
   reject an EGLImage import at an unaligned pitch. Read the real pitch from
   [`Tensor::effective_row_stride`]; don't assume `width * bpp`.
  */
-#[cfg(all(feature = "static", feature = "dynamic"))]
-compile_error!(
-    "edgefirst-tensor: `static` and `dynamic` are mutually exclusive. \
-     A consumer building the C-API leaves wants `--no-default-features \
-     --features dynamic`; everything else wants the default."
-);
-
-// The workspace declares `default-features = false` for this crate, so
-// nothing arrives here by accident anymore -- every consumer names a
-// backend explicitly. Before that change `static` was always a default and
-// this state was unreachable; now a manifest that forgot to ask for either
-// backend back builds an empty `tensor_dyn` module and fails on confusing
-// `E0432: unresolved import` errors instead of a message that names the
-// actual problem.
-#[cfg(not(any(feature = "static", feature = "dynamic")))]
-compile_error!(
-    "edgefirst-tensor: exactly one backend must be enabled. This crate has \
-     `default-features = false` at the workspace level, so every consumer \
-     must name one explicitly: `features = [\"static\"]` for Rust consumers, \
-     or `[\"dynamic\"]` for the C-API leaves."
-);
-
-// `static`-only: every constructor/accessor here is reached exclusively
-// through `TensorStorage`'s `AHardwareBuffer` variant (`impl<T> Tensor<T>`,
-// gated `#[cfg(feature = "static")]`); under `dynamic` nothing calls into
-// it, which clippy's dead-code lint on Android correctly flags without this
-// gate. Not `#[allow]`-ed: an `allow` here would hide the next real
-// dead-code signal in this module, the opposite of what a gate does.
-#[cfg(all(target_os = "android", feature = "static"))]
+// Static backend only: reached solely through `TensorStorage`'s AHardwareBuffer variant.
+#[cfg(all(target_os = "android", not(edgefirst_tensor_dynamic)))]
 mod ahardwarebuffer;
 // Pure AHardwareBuffer layout logic (format table, descriptor geometry,
 // overflow-checked shape math) — cfg-free so it compiles and unit-tests
@@ -85,19 +58,10 @@ pub mod trace;
 pub mod covguard;
 mod cuda;
 mod detect;
-// `static`-gated as well as Linux-gated. `DmaTensor` is storage, and only
-// the `static` backend has storage -- `TensorStorage` itself is already
-// `#[cfg(feature = "static")]`, and the `dynamic` backend reaches a
-// DMA-BUF's fd through `ef_tensor_plane_at` instead of ever constructing
-// one. Until task P2b's F3, this module was kept alive under `dynamic` by a
-// single always-`None` `Tensor::as_dma` whose signature named `DmaTensor`;
-// removing that stub revealed the whole module (the tensor, the sync
-// ioctls, the DRM PRIME helpers, the mmap owner) as dead code there --
-// twenty-six dead-code warnings' worth. It was always dead; one method
-// hid it.
-#[cfg(all(target_os = "linux", feature = "static"))]
+// Static backend only: the dynamic backend reaches DMA-BUF fds through `ef_tensor_plane_at`.
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 mod dma;
-#[cfg(all(target_os = "linux", feature = "static"))]
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 mod dmabuf;
 mod error;
 mod format;
@@ -115,7 +79,10 @@ pub mod d3d11_layout;
 mod iosurface_layout;
 // `static`-only, same reasoning as `ahardwarebuffer` above: reached only
 // through `TensorStorage`'s `IoSurface` variant.
-#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "static"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    not(edgefirst_tensor_dynamic)
+))]
 mod iosurface;
 pub mod lens;
 // `static`-only: `MemTensor` backs `TensorStorage::Mem`, `impl<T> Tensor<T>`
@@ -123,14 +90,14 @@ pub mod lens;
 // `ef_tensor_builder_alloc` in `libedgefirst_tensor.so` instead -- there is
 // no local `MemTensor` under `dynamic` to be dead code, so the whole module
 // gates rather than an internal `#[allow]`.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 mod mem;
 mod pbo;
 pub mod pin;
 pub mod protocol;
 // `static`-only, same reasoning as `mem` above: `ShmTensor` backs
 // `TensorStorage::Shm`, `impl<T> Tensor<T>` only.
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 mod shm;
 mod tensor_dyn;
 #[cfg(test)]
@@ -160,13 +127,16 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
 // `TensorStorage` / `TensorMap` enums without leaking into the public API.
 // Exceptions kept public: `Pbo*` is a GL extension point implemented by the
 // image crate, and `image_iosurface_layout` is a public helper.
-#[cfg(all(target_os = "android", feature = "static"))]
+#[cfg(all(target_os = "android", not(edgefirst_tensor_dynamic)))]
 pub use crate::ahardwarebuffer::image_ahardwarebuffer_layout;
-#[cfg(all(target_os = "android", feature = "static"))]
+#[cfg(all(target_os = "android", not(edgefirst_tensor_dynamic)))]
 pub(crate) use crate::ahardwarebuffer::AHardwareBufferTensor;
-#[cfg(all(target_os = "linux", feature = "static"))]
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 pub(crate) use crate::dma::DmaTensor;
-#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "static"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    not(edgefirst_tensor_dynamic)
+))]
 pub(crate) use crate::iosurface::IoSurfaceTensor;
 // The two geometry helpers are compiled for both backends: three of the four
 // surfaces that read a raw texture's geometry (the Python bindings, and the
@@ -176,13 +146,13 @@ pub(crate) use crate::iosurface::IoSurfaceTensor;
 pub use crate::d3d11::geometry::{d3d11_shared_handle_geometry, d3d11_texture_geometry};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use crate::iosurface_layout::image_iosurface_layout;
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub(crate) use crate::mem::MemTensor;
 pub use crate::pbo::{
     client_state_pbo_ops, read_pbo_vtable_parts, EfClientState, EfPboMapFn, EfPboUnmapFn,
     PboClientParts, PboMapping, PboOps, PboOpsVtableParts, PboTensor,
 };
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 pub(crate) use crate::shm::ShmTensor;
 pub use cuda::{
     client_state_cuda_ops, gl_map_resource, gl_register_buffer, gl_unmap_resource,
@@ -200,9 +170,9 @@ pub use error::{Error, Result};
 // richer `TensorDyn` surface has, so it never compiled under `dynamic` in
 // fact even though nothing gated it -- see `PRIMITIVE-INVENTORY.md`'s
 // "structural findings".
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub mod blob;
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub use blob::{
     BlobError, BlobHeader, BlobPlane, BlobStrings, BlobView, Regions, TransportMode, HEADER_LEN,
     PLANE_RECORD_LEN,
@@ -229,7 +199,7 @@ use std::{
 // nothing to re-export for it. `dynamic`'s lives in `tensor_dyn` (see that
 // module's docs) and is re-exported here under the same crate-root name so
 // both backends present the same `edgefirst_tensor::Tensor` to callers.
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub use tensor_dyn::Tensor;
 pub use tensor_dyn::{Raw, TensorDyn};
 pub use view::HostView;
@@ -701,8 +671,8 @@ impl fmt::Display for DType {
 /// backing's `alloc_zeroed` fast path (these types' `T::zero()` is the
 /// all-zeros bit pattern), so it is compiled on every target -- but only
 /// under `static`: every call site lives in `impl<T> Tensor<T>`, itself
-/// `#[cfg(feature = "static")]`.
-#[cfg(feature = "static")]
+/// `#[cfg(not(edgefirst_tensor_dynamic))]`.
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub(crate) fn dtype_of<T: 'static>() -> Option<DType> {
     use std::any::TypeId;
     let id = TypeId::of::<T>();
@@ -984,12 +954,12 @@ impl Quantization {
     ///   - per-tensor with redundant axis (reject)
     ///
     /// `static`-only: `Tensor::set_quantization` is `impl<T> Tensor<T>`,
-    /// itself `#[cfg(feature = "static")]`. `dynamic`'s
+    /// itself `#[cfg(not(edgefirst_tensor_dynamic))]`. `dynamic`'s
     /// `TensorDyn::set_quantization` (`dynamic_backend.rs`) sends the raw
     /// scale/zero-point/axis over FFI and lets `libedgefirst_tensor.so`
     /// validate them on its own (`static`) side instead of calling this
     /// method locally.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn validate(&self, shape: &[usize]) -> Result<()> {
         // `Quantization` is `Deserialize`, so malformed JSON like
         // `{"scale": [], "zero_point": []}` could otherwise produce an
@@ -1205,11 +1175,11 @@ pub fn unplanned_cpu_access_count() -> u64 {
 /// per-map warn would flood the log; repeats count silently).
 ///
 /// `static`-only: the sole caller is `impl<T> TensorMapTrait<T> for
-/// Tensor<T>` in `lib.rs`, itself `#[cfg(feature = "static")]`.
+/// Tensor<T>` in `lib.rs`, itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
 /// [`unplanned_cpu_access_count`] stays available under `dynamic` too --
 /// it just always reads 0 there, honestly reflecting that this backend
 /// produces no such telemetry.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub(crate) fn note_unplanned_cpu_access(identity_id: u64, backend: &str, detail: &str) {
     UNPLANNED_CPU_ACCESS.fetch_add(1, Ordering::Relaxed);
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
@@ -1390,10 +1360,10 @@ pub fn compression_fallback_count() -> u64 {
 /// Record a `Compression::Any` request resolving linear.
 ///
 /// `static`-only: the sole caller is `Tensor::image_desc` (`impl<T>
-/// Tensor<T>`), itself `#[cfg(feature = "static")]`.
+/// Tensor<T>`), itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
 /// [`compression_fallback_count`] stays available under `dynamic` too --
 /// it just always reads 0 there.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub(crate) fn note_compression_fallback(detail: &str) {
     COMPRESSION_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     log::debug!("compression request fell back to linear: {detail}");
@@ -1674,10 +1644,10 @@ impl BufferIdentity {
 
 // `static`-only from here through `fs_magic` below: every use site lives in
 // `impl<T> TensorStorage<T>` (`from_fd`'s DMA-BUF-vs-tmpfs classification),
-// itself `#[cfg(feature = "static")]`. `dynamic`'s `from_fd`
+// itself `#[cfg(not(edgefirst_tensor_dynamic))]`. `dynamic`'s `from_fd`
 // (`dynamic_backend.rs`) drives `ef_tensor_builder_wrap` instead, which
 // does this same classification inside `libedgefirst_tensor.so`.
-#[cfg(all(target_os = "linux", feature = "static"))]
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 use nix::sys::stat::{major, minor};
 
 /// Filesystem magic of the internal `dma_buf` mount, from
@@ -1685,13 +1655,13 @@ use nix::sys::stat::{major, minor};
 ///
 /// This is stable UAPI and is the only reliable way to recognize a DMA-BUF
 /// fd — see [`TensorStorage::from_fd`] for why `st_dev` cannot be used.
-#[cfg(all(target_os = "linux", feature = "static"))]
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 const DMA_BUF_MAGIC: u32 = 0x444d_4142;
 
 /// Filesystem magic of tmpfs, from `include/uapi/linux/magic.h`
 /// (`TMPFS_MAGIC`). Covers both POSIX `shm_open` segments under `/dev/shm`
 /// and anonymous `memfd_create` files.
-#[cfg(all(target_os = "linux", feature = "static"))]
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 const TMPFS_MAGIC: u32 = 0x0102_1994;
 
 /// Normalize a raw `fstatfs` `f_type` to the 32-bit unsigned magic that
@@ -1708,7 +1678,7 @@ const TMPFS_MAGIC: u32 = 0x0102_1994;
 ///
 /// Every magic is a 32-bit quantity, so truncating back to `u32` recovers
 /// the true value from all four representations and loses nothing.
-#[cfg(all(target_os = "linux", feature = "static"))]
+#[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 const fn fs_magic(raw: i64) -> u32 {
     raw as u32
 }
@@ -2243,8 +2213,8 @@ impl TensorMemory {
     /// it is what every other unservable request here already returns.
     ///
     /// `static`-only: every call site is inside `impl<T> TensorStorage<T>`
-    /// (`TensorStorage::new`), itself `#[cfg(feature = "static")]`.
-    #[cfg(feature = "static")]
+    /// (`TensorStorage::new`), itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn unsupported_here(self) -> Error {
         let reason = match self {
             // Not reachable: `Mem` is servable on every target. Stated
@@ -2312,7 +2282,7 @@ impl TryFrom<&str> for TensorMemory {
 // struct that wraps it. `dynamic`'s `Tensor<T>` is a different, much
 // smaller type -- a typed lens over `TensorDyn` with no storage of its
 // own -- defined in `tensor_dyn/dynamic_tensor.rs` and re-exported below.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 #[derive(Debug)]
 #[allow(dead_code)] // Variants are constructed by downstream crates via pub(crate) helpers
 pub(crate) enum TensorStorage<T>
@@ -2337,7 +2307,7 @@ where
     Pbo(PboTensor<T>),
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 impl<T> TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -2683,7 +2653,7 @@ where
     }
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 impl<T> TensorTrait<T> for TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -2905,7 +2875,7 @@ where
 /// This is the `static` backend's `Tensor<T>` -- it owns its storage. See
 /// `tensor_dyn/dynamic_tensor.rs` for `dynamic`'s `Tensor<T>`, a typed lens
 /// with no storage of its own.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 #[derive(Debug)]
 pub struct Tensor<T>
 where
@@ -2953,7 +2923,7 @@ where
     view_origin: Option<ViewOrigin>,
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -5493,7 +5463,7 @@ where
 
 /// Windows D3D11 texture accessors. No `'static` bound: none of these needs
 /// `dtype_of::<T>()`.
-#[cfg(all(feature = "static", target_os = "windows"))]
+#[cfg(all(not(edgefirst_tensor_dynamic), target_os = "windows"))]
 impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -5578,7 +5548,7 @@ where
 /// The recorded GPU write value, on every platform: the descriptor path and
 /// the Python bindings forward it without a `cfg` of their own, and only
 /// Windows can record one.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -5612,7 +5582,7 @@ where
 /// a padded texture at the image width.
 ///
 /// `t.format` must already be set: the natural stride comes from it.
-#[cfg(all(feature = "static", target_os = "windows"))]
+#[cfg(all(not(edgefirst_tensor_dynamic), target_os = "windows"))]
 fn record_d3d11_row_stride<T>(t: &mut Tensor<T>, format: PixelFormat, what: &str)
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -5635,7 +5605,7 @@ where
 
 /// The two texture-importing constructors. Separate from the accessors above
 /// because `dtype_of::<T>()` needs `T: 'static`.
-#[cfg(all(feature = "static", target_os = "windows"))]
+#[cfg(all(not(edgefirst_tensor_dynamic), target_os = "windows"))]
 impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync + 'static,
@@ -5739,7 +5709,7 @@ where
 // Quantization accessors — type-gated to integer element types via the
 // sealed `IntegerType` trait. Calling `.quantization()` on a `Tensor<f32>`
 // produces a compile error, not a runtime one.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 impl<T> Tensor<T>
 where
     T: IntegerType + Num + Clone + fmt::Debug + Send + Sync,
@@ -5776,7 +5746,7 @@ where
 
 /// Rank of one image's shape in `layout`: `[H, W, C]` / `[C, H, W]` are 3-D,
 /// semi-planar `[H*k, W]` is 2-D. A batched tensor has one more.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 fn image_rank(layout: PixelLayout) -> usize {
     match layout {
         PixelLayout::SemiPlanar => 2,
@@ -5784,7 +5754,7 @@ fn image_rank(layout: PixelLayout) -> usize {
     }
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 fn map_strided_host_view<'a, T>(
     tensor: &Tensor<T>,
     stride: usize,
@@ -5809,7 +5779,7 @@ where
 /// `H` per packed image, `C * H` per planar one (C planes of H rows), and the
 /// combined `H*k` per semi-planar one. No product here can overflow: each is
 /// a factor of the shape's element count, which the allocation already holds.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 fn strided_rows<T>(tensor: &Tensor<T>) -> Result<usize>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -5834,7 +5804,7 @@ where
     Ok(batch * per_image)
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 fn map_strided_storage<'a, T>(
     tensor: &Tensor<T>,
     _stride: usize,
@@ -5979,7 +5949,7 @@ where
     }
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -6086,7 +6056,7 @@ where
 }
 
 #[cfg(all(
-    feature = "static",
+    not(edgefirst_tensor_dynamic),
     any(
         target_os = "macos",
         target_os = "ios",
@@ -6134,7 +6104,7 @@ where
     }
 }
 
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 impl<T> TensorTrait<T> for Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -7185,7 +7155,7 @@ mod compression_tests {
     }
 }
 
-#[cfg(all(test, feature = "static"))]
+#[cfg(all(test, not(edgefirst_tensor_dynamic)))]
 mod vocabulary_and_probe_tests {
     use super::*;
 
@@ -7278,7 +7248,7 @@ mod vocabulary_and_probe_tests {
     }
 }
 
-#[cfg(all(test, feature = "static"))]
+#[cfg(all(test, not(edgefirst_tensor_dynamic)))]
 mod quantization_serde_tests {
     use super::*;
 
@@ -7377,7 +7347,7 @@ mod quantization_serde_tests {
     }
 }
 
-#[cfg(all(test, feature = "static"))]
+#[cfg(all(test, not(edgefirst_tensor_dynamic)))]
 mod image_geometry_tests {
     use super::*;
 
@@ -7783,7 +7753,7 @@ mod image_geometry_tests {
     }
 }
 
-#[cfg(all(test, feature = "static"))]
+#[cfg(all(test, not(edgefirst_tensor_dynamic)))]
 mod strided_access_tests {
     use super::*;
 
@@ -8031,7 +8001,7 @@ mod strided_access_tests {
     }
 }
 
-#[cfg(all(test, feature = "static"))]
+#[cfg(all(test, not(edgefirst_tensor_dynamic)))]
 mod accessor_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

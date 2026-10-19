@@ -424,10 +424,10 @@ where
     ///   (the request would lose data)
     /// - `IoError` if the DMA-heap allocation fails
     // `static`-only: called from `Tensor::image_with_stride` (`lib.rs`,
-    // `impl<T> Tensor<T>`), which is itself `#[cfg(feature = "static")]`.
+    // `impl<T> Tensor<T>`), which is itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
     // `dynamic`'s `image_with_stride` drives `ef_tensor_image_with_stride_alloc`
     // instead, never this method directly.
-    #[cfg(all(target_os = "linux", feature = "static", not(miri)))]
+    #[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic), not(miri)))]
     pub(crate) fn new_with_byte_size(
         shape: &[usize],
         byte_size: usize,
@@ -523,8 +523,8 @@ where
     /// `Tensor::effective_row_stride()` so they don't read past the end.
     ///
     /// `static`-only: the sole caller, `impl<T> TensorMapTrait<T> for
-    /// Tensor<T>` in `lib.rs`, is itself `#[cfg(feature = "static")]`.
-    #[cfg(feature = "static")]
+    /// Tensor<T>` in `lib.rs`, is itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,
@@ -676,8 +676,8 @@ where
     /// [`Tensor::sync_for_cpu`](crate::Tensor::sync_for_cpu).
     ///
     /// `static`-only: called only from `TensorStorage::pin_host`
-    /// (`lib.rs`), itself `#[cfg(feature = "static")]`.
-    #[cfg(feature = "static")]
+    /// (`lib.rs`), itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn host_pin<'a>(&self) -> crate::Result<crate::pin::HostPin<'a>>
     where
         T: 'a,

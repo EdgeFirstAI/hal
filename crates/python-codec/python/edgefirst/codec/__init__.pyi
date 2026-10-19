@@ -28,6 +28,9 @@ from edgefirst.tensor import Region as Region
 from edgefirst.tensor import Tensor as _BaseTensor
 from edgefirst.tensor import TensorMemory as TensorMemory
 
+# "dynamic" in every wheel; "static" only in the G13 comparison build.
+__tensor_backend__: str
+
 def version() -> str:
     """Return the HAL version string (matches ``Cargo.toml``)."""
 

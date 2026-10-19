@@ -18,29 +18,14 @@
 //!
 //! # Running this file
 //!
-//! This crate's `dynamic` feature deliberately links no `ef_tensor_*`
-//! implementation of its own (`edgefirst-tensor-ffi`'s declarations carry no
-//! `#[link]` attribute -- see that crate's module docs); linking is
-//! normally the *consumer*'s decision (each `-capi` leaf's own build). This
-//! crate has no other consumer to make that decision on its own tests'
-//! behalf, so the opt-in `dynamic-test-link` feature (never enabled by a
-//! production consumer -- see its doc comment in `Cargo.toml`) makes
-//! `build.rs` link this test binary against `libedgefirst_tensor.so`
-//! directly.
+//! Under the dynamic cfg the crate's build.rs links this test binary against
+//! `libedgefirst_tensor`, so the producer must be built first:
 //!
 //! ```sh
-//! export TMPDIR=/home/sebastien/.cache/hal-tmp   # avoid a near-full /tmp
-//! # 1. Build the producer first (the real implementation lives here):
-//! cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
-//! # 2. Run just this integration test target (not the whole crate's test
-//! #    suite -- the other files under tests/ are static-only and do not
-//! #    compile under `dynamic`, a pre-existing gap this task does not
-//! #    close; see the task report):
-//! cargo test -p edgefirst-tensor --no-default-features \
-//!     --features dynamic,dynamic-test-link,ndarray --test dynamic_primitives
+//! make test-tensor-dynamic
 //! ```
 
-#![cfg(feature = "dynamic")]
+#![cfg(edgefirst_tensor_dynamic)]
 
 use edgefirst_tensor::{
     CpuAccess, DType, Error, PixelFormat, Quantization, Region, Tensor, TensorDyn, TensorMapTrait,

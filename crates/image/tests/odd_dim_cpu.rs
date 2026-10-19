@@ -9,7 +9,7 @@
 //! analytically-constructed odd-both sources), and the resize strided-source
 //! path (Deliverable 3 subset).
 //!
-//! All cells run under the default feature set (no `dma_test_formats` flag).
+//! All cells run under the default feature set.
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_image::{CPUProcessor, Crop, ImageProcessorTrait};

@@ -8,6 +8,12 @@
 //! the exported `ef_detect_box_list_data()`/`_len()` without linking this
 //! library: those give back a plain `(ef_detect_box *, size_t)` view.
 
+#[cfg(not(edgefirst_tensor_dynamic))]
+compile_error!(
+    "edgefirst-decoder-capi links libedgefirst_tensor and must be built with the dynamic tensor backend: \
+     `cargo build --config .cargo/tensor-dynamic.toml` (or `make capi-libs`)."
+);
+
 pub mod codes;
 pub mod decode;
 pub mod infer;

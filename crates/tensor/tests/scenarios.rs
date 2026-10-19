@@ -5,21 +5,10 @@
 //! Miri with both aliasing models (`scripts/miri.sh` runs this file with
 //! Stacked Borrows, then again with `MIRIFLAGS=-Zmiri-tree-borrows`).
 //!
-//! This crate is built with its plain default features (`static`,
-//! `ndarray`), so `TensorDyn::into_raw`/`from_raw`/`with_raw` are the
-//! `static` backend's own implementations (`tensor_dyn/static_backend.rs`)
-//! -- `Box::into_raw`/`Box::from_raw`/`ManuallyDrop` over a boxed,
-//! in-process `TensorDyn`, not the `dynamic` backend's `NonNull<EfTensor>`
-//! over an opaque handle from `libedgefirst_tensor.so`. That distinction is
-//! not a downgrade of what this file tests: both backends expose the
-//! identical `into_raw`/`from_raw`/`with_raw` names and reborrow contract
-//! precisely so a `-capi` leaf's calling convention does not change with
-//! the backend (see `Raw`'s doc comment in both `static_backend.rs` and
-//! `dynamic_backend.rs`), and the hazard this file guards against -- a
-//! `with_raw` reborrow's guard dropped before the handle's window of use,
-//! aliasing two `&mut` over the same allocation -- lives entirely in that
-//! shared shape, not in how the bytes on the other side of the pointer
-//! happen to be produced.
+//! The file runs against the static backend (`tensor_dyn/static_backend.rs`).
+//! Both backends expose the same `into_raw`/`from_raw`/`with_raw` reborrow
+//! contract, and the hazard guarded here -- a `with_raw` guard dropped
+//! before the handle's window of use -- lives in that shared shape.
 //!
 //! Platform storage (`dma.rs` and friends) drops its `dma-heap` dependency
 //! under Miri specifically (`Cargo.toml`'s `cfg(all(target_os = "linux",
