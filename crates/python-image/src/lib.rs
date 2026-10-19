@@ -22,6 +22,9 @@ fn _image(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<colorimetry::PyColorRange>()?;
     m.add_class::<image::PyRotation>()?;
     m.add_class::<image::PyFlip>()?;
+    m.add_class::<image::PyLetterboxPlacement>()?;
+    m.add_class::<image::PyNormalizationPreset>()?;
+    m.add_class::<image::PyConvertOptions>()?;
     m.add_class::<image::PyColorMode>()?;
     m.add_class::<image::PyMaskResolution>()?;
     m.add_class::<image::PyImageProcessor>()?;

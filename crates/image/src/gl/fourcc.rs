@@ -27,7 +27,7 @@ pub(super) fn pixel_format_to_drm(fmt: PixelFormat) -> Result<DrmFourcc, Error> 
         PixelFormat::Rgb => Ok(DrmFourcc::Bgr888),
         PixelFormat::Grey => Ok(DrmFourcc::R8),
         PixelFormat::Nv12 => Ok(DrmFourcc::Nv12),
-        PixelFormat::PlanarRgb => Ok(DrmFourcc::R8),
+        PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => Ok(DrmFourcc::R8),
         _ => Err(Error::NotSupported(format!(
             "PixelFormat {fmt:?} has no DRM format mapping"
         ))),

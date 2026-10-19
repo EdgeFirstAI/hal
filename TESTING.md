@@ -1090,11 +1090,11 @@ fn test_steady_state_no_realloc() {
     let src = load_image(&fixture_bytes(), Some(PixelFormat::Rgb), None).unwrap();
 
     // Warm-up
-    proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()).unwrap();
+    proc.convert(&src, &mut dst, None).unwrap();
 
     // Steady state — every iteration must hit the EGL image cache.
     for _ in 0..100 {
-        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()).unwrap();
+        proc.convert(&src, &mut dst, None).unwrap();
     }
     // Drop `proc` to flush the EglImageCache stats log line. Assert in
     // the test harness that misses == 1 (the warm-up) by parsing the log.

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, ResolvedCrop, Result, Rotation,
+    Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, ResolvedCrop, Result, Rotation,
 };
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
@@ -11,6 +11,7 @@ use edgefirst_tensor::{DetectBox, ProtoData, Segmentation};
 
 mod convert;
 mod masks;
+mod normalize;
 mod resize;
 mod simd;
 mod tests;
@@ -784,22 +785,62 @@ impl CPUProcessor {
     }
 }
 
+/// Colour parameters for a convert from `src` to `dst`, resolved once from
+/// each tensor's effective colorimetry.
+fn color_params(src: &TensorDyn, dst: &TensorDyn) -> (ColorParams, ColorParams) {
+    // Resolve per-tensor colorimetry once, at the use site, without
+    // mutating either tensor. YUV→RGB conversions take their matrix/range
+    // from the source; RGB→YUV conversions from the destination. The grey/
+    // luma expansion is gated on the resolved range of the relevant side.
+    let src_cm = crate::colorimetry::effective_colorimetry(src);
+    let dst_cm = crate::colorimetry::effective_colorimetry(dst);
+    let src_full = src_cm.range == Some(edgefirst_tensor::ColorRange::Full);
+    let dst_full = dst_cm.range == Some(edgefirst_tensor::ColorRange::Full);
+    let src_params = ColorParams {
+        matrix: crate::colorimetry::yuv_matrix(src_cm.encoding.unwrap()),
+        range: crate::colorimetry::yuv_range(src_cm.range.unwrap()),
+        encoding: src_cm.encoding.unwrap(),
+        range_kind: src_cm.range.unwrap(),
+        src_full_range: src_full,
+        dst_full_range: dst_full,
+    };
+    let dst_params = ColorParams {
+        matrix: crate::colorimetry::yuv_matrix(dst_cm.encoding.unwrap()),
+        range: crate::colorimetry::yuv_range(dst_cm.range.unwrap()),
+        encoding: dst_cm.encoding.unwrap(),
+        range_kind: dst_cm.range.unwrap(),
+        src_full_range: src_full,
+        dst_full_range: dst_full,
+    };
+    (src_params, dst_params)
+}
+
 impl ImageProcessorTrait for CPUProcessor {
     fn convert(
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: Option<crate::ConvertOptions>,
     ) -> Result<()> {
+        let options = options.unwrap_or_default();
+        let (rotation, flip, crop) = (
+            options.get_rotation(),
+            options.get_flip(),
+            options.get_crop(),
+        );
         let crop = crop.resolve(
             src.width().unwrap_or(0),
             src.height().unwrap_or(0),
             dst.width().unwrap_or(0),
             dst.height().unwrap_or(0),
+            options.get_placement(),
         )?;
-        self.convert_impl(src, dst, rotation, flip, crop)
+        match crate::options::output_map_for(&options, dst, crop.dst_rect.is_some())? {
+            None => self.convert_impl(src, dst, rotation, flip, crop),
+            Some((map, pad_output)) => {
+                self.convert_mapped(src, dst, rotation, flip, crop, &map, pad_output)
+            }
+        }
     }
 
     fn draw_decoded_masks(
@@ -852,6 +893,62 @@ impl ImageProcessorTrait for CPUProcessor {
 
 // Internal methods — dtype-aware dispatch layer.
 impl CPUProcessor {
+    /// Convert into a u8 scratch, then map it into `dst` with `map`, and
+    /// overwrite the letterbox band with `pad_output` when set.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_mapped(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+        map: &crate::options::OutputMap,
+        pad_output: Option<[f32; 4]>,
+    ) -> Result<()> {
+        let src_u8 = src
+            .as_typed::<u8>()
+            .ok_or_else(|| Error::NotSupported(format!("dtype {} source", src.dtype())))?;
+        let src_fmt = src.format().ok_or(Error::NotAnImage)?;
+        let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
+        let dw = dst.width().ok_or(Error::NotAnImage)?;
+        let dh = dst.height().ok_or(Error::NotAnImage)?;
+        let mut tmp = self.take_scratch(dw, dh, dst_fmt)?;
+        let (src_params, dst_params) = color_params(src, dst);
+        let result = (|| {
+            let tmp_u8 = tmp.as_typed_mut::<u8>().unwrap();
+            self.convert_u8(
+                src_u8, tmp_u8, src_fmt, dst_fmt, rotation, flip, crop, src_params, dst_params,
+            )?;
+            normalize::write_mapped(tmp.as_typed::<u8>().unwrap(), dst, map)?;
+            if let (Some(pad), Some(rect)) = (pad_output, crop.dst_rect) {
+                let values = map.pad_values([0; 4], Some(pad));
+                normalize::fill_outside(dst, rect, values)?;
+            }
+            Ok(())
+        })();
+        self.widen_scratch = Some(tmp);
+        result
+    }
+
+    /// The cached u8 scratch when it matches, else a new one.
+    fn take_scratch(&mut self, w: usize, h: usize, fmt: PixelFormat) -> Result<TensorDyn> {
+        let matches = self.widen_scratch.as_ref().is_some_and(|t| {
+            t.width() == Some(w) && t.height() == Some(h) && t.format() == Some(fmt)
+        });
+        if matches {
+            return Ok(self.widen_scratch.take().unwrap());
+        }
+        Ok(TensorDyn::image(
+            w,
+            h,
+            fmt,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?)
+    }
+
     /// Top-level conversion dispatcher: handles dtype combinations.
     pub(crate) fn convert_impl(
         &mut self,
@@ -864,30 +961,7 @@ impl CPUProcessor {
         let src_fmt = src.format().ok_or(Error::NotAnImage)?;
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
 
-        // Resolve per-tensor colorimetry once, at the use site, without
-        // mutating either tensor. YUV→RGB conversions take their matrix/range
-        // from the source; RGB→YUV conversions from the destination. The grey/
-        // luma expansion is gated on the resolved range of the relevant side.
-        let src_cm = crate::colorimetry::effective_colorimetry(src);
-        let dst_cm = crate::colorimetry::effective_colorimetry(dst);
-        let src_full = src_cm.range == Some(edgefirst_tensor::ColorRange::Full);
-        let dst_full = dst_cm.range == Some(edgefirst_tensor::ColorRange::Full);
-        let src_params = ColorParams {
-            matrix: crate::colorimetry::yuv_matrix(src_cm.encoding.unwrap()),
-            range: crate::colorimetry::yuv_range(src_cm.range.unwrap()),
-            encoding: src_cm.encoding.unwrap(),
-            range_kind: src_cm.range.unwrap(),
-            src_full_range: src_full,
-            dst_full_range: dst_full,
-        };
-        let dst_params = ColorParams {
-            matrix: crate::colorimetry::yuv_matrix(dst_cm.encoding.unwrap()),
-            range: crate::colorimetry::yuv_range(dst_cm.range.unwrap()),
-            encoding: dst_cm.encoding.unwrap(),
-            range_kind: dst_cm.range.unwrap(),
-            src_full_range: src_full,
-            dst_full_range: dst_full,
-        };
+        let (src_params, dst_params) = color_params(src, dst);
         match (src.dtype(), dst.dtype()) {
             (DType::U8, DType::U8) => {
                 let src = src.as_typed::<u8>().unwrap();
@@ -919,21 +993,7 @@ impl CPUProcessor {
                 // otherwise reallocate and cache the new scratch.  Take the
                 // scratch out of `self` so that `convert_u8` can borrow `self`
                 // exclusively, then restore it afterwards.
-                let scratch_matches = self.widen_scratch.as_ref().is_some_and(|t| {
-                    t.width() == Some(dw) && t.height() == Some(dh) && t.format() == Some(dst_fmt)
-                });
-                let mut tmp = if scratch_matches {
-                    self.widen_scratch.take().unwrap()
-                } else {
-                    TensorDyn::image(
-                        dw,
-                        dh,
-                        dst_fmt,
-                        DType::U8,
-                        Some(TensorMemory::Mem),
-                        edgefirst_tensor::CpuAccess::ReadWrite,
-                    )?
-                };
+                let mut tmp = self.take_scratch(dw, dh, dst_fmt)?;
                 {
                     let tmp_u8 = tmp.as_typed_mut::<u8>().unwrap();
                     self.convert_u8(

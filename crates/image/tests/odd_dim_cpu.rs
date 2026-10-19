@@ -12,7 +12,7 @@
 //! All cells run under the default feature set (no `dma_test_formats` flag).
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rotation};
+use edgefirst_image::{CPUProcessor, Crop, ImageProcessorTrait};
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -299,14 +299,7 @@ fn jpeg_nv_to_rgb_mae(fixture: &str, fmt: PixelFormat, w: usize, h: usize) -> (f
     )
     .unwrap();
     let mut proc = CPUProcessor::default();
-    proc.convert(
-        &src_dyn,
-        &mut dst_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_dyn, &mut dst_dyn, None).unwrap();
     let dst_u8 = dst_dyn.as_u8().unwrap();
     mae_vs_image_crate_rgb(dst_u8, &ref_rgb, w, h)
 }
@@ -387,14 +380,7 @@ fn c02_grey_odd_h_to_rgb() {
     )
     .unwrap();
     let mut proc = CPUProcessor::default();
-    proc.convert(
-        &src_dyn,
-        &mut dst_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_dyn, &mut dst_dyn, None).unwrap();
 
     let dst_u8 = dst_dyn.as_u8().unwrap();
     let dst_stride = dst_u8.effective_row_stride().unwrap_or(w * 3);
@@ -658,14 +644,7 @@ fn run_odd_both(w: usize, h: usize, fmt: PixelFormat, label: &str) {
     )
     .unwrap();
     let mut proc = CPUProcessor::default();
-    proc.convert(
-        &src_dyn,
-        &mut dst_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_dyn, &mut dst_dyn, None).unwrap();
     let dst_u8 = dst_dyn.as_u8().unwrap();
     // max_diff tolerance 4 (vs the analytic ideal): the YUV→RGB step rounds
     // architecture-dependently — the `yuv` crate's NEON kernels differ from x86
@@ -741,14 +720,7 @@ fn c10_nv12_to_rgb_i8() {
     )
     .unwrap();
     let mut proc = CPUProcessor::default();
-    proc.convert(
-        &src_i8_dyn,
-        &mut dst_i8_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_i8_dyn, &mut dst_i8_dyn, None).unwrap();
 
     // u8 reference path
     let mut src_u8 = Tensor::<u8>::image(
@@ -773,14 +745,7 @@ fn c10_nv12_to_rgb_i8() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &src_u8_dyn,
-        &mut dst_u8_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_u8_dyn, &mut dst_u8_dyn, None).unwrap();
 
     let i8_t = dst_i8_dyn.as_i8().unwrap();
     let u8_t = dst_u8_dyn.as_u8().unwrap();
@@ -841,14 +806,7 @@ fn c11_nv12_to_rgb_f16() {
     )
     .unwrap();
     let mut proc = CPUProcessor::default();
-    proc.convert(
-        &src_f16_dyn,
-        &mut dst_f16_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_f16_dyn, &mut dst_f16_dyn, None).unwrap();
 
     // u8 reference path
     let mut src_u8 = Tensor::<u8>::image(
@@ -873,14 +831,7 @@ fn c11_nv12_to_rgb_f16() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &src_u8_dyn,
-        &mut dst_u8_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_u8_dyn, &mut dst_u8_dyn, None).unwrap();
 
     let f16_t = dst_f16_dyn.as_f16().unwrap();
     let u8_ref = dst_u8_dyn.as_u8().unwrap();
@@ -944,8 +895,12 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
     )
     .unwrap();
     let mut proc = CPUProcessor::default();
-    proc.convert(&src_dyn, &mut dst_dyn, Rotation::None, Flip::None, crop)
-        .unwrap();
+    proc.convert(
+        &src_dyn,
+        &mut dst_dyn,
+        Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+    )
+    .unwrap();
 
     let dst_u8 = dst_dyn.as_u8().unwrap();
     let dst_stride = dst_u8.effective_row_stride().unwrap_or(640 * 3);
@@ -1027,14 +982,7 @@ fn d3_rgb_to_nv16_stride_round_trip() {
     let src_dyn = TensorDyn::from(build_ref_rgb());
     let mut nv16_dyn = TensorDyn::from(nv16);
     let mut proc = CPUProcessor::default();
-    proc.convert(
-        &src_dyn,
-        &mut nv16_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_dyn, &mut nv16_dyn, None).unwrap();
 
     // NV16 → RGB
     let mut out_dyn = TensorDyn::image(
@@ -1046,14 +994,7 @@ fn d3_rgb_to_nv16_stride_round_trip() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &nv16_dyn,
-        &mut out_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&nv16_dyn, &mut out_dyn, None).unwrap();
 
     // --- Reference: direct RGB→RGB (no NV16 intermediate), same pattern ---
     let src2_dyn = TensorDyn::from(build_ref_rgb());
@@ -1077,22 +1018,8 @@ fn d3_rgb_to_nv16_stride_round_trip() {
     )
     .unwrap();
     let mut nv16_ref_dyn = TensorDyn::from(nv16_ref);
-    proc.convert(
-        &src2_dyn,
-        &mut nv16_ref_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
-    proc.convert(
-        &nv16_ref_dyn,
-        &mut ref_dyn,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src2_dyn, &mut nv16_ref_dyn, None).unwrap();
+    proc.convert(&nv16_ref_dyn, &mut ref_dyn, None).unwrap();
 
     let out_u8 = out_dyn.as_u8().unwrap();
     let ref_u8 = ref_dyn.as_u8().unwrap();
@@ -1217,14 +1144,7 @@ fn d3_resize_strided_rgb_source() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &tight_dyn,
-        &mut tight_dst,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&tight_dyn, &mut tight_dst, None).unwrap();
 
     // Resize strided source
     let strided_dyn = TensorDyn::from(strided_src);
@@ -1237,14 +1157,7 @@ fn d3_resize_strided_rgb_source() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &strided_dyn,
-        &mut strided_dst,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&strided_dyn, &mut strided_dst, None).unwrap();
 
     if strided_stride == w * 3 {
         // Both paths are identical (fallback hit); trivially passes.
@@ -1292,14 +1205,7 @@ fn cpu_to_grey_packed(src: Tensor<u8>, w: usize, h: usize) -> Vec<u8> {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &src_dyn,
-        &mut dst,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_dyn, &mut dst, None).unwrap();
     let dst_u8 = dst.as_u8().unwrap();
     let stride = dst_u8.effective_row_stride().unwrap_or(w);
     let map = dst_u8.map().unwrap();
@@ -1404,8 +1310,7 @@ fn d6_planar_packed_roundtrip() {
         )
         .unwrap();
         let _ = dst_ch;
-        proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        proc.convert(src, &mut dst, None).unwrap();
         dst
     };
 
@@ -1533,14 +1438,7 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &src_dyn,
-        &mut planar,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_dyn, &mut planar, None).unwrap();
 
     // Reference: the proven NV→RGB packed conversion (unchanged path).
     let mut rgb = TensorDyn::image(
@@ -1552,14 +1450,7 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    proc.convert(
-        &src_dyn,
-        &mut rgb,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap();
+    proc.convert(&src_dyn, &mut rgb, None).unwrap();
 
     let planar_t = planar.as_u8().unwrap();
     let rgb_t = rgb.as_u8().unwrap();
@@ -1667,7 +1558,7 @@ fn yuyv_dst_fully_written(w: usize, h: usize, src_fmt: PixelFormat, label: &str)
         .fill(POISON);
 
     CPUProcessor::default()
-        .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+        .convert(&src, &mut dst, None)
         .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
 
     let dst_u8 = dst.as_u8().unwrap();

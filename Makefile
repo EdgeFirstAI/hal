@@ -38,6 +38,10 @@ RUFF_PATHS := $(PYTHON_CRATES) crates/python-common $(TEST_DIR)
 # target dir a hard failure instead of a silent skip.
 CAPI_MODULAR_CRATES := tensor-capi image-capi codec-capi decoder-capi tracker-capi
 
+# The crates.io packages, each checked on its own as a dependent builds it, without workspace feature unification.
+PUBLISHED_CRATES := edgefirst-tensor-abi edgefirst-tensor-ffi edgefirst-tensor edgefirst-egl edgefirst-gl \
+	edgefirst-codec edgefirst-decoder-abi edgefirst-decoder edgefirst-tracker edgefirst-image
+
 # Use profiling profile for testing (optimized with debug symbols)
 CARGO_PROFILE := --profile profiling
 # For cargo-llvm-cov nextest, the cargo profile flag is different
@@ -221,11 +225,21 @@ lint-capi-modular:
 # ===========================================================================
 
 .PHONY: check
-check: check-capi-modular
+check: check-capi-modular check-standalone
 	@echo "Running cargo check..."
 	@cargo check $(RUST_FEATURES) --workspace \
 		$(foreach c,$(PYTHON_CRATE_NAMES),--exclude $(c))
 	@echo "✓ Check passed"
+
+.PHONY: check-standalone
+check-standalone:
+	@echo "Running cargo check on each published crate on its own..."
+	@for c in $(PUBLISHED_CRATES); do \
+		cargo check -p $$c || exit 1; \
+	done
+	@cargo check -p edgefirst-codec --all-targets --no-default-features \
+		--features v4l2,nvjpeg,png,edgefirst-tensor/dynamic
+	@echo "✓ Standalone check passed"
 
 .PHONY: check-capi-modular
 check-capi-modular:

@@ -75,6 +75,15 @@ extern "C" {
  */
 typedef struct ef_image_processor ef_image_processor;
 
+/**
+ * @brief Opaque convert options.
+ *
+ * Built with `ef_convert_options_new` and the `ef_convert_options_set_*`
+ * setters, freed with `ef_convert_options_free`. `NULL` where options are
+ * accepted means the defaults.
+ */
+typedef struct ef_convert_options ef_convert_options;
+
 /** @brief An owned list of materialized masks. */
 typedef struct ef_mask_list ef_mask_list;
 
@@ -104,6 +113,7 @@ exclude = [
   "EfTensorPlane",
   "EfTensorImageDesc",
   "EfImageProcessor",
+  "EfConvertOptions",
   "EfMaskList",
   "EfTileSpecList",
   "EfTilePlacementList",
@@ -119,6 +129,8 @@ include = [
   "EfColorMode",
   "EfFit",
   "EfComputeBackend",
+  "EfLetterboxPlacement",
+  "EfNormalization",
 ]
 
 
@@ -126,7 +138,7 @@ include = [
 "EfTensor" = "ef_tensor"
 "EfImageProcessor" = "ef_image_processor"
 "EfTensorImageDesc" = "ef_tensor_image_desc"
-"EfCrop" = "ef_crop"
+"EfConvertOptions" = "ef_convert_options"
 "EfTilingConfig" = "ef_tiling_config"
 "EfTileSpec" = "ef_tile_spec"
 "EfTilePlacement" = "ef_tile_placement"
@@ -140,6 +152,8 @@ include = [
 "EfColorMode" = "ef_color_mode"
 "EfFit" = "ef_fit"
 "EfComputeBackend" = "ef_compute_backend"
+"EfLetterboxPlacement" = "ef_letterbox_placement"
+"EfNormalization" = "ef_normalization"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

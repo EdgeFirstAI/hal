@@ -40,9 +40,7 @@
 
 #![cfg(all(target_os = "linux", feature = "opengl"))]
 
-use edgefirst_image::{
-    CPUProcessor, Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation,
-};
+use edgefirst_image::{CPUProcessor, GLProcessorThreaded, ImageProcessorTrait};
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, Colorimetry, CpuAccess, DType, PixelFormat, Region, TensorDyn,
     TensorMapTrait, TensorMemory,
@@ -176,7 +174,7 @@ fn rgba_source_views_convert_their_own_tile_at_every_origin() {
     for (x0, y0) in ORIGINS {
         let view = src.view(Region::new(x0, y0, SIDE, SIDE)).expect("view");
         let mut dst = rgba_dst(SIDE, SIDE);
-        if let Err(e) = gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default()) {
+        if let Err(e) = gl.convert(&view, &mut dst, None) {
             failures.push(format!(
                 "({x0},{y0}) offset {}: convert failed: {e}",
                 y0 * pitch + x0 * BPP
@@ -328,19 +326,13 @@ fn rgba_offset_frames_convert_at_a_pitch_with_no_room_to_rebase() {
         );
         let mut reference = rgba_dst(W, H);
         CPUProcessor::new()
-            .convert(
-                &src,
-                &mut reference,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )
+            .convert(&src, &mut reference, None)
             .expect("CPU reference");
         let want = bytes(&reference);
 
         let before = gl.convert_stats().expect("convert stats");
         let mut dst = rgba_dst(W, H);
-        let outcome = gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default());
+        let outcome = gl.convert(&src, &mut dst, None);
         let after = gl.convert_stats().expect("convert stats");
         let imports = after.src_imports - before.src_imports;
         let uploads = after.src_uploads - before.src_uploads;
@@ -452,17 +444,11 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
         );
         let mut reference = rgba_dst(W, H);
         CPUProcessor::new()
-            .convert(
-                &src,
-                &mut reference,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )
+            .convert(&src, &mut reference, None)
             .expect("CPU reference");
         let want = bytes(&reference);
         let mut dst = rgba_dst(W, H);
-        match gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
+        match gl.convert(&src, &mut dst, None) {
             Err(e) => failures.push(format!(
                 "offset {offset}: GL refused the NV12 source: {e} \
                  (issue #166: the declined import must reach the R8 upload)"
@@ -589,7 +575,7 @@ fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() 
             .convert_stats()
             .expect("convert stats")
             .dst_import_fallbacks;
-        if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
+        if let Err(e) = gl.convert(&src, &mut dst, None) {
             failures.push(format!("({x0},{y0}) offset {offset}: convert failed: {e}"));
             continue;
         }

@@ -4,7 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::colorimetry::effective_colorimetry;
-use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Result, Rotation};
+use crate::{CPUProcessor, Error, Flip, ImageProcessorTrait, ResolvedCrop, Result, Rotation};
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMemory,
     TensorTrait,
@@ -384,10 +384,14 @@ impl ImageProcessorTrait for G2DProcessor {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: Option<crate::ConvertOptions>,
     ) -> Result<()> {
+        let options = options.unwrap_or_default();
+        let (rotation, flip, crop) = (
+            options.get_rotation(),
+            options.get_flip(),
+            options.get_crop(),
+        );
         // A view()/batch() destination needs no special handling here: G2D blits
         // to the destination's `plane_offset` + parent `row_stride`, so a sub-view
         // (the tile) lands in its window of the parent buffer natively — the same
@@ -398,7 +402,13 @@ impl ImageProcessorTrait for G2DProcessor {
             src.height().unwrap_or(0),
             dst.width().unwrap_or(0),
             dst.height().unwrap_or(0),
+            options.get_placement(),
         )?;
+        if crate::options::output_map_for(&options, dst, crop.dst_rect.is_some())?.is_some() {
+            return Err(Error::NotSupported(
+                "G2D does not normalize or quantize; GL or CPU maps the output".into(),
+            ));
+        }
         if self.interpolation == crate::Interpolation::Nearest
             && crop.resizes(
                 (src.width().unwrap_or(0), src.height().unwrap_or(0)),
@@ -666,7 +676,7 @@ mod g2d_predicate_tests {
 #[allow(deprecated)]
 mod g2d_tests {
     use super::*;
-    use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rotation};
+    use crate::{CPUProcessor, G2DProcessor, ImageProcessorTrait};
     use edgefirst_tensor::{
         is_dma_available, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
@@ -739,7 +749,7 @@ mod g2d_tests {
                 .as_mut_slice()
                 .copy_from_slice(&nv12_bytes);
         } else {
-            cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
+            cpu_converter.convert(&src, &mut src2, None)?;
         }
 
         let mut g2d_dst = TensorDyn::image(
@@ -753,13 +763,7 @@ mod g2d_tests {
         let mut g2d_converter = G2DProcessor::new()?;
         let src2_dyn = src2;
         let mut g2d_dst_dyn = g2d_dst;
-        g2d_converter.convert(
-            &src2_dyn,
-            &mut g2d_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d_converter.convert(&src2_dyn, &mut g2d_dst_dyn, None)?;
         g2d_dst = {
             let mut __t = g2d_dst_dyn.into_u8().unwrap();
             __t.set_format(g2d_out_fmt)
@@ -775,13 +779,7 @@ mod g2d_tests {
             None,
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        cpu_converter.convert(
-            &g2d_dst,
-            &mut cpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        cpu_converter.convert(&g2d_dst, &mut cpu_dst, None)?;
 
         compare_images(
             &src,
@@ -862,13 +860,7 @@ mod g2d_tests {
             Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        cpu_converter.convert(
-            &src,
-            &mut reference,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        cpu_converter.convert(&src, &mut reference, None)?;
 
         // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(
@@ -889,7 +881,7 @@ mod g2d_tests {
                 .as_mut_slice()
                 .copy_from_slice(&nv12_bytes);
         } else {
-            cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
+            cpu_converter.convert(&src, &mut src2, None)?;
         }
 
         let mut g2d_dst = TensorDyn::image(
@@ -903,13 +895,7 @@ mod g2d_tests {
         let mut g2d_converter = G2DProcessor::new()?;
         let src2_dyn = src2;
         let mut g2d_dst_dyn = g2d_dst;
-        g2d_converter.convert(
-            &src2_dyn,
-            &mut g2d_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d_converter.convert(&src2_dyn, &mut g2d_dst_dyn, None)?;
         g2d_dst = {
             let mut __t = g2d_dst_dyn.into_u8().unwrap();
             __t.set_format(g2d_out_fmt)
@@ -925,13 +911,7 @@ mod g2d_tests {
             None,
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        cpu_converter.convert(
-            &g2d_dst,
-            &mut cpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        cpu_converter.convert(&g2d_dst, &mut cpu_dst, None)?;
 
         compare_images(
             &reference,
@@ -972,13 +952,7 @@ mod g2d_tests {
             .unwrap()
             .as_mut_slice()
             .fill(128);
-        cpu_converter.convert(
-            &src,
-            &mut reference.view(region)?,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        cpu_converter.convert(&src, &mut reference.view(region)?, None)?;
 
         // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(
@@ -999,7 +973,7 @@ mod g2d_tests {
                 .as_mut_slice()
                 .copy_from_slice(&nv12_bytes);
         } else {
-            cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
+            cpu_converter.convert(&src, &mut src2, None)?;
         }
 
         let mut g2d_dst = TensorDyn::image(
@@ -1020,13 +994,7 @@ mod g2d_tests {
         let mut g2d_converter = G2DProcessor::new()?;
         let src2_dyn = src2;
         let g2d_dst_dyn = g2d_dst;
-        g2d_converter.convert(
-            &src2_dyn,
-            &mut g2d_dst_dyn.view(region)?,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d_converter.convert(&src2_dyn, &mut g2d_dst_dyn.view(region)?, None)?;
         g2d_dst = {
             let mut __t = g2d_dst_dyn.into_u8().unwrap();
             __t.set_format(g2d_out_fmt)
@@ -1042,13 +1010,7 @@ mod g2d_tests {
             None,
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        cpu_converter.convert(
-            &g2d_dst,
-            &mut cpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        cpu_converter.convert(&g2d_dst, &mut cpu_dst, None)?;
 
         compare_images(
             &reference,
@@ -1199,13 +1161,7 @@ mod g2d_tests {
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
         let mut dst_dyn = dst;
-        g2d.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d.convert(&src_dyn, &mut dst_dyn, None)?;
         dst = {
             let mut __t = dst_dyn.into_u8().unwrap();
             __t.set_format(PixelFormat::Rgba)
@@ -1269,13 +1225,7 @@ mod g2d_tests {
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
         let mut dst_dyn = dst;
-        g2d.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d.convert(&src_dyn, &mut dst_dyn, None)?;
         dst = {
             let mut __t = dst_dyn.into_u8().unwrap();
             __t.set_format(PixelFormat::Rgb)
@@ -1339,13 +1289,7 @@ mod g2d_tests {
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
         let mut dst_dyn = dst;
-        g2d.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d.convert(&src_dyn, &mut dst_dyn, None)?;
         dst = {
             let mut __t = dst_dyn.into_u8().unwrap();
             __t.set_format(PixelFormat::Rgba)
@@ -1409,13 +1353,7 @@ mod g2d_tests {
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
         let mut dst_dyn = dst;
-        g2d.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d.convert(&src_dyn, &mut dst_dyn, None)?;
         dst = {
             let mut __t = dst_dyn.into_u8().unwrap();
             __t.set_format(PixelFormat::Rgb)
@@ -1483,7 +1421,7 @@ mod g2d_tests {
                 .as_mut_slice()
                 .copy_from_slice(&nv12_bytes);
         } else {
-            cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
+            cpu_converter.convert(&src, &mut src2, None)?;
         }
 
         let mut g2d = G2DProcessor::new()?;
@@ -1499,13 +1437,7 @@ mod g2d_tests {
         )?;
         let src2_dyn = src2;
         let mut bgra_dst_dyn = bgra_dst;
-        g2d.convert(
-            &src2_dyn,
-            &mut bgra_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d.convert(&src2_dyn, &mut bgra_dst_dyn, None)?;
         bgra_dst = {
             let mut __t = bgra_dst_dyn.into_u8().unwrap();
             __t.set_format(PixelFormat::Bgra)
@@ -1532,13 +1464,7 @@ mod g2d_tests {
         )?;
         let src2_dyn2 = src2;
         let mut rgba_dst_dyn = rgba_dst;
-        g2d.convert(
-            &src2_dyn2,
-            &mut rgba_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )?;
+        g2d.convert(&src2_dyn2, &mut rgba_dst_dyn, None)?;
         rgba_dst = {
             let mut __t = rgba_dst_dyn.into_u8().unwrap();
             __t.set_format(PixelFormat::Rgba)
@@ -1975,13 +1901,7 @@ mod g2d_tests {
         )
         .unwrap();
         CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         // G2D convert: Nv12 → Rgba.
@@ -2005,16 +1925,10 @@ mod g2d_tests {
         };
 
         // (a) G2D must accept odd-width NV12 without error.
-        g2d.convert(
-            &src_dma,
-            &mut g2d_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap_or_else(|e| {
-            panic!("D-01: G2D rejected odd-width (65) NV12 source: {e}");
-        });
+        g2d.convert(&src_dma, &mut g2d_dst, None)
+            .unwrap_or_else(|e| {
+                panic!("D-01: G2D rejected odd-width (65) NV12 source: {e}");
+            });
 
         // (b) G2D output ≈ CPU reference ±4 on RGB channels.
         let tol = 4u32;
@@ -2101,13 +2015,7 @@ mod g2d_tests {
         )
         .unwrap();
         CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         // G2D convert: Nv12 → Rgba.
@@ -2132,16 +2040,10 @@ mod g2d_tests {
 
         // G2D must accept odd-both NV12 without error (documented behaviour).
         // If hardware rejects it, the panic message is the intended failure report.
-        g2d.convert(
-            &src_dma,
-            &mut g2d_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap_or_else(|e| {
-            panic!("D-03: G2D rejected odd-both (65×63) NV12 source: {e}");
-        });
+        g2d.convert(&src_dma, &mut g2d_dst, None)
+            .unwrap_or_else(|e| {
+                panic!("D-03: G2D rejected odd-both (65×63) NV12 source: {e}");
+            });
 
         let tol = 4u32;
         let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
@@ -2263,22 +2165,8 @@ mod g2d_tests {
             .fill(POISON as i8);
 
         let mut g2d = G2DProcessor::new().unwrap();
-        g2d.convert(
-            &src,
-            &mut u8_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .expect("U8 blit");
-        g2d.convert(
-            &src,
-            &mut i8_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .expect("I8 blit");
+        g2d.convert(&src, &mut u8_dst, None).expect("U8 blit");
+        g2d.convert(&src, &mut i8_dst, None).expect("I8 blit");
 
         let u8_stride = u8_dst.effective_row_stride().unwrap();
         let want = u8_dst

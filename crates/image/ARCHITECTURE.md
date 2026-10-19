@@ -46,6 +46,7 @@ shutdown quirks of each driver stack.
 
 - [`ImageProcessor`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.ImageProcessor.html) — the orchestrator. Owns CPU + G2D + GL backends and dispatches per call.
 - [`ImageProcessorTrait`](https://docs.rs/edgefirst-image/latest/edgefirst_image/trait.ImageProcessorTrait.html) — the convert/draw API common to every backend.
+- [`ConvertOptions`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.ConvertOptions.html) — everything `convert(src, dst, Option<ConvertOptions>)` takes beyond the two tensors: rotation, flip, the `Crop`, the letterbox placement (`LetterboxPlacement::{Center, TopLeft}`), an output-domain pad, and the `Normalization`. `None` is the default. See [Output mapping](#output-mapping).
 - [`Rotation`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Rotation.html), [`Flip`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Flip.html), [`Crop`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.Crop.html) — **source-side** geometry: `Crop { source: Option<Region>, fit: Fit }` selects the sampled source sub-rectangle and the fit mode. `Fit = Stretch | Letterbox { pad: [u8; 4] }`; **letterbox** preserves the *source* aspect ratio while filling the requested *destination* shape, padding the remainder with `pad` (`Crop::letterbox([114, 114, 114, 255])` is the YOLO-style shorthand). When a source crop is set, the preserved aspect ratio is the *crop's*, not the full frame's. Destination placement is the destination itself (a tensor or a `view`/`batch` of one), never a `Crop` field.
 - **Destination / source regions** (`dst.view(rect)` / `dst.batch(n)`, `src.view(rect)`) — a sub-region of a tensor used to target a batch tile or select a sampling window in `convert()`. The `view`/`batch` primitive is a **raw tensor** concept (it shares the parent's `BufferIdentity` and carries the sub-region — defined in [`crates/tensor/ARCHITECTURE.md` § Views and sub-regions](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#views-and-sub-regions)); the *mechanics* of consuming one live here. A region lowers to `glViewport`/`glScissor` (GL dst), the destination crop (G2D dst), an offset+stride (CPU dst), or `Crop.source` sampling (src). It is render state, not a buffer attribute, so it never re-keys the EGLImage. See [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert).
 - [`MaskOverlay`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.MaskOverlay.html) — composite control for mask-rendering APIs (`background`, `opacity`).
@@ -609,6 +610,21 @@ YUV→RGB on every backend is driven by the source tensor's per-tensor
 
 See the [Colorimetry](#colorimetry-1) section for the full design.
 
+### Output mapping
+
+`options::OutputMap::resolve` folds the convert's `Normalization` (`(x - mean) / std` on 0–255 values, RGB order) and, for a u8 or i8 destination, the destination's `Quantization` into one per-channel affine on 8-bit samples, in the destination's channel order:
+
+- float: `y = x * scale + offset`;
+- integer: `clamp(floor(x * scale + offset + 0.5) + zero_point, lo, hi)`, stored as the low byte. Rounding is half up, before the integer zero point is added, which is what the GL shaders always did and keeps the CPU and GL paths in agreement on ties.
+
+Alpha maps to `x / 255` for float destinations and stays the raw byte for integer ones. An integer destination without quantization uses scale 1/255 and zero point 0 (u8) or -128 (i8), which is the plain copy and the `x ^ 0x80` bias; a non-default normalization on one is `InvalidOptions`. When the resolved map equals that plain mapping and no output-domain pad is set, `output_map_for` returns `None` and every backend runs its existing path unchanged.
+
+- **CPU** (`cpu/normalize.rs`) converts into the u8 scratch, then maps it row by row: NEON on aarch64 (48-byte blocks against a 12-lane coefficient pattern, which covers 1-, 3- and 4-channel packed rows and a planar plane), scalar elsewhere, with the same unfused arithmetic. An output-domain pad is written over the letterbox band afterwards.
+- **GL float** shaders apply `sample * norm_scale + norm_offset` (`FloatNorm`, set per convert; identity is exact) and write the precomputed pad.
+- **GL integer**: every int8 program is linked in two builds from one source. The default build compiles `quantize()` as the plain `(q + 128) mod 256` bias in literals, so a convert without a mapping runs the same shader as before mapping existed. The mapped build (`#define QUANT_MAPPED`, linked on the first mapped convert) reads the coefficients as uniforms: per-program state that `load_int_quant` uploads only when a convert's mapping differs from the loaded one, with the rounding offset and zero point folded in (clamp bounds shifted by the zero point, the wrap to a negative stored byte as one `step`). `use_int8_set` swaps the builds, with the uniform locations each draw caches, between the processor's int8 fields and `int8_alt`. Literals matter on Vivante, where the int8 draws are ALU-bound: the uniform build costs 10-13% on planar output there. A mapped u8 destination renders through the int8 programs. The planar draws swizzle each plane's channel into `.r`, so `set_plane_quant` points a mapped program at that plane's colour coefficients for each plane draw. The letterbox `glClear` writes the mapped pad bytes.
+- An **output-domain pad** on an integer destination is first replaced by the pixel pad that maps to it exactly (`OutputMap::sample_for`), when every channel has one, so every route renders it, two-pass ones included; otherwise a two-pass route (pass 1 pads with a pixel colour, pass 2 maps it) declines and the CPU writes it. The NV→float two-pass route samples its pass-2 letterbox rectangle 1:1 from the intermediate and writes the pad outside it, so it takes either pad. GL also declines a mapped `Bgra` integer destination.
+- **G2D** declines any non-default mapping.
+
 ### Resampling and source crops
 
 `ImageProcessorConfig::interpolation` (`Interpolation::{Nearest, Bilinear}`, default `Bilinear`; env `EDGEFIRST_INTERPOLATION` overrides it) selects how a convert resamples when the source region and the destination differ in size. Bilinear uses half-pixel centres, the OpenCV `INTER_LINEAR` convention that detectors are trained with. A convert that does not resize reads each source pixel exactly in either mode.
@@ -797,8 +813,9 @@ origin), and the readback targets the PACK binding. Mem tensors map directly —
 — so the `TextureMem` lowering may map freely.
 
 **Int8 letterbox bias is lowering-independent:** the int8 fragment shader
-XORs rendered pixels with 0x80 and no readback un-biases, so the letterbox
-clear colour is pre-biased (`int8_bias_clear`) on every lowering alike.
+maps rendered pixels (`quantize()`) and no readback un-maps them, so the
+letterbox clear colour is pre-mapped (`int8_bias_clear`: the convert's mapped
+pad, else the plain `^ 0x80`) on every lowering alike.
 
 ### CUDA registration of PBO tensors (u8 and float)
 

@@ -247,6 +247,15 @@ impl TensorDyn {
             .as_deref()
     }
 
+    /// Owned chroma plane as its own `TensorDyn`, or `None` if this is not
+    /// a two-allocation semi-planar tensor.
+    pub fn chroma_dyn(&self) -> Option<TensorDyn> {
+        // SAFETY: `self.handle` is live. A non-NULL result carries one
+        // retained reference that the returned tensor owns.
+        let p = unsafe { edgefirst_tensor_ffi::ef_tensor_chroma(self.handle.as_ptr()) };
+        std::ptr::NonNull::new(p).map(|h| unsafe { Self::from_raw(h.as_ptr()) })
+    }
+
     /// Read the handle's current shape via `ef_tensor_ndim`/`ef_tensor_shape`.
     fn query_shape(handle: NonNull<EfTensor>) -> Vec<usize> {
         // SAFETY: `handle` is a live handle for the duration of this call.
@@ -1554,6 +1563,33 @@ impl TensorDyn {
                 Err(batch_error(n, self.shape().first().copied(), is_index))
             }
         }
+    }
+
+    /// Borrow the DMA-BUF file descriptor backing this tensor (Linux only).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotImplemented`] if this tensor is not DMA-backed, has no
+    /// plane 0, or that plane carries no native fd.
+    #[cfg(target_os = "linux")]
+    pub fn dmabuf(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
+        if self.memory() != TensorMemory::DmaBuf {
+            return Err(Error::NotImplemented(format!(
+                "dmabuf requires DMA-backed tensor, got {:?}",
+                self.memory()
+            )));
+        }
+        let plane = self
+            .plane0()
+            .ok_or_else(|| Error::NotImplemented("dmabuf: this tensor has no plane 0".into()))?;
+        if plane.handle < 0 {
+            return Err(Error::NotImplemented(
+                "dmabuf: this tensor has no native fd (not DMA-backed)".into(),
+            ));
+        }
+        // SAFETY: `plane.handle` is a valid fd owned by the live handle,
+        // which outlives the `&self` borrow.
+        Ok(unsafe { std::os::fd::BorrowedFd::borrow_raw(plane.handle as i32) })
     }
 
     /// Clone the DMA-BUF file descriptor backing this tensor (Linux only).

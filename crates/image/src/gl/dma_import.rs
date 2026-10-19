@@ -296,7 +296,9 @@ impl DmaImportAttrs {
                 )));
             }
             match src_fmt {
-                PixelFormat::PlanarRgb => (src_w, src_h * 3, DrmFourcc::R8, 1),
+                PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => {
+                    (src_w, src_h * src_fmt.channels(), DrmFourcc::R8, 1)
+                }
                 _ => {
                     return Err(Error::NotSupported(format!(
                         "Unsupported Planar format {src_fmt:?}"

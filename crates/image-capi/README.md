@@ -29,7 +29,7 @@ ef_tensor *dst = ef_image_processor_create_image(p, 640, 480, "rgb8",
                                                  EF_DTYPE_U8,
                                                  EF_STORAGE_KIND_DMA_BUF, 0);
 
-ef_image_processor_convert(p, src, dst);
+ef_image_processor_convert(p, src, dst, NULL); /* NULL: default options */
 
 ef_tensor_free(src);
 ef_tensor_free(dst);
@@ -39,6 +39,24 @@ ef_image_processor_free(p);
 Tensors from here are ordinary tensors — read them with `ef_tensor_shape`,
 release them with `ef_tensor_free`. There is no separate image-tensor type, and
 one from `ef_tensor_new()` works here just as well.
+
+## Convert options
+
+`NULL` options convert the whole source, stretched, with float outputs mapped as `x / 255`. An `ef_convert_options` handle adds rotation, flip, a source rectangle, a letterbox with its placement and pad, and normalization:
+
+```c
+ef_convert_options *o = ef_convert_options_new();
+const uint8_t pad[4] = {0, 0, 0, 255};
+const float pad_out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+ef_convert_options_set_letterbox(o, pad);
+ef_convert_options_set_letterbox_placement(o, EF_LETTERBOX_PLACEMENT_TOP_LEFT);
+ef_convert_options_set_pad_output(o, pad_out);
+ef_convert_options_set_normalization_preset(o, EF_NORMALIZATION_IMAGENET);
+ef_image_processor_convert(p, src, dst, o);
+ef_convert_options_free(o);
+```
+
+Normalization is `(x - mean) / std` on 0-255 values (`ef_convert_options_set_normalization` takes explicit coefficients). A u8 or i8 destination with a non-default normalization must carry quantization (`ef_tensor_quantization_set`); the result is quantized with it, and the convert returns `EINVAL` without it. The setters return `EINVAL` for an unknown code and leave the options unchanged.
 
 ## What actually needs a processor
 

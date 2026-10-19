@@ -19,7 +19,7 @@ use edgefirst_codec::video::{
     access_units, DecodeEvent, DecodedFrame, DecoderConfig, VideoDecoder,
 };
 use edgefirst_codec::CodecError;
-use edgefirst_image::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};
+use edgefirst_image::{GLProcessorThreaded, ImageProcessorTrait};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
 #[path = "../../tensor/tests/support/dma_require.rs"]
@@ -120,13 +120,7 @@ impl Check {
         assert_eq!(src.memory(), TensorMemory::DmaBuf);
         let before = self.gl.egl_cache_stats().unwrap().src.misses;
         self.gl
-            .convert(
-                src,
-                &mut self.dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(src, &mut self.dst, None)
             .expect("GL converts a decoded frame");
         let imports = self.gl.egl_cache_stats().unwrap().src.misses - before;
         if !self.seen.insert(src as *const TensorDyn as usize) {
@@ -139,15 +133,7 @@ impl Check {
             // same GPU path: any difference is the decoder's layout.
             let copy = contiguous_copy(src);
             let mut copy_dst = rgba(src.width().unwrap(), src.height().unwrap());
-            self.gl
-                .convert(
-                    &copy,
-                    &mut copy_dst,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::no_crop(),
-                )
-                .unwrap();
+            self.gl.convert(&copy, &mut copy_dst, None).unwrap();
             self.first_copy = Some(copy_dst.map_bytes(CpuAccess::Read).unwrap().to_vec());
         }
         self.frames += 1;

@@ -262,20 +262,8 @@ mod cpu_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            let r1 = converter.convert(
-                img1,
-                &mut rgb1,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            );
-            let r2 = converter.convert(
-                img2,
-                &mut rgb2,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            );
+            let r1 = converter.convert(img1, &mut rgb1, None);
+            let r2 = converter.convert(img2, &mut rgb2, None);
             if r1.is_err() || r2.is_err() {
                 // Fallback: compare raw bytes as greyscale strip
                 compare_images_convert_to_grey(img1, img2, threshold, name);
@@ -384,13 +372,7 @@ mod cpu_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )?;
 
-            converter.convert(
-                &src,
-                &mut converted,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )?;
+            converter.convert(&src, &mut converted, None)?;
 
             // Post-WS1 the CPU YUV paths resolve per-source colorimetry against
             // the BT.709 fixtures: every colour↔colour conversion here now
@@ -435,13 +417,7 @@ mod cpu_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )?;
 
-            converter.convert(
-                &src,
-                &mut converted,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )?;
+            converter.convert(&src, &mut converted, None)?;
 
             // Used whenever grey is on either side (compared in luma space). The
             // floor is grey→colour (~0.978): one luma channel replicated to RGB
@@ -882,13 +858,7 @@ mod cpu_tests {
         let src_dyn = src;
         let mut converted_dyn = converted;
 
-        converter.convert(
-            &src_dyn,
-            &mut converted_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        converter.convert(&src_dyn, &mut converted_dyn, None)?;
 
         assert_eq!(
             &converted_dyn.as_u8().unwrap().map()?.as_slice(),
@@ -925,9 +895,7 @@ mod cpu_tests {
         converter.convert(
             &src_dyn,
             &mut converted_dyn,
-            Rotation::Clockwise90,
-            Flip::None,
-            Crop::default(),
+            Some(crate::ConvertOptions::new().rotation(Rotation::Clockwise90)),
         )?;
 
         let map = converted_dyn.as_u8().unwrap().map()?;
@@ -966,9 +934,7 @@ mod cpu_tests {
         converter.convert(
             &src_dyn,
             &mut converted_dyn,
-            Rotation::CounterClockwise90,
-            Flip::None,
-            Crop::default(),
+            Some(crate::ConvertOptions::new().rotation(Rotation::CounterClockwise90)),
         )?;
 
         let map = converted_dyn.as_u8().unwrap().map()?;
@@ -1007,9 +973,7 @@ mod cpu_tests {
         converter.convert(
             &src_dyn,
             &mut converted_dyn,
-            Rotation::Rotate180,
-            Flip::None,
-            Crop::default(),
+            Some(crate::ConvertOptions::new().rotation(Rotation::Rotate180)),
         )?;
 
         let map = converted_dyn.as_u8().unwrap().map()?;
@@ -1048,9 +1012,7 @@ mod cpu_tests {
         converter.convert(
             &src_dyn,
             &mut converted_dyn,
-            Rotation::None,
-            Flip::Vertical,
-            Crop::default(),
+            Some(crate::ConvertOptions::new().flip(Flip::Vertical)),
         )?;
 
         let map = converted_dyn.as_u8().unwrap().map()?;
@@ -1089,9 +1051,7 @@ mod cpu_tests {
         converter.convert(
             &src_dyn,
             &mut converted_dyn,
-            Rotation::None,
-            Flip::Horizontal,
-            Crop::default(),
+            Some(crate::ConvertOptions::new().flip(Flip::Horizontal)),
         )?;
 
         let map = converted_dyn.as_u8().unwrap().map()?;
@@ -1124,9 +1084,10 @@ mod cpu_tests {
         converter.convert(
             &src_dyn,
             &mut converted_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::new().with_source(Some(Region::new(0, 0, 1, 2))),
+            Some(
+                crate::ConvertOptions::new()
+                    .crop(Crop::new().with_source(Some(Region::new(0, 0, 1, 2)))),
+            ),
         )?;
 
         assert_eq!(
@@ -1156,13 +1117,7 @@ mod cpu_tests {
         // Destination crop is now a destination view: render into the top-row
         // sub-region; the bottom row keeps its pre-fill.
         let mut dst_view = converted_dyn.view(Region::new(0, 0, 2, 1))?;
-        converter.convert(
-            &src_dyn,
-            &mut dst_view,
-            Rotation::None,
-            Flip::None,
-            Crop::new(),
-        )?;
+        converter.convert(&src_dyn, &mut dst_view, None)?;
 
         // The untagged 2x2 Grey source is below the HD threshold, so the
         // colorimetry heuristic resolves it to BT.601 limited range: grey luma
@@ -1197,21 +1152,9 @@ mod cpu_tests {
         // Destination fill + sub-region render: fill the whole dst with the pad
         // colour, then render the source into the sub-region view.
         let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[255, 0, 0, 255])?;
-        converter.convert(
-            &pad,
-            &mut converted_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::new(),
-        )?;
+        converter.convert(&pad, &mut converted_dyn, None)?;
         let mut dst_view = converted_dyn.view(Region::new(1, 1, 1, 1))?;
-        converter.convert(
-            &src_dyn,
-            &mut dst_view,
-            Rotation::None,
-            Flip::None,
-            Crop::new(),
-        )?;
+        converter.convert(&src_dyn, &mut dst_view, None)?;
 
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
@@ -1240,21 +1183,9 @@ mod cpu_tests {
         let mut converted_dyn = converted;
 
         let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[255, 0, 0, 255])?;
-        converter.convert(
-            &pad,
-            &mut converted_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::new(),
-        )?;
+        converter.convert(&pad, &mut converted_dyn, None)?;
         let mut dst_view = converted_dyn.view(Region::new(0, 1, 2, 1))?;
-        converter.convert(
-            &src_dyn,
-            &mut dst_view,
-            Rotation::None,
-            Flip::None,
-            Crop::new(),
-        )?;
+        converter.convert(&src_dyn, &mut dst_view, None)?;
 
         // 2x3 YUYV is below the HD threshold, so the colorimetry heuristic
         // resolves it to BT.601 limited (previously a BT.709 hardcode). Red
@@ -1286,21 +1217,9 @@ mod cpu_tests {
         let mut converted_dyn = converted;
 
         let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[200, 200, 200, 255])?;
-        converter.convert(
-            &pad,
-            &mut converted_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::new(),
-        )?;
+        converter.convert(&pad, &mut converted_dyn, None)?;
         let mut dst_view = converted_dyn.view(Region::new(0, 1, 2, 1))?;
-        converter.convert(
-            &src_dyn,
-            &mut dst_view,
-            Rotation::None,
-            Flip::None,
-            Crop::new(),
-        )?;
+        converter.convert(&src_dyn, &mut dst_view, None)?;
 
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
@@ -1473,14 +1392,7 @@ mod cpu_tests {
 
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut dst, None).unwrap();
         }
 
         // Verify the conversion - check first few pixels of each plane
@@ -1534,14 +1446,7 @@ mod cpu_tests {
 
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut dst, None).unwrap();
         }
 
         // Verify the conversion
@@ -1586,14 +1491,7 @@ mod cpu_tests {
 
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut dst, None).unwrap();
         }
 
         // Verify data was copied
@@ -1626,13 +1524,7 @@ mod cpu_tests {
 
         let result = {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
+            __cv.convert(&src, &mut dst, None)
         };
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::NotSupported(_))));
@@ -1951,14 +1843,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut dst, None).unwrap();
         }
         let map = dst.as_u8().unwrap().map().unwrap();
         let buf = map.as_slice();
@@ -1996,14 +1881,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut rgba_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut rgba_dst, None).unwrap();
         }
 
         let mut bgra_dst = TensorDyn::image(
@@ -2017,14 +1895,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut bgra_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut bgra_dst, None).unwrap();
         }
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
@@ -2069,14 +1940,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut dst, None).unwrap();
         }
         let map = dst.as_u8().unwrap().map().unwrap();
         let buf = map.as_slice();
@@ -2114,14 +1978,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut dst, None).unwrap();
         }
         let map = dst.as_u8().unwrap().map().unwrap();
         let buf = map.as_slice();
@@ -2181,14 +2038,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut rgba_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut rgba_dst, None).unwrap();
         }
 
         let mut bgra_dst = TensorDyn::image(
@@ -2202,14 +2052,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut bgra_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut bgra_dst, None).unwrap();
         }
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
@@ -2237,14 +2080,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut rgba_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut rgba_dst, None).unwrap();
         }
 
         let mut bgra_dst = TensorDyn::image(
@@ -2258,14 +2094,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut bgra_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut bgra_dst, None).unwrap();
         }
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
@@ -2293,14 +2122,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut rgba_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut rgba_dst, None).unwrap();
         }
 
         let mut bgra_dst = TensorDyn::image(
@@ -2314,14 +2136,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut bgra_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut bgra_dst, None).unwrap();
         }
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
@@ -2349,14 +2164,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut rgba_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut rgba_dst, None).unwrap();
         }
 
         let mut bgra_dst = TensorDyn::image(
@@ -2370,14 +2178,7 @@ mod cpu_tests {
         .unwrap();
         {
             let mut __cv = CPUProcessor::default();
-            __cv.convert(
-                &src,
-                &mut bgra_dst,
-                crate::Rotation::None,
-                crate::Flip::None,
-                crate::Crop::default(),
-            )
-            .unwrap();
+            __cv.convert(&src, &mut bgra_dst, None).unwrap();
         }
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
@@ -3637,13 +3438,7 @@ mod cpu_tests {
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
         let mut dst_contiguous_dyn = dst_contiguous;
-        converter.convert(
-            &contiguous_dyn,
-            &mut dst_contiguous_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        converter.convert(&contiguous_dyn, &mut dst_contiguous_dyn, None)?;
 
         // ── Multiplane path ─────────────────────────────────────────
         let luma = Tensor::<u8>::new(&[height, width], Some(TensorMemory::Mem), Some("luma"))?;
@@ -3671,13 +3466,7 @@ mod cpu_tests {
         )?;
         let multiplane_dyn = multiplane;
         let mut dst_multiplane_dyn = dst_multiplane;
-        converter.convert(
-            &multiplane_dyn,
-            &mut dst_multiplane_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        converter.convert(&multiplane_dyn, &mut dst_multiplane_dyn, None)?;
 
         // ── Compare: both paths must produce identical output ───────
         let contiguous_map = dst_contiguous_dyn.as_u8().unwrap().map()?;
@@ -3710,13 +3499,7 @@ mod cpu_tests {
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
         let mut dst_contiguous_dyn = dst_contiguous;
-        converter.convert(
-            &contiguous_dyn,
-            &mut dst_contiguous_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        converter.convert(&contiguous_dyn, &mut dst_contiguous_dyn, None)?;
 
         let luma = Tensor::<u8>::new(&[height, width], Some(TensorMemory::Mem), Some("luma"))?;
         luma.map()?.as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
@@ -3742,13 +3525,7 @@ mod cpu_tests {
         )?;
         let multiplane_dyn = multiplane;
         let mut dst_multiplane_dyn = dst_multiplane;
-        converter.convert(
-            &multiplane_dyn,
-            &mut dst_multiplane_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        converter.convert(&multiplane_dyn, &mut dst_multiplane_dyn, None)?;
 
         let contiguous_map = dst_contiguous_dyn.as_u8().unwrap().map()?;
         let multiplane_map = dst_multiplane_dyn.as_u8().unwrap().map()?;
@@ -3780,13 +3557,7 @@ mod cpu_tests {
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
         let mut dst_contiguous_dyn = dst_contiguous;
-        converter.convert(
-            &contiguous_dyn,
-            &mut dst_contiguous_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        converter.convert(&contiguous_dyn, &mut dst_contiguous_dyn, None)?;
 
         let luma = Tensor::<u8>::new(&[height, width], Some(TensorMemory::Mem), Some("luma"))?;
         luma.map()?.as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
@@ -3812,13 +3583,7 @@ mod cpu_tests {
         )?;
         let multiplane_dyn = multiplane;
         let mut dst_multiplane_dyn = dst_multiplane;
-        converter.convert(
-            &multiplane_dyn,
-            &mut dst_multiplane_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        converter.convert(&multiplane_dyn, &mut dst_multiplane_dyn, None)?;
 
         let contiguous_map = dst_contiguous_dyn.as_u8().unwrap().map()?;
         let multiplane_map = dst_multiplane_dyn.as_u8().unwrap().map()?;
@@ -3896,7 +3661,11 @@ mod cpu_tests {
         // Crop only the right (blue) half
         let crop = Crop::new().with_source(Some(Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
-        cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
+        cpu.convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )?;
 
         // Skip the leftmost 2 columns (resize filter radius at crop boundary)
         let map = dst.as_u8().unwrap().map()?;
@@ -3939,7 +3708,11 @@ mod cpu_tests {
         // Crop only the left (red) half
         let crop = Crop::new().with_source(Some(Region::new(0, 0, src_w / 2, src_h)));
 
-        cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
+        cpu.convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )?;
 
         // Skip the rightmost 2 columns (resize filter radius at crop boundary)
         let map = dst.as_u8().unwrap().map()?;
@@ -3983,7 +3756,11 @@ mod cpu_tests {
         // Crop the right half — boundary is exactly at the colour transition
         let crop = Crop::new().with_source(Some(Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
-        cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
+        cpu.convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )?;
 
         // Skip the leftmost 2 columns (filter radius near crop boundary)
         let map = dst.as_u8().unwrap().map()?;
@@ -4045,7 +3822,7 @@ mod cpu_tests {
         )?;
         {
             let mut cv = CPUProcessor::default();
-            cv.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+            cv.convert(&src, &mut dst, None)?;
         }
 
         // Verify: dst[i*3+c] == src_u8[i*4+c] as f32 / 255.0 exactly.
@@ -4111,7 +3888,7 @@ mod cpu_tests {
         )?;
         {
             let mut cv = CPUProcessor::default();
-            cv.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+            cv.convert(&src, &mut dst, None)?;
         }
 
         // F16 tolerance: 2^-9 ≈ 0.00195 (one ULP at 0.5 for f16 with 10-bit mantissa)
@@ -4223,21 +4000,9 @@ mod cpu_tests {
         )?;
 
         // 1st convert: scratch is None → allocate + cache.
-        cv.convert(
-            &src4,
-            &mut dst_a,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        cv.convert(&src4, &mut dst_a, None)?;
         // 2nd convert, same dst format+size → cache-hit branch (reuse scratch).
-        cv.convert(
-            &src4,
-            &mut dst_b,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        cv.convert(&src4, &mut dst_b, None)?;
 
         // Both results must be identical and correctly normalized.
         let a = dst_a.as_f32().unwrap().map()?;
@@ -4258,13 +4023,7 @@ mod cpu_tests {
             Some(TensorMemory::Mem),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        cv.convert(
-            &src8,
-            &mut dst_c,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )?;
+        cv.convert(&src8, &mut dst_c, None)?;
         let c = dst_c.as_f32().unwrap().map()?;
         assert_eq!(c.as_slice().len(), 8 * 8 * 3);
         assert!(c.as_slice().iter().all(|v| (0.0..=1.0).contains(v)));
@@ -4286,9 +4045,7 @@ mod cpu_tests {
         // A plain tensor with no image format set.
         let mut dst = TensorDyn::new(&[4, 4, 3], DType::F32, Some(TensorMemory::Mem), None)?;
         let mut cv = CPUProcessor::default();
-        let err = cv
-            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .unwrap_err();
+        let err = cv.convert(&src, &mut dst, None).unwrap_err();
         assert!(
             matches!(err, Error::NotAnImage),
             "expected NotAnImage, got {err:?}"
@@ -4346,7 +4103,7 @@ mod cpu_tests {
         )?;
         {
             let mut cv = CPUProcessor::default();
-            cv.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+            cv.convert(&src, &mut dst, None)?;
         }
 
         let dst_map = dst.as_f32().unwrap().map()?;
@@ -4432,7 +4189,7 @@ mod cpu_tests {
             )
             .unwrap();
             CPUProcessor::default()
-                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .convert(&src, &mut dst, None)
                 .unwrap();
             dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
         };
@@ -4468,7 +4225,7 @@ mod cpu_tests {
             )
             .unwrap();
             CPUProcessor::default()
-                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .convert(&src, &mut dst, None)
                 .unwrap();
             dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
         };
@@ -4504,7 +4261,7 @@ mod cpu_tests {
             )
             .unwrap();
             CPUProcessor::default()
-                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .convert(&src, &mut dst, None)
                 .unwrap();
             dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
         };
@@ -4530,7 +4287,7 @@ mod cpu_tests {
             )
             .unwrap();
             CPUProcessor::default()
-                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .convert(&src, &mut dst, None)
                 .unwrap();
             dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
         };
@@ -4592,9 +4349,7 @@ mod cpu_tests {
             .fill(200);
 
         let mut do_convert = |src: &TensorDyn, dst: &mut TensorDyn| {
-            converter
-                .convert(src, dst, Rotation::None, Flip::None, Crop::default())
-                .unwrap();
+            converter.convert(src, dst, None).unwrap();
         };
 
         // Standalone reference conversions into full, independent buffers.
@@ -4687,9 +4442,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
         let mut do_convert = |dst: &mut TensorDyn| {
-            converter
-                .convert(&src, dst, Rotation::None, Flip::None, Crop::default())
-                .unwrap();
+            converter.convert(&src, dst, None).unwrap();
         };
 
         // Reference: standalone tight 320x240 destination.
@@ -4807,9 +4560,7 @@ mod cpu_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        converter
-            .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        converter.convert(&src, &mut full, None).unwrap();
         (src, full)
     }
 
@@ -4837,7 +4588,11 @@ mod cpu_tests {
         .unwrap();
         let crop = Crop::new().with_source(Some(region));
         converter
-            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut cropped,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
 
         let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
@@ -4875,7 +4630,11 @@ mod cpu_tests {
 
         let before = converter.fused_hits();
         converter
-            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut cropped,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
         assert_eq!(
             converter.fused_hits(),
@@ -4908,7 +4667,11 @@ mod cpu_tests {
 
         let before = converter.fused_hits();
         converter
-            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut cropped,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
         assert_eq!(
             converter.fused_hits(),
@@ -4956,9 +4719,7 @@ mod cpu_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            converter
-                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
-                .unwrap();
+            converter.convert(&src, &mut full, None).unwrap();
 
             // Even left/top (chroma-aligned) but an ODD width — the shape
             // that used to crash.
@@ -4978,7 +4739,11 @@ mod cpu_tests {
 
             let before = converter.fused_hits();
             converter
-                .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+                .convert(
+                    &src,
+                    &mut cropped,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
                 .unwrap_or_else(|e| {
                     panic!("{src_fmt:?} odd-width scale-identity crop must not error: {e}")
                 });
@@ -5076,9 +4841,7 @@ mod cpu_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            converter
-                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
-                .unwrap();
+            converter.convert(&src, &mut full, None).unwrap();
             let reference = manual_planar_rgb_crop(&full, region);
 
             let mut cropped = TensorDyn::image(
@@ -5094,7 +4857,11 @@ mod cpu_tests {
 
             let before = converter.fused_hits();
             converter
-                .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+                .convert(
+                    &src,
+                    &mut cropped,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
                 .unwrap_or_else(|e| panic!("left-edge {label} crop must not error: {e}"));
             assert_eq!(
                 converter.fused_hits(),
@@ -5196,9 +4963,7 @@ mod cpu_tests {
 
                 // The pre-Task-4 intermediate: the whole frame, converted once.
                 let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
-                converter
-                    .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
-                    .unwrap();
+                converter.convert(&src, &mut full, None).unwrap();
 
                 let origins = [
                     (0, 0),                   // top-left corner
@@ -5215,13 +4980,21 @@ mod cpu_tests {
 
                         let mut actual = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
                         converter
-                            .convert(&src, &mut actual, Rotation::None, Flip::None, crop)
+                            .convert(
+                                &src,
+                                &mut actual,
+                                Some(crate::ConvertOptions::new().crop(crop)),
+                            )
                             .unwrap();
                         let dims = converter.last_tmp_dims();
 
                         let mut expect = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
                         converter
-                            .convert(&full, &mut expect, Rotation::None, Flip::None, crop)
+                            .convert(
+                                &full,
+                                &mut expect,
+                                Some(crate::ConvertOptions::new().crop(crop)),
+                            )
                             .unwrap();
 
                         let case = format!(
@@ -5283,19 +5056,25 @@ mod cpu_tests {
         // Reference A: standalone, tightly-packed destination.
         let mut reference = gradient_image(tile_w, tile_h, PixelFormat::Rgb);
         converter
-            .convert(&src, &mut reference, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut reference,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
         let reference_bytes = reference.as_u8().unwrap().map().unwrap().to_vec();
 
         // Reference B: the pre-Task-4 algorithm — whole frame converted once
         // into the packed-RGB intermediate, then the same crop applied to it.
         let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
-        converter
-            .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        converter.convert(&src, &mut full, None).unwrap();
         let mut oracle = gradient_image(tile_w, tile_h, PixelFormat::Rgb);
         converter
-            .convert(&full, &mut oracle, Rotation::None, Flip::None, crop)
+            .convert(
+                &full,
+                &mut oracle,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
         assert_eq!(
             reference_bytes,
@@ -5323,7 +5102,11 @@ mod cpu_tests {
 
         let mut view = parent.view(Region::new(0, tile_h, tile_w, tile_h)).unwrap();
         converter
-            .convert(&src, &mut view, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut view,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
 
         let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
@@ -5379,9 +5162,7 @@ mod cpu_tests {
             .convert(
                 &multiplane,
                 &mut from_multi,
-                Rotation::None,
-                Flip::None,
-                crop,
+                Some(crate::ConvertOptions::new().crop(crop)),
             )
             .unwrap();
         let mut from_contig = gradient_image(160, 120, PixelFormat::Rgb);
@@ -5389,9 +5170,7 @@ mod cpu_tests {
             .convert(
                 &contiguous,
                 &mut from_contig,
-                Rotation::None,
-                Flip::None,
-                crop,
+                Some(crate::ConvertOptions::new().crop(crop)),
             )
             .unwrap();
 
@@ -5450,7 +5229,11 @@ mod cpu_tests {
             .with_fit(crate::Fit::Stretch);
 
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
 
         let dims = converter
@@ -5591,9 +5374,7 @@ mod cpu_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        CPUProcessor::new()
-            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        CPUProcessor::new().convert(&src, &mut dst, None).unwrap();
         let bound = dst.as_typed::<u8>().unwrap();
         let m = bound.map().unwrap();
         let p = m.as_slice();

@@ -42,9 +42,7 @@
     feature = "opengl"
 ))]
 use edgefirst_image::GLProcessorThreaded;
-use edgefirst_image::{
-    CPUProcessor, Crop, Flip, ImageProcessor, ImageProcessorTrait, Region, Rotation,
-};
+use edgefirst_image::{CPUProcessor, Crop, ImageProcessor, ImageProcessorTrait, Region};
 use edgefirst_tensor::{
     CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -111,8 +109,12 @@ fn assert_view_dst_matches_standalone(
     // Reference: the same convert into a tensor sized exactly to the view.
     let mut reference = mem_image(region.width, region.height, dst_fmt);
     fill(&mut reference, POISON);
-    cpu.convert(src, &mut reference, Rotation::None, Flip::None, crop)
-        .unwrap_or_else(|e| panic!("{label}: standalone convert failed: {e}"));
+    cpu.convert(
+        src,
+        &mut reference,
+        Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+    )
+    .unwrap_or_else(|e| panic!("{label}: standalone convert failed: {e}"));
     let ref_bytes = bytes(&reference);
     let ref_stride = reference
         .effective_row_stride()
@@ -131,8 +133,12 @@ fn assert_view_dst_matches_standalone(
             Some(parent_stride),
             "{label}: a multi-row view must report the PARENT row pitch"
         );
-        cpu.convert(src, &mut view, Rotation::None, Flip::None, crop)
-            .unwrap_or_else(|e| panic!("{label}: view convert failed: {e}"));
+        cpu.convert(
+            src,
+            &mut view,
+            Some(edgefirst_image::ConvertOptions::new().crop(crop)),
+        )
+        .unwrap_or_else(|e| panic!("{label}: view convert failed: {e}"));
     }
     let got = bytes(&parent);
 
@@ -433,14 +439,8 @@ fn assert_typed_view_dst_matches_standalone(label: &str, dtype: DType, elem: usi
     };
 
     let mut reference = alloc(region.width, region.height);
-    cpu.convert(
-        &src,
-        &mut reference,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .unwrap_or_else(|e| panic!("{label}: standalone convert failed: {e}"));
+    cpu.convert(&src, &mut reference, None)
+        .unwrap_or_else(|e| panic!("{label}: standalone convert failed: {e}"));
 
     let mut parent = alloc(PARENT_W, PARENT_H);
     poison(&mut parent);
@@ -450,7 +450,7 @@ fn assert_typed_view_dst_matches_standalone(label: &str, dtype: DType, elem: usi
         let mut view = parent
             .view(region)
             .unwrap_or_else(|e| panic!("{label}: view failed: {e}"));
-        cpu.convert(&src, &mut view, Rotation::None, Flip::None, Crop::default())
+        cpu.convert(&src, &mut view, None)
             .unwrap_or_else(|e| panic!("{label}: view convert failed: {e}"));
     }
 
@@ -522,24 +522,12 @@ fn padded_planar_dst_honours_stride() {
         .configure_image(SRC_W, SRC_H, PixelFormat::PlanarRgb)
         .expect("shrink logical geometry");
     padded.set_row_stride(stride).expect("declare padded pitch");
-    cpu.convert(
-        &src,
-        &mut padded,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .expect("planar convert");
+    cpu.convert(&src, &mut padded, None)
+        .expect("planar convert");
 
     let mut reference = mem_image(SRC_W, SRC_H, PixelFormat::PlanarRgb);
-    cpu.convert(
-        &src,
-        &mut reference,
-        Rotation::None,
-        Flip::None,
-        Crop::default(),
-    )
-    .expect("planar reference convert");
+    cpu.convert(&src, &mut reference, None)
+        .expect("planar reference convert");
 
     let got = bytes(&padded);
     let want = bytes(&reference);
@@ -583,25 +571,13 @@ fn gl_padded_dst_rows_land_at_the_declared_stride() {
             .configure_image(SRC_W, SRC_H, dst_fmt)
             .expect("shrink logical geometry");
         padded.set_row_stride(stride).expect("declare padded pitch");
-        gl.convert(
-            &src,
-            &mut padded,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .unwrap_or_else(|e| panic!("{dst_fmt:?}: padded convert failed: {e}"));
+        gl.convert(&src, &mut padded, None)
+            .unwrap_or_else(|e| panic!("{dst_fmt:?}: padded convert failed: {e}"));
 
         let mut reference = mem_image(SRC_W, SRC_H, dst_fmt);
         fill(&mut reference, POISON);
-        gl.convert(
-            &src,
-            &mut reference,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .unwrap_or_else(|e| panic!("{dst_fmt:?}: reference convert failed: {e}"));
+        gl.convert(&src, &mut reference, None)
+            .unwrap_or_else(|e| panic!("{dst_fmt:?}: reference convert failed: {e}"));
         let ref_stride = reference.effective_row_stride().expect("reference stride");
         assert_eq!(
             ref_stride,
@@ -748,14 +724,8 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
         padded.set_row_stride(stride).expect("declare padded pitch");
         let mut padded = TensorDyn::from(padded);
         fill(&mut padded, POISON);
-        gl.convert(
-            &src,
-            &mut padded,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .unwrap_or_else(|e| panic!("{label}: padded convert failed: {e}"));
+        gl.convert(&src, &mut padded, None)
+            .unwrap_or_else(|e| panic!("{label}: padded convert failed: {e}"));
 
         // A tight PBO of the same render is the row oracle, and the Mem
         // readback of the same render checks that the tight PBO route itself
@@ -765,14 +735,8 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
                 .unwrap_or_else(|e| panic!("{label}: tight PBO: {e}")),
         );
         fill(&mut reference, POISON);
-        gl.convert(
-            &src,
-            &mut reference,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .unwrap_or_else(|e| panic!("{label}: reference convert failed: {e}"));
+        gl.convert(&src, &mut reference, None)
+            .unwrap_or_else(|e| panic!("{label}: reference convert failed: {e}"));
         let row_bytes = SRC_W * bpp;
         assert_eq!(
             reference.effective_row_stride(),
@@ -781,14 +745,8 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
         );
         let mut mem_reference = mem_image(SRC_W, SRC_H, dst_fmt);
         fill(&mut mem_reference, POISON);
-        gl.convert(
-            &src,
-            &mut mem_reference,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .unwrap_or_else(|e| panic!("{label}: Mem reference convert failed: {e}"));
+        gl.convert(&src, &mut mem_reference, None)
+            .unwrap_or_else(|e| panic!("{label}: Mem reference convert failed: {e}"));
         let want = bytes(&reference);
         assert_eq!(
             want,

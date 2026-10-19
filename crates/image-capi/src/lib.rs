@@ -48,6 +48,12 @@ pub mod tiling;
 
 /// ABI version of this library's C surface.
 ///
+/// 3: the convert functions take a `const ef_convert_options *` (built with
+/// the `ef_convert_options_*` setters) in place of `rotation`, `flip` and a
+/// `const ef_crop *`, and `ef_crop` is gone. A caller built against
+/// generation 2 fails to compile; one linked against it passes arguments the
+/// functions no longer read the same way.
+///
 /// 2: an unknown `color_mode` passed to `ef_image_processor_draw_decoded_masks`
 /// or `ef_image_processor_draw_proto_masks` returns `EINVAL` (it was drawn as
 /// `EF_COLOR_MODE_CLASS`), and an unknown `ef_tiling_config.fit` fails the
@@ -56,7 +62,7 @@ pub mod tiling;
 /// probe is the only signal.
 #[no_mangle]
 pub extern "C" fn ef_image_abi_version() -> u32 {
-    2
+    3
 }
 
 // Test-support modules that live in the tensor leaf. They are included here,
@@ -537,8 +543,8 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_probe_is_generation_2() {
-        assert_eq!(super::ef_image_abi_version(), 2);
+    fn the_abi_probe_is_generation_3() {
+        assert_eq!(super::ef_image_abi_version(), 3);
     }
 
     #[test]

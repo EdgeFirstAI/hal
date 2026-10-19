@@ -160,6 +160,8 @@ jobs:
           cache-on-failure: true
       - name: Clippy on each modular C-API crate
         run: make lint-capi-modular
+      - name: Check each published crate on its own
+        run: make check-standalone
 
   full:
     needs: changes

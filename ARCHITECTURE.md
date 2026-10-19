@@ -169,15 +169,17 @@ dtype to request; `convert()` always succeeds (GPU or CPU fallback).
 | DType / layout | GL render target | Tensor shape |
 |----------------|-----------------|--------------|
 | F16 NCHW `PlanarRgb` | RGBA16F-packed `(W/4, 3H)` — four contiguous f16 planar elements per RGBA16F pixel | `[3, H, W]` f16 |
+| F32 NCHW `PlanarRgb` | RGBA32F-packed `(W/4, 3H)` — the same planar packer into an RGBA32F target (PBO) | `[3, H, W]` f32 |
 | F32 NHWC `Rgb` | R32F-wide `(W×3, H)` — one f32 per R channel | `[H, W, 3]` f32 |
+| F16 NHWC `Rgb` | RGBA16F-packed `(W×3/4, H)` — four interleaved f16 elements per pixel (PBO) | `[H, W, 3]` f16 |
 
 **Key constraints**
 
 - Source must be `Rgba` for the GPU float path; other sources fall back to CPU.
 - F32 DMA-BUF is impossible (no 32-bit-float DRM fourcc); `create_image(memory: Some(Dma), dtype: F32)` returns `NotSupported`.
-- F16 packing requires `W % 4 == 0` (validated at allocation; non-multiples return `InvalidShape`).
+- Packed float surfaces require `W % 4 == 0` (validated at allocation for F16; other widths fall back to CPU).
 - Rotation or flip with a float destination falls back to CPU.
-- Normalization is `[0, 1]` only; per-channel mean/std is a future item.
+- The value mapping comes from `ConvertOptions`: per-channel `(x - mean) / std` on 0–255 values (default `x / 255`), and for u8/i8 destinations quantization with the destination's own `Quantization`. The float shaders apply it as `sample * norm_scale + norm_offset`, the int8 programs as `quantize()`; see [crates/image/ARCHITECTURE.md § Output mapping](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#output-mapping).
 - CPU fallback widens after a u8-precision resize.
 
 **Consumer contract**
@@ -348,13 +350,13 @@ This yields the rule:
 convention (`clone_args`, `sched_attr`), Win32's `cbSize` — is the one
 mechanism that would let a struct grow *in place* within a minor post-1.0.
 It was considered for this codebase and **declined**, because it only works
-as a convention and this vocabulary cannot adopt it as one. Of the fourteen
-by-value structs across the five libraries, only three are caller-filled
+as a convention and this vocabulary cannot adopt it as one. Of the thirteen
+by-value structs across the five libraries, only two are caller-filled
 configuration where the handshake means anything:
 
 | Class | Structs | Verdict |
 |---|---|---|
-| Caller-filled config | `ef_merge_config`, `ef_tiling_config`, `ef_crop` | the handshake would work |
+| Caller-filled config | `ef_merge_config`, `ef_tiling_config` | the handshake would work |
 | Library-filled `*out` | `ef_tensor_view`, `ef_tensor_plane`, `ef_image_desc_view`, `EfViewOrigin`, `ef_quantization_info`, `ef_tile_spec`, `ef_decoder_track`, `ef_track_info` | inverts the contract — the caller would be declaring its buffer size, paid per call on hot accessors |
 | Arrayed elements | `ef_detect_box`, `ef_segmentation`, `ef_tile_placement` | actively harmful |
 
@@ -368,13 +370,13 @@ convention, and applying it to `ef_merge_config` alone would leave
 it. That asymmetry is the kind that produced a successor struct in the first
 place.
 
-`ef_crop` is the sharpest single argument: it documents a zeroed struct as
-meaning "the whole source, same as passing `NULL`". A mandatory size field
-would turn `{0}` from a useful default into an error.
+Convert options, which grow with the image pipeline, are an opaque handle
+(`ef_convert_options`) with one setter per option, so they gain options by
+adding setters and have no layout to version.
 
 So by-value structs here evolve by major bump or by successor type, and the
 SONAME is the handshake. Revisit this only if the config structs ever
-outnumber the data structs, and revisit it for all three at once.
+outnumber the data structs, and revisit it for both at once.
 
 **`ef_client_state` — one frozen struct for every callback domain.** Some
 state cannot move into a library because it *is* a callback into a context
@@ -409,7 +411,7 @@ currently partial:
 |---|---|---|
 | `tensor` | `ef_tensor_view`, `ef_tensor_plane`, `ef_image_desc_view`, `ef_quantization_info`, … | yes |
 | `decoder` | `ef_detect_box`, `ef_segmentation`, `ef_merge_config`, `ef_tile_placement` (via `detect.h`) | yes |
-| `image` | `ef_crop`, `ef_tiling_config`, `ef_tile_spec` | **none — gap** |
+| `image` | `ef_tiling_config`, `ef_tile_spec` | **none — gap** |
 | `tracker` | `ef_track_info` | **none — gap** |
 | `codec` | none (opaque handles only) | not needed |
 

@@ -3394,6 +3394,19 @@ where
         Ok(t)
     }
 
+    /// Import an existing buffer as a tensor, taking ownership of its file
+    /// descriptor. No bytes are copied.
+    #[cfg(unix)]
+    pub fn from_fd(fd: std::os::fd::OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut t = Self::wrap(TensorStorage::from_fd(fd, shape, name)?);
+        // Best-effort CUDA external memory import for DMA-backed tensors.
+        // RUNTIME-UNVALIDATED: see try_init_dma_cuda().
+        #[cfg(target_os = "linux")]
+        t.try_init_dma_cuda();
+        Ok(t)
+    }
+
     /// Create an image tensor with the given format.
     /// Allocate an image tensor from a declarative request — the
     /// full-featured constructor behind [`Self::image`] and friends.
@@ -6138,13 +6151,7 @@ where
     where
         Self: Sized,
     {
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let mut t = Self::wrap(TensorStorage::from_fd(fd, shape, name)?);
-        // Best-effort CUDA external memory import for DMA-backed tensors.
-        // RUNTIME-UNVALIDATED: see try_init_dma_cuda().
-        #[cfg(target_os = "linux")]
-        t.try_init_dma_cuda();
-        Ok(t)
+        Self::from_fd(fd, shape, name)
     }
 
     #[cfg(unix)]

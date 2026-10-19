@@ -110,7 +110,7 @@ Depend on the crates you use. There is no umbrella `edgefirst-hal` crate.
 
 ```rust
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{ConvertOptions, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat};
 
 let bytes = std::fs::read("image.jpg")?;
@@ -128,8 +128,11 @@ let _info = input.load_image(&mut decoder, &bytes)?;
 // decode never rotates; pass the EXIF rotation here if you want it applied.
 let mut output =
     processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::Read)?;
-processor.convert(&input, &mut output, Rotation::None, Flip::None,
-    Crop::letterbox([114, 114, 114, 255]))?;
+processor.convert(
+    &input,
+    &mut output,
+    Some(ConvertOptions::new().letterbox([114, 114, 114, 255])),
+)?;
 ```
 
 `decoder.set_output_format(Some(PixelFormat::Rgb))` (4:4:4 sources) or
@@ -447,7 +450,7 @@ let mut proc = ImageProcessor::new()?;
 let mut dst = proc.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 
 for frame in camera_frames {
-    proc.convert(&frame, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+    proc.convert(&frame, &mut dst, None)?;
     run_inference(&dst)?;
 }
 ```

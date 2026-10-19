@@ -7,7 +7,7 @@
 mod gl_tests {
     #[cfg(target_os = "linux")]
     use crate::{probe_egl_displays, EglDisplayKind};
-    use crate::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};
+    use crate::{Crop, GLProcessorThreaded, ImageProcessorTrait};
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     use edgefirst_tensor::is_dma_available;
     use edgefirst_tensor::{
@@ -262,7 +262,11 @@ mod gl_tests {
         assert!(
             matches!(
                 img1.format().unwrap(),
-                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::PlanarRgb
+                PixelFormat::Rgb
+                    | PixelFormat::Rgba
+                    | PixelFormat::Grey
+                    | PixelFormat::PlanarRgb
+                    | PixelFormat::PlanarRgba
             ),
             "format must be Rgb or Rgba for comparison"
         );
@@ -301,9 +305,9 @@ mod gl_tests {
             )
             .unwrap()
             .convert(),
-            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+            PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => image::GrayImage::from_vec(
                 img1.width().unwrap() as u32,
-                (img1.height().unwrap() * 3) as u32,
+                (img1.height().unwrap() * img1.format().unwrap().channels()) as u32,
                 flat(img1),
             )
             .unwrap()
@@ -332,9 +336,9 @@ mod gl_tests {
             )
             .unwrap()
             .convert(),
-            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+            PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => image::GrayImage::from_vec(
                 img2.width().unwrap() as u32,
-                (img2.height().unwrap() * 3) as u32,
+                (img2.height().unwrap() * img2.format().unwrap().channels()) as u32,
                 flat(img2),
             )
             .unwrap()
@@ -513,9 +517,7 @@ mod gl_tests {
         .unwrap();
         let mut frame = |renderer: &mut GLProcessorThreaded, src: &TensorDyn| {
             for dst in [&mut dst, &mut scaled] {
-                renderer
-                    .convert(src, dst, Rotation::None, Flip::None, Crop::no_crop())
-                    .unwrap();
+                renderer.convert(src, dst, None).unwrap();
             }
         };
 
@@ -616,15 +618,7 @@ mod gl_tests {
         // Warmup: import the buffer (and the destination) exactly once.
         {
             let frame = TensorDyn::import_descriptor(&desc).unwrap();
-            renderer
-                .convert(
-                    &frame,
-                    &mut dst,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::no_crop(),
-                )
-                .unwrap();
+            renderer.convert(&frame, &mut dst, None).unwrap();
         }
         let warm = renderer.egl_cache_stats().unwrap();
 
@@ -632,15 +626,7 @@ mod gl_tests {
             // Freshly imported, used, and dropped within the iteration —
             // precisely what a cross-package `convert()` does per frame.
             let frame = TensorDyn::import_descriptor(&desc).unwrap();
-            renderer
-                .convert(
-                    &frame,
-                    &mut dst,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::no_crop(),
-                )
-                .unwrap();
+            renderer.convert(&frame, &mut dst, None).unwrap();
         }
         let steady = renderer.egl_cache_stats().unwrap();
 
@@ -751,13 +737,7 @@ mod gl_tests {
         )
         .expect("dst alloc");
         let fence = gl
-            .convert_with_fence(
-                &src,
-                &mut dst_fenced,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert_with_fence(&src, &mut dst_fenced, None)
             .expect("convert_with_fence");
         if cfg!(not(any(target_os = "android", target_os = "windows"))) {
             assert!(
@@ -765,14 +745,7 @@ mod gl_tests {
                 "no platform in this test tier has native fence sync"
             );
         }
-        gl.convert(
-            &src,
-            &mut dst_blocking,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .expect("convert");
+        gl.convert(&src, &mut dst_blocking, None).expect("convert");
         let (ma, mb) = (
             dst_fenced.as_u8().unwrap().map().unwrap(),
             dst_blocking.as_u8().unwrap().map().unwrap(),
@@ -856,22 +829,8 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &src_dma,
-            &mut dst_a,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
-        gl.convert(
-            &src_mem,
-            &mut dst_b,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut dst_a, None).unwrap();
+        gl.convert(&src_mem, &mut dst_b, None).unwrap();
 
         let (ma, mb) = (
             dst_a.as_f16().unwrap().map().unwrap(),
@@ -972,8 +931,7 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(src, &mut dst, None).unwrap();
             let m = dst.as_f16().unwrap().map().unwrap();
             m.as_slice().iter().map(|v| v.to_bits()).collect()
         };
@@ -1005,14 +963,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &u8_src,
-            &mut u8_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&u8_src, &mut u8_dst, None).unwrap();
 
         // Frame 2: Mem source (upload arm; storage must be respecified).
         let out2 = run_float(&mut gl, &u8_src);
@@ -1108,14 +1059,12 @@ mod gl_tests {
         .unwrap();
 
         for src in pool.iter().cycle().take(4) {
-            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(src, &mut dst, None).unwrap();
         }
         let warm = gl.egl_cache_stats().unwrap();
         let warm_feed = gl.convert_stats().unwrap();
         for src in pool.iter().cycle().take(FRAMES) {
-            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(src, &mut dst, None).unwrap();
         }
         let steady = gl.egl_cache_stats().unwrap();
         let steady_feed = gl.convert_stats().unwrap();
@@ -1229,7 +1178,7 @@ mod gl_tests {
             let mut first: Option<Vec<u8>> = None;
             for round in 0..4 {
                 renderer
-                    .convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                    .convert(&src, &mut dst, Some(crate::ConvertOptions::new().crop(lb)))
                     .unwrap_or_else(|e| {
                         panic!(
                             "rgba@mem->rgb.{dtype:?}@dma convert #{} failed: {e} \
@@ -1323,9 +1272,7 @@ mod gl_tests {
                     edgefirst_tensor::CpuAccess::ReadWrite,
                 )
                 .unwrap();
-                if let Err(e) =
-                    renderer.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                {
+                if let Err(e) = renderer.convert(&src, &mut dst, None) {
                     if fmt == PixelFormat::Rgba {
                         panic!("nv12@mem -> rgba.{dtype:?}@mem must be supported: {e}");
                     }
@@ -1421,14 +1368,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let src_dyn = src;
         let mut dst_dyn = dst;
-        gl.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_dyn, None).unwrap();
 
         // Copy to CPU for comparison
         let cpu_dst = TensorDyn::image(
@@ -1498,14 +1438,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let src_dyn = src;
         let mut dst_dyn = dst;
-        gl.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_dyn, None).unwrap();
 
         // Copy to CPU for comparison
         let cpu_dst = TensorDyn::image(
@@ -1580,8 +1513,7 @@ mod gl_tests {
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(s, d, None).unwrap();
         };
 
         // Standalone full-buffer reference conversions (independent buffers).
@@ -1695,8 +1627,7 @@ mod gl_tests {
         let src = load_raw_image(w, h, src_fmt, Some(TensorMemory::DmaBuf), bytes_a).unwrap();
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(s, d, None).unwrap();
         };
 
         // Frame A: warms the src EGLImage cache + texture binding.
@@ -1855,8 +1786,7 @@ mod gl_tests {
         ];
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(s, d, None).unwrap();
         };
 
         for (frame, &luma) in lumas.iter().enumerate() {
@@ -1947,8 +1877,7 @@ mod gl_tests {
         .unwrap();
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(s, d, None).unwrap();
         };
 
         // A sequence of DISTINCT geometries (varying width → varying stride),
@@ -2044,8 +1973,7 @@ mod gl_tests {
         ];
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(s, d, None).unwrap();
         };
 
         // Interleave buffers AND geometries: each step reuses a pool slot at a
@@ -2116,8 +2044,7 @@ mod gl_tests {
         let bytes = vec![128u8; w * h];
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(s, d, None).unwrap();
         };
 
         let src =
@@ -2269,14 +2196,7 @@ mod gl_tests {
         )
         .expect("create dst failed");
 
-        gl.convert(
-            &src,
-            &mut dst,
-            crate::Rotation::None,
-            crate::Flip::None,
-            crate::Crop::default(),
-        )
-        .expect("convert failed");
+        gl.convert(&src, &mut dst, None).expect("convert failed");
 
         assert_eq!(dst.width(), Some(32));
         assert_eq!(dst.height(), Some(32));
@@ -2352,14 +2272,10 @@ mod gl_tests {
             .unwrap();
             let src_dyn = src;
             let mut dst_dyn = dst;
-            gl.convert(
-                &src_dyn,
-                &mut dst_dyn,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap_or_else(|e| panic!("convert() with {:?} display failed: {e:?}", display.kind));
+            gl.convert(&src_dyn, &mut dst_dyn, None)
+                .unwrap_or_else(|e| {
+                    panic!("convert() with {:?} display failed: {e:?}", display.kind)
+                });
             eprintln!("  {:?} display: convert OK", display.kind);
         }
     }
@@ -2435,14 +2351,8 @@ mod gl_tests {
         .unwrap();
         let src_dyn = src;
         let mut dst_dyn = dst;
-        gl.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .expect("auto-detect convert should succeed");
+        gl.convert(&src_dyn, &mut dst_dyn, None)
+            .expect("auto-detect convert should succeed");
     }
 
     #[test]
@@ -2560,9 +2470,7 @@ mod gl_tests {
         gl.convert(
             &src_dyn,
             &mut dst_rgba_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
+            Some(crate::ConvertOptions::new().crop(crop)),
         )
         .unwrap();
 
@@ -2577,8 +2485,12 @@ mod gl_tests {
         )
         .unwrap();
         let mut dst_rgb_dyn = dst_rgb;
-        gl.convert(&src_dyn, &mut dst_rgb_dyn, Rotation::None, Flip::None, crop)
-            .unwrap();
+        gl.convert(
+            &src_dyn,
+            &mut dst_rgb_dyn,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )
+        .unwrap();
 
         let rgba_data = dst_rgba_dyn.as_u8().unwrap().map().unwrap();
         let expected_rgb = rgba_to_rgb(rgba_data.as_slice());
@@ -2636,9 +2548,7 @@ mod gl_tests {
         gl.convert(
             &src_dyn,
             &mut dst_rgba_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
+            Some(crate::ConvertOptions::new().crop(crop)),
         )
         .unwrap();
 
@@ -2653,8 +2563,12 @@ mod gl_tests {
         )
         .unwrap();
         let mut dst_rgb_dyn = dst_rgb;
-        gl.convert(&src_dyn, &mut dst_rgb_dyn, Rotation::None, Flip::None, crop)
-            .unwrap();
+        gl.convert(
+            &src_dyn,
+            &mut dst_rgb_dyn,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )
+        .unwrap();
 
         let rgba_data = dst_rgba_dyn.as_u8().unwrap().map().unwrap();
         let expected_rgb = uint8_to_int8(&rgba_to_rgb(rgba_data.as_slice()));
@@ -2700,14 +2614,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut dst_rgba_dyn = dst_rgba;
-        gl.convert(
-            &src_dyn,
-            &mut dst_rgba_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_rgba_dyn, None).unwrap();
 
         // GL packed PixelFormat::Rgb output
         let dst_rgb = TensorDyn::image(
@@ -2720,14 +2627,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut dst_rgb_dyn = dst_rgb;
-        gl.convert(
-            &src_dyn,
-            &mut dst_rgb_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_rgb_dyn, None).unwrap();
 
         let rgba_data = dst_rgba_dyn.as_u8().unwrap().map().unwrap();
         let expected_rgb = rgba_to_rgb(rgba_data.as_slice());
@@ -2772,14 +2672,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_dst_dyn = rgba_dst;
-        gl.convert(
-            &src_dyn,
-            &mut rgba_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut rgba_dst_dyn, None).unwrap();
 
         // Convert to PixelFormat::Bgra
         let bgra_dst = TensorDyn::image(
@@ -2792,14 +2685,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut bgra_dst_dyn = bgra_dst;
-        gl.convert(
-            &src_dyn,
-            &mut bgra_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut bgra_dst_dyn, None).unwrap();
 
         // Compare: PixelFormat::Bgra[B,G,R,A] should match PixelFormat::Rgba[R,G,B,A] with R↔B swapped
         let bgra_map = bgra_dst_dyn.as_u8().unwrap().map().unwrap();
@@ -2860,14 +2746,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_dst_dyn = rgba_dst;
-        gl.convert(
-            &src_dyn,
-            &mut rgba_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut rgba_dst_dyn, None).unwrap();
 
         let bgra_dst = TensorDyn::image(
             1280,
@@ -2879,14 +2758,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut bgra_dst_dyn = bgra_dst;
-        gl.convert(
-            &src_dyn,
-            &mut bgra_dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut bgra_dst_dyn, None).unwrap();
 
         let bgra_map = bgra_dst_dyn.as_u8().unwrap().map().unwrap();
         let rgba_map = rgba_dst_dyn.as_u8().unwrap().map().unwrap();
@@ -2973,14 +2845,7 @@ mod gl_tests {
         .unwrap();
         let rgba_src_dyn = rgba_src;
         let mut bgra_img_dyn = bgra_img;
-        gl.convert(
-            &rgba_src_dyn,
-            &mut bgra_img_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&rgba_src_dyn, &mut bgra_img_dyn, None).unwrap();
         gl.draw_decoded_masks(&mut bgra_img_dyn, &[], &[make_seg()], Default::default())
             .unwrap();
 
@@ -3062,14 +2927,7 @@ mod gl_tests {
         .unwrap();
         let rgba_src_dyn = rgba_src;
         let mut bgra_img_dyn = bgra_img;
-        gl.convert(
-            &rgba_src_dyn,
-            &mut bgra_img_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&rgba_src_dyn, &mut bgra_img_dyn, None).unwrap();
         gl.draw_decoded_masks(&mut bgra_img_dyn, &[detect], &[], Default::default())
             .unwrap();
 
@@ -3215,13 +3073,7 @@ mod gl_tests {
         // fix is intact. We do not assert pixel-perfect contents here —
         // that is covered by other GL tests; this is a liveness regression
         // gate.
-        let res = gl.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        );
+        let res = gl.convert(&src_dyn, &mut dst_dyn, None);
         match res {
             Ok(()) => {
                 assert_eq!(dst_dyn.width(), Some(64));
@@ -3279,13 +3131,7 @@ mod gl_tests {
         };
         let src_dyn = TensorDyn::from(pbo_src);
         let mut dst_dyn = TensorDyn::from(pbo_dst);
-        let res = gl.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        );
+        let res = gl.convert(&src_dyn, &mut dst_dyn, None);
         match res {
             Ok(()) => {
                 assert_eq!(dst_dyn.width(), Some(64));
@@ -3349,13 +3195,7 @@ mod gl_tests {
         let before = gl.convert_stats().expect("convert stats before");
         let src_dyn = TensorDyn::from(pbo_src);
         let mut dst_dyn = TensorDyn::from(dst);
-        let res = gl.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        );
+        let res = gl.convert(&src_dyn, &mut dst_dyn, None);
         match res {
             Ok(()) => {
                 let after = gl.convert_stats().expect("convert stats after");
@@ -3451,13 +3291,7 @@ mod gl_tests {
         let mut dst_dyn = TensorDyn::from(dst);
         // The planar destination is what routes the source through
         // `draw_src_texture`'s mapping arm; see the PBO-source test above.
-        let res = gl_a.convert(
-            &src_dyn,
-            &mut dst_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        );
+        let res = gl_a.convert(&src_dyn, &mut dst_dyn, None);
         let msg = format!(
             "{:?}",
             res.expect_err("a cross-context PBO map under Full serialization must be refused")
@@ -3506,14 +3340,8 @@ mod gl_tests {
 
         let mut got = rgba();
         let before = gl_a.convert_stats().expect("convert stats before");
-        gl_a.convert(
-            &foreign,
-            &mut got,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .expect("a foreign PBO source converts through its owner's map");
+        gl_a.convert(&foreign, &mut got, None)
+            .expect("a foreign PBO source converts through its owner's map");
         let after = gl_a.convert_stats().expect("convert stats after");
         assert_eq!(
             after.src_pbo_uploads, before.src_pbo_uploads,
@@ -3567,22 +3395,14 @@ mod gl_tests {
             access,
         )
         .unwrap();
-        CPUProcessor::new()
-            .convert(&src, &mut want, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        CPUProcessor::new().convert(&src, &mut want, None).unwrap();
 
         let mut foreign: TensorDyn = gl_b
             .create_pbo_image(w, h, PixelFormat::Rgba)
             .expect("allocate a PBO on the other processor")
             .into();
-        gl_a.convert(
-            &src,
-            &mut foreign,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .expect("a foreign PBO destination is written through its owner's map");
+        gl_a.convert(&src, &mut foreign, None)
+            .expect("a foreign PBO destination is written through its owner's map");
         let (worst, first) = image_max_diff(&foreign, &want, 4);
         assert!(
             first.is_none(),
@@ -3682,14 +3502,8 @@ mod gl_tests {
         .unwrap();
         let src_contiguous_dyn = src_contiguous;
         let mut dst_contig_dyn = dst_contig;
-        gl.convert(
-            &src_contiguous_dyn,
-            &mut dst_contig_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_contiguous_dyn, &mut dst_contig_dyn, None)
+            .unwrap();
 
         // Convert multiplane
         let dst_multi = TensorDyn::image(
@@ -3703,13 +3517,7 @@ mod gl_tests {
         .unwrap();
         let src_multiplane_dyn = src_multiplane;
         let mut dst_multi_dyn = dst_multi;
-        let result = gl.convert(
-            &src_multiplane_dyn,
-            &mut dst_multi_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let result = gl.convert(&src_multiplane_dyn, &mut dst_multi_dyn, None);
         if declined_separate_chroma(&result, function!()) {
             return;
         }
@@ -3823,14 +3631,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &src,
-            &mut dst_same_fd,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src, &mut dst_same_fd, None).unwrap();
 
         // Render contiguous reference
         let mut dst_contig = TensorDyn::image(
@@ -3842,14 +3643,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &src_contig,
-            &mut dst_contig,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_contig, &mut dst_contig, None).unwrap();
 
         // Same-fd multiplane and contiguous must produce identical pixels.
         let map_same = dst_same_fd.as_u8().unwrap().map().unwrap();
@@ -3902,9 +3696,7 @@ mod gl_tests {
         gl.convert(
             &src_contiguous_dyn,
             &mut dst_contig_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
+            Some(crate::ConvertOptions::new().crop(crop)),
         )
         .unwrap();
 
@@ -3923,9 +3715,7 @@ mod gl_tests {
         let result = gl.convert(
             &src_multiplane_dyn,
             &mut dst_multi_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
+            Some(crate::ConvertOptions::new().crop(crop)),
         );
         if declined_separate_chroma(&result, function!()) {
             return;
@@ -3984,9 +3774,7 @@ mod gl_tests {
         gl.convert(
             &src_contiguous_dyn,
             &mut dst_contig_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
+            Some(crate::ConvertOptions::new().crop(crop)),
         )
         .unwrap();
 
@@ -4005,9 +3793,7 @@ mod gl_tests {
         let result = gl.convert(
             &src_multiplane_dyn,
             &mut dst_multi_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
+            Some(crate::ConvertOptions::new().crop(crop)),
         );
         if declined_separate_chroma(&result, function!()) {
             return;
@@ -4047,15 +3833,9 @@ mod gl_tests {
     /// `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
     /// decline logs at debug and the CPU serves the same convert — and the
     /// CPU places the content band correctly, so a silent decline reads as
-    /// a pass here. The route each leg is entitled to comes from
-    /// `check_dst_format_supported`: it accepts `PlanarRgb` on both the
-    /// zero-copy DMA arm and the texture arm, so every `PlanarRgb` leg must
-    /// stay on GL and `convert_fallback_count()` must not move across it.
-    /// It accepts `PlanarRgba` on neither, so those legs take the CPU
-    /// fallback **by design** — they are the CPU half of the dispatch
-    /// surface this test exists to cover, and are asserted to fall back
-    /// rather than left unasserted, so the day GL grows a four-plane
-    /// readback this test says so instead of quietly changing meaning.
+    /// a pass here. `check_dst_format_supported` accepts both planar formats
+    /// on the zero-copy DMA arm and the texture arm, so every leg must stay
+    /// on GL and `convert_fallback_count()` must not move across it.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn letterbox_nv_to_planar_content_band_geometry() {
@@ -4078,11 +3858,9 @@ mod gl_tests {
                 return;
             }
         };
-        // Without this the route assertions below go vacuous in one
-        // direction and wrong in the other: with no GL backend at all
-        // nothing ever declines, so every `PlanarRgb` leg would pass having
-        // run on the CPU while every `PlanarRgba` leg would fail for the
-        // wrong reason.
+        // Without this the route assertions below go vacuous: with no GL
+        // backend at all nothing ever declines, so every leg would pass
+        // having run on the CPU.
         if proc.opengl.is_none() {
             crate::test_support::report_skip(&format!(
                 "{} - ImageProcessor resolved no GL backend",
@@ -4133,31 +3911,18 @@ mod gl_tests {
                         )
                         .unwrap();
                     let fallbacks_before = proc.convert_fallback_count();
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                    proc.convert(&src, &mut dst, Some(crate::ConvertOptions::new().crop(lb)))
                         .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
                     let declines = proc.convert_fallback_count() - fallbacks_before;
-                    if dst_fmt == PixelFormat::PlanarRgb {
-                        assert_eq!(
-                            declines, 0,
-                            "{label}: the GL backend declined this convert and the \
-                             CPU served it — the band probes below would pass on the \
-                             CPU answer, so this leg proved nothing about the GL \
-                             two-pass plan"
-                        );
-                    } else {
-                        assert_eq!(
-                            declines, 1,
-                            "{label}: GL was expected to decline PlanarRgba (no \
-                             four-plane readback geometry) and leave this leg to the \
-                             CPU; it did not, so either the GL gate changed or the \
-                             fallback counter did"
-                        );
-                    }
+                    assert_eq!(
+                        declines, 0,
+                        "{label}: the GL backend declined this convert and the \
+                         CPU served it — the band probes below would pass on the \
+                         CPU answer, so this leg proved nothing about the GL \
+                         two-pass plan"
+                    );
 
-                    // Raw bytes; undo the int8 XOR-0x80 bias so both dtypes
-                    // share one set of thresholds.
-                    let unbias = if dtype == DType::I8 { 0x80u8 } else { 0 };
-                    let bytes: Vec<u8> = match dtype {
+                    let raw: Vec<u8> = match dtype {
                         DType::U8 => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
                         _ => dst
                             .as_i8()
@@ -4166,12 +3931,22 @@ mod gl_tests {
                             .unwrap()
                             .as_slice()
                             .iter()
-                            .map(|&v| v as u8 ^ unbias)
+                            .map(|&v| v as u8)
                             .collect(),
                     };
+                    // The alpha plane is 255 everywhere (content and pad) and
+                    // stays the raw byte for i8 too.
+                    if dst_fmt == PixelFormat::PlanarRgba {
+                        let alpha = &raw[3 * dh * dw..4 * dh * dw];
+                        if let Some(i) = alpha.iter().position(|&a| a != 255) {
+                            panic!("{label}: alpha plane byte {i} = {}, expected 255", alpha[i]);
+                        }
+                    }
+                    // Undo the int8 XOR-0x80 bias so both dtypes share one set
+                    // of thresholds.
+                    let unbias = if dtype == DType::I8 { 0x80u8 } else { 0 };
+                    let bytes: Vec<u8> = raw.iter().map(|&v| v ^ unbias).collect();
 
-                    // Only the three colour planes — the alpha plane is 255
-                    // everywhere (content and pad) and is bias-exempt.
                     for plane in 0..3 {
                         let plane_base = plane * dh * dw;
                         for row in CONTENT_ROWS {
@@ -4205,10 +3980,8 @@ mod gl_tests {
     /// Letterboxed PixelFormat::Nv12 → planar against the verified RGBA
     /// reference: the same processor letterboxes camera NV12 720p → RGBA
     /// 640x640, the reference is channel-split on the CPU, and the GL planar
-    /// output (PlanarRgb@Dma — the TwoPassNvPlanar plan) must match it.
-    /// PlanarRgb@Dma is the only planar destination the GL engine accepts:
-    /// `check_dst_format_supported` rejects PlanarRgba outright and Mem has
-    /// no planar texture destination. Catches placement, scale, and content
+    /// output (PlanarRgb/PlanarRgba@Dma — the TwoPassNvPlanar plan) must
+    /// match it. Catches placement, scale, and content
     /// drift in the two-pass plan at full resolution — the per-pixel
     /// complement to the content-band geometry probe above.
     #[test]
@@ -4242,31 +4015,42 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(&src, &mut dst_rgba, Rotation::None, Flip::None, crop)
-            .unwrap();
+        gl.convert(
+            &src,
+            &mut dst_rgba,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )
+        .unwrap();
         let rgba = dst_rgba.as_u8().unwrap().map().unwrap();
         let rgba = rgba.as_slice();
 
-        // Channel-split the RGBA reference into the planar layout.
-        let mut expected = vec![0u8; 3 * dh * dw];
-        for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
-            for (plane, &channel) in px.iter().take(3).enumerate() {
-                expected[plane * dh * dw + i] = channel;
+        for fmt in [PixelFormat::PlanarRgb, PixelFormat::PlanarRgba] {
+            // Channel-split the RGBA reference into the planar layout.
+            let planes = fmt.channels();
+            let mut expected = vec![0u8; planes * dh * dw];
+            for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
+                for (plane, &channel) in px.iter().take(planes).enumerate() {
+                    expected[plane * dh * dw + i] = channel;
+                }
             }
+            let mut dst = TensorDyn::image(
+                dw,
+                dh,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            gl.convert(
+                &src,
+                &mut dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap_or_else(|e| panic!("nv12->{fmt}@Dma: convert failed: {e}"));
+            let map = dst.as_u8().unwrap().map().unwrap();
+            assert_pixels_match(&expected, map.as_slice(), 1);
         }
-        let mut dst = TensorDyn::image(
-            dw,
-            dh,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-            .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Dma: convert failed: {e}"));
-        let map = dst.as_u8().unwrap().map().unwrap();
-        assert_pixels_match(&expected, map.as_slice(), 1);
     }
 
     /// Build a heap-memory (`TensorMemory::Mem`) NV12 image from a raw fixture.
@@ -4318,37 +4102,47 @@ mod gl_tests {
                 return;
             }
         };
-        let mut gl_dst = TensorDyn::image(
-            dw,
-            dh,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            Some(TensorMemory::Mem),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        gl.convert(&src, &mut gl_dst, Rotation::None, Flip::None, crop)
-            .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Mem: GL convert failed: {e}"));
-
-        // CPU reference — the Task 3/4 fused NV->planar + halo-resize path.
-        let mut cpu_dst = TensorDyn::image(
-            dw,
-            dh,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            None,
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        crate::cpu::CPUProcessor::new()
-            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
+        for fmt in [PixelFormat::PlanarRgb, PixelFormat::PlanarRgba] {
+            let mut gl_dst = TensorDyn::image(
+                dw,
+                dh,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
+            gl.convert(
+                &src,
+                &mut gl_dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap_or_else(|e| panic!("nv12->{fmt}@Mem: GL convert failed: {e}"));
 
-        // GL is not bit-exact vs CPU (bilinear rounding, matrix precision) —
-        // reuse the 0.95 structural-similarity threshold the existing
-        // GL-vs-CPU planar oracle (`test_nv12_to_planar_rgb_uses_shader_path`)
-        // and the mask-render suite (`test_segmentation_yolo`) both use.
-        compare_images(&gl_dst, &cpu_dst, 0.95, function!());
+            // CPU reference — the Task 3/4 fused NV->planar + halo-resize path.
+            let mut cpu_dst = TensorDyn::image(
+                dw,
+                dh,
+                fmt,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            crate::cpu::CPUProcessor::new()
+                .convert(
+                    &src,
+                    &mut cpu_dst,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
+                .unwrap();
+
+            // GL is not bit-exact vs CPU (bilinear rounding, matrix precision) —
+            // reuse the 0.95 structural-similarity threshold the existing
+            // GL-vs-CPU planar oracle (`test_nv12_to_planar_rgb_uses_shader_path`)
+            // and the mask-render suite (`test_segmentation_yolo`) both use.
+            compare_images(&gl_dst, &cpu_dst, 0.95, function!());
+        }
     }
 
     /// Steady-state companion to [`gl_planar_heap_matches_cpu`]: once the gate
@@ -4391,8 +4185,12 @@ mod gl_tests {
 
         let before = proc.convert_fallback_count();
         for i in 0..10 {
-            proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Mem: convert failed on iter {i}: {e}"));
+            proc.convert(
+                &src,
+                &mut dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Mem: convert failed on iter {i}: {e}"));
         }
         let after = proc.convert_fallback_count();
         assert_eq!(
@@ -4446,8 +4244,12 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(&src, &mut gl_dst, Rotation::None, Flip::None, crop)
-            .unwrap_or_else(|e| panic!("rgba->PlanarRgb@Mem: GL convert failed: {e}"));
+        gl.convert(
+            &src,
+            &mut gl_dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )
+        .unwrap_or_else(|e| panic!("rgba->PlanarRgb@Mem: GL convert failed: {e}"));
 
         let mut cpu_dst = TensorDyn::image(
             dw,
@@ -4459,7 +4261,11 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
 
         compare_images(&gl_dst, &cpu_dst, 0.95, function!());
@@ -4505,8 +4311,12 @@ mod gl_tests {
 
         let before = proc.convert_fallback_count();
         for i in 0..10 {
-            proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                .unwrap_or_else(|e| panic!("rgba->PlanarRgb@Mem: convert failed on iter {i}: {e}"));
+            proc.convert(
+                &src,
+                &mut dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap_or_else(|e| panic!("rgba->PlanarRgb@Mem: convert failed on iter {i}: {e}"));
         }
         let after = proc.convert_fallback_count();
         assert_eq!(
@@ -5061,14 +4871,7 @@ mod gl_tests {
         .unwrap();
         let src_dyn = src;
         let mut dst_no_off_dyn = dst_no_off;
-        gl.convert(
-            &src_dyn,
-            &mut dst_no_off_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_no_off_dyn, None).unwrap();
 
         // Destination with explicit offset=0
         let mut dst_zero = Tensor::<u8>::image(
@@ -5081,14 +4884,7 @@ mod gl_tests {
         .unwrap();
         dst_zero.set_plane_offset(0);
         let mut dst_zero_dyn = TensorDyn::from(dst_zero);
-        gl.convert(
-            &src_dyn,
-            &mut dst_zero_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_zero_dyn, None).unwrap();
 
         let a = dst_no_off_dyn.as_u8().unwrap().map().unwrap();
         let b = dst_zero_dyn.as_u8().unwrap().map().unwrap();
@@ -5151,14 +4947,7 @@ mod gl_tests {
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let src_dyn = src;
-        gl.convert(
-            &src_dyn,
-            &mut dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst, None).unwrap();
 
         // Verify: the first half (before offset) must still be our sentinel
         let map = large_buf.map().unwrap();
@@ -5221,14 +5010,7 @@ mod gl_tests {
         .unwrap();
         let src_dyn = src;
         let mut dst_ref_dyn = dst_ref;
-        gl.convert(
-            &src_dyn,
-            &mut dst_ref_dyn,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_ref_dyn, None).unwrap();
 
         // Imported: PlaneDescriptor with offset=0
         let dst_buf = Tensor::<u8>::image(
@@ -5253,14 +5035,7 @@ mod gl_tests {
                 None,
             )
             .unwrap();
-        gl.convert(
-            &src_dyn,
-            &mut dst_imported,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst_imported, None).unwrap();
 
         let a = dst_ref_dyn.as_u8().unwrap().map().unwrap();
         let b = dst_buf.map().unwrap();
@@ -5323,14 +5098,7 @@ mod gl_tests {
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let src_dyn = src;
-        gl.convert(
-            &src_dyn,
-            &mut dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dyn, &mut dst, None).unwrap();
 
         // Verify: the first half (before offset) must still be our sentinel
         let map = large_buf.map().unwrap();
@@ -5421,8 +5189,7 @@ mod gl_tests {
         .unwrap();
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        gl.convert(&src, &mut dst, None).unwrap();
 
         // Verify: sentinel intact before offset
         let map = large_buf.map().unwrap();
@@ -5499,13 +5266,7 @@ mod gl_tests {
             .unwrap();
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let rgba_result = gl.convert(
-            &src,
-            &mut dst_rgba,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let rgba_result = gl.convert(&src, &mut dst_rgba, None);
         assert!(
             rgba_result.is_ok(),
             "RGBA U8 single-pass at large offset failed: {:?}",
@@ -5531,13 +5292,7 @@ mod gl_tests {
             .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
-        let rgb_result = gl.convert(
-            &src,
-            &mut dst_rgb,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let rgb_result = gl.convert(&src, &mut dst_rgb, None);
         assert!(
             rgb_result.is_ok(),
             "RGB I8 two-pass at large offset failed (RGBA succeeded): {:?}",
@@ -5604,13 +5359,7 @@ mod gl_tests {
             .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::U8, None)
             .unwrap();
 
-        let u8_result = gl.convert(
-            &src,
-            &mut dst_u8,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let u8_result = gl.convert(&src, &mut dst_u8, None);
         assert!(
             u8_result.is_ok(),
             "RGB U8 two-pass at large offset failed: {:?}",
@@ -5636,13 +5385,7 @@ mod gl_tests {
             .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
-        let i8_result = gl.convert(
-            &src,
-            &mut dst_i8,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let i8_result = gl.convert(&src, &mut dst_i8, None);
         assert!(
             i8_result.is_ok(),
             "RGB I8 two-pass at large offset failed (U8 succeeded): {:?}",
@@ -5712,13 +5455,7 @@ mod gl_tests {
             .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
-        let aligned_result = gl.convert(
-            &src,
-            &mut dst_aligned,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let aligned_result = gl.convert(&src, &mut dst_aligned, None);
         assert!(
             aligned_result.is_ok(),
             "Page-aligned offset {} failed: {:?}",
@@ -5748,13 +5485,7 @@ mod gl_tests {
             .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
-        let unaligned_result = gl.convert(
-            &src,
-            &mut dst_unaligned,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let unaligned_result = gl.convert(&src, &mut dst_unaligned, None);
         assert!(
             unaligned_result.is_ok(),
             "Non-page-aligned Neutron offset {} failed (page-aligned {} succeeded): {:?}",
@@ -6063,26 +5794,13 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let result = gl.convert(
-            &src,
-            &mut dst_multi,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        );
+        let result = gl.convert(&src, &mut dst_multi, None);
         if declined_separate_chroma(&result, function!()) {
             // The decline must still leave the caller a correct convert:
             // ImageProcessor serves it on the CPU, which must match the CPU's
             // answer for the same bytes held contiguously.
             let mut proc = proc;
-            proc.convert(
-                &src,
-                &mut dst_multi,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            proc.convert(&src, &mut dst_multi, None).unwrap();
             let mut dst_cpu = TensorDyn::image(
                 width,
                 height,
@@ -6093,13 +5811,7 @@ mod gl_tests {
             )
             .unwrap();
             crate::CPUProcessor::new()
-                .convert(
-                    &src_contig,
-                    &mut dst_cpu,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::no_crop(),
-                )
+                .convert(&src_contig, &mut dst_cpu, None)
                 .unwrap();
             let map_multi = dst_multi.as_u8().unwrap().map().unwrap();
             let map_cpu = dst_cpu.as_u8().unwrap().map().unwrap();
@@ -6118,14 +5830,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &src_contig,
-            &mut dst_contig,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_contig, &mut dst_contig, None).unwrap();
 
         // True multiplane and contiguous must produce identical pixels.
         let map_multi = dst_multi.as_u8().unwrap().map().unwrap();
@@ -6214,14 +5919,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &src,
-            &mut dst_imported,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src, &mut dst_imported, None).unwrap();
 
         // Render reference
         let mut dst_ref = TensorDyn::image(
@@ -6233,14 +5931,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &src_ref,
-            &mut dst_ref,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_ref, &mut dst_ref, None).unwrap();
 
         // Compare: import_image contiguous and load_raw_image must produce identical pixels
         let map_imported = dst_imported.as_u8().unwrap().map().unwrap();
@@ -6383,7 +6074,11 @@ mod gl_tests {
             src_h,
         )));
 
-        if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+        if let Err(e) = gl.convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        ) {
             // Vivante GL rejects RGB source textures. The src_rect no-bleed crop
             // logic is still covered on RGBA-capable drivers (e.g. Mesa); Vivante
             // RGB-source support is tracked for separate investigation.
@@ -6452,7 +6147,11 @@ mod gl_tests {
         let crop =
             Crop::new().with_source(Some(crate::Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
-        if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+        if let Err(e) = gl.convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        ) {
             // Vivante GL rejects RGB source textures. The src_rect no-bleed crop
             // logic is still covered on RGBA-capable drivers (e.g. Mesa); Vivante
             // RGB-source support is tracked for separate investigation.
@@ -6508,7 +6207,11 @@ mod gl_tests {
         // Crop only the left (red) half
         let crop = Crop::new().with_source(Some(crate::Region::new(0, 0, src_w / 2, src_h)));
 
-        if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+        if let Err(e) = gl.convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        ) {
             // Vivante GL rejects RGB source textures. The src_rect no-bleed crop
             // logic is still covered on RGBA-capable drivers (e.g. Mesa); Vivante
             // RGB-source support is tracked for separate investigation.
@@ -6913,7 +6616,7 @@ mod gl_tests {
                 .unwrap();
             assert_eq!(dst.memory(), dst_mem, "{label}: dst backing not honoured");
             let fallbacks_before = proc.convert_fallback_count();
-            proc.convert(src, &mut dst, Rotation::None, Flip::None, lb)
+            proc.convert(src, &mut dst, Some(crate::ConvertOptions::new().crop(lb)))
                 .unwrap_or_else(|e| panic!("{label} convert failed: {e}"));
             // Without this the test is vacuous on a GL-declining host: every
             // convert here, oracle included, would produce the same CPU answer
@@ -7051,8 +6754,7 @@ mod gl_tests {
         let mut max_err = 0.0f32;
         for iter in 0..2 {
             let fallbacks_before = proc.convert_fallback_count();
-            proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-                .unwrap();
+            proc.convert(&src, &mut dst, None).unwrap();
             assert_eq!(
                 proc.convert_fallback_count(),
                 fallbacks_before,
@@ -7181,8 +6883,7 @@ mod gl_tests {
         }
 
         let fallbacks_before = proc.convert_fallback_count();
-        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        proc.convert(&src, &mut dst, None).unwrap();
         assert_eq!(
             proc.convert_fallback_count(),
             fallbacks_before,
@@ -7312,8 +7013,7 @@ mod gl_tests {
         }
 
         let fallbacks_before = proc.convert_fallback_count();
-        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        proc.convert(&src, &mut dst, None).unwrap();
         assert_eq!(
             proc.convert_fallback_count(),
             fallbacks_before,
@@ -7472,8 +7172,7 @@ mod gl_tests {
         }
 
         let fallbacks_before = proc.convert_fallback_count();
-        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        proc.convert(&src, &mut dst, None).unwrap();
         // Skip condition 4, and the reason it is a skip rather than an
         // assertion: unlike the PBO siblings -- whose feed has no import to
         // fail -- this one needs a working zero-copy EGLImage import of the
@@ -7620,7 +7319,11 @@ mod gl_tests {
         let crop = Crop::letterbox([114, 114, 114, 255]);
 
         let fallbacks_before = proc.convert_fallback_count();
-        let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
+        let result = proc.convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        );
         assert!(
             result.is_ok(),
             "F32 PBO letterbox convert must not error: {:?}",
@@ -7749,8 +7452,7 @@ mod gl_tests {
         // coverage. Reported as a skip rather than a failure because the
         // decline is a property of the host's driver, not of this code.
         let fallbacks_before = proc.convert_fallback_count();
-        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        proc.convert(&src, &mut dst, None).unwrap();
         if proc.convert_fallback_count() != fallbacks_before {
             crate::test_support::report_skip(
                 "convert_f32_pbo_cuda_map_roundtrip - the GL float path declined \
@@ -7875,8 +7577,7 @@ mod gl_tests {
         // coverage. Reported as a skip rather than a failure because the
         // decline is a property of the host's driver, not of this code.
         let fallbacks_before = proc.convert_fallback_count();
-        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .unwrap();
+        proc.convert(&src, &mut dst, None).unwrap();
         if proc.convert_fallback_count() != fallbacks_before {
             crate::test_support::report_skip(
                 "convert_f32_pbo_cuda_map_numeric - the GL float path declined \
@@ -8013,14 +7714,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        proc.convert(
-            &src,
-            &mut ref_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .unwrap();
+        proc.convert(&src, &mut ref_dst, None).unwrap();
         let ref_map = ref_dst.as_f32().unwrap().map().unwrap();
         let ref_px = ref_map.as_slice();
 
@@ -8042,14 +7736,7 @@ mod gl_tests {
         ) {
             return;
         }
-        proc.convert(
-            &src,
-            &mut pbo_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .unwrap();
+        proc.convert(&src, &mut pbo_dst, None).unwrap();
         let cm = match pbo_dst.cuda_map() {
             Some(cm) => cm,
             None => {
@@ -8237,8 +7924,7 @@ mod gl_tests {
             }
         };
 
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        gl.convert(&src, &mut dst, None).unwrap();
 
         // (a) Assert Path B ran — no CPU fallback for a DMA NV16 source.
         assert_eq!(
@@ -8355,8 +8041,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut path_for = |gl: &mut GLProcessorST, src: &TensorDyn| {
-            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(src, &mut dst, None).unwrap();
             gl.last_nv_convert_path
         };
 
@@ -8406,14 +8091,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut grey_path = |gl: &mut GLProcessorST, src: &TensorDyn| {
-            gl.convert(
-                src,
-                &mut grey_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            gl.convert(src, &mut grey_dst, None).unwrap();
             gl.last_nv_convert_path
         };
         gl.set_colorimetry_mode(ColorimetryMode::Fast);
@@ -8505,8 +8183,7 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(&src, &mut dst, None).unwrap();
             Some((gl.last_nv_convert_path, gl.is_vivante))
         };
 
@@ -8587,14 +8264,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(
-            &mem_src,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&mem_src, &mut gpu_dst, None).unwrap();
         assert_eq!(
             gl.last_nv_convert_path,
             NvConvertPath::ShaderR8,
@@ -8615,13 +8285,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &cpu_src,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&cpu_src, &mut cpu_dst, None)
             .unwrap();
 
         let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
@@ -8693,8 +8357,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        gl.convert(&src, &mut dst, None).unwrap();
         assert_eq!(
             gl.last_nv_convert_path,
             NvConvertPath::ShaderR8,
@@ -8715,13 +8378,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &cpu_src,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&cpu_src, &mut cpu_dst, None)
             .unwrap();
         compare_images(&cpu_dst, &dst, 0.95, "nv12_to_planar_rgb_shader");
     }
@@ -8947,8 +8604,12 @@ mod gl_tests {
                         edgefirst_tensor::CpuAccess::ReadWrite,
                     )
                     .unwrap();
-                    gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
-                        .unwrap();
+                    gl.convert(
+                        &src,
+                        &mut gpu,
+                        Some(crate::ConvertOptions::new().crop(crop)),
+                    )
+                    .unwrap();
                     let sampling = gl.last_nv_sampling.expect("an NV draw ran");
                     if !hw {
                         assert_eq!(
@@ -9010,21 +8671,18 @@ mod gl_tests {
             .unwrap()
         };
         let mut whole = image(sw, sh);
-        gl.convert(
-            &src,
-            &mut whole,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src, &mut whole, None).unwrap();
         let whole = planar_bytes(&whole);
         for (cx, cy) in [(101usize, 53usize), (100, 52)] {
             let (cw, ch) = (320usize, 180usize);
             let mut tile = image(cw, ch);
             let crop = Crop::new().with_source(Some(crate::Region::new(cx, cy, cw, ch)));
-            gl.convert(&src, &mut tile, Rotation::None, Flip::None, crop)
-                .unwrap();
+            gl.convert(
+                &src,
+                &mut tile,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap();
             assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
             let tile = planar_bytes(&tile);
             for c in 0..3 {
@@ -9065,8 +8723,7 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(&src, &mut gpu, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(&src, &mut gpu, None).unwrap();
             assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
             let mad = mean_abs_diff(
                 &planar_bytes(&gpu),
@@ -9105,11 +8762,19 @@ mod gl_tests {
             .unwrap()
         };
         let mut gpu = image(Some(TensorMemory::Mem));
-        gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
-            .unwrap();
+        gl.convert(
+            &src,
+            &mut gpu,
+            Some(crate::ConvertOptions::new().crop(crop)),
+        )
+        .unwrap();
         let mut cpu = image(None);
         crate::cpu::CPUProcessor::new()
-            .convert(&src, &mut cpu, Rotation::None, Flip::None, crop)
+            .convert(
+                &src,
+                &mut cpu,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
             .unwrap();
         let mad = mean_abs_diff(&planar_bytes(&gpu), &planar_bytes(&cpu));
         assert!(
@@ -9161,8 +8826,7 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(&src, &mut dst, None).unwrap();
             let got = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
             assert_eq!(
                 got == want,
@@ -9239,11 +8903,19 @@ mod gl_tests {
                         .unwrap()
                     };
                     let mut gpu = image(Some(mem));
-                    gl.convert(&src, &mut gpu, Rotation::None, Flip::None, crop)
-                        .unwrap();
+                    gl.convert(
+                        &src,
+                        &mut gpu,
+                        Some(crate::ConvertOptions::new().crop(crop)),
+                    )
+                    .unwrap();
                     let mut cpu = image(None);
                     crate::cpu::CPUProcessor::new()
-                        .convert(&src, &mut cpu, Rotation::None, Flip::None, crop)
+                        .convert(
+                            &src,
+                            &mut cpu,
+                            Some(crate::ConvertOptions::new().crop(crop)),
+                        )
                         .unwrap();
                     let g = gpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
                     let c = cpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
@@ -9300,14 +8972,7 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(
-                &mem_src,
-                &mut gpu,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            gl.convert(&mem_src, &mut gpu, None).unwrap();
             assert_eq!(
                 gl.last_nv_convert_path,
                 NvConvertPath::ShaderR8,
@@ -9326,13 +8991,7 @@ mod gl_tests {
             )
             .unwrap();
             crate::cpu::CPUProcessor::new()
-                .convert(
-                    &cpu_src,
-                    &mut cpu,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::no_crop(),
-                )
+                .convert(&cpu_src, &mut cpu, None)
                 .unwrap();
             assert_pixels_match(
                 cpu.as_u8().unwrap().map().unwrap().as_slice(),
@@ -9407,8 +9066,7 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(&src, &mut dst, None).unwrap();
             let out = dst.as_u8().unwrap().map().unwrap().to_vec();
             Some((gl.last_nv_convert_path, out))
         };
@@ -9425,7 +9083,7 @@ mod gl_tests {
             )
             .unwrap();
             crate::cpu::CPUProcessor::new()
-                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .convert(&src, &mut dst, None)
                 .unwrap();
             dst.as_u8().unwrap().map().unwrap().to_vec()
         };
@@ -9560,8 +9218,12 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            g.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                .ok()?;
+            g.convert(
+                &src,
+                &mut dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .ok()?;
             let stride = dst
                 .as_u8()
                 .unwrap()
@@ -9582,7 +9244,11 @@ mod gl_tests {
             )
             .unwrap();
             crate::cpu::CPUProcessor::new()
-                .convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                .convert(
+                    &src,
+                    &mut dst,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
                 .unwrap();
             let stride = dst
                 .as_u8()
@@ -9711,8 +9377,7 @@ mod gl_tests {
             }
         };
 
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        gl.convert(&src, &mut dst, None).unwrap();
 
         // (a) Assert Path B ran — no CPU fallback for a DMA NV24 source.
         assert_eq!(
@@ -9786,14 +9451,7 @@ mod gl_tests {
         .unwrap();
         {
             let mut cpu = crate::cpu::CPUProcessor::new();
-            cpu.convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            cpu.convert(&src_mem, &mut cpu_dst, None).unwrap();
         }
 
         // GPU Path B.
@@ -9816,14 +9474,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -9890,14 +9541,7 @@ mod gl_tests {
         .unwrap();
         {
             let mut cpu = crate::cpu::CPUProcessor::new();
-            cpu.convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            cpu.convert(&src_mem, &mut cpu_dst, None).unwrap();
         }
 
         // GPU Path B.
@@ -9920,14 +9564,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -9990,8 +9627,7 @@ mod gl_tests {
             }
         };
 
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        gl.convert(&src, &mut dst, None).unwrap();
 
         // NV12 must stay on a GPU path (no CPU-fallback regression). The exact
         // path is GPU-dependent: Path A (ExternalSampler) on Vivante, Path B (ShaderR8)
@@ -10057,14 +9693,7 @@ mod gl_tests {
         .unwrap();
         {
             let mut cpu = crate::cpu::CPUProcessor::new();
-            cpu.convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            cpu.convert(&src_mem, &mut cpu_dst, None).unwrap();
         }
 
         // GPU Path B, int8 RGB.
@@ -10087,14 +9716,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -10334,13 +9956,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -10362,14 +9978,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -10415,13 +10024,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -10443,14 +10046,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -10500,13 +10096,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -10528,14 +10118,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -10585,13 +10168,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -10613,14 +10190,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -10693,13 +10263,7 @@ mod gl_tests {
                 return;
             }
         };
-        match gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        ) {
+        match gl.convert(&src_dma, &mut gpu_dst, None) {
             Ok(()) => eprintln!("G-09: platform accepts non-aligned odd dst (OK)"),
             Err(crate::Error::NotSupported(msg)) => {
                 assert!(
@@ -10747,13 +10311,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -10775,14 +10333,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         // NV12 width 65 (not mult-4) routes to Path B (R8 shader).
         assert_eq!(
@@ -10840,13 +10391,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -10868,14 +10413,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         // Even-width NV12 uses a hardware GPU path: Path A (ExternalSampler,
         // samplerExternalOES) on Vivante, or Path B (ShaderR8) elsewhere —
@@ -10983,13 +10521,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         // GPU convert: Grey→RGBA on GL.
@@ -11012,14 +10544,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
         eprintln!("g_grey_odd_w: GPU vs CPU max_diff={max_diff}");
@@ -11071,13 +10596,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         // GPU i8 output.
@@ -11100,14 +10619,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         // Odd-width single-plane NV12 routes to ShaderR8 (no width gate); the
         // driver ExternalSampler requires even/4-aligned width. (This assert only
@@ -11163,13 +10675,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         // GPU i8 output.
@@ -11192,14 +10698,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -11249,13 +10748,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -11277,14 +10770,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -11324,13 +10810,7 @@ mod gl_tests {
         )
         .unwrap();
         crate::cpu::CPUProcessor::new()
-            .convert(
-                &src_mem,
-                &mut cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
+            .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
         let mut gpu_dst = TensorDyn::image(
@@ -11352,14 +10832,7 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(
-            &src_dma,
-            &mut gpu_dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        )
-        .unwrap();
+        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert_eq!(
             gl.last_nv_convert_path,
@@ -11507,17 +10980,9 @@ mod gl_tests {
         }
         for (w, h) in [(160usize, 120usize), (64, 48)] {
             pool.configure_image(w, h, PixelFormat::Rgba).unwrap();
-            gl.convert(&src, &mut pool, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(&src, &mut pool, None).unwrap();
             let mut fresh = rgba_dst(w, h).unwrap();
-            gl.convert(
-                &src,
-                &mut fresh,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            gl.convert(&src, &mut fresh, None).unwrap();
             let (got, want) = (flat_bytes(&pool), flat_bytes(&fresh));
             assert_eq!(got.len(), want.len(), "{w}x{h}: output size mismatch");
             let worst = got
@@ -11586,7 +11051,7 @@ mod gl_tests {
             (sw, sh),
             (dw, dh),
             salt,
-            Rotation::None,
+            crate::Rotation::None,
             Crop::no_crop(),
         )
     }
@@ -11601,11 +11066,16 @@ mod gl_tests {
         (sw, sh): (usize, usize),
         (dw, dh): (usize, usize),
         salt: u8,
-        rotation: Rotation,
+        rotation: crate::Rotation,
         crop: Crop,
     ) -> (Vec<u8>, Vec<u8>) {
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, rotation, Flip::None, crop).unwrap();
+            gl.convert(
+                s,
+                d,
+                Some(crate::ConvertOptions::new().rotation(rotation).crop(crop)),
+            )
+            .unwrap();
         };
         let rgba_dst = || {
             TensorDyn::image(
@@ -11771,16 +11241,23 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // (src w, src h, dst w, dst h, rotation, crop).
-        let cases: [(usize, usize, usize, usize, Rotation, Crop); 2] = [
+        let cases: [(usize, usize, usize, usize, crate::Rotation, Crop); 2] = [
             (
                 128,
                 64,
                 256,
                 128,
-                Rotation::None,
+                crate::Rotation::None,
                 Crop::no_crop().with_source(Some(crate::Region::new(64, 32, 64, 32))),
             ),
-            (64, 128, 256, 128, Rotation::Clockwise90, Crop::no_crop()),
+            (
+                64,
+                128,
+                256,
+                128,
+                crate::Rotation::Clockwise90,
+                Crop::no_crop(),
+            ),
         ];
         for (i, &(sw, sh, dw, dh, rotation, crop)) in cases.iter().enumerate() {
             let (oracle_bytes, recycled_bytes) = convert_narrowed_and_fresh_grey_as(
@@ -11841,8 +11318,7 @@ mod gl_tests {
         fill_yuyv_pattern(&pool, 128, 128, 200);
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
-            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap();
+            gl.convert(s, d, None).unwrap();
         };
 
         let rgba_dst = |w: usize, h: usize| {
@@ -12019,14 +11495,7 @@ mod gl_tests {
                 return;
             };
             let fallbacks_before = proc.convert_fallback_count();
-            proc.convert(
-                &pool,
-                &mut recycled,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            proc.convert(&pool, &mut recycled, None).unwrap();
             assert_eq!(
                 proc.convert_fallback_count(),
                 fallbacks_before,
@@ -12048,14 +11517,7 @@ mod gl_tests {
             fill_rgba_pattern(&fresh, w, h, salt);
             let mut oracle = float_dst(&proc).unwrap();
             let fallbacks_before = proc.convert_fallback_count();
-            proc.convert(
-                &fresh,
-                &mut oracle,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            proc.convert(&fresh, &mut oracle, None).unwrap();
             assert_eq!(
                 proc.convert_fallback_count(),
                 fallbacks_before,
@@ -12136,22 +11598,8 @@ mod gl_tests {
                 out
             };
             let fallbacks_before = proc.convert_fallback_count();
-            proc.convert(
-                &pool,
-                &mut zc_recycled,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
-            proc.convert(
-                &fresh,
-                &mut zc_oracle,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            )
-            .unwrap();
+            proc.convert(&pool, &mut zc_recycled, None).unwrap();
+            proc.convert(&fresh, &mut zc_oracle, None).unwrap();
             // A driver that refuses the zero-copy float destination has
             // nothing inside GL to lower to -- there is no mapped-texture
             // readback for a float DMA destination -- so the CPU serves the
@@ -12331,13 +11779,7 @@ mod gl_tests {
 
         let mut reference = rgba_dst();
         crate::CPUProcessor::new()
-            .convert(
-                &src,
-                &mut reference,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )
+            .convert(&src, &mut reference, None)
             .expect("CPU reference convert of the offset NV12 frame");
         let want = read(&reference);
         // A flat reference would make any wrong read agree; the pattern must
@@ -12350,11 +11792,10 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
         let before = gl.convert_stats().expect("convert stats before");
         let mut dst = rgba_dst();
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
-            .expect(
-                "GL refused an NV12 source at an unaligned plane offset; a declined \
+        gl.convert(&src, &mut dst, None).expect(
+            "GL refused an NV12 source at an unaligned plane offset; a declined \
                  zero-copy NV import must reach the R8 upload (issue #166)",
-            );
+        );
         let after = gl.convert_stats().expect("convert stats after");
         let got = read(&dst);
         let bad = got
@@ -12520,14 +11961,8 @@ mod gl_tests {
         // is what says whether this host imports destinations at all.
         let mut whole = dma_rgba(SIDE, SIDE).expect("control destination");
         let before_control = imports(&gl);
-        gl.convert(
-            &src,
-            &mut whole,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .expect("control convert into a whole zero-copy destination");
+        gl.convert(&src, &mut whole, None)
+            .expect("control convert into a whole zero-copy destination");
         let control = imports(&gl) - before_control;
 
         // A view destination is only supported at all on a zero-copy transfer
@@ -12570,7 +12005,7 @@ mod gl_tests {
              import at 0"
         );
         let before_subject = imports(&gl);
-        gl.convert(&src, &mut tile, Rotation::None, Flip::None, Crop::default())
+        gl.convert(&src, &mut tile, None)
             .expect("convert into a fresh view destination at an unaligned offset");
         let subject = imports(&gl) - before_subject;
         log::info!(
@@ -12832,7 +12267,7 @@ mod gl_tests {
         let mut dst = rgba8_pbo(&gl, SIDE, SIDE);
 
         let before = gl.convert_stats().expect("convert stats before");
-        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+        gl.convert(&view, &mut dst, None)
             .expect("GL declined a PBO view source");
         assert_pbo_source_route(&gl, &before, "u8 PBO view");
 
@@ -12894,7 +12329,7 @@ mod gl_tests {
             .expect("allocate an F32 RGB PBO destination");
 
         let before = gl.convert_stats().expect("convert stats before");
-        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+        gl.convert(&view, &mut dst, None)
             .expect("GL declined a PBO view source into an F32 destination");
         assert_pbo_source_route(&gl, &before, "float PBO view");
 
@@ -12951,7 +12386,7 @@ mod gl_tests {
             .expect("allocate an F32 RGB PBO destination");
 
         let before = gl.convert_stats().expect("convert stats before");
-        gl.convert(&view, &mut dst, Rotation::None, Flip::None, Crop::default())
+        gl.convert(&view, &mut dst, None)
             .expect("GL declined a padded PBO source into an F32 destination");
         assert_pbo_source_route(&gl, &before, "float padded PBO source");
 
@@ -13022,7 +12457,7 @@ mod gl_tests {
         );
 
         let before = gl.convert_stats().expect("convert stats before");
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+        gl.convert(&src, &mut dst, None)
             .expect("GL declined a pitch-aligned PBO destination");
         assert_pbo_source_route(&gl, &before, "padded PBO destination");
 
@@ -13182,14 +12617,8 @@ mod gl_tests {
             }
         };
         let before = imports(&gl);
-        gl.convert(
-            &src,
-            &mut oracle,
-            Rotation::None,
-            Flip::None,
-            Crop::default(),
-        )
-        .expect("calibration convert into a whole zero-copy destination");
+        gl.convert(&src, &mut oracle, None)
+            .expect("calibration convert into a whole zero-copy destination");
         if imports(&gl) - before == 0 {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy destination import on this host, so a view() \
@@ -13223,8 +12652,12 @@ mod gl_tests {
             // ORACLE: the same convert into the same WHOLE destination, on the same
             // mapped-texture path. Comparing the view against this isolates the
             // view-ness of the destination from the readback path itself.
-            gl.convert(&src, &mut oracle, Rotation::None, Flip::None, crop)
-                .expect("oracle convert into a whole destination on the mapped path");
+            gl.convert(
+                &src,
+                &mut oracle,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .expect("oracle convert into a whole destination on the mapped path");
             let oracle_stride = oracle.effective_row_stride().expect("oracle stride");
             let oracle_bytes = oracle
                 .map_bytes(edgefirst_tensor::CpuAccess::Read)
@@ -13247,20 +12680,18 @@ mod gl_tests {
                     m.as_mut_slice().fill(POISON);
                 }
                 let mut scratch = dma_rgba(VIEW_W, VIEW_H).expect("decoy destination");
-                gl.convert(
-                    &decoy,
-                    &mut scratch,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::default(),
-                )
-                .expect("decoy convert");
+                gl.convert(&decoy, &mut scratch, None)
+                    .expect("decoy convert");
                 let before = fallbacks(&gl);
                 {
                     let mut view = parent
                         .view(edgefirst_tensor::Region::new(x0, y0, VIEW_W, VIEW_H))
                         .expect("destination view");
-                    if let Err(e) = gl.convert(&src, &mut view, Rotation::None, Flip::None, crop) {
+                    if let Err(e) = gl.convert(
+                        &src,
+                        &mut view,
+                        Some(crate::ConvertOptions::new().crop(crop)),
+                    ) {
                         failures.push(format!("{label} ({x0},{y0}): GL declined the view: {e}"));
                         continue;
                     }
@@ -13369,13 +12800,7 @@ mod gl_tests {
                     .view(edgefirst_tensor::Region::new(8, 8, VIEW_W, VIEW_H))
                     .expect("packed-RGB destination view");
                 let before = fallbacks(&gl);
-                let outcome = gl.convert(
-                    &rgb_src,
-                    &mut view,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::default(),
-                );
+                let outcome = gl.convert(&rgb_src, &mut view, None);
                 match outcome {
                     Err(crate::Error::NotSupported(_)) => {}
                     other => failures.push(format!(
@@ -13428,13 +12853,7 @@ mod gl_tests {
                     m.as_mut_slice().fill(0x5A);
                 }
                 let before = fallbacks(&gl);
-                match gl.convert(
-                    &rgb_src,
-                    &mut rgb_dst,
-                    Rotation::None,
-                    Flip::None,
-                    Crop::default(),
-                ) {
+                match gl.convert(&rgb_src, &mut rgb_dst, None) {
                     Ok(()) => {
                         let spent = fallbacks(&gl) - before;
                         if spent != 1 {
@@ -13523,13 +12942,7 @@ mod gl_tests {
         )
         .expect("reference destination");
         crate::CPUProcessor::new()
-            .convert(
-                &src,
-                &mut reference,
-                Rotation::None,
-                Flip::None,
-                Crop::default(),
-            )
+            .convert(&src, &mut reference, None)
             .expect("CPU reference convert");
         let want = reference
             .map_bytes(edgefirst_tensor::CpuAccess::Read)
@@ -13583,7 +12996,7 @@ mod gl_tests {
                 .convert_stats()
                 .expect("convert stats")
                 .dst_import_fallbacks;
-            let outcome = gl.convert(&src, dst, Rotation::None, Flip::None, Crop::default());
+            let outcome = gl.convert(&src, dst, None);
             let spent = gl
                 .convert_stats()
                 .expect("convert stats")
@@ -13784,12 +13197,10 @@ mod gl_tests {
         ));
         let image = |fmt, mem| TensorDyn::image(w, h, fmt, DType::U8, Some(mem), access).unwrap();
         let mut want = image(PixelFormat::PlanarRgb, TensorMemory::Mem);
-        CPUProcessor::new()
-            .convert(&src, &mut want, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        CPUProcessor::new().convert(&src, &mut want, None).unwrap();
         for dst_fmt in [PixelFormat::Rgb, PixelFormat::PlanarRgb] {
             let mut got = image(dst_fmt, TensorMemory::DmaBuf);
-            gl.convert(&src, &mut got, Rotation::None, Flip::None, Crop::no_crop())
+            gl.convert(&src, &mut got, None)
                 .unwrap_or_else(|e| panic!("{dst_fmt:?}: {e}"));
             if dst_fmt == PixelFormat::PlanarRgb {
                 let (worst, first) = image_max_diff(&got, &want, 4);
@@ -13877,19 +13288,12 @@ mod gl_tests {
                         let mut want =
                             TensorDyn::image(w, h, dst_fmt, dtype, Some(TensorMemory::Mem), access)
                                 .unwrap();
-                        cpu.convert(
-                            &reference,
-                            &mut want,
-                            Rotation::None,
-                            Flip::None,
-                            Crop::no_crop(),
-                        )
-                        .unwrap_or_else(|e| panic!("{case}: CPU reference: {e}"));
+                        cpu.convert(&reference, &mut want, None)
+                            .unwrap_or_else(|e| panic!("{case}: CPU reference: {e}"));
                         let mut got = TensorDyn::image(w, h, dst_fmt, dtype, Some(dst_mem), access)
                             .unwrap_or_else(|e| panic!("{case}: destination: {e}"));
                         let before = gl.convert_stats().expect("convert stats before");
-                        let result =
-                            gl.convert(&src, &mut got, Rotation::None, Flip::None, Crop::no_crop());
+                        let result = gl.convert(&src, &mut got, None);
                         let declined = !uploads_yuv
                             && (src_fmt == PixelFormat::Yuyv || src_mem == TensorMemory::Pbo);
                         if declined {

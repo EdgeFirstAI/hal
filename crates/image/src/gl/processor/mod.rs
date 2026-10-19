@@ -38,9 +38,10 @@ use super::shaders::{
     generate_proto_segmentation_shader_int8_nearest, generate_segmentation_shader,
     generate_texture_fragment_shader, generate_texture_fragment_shader_yuv,
     generate_texture_int8_shader, generate_texture_int8_shader_yuv, generate_vertex_shader,
+    quant_mapped,
 };
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
-use crate::{Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Rotation, DEFAULT_COLORS};
+use crate::{Error, Flip, ImageProcessorTrait, ResolvedCrop, Rotation, DEFAULT_COLORS};
 use edgefirst_tensor::TensorDyn;
 
 /// Linux GL float (F16/F32) preprocessing paths. Declared as a child of
@@ -196,6 +197,161 @@ pub(super) struct FloatQuadLocs {
     pub(super) dst_rect_px: i32,
     pub(super) pad_color: i32,
     pub(super) dst_image_size: i32,
+    pub(super) norm_scale: i32,
+    pub(super) norm_offset: i32,
+}
+
+/// Per-channel output mapping for the float render paths, in sampler units
+/// (`output = sample * scale + offset`), plus the letterbox pad as written.
+/// Identity outside a convert that asks for normalization.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FloatNorm {
+    pub(super) scale: [f32; 4],
+    pub(super) offset: [f32; 4],
+    pub(super) pad: Option<[f32; 4]>,
+}
+
+impl FloatNorm {
+    pub(super) const IDENTITY: Self = Self {
+        scale: [1.0; 4],
+        offset: [0.0; 4],
+        pad: None,
+    };
+}
+
+/// The `quantize()` uniforms of the int8 programs, in sampler units for the
+/// RGB channels: `clamp(floor(v * scale + offset + 0.5) + zero, lo, hi)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct IntQuant {
+    pub(super) scale: [f32; 3],
+    pub(super) offset: [f32; 3],
+    pub(super) zero: [f32; 3],
+    pub(super) lo: [f32; 3],
+    pub(super) hi: [f32; 3],
+}
+
+impl IntQuant {
+    /// From an integer output map in RGB order.
+    pub(super) fn from_map(map: &crate::options::OutputMap) -> Self {
+        let b = map.bounds.unwrap_or([(0.0, 255.0); 4]);
+        Self {
+            scale: std::array::from_fn(|c| map.scale[c] * 255.0),
+            offset: std::array::from_fn(|c| map.offset[c]),
+            zero: std::array::from_fn(|c| map.zero_point[c]),
+            lo: std::array::from_fn(|c| b[c].0),
+            hi: std::array::from_fn(|c| b[c].1),
+        }
+    }
+}
+
+/// One build of every int8 program, with the link-time state its draws read.
+/// The processor's int8 fields hold the active build and `int8_alt` the
+/// other; [`GLProcessorST::use_int8_set`] swaps them.
+struct Int8Set {
+    texture: GlProgram,
+    texture_yuv: Option<GlProgram>,
+    planar: Option<GlProgram>,
+    planar_2d: GlProgram,
+    yuyv_2d: GlProgram,
+    yuyv_2d_locs: [i32; 8],
+    packed_rgba8_2d: GlProgram,
+    /// In [`NvSampling::program`] order, int8 entries only.
+    nv_r8: [GlProgram; 3],
+    nv_r8_uniforms: [NvUniformState; 3],
+    nv_y2y: Option<(GlProgram, NvUniformState)>,
+    texture_src_extent_loc: i32,
+    yuv_src_extent_loc: i32,
+    planar_src_extent_loc: i32,
+}
+
+impl Int8Set {
+    /// Link the int8 programs: `quantize()` as uniforms when `mapped`, else
+    /// the plain bias in literals. The Y2Y program is built only with `y2y`,
+    /// and is `None` if the driver refuses it.
+    fn new(mapped: bool, y2y: bool) -> Result<Self, Error> {
+        let build = |src: &str| {
+            if mapped {
+                GlProgram::new(generate_vertex_shader(), &quant_mapped(src))
+            } else {
+                GlProgram::new(generate_vertex_shader(), src)
+            }
+        };
+        let external = |src: &str| Platform::EXTERNAL_OES.then(|| build(src)).transpose();
+        let texture = build(generate_texture_int8_shader())?;
+        let texture_yuv = external(generate_texture_int8_shader_yuv())?;
+        let planar = external(generate_planar_rgb_int8_shader())?;
+        let planar_2d = build(generate_planar_rgb_int8_shader_2d())?;
+        planar_2d.load_uniform_1i(c"tex", 0)?;
+        let yuyv_2d = build(super::shaders_common::YUYV_RGBA_2D_INT8_FRAGMENT)?;
+        let yuyv_2d_locs = yuyv_2d_locs(&yuyv_2d);
+        let packed_rgba8_2d = build(generate_packed_rgba8_int8_shader_2d())?;
+        packed_rgba8_2d.load_uniform_1i(c"tex", 1)?;
+        let nv_r8 = [
+            build(generate_nv_to_rgba_int8_shader_2d())?,
+            build(generate_nv_to_rgba_bilinear_int8_shader_2d())?,
+            build(generate_nv_to_rgba_hw_bilinear_int8_shader_2d())?,
+        ];
+        let nv_r8_uniforms = nv_r8.each_ref().map(NvUniformState::resolve);
+        let nv_y2y = if y2y {
+            match build(generate_nv_to_rgba_y2y_int8_shader()) {
+                Ok(p) => {
+                    let u = NvUniformState::resolve(&p);
+                    Some((p, u))
+                }
+                Err(e) => {
+                    log::info!("the int8 Y2Y NV program did not build: {e:?}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let src_extent = |p: Option<&GlProgram>| {
+            p.map_or(-1, |p| {
+                // SAFETY: `p` was linked above on this thread's current
+                // context and the name is a `c"..."` literal.
+                unsafe { edgefirst_gl::gl::GetUniformLocation(p.id, c"src_extent".as_ptr()) }
+            })
+        };
+        Ok(Self {
+            texture_src_extent_loc: src_extent(Some(&texture)),
+            yuv_src_extent_loc: src_extent(texture_yuv.as_ref()),
+            planar_src_extent_loc: src_extent(planar.as_ref()),
+            texture,
+            texture_yuv,
+            planar,
+            planar_2d,
+            yuyv_2d,
+            yuyv_2d_locs,
+            packed_rgba8_2d,
+            nv_r8,
+            nv_r8_uniforms,
+            nv_y2y,
+        })
+    }
+}
+
+/// Bind `tex` to unit 0 and resolve the YUYV program's uniforms, in the
+/// order `(src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub, src_extent)`.
+fn yuyv_2d_locs(p: &GlProgram) -> [i32; 8] {
+    // SAFETY: `p` is linked on this thread's current context; each name is a
+    // `c"..."` literal, a live NUL-terminated string for the call.
+    unsafe {
+        edgefirst_gl::gl::UseProgram(p.id);
+        let tex = edgefirst_gl::gl::GetUniformLocation(p.id, c"tex".as_ptr());
+        edgefirst_gl::gl::Uniform1i(tex, 0);
+        [
+            c"src_size",
+            c"y_offset",
+            c"y_scale",
+            c"c_vr",
+            c"c_ug",
+            c"c_vg",
+            c"c_ub",
+            c"src_extent",
+        ]
+        .map(|name| edgefirst_gl::gl::GetUniformLocation(p.id, name.as_ptr()))
+    }
 }
 
 /// Per-program uniform state for one `nv_r8` variant. Uniform values are
@@ -653,6 +809,21 @@ pub struct GLProcessorST {
     pub(super) owned_pbos: std::sync::Arc<OwnedPbos>,
     /// Uniform locations per float-path program (see [`FloatQuadLocs`]).
     pub(super) float_quad_locs: std::collections::HashMap<u32, FloatQuadLocs>,
+    /// Output mapping applied by `draw_float_quad` for the current convert.
+    pub(super) float_norm: FloatNorm,
+    /// The mapped int8 programs, with their `q_*` uniform locations, and the
+    /// uniforms they hold. Empty until the mapped build links.
+    int8_programs: Vec<(u32, [i32; 6])>,
+    int_quant: Option<IntQuant>,
+    /// Whether the int8 fields hold the mapped build.
+    int8_mapped: bool,
+    /// The int8 build not in use, once both exist.
+    int8_alt: Option<Int8Set>,
+    /// Letterbox clear bytes for the current integer convert, when mapped.
+    int_pad: Option<[u8; 4]>,
+    /// Whether that pad is an output-domain value, which a two-pass route
+    /// (pixel pad in pass 1, mapped in pass 2) cannot write.
+    int_pad_output: bool,
     /// Static full-screen quad VBOs `(pos, uv)` for the float paths,
     /// uploaded once (`STATIC_DRAW`) — previously `BufferData`-re-uploaded
     /// on every float draw. `0` = not yet created (lazy, on the first
@@ -862,11 +1033,9 @@ impl ImageProcessorTrait for GLProcessorST {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: Option<crate::ConvertOptions>,
     ) -> crate::Result<()> {
-        self.convert_inner(src, dst, rotation, flip, crop)?;
+        self.convert_inner(src, dst, &options.unwrap_or_default())?;
         // Recorded after every convert, deferred (batched) or not — see
         // `GlPlatform::record_completion`. A leaf with a device fence
         // flushes the GL work first so the recorded value covers it even
@@ -886,16 +1055,14 @@ impl ImageProcessorTrait for GLProcessorST {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: Option<crate::ConvertOptions>,
     ) -> Result<(), crate::Error> {
         // Render without the terminal `glFinish` (gated in `convert_to` by
         // `defer_finish`), leaving a single `finish_via_fence` owed at `flush`.
         // The flag resets unconditionally so a later standalone `convert` always
         // finishes; only a successful deferred render arms `pending_flush`.
         self.defer_finish = true;
-        let result = self.convert(src, dst, rotation, flip, crop);
+        let result = self.convert(src, dst, options);
         self.defer_finish = false;
         if result.is_ok() {
             self.pending_flush = true;
@@ -2029,53 +2196,24 @@ impl GLProcessorST {
             None
         };
 
-        let texture_int8_program =
-            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
-        // SAFETY: both programs linked above on this thread's current context,
-        // and `GetUniformLocation` reads a linked program without needing it
+        // The default build; the mapped one links on the first mapped convert.
+        let int8 = Int8Set::new(false, has_yuv_target)?;
+        // SAFETY: linked above on this thread's current context, and
+        // `GetUniformLocation` reads a linked program without needing it
         // current. The name is a `c"..."` literal, so the pointer is a live
         // NUL-terminated string for the call.
-        let texture_src_extent_locs = unsafe {
-            [&texture_program, &texture_int8_program]
-                .map(|p| edgefirst_gl::gl::GetUniformLocation(p.id, c"src_extent".as_ptr()))
-        };
-        let texture_int8_program_yuv = if Platform::EXTERNAL_OES {
-            Some(GlProgram::new(
-                generate_vertex_shader(),
-                generate_texture_int8_shader_yuv(),
-            )?)
-        } else {
-            None
-        };
+        let texture_src_extent_locs = [
+            unsafe {
+                edgefirst_gl::gl::GetUniformLocation(texture_program.id, c"src_extent".as_ptr())
+            },
+            int8.texture_src_extent_loc,
+        ];
 
         let yuyv_program_2d = GlProgram::new(
             generate_vertex_shader(),
             super::shaders_common::YUYV_RGBA_2D_FRAGMENT,
         )?;
-        let yuyv_int8_program_2d = GlProgram::new(
-            generate_vertex_shader(),
-            super::shaders_common::YUYV_RGBA_2D_INT8_FRAGMENT,
-        )?;
-        // SAFETY: both programs linked above on this thread's current
-        // context; each name is a `c"..."` literal, a live NUL-terminated
-        // string for the call.
-        let yuyv_2d_locs = [&yuyv_program_2d, &yuyv_int8_program_2d].map(|p| unsafe {
-            edgefirst_gl::gl::UseProgram(p.id);
-            // Constant sampler binding resolved at link (B6 pattern).
-            let tex = edgefirst_gl::gl::GetUniformLocation(p.id, c"tex".as_ptr());
-            edgefirst_gl::gl::Uniform1i(tex, 0);
-            [
-                c"src_size",
-                c"y_offset",
-                c"y_scale",
-                c"c_vr",
-                c"c_ug",
-                c"c_vg",
-                c"c_ub",
-                c"src_extent",
-            ]
-            .map(|name| edgefirst_gl::gl::GetUniformLocation(p.id, name.as_ptr()))
-        });
+        let yuyv_2d_locs = [yuyv_2d_locs(&yuyv_program_2d), int8.yuyv_2d_locs];
 
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
@@ -2121,49 +2259,33 @@ impl GLProcessorST {
         let color_program = GlProgram::new(generate_vertex_shader(), generate_color_shader())?;
         color_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
-        // Int8 variant of the existing planar RGB shader (for planar RGB int8 destinations).
-        let texture_program_planar_int8 = if Platform::EXTERNAL_OES {
-            Some(GlProgram::new(
-                generate_vertex_shader(),
-                generate_planar_rgb_int8_shader(),
-            )?)
-        } else {
-            None
-        };
-
         // SAFETY: each program, when present, was linked above on this
         // thread's current context; `GetUniformLocation` reads a linked
         // program without needing it current, and the name is a `c"..."`
         // literal.
-        let external_src_extent_locs = unsafe {
-            [
-                texture_program_yuv.as_ref(),
-                texture_int8_program_yuv.as_ref(),
-                texture_program_planar.as_ref(),
-                texture_program_planar_int8.as_ref(),
-            ]
-            .map(|p| {
-                p.map_or(-1, |p| {
-                    edgefirst_gl::gl::GetUniformLocation(p.id, c"src_extent".as_ptr())
-                })
+        let [yuv_loc, planar_loc] = [
+            texture_program_yuv.as_ref(),
+            texture_program_planar.as_ref(),
+        ]
+        .map(|p| {
+            p.map_or(-1, |p| unsafe {
+                edgefirst_gl::gl::GetUniformLocation(p.id, c"src_extent".as_ptr())
             })
-        };
+        });
+        let external_src_extent_locs = [
+            yuv_loc,
+            int8.yuv_src_extent_loc,
+            planar_loc,
+            int8.planar_src_extent_loc,
+        ];
 
         // Planar RGB shaders with sampler2D (for two-pass NV12→RGBA→PlanarRgb on Vivante)
         let texture_program_planar_2d =
             GlProgram::new(generate_vertex_shader(), generate_planar_rgb_shader_2d())?;
-        let texture_program_planar_int8_2d = GlProgram::new(
-            generate_vertex_shader(),
-            generate_planar_rgb_int8_shader_2d(),
-        )?;
 
         // RGB packing shaders (2D only — used in pass 2 of two-pass pipeline)
         let packed_rgba8_program_2d =
             GlProgram::new(generate_vertex_shader(), generate_packed_rgba8_shader_2d())?;
-        let packed_rgba8_int8_program_2d = GlProgram::new(
-            generate_vertex_shader(),
-            generate_packed_rgba8_int8_shader_2d(),
-        )?;
 
         // Float render programs. All four are full-viewport fragment shaders
         // driven by `gl_FragCoord`; the standard vertex shader emits a
@@ -2185,52 +2307,60 @@ impl GLProcessorST {
             GlProgram::new(generate_vertex_shader(), generate_float_rgba_shader())?;
 
         // Path B: NV12/NV16/NV24 → RGBA via R8 texelFetch shader (ES 3.0 core, no extension).
-        let nv_r8_programs = [
-            GlProgram::new(generate_vertex_shader(), generate_nv_to_rgba_shader_2d())?,
-            GlProgram::new(
-                generate_vertex_shader(),
-                generate_nv_to_rgba_int8_shader_2d(),
-            )?,
-            GlProgram::new(
-                generate_vertex_shader(),
-                generate_nv_to_rgba_bilinear_shader_2d(),
-            )?,
-            GlProgram::new(
-                generate_vertex_shader(),
-                generate_nv_to_rgba_bilinear_int8_shader_2d(),
-            )?,
-            GlProgram::new(
-                generate_vertex_shader(),
-                generate_nv_to_rgba_hw_bilinear_shader_2d(),
-            )?,
-            GlProgram::new(
-                generate_vertex_shader(),
-                generate_nv_to_rgba_hw_bilinear_int8_shader_2d(),
-            )?,
-        ];
+        let Int8Set {
+            texture: texture_int8_program,
+            texture_yuv: texture_int8_program_yuv,
+            planar: texture_program_planar_int8,
+            planar_2d: texture_program_planar_int8_2d,
+            yuyv_2d: yuyv_int8_program_2d,
+            packed_rgba8_2d: packed_rgba8_int8_program_2d,
+            nv_r8: [nv_int8, nv_bilinear_int8, nv_hw_bilinear_int8],
+            nv_r8_uniforms: [nv_int8_u, nv_bilinear_int8_u, nv_hw_bilinear_int8_u],
+            nv_y2y: y2y_int8,
+            ..
+        } = int8;
+        let [nv, nv_bilinear, nv_hw_bilinear] = [
+            generate_nv_to_rgba_shader_2d(),
+            generate_nv_to_rgba_bilinear_shader_2d(),
+            generate_nv_to_rgba_hw_bilinear_shader_2d(),
+        ]
+        .map(|src| GlProgram::new(generate_vertex_shader(), src));
+        let [nv, nv_bilinear, nv_hw_bilinear] = [nv?, nv_bilinear?, nv_hw_bilinear?];
         // Resolve uniform locations once at link time (the NV draw is per-frame)
         // and upload the constant sampler bindings while the programs are fresh:
         // pass-2 packing samples the intermediate on unit 1, planar-2d on unit 0.
-        let nv_r8_uniforms = nv_r8_programs.each_ref().map(NvUniformState::resolve);
+        let [nv_u, nv_bilinear_u, nv_hw_bilinear_u] =
+            [&nv, &nv_bilinear, &nv_hw_bilinear].map(NvUniformState::resolve);
+        let nv_r8_programs = [
+            nv,
+            nv_int8,
+            nv_bilinear,
+            nv_bilinear_int8,
+            nv_hw_bilinear,
+            nv_hw_bilinear_int8,
+        ];
+        let nv_r8_uniforms = [
+            nv_u,
+            nv_int8_u,
+            nv_bilinear_u,
+            nv_bilinear_int8_u,
+            nv_hw_bilinear_u,
+            nv_hw_bilinear_int8_u,
+        ];
         let nv_y2y_programs = if has_yuv_target {
-            let programs = [
+            match (
                 GlProgram::new(generate_vertex_shader(), generate_nv_to_rgba_y2y_shader()),
-                GlProgram::new(
-                    generate_vertex_shader(),
-                    generate_nv_to_rgba_y2y_int8_shader(),
-                ),
-            ];
-            match programs {
-                [Ok(u8_program), Ok(int8_program)] => {
-                    let programs = [u8_program, int8_program];
-                    let uniforms = programs.each_ref().map(NvUniformState::resolve);
-                    Some((programs, uniforms))
+                y2y_int8,
+            ) {
+                (Ok(u8_program), Some((int8_program, int8_uniforms))) => {
+                    let u8_uniforms = NvUniformState::resolve(&u8_program);
+                    Some(([u8_program, int8_program], [u8_uniforms, int8_uniforms]))
                 }
-                [a, b] => {
+                (a, _) => {
                     log::info!(
                         "GL_EXT_YUV_target present but the Y2Y NV programs did not build \
                          ({:?}); bilinear NV resizes of imports filter in the shader",
-                        a.err().or(b.err())
+                        a.err()
                     );
                     None
                 }
@@ -2239,9 +2369,7 @@ impl GLProcessorST {
             None
         };
         packed_rgba8_program_2d.load_uniform_1i(c"tex", 1)?;
-        packed_rgba8_int8_program_2d.load_uniform_1i(c"tex", 1)?;
         texture_program_planar_2d.load_uniform_1i(c"tex", 0)?;
-        texture_program_planar_int8_2d.load_uniform_1i(c"tex", 0)?;
 
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
@@ -2398,6 +2526,13 @@ impl GLProcessorST {
             nv_import_warned: std::collections::HashSet::new(),
             owned_pbos: Default::default(),
             float_quad_locs: std::collections::HashMap::new(),
+            float_norm: FloatNorm::IDENTITY,
+            int8_programs: Vec::new(),
+            int8_mapped: false,
+            int8_alt: None,
+            int_quant: None,
+            int_pad: None,
+            int_pad_output: false,
             float_quad_pos_vbo: 0,
             float_quad_uv_vbo: 0,
             nv_path_pref,
@@ -2689,10 +2824,13 @@ impl GLProcessorST {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: &crate::ConvertOptions,
     ) -> crate::Result<()> {
+        let (rotation, flip, crop) = (
+            options.get_rotation(),
+            options.get_flip(),
+            options.get_crop(),
+        );
         // A view()/batch() destination is lowered to a glViewport/scissor band
         // only on the u8/i8 DMA packed path (see `setup_renderbuffer_dma` +
         // `convert_to`). For any other GL destination — a non-DMA CPU upload, a
@@ -2719,7 +2857,54 @@ impl GLProcessorST {
             src.height().unwrap_or(0),
             dst.width().unwrap_or(0),
             dst.height().unwrap_or(0),
+            options.get_placement(),
         )?;
+        let mapping = crate::options::output_map_for(options, dst, crop.dst_rect.is_some())?;
+        let pad_output = mapping.as_ref().and_then(|(_, p)| *p);
+        let mut crop = crop;
+        let mut pad_output_exact = false;
+        self.float_norm = FloatNorm::IDENTITY;
+        self.int_pad = None;
+        self.int_pad_output = false;
+        let mut int_mapped = false;
+        if let Some((map, pad_output)) = &mapping {
+            let pad = crop.dst_color.map(|p| map.pad_values(p, *pad_output));
+            if map.bounds.is_some() {
+                // The int8 programs work in RGB order; Bgra swaps on readback.
+                if dst.format() == Some(PixelFormat::Bgra) {
+                    return Err(Error::NotSupported(
+                        "GL integer output mapping of Bgra; CPU fallback".into(),
+                    ));
+                }
+                self.use_int8_set(true)?;
+                self.load_int_quant(IntQuant::from_map(map))?;
+                self.int_pad = pad.map(|v| v.map(|x| x as i32 as u8));
+                int_mapped = true;
+                // An output pad that some sample maps to exactly is that pixel
+                // pad, which every route (two-pass included) can render.
+                if let (Some(p), Some([_, _, _, a])) = (pad, crop.dst_color) {
+                    let samples = [
+                        map.sample_for(0, p[0]),
+                        map.sample_for(1, p[1]),
+                        map.sample_for(2, p[2]),
+                    ];
+                    if let [Some(sr), Some(sg), Some(sb)] = samples {
+                        crop.dst_color = Some([sr, sg, sb, a]);
+                        pad_output_exact = true;
+                    }
+                }
+            } else {
+                // The float shaders sample in [0, 1]; the map is per 8-bit value.
+                self.float_norm = FloatNorm {
+                    scale: map.scale.map(|s| s * 255.0),
+                    offset: map.offset,
+                    pad,
+                };
+            }
+        }
+        if !int_mapped && dst.dtype() == edgefirst_tensor::DType::I8 {
+            self.use_int8_set(false)?;
+        }
 
         // F16/F32 destination: check for a GL float render path BEFORE the u8
         // extraction functions reject the dtype. When a path is found, dispatch
@@ -2838,7 +3023,10 @@ impl GLProcessorST {
                         )
                     };
                 }
-                FloatRenderPath::PboF16Nchw | FloatRenderPath::PboF32Nhwc => {
+                FloatRenderPath::PboF16Nchw
+                | FloatRenderPath::PboF32Nhwc
+                | FloatRenderPath::PboF32Nchw
+                | FloatRenderPath::PboF16Nhwc => {
                     let _span = Self::enter_image_convert_gl_span(
                         src_fmt,
                         dst_fmt,
@@ -2872,6 +3060,9 @@ impl GLProcessorST {
 
         let (src_u8, src_fmt) = dyn_to_u8_src(src)?;
         let (dst_u8, dst_fmt, is_int8) = dyn_to_u8_dst(dst)?;
+        // A mapped u8 destination renders through the int8 programs too.
+        let is_int8 = is_int8 || int_mapped;
+        self.int_pad_output = int_mapped && pad_output.is_some() && !pad_output_exact;
 
         let result = self.convert_impl(
             src_u8, src_fmt, dst_u8, dst_fmt, is_int8, rotation, flip, crop,
@@ -2911,12 +3102,10 @@ impl GLProcessorST {
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
+        options: crate::ConvertOptions,
     ) -> Result<Option<super::CompletionFence>, crate::Error> {
         self.defer_finish = true;
-        let result = self.convert_inner(src, dst, rotation, flip, crop);
+        let result = self.convert_inner(src, dst, &options);
         self.defer_finish = false;
         result?;
         // One flush and one signal for the whole call: the value recorded on
@@ -3243,7 +3432,7 @@ impl GLProcessorST {
         // Bias the letterbox clear colour for int8 on every lowering: the
         // fragment shader XORs rendered pixels and no readback un-biases,
         // so the glClear'd letterbox region must be pre-biased.
-        let crop = Self::int8_bias_clear(is_int8, crop);
+        let crop = self.int8_bias_clear(is_int8, crop);
 
         let start = Instant::now();
         self.render_packed_or_planar(
@@ -3642,10 +3831,11 @@ impl GLProcessorST {
                     | PixelFormat::Bgra
                     | PixelFormat::Grey
                     | PixelFormat::PlanarRgb
+                    | PixelFormat::PlanarRgba
                     | PixelFormat::Rgb
             )
         } else {
-            // PlanarRgb into heap (`Mem`) or `Pbo` memory routes through
+            // Planar RGB(A) into heap (`Mem`) or `Pbo` memory routes through
             // `plan_convert`'s two-pass plan (`TwoPassNvPlanar`, selected
             // for every source format on a texture lowering — see its doc),
             // not the single-pass planar shader: that shader needs
@@ -3653,9 +3843,7 @@ impl GLProcessorST {
             // DMA-importable source. `readback_rendered` recovers the
             // single-channel (R8) render target — full dst_w, `channels`
             // planes stacked in height, no multi-byte-per-texel packing —
-            // into the destination's CHW layout. PlanarRgba stays
-            // unsupported here — no readback geometry has been proven for a
-            // 4th plane.
+            // into the destination's CHW layout.
             matches!(
                 fmt,
                 PixelFormat::Rgb
@@ -3663,6 +3851,7 @@ impl GLProcessorST {
                     | PixelFormat::Bgra
                     | PixelFormat::Grey
                     | PixelFormat::PlanarRgb
+                    | PixelFormat::PlanarRgba
             )
         }
     }
@@ -4017,8 +4206,8 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
-        let (width, height) = if dst_fmt == PixelFormat::PlanarRgb {
-            (dst_w as i32, (dst_h * 3) as i32)
+        let (width, height) = if dst_fmt.layout() == PixelLayout::Planar {
+            (dst_w as i32, (dst_h * dst_fmt.channels()) as i32)
         } else {
             (dst_w as i32, dst_h as i32)
         };
@@ -4109,8 +4298,8 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
-        let (width, height) = if dst_fmt == PixelFormat::PlanarRgb {
-            (dst_w as i32, (dst_h * 3) as i32)
+        let (width, height) = if dst_fmt.layout() == PixelLayout::Planar {
+            (dst_w as i32, (dst_h * dst_fmt.channels()) as i32)
         } else {
             (dst_w as i32, dst_h as i32)
         };
@@ -4166,11 +4355,194 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Bias a letterbox clear colour by XOR 0x80 for int8 destinations, since
-    /// `glClear` bypasses the shader that otherwise applies the bias. No-op when
-    /// not int8 or when there is no fill colour. Shared by every destination path.
-    fn int8_bias_clear(is_int8: bool, mut crop: ResolvedCrop) -> ResolvedCrop {
-        if is_int8 {
+    /// The int8 programs, whose `quantize()` uniforms `load_int_quant` sets,
+    /// with their `quantize()` uniform locations in [`Self::upload_quant`] order.
+    fn collect_int8_programs(&self) -> Vec<(u32, [i32; 6])> {
+        let mut ids = vec![
+            self.texture_int8_program.id,
+            self.yuyv_int8_program_2d.id,
+            self.packed_rgba8_int8_program_2d.id,
+            self.texture_program_planar_int8_2d.id,
+        ];
+        ids.extend(self.texture_int8_program_yuv.iter().map(|p| p.id));
+        ids.extend(self.texture_program_planar_int8.iter().map(|p| p.id));
+        // `NvSampling::program`: u8 at even indices, int8 at odd.
+        ids.extend(self.nv_r8_programs.iter().skip(1).step_by(2).map(|p| p.id));
+        if let Some((programs, _)) = &self.nv_y2y_programs {
+            ids.push(programs[1].id);
+        }
+        ids.into_iter()
+            .map(|id| {
+                // SAFETY: on the GL thread with this processor's context
+                // current; `id` is a linked program and the names C literals.
+                let locs = [
+                    c"q_scale",
+                    c"q_offset",
+                    c"q_lo",
+                    c"q_hi",
+                    c"q_zero",
+                    c"q_wrap",
+                ]
+                .map(|name| unsafe { edgefirst_gl::gl::GetUniformLocation(id, name.as_ptr()) });
+                (id, locs)
+            })
+            .collect()
+    }
+
+    /// Upload `q` to one program's `quantize()` uniforms, with the rounding
+    /// and zero point folded in so the shader costs what the plain bias did.
+    ///
+    /// # Safety
+    /// On the GL thread with this processor's context current and `id` bound.
+    unsafe fn upload_quant(locs: &[i32; 6], q: &IntQuant) {
+        let offset = q.offset.map(|o| o + 0.5);
+        let lo: [f32; 3] = std::array::from_fn(|c| q.lo[c] - q.zero[c]);
+        let hi: [f32; 3] = std::array::from_fn(|c| q.hi[c] - q.zero[c]);
+        let zero = q.zero.map(|z| z / 255.0);
+        let wrap = q.zero.map(|z| -z - 0.5);
+        for (loc, v) in locs.iter().zip([&q.scale, &offset, &lo, &hi, &zero, &wrap]) {
+            // SAFETY: the caller's contract.
+            unsafe { edgefirst_gl::gl::Uniform3fv(*loc, 1, v.as_ptr()) };
+        }
+    }
+
+    /// Put the mapped int8 build in the int8 fields when `mapped`, else the
+    /// default one, linking the mapped build on first use. The default build
+    /// has the plain bias in literals, which Vivante runs measurably faster
+    /// than the uniforms.
+    fn use_int8_set(&mut self, mapped: bool) -> crate::Result<()> {
+        if self.int8_mapped == mapped {
+            return Ok(());
+        }
+        let mut alt = match self.int8_alt.take() {
+            Some(alt) => alt,
+            None => {
+                let set = Int8Set::new(true, self.nv_y2y_programs.is_some())?;
+                if set.nv_y2y.is_none() && self.nv_y2y_programs.take().is_some() {
+                    log::info!(
+                        "the mapped int8 Y2Y program did not build; NV filters in the shader"
+                    );
+                }
+                set
+            }
+        };
+        self.swap_int8_set(&mut alt);
+        self.int8_alt = Some(alt);
+        self.int8_mapped = mapped;
+        if mapped && self.int8_programs.is_empty() {
+            self.int8_programs = self.collect_int8_programs();
+        }
+        Ok(())
+    }
+
+    /// Exchange the int8 programs and their link-time state with `set`.
+    fn swap_int8_set(&mut self, set: &mut Int8Set) {
+        use std::mem::swap;
+        swap(&mut self.texture_int8_program, &mut set.texture);
+        swap(&mut self.texture_int8_program_yuv, &mut set.texture_yuv);
+        swap(&mut self.texture_program_planar_int8, &mut set.planar);
+        swap(&mut self.texture_program_planar_int8_2d, &mut set.planar_2d);
+        swap(&mut self.yuyv_int8_program_2d, &mut set.yuyv_2d);
+        swap(&mut self.yuyv_2d_locs[1], &mut set.yuyv_2d_locs);
+        swap(
+            &mut self.packed_rgba8_int8_program_2d,
+            &mut set.packed_rgba8_2d,
+        );
+        for (i, (program, uniforms)) in set
+            .nv_r8
+            .iter_mut()
+            .zip(set.nv_r8_uniforms.iter_mut())
+            .enumerate()
+        {
+            swap(&mut self.nv_r8_programs[2 * i + 1], program);
+            swap(&mut self.nv_r8_uniforms[2 * i + 1], uniforms);
+        }
+        if let (Some((programs, uniforms)), Some((program, u))) =
+            (self.nv_y2y_programs.as_mut(), set.nv_y2y.as_mut())
+        {
+            swap(&mut programs[1], program);
+            swap(&mut uniforms[1], u);
+        }
+        swap(
+            &mut self.texture_src_extent_locs[1],
+            &mut set.texture_src_extent_loc,
+        );
+        swap(
+            &mut self.external_src_extent_locs[1],
+            &mut set.yuv_src_extent_loc,
+        );
+        swap(
+            &mut self.external_src_extent_locs[3],
+            &mut set.planar_src_extent_loc,
+        );
+    }
+
+    /// Upload `q` to every mapped int8 program, unless they already hold it.
+    /// Uniforms are per-program state, so the draws need no change.
+    fn load_int_quant(&mut self, q: IntQuant) -> crate::Result<()> {
+        if self.int_quant == Some(q) {
+            return Ok(());
+        }
+        // SAFETY: on the GL thread with this processor's context current; the
+        // ids are programs this processor linked and still owns.
+        unsafe {
+            let mut current = 0i32;
+            edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::CURRENT_PROGRAM, &mut current);
+            for (id, locs) in &self.int8_programs {
+                edgefirst_gl::gl::UseProgram(*id);
+                Self::upload_quant(locs, &q);
+            }
+            edgefirst_gl::gl::UseProgram(current as u32);
+            check_gl_error(function!(), line!())?;
+        }
+        self.int_quant = Some(q);
+        Ok(())
+    }
+
+    /// Point a mapped int8 `program`'s `quantize()` at one plane's colour
+    /// channel, for the planar draws that swizzle each plane's channel into
+    /// `.r`; `None` restores the loaded per-channel uniforms. A no-op for
+    /// other programs and for coefficients equal across channels.
+    ///
+    /// # Safety
+    /// On the GL thread with this processor's context current and `program`
+    /// bound.
+    unsafe fn set_plane_quant(&self, program: u32, plane: Option<usize>) {
+        let Some(q) = self.int_quant else {
+            return;
+        };
+        let same = |v: &[f32; 3]| v.iter().all(|&x| x == v[0]);
+        if [&q.scale, &q.offset, &q.zero, &q.lo, &q.hi]
+            .into_iter()
+            .all(same)
+        {
+            return;
+        }
+        let Some((_, locs)) = self.int8_programs.iter().find(|(p, _)| *p == program) else {
+            return;
+        };
+        let q = match plane {
+            Some(p) if p < 3 => IntQuant {
+                scale: [q.scale[p]; 3],
+                offset: [q.offset[p]; 3],
+                zero: [q.zero[p]; 3],
+                lo: [q.lo[p]; 3],
+                hi: [q.hi[p]; 3],
+            },
+            _ => q,
+        };
+        // SAFETY: the caller's contract; `program` is bound.
+        unsafe { Self::upload_quant(locs, &q) };
+    }
+
+    /// The letterbox clear colour for integer destinations, since `glClear`
+    /// bypasses the shader that otherwise maps the output: the mapped pad of
+    /// the current convert, else the plain XOR 0x80 for int8. No-op when there
+    /// is no fill colour. Shared by every destination path.
+    fn int8_bias_clear(&self, is_int8: bool, mut crop: ResolvedCrop) -> ResolvedCrop {
+        if let (Some(color), Some(pad)) = (crop.dst_color.as_mut(), self.int_pad) {
+            *color = pad;
+        } else if is_int8 {
             if let Some(ref mut color) = crop.dst_color {
                 color[0] ^= 0x80;
                 color[1] ^= 0x80;
@@ -4463,17 +4835,16 @@ impl GLProcessorST {
             // texel — NOT a multi-byte-per-texel pack), dst_h stacked
             // `channels` times. CHW planes are contiguous in row-major
             // order, so a single-channel readback at that geometry lands
-            // directly in the destination's CHW byte layout. PlanarRgba is
-            // NOT covered — no 4th-plane readback geometry proven yet.
-            PixelFormat::PlanarRgb => edgefirst_gl::gl::RED,
+            // directly in the destination's CHW byte layout.
+            PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => edgefirst_gl::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
                     "GL readback not supported for {dst_fmt}"
                 )))
             }
         };
-        let read_h = if dst_fmt == PixelFormat::PlanarRgb {
-            dst_h * 3
+        let read_h = if dst_fmt.layout() == PixelLayout::Planar {
+            dst_h * dst_fmt.channels()
         } else {
             dst_h
         };
@@ -5575,7 +5946,6 @@ impl GLProcessorST {
                 self.clear_rect_planar(
                     dst_w,
                     dst_h,
-                    dst_roi,
                     [
                         dst_color[0] as f32 / 255.0,
                         dst_color[1] as f32 / 255.0,
@@ -5643,6 +6013,12 @@ impl GLProcessorST {
         crop: ResolvedCrop,
         convert_span: &tracing::Span,
     ) -> crate::Result<()> {
+        if self.int_pad_output {
+            return Err(Error::NotSupported(
+                "GL two-pass integer convert cannot write an output-domain pad; CPU fallback"
+                    .into(),
+            ));
+        }
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
@@ -5831,6 +6207,12 @@ impl GLProcessorST {
         lowering: super::render::DstLowering,
         convert_span: &tracing::Span,
     ) -> crate::Result<()> {
+        if self.int_pad_output {
+            return Err(Error::NotSupported(
+                "GL two-pass integer convert cannot write an output-domain pad; CPU fallback"
+                    .into(),
+            ));
+        }
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
@@ -5893,12 +6275,12 @@ impl GLProcessorST {
         pass1?;
         drop(_pass1);
 
-        // --- Pass 2: RGBA→PlanarRgb into the classified destination ---
+        // --- Pass 2: RGBA→planar into the classified destination ---
         // bind_dst rebinds convert_fbo with the destination target (DMA
         // EGLImage — zero-copy, no readback needed — or a texture backed by
         // the Mem/Pbo readback below), replacing packed_rgb_fbo that was
         // active during pass 1. It also sets the viewport to
-        // (dst_w, dst_h * 3) for the tall R8 planar target.
+        // (dst_w, dst_h * planes) for the tall R8 planar target.
         let _pass2 = tracing::trace_span!(
             "image.convert.gl.nv_to_planar.pass2_deinterleave",
             dst_w,
@@ -6015,32 +6397,28 @@ impl GLProcessorST {
         Ok(())
     }
 
+    /// Fill each plane of the `(width, split * height)` planar target with
+    /// its pad value before the content is drawn over it. Plane `i` is the
+    /// framebuffer band of rows `[i * height, (i + 1) * height)` (the draws
+    /// start from the bottom).
     fn clear_rect_planar(
         &self,
         width: usize,
         height: usize,
-        dst_roi: RegionOfInterest,
         color: [f32; 4],
         alpha: bool,
     ) -> Result<(), Error> {
-        if !alpha && color[0] == color[1] && color[1] == color[2] {
-            unsafe {
+        let split = if alpha { 4 } else { 3 };
+        // SAFETY: on the GL thread with the planar target bound.
+        unsafe {
+            if color[..split].iter().all(|&c| c == color[0]) {
                 edgefirst_gl::gl::ClearColor(color[0], color[0], color[0], 1.0);
                 edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
-            };
-        }
-
-        let split = if alpha { 4 } else { 3 };
-
-        unsafe {
+                return Ok(());
+            }
             edgefirst_gl::gl::Enable(edgefirst_gl::gl::SCISSOR_TEST);
-            let x = (((dst_roi.left + 1.0) / 2.0) * width as f32).round() as i32;
-            let y = (((dst_roi.bottom + 1.0) / 2.0) * height as f32).round() as i32;
-            let width = (((dst_roi.right - dst_roi.left) / 2.0) * width as f32).round() as i32;
-            let height = (((dst_roi.top - dst_roi.bottom) / 2.0) * height as f32 / split as f32)
-                .round() as i32;
             for (i, c) in color.iter().enumerate().take(split) {
-                edgefirst_gl::gl::Scissor(x, y + i as i32 * height, width, height);
+                edgefirst_gl::gl::Scissor(0, (i * height) as i32, width as i32, height as i32);
                 edgefirst_gl::gl::ClearColor(*c, *c, *c, 1.0);
                 edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
             }
@@ -6085,6 +6463,7 @@ impl GLProcessorST {
             Error::NotSupported("external-OES planar program unavailable on this platform".into())
         })?
         .id;
+        let raw_alpha_id = self.texture_program_planar.as_ref().map_or(0, |p| p.id);
         unsafe {
             edgefirst_gl::gl::UseProgram(program_id);
             let [e0, e1, e2, e3] = src_extent;
@@ -6125,6 +6504,7 @@ impl GLProcessorST {
             } else {
                 vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
             };
+            let planes = y_centers.len() as f32;
             let swizzles = [
                 edgefirst_gl::gl::RED,
                 edgefirst_gl::gl::GREEN,
@@ -6137,16 +6517,16 @@ impl GLProcessorST {
                 edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let camera_vertices: [f32; 12] = [
                     dst_roi.left,
-                    dst_roi.top / 3.0 + y_center,
+                    dst_roi.top / planes + y_center,
                     0., // left top
                     dst_roi.right,
-                    dst_roi.top / 3.0 + y_center,
+                    dst_roi.top / planes + y_center,
                     0., // right top
                     dst_roi.right,
-                    dst_roi.bottom / 3.0 + y_center,
+                    dst_roi.bottom / planes + y_center,
                     0., // right bottom
                     dst_roi.left,
-                    dst_roi.bottom / 3.0 + y_center,
+                    dst_roi.bottom / planes + y_center,
                     0., // left bottom
                 ];
                 edgefirst_gl::gl::BufferData(
@@ -6195,6 +6575,21 @@ impl GLProcessorST {
                     edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                     swizzles[i] as i32,
                 );
+                if int8 && i == 3 {
+                    // Integer alpha stays the raw byte: the u8 program draws it.
+                    self.set_plane_quant(program_id, None);
+                    edgefirst_gl::gl::UseProgram(raw_alpha_id);
+                    let [e0, e1, e2, e3] = src_extent;
+                    edgefirst_gl::gl::Uniform4f(
+                        self.external_src_extent_loc(false, true),
+                        e0,
+                        e1,
+                        e2,
+                        e3,
+                    );
+                } else {
+                    self.set_plane_quant(program_id, Some(i));
+                }
 
                 edgefirst_gl::gl::DrawElements(
                     edgefirst_gl::gl::TRIANGLE_FAN,
@@ -6202,6 +6597,9 @@ impl GLProcessorST {
                     edgefirst_gl::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
+            }
+            if !(int8 && alpha) {
+                self.set_plane_quant(program_id, None);
             }
             // Reset the texture swizzle to identity before returning. The
             // loop above left `TEXTURE_SWIZZLE_R` pointing at the last
@@ -6259,6 +6657,7 @@ impl GLProcessorST {
             } else {
                 vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
             };
+            let planes = y_centers.len() as f32;
             let swizzles = [
                 edgefirst_gl::gl::RED,
                 edgefirst_gl::gl::GREEN,
@@ -6279,16 +6678,16 @@ impl GLProcessorST {
                 edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let camera_vertices: [f32; 12] = [
                     dst_roi.left,
-                    dst_roi.top / 3.0 + y_center,
+                    dst_roi.top / planes + y_center,
                     0., // left top
                     dst_roi.right,
-                    dst_roi.top / 3.0 + y_center,
+                    dst_roi.top / planes + y_center,
                     0., // right top
                     dst_roi.right,
-                    dst_roi.bottom / 3.0 + y_center,
+                    dst_roi.bottom / planes + y_center,
                     0., // right bottom
                     dst_roi.left,
-                    dst_roi.bottom / 3.0 + y_center,
+                    dst_roi.bottom / planes + y_center,
                     0., // left bottom
                 ];
                 edgefirst_gl::gl::BufferData(
@@ -6328,6 +6727,13 @@ impl GLProcessorST {
                     edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                     swizzles[i] as i32,
                 );
+                if int8 && i == 3 {
+                    // Integer alpha stays the raw byte: the u8 program draws it.
+                    self.set_plane_quant(program.id, None);
+                    edgefirst_gl::gl::UseProgram(self.texture_program_planar_2d.id);
+                } else {
+                    self.set_plane_quant(program.id, Some(i));
+                }
 
                 edgefirst_gl::gl::DrawElements(
                     edgefirst_gl::gl::TRIANGLE_FAN,
@@ -6335,6 +6741,9 @@ impl GLProcessorST {
                     edgefirst_gl::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
+            }
+            if !(int8 && alpha) {
+                self.set_plane_quant(program.id, None);
             }
             // Reset the texture swizzle to identity (see the matching
             // comment in `draw_camera_texture_to_rgb_planar` above). This
@@ -9263,12 +9672,27 @@ impl GLProcessorST {
         pass1?;
 
         // ── Pass 2: 1:1 pack of the intermediate into the zero-copy float
-        // destination. NO crop here: pass 1 already placed the content band
-        // and padding at destination geometry — re-applying the crop would
-        // letterbox a second time (the PR #107 bug class; see
-        // convert_nv_to_planar_two_pass pass 2).
-        let (src_rect_uv, dst_rect_px, pad_color) =
+        // destination. Pass 1 already placed the content band at destination
+        // geometry, so pass 2 samples its letterbox rectangle 1:1 from the
+        // same rectangle of the intermediate (re-applying the crop's scaling
+        // would letterbox a second time, the PR #107 bug class) and writes the
+        // pad outside it, which is what an output-domain pad needs.
+        let (mut src_rect_uv, mut dst_rect_px, mut pad_color) =
             super::core::float_crop_uniforms(&ResolvedCrop::no_crop(), dst_w, dst_h, dst_w, dst_h)?;
+        // The pixel pad in sampler units; a mapped convert's `FloatNorm::pad`
+        // replaces it in `draw_float_quad`.
+        if let Some(c) = crop.dst_color {
+            pad_color = c.map(|v| v as f32 / 255.0);
+        }
+        if let Some(r) = crop.dst_rect {
+            dst_rect_px = [r.left as f32, r.top as f32, r.width as f32, r.height as f32];
+            src_rect_uv = [
+                r.left as f32 / dst_w as f32,
+                r.top as f32 / dst_h as f32,
+                r.width as f32 / dst_w as f32,
+                r.height as f32 / dst_h as f32,
+            ];
+        }
         // The intermediate texture is exactly the pass-1 destination.
         let src_extent =
             super::render::sample_clamp_rect((dst_w, dst_h), super::render::ImportMap::WHOLE);

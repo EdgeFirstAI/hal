@@ -494,6 +494,8 @@ impl GLProcessorST {
                     dst_rect_px: loc(c"dst_rect_px"),
                     pad_color: loc(c"pad_color"),
                     dst_image_size: loc(c"dst_image_size"),
+                    norm_scale: loc(c"norm_scale"),
+                    norm_offset: loc(c"norm_offset"),
                 }
             });
         let (pos_vbo, uv_vbo) = self.ensure_float_quad_vbos();
@@ -525,6 +527,8 @@ impl GLProcessorST {
                 dst_rect_px[2],
                 dst_rect_px[3],
             );
+            let norm = self.float_norm;
+            let pad_color = norm.pad.unwrap_or(pad_color);
             edgefirst_gl::gl::Uniform4f(
                 locs.pad_color,
                 pad_color[0],
@@ -532,6 +536,9 @@ impl GLProcessorST {
                 pad_color[2],
                 pad_color[3],
             );
+            // Always set: an unset uniform reads as zero.
+            edgefirst_gl::gl::Uniform4fv(locs.norm_scale, 1, norm.scale.as_ptr());
+            edgefirst_gl::gl::Uniform4fv(locs.norm_offset, 1, norm.offset.as_ptr());
             if let Some((w, h)) = dst_image_size {
                 edgefirst_gl::gl::Uniform2f(locs.dst_image_size, w, h);
             }
@@ -676,11 +683,17 @@ impl GLProcessorST {
                 edgefirst_gl::gl::FLOAT,
                 4,
             ),
-            FloatRenderPath::PboF16Nchw => (
+            FloatRenderPath::PboF16Nchw | FloatRenderPath::PboF16Nhwc => (
                 edgefirst_gl::gl::RGBA16F,
                 edgefirst_gl::gl::RGBA,
                 edgefirst_gl::gl::HALF_FLOAT,
                 8,
+            ),
+            FloatRenderPath::PboF32Nchw => (
+                edgefirst_gl::gl::RGBA32F,
+                edgefirst_gl::gl::RGBA,
+                edgefirst_gl::gl::FLOAT,
+                16,
             ),
             // The zero-copy variants and `None` are not PBO paths;
             // `convert()` never routes them here (see the match in
@@ -691,9 +704,7 @@ impl GLProcessorST {
             | FloatRenderPath::ZeroCopyFloatRgba
             | FloatRenderPath::None => {
                 return Err(crate::Error::NotSupported(
-                    "GL float render-to-PBO: only PBO F32 NHWC / F16 NCHW are implemented; \
-                     using CPU fallback"
-                        .to_string(),
+                    "GL float render-to-PBO: not a PBO path; using CPU fallback".to_string(),
                 ));
             }
         };
@@ -749,6 +760,22 @@ impl GLProcessorST {
                 })?;
                 (layout.surface_w, layout.surface_h)
             }
+            FloatRenderPath::PboF32Nchw => packed_planar_layout(dst_w as u32, dst_h as u32, 3)
+                .map(|(w, h)| (w as usize, h as usize))
+                .ok_or_else(|| {
+                    crate::Error::NotSupported(format!(
+                        "GL float render-to-PBO: F32 NCHW requires width divisible by 4, \
+                         got {dst_w}; using CPU fallback"
+                    ))
+                })?,
+            FloatRenderPath::PboF16Nhwc => packed_interleaved_layout(dst_w as u32, dst_h as u32)
+                .map(|(w, h)| (w as usize, h as usize))
+                .ok_or_else(|| {
+                    crate::Error::NotSupported(format!(
+                        "GL float render-to-PBO: F16 NHWC requires width divisible by 4, \
+                         got {dst_w}; using CPU fallback"
+                    ))
+                })?,
             _ => unreachable!(),
         };
 
@@ -782,14 +809,16 @@ impl GLProcessorST {
 
         let program_id = match path {
             FloatRenderPath::PboF32Nhwc => self.float_f32_nhwc_program.id,
-            FloatRenderPath::PboF16Nchw => self.float_f16_nchw_program.id,
+            FloatRenderPath::PboF16Nchw | FloatRenderPath::PboF32Nchw => {
+                self.float_f16_nchw_program.id
+            }
+            FloatRenderPath::PboF16Nhwc => self.float_nhwc_pack_program.id,
             _ => unreachable!(),
         };
-        // F32 shader samples `u_tex`; F16 shader samples `src`.
+        // The R32F shader samples `u_tex`; the packed shaders sample `src`.
         let sampler_name: &CStr = match path {
             FloatRenderPath::PboF32Nhwc => c"u_tex",
-            FloatRenderPath::PboF16Nchw => c"src",
-            _ => unreachable!(),
+            _ => c"src",
         };
 
         let render_tex_id = self.float_render_texture.id;
@@ -864,7 +893,9 @@ impl GLProcessorST {
 
         // ── Render the full-screen quad with the float program (shared) ──
         let dst_image_size = match path {
-            FloatRenderPath::PboF16Nchw => Some((dst_w as f32, dst_h as f32)),
+            FloatRenderPath::PboF16Nchw | FloatRenderPath::PboF32Nchw => {
+                Some((dst_w as f32, dst_h as f32))
+            }
             _ => None,
         };
         self.draw_float_quad(

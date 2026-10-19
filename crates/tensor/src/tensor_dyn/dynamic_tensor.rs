@@ -353,25 +353,7 @@ impl<T: Element> Tensor<T> {
     /// plane 0, or that plane carries no native fd.
     #[cfg(target_os = "linux")]
     pub fn dmabuf(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
-        if self.inner.memory() != TensorMemory::DmaBuf {
-            return Err(Error::NotImplemented(format!(
-                "dmabuf requires DMA-backed tensor, got {:?}",
-                self.inner.memory()
-            )));
-        }
-        let plane = self
-            .inner
-            .plane0()
-            .ok_or_else(|| Error::NotImplemented("dmabuf: this tensor has no plane 0".into()))?;
-        if plane.handle < 0 {
-            return Err(Error::NotImplemented(
-                "dmabuf: this tensor has no native fd (not DMA-backed)".into(),
-            ));
-        }
-        // SAFETY: `plane.handle` is a valid fd owned by this tensor (via the
-        // live handle behind `self.inner`) for at least as long as `self`
-        // is borrowed.
-        Ok(unsafe { std::os::fd::BorrowedFd::borrow_raw(plane.handle as i32) })
+        self.inner.dmabuf()
     }
 
     /// Borrow the raw `IOSurfaceRef` backing this tensor (macOS/iOS).
