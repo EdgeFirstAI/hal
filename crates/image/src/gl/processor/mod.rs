@@ -4363,7 +4363,8 @@ impl GLProcessorST {
     /// Point the bound int8 program's `quantize()` at one plane's channel, for
     /// the planar draws that swizzle each plane's channel into `.r`; `None`
     /// restores the loaded per-channel uniforms. The alpha plane stays the
-    /// raw byte. A no-op for other programs and per-tensor coefficients.
+    /// raw byte. A no-op for other programs and for coefficients equal across
+    /// channels.
     ///
     /// # Safety
     /// On the GL thread with this processor's context current.
@@ -4371,8 +4372,10 @@ impl GLProcessorST {
         let Some(q) = self.int_quant else {
             return;
         };
-        let uniform =
-            q.scale.iter().all(|&v| v == q.scale[0]) && q.offset.iter().all(|&v| v == q.offset[0]);
+        let same = |v: &[f32; 3]| v.iter().all(|&x| x == v[0]);
+        let uniform = [&q.scale, &q.offset, &q.zero, &q.lo, &q.hi]
+            .into_iter()
+            .all(same);
         if uniform && plane != Some(3) {
             return;
         }

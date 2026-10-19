@@ -246,6 +246,12 @@ mod gl_norm_tests {
                 compare(fmt, dtype, segformer(), Some(q.clone()));
             }
         }
+        // Per-channel zero points with equal scales: each plane draw takes
+        // its own channel's coefficients.
+        let zp =
+            Quantization::per_channel(vec![1.0 / 255.0; 3], vec![-128, -127, -126], 0).unwrap();
+        let unsigned = ConvertOptions::new().normalization(Normalization::unsigned());
+        compare(PixelFormat::PlanarRgb, DType::I8, unsigned, Some(zp));
         // A pad whose channels differ fills each plane with its own value.
         let colour_pad = ConvertOptions::new().letterbox([0, 64, 255, 255]);
         compare(PixelFormat::PlanarRgb, DType::U8, colour_pad, None);

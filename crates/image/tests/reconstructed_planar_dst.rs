@@ -37,9 +37,7 @@
 
 #![cfg(all(any(target_os = "macos", target_os = "ios"), feature = "opengl"))]
 
-use edgefirst_image::{
-    Crop, Flip, GLProcessorThreaded, ImageProcessor, ImageProcessorTrait, Rotation,
-};
+use edgefirst_image::{GLProcessorThreaded, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory};
 
 const W: usize = 64;

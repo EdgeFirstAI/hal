@@ -8305,14 +8305,7 @@ mod image_tests {
         };
         let mut dst = dst;
         // Call convert directly (the convert_img helper restores u8 only).
-        if let Err(e) = ImageProcessorTrait::convert(
-            &mut gpu,
-            &src,
-            &mut dst,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        ) {
+        if let Err(e) = ImageProcessorTrait::convert(&mut gpu, &src, &mut dst, None) {
             // GL_EXT_color_buffer_half_float may be absent on some configs; the
             // RGBA8 pass-1 + F16 pass-2 path then can't render. Skip rather than
             // fail on a capability gap (the same policy as the F16 path tests).
@@ -8421,9 +8414,12 @@ mod image_tests {
             .with_fit(Fit::Letterbox {
                 pad: [0, 0, 0, 255],
             });
-        if let Err(e) =
-            ImageProcessorTrait::convert(&mut gpu, &src, &mut dst, Rotation::None, Flip::None, crop)
-        {
+        if let Err(e) = ImageProcessorTrait::convert(
+            &mut gpu,
+            &src,
+            &mut dst,
+            Some(ConvertOptions::new().crop(crop)),
+        ) {
             crate::test_support::report_skip(&format!(
                 "{} — NV12→PlanarRgb F16 unavailable ({e:?})",
                 function!()
@@ -8507,9 +8503,7 @@ mod image_tests {
                 &mut proc,
                 &src,
                 &mut dst,
-                Rotation::None,
-                Flip::None,
-                crop,
+                Some(ConvertOptions::new().crop(crop)),
             );
             let _ = tx.send(true);
         });
@@ -8605,8 +8599,13 @@ mod image_tests {
                 .fill(128);
             let crop = Crop::new().with_source(Some(Region::new(0, 0, fw, fh)));
             let t0 = std::time::Instant::now();
-            ImageProcessorTrait::convert(&mut gpu, src, dst, Rotation::None, Flip::None, crop)
-                .unwrap_or_else(|e| panic!("convert iter {i} ({fw}×{fh}): {e}"));
+            ImageProcessorTrait::convert(
+                &mut gpu,
+                src,
+                dst,
+                Some(ConvertOptions::new().crop(crop)),
+            )
+            .unwrap_or_else(|e| panic!("convert iter {i} ({fw}×{fh}): {e}"));
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             if i == 2 {
                 first_ms = ms;
