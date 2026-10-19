@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`edgefirst-codec`: building `edgefirst-image` (or another crate that depends on the codec with `default-features = false`) on its own failed to compile the codec.** The codec chose between two code paths with its own `static` feature, because `edgefirst-tensor`'s static and dynamic backends offered different methods. Both backends now offer `TensorDyn::chroma_dyn`, `TensorDyn::dmabuf` and an inherent `Tensor::from_fd`, so the codec has no backend-specific code. CI now checks each published crate on its own (`make check-standalone`).
 - **`edgefirst-image`: a GL `PlanarRgb`/`PlanarRgba` letterbox whose pad channels differ left the band unfilled.** The single-pass planar route (DMA-BUF destinations) filled the band only when all channels of the pad were equal, so a pad such as `[0, 64, 255, 255]` left it holding the destination's previous contents. Each plane is now filled with its own value.
 
 ## [0.35.0] - 2026-10-12

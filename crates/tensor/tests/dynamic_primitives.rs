@@ -373,6 +373,12 @@ fn family5_from_planes_is_genuinely_multiplane_and_chroma_is_independently_writa
         .chroma()
         .expect("from_raw must yield a working chroma() handle");
     assert_eq!(chroma.effective_row_stride(), Some(w + 16));
+
+    let owned = wrapped
+        .chroma_dyn()
+        .expect("chroma_dyn must yield the chroma plane, as under the static backend");
+    assert_eq!(owned.effective_row_stride(), Some(w + 16));
+    assert_eq!(owned.shape(), &[h / 2, w]);
 }
 
 #[test]
@@ -402,6 +408,26 @@ fn dma_multiplane_from_planes_makes_is_multiplane_and_chroma_honest() {
         Some(w + 16),
         "the stride set on chroma before from_planes must read back through chroma()"
     );
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let combined = TensorDyn::from(combined);
+        let luma_fd = combined
+            .dmabuf()
+            .expect("a DMA-backed TensorDyn lends its DMA-BUF");
+        let chroma = combined
+            .chroma_dyn()
+            .expect("chroma_dyn on a DMA multiplane tensor");
+        let chroma_fd = chroma
+            .dmabuf()
+            .expect("the chroma plane lends its own DMA-BUF");
+        assert_ne!(
+            luma_fd.as_raw_fd(),
+            chroma_fd.as_raw_fd(),
+            "the two planes are separate allocations"
+        );
+    }
 }
 
 // --- Task 17: BufferIdentity for DMA-backed handles ------------------------
