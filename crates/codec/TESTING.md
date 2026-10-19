@@ -37,6 +37,8 @@ Located in `crates/codec/tests/`:
 | `decode_tensordyn.rs`   | TensorDyn decode for all dtypes, file path API     |
 | `exif_orientations.rs`  | End-to-end EXIF orientation reporting (JPEG + PNG): native dims preserved, `(rotation_degrees, flip_horizontal)` per tag |
 | `v4l2_jpeg.rs`          | Device-gated hardware decode: NV12 parity vs CPU, persistent streaming loop, geometry change, DMA-BUF zero-copy (skips cleanly when no V4L2 JPEG device / dma_heap) |
+| `video_encode.rs`       | Device-gated H.264 encoding (see [Video Encoder Verification](#video-encoder-verification)) |
+| `video_decode.rs`       | Device-gated H.264 decoding (see [Video Decoder Verification](#video-decoder-verification)) |
 
 ### Test Images
 
@@ -275,6 +277,30 @@ A correct crop gives a PSNR above 35 dB; a wrong plane offset falls to about 10 
 |-------|--------|----------------------|---------------------------------|
 | imx95-evk | Wave6 (`/dev/video10`) | 3.6 ms | 45.1 / 48.1 dB |
 | imx8mpevk-06 | `vsi_v4l2` (`/dev/video0`) | 5.9 ms | 37.7 / 44.2 dB |
+
+## Video Decoder Verification
+
+`tests/video_decode.rs` needs a V4L2 H.264 decoder and a DMA-BUF heap, and
+prints `SKIPPED` and passes without them. On a board it decodes the
+`testdata/h264_*.h264` fixtures and compares every picture with a hash of
+ffmpeg's decode of the same stream: Main profile with B-frames, and a
+mid-stream resolution change. It also covers a provided pool (including frames
+held across the change), pool exhaustion and recovery, reuse after `flush()`,
+and a stream from the hardware encoder.
+`crates/image/tests/decoded_video_import.rs` checks that decoded frames convert
+on the GPU without a copy.
+
+The Full tier's board lanes run `video_encode`, `video_decode` and
+`decoded_video_import` (`board-binaries` in `.github/workflows/ci.yml`). To run
+them by hand:
+
+```bash
+cargo zigbuild --release -p edgefirst-codec --test video_decode \
+    --target aarch64-unknown-linux-gnu.2.35
+
+# On the target, with its CI runner taken offline first:
+EDGEFIRST_TESTDATA_DIR=$HOME/testdata ./video_decode-* --test-threads=1
+```
 
 ## Benchmarks
 
