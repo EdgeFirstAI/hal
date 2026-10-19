@@ -82,7 +82,7 @@ jobs:
           echo "${{ github.workspace }}/venv/bin" >> "$GITHUB_PATH"
           venv/bin/pip install --upgrade pip setuptools wheel
           venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout pytest-benchmark numpy pillow pyyaml safetensors psutil tensorflow
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview, clippy, rustfmt
@@ -94,7 +94,7 @@ jobs:
       # cargo llvm-cov. The split of test.yml into this file dropped the tool
       # install that the original build-and-test-x86 lane had, and Full had
       # never run, so nothing caught it. Same pin as the old lane.
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe  # v2.87.27
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
       # Folded in from the old doc-tests job: same runner, deps and toolchain,
@@ -214,7 +214,7 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dri libegl1 libegl-mesa0 libgles2 mesa-utils-extra clang libclang-dev
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview
@@ -222,7 +222,7 @@ jobs:
         with:
           shared-key: rust-x86_64
           cache-on-failure: true
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe  # v2.87.27
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
       - name: Probe software-GL
@@ -264,7 +264,7 @@ jobs:
         with:
           name: testdata-lfs
           path: testdata/
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt, llvm-tools-preview
@@ -273,7 +273,7 @@ jobs:
           shared-key: rust-macos
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe  # v2.87.27
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - run: bash scripts/fetch-angle.sh
@@ -317,7 +317,7 @@ jobs:
         with:
           name: testdata-lfs
           path: testdata/
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt, llvm-tools-preview
@@ -327,7 +327,7 @@ jobs:
           shared-key: rust-windows
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe  # v2.87.27
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - name: Clippy
@@ -366,7 +366,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
@@ -396,7 +396,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           targets: aarch64-linux-android,x86_64-linux-android
@@ -444,7 +444,7 @@ jobs:
         with:
           name: testdata-lfs
           path: testdata/
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt, llvm-tools-preview
@@ -454,7 +454,7 @@ jobs:
           shared-key: rust-windows-warp
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe  # v2.87.27
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - name: Fetch ANGLE
@@ -496,7 +496,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           lfs: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt
@@ -542,7 +542,7 @@ jobs:
         with:
           name: testdata-lfs
           path: testdata/
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt
