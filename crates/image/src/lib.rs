@@ -10936,7 +10936,11 @@ mod image_tests {
         assert!(
             matches!(
                 img1.format().unwrap(),
-                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::PlanarRgb
+                PixelFormat::Rgb
+                    | PixelFormat::Rgba
+                    | PixelFormat::Grey
+                    | PixelFormat::PlanarRgb
+                    | PixelFormat::PlanarRgba
             ),
             "format must be Rgb or Rgba for comparison"
         );
@@ -10975,9 +10979,9 @@ mod image_tests {
             )
             .unwrap()
             .convert(),
-            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+            PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => image::GrayImage::from_vec(
                 img1.width().unwrap() as u32,
-                (img1.height().unwrap() * 3) as u32,
+                (img1.height().unwrap() * img1.format().unwrap().channels()) as u32,
                 flat(img1),
             )
             .unwrap()
@@ -11006,9 +11010,9 @@ mod image_tests {
             )
             .unwrap()
             .convert(),
-            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+            PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => image::GrayImage::from_vec(
                 img2.width().unwrap() as u32,
-                (img2.height().unwrap() * 3) as u32,
+                (img2.height().unwrap() * img2.format().unwrap().channels()) as u32,
                 flat(img2),
             )
             .unwrap()

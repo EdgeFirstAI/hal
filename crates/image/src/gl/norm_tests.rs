@@ -102,9 +102,19 @@ mod gl_norm_tests {
     /// The content is placed 1:1 (16x8 source, 16x16 destination), so both
     /// sample texel centres and differ only by arithmetic precision.
     fn compare(fmt: PixelFormat, dtype: DType, opts: ConvertOptions, quant: Option<Quantization>) {
-        let Some(mut proc) = gl_processor() else {
-            return;
-        };
+        if let Some(mut proc) = gl_processor() {
+            compare_on(&mut proc, fmt, dtype, opts, quant);
+        }
+    }
+
+    /// [`compare`] on a given processor, so one processor can run a sequence.
+    fn compare_on(
+        proc: &mut ImageProcessor,
+        fmt: PixelFormat,
+        dtype: DType,
+        opts: ConvertOptions,
+        quant: Option<Quantization>,
+    ) {
         let src = proc
             .create_image(
                 16,
@@ -206,6 +216,28 @@ mod gl_norm_tests {
         }
     }
 
+    /// One processor alternating default and mapped int8 converts, each with
+    /// its own program build; a planar alpha plane keeps the raw byte.
+    #[test]
+    fn gl_int8_default_and_mapped_converts_alternate() {
+        let Some(mut proc) = gl_processor() else {
+            return;
+        };
+        let q = Quantization::per_tensor(0.0187, -14);
+        let mapped = ConvertOptions::new().normalization(Normalization::imagenet());
+        let plain = ConvertOptions::new();
+        for fmt in [
+            PixelFormat::PlanarRgb,
+            PixelFormat::PlanarRgba,
+            PixelFormat::Rgb,
+            PixelFormat::Rgba,
+        ] {
+            compare_on(&mut proc, fmt, DType::I8, plain, None);
+            compare_on(&mut proc, fmt, DType::I8, mapped, Some(q.clone()));
+            compare_on(&mut proc, fmt, DType::I8, plain, None);
+        }
+    }
+
     fn segformer() -> ConvertOptions {
         ConvertOptions::new()
             .letterbox([0, 0, 0, 255])
@@ -237,7 +269,12 @@ mod gl_norm_tests {
             .letterbox([114, 114, 114, 255])
             .normalization(Normalization::imagenet());
         for dtype in [DType::I8, DType::U8] {
-            for fmt in [PixelFormat::Rgb, PixelFormat::Rgba, PixelFormat::PlanarRgb] {
+            for fmt in [
+                PixelFormat::Rgb,
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                PixelFormat::PlanarRgba,
+            ] {
                 compare(fmt, dtype, pixel_pad, Some(q.clone()));
             }
             // An output-domain pad needs the single-pass route (pass 1 of the

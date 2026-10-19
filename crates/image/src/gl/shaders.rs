@@ -189,6 +189,7 @@ in vec2 tc;
 
 out vec4 color;
 
+#ifdef QUANT_MAPPED
 uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
 uniform highp vec3 q_offset;
 uniform highp vec3 q_lo;
@@ -199,6 +200,13 @@ highp vec3 quantize(highp vec3 v) {
     highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
     return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
+#else
+// The plain XOR 0x80 bias, `(q + 128) mod 256`, as the CPU `byte ^ 0x80`.
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+#endif
 
 void main(){
     vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
@@ -223,6 +231,7 @@ in vec2 tc;
 
 out vec4 color;
 
+#ifdef QUANT_MAPPED
 uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
 uniform highp vec3 q_offset;
 uniform highp vec3 q_lo;
@@ -233,6 +242,13 @@ highp vec3 quantize(highp vec3 v) {
     highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
     return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
+#else
+// The plain XOR 0x80 bias, `(q + 128) mod 256`, as the CPU `byte ^ 0x80`.
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+#endif
 
 void main(){
     vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
@@ -257,6 +273,7 @@ in vec2 tc;
 
 out vec4 color;
 
+#ifdef QUANT_MAPPED
 uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
 uniform highp vec3 q_offset;
 uniform highp vec3 q_lo;
@@ -267,6 +284,13 @@ highp vec3 quantize(highp vec3 v) {
     highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
     return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
+#else
+// The plain XOR 0x80 bias, `(q + 128) mod 256`, as the CPU `byte ^ 0x80`.
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+#endif
 
 void main(){
     vec4 c = texture(tex, clamp(tc, src_extent.xy, src_extent.zw));
@@ -307,6 +331,7 @@ in vec2 tc;
 
 out vec4 color;
 
+#ifdef QUANT_MAPPED
 uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
 uniform highp vec3 q_offset;
 uniform highp vec3 q_lo;
@@ -317,6 +342,13 @@ highp vec3 quantize(highp vec3 v) {
     highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
     return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
+#else
+// The plain XOR 0x80 bias, `(q + 128) mod 256`, as the CPU `byte ^ 0x80`.
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+#endif
 
 void main(){
     vec4 c = texture(tex, tc);
@@ -792,6 +824,7 @@ precision highp int;
 uniform sampler2D tex;
 out vec4 color;
 
+#ifdef QUANT_MAPPED
 uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
 uniform highp vec3 q_offset;
 uniform highp vec3 q_lo;
@@ -802,6 +835,13 @@ highp vec3 quantize(highp vec3 v) {
     highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
     return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
+#else
+// The plain XOR 0x80 bias, `(q + 128) mod 256`, as the CPU `byte ^ 0x80`.
+vec4 int8_bias(vec4 v) {
+    vec4 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+#endif
 
 void main() {
     // gl_FragCoord is at pixel center (n+0.5). Use floor() for robust
@@ -816,6 +856,7 @@ void main() {
     vec4 s1 = (px1 != px0) ? texelFetch(tex, ivec2(px1, out_y), 0) : s0;
     // Extract channels based on phase (base % 3), then apply int8 bias
     int phase = base - px0 * 3;
+#ifdef QUANT_MAPPED
     // Quantize per pixel: a packed texel mixes channels by phase.
     vec3 q0 = quantize(s0.rgb);
     vec3 q1 = quantize(s1.rgb);
@@ -826,6 +867,15 @@ void main() {
     } else {
         color = vec4(q0.b, q1.r, q1.g, q1.b);
     }
+#else
+    if (phase == 0) {
+        color = int8_bias(vec4(s0.r, s0.g, s0.b, s1.r));
+    } else if (phase == 1) {
+        color = int8_bias(vec4(s0.g, s0.b, s1.r, s1.g));
+    } else {
+        color = int8_bias(vec4(s0.b, s1.r, s1.g, s1.b));
+    }
+#endif
 }
 "
 }
@@ -950,6 +1000,43 @@ void main() {
     }
 }
 "
+}
+
+/// An int8 shader built with the uniform output mapping of its `quantize()`:
+/// `QUANT_MAPPED` defined after the `#version` line, which must stay first.
+pub(super) fn quant_mapped(src: &str) -> String {
+    match src.split_once('\n') {
+        Some((version, rest)) => format!("{version}\n#define QUANT_MAPPED\n{rest}"),
+        None => src.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod quant_build_tests {
+    /// Every int8 shader carries both `quantize()` builds, and the mapped
+    /// build keeps `#version` first.
+    #[test]
+    fn int8_shaders_build_both_ways() {
+        let int8 = [
+            super::generate_texture_int8_shader(),
+            super::generate_texture_int8_shader_yuv(),
+            super::generate_planar_rgb_int8_shader(),
+            super::generate_planar_rgb_int8_shader_2d(),
+            super::generate_packed_rgba8_int8_shader_2d(),
+            super::generate_nv_to_rgba_int8_shader_2d(),
+            super::generate_nv_to_rgba_bilinear_int8_shader_2d(),
+            super::generate_nv_to_rgba_hw_bilinear_int8_shader_2d(),
+            super::generate_nv_to_rgba_y2y_int8_shader(),
+            super::super::shaders_common::YUYV_RGBA_2D_INT8_FRAGMENT,
+        ];
+        for src in int8 {
+            assert!(src.contains("#ifdef QUANT_MAPPED"), "{src}");
+            let mapped = super::quant_mapped(src);
+            let mut lines = mapped.lines();
+            assert!(lines.next().unwrap().starts_with("#version"));
+            assert_eq!(lines.next(), Some("#define QUANT_MAPPED"));
+        }
+    }
 }
 
 #[cfg(test)]

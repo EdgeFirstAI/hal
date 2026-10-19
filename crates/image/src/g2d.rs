@@ -676,7 +676,7 @@ mod g2d_predicate_tests {
 #[allow(deprecated)]
 mod g2d_tests {
     use super::*;
-    use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rotation};
+    use crate::{CPUProcessor, G2DProcessor, ImageProcessorTrait};
     use edgefirst_tensor::{
         is_dma_available, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };

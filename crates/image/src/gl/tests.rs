@@ -262,7 +262,11 @@ mod gl_tests {
         assert!(
             matches!(
                 img1.format().unwrap(),
-                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::PlanarRgb
+                PixelFormat::Rgb
+                    | PixelFormat::Rgba
+                    | PixelFormat::Grey
+                    | PixelFormat::PlanarRgb
+                    | PixelFormat::PlanarRgba
             ),
             "format must be Rgb or Rgba for comparison"
         );
@@ -301,9 +305,9 @@ mod gl_tests {
             )
             .unwrap()
             .convert(),
-            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+            PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => image::GrayImage::from_vec(
                 img1.width().unwrap() as u32,
-                (img1.height().unwrap() * 3) as u32,
+                (img1.height().unwrap() * img1.format().unwrap().channels()) as u32,
                 flat(img1),
             )
             .unwrap()
@@ -332,9 +336,9 @@ mod gl_tests {
             )
             .unwrap()
             .convert(),
-            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+            PixelFormat::PlanarRgb | PixelFormat::PlanarRgba => image::GrayImage::from_vec(
                 img2.width().unwrap() as u32,
-                (img2.height().unwrap() * 3) as u32,
+                (img2.height().unwrap() * img2.format().unwrap().channels()) as u32,
                 flat(img2),
             )
             .unwrap()
@@ -3829,15 +3833,9 @@ mod gl_tests {
     /// `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
     /// decline logs at debug and the CPU serves the same convert — and the
     /// CPU places the content band correctly, so a silent decline reads as
-    /// a pass here. The route each leg is entitled to comes from
-    /// `check_dst_format_supported`: it accepts `PlanarRgb` on both the
-    /// zero-copy DMA arm and the texture arm, so every `PlanarRgb` leg must
-    /// stay on GL and `convert_fallback_count()` must not move across it.
-    /// It accepts `PlanarRgba` on neither, so those legs take the CPU
-    /// fallback **by design** — they are the CPU half of the dispatch
-    /// surface this test exists to cover, and are asserted to fall back
-    /// rather than left unasserted, so the day GL grows a four-plane
-    /// readback this test says so instead of quietly changing meaning.
+    /// a pass here. `check_dst_format_supported` accepts both planar formats
+    /// on the zero-copy DMA arm and the texture arm, so every leg must stay
+    /// on GL and `convert_fallback_count()` must not move across it.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn letterbox_nv_to_planar_content_band_geometry() {
@@ -3860,11 +3858,9 @@ mod gl_tests {
                 return;
             }
         };
-        // Without this the route assertions below go vacuous in one
-        // direction and wrong in the other: with no GL backend at all
-        // nothing ever declines, so every `PlanarRgb` leg would pass having
-        // run on the CPU while every `PlanarRgba` leg would fail for the
-        // wrong reason.
+        // Without this the route assertions below go vacuous: with no GL
+        // backend at all nothing ever declines, so every leg would pass
+        // having run on the CPU.
         if proc.opengl.is_none() {
             crate::test_support::report_skip(&format!(
                 "{} - ImageProcessor resolved no GL backend",
@@ -3918,28 +3914,15 @@ mod gl_tests {
                     proc.convert(&src, &mut dst, Some(crate::ConvertOptions::new().crop(lb)))
                         .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
                     let declines = proc.convert_fallback_count() - fallbacks_before;
-                    if dst_fmt == PixelFormat::PlanarRgb {
-                        assert_eq!(
-                            declines, 0,
-                            "{label}: the GL backend declined this convert and the \
-                             CPU served it — the band probes below would pass on the \
-                             CPU answer, so this leg proved nothing about the GL \
-                             two-pass plan"
-                        );
-                    } else {
-                        assert_eq!(
-                            declines, 1,
-                            "{label}: GL was expected to decline PlanarRgba (no \
-                             four-plane readback geometry) and leave this leg to the \
-                             CPU; it did not, so either the GL gate changed or the \
-                             fallback counter did"
-                        );
-                    }
+                    assert_eq!(
+                        declines, 0,
+                        "{label}: the GL backend declined this convert and the \
+                         CPU served it — the band probes below would pass on the \
+                         CPU answer, so this leg proved nothing about the GL \
+                         two-pass plan"
+                    );
 
-                    // Raw bytes; undo the int8 XOR-0x80 bias so both dtypes
-                    // share one set of thresholds.
-                    let unbias = if dtype == DType::I8 { 0x80u8 } else { 0 };
-                    let bytes: Vec<u8> = match dtype {
+                    let raw: Vec<u8> = match dtype {
                         DType::U8 => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
                         _ => dst
                             .as_i8()
@@ -3948,12 +3931,22 @@ mod gl_tests {
                             .unwrap()
                             .as_slice()
                             .iter()
-                            .map(|&v| v as u8 ^ unbias)
+                            .map(|&v| v as u8)
                             .collect(),
                     };
+                    // The alpha plane is 255 everywhere (content and pad) and
+                    // stays the raw byte for i8 too.
+                    if dst_fmt == PixelFormat::PlanarRgba {
+                        let alpha = &raw[3 * dh * dw..4 * dh * dw];
+                        if let Some(i) = alpha.iter().position(|&a| a != 255) {
+                            panic!("{label}: alpha plane byte {i} = {}, expected 255", alpha[i]);
+                        }
+                    }
+                    // Undo the int8 XOR-0x80 bias so both dtypes share one set
+                    // of thresholds.
+                    let unbias = if dtype == DType::I8 { 0x80u8 } else { 0 };
+                    let bytes: Vec<u8> = raw.iter().map(|&v| v ^ unbias).collect();
 
-                    // Only the three colour planes — the alpha plane is 255
-                    // everywhere (content and pad) and is bias-exempt.
                     for plane in 0..3 {
                         let plane_base = plane * dh * dw;
                         for row in CONTENT_ROWS {
@@ -3987,10 +3980,8 @@ mod gl_tests {
     /// Letterboxed PixelFormat::Nv12 → planar against the verified RGBA
     /// reference: the same processor letterboxes camera NV12 720p → RGBA
     /// 640x640, the reference is channel-split on the CPU, and the GL planar
-    /// output (PlanarRgb@Dma — the TwoPassNvPlanar plan) must match it.
-    /// PlanarRgb@Dma is the only planar destination the GL engine accepts:
-    /// `check_dst_format_supported` rejects PlanarRgba outright and Mem has
-    /// no planar texture destination. Catches placement, scale, and content
+    /// output (PlanarRgb/PlanarRgba@Dma — the TwoPassNvPlanar plan) must
+    /// match it. Catches placement, scale, and content
     /// drift in the two-pass plan at full resolution — the per-pixel
     /// complement to the content-band geometry probe above.
     #[test]
@@ -4033,30 +4024,33 @@ mod gl_tests {
         let rgba = dst_rgba.as_u8().unwrap().map().unwrap();
         let rgba = rgba.as_slice();
 
-        // Channel-split the RGBA reference into the planar layout.
-        let mut expected = vec![0u8; 3 * dh * dw];
-        for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
-            for (plane, &channel) in px.iter().take(3).enumerate() {
-                expected[plane * dh * dw + i] = channel;
+        for fmt in [PixelFormat::PlanarRgb, PixelFormat::PlanarRgba] {
+            // Channel-split the RGBA reference into the planar layout.
+            let planes = fmt.channels();
+            let mut expected = vec![0u8; planes * dh * dw];
+            for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
+                for (plane, &channel) in px.iter().take(planes).enumerate() {
+                    expected[plane * dh * dw + i] = channel;
+                }
             }
+            let mut dst = TensorDyn::image(
+                dw,
+                dh,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            gl.convert(
+                &src,
+                &mut dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap_or_else(|e| panic!("nv12->{fmt}@Dma: convert failed: {e}"));
+            let map = dst.as_u8().unwrap().map().unwrap();
+            assert_pixels_match(&expected, map.as_slice(), 1);
         }
-        let mut dst = TensorDyn::image(
-            dw,
-            dh,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        gl.convert(
-            &src,
-            &mut dst,
-            Some(crate::ConvertOptions::new().crop(crop)),
-        )
-        .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Dma: convert failed: {e}"));
-        let map = dst.as_u8().unwrap().map().unwrap();
-        assert_pixels_match(&expected, map.as_slice(), 1);
     }
 
     /// Build a heap-memory (`TensorMemory::Mem`) NV12 image from a raw fixture.
@@ -4108,45 +4102,47 @@ mod gl_tests {
                 return;
             }
         };
-        let mut gl_dst = TensorDyn::image(
-            dw,
-            dh,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            Some(TensorMemory::Mem),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        gl.convert(
-            &src,
-            &mut gl_dst,
-            Some(crate::ConvertOptions::new().crop(crop)),
-        )
-        .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Mem: GL convert failed: {e}"));
-
-        // CPU reference — the Task 3/4 fused NV->planar + halo-resize path.
-        let mut cpu_dst = TensorDyn::image(
-            dw,
-            dh,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            None,
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        crate::cpu::CPUProcessor::new()
-            .convert(
-                &src,
-                &mut cpu_dst,
-                Some(crate::ConvertOptions::new().crop(crop)),
+        for fmt in [PixelFormat::PlanarRgb, PixelFormat::PlanarRgba] {
+            let mut gl_dst = TensorDyn::image(
+                dw,
+                dh,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
+            gl.convert(
+                &src,
+                &mut gl_dst,
+                Some(crate::ConvertOptions::new().crop(crop)),
+            )
+            .unwrap_or_else(|e| panic!("nv12->{fmt}@Mem: GL convert failed: {e}"));
 
-        // GL is not bit-exact vs CPU (bilinear rounding, matrix precision) —
-        // reuse the 0.95 structural-similarity threshold the existing
-        // GL-vs-CPU planar oracle (`test_nv12_to_planar_rgb_uses_shader_path`)
-        // and the mask-render suite (`test_segmentation_yolo`) both use.
-        compare_images(&gl_dst, &cpu_dst, 0.95, function!());
+            // CPU reference — the Task 3/4 fused NV->planar + halo-resize path.
+            let mut cpu_dst = TensorDyn::image(
+                dw,
+                dh,
+                fmt,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            crate::cpu::CPUProcessor::new()
+                .convert(
+                    &src,
+                    &mut cpu_dst,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
+                .unwrap();
+
+            // GL is not bit-exact vs CPU (bilinear rounding, matrix precision) —
+            // reuse the 0.95 structural-similarity threshold the existing
+            // GL-vs-CPU planar oracle (`test_nv12_to_planar_rgb_uses_shader_path`)
+            // and the mask-render suite (`test_segmentation_yolo`) both use.
+            compare_images(&gl_dst, &cpu_dst, 0.95, function!());
+        }
     }
 
     /// Steady-state companion to [`gl_planar_heap_matches_cpu`]: once the gate
@@ -11055,7 +11051,7 @@ mod gl_tests {
             (sw, sh),
             (dw, dh),
             salt,
-            Rotation::None,
+            crate::Rotation::None,
             Crop::no_crop(),
         )
     }
@@ -11070,7 +11066,7 @@ mod gl_tests {
         (sw, sh): (usize, usize),
         (dw, dh): (usize, usize),
         salt: u8,
-        rotation: Rotation,
+        rotation: crate::Rotation,
         crop: Crop,
     ) -> (Vec<u8>, Vec<u8>) {
         let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
@@ -11245,16 +11241,23 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // (src w, src h, dst w, dst h, rotation, crop).
-        let cases: [(usize, usize, usize, usize, Rotation, Crop); 2] = [
+        let cases: [(usize, usize, usize, usize, crate::Rotation, Crop); 2] = [
             (
                 128,
                 64,
                 256,
                 128,
-                Rotation::None,
+                crate::Rotation::None,
                 Crop::no_crop().with_source(Some(crate::Region::new(64, 32, 64, 32))),
             ),
-            (64, 128, 256, 128, Rotation::Clockwise90, Crop::no_crop()),
+            (
+                64,
+                128,
+                256,
+                128,
+                crate::Rotation::Clockwise90,
+                Crop::no_crop(),
+            ),
         ];
         for (i, &(sw, sh, dw, dh, rotation, crop)) in cases.iter().enumerate() {
             let (oracle_bytes, recycled_bytes) = convert_narrowed_and_fresh_grey_as(

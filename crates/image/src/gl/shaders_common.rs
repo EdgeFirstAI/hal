@@ -393,12 +393,13 @@ macro_rules! nv_rgb_hw_bilinear_body {
     };
 }
 
-/// The integer output mapping every int8 program applies to its RGB output:
-/// normalization and quantization as uniforms, stored as the low byte. The
-/// default uniforms (scale 255, zero point -128) are the `x ^ 0x80` bias.
+/// The integer output mapping every int8 program applies to its RGB output.
+/// Built with `QUANT_MAPPED`, normalization and quantization are uniforms and
+/// the result is stored as the low byte; without it, the plain `x ^ 0x80` bias.
 macro_rules! int_quantize {
     () => {
-        "uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
+        "#ifdef QUANT_MAPPED
+uniform highp vec3 q_scale;   // q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi)
 uniform highp vec3 q_offset;
 uniform highp vec3 q_lo;
 uniform highp vec3 q_hi;
@@ -408,6 +409,13 @@ highp vec3 quantize(highp vec3 v) {
     highp vec3 q = clamp(floor(v * q_scale + q_offset), q_lo, q_hi);
     return q * (1.0 / 255.0) + q_zero + step(q, q_wrap) * (256.0 / 255.0);
 }
+#else
+// The plain XOR 0x80 bias, `(q + 128) mod 256`, as the CPU `byte ^ 0x80`.
+highp vec3 quantize(highp vec3 v) {
+    highp vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+#endif
 
 "
     };
