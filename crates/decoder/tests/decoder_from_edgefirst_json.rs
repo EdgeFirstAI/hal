@@ -16,29 +16,16 @@
 //!
 //! [`Decoder`]: edgefirst_decoder::Decoder
 
+mod common;
+
 use std::path::PathBuf;
+
+use common::testdata_root;
 
 use edgefirst_decoder::{
     schema::{DecoderVersion, SchemaV2},
     DecoderBuilder,
 };
-
-/// Root of the `testdata/` tree.
-///
-/// `EDGEFIRST_TESTDATA_DIR` wins when set. The manifest-relative fallback is
-/// baked in at **compile** time, so a cross-compiled binary carries the build
-/// host's absolute path and can never find fixtures on target — which is
-/// exactly how this test failed on every board until the env var was honoured.
-fn testdata_root() -> PathBuf {
-    std::env::var("EDGEFIRST_TESTDATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("testdata")
-        })
-}
 
 fn fixture_path(stem: &str) -> PathBuf {
     testdata_root().join("decoder").join(format!("{stem}.json"))

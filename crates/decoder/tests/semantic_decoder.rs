@@ -4,6 +4,8 @@
 //! Semantic segmentation decoder: PyTorch goldens, a naive reference across
 //! layouts and dtypes, thresholding, class maps, letterbox and errors.
 
+mod common;
+
 use edgefirst_decoder::schema::{Activation, DecodeMode, Upsample, UpsampleMethod};
 use edgefirst_decoder::semantic::{decode_semantic, SemanticConfig, SemanticOptions};
 use edgefirst_decoder::{DecoderBuilder, DecoderError};
@@ -159,12 +161,9 @@ fn upsample(align_corners: bool) -> Upsample {
 
 #[test]
 fn matches_pytorch_golden() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../testdata/decoder/semantic_torch_golden.json"
-    );
+    let path = common::testdata_root().join("decoder/semantic_torch_golden.json");
     let golden: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let shape: Vec<usize> = serde_json::from_value(golden["shape"].clone()).unwrap();
     let [oh, ow]: [usize; 2] = serde_json::from_value(golden["out"].clone()).unwrap();
     let logits: Vec<f32> = serde_json::from_value(golden["logits"].clone()).unwrap();
@@ -187,84 +186,87 @@ fn matches_pytorch_golden() {
 #[test]
 fn layouts_and_dtypes_match_reference() {
     let (c, h, w) = (6, 9, 11);
-    let (oh, ow) = (23, 31);
     let v = values(c * h * w, 7);
+    for nhwc in [false, true] {
+        let (shape, axes, stored) = if nhwc {
+            (vec![1, h, w, c], (3, 1, 2), nchw_to_nhwc(&v, c, h, w))
+        } else {
+            (vec![1, c, h, w], (1, 2, 3), v.clone())
+        };
+        for (input, nchw) in quantized_inputs(&shape, &stored, &v) {
+            assert_matches_reference(&input, &shape, axes, &nchw, (c, h, w), nhwc);
+        }
+    }
+}
+
+/// The scores as f32, f16, i8 and u8 tensors, each with the NCHW values its
+/// decode must match. Values sit on a 1/16 grid in [-4, 4): exact in f16, and
+/// in i8/u8 as 16*v (+128 for u8) with a matching scale and zero point. u8
+/// carries a zero point, so its interpolated values round differently from
+/// the real ones; it is checked on stored values, which differ from the
+/// real-value argmax only at exact ties.
+fn quantized_inputs(shape: &[usize], stored: &[f32], nchw: &[f32]) -> Vec<(TensorDyn, Vec<f32>)> {
+    let mut i8_input = tensor(
+        shape,
+        &stored.iter().map(|&x| (x * 16.0) as i8).collect::<Vec<_>>(),
+    );
+    i8_input
+        .set_quantization(Quantization::per_tensor_symmetric(1.0 / 16.0))
+        .unwrap();
+    let mut u8_input = tensor(
+        shape,
+        &stored
+            .iter()
+            .map(|&x| (x * 16.0 + 128.0) as u8)
+            .collect::<Vec<_>>(),
+    );
+    u8_input
+        .set_quantization(Quantization::per_tensor(1.0 / 16.0, 128))
+        .unwrap();
+    let f16_input = tensor(
+        shape,
+        &stored.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>(),
+    );
+    vec![
+        (tensor(shape, stored), nchw.to_vec()),
+        (f16_input, nchw.to_vec()),
+        (i8_input, nchw.to_vec()),
+        (u8_input, nchw.iter().map(|&x| x * 16.0 + 128.0).collect()),
+    ]
+}
+
+/// Every alignment, mode and letterbox of `input` against the reference.
+fn assert_matches_reference(
+    input: &TensorDyn,
+    shape: &[usize],
+    axes: (usize, usize, usize),
+    nchw: &[f32],
+    dims: (usize, usize, usize),
+    nhwc: bool,
+) {
+    let (oh, ow) = (23, 31);
     let letterboxes = [
         [0.0, 0.0, 1.0, 1.0],
         [0.0, 0.0, 0.8, 0.6],
         [0.1, 0.2, 0.9, 0.8],
     ];
-    for nhwc in [false, true] {
-        let (shape, axes) = if nhwc {
-            (vec![1, h, w, c], (3, 1, 2))
-        } else {
-            (vec![1, c, h, w], (1, 2, 3))
-        };
-        let stored = if nhwc {
-            nchw_to_nhwc(&v, c, h, w)
-        } else {
-            v.clone()
-        };
-        // Values sit on a 1/16 grid in [-4, 4): exact in f16, and in i8/u8
-        // as 16*v (+128 for u8) with a matching scale and zero point.
-        let inputs = [
-            tensor(&shape, &stored),
-            tensor(
-                &shape,
-                &stored.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>(),
-            ),
-            tensor(
-                &shape,
-                &stored.iter().map(|&x| (x * 16.0) as i8).collect::<Vec<_>>(),
-            ),
-            tensor(
-                &shape,
-                &stored
-                    .iter()
-                    .map(|&x| (x * 16.0 + 128.0) as u8)
-                    .collect::<Vec<_>>(),
-            ),
-        ];
-        let quants = [
-            None,
-            None,
-            Some(Quantization::per_tensor_symmetric(1.0 / 16.0)),
-            Some(Quantization::per_tensor(1.0 / 16.0, 128)),
-        ];
-        // u8 carries a zero point, so its interpolated values round
-        // differently from the real ones; it is checked on stored values,
-        // which differ from real-value argmax only at exact ties.
-        let u8_nchw: Vec<f32> = v.iter().map(|&x| x * 16.0 + 128.0).collect();
-        for (input, quant) in inputs.into_iter().zip(quants) {
-            let mut input = input;
-            let nchw = if input.dtype() == DType::U8 {
-                &u8_nchw
-            } else {
-                &v
-            };
-            if let Some(q) = quant {
-                input.set_quantization(q).unwrap();
-            }
-            for align in [false, true] {
-                let config = SemanticConfig::scores(&shape, axes.0, axes.1, axes.2)
-                    .unwrap()
-                    .with_upsample(upsample(align))
-                    .unwrap();
-                for mode in [DecodeMode::Accurate, DecodeMode::Fast] {
-                    for lb in letterboxes {
-                        let mut dst = zeros(&[oh, ow], DType::U8);
-                        decode_semantic(&input, &config, &mut dst, None, &options(mode, lb))
-                            .unwrap();
-                        let expected = reference(&nchw[..], (c, h, w), (oh, ow), lb, mode, align);
-                        assert_eq!(
-                            classes(&dst),
-                            expected,
-                            "nhwc={nhwc} dtype={:?} align={align} mode={mode:?} lb={lb:?}",
-                            input.dtype()
-                        );
-                    }
-                }
-            }
+    for align in [false, true] {
+        let config = SemanticConfig::scores(shape, axes.0, axes.1, axes.2)
+            .unwrap()
+            .with_upsample(upsample(align))
+            .unwrap();
+        for (mode, lb) in [DecodeMode::Accurate, DecodeMode::Fast]
+            .into_iter()
+            .flat_map(|m| letterboxes.map(|lb| (m, lb)))
+        {
+            let mut dst = zeros(&[oh, ow], DType::U8);
+            decode_semantic(input, &config, &mut dst, None, &options(mode, lb)).unwrap();
+            assert_eq!(
+                classes(&dst),
+                reference(nchw, dims, (oh, ow), lb, mode, align),
+                "nhwc={nhwc} dtype={:?} align={align} mode={mode:?} lb={lb:?}",
+                input.dtype()
+            );
         }
     }
 }
@@ -445,7 +447,8 @@ fn single_channel_thresholds() {
         .unwrap();
     let config = SemanticConfig::scores(&[1, 5, 5, 1], 3, 1, 2)
         .unwrap()
-        .with_activation(Activation::Sigmoid);
+        .with_activation(Activation::Sigmoid)
+        .unwrap();
     let mut dst = zeros(&[5, 5], DType::U8);
     let mut conf = zeros(&[5, 5], DType::F32);
     decode_semantic(
@@ -732,6 +735,260 @@ outputs:
             (12, 16),
             [0.0, 0.0, 1.0, 1.0],
             DecodeMode::Fast,
+            false
+        )
+    );
+}
+
+fn schema_json(output: &str) -> String {
+    format!(r#"{{"schema_version": 2, "outputs": [{output}]}}"#)
+}
+
+/// A `width` x 2 image view into a `width + 1` x 2 image, so each row carries
+/// one padding pixel per channel.
+fn padded_view<T: Element + Copy>(format: edgefirst_tensor::PixelFormat, rows: &[T]) -> TensorDyn
+where
+    TensorDyn: From<Tensor<T>>,
+{
+    use edgefirst_tensor::{CpuAccess, Region};
+    let channels = format.channels();
+    let width = rows.len() / 2 / channels - 1;
+    let full = Tensor::<T>::image(
+        width + 1,
+        2,
+        format,
+        Some(TensorMemory::Mem),
+        CpuAccess::ReadWrite,
+    )
+    .unwrap();
+    full.map().unwrap().as_mut_slice().copy_from_slice(rows);
+    full.view(Region::new(0, 0, width, 2)).unwrap().into()
+}
+
+#[test]
+fn modelpack_schema_keeps_the_applied_activation() {
+    let json = schema_json(
+        r#"{"name": "seg", "type": "segmentation", "decoder": "modelpack",
+            "shape": [1, 1, 1, 2],
+            "dshape": [{"batch": 1}, {"height": 1}, {"width": 1}, {"num_classes": 2}],
+            "dtype": "float32", "activation_applied": "softmax"}"#,
+    );
+    let decoder = DecoderBuilder::new()
+        .with_config_json_str(json)
+        .build()
+        .unwrap();
+    let input = tensor(&[1, 1, 1, 2], &[0.8f32, 0.2]);
+    let mut dst = zeros(&[1, 1], DType::U8);
+    let mut conf = zeros(&[1, 1], DType::F32);
+    decoder
+        .decode_semantic(
+            &[&input],
+            &mut dst,
+            Some(&mut conf),
+            &SemanticOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(classes(&dst), [0]);
+    assert!((read::<f32>(&conf)[0] - 0.8).abs() < 1e-6);
+}
+
+#[test]
+fn empty_axes_are_rejected() {
+    for shape in [[1, 0, 2, 2], [1, 3, 0, 2], [0, 3, 2, 2]] {
+        assert!(
+            SemanticConfig::scores(&shape, 1, 2, 3).is_err(),
+            "{shape:?}"
+        );
+    }
+}
+
+#[test]
+fn required_activation_applies_after_resampling() {
+    let output = |required: &str| {
+        schema_json(&format!(
+            r#"{{"name": "l", "type": "segmentation", "decoder": "semantic",
+                "shape": [1, 2, 1, 2],
+                "dshape": [{{"batch": 1}}, {{"num_classes": 2}}, {{"height": 1}}, {{"width": 2}}],
+                "dtype": "float32", {required} "decode_mode": "accurate"}}"#
+        ))
+    };
+    // Class 0 is [-100, 10] and class 1 is [-1, -1]: resampled logits pick class 1.
+    let input = tensor(&[1, 2, 1, 2], &[-100.0f32, 10.0, -1.0, -1.0]);
+    // Confidence is computed per source pixel, then resampled to their midpoint.
+    let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+    let softmax = (sigmoid(99.0) + sigmoid(11.0)) / 2.0;
+    for (required, conf) in [
+        ("", softmax),
+        (r#""activation_required": "softmax","#, softmax),
+        (
+            r#""activation_required": "sigmoid","#,
+            (sigmoid(-1.0) + sigmoid(10.0)) / 2.0,
+        ),
+    ] {
+        let decoder = DecoderBuilder::new()
+            .with_config_json_str(output(required))
+            .build()
+            .unwrap();
+        let mut dst = zeros(&[1, 1], DType::U8);
+        let mut confidence = zeros(&[1, 1], DType::F32);
+        decoder
+            .decode_semantic(
+                &[&input],
+                &mut dst,
+                Some(&mut confidence),
+                &SemanticOptions::new(),
+            )
+            .unwrap();
+        assert_eq!(classes(&dst), [1], "{required}");
+        let got = read::<f32>(&confidence)[0];
+        assert!((got - conf).abs() < 1e-4, "{required}: {got} vs {conf}");
+    }
+}
+
+#[test]
+fn contradictory_activations_are_rejected() {
+    let config = || SemanticConfig::scores(&[1, 2, 2, 2], 1, 2, 3).unwrap();
+    assert!(config()
+        .with_activation(Activation::Softmax)
+        .unwrap()
+        .with_activation_required(Activation::Sigmoid)
+        .is_err());
+    assert!(config().with_activation_required(Activation::Tanh).is_err());
+    let single = SemanticConfig::scores(&[1, 1, 2, 2], 1, 2, 3).unwrap();
+    assert!(single
+        .with_activation_required(Activation::Softmax)
+        .is_err());
+}
+
+#[test]
+fn modelpack_channel_axis_without_num_classes_decodes() {
+    use edgefirst_decoder::configs::{DecoderType, DimName, Segmentation};
+    use edgefirst_decoder::{ConfigOutput, ConfigOutputs};
+    let mut cfg = ConfigOutputs::default();
+    cfg.outputs = vec![ConfigOutput::Segmentation(Segmentation {
+        decoder: DecoderType::ModelPack,
+        shape: vec![1, 2, 2, 3],
+        quantization: None,
+        dshape: vec![
+            (DimName::Batch, 1),
+            (DimName::Height, 2),
+            (DimName::Width, 2),
+            (DimName::NumProtos, 3),
+        ],
+    })];
+    let decoder = DecoderBuilder::new().with_config(cfg).build().unwrap();
+    assert_eq!(decoder.semantic().map(|s| s.classes()), Some(3));
+    // NHWC: pixel p has its winner at channel p % 3.
+    let v: Vec<f32> = (0..12)
+        .map(|i| if i % 3 == (i / 3) % 3 { 1.0 } else { 0.0 })
+        .collect();
+    let mut dst = zeros(&[2, 2], DType::U8);
+    decoder
+        .decode_semantic(
+            &[&tensor(&[1, 2, 2, 3], &v)],
+            &mut dst,
+            None,
+            &SemanticOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(classes(&dst), [0, 1, 2, 0]);
+}
+
+#[test]
+fn dshape_must_describe_the_shape() {
+    for dshape in [
+        r#"[{"batch": 1}, {"num_classes": 3}, {"width": 6}, {"height": 4}]"#,
+        r#"[{"batch": 1}, {"num_classes": 6}, {"height": 4}, {"width": 3}]"#,
+        r#"[{"batch": 1}, {"num_classes": 3}, {"height": 4}, {"height": 6}]"#,
+        r#"[{"num_classes": 3}, {"height": 4}, {"width": 6}]"#,
+    ] {
+        let json = schema_json(&format!(
+            r#"{{"name": "l", "type": "segmentation", "decoder": "semantic",
+                "shape": [1, 3, 4, 6], "dshape": {dshape}, "dtype": "float32"}}"#
+        ));
+        assert!(
+            DecoderBuilder::new()
+                .with_config_json_str(json)
+                .build()
+                .is_err(),
+            "{dshape}"
+        );
+    }
+}
+
+#[test]
+fn padded_class_map_rows_are_skipped() {
+    let input = padded_view(
+        edgefirst_tensor::PixelFormat::Grey,
+        &[1u8, 1, 1, 9, 2, 2, 2, 9],
+    );
+    assert_eq!(input.row_stride(), Some(4));
+    let config = SemanticConfig::class_map(input.shape(), 0, 1).unwrap();
+    let mut dst = zeros(&[2, 3], DType::U8);
+    decode_semantic(&input, &config, &mut dst, None, &SemanticOptions::new()).unwrap();
+    assert_eq!(classes(&dst), [1, 1, 1, 2, 2, 2]);
+}
+
+#[test]
+fn padded_score_rows_match_packed_scores() {
+    // Three interleaved classes over a 2x2 map, padded by one pixel per row.
+    let packed: Vec<f32> = vec![
+        3.0, 1.0, 0.0, 0.0, 2.0, 1.0, //
+        1.0, 0.0, 5.0, 0.0, 4.0, 0.0,
+    ];
+    let mut rows = packed[..6].to_vec();
+    rows.extend([9.0, 9.0, 9.0]);
+    rows.extend(&packed[6..]);
+    rows.extend([9.0, 9.0, 9.0]);
+    let padded = padded_view(edgefirst_tensor::PixelFormat::Rgb, &rows);
+    let config = SemanticConfig::scores(padded.shape(), 2, 0, 1).unwrap();
+    let reference = tensor(padded.shape(), &packed);
+    for mode in [DecodeMode::Accurate, DecodeMode::Fast] {
+        let opts = SemanticOptions::new().with_mode(mode);
+        let (mut a, mut b) = (zeros(&[5, 7], DType::U8), zeros(&[5, 7], DType::U8));
+        let (mut ca, mut cb) = (zeros(&[5, 7], DType::F32), zeros(&[5, 7], DType::F32));
+        decode_semantic(&padded, &config, &mut a, Some(&mut ca), &opts).unwrap();
+        decode_semantic(&reference, &config, &mut b, Some(&mut cb), &opts).unwrap();
+        assert_eq!(classes(&a), classes(&b), "{mode:?}");
+        assert_eq!(read::<f32>(&ca), read::<f32>(&cb), "{mode:?}");
+    }
+}
+
+#[test]
+fn programmatic_semantic_config_decodes_like_json() {
+    use edgefirst_decoder::configs::{DecoderType, DimName, Segmentation};
+    use edgefirst_decoder::{ConfigOutput, ConfigOutputs};
+    let mut cfg = ConfigOutputs::default();
+    cfg.outputs = vec![ConfigOutput::Segmentation(Segmentation {
+        decoder: DecoderType::Semantic,
+        shape: vec![1, 4, 8, 12],
+        quantization: None,
+        dshape: vec![
+            (DimName::Batch, 1),
+            (DimName::NumClasses, 4),
+            (DimName::Height, 8),
+            (DimName::Width, 12),
+        ],
+    })];
+    let decoder = DecoderBuilder::new().with_config(cfg).build().unwrap();
+    assert_eq!(
+        decoder.semantic().map(|s| s.mode()),
+        Some(DecodeMode::Accurate)
+    );
+    let v = values(4 * 8 * 12, 5);
+    let mut dst = zeros(&[30, 60], DType::U8);
+    let opts = options(DecodeMode::Accurate, [0.0, 0.0, 1.0, 1.0]);
+    decoder
+        .decode_semantic(&[&tensor(&[1, 4, 8, 12], &v)], &mut dst, None, &opts)
+        .unwrap();
+    assert_eq!(
+        classes(&dst),
+        reference(
+            &v,
+            (4, 8, 12),
+            (30, 60),
+            [0.0, 0.0, 1.0, 1.0],
+            DecodeMode::Accurate,
             false
         )
     );

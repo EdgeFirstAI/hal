@@ -58,7 +58,9 @@ def test_decode_semantic_upsamples(mode):
     decoder.decode_semantic([tensor(stripes())], dst, mode=mode)
     out = read(dst, np.uint8)
     assert out.shape == (8, 12)
-    assert (out[:, 0] == 0).all() and (out[:, 6] == 1).all() and (out[:, 11] == 2).all()
+    assert (out[:, 0] == 0).all()
+    assert (out[:, 6] == 1).all()
+    assert (out[:, 11] == 2).all()
 
 
 def test_decode_semantic_letterbox_and_confidence():
@@ -82,17 +84,15 @@ def test_decode_semantic_letterbox_and_confidence():
 
 def test_decode_semantic_errors():
     decoder = ef.Decoder.new_from_json_str(json.dumps(SCHEMA))
+    scores = [tensor(stripes())]
+    float_dst = ef.Tensor([4, 4], dtype="float32")
     with pytest.raises(RuntimeError):
-        decoder.decode_semantic([tensor(stripes())], ef.Tensor([4, 4], dtype="float32"))
+        decoder.decode_semantic(scores, float_dst)
+    dst = ef.Tensor([4, 4], dtype="uint8")
     with pytest.raises(RuntimeError):
-        decoder.decode_semantic(
-            [tensor(stripes())],
-            ef.Tensor([4, 4], dtype="uint8"),
-            letterbox=[0.5, 0.0, 0.5, 1.0],
-        )
+        decoder.decode_semantic(scores, dst, letterbox=[0.5, 0.0, 0.5, 1.0])
     with pytest.raises(RuntimeError):
-        boxes = decoder.decode([tensor(stripes())])
-        del boxes
+        decoder.decode(scores)
 
 
 def test_detection_decoder_has_no_semantic_output():
@@ -112,11 +112,10 @@ def test_detection_decoder_has_no_semantic_output():
     decoder = ef.Decoder.new_from_json_str(json.dumps(schema))
     assert decoder.semantic_classes is None
     assert decoder.semantic_mode is None
+    outputs = [tensor(np.zeros((1, 84, 8400), dtype=np.float32))]
+    dst = ef.Tensor([4, 4], dtype="uint8")
     with pytest.raises(RuntimeError):
-        decoder.decode_semantic(
-            [tensor(np.zeros((1, 84, 8400), dtype=np.float32))],
-            ef.Tensor([4, 4], dtype="uint8"),
-        )
+        decoder.decode_semantic(outputs, dst)
 
 
 SEGFORMER_FIXTURES = [
@@ -170,3 +169,23 @@ def test_segformer_outputs_match_the_reference_decode(name, suffix):
         decoder.decode_semantic([logits], dst, mode=mode, letterbox=letterbox)
         agreement = (read(dst, np.uint8) == reference).mean()
         assert agreement >= floor, f"{key}: {agreement:.4%}"
+
+
+def test_programmatic_semantic_output_decodes_like_json():
+    dshape = [
+        (ef.DimName.Batch, 1),
+        (ef.DimName.NumClasses, 3),
+        (ef.DimName.Height, 4),
+        (ef.DimName.Width, 6),
+    ]
+    output = ef.Output.segmentation(dshape=dshape, decoder=ef.DecoderType.Semantic)
+    decoder = ef.Decoder.new_from_outputs([output])
+    assert decoder.semantic_classes == 3
+    reference = ef.Decoder.new_from_json_str(json.dumps(SCHEMA))
+    outputs = [tensor(stripes())]
+    for mode in (ef.DecodeMode.Accurate, ef.DecodeMode.Fast):
+        dst = ef.Tensor([8, 12], dtype="uint8")
+        expected = ef.Tensor([8, 12], dtype="uint8")
+        decoder.decode_semantic(outputs, dst, mode=mode)
+        reference.decode_semantic(outputs, expected, mode=mode)
+        assert read(dst, np.uint8).tolist() == read(expected, np.uint8).tolist()

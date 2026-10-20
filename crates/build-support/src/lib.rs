@@ -273,7 +273,7 @@ pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
     let profile_dir = profile_dir_from_out_dir(Path::new(&out_dir));
     let profile = profile_dir
         .file_name()
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .expect("the profile directory has a UTF-8 name")
         .to_string();
     let target = env::var("TARGET").unwrap_or_default();

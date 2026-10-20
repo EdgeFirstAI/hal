@@ -13,17 +13,9 @@
 //!
 //! Fixtures are regenerated with `scripts/decoder_generate_semantic_fixture.py`.
 
-/// Emit a skip notice that survives libtest's output capture. See TESTING.md.
-macro_rules! skip_note {
-    ($($arg:tt)*) => {{
-        use std::io::Write;
-        let _ = write!(&mut std::io::stderr(), "WARNING: SKIPPED: ");
-        let _ = writeln!(&mut std::io::stderr(), $($arg)*);
-    }};
-}
+mod common;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use edgefirst_decoder::schema::DecodeMode;
 use edgefirst_decoder::semantic::SemanticOptions;
@@ -33,6 +25,8 @@ use edgefirst_tensor::{
 };
 use half::f16;
 use safetensors::SafeTensors;
+
+use common::testdata_root;
 
 /// Minimum share of pixels where accurate matches the accurate reference.
 const ACCURATE_AGREEMENT: f64 = 0.998;
@@ -47,29 +41,8 @@ const FIXTURES: [&str; 3] = [
     "segformer-b1-ade-512x512_coco_420_odd.safetensors",
 ];
 
-fn testdata_root() -> PathBuf {
-    std::env::var("EDGEFIRST_TESTDATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("testdata")
-        })
-}
-
-/// Fixture bytes, or `None` (with a skip notice) when LFS has not fetched it.
 fn load(name: &str) -> Option<Vec<u8>> {
-    let path = testdata_root().join("decoder").join(name);
-    let Ok(bytes) = std::fs::read(&path) else {
-        skip_note!("fixture {path:?} not present (run `git lfs pull`)");
-        return None;
-    };
-    if bytes.starts_with(b"version https://git-lfs") {
-        skip_note!("fixture {path:?} is an LFS pointer (run `git lfs pull`)");
-        return None;
-    }
-    Some(bytes)
+    common::read_fixture(&testdata_root().join("decoder").join(name))
 }
 
 struct Fixture<'a> {

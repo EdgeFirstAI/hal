@@ -46,7 +46,9 @@ use edgefirst_tensor::{DType, QuantMode, TensorDyn, TensorMapTrait, TensorTrait}
 use half::f16;
 
 use crate::configs::DimName;
-use crate::schema::{Activation, DecodeMode, LogicalOutput, LogicalType, Upsample, UpsampleMethod};
+use crate::schema::{
+    Activation, DecodeMode, DecoderKind, LogicalOutput, LogicalType, Upsample, UpsampleMethod,
+};
 use crate::{DecoderError, DecoderResult};
 use kernels::{ClassOut, ConfKind, ConfOut, Dequant, Grid, Score};
 
@@ -87,6 +89,7 @@ pub struct SemanticConfig {
     mode: DecodeMode,
     threshold: Option<f32>,
     activation: Option<Activation>,
+    activation_required: Option<Activation>,
     quantization: Option<edgefirst_tensor::Quantization>,
 }
 
@@ -147,7 +150,7 @@ impl SemanticConfig {
                 "semantic output shape {shape:?} has unnamed axis {axis} of size {n}"
             )));
         }
-        if shape[layout.height] == 0 || shape[layout.width] == 0 {
+        if shape.contains(&0) {
             return Err(DecoderError::InvalidShape(format!(
                 "semantic output shape {shape:?} is empty"
             )));
@@ -165,6 +168,7 @@ impl SemanticConfig {
             mode: DecodeMode::Accurate,
             threshold: None,
             activation: None,
+            activation_required: None,
             quantization: None,
         };
         if config.classes() > MAX_CLASSES {
@@ -177,7 +181,8 @@ impl SemanticConfig {
     }
 
     /// Builds the configuration of a `segmentation` or `masks` logical output
-    /// with `decoder: semantic`.
+    /// with `decoder: semantic`, or of a ModelPack `segmentation` output, which
+    /// is NHWC and decoded in [`DecodeMode::Fast`] unless it says otherwise.
     pub fn from_logical(logical: &LogicalOutput) -> DecoderResult<Self> {
         let label = logical.name.as_deref().unwrap_or("<anonymous>");
         if logical.is_split() {
@@ -185,17 +190,23 @@ impl SemanticConfig {
                 "semantic output `{label}` is split into physical tensors"
             )));
         }
-        let input = match logical.type_ {
-            Some(LogicalType::Segmentation) => SemanticInput::Scores,
-            Some(LogicalType::Masks) => SemanticInput::ClassMap,
+        let (input, role) = match logical.type_ {
+            Some(LogicalType::Segmentation) => (SemanticInput::Scores, "segmentation"),
+            Some(LogicalType::Masks) => (SemanticInput::ClassMap, "masks"),
             other => {
                 return Err(DecoderError::InvalidConfig(format!(
                     "semantic output `{label}` has type {other:?}; expected segmentation or masks"
                 )))
             }
         };
-        let layout = layout_from_dshape(logical, input)?;
-        let mut config = Self::new(input, &logical.shape, layout)?;
+        crate::configs::validate_dshape(role, &logical.shape, &logical.dshape)?;
+        let modelpack = logical.decoder == Some(DecoderKind::ModelPack);
+        let mut config = if modelpack && input == SemanticInput::Scores {
+            let (c, h, w) = modelpack_axes(&logical.shape, &logical.dshape)?;
+            Self::scores(&logical.shape, c, h, w)?.with_mode(DecodeMode::Fast)
+        } else {
+            Self::new(input, &logical.shape, layout_from_dshape(logical, input)?)?
+        };
         config.name = logical.name.clone();
         if let Some(upsample) = logical.semantic.upsample {
             config = config.with_upsample(upsample)?;
@@ -205,6 +216,8 @@ impl SemanticConfig {
         }
         config.threshold = logical.semantic.threshold;
         config.activation = logical.activation_applied;
+        config.activation_required = logical.activation_required;
+        config.check_activation()?;
         if let Some(q) = &logical.quantization {
             config.quantization = Some(q.try_into().map_err(|e| {
                 DecoderError::InvalidConfig(format!("semantic output `{label}` quantization: {e}"))
@@ -213,36 +226,11 @@ impl SemanticConfig {
         Ok(config)
     }
 
-    /// The segmentation output of a ModelPack model: NHWC unless `dshape`
-    /// says otherwise, decoded in [`DecodeMode::Fast`] by default.
+    /// The segmentation output of a ModelPack model configured without a
+    /// schema: NHWC unless `dshape` names the axes, decoded in
+    /// [`DecodeMode::Fast`] by default.
     pub(crate) fn from_modelpack(seg: &crate::configs::Segmentation) -> DecoderResult<Self> {
-        let find = |name: DimName| seg.dshape.iter().position(|(n, _)| *n == name);
-        let (classes, height, width) = if seg.dshape.is_empty() {
-            match seg.shape.len() {
-                3 => (2, 0, 1),
-                4 => (3, 1, 2),
-                _ => {
-                    return Err(DecoderError::InvalidShape(format!(
-                        "ModelPack segmentation shape {:?}",
-                        seg.shape
-                    )))
-                }
-            }
-        } else {
-            match (
-                find(DimName::NumClasses),
-                find(DimName::Height),
-                find(DimName::Width),
-            ) {
-                (Some(c), Some(h), Some(w)) => (c, h, w),
-                _ => {
-                    return Err(DecoderError::InvalidConfig(
-                        "ModelPack segmentation dshape must name num_classes, height and width"
-                            .to_string(),
-                    ))
-                }
-            }
-        };
+        let (classes, height, width) = modelpack_axes(&seg.shape, &seg.dshape)?;
         let mut config =
             Self::scores(&seg.shape, classes, height, width)?.with_mode(DecodeMode::Fast);
         if let Some(q) = &seg.quantization {
@@ -280,9 +268,47 @@ impl SemanticConfig {
     }
 
     /// Declares an activation the model already applied to the scores.
-    pub fn with_activation(mut self, activation: Activation) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::with_activation_required`].
+    pub fn with_activation(mut self, activation: Activation) -> DecoderResult<Self> {
         self.activation = Some(activation);
-        self
+        self.check_activation()?;
+        Ok(self)
+    }
+
+    /// Declares the activation the scores still need. It is applied after
+    /// resampling, as reference pipelines do, so it leaves the class map
+    /// unchanged and sets how [`decode_semantic`] computes confidence.
+    ///
+    /// # Errors
+    ///
+    /// [`DecoderError::InvalidConfig`] when an activation is both applied
+    /// and required, or a single channel declares softmax;
+    /// [`DecoderError::NotSupported`] for `tanh`.
+    pub fn with_activation_required(mut self, activation: Activation) -> DecoderResult<Self> {
+        self.activation_required = Some(activation);
+        self.check_activation()?;
+        Ok(self)
+    }
+
+    fn check_activation(&self) -> DecoderResult<()> {
+        let single = self.input == SemanticInput::Scores && self.grid().classes == 1;
+        match (self.activation, self.activation_required) {
+            (Some(_), Some(_)) => Err(DecoderError::InvalidConfig(
+                "a semantic output cannot both apply and require an activation".to_string(),
+            )),
+            (Some(Activation::Tanh), _) | (_, Some(Activation::Tanh)) => Err(
+                DecoderError::NotSupported("tanh semantic scores are not supported".to_string()),
+            ),
+            (Some(Activation::Softmax), _) | (_, Some(Activation::Softmax)) if single => {
+                Err(DecoderError::InvalidConfig(
+                    "softmax over a single channel is constant; declare sigmoid".to_string(),
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Quantization of integer scores, used when the tensor carries none.
@@ -387,10 +413,74 @@ impl SemanticConfig {
             xs: strides[self.layout.width],
         }
     }
+
+    /// Element strides of `input`, with a padded row pitch applied to the
+    /// height axis and every axis outside it.
+    fn grid_for(&self, input: &TensorDyn) -> DecoderResult<Grid> {
+        let mut grid = self.grid();
+        let Some(pitch) = input.row_stride() else {
+            return Ok(grid);
+        };
+        let size = input.dtype().size();
+        let (h, w) = (self.layout.height, self.layout.width);
+        if w < h || pitch % size != 0 || pitch / size < grid.ys {
+            return Err(DecoderError::NotSupported(format!(
+                "semantic input row stride of {pitch} bytes does not pad its rows of {} {:?} elements",
+                grid.ys,
+                input.dtype()
+            )));
+        }
+        let (packed, pitch) = (grid.ys, pitch / size);
+        if self.layout.classes.is_some_and(|c| c < h) {
+            grid.cs = grid.cs / packed * pitch;
+        }
+        grid.ys = pitch;
+        Ok(grid)
+    }
+}
+
+/// Fails unless every element `g` addresses lies within `len` elements.
+fn check_extent(len: usize, g: Grid, what: &str) -> DecoderResult<()> {
+    let extent = (g.classes - 1) * g.cs + (g.height - 1) * g.ys + (g.width - 1) * g.xs + 1;
+    if extent > len {
+        return Err(DecoderError::InvalidShape(format!(
+            "{what} holds {len} elements but its layout addresses {extent}"
+        )));
+    }
+    Ok(())
 }
 
 fn squeeze(shape: &[usize]) -> Vec<usize> {
     shape.iter().copied().filter(|&n| n != 1).collect()
+}
+
+/// Class axis of a rank-4 ModelPack segmentation output: the axis named
+/// `num_classes`, else the NHWC channel axis.
+pub(crate) fn modelpack_class_axis(dshape: &[(DimName, usize)]) -> usize {
+    dshape
+        .iter()
+        .position(|(n, _)| *n == DimName::NumClasses)
+        .unwrap_or(3)
+}
+
+/// `(classes, height, width)` axes of a ModelPack segmentation output: NHWC,
+/// with any axis `dshape` names taking its named position.
+fn modelpack_axes(
+    shape: &[usize],
+    dshape: &[(DimName, usize)],
+) -> DecoderResult<(usize, usize, usize)> {
+    if shape.len() != 4 {
+        return Err(DecoderError::InvalidShape(format!(
+            "ModelPack segmentation shape {shape:?}; expected rank 4"
+        )));
+    }
+    let find =
+        |name: DimName, nhwc: usize| dshape.iter().position(|(n, _)| *n == name).unwrap_or(nhwc);
+    Ok((
+        modelpack_class_axis(dshape),
+        find(DimName::Height, 1),
+        find(DimName::Width, 2),
+    ))
 }
 
 fn layout_from_dshape(
@@ -763,25 +853,34 @@ fn decode_scores(
     dst: &mut TensorDyn,
     confidence: Option<&mut TensorDyn>,
 ) -> DecoderResult<()> {
-    let needs_real = config.grid().classes == 1 || confidence.is_some();
+    let g = config.grid_for(input)?;
+    let needs_real = g.classes == 1 || confidence.is_some();
     macro_rules! typed {
         ($t:ty) => {{
             let map = input
                 .as_typed::<$t>()
                 .ok_or_else(|| DecoderError::Internal("semantic input dtype".to_string()))?
-                .map()
+                .map_read()
                 .map_err(map_err("semantic input"))?;
+            check_extent(map.as_slice().len(), g, "semantic input")?;
             match resolve_quant(input, config, needs_real)? {
                 Quant::PerTensor(dq) => {
-                    scores_into(map.as_slice(), config, dq, geometry, dst, confidence)
+                    scores_into(map.as_slice(), g, config, dq, geometry, dst, confidence)
                 }
                 Quant::PerChannel {
                     scales,
                     zero_points,
                 } => {
-                    let real =
-                        dequantize_per_channel(map.as_slice(), config, &scales, &zero_points);
-                    scores_into(&real, config, Dequant::IDENTITY, geometry, dst, confidence)
+                    let real = dequantize_per_channel(map.as_slice(), g, &scales, &zero_points);
+                    scores_into(
+                        &real,
+                        g,
+                        config,
+                        Dequant::IDENTITY,
+                        geometry,
+                        dst,
+                        confidence,
+                    )
                 }
             }
         }};
@@ -801,11 +900,10 @@ fn decode_scores(
 
 fn dequantize_per_channel<T: Score>(
     data: &[T],
-    config: &SemanticConfig,
+    g: Grid,
     scales: &[f32],
     zero_points: &[i32],
 ) -> Vec<f32> {
-    let g = config.grid();
     let mut out = vec![0f32; data.len()];
     for (c, (&s, &z)) in scales.iter().zip(zero_points).enumerate() {
         let z = z as f32;
@@ -821,13 +919,13 @@ fn dequantize_per_channel<T: Score>(
 
 fn scores_into<T: Score>(
     data: &[T],
+    g: Grid,
     config: &SemanticConfig,
     dq: Dequant,
     geometry: &Geometry,
     dst: &mut TensorDyn,
     confidence: Option<&mut TensorDyn>,
 ) -> DecoderResult<()> {
-    let g = config.grid();
     let single = g.classes == 1;
     let cut = dq.stored(config.threshold());
     // The low-resolution winners feed the fast path, the accurate early-out
@@ -848,11 +946,12 @@ fn scores_into<T: Score>(
     let (Some(conf), Some(winners)) = (confidence, winners) else {
         return Ok(());
     };
-    let kind = match (single, config.activation) {
-        (true, Some(Activation::Sigmoid)) => ConfKind::BinaryProbability,
-        (true, _) => ConfKind::BinaryLogit,
-        (false, Some(Activation::Softmax | Activation::Sigmoid)) => ConfKind::Probability,
-        (false, _) => ConfKind::Softmax,
+    let kind = match (single, config.activation, config.activation_required) {
+        (true, Some(_), _) => ConfKind::BinaryProbability,
+        (true, None, _) => ConfKind::BinaryLogit,
+        (false, Some(_), _) => ConfKind::Probability,
+        (false, None, Some(Activation::Sigmoid)) => ConfKind::Sigmoid,
+        (false, None, _) => ConfKind::Softmax,
     };
     let low = kernels::confidence_map(data, g, &winners, dq, kind);
     match conf.dtype() {
@@ -889,7 +988,7 @@ fn write_classes<T: Score, O: ClassOut + edgefirst_tensor::Element>(
         }
         (false, Some(winners)) => {
             let (ys, xs) = geometry.nearest();
-            kernels::upsample_nearest(winners, g.width, &ys, &xs, out);
+            kernels::upsample_nearest(winners, g.width, &ys, &xs, out, O::from_class);
         }
         (false, None) => {
             return Err(DecoderError::Internal(
@@ -917,7 +1016,7 @@ fn write_confidence<C: ConfOut + edgefirst_tensor::Element>(
         kernels::upsample_conf_bilinear(low, width, &ys, &xs, out);
     } else {
         let (ys, xs) = geometry.nearest();
-        kernels::upsample_conf_nearest(low, width, &ys, &xs, out);
+        kernels::upsample_nearest(low, width, &ys, &xs, out, C::from_conf);
     }
     Ok(())
 }
@@ -929,14 +1028,16 @@ fn decode_class_map(
     geometry: &Geometry,
     dst: &mut TensorDyn,
 ) -> DecoderResult<()> {
+    let g = config.grid_for(input)?;
     macro_rules! typed {
         ($t:ty) => {{
             let map = input
                 .as_typed::<$t>()
                 .ok_or_else(|| DecoderError::Internal("class map input dtype".to_string()))?
-                .map()
+                .map_read()
                 .map_err(map_err("class map input"))?;
-            class_map_into(map.as_slice(), config.grid(), geometry, dst)
+            check_extent(map.as_slice().len(), g, "class map input")?;
+            class_map_into(map.as_slice(), g, geometry, dst)
         }};
     }
     match input.dtype() {
@@ -986,7 +1087,14 @@ where
                 .ok_or_else(|| DecoderError::Internal("class map dtype".to_string()))?
                 .map_mut()
                 .map_err(map_err("class map"))?;
-            kernels::upsample_nearest(&classes, geometry.src_w, &ys, &xs, map.as_mut_slice());
+            kernels::upsample_nearest(
+                &classes,
+                geometry.src_w,
+                &ys,
+                &xs,
+                map.as_mut_slice(),
+                <$o>::from_class,
+            );
         }};
     }
     match dst.dtype() {

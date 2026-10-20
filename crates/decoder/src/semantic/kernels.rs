@@ -233,6 +233,8 @@ pub(super) fn threshold_map<T: Score>(data: &[T], g: Grid, cut: f32) -> Vec<u16>
 pub(super) enum ConfKind {
     /// Scores are probabilities already: the winner's real value.
     Probability,
+    /// Independent per-class logits: the winner's sigmoid.
+    Sigmoid,
     /// Logits: the maximum of the softmax across classes.
     Softmax,
     /// One logit channel: `max(p, 1 - p)` with `p = sigmoid(v)`.
@@ -270,61 +272,85 @@ pub(super) fn confidence_map<T: Score>(
         .with_min_len(MIN_ROWS_PER_TASK)
         .for_each_init(
             || (vec![0f32; g.width], vec![0f32; g.width]),
-            |(top, sum), (y, row)| {
+            |scratch, (y, row)| {
                 let win = &winners[y * g.width..][..g.width];
-                let at = |c: usize, x: usize| data[c * g.cs + y * g.ys + x * g.xs].to_f32();
+                let at =
+                    |c: usize, x: usize| dq.real(data[c * g.cs + y * g.ys + x * g.xs].to_f32());
                 match kind {
-                    ConfKind::Probability => {
-                        for (x, slot) in row.iter_mut().enumerate() {
-                            *slot = dq.real(at(win[x] as usize, x));
-                        }
-                    }
-                    ConfKind::Softmax => {
-                        for (x, t) in top.iter_mut().enumerate() {
-                            *t = at(win[x] as usize, x);
-                        }
-                        sum.fill(0.0);
-                        for c in 0..g.classes {
-                            if g.xs == 1 {
-                                let plane = &data[c * g.cs + y * g.ys..][..g.width];
-                                for ((s, &t), &v) in sum.iter_mut().zip(top.iter()).zip(plane) {
-                                    *s += exp_nonpositive(dq.scale * (v.to_f32() - t));
-                                }
-                            } else {
-                                for (x, (s, &t)) in sum.iter_mut().zip(top.iter()).enumerate() {
-                                    *s += exp_nonpositive(dq.scale * (at(c, x) - t));
-                                }
-                            }
-                        }
-                        for (slot, &s) in row.iter_mut().zip(sum.iter()) {
-                            *slot = 1.0 / s;
-                        }
-                    }
-                    ConfKind::BinaryLogit => {
-                        for (x, slot) in row.iter_mut().enumerate() {
-                            let p = 1.0 / (1.0 + (-dq.real(at(0, x))).exp());
-                            *slot = p.max(1.0 - p);
-                        }
-                    }
-                    ConfKind::BinaryProbability => {
-                        for (x, slot) in row.iter_mut().enumerate() {
-                            let p = dq.real(at(0, x));
-                            *slot = p.max(1.0 - p);
-                        }
-                    }
+                    ConfKind::Probability => winner_row(row, win, at),
+                    ConfKind::Sigmoid => winner_row(row, win, |c, x| sigmoid(at(c, x))),
+                    ConfKind::Softmax => softmax_row(data, g, y, win, dq, scratch, row),
+                    ConfKind::BinaryLogit => binary_row(row, |x| sigmoid(at(0, x))),
+                    ConfKind::BinaryProbability => binary_row(row, |x| at(0, x)),
                 }
             },
         );
     out
 }
 
-/// Nearest-neighbour upsample of a low-resolution class map.
-pub(super) fn upsample_nearest<O: ClassOut>(
-    map: &[u16],
+#[inline(always)]
+fn sigmoid(v: f32) -> f32 {
+    1.0 / (1.0 + (-v).exp())
+}
+
+/// A function of each pixel's winning class and column.
+#[inline(always)]
+fn winner_row(row: &mut [f32], win: &[u16], f: impl Fn(usize, usize) -> f32) {
+    for (x, (slot, &c)) in row.iter_mut().zip(win).enumerate() {
+        *slot = f(c as usize, x);
+    }
+}
+
+/// `max(p, 1 - p)` of a single-channel probability.
+#[inline(always)]
+fn binary_row(row: &mut [f32], p: impl Fn(usize) -> f32) {
+    for (x, slot) in row.iter_mut().enumerate() {
+        let p = p(x);
+        *slot = p.max(1.0 - p);
+    }
+}
+
+/// The winner's softmax probability, `1 / sum(exp(v - top))`.
+#[inline(always)]
+fn softmax_row<T: Score>(
+    data: &[T],
+    g: Grid,
+    y: usize,
+    win: &[u16],
+    dq: Dequant,
+    (top, sum): &mut (Vec<f32>, Vec<f32>),
+    row: &mut [f32],
+) {
+    let at = |c: usize, x: usize| data[c * g.cs + y * g.ys + x * g.xs].to_f32();
+    for (x, t) in top.iter_mut().enumerate() {
+        *t = at(win[x] as usize, x);
+    }
+    sum.fill(0.0);
+    for c in 0..g.classes {
+        if g.xs == 1 {
+            let plane = &data[c * g.cs + y * g.ys..][..g.width];
+            for ((s, &t), &v) in sum.iter_mut().zip(top.iter()).zip(plane) {
+                *s += exp_nonpositive(dq.scale * (v.to_f32() - t));
+            }
+        } else {
+            for (x, (s, &t)) in sum.iter_mut().zip(top.iter()).enumerate() {
+                *s += exp_nonpositive(dq.scale * (at(c, x) - t));
+            }
+        }
+    }
+    for (slot, &s) in row.iter_mut().zip(sum.iter()) {
+        *slot = 1.0 / s;
+    }
+}
+
+/// Nearest-neighbour upsample of a low-resolution map, converting each value.
+pub(super) fn upsample_nearest<S: Copy + Sync, O: Send>(
+    map: &[S],
     width: usize,
     ys: &[u32],
     xs: &[u32],
     dst: &mut [O],
+    convert: impl Fn(S) -> O + Sync,
 ) {
     dst.par_chunks_mut(xs.len())
         .zip(ys.par_iter())
@@ -332,26 +358,7 @@ pub(super) fn upsample_nearest<O: ClassOut>(
         .for_each(|(row, &sy)| {
             let src = &map[sy as usize * width..][..width];
             for (o, &sx) in row.iter_mut().zip(xs) {
-                *o = O::from_class(src[sx as usize]);
-            }
-        });
-}
-
-/// Nearest-neighbour upsample of a low-resolution confidence map.
-pub(super) fn upsample_conf_nearest<C: ConfOut>(
-    map: &[f32],
-    width: usize,
-    ys: &[u32],
-    xs: &[u32],
-    dst: &mut [C],
-) {
-    dst.par_chunks_mut(xs.len())
-        .zip(ys.par_iter())
-        .with_min_len(MIN_ROWS_PER_TASK)
-        .for_each(|(row, &sy)| {
-            let src = &map[sy as usize * width..][..width];
-            for (o, &sx) in row.iter_mut().zip(xs) {
-                *o = C::from_conf(src[sx as usize]);
+                *o = convert(src[sx as usize]);
             }
         });
 }

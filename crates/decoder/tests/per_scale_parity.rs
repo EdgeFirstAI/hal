@@ -12,24 +12,13 @@
 //! Tests gracefully skip when `tflite_runtime` is not available or the
 //! fixture model files are missing.
 
-/// Emit a skip notice that survives libtest's output capture.
-///
-/// libtest captures `println!`/`eprintln!` and replays it only for **failing**
-/// tests, so a test that skips and returns prints `... ok` with its reason
-/// discarded — indistinguishable from one that did the work. Writing to
-/// `std::io::stderr()` directly bypasses that. See TESTING.md.
-macro_rules! skip_note {
-    ($($arg:tt)*) => {{
-        use std::io::Write;
-        let _ = write!(&mut std::io::stderr(), "WARNING: SKIPPED: ");
-        let _ = writeln!(&mut std::io::stderr(), $($arg)*);
-    }};
-}
-
+#[macro_use]
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use common::testdata_root;
 
 const REFERENCE_SCRIPT: &str = "scripts/per_scale_decode_reference.py";
 
@@ -49,20 +38,6 @@ fn reference_script_path() -> PathBuf {
 }
 
 /// Path to the per-scale fixtures directory.
-#[allow(dead_code)]
-/// Root of the `testdata/` tree.
-///
-/// `EDGEFIRST_TESTDATA_DIR` wins when set; the `workspace_root()` fallback is
-/// baked in at COMPILE time, so a cross-compiled binary carries the build
-/// host's absolute path. That is why 12 of these tests skipped silently on
-/// every board — they looked for `/Users/.../crates/decoder/../../testdata`,
-/// found nothing, and reported `... ok`.
-fn testdata_root() -> PathBuf {
-    std::env::var("EDGEFIRST_TESTDATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root().join("testdata"))
-}
-
 fn fixtures_dir_path() -> PathBuf {
     testdata_root().join("per_scale")
 }

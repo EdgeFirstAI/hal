@@ -1129,16 +1129,21 @@ impl DecoderBuilder {
     pub fn build(self) -> Result<Decoder, DecoderError> {
         let decode_dtype = self.decode_dtype;
         let explicit_input_dims = self.input_dims;
-        let (config, decode_program, per_scale_plan, schema_input_dims, semantic) = match self
-            .config_src
-        {
+        let Lowered {
+            config,
+            decode_program,
+            per_scale_plan,
+            schema_input_dims,
+            semantic,
+            semantic_only,
+        } = match self.config_src {
             Some(ConfigSource::Json(s)) => {
                 Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
             }
             Some(ConfigSource::Yaml(s)) => {
                 Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype)?
             }
-            Some(ConfigSource::Config(c)) => (c, None, None, None, None),
+            Some(ConfigSource::Config(c)) => Self::build_from_config(c, decode_dtype)?,
             Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
@@ -1218,20 +1223,10 @@ impl DecoderBuilder {
             // Drop the un-needed config; the per-scale subsystem owns it.
             drop(config);
             ModelType::PerScale
-        } else if semantic.is_some() {
+        } else if semantic_only {
             ModelType::Semantic
         } else {
             Self::get_model_type(config)?
-        };
-        let semantic = match (&model_type, semantic) {
-            (_, Some(semantic)) => Some(semantic),
-            (
-                ModelType::ModelPackSeg { segmentation }
-                | ModelType::ModelPackSegDet { segmentation, .. }
-                | ModelType::ModelPackSegDetSplit { segmentation, .. },
-                None,
-            ) => crate::semantic::SemanticConfig::from_modelpack(segmentation).ok(),
-            _ => None,
         };
 
         let per_scale = per_scale_plan
@@ -1271,30 +1266,21 @@ impl DecoderBuilder {
     /// schema either way (v1 inputs are upgraded in memory via
     /// `from_v1`), so this helper is the sole place that turns a
     /// schema into builder-ready state.
-    #[allow(clippy::type_complexity)]
     fn build_from_schema(
         schema: SchemaV2,
         decode_dtype: DecodeDtype,
-    ) -> Result<
-        (
-            ConfigOutputs,
-            Option<DecodeProgram>,
-            Option<PerScalePlan>,
-            Option<(usize, usize)>,
-            Option<SemanticConfig>,
-        ),
-        DecoderError,
-    > {
+    ) -> Result<Lowered, DecoderError> {
         schema.validate()?;
         let input_dims = schema.input.as_ref().and_then(input_dims_from_spec);
         if let Some(semantic) = Self::semantic_from_schema(&schema)? {
-            return Ok((
-                ConfigOutputs::default(),
-                None,
-                None,
-                input_dims,
-                Some(semantic),
-            ));
+            return Ok(Lowered {
+                config: ConfigOutputs::default(),
+                decode_program: None,
+                per_scale_plan: None,
+                schema_input_dims: input_dims,
+                semantic: Some(semantic),
+                semantic_only: true,
+            });
         }
         // The per-scale subsystem claims per-scale schemas in full and owns
         // their decode end-to-end (`decode` / `decode_proto` short-circuit on
@@ -1314,7 +1300,55 @@ impl DecoderBuilder {
         // EDGEAI-1303). `None` is fine when the schema omits the input
         // spec — the decoder falls back to the protobox `>2.0` reject.
         let legacy = schema.to_legacy_config_outputs()?;
-        Ok((legacy, program, per_scale, input_dims, None))
+        Ok(Lowered {
+            config: legacy,
+            decode_program: program,
+            per_scale_plan: per_scale,
+            schema_input_dims: input_dims,
+            semantic: Self::modelpack_semantic_from_schema(&schema),
+            semantic_only: false,
+        })
+    }
+
+    /// Lowers a programmatic configuration. One with a semantic output goes
+    /// through the schema path, as JSON and YAML do.
+    fn build_from_config(
+        c: ConfigOutputs,
+        decode_dtype: DecodeDtype,
+    ) -> Result<Lowered, DecoderError> {
+        if c.outputs
+            .iter()
+            .any(|o| *o.decoder() == DecoderType::Semantic)
+        {
+            return Self::build_from_schema(SchemaV2::from_v1(&c)?, decode_dtype);
+        }
+        let semantic = c.outputs.iter().find_map(|o| match o {
+            ConfigOutput::Segmentation(seg) if seg.decoder == DecoderType::ModelPack => {
+                warn_no_semantic(SemanticConfig::from_modelpack(seg))
+            }
+            _ => None,
+        });
+        Ok(Lowered {
+            config: c,
+            decode_program: None,
+            per_scale_plan: None,
+            schema_input_dims: None,
+            semantic,
+            semantic_only: false,
+        })
+    }
+
+    /// The semantic view of a ModelPack schema's segmentation output, which
+    /// keeps the output's activation, name and position.
+    fn modelpack_semantic_from_schema(schema: &SchemaV2) -> Option<SemanticConfig> {
+        let count = schema.outputs.len();
+        schema.outputs.iter().enumerate().find_map(|(index, o)| {
+            (o.type_ == Some(crate::schema::LogicalType::Segmentation)
+                && o.decoder == Some(DecoderKind::ModelPack))
+            .then(|| warn_no_semantic(SemanticConfig::from_logical(o)))
+            .flatten()
+            .map(|c| c.with_position(index, count))
+        })
     }
 
     /// The semantic output of a schema with a `decoder: semantic` output.
@@ -2189,12 +2223,7 @@ impl DecoderBuilder {
     /// `verify_modelpack_seg` has validated that `shape` is rank-4 (it returns
     /// `InvalidConfig` otherwise), so `shape[3]` cannot panic.
     fn modelpack_seg_num_classes(segmentation: &configs::Segmentation) -> usize {
-        for (dim_name, dim_size) in &segmentation.dshape {
-            if *dim_name == DimName::NumClasses {
-                return *dim_size;
-            }
-        }
-        segmentation.shape[3]
+        segmentation.shape[crate::semantic::modelpack_class_axis(&segmentation.dshape)]
     }
 
     // verifies that dshapes match the given shape
@@ -2402,4 +2431,23 @@ impl DecoderBuilder {
         }
         None
     }
+}
+
+/// A configuration lowered for [`DecoderBuilder::build`].
+struct Lowered {
+    config: ConfigOutputs,
+    decode_program: Option<DecodeProgram>,
+    per_scale_plan: Option<PerScalePlan>,
+    schema_input_dims: Option<(usize, usize)>,
+    semantic: Option<SemanticConfig>,
+    /// The model is decoded only by `Decoder::decode_semantic`.
+    semantic_only: bool,
+}
+
+/// A ModelPack model whose segmentation output has no semantic view still
+/// decodes boxes and masks, so the reason is logged rather than returned.
+fn warn_no_semantic(config: Result<SemanticConfig, DecoderError>) -> Option<SemanticConfig> {
+    config
+        .map_err(|e| tracing::warn!("ModelPack segmentation has no semantic decode: {e}"))
+        .ok()
 }

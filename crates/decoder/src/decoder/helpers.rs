@@ -328,57 +328,6 @@ impl Decoder {
             Classes(v) => &v.shape,
         };
 
-        if dshape.is_empty() {
-            // Omitted dshape → caller asserts shape is already canonical.
-            return Ok(());
-        }
-
-        if dshape.len() != shape.len() {
-            return Err(DecoderError::InvalidConfig(format!(
-                "{role_name} output: dshape has {} entries but shape has {} entries \
-                 — shape and dshape must describe the same axes in the same order",
-                dshape.len(),
-                shape.len()
-            )));
-        }
-
-        for (i, (name, size)) in dshape.iter().enumerate() {
-            if *size != shape[i] {
-                return Err(DecoderError::InvalidConfig(format!(
-                    "{role_name} output: dshape[{i}] = ({name}, {size}) does not \
-                     match shape[{i}] = {} — declare shape and dshape in the \
-                     same physical order (outermost axis first)",
-                    shape[i]
-                )));
-            }
-            // Role-agnostic size constraints on well-known axis roles.
-            if *name == DimName::Padding && *size != 1 {
-                return Err(DecoderError::InvalidConfig(format!(
-                    "{role_name} output: `padding` axis must have size 1, got {size}"
-                )));
-            }
-            if *name == DimName::BoxCoords && *size != 4 {
-                return Err(DecoderError::InvalidConfig(format!(
-                    "{role_name} output: `box_coords` axis must have size 4, got {size}"
-                )));
-            }
-        }
-
-        // Duplicate-axis check: duplicates map to the same canonical slot
-        // and would break `swap_axes_if_needed` by producing a
-        // non-permutation ordering.
-        for i in 0..dshape.len() {
-            for j in (i + 1)..dshape.len() {
-                if dshape[i].0 == dshape[j].0 {
-                    return Err(DecoderError::InvalidConfig(format!(
-                        "{role_name} output: dshape axis `{}` appears at \
-                         both index {i} and {j}",
-                        dshape[i].0
-                    )));
-                }
-            }
-        }
-
-        Ok(())
+        crate::configs::validate_dshape(role_name, shape, dshape)
     }
 }
