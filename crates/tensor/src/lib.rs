@@ -3046,7 +3046,7 @@ where
         shape
             .iter()
             .copied()
-            .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
+            .try_fold(1usize, usize::checked_mul)
             .ok_or_else(|| {
                 Error::InvalidArgument(format!(
                     "from_foreign: shape.product() overflows usize (shape={shape:?})"
