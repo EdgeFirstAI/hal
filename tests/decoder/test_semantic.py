@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import struct
+from pathlib import Path
 
 import edgefirst.decoder as ef
 import numpy as np
@@ -115,3 +117,56 @@ def test_detection_decoder_has_no_semantic_output():
             [tensor(np.zeros((1, 84, 8400), dtype=np.float32))],
             ef.Tensor([4, 4], dtype="uint8"),
         )
+
+
+SEGFORMER_FIXTURES = [
+    "segformer-b1-ade-512x672_zidane.safetensors",
+    "segformer-b1-ade-512x512_jaguar.safetensors",
+    "segformer-b1-ade-512x512_coco_420_odd.safetensors",
+]
+SAFETENSORS_DTYPES = {
+    "F32": np.float32,
+    "F16": np.float16,
+    "I8": np.int8,
+    "U8": np.uint8,
+}
+
+
+def load_safetensors(path):
+    """Tensors and metadata of a safetensors file, without the safetensors package."""
+    data = path.read_bytes()
+    if data.startswith(b"version https://git-lfs"):
+        pytest.skip(f"{path} is an LFS pointer (run `git lfs pull`)")
+    (size,) = struct.unpack("<Q", data[:8])
+    header = json.loads(data[8 : 8 + size])
+    metadata = header.pop("__metadata__", {})
+    body = data[8 + size :]
+    tensors = {
+        key: np.frombuffer(body[b:e], dtype=SAFETENSORS_DTYPES[info["dtype"]]).reshape(
+            info["shape"]
+        )
+        for key, info in header.items()
+        for b, e in [info["data_offsets"]]
+    }
+    return tensors, metadata
+
+
+@pytest.mark.parametrize("name", SEGFORMER_FIXTURES)
+@pytest.mark.parametrize("suffix", ["", "_i8"])
+def test_segformer_outputs_match_the_reference_decode(name, suffix):
+    path = Path(__file__).resolve().parents[2] / "testdata" / "decoder" / name
+    if not path.exists():
+        pytest.skip(f"{path} not present (run `git lfs pull`)")
+    tensors, metadata = load_safetensors(path)
+    decoder = ef.Decoder.new_from_json_str(metadata["edgefirst_json" + suffix])
+    logits = tensor(tensors["logits" + suffix])
+    letterbox = json.loads(metadata["letterbox"])
+    for key, mode, floor in (
+        ("accurate", ef.DecodeMode.Accurate, 0.998),
+        ("fast", ef.DecodeMode.Fast, 0.97),
+    ):
+        reference = tensors[f"ref.{key}{suffix}"]
+        dst = ef.Tensor(list(reference.shape), dtype="uint8")
+        decoder.decode_semantic([logits], dst, mode=mode, letterbox=letterbox)
+        agreement = (read(dst, np.uint8) == reference).mean()
+        assert agreement >= floor, f"{key}: {agreement:.4%}"
