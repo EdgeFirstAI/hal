@@ -27,11 +27,14 @@ publish = false
 # Optimized + debug symbols for on-target perf / chrome traces (mirrors root).
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 strip = true
 debug = false
 
 [profile.profiling]
 inherits = "release"
+lto = "thin"
+codegen-units = 16
 strip = false
 debug = true

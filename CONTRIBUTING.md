@@ -262,6 +262,8 @@ alongside a workspace built with LTO and stripping.
 
 **`release` is for shipped artifacts only.** It links with fat LTO in a single codegen unit, which shrinks the C libraries by about a fifth and roughly doubles link time, so it runs only on `release/X.Y.Z` branches (`release.yml`) and in `make package`/`make wheel`. Every test, board archive and CI packaging smoke test uses `profiling`: the same optimisation level with thin LTO and line tables. Pass `--profile profiling` (or `PACKAGE_PROFILE=profiling` to `make package`) rather than `--release` when building to test.
 
+**Prove performance on the release build.** Performance comes first and size second: fat LTO's smaller libraries are a welcome side effect, not the goal. Whole-program LTO changes which functions are inlined into their callers, so a loop that only vectorizes once inlined can run several times slower in a release build than in a `profiling` one, and a scalar loop inlined into a large caller can start spilling registers on every iteration, which in-order Cortex-A53/A55 cores cannot hide. Write hot loops so they vectorize on their own (fixed-width chunks such as `chunks_exact`, per-row slice fills, no per-element closures that need inlining to fold away), and measure any optimization with `cargo bench` or `scripts/on-target-bundle.sh bench`, both of which build with the release profile. On a board, compare against a thin-LTO build of the same commit (`CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`) when a change could depend on inlining.
+
 ### Python Code
 
 For Python bindings:
