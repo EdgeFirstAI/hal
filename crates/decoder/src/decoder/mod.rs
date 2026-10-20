@@ -300,7 +300,7 @@ mod helpers;
 mod merge;
 mod per_scale_bridge;
 mod postprocess;
-mod tensor_bridge;
+pub(crate) mod tensor_bridge;
 mod tests;
 
 pub use builder::{DecoderBuilder, DEFAULT_PRE_NMS_TOP_K, MULTI_LABEL_PRE_NMS_TOP_K};

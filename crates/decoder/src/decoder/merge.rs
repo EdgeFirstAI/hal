@@ -35,11 +35,12 @@
 //!   during merge. For split ARA-2 typical usage the NPU applies
 //!   sigmoid on-chip (`activation_applied`), so this is not blocking.
 
-use ndarray::{Array, ArrayD, ArrayViewD, Axis, IxDyn};
+use ndarray::{Array, ArrayD, Axis, IxDyn};
 
 use crate::configs::DimName;
 use crate::schema::{self, padding_axes, squeeze_padding_dims, LogicalOutput, SchemaV2};
 // `squeeze_padding_dims` is re-used by plan_channel_concat below.
+use super::tensor_bridge::{padded_strides, strided_view};
 use crate::{dequantize_cpu_chunked, DecoderError, DecoderResult, Quantization};
 use edgefirst_tensor::{DType, TensorDyn, TensorMapTrait, TensorTrait};
 
@@ -413,37 +414,41 @@ fn find_axis_permutation(from: &[usize], to: &[usize]) -> Option<Vec<usize>> {
 /// intentionally promoted rather than kept native.
 fn tensor_to_f32(t: &TensorDyn, quant: Option<Quantization>) -> DecoderResult<ArrayD<f32>> {
     let shape = t.shape().to_vec();
+    let strides = padded_strides(t)?;
+    let map_fail = |e: edgefirst_tensor::Error| DecoderError::Internal(format!("tensor map: {e}"));
+    let typed_fail = || DecoderError::Internal(format!("tensor is not {:?}", t.dtype()));
     match t.dtype() {
         DType::F16 => {
-            let tensor = t.as_typed::<half::f16>().expect("dtype checked");
-            let m = tensor
-                .map()
-                .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
+            let tensor = t.as_typed::<half::f16>().ok_or_else(typed_fail)?;
+            let m = tensor.map_read().map_err(map_fail)?;
+            if strides.is_some() {
+                let view = strided_view(&shape, strides.as_deref(), m.as_slice())?;
+                return Ok(view.mapv(half::f16::to_f32));
+            }
             // Vectorized f16 → f32 widening via the `half` crate.
             use half::slice::HalfFloatSliceExt;
             let total: usize = shape.iter().product();
+            let src = m.as_slice().get(..total).ok_or_else(|| {
+                DecoderError::InvalidShape(format!("f16 tensor maps fewer than {total} elements"))
+            })?;
             let mut out = vec![0.0_f32; total];
-            m.as_slice().convert_to_f32_slice(&mut out);
+            src.convert_to_f32_slice(&mut out);
             Ok(Array::from_shape_vec(IxDyn(&shape), out)?)
         }
         DType::F32 => {
-            let tensor = t.as_typed::<f32>().expect("dtype checked");
-            let m = tensor
-                .map()
-                .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
-            let view = ArrayViewD::from_shape(IxDyn(&shape), m.as_slice())?;
+            let tensor = t.as_typed::<f32>().ok_or_else(typed_fail)?;
+            let m = tensor.map_read().map_err(map_fail)?;
+            let view = strided_view(&shape, strides.as_deref(), m.as_slice())?;
             Ok(view.to_owned())
         }
         DType::F64 => {
-            let tensor = t.as_typed::<f64>().expect("dtype checked");
-            let m = tensor
-                .map()
-                .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
-            let view = ArrayViewD::from_shape(IxDyn(&shape), m.as_slice())?;
+            let tensor = t.as_typed::<f64>().ok_or_else(typed_fail)?;
+            let m = tensor.map_read().map_err(map_fail)?;
+            let view = strided_view(&shape, strides.as_deref(), m.as_slice())?;
             Ok(view.mapv(|v| v as f32))
         }
         DType::U8 | DType::I8 | DType::U16 | DType::I16 | DType::U32 | DType::I32 => {
-            dequantize_integer_tensor(t, quant, &shape)
+            dequantize_integer_tensor(t, quant, &shape, strides.as_deref())
         }
         other => Err(DecoderError::NotSupported(format!(
             "merge: unsupported tensor dtype {other:?}"
@@ -455,17 +460,36 @@ fn dequantize_integer_tensor(
     t: &TensorDyn,
     quant: Option<Quantization>,
     shape: &[usize],
+    strides: Option<&[usize]>,
 ) -> DecoderResult<ArrayD<f32>> {
     let quant = quant.unwrap_or(Quantization::new(1.0, 0));
     let total: usize = shape.iter().product();
     let mut out = vec![0.0_f32; total];
     macro_rules! dq {
         ($ty:ty) => {{
-            let tensor = t.as_typed::<$ty>().expect("dtype checked");
+            let tensor = t
+                .as_typed::<$ty>()
+                .ok_or_else(|| DecoderError::Internal(format!("tensor is not {:?}", t.dtype())))?;
             let m = tensor
-                .map()
+                .map_read()
                 .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
-            dequantize_cpu_chunked(m.as_slice(), quant, &mut out);
+            match strides {
+                None => {
+                    let src = m.as_slice().get(..total).ok_or_else(|| {
+                        DecoderError::InvalidShape(format!(
+                            "tensor maps fewer than {total} elements"
+                        ))
+                    })?;
+                    dequantize_cpu_chunked(src, quant, &mut out);
+                }
+                Some(_) => {
+                    let packed: Vec<$ty> = strided_view(shape, strides, m.as_slice())?
+                        .iter()
+                        .copied()
+                        .collect();
+                    dequantize_cpu_chunked(&packed, quant, &mut out);
+                }
+            }
         }};
     }
     match t.dtype() {
@@ -475,7 +499,11 @@ fn dequantize_integer_tensor(
         DType::I16 => dq!(i16),
         DType::U32 => dq!(u32),
         DType::I32 => dq!(i32),
-        _ => unreachable!("dequantize_integer_tensor called on non-integer dtype"),
+        other => {
+            return Err(DecoderError::NotSupported(format!(
+                "merge: {other:?} is not an integer dtype"
+            )))
+        }
     }
     let arr = Array::from_shape_vec(IxDyn(shape), out)?;
     Ok(arr)
@@ -581,6 +609,63 @@ mod tests {
         assert_eq!(arr.shape(), &[2, 3]);
         let flat: Vec<f32> = arr.iter().copied().collect();
         assert_eq!(flat, vec![1.0, -2.0, 0.5, 0.25, -0.125, 4.0]);
+    }
+
+    /// A `[2, 3, 1]` region view of a 4-wide Grey image whose padding column holds `pad`.
+    macro_rules! padded_grey {
+        ($ty:ty, $values:expr, $pad:expr) => {{
+            let parent = Tensor::<$ty>::image(
+                4,
+                2,
+                edgefirst_tensor::PixelFormat::Grey,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            {
+                let mut m = parent.map().unwrap();
+                let dst = m.as_mut_slice();
+                dst.fill($pad);
+                for (row, src) in $values.chunks_exact(3).enumerate() {
+                    dst[row * 4..row * 4 + 3].copy_from_slice(src);
+                }
+            }
+            let view = parent
+                .view(edgefirst_tensor::Region::new(0, 0, 3, 2))
+                .unwrap();
+            assert_eq!(view.shape(), &[2, 3, 1]);
+            assert_eq!(view.row_stride(), Some(4 * std::mem::size_of::<$ty>()));
+            TensorDyn::from(view)
+        }};
+    }
+
+    #[test]
+    fn tensor_to_f32_skips_row_padding_of_integer_input() {
+        let values: [u8; 6] = [10, 20, 30, 40, 50, 60];
+        let padded = padded_grey!(u8, values, 0xEE);
+        let packed = make_u8_tensor(&[2, 3, 1], &values);
+        let q = Some(Quantization::new(0.5, 10));
+        let got = super::tensor_to_f32(&padded, q).unwrap();
+        assert_eq!(got, super::tensor_to_f32(&packed, q).unwrap());
+        assert_eq!(
+            got.iter().copied().collect::<Vec<_>>(),
+            [0.0, 5.0, 10.0, 15.0, 20.0, 25.0]
+        );
+    }
+
+    #[test]
+    fn tensor_to_f32_skips_row_padding_of_float_inputs() {
+        let values = [1.0_f32, -2.0, 0.5, 0.25, -0.125, 4.0];
+        let padded = padded_grey!(f32, values, f32::NAN);
+        let got = super::tensor_to_f32(&padded, None).unwrap();
+        assert_eq!(got.shape(), &[2, 3, 1]);
+        assert_eq!(got.iter().copied().collect::<Vec<_>>(), values);
+
+        let values_f16 = values.map(half::f16::from_f32);
+        let padded = padded_grey!(half::f16, values_f16, half::f16::NAN);
+        let got = super::tensor_to_f32(&padded, None).unwrap();
+        assert_eq!(got.shape(), &[2, 3, 1]);
+        assert_eq!(got.iter().copied().collect::<Vec<_>>(), values);
     }
 
     fn per_tensor_q(scale: f32, zp: i32, dt: DType) -> SchemaQuant {
