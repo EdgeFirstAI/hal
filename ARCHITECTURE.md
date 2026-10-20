@@ -876,7 +876,7 @@ macOS, and Android.
 | `decoder.<op>.<step>` | Sub-step within a decode phase | `decoder.nms_get_boxes.score_filter`, `decoder.nms_get_boxes.suppress`, `decoder.decode_proto.extract_proto_data` |
 | `decoder.tiled.` | SAHI tiling output side | `decoder.tiled.lift`, `decoder.tiled.merge` |
 | `tracker.` | ByteTrack association | `tracker.update`, `tracker.update.match_high_conf`, `tracker.update.predict` |
-| `python.` | Python binding entry point | `python.convert`, `python.convert_deferred`, `python.convert_with_fence`, `python.flush`, `python.decode`, `python.decode_proto`, `python.tile_into`, `python.tile_one`, `python.materialize_masks` |
+| `python.` | Python binding entry point | `python.convert`, `python.convert_deferred`, `python.convert_with_fence`, `python.flush`, `python.decode`, `python.decode_proto`, `python.decode_semantic`, `python.tile_into`, `python.tile_one`, `python.materialize_masks` |
 
 Every span site uses `tracing::trace_span!`, except `image.gl_init`, which
 uses `info_span!` so GL bring-up stays visible at a coarser filter level.

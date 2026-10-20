@@ -77,7 +77,7 @@ pub struct EfDecoderParams {
 
 /// An opaque decoder.
 pub struct EfDecoder {
-    inner: edgefirst_decoder::Decoder,
+    pub(crate) inner: edgefirst_decoder::Decoder,
 }
 
 /// An owned list of segmentation masks.

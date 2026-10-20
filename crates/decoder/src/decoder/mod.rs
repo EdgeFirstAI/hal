@@ -113,6 +113,9 @@ pub struct Decoder {
     /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
     /// the per-scale buffers are mutated per-frame.
     pub(crate) per_scale: Option<std::sync::Mutex<crate::per_scale::PerScaleDecoder>>,
+    /// Semantic segmentation output: a `decoder: semantic` output, or the
+    /// segmentation output of a ModelPack model.
+    pub(crate) semantic: Option<crate::semantic::SemanticConfig>,
 }
 
 /// Where a decoder's multi-label setting came from.
@@ -125,6 +128,10 @@ pub(crate) enum MultiLabelSource {
     Metadata,
     /// Set by the caller through [`DecoderBuilder::with_multi_label`].
     Explicit,
+}
+
+fn semantic_only() -> DecoderError {
+    DecoderError::NotSupported("semantic segmentation models are decoded by decode_semantic".into())
 }
 
 impl PartialEq for Decoder {
@@ -142,6 +149,7 @@ impl PartialEq for Decoder {
             && self.multi_label == other.multi_label
             && self.decode_program.is_some() == other.decode_program.is_some()
             && self.per_scale.is_some() == other.per_scale.is_some()
+            && self.semantic == other.semantic
     }
 }
 
@@ -167,6 +175,7 @@ impl Clone for Decoder {
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
             decode_program: self.decode_program.clone(),
             per_scale: None,
+            semantic: self.semantic.clone(),
         }
     }
 }
@@ -735,6 +744,7 @@ impl Decoder {
             ModelType::PerScale => Err(DecoderError::Internal(
                 "per-scale path must be intercepted before ModelType dispatch".into(),
             )),
+            ModelType::Semantic => Err(semantic_only()),
         }
     }
 
@@ -909,6 +919,7 @@ impl Decoder {
                     "per-scale path must be intercepted before ModelType dispatch".into(),
                 ));
             }
+            ModelType::Semantic => return Err(semantic_only()),
         }
         Ok(())
     }
@@ -1086,6 +1097,7 @@ impl Decoder {
             ModelType::PerScale => Err(DecoderError::Internal(
                 "per-scale path must be intercepted before ModelType dispatch".into(),
             )),
+            ModelType::Semantic => Err(semantic_only()),
         }
     }
 
@@ -1258,6 +1270,7 @@ impl Decoder {
             ModelType::PerScale => Err(DecoderError::Internal(
                 "per-scale path must be intercepted before ModelType dispatch".into(),
             )),
+            ModelType::Semantic => Err(semantic_only()),
         }
     }
 
@@ -1322,6 +1335,42 @@ impl Decoder {
     ) -> Result<(), DecoderError> {
         self.warn_once_tracked_multi_label();
         self.decode_impl(outputs, output_boxes, output_masks, false)
+    }
+
+    /// The model's semantic segmentation output: a `decoder: semantic`
+    /// output, or the segmentation output of a ModelPack model. `None` when
+    /// the model has neither.
+    pub fn semantic(&self) -> Option<&crate::semantic::SemanticConfig> {
+        self.semantic.as_ref()
+    }
+
+    /// Decodes the model's semantic segmentation output into `dst`, an
+    /// `[H, W]` class map of dtype `u8` (up to 256 classes) or `u16`, at any
+    /// resolution.
+    ///
+    /// `confidence`, when given, receives the winning class's probability as
+    /// an `[H, W]` map of `f32` or `u8` (scaled to 255); it is approximate
+    /// and meant for overlays. See [`crate::semantic`] for the decode modes
+    /// and [`crate::semantic::SemanticOptions`] for the letterbox and the
+    /// runtime mode override.
+    ///
+    /// # Errors
+    ///
+    /// [`DecoderError::NotSupported`] if the model has no semantic output;
+    /// otherwise the errors of [`crate::semantic::decode_semantic`].
+    pub fn decode_semantic(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        dst: &mut edgefirst_tensor::TensorDyn,
+        confidence: Option<&mut edgefirst_tensor::TensorDyn>,
+        options: &crate::semantic::SemanticOptions,
+    ) -> Result<(), DecoderError> {
+        let config = self.semantic.as_ref().ok_or_else(|| {
+            DecoderError::NotSupported("the model has no semantic segmentation output".into())
+        })?;
+        let _span = tracing::trace_span!("decoder.decode_semantic").entered();
+        let input = crate::semantic::select_output(outputs, config)?;
+        crate::semantic::decode_semantic(input, config, dst, confidence, options)
     }
 
     /// [`Self::decode`] with an explicit multi-label setting.

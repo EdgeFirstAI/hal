@@ -13,6 +13,7 @@
 use edgefirst_decoder::configs::{
     DecoderType, DecoderVersion, DimName, Nms, OutputType, NMS_OFF_CODE,
 };
+use edgefirst_decoder::schema::DecodeMode;
 use edgefirst_decoder::tiling::{MatchMetric, MergeMode};
 use edgefirst_decoder::ModelSource;
 
@@ -36,8 +37,18 @@ pub enum EfNms {
 pub enum EfDecoderType {
     Ultralytics = 0,
     ModelPack = 1,
-    /// Generic semantic segmentation; not decoded by this HAL version.
+    /// Generic semantic segmentation, decoded by `ef_decoder_decode_semantic`.
     Semantic = 2,
+}
+
+/// Semantic segmentation decode mode, for `ef_semantic_options_set_mode`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfDecodeMode {
+    /// Upsample the scores of every class, then take the argmax.
+    Accurate = 0,
+    /// Argmax at the model's output resolution, then nearest upsampling.
+    Fast = 1,
 }
 
 /// Ultralytics architecture, for `ef_decoder_params_set_decoder_version`.
@@ -126,6 +137,9 @@ const _: () = {
     assert!(EfDecoderType::Ultralytics as u32 == DecoderType::Ultralytics.code());
     assert!(EfDecoderType::ModelPack as u32 == DecoderType::ModelPack.code());
     assert!(EfDecoderType::Semantic as u32 == DecoderType::Semantic.code());
+
+    assert!(EfDecodeMode::Accurate as u32 == DecodeMode::Accurate.code());
+    assert!(EfDecodeMode::Fast as u32 == DecodeMode::Fast.code());
 
     assert!(EfDecoderVersion::Yolov5 as u32 == DecoderVersion::Yolov5.code());
     assert!(EfDecoderVersion::Yolov8 as u32 == DecoderVersion::Yolov8.code());
@@ -271,6 +285,11 @@ mod tests {
                 .iter()
                 .map(|&v| (enumerator("EF_MODEL_SOURCE", v), v.code())),
         );
+        expected.extend(
+            [DecodeMode::Accurate, DecodeMode::Fast]
+                .iter()
+                .map(|&v| (enumerator("EF_DECODE_MODE", v), v.code())),
+        );
         for (name, code) in expected {
             let line = format!("{name} = {code},");
             assert!(
@@ -284,6 +303,7 @@ mod tests {
     fn unknown_option_codes_decode_to_nothing() {
         assert_eq!(Nms::from_option_code(4), None);
         assert_eq!(DecoderType::from_code(3), None);
+        assert_eq!(DecodeMode::from_code(2), None);
         assert_eq!(DimName::from_code(12), None);
         assert_eq!(DecoderVersion::from_code(4), None);
         assert_eq!(OutputType::from_code(8), None);

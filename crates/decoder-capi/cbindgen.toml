@@ -120,7 +120,7 @@ prefix = ""
 # get declared.
 # The option vocabularies are not reachable from any signature (the
 # functions and fields take `uint32_t`), so they are named here.
-include = ["EfNms", "EfDecoderType", "EfDecoderVersion", "EfOutputType", "EfDimName", "EfMatchMetric", "EfMergeMode", "EfModelSource"]
+include = ["EfNms", "EfDecoderType", "EfDecodeMode", "EfDecoderVersion", "EfOutputType", "EfDimName", "EfMatchMetric", "EfMergeMode", "EfModelSource"]
 exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderParams", "EfSegmentationList", "EfDetectBox", "EfSegmentation", "EfMergeConfig", "TilePlacement", "EfTilePlacement", "EfProtoData", "EfDecoderTracker", "EfDecoderTrackList"]
 
 
@@ -149,6 +149,8 @@ exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderP
 "EfMatchMetric" = "ef_match_metric"
 "EfMergeMode" = "ef_merge_mode"
 "EfModelSource" = "ef_model_source"
+"EfDecodeMode" = "ef_decode_mode"
+"EfSemanticOptions" = "ef_semantic_options"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

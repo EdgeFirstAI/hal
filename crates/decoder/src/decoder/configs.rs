@@ -459,6 +459,9 @@ pub enum ModelType {
     /// `Decoder::model_type` field has a sensible value for per-scale
     /// Decoders that bypass the legacy `ModelType`-driven dispatch.
     PerScale,
+    /// Semantic segmentation model (`decoder: semantic`). Decoded only by
+    /// `Decoder::decode_semantic`; the box and mask entry points reject it.
+    Semantic,
 }
 
 #[cfg(test)]

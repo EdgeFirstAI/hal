@@ -8,7 +8,8 @@ use super::configs::{self, DecoderType, DecoderVersion, DimName, ModelType};
 use super::merge::DecodeProgram;
 use super::{ConfigOutput, ConfigOutputs, Decoder};
 use crate::per_scale::{DecodeDtype, PerScalePlan};
-use crate::schema::SchemaV2;
+use crate::schema::{DecoderKind, SchemaV2};
+use crate::semantic::SemanticConfig;
 use crate::DecoderError;
 
 /// Extract `(width, height)` from a schema [`crate::schema::InputSpec`].
@@ -1128,14 +1129,16 @@ impl DecoderBuilder {
     pub fn build(self) -> Result<Decoder, DecoderError> {
         let decode_dtype = self.decode_dtype;
         let explicit_input_dims = self.input_dims;
-        let (config, decode_program, per_scale_plan, schema_input_dims) = match self.config_src {
+        let (config, decode_program, per_scale_plan, schema_input_dims, semantic) = match self
+            .config_src
+        {
             Some(ConfigSource::Json(s)) => {
                 Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
             }
             Some(ConfigSource::Yaml(s)) => {
                 Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype)?
             }
-            Some(ConfigSource::Config(c)) => (c, None, None, None),
+            Some(ConfigSource::Config(c)) => (c, None, None, None, None),
             Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
@@ -1215,8 +1218,20 @@ impl DecoderBuilder {
             // Drop the un-needed config; the per-scale subsystem owns it.
             drop(config);
             ModelType::PerScale
+        } else if semantic.is_some() {
+            ModelType::Semantic
         } else {
             Self::get_model_type(config)?
+        };
+        let semantic = match (&model_type, semantic) {
+            (_, Some(semantic)) => Some(semantic),
+            (
+                ModelType::ModelPackSeg { segmentation }
+                | ModelType::ModelPackSegDet { segmentation, .. }
+                | ModelType::ModelPackSegDetSplit { segmentation, .. },
+                None,
+            ) => crate::semantic::SemanticConfig::from_modelpack(segmentation).ok(),
+            _ => None,
         };
 
         let per_scale = per_scale_plan
@@ -1241,6 +1256,7 @@ impl DecoderBuilder {
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
             decode_program,
             per_scale,
+            semantic,
         })
     }
 
@@ -1265,10 +1281,21 @@ impl DecoderBuilder {
             Option<DecodeProgram>,
             Option<PerScalePlan>,
             Option<(usize, usize)>,
+            Option<SemanticConfig>,
         ),
         DecoderError,
     > {
         schema.validate()?;
+        let input_dims = schema.input.as_ref().and_then(input_dims_from_spec);
+        if let Some(semantic) = Self::semantic_from_schema(&schema)? {
+            return Ok((
+                ConfigOutputs::default(),
+                None,
+                None,
+                input_dims,
+                Some(semantic),
+            ));
+        }
         // The per-scale subsystem claims per-scale schemas in full and owns
         // their decode end-to-end (`decode` / `decode_proto` short-circuit on
         // `per_scale.is_some()`). Build it first and use its claim as the
@@ -1286,9 +1313,31 @@ impl DecoderBuilder {
         // the legacy decode path to honour `normalized: false` (see
         // EDGEAI-1303). `None` is fine when the schema omits the input
         // spec — the decoder falls back to the protobox `>2.0` reject.
-        let input_dims = schema.input.as_ref().and_then(input_dims_from_spec);
         let legacy = schema.to_legacy_config_outputs()?;
-        Ok((legacy, program, per_scale, input_dims))
+        Ok((legacy, program, per_scale, input_dims, None))
+    }
+
+    /// The semantic output of a schema with a `decoder: semantic` output.
+    /// Such a model is decoded only by `Decoder::decode_semantic`, so every
+    /// other output must be typeless.
+    fn semantic_from_schema(schema: &SchemaV2) -> Result<Option<SemanticConfig>, DecoderError> {
+        let (semantic, others): (Vec<_>, Vec<_>) = schema
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.type_.is_some())
+            .partition(|(_, o)| o.decoder == Some(DecoderKind::Semantic));
+        match (semantic.as_slice(), others.is_empty()) {
+            ([], _) => Ok(None),
+            ([(index, one)], true) => SemanticConfig::from_logical(one)
+                .map(|c| Some(c.with_position(*index, schema.outputs.len()))),
+            ([_], false) => Err(DecoderError::NotSupported(
+                "a semantic output cannot be combined with other decoded outputs".to_string(),
+            )),
+            _ => Err(DecoderError::NotSupported(
+                "a model may have only one semantic output".to_string(),
+            )),
+        }
     }
 
     /// Extracts the normalized flag from config outputs.

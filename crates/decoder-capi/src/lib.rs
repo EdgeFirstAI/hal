@@ -17,6 +17,7 @@ compile_error!(
 pub mod codes;
 pub mod decode;
 pub mod infer;
+pub mod semantic;
 pub mod tiling;
 
 /// ABI version of this library's C surface.
