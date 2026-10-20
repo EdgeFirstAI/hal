@@ -28,7 +28,7 @@
 macro_rules! skip_note {
     ($($arg:tt)*) => {{
         use std::io::Write;
-        let _ = write!(&mut std::io::stderr(), "SKIPPED: ");
+        let _ = write!(&mut std::io::stderr(), "WARNING: SKIPPED: ");
         let _ = writeln!(&mut std::io::stderr(), $($arg)*);
     }};
 }

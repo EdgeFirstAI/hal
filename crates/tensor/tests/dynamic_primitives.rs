@@ -32,6 +32,11 @@ use edgefirst_tensor::{
     TensorMemory, TensorTrait,
 };
 
+/// Allocation policy: a failure the host's probe did not predict fails the test.
+#[path = "support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+
 /// The DMA-heap skip policy, shared with every DMA-gated test so a skip under
 /// `HAL_TEST_REQUIRE_DMA=1` fails instead.
 #[path = "support/dma_require.rs"]
@@ -54,7 +59,7 @@ fn dma_or_skip(what: &str) -> bool {
 #[cfg(target_os = "windows")]
 fn report_skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+    let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {reason}");
 }
 
 /// Allocate a bare (formatless) `TensorDyn` of the given shape/dtype code,
@@ -62,27 +67,6 @@ fn report_skip(reason: &str) {
 /// below builds on before attaching format/quantization metadata.
 fn bare_u8(shape: &[usize]) -> Tensor<u8> {
     Tensor::<u8>::new(shape, None, None).expect("bare tensor allocation")
-}
-
-/// Host has no usable dma-heap / shm device. The C builder wraps the OS
-/// error in `io::ErrorKind::Other` (`builder_alloc: IoError(Os { kind:
-/// PermissionDenied, ... })`), so matching only `e.kind()` misses the
-/// GitHub-hosted runner case and panics as "unexpected".
-#[cfg(unix)]
-fn platform_resource_absent(err: &Error) -> bool {
-    match err {
-        Error::IoError(e) => {
-            matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) || e.to_string().contains("Permission denied")
-                || e.to_string().contains("No such file or directory")
-        }
-        Error::NotImplemented(msg) => {
-            msg.contains("Permission denied") || msg.contains("errno 13") || msg.contains("errno 2")
-        }
-        _ => false,
-    }
 }
 
 // --- Family 1: set_format / set_row_stride / set_plane_offset -------------
@@ -483,28 +467,13 @@ fn a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_addres
     // `edgefirst-image`'s `create_image` makes on its Dma-first arm -- the
     // path the C harness reached this defect through.
     //
-    // Both formats are probed, not just the first: `Rgb` has its own layout
-    // (packed three bytes into an RGBA8 texel, so the texture is a quarter
-    // width) and a host that cannot allocate it must skip rather than panic
-    // inside the loop on a `None` texture.
-    for format in [PixelFormat::Rgba, PixelFormat::Rgb] {
-        match Tensor::<u8>::image(
-            64,
-            48,
-            format,
-            Some(TensorMemory::DmaBuf),
-            CpuAccess::ReadWrite,
-        ) {
-            Ok(t) if t.d3d11_texture().is_some() => drop(t),
-            other => {
-                report_skip(&format!("\
-                     a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_address \
-                     - no D3D11 {format:?} texture tensors on this host ({:?})",
-                    other.map(|t| t.memory())
-                ));
-                return;
-            }
-        }
+    // With a D3D11 device, both formats (`Rgb` packs into a quarter-width RGBA8 texture) must allocate.
+    if !edgefirst_tensor::is_gpu_buffer_available() {
+        report_skip(
+            "a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_address \
+             - no D3D11 device on this host",
+        );
+        return;
     }
 
     // The id `BufferIdentity::derived` builds: the kind's discriminant in the
@@ -1810,17 +1779,17 @@ fn reshape_changes_the_shape_and_the_cache_follows() {
 #[test]
 fn clone_fd_works_for_shm_not_only_dma() {
     const SHAPE: [usize; 2] = [64, 64];
-    let shm = match Tensor::<u8>::new(&SHAPE, Some(TensorMemory::Shm), None) {
-        Ok(t) => t,
-        Err(e) if platform_resource_absent(&e) => {
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIPPED: clone_fd_works_for_shm_not_only_dma -- no usable /dev/shm here"
-            );
-            return;
-        }
-        Err(e) => panic!("unexpected SHM allocation failure: {e:?}"),
+    let expect = if edgefirst_tensor::is_shm_available() {
+        outcome::Expect::Succeeds
+    } else {
+        outcome::Expect::MayFail("no usable /dev/shm on this host")
+    };
+    let Some(shm) = outcome::allocated(
+        Tensor::<u8>::new(&SHAPE, Some(TensorMemory::Shm), None),
+        "SHM allocation",
+        expect,
+    ) else {
+        return;
     };
 
     // A marker written through the tensor, so the fd can be checked against

@@ -478,6 +478,7 @@ mod tests {
         let Some(out) = cc_build_and_run(src, "ef_test_cross_library") else {
             return;
         };
+        artifacts::relay_skips("a_tensor_crosses_the_library_boundary_intact", &out);
         assert!(
             out.status.success(),
             "cross-library contract failed:\n{}{}",
@@ -501,6 +502,10 @@ mod tests {
         let Some(out) = cc_build_and_run(src, "ef_test_image_desc_cross_library") else {
             return;
         };
+        artifacts::relay_skips(
+            "an_image_desc_request_crosses_the_library_boundary_intact",
+            &out,
+        );
         assert!(
             out.status.success(),
             "image-desc cross-library contract failed:\n{}{}",

@@ -6,20 +6,11 @@ use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
 
-/// Report a skip as `SKIPPED: {why}`, straight to stderr.
-///
-/// Not `println!`/`eprintln!`: libtest captures both and replays them only
-/// for a *failing* test, and a skip is a pass, so the reason was discarded
-/// exactly when it mattered. The `SKIPPED:` prefix is what
-/// `scripts/on-target-test.sh` greps a board's log for to count skips.
-/// Written out here rather than shared: an integration test is its own
-/// compilation unit and cannot reach `edgefirst-tensor`'s `pub(crate)`
-/// `test_support::report_skip`.
+/// Allocation policy: a failure the IOSurface probe did not predict fails the test.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
-}
+#[path = "support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
 
 /// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
 #[cfg(target_os = "linux")]
@@ -59,13 +50,16 @@ fn a_dup_of_the_same_dma_buf_has_the_same_identity() {
 /// with no IOSurface support.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn iosurface_tensor_or_skip() -> Option<Tensor<u8>> {
-    match Tensor::<u8>::new(&[4096], Some(TensorMemory::DmaBuf), None) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            skip(&format!("no IOSurface support on this host ({e})"));
-            None
-        }
-    }
+    let expect = if edgefirst_tensor::is_iosurface_available() {
+        outcome::Expect::Succeeds
+    } else {
+        outcome::Expect::MayFail("the IOSurface probe failed on this host")
+    };
+    outcome::allocated(
+        Tensor::<u8>::new(&[4096], Some(TensorMemory::DmaBuf), None),
+        "IOSurface allocation",
+        expect,
+    )
 }
 
 /// Re-wrap `t`'s underlying IOSurface as a second, independent tensor — the

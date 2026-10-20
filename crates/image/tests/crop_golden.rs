@@ -39,16 +39,10 @@ use serde::{Deserialize, Serialize};
 const SRC_W: usize = 640;
 const SRC_H: usize = 480;
 
-/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
-/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
-/// it -- see `edgefirst_image`'s (crate-internal) `test_support` module
-/// for the same mechanism in the library's own `#[cfg(test)]` code; this
-/// integration test binary is a separate compilation unit and cannot reach
-/// that `pub(crate)` helper, so it carries a local copy.
-fn report_skip(reason: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
-}
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+use outcome::report_skip;
 
 /// One golden-fixture entry: the case parameters plus the CRC32 of the CPU
 /// backend's converted output bytes.
@@ -147,7 +141,7 @@ fn run_case(
         Some(TensorMemory::Mem),
         CpuAccess::ReadWrite,
     )
-    .ok()?;
+    .expect("host-memory destination");
 
     let (left, top, width, height) = crop_rect;
     let crop = Crop::new()

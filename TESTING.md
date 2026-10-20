@@ -249,7 +249,7 @@ passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
 serialization policy.
 
 `-RequireCuda` sets `HAL_TEST_REQUIRE_CUDA=1`, turning a silent
-`SKIPPED: <test> - no CUDA runtime …` in
+`WARNING: SKIPPED: <test> - no CUDA runtime …` in
 `crates/tensor/tests/d3d11_tensor.rs`'s three D3D11 CUDA interop tests into
 a failure naming the test and the reason. The
 WARP-adapter skip is unaffected — it is correct by design, and those tests
@@ -834,29 +834,15 @@ missing node. When reporting on-target results, say which board skipped
 what and why — never summarise a run that skipped every DMA test as
 "passing".
 
-> **libtest hides skip reasons.** A hardware-gated test that returns early
-> prints `... ok`, identical to one that did the work — and libtest captures
-> `println!`/`eprintln!`, replaying it only for **failing** tests. So the
-> absence of a skip message is *not* evidence that a test ran. Announce
-> skips through a channel that bypasses the capture: `log::warn!`, or
-> `writeln!(&mut std::io::stderr(), …)` as `crates/tensor/tests/pin.rs`
-> does. Both hold their own handle to the real stderr. Cross-check against
-> the board's `capabilities.txt` before claiming a hardware path was
-> exercised.
->
-> **Start that line with `SKIPPED: `.** That literal prefix is what
-> `scripts/on-target-run.sh` greps each board's captured log for to report
-> the per-board skip count, so a skip announced under any other spelling is
-> invisible to the summary even when it reaches the log. Prefer the helper
-> your crate already has — `edgefirst-image`'s
-> `crate::test_support::report_skip`, or `artifacts::skip` in the two C-API
-> leaves that carry the `artifacts` module, `edgefirst-tensor-capi` and
-> `edgefirst-image-capi`. The other three modular leaves
-> (`edgefirst-codec-capi`, `edgefirst-decoder-capi`,
-> `edgefirst-tracker-capi`) do not include that module, so their tests write
-> the `writeln!(std::io::stderr(), "SKIPPED: …")` by hand; do the same
-> anywhere else an integration test cannot reach a helper, as
-> `crates/tensor/tests/support/cuda_require.rs` does.
+### Skips are warnings, unexpected allocation failures are failures
+
+A test that cannot exercise what it tests reports a **warning**, never a silent pass:
+
+- **Report a skip with `report_skip`.** It writes `WARNING: SKIPPED: <reason>` straight to stderr. libtest and nextest capture `println!`/`eprintln!` and show it only for failing tests, and `log::*` goes nowhere without a logger, so neither may announce a skip. The shared implementation is `crates/tensor/tests/support/outcome.rs`, `#[path]`-included wherever a crate's `test_support` cannot be reached.
+- **An allocation that the host should serve must not skip.** `outcome::allocated(result, what, Expect::Succeeds)` fails the test on an error. Only an allocation that can legitimately fail on this host, named by `Expect::MayFail("<why>")`, skips with a warning. A DMA-BUF allocation is `Expect::Succeeds` whenever the heap probe says the heap is usable (`expect_dma`, or `dma_allocated` in `edgefirst-image`/`edgefirst-tensor`), so a usable heap that fails to allocate is a bug, not a skip. Plain host memory is always `Succeeds`.
+- **`HAL_TEST_REQUIRE_*` turns a missing capability into a failure** on lanes that are meant to have it (see the guards above).
+
+The warnings are audited, not just counted. `.github/scripts/test_warnings.py` groups every `WARNING:` line from JUnit output and logs into a table in the step summary, with one annotation per distinct warning. It runs after the `hal-full` test jobs and in the hardware-test summary. `scripts/on-target-run.sh` counts skips per binary and writes the distinct warnings to `warnings.txt` in the results directory. Cross-check a skipped hardware test against the board's `capabilities.txt` before claiming a path was exercised.
 
 The `--test-threads=1` flag is mandatory on target for the same reasons
 as local development — CMA pool exhaustion risk is higher on embedded

@@ -43,10 +43,10 @@ const N: usize = 3;
 const LUMA: [u8; N] = [40, 200, 120];
 const CHROMA: u8 = 128;
 
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
-}
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+use outcome::report_skip as skip;
 
 fn rgba_dst() -> TensorDyn {
     TensorDyn::image(

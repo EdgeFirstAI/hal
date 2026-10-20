@@ -50,14 +50,18 @@ pub(crate) fn affine_u8_to_f32(src: &[u8], dst: &mut [f32], p: &Pattern) {
     let done = unsafe { neon::affine_f32(src, dst, p) };
     #[cfg(not(target_arch = "aarch64"))]
     let done = 0;
-    // `done` is a whole number of 12-lane groups, so each chunk starts at lane 0.
-    for (s, d) in src[done..]
-        .chunks(PERIOD)
-        .zip(dst[done..].chunks_mut(PERIOD))
-    {
-        for (l, (&x, y)) in s.iter().zip(d).enumerate() {
-            *y = x as f32 * p.scale[l] + p.offset[l];
+    // `done` is a whole number of 12-lane groups, so each group starts at lane 0.
+    // Fixed-width groups vectorize whatever the caller's inlining; a variable-length chunk did not under fat LTO.
+    let (src, dst) = (&src[done..], &mut dst[done..]);
+    let mut groups = src.chunks_exact(PERIOD).zip(dst.chunks_exact_mut(PERIOD));
+    for (s, d) in &mut groups {
+        for l in 0..PERIOD {
+            d[l] = s[l] as f32 * p.scale[l] + p.offset[l];
         }
+    }
+    let whole = src.len() / PERIOD * PERIOD;
+    for (l, (&x, y)) in src[whole..].iter().zip(&mut dst[whole..]).enumerate() {
+        *y = x as f32 * p.scale[l] + p.offset[l];
     }
 }
 
@@ -344,24 +348,27 @@ pub(super) fn fill_outside(dst: &mut TensorDyn, rect: Rect, values: [f32; 4]) ->
             ]
         }
     };
-    let value_at = |r: usize, i: usize| {
-        if planar {
-            values[r / h]
-        } else {
-            values[i % channels]
-        }
-    };
+    // A planar row holds one channel; a packed row cycles through `channels` lanes.
+    let lanes = if planar { 1 } else { channels };
+    let row_values = |r: usize| if planar { [values[r / h]; 4] } else { values };
+    // Whole-slice fills per row, so the loop stays a memset-like store whatever the caller's inlining.
     fn fill<T: Copy>(
         buf: &mut [T],
         stride: usize,
         rows: usize,
+        lanes: usize,
         spans: impl Fn(usize) -> [(usize, usize); 2],
-        value: impl Fn(usize, usize) -> T,
+        row_values: impl Fn(usize) -> [T; 4],
     ) {
         for (r, row) in buf.chunks_mut(stride).take(rows).enumerate() {
+            let v = row_values(r);
             for (a, b) in spans(r) {
-                for (i, e) in row[a..b].iter_mut().enumerate() {
-                    *e = value(r, a + i);
+                if lanes == 1 {
+                    row[a..b].fill(v[0]);
+                } else {
+                    for px in row[a..b].chunks_exact_mut(lanes) {
+                        px.copy_from_slice(&v[..lanes]);
+                    }
                 }
             }
         }
@@ -370,20 +377,20 @@ pub(super) fn fill_outside(dst: &mut TensorDyn, rect: Rect, values: [f32; 4]) ->
         DType::F32 => {
             let mut m = dst.as_typed_mut::<f32>().unwrap().map_mut()?;
             guard_plane(m.as_slice().len(), dst_stride, rows, row_len, "pad f32")?;
-            fill(m.as_mut_slice(), dst_stride, rows, spans, value_at);
+            fill(m.as_mut_slice(), dst_stride, rows, lanes, spans, row_values);
         }
         DType::F16 => {
             let mut m = dst.as_typed_mut::<half::f16>().unwrap().map_mut()?;
             guard_plane(m.as_slice().len(), dst_stride, rows, row_len, "pad f16")?;
-            fill(m.as_mut_slice(), dst_stride, rows, spans, |r, i| {
-                half::f16::from_f32(value_at(r, i))
+            fill(m.as_mut_slice(), dst_stride, rows, lanes, spans, |r| {
+                row_values(r).map(half::f16::from_f32)
             });
         }
         DType::U8 | DType::I8 => {
             let mut m = int_map(dst)?;
             guard_plane(m.as_slice().len(), dst_stride, rows, row_len, "pad int")?;
-            fill(m.as_mut_slice(), dst_stride, rows, spans, |r, i| {
-                value_at(r, i) as i32 as u8
+            fill(m.as_mut_slice(), dst_stride, rows, lanes, spans, |r| {
+                row_values(r).map(|x| x as i32 as u8)
             });
         }
         other => return Err(Error::NotSupported(format!("convert to {other}"))),

@@ -826,18 +826,10 @@ mod tests {
         // `crates/tensor/tests/pin.rs`'s DMA tests use. It is the only path
         // that exercises the map window's `DMA_BUF_IOCTL_SYNC` sync-bracket
         // arm, which a `Mem`-backed tensor never reaches.
-        if !edgefirst_tensor::is_dma_available() {
-            // Through `artifacts::skip`, which writes straight to stderr
-            // rather than through `eprintln!`: libtest swallows `eprintln!`
-            // output for passing tests (see check_abi.rs's
-            // `artifact_is_fresh`, which documents this exact trap), and this
-            // is the plan's only executable evidence for the
-            // `DMA_BUF_IOCTL_SYNC` sync-bracket arm -- a skip nobody sees is
-            // indistinguishable from a pass.
-            crate::artifacts::skip(
-                "dma_buf_map_write_unmap_copy_to_round_trip -- no usable \
-                 dma-heap on this host (missing or unprivileged)",
-            );
+        if !crate::dma_require::available_or_skip(
+            edgefirst_tensor::is_dma_available(),
+            "dma_buf_map_write_unmap_copy_to_round_trip",
+        ) {
             return;
         }
         let t = edgefirst_tensor::TensorDyn::new(

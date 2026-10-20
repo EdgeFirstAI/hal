@@ -8194,8 +8194,16 @@ mod cpu_access_tests {
     fn iosurface_read_only_lock_roundtrip() {
         // Declares this test as an fd-opener; see FD_LOCK.
         let _lock = crate::tests::fd_lock_shared();
-        let Ok(t) = Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None) else {
-            crate::test_support::report_skip("IOSurface unavailable");
+        let expect = if crate::is_iosurface_available() {
+            crate::test_support::Expect::Succeeds
+        } else {
+            crate::test_support::Expect::MayFail("the IOSurface probe failed on this host")
+        };
+        let Some(t) = crate::test_support::allocated(
+            Tensor::<u8>::new(&[64], Some(TensorMemory::DmaBuf), None),
+            "IOSurface allocation",
+            expect,
+        ) else {
             return;
         };
         {
@@ -8385,7 +8393,9 @@ mod tests {
     fn test_shm_tensor() {
         let _lock = crate::tests::fd_lock_shared();
         if !is_shm_available() {
-            log::warn!("SKIPPED: test_shm_tensor - SHM allocation unavailable on this platform");
+            crate::test_support::report_skip(
+                "test_shm_tensor - SHM allocation unavailable on this platform",
+            );
             return;
         }
         let shape = vec![2, 3, 4];
@@ -8691,6 +8701,9 @@ mod tests {
     #[test]
     fn subview_of_a_texture_tensor_maps_at_its_offset() {
         if !crate::is_gpu_buffer_available() {
+            crate::test_support::report_skip(
+                "subview_of_a_texture_tensor_maps_at_its_offset - no D3D11 device on this host",
+            );
             return;
         }
         let t = Tensor::<u8>::image(
@@ -9169,7 +9182,10 @@ mod tests {
     fn test_from_fd_shm_imports_as_shm() {
         let _lock = crate::tests::fd_lock_shared();
         if !is_shm_available() {
-            log::warn!("SKIPPED: {} - SHM memory not available", function!());
+            crate::test_support::report_skip(&format!(
+                "{} - SHM memory not available",
+                function!()
+            ));
             return;
         }
 
@@ -9215,10 +9231,10 @@ mod tests {
     fn test_shm_no_fd_leaks() {
         let _lock = fd_lock_exclusive();
         if !is_shm_available() {
-            log::warn!(
-                "SKIPPED: {} - SHM memory allocation not available (permission denied or no SHM support)",
+            crate::test_support::report_skip(&format!(
+                "{} - SHM memory allocation not available (permission denied or no SHM support)",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -9258,10 +9274,10 @@ mod tests {
     fn test_shm_from_fd_no_fd_leaks() {
         let _lock = fd_lock_exclusive();
         if !is_shm_available() {
-            log::warn!(
-                "SKIPPED: {} - SHM memory allocation not available (permission denied or no SHM support)",
+            crate::test_support::report_skip(&format!(
+                "{} - SHM memory allocation not available (permission denied or no SHM support)",
                 function!()
-            );
+            ));
             return;
         }
 
@@ -9782,9 +9798,9 @@ mod tests {
         // NotImplemented (see shm.rs module docs). Asserting availability
         // outright fails there for a documented reason.
         if !is_shm_available() {
-            log::warn!(
-                "SKIPPED: test_shm_available_and_usable - SHM allocation \
-                 unavailable on this platform"
+            crate::test_support::report_skip(
+                "test_shm_available_and_usable - SHM allocation \
+                 unavailable on this platform",
             );
             return;
         }

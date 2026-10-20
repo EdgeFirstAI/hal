@@ -28,7 +28,8 @@ mod dma_require;
 const TEST: &str = "decoded_frames_convert_on_the_gpu_without_new_imports";
 
 fn skip(why: &str) {
-    eprintln!("SKIPPED: {TEST} - {why}");
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {TEST} - {why}");
 }
 
 fn testdata(name: &str) -> Vec<u8> {

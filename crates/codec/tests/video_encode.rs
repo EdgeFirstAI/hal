@@ -16,7 +16,8 @@ use edgefirst_codec::CodecError;
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
 fn skip(test: &str, why: &str) {
-    eprintln!("SKIPPED: {test} - {why}");
+    use std::io::Write;
+    let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {test} - {why}");
 }
 
 /// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.

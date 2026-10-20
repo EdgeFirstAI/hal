@@ -58,7 +58,10 @@ mod tests {
             Ok(o) => Some(o),
             Err(e) => {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr(), "SKIPPED: no C compiler ({cc}: {e})");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "WARNING: SKIPPED: no C compiler ({cc}: {e})"
+                );
                 None
             }
         }
@@ -118,7 +121,7 @@ mod tests {
                     use std::io::Write;
                     let _ = writeln!(
                         std::io::stderr(),
-                        "SKIPPED: libedgefirst_{name} not built; collision check not run"
+                        "WARNING: SKIPPED: libedgefirst_{name} not built; collision check not run"
                     );
                     return;
                 }
@@ -225,7 +228,7 @@ mod tests {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIPPED: nothing built; name not checked"
+                "WARNING: SKIPPED: nothing built; name not checked"
             );
             return;
         }

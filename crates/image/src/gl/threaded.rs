@@ -1719,16 +1719,9 @@ mod tests {
                 return;
             }
         };
-        let tensor_a = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "concurrent_maps_from_two_independent_handles... - \
-                     PBO not supported: {e:?}"
-                ));
-                return;
-            }
-        };
+        let tensor_a = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("a PBO on a live GL context");
         let buffer_id = tensor_a.pbo_id().expect("just created a PBO tensor");
         let size = tensor_a.capacity_bytes();
         let shape = tensor_a.shape().to_vec();

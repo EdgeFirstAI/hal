@@ -45,7 +45,7 @@ fn warp_has_no_cuda_device(what: &str) -> bool {
 /// that `pub(crate)` helper, so it carries a local copy.
 fn report_skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+    let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {reason}");
 }
 
 #[test]

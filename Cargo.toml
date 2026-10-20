@@ -142,14 +142,19 @@ zune-jpeg = "0.5.15"
 zune-png = "0.5.2"
 safetensors = "0.8.0"
 
+# Shipped artifacts only (release branches): whole-program LTO in one codegen unit.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 strip = true
 debug = false
 
+# Every test and CI build: release optimisation without the fat-LTO link time.
 [profile.profiling]
 inherits = "release"
+lto = "thin"
+codegen-units = 16
 strip = false
 debug = "line-tables-only"
 

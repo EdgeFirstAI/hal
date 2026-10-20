@@ -28,7 +28,7 @@ fn cuda_or_skip(what: &str) -> bool {
         why,
     );
     if !run {
-        let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {what} - {why}");
+        let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {what} - {why}");
     }
     run
 }

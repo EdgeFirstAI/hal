@@ -335,13 +335,13 @@ capi-libs:
 # comparison would be meaningless -- while capi-libs above only ever
 # produces target/debug. This is that release build, kept separate so a
 # plain `make capi-libs` (used by test-capi-modular and friends) stays fast.
-.PHONY: capi-libs-release
-capi-libs-release:
-	@echo "Building the five modular C-API crates (release, for G5 footprint)..."
+.PHONY: capi-libs-release capi-libs-profiling
+capi-libs-release capi-libs-profiling: capi-libs-%:
+	@echo "Building the five modular C-API crates ($*)..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo build --release $(if $(TARGET),--target $(TARGET)) $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
+		cargo build --profile $* $(if $(TARGET),--target $(TARGET)) $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
 	done
-	@echo "✓ Modular C-API release build complete"
+	@echo "✓ Modular C-API $* build complete"
 	@$(MAKE) capi-symlinks
 
 # build.rs sets `-soname libedgefirst_X.so.0` / install_name
@@ -363,11 +363,12 @@ capi-symlinks:
 # One relocatable archive: headers, soversioned libraries, pkg-config,
 # LICENSE, INSTALL.txt. tar.gz on Linux, zip on Windows and macOS. The same
 # script release.yml's build-capi job runs, so local `make package` and CI
-# cannot drift.
+# cannot drift. PACKAGE_PROFILE=profiling packages a test build (CI smoke tests on ordinary PRs).
+PACKAGE_PROFILE ?= release
 .PHONY: package
-package: capi-libs-release
+package: capi-libs-$(PACKAGE_PROFILE)
 	@mkdir -p dist
-	@./scripts/package-capi.sh --outdir dist
+	@./scripts/package-capi.sh --libdir target/$(PACKAGE_PROFILE) --outdir dist
 	@$(PYTHON) scripts/check_macho_alignment.py dist
 	@echo "✓ C archive in dist/"
 
@@ -540,10 +541,10 @@ install-python:
 	@# tensor backend's --config.
 	@for c in $(PYTHON_CRATES); do \
 		if [ -f "venv/bin/activate" ]; then \
-			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip $(TENSOR_DYNAMIC)" \
+			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling $(TENSOR_DYNAMIC)" \
 				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		else \
-			MATURIN_PEP517_ARGS="--auditwheel skip $(TENSOR_DYNAMIC)" \
+			MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling $(TENSOR_DYNAMIC)" \
 				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		fi; \
 	done
@@ -757,7 +758,7 @@ venv-static:
 	@$(DIFFERENTIAL_STATIC_VENV)/bin/pip install -q --upgrade pip
 	@$(DIFFERENTIAL_STATIC_VENV)/bin/pip install -q maturin $(DIFFERENTIAL_TEST_DEPS)
 	@for c in $(PYTHON_CRATES); do \
-		EDGEFIRST_TENSOR_STATIC_COMPARISON=1 $(DIFFERENTIAL_STATIC_VENV)/bin/maturin build --release --auditwheel skip \
+		EDGEFIRST_TENSOR_STATIC_COMPARISON=1 $(DIFFERENTIAL_STATIC_VENV)/bin/maturin build --profile profiling --auditwheel skip \
 			-o target/differential-wheels-static \
 			-m "$$c/Cargo.toml" -i $(DIFFERENTIAL_STATIC_VENV)/bin/python || exit 1; \
 	done
@@ -776,7 +777,7 @@ venv-dynamic:
 	@$(DIFFERENTIAL_DYNAMIC_VENV)/bin/pip install -q --upgrade pip
 	@$(DIFFERENTIAL_DYNAMIC_VENV)/bin/pip install -q maturin $(DIFFERENTIAL_TEST_DEPS)
 	@for c in $(PYTHON_CRATES); do \
-		$(DIFFERENTIAL_DYNAMIC_VENV)/bin/maturin build --release --auditwheel skip $(TENSOR_DYNAMIC) \
+		$(DIFFERENTIAL_DYNAMIC_VENV)/bin/maturin build --profile profiling --auditwheel skip $(TENSOR_DYNAMIC) \
 			-o target/differential-wheels-dynamic \
 			-m "$$c/Cargo.toml" -i $(DIFFERENTIAL_DYNAMIC_VENV)/bin/python || exit 1; \
 	done

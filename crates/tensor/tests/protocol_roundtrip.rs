@@ -326,7 +326,7 @@ fn dmabuf_import_has_no_coverage_off_linux() {
     use std::io::Write;
     let _ = writeln!(
         std::io::stderr(),
-        "SKIPPED: TensorDyn::import_descriptor's kind::DMABUF arm is untested on \
+        "WARNING: SKIPPED: TensorDyn::import_descriptor's kind::DMABUF arm is untested on \
          this platform (dma-buf is Linux-only). No aliasing coverage for the \
          dma-buf import path outside a Linux run."
     );

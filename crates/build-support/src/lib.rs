@@ -267,7 +267,14 @@ pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
         );
     }
 
-    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    // PROFILE only says debug or release; the profile directory names a custom profile such as `profiling`.
+    let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts");
+    let profile_dir = profile_dir_from_out_dir(Path::new(&out_dir));
+    let profile = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the profile directory has a UTF-8 name")
+        .to_string();
     let target = env::var("TARGET").unwrap_or_default();
     let host = env::var("HOST").unwrap_or_default();
     let cross = !target.is_empty() && target != host;
@@ -282,9 +289,7 @@ pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
         .arg(nested_target_dir)
         .env("CARGO_ENCODED_RUSTFLAGS", strip_cfg(&encoded, DYNAMIC_CFG))
         .env_remove("RUSTC_WORKSPACE_WRAPPER");
-    if profile == "release" {
-        cmd.arg("--release");
-    }
+    cmd.arg("--profile").arg(cargo_profile_name(&profile));
     if cross {
         cmd.arg("--target").arg(&target);
     }
@@ -306,6 +311,14 @@ pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
         built.push(&target);
     }
     built.join(profile)
+}
+
+/// The `--profile` name for a profile directory: cargo's `dev` profile builds into `debug/`.
+fn cargo_profile_name(profile_dir_name: &str) -> &str {
+    match profile_dir_name {
+        "debug" => "dev",
+        name => name,
+    }
 }
 
 /// Removes every `--cfg <name>` pair (and `--cfg=<name>`) from a `CARGO_ENCODED_RUSTFLAGS` value.
@@ -411,6 +424,13 @@ mod tests {
             )),
             Path::new("/w/target/aarch64-unknown-linux-gnu/profiling")
         );
+    }
+
+    #[test]
+    fn profile_dir_names_map_to_cargo_profiles() {
+        assert_eq!(cargo_profile_name("debug"), "dev");
+        assert_eq!(cargo_profile_name("release"), "release");
+        assert_eq!(cargo_profile_name("profiling"), "profiling");
     }
 
     #[test]

@@ -106,7 +106,7 @@ jobs:
       - run: make lint-python-abi3-py38
       - name: Package and smoke the C archive
         run: |
-          make package
+          make package PACKAGE_PROFILE=profiling
           ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.tar.gz
       - run: make test-capi-modular
       - run: make test-capi-link
@@ -156,6 +156,10 @@ jobs:
             --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
             --no-report -j 1 \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
+      - name: Audit test warnings
+        if: always()
+        shell: bash
+        run: python3 .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
 
       - name: Run Python tests with coverage
         run: |
@@ -236,6 +240,10 @@ jobs:
             --lcov --output-path target/coverage_rust.lcov \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             2>&1 | tee target/test-metrics-software-gl.txt || true
+      - name: Audit test warnings
+        if: always()
+        shell: bash
+        run: python3 .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
@@ -289,6 +297,10 @@ jobs:
           COV_LCOV: target/coverage_rust.lcov
           HAL_TEST_REQUIRE_GL: "1"
         run: ./scripts/test-macos.sh -j 1
+      - name: Audit test warnings
+        if: always()
+        shell: bash
+        run: python3 .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
       - run: make test-capi-modular
       - run: make test-capi-link
       - run: make test-two-library-user
@@ -343,6 +355,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo llvm-cov nextest --no-report --workspace --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Audit test warnings
+        if: always()
+        shell: bash
+        run: python .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
       - name: Generate LCOV
         shell: pwsh
         run: |
@@ -384,8 +400,8 @@ jobs:
             -- -D warnings
       - name: Build native Rust API (device + simulator)
         run: |
-          cargo build --target aarch64-apple-ios --release -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
-          cargo build --target aarch64-apple-ios-sim --release -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
+          cargo build --target aarch64-apple-ios --profile profiling -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
+          cargo build --target aarch64-apple-ios-sim --profile profiling -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 
   build-android:
     name: Build & Lint (Android, native Rust API)
@@ -422,7 +438,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release \
+          cargo ndk -t arm64-v8a -t x86_64 -P 26 build --profile profiling \
             -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
 
   test-windows-warp:
@@ -467,6 +483,10 @@ jobs:
       - name: Run GL tests on WARP
         shell: pwsh
         run: pwsh -NoProfile -File scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci
+      - name: Audit test warnings
+        if: always()
+        shell: bash
+        run: python .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
       - name: Generate LCOV
         if: always()
         shell: pwsh
@@ -514,14 +534,14 @@ jobs:
           $dynamic = @('--config', "$PWD/.cargo/tensor-dynamic.toml")
           foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
             $cfg = if (@('image','codec','decoder') -contains $leaf) { $dynamic } else { @() }
-            cargo build --release @cfg --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
+            cargo build --profile profiling @cfg --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Package and smoke
         shell: bash
         run: |
           mkdir -p dist
-          ./scripts/package-capi.sh --target x86_64-windows --libdir target/release --outdir dist
+          ./scripts/package-capi.sh --target x86_64-windows --libdir target/profiling --outdir dist
           ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.zip
 
   package-macos-capi-gpu:
@@ -558,7 +578,7 @@ jobs:
           if ! command -v pkg-config >/dev/null 2>&1; then
             brew install pkgconf
           fi
-          make package
+          make package PACKAGE_PROFILE=profiling
           ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.zip
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
@@ -575,7 +595,7 @@ jobs:
               --config "$PWD/.cargo/tensor-dynamic.toml" \
               --manifest-path "crates/python-$pkg/Cargo.toml" \
               --out target/wheels \
-              --release \
+              --profile profiling \
               --features abi3-py311 \
               --auditwheel skip
           done

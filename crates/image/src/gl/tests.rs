@@ -783,18 +783,11 @@ mod gl_tests {
         // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
         // `lib.rs` already gate, on the capability the processor reports
         // rather than on a driver name.
-        //
-        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
-        // and replays it only for FAILING tests, so a skip would print
-        // "... ok" with its reason discarded and be indistinguishable from
-        // having run. See TESTING.md.
         if !gl.supported_render_dtypes().f16 {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - this GPU has no F16 render target",
+            crate::test_support::report_skip(&format!(
+                "{} - this GPU has no F16 render target",
                 function!()
-            );
+            ));
             return;
         }
         let (sw, sh, dw) = (96usize, 72usize, 64usize);
@@ -892,18 +885,11 @@ mod gl_tests {
         // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
         // `lib.rs` already gate, on the capability the processor reports
         // rather than on a driver name.
-        //
-        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
-        // and replays it only for FAILING tests, so a skip would print
-        // "... ok" with its reason discarded and be indistinguishable from
-        // having run. See TESTING.md.
         if !gl.supported_render_dtypes().f16 {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - this GPU has no F16 render target",
+            crate::test_support::report_skip(&format!(
+                "{} - this GPU has no F16 render target",
                 function!()
-            );
+            ));
             return;
         }
         let (sw, sh, dw) = (96usize, 72usize, 64usize);
@@ -1019,18 +1005,11 @@ mod gl_tests {
         // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
         // `lib.rs` already gate, on the capability the processor reports
         // rather than on a driver name.
-        //
-        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
-        // and replays it only for FAILING tests, so a skip would print
-        // "... ok" with its reason discarded and be indistinguishable from
-        // having run. See TESTING.md.
         if !gl.supported_render_dtypes().f16 {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - this GPU has no F16 render target",
+            crate::test_support::report_skip(&format!(
+                "{} - this GPU has no F16 render target",
                 function!()
-            );
+            ));
             return;
         }
         let (sw, sh, dw) = (128usize, 96usize, 64usize);
@@ -1158,21 +1137,18 @@ mod gl_tests {
 
         let lb = Crop::letterbox([114, 114, 114, 255]);
         for dtype in [DType::U8, DType::I8] {
-            let mut dst = match TensorDyn::image(
-                640,
-                640,
-                PixelFormat::Rgb,
-                dtype,
-                Some(TensorMemory::DmaBuf),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    crate::test_support::report_skip(&format!(
-                        "cell {dtype:?}: DMA RGB dst unavailable: {e}"
-                    ));
-                    continue;
-                }
+            let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
+                TensorDyn::image(
+                    640,
+                    640,
+                    PixelFormat::Rgb,
+                    dtype,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ),
+                &format!("cell {dtype:?}: DMA RGB destination"),
+            ) else {
+                continue;
             };
             let mut first: Option<Vec<u8>> = None;
             for round in 0..4 {
@@ -2438,6 +2414,10 @@ mod gl_tests {
     // two-pass packed-RGB pipeline runs zero-copy on both backends.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_rgb_correctness() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(
                 "test_opengl_rgb_correctness - zero-copy GPU image buffers not available",
@@ -2592,6 +2572,10 @@ mod gl_tests {
     // two-pass packed-RGB pipeline runs zero-copy on both backends.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_rgb_no_letterbox_correctness() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip("test_opengl_rgb_no_letterbox_correctness - zero-copy GPU image buffers not available");
             return;
@@ -3007,21 +2991,13 @@ mod gl_tests {
         }
 
         let gl = GLProcessorThreaded::new(None).unwrap();
-        let result = gl.create_pbo_image(64, 64, PixelFormat::Rgba);
-        match result {
-            Ok(pbo_img) => {
-                assert_eq!(pbo_img.width(), Some(64));
-                assert_eq!(pbo_img.height(), Some(64));
-                assert_eq!(pbo_img.format().unwrap(), PixelFormat::Rgba);
-            }
-            Err(e) => {
-                // PBO may not be supported on all GL implementations
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-            }
-        }
+        // PBOs are core GLES 3.0, so a live GL processor always serves one.
+        let pbo_img = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate an RGBA8 PBO on the GL thread");
+        assert_eq!(pbo_img.width(), Some(64));
+        assert_eq!(pbo_img.height(), Some(64));
+        assert_eq!(pbo_img.format().unwrap(), PixelFormat::Rgba);
     }
 
     /// Regression test for the PBO deadlock fix in `convert_any_to_pbo`
@@ -3044,16 +3020,9 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_dst = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO destination");
         let src = Tensor::<u8>::image(
             64,
             64,
@@ -3114,26 +3083,12 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let pbo_src = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
-        let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO dst not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_src = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO source");
+        let pbo_dst = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO destination");
         let src_dyn = TensorDyn::from(pbo_src);
         let mut dst_dyn = TensorDyn::from(pbo_dst);
         let res = gl.convert(&src_dyn, &mut dst_dyn, None);
@@ -3178,16 +3133,9 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let pbo_src = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_src = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO source");
         let dst = Tensor::<u8>::image(
             64,
             64,
@@ -3273,16 +3221,9 @@ mod gl_tests {
         let mut gl_a = GLProcessorThreaded::new(None).unwrap();
         let gl_b = GLProcessorThreaded::new(None).unwrap();
 
-        let pbo_src = match gl_b.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_src = gl_b
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO source on the other processor");
         let dst = Tensor::<u8>::image(
             64,
             64,
@@ -3462,6 +3403,10 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_multiplane_nv12_to_rgba_opengl() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -3568,17 +3513,15 @@ mod gl_tests {
         assert_eq!(nv12_bytes.len(), total_bytes);
 
         // Single DMA-BUF holding both planes contiguously
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("same_fd_nv12"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!("{} - DMA alloc failed", function!()));
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("same_fd_nv12"),
+            ),
+            "same-fd NV12 DMA buffer",
+        ) else {
+            return;
         };
         // Fill with real NV12 camera data
         buf.map().unwrap().as_mut_slice()[..total_bytes].copy_from_slice(nv12_bytes);
@@ -3661,6 +3604,10 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_multiplane_nv12_to_rgb_letterbox_opengl() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -3737,6 +3684,10 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_multiplane_nv12_to_rgb_int8_letterbox_opengl() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -3991,6 +3942,10 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn letterbox_nv12_to_planar_matches_rgba_reference() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -5163,16 +5118,11 @@ mod gl_tests {
         let offset: usize = 3_450_400; // Neutron input tensor offset
         let image_bytes: usize = 640 * 640 * 3; // RGB
 
-        let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate {} MB DMA buffer",
-                    function!(),
-                    total_size / 1_048_576
-                ));
-                return;
-            }
+        let Some(large_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         large_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5250,15 +5200,11 @@ mod gl_tests {
         .unwrap();
 
         // --- RGBA U8 at large offset (single-pass path) ---
-        let rgba_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(rgba_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         rgba_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5278,15 +5224,11 @@ mod gl_tests {
         );
 
         // --- RGB I8 at same large offset (two-pass path) ---
-        let rgb_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate second DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(rgb_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         rgb_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5345,15 +5287,11 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // --- RGB U8 at large offset (two-pass, packed_rgba8_program_2d) ---
-        let u8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(u8_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         u8_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5371,15 +5309,11 @@ mod gl_tests {
         );
 
         // --- RGB I8 at same large offset (two-pass, packed_rgba8_int8_program_2d) ---
-        let i8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate second DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(i8_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         i8_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5439,15 +5373,11 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // --- Page-aligned offset ---
-        let aligned_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(aligned_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         aligned_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5468,16 +5398,11 @@ mod gl_tests {
         );
 
         // --- Non-page-aligned Neutron offset ---
-        let unaligned_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None)
-        {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate second DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(unaligned_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         unaligned_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5524,19 +5449,15 @@ mod gl_tests {
         let stride = width * bpp; // 2560, tightly packed
 
         // Allocate a DMA tensor large enough for the RGBA image
-        let buf = Tensor::<u8>::new(
-            &[height, width, bpp],
-            Some(TensorMemory::DmaBuf),
-            Some("import_rgba_tight"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_rgba_with_stride - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[height, width, bpp],
+                Some(TensorMemory::DmaBuf),
+                Some("import_rgba_tight"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -5587,19 +5508,15 @@ mod gl_tests {
 
         // Allocate a DMA buffer large enough for the padded rows
         let total_bytes = stride * height;
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("import_rgba_padded"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_rgba_padded_stride - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("import_rgba_padded"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -5649,19 +5566,15 @@ mod gl_tests {
         let total_bytes = luma_size + chroma_size;
 
         // Single DMA buffer holding both luma and chroma planes
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("import_nv12_planes"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_nv12_with_offset - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("import_nv12_planes"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -5725,34 +5638,23 @@ mod gl_tests {
         assert_eq!(nv12_bytes.len(), y_size + uv_size);
 
         // Two separate DMA allocations filled with real NV12 data
-        let luma_buf =
-            Tensor::<u8>::new(&[y_size], Some(TensorMemory::DmaBuf), Some("true_mp_luma"));
-        let luma_buf = match luma_buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!(
-                    "{} - luma DMA alloc failed",
-                    function!()
-                ));
-                return;
-            }
+        let Some(luma_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[y_size], Some(TensorMemory::DmaBuf), Some("true_mp_luma")),
+            "luma DMA buffer",
+        ) else {
+            return;
         };
         luma_buf.map().unwrap().as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
 
-        let chroma_buf = Tensor::<u8>::new(
-            &[uv_size],
-            Some(TensorMemory::DmaBuf),
-            Some("true_mp_chroma"),
-        );
-        let chroma_buf = match chroma_buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!(
-                    "{} - chroma DMA alloc failed",
-                    function!()
-                ));
-                return;
-            }
+        let Some(chroma_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[uv_size],
+                Some(TensorMemory::DmaBuf),
+                Some("true_mp_chroma"),
+            ),
+            "chroma DMA buffer",
+        ) else {
+            return;
         };
         chroma_buf.map().unwrap().as_mut_slice()[..uv_size].copy_from_slice(&nv12_bytes[y_size..]);
 
@@ -5866,17 +5768,15 @@ mod gl_tests {
         let total_bytes = nv12_bytes.len();
 
         // Single DMA buffer holding Y+UV contiguously
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("nv12_contiguous"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!("{} - DMA alloc failed", function!()));
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("nv12_contiguous"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
         buf.map().unwrap().as_mut_slice()[..total_bytes].copy_from_slice(nv12_bytes);
 
@@ -5962,19 +5862,15 @@ mod gl_tests {
         let bpp: usize = 4;
         let bad_stride = width * bpp - 1; // one byte too narrow
 
-        let buf = Tensor::<u8>::new(
-            &[height, width, bpp],
-            Some(TensorMemory::DmaBuf),
-            Some("import_bad_stride"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_stride_too_small - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[height, width, bpp],
+                Some(TensorMemory::DmaBuf),
+                Some("import_bad_stride"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -7064,10 +6960,11 @@ mod gl_tests {
     /// `convert_fallback_count()` moving means the zero-copy import was
     /// refused, and the run is reported as a skip rather than a pass.
     ///
-    /// Skip conditions (treated as pass):
+    /// Skip conditions (each reported as a warning):
     /// 1. GL unavailable, or F16 render not supported (e.g. Vivante).
-    /// 2. `create_image(..., Dma)` returns `Err` — no dma-heap (e.g. dev host,
-    ///    Orin-nano with permission-denied).
+    /// 2. `create_image(..., Dma)` returns `Err` on a host with no zero-copy
+    ///    backing (e.g. dev host, Orin-nano with permission-denied); where the
+    ///    backing exists the failure fails the test.
     /// 3. The created tensor's `.memory()` is not `TensorMemory::DmaBuf` — it
     ///    fell back; only the real DMA path is of interest here.
     /// 4. The GL path declined the destination import and the convert fell
@@ -7145,23 +7042,18 @@ mod gl_tests {
         }
 
         // F16 PlanarRgb DMA-BUF destination, logical [3,H,W].
-        // Skip if dma-heap is unavailable (permission-denied on dev host).
-        let mut dst = match proc.create_image(
-            w,
-            h,
-            PixelFormat::PlanarRgb,
-            DType::F16,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - F16 DMA tensor alloc failed (no dma-heap?): {e}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
+            proc.create_image(
+                w,
+                h,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "F16 PlanarRgb DMA destination",
+        ) else {
+            return;
         };
 
         // Confirm the tensor is genuinely DMA-backed — skip if the allocator
@@ -8003,6 +7895,10 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn colorimetry_mode_policy_nv12_auto() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         use crate::ColorimetryMode;
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
@@ -9222,12 +9118,17 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            g.convert(
+            if let Err(e) = g.convert(
                 &src,
                 &mut dst,
                 Some(crate::ConvertOptions::new().crop(crop)),
-            )
-            .ok()?;
+            ) {
+                crate::test_support::report_skip(&format!(
+                    "{} - {env} convert declined: {e}",
+                    function!()
+                ));
+                return None;
+            }
             let stride = dst
                 .as_u8()
                 .unwrap()
@@ -10479,26 +10380,22 @@ mod gl_tests {
         let h = 438usize;
 
         // Decode into a DMA-backed Grey tensor (odd width, 64-aligned pitch).
-        let src_dma = match Tensor::<u8>::image(
-            w,
-            h,
-            PixelFormat::Grey,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => {
-                let mut t = t;
-                let mut dec = ImageDecoder::new();
-                t.load_image(&mut dec, jpeg).unwrap();
-                TensorDyn::from(t)
-            }
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - DMA Grey alloc failed: {e}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut src_grey) = crate::test_support::gpu_buffer_allocated(
+            Tensor::<u8>::image(
+                w,
+                h,
+                PixelFormat::Grey,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "DMA Grey source",
+        ) else {
+            return;
+        };
+        let src_dma = {
+            let mut dec = ImageDecoder::new();
+            src_grey.load_image(&mut dec, jpeg).unwrap();
+            TensorDyn::from(src_grey)
         };
 
         // CPU reference: decode into a Mem Grey tensor, convert Grey→RGBA via CPU.
@@ -10944,20 +10841,12 @@ mod gl_tests {
             ));
             return;
         }
-        let src = match crate::load_image_test_helper(
+        let src = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - source decode failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
-        };
+        )
+        .expect("decode the source fixture");
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let rgba_dst = |w: usize, h: usize| {
             TensorDyn::image(
@@ -10969,11 +10858,10 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
         };
-        let Ok(mut pool) = rgba_dst(256, 192) else {
-            crate::test_support::report_skip(&format!(
-                "{} - texture destination alloc failed",
-                function!()
-            ));
+        let Some(mut pool) = crate::test_support::gpu_buffer_allocated(
+            rgba_dst(256, 192),
+            "RGBA texture destination",
+        ) else {
             return;
         };
         // Seed the whole texture, so anything the narrowed convert fails to
@@ -11491,13 +11379,7 @@ mod gl_tests {
                     .expect("OpenGl backend")
                     .create_pbo_image_dtype(dw, dh, PixelFormat::Rgb, DType::F32)
             };
-            let Ok(mut recycled) = float_dst(&proc) else {
-                crate::test_support::report_skip(&format!(
-                    "{} - no F32 PBO destination",
-                    function!()
-                ));
-                return;
-            };
+            let mut recycled = float_dst(&proc).expect("allocate the F32 PBO destination");
             let fallbacks_before = proc.convert_fallback_count();
             proc.convert(&pool, &mut recycled, None).unwrap();
             assert_eq!(
@@ -11578,11 +11460,16 @@ mod gl_tests {
                     edgefirst_tensor::CpuAccess::ReadWrite,
                 )
             };
-            let (Ok(mut zc_recycled), Ok(mut zc_oracle)) = (planar_dst(), planar_dst()) else {
-                crate::test_support::report_skip(&format!(
-                    "(zero-copy float dst): {} - no F16 PlanarRgb texture",
-                    function!()
-                ));
+            let Some(mut zc_recycled) = crate::test_support::gpu_buffer_allocated(
+                planar_dst(),
+                "F16 PlanarRgb zero-copy destination",
+            ) else {
+                continue;
+            };
+            let Some(mut zc_oracle) = crate::test_support::gpu_buffer_allocated(
+                planar_dst(),
+                "F16 PlanarRgb zero-copy oracle",
+            ) else {
                 continue;
             };
             if zc_recycled.memory() != TensorMemory::DmaBuf {
@@ -11676,9 +11563,10 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
         #[cfg(target_os = "macos")]
-        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+        if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+            && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
+        {
             crate::test_support::report_skip(&format!(
                 "{} - ANGLE dlopen gate closed (coverage pass 1)",
                 function!()
@@ -11687,38 +11575,19 @@ mod gl_tests {
         }
         // Two rows taller than the logical frame, so a window starting a row
         // in is still fully backed.
-        let allocated = match TensorDyn::image(
-            W,
-            H + 2,
-            PixelFormat::Nv12,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            other => {
-                // `is_gpu_buffer_available` is the portable "can this host hold
-                // a zero-copy image at all" probe: a DMA heap on Linux, an
-                // IOSurface on macOS, a D3D11 device on Windows. Where it says
-                // yes, a REQUIRE_GL lane must not let this test evaporate --
-                // the arms it covers are reachable nowhere else.
-                let what = match &other {
-                    Ok(t) => format!("fell back to {:?}", t.memory()),
-                    Err(e) => format!("failed: {e}"),
-                };
-                assert!(
-                    !(require_gl && crate::test_support::is_gpu_buffer_available()),
-                    "HAL_TEST_REQUIRE_GL=1 and this host reports a zero-copy \
-                     buffer backing, but the NV12 zero-copy allocation {what}"
-                );
-                crate::test_support::report_skip(&format!(
-                    "{} - no zero-copy NV12 image here ({what})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut src) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                W,
+                H + 2,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "zero-copy NV12 source",
+        ) else {
+            return;
         };
-        let mut src = allocated;
         let pitch = src.effective_row_stride().unwrap_or(W);
         // The same pattern `tests/offset_source_view_alignment.rs` uses, and
         // for the same reasons: period 31 is coprime with the pitch and with
@@ -11884,9 +11753,10 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
         #[cfg(target_os = "macos")]
-        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+        if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+            && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
+        {
             crate::test_support::report_skip(&format!(
                 "{} - ANGLE dlopen gate closed (coverage pass 1)",
                 function!()
@@ -11903,24 +11773,10 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
         };
-        let canvas = match dma_rgba(W, H) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            other => {
-                let what = match &other {
-                    Ok(t) => format!("fell back to {:?}", t.memory()),
-                    Err(e) => format!("failed: {e}"),
-                };
-                assert!(
-                    !(require_gl && crate::test_support::is_gpu_buffer_available()),
-                    "HAL_TEST_REQUIRE_GL=1 and this host reports a zero-copy buffer \
-                     backing, but the RGBA zero-copy allocation {what}"
-                );
-                crate::test_support::report_skip(&format!(
-                    "{} - no zero-copy RGBA image here ({what})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(canvas) =
+            crate::test_support::gpu_buffer_allocated(dma_rgba(W, H), "zero-copy RGBA canvas")
+        else {
+            return;
         };
         let pitch = canvas.effective_row_stride().unwrap_or(W * BPP);
         let offset = Y0 * pitch + X0 * BPP;
@@ -12606,19 +12462,11 @@ mod gl_tests {
             let c = g.egl_cache_stats().expect("cache stats").dst;
             c.misses + c.hits
         };
-        let mut oracle = match dma_rgba(VIEW_W, VIEW_H) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            other => {
-                let what = match &other {
-                    Ok(t) => format!("fell back to {:?}", t.memory()),
-                    Err(e) => format!("failed: {e}"),
-                };
-                crate::test_support::report_skip(&format!(
-                    "{} - no zero-copy RGBA image here ({what})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut oracle) = crate::test_support::gpu_buffer_allocated(
+            dma_rgba(VIEW_W, VIEW_H),
+            "zero-copy RGBA oracle",
+        ) else {
+            return;
         };
         let before = imports(&gl);
         gl.convert(&src, &mut oracle, None)
@@ -12782,43 +12630,44 @@ mod gl_tests {
         // Asserted with the counter too: the refusal must come BEFORE the
         // engine spends an import on a destination it is going to decline.
         #[cfg(target_os = "linux")]
-        if let Ok(rgb_parent) = TensorDyn::image(
-            PARENT_W,
-            PARENT_H,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+        if let Some(rgb_parent) = crate::test_support::dma_allocated(
+            TensorDyn::image(
+                PARENT_W,
+                PARENT_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "packed-RGB DMA parent",
         ) {
-            if rgb_parent.memory() == TensorMemory::DmaBuf {
-                let rgb_src = TensorDyn::image(
-                    VIEW_W,
-                    VIEW_H,
-                    PixelFormat::Rgb,
-                    DType::U8,
-                    Some(TensorMemory::Mem),
-                    edgefirst_tensor::CpuAccess::ReadWrite,
-                )
-                .expect("packed-RGB source");
-                let mut view = rgb_parent
-                    .view(edgefirst_tensor::Region::new(8, 8, VIEW_W, VIEW_H))
-                    .expect("packed-RGB destination view");
-                let before = fallbacks(&gl);
-                let outcome = gl.convert(&rgb_src, &mut view, None);
-                match outcome {
-                    Err(crate::Error::NotSupported(_)) => {}
-                    other => failures.push(format!(
-                        "a packed-RGB view() destination must be declined on every \
-                         destination route, got {other:?}"
-                    )),
-                }
-                let spent = fallbacks(&gl) - before;
-                if spent != 0 {
-                    failures.push(format!(
-                        "a packed-RGB view() destination was declined only after \
-                         spending {spent} destination import(s) on it"
-                    ));
-                }
+            let rgb_src = TensorDyn::image(
+                VIEW_W,
+                VIEW_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("packed-RGB source");
+            let mut view = rgb_parent
+                .view(edgefirst_tensor::Region::new(8, 8, VIEW_W, VIEW_H))
+                .expect("packed-RGB destination view");
+            let before = fallbacks(&gl);
+            let outcome = gl.convert(&rgb_src, &mut view, None);
+            match outcome {
+                Err(crate::Error::NotSupported(_)) => {}
+                other => failures.push(format!(
+                    "a packed-RGB view() destination must be declined on every \
+                     destination route, got {other:?}"
+                )),
+            }
+            let spent = fallbacks(&gl) - before;
+            if spent != 0 {
+                failures.push(format!(
+                    "a packed-RGB view() destination was declined only after \
+                     spending {spent} destination import(s) on it"
+                ));
             }
         }
         // A WHOLE packed-RGB destination whose import is refused re-plans onto
@@ -12832,56 +12681,56 @@ mod gl_tests {
         // here, and an engine span whose `lowering` field says the opposite of
         // what happened.
         #[cfg(target_os = "linux")]
-        if let Ok(mut rgb_dst) = TensorDyn::image(
-            VIEW_W,
-            VIEW_H,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+        if let Some(mut rgb_dst) = crate::test_support::dma_allocated(
+            TensorDyn::image(
+                VIEW_W,
+                VIEW_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "packed-RGB DMA destination",
         ) {
-            if rgb_dst.memory() == TensorMemory::DmaBuf {
-                let rgb_src = TensorDyn::image(
-                    VIEW_W,
-                    VIEW_H,
-                    PixelFormat::Rgb,
-                    DType::U8,
-                    Some(TensorMemory::Mem),
-                    edgefirst_tensor::CpuAccess::ReadWrite,
-                )
-                .expect("packed-RGB source");
-                {
-                    let mut m = rgb_src
-                        .map_bytes(edgefirst_tensor::CpuAccess::Write)
-                        .expect("map packed-RGB source");
-                    m.as_mut_slice().fill(0x5A);
-                }
-                let before = fallbacks(&gl);
-                match gl.convert(&rgb_src, &mut rgb_dst, None) {
-                    Ok(()) => {
-                        let spent = fallbacks(&gl) - before;
-                        if spent != 1 {
-                            failures.push(format!(
-                                "a refused packed-RGB destination import must re-plan \
-                                 after exactly one attempt, spent {spent}"
-                            ));
-                        }
-                        let out = rgb_dst
-                            .map_bytes(edgefirst_tensor::CpuAccess::Read)
-                            .expect("map packed-RGB destination")
-                            .as_slice()
-                            .to_vec();
-                        if out.iter().all(|&b| b == 0) {
-                            failures.push(
-                                "the re-planned packed-RGB convert wrote nothing".to_string(),
-                            );
-                        }
+            let rgb_src = TensorDyn::image(
+                VIEW_W,
+                VIEW_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("packed-RGB source");
+            {
+                let mut m = rgb_src
+                    .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                    .expect("map packed-RGB source");
+                m.as_mut_slice().fill(0x5A);
+            }
+            let before = fallbacks(&gl);
+            match gl.convert(&rgb_src, &mut rgb_dst, None) {
+                Ok(()) => {
+                    let spent = fallbacks(&gl) - before;
+                    if spent != 1 {
+                        failures.push(format!(
+                            "a refused packed-RGB destination import must re-plan \
+                             after exactly one attempt, spent {spent}"
+                        ));
                     }
-                    Err(e) => failures.push(format!(
-                        "a refused packed-RGB destination import must re-plan onto the \
-                         mapped route, not end the convert: {e}"
-                    )),
+                    let out = rgb_dst
+                        .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                        .expect("map packed-RGB destination")
+                        .as_slice()
+                        .to_vec();
+                    if out.iter().all(|&b| b == 0) {
+                        failures
+                            .push("the re-planned packed-RGB convert wrote nothing".to_string());
+                    }
                 }
+                Err(e) => failures.push(format!(
+                    "a refused packed-RGB destination import must re-plan onto the \
+                     mapped route, not end the convert: {e}"
+                )),
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -12971,22 +12820,27 @@ mod gl_tests {
             .unwrap_or(0);
         let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
         let planar_dma = || {
-            TensorDyn::image(
+            let image = TensorDyn::image(
                 W,
                 H,
                 PixelFormat::PlanarRgb,
                 DType::U8,
                 Some(TensorMemory::DmaBuf),
                 edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .ok()
-            .filter(|t| t.memory() == TensorMemory::DmaBuf)
+            );
+            if cfg!(target_os = "linux") {
+                crate::test_support::dma_allocated(image, "PlanarRgb DMA destination")
+            } else {
+                crate::test_support::allocated(
+                    image,
+                    "PlanarRgb DMA destination",
+                    crate::test_support::Expect::MayFail(
+                        "PlanarRgb u8 has no zero-copy image layout on this platform",
+                    ),
+                )
+            }
         };
         let Some(mut dst) = planar_dma() else {
-            crate::test_support::report_skip(&format!(
-                "{} - no zero-copy PlanarRgb destination here",
-                function!()
-            ));
             return;
         };
 

@@ -187,6 +187,12 @@ else
 fi
 
 skipped="$(cat "${RESULTS}"/*.log 2>/dev/null | grep -c "SKIPPED")"
+# Every distinct test warning, most frequent first, so skips are audited rather than only counted.
+grep -h "WARNING: " "${RESULTS}"/*.log 2>/dev/null | sed 's/.*WARNING: //' | sort | uniq -c | sort -rn > "${RESULTS}/warnings.txt" || true
+if [[ -s "${RESULTS}/warnings.txt" ]]; then
+  echo "  -- test warnings"
+  sed 's/^/     /' "${RESULTS}/warnings.txt"
+fi
 if [[ ${fail} -gt 0 ]]; then
   write_summary FAIL "${pass} ok, ${fail} failed: ${failed_bins[*]}"
   exit 1

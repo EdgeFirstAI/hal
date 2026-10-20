@@ -245,7 +245,7 @@ The five excluded C-API leaves (`tensor-capi`, `image-capi`, `codec-capi`,
 the workspace's target directory — see [Clone and Build](#clone-and-build)
 above, or run `make lint-capi-modular` to cover all five at once.
 
-**The five leaves also carry their own `[lints]` and `[profile.release]`
+**The five leaves also carry their own `[lints]`, `[profile.release]` and `[profile.profiling]`
 tables, hand-copied from the root `Cargo.toml`, and must be kept in sync by
 hand.** Being excluded from the workspace (see the root `Cargo.toml`'s
 `[workspace] exclude` comment) means they inherit *nothing* from it — not
@@ -254,11 +254,13 @@ standalone one-crate workspace (`[workspace] resolver = "3"` at the bottom
 of each leaf's manifest stops cargo's upward search), and `lints.workspace =
 true` only works for an actual member of the workspace it names. Cargo has
 no mechanism to propagate either table across that boundary automatically.
-Concretely: if you change `[workspace.lints.rust]` or `[profile.release]` at
+Concretely: if you change `[workspace.lints.rust]` or either profile at
 the root, update all five leaves' copies in the same commit, or they will
 silently drift — a leaf built with a stale profile is exactly how this
 project ended up shipping an unstripped, non-LTO `.so` with 17,035 symbols
 alongside a workspace built with LTO and stripping.
+
+**`release` is for shipped artifacts only.** It links with fat LTO in a single codegen unit, which shrinks the C libraries by about a fifth and roughly doubles link time, so it runs only on `release/X.Y.Z` branches (`release.yml`) and in `make package`/`make wheel`. Every test, board archive and CI packaging smoke test uses `profiling`: the same optimisation level with thin LTO and line tables. Pass `--profile profiling` (or `PACKAGE_PROFILE=profiling` to `make package`) rather than `--release` when building to test.
 
 ### Python Code
 

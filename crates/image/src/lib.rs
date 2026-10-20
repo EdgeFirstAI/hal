@@ -3984,22 +3984,18 @@ mod image_tests {
         };
         // Tall destination: N stacked row-bands. DMA so the Linux GL band path
         // runs (one parent import + per-tile glViewport); skip if unavailable.
-        let parent = match TensorDyn::image(
-            w,
-            n * h,
-            PixelFormat::Rgba,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — tall DMA destination alloc failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(parent) = crate::test_support::dma_allocated(
+            TensorDyn::image(
+                w,
+                n * h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "tall DMA destination",
+        ) else {
+            return;
         };
 
         // Deferred batch: one parent import, glViewport/scissor per band, one sync.
@@ -4072,19 +4068,11 @@ mod image_tests {
     /// makes a wrong crop origin or a sibling-band wipe a hard failure.
     #[test]
     fn tile_into_cpu_distinct_content_parity() {
-        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+        let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
             ..Default::default()
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — CPU init failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
-        };
+        })
+        .expect("the CPU backend is always available");
         let (fw, fh) = (96usize, 64usize);
         let src = gradient_frame(fw, fh);
         let cfg = TilingConfig::new(32, 32).with_overlap(0.0); // exact 3×2 tiling
@@ -4159,19 +4147,11 @@ mod image_tests {
     /// `tile_into` band (proves the two paths agree).
     #[test]
     fn tile_one_matches_tile_into_band() {
-        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+        let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
             ..Default::default()
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — CPU init failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
-        };
+        })
+        .expect("the CPU backend is always available");
         let (fw, fh) = (96usize, 64usize);
         let src = gradient_frame(fw, fh);
         let cfg = TilingConfig::new(32, 32).with_overlap(0.0);
@@ -4248,22 +4228,18 @@ mod image_tests {
         let cfg = TilingConfig::new(32, 32).with_overlap(0.0);
         let n = tile_grid(fh, fw, 32, 32, 0.0).len();
 
-        let mut parent = match proc.alloc_tile_batch(
-            n,
-            &cfg,
-            PixelFormat::Rgba,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — tall DMA parent alloc failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut parent) = crate::test_support::dma_allocated(
+            proc.alloc_tile_batch(
+                n,
+                &cfg,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "tall DMA parent",
+        ) else {
+            return;
         };
         let placements = proc.tile_into(&src, &mut parent, &cfg).unwrap();
 
@@ -4313,19 +4289,11 @@ mod image_tests {
     /// `tile_into` rejects a destination too small to hold all tile bands.
     #[test]
     fn tile_into_undersized_dst_errors() {
-        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+        let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
             ..Default::default()
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — CPU init failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
-        };
+        })
+        .expect("the CPU backend is always available");
         let (fw, fh) = (96usize, 64usize);
         let src = gradient_frame(fw, fh);
         let cfg = TilingConfig::new(32, 32).with_overlap(0.0); // 6 tiles
@@ -4349,19 +4317,11 @@ mod image_tests {
     /// `alloc_tile_batch` / `plan_tiles` reject an invalid config (zero tile).
     #[test]
     fn tiling_alloc_rejects_invalid_config() {
-        let proc = match ImageProcessor::with_config(ImageProcessorConfig {
+        let proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
             ..Default::default()
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — CPU init failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
-        };
+        })
+        .expect("the CPU backend is always available");
         let bad = TilingConfig::new(0, 640);
         assert!(proc.plan_tiles(1920, 1080, &bad).is_err());
         assert!(proc
@@ -4378,19 +4338,11 @@ mod image_tests {
 
     #[test]
     fn plan_tiles_metadata_4k() {
-        let proc = match ImageProcessor::with_config(ImageProcessorConfig {
+        let proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
             ..Default::default()
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — CPU init failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
-        };
+        })
+        .expect("the CPU backend is always available");
         let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
         let plan = proc.plan_tiles(3840, 2160, &cfg).unwrap();
         assert_eq!(plan.len(), 32);
@@ -4879,33 +4831,27 @@ mod image_tests {
         let converter = ImageProcessor::new().unwrap();
 
         // 100 is intentionally not a multiple of 64 (the GPU pitch alignment).
-        let result = converter.create_image(
-            100,
-            64,
-            PixelFormat::Nv12,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        );
-
-        match result {
-            Ok(img) => {
-                assert_eq!(img.width(), Some(100));
-                assert_eq!(img.height(), Some(64));
-                assert_eq!(img.format(), Some(PixelFormat::Nv12));
-                if let Some(stride) = img.row_stride() {
-                    assert!(
-                        stride >= 100,
-                        "NV12 row_stride {stride} must be >= the logical width (100)",
-                    );
-                }
-            }
-            Err(e) => {
-                // Skip cleanly on hosts without a dma-heap.
-                crate::test_support::report_skip(&format!(
-                    "create_image NV12 DMA non-aligned width: {e}"
-                ));
-            }
+        let Some(img) = crate::test_support::dma_allocated(
+            converter.create_image(
+                100,
+                64,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "create_image NV12 DMA non-aligned width",
+        ) else {
+            return;
+        };
+        assert_eq!(img.width(), Some(100));
+        assert_eq!(img.height(), Some(64));
+        assert_eq!(img.format(), Some(PixelFormat::Nv12));
+        if let Some(stride) = img.row_stride() {
+            assert!(
+                stride >= 100,
+                "NV12 row_stride {stride} must be >= the logical width (100)",
+            );
         }
     }
 
@@ -6311,16 +6257,9 @@ mod image_tests {
                 return;
             };
             // The oracle: a tight PBO of the target geometry, same route.
-            let mut reference = match gl.create_pbo_image_dtype(W, H, fmt, dtype) {
-                Ok(t) => t,
-                Err(e) => {
-                    crate::test_support::report_skip(&format!(
-                        "{} - no float PBO images: {e:?}",
-                        function!()
-                    ));
-                    return;
-                }
-            };
+            let mut reference = gl
+                .create_pbo_image_dtype(W, H, fmt, dtype)
+                .unwrap_or_else(|e| panic!("{fmt:?}/{dtype:?}: tight reference PBO: {e:?}"));
             assert_eq!(
                 reference.memory(),
                 TensorMemory::Pbo,
@@ -6411,7 +6350,10 @@ mod image_tests {
             (PixelFormat::Rgba, DType::F32, support.f32),
         ] {
             if !need {
-                eprintln!("{}: {fmt:?}/{dtype:?} not reported", function!());
+                crate::test_support::report_skip(&format!(
+                    "{} - {fmt:?}/{dtype:?} not reported",
+                    function!()
+                ));
                 continue;
             }
             let mut dst_gpu = gpu
@@ -7247,6 +7189,11 @@ mod image_tests {
         }
         if crate::test_support::is_gpu_buffer_available() {
             mem.push(Some(TensorMemory::DmaBuf));
+        } else {
+            crate::test_support::report_skip(&format!(
+                "{} - DmaBuf backing not exercised: no zero-copy GPU buffers",
+                function!()
+            ));
         }
         let crop = Crop::new().with_source(Some(Region::new(50, 120, 1024, 576)));
         for m in mem {
@@ -7445,6 +7392,11 @@ mod image_tests {
         }
         if crate::test_support::is_gpu_buffer_available() {
             mem.push(Some(TensorMemory::DmaBuf));
+        } else {
+            crate::test_support::report_skip(&format!(
+                "{} - DmaBuf backing not exercised: no zero-copy GPU buffers",
+                function!()
+            ));
         }
         for m in mem {
             for rot in [
@@ -8260,22 +8212,18 @@ mod image_tests {
             }
         };
         let (w, h) = (64usize, 64usize);
-        let src = match TensorDyn::image(
-            w,
-            h,
-            PixelFormat::Nv12,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — NV12 IOSurface alloc: {e:?}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(src) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "NV12 IOSurface",
+        ) else {
+            return;
         };
         src.as_typed::<u8>()
             .unwrap()
@@ -8284,22 +8232,18 @@ mod image_tests {
             .as_mut_slice()
             .fill(128); // Y=U=V=128
 
-        let dst = match TensorDyn::image(
-            w,
-            h,
-            PixelFormat::PlanarRgb,
-            DType::F16,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — F16 PlanarRgb IOSurface: {e:?}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(dst) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "F16 PlanarRgb IOSurface",
+        ) else {
+            return;
         };
         let mut dst = dst;
         // Call convert directly (the convert_img helper restores u8 only).
@@ -8356,22 +8300,18 @@ mod image_tests {
         let (pool_w, pool_h) = (256usize, 768usize);
         let (model_w, model_h) = (128usize, 128usize);
 
-        let mut src = match TensorDyn::image(
-            pool_w,
-            pool_h,
-            PixelFormat::Grey,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — R8 pool alloc: {e:?}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut src) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                pool_w,
+                pool_h,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "R8 pool",
+        ) else {
+            return;
         };
         src.configure_image(fw, fh, PixelFormat::Nv12)
             .unwrap_or_else(|e| panic!("configure_image NV12 on pool: {e}"));
@@ -8387,22 +8327,18 @@ mod image_tests {
             .as_mut_slice()
             .fill(128); // neutral grey
 
-        let mut dst = match TensorDyn::image(
-            model_w,
-            model_h,
-            PixelFormat::PlanarRgb,
-            DType::F16,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} — F16 PlanarRgb dst: {e:?}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                model_w,
+                model_h,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "F16 PlanarRgb dst",
+        ) else {
+            return;
         };
 
         // Letterbox crop like the profiler: the backend computes the band.
@@ -8456,19 +8392,18 @@ mod image_tests {
             }
         };
         let (fw, fh) = (96usize, 64usize);
-        let mut src = match TensorDyn::image(
-            256,
-            768,
-            PixelFormat::Grey,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!("{} — pool: {e:?}", function!()));
-                return;
-            }
+        let Some(mut src) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                256,
+                768,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "NV12 R8 pool",
+        ) else {
+            return;
         };
         src.configure_image(fw, fh, PixelFormat::Nv12).unwrap();
         src.as_typed::<u8>()
@@ -8477,19 +8412,18 @@ mod image_tests {
             .unwrap()
             .as_mut_slice()
             .fill(128);
-        let mut dst = match TensorDyn::image(
-            128,
-            128,
-            PixelFormat::PlanarRgb,
-            DType::F16,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!("{} — dst: {e:?}", function!()));
-                return;
-            }
+        let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                128,
+                128,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "F16 PlanarRgb dst",
+        ) else {
+            return;
         };
         let crop = Crop::new().with_source(Some(Region::new(0, 0, fw, fh)));
 
@@ -8537,38 +8471,34 @@ mod image_tests {
         let mut srcs = Vec::new();
         let mut dsts = Vec::new();
         for _ in 0..depth {
-            srcs.push(
-                match TensorDyn::image(
+            let Some(src) = crate::test_support::gpu_buffer_allocated(
+                TensorDyn::image(
                     max_w,
                     max_h * 3,
                     PixelFormat::Grey,
                     DType::U8,
                     Some(TensorMemory::DmaBuf),
                     edgefirst_tensor::CpuAccess::ReadWrite,
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        crate::test_support::report_skip(&format!("{} — pool: {e:?}", function!()));
-                        return;
-                    }
-                },
-            );
-            dsts.push(
-                match TensorDyn::image(
+                ),
+                "R8 pool",
+            ) else {
+                return;
+            };
+            srcs.push(src);
+            let Some(dst) = crate::test_support::gpu_buffer_allocated(
+                TensorDyn::image(
                     640,
                     640,
                     PixelFormat::PlanarRgb,
                     DType::F16,
                     Some(TensorMemory::DmaBuf),
                     edgefirst_tensor::CpuAccess::ReadWrite,
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        crate::test_support::report_skip(&format!("{} — dst: {e:?}", function!()));
-                        return;
-                    }
-                },
-            );
+                ),
+                "F16 PlanarRgb dst",
+            ) else {
+                return;
+            };
+            dsts.push(dst);
         }
         // COCO-like assorted frame sizes (all ≤ max), cycled.
         let sizes = [
@@ -8895,22 +8825,18 @@ mod image_tests {
                 // GPU source: a LARGER R8 pool surface, reconfigured down to the
                 // frame. Phase 1 preserves the pool's padded `bytesPerRow` as the
                 // tensor's row stride; the fill writes the frame at that stride.
-                let mut ios = match TensorDyn::image(
-                    pool_w,
-                    pool_h,
-                    PixelFormat::Grey,
-                    DType::U8,
-                    Some(TensorMemory::DmaBuf),
-                    edgefirst_tensor::CpuAccess::ReadWrite,
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        crate::test_support::report_skip(&format!(
-                            "{} — R8 pool IOSurface alloc: {e:?}",
-                            function!()
-                        ));
-                        return;
-                    }
+                let Some(mut ios) = crate::test_support::gpu_buffer_allocated(
+                    TensorDyn::image(
+                        pool_w,
+                        pool_h,
+                        PixelFormat::Grey,
+                        DType::U8,
+                        Some(TensorMemory::DmaBuf),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    ),
+                    "R8 pool IOSurface",
+                ) else {
+                    return;
                 };
                 ios.configure_image(w, h, fmt)
                     .unwrap_or_else(|e| panic!("configure_image {fmt:?} {w}x{h} on pool: {e}"));
@@ -10332,24 +10258,24 @@ mod image_tests {
             return;
         }
 
-        // VYUY has a DMA-BUF FourCC on Linux but no IOSurface mapping on
-        // macOS/iOS, so the zero-copy allocation itself is the per-format
-        // probe: a platform that declines it is a skip, not a failure.
-        let src = match load_bytes_to_tensor(
-            1280,
-            720,
-            PixelFormat::Vyuy,
-            Some(TensorMemory::DmaBuf),
-            &edgefirst_bench::testdata::read("camera720p.vyuy"),
-        ) {
-            Ok(src) => src,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - zero-copy VYUY source not allocatable on this platform ({e})",
-                    function!()
-                ));
-                return;
-            }
+        // VYUY has a DMA-BUF FourCC on Linux but no IOSurface mapping on macOS/iOS.
+        let expect = if cfg!(target_os = "linux") {
+            crate::test_support::Expect::Succeeds
+        } else {
+            crate::test_support::Expect::MayFail("no zero-copy VYUY mapping on this platform")
+        };
+        let Some(src) = crate::test_support::allocated(
+            load_bytes_to_tensor(
+                1280,
+                720,
+                PixelFormat::Vyuy,
+                Some(TensorMemory::DmaBuf),
+                &edgefirst_bench::testdata::read("camera720p.vyuy"),
+            ),
+            "zero-copy VYUY source",
+            expect,
+        ) else {
+            return;
         };
 
         let dst = TensorDyn::image(
@@ -11336,14 +11262,8 @@ mod image_tests {
             .as_ref()
             .is_some_and(|gl| gl.transfer_backend() == opengl_headless::TransferBackend::Pbo);
         if !is_pbo {
-            // Direct stderr, not eprintln!: libtest captures println!/eprintln!
-            // and replays it only for FAILING tests, so a skip would print
-            // "... ok" with its reason discarded and be indistinguishable from
-            // having run. See TESTING.md.
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: pbo_reports_why_it_cannot_pin - transfer backend is not PBO"
+            crate::test_support::report_skip(
+                "pbo_reports_why_it_cannot_pin - transfer backend is not PBO",
             );
             return;
         }
@@ -11397,7 +11317,9 @@ mod image_tests {
             .as_ref()
             .is_some_and(|gl| gl.transfer_backend() == opengl_headless::TransferBackend::Pbo);
         if !is_pbo {
-            log::warn!("Skipping test_convert_pbo_to_pbo: backend is not PBO");
+            crate::test_support::report_skip(
+                "test_convert_pbo_to_pbo - transfer backend is not PBO",
+            );
             return;
         }
 
@@ -12497,6 +12419,12 @@ mod image_tests {
         let _lock = acquire_env_lock();
         // Probed here, where the policy can name the test; worker threads are unnamed.
         let use_dma = crate::test_support::is_dma_available();
+        if !use_dma {
+            crate::test_support::report_skip(&format!(
+                "{} - DmaBuf sources not exercised, running on Mem: no usable DMA heap",
+                function!()
+            ));
+        }
         let (tx, rx) = mpsc::channel::<()>();
 
         std::thread::spawn(move || {
@@ -12609,6 +12537,12 @@ mod image_tests {
         let _lock = acquire_env_lock();
         // Probed here, where the policy can name the test; worker threads are unnamed.
         let use_dma = crate::test_support::is_dma_available();
+        if !use_dma {
+            crate::test_support::report_skip(&format!(
+                "{} - DmaBuf sources not exercised, running on Mem: no usable DMA heap",
+                function!()
+            ));
+        }
         let (tx, rx) = mpsc::channel::<()>();
 
         std::thread::spawn(move || {
@@ -13083,35 +13017,28 @@ mod image_tests {
             // and the classifier matches on that one variant for all of them,
             // so this needs no `cfg`. Where the platform cannot hold one the
             // allocation fails or falls back, and both are reported below.
-            let mut dst = match TensorDyn::image(
-                W,
-                H,
-                PixelFormat::PlanarRgb,
-                DType::F16,
-                Some(TensorMemory::DmaBuf),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            ) {
-                Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-                // No routable float destination on this host. Reported here,
-                // BEFORE the `HAL_TEST_REQUIRE_GL` gate below: that gate
-                // exists to catch a GL backend declining a destination it
-                // should serve, not a host that cannot hold one.
-                Ok(t) => {
-                    crate::test_support::report_skip(&format!(
-                        "convert_f16_gl_cpu_parity_identity - the zero-copy F16 \
-                         destination fell back to {:?}",
-                        t.memory()
-                    ));
-                    return;
-                }
-                Err(e) => {
-                    crate::test_support::report_skip(&format!(
-                        "convert_f16_gl_cpu_parity_identity - no zero-copy F16 \
-                         destination on this host: {e}"
-                    ));
-                    return;
-                }
+            // Checked before the HAL_TEST_REQUIRE_GL gate below, which covers a declined destination.
+            let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
+                TensorDyn::image(
+                    W,
+                    H,
+                    PixelFormat::PlanarRgb,
+                    DType::F16,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ),
+                "zero-copy F16 PlanarRgb destination",
+            ) else {
+                return;
             };
+            if dst.memory() != TensorMemory::DmaBuf {
+                crate::test_support::report_skip(&format!(
+                    "convert_f16_gl_cpu_parity_identity - the zero-copy F16 \
+                     destination fell back to {:?}",
+                    dst.memory()
+                ));
+                return;
+            }
             let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
             let fallbacks_before = gl_proc.convert_fallback_count();
             match gl_proc.convert(&src, &mut dst, None) {
@@ -13496,7 +13423,13 @@ mod image_tests {
                 assert_eq!(t.memory(), TensorMemory::DmaBuf);
                 assert_eq!(t.contiguity(), Contiguity::Contiguous);
             }
-            Err(e) => assert!(e.to_string().contains("linux,cma"), "{e}"),
+            Err(e) => {
+                assert!(e.to_string().contains("linux,cma"), "{e}");
+                crate::test_support::report_skip(&format!(
+                    "{} - no CMA heap, the contiguous DMA-BUF arm did not run: {e}",
+                    function!()
+                ));
+            }
         }
     }
 

@@ -43,7 +43,7 @@ fn vivid(buf_type: BufType) -> Option<Device> {
             "HAL_TEST_REQUIRE_VIVID=1 but the test would have skipped: {why}"
         );
         use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "SKIPPED: {why}");
+        let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {why}");
     }
     found
 }

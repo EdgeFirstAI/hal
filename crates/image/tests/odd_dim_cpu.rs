@@ -17,6 +17,41 @@ use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
 
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+
+/// A padded-stride image, which is DMA-BUF backed: on Linux it must allocate
+/// when the DMA heap is usable; elsewhere `image_with_stride` is unsupported.
+/// `None` after a warning when it may not allocate.
+fn strided_image(w: usize, h: usize, fmt: PixelFormat, stride: usize) -> Option<Tensor<u8>> {
+    let expect = if cfg!(target_os = "linux") {
+        outcome::expect_dma(dma_require::decide(
+            edgefirst_tensor::is_dma_available(),
+            dma_require::required(),
+            &outcome::current_test(),
+            "no usable DMA heap for a padded-stride image",
+        ))
+    } else {
+        outcome::Expect::MayFail("image_with_stride needs DMA-BUF, which only Linux has")
+    };
+    outcome::allocated(
+        Tensor::<u8>::image_with_stride(
+            w,
+            h,
+            fmt,
+            stride,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ),
+        &format!("{w}x{h} {fmt:?} image at a {stride} B stride"),
+        expect,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Test-data helper — mirrors the codec test suite resolution order.
 // ---------------------------------------------------------------------------
@@ -1095,16 +1130,8 @@ fn d3_resize_strided_rgb_source() {
     // fall back to the tight allocation (the resize path is still exercised,
     // just without the copy-to-tight branch — a no-op is fine there).
     let padded_stride = 256usize; // 64-aligned, > w*3=192
-    let strided_src_result = Tensor::<u8>::image_with_stride(
-        w,
-        h,
-        PixelFormat::Rgb,
-        padded_stride,
-        None,
-        edgefirst_tensor::CpuAccess::ReadWrite,
-    );
-    let (strided_src, strided_stride) = match strided_src_result {
-        Ok(mut s) => {
+    let (strided_src, strided_stride) = match strided_image(w, h, PixelFormat::Rgb, padded_stride) {
+        Some(mut s) => {
             let stride = s.effective_row_stride().unwrap_or(padded_stride);
             {
                 let mut map = s.map().unwrap();
@@ -1112,8 +1139,8 @@ fn d3_resize_strided_rgb_source() {
             }
             (s, stride)
         }
-        Err(_) => {
-            // Platform doesn't support image_with_stride (non-Linux); use tight.
+        None => {
+            // No padded-stride image here (warned above); use tight.
             let mut s = Tensor::<u8>::image(
                 w,
                 h,
@@ -1257,14 +1284,7 @@ fn packed_yuv_to_grey_strided_matches_tight(fmt: PixelFormat, luma_off: usize) {
     // Strided source is DMA-backed (Linux only); elsewhere `image_with_stride`
     // returns NotImplemented and the tight path above is the whole assertion.
     let padded = 192usize; // 64-aligned, > w*2 = 128
-    if let Ok(mut s) = Tensor::<u8>::image_with_stride(
-        w,
-        h,
-        fmt,
-        padded,
-        None,
-        edgefirst_tensor::CpuAccess::ReadWrite,
-    ) {
+    if let Some(mut s) = strided_image(w, h, fmt, padded) {
         let stride = s.effective_row_stride().unwrap_or(padded);
         assert!(stride > w * 2, "expected a padded stride, got {stride}");
         {

@@ -2481,19 +2481,34 @@ mod tests {
         // A non-64-aligned packed width on a DMA buffer records the 64-aligned
         // stride so the EGLImage import is accepted by Mali/Vivante (RGB 100px:
         // 100*3 = 300 → padded to 320). This padding is DMA-specific — host-only
-        // memory keeps the tight pitch — so skip when DMA is unavailable (e.g. CI
-        // without dma_heap); the behaviour is also validated on-target.
-        let t = match TensorDyn::image(
+        // memory keeps the tight pitch — so skip, with a warning, when DMA is
+        // unavailable (e.g. CI without dma_heap); also validated on-target.
+        let result = TensorDyn::image(
             100,
             100,
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::DmaBuf),
             crate::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => return,
+        );
+        #[cfg(target_os = "linux")]
+        let t = crate::test_support::dma_allocated(result, "DMA-BUF RGB image allocation");
+        #[cfg(not(target_os = "linux"))]
+        let t = crate::test_support::allocated(
+            result,
+            "zero-copy RGB image allocation",
+            if crate::is_gpu_buffer_available() {
+                crate::test_support::Expect::Succeeds
+            } else {
+                crate::test_support::Expect::MayFail(
+                    "no zero-copy GPU buffer allocator on this host",
+                )
+            },
+        );
+        let Some(t) = t else {
+            return;
         };
+        assert_eq!(t.memory(), TensorMemory::DmaBuf);
         // 100px * 3 bytes = 300, rounded up to the 64-byte alignment DMA-BUF
         // imports require -> 320. That is a DMA-BUF property, not a universal
         // one: Android's TensorMemory::DmaBuf is an AHardwareBuffer, whose

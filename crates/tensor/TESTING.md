@@ -127,7 +127,7 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
 
 ## DMA require gate
 
-`crates/tensor/tests/support/dma_require.rs` is the guard, mirroring `tests/support/cuda_require.rs`: under `HAL_TEST_REQUIRE_DMA=1` a DMA test that would skip for want of a usable heap fails instead, naming the test and the reason. Without the variable it skips as before and writes `SKIPPED: <test> - <reason>` straight to stderr, so libtest's capture cannot hide it.
+`crates/tensor/tests/support/dma_require.rs` is the guard, mirroring `tests/support/cuda_require.rs`: under `HAL_TEST_REQUIRE_DMA=1` a DMA test that would skip for want of a usable heap fails instead, naming the test and the reason. Without the variable it skips and writes `WARNING: SKIPPED: <test> - <reason>` straight to stderr, so test capture cannot hide it.
 
 - Unit tests in `src/` call `crate::test_support::dma_or_skip("<test name>")`, which `#[path]`-includes the same support module and feeds it `is_dma_available()`.
 - Integration tests in `tests/` include `support/dma_require.rs` with `#[path]` and call `dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), "<test name>")`.

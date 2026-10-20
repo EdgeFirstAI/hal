@@ -49,7 +49,7 @@ int main(void) {
     assert(ef_tensor_from_d3d11_shared_handle(NULL, EF_DTYPE_U8, dims, 3, "rgba8",
                                               EF_CPU_ACCESS_READ, NULL, 0,
                                               NULL) == NULL);
-    printf("SKIP: D3D11 exports refuse off Windows as declared\n");
+    printf("D3D11 exports refuse off Windows as declared\n");
     return 0;
 #else
     if (ef_is_gpu_buffer_available() == 0) {

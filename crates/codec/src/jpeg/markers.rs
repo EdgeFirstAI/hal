@@ -470,6 +470,10 @@ mod tests {
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata").into());
         let path = std::path::Path::new(&testdata).join("zidane.jpg");
         if !path.exists() {
+            crate::test_support::report_skip(&format!(
+                "parse_real_jpeg - {} not found (set EDGEFIRST_TESTDATA_DIR)",
+                path.display()
+            ));
             return;
         }
         let data = std::fs::read(&path).unwrap();

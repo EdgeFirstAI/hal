@@ -1,40 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared test-only helper for reporting a skipped test so the report
-//! survives libtest's output capture.
-//!
-//! `eprintln!`/`println!` route through `std::io::_eprint`/`_print`, which
-//! libtest hooks to capture per-test output and replay it only for a
-//! *failing* test. A hardware-gated test that returns early after printing
-//! its reason with `eprintln!` therefore reports `ok` with the reason
-//! silently discarded -- indistinguishable from having actually exercised
-//! the code, both locally (`cargo test` without `--nocapture`) and in CI.
-//! Writing directly to `std::io::stderr()` bypasses that hook, so the
-//! `SKIPPED: ...` line survives capture in both directions; `scripts/
-//! on-target-test.sh` greps captured logs for the literal string
-//! `SKIPPED` to report a skip count per board.
+//! Test-only helpers: skip reporting and the allocation policy live in the
+//! shared `outcome` file; this module adds the DMA and G2D probes.
 
-/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
-/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
-/// it.
-#[cfg(test)]
-pub(crate) fn report_skip(reason: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
-}
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+#[allow(unused_imports)]
+pub(crate) use outcome::{allocated, current_test, report_skip, Expect};
 
 #[path = "../../tensor/tests/support/dma_require.rs"]
 #[allow(dead_code)]
 mod dma_require;
-
-/// libtest names each test's thread after the test.
-fn current_test() -> String {
-    std::thread::current()
-        .name()
-        .unwrap_or("this test")
-        .to_string()
-}
 
 /// [`edgefirst_tensor::is_dma_available`] under the `HAL_TEST_REQUIRE_DMA=1`
 /// policy: on a lane that requires a DMA heap, an unavailable one fails the
@@ -50,6 +28,7 @@ pub(crate) fn is_dma_available() -> bool {
 
 /// [`edgefirst_tensor::is_gpu_buffer_available`], under the `HAL_TEST_REQUIRE_DMA=1` policy on Linux
 /// where the buffers are DMA-BUFs.
+#[cfg_attr(not(feature = "opengl"), allow(dead_code))]
 pub(crate) fn is_gpu_buffer_available() -> bool {
     #[cfg(target_os = "linux")]
     return is_dma_available();
@@ -57,11 +36,41 @@ pub(crate) fn is_gpu_buffer_available() -> bool {
     edgefirst_tensor::is_gpu_buffer_available()
 }
 
+/// Unwraps a DMA-BUF allocation: it must succeed when the heap probe (under
+/// `HAL_TEST_REQUIRE_DMA`) says the heap is usable, and may fail with a warning otherwise.
+pub(crate) fn dma_allocated<T, E: std::fmt::Debug>(result: Result<T, E>, what: &str) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => allocated(Err(e), what, outcome::expect_dma(is_dma_available())),
+    }
+}
+
+/// Unwraps a zero-copy GPU buffer allocation (DMA-BUF, IOSurface or D3D11): it must succeed when
+/// [`is_gpu_buffer_available`] reports the backing, and may fail with a warning otherwise.
+#[cfg_attr(not(feature = "opengl"), allow(dead_code))]
+pub(crate) fn gpu_buffer_allocated<T, E: std::fmt::Debug>(
+    result: Result<T, E>,
+    what: &str,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            let expect = if is_gpu_buffer_available() {
+                Expect::Succeeds
+            } else {
+                Expect::MayFail("no zero-copy GPU buffer backing on this host")
+            };
+            allocated(Err(e), what, expect)
+        }
+    }
+}
+
 /// Applies the `HAL_TEST_REQUIRE_G2D=1` policy to a G2D availability probe.
 ///
 /// # Panics
 ///
 /// When `HAL_TEST_REQUIRE_G2D=1` and `available` is `false`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn g2d_required_or(available: bool) -> bool {
     let required = std::env::var("HAL_TEST_REQUIRE_G2D").as_deref() == Ok("1");
     g2d_decide(available, required, &current_test())

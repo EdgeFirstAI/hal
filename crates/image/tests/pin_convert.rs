@@ -54,17 +54,17 @@ const H: usize = 48;
 /// custom allocation can crash inside `Invoke()` rather than being rejected.
 const TFLITE_ALIGNMENT: usize = 64;
 
-/// Report a skip so it survives to the log.
-///
-/// libtest captures `println!`/`eprintln!` and discards it for **passing**
-/// tests, so a test that skips and returns is indistinguishable from one that
-/// did the work. Writing to `std::io::stderr()` directly bypasses that capture.
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
-}
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+#[path = "support/zero_copy.rs"]
+#[allow(dead_code)]
+mod zero_copy;
 
-/// Emit a note that must survive a *passing* test, for the same reason.
+/// Emit a note that must survive a *passing* test, whose captured output libtest discards.
 fn note(what: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "NOTE: {what}");
@@ -167,8 +167,7 @@ fn assert_pixels(
 
 #[test]
 fn pin_survives_convert_into_the_pinned_destination() {
-    if !edgefirst_tensor::is_gpu_buffer_available() {
-        skip("no zero-copy GPU buffer (no DMA heap / no IOSurface) on this host");
+    if !zero_copy::served_or_skip() {
         return;
     }
 
@@ -258,8 +257,7 @@ fn pin_taken_after_convert_sees_the_converted_frame() {
     // The mirror case: a runtime that pins *late*, after the pipeline has
     // already been running. The pin must expose the current frame rather than
     // a fresh mapping of stale or zeroed pages.
-    if !edgefirst_tensor::is_gpu_buffer_available() {
-        skip("no zero-copy GPU buffer (no DMA heap / no IOSurface) on this host");
+    if !zero_copy::served_or_skip() {
         return;
     }
 
