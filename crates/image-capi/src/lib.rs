@@ -41,6 +41,12 @@
 //! handle through `ef_tensor_image_desc_get`'s scalar view rather than a
 //! dereference of tensor-capi's private layout.
 
+#[cfg(not(edgefirst_tensor_dynamic))]
+compile_error!(
+    "edgefirst-image-capi links libedgefirst_tensor and must be built with the dynamic tensor backend: \
+     `cargo build --config .cargo/tensor-dynamic.toml` (or `make capi-libs`)."
+);
+
 pub mod codes;
 pub mod draw;
 pub mod processor;
@@ -472,6 +478,7 @@ mod tests {
         let Some(out) = cc_build_and_run(src, "ef_test_cross_library") else {
             return;
         };
+        artifacts::relay_skips("a_tensor_crosses_the_library_boundary_intact", &out);
         assert!(
             out.status.success(),
             "cross-library contract failed:\n{}{}",
@@ -495,6 +502,10 @@ mod tests {
         let Some(out) = cc_build_and_run(src, "ef_test_image_desc_cross_library") else {
             return;
         };
+        artifacts::relay_skips(
+            "an_image_desc_request_crosses_the_library_boundary_intact",
+            &out,
+        );
         assert!(
             out.status.success(),
             "image-desc cross-library contract failed:\n{}{}",

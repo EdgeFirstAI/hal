@@ -17,19 +17,13 @@
 //! backend, and the workspace test convention is `-j 1` already.
 #![cfg(all(target_os = "linux", feature = "v4l2"))]
 
-/// Emit a skip notice that survives libtest's output capture.
-///
-/// libtest captures `println!`/`eprintln!` and replays it only for **failing**
-/// tests, so a test that skips and returns prints `... ok` with its reason
-/// discarded — indistinguishable from one that did the work. Writing to
-/// `std::io::stderr()` directly bypasses that. See TESTING.md.
-macro_rules! skip_note {
-    ($($arg:tt)*) => {{
-        use std::io::Write;
-        let _ = write!(&mut std::io::stderr(), "SKIPPED: ");
-        let _ = writeln!(&mut std::io::stderr(), $($arg)*);
-    }};
-}
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
 
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
@@ -391,23 +385,30 @@ fn v4l2_zero_copy_dma_nv12() {
     // Zero-copy: decode into a DMA-backed NV12 tensor. On a target with a JPEG
     // M2M device + dma_heap, the hardware decodes straight into the tensor
     // (V4L2_MEMORY_DMABUF import, no plane copy); the result must match the
-    // scratch copy-out path byte-for-byte (same hardware decode). Skips
-    // cleanly where DMA allocation is unavailable (no dma_heap on this host).
+    // scratch copy-out path byte-for-byte (same hardware decode). Skips, with
+    // a warning, where no DMA heap is usable (failing under HAL_TEST_REQUIRE_DMA=1).
     // zidane is 1280×720 — both MCU(16)-aligned, so zero-copy is eligible.
     let jpeg = testdata("zidane.jpg");
     std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
-    let mut dma = match Tensor::<u8>::image(
+    let result = Tensor::<u8>::image(
         1280,
         720,
         PixelFormat::Nv12,
         Some(TensorMemory::DmaBuf),
         edgefirst_tensor::CpuAccess::ReadWrite,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            skip_note!("v4l2_zero_copy_dma_nv12: no DMA allocation ({e})");
-            return;
-        }
+    );
+    let usable = dma_require::decide(
+        edgefirst_tensor::is_dma_available(),
+        dma_require::required(),
+        "v4l2_zero_copy_dma_nv12",
+        "no usable DMA heap",
+    );
+    let Some(mut dma) = outcome::allocated(
+        result,
+        "DMA-BUF NV12 allocation",
+        outcome::expect_dma(usable),
+    ) else {
+        return;
     };
     let mut decoder = ImageDecoder::new();
     let info = dma.load_image(&mut decoder, &jpeg).unwrap();

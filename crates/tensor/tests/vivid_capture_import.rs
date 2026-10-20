@@ -10,7 +10,7 @@
 //! `sudo modprobe vivid n_devs=2 node_types=0x1,0x1 multiplanar=1,2` and
 //! give the user read-write access to its nodes. Without it the tests skip;
 //! `HAL_TEST_REQUIRE_VIVID=1` makes that a failure.
-#![cfg(all(target_os = "linux", feature = "static"))]
+#![cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ fn vivid(buf_type: BufType) -> Option<Device> {
             "HAL_TEST_REQUIRE_VIVID=1 but the test would have skipped: {why}"
         );
         use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "SKIPPED: {why}");
+        let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {why}");
     }
     found
 }

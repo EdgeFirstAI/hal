@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-build-support"
+description = "Build-script helpers shared by the C-API and Python leaves that link libedgefirst_tensor"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# No dependencies: this compiles into every leaf's build script.
+[dependencies]

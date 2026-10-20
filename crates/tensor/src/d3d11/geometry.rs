@@ -288,7 +288,7 @@ pub unsafe fn d3d11_shared_handle_geometry(
 // `D3d11TextureTensor` is `TensorStorage`'s and `dynamic` forwards every
 // tensor call to the C ABI instead. The code under test is the same in both
 // builds, and the `dynamic` lint lane still compiles it.
-#[cfg(all(test, feature = "static"))]
+#[cfg(all(test, not(edgefirst_tensor_dynamic)))]
 mod tests {
     use super::*;
     use crate::d3d11::texture::D3d11TextureTensor;

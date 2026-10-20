@@ -30,13 +30,21 @@ crates/python-tracker/         cdylib -> edgefirst.tracker     (_tracker.so)
 
 Each sibling extension **links `libedgefirst_tensor.so`**. Tensor
 implementation lives in that one shared library; the other wheels do not
-embed a second copy. `edgefirst-tensor`'s wheel ships the `.so` (and the
-`.so.0` soname symlink); codec/image/decoder set `DT_NEEDED` +
+embed a second copy. `edgefirst-tensor`'s wheel ships it under its SONAME
+(`libedgefirst_tensor.so.0`) only; codec/image/decoder set `DT_NEEDED` +
 `RUNPATH=$ORIGIN/../tensor`. Tracker does not link tensor: it consumes
 plain detection values. On Windows the same library is `edgefirst_tensor.dll`
 (no `lib` prefix, no SONAME) and there is no rpath: codec/image/decoder's
 `__init__.py` call `os.add_dll_directory()` on `edgefirst/tensor/` before
 importing their `.pyd`.
+
+These four extensions are built with edgefirst-tensor's dynamic backend:
+every `maturin build` passes `--config .cargo/tensor-dynamic.toml` (`make
+wheel`, `make install-python` and release.yml do), and a build without it
+fails in `build.rs` rather than quietly producing a wheel with its own tensor
+copy. Each extension reports `__tensor_backend__`. The one exception is G13's
+static comparison build, opted into with `EDGEFIRST_TENSOR_STATIC_COMPARISON=1`.
+The link, rpath and nested `tensor-capi` build logic lives in `crates/build-support`.
 
 A JPEG-only user installs `edgefirst-codec` + `edgefirst-tensor`. An
 image-only user installs `edgefirst-image` + `edgefirst-tensor` and does

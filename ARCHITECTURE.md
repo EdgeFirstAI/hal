@@ -443,6 +443,47 @@ reason the probe check has to be real rather than emergent.
 
 ---
 
+## Tensor Backend Selection
+
+`edgefirst-tensor` has two implementations of `TensorDyn` and `Tensor<T>` behind one public API:
+
+- **Static** (always, for Rust): the implementation is compiled into the crate. Every Rust consumer uses it — crates.io users, `mobile-sdk`, the workspace's own tests and benches. There is no dynamic library, no feature to enable, and nothing to opt out of.
+- **Dynamic** (only for shared-library packaging): `TensorDyn` is a thin wrapper over an `ef_tensor*` handle and every operation calls into `libedgefirst_tensor`. Only the C libraries and Python wheels use it, so a process that loads several of them holds exactly one tensor implementation rather than one private copy per library.
+
+The backend is a packaging decision made by the final artifact, not a capability, so it is a build cfg rather than a Cargo feature: Cargo unifies features across a build, which would let one artifact's choice leak into every crate in the graph. The dynamic backend is selected with `--cfg edgefirst_tensor_dynamic`, injected only through a Cargo config fragment:
+
+```bash
+cargo build --config .cargo/tensor-dynamic.toml --manifest-path crates/image-capi/Cargo.toml --target-dir target
+maturin build --config .cargo/tensor-dynamic.toml -m crates/python-image/Cargo.toml
+```
+
+`make capi-libs`, `make wheel` and `make install-python` pass it for you. Never select the backend through `RUSTFLAGS`: an environment `RUSTFLAGS` replaces every per-target `rustflags` table in `.cargo/config.toml`, including the Mach-O strip workaround shipped macOS libraries and wheels need in order to load. `make lint-backend-scope` rejects it.
+
+Two consequences of carrying the cfg in a target table:
+
+- A build environment that already owns `RUSTFLAGS` (Yocto's cargo class, for example) makes Cargo ignore every target table, the fragment included. Add `--cfg edgefirst_tensor_dynamic` to that `RUSTFLAGS` for the C libraries and wheels instead.
+- A `target` table takes precedence over `build.rustflags`, so a user-level `build.rustflags` (a linker or `target-cpu` choice) does not apply under the fragment. Put such flags in a `[target.<triple>]` table, which Cargo joins with the fragment's.
+
+rustdoc does not read target tables, so doctests and `cargo doc` always describe the static backend.
+
+| Artifact | Crate | Backend | Guard |
+|---|---|---|---|
+| `libedgefirst_tensor` | `tensor-capi` | static — the one implementation | refuses the dynamic cfg (`compile_error!`) |
+| `libedgefirst_{image,codec,decoder}` | `{image,codec,decoder}-capi` | dynamic, links `libedgefirst_tensor` | refuses static (`compile_error!`) |
+| `libedgefirst_tracker` | `tracker-capi` | none (no tensor) | — |
+| `edgefirst.tensor` wheel | `python-tensor` | dynamic, bundles `libedgefirst_tensor` | refuses static outside the G13 comparison |
+| `edgefirst.{codec,image,decoder}` wheels | `python-{codec,image,decoder}` | dynamic, rpath `../tensor` | refuses static outside the G13 comparison |
+| `edgefirst.tracker` wheel | `python-tracker` | none (no tensor) | — |
+| Rust crates | `edgefirst-*` | static | — |
+
+The guards turn a mis-built artifact into a compile error rather than a silently wrong binary: a C library built static would reinterpret another library's `ef_tensor*` handles, and a wheel built static would quietly carry its own tensor copy. Each Python extension reports its backend as `__tensor_backend__`.
+
+Library crates (codec, image, decoder, tracker, python-common) never name the backend; they compile against whichever `TensorDyn` the build selects. `make check-backends` compiles all of them against both, and `make check-single-home` proves on the built artifacts that the implementation exists once. The link and rpath logic every leaf shares lives in `crates/build-support`.
+
+Each C library is built by its own cargo invocation outside the workspace, so its feature set, lockfile and output path belong to that artifact alone; each wheel is its own maturin invocation.
+
+---
+
 ## Zero-copy CUDA Tensor Mapping
 
 This section describes the cross-crate mechanism that lets the destination
@@ -990,6 +1031,7 @@ hal/
 │   ├── tensor-abi/         # edgefirst-tensor-abi (plain C value types shared by tensor and its FFI)
 │   ├── tensor-ffi/         # edgefirst-tensor-ffi (the `ef_tensor_*` declarations the dynamic backend calls)
 │   ├── decoder-abi/        # edgefirst-decoder-abi (header-only `edgefirst/detect.h` values: boxes, masks, tile placements)
+│   ├── build-support/      # build-script helpers the shared-library leaves use to link libedgefirst_tensor
 │   ├── tensor-capi/        # libedgefirst_tensor (C ABI; the five -capi leaves are workspace-excluded)
 │   ├── codec-capi/         # libedgefirst_codec
 │   ├── image-capi/         # libedgefirst_image

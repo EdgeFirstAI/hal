@@ -132,9 +132,9 @@ not have their own instrumentation.
 
 The tracker crate's only `edgefirst-*` dependency is an optional
 [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/),
-pulled in by the default `static` and `tensor-boxes` features — the latter is
-the orphan-rule home for `impl DetectionBox for DetectBox`. Both are off in
-the C leaf, so `libedgefirst_tracker` links no tensor at all. Nothing here
+pulled in by the default `tensor-boxes` feature — the orphan-rule home for
+`impl DetectionBox for DetectBox`. It is off in the C leaf, so
+`libedgefirst_tracker` links no tensor at all. Nothing here
 depends on the model decoder.
 
 It is consumed by:

@@ -32,11 +32,33 @@ TEST_DIR := tests
 RUFF_PATHS := $(PYTHON_CRATES) crates/python-common $(TEST_DIR)
 
 # The five modular C-API leaves: standalone packages excluded from the
-# workspace (static/dynamic feature conflict, plans R3-R5). Every invocation
-# MUST carry --target-dir target: their artifact-reading tests hardcode the
-# shared <root>/target dir, and EF_REQUIRE_FRESH_ARTIFACTS=1 makes a wrong
-# target dir a hard failure instead of a silent skip.
+# workspace so each library resolves its own features and lockfile, and
+# workspace builds never re-link them over the artifacts the gates read.
+# Every invocation MUST carry --target-dir target: their artifact-reading
+# tests hardcode the shared <root>/target dir, and EF_REQUIRE_FRESH_ARTIFACTS=1
+# makes a wrong target dir a hard failure instead of a silent skip.
+# tensor-capi comes first: the dynamic leaves link the library it builds.
 CAPI_MODULAR_CRATES := tensor-capi image-capi codec-capi decoder-capi tracker-capi
+
+# Selects edgefirst-tensor's dynamic backend (see ARCHITECTURE.md, Tensor
+# Backend Selection). Never RUSTFLAGS: that replaces .cargo/config.toml's
+# per-target flags.
+TENSOR_DYNAMIC := --config $(CURDIR)/.cargo/tensor-dynamic.toml
+# An environment RUSTFLAGS suppresses the fragment's cfg, so a dynamic-backend lane would quietly build static.
+define require_fragment_rustflags
+	@if [ -n "$$RUSTFLAGS" ]; then \
+		echo "ERROR: RUSTFLAGS is set, which hides .cargo/tensor-dynamic.toml's cfg; use CARGO_TARGET_<TRIPLE>_RUSTFLAGS instead" >&2; \
+		exit 1; \
+	fi
+endef
+# The C-API leaves that call into libedgefirst_tensor instead of embedding it.
+CAPI_DYNAMIC_CRATES := image-capi codec-capi decoder-capi
+# Expands, inside a `for c in $(CAPI_MODULAR_CRATES)` loop, to $(TENSOR_DYNAMIC) for a dynamic leaf.
+capi_cfg_sh = $$(case " $(CAPI_DYNAMIC_CRATES) " in *" $$c "*) echo "$(TENSOR_DYNAMIC)";; esac)
+# Every library a shared-library leaf compiles in, checked under both backends.
+BACKEND_CHECK_CRATES := edgefirst-tensor edgefirst-codec edgefirst-image \
+	edgefirst-decoder edgefirst-tracker edgefirst-python-common
+BACKEND_CHECK_FEATURES := edgefirst-python-common/codec,edgefirst-python-common/image,edgefirst-python-common/decoder,edgefirst-python-common/tracker
 
 # The crates.io packages, each checked on its own as a dependent builds it, without workspace feature unification.
 PUBLISHED_CRATES := edgefirst-tensor-abi edgefirst-tensor-ffi edgefirst-tensor edgefirst-egl edgefirst-gl \
@@ -169,7 +191,7 @@ format-capi-modular:
 # ===========================================================================
 
 .PHONY: lint
-lint: lint-rust lint-tensor-dynamic lint-python lint-python-abi3-py38 lint-capi-modular
+lint: lint-rust lint-tensor-dynamic lint-python lint-python-abi3-py38 lint-capi-modular lint-backend-scope
 	@echo "✓ All linting complete"
 
 .PHONY: lint-rust
@@ -180,23 +202,14 @@ lint-rust:
 		-- -D warnings
 	@echo "✓ Clippy passed"
 
-# The `--exclude`s above and the coverage build in test.yml only ever compile
-# the Python bindings under `abi3-py311` (the ABI our own CI Python happens
-# to be); `abi3-py38` -- the OTHER of the two mutually exclusive ABI configs
-# every one of the five wheels ships -- was compiled by nothing short of
-# release.yml's actual `--features abi3-py38` maturin build, on a tag push,
-# after the version bump PR had already merged. That gap let a
-# `#[cfg(...)]` mismatch in crates/python-common/src/tensor.rs (a method
-# compiled out in the exact one ABI config that called it) reach three
-# release attempts (0.29.0-0.29.2) before anything caught it. `-p` per crate,
-# not `--workspace`, for the same reason lint-tensor-dynamic below is: only
-# the one package's own dependency edge should pull in `dynamic`, not every
-# workspace member's default `static` unified alongside it.
+# The workspace lanes compile the Python bindings under abi3-py311 only;
+# this lints the abi3-py38 configuration every wheel also ships. `-p` per
+# crate keeps each extension's own python-common feature set.
 .PHONY: lint-python-abi3-py38
 lint-python-abi3-py38:
 	@echo "Running clippy on the Python bindings under abi3-py38 (the ABI regular CI otherwise never compiles)..."
 	@for pkg in $(PYTHON_PACKAGES); do \
-		cargo clippy -p edgefirst-python-$$pkg --features abi3-py38 --all-targets -- -D warnings || exit 1; \
+		cargo clippy $(TENSOR_DYNAMIC) -p edgefirst-python-$$pkg --features abi3-py38 --all-targets -- -D warnings || exit 1; \
 	done
 	@echo "✓ abi3-py38 Python-bindings clippy passed"
 
@@ -216,7 +229,7 @@ lint-python:
 lint-capi-modular:
 	@echo "Running clippy on the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo clippy --manifest-path crates/$$c/Cargo.toml --all-targets --target-dir target -- -D warnings || exit 1; \
+		cargo clippy $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --all-targets --target-dir target -- -D warnings || exit 1; \
 	done
 	@echo "✓ Modular C-API clippy passed"
 
@@ -225,7 +238,7 @@ lint-capi-modular:
 # ===========================================================================
 
 .PHONY: check
-check: check-capi-modular check-standalone
+check: check-capi-modular check-standalone check-backend-guards
 	@echo "Running cargo check..."
 	@cargo check $(RUST_FEATURES) --workspace \
 		$(foreach c,$(PYTHON_CRATE_NAMES),--exclude $(c))
@@ -237,15 +250,62 @@ check-standalone:
 	@for c in $(PUBLISHED_CRATES); do \
 		cargo check -p $$c || exit 1; \
 	done
-	@cargo check -p edgefirst-codec --all-targets --no-default-features \
-		--features v4l2,nvjpeg,png,edgefirst-tensor/dynamic
 	@echo "✓ Standalone check passed"
+	@$(MAKE) --no-print-directory check-backends
+
+# Every library a shared-library leaf compiles in, against both tensor
+# backends. Libraries never name the backend, so a dynamic-only compile
+# break is otherwise found only by the C-API and wheel builds.
+.PHONY: check-backends
+check-backends:
+	$(require_fragment_rustflags)
+	@echo "Checking the libraries against the static tensor backend..."
+	@cargo check $(foreach c,$(BACKEND_CHECK_CRATES),-p $(c)) --features $(BACKEND_CHECK_FEATURES) --lib
+	@echo "Checking the libraries against the dynamic tensor backend..."
+	@cargo check $(TENSOR_DYNAMIC) $(foreach c,$(BACKEND_CHECK_CRATES),-p $(c)) --features $(BACKEND_CHECK_FEATURES) --lib
+	@echo "✓ Both backends check"
+
+# Only edgefirst-tensor and the shared-library leaves may name the tensor
+# backend, and nothing may select it through RUSTFLAGS.
+BACKEND_SCOPE_ALLOWED := ^(crates/tensor/|crates/build-support/|crates/(image|codec|decoder|tensor)-capi/|crates/python-(tensor|codec|image|decoder)/|\.cargo/tensor-dynamic\.toml|Cargo\.toml|Makefile|\.github/|scripts/|tests/|[^:]*\.md:)
+.PHONY: lint-backend-scope
+lint-backend-scope:
+	@echo "Checking that only the tensor crate and the leaves name the tensor backend..."
+	@hits=$$(git grep --untracked -nIiE 'edgefirst_tensor_dynamic|edgefirst-tensor/(static|dynamic)|CARGO_FEATURE_(STATIC|DYNAMIC)\b' -- . ':!.claude' \
+		| grep -vE '$(BACKEND_SCOPE_ALLOWED)' || true); \
+	if [ -n "$$hits" ]; then echo "$$hits"; echo "ERROR: the tensor backend is named outside edgefirst-tensor and the leaves"; exit 1; fi
+	@hits=$$(git grep --untracked -nIiE 'RUSTFLAGS[^#]*edgefirst_tensor_dynamic' -- Makefile .github scripts || true); \
+	if [ -n "$$hits" ]; then echo "$$hits"; echo "ERROR: select the dynamic backend with $(TENSOR_DYNAMIC), never RUSTFLAGS"; exit 1; fi
+	@echo "✓ Backend scope clean"
+
+# Each guard must reject the wrong backend with its own message; a build that
+# fails for any other reason does not count as the guard working.
+.PHONY: check-backend-guards
+check-backend-guards:
+	$(require_fragment_rustflags)
+	@echo "Checking that each leaf rejects the wrong tensor backend..."
+	@out=$$(cargo check $(TENSOR_DYNAMIC) --manifest-path crates/tensor-capi/Cargo.toml --target-dir target 2>&1); \
+	echo "$$out" | grep -q 'edgefirst-tensor-capi is the tensor implementation' \
+		|| { echo "$$out" | tail -20; echo "ERROR: tensor-capi accepted the dynamic backend"; exit 1; }
+	@for c in $(CAPI_DYNAMIC_CRATES); do \
+		out=$$(cargo check --manifest-path crates/$$c/Cargo.toml --target-dir target 2>&1); \
+		echo "$$out" | grep -q "edgefirst-$$c links libedgefirst_tensor and must be built with the dynamic" \
+			|| { echo "$$out" | tail -20; echo "ERROR: $$c accepted the static backend"; exit 1; }; \
+	done
+	@for p in tensor codec image decoder; do \
+		out=$$(env -u EDGEFIRST_TENSOR_STATIC_COMPARISON cargo check -p edgefirst-python-$$p 2>&1); \
+		echo "$$out" | grep -q "edgefirst-python-$$p links libedgefirst_tensor and must be built with the dynamic" \
+			|| { echo "$$out" | tail -20; echo "ERROR: python-$$p accepted the static backend"; exit 1; }; \
+	done
+	@EDGEFIRST_TENSOR_STATIC_COMPARISON=1 cargo check -q -p edgefirst-python-image \
+		|| { echo "ERROR: the G13 static comparison opt-in no longer builds"; exit 1; }
+	@echo "✓ Every leaf guard fires"
 
 .PHONY: check-capi-modular
 check-capi-modular:
 	@echo "Running cargo check on the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo check --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
+		cargo check $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
 	done
 	@echo "✓ Modular C-API check passed"
 
@@ -265,7 +325,7 @@ build: capi-libs
 capi-libs:
 	@echo "Building the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo build --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
+		cargo build $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
 	done
 	@echo "✓ Modular C-API build complete"
 	@$(MAKE) capi-symlinks
@@ -275,13 +335,13 @@ capi-libs:
 # comparison would be meaningless -- while capi-libs above only ever
 # produces target/debug. This is that release build, kept separate so a
 # plain `make capi-libs` (used by test-capi-modular and friends) stays fast.
-.PHONY: capi-libs-release
-capi-libs-release:
-	@echo "Building the five modular C-API crates (release, for G5 footprint)..."
+.PHONY: capi-libs-release capi-libs-profiling
+capi-libs-release capi-libs-profiling: capi-libs-%:
+	@echo "Building the five modular C-API crates ($*)..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo build --release --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
+		cargo build --profile $* $(if $(TARGET),--target $(TARGET)) $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
 	done
-	@echo "✓ Modular C-API release build complete"
+	@echo "✓ Modular C-API $* build complete"
 	@$(MAKE) capi-symlinks
 
 # build.rs sets `-soname libedgefirst_X.so.0` / install_name
@@ -303,11 +363,12 @@ capi-symlinks:
 # One relocatable archive: headers, soversioned libraries, pkg-config,
 # LICENSE, INSTALL.txt. tar.gz on Linux, zip on Windows and macOS. The same
 # script release.yml's build-capi job runs, so local `make package` and CI
-# cannot drift.
+# cannot drift. PACKAGE_PROFILE=profiling packages a test build (CI smoke tests on ordinary PRs).
+PACKAGE_PROFILE ?= release
 .PHONY: package
-package: capi-libs-release
+package: capi-libs-$(PACKAGE_PROFILE)
 	@mkdir -p dist
-	@./scripts/package-capi.sh --outdir dist
+	@./scripts/package-capi.sh --libdir target/$(PACKAGE_PROFILE) --outdir dist
 	@$(PYTHON) scripts/check_macho_alignment.py dist
 	@echo "✓ C archive in dist/"
 
@@ -339,7 +400,7 @@ build-python:
 	@echo "Building Python bindings..."
 	@if command -v maturin >/dev/null 2>&1; then \
 		for c in $(PYTHON_CRATES); do \
-			maturin build --auditwheel skip -m "$$c/Cargo.toml" $(CARGO_PROFILE) || exit 1; \
+			maturin build --auditwheel skip $(TENSOR_DYNAMIC) -m "$$c/Cargo.toml" $(CARGO_PROFILE) || exit 1; \
 		done; \
 	else \
 		echo "ERROR: maturin not found (see README.md for installation)"; \
@@ -369,12 +430,12 @@ wheel:
 	@for c in $(PYTHON_CRATES); do \
 		if [ -f "venv/bin/activate" ]; then \
 			. venv/bin/activate && \
-				maturin build --release --zig --compatibility manylinux2014 --auditwheel skip \
+				maturin build --release --zig --compatibility manylinux2014 --auditwheel skip $(TENSOR_DYNAMIC) \
 					$(if $(TARGET),--target $(TARGET)) \
 					-m "$$c/Cargo.toml" -i $(PYTHON_INTERPRETER) \
 					$(if $(PYABI),--features abi3-$(PYABI)) || exit 1; \
 		else \
-			maturin build --release --zig --compatibility manylinux2014 --auditwheel skip \
+			maturin build --release --zig --compatibility manylinux2014 --auditwheel skip $(TENSOR_DYNAMIC) \
 				$(if $(TARGET),--target $(TARGET)) \
 				-m "$$c/Cargo.toml" -i $(PYTHON_INTERPRETER) \
 				$(if $(PYABI),--features abi3-$(PYABI)) || exit 1; \
@@ -476,13 +537,14 @@ install-python:
 	@#
 	@# Linux never hit this because maturin skips auditwheel entirely under the
 	@# `--compatibility off` that pip's invocation carries; the macOS dylib
-	@# repair path has no such opt-out.
+	@# repair path has no such opt-out. The same channel carries the dynamic
+	@# tensor backend's --config.
 	@for c in $(PYTHON_CRATES); do \
 		if [ -f "venv/bin/activate" ]; then \
-			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip" \
+			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling $(TENSOR_DYNAMIC)" \
 				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		else \
-			MATURIN_PEP517_ARGS="--auditwheel skip" \
+			MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling $(TENSOR_DYNAMIC)" \
 				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		fi; \
 	done
@@ -521,68 +583,37 @@ test-python: install-python
 test-capi-modular: capi-libs
 	@echo "Running tests for the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --manifest-path crates/$$c/Cargo.toml --target-dir target -- --test-threads=1 || exit 1; \
+		EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target -- --test-threads=1 || exit 1; \
 	done
 	@echo "✓ Modular C-API tests passed"
 
-# `test-rust` above runs the STATIC backend only, and cannot also run the
-# dynamic one: `static` is edgefirst-tensor's default feature and the two
-# backends are mutually exclusive (the compile_error! guard at
-# crates/tensor/src/lib.rs), so `--workspace` can only ever select one. The
-# dynamic backend therefore needs a build of its own, and until this lane
-# existed it had none -- every gate in `dynamic_primitives.rs`, and the
-# whole `protocol_roundtrip.rs` suite under `dynamic`, ran only when someone
-# typed the command by hand. On a branch whose standard is "demonstrated red
-# before it is trusted green", a gate nothing re-runs decays to no gate.
-#
-# `capi-libs` first, and not incidentally: `edgefirst-tensor-ffi` declares
-# its symbols with no `#[link]` attribute, so `dynamic-test-link` (opt-in,
-# never enabled by a production consumer) points build.rs at target/debug
-# for the real `libedgefirst_tensor.so`. A stale or missing one is a link
-# error, not a silent pass.
-#
-# Targets are named one by one rather than via `--all-targets`, and the
-# reason is worth stating so nobody "simplifies" this later: the crate's own
-# unit tests (`--lib`) are static-only and do not compile under `dynamic` --
-# a pre-existing gap this lane does not close.
-#
-# `vocabulary` was excluded by name here when this lane was written, because
-# `ef_tensor_builder_alloc` collapsed every refusal to ENOMEM and its
-# `a_defined_but_unbacked_code_errors_instead_of_panicking` could not pass.
-# That was left as a marker rather than a silent omission, and task P2d
-# removed the defect -- so the exclusion is gone with it, which was that
-# task's acceptance test.
-#
-# `logical_shape` (task P2e) is deliberately NOT cfg-gated to either
-# backend: it pins a contract both must honour, and the defect it caught was
-# identical on both -- which is exactly the kind G13 cannot see, since G13
-# compares the two against each other.
+# `test-rust` runs the static backend; this runs edgefirst-tensor's own
+# tests against the dynamic one. `capi-libs` first: under the dynamic cfg the
+# crate's build.rs links its test binaries against target/debug's
+# libedgefirst_tensor, so a missing library is a link error. Targets are
+# named because the crate's `--lib` unit tests are static-only.
 DYNAMIC_TEST_TARGETS := dynamic_primitives protocol_roundtrip map_access \
 	identity scenarios no_global_state vocabulary logical_shape
 
 .PHONY: test-tensor-dynamic
 test-tensor-dynamic: capi-libs
+	$(require_fragment_rustflags)
 	@echo "Running edgefirst-tensor's dynamic-backend tests..."
 	@for t in $(DYNAMIC_TEST_TARGETS); do \
-		LD_LIBRARY_PATH=$(CURDIR)/target/debug cargo test -p edgefirst-tensor \
-			--no-default-features --features dynamic,dynamic-test-link,ndarray \
+		LD_LIBRARY_PATH=$(CURDIR)/target/debug cargo test $(TENSOR_DYNAMIC) -p edgefirst-tensor \
 			--test $$t || exit 1; \
 	done
 	@echo "✓ Dynamic-backend tests passed"
 
-# The dynamic backend's own clippy run. `lint-rust` above is `--workspace
-# --all-targets` on default features, i.e. static, so nothing lints this
-# code either. `--all-targets` is not usable here for the same reason the
-# test lane names its targets: the static-only `--lib` unit tests do not
-# compile under `dynamic`.
+# Clippy for the dynamic backend, which `lint-rust` (static) never compiles.
 .PHONY: lint-tensor-dynamic
 lint-tensor-dynamic:
+	$(require_fragment_rustflags)
 	@echo "Running clippy on the dynamic backend (strict mode)..."
-	@cargo clippy -p edgefirst-tensor --no-default-features \
-		--features dynamic,ndarray --lib -- -D warnings
+	@cargo clippy $(TENSOR_DYNAMIC) -p edgefirst-tensor --lib -- -D warnings
 	@for t in $(DYNAMIC_TEST_TARGETS); do \
-		cargo clippy -p edgefirst-tensor --no-default-features \
-			--features dynamic,dynamic-test-link,ndarray --test $$t -- -D warnings \
+		cargo clippy $(TENSOR_DYNAMIC) -p edgefirst-tensor \
+			--test $$t -- -D warnings \
 			|| exit 1; \
 	done
 	@echo "✓ Dynamic-backend clippy passed"
@@ -616,17 +647,9 @@ check-single-home: capi-libs capi-libs-release
 # supplied by PY_STATIC_VENV/PY_DYNAMIC_VENV -- building those two venvs is
 # packaging work, done here rather than by hand, so G13 can run in CI.
 #
-# Both venvs build from the SAME commit (whatever HEAD is when this runs),
-# not a historical checkout: the four Python extensions carry `static`/
-# `dynamic` forwarding features (this task, mirroring edgefirst-tracker/
-# -image/-codec/-decoder and python-common), so `--no-default-features
-# --features static` reaches a genuine static-linked build without a
-# second checkout. A first design pinned the static side to the last
-# all-static commit in a scratch worktree; reviewed and rejected before
-# landing, because a fixed historical pin decays as the branch grows --
-# every legitimate change to shared code after the pin becomes a false
-# divergence, making G13 noisier over time instead of staying meaningful.
-# Building both sides from identical source removes that decay entirely.
+# Both venvs build from the same commit. The static side builds without
+# $(TENSOR_DYNAMIC) and sets EDGEFIRST_TENSOR_STATIC_COMPARISON=1, the only
+# opt-in that lets a tensor-linked wheel build static (build-support's guard).
 DIFFERENTIAL_STATIC_VENV := $(CURDIR)/target/differential-static-venv
 DIFFERENTIAL_DYNAMIC_VENV := $(CURDIR)/target/differential-dynamic-venv
 # Matches venv's own pinned versions (`pip freeze`), not "latest" -- G13's
@@ -642,14 +665,8 @@ DIFFERENTIAL_DYNAMIC_VENV := $(CURDIR)/target/differential-dynamic-venv
 DIFFERENTIAL_TEST_DEPS := numpy==2.4.6 pillow==12.2.0 \
 	pytest==9.0.3 pyyaml==6.0.3 safetensors==0.8.0 psutil==7.2.2
 
-# NOT a dedicated --target-dir per venv, unlike the wheel output directory
-# below. Flipping edgefirst-tensor's static/dynamic feature rebuilds the
-# whole dependency graph, so `venv-static` then `venv-dynamic` in the same
-# `test-differential` run will thrash the shared target/ between the two
-# builds either way -- a separate target-dir per side would trade that
-# rebuild for a second, persistent full build cache instead, and this host
-# is at 97% disk. Considered and rejected for now, not overlooked; revisit
-# if this lane's own build time becomes the bottleneck rather than disk.
+# One shared --target-dir for both venvs: cargo keeps the static and
+# dynamic builds side by side in it, so neither side rebuilds the other.
 # A DEDICATED wheel output directory per venv (`-o`), never the shared
 # target/wheels/ `make wheel`/`make build-python` use -- reusing that one
 # is exactly how a stale wheel from unrelated manual testing (an aarch64
@@ -701,6 +718,7 @@ endef
 # not just that the architecture is right: a "static" wheel could still
 # link dynamically (a feature flag not threaded through correctly) and
 # pass the architecture check while comparing dynamic against itself.
+# Each wheel's `__tensor_backend__` attribute is the in-process counterpart.
 #
 # Dynamic: reuses scripts/check_wheel_layout.py's own A3 check (already
 # verified against both directions when it was written) rather than a
@@ -740,8 +758,7 @@ venv-static:
 	@$(DIFFERENTIAL_STATIC_VENV)/bin/pip install -q --upgrade pip
 	@$(DIFFERENTIAL_STATIC_VENV)/bin/pip install -q maturin $(DIFFERENTIAL_TEST_DEPS)
 	@for c in $(PYTHON_CRATES); do \
-		$(DIFFERENTIAL_STATIC_VENV)/bin/maturin build --release --auditwheel skip \
-			--no-default-features --features static,tracing \
+		EDGEFIRST_TENSOR_STATIC_COMPARISON=1 $(DIFFERENTIAL_STATIC_VENV)/bin/maturin build --profile profiling --auditwheel skip \
 			-o target/differential-wheels-static \
 			-m "$$c/Cargo.toml" -i $(DIFFERENTIAL_STATIC_VENV)/bin/python || exit 1; \
 	done
@@ -760,7 +777,7 @@ venv-dynamic:
 	@$(DIFFERENTIAL_DYNAMIC_VENV)/bin/pip install -q --upgrade pip
 	@$(DIFFERENTIAL_DYNAMIC_VENV)/bin/pip install -q maturin $(DIFFERENTIAL_TEST_DEPS)
 	@for c in $(PYTHON_CRATES); do \
-		$(DIFFERENTIAL_DYNAMIC_VENV)/bin/maturin build --release --auditwheel skip \
+		$(DIFFERENTIAL_DYNAMIC_VENV)/bin/maturin build --profile profiling --auditwheel skip $(TENSOR_DYNAMIC) \
 			-o target/differential-wheels-dynamic \
 			-m "$$c/Cargo.toml" -i $(DIFFERENTIAL_DYNAMIC_VENV)/bin/python || exit 1; \
 	done

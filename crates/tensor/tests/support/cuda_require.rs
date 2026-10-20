@@ -85,7 +85,7 @@ pub fn cuda_available_or_skip(what: &str) -> bool {
          or it is not on PATH or CUDA_PATH\\bin)";
     let run = decide(edgefirst_tensor::is_cuda_available(), required(), what, why);
     if !run {
-        let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {what} - {why}");
+        let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {what} - {why}");
     }
     run
 }

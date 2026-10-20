@@ -47,11 +47,7 @@ fi
 COVERAGE="${COVERAGE:-0}"
 COV_LCOV="${COV_LCOV:-target/coverage_rust.lcov}"
 
-# Python crates request edgefirst-tensor's `dynamic` feature. --workspace
-# unions features across every member, so leaving them in activates
-# `static` (workspace default) and `dynamic` at once and trips tensor's
-# mutual-exclusion guard (E0252 / infinite-size recursive types). Same
-# exclude set as the other --workspace lanes in test.yml.
+# The Python crates are built and tested as wheels, not in --workspace lanes.
 WS_EXCLUDES=(
     --workspace
     --exclude gpu-probe
@@ -64,12 +60,11 @@ WS_EXCLUDES=(
     --exclude edgefirst-python-common
 )
 
-# dma_test_formats un-gates the gl/tests.rs zero-copy tier on macOS
-# (IOSurface-backed @Dma fixtures). MUST be identical across the build
-# and every nextest invocation below — a feature mismatch between the
-# coverage passes triggers a rebuild between the codesign step and the
-# run, leaving pass 2 with unsigned binaries (GL tests SIGKILL/skip).
-FEATURES=(--features edgefirst-image/dma_test_formats)
+# MUST be identical across the build and every nextest invocation below — a
+# feature mismatch between the coverage passes triggers a rebuild between the
+# codesign step and the run, leaving pass 2 with unsigned binaries (GL tests
+# SIGKILL/skip). The zero-copy @Dma tier needs no feature; it is always built.
+FEATURES=(--features edgefirst-image/opengl)
 
 sign_test_binaries() {
     # Sign every test binary in the given deps dir with the library-

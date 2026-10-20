@@ -37,7 +37,7 @@ Per-backend unit tests live in the source files alongside the implementation. `t
 | `cuda_runtime_loader.rs` | libcudart loading; under `HAL_TEST_REQUIRE_CUDA=1` a loaded runtime must also create and synchronize a stream |
 | `d3d11_tensor.rs` | Windows D3D11 texture tensors (Windows only) |
 | `vivid_capture_import.rs` | A padded V4L2 capture buffer from the kernel's vivid driver, exported with `EXPBUF` and imported through `from_fd`, maps at its row stride (Linux; needs vivid loaded, skips without it, fails instead under `HAL_TEST_REQUIRE_VIVID=1`) |
-| `dynamic_primitives.rs` | The `dynamic` backend (`--no-default-features --features dynamic`) |
+| `dynamic_primitives.rs` | The dynamic backend (`make test-tensor-dynamic`; `--config .cargo/tensor-dynamic.toml`) |
 
 ## Running Tests
 
@@ -127,7 +127,7 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
 
 ## DMA require gate
 
-`crates/tensor/tests/support/dma_require.rs` is the guard, mirroring `tests/support/cuda_require.rs`: under `HAL_TEST_REQUIRE_DMA=1` a DMA test that would skip for want of a usable heap fails instead, naming the test and the reason. Without the variable it skips as before and writes `SKIPPED: <test> - <reason>` straight to stderr, so libtest's capture cannot hide it.
+`crates/tensor/tests/support/dma_require.rs` is the guard, mirroring `tests/support/cuda_require.rs`: under `HAL_TEST_REQUIRE_DMA=1` a DMA test that would skip for want of a usable heap fails instead, naming the test and the reason. Without the variable it skips and writes `WARNING: SKIPPED: <test> - <reason>` straight to stderr, so test capture cannot hide it.
 
 - Unit tests in `src/` call `crate::test_support::dma_or_skip("<test name>")`, which `#[path]`-includes the same support module and feeds it `is_dma_available()`.
 - Integration tests in `tests/` include `support/dma_require.rs` with `#[path]` and call `dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), "<test name>")`.
@@ -219,7 +219,7 @@ cargo test -p edgefirst-tensor cuda -- --test-threads=1
 
 ### Windows D3D11 CUDA interop tests
 
-`crates/tensor/tests/d3d11_tensor.rs` (Windows-only, `feature = "static"`)
+`crates/tensor/tests/d3d11_tensor.rs` (Windows-only, static backend)
 has three tests exercising CUDA's external-memory import of a D3D11 texture
 tensor (`cuda_map_matches_the_cpu_map_and_map_mut_writes_back`,
 `cuda_map_covers_a_texture_whose_allocation_the_driver_padded`,

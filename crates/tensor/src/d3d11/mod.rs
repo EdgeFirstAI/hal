@@ -16,7 +16,7 @@ pub mod geometry;
 // The texture storage is reachable only through the `static` backend's
 // `TensorStorage`; `dynamic` forwards every tensor call to the C ABI and never
 // constructs one, so compiling it there would be dead code.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub(crate) mod texture;
 
 pub use adapter::{
@@ -37,7 +37,7 @@ pub use geometry::{d3d11_shared_handle_geometry, d3d11_texture_geometry};
 ///
 /// **Borrowed**: no reference is transferred, and the caller must never
 /// `Release` it.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
     device().map(|d| d.raw())
 }
@@ -58,7 +58,7 @@ pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
 ///
 /// As [`use_external_device`]: `ptr` must be a live `ID3D11Device*` and must
 /// stay live until the first device use takes the reference.
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub unsafe fn backend_use_external_device(ptr: *mut std::ffi::c_void) -> crate::Result<()> {
     // SAFETY: the caller carries this function's own contract, which is the
     // one `use_external_device` states.
@@ -67,7 +67,7 @@ pub unsafe fn backend_use_external_device(ptr: *mut std::ffi::c_void) -> crate::
 
 /// The `dynamic` backend's [`backend_device`]: the library's device, not this
 /// copy's.
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
     // SAFETY: no arguments; the export returns a borrowed pointer or NULL
     // with the reason recorded on this thread.
@@ -85,7 +85,7 @@ pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
 /// # Safety
 ///
 /// As [`use_external_device`].
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub unsafe fn backend_use_external_device(ptr: *mut std::ffi::c_void) -> crate::Result<()> {
     // SAFETY: the caller carries the contract `ef_d3d11_use_external_device`
     // states, which is the one `use_external_device` states.

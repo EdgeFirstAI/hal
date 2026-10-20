@@ -20,6 +20,8 @@ publish = false # C library - distributed via GitHub Releases, not crates.io
 # `rlib` is deliberately absent: it would collide with the edgefirst-tracker
 # crate's own libedgefirst_tracker.rlib, and nothing needs it.
 crate-type = ["staticlib", "cdylib"]
+# Shares its lib name with the library crate it wraps; rustdoc output would collide.
+doc = false
 name = "edgefirst_tracker"
 
 [features]
@@ -40,17 +42,27 @@ cbindgen = "0.29"
 
 # Excluded from the workspace (see the root Cargo.toml's [workspace.exclude]
 # comment), so this crate inherits NEITHER the root's [workspace.lints] NOR
-# its [profile.release] -- both are restated here by hand. CONTRIBUTING.md
+# its [profile.release]/[profile.profiling] -- both are restated here by hand. CONTRIBUTING.md
 # documents why and says to keep this in sync with the root manually.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
 
+# Shipped artifacts only (release branches): whole-program LTO in one codegen unit.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 strip = true
 debug = false
+
+# Every test and CI build: release optimisation without the fat-LTO link time.
+[profile.profiling]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+debug = "line-tables-only"
 
 # Standalone package: stops cargo's upward workspace search. The resolver is
 # pinned to match the root workspace's behavior.

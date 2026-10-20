@@ -8,6 +8,12 @@
 //! the exported `ef_detect_box_list_data()`/`_len()` without linking this
 //! library: those give back a plain `(ef_detect_box *, size_t)` view.
 
+#[cfg(not(edgefirst_tensor_dynamic))]
+compile_error!(
+    "edgefirst-decoder-capi links libedgefirst_tensor and must be built with the dynamic tensor backend: \
+     `cargo build --config .cargo/tensor-dynamic.toml` (or `make capi-libs`)."
+);
+
 pub mod codes;
 pub mod decode;
 pub mod infer;
@@ -63,7 +69,10 @@ mod tests {
             Ok(o) => Some(o),
             Err(e) => {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr(), "SKIPPED: no C compiler ({cc}: {e})");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "WARNING: SKIPPED: no C compiler ({cc}: {e})"
+                );
                 None
             }
         }
@@ -96,7 +105,10 @@ mod tests {
             Ok(o) => Some(o),
             Err(e) => {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr(), "SKIPPED: no C compiler ({cc}: {e})");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "WARNING: SKIPPED: no C compiler ({cc}: {e})"
+                );
                 None
             }
         }
@@ -198,7 +210,7 @@ mod tests {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIPPED: nothing built; name not checked"
+                "WARNING: SKIPPED: nothing built; name not checked"
             );
             return;
         }

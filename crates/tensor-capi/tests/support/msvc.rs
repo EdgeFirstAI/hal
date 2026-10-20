@@ -90,7 +90,7 @@ pub struct Toolchain {
 /// board's skips by grepping for the literal `SKIPPED`.
 pub fn skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "SKIPPED: {reason}");
+    let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {reason}");
 }
 
 /// The toolchain for this process, or the reason there is none.

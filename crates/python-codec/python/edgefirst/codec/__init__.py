@@ -27,7 +27,10 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 
 from ._codec import *
-from ._codec import __doc__  # noqa: F401
+from ._codec import (
+    __doc__,  # noqa: F401
+    __tensor_backend__,  # noqa: F401
+)
 
 # `os`/`sys` must not remain bound as module attributes: both
 # tests/packaging/test_stub_parity.py (via `dir()`) and

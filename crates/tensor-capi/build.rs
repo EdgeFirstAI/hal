@@ -4,23 +4,16 @@
 use std::env;
 use std::path::PathBuf;
 
-fn rustflags() -> String {
-    format!(
-        "{} {}",
-        env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default(),
-        env::var("RUSTFLAGS").unwrap_or_default()
-    )
-}
-
 fn skip_exports_map() -> bool {
-    let flags = rustflags();
     // rustc 1.94 injects its own `--version-script=.../list` for Linux
     // cdylibs (`--no-undefined-version`). A second script is
     // `ld: anonymous version tag cannot be combined with other version tags`
-    // on aarch64 bfd. Coverage rustflags carry the same collision.
+    // on aarch64 bfd. Coverage builds carry the same collision.
     env::var_os("EF_SKIP_VERSION_SCRIPT").is_some()
-        || flags.contains("instrument-coverage")
-        || flags.contains("version-script")
+        || edgefirst_build_support::coverage_instrumented()
+        || env::var("CARGO_ENCODED_RUSTFLAGS")
+            .unwrap_or_default()
+            .contains("version-script")
 }
 
 fn main() {
@@ -37,14 +30,9 @@ fn main() {
         .expect("Unable to generate C bindings")
         .write_to_file(output_dir.join("tensor.h"));
 
-    // DT_SONAME carries only the major version, matching the convention used
-    // by glibc/OpenSSL/zlib: it is copied verbatim into every dependent's
-    // DT_NEEDED, so embedding MINOR or PATCH would force downstream re-links
-    // on every release and defeat ABI versioning.
+    edgefirst_build_support::soname("edgefirst_tensor");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
-        let major = env::var("CARGO_PKG_VERSION_MAJOR").unwrap();
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libedgefirst_tensor.so.{major}");
         // aarch64 GNU bfd rejects rustc's injected version script combined
         // with exports.map. lld concatenates them, which keeps the ef_*
         // export set G1 measures. Only force lld when we actually pass
@@ -75,7 +63,7 @@ fn main() {
     // The header is regenerated only when a source file or the cbindgen
     // config changes -- NOT when the header itself is edited or deleted. Any
     // test that reads the header must therefore depend on the source, or it
-    // is validating a stale artifact. (Learned the hard way in Plan 2.)
+    // is validating a stale artifact.
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 }

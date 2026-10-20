@@ -28,7 +28,10 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 
 from ._decoder import *
-from ._decoder import __doc__  # noqa: F401
+from ._decoder import (
+    __doc__,  # noqa: F401
+    __tensor_backend__,  # noqa: F401
+)
 
 
 class EdgeFirstDecoderExportable(Protocol):

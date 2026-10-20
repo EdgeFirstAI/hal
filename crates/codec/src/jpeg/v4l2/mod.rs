@@ -1577,34 +1577,39 @@ mod tests {
         const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         let Some(dev) = device::probe() else {
-            log::warn!("skip: no v4l2 jpeg decoder on this host");
+            crate::test_support::report_skip(
+                "probe_dmabuf_reconfigure - no v4l2 jpeg decoder on this host",
+            );
             return;
         };
         if dev.api != ApiVariant::MultiPlanar {
-            log::warn!("skip: device is not multi-planar");
+            crate::test_support::report_skip(
+                "probe_dmabuf_reconfigure - device is not multi-planar",
+            );
             return;
         }
         let (Some(jpeg_a), Some(jpeg_b)) =
             (testdata_file("zidane.jpg"), testdata_file("giraffe.jpg"))
         else {
-            log::warn!("skip: testdata not found (set EDGEFIRST_TESTDATA_DIR)");
+            crate::test_support::report_skip(
+                "probe_dmabuf_reconfigure - testdata not found (set EDGEFIRST_TESTDATA_DIR)",
+            );
             return;
         };
 
         // Persistent CAPTURE scratch: 4 MiB DMA buffer — larger than any
         // sizeimage in this probe, to confirm question 3.
-        let scratch = match Tensor::<u8>::image(
-            4096,
-            1024,
-            PixelFormat::Grey,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                log::warn!("skip: no DMA heap ({e})");
-                return;
-            }
+        let Some(scratch) = crate::test_support::dma_allocated(
+            Tensor::<u8>::image(
+                4096,
+                1024,
+                PixelFormat::Grey,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "probe_dmabuf_reconfigure scratch DMA-BUF",
+        ) else {
+            return;
         };
         let scratch_fd = scratch.dmabuf().unwrap();
         let scratch_cap = scratch.capacity_bytes();
@@ -1826,14 +1831,16 @@ mod tests {
         let mut scratches = Vec::new();
         for _ in 0..depth {
             let rows = sizeimage.div_ceil(4096);
-            let t = Tensor::<u8>::image(
-                4096,
-                rows,
-                PixelFormat::Grey,
-                Some(TensorMemory::DmaBuf),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .ok()?;
+            let t = crate::test_support::dma_allocated(
+                Tensor::<u8>::image(
+                    4096,
+                    rows,
+                    PixelFormat::Grey,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ),
+                "run_throughput capture DMA-BUF",
+            )?;
             scratches.push(t);
         }
         let got_cap = m2m.capture_mut().request(Memory::DmaBuf, depth).ok()?;
@@ -1897,14 +1904,18 @@ mod tests {
     #[ignore = "on-target hardware probe; run with --ignored --nocapture on a JPEG M2M device"]
     fn probe_decode_throughput() {
         let Some(jpeg) = testdata_file("zidane.jpg") else {
-            log::warn!("skip: testdata not found (set EDGEFIRST_TESTDATA_DIR)");
+            crate::test_support::report_skip(
+                "probe_decode_throughput - testdata not found (set EDGEFIRST_TESTDATA_DIR)",
+            );
             return;
         };
         let frames = 300usize;
 
         for depth in [1u32, 2, 4] {
             let Some(dev) = device::probe() else {
-                log::warn!("skip: no v4l2 jpeg decoder");
+                crate::test_support::report_skip(
+                    "probe_decode_throughput - no v4l2 jpeg decoder on this host",
+                );
                 return;
             };
             match run_throughput(&dev, &jpeg, depth, frames) {
@@ -1921,7 +1932,9 @@ mod tests {
                 match device::probe() {
                     Some(d) => devs.push(d),
                     None => {
-                        log::warn!("skip: could not open context");
+                        crate::test_support::report_skip(
+                            "probe_decode_throughput - could not open a second context",
+                        );
                         return;
                     }
                 }

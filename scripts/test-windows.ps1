@@ -160,8 +160,7 @@ if ($Coverage -and -not (Get-Command cargo-llvm-cov -ErrorAction Ignore)) {
 }
 
 # Same exclusions as the macOS lane: gpu-probe is Linux-only (gbm/nix);
-# the python-* crates cannot join a --workspace build (edgefirst-tensor's
-# static/dynamic feature exclusion) and are exercised through maturin.
+# the python-* crates are exercised as wheels through maturin.
 $exclude = @(
     '--exclude', 'gpu-probe',
     '--exclude', 'edgefirst-bench',

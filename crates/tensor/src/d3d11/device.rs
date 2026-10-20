@@ -106,7 +106,7 @@ impl Counter {
 /// forwards every tensor call to the C ABI instead. The device itself is still
 /// built there, because the adapter and fence probes are part of the public
 /// surface on both backends.
-#[cfg_attr(not(feature = "static"), allow(dead_code))]
+#[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))]
 pub struct D3d11Device {
     dev: ID3D11Device,
     dev1: Option<ID3D11Device1>,
@@ -848,7 +848,7 @@ fn device_pointer_is_live(ptr: usize) -> bool {
         .is_some_and(|u| u.cast::<ID3D11Device>().is_ok())
 }
 
-#[cfg_attr(not(feature = "static"), allow(dead_code))] // see the struct's own note
+#[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))] // see the struct's own note
 impl D3d11Device {
     /// The `ID3D11Device*` itself, borrowed: no reference is transferred, so
     /// a caller that keeps it must AddRef.
@@ -1093,7 +1093,7 @@ fn event_on(fence: &ID3D11Fence, value: u64) -> std::io::Result<OwnedHandle> {
 /// the producer's work behind its own has to be sure the work is done before
 /// it hands the tensor back. Bounded rather than infinite so a value the
 /// producer never signals costs a warning instead of a hung thread.
-#[cfg_attr(not(feature = "static"), allow(dead_code))] // only the texture storage waits
+#[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))] // only the texture storage waits
 pub(crate) fn wait_cpu_for(
     fence: &ID3D11Fence,
     value: u64,

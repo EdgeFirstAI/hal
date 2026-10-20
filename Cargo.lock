@@ -521,6 +521,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefirst-build-support"
+version = "0.35.0"
+
+[[package]]
 name = "edgefirst-codec"
 version = "0.35.0"
 dependencies = [
@@ -658,18 +662,19 @@ dependencies = [
 name = "edgefirst-python-codec"
 version = "0.35.0"
 dependencies = [
+ "edgefirst-build-support",
  "edgefirst-python-common",
  "edgefirst-tensor",
  "numpy",
  "pyo3",
  "pyo3-build-config",
- "rustc_version",
 ]
 
 [[package]]
 name = "edgefirst-python-common"
 version = "0.35.0"
 dependencies = [
+ "edgefirst-build-support",
  "edgefirst-codec",
  "edgefirst-decoder",
  "edgefirst-decoder-abi",
@@ -697,30 +702,31 @@ dependencies = [
 name = "edgefirst-python-decoder"
 version = "0.35.0"
 dependencies = [
+ "edgefirst-build-support",
  "edgefirst-python-common",
  "edgefirst-tensor",
  "numpy",
  "pyo3",
  "pyo3-build-config",
- "rustc_version",
 ]
 
 [[package]]
 name = "edgefirst-python-image"
 version = "0.35.0"
 dependencies = [
+ "edgefirst-build-support",
  "edgefirst-python-common",
  "edgefirst-tensor",
  "numpy",
  "pyo3",
  "pyo3-build-config",
- "rustc_version",
 ]
 
 [[package]]
 name = "edgefirst-python-tensor"
 version = "0.35.0"
 dependencies = [
+ "edgefirst-build-support",
  "edgefirst-python-common",
  "edgefirst-tensor",
  "numpy",
@@ -733,11 +739,11 @@ dependencies = [
 name = "edgefirst-python-tracker"
 version = "0.35.0"
 dependencies = [
+ "edgefirst-build-support",
  "edgefirst-python-common",
  "numpy",
  "pyo3",
  "pyo3-build-config",
- "rustc_version",
 ]
 
 [[package]]

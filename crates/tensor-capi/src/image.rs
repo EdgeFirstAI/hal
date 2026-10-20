@@ -526,17 +526,19 @@ mod tests {
 
     #[test]
     fn image_with_stride_alloc_reports_the_padded_pitch() {
-        if !edgefirst_tensor::is_dma_available() {
-            crate::artifacts::skip("DMA not available on this host");
+        if !crate::dma_require::available_or_skip(
+            edgefirst_tensor::is_dma_available(),
+            "image_with_stride_alloc_reports_the_padded_pitch",
+        ) {
             return;
         }
         let fmt = u8_c("Rgba");
         // Natural pitch is 64*4=256; pad to 320.
         let t = unsafe { ef_tensor_image_with_stride_alloc(64, 64, fmt.as_ptr(), 0, 320, 1, 2, 3) };
-        if t.is_null() {
-            crate::artifacts::skip("image_with_stride_alloc unavailable on this host");
-            return;
-        }
+        assert!(
+            !t.is_null(),
+            "a usable DMA heap must allocate a padded-stride image"
+        );
         assert_eq!(inner_of(t).effective_row_stride(), Some(320));
         unsafe { ef_tensor_free(t) };
     }

@@ -3,10 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 exclude = [
     "benchmarks",
-    # The five modular C-API leaves are standalone packages: the static/dynamic
-    # feature switch (plans R3-R5) is mutually exclusive, and cargo unifies
-    # features across one invocation's package set. Built via --manifest-path
-    # with --target-dir target -- see the Makefile's capi lane.
+    # C-API leaves: standalone packages for per-artifact feature and lockfile isolation; built by the Makefile's capi lane.
     "crates/tensor-capi",
     "crates/image-capi",
     "crates/codec-capi",
@@ -51,8 +48,10 @@ dma-heap = "0.4.1"
 # fast-math removed: upstream abandoned (last release 2019). Its single use
 # (an approximate sigmoid in the decoder) now calls a bit-identical `exp_raw`
 # vendored from fast-math, preserving outputs — see crates/decoder/src/modelpack.rs.
-# Internal crates
+# Internal crates. They keep `default-features = false` here so each member's own
+# `default-features`/`features` on a `workspace = true` edge takes effect.
 edgefirst-bench = { path = "crates/bench" }
+edgefirst-build-support = { path = "crates/build-support" }
 edgefirst-codec = { version = "0.35.0", path = "crates/codec", default-features = false }
 edgefirst-decoder = { version = "0.35.0", path = "crates/decoder", default-features = false }
 edgefirst-decoder-abi = { version = "0.35.0", path = "crates/decoder-abi" }
@@ -61,39 +60,11 @@ edgefirst-decoder-abi = { version = "0.35.0", path = "crates/decoder-abi" }
 edgefirst-egl = { version = "0.35.0", path = "crates/egl", features = ["dynamic"] }
 # Vendored trimmed fork of the abandoned `gls`; imported as `edgefirst_gl`.
 edgefirst-gl = { version = "0.35.0", path = "crates/gl" }
-# `default-features = false`, same mechanic and same reason as
-# edgefirst-codec/edgefirst-decoder/edgefirst-tracker/edgefirst-tensor: a
-# member's own `default-features = false` on a `workspace = true` edge is a
-# silent no-op unless this root entry also states one. Without it,
-# edgefirst-image's own default (`["opengl", "static"]`) reaches every
-# `workspace = true` consumer regardless of what that consumer's own
-# dependency line says, so `static` lands on the same edgefirst-tensor unit
-# as whatever backend the real consumer asked for -- one hop further out
-# than the codec/tracker/tensor case, discovered while wiring the Python
-# extensions to `dynamic` (single-tensor-home, task P2). Two consumers
-# relied on the removed `opengl` default without stating it themselves
-# (`crates/python-common`) and have it spelled out
-# explicitly now, the same way `crates/image-capi` already does.
 edgefirst-image = { version = "0.35.0", path = "crates/image", default-features = false }
 edgefirst-python-common = { path = "crates/python-common" }
 edgefirst-tensor = { version = "0.35.0", path = "crates/tensor", default-features = false }
 edgefirst-tensor-abi = { version = "0.35.0", path = "crates/tensor-abi" }
 edgefirst-tensor-ffi = { version = "0.35.0", path = "crates/tensor-ffi" }
-# `default-features = false`, matching edgefirst-codec/edgefirst-tensor
-# above: a member depending via `workspace = true` cannot override
-# `default-features` on its own dependency line unless this root entry also
-# states one (a silent no-op otherwise -- Cargo warns "default-features is
-# ignored ... this could become a hard error in the future"). Needed so
-# `crates/decoder`'s own `edgefirst-tracker = { workspace = true, optional =
-# true, default-features = false }` (its `tracker` feature) actually drops
-# edgefirst-tracker's own `static` default -- left enabled, it silently
-# turns on `edgefirst-tensor/static` alongside whatever backend the real
-# consumer selected, tripping the static+dynamic compile_error! guard the
-# moment decoder-capi (task 9) requests `edgefirst-tensor/dynamic`. Every
-# workspace member that wants edgefirst-tracker's `static` feature still
-# gets it: `crates/tracker` is built directly as its own workspace package,
-# whose own `default = ["static"]` (its Cargo.toml) supplies it regardless
-# of this dependency-edge default.
 edgefirst-tracker = { version = "0.35.0", path = "crates/tracker", default-features = false }
 edgefirst-v4l2 = "0.2.2"
 enum_dispatch = "0.3.13"
@@ -171,24 +142,25 @@ zune-jpeg = "0.5.15"
 zune-png = "0.5.2"
 safetensors = "0.8.0"
 
+# Shipped artifacts only (release branches): whole-program LTO in one codegen unit.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 strip = true
 debug = false
 
+# Every test and CI build: release optimisation without the fat-LTO link time.
 [profile.profiling]
 inherits = "release"
+lto = "thin"
+codegen-units = 16
 strip = false
 debug = "line-tables-only"
 
-# Not yet consumed by any member: opting in requires `[lints] workspace =
-# true` in the member's own manifest, and none does today (see
-# CONTRIBUTING.md). This table exists so a member can opt in with one line,
-# and so the five workspace-excluded C-API leaves -- which cannot inherit at
-# all, being outside this workspace -- have a canonical definition to copy by
-# hand into their own [lints.rust] tables rather than inventing one.
+# Members opt in with `[lints] workspace = true`; the workspace-excluded C-API
+# leaves cannot inherit and copy this table by hand into their own [lints.rust].
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(edgefirst_tensor_dynamic)'] }
 

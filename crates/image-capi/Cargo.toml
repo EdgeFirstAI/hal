@@ -20,22 +20,20 @@ publish = false # C library - distributed via GitHub Releases, not crates.io
 # `rlib` is deliberately absent: it would collide with the edgefirst-image
 # crate's own libedgefirst_image.rlib, and nothing needs it.
 crate-type = ["staticlib", "cdylib"]
+# Shares its lib name with the library crate it wraps; rustdoc output would collide.
+doc = false
 name = "edgefirst_image"
 
 [features]
 default = ["tracing"]
 tracing = ["edgefirst-tensor/tracing"]
 
-# `edgefirst-image` (opengl) plus `edgefirst-tensor/dynamic` so this
-# library mints tensors via libedgefirst_tensor.so instead of embedding a
-# private copy. `edgefirst-tensor-ffi` is declarations-only.
 [dependencies]
 edgefirst-image = { version = "0.35.0", path = "../image", default-features = false, features = [
     "opengl",
 ] }
-edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false, features = [
-    "dynamic",
-] }
+# Built with `--cfg edgefirst_tensor_dynamic` (.cargo/tensor-dynamic.toml): calls into libedgefirst_tensor.
+edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
 edgefirst-tensor-ffi = { path = "../tensor-ffi" }
 edgefirst-decoder-abi = { path = "../decoder-abi" }
@@ -45,20 +43,31 @@ log = "0.4.33"
 
 [build-dependencies]
 cbindgen = "0.29"
+edgefirst-build-support = { path = "../build-support" }
 
 # Excluded from the workspace (see the root Cargo.toml's [workspace.exclude]
 # comment), so this crate inherits NEITHER the root's [workspace.lints] NOR
-# its [profile.release] -- both are restated here by hand. CONTRIBUTING.md
+# its [profile.release]/[profile.profiling] -- both are restated here by hand. CONTRIBUTING.md
 # documents why and says to keep this in sync with the root manually.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(edgefirst_tensor_dynamic)'] }
 
+# Shipped artifacts only (release branches): whole-program LTO in one codegen unit.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 strip = true
 debug = false
+
+# Every test and CI build: release optimisation without the fat-LTO link time.
+[profile.profiling]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+debug = "line-tables-only"
 
 # Standalone package: stops cargo's upward workspace search. The resolver is
 # pinned to match the root workspace's behavior.

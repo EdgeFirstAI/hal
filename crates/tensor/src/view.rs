@@ -95,7 +95,7 @@ where
     /// straight from `ef_tensor_map` -- including for a PBO, whose storage
     /// lives inside `libedgefirst_tensor.so` since Stage B and is mapped by
     /// the library rather than by a `PboTensor<T>` on this side.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn into_bytes(self) -> HostView<'a, u8> {
         let elem = std::mem::size_of::<T>().max(1);
         let requested_bytes = match self.byte_size_override {

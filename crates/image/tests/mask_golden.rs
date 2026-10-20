@@ -226,7 +226,7 @@ fn masks_match_golden() {
         use std::io::Write;
         let _ = writeln!(
             &mut std::io::stderr(),
-            "SKIPPED: no frozen mask fixture for {}",
+            "WARNING: SKIPPED: no frozen mask fixture for {}",
             std::env::consts::ARCH
         );
         return;

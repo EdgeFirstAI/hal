@@ -47,6 +47,10 @@ use edgefirst_tensor::{
     CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
 
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+
 /// Byte the parent buffer is pre-filled with; any of these left inside the view
 /// region means the convert under-wrote, any byte outside that is *not* poison
 /// means it over-wrote.
@@ -626,9 +630,6 @@ fn gl_padded_dst_rows_land_at_the_declared_stride() {
     );
 }
 
-/// Report a skip so it survives to the log: libtest discards captured output
-/// for a passing test, so a skip that only `eprintln!`s is indistinguishable
-/// from a run that did the work.
 #[cfg(all(
     any(
         target_os = "linux",
@@ -639,10 +640,7 @@ fn gl_padded_dst_rows_land_at_the_declared_stride() {
     ),
     feature = "opengl"
 ))]
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
-}
+use outcome::report_skip as skip;
 
 /// The PBO readback has to land each output row at the destination's pitch
 /// too, and it reaches the destination by routes of its own: `glReadPixels`
@@ -705,19 +703,9 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
         // geometry and the pitch, as the Mem test does. The spare row is for
         // the tensor's own map, which spans `stride * rows` and the odd pitch
         // pushes past a `PARENT_W x SRC_H` allocation.
-        let mut padded = match gl.create_pbo_image(PARENT_W, SRC_H + 1, dst_fmt) {
-            Ok(t) => t,
-            Err(e) => {
-                assert!(
-                    !require_gl,
-                    "HAL_TEST_REQUIRE_GL=1 but a PBO image could not be created: {e}"
-                );
-                skip(&format!(
-                    "gl_padded_pbo_dst_rows_land_at_the_declared_stride: no PBO images: {e}"
-                ));
-                return;
-            }
-        };
+        let mut padded = gl
+            .create_pbo_image(PARENT_W, SRC_H + 1, dst_fmt)
+            .unwrap_or_else(|e| panic!("{label}: a PBO on a live GL context: {e}"));
         padded
             .configure_image(SRC_W, SRC_H, dst_fmt)
             .expect("shrink logical geometry");
@@ -816,19 +804,9 @@ fn gl_pbo_view_dst_is_refused_rather_than_written_at_offset_zero() {
             return;
         }
     };
-    let parent = match gl.create_pbo_image(PARENT_W, PARENT_H, PixelFormat::Rgba) {
-        Ok(t) => t,
-        Err(e) => {
-            assert!(
-                !require_gl,
-                "HAL_TEST_REQUIRE_GL=1 but a PBO image could not be created: {e}"
-            );
-            skip(&format!(
-                "gl_pbo_view_dst_is_refused_rather_than_written_at_offset_zero: no PBO images: {e}"
-            ));
-            return;
-        }
-    };
+    let parent = gl
+        .create_pbo_image(PARENT_W, PARENT_H, PixelFormat::Rgba)
+        .expect("a PBO on a live GL context");
     let mut parent = TensorDyn::from(parent);
     fill(&mut parent, POISON);
     let before = bytes(&parent);

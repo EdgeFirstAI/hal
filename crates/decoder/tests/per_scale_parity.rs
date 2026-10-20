@@ -21,7 +21,7 @@
 macro_rules! skip_note {
     ($($arg:tt)*) => {{
         use std::io::Write;
-        let _ = write!(&mut std::io::stderr(), "SKIPPED: ");
+        let _ = write!(&mut std::io::stderr(), "WARNING: SKIPPED: ");
         let _ = writeln!(&mut std::io::stderr(), $($arg)*);
     }};
 }
@@ -727,7 +727,10 @@ fn parity_yolo26n_seg_per_scale_int8() {
     let py_result = run_python_reference(&model, None);
     let py_result = match py_result {
         Some(v) => v,
-        None => return,
+        None => {
+            skip_note!("Python reference failed to run");
+            return;
+        }
     };
     let n = py_result
         .get("num_detections")
@@ -778,10 +781,7 @@ stnp.save_file({{
     match out {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
-            eprintln!(
-                "skip: python failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
+            skip_note!("python failed: {}", String::from_utf8_lossy(&o.stderr));
             return;
         }
         Err(e) => {

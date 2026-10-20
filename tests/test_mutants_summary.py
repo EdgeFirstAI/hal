@@ -648,8 +648,8 @@ TENSOR_TOML = """[package]
 name = "edgefirst-tensor"
 
 [features]
-default = ["ndarray", "static"]
-static = []
+default = ["ndarray"]
+ndarray = []
 tracing = []
 """
 
@@ -728,7 +728,7 @@ def tensor_mutant(outcome, file, line, what, runner_log=None, col=5, diff="-x\n"
     )
 
 
-def evaluate(expr, target=LINUX_X86, features=("ndarray", "static")):
+def evaluate(expr, target=LINUX_X86, features=("ndarray",)):
     return mutants_summary.cfg_eval(expr, target, set(features))
 
 
@@ -752,8 +752,8 @@ def evaluate(expr, target=LINUX_X86, features=("ndarray", "static")):
         ('all(unix, not(target_os = "macos"))', MACOS, False),
         ('any(target_os = "macos", target_os = "ios")', MACOS, True),
         ('any(target_os = "macos", target_os = "ios")', LINUX_X86, False),
-        ('all(target_os = "linux", feature = "static")', LINUX_X86, True),
-        ('all(target_os = "android", feature = "static")', LINUX_X86, False),
+        ('all(target_os = "linux", feature = "ndarray")', LINUX_X86, True),
+        ('all(target_os = "android", feature = "ndarray")', LINUX_X86, False),
     ],
 )
 def test_cfg_evaluator_decides_target_predicates(expr, target, expected):
@@ -761,12 +761,15 @@ def test_cfg_evaluator_decides_target_predicates(expr, target, expected):
 
 
 def test_cfg_evaluator_reads_features_from_the_leg():
-    assert evaluate('feature = "static"') is True
+    assert evaluate('feature = "ndarray"') is True
     assert evaluate('feature = "tracing"') is False
     assert evaluate('feature = "tracing"', features=("tracing",)) is True
 
 
-@pytest.mark.parametrize("flag", ["coverage", "coverage_nightly", "miri", "docsrs"])
+@pytest.mark.parametrize(
+    "flag",
+    ["coverage", "coverage_nightly", "miri", "docsrs", "edgefirst_tensor_dynamic"],
+)
 def test_cfg_evaluator_treats_tooling_flags_as_off(flag):
     assert evaluate(flag) is False
     assert evaluate(f"not({flag})") is True
@@ -786,7 +789,7 @@ def rust(*lines):
     return "\n".join(lines)
 
 
-def regions_false(text, target=LINUX_X86, features=("ndarray", "static")):
+def regions_false(text, target=LINUX_X86, features=("ndarray",)):
     """Lines the scanner considers cfg'd out for a target."""
     source = mutants_summary.SourceFile(text)
     out = []
@@ -891,7 +894,7 @@ def test_module_chain_decides_whether_a_file_is_compiled(tmp_path):
         },
     )
     index = mutants_summary.SourceIndex(repo)
-    feats = {"static"}
+    feats = {"ndarray"}
     adapter = "crates/tensor/src/d3d11/adapter.rs"
     assert index.reachable(adapter, LINUX_X86, feats)[0] is False
     assert index.reachable(adapter, WINDOWS, feats)[0] is True
@@ -1001,7 +1004,7 @@ def test_feature_gated_region_uses_the_features_the_leg_built_with(tmp_path, sha
     baseline = (
         "     Running `rustc --crate-name edgefirst_tensor --edition=2021 "
         "crates/tensor/src/lib.rs --cfg 'feature=\"default\"' "
-        "--cfg 'feature=\"static\"' --cfg 'feature=\"tracing\"'`\n"
+        "--cfg 'feature=\"ndarray\"' --cfg 'feature=\"tracing\"'`\n"
     )
     write_shard(
         shards,

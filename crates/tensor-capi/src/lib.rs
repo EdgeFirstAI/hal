@@ -25,6 +25,12 @@
 //! **constructors**, which is correct: "who allocated this" is the one
 //! question where library identity matters.
 
+#[cfg(edgefirst_tensor_dynamic)]
+compile_error!(
+    "edgefirst-tensor-capi is the tensor implementation behind libedgefirst_tensor and \
+     cannot be built with `--cfg edgefirst_tensor_dynamic`; build it without .cargo/tensor-dynamic.toml."
+);
+
 pub mod builder;
 pub mod codes;
 pub mod cuda;
@@ -61,6 +67,9 @@ pub extern "C" fn ef_tensor_abi_version() -> u32 {
 #[cfg(test)]
 #[path = "../tests/support/artifacts.rs"]
 mod artifacts;
+#[cfg(test)]
+#[path = "../../tensor/tests/support/dma_require.rs"]
+mod dma_require;
 #[cfg(all(test, windows))]
 #[path = "../tests/support/msvc.rs"]
 mod msvc;
@@ -606,9 +615,7 @@ mod tests {
         let Some(out) = cc_build_and_run(src, "ef_test_d3d11") else {
             return;
         };
-        // The program reports a missing device on stdout, so a --nocapture
-        // run shows whether the Windows arm ran or skipped.
-        eprint!("{}", String::from_utf8_lossy(&out.stdout));
+        artifacts::relay_skips("d3d11_exports_are_usable_or_refuse_off_windows", &out);
         assert!(
             out.status.success(),
             "C D3D11 contract failed:\n{}",

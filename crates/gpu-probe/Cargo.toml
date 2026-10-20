@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 edgefirst-bench = { workspace = true }
-edgefirst-tensor = { workspace = true, features = ["static"] }
+edgefirst-tensor = { workspace = true }
 gbm = { workspace = true }
 edgefirst-gl = { workspace = true }
 edgefirst-egl = { workspace = true }

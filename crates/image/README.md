@@ -119,7 +119,6 @@ Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with
 - `opengl` (default) — Enable the OpenGL backend.
 - `tracker` — Enable multi-object tracking in `draw_masks_tracked()`. Requires `features = ["tracker"]` in your dependency declaration.
 - `opencv` — Build the OpenCV comparison benchmark. Needs a system OpenCV install.
-- `dma_test_formats`, `g2d_test_formats` — Test-only: unlock the zero-copy and G2D fixture tiers. See [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md).
 
 The decoder dependency is unconditional — there is no feature flag to opt out
 of detection-box and mask rendering.

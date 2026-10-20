@@ -628,6 +628,12 @@ RUSTFLAGS="-C target-feature=+f16c,+fma,+avx2" cargo build --release \
   -p edgefirst-image
 ```
 
+`RUSTFLAGS` replaces every per-target `rustflags` table in `.cargo/config.toml`
+(including the macOS Mach-O workaround) and the dynamic tensor backend's
+config, so the C libraries and wheels refuse to build under it. For those,
+pass the flags as a merged config instead:
+`--config "target.'cfg(all())'.rustflags=['-C','target-cpu=cortex-a78ae']"`.
+
 When active, the f16 mask kernel at
 [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs)
 compiles to native widening (`fcvt` on aarch64, `vcvtph2ps` on x86_64),
@@ -746,14 +752,9 @@ combinations that compile genuinely different code:
 | macOS host, all crates, `--all-targets` | IOSurface, ANGLE/GL, the PyO3 bindings |
 | `aarch64-unknown-linux-gnu`, `--all-targets` | DMA-BUF, SHM, the `dmabuf` ioctls, G2D |
 | `edgefirst-tensor --features tracing` | `trace.rs`, which is **off** by default |
-| `edgefirst-tensor --no-default-features --features static` | the `ndarray`-free build |
-| `edgefirst-codec --no-default-features --features static` | PNG/V4L2/nvJPEG all gated out |
+| `edgefirst-tensor --no-default-features` | the `ndarray`-free build |
+| `edgefirst-codec --no-default-features` | PNG/V4L2/nvJPEG all gated out |
 | `edgefirst-image --features tracker` | the optional tracker path |
-
-`--no-default-features` always needs `static` (or `dynamic`) named alongside
-it: `edgefirst-tensor`'s two backend features are mutually exclusive and one
-is required, so `--no-default-features` with neither is a compile error, not
-a fallback to a default.
 
 The `python-*` crates cannot be cross-compiled without
 `PYO3_CROSS_PYTHON_VERSION` or an `abi3-py3*` feature, so they are covered
@@ -828,10 +829,7 @@ at runtime the HAL logs a warning and falls back to the CPU backend.
 >   below). The HAL finds it automatically.
 > - **Build without macOS/iOS GL** — the HAL's default features include
 >   `opengl`, but you can disable it (`--no-default-features --features
->   static,ndarray,tracing`) to build the CPU-only path, which needs no
->   ANGLE at all. `static` is required alongside `--no-default-features`:
->   `edgefirst-tensor`'s two backend features are mutually exclusive and one
->   is required, so naming neither is a compile error, not a fallback.
+>   ndarray,tracing`) to build the CPU-only path, which needs no ANGLE at all.
 
 ### Installing ANGLE (macOS)
 
@@ -1103,9 +1101,7 @@ the same ANGLE-over-Metal GL backend as macOS. The supported targets are:
 > with `scripts/fetch-angle.sh` (no credentials needed). If you would
 > rather not fetch ANGLE at all, you can still build the Rust library
 > for iOS with the `opengl` feature disabled:
-> `cargo build --target aarch64-apple-ios --no-default-features --features static,ndarray,tracing`
-> (`static` is required alongside `--no-default-features` — `edgefirst-tensor`'s
-> two backend features are mutually exclusive and one is required).
+> `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`.
 > The Rust `cargo build` itself (with `opengl`) succeeds without ANGLE
 > present — see [How the GL backend resolves ANGLE on iOS](#how-the-gl-backend-resolves-angle-on-ios).
 
@@ -1362,6 +1358,15 @@ The workspace builds with standard `cargo`. The
 [`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile) wraps
 the common workflows (`make test`, `make bench`, `make build`,
 `make format lint check`) with the right flags and gates.
+
+Rust users always get the statically linked tensor implementation; there is
+nothing to select. The C libraries and the tensor-linked Python wheels share
+one `libedgefirst_tensor` instead, which their builds select with
+`--config .cargo/tensor-dynamic.toml` (see
+[ARCHITECTURE.md § Tensor Backend Selection](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#tensor-backend-selection)).
+`make capi-libs` / `make package` build the C libraries and `make wheel` the
+wheels with it applied; building them by hand without it is a compile error
+that names the fix.
 
 For Python wheels, see
 [`crates/python-tensor/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-tensor/README.md)

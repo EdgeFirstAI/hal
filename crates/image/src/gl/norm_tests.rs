@@ -138,13 +138,10 @@ mod gl_norm_tests {
             crate::test_support::report_skip(&format!("{fmt:?} {dtype:?}: no GL float render"));
             return;
         }
-        let mut gl_dst = match proc.create_image(16, 16, fmt, dtype, None, CpuAccess::ReadWrite) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!("{fmt:?} {dtype:?}: {e}"));
-                return;
-            }
-        };
+        // With no memory requested, create_image falls back to host memory, so it cannot fail.
+        let mut gl_dst = proc
+            .create_image(16, 16, fmt, dtype, None, CpuAccess::ReadWrite)
+            .unwrap_or_else(|e| panic!("{fmt:?} {dtype:?}: create_image: {e}"));
         // Float renders reach a PBO, or a DMA-BUF only as F16 PlanarRgb
         // (Linux has no other float DMA-BUF format).
         let mem = gl_dst.memory();

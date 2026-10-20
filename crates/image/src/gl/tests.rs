@@ -6,10 +6,10 @@
 #[allow(deprecated)]
 mod gl_tests {
     #[cfg(target_os = "linux")]
+    use crate::test_support::is_dma_available;
+    #[cfg(target_os = "linux")]
     use crate::{probe_egl_displays, EglDisplayKind};
     use crate::{Crop, GLProcessorThreaded, ImageProcessorTrait};
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
-    use edgefirst_tensor::is_dma_available;
     use edgefirst_tensor::{
         DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
@@ -217,7 +217,7 @@ mod gl_tests {
     }
 
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     static NEUTRON_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
     fn is_opengl_available() -> bool {
@@ -234,7 +234,7 @@ mod gl_tests {
     /// packed-RGB `@Dma` has no IOSurface FourCC, so tests with RGB DMA
     /// destinations stay Linux-gated.
     fn is_gpu_image_buffer_available() -> bool {
-        edgefirst_tensor::is_gpu_buffer_available()
+        crate::test_support::is_gpu_buffer_available()
     }
 
     /// Returns true when running on an i.MX 95 board with Mali GPU.
@@ -243,7 +243,7 @@ mod gl_tests {
     /// not as a check for NPU functionality.  The Neutron-scenario tests exercise
     /// large-offset DMA-BUF EGLImage imports that work on Mali but fail with
     /// `EGL(BadAccess)` on Vivante (i.MX 8MP) — even without the NPU driver.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn is_neutron_available() -> bool {
         *NEUTRON_AVAILABLE.get_or_init(|| std::path::Path::new("/dev/neutron0").exists())
     }
@@ -375,7 +375,7 @@ mod gl_tests {
 
     /// An image tensor of `format` holding `bytes`, a *tight* buffer laid into
     /// it at the destination's own row pitch by [`write_tight_rows`].
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn load_raw_image(
         width: usize,
         height: usize,
@@ -414,7 +414,7 @@ mod gl_tests {
     /// `ChromaLayout::uv_rows_per_luma` destination rows apart -- two, for
     /// NV24, whose `2W`-byte line is wider than one image row. That is the
     /// layout `fill_patterned_nv` writes and the layout the shader decodes.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn write_tight_rows(t: &TensorDyn, bytes: &[u8]) -> Result<(), crate::Error> {
         let format = t.format().unwrap();
         let width = t.width().unwrap();
@@ -466,7 +466,7 @@ mod gl_tests {
     /// behavior across GL refactors: a refactor that re-imports per frame
     /// passes every pixel-equality test but fails this one.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_pool_steady_state_zero_imports() {
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
@@ -576,7 +576,7 @@ mod gl_tests {
     /// texture. The Windows arm below therefore asserts what is true and
     /// load-bearing instead.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn reimported_buffer_hits_the_cache() {
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
@@ -673,7 +673,7 @@ mod gl_tests {
 
     /// RGBA gradient bytes (w*h*4) with distinct R/G/B functions and a salt —
     /// non-uniform content so a stride/geometry/feed misread cannot pass.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn rgba_gradient(w: usize, h: usize, salt: u8) -> Vec<u8> {
         let mut v = Vec::with_capacity(w * h * 4);
         for y in 0..h {
@@ -695,10 +695,9 @@ mod gl_tests {
     /// `EGL_ANDROID_native_fence_sync` fd and Windows an event on the D3D11
     /// device fence, so those two may return a handle; the Android arm is
     /// device-verified by `verify_fence_handoff` in the Device Farm harness.
-    // dma_test_formats only for the fixture helpers (`rgba_gradient`,
-    // `load_raw_image`) — the tensors here are plain Mem.
+    // Desktop-gated only for the fixture helpers (`rgba_gradient`, `load_raw_image`); the tensors are Mem.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn convert_with_fence_blocking_fallback_matches() {
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - GL not available", function!()));
@@ -758,7 +757,7 @@ mod gl_tests {
     /// same shader, same filtering, only the source feed differs. Also proves
     /// the imported source buffer is left untouched.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn float_dma_src_import_matches_upload() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -784,18 +783,11 @@ mod gl_tests {
         // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
         // `lib.rs` already gate, on the capability the processor reports
         // rather than on a driver name.
-        //
-        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
-        // and replays it only for FAILING tests, so a skip would print
-        // "... ok" with its reason discarded and be indistinguishable from
-        // having run. See TESTING.md.
         if !gl.supported_render_dtypes().f16 {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - this GPU has no F16 render target",
+            crate::test_support::report_skip(&format!(
+                "{} - this GPU has no F16 render target",
                 function!()
-            );
+            ));
             return;
         }
         let (sw, sh, dw) = (96usize, 72usize, 64usize);
@@ -867,7 +859,7 @@ mod gl_tests {
     /// skipped re-attach would sample stale uploaded bytes). A u8 convert is
     /// interleaved because it shares `camera_normal_texture`.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn float_src_feed_alternating_frames() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -893,18 +885,11 @@ mod gl_tests {
         // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
         // `lib.rs` already gate, on the capability the processor reports
         // rather than on a driver name.
-        //
-        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
-        // and replays it only for FAILING tests, so a skip would print
-        // "... ok" with its reason discarded and be indistinguishable from
-        // having run. See TESTING.md.
         if !gl.supported_render_dtypes().f16 {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - this GPU has no F16 render target",
+            crate::test_support::report_skip(&format!(
+                "{} - this GPU has no F16 render target",
                 function!()
-            );
+            ));
             return;
         }
         let (sw, sh, dw) = (96usize, 72usize, 64usize);
@@ -994,7 +979,7 @@ mod gl_tests {
     /// Steady-state: a fixed pool of Dma float sources must import once and
     /// hit the src cache thereafter — the float analog of the NV pool gate.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn float_dma_src_pool_steady_state() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1020,18 +1005,11 @@ mod gl_tests {
         // `convert_f16_gl_cpu_parity_identity` and the F16 cache tests in
         // `lib.rs` already gate, on the capability the processor reports
         // rather than on a driver name.
-        //
-        // Direct stderr, not eprintln!: libtest captures println!/eprintln!
-        // and replays it only for FAILING tests, so a skip would print
-        // "... ok" with its reason discarded and be indistinguishable from
-        // having run. See TESTING.md.
         if !gl.supported_render_dtypes().f16 {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - this GPU has no F16 render target",
+            crate::test_support::report_skip(&format!(
+                "{} - this GPU has no F16 render target",
                 function!()
-            );
+            ));
             return;
         }
         let (sw, sh, dw) = (128usize, 96usize, 64usize);
@@ -1117,7 +1095,7 @@ mod gl_tests {
     // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
     // (`packed_rgb888_layout`): the fixture allocates on macOS too, and the
     // two-pass packed-RGB pipeline runs zero-copy on both backends.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn repeat_convert_rgba_mem_to_rgb_dma() {
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
@@ -1159,21 +1137,18 @@ mod gl_tests {
 
         let lb = Crop::letterbox([114, 114, 114, 255]);
         for dtype in [DType::U8, DType::I8] {
-            let mut dst = match TensorDyn::image(
-                640,
-                640,
-                PixelFormat::Rgb,
-                dtype,
-                Some(TensorMemory::DmaBuf),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    crate::test_support::report_skip(&format!(
-                        "cell {dtype:?}: DMA RGB dst unavailable: {e}"
-                    ));
-                    continue;
-                }
+            let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
+                TensorDyn::image(
+                    640,
+                    640,
+                    PixelFormat::Rgb,
+                    dtype,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ),
+                &format!("cell {dtype:?}: DMA RGB destination"),
+            ) else {
+                continue;
             };
             let mut first: Option<Vec<u8>> = None;
             for round in 0..4 {
@@ -1220,10 +1195,9 @@ mod gl_tests {
     /// program (only the DMA destination path swapped `nv_r8_program`),
     /// producing u8-semantics bytes in an i8 tensor — 0x80 off on every
     /// channel. Needs no DMA at runtime (Mem src/dst — runs on llvmpipe,
-    /// whose coverage lane enables the feature); the `dma_test_formats`
-    /// gate only matches the `load_raw_image` helper's.
+    /// included); the platform gate only matches the `load_raw_image` helper's.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn int8_mem_convert_is_xor_biased_u8() {
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
@@ -1326,7 +1300,7 @@ mod gl_tests {
 
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_nv12_to_rgba_reference() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1396,7 +1370,7 @@ mod gl_tests {
 
     /// Test OpenGL PixelFormat::Yuyv→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_yuyv_to_rgba_reference() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1476,7 +1450,7 @@ mod gl_tests {
     /// exact failure that capped batched render-to-DMA-BUF. With the fix each
     /// offset gets its own EGLImage and the buffer is correctly partitioned.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn opengl_render_into_dma_subviews_no_aliasing() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1606,7 +1580,7 @@ mod gl_tests {
     /// tests: the recycled buffer and the oracle must be laid out identically,
     /// or the comparison measures the two writers' disagreement instead of the
     /// stale read it is looking for.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn overwrite_in_place(t: &TensorDyn, bytes: &[u8]) {
         write_tight_rows(t, bytes).unwrap();
     }
@@ -1614,7 +1588,7 @@ mod gl_tests {
     /// Write image A into a DMA source, convert, then overwrite the SAME source
     /// with distinct image B and convert again on the SAME processor. Assert the
     /// second output matches a fresh-DMA-source convert of B (no stale read).
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_stale_read_check(
         w: usize,
         h: usize,
@@ -1686,7 +1660,7 @@ mod gl_tests {
     /// Grey source (profiler's decode-pool format; EXTERNAL_OES Path A).
     /// Grey→Rgba is a scalar luma replicate (no YUV matrix) → byte-exact.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_grey_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1709,7 +1683,7 @@ mod gl_tests {
     /// NV12 source (EXTERNAL_OES Path A on Vivante / R8 texelFetch Path B on
     /// V3D/Mali). YUV→Rgba carries a small color-matrix rounding → tolerance 4.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_nv12_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1729,7 +1703,7 @@ mod gl_tests {
 
     /// NV16 source (full-res chroma; R8 texelFetch Path B). tolerance 4.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_nv16_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1752,7 +1726,7 @@ mod gl_tests {
     /// the same frame. Exercises the cache/LRU interaction across more than one
     /// recycled identity.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_pool_recycle_all_frames_match_oracle() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1834,7 +1808,7 @@ mod gl_tests {
     /// tensor's effective row stride. Non-uniform content is essential: a solid
     /// fill survives any stride/geometry misread, so it could not detect the
     /// cache-key bug.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn fill_grey_pattern(t: &TensorDyn, w: usize, h: usize, salt: u8) {
         let stride = t.effective_row_stride().unwrap_or(w);
         let mut map = t.as_u8().unwrap().map().unwrap();
@@ -1855,7 +1829,7 @@ mod gl_tests {
     /// stride and samples the buffer at the wrong pitch → mismatch. This test
     /// FAILS on buggy main and passes once the cache key carries geometry.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_geometry_change_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -1942,7 +1916,7 @@ mod gl_tests {
     /// (buffer, geometry) has its own entry, so interleaving is order-
     /// independent and every output must match its fresh-source oracle.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_pool_geometry_interleaved_stale_read() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -2031,7 +2005,7 @@ mod gl_tests {
     /// Regression guard: a single-shot (non-recycled) DMA source must equal a
     /// fresh-source convert — the fix must not break the first-frame path.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_single_shot_grey_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -2377,7 +2351,7 @@ mod gl_tests {
 
     /// Compare two byte slices pixel-by-pixel with tolerance.
     /// Panics with details if any byte differs by more than `tolerance`.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn assert_pixels_match(expected: &[u8], actual: &[u8], tolerance: u8) {
         assert_eq!(expected.len(), actual.len(), "Buffer size mismatch");
         let mut max_diff: u8 = 0;
@@ -2401,7 +2375,7 @@ mod gl_tests {
     }
 
     /// Build a letterbox crop that fits src into dst_w x dst_h, preserving aspect ratio.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn letterbox_crop(_src_w: usize, _src_h: usize, _dst_w: usize, _dst_h: usize) -> Crop {
         // Letterbox placement is now computed by the backend from the actual
         // src/dst dims (identical centred aspect-fit math); the helper just
@@ -2410,7 +2384,7 @@ mod gl_tests {
     }
 
     /// Strip alpha from PixelFormat::Rgba bytes → packed PixelFormat::Rgb bytes.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
         assert_eq!(
             rgba.len() % 4,
@@ -2427,7 +2401,7 @@ mod gl_tests {
     }
 
     /// Convert uint8 PixelFormat::Rgb bytes to int8 (XOR 0x80 each byte).
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn uint8_to_int8(data: &[u8]) -> Vec<u8> {
         data.iter().map(|&b| b ^ 0x80).collect()
     }
@@ -2438,9 +2412,16 @@ mod gl_tests {
     // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
     // (`packed_rgb888_layout`): the fixture allocates on macOS too, and the
     // two-pass packed-RGB pipeline runs zero-copy on both backends.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_rgb_correctness() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_gpu_image_buffer_available() {
+            crate::test_support::report_skip(
+                "test_opengl_rgb_correctness - zero-copy GPU image buffers not available",
+            );
             return;
         }
         let src_dma = load_raw_image(
@@ -2503,9 +2484,12 @@ mod gl_tests {
     #[test]
     // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
     // (see test_opengl_rgb_correctness).
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_rgb_int8_correctness() {
         if !is_gpu_image_buffer_available() {
+            crate::test_support::report_skip(
+                "test_opengl_rgb_int8_correctness - zero-copy GPU image buffers not available",
+            );
             return;
         }
         let src_dma = load_raw_image(
@@ -2586,9 +2570,14 @@ mod gl_tests {
     // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
     // (`packed_rgb888_layout`): the fixture allocates on macOS too, and the
     // two-pass packed-RGB pipeline runs zero-copy on both backends.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_rgb_no_letterbox_correctness() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_gpu_image_buffer_available() {
+            crate::test_support::report_skip("test_opengl_rgb_no_letterbox_correctness - zero-copy GPU image buffers not available");
             return;
         }
         let src_dma = load_raw_image(
@@ -2640,7 +2629,7 @@ mod gl_tests {
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Bgra conversion with DMA buffers.
     /// Compares against PixelFormat::Nv12→PixelFormat::Rgba by verifying R↔B swap.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_nv12_to_bgra() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(
@@ -2715,7 +2704,7 @@ mod gl_tests {
 
     /// Test OpenGL PixelFormat::Yuyv→PixelFormat::Bgra conversion with DMA buffers.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_opengl_yuyv_to_bgra() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(
@@ -3002,21 +2991,13 @@ mod gl_tests {
         }
 
         let gl = GLProcessorThreaded::new(None).unwrap();
-        let result = gl.create_pbo_image(64, 64, PixelFormat::Rgba);
-        match result {
-            Ok(pbo_img) => {
-                assert_eq!(pbo_img.width(), Some(64));
-                assert_eq!(pbo_img.height(), Some(64));
-                assert_eq!(pbo_img.format().unwrap(), PixelFormat::Rgba);
-            }
-            Err(e) => {
-                // PBO may not be supported on all GL implementations
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-            }
-        }
+        // PBOs are core GLES 3.0, so a live GL processor always serves one.
+        let pbo_img = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate an RGBA8 PBO on the GL thread");
+        assert_eq!(pbo_img.width(), Some(64));
+        assert_eq!(pbo_img.height(), Some(64));
+        assert_eq!(pbo_img.format().unwrap(), PixelFormat::Rgba);
     }
 
     /// Regression test for the PBO deadlock fix in `convert_any_to_pbo`
@@ -3039,16 +3020,9 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_dst = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO destination");
         let src = Tensor::<u8>::image(
             64,
             64,
@@ -3109,26 +3083,12 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let pbo_src = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
-        let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO dst not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_src = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO source");
+        let pbo_dst = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO destination");
         let src_dyn = TensorDyn::from(pbo_src);
         let mut dst_dyn = TensorDyn::from(pbo_dst);
         let res = gl.convert(&src_dyn, &mut dst_dyn, None);
@@ -3173,16 +3133,9 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let pbo_src = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_src = gl
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO source");
         let dst = Tensor::<u8>::image(
             64,
             64,
@@ -3268,16 +3221,9 @@ mod gl_tests {
         let mut gl_a = GLProcessorThreaded::new(None).unwrap();
         let gl_b = GLProcessorThreaded::new(None).unwrap();
 
-        let pbo_src = match gl_b.create_pbo_image(64, 64, PixelFormat::Rgba) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - PBO not supported: {e:?}",
-                    function!()
-                ));
-                return;
-            }
-        };
+        let pbo_src = gl_b
+            .create_pbo_image(64, 64, PixelFormat::Rgba)
+            .expect("allocate the PBO source on the other processor");
         let dst = Tensor::<u8>::image(
             64,
             64,
@@ -3416,7 +3362,7 @@ mod gl_tests {
     /// semi-planar source whose chroma is a separate DMA-BUF (Adreno imports
     /// only the first buffer of a multi-fd import). Reports the skip, so a
     /// test of that import on such a driver is attributed rather than green.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn declined_separate_chroma(result: &crate::Result<()>, test: &str) -> bool {
         match result {
             Err(crate::Error::NotSupported(m)) if m.contains("separate DMA-BUF") => {
@@ -3429,7 +3375,7 @@ mod gl_tests {
 
     /// Helper: load PixelFormat::Nv12 raw bytes into separate DMA-backed luma and chroma tensors,
     /// returning a multiplane TensorDyn suitable for GPU EGLImage import.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn load_multiplane_nv12_dma(width: usize, height: usize, nv12_bytes: &[u8]) -> TensorDyn {
         let y_size = width * height;
         let uv_size = width * (height / 2);
@@ -3455,8 +3401,12 @@ mod gl_tests {
     /// Multiplane PixelFormat::Nv12 → PixelFormat::Rgba via OpenGL DMA-BUF EGLImage (two separate FDs).
     /// Compares against contiguous PixelFormat::Nv12 → PixelFormat::Rgba to prove EGL multi-plane import works.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_multiplane_nv12_to_rgba_opengl() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -3540,7 +3490,7 @@ mod gl_tests {
     /// limitation; if it fails everywhere the HAL attribute construction
     /// is wrong.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_same_fd_multiplane_nv12_to_rgba_opengl() {
         use edgefirst_tensor::PlaneDescriptor;
 
@@ -3563,17 +3513,15 @@ mod gl_tests {
         assert_eq!(nv12_bytes.len(), total_bytes);
 
         // Single DMA-BUF holding both planes contiguously
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("same_fd_nv12"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!("{} - DMA alloc failed", function!()));
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("same_fd_nv12"),
+            ),
+            "same-fd NV12 DMA buffer",
+        ) else {
+            return;
         };
         // Fill with real NV12 camera data
         buf.map().unwrap().as_mut_slice()[..total_bytes].copy_from_slice(nv12_bytes);
@@ -3654,8 +3602,12 @@ mod gl_tests {
     /// Multiplane PixelFormat::Nv12 720p → packed PixelFormat::Rgb 640x640 with letterbox resize via GL.
     /// Validates the packing shader works with multiplane EGLImage source.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_multiplane_nv12_to_rgb_letterbox_opengl() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -3730,8 +3682,12 @@ mod gl_tests {
     /// Multiplane PixelFormat::Nv12 720p → packed PixelFormat::Rgb 640x640 with letterbox resize via GL.
     /// Validates the int8 packing shader (XOR 0x80) works with multiplane source.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_multiplane_nv12_to_rgb_int8_letterbox_opengl() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -3825,9 +3781,8 @@ mod gl_tests {
     /// dropped entirely: pad rows would hold content). Covers PlanarRgb /
     /// PlanarRgba × u8 / i8 × Dma (the GL TwoPassNvPlanar plan) and Mem
     /// destinations, guarding the whole dispatch surface against the bug
-    /// class. (`dma_test_formats` gate matches the helpers it uses; the Mem
-    /// legs still run on the llvmpipe coverage lane, which enables the
-    /// feature.)
+    /// class. (The platform gate matches the helpers it uses; the Mem legs
+    /// run on the llvmpipe coverage lane.)
     ///
     /// **Each leg asserts its own route** (issue #179).
     /// `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
@@ -3837,7 +3792,7 @@ mod gl_tests {
     /// on the zero-copy DMA arm and the texture arm, so every leg must stay
     /// on GL and `convert_fallback_count()` must not move across it.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn letterbox_nv_to_planar_content_band_geometry() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -3985,8 +3940,12 @@ mod gl_tests {
     /// drift in the two-pass plan at full resolution — the per-pixel
     /// complement to the content-band geometry probe above.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn letterbox_nv12_to_planar_matches_rgba_reference() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -4054,8 +4013,8 @@ mod gl_tests {
     }
 
     /// Build a heap-memory (`TensorMemory::Mem`) NV12 image from a raw fixture.
-    /// Portable (no `dma_test_formats` gate): distinct from `load_raw_image`,
-    /// which is feature-gated for the `@Dma` tiers.
+    /// Portable (no platform gate): distinct from `load_raw_image`, which is
+    /// gated to the desktop platforms the `@Dma` tiers allocate on.
     fn mem_nv12_image(width: usize, height: usize, bytes: &[u8]) -> TensorDyn {
         let img = TensorDyn::image(
             width,
@@ -4837,7 +4796,7 @@ mod gl_tests {
     /// Regression: destination with explicit offset=0 must produce the same
     /// output as a destination with no offset set.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_opengl_dst_offset_zero_regression() {
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
@@ -4895,7 +4854,7 @@ mod gl_tests {
     /// as a destination via PlaneDescriptor with offset, convert, and verify
     /// the GPU wrote at the offset — not at byte 0.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_opengl_dst_nonzero_offset() {
         use edgefirst_tensor::PlaneDescriptor;
         use std::os::fd::AsFd;
@@ -4970,7 +4929,7 @@ mod gl_tests {
     /// Destination with offset=0 via PlaneDescriptor import (same path as NPU
     /// workflow) must produce identical output to a normal DMA allocation.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_opengl_dst_imported_offset_zero() {
         use edgefirst_tensor::PlaneDescriptor;
         use std::os::fd::AsFd;
@@ -5046,7 +5005,7 @@ mod gl_tests {
     /// `create_egl_image_with_dims` (the two-pass RGB pipeline), which was the
     /// specific function that had the hardcoded offset=0 bug.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_opengl_dst_nonzero_offset_rgb() {
         use edgefirst_tensor::PlaneDescriptor;
         use std::os::fd::AsFd;
@@ -5134,7 +5093,7 @@ mod gl_tests {
     /// destination at offset 3,450,400 inside a ~10 MB DMA buffer.
     /// Exercises the two-pass `convert_to_packed_rgb` with `is_int8=true`.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_neutron_scenario_large_offset_rgb_int8() {
         use edgefirst_tensor::PlaneDescriptor;
         use std::os::fd::AsFd;
@@ -5159,16 +5118,11 @@ mod gl_tests {
         let offset: usize = 3_450_400; // Neutron input tensor offset
         let image_bytes: usize = 640 * 640 * 3; // RGB
 
-        let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate {} MB DMA buffer",
-                    function!(),
-                    total_size / 1_048_576
-                ));
-                return;
-            }
+        let Some(large_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         large_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5212,7 +5166,7 @@ mod gl_tests {
     /// (single-pass EGLImage) vs RGB I8 (two-pass convert_to_packed_rgb).
     /// If RGBA succeeds and RGB fails, the bug is in the two-pass path.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_neutron_scenario_rgba_vs_rgb_isolation() {
         use edgefirst_tensor::PlaneDescriptor;
         use std::os::fd::AsFd;
@@ -5246,15 +5200,11 @@ mod gl_tests {
         .unwrap();
 
         // --- RGBA U8 at large offset (single-pass path) ---
-        let rgba_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(rgba_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         rgba_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5274,15 +5224,11 @@ mod gl_tests {
         );
 
         // --- RGB I8 at same large offset (two-pass path) ---
-        let rgb_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate second DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(rgb_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         rgb_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5304,7 +5250,7 @@ mod gl_tests {
     /// If RGB U8 succeeds and RGB I8 fails, the int8 shader interacts
     /// poorly with large-offset FBOs.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_neutron_scenario_rgb_u8_vs_int8() {
         use edgefirst_tensor::PlaneDescriptor;
         use std::os::fd::AsFd;
@@ -5341,15 +5287,11 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // --- RGB U8 at large offset (two-pass, packed_rgba8_program_2d) ---
-        let u8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(u8_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         u8_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5367,15 +5309,11 @@ mod gl_tests {
         );
 
         // --- RGB I8 at same large offset (two-pass, packed_rgba8_int8_program_2d) ---
-        let i8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate second DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(i8_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         i8_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5397,7 +5335,7 @@ mod gl_tests {
     /// 3,450,400 is NOT page-aligned (3,450,400 % 4096 = 3488). Compare
     /// against the nearest page-aligned offset below it.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_neutron_scenario_offset_alignment() {
         use edgefirst_tensor::PlaneDescriptor;
         use std::os::fd::AsFd;
@@ -5435,15 +5373,11 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // --- Page-aligned offset ---
-        let aligned_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None) {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(aligned_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         aligned_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5464,16 +5398,11 @@ mod gl_tests {
         );
 
         // --- Non-page-aligned Neutron offset ---
-        let unaligned_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None)
-        {
-            Ok(buf) => buf,
-            Err(_) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - cannot allocate second DMA buffer",
-                    function!()
-                ));
-                return;
-            }
+        let Some(unaligned_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None),
+            "Neutron-sized DMA buffer",
+        ) else {
+            return;
         };
         unaligned_buf.map().unwrap().as_mut_slice().fill(0xAA);
 
@@ -5503,7 +5432,7 @@ mod gl_tests {
     /// equal to width * 4. Verifies that import_image succeeds and the
     /// returned tensor has the expected dimensions and format.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_import_image_rgba_with_stride() {
         use edgefirst_tensor::PlaneDescriptor;
 
@@ -5520,19 +5449,15 @@ mod gl_tests {
         let stride = width * bpp; // 2560, tightly packed
 
         // Allocate a DMA tensor large enough for the RGBA image
-        let buf = Tensor::<u8>::new(
-            &[height, width, bpp],
-            Some(TensorMemory::DmaBuf),
-            Some("import_rgba_tight"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_rgba_with_stride - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[height, width, bpp],
+                Some(TensorMemory::DmaBuf),
+                Some("import_rgba_tight"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -5561,7 +5486,7 @@ mod gl_tests {
     /// The stride is larger than width * bpp; import_image must accept
     /// the padding and report the correct shape.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_import_image_rgba_padded_stride() {
         use edgefirst_tensor::PlaneDescriptor;
 
@@ -5583,19 +5508,15 @@ mod gl_tests {
 
         // Allocate a DMA buffer large enough for the padded rows
         let total_bytes = stride * height;
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("import_rgba_padded"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_rgba_padded_stride - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("import_rgba_padded"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -5625,7 +5546,7 @@ mod gl_tests {
     /// height * stride. This mirrors the layout produced by V4L2 camera
     /// drivers that expose NV12 as two separate planes sharing one fd.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_import_image_nv12_with_offset() {
         use edgefirst_tensor::PlaneDescriptor;
 
@@ -5645,19 +5566,15 @@ mod gl_tests {
         let total_bytes = luma_size + chroma_size;
 
         // Single DMA buffer holding both luma and chroma planes
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("import_nv12_planes"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_nv12_with_offset - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("import_nv12_planes"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -5693,7 +5610,7 @@ mod gl_tests {
     /// `convert()` render path.  Compares pixel output against contiguous
     /// NV12 → RGBA reference.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_import_image_nv12_true_multiplane() {
         use edgefirst_tensor::PlaneDescriptor;
 
@@ -5721,34 +5638,23 @@ mod gl_tests {
         assert_eq!(nv12_bytes.len(), y_size + uv_size);
 
         // Two separate DMA allocations filled with real NV12 data
-        let luma_buf =
-            Tensor::<u8>::new(&[y_size], Some(TensorMemory::DmaBuf), Some("true_mp_luma"));
-        let luma_buf = match luma_buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!(
-                    "{} - luma DMA alloc failed",
-                    function!()
-                ));
-                return;
-            }
+        let Some(luma_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(&[y_size], Some(TensorMemory::DmaBuf), Some("true_mp_luma")),
+            "luma DMA buffer",
+        ) else {
+            return;
         };
         luma_buf.map().unwrap().as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
 
-        let chroma_buf = Tensor::<u8>::new(
-            &[uv_size],
-            Some(TensorMemory::DmaBuf),
-            Some("true_mp_chroma"),
-        );
-        let chroma_buf = match chroma_buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!(
-                    "{} - chroma DMA alloc failed",
-                    function!()
-                ));
-                return;
-            }
+        let Some(chroma_buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[uv_size],
+                Some(TensorMemory::DmaBuf),
+                Some("true_mp_chroma"),
+            ),
+            "chroma DMA buffer",
+        ) else {
+            return;
         };
         chroma_buf.map().unwrap().as_mut_slice()[..uv_size].copy_from_slice(&nv12_bytes[y_size..]);
 
@@ -5842,7 +5748,7 @@ mod gl_tests {
     /// full `import_image` → `eglCreateImage` → `convert()` render path.
     /// Compares pixel output against `load_raw_image` contiguous reference.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_import_image_nv12_contiguous() {
         use edgefirst_tensor::PlaneDescriptor;
 
@@ -5862,17 +5768,15 @@ mod gl_tests {
         let total_bytes = nv12_bytes.len();
 
         // Single DMA buffer holding Y+UV contiguously
-        let buf = Tensor::<u8>::new(
-            &[total_bytes],
-            Some(TensorMemory::DmaBuf),
-            Some("nv12_contiguous"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(&format!("{} - DMA alloc failed", function!()));
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[total_bytes],
+                Some(TensorMemory::DmaBuf),
+                Some("nv12_contiguous"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
         buf.map().unwrap().as_mut_slice()[..total_bytes].copy_from_slice(nv12_bytes);
 
@@ -5942,7 +5846,7 @@ mod gl_tests {
     /// Attempt to import with a stride smaller than width * bpp.
     /// import_image (via set_row_stride) must reject this with an error.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_import_image_stride_too_small() {
         use edgefirst_tensor::PlaneDescriptor;
 
@@ -5958,19 +5862,15 @@ mod gl_tests {
         let bpp: usize = 4;
         let bad_stride = width * bpp - 1; // one byte too narrow
 
-        let buf = Tensor::<u8>::new(
-            &[height, width, bpp],
-            Some(TensorMemory::DmaBuf),
-            Some("import_bad_stride"),
-        );
-        let buf = match buf {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            _ => {
-                crate::test_support::report_skip(
-                    "test_import_image_stride_too_small - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(buf) = crate::test_support::dma_allocated(
+            Tensor::<u8>::new(
+                &[height, width, bpp],
+                Some(TensorMemory::DmaBuf),
+                Some("import_bad_stride"),
+            ),
+            "DMA buffer",
+        ) else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -7060,10 +6960,11 @@ mod gl_tests {
     /// `convert_fallback_count()` moving means the zero-copy import was
     /// refused, and the run is reported as a skip rather than a pass.
     ///
-    /// Skip conditions (treated as pass):
+    /// Skip conditions (each reported as a warning):
     /// 1. GL unavailable, or F16 render not supported (e.g. Vivante).
-    /// 2. `create_image(..., Dma)` returns `Err` — no dma-heap (e.g. dev host,
-    ///    Orin-nano with permission-denied).
+    /// 2. `create_image(..., Dma)` returns `Err` on a host with no zero-copy
+    ///    backing (e.g. dev host, Orin-nano with permission-denied); where the
+    ///    backing exists the failure fails the test.
     /// 3. The created tensor's `.memory()` is not `TensorMemory::DmaBuf` — it
     ///    fell back; only the real DMA path is of interest here.
     /// 4. The GL path declined the destination import and the convert fell
@@ -7141,23 +7042,18 @@ mod gl_tests {
         }
 
         // F16 PlanarRgb DMA-BUF destination, logical [3,H,W].
-        // Skip if dma-heap is unavailable (permission-denied on dev host).
-        let mut dst = match proc.create_image(
-            w,
-            h,
-            PixelFormat::PlanarRgb,
-            DType::F16,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - F16 DMA tensor alloc failed (no dma-heap?): {e}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
+            proc.create_image(
+                w,
+                h,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "F16 PlanarRgb DMA destination",
+        ) else {
+            return;
         };
 
         // Confirm the tensor is genuinely DMA-backed — skip if the allocator
@@ -7817,7 +7713,7 @@ mod gl_tests {
     // =========================================================================
     // Path B: NV16/NV24 → RGBA GPU round-trip tests
     //
-    // Gate: Linux + dma_test_formats + runtime skip if DMA or GL unavailable.
+    // Gate: Linux + runtime skip if DMA or GL unavailable (`HAL_TEST_REQUIRE_DMA=1` fails instead).
     // Strategy: solid-colour sources → exact expected RGB computable from
     // BT.601 full-range; assert Path B ran (no CPU fallback); assert output
     // matches CPU reference within tolerance.
@@ -7827,7 +7723,7 @@ mod gl_tests {
     ///
     /// Matches the coefficient set used in both the CPU kernels and the
     /// `generate_nv_to_rgba_shader_2d` shader (and the macOS `NV_TO_RGBA_FRAGMENT`).
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn yuv601_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
         let yf = y as f32 / 255.0;
         let up = cb as f32 / 255.0 - 128.0 / 255.0;
@@ -7845,7 +7741,7 @@ mod gl_tests {
     /// Build a solid-colour NV16 (4:2:2) buffer of dimensions `(w, h)`.
     ///
     /// Layout: `[H rows of Y][H rows of interleaved CbCr]` (contiguous, width-aligned).
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn make_nv16_solid(w: usize, h: usize, y: u8, cb: u8, cr: u8) -> Vec<u8> {
         let y_plane = vec![y; w * h];
         // NV16: H rows of UV, each row has w/2 pairs → w bytes/row.
@@ -7856,7 +7752,7 @@ mod gl_tests {
     /// Build a solid-colour NV24 (4:4:4) buffer of dimensions `(w, h)`.
     ///
     /// Layout: `[H rows of Y][H rows of interleaved CbCr full-res]`.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn make_nv24_solid(w: usize, h: usize, y: u8, cb: u8, cr: u8) -> Vec<u8> {
         let y_plane = vec![y; w * h];
         // NV24: H rows of UV, each row has w pairs → 2w bytes/row.
@@ -7871,7 +7767,7 @@ mod gl_tests {
     ///   (b) Every output pixel matches the expected BT.601 full-range RGB
     ///       within ±2 (rounding from f32 shader arithmetic).
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv16_to_rgba_path_b() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -7955,32 +7851,32 @@ mod gl_tests {
     /// RAII guard: sets `EDGEFIRST_NV_CONVERT_PATH` and removes it on drop, so a
     /// panic in `GLProcessorST::new` cannot leak the override to later tests.
     /// GL tests run `--test-threads=1` (CI), so there is no concurrent reader.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     struct NvPathEnvGuard;
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     impl NvPathEnvGuard {
         fn set(v: &str) -> Self {
             std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", v);
             NvPathEnvGuard
         }
     }
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     impl Drop for NvPathEnvGuard {
         fn drop(&mut self) {
             std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     struct ColorimetryEnvGuard;
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     impl ColorimetryEnvGuard {
         fn set(v: &str) -> Self {
             std::env::set_var("EDGEFIRST_COLORIMETRY", v);
             ColorimetryEnvGuard
         }
     }
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     impl Drop for ColorimetryEnvGuard {
         fn drop(&mut self) {
             std::env::remove_var("EDGEFIRST_COLORIMETRY");
@@ -7997,8 +7893,12 @@ mod gl_tests {
     /// driver matrix matches exactly), and `EDGEFIRST_COLORIMETRY` wins over
     /// the setter.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn colorimetry_mode_policy_nv12_auto() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         use crate::ColorimetryMode;
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
@@ -8131,7 +8031,7 @@ mod gl_tests {
     ///   recorded path is `ExternalSampler` on success or `Cpu` if the driver
     ///   rejects the NV12 EGLImage import — never `ShaderR8`.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_path_env_override() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
@@ -8224,7 +8124,7 @@ mod gl_tests {
     /// (b) the GPU upload output matches the `CPUProcessor` reference within ±2
     /// (same in-shader matrix as DMA `ShaderR8`).
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_nondma_upload_uses_shader() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_opengl_available() {
@@ -8299,7 +8199,7 @@ mod gl_tests {
     /// which diverged on chroma edges (V3D/Mali) and had no path for NV16/NV24.
     /// Full-range tag keeps the path deterministic (avoids the Vivante carve-out).
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_to_planar_rgb_uses_shader_path() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
@@ -8386,7 +8286,7 @@ mod gl_tests {
     /// A 1280x720 NV12 frame whose luma and chroma vary over a few pixels,
     /// like dense small objects: nearest and bilinear resampling differ by
     /// 16-24 grey levels on it.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn detailed_nv12() -> (usize, usize, Vec<u8>) {
         let (w, h) = (1280usize, 720usize);
         let mut nv12 = Vec::with_capacity(w * h * 3 / 2);
@@ -8406,7 +8306,7 @@ mod gl_tests {
 
     /// Float reference for the GL NV programs on a tight NV12 frame, sampling
     /// a source crop `(x, y, w, h)` into `dw`x`dh` planar RGB bytes.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     struct NvOracle<'a> {
         nv12: &'a [u8],
         w: usize,
@@ -8414,7 +8314,7 @@ mod gl_tests {
         k: crate::colorimetry::YuvToRgbCoeffs,
     }
 
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     impl<'a> NvOracle<'a> {
         fn new(nv12: &'a [u8], w: usize, h: usize, src: &TensorDyn) -> Self {
             let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
@@ -8515,7 +8415,7 @@ mod gl_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn planar_bytes(t: &TensorDyn) -> Vec<u8> {
         match t.dtype() {
             DType::I8 => t
@@ -8531,7 +8431,7 @@ mod gl_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
         assert_eq!(a.len(), b.len());
         a.iter()
@@ -8541,7 +8441,7 @@ mod gl_tests {
             / a.len() as f64
     }
 
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn nv_test_processor() -> Option<crate::opengl_headless::processor::GLProcessorST> {
         if !is_opengl_available() {
             return None;
@@ -8563,7 +8463,7 @@ mod gl_tests {
     /// under 0.8 on NVIDIA, Mali, Adreno, Tegra and V3D; Vivante's in-shader
     /// YUV arithmetic adds about 1.7 on its saturated chroma, at 1:1 too.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_resize_matches_its_sampling() {
         use crate::opengl_headless::processor::NvSampling;
         const MAX_MEAN_ERROR: f64 = 3.0;
@@ -8649,7 +8549,7 @@ mod gl_tests {
     /// Comparing against the GL whole frame isolates geometry from each GPU's
     /// YUV arithmetic, so this holds bit-exactly on every driver.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_crop_1to1_matches_whole_frame() {
         use crate::opengl_headless::processor::NvSampling;
         let Some(mut gl) = nv_test_processor() else {
@@ -8701,7 +8601,7 @@ mod gl_tests {
     /// the boundary between two source pixels, where nearest has no unique
     /// answer and GPU rounding may take either side.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_nearest_interpolation() {
         use crate::opengl_headless::processor::NvSampling;
         let Some(mut gl) = nv_test_processor() else {
@@ -8740,7 +8640,7 @@ mod gl_tests {
     /// stays close to the CPU backend's (they differ only in how chroma is
     /// upsampled, which natural chroma barely shows).
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_letterbox_close_to_cpu_on_camera_frame() {
         let Some(mut gl) = nv_test_processor() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
@@ -8788,7 +8688,7 @@ mod gl_tests {
     /// each output centre (a 7/5 upscale keeps every centre off a pixel
     /// boundary), where `Bilinear` blends.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_gl_texture_nearest_interpolation() {
         let Some(mut gl) = nv_test_processor() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
@@ -8844,7 +8744,7 @@ mod gl_tests {
     /// to grey (110 levels off), while interpolation and filter-weight
     /// precision leave up to 6 on Mali.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_gl_crop_1to1_is_exact() {
         use crate::opengl_headless::processor::GLProcessorST;
         if !is_opengl_available() {
@@ -8934,7 +8834,7 @@ mod gl_tests {
     /// Phase 4b coverage: NV16/NV24 (not just NV12) on a non-DMA (heap) source
     /// must also GPU-convert via the R8-upload `ShaderR8` path and match CPU ≤2.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv16_nv24_nondma_upload_uses_shader() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_opengl_available() {
@@ -9015,7 +8915,7 @@ mod gl_tests {
     /// bounded (it is platform-dependent and is the thing under study).
     #[test]
     #[ignore = "diagnostic probe — run manually on-target with --nocapture --ignored"]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn probe_nv12_sampler_vs_shader_divergence() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
@@ -9146,7 +9046,7 @@ mod gl_tests {
     ///   - shader vs sampler shows whether the driver's LINEAR resize is closer.
     #[test]
     #[ignore = "diagnostic probe — run manually on-target with --nocapture --ignored"]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn probe_nv12_packed_letterbox_divergence() {
         use crate::opengl_headless::processor::GLProcessorST;
         use crate::{Fit, Region};
@@ -9218,12 +9118,17 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            g.convert(
+            if let Err(e) = g.convert(
                 &src,
                 &mut dst,
                 Some(crate::ConvertOptions::new().crop(crop)),
-            )
-            .ok()?;
+            ) {
+                crate::test_support::report_skip(&format!(
+                    "{} - {env} convert declined: {e}",
+                    function!()
+                ));
+                return None;
+            }
             let stride = dst
                 .as_u8()
                 .unwrap()
@@ -9325,7 +9230,7 @@ mod gl_tests {
     ///   (b) Every output pixel matches the expected BT.601 full-range RGB
     ///       within ±2.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv24_to_rgba_path_b() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -9410,7 +9315,7 @@ mod gl_tests {
     /// Builds a patterned NV16 source, runs it through the CPU and GPU
     /// converters, and asserts the GPU output matches the CPU output within ±2.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv16_matches_cpu_reference() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -9500,7 +9405,7 @@ mod gl_tests {
 
     /// Verify NV24→RGBA Path B output matches the CPU reference converter.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv24_matches_cpu_reference() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -9591,7 +9496,7 @@ mod gl_tests {
     /// Verify a DMA NV12 source converts on the GPU (ExternalSampler or
     /// ShaderR8, platform-dependent) and never silently falls back to CPU.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_nv12_dma_gpu_path_no_cpu_fallback() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
@@ -9647,7 +9552,7 @@ mod gl_tests {
     /// Path B tests never reach the int8 packing shader; the quantized NPU
     /// targets (imx8mp vx / imx95 Neutron) consume exactly this i8 output.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn test_gpu_nv16_path_b_int8_output() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
@@ -9769,7 +9674,7 @@ mod gl_tests {
     ///
     /// This is intentionally the same pattern as `make_odd_both_source` in
     /// `odd_dim_cpu.rs` so the two test suites share an analytic ground truth.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn fill_patterned_nv(t: &TensorDyn) {
         let fmt = t.format().unwrap();
         let w = t.width().unwrap();
@@ -9817,7 +9722,7 @@ mod gl_tests {
 
     /// Build a pair of identically-filled NV tensors: one `Dma` (for the GPU),
     /// one `Mem` (for the CPU reference).  Returns `(dma_src, mem_src)`.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn make_patterned_nv_pair(w: usize, h: usize, fmt: PixelFormat) -> (TensorDyn, TensorDyn) {
         let mut dma = TensorDyn::image(
             w,
@@ -9856,7 +9761,7 @@ mod gl_tests {
     /// reading both maps at their real `effective_row_stride`.
     ///
     /// Returns `(max_diff, first_failing_location)`.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn compare_gpu_vs_cpu_u8(
         gpu_dst: &TensorDyn,
         cpu_dst: &TensorDyn,
@@ -9894,7 +9799,7 @@ mod gl_tests {
 
     /// Compare a GPU RGB `i8` output against a CPU RGB `i8` reference,
     /// reading both at their real `effective_row_stride`.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn compare_gpu_vs_cpu_i8(gpu_dst: &TensorDyn, cpu_dst: &TensorDyn, w: usize, h: usize) -> u32 {
         let channels = 3usize; // RGB only (i8 output is always Rgb)
         let gpu_t = gpu_dst.as_i8().unwrap();
@@ -9933,7 +9838,7 @@ mod gl_tests {
     ///       Tolerance 4 absorbs f32 shader rounding; identical fill on both sides
     ///       rules out test-infrastructure bias.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g03_nv16_odd_w_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10001,7 +9906,7 @@ mod gl_tests {
 
     /// G-04: NV24 odd-width (65×64) end-to-end GPU vs CPU reference.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g04_nv24_odd_w_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10073,7 +9978,7 @@ mod gl_tests {
     /// constraint that causes incorrect reads on strict tiled GPUs (e.g. V3D)
     /// when the last chroma row straddles the 64-byte alignment boundary.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g05_nv16_odd_both_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10145,7 +10050,7 @@ mod gl_tests {
     /// UV row at offset `3H − 2` (0-indexed), making it a different boundary
     /// from NV16.  This is the regression cell for the NV24 3H height bug.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g06_nv24_odd_both_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10225,7 +10130,7 @@ mod gl_tests {
     /// Tolerant by design (platform-dependent), so it is CI-safe: it asserts the
     /// outcome is one of those two, never a raw EGL error.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn g09_odd_dst_unaligned_stride_guarded() {
         use crate::opengl_headless::processor::GLProcessorST;
         if !is_dma_available() {
@@ -10288,7 +10193,7 @@ mod gl_tests {
     /// Path A — see `test_nv12_still_uses_path_a` (64×64). Asserts the GPU output
     /// agrees with the CPU reference ±4.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g01_nv12_odd_w_path_b_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10367,7 +10272,7 @@ mod gl_tests {
     ///   (a) `last_nv_convert_path == ShaderR8` — no CPU fallback for DMA source.
     ///   (b) GPU output matches CPU reference within ±4.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g02_nv12_odd_h_path_b_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10459,7 +10364,7 @@ mod gl_tests {
     /// This guards the odd-W Grey IOSurface / EGLImage path that the macOS NV24
     /// fix relies on (64-aligned pitch + physical-stride shader addressing).
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g_grey_odd_w_vs_cpu() {
         use crate::opengl_headless::processor::GLProcessorST;
         use edgefirst_codec::{ImageDecoder, ImageLoad};
@@ -10475,26 +10380,22 @@ mod gl_tests {
         let h = 438usize;
 
         // Decode into a DMA-backed Grey tensor (odd width, 64-aligned pitch).
-        let src_dma = match Tensor::<u8>::image(
-            w,
-            h,
-            PixelFormat::Grey,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => {
-                let mut t = t;
-                let mut dec = ImageDecoder::new();
-                t.load_image(&mut dec, jpeg).unwrap();
-                TensorDyn::from(t)
-            }
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - DMA Grey alloc failed: {e}",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut src_grey) = crate::test_support::gpu_buffer_allocated(
+            Tensor::<u8>::image(
+                w,
+                h,
+                PixelFormat::Grey,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "DMA Grey source",
+        ) else {
+            return;
+        };
+        let src_dma = {
+            let mut dec = ImageDecoder::new();
+            src_grey.load_image(&mut dec, jpeg).unwrap();
+            TensorDyn::from(src_grey)
         };
 
         // CPU reference: decode into a Mem Grey tensor, convert Grey→RGBA via CPU.
@@ -10575,7 +10476,7 @@ mod gl_tests {
     // `test_gpu_nv16_path_b_int8_output`.
     #[test]
     #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (pack-as-RGBA8 architecture in convert_to_packed_rgb, NOT the stride bug); use RGBA or even/mult-4 RGB dst"]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn g07_nv12_odd_w_i8_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
@@ -10654,7 +10555,7 @@ mod gl_tests {
     // `test_gpu_nv16_path_b_int8_output`.
     #[test]
     #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (pack-as-RGBA8 architecture in convert_to_packed_rgb, NOT the stride bug); use RGBA or even/mult-4 RGB dst"]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(target_os = "linux")]
     fn g08_nv16_odd_both_i8_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
@@ -10725,7 +10626,7 @@ mod gl_tests {
     /// behaviour on Path B.  Uses the same patterned fill and stride-aware
     /// comparison as the odd-dim cells.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g_even_nv16_64x64_regression() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10787,7 +10688,7 @@ mod gl_tests {
 
     /// Even-dim regression: NV24 64×64 → RGBA GPU vs CPU ±4.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g_even_nv24_64x64_regression() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_gpu_image_buffer_available() {
@@ -10849,7 +10750,7 @@ mod gl_tests {
 
     /// Fill a YUYV tensor at its real row stride: two bytes per pixel, Y in
     /// the even byte and alternating Cb/Cr in the odd one.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn fill_yuyv_pattern(t: &TensorDyn, w: usize, h: usize, salt: u8) {
         let stride = t.effective_row_stride().unwrap_or(w * 2);
         let bound = t.as_u8().unwrap();
@@ -10865,7 +10766,7 @@ mod gl_tests {
     }
 
     /// Fill an RGBA tensor at its real row stride.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn fill_rgba_pattern(t: &TensorDyn, w: usize, h: usize, salt: u8) {
         let stride = t.effective_row_stride().unwrap_or(w * 4);
         let bound = t.as_u8().unwrap();
@@ -10883,7 +10784,7 @@ mod gl_tests {
     }
 
     /// Worst absolute channel difference between two packed outputs.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn worst_channel_diff(expected: &[u8], actual: &[u8]) -> u8 {
         assert_eq!(expected.len(), actual.len(), "Buffer size mismatch");
         expected
@@ -10896,7 +10797,7 @@ mod gl_tests {
 
     /// Bytes that differ between two `w x h` packed outputs on the last row
     /// or the last column.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn edge_mismatches(
         expected: &[u8],
         actual: &[u8],
@@ -10940,20 +10841,12 @@ mod gl_tests {
             ));
             return;
         }
-        let src = match crate::load_image_test_helper(
+        let src = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::test_support::report_skip(&format!(
-                    "{} - source decode failed ({e:?})",
-                    function!()
-                ));
-                return;
-            }
-        };
+        )
+        .expect("decode the source fixture");
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let rgba_dst = |w: usize, h: usize| {
             TensorDyn::image(
@@ -10965,11 +10858,10 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
         };
-        let Ok(mut pool) = rgba_dst(256, 192) else {
-            crate::test_support::report_skip(&format!(
-                "{} - texture destination alloc failed",
-                function!()
-            ));
+        let Some(mut pool) = crate::test_support::gpu_buffer_allocated(
+            rgba_dst(256, 192),
+            "RGBA texture destination",
+        ) else {
             return;
         };
         // Seed the whole texture, so anything the narrowed convert fails to
@@ -11019,7 +10911,7 @@ mod gl_tests {
     /// The 128x128 Grey pool the narrowed-source tests recycle, seeded over
     /// its whole extent so anything sampled from outside a later narrowed
     /// image is unmistakable.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn seeded_grey_pool() -> TensorDyn {
         let pool = TensorDyn::image(
             128,
@@ -11037,7 +10929,7 @@ mod gl_tests {
     /// Convert a `sw x sh` Grey image to `dw x dh` RGBA twice: recycled
     /// through `pool` (narrowed by `configure_image`) and from a fresh buffer
     /// of exactly its size. Returns `(fresh, recycled)` output bytes.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn convert_narrowed_and_fresh_grey(
         gl: &mut GLProcessorThreaded,
         pool: &mut TensorDyn,
@@ -11059,7 +10951,7 @@ mod gl_tests {
     /// [`convert_narrowed_and_fresh_grey`] with an explicit rotation and crop,
     /// so a case can put the sampling rectangle's far edge on the logical edge
     /// by a route other than a whole-source stretch.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn convert_narrowed_and_fresh_grey_as(
         gl: &mut GLProcessorThreaded,
         pool: &mut TensorDyn,
@@ -11122,7 +11014,7 @@ mod gl_tests {
     /// makes a mis-mapping obvious — every sample moves, not just the edge —
     /// so each case must equal a fresh-buffer convert of the same geometry.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_narrowed_source_resized_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -11173,7 +11065,7 @@ mod gl_tests {
     /// texel positions, and the edge clamp is the only thing left to differ.
     /// The interior keeps the sibling test's tolerance of 1.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_narrowed_source_upscaled_edges_match_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -11228,7 +11120,7 @@ mod gl_tests {
     /// Both narrow an axis to half the pool, so the scaled coordinates are
     /// exact and the edges must match the fresh-buffer oracle byte for byte.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_narrowed_source_cropped_and_rotated_edges_match_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -11297,7 +11189,7 @@ mod gl_tests {
     /// therefore equal the fresh-buffer oracle exactly, with or without the
     /// clamp — the frames pin that down rather than reproducing a bleed.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_narrowed_yuyv_source_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -11395,7 +11287,7 @@ mod gl_tests {
     /// that axis is half the pool so the scaled coordinates are exact and the
     /// clamp is the only difference from the fresh buffer.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_recycle_narrowed_source_into_float_dst_matches_fresh() {
         if !is_gpu_image_buffer_available() || !is_opengl_available() {
             crate::test_support::report_skip(&format!(
@@ -11487,13 +11379,7 @@ mod gl_tests {
                     .expect("OpenGl backend")
                     .create_pbo_image_dtype(dw, dh, PixelFormat::Rgb, DType::F32)
             };
-            let Ok(mut recycled) = float_dst(&proc) else {
-                crate::test_support::report_skip(&format!(
-                    "{} - no F32 PBO destination",
-                    function!()
-                ));
-                return;
-            };
+            let mut recycled = float_dst(&proc).expect("allocate the F32 PBO destination");
             let fallbacks_before = proc.convert_fallback_count();
             proc.convert(&pool, &mut recycled, None).unwrap();
             assert_eq!(
@@ -11574,11 +11460,16 @@ mod gl_tests {
                     edgefirst_tensor::CpuAccess::ReadWrite,
                 )
             };
-            let (Ok(mut zc_recycled), Ok(mut zc_oracle)) = (planar_dst(), planar_dst()) else {
-                crate::test_support::report_skip(&format!(
-                    "(zero-copy float dst): {} - no F16 PlanarRgb texture",
-                    function!()
-                ));
+            let Some(mut zc_recycled) = crate::test_support::gpu_buffer_allocated(
+                planar_dst(),
+                "F16 PlanarRgb zero-copy destination",
+            ) else {
+                continue;
+            };
+            let Some(mut zc_oracle) = crate::test_support::gpu_buffer_allocated(
+                planar_dst(),
+                "F16 PlanarRgb zero-copy oracle",
+            ) else {
                 continue;
             };
             if zc_recycled.memory() != TensorMemory::DmaBuf {
@@ -11672,9 +11563,10 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
         #[cfg(target_os = "macos")]
-        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+        if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+            && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
+        {
             crate::test_support::report_skip(&format!(
                 "{} - ANGLE dlopen gate closed (coverage pass 1)",
                 function!()
@@ -11683,38 +11575,19 @@ mod gl_tests {
         }
         // Two rows taller than the logical frame, so a window starting a row
         // in is still fully backed.
-        let allocated = match TensorDyn::image(
-            W,
-            H + 2,
-            PixelFormat::Nv12,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            other => {
-                // `is_gpu_buffer_available` is the portable "can this host hold
-                // a zero-copy image at all" probe: a DMA heap on Linux, an
-                // IOSurface on macOS, a D3D11 device on Windows. Where it says
-                // yes, a REQUIRE_GL lane must not let this test evaporate --
-                // the arms it covers are reachable nowhere else.
-                let what = match &other {
-                    Ok(t) => format!("fell back to {:?}", t.memory()),
-                    Err(e) => format!("failed: {e}"),
-                };
-                assert!(
-                    !(require_gl && edgefirst_tensor::is_gpu_buffer_available()),
-                    "HAL_TEST_REQUIRE_GL=1 and this host reports a zero-copy \
-                     buffer backing, but the NV12 zero-copy allocation {what}"
-                );
-                crate::test_support::report_skip(&format!(
-                    "{} - no zero-copy NV12 image here ({what})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut src) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                W,
+                H + 2,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "zero-copy NV12 source",
+        ) else {
+            return;
         };
-        let mut src = allocated;
         let pitch = src.effective_row_stride().unwrap_or(W);
         // The same pattern `tests/offset_source_view_alignment.rs` uses, and
         // for the same reasons: period 31 is coprime with the pitch and with
@@ -11880,9 +11753,10 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
         #[cfg(target_os = "macos")]
-        if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+        if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
+            && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
+        {
             crate::test_support::report_skip(&format!(
                 "{} - ANGLE dlopen gate closed (coverage pass 1)",
                 function!()
@@ -11899,24 +11773,10 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
         };
-        let canvas = match dma_rgba(W, H) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            other => {
-                let what = match &other {
-                    Ok(t) => format!("fell back to {:?}", t.memory()),
-                    Err(e) => format!("failed: {e}"),
-                };
-                assert!(
-                    !(require_gl && edgefirst_tensor::is_gpu_buffer_available()),
-                    "HAL_TEST_REQUIRE_GL=1 and this host reports a zero-copy buffer \
-                     backing, but the RGBA zero-copy allocation {what}"
-                );
-                crate::test_support::report_skip(&format!(
-                    "{} - no zero-copy RGBA image here ({what})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(canvas) =
+            crate::test_support::gpu_buffer_allocated(dma_rgba(W, H), "zero-copy RGBA canvas")
+        else {
+            return;
         };
         let pitch = canvas.effective_row_stride().unwrap_or(W * BPP);
         let offset = Y0 * pitch + X0 * BPP;
@@ -12602,19 +12462,11 @@ mod gl_tests {
             let c = g.egl_cache_stats().expect("cache stats").dst;
             c.misses + c.hits
         };
-        let mut oracle = match dma_rgba(VIEW_W, VIEW_H) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-            other => {
-                let what = match &other {
-                    Ok(t) => format!("fell back to {:?}", t.memory()),
-                    Err(e) => format!("failed: {e}"),
-                };
-                crate::test_support::report_skip(&format!(
-                    "{} - no zero-copy RGBA image here ({what})",
-                    function!()
-                ));
-                return;
-            }
+        let Some(mut oracle) = crate::test_support::gpu_buffer_allocated(
+            dma_rgba(VIEW_W, VIEW_H),
+            "zero-copy RGBA oracle",
+        ) else {
+            return;
         };
         let before = imports(&gl);
         gl.convert(&src, &mut oracle, None)
@@ -12778,43 +12630,44 @@ mod gl_tests {
         // Asserted with the counter too: the refusal must come BEFORE the
         // engine spends an import on a destination it is going to decline.
         #[cfg(target_os = "linux")]
-        if let Ok(rgb_parent) = TensorDyn::image(
-            PARENT_W,
-            PARENT_H,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+        if let Some(rgb_parent) = crate::test_support::dma_allocated(
+            TensorDyn::image(
+                PARENT_W,
+                PARENT_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "packed-RGB DMA parent",
         ) {
-            if rgb_parent.memory() == TensorMemory::DmaBuf {
-                let rgb_src = TensorDyn::image(
-                    VIEW_W,
-                    VIEW_H,
-                    PixelFormat::Rgb,
-                    DType::U8,
-                    Some(TensorMemory::Mem),
-                    edgefirst_tensor::CpuAccess::ReadWrite,
-                )
-                .expect("packed-RGB source");
-                let mut view = rgb_parent
-                    .view(edgefirst_tensor::Region::new(8, 8, VIEW_W, VIEW_H))
-                    .expect("packed-RGB destination view");
-                let before = fallbacks(&gl);
-                let outcome = gl.convert(&rgb_src, &mut view, None);
-                match outcome {
-                    Err(crate::Error::NotSupported(_)) => {}
-                    other => failures.push(format!(
-                        "a packed-RGB view() destination must be declined on every \
-                         destination route, got {other:?}"
-                    )),
-                }
-                let spent = fallbacks(&gl) - before;
-                if spent != 0 {
-                    failures.push(format!(
-                        "a packed-RGB view() destination was declined only after \
-                         spending {spent} destination import(s) on it"
-                    ));
-                }
+            let rgb_src = TensorDyn::image(
+                VIEW_W,
+                VIEW_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("packed-RGB source");
+            let mut view = rgb_parent
+                .view(edgefirst_tensor::Region::new(8, 8, VIEW_W, VIEW_H))
+                .expect("packed-RGB destination view");
+            let before = fallbacks(&gl);
+            let outcome = gl.convert(&rgb_src, &mut view, None);
+            match outcome {
+                Err(crate::Error::NotSupported(_)) => {}
+                other => failures.push(format!(
+                    "a packed-RGB view() destination must be declined on every \
+                     destination route, got {other:?}"
+                )),
+            }
+            let spent = fallbacks(&gl) - before;
+            if spent != 0 {
+                failures.push(format!(
+                    "a packed-RGB view() destination was declined only after \
+                     spending {spent} destination import(s) on it"
+                ));
             }
         }
         // A WHOLE packed-RGB destination whose import is refused re-plans onto
@@ -12828,56 +12681,56 @@ mod gl_tests {
         // here, and an engine span whose `lowering` field says the opposite of
         // what happened.
         #[cfg(target_os = "linux")]
-        if let Ok(mut rgb_dst) = TensorDyn::image(
-            VIEW_W,
-            VIEW_H,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+        if let Some(mut rgb_dst) = crate::test_support::dma_allocated(
+            TensorDyn::image(
+                VIEW_W,
+                VIEW_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "packed-RGB DMA destination",
         ) {
-            if rgb_dst.memory() == TensorMemory::DmaBuf {
-                let rgb_src = TensorDyn::image(
-                    VIEW_W,
-                    VIEW_H,
-                    PixelFormat::Rgb,
-                    DType::U8,
-                    Some(TensorMemory::Mem),
-                    edgefirst_tensor::CpuAccess::ReadWrite,
-                )
-                .expect("packed-RGB source");
-                {
-                    let mut m = rgb_src
-                        .map_bytes(edgefirst_tensor::CpuAccess::Write)
-                        .expect("map packed-RGB source");
-                    m.as_mut_slice().fill(0x5A);
-                }
-                let before = fallbacks(&gl);
-                match gl.convert(&rgb_src, &mut rgb_dst, None) {
-                    Ok(()) => {
-                        let spent = fallbacks(&gl) - before;
-                        if spent != 1 {
-                            failures.push(format!(
-                                "a refused packed-RGB destination import must re-plan \
-                                 after exactly one attempt, spent {spent}"
-                            ));
-                        }
-                        let out = rgb_dst
-                            .map_bytes(edgefirst_tensor::CpuAccess::Read)
-                            .expect("map packed-RGB destination")
-                            .as_slice()
-                            .to_vec();
-                        if out.iter().all(|&b| b == 0) {
-                            failures.push(
-                                "the re-planned packed-RGB convert wrote nothing".to_string(),
-                            );
-                        }
+            let rgb_src = TensorDyn::image(
+                VIEW_W,
+                VIEW_H,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("packed-RGB source");
+            {
+                let mut m = rgb_src
+                    .map_bytes(edgefirst_tensor::CpuAccess::Write)
+                    .expect("map packed-RGB source");
+                m.as_mut_slice().fill(0x5A);
+            }
+            let before = fallbacks(&gl);
+            match gl.convert(&rgb_src, &mut rgb_dst, None) {
+                Ok(()) => {
+                    let spent = fallbacks(&gl) - before;
+                    if spent != 1 {
+                        failures.push(format!(
+                            "a refused packed-RGB destination import must re-plan \
+                             after exactly one attempt, spent {spent}"
+                        ));
                     }
-                    Err(e) => failures.push(format!(
-                        "a refused packed-RGB destination import must re-plan onto the \
-                         mapped route, not end the convert: {e}"
-                    )),
+                    let out = rgb_dst
+                        .map_bytes(edgefirst_tensor::CpuAccess::Read)
+                        .expect("map packed-RGB destination")
+                        .as_slice()
+                        .to_vec();
+                    if out.iter().all(|&b| b == 0) {
+                        failures
+                            .push("the re-planned packed-RGB convert wrote nothing".to_string());
+                    }
                 }
+                Err(e) => failures.push(format!(
+                    "a refused packed-RGB destination import must re-plan onto the \
+                     mapped route, not end the convert: {e}"
+                )),
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -12967,22 +12820,27 @@ mod gl_tests {
             .unwrap_or(0);
         let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
         let planar_dma = || {
-            TensorDyn::image(
+            let image = TensorDyn::image(
                 W,
                 H,
                 PixelFormat::PlanarRgb,
                 DType::U8,
                 Some(TensorMemory::DmaBuf),
                 edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .ok()
-            .filter(|t| t.memory() == TensorMemory::DmaBuf)
+            );
+            if cfg!(target_os = "linux") {
+                crate::test_support::dma_allocated(image, "PlanarRgb DMA destination")
+            } else {
+                crate::test_support::allocated(
+                    image,
+                    "PlanarRgb DMA destination",
+                    crate::test_support::Expect::MayFail(
+                        "PlanarRgb u8 has no zero-copy image layout on this platform",
+                    ),
+                )
+            }
         };
         let Some(mut dst) = planar_dma() else {
-            crate::test_support::report_skip(&format!(
-                "{} - no zero-copy PlanarRgb destination here",
-                function!()
-            ));
             return;
         };
 
@@ -13174,7 +13032,7 @@ mod gl_tests {
         let Some(mut gl) = pbo_gl_or_skip(function!()) else {
             return;
         };
-        if !edgefirst_tensor::is_dma_available() {
+        if !crate::test_support::is_dma_available() {
             crate::test_support::report_skip(&format!("{} - no DMA heap", function!()));
             return;
         }
@@ -13255,7 +13113,7 @@ mod gl_tests {
         #[allow(unused_mut)]
         let mut dst_mems = vec![TensorMemory::Mem];
         #[cfg(target_os = "linux")]
-        if edgefirst_tensor::is_dma_available() {
+        if crate::test_support::is_dma_available() {
             dst_mems.push(TensorMemory::DmaBuf);
         }
         let access = edgefirst_tensor::CpuAccess::ReadWrite;

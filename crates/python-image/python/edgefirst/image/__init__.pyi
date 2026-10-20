@@ -46,6 +46,9 @@ class EdgeFirstProtoDataExportable(Protocol):
 # as this package's public surface.
 del Protocol
 
+# "dynamic" in every wheel; "static" only in the G13 comparison build.
+__tensor_backend__: str
+
 def version() -> str:
     """Return the HAL version string (matches ``Cargo.toml``)."""
 

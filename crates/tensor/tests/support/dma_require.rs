@@ -52,7 +52,7 @@ pub fn available_or_skip(available: bool, what: &str) -> bool {
                openable by this user)";
     let run = decide(available, required(), what, why);
     if !run {
-        let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {what} - {why}");
+        let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {what} - {why}");
     }
     run
 }

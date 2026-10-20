@@ -11,7 +11,7 @@
 //! parent at the element's real row pitch -- not at `H * C` bytes, which is
 //! what reading `shape[1]` as the width produces.
 
-#![cfg(feature = "static")]
+#![cfg(not(edgefirst_tensor_dynamic))]
 
 use edgefirst_tensor::{
     CpuAccess, Error, PixelFormat, Tensor, TensorMapTrait, TensorMemory, TensorTrait, ViewOrigin,

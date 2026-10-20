@@ -194,7 +194,13 @@ Each backend provides its own map type implementing `TensorMapTrait<T>`:
 `ndarray` feature enabled, `TensorMapTrait` also provides `view()` /
 `view_mut()` returning ndarray `ArrayView` / `ArrayViewMut`.
 
-**The `dynamic` lens holds caches only.** Authoritative state lives in
+### Static and dynamic backends
+
+`TensorDyn`/`Tensor<T>` have two implementations behind one API (`src/tensor_dyn/`). `static_backend.rs` is the implementation; `dynamic_backend.rs` and `dynamic_tensor.rs` wrap an `ef_tensor*` handle and call `libedgefirst_tensor` through `edgefirst-tensor-ffi`. `derived.rs` holds every method expressible over the shared public surface, written once and compiled into both, which keeps the C ABI to the primitives.
+
+The static backend is unconditional for Rust consumers. The dynamic one is selected by `--cfg edgefirst_tensor_dynamic` (`cfg(not(edgefirst_tensor_dynamic))` gates static-only code), which only the C-library and wheel builds pass, through `.cargo/tensor-dynamic.toml`. `edgefirst-tensor-ffi` is a `[target.'cfg(edgefirst_tensor_dynamic)'.dependencies]` entry, so a static build never resolves it. See the top-level [ARCHITECTURE.md § Tensor Backend Selection](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#tensor-backend-selection) for which artifact uses which backend and the guards that enforce it.
+
+**The dynamic lens holds caches only.** Authoritative state lives in
 `libedgefirst_tensor`. A field on dynamic `TensorDyn` may only be a cache
 re-derived from the handle (`shape_cache`, `quantization_cache`, `identity`,
 and Windows `descriptor_texture_handle`). `from_handle` initializes those

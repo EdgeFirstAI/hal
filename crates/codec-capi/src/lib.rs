@@ -8,6 +8,12 @@
 //! will read next, with no copy in between — and it is why the tensor may have
 //! been minted by any EdgeFirst library, not only this one.
 
+#[cfg(not(edgefirst_tensor_dynamic))]
+compile_error!(
+    "edgefirst-codec-capi links libedgefirst_tensor and must be built with the dynamic tensor backend: \
+     `cargo build --config .cargo/tensor-dynamic.toml` (or `make capi-libs`)."
+);
+
 pub mod decoder;
 
 /// ABI version of this library's C surface.
@@ -52,7 +58,10 @@ mod tests {
             Ok(o) => Some(o),
             Err(e) => {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr(), "SKIPPED: no C compiler ({cc}: {e})");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "WARNING: SKIPPED: no C compiler ({cc}: {e})"
+                );
                 None
             }
         }
@@ -112,7 +121,7 @@ mod tests {
                     use std::io::Write;
                     let _ = writeln!(
                         std::io::stderr(),
-                        "SKIPPED: libedgefirst_{name} not built; collision check not run"
+                        "WARNING: SKIPPED: libedgefirst_{name} not built; collision check not run"
                     );
                     return;
                 }
@@ -219,7 +228,7 @@ mod tests {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "SKIPPED: nothing built; name not checked"
+                "WARNING: SKIPPED: nothing built; name not checked"
             );
             return;
         }

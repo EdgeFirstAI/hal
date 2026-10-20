@@ -727,26 +727,68 @@ mod tests {
     use super::*;
 
     // ─── DmaImportAttrs::from_tensor tests ───────────────────────────
-    // These require real DMA-BUF allocations, gated on dma_test_formats.
+    // These require real DMA-BUF allocations; they skip without a heap unless HAL_TEST_REQUIRE_DMA=1.
 
-    #[cfg(feature = "dma_test_formats")]
-    use edgefirst_tensor::{is_dma_available, PlaneDescriptor, TensorMemory};
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    use crate::test_support::is_dma_available;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    use edgefirst_tensor::{PlaneDescriptor, TensorMemory};
 
-    /// Helper: allocate a DMA tensor of the given byte count, or return None if unavailable.
-    #[cfg(feature = "dma_test_formats")]
+    /// Reports a skip and returns `false` when this host has no usable DMA heap.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn dma_heap_or_skip(what: &str) -> bool {
+        if is_dma_available() {
+            return true;
+        }
+        crate::test_support::report_skip(&format!(
+            "{}: {what}: DMA not available",
+            crate::test_support::current_test()
+        ));
+        false
+    }
+
+    /// A failed allocation's reason, printed without the quotes `String`'s `Debug` adds.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    struct Failure(String);
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    impl std::fmt::Debug for Failure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    /// Treats a DMA request that fell back to other memory as a failed allocation.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn dma_only(
+        result: Result<Tensor<u8>, edgefirst_tensor::Error>,
+    ) -> Result<Tensor<u8>, Failure> {
+        match result {
+            Ok(t) if t.memory() == TensorMemory::DmaBuf => Ok(t),
+            Ok(t) => Err(Failure(format!("fell back to {:?}", t.memory()))),
+            Err(e) => Err(Failure(format!("{e:?}"))),
+        }
+    }
+
+    /// A DMA tensor of `bytes`, or `None` (warned) when the host has no usable DMA heap.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn alloc_dma(bytes: usize, name: &str) -> Option<Tensor<u8>> {
-        if !is_dma_available() {
+        if !dma_heap_or_skip(name) {
             return None;
         }
-        match Tensor::<u8>::new(&[bytes], Some(TensorMemory::DmaBuf), Some(name)) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => Some(t),
-            _ => None,
-        }
+        crate::test_support::dma_allocated(
+            dma_only(Tensor::<u8>::new(
+                &[bytes],
+                Some(TensorMemory::DmaBuf),
+                Some(name),
+            )),
+            name,
+        )
     }
 
     /// Helper: import an NV12 image via the public ImageProcessor API and
     /// return the resulting tensor for inspection.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn import_nv12(
         luma_pd: PlaneDescriptor,
         chroma_pd: Option<PlaneDescriptor>,
@@ -771,26 +813,25 @@ mod tests {
     /// source view would import the parent but sample using the view's dims,
     /// reading the wrong region.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_source_view_imports_own_region_dst_imports_parent() {
         if !is_dma_available() {
             crate::test_support::report_skip("from_tensor_source_view... - DMA not available");
             return;
         }
         // 64x64 RGBA with a padded 320-byte stride (tight row = 64*4 = 256).
-        let parent = match Tensor::<u8>::image_with_stride(
-            64,
-            64,
-            PixelFormat::Rgba,
-            320,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(_) => {
-                crate::test_support::report_skip("image_with_stride DMA unavailable");
-                return;
-            }
+        let Some(parent) = crate::test_support::dma_allocated(
+            Tensor::<u8>::image_with_stride(
+                64,
+                64,
+                PixelFormat::Rgba,
+                320,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "64x64 RGBA image_with_stride",
+        ) else {
+            return;
         };
         let view = parent
             .view(edgefirst_tensor::Region::new(8, 8, 32, 16))
@@ -842,7 +883,7 @@ mod tests {
     /// Verifies that plane0_fd and plane1.fd are different raw fds pointing
     /// to different underlying DMA-BUFs, and that offsets default to 0.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_true_multiplane_attrs() {
         let width: usize = 1920;
         let height: usize = 1088;
@@ -850,23 +891,11 @@ mod tests {
         let luma_bytes = stride * height;
         let chroma_bytes = stride * height.div_ceil(2);
 
-        let luma_buf = match alloc_dma(luma_bytes, "luma_buf") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_true_multiplane_attrs - DMA not available",
-                );
-                return;
-            }
+        let Some(luma_buf) = alloc_dma(luma_bytes, "luma_buf") else {
+            return;
         };
-        let chroma_buf = match alloc_dma(chroma_bytes, "chroma_buf") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_true_multiplane_attrs - DMA alloc failed",
-                );
-                return;
-            }
+        let Some(chroma_buf) = alloc_dma(chroma_bytes, "chroma_buf") else {
+            return;
         };
 
         let luma_fd = luma_buf.dmabuf().unwrap();
@@ -908,7 +937,7 @@ mod tests {
     /// PLANE descriptors with different raw fds that resolve to the same
     /// underlying DMA-BUF.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_same_fd_multiplane_attrs() {
         let width: usize = 1920;
         let height: usize = 1088;
@@ -917,14 +946,8 @@ mod tests {
         let chroma_size = stride * height.div_ceil(2);
         let total_bytes = luma_size + chroma_size;
 
-        let buf = match alloc_dma(total_bytes, "shared_buf") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_same_fd_multiplane_attrs - DMA not available",
-                );
-                return;
-            }
+        let Some(buf) = alloc_dma(total_bytes, "shared_buf") else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -970,18 +993,12 @@ mod tests {
     /// The import uses the 64-aligned `plane0_pitch`, not `width`, so the old
     /// word-alignment rationale for `%4` no longer applies.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_even_width_relaxed_gate() {
         let (height, stride) = (64usize, 128usize);
         let total = stride * height + stride * height.div_ceil(2);
-        let buf = match alloc_dma(total, "nv12_even_w") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_even_width_relaxed_gate - DMA not available",
-                );
-                return;
-            }
+        let Some(buf) = alloc_dma(total, "nv12_even_w") else {
+            return;
         };
 
         // 66 is even but NOT 4-aligned — previously rejected by the width%4 gate.
@@ -1011,7 +1028,7 @@ mod tests {
     /// Plane1 fd must be the EXACT SAME raw fd as plane0 (not a dup), and
     /// the UV offset is computed as plane0_offset + plane0_pitch * height.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_contiguous_single_fd_attrs() {
         let width: usize = 1920;
         let height: usize = 1088;
@@ -1019,14 +1036,8 @@ mod tests {
         let total_h = height * 3 / 2; // NV12: Y + UV/2
         let total_bytes = stride * total_h;
 
-        let buf = match alloc_dma(total_bytes, "contiguous_buf") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_contiguous_single_fd_attrs - DMA not available",
-                );
-                return;
-            }
+        let Some(buf) = alloc_dma(total_bytes, "contiguous_buf") else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -1062,7 +1073,7 @@ mod tests {
     ///
     /// When the stride > width, the UV offset must use stride (not width).
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_contiguous_padded_stride_attrs() {
         let width: usize = 1920;
         let height: usize = 1080;
@@ -1070,14 +1081,8 @@ mod tests {
         let total_h = height * 3 / 2;
         let total_bytes = stride * total_h;
 
-        let buf = match alloc_dma(total_bytes, "padded_buf") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_contiguous_padded_stride_attrs - DMA not available",
-                );
-                return;
-            }
+        let Some(buf) = alloc_dma(total_bytes, "padded_buf") else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -1101,7 +1106,7 @@ mod tests {
 
     /// Multiplane with padded strides: each plane has its own explicit stride.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_multiplane_padded_strides_attrs() {
         let width: usize = 1920;
         let height: usize = 1080;
@@ -1110,21 +1115,11 @@ mod tests {
         let luma_bytes = luma_stride * height;
         let chroma_bytes = chroma_stride * height.div_ceil(2);
 
-        let luma_buf = match alloc_dma(luma_bytes, "luma_padded") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_multiplane_padded_strides_attrs - DMA not available",
-                );
-                return;
-            }
+        let Some(luma_buf) = alloc_dma(luma_bytes, "luma_padded") else {
+            return;
         };
-        let chroma_buf = match alloc_dma(chroma_bytes, "chroma_padded") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip("DMA alloc failed");
-                return;
-            }
+        let Some(chroma_buf) = alloc_dma(chroma_bytes, "chroma_padded") else {
+            return;
         };
 
         let luma_fd = luma_buf.dmabuf().unwrap();
@@ -1154,7 +1149,7 @@ mod tests {
     /// Some V4L2 drivers place the luma plane at a non-zero offset in the
     /// DMA-BUF (e.g. after a metadata header).
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_same_fd_nonzero_luma_offset() {
         let width: usize = 640;
         let height: usize = 480;
@@ -1164,14 +1159,8 @@ mod tests {
         let chroma_offset = luma_offset + luma_size;
         let total_bytes = chroma_offset + stride * height.div_ceil(2);
 
-        let buf = match alloc_dma(total_bytes, "offset_buf") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_same_fd_nonzero_luma_offset - DMA not available",
-                );
-                return;
-            }
+        let Some(buf) = alloc_dma(total_bytes, "offset_buf") else {
+            return;
         };
 
         let fd = buf.dmabuf().unwrap();
@@ -1202,7 +1191,7 @@ mod tests {
     /// plane, so the offset exceeds the buffer → must return a clear error
     /// instead of passing through to EGL (which returns opaque BadAlloc).
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_nv12_chroma_offset_exceeds_buffer() {
         let width: usize = 1920;
         let height: usize = 1088;
@@ -1212,14 +1201,8 @@ mod tests {
         let _chroma_size = stride * chroma_h;
 
         // Allocate a buffer sized for Y ONLY (not Y+UV)
-        let y_buf = match alloc_dma(y_size, "y_only_buf") {
-            Some(t) => t,
-            None => {
-                crate::test_support::report_skip(
-                    "test_nv12_chroma_offset_exceeds_buffer - DMA not available",
-                );
-                return;
-            }
+        let Some(y_buf) = alloc_dma(y_size, "y_only_buf") else {
+            return;
         };
 
         let fd = y_buf.dmabuf().unwrap();
@@ -1539,7 +1522,7 @@ mod tests {
     ///
     /// This unlocks the zero-copy EGL path for dataset-loader widths that
     /// previously fell back to CPU texture upload.
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_from_tensor_accepts_non_4_aligned_rgba() {
         if !is_dma_available() {
@@ -1552,21 +1535,18 @@ mod tests {
         for &w in &[375usize, 427, 443] {
             let bpp = primary_plane_bpp(PixelFormat::Rgba, 1).unwrap();
             let aligned = align_pitch_bytes_to_gpu_alignment(w * bpp).unwrap();
-            let t = match Tensor::<u8>::image_with_stride(
-                w,
-                64,
-                PixelFormat::Rgba,
-                aligned,
-                Some(edgefirst_tensor::TensorMemory::DmaBuf),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    crate::test_support::report_skip(&format!(
-                        "image_with_stride failed at width {w}: {e}"
-                    ));
-                    return;
-                }
+            let Some(t) = crate::test_support::dma_allocated(
+                Tensor::<u8>::image_with_stride(
+                    w,
+                    64,
+                    PixelFormat::Rgba,
+                    aligned,
+                    Some(edgefirst_tensor::TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ),
+                &format!("RGBA image_with_stride at width {w}"),
+            ) else {
+                return;
             };
             let attrs =
                 DmaImportAttrs::from_tensor(&t, PixelFormat::Rgba, false).unwrap_or_else(|e| {
@@ -1582,7 +1562,7 @@ mod tests {
 
     /// BGRA must also accept non-4-aligned widths (same reasoning as RGBA —
     /// 4-bpp packed, pitch always 4-byte aligned).
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_from_tensor_accepts_non_4_aligned_bgra() {
         if !is_dma_available() {
@@ -1594,19 +1574,18 @@ mod tests {
         use crate::{align_pitch_bytes_to_gpu_alignment, primary_plane_bpp};
         let bpp = primary_plane_bpp(PixelFormat::Bgra, 1).unwrap();
         let aligned = align_pitch_bytes_to_gpu_alignment(375 * bpp).unwrap();
-        let t = match Tensor::<u8>::image_with_stride(
-            375,
-            64,
-            PixelFormat::Bgra,
-            aligned,
-            Some(edgefirst_tensor::TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::test_support::report_skip(&format!("image_with_stride failed: {e}"));
-                return;
-            }
+        let Some(t) = crate::test_support::dma_allocated(
+            Tensor::<u8>::image_with_stride(
+                375,
+                64,
+                PixelFormat::Bgra,
+                aligned,
+                Some(edgefirst_tensor::TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "BGRA image_with_stride at width 375",
+        ) else {
+            return;
         };
         DmaImportAttrs::from_tensor(&t, PixelFormat::Bgra, false)
             .expect("BGRA width 375 must pass the pre-check");
@@ -1741,24 +1720,24 @@ mod tests {
 
     // ─── source rebase onto an aligned base (issue #170) ─────────────
 
-    /// Allocate the DMA parent the rebase tests view into, or `None` when
-    /// this machine has no usable DMA heap (the heap is root-only on the
-    /// desk, so an unprivileged run skips) or cannot allocate this format.
-    #[cfg(feature = "dma_test_formats")]
+    /// Allocate the DMA parent the rebase tests view into, or `None` (warned)
+    /// when this machine has no usable DMA heap.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn dma_parent(width: usize, height: usize, fmt: PixelFormat) -> Option<Tensor<u8>> {
-        if !is_dma_available() {
+        let what = format!("{width}x{height} {fmt:?} DMA image");
+        if !dma_heap_or_skip(&what) {
             return None;
         }
-        match Tensor::<u8>::image(
-            width,
-            height,
-            fmt,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        ) {
-            Ok(t) if t.memory() == TensorMemory::DmaBuf => Some(t),
-            _ => None,
-        }
+        crate::test_support::dma_allocated(
+            dma_only(Tensor::<u8>::image(
+                width,
+                height,
+                fmt,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )),
+            &what,
+        )
     }
 
     /// A source at an unaligned RGBA offset imports from the 64-byte floor,
@@ -1767,15 +1746,9 @@ mod tests {
     /// import Mali samples correctly where the unrebased one sampled zeros
     /// (issue #170).
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_rebases_an_unaligned_rgba_source_to_an_aligned_base() {
         let Some(parent) = dma_parent(64, 64, PixelFormat::Rgba) else {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - DMA not available",
-                function!()
-            );
             return;
         };
         let pitch = parent.effective_row_stride().unwrap_or(256);
@@ -1799,15 +1772,9 @@ mod tests {
     /// An ALIGNED source is untouched -- no rebase, no shift, no widening --
     /// so every driver sees exactly the import it saw before issue #170.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_leaves_an_aligned_source_alone() {
         let Some(parent) = dma_parent(64, 64, PixelFormat::Rgba) else {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - DMA not available",
-                function!()
-            );
             return;
         };
         let pitch = parent.effective_row_stride().unwrap_or(256);
@@ -1827,15 +1794,9 @@ mod tests {
     /// destination side fail loudly rather than silently (Vivante,
     /// EGL_BAD_ACCESS), which `dst_import_places` already lowers.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_never_rebases_a_destination() {
         let Some(parent) = dma_parent(64, 64, PixelFormat::Rgba) else {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - DMA not available",
-                function!()
-            );
             return;
         };
         let view = parent
@@ -1880,15 +1841,9 @@ mod tests {
     /// Asserted against the offset the view actually reports, so a board
     /// whose pitch padding differs is still pinned rather than skipped.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_rebases_an_unaligned_rgb_source_by_the_lcm_step() {
         let Some(parent) = dma_parent(64, 64, PixelFormat::Rgb) else {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - DMA not available",
-                function!()
-            );
             return;
         };
         let pitch = parent.effective_row_stride().unwrap_or(192);
@@ -1919,15 +1874,9 @@ mod tests {
     /// `Grey` is 1 byte per pixel, so every residue byte is a texel of
     /// shift and the step is just the 64-byte alignment.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_rebases_an_unaligned_grey_source_byte_for_texel() {
         let Some(parent) = dma_parent(64, 64, PixelFormat::Grey) else {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - DMA not available",
-                function!()
-            );
             return;
         };
         let pitch = parent.effective_row_stride().unwrap_or(64);
@@ -1995,13 +1944,13 @@ mod tests {
     /// about an import that does not exist -- declining a good one, or
     /// waving through one that comes back black.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn the_gate_reads_the_offset_the_import_presents() {
         if !is_dma_available() {
             use std::io::Write;
             let _ = writeln!(
                 &mut std::io::stderr(),
-                "SKIPPED: {} - DMA not available",
+                "WARNING: SKIPPED: {} - DMA not available",
                 function!()
             );
             return;
@@ -2028,13 +1977,7 @@ mod tests {
         let mut compared = 0usize;
         for (fmt, w, h, whole_offset) in cases {
             let Some(mut parent) = dma_parent(w, h, fmt) else {
-                use std::io::Write;
-                let _ = writeln!(
-                    &mut std::io::stderr(),
-                    "SKIPPED: {} {fmt:?} - not allocatable here",
-                    function!()
-                );
-                continue;
+                return;
             };
             if fmt == PixelFormat::Rgb {
                 // The premise of this row: a 100-wide RGB surface pads its
@@ -2091,15 +2034,9 @@ mod tests {
     /// leaving no room to widen, so the import keeps its own unaligned
     /// offset and Mali must go on declining it.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_cannot_rebase_a_window_into_a_tight_pitch() {
         let Some(mut t) = dma_parent(64, 64, PixelFormat::Rgba) else {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: {} - DMA not available",
-                function!()
-            );
             return;
         };
         let pitch = t.effective_row_stride().unwrap_or(256);
@@ -2124,17 +2061,11 @@ mod tests {
     /// row. The Mali gate in the processor must keep declining these, which
     /// is only sound while they are not rebased here.
     #[test]
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn from_tensor_never_rebases_the_formats_the_fold_misses() {
         for fmt in [PixelFormat::Yuyv, PixelFormat::Nv12, PixelFormat::PlanarRgb] {
             let Some(mut t) = dma_parent(64, 64, fmt) else {
-                use std::io::Write;
-                let _ = writeln!(
-                    &mut std::io::stderr(),
-                    "SKIPPED: {} {fmt:?} - not allocatable here",
-                    function!()
-                );
-                continue;
+                return;
             };
             // 32 is one of the two offsets i.MX 95 sampled zeros from, and
             // is unaligned for every one of these formats.

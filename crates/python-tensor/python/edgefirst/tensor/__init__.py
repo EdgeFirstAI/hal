@@ -8,7 +8,10 @@ every sibling.
 from typing import Optional, Protocol
 
 from ._tensor import *
-from ._tensor import __doc__  # noqa: F401
+from ._tensor import (
+    __doc__,  # noqa: F401
+    __tensor_backend__,  # noqa: F401
+)
 
 
 class EdgeFirstTensorExportable(Protocol):

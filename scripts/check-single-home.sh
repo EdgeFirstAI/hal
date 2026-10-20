@@ -71,6 +71,8 @@ SIBS="image codec decoder tracker"
 # The five modular Python extensions, by their cdylib stem (`[lib] name` in
 # each crates/python-*/Cargo.toml, so `_tensor` -> `lib_tensor.so`).
 PY_EXTS="tensor image codec decoder tracker"
+# Selects the dynamic tensor backend (ARCHITECTURE.md, Tensor Backend Selection).
+TENSOR_DYNAMIC=(--config "${ROOT}/.cargo/tensor-dynamic.toml")
 
 # Hash a shared object's LOADABLE content -- everything the dynamic linker
 # maps and the CPU executes -- with debug info and the build-id note removed.
@@ -291,7 +293,7 @@ PY
   elif [[ ! -s "${DEBUG_LIBDIR}/libedgefirst_image.so" ]]; then
     cannot_measure "G6" "${DEBUG_LIBDIR}/libedgefirst_image.so is missing -- run \`make capi-libs\` first"
   elif [[ ! -s "${DEBUG_LIBDIR}/lib_tensor.so" ]]; then
-    cannot_measure "G6" "${DEBUG_LIBDIR}/lib_tensor.so is missing -- run \`cargo build -p edgefirst-python-tensor -p edgefirst-python-image -p edgefirst-python-codec -p edgefirst-python-decoder\` first"
+    cannot_measure "G6" "${DEBUG_LIBDIR}/lib_tensor.so is missing -- run \`cargo build --config .cargo/tensor-dynamic.toml -p edgefirst-python-tensor -p edgefirst-python-image -p edgefirst-python-codec -p edgefirst-python-decoder\` first"
   else
     # Hash edgefirst-tensor's own library too, not just the four siblings --
     # see the rebuild step below for why: a causal test has to prove the
@@ -313,7 +315,7 @@ PY
     # The `git diff --quiet` guard above has already established the source
     # is clean at this point, so this build IS the clean baseline.
     g6_py_baseline_log="${TMPDIR:-/tmp}/check-single-home-g6-baseline.$$.log"
-    if ! cargo build $(for l in $PY_EXTS; do printf -- "-p edgefirst-python-%s " "$l"; done) \
+    if ! cargo build "${TENSOR_DYNAMIC[@]}" $(for l in $PY_EXTS; do printf -- "-p edgefirst-python-%s " "$l"; done) \
          >"${g6_py_baseline_log}" 2>&1; then
       cannot_measure "G6" "could not build the Python extensions' clean baseline -- see ${g6_py_baseline_log}"
       g6_py_before=""
@@ -409,7 +411,7 @@ PY
       # `edgefirst-tensor` as a Rust crate, so a source change to it
       # recompiles the crate for them; if the probe were reaching their code
       # their bytes would move. `_drift_probe` goes into `Tensor<T>`, which
-      # is `#[cfg(feature = "static")]` -- the extensions build `dynamic`, so
+      # is `#[cfg(not(edgefirst_tensor_dynamic))]` -- the extensions build dynamic, so
       # they compile the changed file and must still emit identical bytes.
       # That is a causal test rather than an absence-of-effect one.
       if ! cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target >"${g6_build_log}" 2>&1; then
@@ -419,7 +421,7 @@ PY
       # gate prints is the one that gets quoted.
       elif [[ -z "${g6_py_before}" ]]; then
         : # the baseline already reported why
-      elif ! cargo build $(for l in $PY_EXTS; do printf -- "-p edgefirst-python-%s " "$l"; done) \
+      elif ! cargo build "${TENSOR_DYNAMIC[@]}" $(for l in $PY_EXTS; do printf -- "-p edgefirst-python-%s " "$l"; done) \
              >>"${g6_build_log}" 2>&1; then
         cannot_measure "G6" "rebuilding the four Python extensions with the probe field failed -- see ${g6_build_log}"
       else
@@ -526,8 +528,8 @@ echo "== G1: no sibling embeds edgefirst-tensor's implementation =="
 #
 # `cuda.rs` is deliberately NOT covered by this marker, and this is a real
 # gap G1 does not close -- not an oversight in the marker's design. Unlike
-# the modules above, `mod cuda;` in `lib.rs` carries no `#[cfg(feature =
-# "static")]` gate: it is a standalone `dlopen(libcudart)` interop layer
+# the modules above, `mod cuda;` in `lib.rs` carries no
+# `#[cfg(not(edgefirst_tensor_dynamic))]` gate: it is a standalone `dlopen(libcudart)` interop layer
 # with no `TensorStorage` dependency, `pub use`d at the crate root on
 # *both* backends. `codec-capi` calls `edgefirst_tensor::is_cuda_available
 # ()`/`stream_create()`/`stream_synchronize()` directly (its nvjpeg path),
@@ -842,13 +844,15 @@ else
   # The same five-crate release build the Makefile's `capi-libs-release`
   # target performs, inlined rather than shelled out to `make` so the gate
   # does not depend on the Makefile staying in sync with it. The leaves are
-  # workspace-EXCLUDED standalone packages (the static/dynamic feature switch
-  # is mutually exclusive and cargo unifies features across one invocation),
-  # so each is built via its own --manifest-path, one invocation apiece.
+  # workspace-EXCLUDED standalone packages, each resolving its own features,
+  # so each is built via its own --manifest-path, one invocation apiece; the
+  # dynamic ones also take the tensor-dynamic config.
   g5_build_log="${TMPDIR:-/tmp}/check-single-home-g5-build.$$.log"
   : >"${g5_build_log}"
   for l in tensor $SIBS; do
-    if ! cargo build --release --manifest-path "crates/${l}-capi/Cargo.toml" \
+    leaf_cfg=()
+    case "${l}" in image|codec|decoder) leaf_cfg=("${TENSOR_DYNAMIC[@]}") ;; esac
+    if ! cargo build --release ${leaf_cfg[@]+"${leaf_cfg[@]}"} --manifest-path "crates/${l}-capi/Cargo.toml" \
          --target-dir target >>"${g5_build_log}" 2>&1; then
       g5_unmeasurable="crates/${l}-capi failed to build at HEAD -- see ${g5_build_log} (G5 measures what it builds; it will not fall back to whatever is on disk)"
       break
@@ -1196,7 +1200,9 @@ if [[ "${DIFFERENTIAL_MODE}" -eq 1 ]]; then
     # path does not exist" (4). Both of the latter still write a VALID junitxml
     # with tests="0", so the XML cannot tell them apart. Discarding this with
     # `|| true` is what let a nonexistent PY_TEST_PATHS report a clean pass.
-    if "${venv}/bin/python" -m pytest "${g13_tests}" --tb=no -q -p no:cacheprovider \
+    local static_comparison=""
+    [[ "${venv}" == "${g13_static}" ]] && static_comparison=1
+    if EDGEFIRST_TENSOR_STATIC_COMPARISON="${static_comparison}" "${venv}/bin/python" -m pytest "${g13_tests}" --tb=no -q -p no:cacheprovider \
       --junitxml="${outfile}.xml" >"${outfile}.raw" 2>&1; then echo 0 >"${outfile}.rc"; else echo "$?" >"${outfile}.rc"; fi
     "${venv}/bin/python" - "${outfile}.xml" >"${outfile}" <<'G13_PARSE' || true
 import sys, xml.etree.ElementTree as ET

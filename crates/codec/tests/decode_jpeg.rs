@@ -823,6 +823,12 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
     }
 }
 
+/// Allocation policy: a failure the D3D11 probe did not predict fails the test.
+#[cfg(windows)]
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+
 /// Profiler decode pools are max-sized Grey surfaces; each JPEG
 /// `configure_image`s a shorter window. On Windows that window is a D3D11
 /// texture sub-region. Covers both real allocations this crate must support:
@@ -842,12 +848,14 @@ fn decode_into_oversized_d3d11_pool_with(access: edgefirst_tensor::CpuAccess) {
         Some(TensorMemory::DmaBuf),
         access,
     );
-    let mut tensor = match allocated {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("skipping: D3D11/DmaBuf image alloc failed: {e}");
-            return;
-        }
+    let expect = if edgefirst_tensor::is_gpu_buffer_available() {
+        outcome::Expect::Succeeds
+    } else {
+        outcome::Expect::MayFail("no D3D11 device on this host")
+    };
+    let Some(mut tensor) = outcome::allocated(allocated, "D3D11 decode pool allocation", expect)
+    else {
+        return;
     };
     let mut decoder = ImageDecoder::new();
     let info = tensor

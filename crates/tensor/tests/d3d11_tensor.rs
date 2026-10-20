@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `Tensor::image(.., TensorMemory::DmaBuf, ..)` on Windows: the public
 //! surface wired onto the D3D11 texture storage.
-#![cfg(all(target_os = "windows", feature = "static"))]
+#![cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 
 use edgefirst_tensor::blob::TransportMode;
 use edgefirst_tensor::{
@@ -45,7 +45,7 @@ fn warp_has_no_cuda_device(what: &str) -> bool {
 /// that `pub(crate)` helper, so it carries a local copy.
 fn report_skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+    let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {reason}");
 }
 
 #[test]

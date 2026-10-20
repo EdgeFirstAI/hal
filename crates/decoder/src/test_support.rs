@@ -29,5 +29,5 @@
 #[cfg(all(test, target_arch = "aarch64"))]
 pub(crate) fn report_skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {reason}");
+    let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {reason}");
 }

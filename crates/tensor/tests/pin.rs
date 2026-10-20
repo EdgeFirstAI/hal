@@ -9,11 +9,17 @@ use edgefirst_tensor::Region;
 #[cfg(unix)]
 use edgefirst_tensor::TensorMapTrait;
 
+/// Allocation policy: a failure the platform probe did not predict fails the test.
+#[cfg(target_os = "android")]
+#[path = "support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+
 /// Skip marker that survives libtest's output capture. See `skip` below.
 #[cfg(unix)]
 fn skip_unix(why: &str) {
     use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
+    let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {why}");
 }
 
 #[test]
@@ -431,18 +437,23 @@ fn ahardwarebuffer_reports_why_it_cannot_pin() {
     // FORMAT_BLOB (AHardwareBuffer_allocate rc=0x80000000 for 1024x1), while
     // image formats allocate fine. Skip if even that is unavailable, so a
     // device without a usable gralloc reports a skip rather than a failure.
-    let t = match Tensor::<u8>::image(
-        64,
-        64,
-        PixelFormat::Rgba,
-        Some(TensorMemory::DmaBuf),
-        CpuAccess::ReadWrite,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            skip_unix(&format!("AHardwareBuffer allocation unavailable: {e}"));
-            return;
-        }
+    let expect = if edgefirst_tensor::is_ahardwarebuffer_available() {
+        outcome::Expect::Succeeds
+    } else {
+        outcome::Expect::MayFail("the AHardwareBuffer probe failed on this device")
+    };
+    let Some(t) = outcome::allocated(
+        Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        ),
+        "AHardwareBuffer allocation",
+        expect,
+    ) else {
+        return;
     };
 
     match t.pin_host(CpuAccess::ReadWrite) {

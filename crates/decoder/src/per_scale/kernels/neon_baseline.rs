@@ -2314,7 +2314,10 @@ mod tests {
     #[test]
     fn dequant_i8_to_f16_neon_matches_scalar() {
         if !std::arch::is_aarch64_feature_detected!("fp16") {
-            return; // FP16 instructions not available (e.g. Cortex-A53).
+            crate::test_support::report_skip(
+                "dequant_i8_to_f16_neon_matches_scalar - no FP16 instructions (e.g. Cortex-A53)",
+            );
+            return;
         }
         let q = Quantization::new(0.1, -10);
         let input: Vec<i8> = (-20..20).collect();
@@ -2339,7 +2342,10 @@ mod tests {
     #[test]
     fn dequant_u8_to_f16_neon_matches_scalar() {
         if !std::arch::is_aarch64_feature_detected!("fp16") {
-            return; // FP16 instructions not available (e.g. Cortex-A53).
+            crate::test_support::report_skip(
+                "dequant_u8_to_f16_neon_matches_scalar - no FP16 instructions (e.g. Cortex-A53)",
+            );
+            return;
         }
         let q = Quantization::new(0.5, 0);
         let input: Vec<u8> = (0..48).collect();

@@ -33,13 +33,22 @@ use std::path::{Path, PathBuf};
 /// `tests/check_abi.rs` (an integration test cannot see the library
 /// crate's `#[cfg(test)]` items -- its header says so), and the
 /// `codec`/`decoder`/`tracker` leaves, which do not `#[path]`-include this
-/// module at all. The `SKIP:` lines left in `tests/c/*.c` are not an
-/// exception to that: a C leaf test's output is captured into the
-/// `std::process::Output` its Rust caller inspects and prints only on
-/// failure, so those lines never reach a board log in the first place.
+/// module at all. A C leaf test's `SKIP:` lines are captured into its
+/// `std::process::Output`; the Rust caller forwards them with [`relay_skips`].
 pub fn skip(reason: &str) {
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "SKIPPED: {reason}");
+    let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {reason}");
+}
+
+/// Forwards each `SKIP: ...` line a C test program printed as a [`skip`] warning.
+pub fn relay_skips(test: &str, out: &std::process::Output) {
+    for stream in [&out.stdout, &out.stderr] {
+        for line in String::from_utf8_lossy(stream).lines() {
+            if let Some(why) = line.trim().strip_prefix("SKIP:") {
+                skip(&format!("{test} - {}", why.trim()));
+            }
+        }
+    }
 }
 
 /// Directories that may hold this leaf's built C libraries, in the order

@@ -20,9 +20,7 @@
 ))]
 
 use edgefirst_image::{GLProcessorThreaded, ImageProcessorTrait};
-use edgefirst_tensor::{
-    CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMapTrait, TensorMemory,
-};
+use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMapTrait};
 
 const W: usize = 50;
 const H: usize = 64;
@@ -31,26 +29,16 @@ const Y0: usize = 8;
 const SIDE: usize = 16;
 const BLANK: u8 = 0x55;
 
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
-}
-
-/// Whether a missing or downgraded zero-copy buffer is a failure rather than
-/// a skip. On macOS and Windows the buffer needs no device node, so it is
-/// required wherever GL is. On Linux it is a DMA-BUF and needs a heap, which
-/// not every GPU board has (Jetson has none): there it is required under
-/// `HAL_TEST_REQUIRE_DMA=1`, or under `HAL_TEST_REQUIRE_GL=1` on a host that
-/// has a heap.
-fn require_zero_copy_buffer() -> bool {
-    let set = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
-    if cfg!(target_os = "linux") {
-        set("HAL_TEST_REQUIRE_DMA")
-            || (set("HAL_TEST_REQUIRE_GL") && std::path::Path::new("/dev/dma_heap").exists())
-    } else {
-        set("HAL_TEST_REQUIRE_GL")
-    }
-}
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+#[path = "support/zero_copy.rs"]
+#[allow(dead_code)]
+mod zero_copy;
+use outcome::report_skip as skip;
 
 #[test]
 fn overlay_into_a_reconstructed_destination_view_is_refused_not_drawn_at_the_origin() {
@@ -74,32 +62,8 @@ fn overlay_into_a_reconstructed_destination_view_is_refused_not_drawn_at_the_ori
         }
     };
 
-    let canvas = match TensorDyn::image(
-        W,
-        H,
-        PixelFormat::Rgba,
-        DType::U8,
-        Some(TensorMemory::DmaBuf),
-        CpuAccess::ReadWrite,
-    ) {
-        Ok(t) if t.memory() == TensorMemory::DmaBuf => t,
-        Ok(t) => {
-            assert!(
-                !require_zero_copy_buffer(),
-                "a zero-copy buffer is required here but the zero-copy request fell back to {:?}",
-                t.memory()
-            );
-            skip(&format!("zero-copy request fell back to {:?}", t.memory()));
-            return;
-        }
-        Err(e) => {
-            assert!(
-                !require_zero_copy_buffer(),
-                "a zero-copy buffer is required here but no zero-copy buffer could be allocated: {e}"
-            );
-            skip(&format!("no zero-copy buffer here: {e}"));
-            return;
-        }
+    let Some(canvas) = zero_copy::image(W, H, PixelFormat::Rgba, DType::U8) else {
+        return;
     };
     {
         let mut m = canvas.map_bytes(CpuAccess::Write).expect("map canvas");

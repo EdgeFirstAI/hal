@@ -98,7 +98,7 @@ selected by per-item `cfg` gates:
 | Tier | Gate | Contents |
 |------|------|----------|
 | Portable | none | mask/segmentation/box render, proto suite, src_rect crops, decision tables, F16 zero-copy roundtrip |
-| Zero-copy | `feature = "dma_test_formats"` | `@Dma` fixtures that allocate on all three platforms (RGBA/BGRA/GREY/NV*/YUYV — DMA-BUF on Linux, IOSurface on macOS, D3D11 textures on Windows): pool/recycle/steady-state, NV12/YUYV references, subview no-aliasing, NV16/NV24 Path-B oracles, odd-geometry `g01–g06`/grey/64×64 GPU-vs-CPU oracles. Runs wherever `is_gpu_buffer_available()` is true, Windows included: every format the tier uses has a D3D11 texture layout |
+| Zero-copy | `cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))` + run-time DMA probe (`HAL_TEST_REQUIRE_DMA=1` fails instead of skipping) | `@Dma` fixtures that allocate on all three platforms (RGBA/BGRA/GREY/NV*/YUYV — DMA-BUF on Linux, IOSurface on macOS, D3D11 textures on Windows): pool/recycle/steady-state, NV12/YUYV references, subview no-aliasing, NV16/NV24 Path-B oracles, odd-geometry `g01–g06`/grey/64×64 GPU-vs-CPU oracles. Runs wherever `is_gpu_buffer_available()` is true, Windows included: every format the tier uses has a D3D11 texture layout |
 | PBO destinations | `cfg(any(target_os = "linux", target_os = "windows"))` | PBO u8/i8/float destinations, cross-handle PBO map exclusion, `float_pbo_eligible` |
 | Linux-only | `cfg(target_os = "linux")` (± the feature) | display probing, CUDA destinations, packed-RGB `@Dma` incl. the int8 odd-geometry oracles (no IOSurface FourCC for 3-byte RGB), DMA stride guards, multi-plane fd imports, Neutron scenarios, NV path-selection asserts and divergence probes |
 
@@ -146,9 +146,8 @@ for the cell catalog and device matrix. The portable tiers above still
 cover the engine code Android shares with Linux/macOS. **Acceptance bar for newly ported tests:** green under
 `EDGEFIRST_GL_SERIALIZE=full` — GitHub's macOS runners expose a
 paravirtualized Metal GPU that takes the Full serialization policy.
-`scripts/test-macos.sh` enables `dma_test_formats` so the macOS lane runs
-the first two tiers; the feature set must stay identical across its
-coverage passes (see the script comment).
+The macOS lane runs the first two tiers; `scripts/test-macos.sh`'s feature
+set must stay identical across its coverage passes (see the script comment).
 
 The Neutron-scenario tests gate on `/dev/neutron0` as a platform
 discriminator for i.MX 95 with Mali GPU. This device node indicates that
@@ -157,13 +156,13 @@ large-offset DMA-BUF EGLImage imports are supported — these fail with
 
 G2D tests live in
 [`crates/image/src/g2d.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/g2d.rs)
-behind the `g2d_test_formats` Cargo feature and use their own DMA / G2D
-availability checks (probing `/dev/galcore` and the DMA-heap nodes). They
-are run by CI on the i.MX 8M Plus hardware runner. To exercise them
-locally on i.MX hardware:
+and always build on Linux. They check DMA and G2D availability at run time
+and skip without them; `HAL_TEST_REQUIRE_G2D=1` (armed on boards that ship
+`libg2d.so.2`) turns a G2D skip into a failure. To exercise them locally on
+i.MX hardware:
 
 ```bash
-cargo test -p edgefirst-image --features g2d_test_formats -- --test-threads=1
+HAL_TEST_REQUIRE_DMA=1 HAL_TEST_REQUIRE_G2D=1 cargo test -p edgefirst-image g2d -- --test-threads=1
 ```
 
 ### Device-node gates

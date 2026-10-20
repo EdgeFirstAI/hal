@@ -80,11 +80,11 @@ impl<'a> HostPin<'a> {
     /// clamped, so this cannot widen a window beyond what was mapped.
     ///
     /// `static`-only: the sole caller, `Tensor::pin_host` (`impl<T>
-    /// Tensor<T>` in `lib.rs`), is itself `#[cfg(feature = "static")]`.
+    /// Tensor<T>` in `lib.rs`), is itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
     /// `dynamic`'s own `pin_host` (`dynamic_backend.rs`/`dynamic_tensor.rs`)
     /// does not call this -- it hands back whatever extent `ef_tensor_map`
     /// reports directly, unnarrowed.
-    #[cfg(feature = "static")]
+    #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn narrowed(mut self, len: usize) -> Self {
         self.len = self.len.min(len);
         self
@@ -172,7 +172,7 @@ impl<'a> HostPin<'a> {
 /// (DMA-BUF and SHM) are storage, and only the `static` backend has
 /// storage. Under `dynamic` the mapping is owned on the far side of the
 /// ABI and reached through `ef_tensor_map`, so nothing here constructs one.
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 pub(crate) struct MmapOwner {
     ptr: std::ptr::NonNull<std::ffi::c_void>,
     len: usize,
@@ -181,12 +181,12 @@ pub(crate) struct MmapOwner {
 // SAFETY: the mapping is valid for `len` bytes until Drop, and MAP_SHARED
 // mappings are shareable across threads. Coherency is the caller's obligation
 // via sync_for_cpu / sync_for_device, exactly as for any map guard.
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 unsafe impl Send for MmapOwner {}
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 unsafe impl Sync for MmapOwner {}
 
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 impl MmapOwner {
     pub(crate) fn new(ptr: std::ptr::NonNull<std::ffi::c_void>, len: usize) -> Self {
         MmapOwner { ptr, len }
@@ -208,11 +208,11 @@ impl MmapOwner {
 /// next access faults. Mappings are established under the shared side and
 /// such driver calls run under the exclusive side, which keeps this crate's
 /// own mappings out of that window.
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 static CPU_MAPPING_GUARD: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// Shared side of [`CPU_MAPPING_GUARD`], held across each `mmap`.
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 pub(crate) fn cpu_mapping_shared() -> std::sync::RwLockReadGuard<'static, ()> {
     CPU_MAPPING_GUARD.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -222,7 +222,7 @@ pub(crate) fn cpu_mapping_shared() -> std::sync::RwLockReadGuard<'static, ()> {
 /// For a GPU-driver call that may unmap a range twice (Adreno
 /// `eglDestroyImage`). `f` must not map a tensor, or it deadlocks.
 #[doc(hidden)]
-#[cfg(feature = "static")]
+#[cfg(not(edgefirst_tensor_dynamic))]
 pub fn with_cpu_mappings_excluded<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(unix)]
     let _guard = CPU_MAPPING_GUARD.write().unwrap_or_else(|e| e.into_inner());
@@ -232,7 +232,7 @@ pub fn with_cpu_mappings_excluded<R>(f: impl FnOnce() -> R) -> R {
 /// The `dynamic` backend's [`with_cpu_mappings_excluded`]: excludes the
 /// library's mappings, which are the only ones this build creates.
 #[doc(hidden)]
-#[cfg(feature = "dynamic")]
+#[cfg(edgefirst_tensor_dynamic)]
 pub fn with_cpu_mappings_excluded<F: FnOnce() -> R, R>(f: F) -> R {
     struct Call<F, R> {
         f: Option<F>,
@@ -268,7 +268,7 @@ pub fn with_cpu_mappings_excluded<F: FnOnce() -> R, R>(f: F) -> R {
     }
 }
 
-#[cfg(all(unix, feature = "static"))]
+#[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 impl Drop for MmapOwner {
     // munmap has no in-process observer that is not racy: probing the range
     // afterwards can see another thread's new mapping at the same address.

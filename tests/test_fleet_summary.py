@@ -53,7 +53,7 @@ def _test_result(root, entry, result="PASS", runner="imx8mpevk-04", passed=2007)
                 "bundle": {
                     "commit": "60208bd0",
                     "glibc": "2.35",
-                    "features": "edgefirst-image/dma_test_formats",
+                    "features": "edgefirst-image/opengl",
                 },
             }
         )
@@ -82,7 +82,7 @@ def test_tests_all_pass_names_each_runner(tmp_path, capsys):
     assert "`imx8mpevk-06`" in out
     assert "`iq9075-evk`" in out
     assert "| 2007 |" in out
-    assert "features `edgefirst-image/dma_test_formats`" in out
+    assert "features `edgefirst-image/opengl`" in out
 
 
 def test_tests_failed_board_fails_the_run(tmp_path, capsys):

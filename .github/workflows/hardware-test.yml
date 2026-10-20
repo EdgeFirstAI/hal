@@ -42,7 +42,7 @@ on:
       features:
         description: Cargo features for the test build (`<pkg>/<feature>`, space-separated)
         type: string
-        default: edgefirst-image/dma_test_formats edgefirst-image/g2d_test_formats
+        default: ""
       filter:
         description: Test-name filter passed to every binary (empty runs everything)
         type: string
@@ -207,7 +207,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          sparse-checkout: .github/scripts/fleet_summary.py
+          sparse-checkout: |
+            .github/scripts/fleet_summary.py
+            .github/scripts/test_warnings.py
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
@@ -233,4 +235,5 @@ jobs:
           fi
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
           cat summary.md
+          python3 .github/scripts/test_warnings.py results
           exit "${status}"

@@ -48,19 +48,13 @@ jobs:
     with:
       lanes: all
       nightly: true
-      # The feature powerset is not meaningful for this workspace. Its whole
-      # premise is removing default features, and `static` -- which selects
-      # edgefirst-tensor's backend -- is a default feature of every consumer.
-      # 16 of 23 members depend on that crate and it rejects a missing
-      # backend with a deliberate compile_error!, so the powerset spends its
-      # 264 runs building configurations the design declares invalid.
-      #
-      # --exclude-no-default-features skips only the bare
-      # --no-default-features run, 1 of those 264; every subset run still
-      # drops `static`. Empty disables the lane, which is honest rather than
-      # a filter list that has to grow with the workspace. Revisit if
-      # backend selection ever stops being feature-gated.
-      hack-args: ""
+      # The PyO3 crates need a target interpreter; opencv/turbojpeg need system libraries; egl's EGL-version features do not compose.
+      hack-args: >-
+        --workspace --feature-powerset --depth 2
+        --exclude-features opencv,turbojpeg --exclude edgefirst-egl
+        --exclude edgefirst-python-tensor --exclude edgefirst-python-codec
+        --exclude edgefirst-python-image --exclude edgefirst-python-decoder
+        --exclude edgefirst-python-tracker --exclude edgefirst-python-common
       # One job per board identity, each run on that specific board: the NXP
       # EVKs carry the vendor BSP (G2D, galcore on the 8M Plus) the hardware
       # tests are written against, where a bare family label could land on a
@@ -108,7 +102,6 @@ jobs:
         pin
         protocol
         protocol_roundtrip
-        dynamic_primitives
         identity
         vocabulary
       # A floor, not a target. Guards against a selection that matches nothing
@@ -120,7 +113,7 @@ jobs:
       # what kept the on-target payload shippable before the migration; the
       # dev profile's full debug info fills the disk.
       archive-profile: profiling
-      archive-args: --locked --package edgefirst-image --features opengl,g2d_test_formats,dma_test_formats --package edgefirst-tensor
+      archive-args: --locked --package edgefirst-image --features opengl --package edgefirst-tensor
     secrets: inherit
 
   nightly-hal:

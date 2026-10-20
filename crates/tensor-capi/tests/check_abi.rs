@@ -59,7 +59,7 @@ fn artifact_is_fresh(artifact: &std::path::Path) -> bool {
     // header gives -- an integration test cannot see the library crate's
     // `#[cfg(test)]` items.
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "SKIPPED: {msg}");
+    let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {msg}");
     false
 }
 

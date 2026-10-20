@@ -1,0 +1,8 @@
+# Selects edgefirst-tensor's dynamic backend for builds that produce a shared-library
+# leaf (the image/codec/decoder C libraries and the tensor-linked Python wheels).
+# Load explicitly: `cargo --config .cargo/tensor-dynamic.toml ...`. Never use RUSTFLAGS
+# instead: it replaces the per-target rustflags in config.toml. See ARCHITECTURE.md
+# § Tensor Backend Selection.
+[target.'cfg(all())']
+rustflags = ["--cfg", "edgefirst_tensor_dynamic"]
+

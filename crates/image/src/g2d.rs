@@ -671,14 +671,14 @@ mod g2d_predicate_tests {
     }
 }
 
-#[cfg(feature = "g2d_test_formats")]
 #[cfg(test)]
 #[allow(deprecated)]
 mod g2d_tests {
     use super::*;
+    use crate::test_support::is_dma_available;
     use crate::{CPUProcessor, G2DProcessor, ImageProcessorTrait};
     use edgefirst_tensor::{
-        is_dma_available, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+        DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
     use image::buffer::ConvertBuffer;
 
@@ -690,12 +690,32 @@ mod g2d_tests {
     /// non-G2D hardware instead of skipping.
     #[cfg(target_os = "linux")]
     fn is_g2d_available() -> bool {
-        G2DProcessor::new().is_ok()
+        crate::test_support::g2d_required_or(G2DProcessor::new().is_ok())
+    }
+
+    /// Whether this host has a usable DMA heap and G2D; reports a skip when it has not.
+    #[cfg(target_os = "linux")]
+    fn dma_and_g2d_or_skip() -> bool {
+        let why = if !is_dma_available() {
+            "DMA not available"
+        } else if !is_g2d_available() {
+            "G2D not available"
+        } else {
+            return true;
+        };
+        crate::test_support::report_skip(&format!(
+            "{}: {why}",
+            crate::test_support::current_test()
+        ));
+        false
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_no_resize() {
+        if !dma_and_g2d_or_skip() {
+            return;
+        }
         for i in [
             PixelFormat::Rgba,
             PixelFormat::Yuyv,
@@ -711,9 +731,10 @@ mod g2d_tests {
             ] {
                 let res = test_g2d_format_no_resize_(i, o);
                 if let Err(e) = res {
-                    println!("{i} to {o} failed: {e:?}");
-                } else {
-                    println!("{i} to {o} success");
+                    crate::test_support::report_skip(&format!(
+                        "{}: {i} to {o} failed: {e:?}",
+                        crate::test_support::current_test()
+                    ));
                 }
             }
         }
@@ -792,6 +813,9 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_with_resize() {
+        if !dma_and_g2d_or_skip() {
+            return;
+        }
         for i in [
             PixelFormat::Rgba,
             PixelFormat::Yuyv,
@@ -807,9 +831,10 @@ mod g2d_tests {
             ] {
                 let res = test_g2d_format_with_resize_(i, o);
                 if let Err(e) = res {
-                    println!("{i} to {o} failed: {e:?}");
-                } else {
-                    println!("{i} to {o} success");
+                    crate::test_support::report_skip(&format!(
+                        "{}: {i} to {o} failed: {e:?}",
+                        crate::test_support::current_test()
+                    ));
                 }
             }
         }
@@ -818,6 +843,9 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_with_resize_dst_crop() {
+        if !dma_and_g2d_or_skip() {
+            return;
+        }
         for i in [
             PixelFormat::Rgba,
             PixelFormat::Yuyv,
@@ -833,9 +861,10 @@ mod g2d_tests {
             ] {
                 let res = test_g2d_format_with_resize_dst_crop(i, o);
                 if let Err(e) = res {
-                    println!("{i} to {o} failed: {e:?}");
-                } else {
-                    println!("{i} to {o} success");
+                    crate::test_support::report_skip(&format!(
+                        "{}: {i} to {o} failed: {e:?}",
+                        crate::test_support::current_test()
+                    ));
                 }
             }
         }
@@ -1128,7 +1157,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgba_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return Ok(());
         }
         // Load PixelFormat::Nv12 source
@@ -1192,7 +1221,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgb_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return Ok(());
         }
         // Load PixelFormat::Nv12 source
@@ -1256,7 +1285,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgba_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return Ok(());
         }
         // Load PixelFormat::Yuyv source
@@ -1320,7 +1349,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgb_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return Ok(());
         }
         // Load PixelFormat::Yuyv source
@@ -1573,7 +1602,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_single_plane_no_offset() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         let s = surface_for(640, 480, PixelFormat::Rgba, None, None).unwrap();
@@ -1584,7 +1613,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_single_plane_with_offset() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         use edgefirst_tensor::TensorMemory;
@@ -1604,7 +1633,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_single_plane_zero_offset() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         use edgefirst_tensor::TensorMemory;
@@ -1625,7 +1654,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_stride_rgba() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         // Default stride: width in pixels = 640
@@ -1639,7 +1668,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_stride_rgb() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         let s_default = surface_for(640, 480, PixelFormat::Rgb, None, None).unwrap();
@@ -1652,13 +1681,18 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_stride_grey() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         // Grey (Y800) may not be supported by all G2D hardware versions
         let s = match surface_for(640, 480, PixelFormat::Grey, None, Some(1024)) {
             Ok(s) => s,
-            Err(crate::Error::G2D(..)) => return,
+            Err(e @ crate::Error::G2D(..)) => {
+                crate::test_support::report_skip(&format!(
+                    "g2d_surface_stride_grey: this G2D does not support Y800: {e:?}"
+                ));
+                return;
+            }
             Err(e) => panic!("unexpected error: {e:?}"),
         };
         // Grey: 1 channel. stride in bytes = stride in pixels
@@ -1667,7 +1701,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_contiguous_nv12_offset() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         use edgefirst_tensor::TensorMemory;
@@ -1694,7 +1728,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_contiguous_nv12_stride() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         // NV12: 1 byte per pixel for Y. stride 640 bytes = 640 pixels.
@@ -1708,7 +1742,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_multiplane_nv12_offset() {
-        if !is_dma_available() || !is_g2d_available() {
+        if !dma_and_g2d_or_skip() {
             return;
         }
         use edgefirst_tensor::TensorMemory;
@@ -1917,6 +1951,7 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
+                crate::test_support::g2d_required_or(false);
                 crate::test_support::report_skip(&format!(
                     "d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}"
                 ));
@@ -2031,6 +2066,7 @@ mod g2d_tests {
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
+                crate::test_support::g2d_required_or(false);
                 crate::test_support::report_skip(&format!(
                     "d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}"
                 ));
@@ -2077,22 +2113,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn g2d_int8_dst_biases_only_the_pixel_bytes_at_the_declared_stride() {
-        // Direct stderr, not eprintln!: libtest replays captured output only
-        // for failing tests, so a skip printed through the capture is
-        // indistinguishable from a run that did the work (TESTING.md).
-        let skip = |why: &str| {
-            use std::io::Write;
-            let _ = writeln!(
-                &mut std::io::stderr(),
-                "SKIPPED: g2d_int8_dst_biases_only_the_pixel_bytes_at_the_declared_stride - {why}"
-            );
-        };
-        if !is_dma_available() {
-            skip("DMA not available");
-            return;
-        }
-        if !is_g2d_available() {
-            skip("G2D not available");
+        if !dma_and_g2d_or_skip() {
             return;
         }
         const W: usize = 64;

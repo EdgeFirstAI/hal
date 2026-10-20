@@ -107,23 +107,31 @@ where
     }
 }
 
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(&mut std::io::stderr(), "SKIPPED: {why}");
-}
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+#[path = "support/zero_copy.rs"]
+#[allow(dead_code)]
+mod zero_copy;
+use outcome::report_skip as skip;
 
-fn image(w: usize, h: usize, memory: TensorMemory) -> Option<TensorDyn> {
-    match TensorDyn::image(
+fn host_image(w: usize, h: usize) -> TensorDyn {
+    TensorDyn::image(
         w,
         h,
         PixelFormat::Rgba,
         DType::U8,
-        Some(memory),
+        Some(TensorMemory::Mem),
         CpuAccess::ReadWrite,
-    ) {
-        Ok(t) if t.memory() == memory => Some(t),
-        _ => None,
-    }
+    )
+    .expect("host-memory RGBA image")
+}
+
+fn zero_copy_rgba(w: usize, h: usize) -> Option<TensorDyn> {
+    zero_copy::image(w, h, PixelFormat::Rgba, DType::U8)
 }
 
 /// Values recorded for `field` on the `image.convert.gl` span.
@@ -160,12 +168,12 @@ fn the_convert_span_records_the_feed_fields() {
     // ── src_feed: asserted on every host ────────────────────────────────
     // A host-memory source and destination need no zero-copy anything, so
     // this half runs on a desktop whose EGL cannot import a DMA-BUF.
-    let src = image(W, H, TensorMemory::Mem).expect("host source");
+    let src = host_image(W, H);
     {
         let mut m = src.map_bytes(CpuAccess::Write).expect("map source");
         m.as_mut_slice().fill(0x5A);
     }
-    let mut dst = image(W, H, TensorMemory::Mem).expect("host destination");
+    let mut dst = host_image(W, H);
     gl.convert(&src, &mut dst, None)
         .expect("host-memory convert");
 
@@ -189,7 +197,7 @@ fn the_convert_span_records_the_feed_fields() {
     );
 
     // A zero-copy source, so the `import` arm is covered where a host has one.
-    if let Some(dma_src) = image(W, H, TensorMemory::DmaBuf) {
+    if let Some(dma_src) = zero_copy_rgba(W, H) {
         {
             let mut m = dma_src.map_bytes(CpuAccess::Write).expect("map dma source");
             m.as_mut_slice().fill(0x33);
@@ -226,7 +234,7 @@ fn the_convert_span_records_the_feed_fields() {
     // `mapped_texture` is then the correct answer. The value is checked
     // against the vocabulary on every host either way, which is what catches a
     // missing or misspelled record.
-    if let Some(mut zc) = image(W, H, TensorMemory::DmaBuf) {
+    if let Some(mut zc) = zero_copy_rgba(W, H) {
         let _ = gl.convert(&src, &mut zc, None);
     }
     let feeds = values_for(&records.lock().unwrap().clone(), "dst_feed");
@@ -250,66 +258,42 @@ fn the_convert_span_records_the_feed_fields() {
     let (dst_fmt, dst_dtype) = (PixelFormat::PlanarRgb, DType::F16);
     #[cfg(target_os = "windows")]
     let (dst_fmt, dst_dtype) = (PixelFormat::Rgba, DType::F32);
-    match TensorDyn::image(
-        W,
-        H,
-        dst_fmt,
-        dst_dtype,
-        Some(TensorMemory::DmaBuf),
-        CpuAccess::ReadWrite,
-    ) {
-        Ok(t) if t.memory() == TensorMemory::DmaBuf => {
-            let float_src = image(W, H, TensorMemory::Mem).expect("host float-route source");
-            {
-                let mut m = float_src
-                    .map_bytes(CpuAccess::Write)
-                    .expect("map float src");
-                m.as_mut_slice().fill(0x40);
-            }
-            let mut float_dst = t;
-            // Isolate this route from the u8 converts above: otherwise their
-            // feed records can satisfy the assertions even when the float
-            // dispatch never enters or records `image.convert.gl`.
-            records.lock().unwrap().clear();
-            match gl.convert(&float_src, &mut float_dst, None) {
-                Ok(()) => {
-                    let seen = records.lock().unwrap().clone();
-                    let src_feeds = values_for(&seen, "src_feed");
-                    let dst_feeds = values_for(&seen, "dst_feed");
-                    assert!(
-                        src_feeds
-                            .iter()
-                            .any(|v| matches!(v.as_str(), "import" | "pbo" | "upload")),
-                        "a float convert recorded no src_feed on image.convert.gl; records: {seen:?}"
-                    );
-                    assert!(
-                        dst_feeds
-                            .iter()
-                            .any(|v| matches!(v.as_str(), "zero_copy" | "pbo")),
-                        "a float convert recorded no dst_feed on image.convert.gl; records: {seen:?}"
-                    );
-                    eprintln!(
+    if let Some(mut float_dst) = zero_copy::image(W, H, dst_fmt, dst_dtype) {
+        let float_src = host_image(W, H);
+        {
+            let mut m = float_src
+                .map_bytes(CpuAccess::Write)
+                .expect("map float src");
+            m.as_mut_slice().fill(0x40);
+        }
+        // Isolated from the u8 converts above, whose feed records would otherwise satisfy these assertions.
+        records.lock().unwrap().clear();
+        match gl.convert(&float_src, &mut float_dst, None) {
+            Ok(()) => {
+                let seen = records.lock().unwrap().clone();
+                let src_feeds = values_for(&seen, "src_feed");
+                let dst_feeds = values_for(&seen, "dst_feed");
+                assert!(
+                    src_feeds
+                        .iter()
+                        .any(|v| matches!(v.as_str(), "import" | "pbo" | "upload")),
+                    "a float convert recorded no src_feed on image.convert.gl; records: {seen:?}"
+                );
+                assert!(
+                    dst_feeds
+                        .iter()
+                        .any(|v| matches!(v.as_str(), "zero_copy" | "pbo")),
+                    "a float convert recorded no dst_feed on image.convert.gl; records: {seen:?}"
+                );
+                eprintln!(
                         "CAPTURE float src_feed={src_feeds:?} dst_feed={dst_feeds:?} for {dst_fmt:?}/{dst_dtype:?}"
                     );
-                }
-                Err(e) => {
-                    skip(&format!(
-                        "GL float convert not routable on this host ({dst_fmt:?}/{dst_dtype:?}): {e}"
-                    ));
-                }
             }
-        }
-        Ok(t) => {
-            skip(&format!(
-                "float destination allocated as {:?}, not the zero-copy buffer the GL float \
-                 route serves",
-                t.memory()
-            ));
-        }
-        Err(e) => {
-            skip(&format!(
-                "no zero-copy {dst_fmt:?}/{dst_dtype:?} image: {e}"
-            ));
+            Err(e) => {
+                skip(&format!(
+                    "GL float convert not routable on this host ({dst_fmt:?}/{dst_dtype:?}): {e}"
+                ));
+            }
         }
     }
 
@@ -317,8 +301,7 @@ fn the_convert_span_records_the_feed_fields() {
     // The rebuilt-view shape `offset_source_view_alignment.rs` pins: it
     // carries the byte offset and no `view_origin`, so the import bases at
     // that offset, and Vivante refuses it when it is not 64-byte aligned.
-    let Some(canvas) = image(64, 64, TensorMemory::DmaBuf) else {
-        skip("no zero-copy RGBA image here, so no destination import to refuse");
+    let Some(canvas) = zero_copy_rgba(64, 64) else {
         return;
     };
     let pitch = canvas.effective_row_stride().unwrap_or(64 * BPP);
@@ -334,7 +317,7 @@ fn the_convert_span_records_the_feed_fields() {
     let mut tile = TensorDyn::import_descriptor(&fresh.descriptor_pinned(None))
         .expect("rebuild the destination view from its descriptor");
     tile.set_plane_offset(offset);
-    let tile_src = image(16, 16, TensorMemory::Mem).expect("tile source");
+    let tile_src = host_image(16, 16);
 
     let before = gl
         .convert_stats()

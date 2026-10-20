@@ -200,6 +200,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefirst-build-support"
+version = "0.35.0"
+
+[[package]]
 name = "edgefirst-decoder"
 version = "0.35.0"
 dependencies = [
@@ -228,6 +232,7 @@ name = "edgefirst-decoder-capi"
 version = "0.35.0"
 dependencies = [
  "cbindgen",
+ "edgefirst-build-support",
  "edgefirst-decoder",
  "edgefirst-decoder-abi",
  "edgefirst-tensor",

@@ -96,7 +96,7 @@ mod shaders_common;
 // Engine GL tests, in three tiers (see crates/image/TESTING.md):
 //   portable                       — run on Linux AND macOS/ANGLE
 //   cfg(target_os = "linux")       — display probing, PBO/CUDA paths
-//   cfg(all(linux, dma_test_formats)) — DMA-BUF import/pool specifics
+//   cfg(target_os = "linux") + DMA probe — DMA-BUF import/pool specifics
 // Per-item cfg gates inside the module select the tier; the mount
 // itself is unconditional so the macOS lane runs the portable tier.
 mod norm_tests;
@@ -130,10 +130,7 @@ pub(super) type Egl = edgefirst_egl::Instance<
 /// when the D3D11 device fence reaches the value the convert queued.
 /// Keeps the engine free of `cfg` branches (precedent: `BlobFd` in
 /// `crates/tensor/src/blob.rs`).
-#[cfg(unix)]
-pub type CompletionFence = std::os::fd::OwnedFd;
-#[cfg(windows)]
-pub type CompletionFence = std::os::windows::io::OwnedHandle;
+pub use crate::CompletionFence;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///

@@ -8,6 +8,15 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn _codec(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Which edgefirst-tensor backend this extension was built against; wheels are always "dynamic".
+    m.add(
+        "__tensor_backend__",
+        if cfg!(edgefirst_tensor_dynamic) {
+            "dynamic"
+        } else {
+            "static"
+        },
+    )?;
     edgefirst_python_common::init_module();
 
     // The decode target. Each extension carries its own copy of this class:
