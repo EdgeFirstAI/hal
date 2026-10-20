@@ -23,12 +23,12 @@
 #[cfg(not(edgefirst_tensor_dynamic))]
 mod static_backend;
 #[cfg(not(edgefirst_tensor_dynamic))]
-pub use static_backend::{Raw, TensorDyn};
+pub use static_backend::{BorrowedTensor, Raw, TensorDyn};
 
 #[cfg(edgefirst_tensor_dynamic)]
 mod dynamic_backend;
 #[cfg(edgefirst_tensor_dynamic)]
-pub use dynamic_backend::{Raw, TensorDyn};
+pub use dynamic_backend::{BorrowedTensor, Raw, TensorDyn};
 // `dynamic_tensor.rs` (a sibling module, not a child of `dynamic_backend`)
 // needs this to enrich its own `ef_tensor_from_planes` error with the C
 // side's advisory detail, the same way `dynamic_backend.rs`'s own

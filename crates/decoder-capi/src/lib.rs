@@ -20,6 +20,9 @@ pub mod infer;
 pub mod semantic;
 pub mod tiling;
 
+#[cfg(test)]
+mod test_alloc;
+
 /// ABI version of this library's C surface.
 ///
 /// 3: the `dtype` argument of `ef_infer_signals_add_input` and

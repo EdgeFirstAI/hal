@@ -4,7 +4,6 @@
 //! Semantic segmentation decode: a class map written into a caller tensor.
 
 use std::ffi::c_int;
-use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_decoder::schema::DecodeMode;
@@ -12,7 +11,7 @@ use edgefirst_decoder::semantic::SemanticOptions;
 use edgefirst_tensor::TensorDyn;
 use edgefirst_tensor_ffi::EfTensor;
 
-use crate::decode::EfDecoder;
+use crate::decode::{borrow_outputs, EfDecoder};
 
 /// Runtime options of a semantic decode. Build with
 /// [`ef_semantic_options_new`], free with [`ef_semantic_options_free`].
@@ -151,23 +150,15 @@ pub unsafe extern "C" fn ef_decoder_decode_semantic(
             return libc::ENOENT;
         }
         // SAFETY: the caller's contract.
-        let handles = unsafe { std::slice::from_raw_parts(outputs, count) };
-        if handles.iter().any(|h| h.is_null()) {
+        let Ok(borrowed) = (unsafe { borrow_outputs(outputs, count) }) else {
             return libc::EINVAL;
-        }
-        // Borrowed handles: `ManuallyDrop` keeps `TensorDyn`'s `Drop` from
-        // freeing tensors the caller still owns.
-        let borrowed: Vec<ManuallyDrop<TensorDyn>> = handles
-            .iter()
-            // SAFETY: each handle is a live `ef_tensor`; the caller's contract.
-            .map(|&h| ManuallyDrop::new(unsafe { TensorDyn::from_raw(h as *mut EfTensor) }))
-            .collect();
+        };
         let refs: Vec<&TensorDyn> = borrowed.iter().map(|t| &**t).collect();
         // SAFETY: live, distinct handles; the caller's contract.
-        let mut dst = ManuallyDrop::new(unsafe { TensorDyn::from_raw(dst) });
+        let mut dst = unsafe { TensorDyn::borrow_raw(dst) };
         let mut confidence = (!confidence.is_null())
             // SAFETY: as for `dst`.
-            .then(|| ManuallyDrop::new(unsafe { TensorDyn::from_raw(confidence) }));
+            .then(|| unsafe { TensorDyn::borrow_raw(confidence) });
         // SAFETY: the caller's contract.
         let options = unsafe { options.as_ref() }
             .map(|o| o.inner)
@@ -340,6 +331,33 @@ mod tests {
             );
             drop(TensorDyn::from_raw(t));
             drop(TensorDyn::from_raw(dst));
+            ef_decoder_free(d);
+        }
+    }
+
+    #[test]
+    fn repeated_semantic_decodes_do_not_grow_the_heap() {
+        unsafe {
+            let d = decoder(SCHEMA);
+            let scores = diagonal_scores().into_raw();
+            let outputs = [scores as *const EfTensor];
+            let dst = tensor(&[2, 6], DType::U8).into_raw();
+            let conf = tensor(&[2, 6], DType::U8).into_raw();
+            let n = 1000;
+            let grown = crate::test_alloc::growth_over(n, || {
+                assert_eq!(
+                    ef_decoder_decode_semantic(d, outputs.as_ptr(), 1, dst, conf, std::ptr::null()),
+                    0
+                );
+            });
+            assert!(grown < 1024, "heap grew {grown} bytes over {n} decodes");
+            let dst = TensorDyn::from_raw(dst);
+            assert!(
+                dst.pin_host(CpuAccess::Write).is_ok(),
+                "the caller's destination must stay writable"
+            );
+            drop(TensorDyn::from_raw(conf));
+            drop(TensorDyn::from_raw(scores));
             ef_decoder_free(d);
         }
     }

@@ -2059,14 +2059,64 @@ impl TensorDyn {
         *unsafe { Box::from_raw(p as *mut TensorDyn) }
     }
 
-    /// Borrow a `TensorDyn` from a raw handle for the duration of `f`.
-    /// `ManuallyDrop` prevents ownership — and the destructor — being taken.
+    /// Borrow a `TensorDyn` from a raw handle the caller keeps owning.
+    ///
+    /// The guard reaches the boxed tensor in place, so mutations land in the
+    /// caller's tensor and dropping the guard frees nothing.
     ///
     /// # Safety
-    /// `p` must be a live handle from `into_raw` in this build.
+    /// `p` must be a live handle from `into_raw` in this build that outlives
+    /// `'a`, not accessed through anything else while the guard is mutably
+    /// dereferenced, and the `TensorDyn` must not be moved out of the guard.
+    pub unsafe fn borrow_raw<'a>(p: Raw) -> BorrowedTensor<'a> {
+        BorrowedTensor {
+            tensor: unsafe { std::ptr::NonNull::new_unchecked(p as *mut TensorDyn) },
+            _handle: std::marker::PhantomData,
+        }
+    }
+
+    /// Borrow a `TensorDyn` from a raw handle for the duration of `f`.
+    ///
+    /// # Safety
+    /// Same as [`Self::borrow_raw`].
     pub unsafe fn with_raw<R>(p: Raw, f: impl FnOnce(&mut TensorDyn) -> R) -> R {
-        let mut t = std::mem::ManuallyDrop::new(unsafe { std::ptr::read(p as *mut TensorDyn) });
+        let mut t = unsafe { Self::borrow_raw(p) };
         f(&mut t)
+    }
+}
+
+/// A [`TensorDyn`] borrowed from a raw handle the caller keeps owning,
+/// returned by [`TensorDyn::borrow_raw`].
+///
+/// Dropping it releases nothing: the handle is the tensor itself.
+pub struct BorrowedTensor<'a> {
+    tensor: std::ptr::NonNull<TensorDyn>,
+    _handle: std::marker::PhantomData<&'a mut TensorDyn>,
+}
+
+// SAFETY: the guard is an exclusive-or-shared borrow of a `TensorDyn`, which
+// is itself `Send + Sync`, exactly as `&'a mut TensorDyn` would be.
+unsafe impl Send for BorrowedTensor<'_> {}
+unsafe impl Sync for BorrowedTensor<'_> {}
+
+impl std::ops::Deref for BorrowedTensor<'_> {
+    type Target = TensorDyn;
+    fn deref(&self) -> &TensorDyn {
+        // SAFETY: `borrow_raw`'s contract keeps the tensor live for `'a`.
+        unsafe { self.tensor.as_ref() }
+    }
+}
+
+impl std::ops::DerefMut for BorrowedTensor<'_> {
+    fn deref_mut(&mut self) -> &mut TensorDyn {
+        // SAFETY: as for `deref`; exclusivity is `borrow_raw`'s contract.
+        unsafe { self.tensor.as_mut() }
+    }
+}
+
+impl fmt::Debug for BorrowedTensor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
     }
 }
 

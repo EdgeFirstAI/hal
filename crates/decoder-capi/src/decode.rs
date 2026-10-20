@@ -11,7 +11,7 @@ use edgefirst_decoder::{
     Quantization, Segmentation,
 };
 pub use edgefirst_decoder_abi::{EfDetectBox, EfSegmentation};
-use edgefirst_tensor::{DetectBox, TensorDyn};
+use edgefirst_tensor::{BorrowedTensor, DetectBox, TensorDyn};
 use edgefirst_tensor_ffi::EfTensor;
 
 /// An owned list of detections.
@@ -583,23 +583,9 @@ pub unsafe extern "C" fn ef_decoder_decode(
             if d.is_null() || outputs.is_null() || out_boxes.is_null() || count == 0 {
                 return libc::EINVAL;
             }
-            let handles = std::slice::from_raw_parts(outputs, count);
-            // Every handle is a real `ef_tensor` from `libedgefirst_tensor.so`
-            // (there is only one implementation), so each is borrowed
-            // straight from its raw pointer -- no per-library dispatch, no
-            // re-import. `ManuallyDrop` suppresses `TensorDyn`'s own `Drop`
-            // (which would otherwise call `ef_tensor_free` on a handle the
-            // caller still owns), and the `Vec` holds every borrow alive for
-            // the duration of the decode call below.
-            let mut borrowed: Vec<std::mem::ManuallyDrop<TensorDyn>> = Vec::with_capacity(count);
-            for h in handles {
-                if h.is_null() {
-                    return libc::EINVAL;
-                }
-                borrowed.push(std::mem::ManuallyDrop::new(TensorDyn::from_raw(
-                    *h as *mut EfTensor,
-                )));
-            }
+            let Ok(borrowed) = borrow_outputs(outputs, count) else {
+                return libc::EINVAL;
+            };
             let refs: Vec<&TensorDyn> = borrowed.iter().map(|t| &**t).collect();
 
             let mut boxes: Vec<DetectBox> = Vec::new();
@@ -1098,9 +1084,10 @@ pub unsafe extern "C" fn ef_decoder_decode_proto(
             if d.is_null() || outputs.is_null() || out_boxes.is_null() || count == 0 {
                 return std::ptr::null_mut();
             }
-            let Ok((refs, _keep)) = borrow_outputs(outputs, count) else {
+            let Ok(borrowed) = borrow_outputs(outputs, count) else {
                 return std::ptr::null_mut();
             };
+            let refs: Vec<&TensorDyn> = borrowed.iter().map(|t| &**t).collect();
             let mut boxes: Vec<DetectBox> = Vec::new();
             let proto = match (*d).inner.decode_proto(&refs, &mut boxes) {
                 Ok(p) => p,
@@ -1189,30 +1176,24 @@ pub unsafe extern "C" fn ef_proto_data_take_mask_coefficients(
     }
 }
 
-fn borrow_outputs(
+/// Borrow `count` caller-owned output handles; `EINVAL` if any is `NULL`.
+///
+/// # Safety
+/// `outputs` must point to `count` handles, each `NULL` or live for `'a`.
+pub(crate) unsafe fn borrow_outputs<'a>(
     outputs: *const *const EfTensor,
     count: usize,
-) -> Result<
-    (
-        Vec<&'static TensorDyn>,
-        Vec<std::mem::ManuallyDrop<TensorDyn>>,
-    ),
-    c_int,
-> {
+) -> Result<Vec<BorrowedTensor<'a>>, c_int> {
+    // SAFETY: the caller's contract.
     let handles = unsafe { std::slice::from_raw_parts(outputs, count) };
-    let mut borrowed = Vec::with_capacity(count);
-    for h in handles {
-        if h.is_null() {
-            return Err(libc::EINVAL);
-        }
-        borrowed.push(std::mem::ManuallyDrop::new(unsafe {
-            TensorDyn::from_raw(*h as *mut EfTensor)
-        }));
+    if handles.iter().any(|h| h.is_null()) {
+        return Err(libc::EINVAL);
     }
-    let refs: Vec<&TensorDyn> = borrowed.iter().map(|t| &**t).collect();
-    // SAFETY: the Vec is returned alongside the refs and outlives them.
-    let refs: Vec<&'static TensorDyn> = unsafe { std::mem::transmute(refs) };
-    Ok((refs, borrowed))
+    Ok(handles
+        .iter()
+        // SAFETY: each handle is non-NULL and live; the caller's contract.
+        .map(|&h| unsafe { TensorDyn::borrow_raw(h as *mut EfTensor) })
+        .collect())
 }
 
 /// Dequantize an integer tensor into a pre-allocated f32 tensor.
@@ -1503,9 +1484,10 @@ pub unsafe extern "C" fn ef_decoder_decode_tracked(
             {
                 return libc::EINVAL;
             }
-            let Ok((refs, _keep)) = borrow_outputs(outputs, count) else {
+            let Ok(borrowed) = borrow_outputs(outputs, count) else {
                 return libc::EINVAL;
             };
+            let refs: Vec<&TensorDyn> = borrowed.iter().map(|t| &**t).collect();
             let mut boxes: Vec<DetectBox> = Vec::new();
             let mut masks: Vec<Segmentation> = Vec::new();
             let mut tracks: Vec<edgefirst_tracker::TrackInfo> = Vec::new();
@@ -1940,6 +1922,43 @@ mod tests {
                 ),
                 libc::EINVAL
             );
+        }
+    }
+
+    #[test]
+    fn repeated_decodes_do_not_grow_the_heap() {
+        use edgefirst_tensor::{DType, TensorMemory};
+        let cfg = serde_json::json!({
+            "outputs": [{
+                "decoder": "ultralytics",
+                "type": "detection",
+                "shape": [1, 84, 64],
+                "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 64]]
+            }]
+        });
+        let j = std::ffi::CString::new(cfg.to_string()).unwrap();
+        unsafe {
+            let p = ef_decoder_params_new();
+            assert_eq!(ef_decoder_params_set_config_json(p, j.as_ptr(), 0), 0);
+            let d = ef_decoder_new(p);
+            ef_decoder_params_free(p);
+            assert!(!d.is_null());
+            let t = TensorDyn::new(&[1, 84, 64], DType::F32, Some(TensorMemory::Mem), None)
+                .unwrap()
+                .into_raw();
+            let outputs = [t as *const EfTensor];
+            let n = 1000;
+            let grown = crate::test_alloc::growth_over(n, || {
+                let mut boxes: *mut EfDetectBoxList = std::ptr::null_mut();
+                assert_eq!(
+                    ef_decoder_decode(d, outputs.as_ptr(), 1, &mut boxes, std::ptr::null_mut()),
+                    0
+                );
+                ef_detect_box_list_free(boxes);
+            });
+            assert!(grown < 1024, "heap grew {grown} bytes over {n} decodes");
+            drop(TensorDyn::from_raw(t));
+            ef_decoder_free(d);
         }
     }
 
