@@ -414,27 +414,31 @@ impl SemanticConfig {
         }
     }
 
-    /// Element strides of `input`, with a padded row pitch applied to the
-    /// height axis and every axis outside it.
+    /// Element strides of `input`, following its row pitch when its rows
+    /// are padded.
     fn grid_for(&self, input: &TensorDyn) -> DecoderResult<Grid> {
         let mut grid = self.grid();
-        let Some(pitch) = input.row_stride() else {
+        let Some(strides) = crate::decoder::tensor_bridge::padded_strides(input)? else {
             return Ok(grid);
         };
-        let size = input.dtype().size();
-        let (h, w) = (self.layout.height, self.layout.width);
-        if w < h || pitch % size != 0 || pitch / size < grid.ys {
-            return Err(DecoderError::NotSupported(format!(
-                "semantic input row stride of {pitch} bytes does not pad its rows of {} {:?} elements",
-                grid.ys,
-                input.dtype()
-            )));
+        // Shapes match up to unit axes, whose strides are never used.
+        let stride = |axis: usize, packed: usize| {
+            squeezed_axis(&self.shape, axis)
+                .and_then(|k| {
+                    input
+                        .shape()
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &n)| n > 1)
+                        .nth(k)
+                })
+                .map_or(packed, |(i, _)| strides[i])
+        };
+        if let Some(axis) = self.layout.classes {
+            grid.cs = stride(axis, grid.cs);
         }
-        let (packed, pitch) = (grid.ys, pitch / size);
-        if self.layout.classes.is_some_and(|c| c < h) {
-            grid.cs = grid.cs / packed * pitch;
-        }
-        grid.ys = pitch;
+        grid.ys = stride(self.layout.height, grid.ys);
+        grid.xs = stride(self.layout.width, grid.xs);
         Ok(grid)
     }
 }

@@ -361,4 +361,100 @@ mod tests {
             ef_decoder_free(d);
         }
     }
+
+    #[test]
+    fn programmatic_semantic_output_decodes_like_json() {
+        use crate::codes::{EfDecoderType, EfDimName, EfOutputType};
+        use crate::decode::ef_decoder_params_add_output;
+        unsafe {
+            let p = ef_decoder_params_new();
+            let shape = [1usize, 3, 2, 3];
+            let dims = [
+                EfDimName::Batch as u32,
+                EfDimName::NumClasses as u32,
+                EfDimName::Height as u32,
+                EfDimName::Width as u32,
+            ];
+            assert_eq!(
+                ef_decoder_params_add_output(
+                    p,
+                    EfOutputType::Segmentation as u32,
+                    EfDecoderType::Semantic as u32,
+                    shape.as_ptr(),
+                    dims.as_ptr(),
+                    4,
+                ),
+                0
+            );
+            let d = ef_decoder_new(p);
+            ef_decoder_params_free(p);
+            assert!(!d.is_null());
+            let mut classes = 0usize;
+            assert_eq!(ef_decoder_semantic_classes(d, &mut classes), 0);
+            assert_eq!(classes, 3);
+
+            let scores = diagonal_scores().into_raw();
+            let outputs = [scores as *const EfTensor];
+            let o = ef_semantic_options_new();
+            assert_eq!(ef_semantic_options_set_mode(o, 1), 0);
+            let dst = tensor(&[2, 6], DType::U8).into_raw();
+            assert_eq!(
+                ef_decoder_decode_semantic(d, outputs.as_ptr(), 1, dst, std::ptr::null_mut(), o),
+                0
+            );
+            assert_eq!(
+                bytes(&TensorDyn::from_raw(dst), 12),
+                [0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2]
+            );
+            ef_semantic_options_free(o);
+            drop(TensorDyn::from_raw(scores));
+            ef_decoder_free(d);
+        }
+    }
+
+    #[test]
+    fn read_only_and_shared_inputs_decode() {
+        const CLASS_MAP: &str = r#"{
+          "schema_version": 2,
+          "outputs": [{
+            "name": "ids", "type": "masks", "decoder": "semantic",
+            "shape": [2, 3, 1], "dtype": "uint8"
+          }]
+        }"#;
+        unsafe {
+            let d = decoder(CLASS_MAP);
+            let dst = tensor(&[2, 3], DType::U8).into_raw();
+            for access in [CpuAccess::Read, CpuAccess::ReadWrite] {
+                let input = TensorDyn::image(
+                    3,
+                    2,
+                    edgefirst_tensor::PixelFormat::Grey,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    access,
+                )
+                .unwrap()
+                .into_raw();
+                let outputs = [input as *const EfTensor];
+                let decode = || {
+                    ef_decoder_decode_semantic(
+                        d,
+                        outputs.as_ptr(),
+                        1,
+                        dst,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    )
+                };
+                assert_eq!(decode(), 0, "{access:?}");
+                // A second reference makes the handle shared; reading must still work.
+                assert_eq!(edgefirst_tensor_ffi::ef_tensor_retain(input), 0);
+                assert_eq!(decode(), 0, "shared {access:?}");
+                drop(TensorDyn::from_raw(input));
+                drop(TensorDyn::from_raw(input));
+            }
+            drop(TensorDyn::from_raw(dst));
+            ef_decoder_free(d);
+        }
+    }
 }
