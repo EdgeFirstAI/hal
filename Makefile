@@ -54,7 +54,7 @@ endef
 # The C-API leaves that call into libedgefirst_tensor instead of embedding it.
 CAPI_DYNAMIC_CRATES := image-capi codec-capi decoder-capi
 # Expands, inside a `for c in $(CAPI_MODULAR_CRATES)` loop, to $(TENSOR_DYNAMIC) for a dynamic leaf.
-capi_cfg_sh = $$(case " $(CAPI_DYNAMIC_CRATES) " in *" $$c "*) echo "$(TENSOR_DYNAMIC)";; esac)
+capi_cfg_sh = $$(for d in $(CAPI_DYNAMIC_CRATES); do [ "$$d" = "$$c" ] && echo "$(TENSOR_DYNAMIC)"; done)
 # Every library a shared-library leaf compiles in, checked under both backends.
 BACKEND_CHECK_CRATES := edgefirst-tensor edgefirst-codec edgefirst-image \
 	edgefirst-decoder edgefirst-tracker edgefirst-python-common
