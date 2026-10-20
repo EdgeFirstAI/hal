@@ -1361,12 +1361,12 @@ the common workflows (`make test`, `make bench`, `make build`,
 
 Rust users always get the statically linked tensor implementation; there is
 nothing to select. The C libraries and the tensor-linked Python wheels share
-one `libedgefirst_tensor` instead, which their builds select with
-`--config .cargo/tensor-dynamic.toml` (see
+one `libedgefirst_tensor` instead, which each selects through a
+`.cargo/config.toml` in its crate directory (see
 [ARCHITECTURE.md § Tensor Backend Selection](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#tensor-backend-selection)).
 `make capi-libs` / `make package` build the C libraries and `make wheel` the
-wheels with it applied; building them by hand without it is a compile error
-that names the fix.
+wheels from those directories; a build from the repository root without
+`--config .cargo/tensor-dynamic.toml` is a compile error that names the fix.
 
 For Python wheels, see
 [`crates/python-tensor/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-tensor/README.md)

@@ -565,6 +565,25 @@ pub enum DecodeMode {
     Fast,
 }
 
+impl DecodeMode {
+    /// Numeric code shared by the C and Python bindings.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Accurate => 0,
+            Self::Fast => 1,
+        }
+    }
+
+    /// The mode with this [`code`](Self::code).
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Accurate),
+            1 => Some(Self::Fast),
+            _ => None,
+        }
+    }
+}
+
 /// Activation over mask-classification mask logits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

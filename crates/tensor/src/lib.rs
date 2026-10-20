@@ -201,7 +201,7 @@ use std::{
 // both backends present the same `edgefirst_tensor::Tensor` to callers.
 #[cfg(edgefirst_tensor_dynamic)]
 pub use tensor_dyn::Tensor;
-pub use tensor_dyn::{Raw, TensorDyn};
+pub use tensor_dyn::{BorrowedTensor, Raw, TensorDyn};
 pub use view::HostView;
 pub use vocabulary::vocabulary_demo;
 
@@ -3046,7 +3046,7 @@ where
         shape
             .iter()
             .copied()
-            .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
+            .try_fold(1usize, usize::checked_mul)
             .ok_or_else(|| {
                 Error::InvalidArgument(format!(
                     "from_foreign: shape.product() overflows usize (shape={shape:?})"

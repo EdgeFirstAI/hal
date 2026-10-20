@@ -794,6 +794,119 @@ fn bench_per_scale_ltrb_i8_to_f32(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
+/// SegFormer-B1-shaped logits (150 classes, 128x168, NCHW) over a Voronoi
+/// class field. Calibrated to SegFormer-B1 on ADE20K val: about 7% of
+/// low-resolution cells straddle a class boundary, where a few classes score
+/// close to the winner (near -2) and the rest sit far below.
+fn semantic_logits() -> Vec<f32> {
+    const C: usize = 150;
+    const H: usize = 128;
+    const W: usize = 168;
+    let mut seed = 0x2164u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
+    };
+    let sites: Vec<(f32, f32, usize)> = (0..24)
+        .map(|_| {
+            let y = (next() % H as u32) as f32;
+            let x = (next() % W as u32) as f32;
+            (y, x, next() as usize % C)
+        })
+        .collect();
+    let mut v = vec![0f32; C * H * W];
+    let mut dist = [0f32; 24];
+    for y in 0..H {
+        for x in 0..W {
+            for (d, s) in dist.iter_mut().zip(&sites) {
+                *d = ((s.0 - y as f32).powi(2) + (s.1 - x as f32).powi(2)).sqrt();
+            }
+            let nearest = dist.iter().copied().fold(f32::INFINITY, f32::min);
+            for c in 0..C {
+                let u = (next() % 1024) as f32 / 1024.0;
+                v[(c * H + y) * W + x] = u * 12.0 - 30.0;
+            }
+            // A site's class fades with its distance beyond the nearest site.
+            for (d, s) in dist.iter().zip(&sites) {
+                let i = (s.2 * H + y) * W + x;
+                v[i] = v[i].max(-2.0 - 1.5 * (d - nearest));
+            }
+        }
+    }
+    v
+}
+
+fn bench_semantic(suite: &mut BenchSuite) {
+    use edgefirst_decoder::schema::DecodeMode;
+    use edgefirst_decoder::semantic::{decode_semantic, SemanticConfig, SemanticOptions};
+    use edgefirst_tensor::DType;
+
+    let shape = [1, 150, 128, 168];
+    let logits = semantic_logits();
+    let f32_nchw = TensorDyn::F32(Tensor::<f32>::from_slice(&logits, &shape).unwrap());
+    // Logits span [-30, -1]: scale 0.125 with zero point 112 fits i8.
+    let q: Vec<i8> = logits
+        .iter()
+        .map(|&x| (x * 8.0 + 112.0).round().clamp(-128.0, 127.0) as i8)
+        .collect();
+    let mut i8_nchw = TensorDyn::I8(Tensor::<i8>::from_slice(&q, &shape).unwrap());
+    i8_nchw
+        .set_quantization(TQ::per_tensor(0.125, 112))
+        .unwrap();
+    let mut nhwc = vec![0u8; q.len()];
+    for c in 0..150 {
+        for p in 0..128 * 168 {
+            nhwc[p * 150 + c] = (q[c * 128 * 168 + p] as i16 + 128) as u8;
+        }
+    }
+    let mut u8_nhwc = TensorDyn::U8(Tensor::<u8>::from_slice(&nhwc, &[1, 128, 168, 150]).unwrap());
+    u8_nhwc
+        .set_quantization(TQ::per_tensor(0.125, 240))
+        .unwrap();
+
+    let nchw_config = SemanticConfig::scores(&shape, 1, 2, 3).unwrap();
+    let nhwc_config = SemanticConfig::scores(&[1, 128, 168, 150], 3, 1, 2).unwrap();
+    // A 683x512 ADE20K image letterboxed top-left into 512x672.
+    let letterbox = [0.0, 0.0, 1.0, 504.0 / 512.0];
+    let mut dst = TensorDyn::new(&[512, 683], DType::U8, Some(TensorMemory::Mem), None).unwrap();
+    let mut conf = TensorDyn::new(&[512, 683], DType::U8, Some(TensorMemory::Mem), None).unwrap();
+
+    let cases = [
+        ("f32_nchw", &f32_nchw, &nchw_config),
+        ("i8_nchw", &i8_nchw, &nchw_config),
+        ("u8_nhwc", &u8_nhwc, &nhwc_config),
+    ];
+    for (label, input, config) in cases {
+        for (mode_label, mode) in [
+            ("accurate", DecodeMode::Accurate),
+            ("fast", DecodeMode::Fast),
+        ] {
+            let options = SemanticOptions::new()
+                .with_mode(mode)
+                .with_letterbox(letterbox);
+            let name = format!("decoder/semantic/{label}/{mode_label}");
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                decode_semantic(input, config, &mut dst, None, &options).unwrap();
+            });
+            result.print_summary();
+            suite.record(&result);
+        }
+    }
+    let options = SemanticOptions::new().with_letterbox(letterbox);
+    let result = run_bench(
+        "decoder/semantic/f32_nchw/accurate_confidence",
+        WARMUP,
+        ITERATIONS,
+        || {
+            decode_semantic(&f32_nchw, &nchw_config, &mut dst, Some(&mut conf), &options).unwrap();
+        },
+    );
+    result.print_summary();
+    suite.record(&result);
+}
+
 fn main() {
     env_logger::init();
 
@@ -828,6 +941,9 @@ fn main() {
     println!("\n== Masks ==\n");
     bench_masks_f32(&mut suite);
     bench_masks_i8(&mut suite);
+
+    println!("\n== Semantic ==\n");
+    bench_semantic(&mut suite);
 
     println!("\n== Per-Scale ==\n");
     bench_per_scale_dfl_i8_to_f32(&mut suite);

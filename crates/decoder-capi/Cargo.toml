@@ -35,7 +35,7 @@ edgefirst-decoder = { version = "0.35.0", path = "../decoder", default-features 
     "tracker",
 ] }
 uuid = { version = "1.23.3", features = ["v4"] }
-# Built with `--cfg edgefirst_tensor_dynamic` (.cargo/tensor-dynamic.toml): calls into libedgefirst_tensor.
+# Built with `--cfg edgefirst_tensor_dynamic` (this crate's .cargo/config.toml): calls into libedgefirst_tensor.
 edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
 edgefirst-tensor-ffi = { path = "../tensor-ffi" }
@@ -48,6 +48,9 @@ libc = "0.2.186"
 log = "0.4.33"
 serde = "1.0"
 serde_json = "1.0"
+
+[dev-dependencies]
+rayon = "1.12.0"
 
 [build-dependencies]
 cbindgen = "0.29"

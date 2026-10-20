@@ -23,6 +23,7 @@ based on the output tensor layout.
 | [`yolo.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/yolo.rs) | local | YOLOv5/8/11 detection + segmentation kernels |
 | [`modelpack.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/modelpack.rs) | local | Au-Zone ModelPack format kernels |
 | [`per_scale/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/) | local | Per-scale split-tensor decoder framework (NEON-optimized hot path) |
+| [`semantic/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/semantic/) | local | Semantic segmentation: score map or class map to an `[H, W]` class map in a caller tensor, with letterbox crop, bilinear or nearest upsampling and optional confidence |
 | [`schema.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/schema.rs) | local | `SchemaV2` parser — model metadata document used by EdgeFirst Studio |
 | [`infer.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/infer.rs) | local | `infer_ultralytics_schema` — synthesizes a `SchemaV2` for vanilla Ultralytics YOLOv8/11/26 ONNX/TFLite/CoreML exports from raw `ModelSignals` (tensor shapes/dtypes + the model's own metadata), with no `edgefirst.json` required |
 | [`float.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/float.rs) / [`byte.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/byte.rs) | local | NMS implementations (float and byte-quantized); `float.rs` also holds the IoU/IoS metric helpers reused by tiled merge |
@@ -40,7 +41,8 @@ based on the output tensor layout.
 - [`SchemaV2`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.SchemaV2.html) — model metadata document (current schema version).
   - `InputSpec::preprocessing` ([`Preprocessing`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.Preprocessing.html)) declares the input normalization (a `validation.normalization` preset or per-channel mean/std on 0–255), the resize mode and the letterbox placement and pad. `Normalization::mean_std` resolves either form to per-channel coefficients; the image crate applies them.
   - `LogicalOutput::semantic` ([`SemanticParams`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/schema/struct.SemanticParams.html)) carries the `decoder: semantic` fields (`upsample`, `decode_mode`, `threshold`, `background_index`) and the reserved mask-classification fields. It is `#[serde(flatten)]`, so the JSON keys sit directly on the output.
-  - `DecoderKind::Semantic`, `LogicalType::ClassLogits`/`MaskLogits` and `DimName::NumQueries` parse and validate but have no legacy v1 lowering: `to_legacy_config_outputs` returns `NotSupported` for them. `Semantic` shares code 2 with `configs::DecoderType::Semantic` (`EF_DECODER_TYPE_SEMANTIC`, Python `DecoderType.Semantic`), and the legacy builder refuses it with `NotSupported`.
+  - `DecoderKind::Semantic`, `LogicalType::ClassLogits`/`MaskLogits` and `DimName::NumQueries` have no legacy v1 lowering: `to_legacy_config_outputs` returns `NotSupported` for them. The builder takes a `decoder: semantic` output to the semantic module instead (see [Semantic segmentation](#semantic-segmentation)); the mask-classification types stay reserved. `Semantic` shares code 2 with `configs::DecoderType::Semantic` (`EF_DECODER_TYPE_SEMANTIC`, Python `DecoderType.Semantic`).
+- [`SemanticConfig`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/semantic/struct.SemanticConfig.html) / [`SemanticOptions`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/semantic/struct.SemanticOptions.html) — a semantic output's static description (axes, upsampling, default mode, threshold, activation, fallback quantization) and the per-call mode override and letterbox.
 
 ## Internal Architecture
 
@@ -372,6 +374,28 @@ upsampled_protos)` per output pixel using a fragment shader. See
 [`../image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
 for the GPU-side fused algorithm.
 
+### Semantic segmentation
+
+`Decoder::decode_semantic` (and the free function `semantic::decode_semantic`) writes an `[H, W]` u8 or u16 class map into a caller tensor. The builder routes a schema whose typed outputs are a single `decoder: semantic` output to `SemanticConfig::from_logical`, sets `ModelType::Semantic`, and skips the legacy lowering; `decode` and `decode_proto` return `NotSupported` for such a decoder. A programmatic configuration with a semantic output is converted with `SchemaV2::from_v1` and takes the same path. ModelPack segmentation outputs also get a `SemanticConfig`, built from the logical output so it keeps `activation_applied` (NHWC with the class axis from `num_classes` or the channel position, the rule `verify_modelpack_seg` uses; fast by default), so `decode_semantic` works on them beside the existing `decode`; a ModelPack output with no semantic view logs a warning instead of failing the build. Semantic outputs pass the same `dshape` validation as every other output (`configs::validate_dshape`).
+
+Geometry: the letterbox `[x0, y0, x1, y1]` scales to a fractional region of the score map, and each output pixel samples it at its centre. Bilinear taps follow PyTorch `interpolate` (`align_corners` false or true) with clamping to the whole score map, so taps at the region's edge read the padding rows, as the reference does when it resizes to the input before cropping. Nearest sampling uses pixel centres (`nearest-exact`). On SegFormer-B1 ADE20K val this exact fractional region agrees with the mmseg two-step reference on 99.94–99.97% of pixels, against 99.4–99.7% for an integer `ceil` crop, and centre sampling gains about 0.05 mIoU points over PyTorch's legacy nearest.
+
+```
+scores [C, h, w] ──argmax──▶ winners [h, w] ─┬─ fast: nearest taps ──────────────▶ class map [H, W]
+                                             └─ accurate: per output band
+                                                 corners agree? ── yes ──▶ winner
+                                                        └─ no ── candidates of the cell ──▶ argmax of
+                                                                 (gathered once per band)    interpolated scores
+```
+
+Accurate mode is exact without interpolating every class at every pixel. Bilinear interpolation is a convex combination, so a pixel whose (up to four) corner winners agree takes that class; about 7% of SegFormer's low-resolution cells straddle a boundary. In a boundary cell, a class whose largest corner score is below the largest smallest-corner score of any class cannot win, which leaves 2–4 candidates out of 150 on real logits. Output rows are processed in bands that share a pair of source rows; each band collects its boundary cells from the winners, then gathers their columns one class plane at a time. Gathering a class vector across NCHW planes directly is slow on the Cortex-A cores: the planes of a 128×168 f32 map sit 86 KB apart and alias to a few cache sets.
+
+Quantization: a positive per-tensor scale preserves the argmax and bilinear order, so integer scores are compared and interpolated as stored; only the single-channel threshold (converted to stored units) and the confidence map use real values. Per-channel quantization must lie on the class axis and is dequantized first. The confidence is the softmax maximum (the winner's sigmoid when `activation_required: sigmoid`, or the winner's probability when `activation_applied` declares one), computed at the score map's resolution with a polynomial `exp` and upsampled like the class map. `activation_required` is applied after resampling, as reference pipelines do, so it never changes the class map.
+
+Inputs are mapped read-only. A padded row pitch (`row_stride`) becomes the height axis's stride, and the strides of the axes outside it scale with it, so padded score maps and class maps decode with the packed kernels; every input is bounds-checked against its mapped length.
+
+Tensor binding: the output whose tensor name matches, else the only tensor with the output's shape (ignoring unit axes), else the tensor at the output's schema position when every output is passed. The dynamic tensor backend has no names, so the C and Python bindings rely on the last two.
+
 ## Tracing Spans
 
 Every public decode entry point emits a [`tracing::trace_span!`] tree. The
@@ -436,6 +460,8 @@ decoder.decode_proto                                    [user-facing fn]
     └── decoder.decode_proto.per_scale_to_proto_data.extract
         └── decoder.decode_proto.extract_proto_data
 
+decoder.decode_semantic                                 [user-facing fn; semantic segmentation into a caller tensor]
+
 # Shared building blocks (reached from both decode and decode_proto;
 # parent in the trace tells you which one)
 
@@ -479,6 +505,7 @@ fields: tiles, boxes_in, boxes_out
 |-------------------------------------------------|---------------------------------------------------------|--------------|
 | `decoder.decode`                                | `non_max_suppression(...)` + segmentation `process_mask`| Top-level decode entry. The `path` field tells you which model topology was selected at builder time. |
 | `decoder.decode_proto`                          | `decode` + skip `process_mask` (returns coeffs/protos)  | Returns proto data instead of materialised masks; pair with `image.materialize_masks` or the fused GPU shader. |
+| `decoder.decode_semantic`                       | resize logits → argmax (accurate) or argmax → resize (fast) | Whole semantic decode: low-resolution argmax, letterbox crop and upsample into the caller's class map, plus the optional confidence map. |
 | `decoder.decode.yolo_{quant,float}_{flat,split}`| `preds.transpose(-1, -2)` + `xywh2xyxy` + per-row filter| Flat-tensor and legacy split-tensor YOLO post-processing (pre-per-scale). Each kernel walks `(4 + nc, anchors)` once. |
 | `decoder.decode.process_masks`                  | `process_mask` / `process_mask_native`                  | `sigmoid(coefficients @ protos)` + crop to detection bbox. The `mode` field is the input dtype (float kernel vs. fused i8/i16 path). |
 | `decoder.decode_proto.extract_proto_data`       | n/a (HAL-specific)                                      | Pack per-detection coefficient rows + protos into a `ProtoData` for the GPU fused shader. The `n == 0` early-exit avoids a ~819 KB proto copy. |

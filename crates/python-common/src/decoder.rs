@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+use edgefirst_decoder::schema::DecodeMode;
+use edgefirst_decoder::semantic::SemanticOptions;
 use edgefirst_decoder::{
     configs, configs::Nms, schema::SchemaV2, ConfigOutput, ConfigOutputs, Decoder, DecoderBuilder,
 };
@@ -65,6 +67,47 @@ impl From<Nms> for PyNms {
             Nms::ClassAgnostic => PyNms::ClassAgnostic,
             Nms::ClassAware => PyNms::ClassAware,
             Nms::Auto => PyNms::Auto,
+        }
+    }
+}
+
+/// Semantic segmentation decode mode.
+#[pyo3::pyclass(name = "DecodeMode", eq, eq_int, from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyDecodeMode {
+    /// Upsample the scores of every class, then take the argmax.
+    Accurate = 0,
+    /// Take the argmax at the model's output resolution, then upsample the
+    /// class map with nearest-neighbour sampling.
+    Fast = 1,
+}
+
+const _: () = {
+    assert!(PyDecodeMode::Accurate as u32 == DecodeMode::Accurate.code());
+    assert!(PyDecodeMode::Fast as u32 == DecodeMode::Fast.code());
+};
+
+#[pyo3::pymethods]
+impl PyDecodeMode {
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
+impl From<PyDecodeMode> for DecodeMode {
+    fn from(mode: PyDecodeMode) -> Self {
+        match mode {
+            PyDecodeMode::Accurate => DecodeMode::Accurate,
+            PyDecodeMode::Fast => DecodeMode::Fast,
+        }
+    }
+}
+
+impl From<DecodeMode> for PyDecodeMode {
+    fn from(mode: DecodeMode) -> Self {
+        match mode {
+            DecodeMode::Fast => PyDecodeMode::Fast,
+            _ => PyDecodeMode::Accurate,
         }
     }
 }
@@ -1180,6 +1223,115 @@ impl PyDecoder {
             )?;
         }
         Ok((boxes, scores, classes))
+    }
+
+    /// Decode the model's semantic segmentation output into a class map.
+    ///
+    /// Each pixel of ``dst`` is mapped through the letterbox region of the
+    /// model input, so the padding is cropped and ``dst`` covers the
+    /// original image at any resolution.
+    ///
+    /// Args:
+    ///     model_output: The model's output tensors, from this or another
+    ///         ``edgefirst.*`` package. The semantic output is found by
+    ///         name, by shape, or by its position when all outputs are
+    ///         passed.
+    ///     dst: ``(H, W)`` class map to write, ``uint8`` (up to 256 classes)
+    ///         or ``uint16``.
+    ///     confidence: Optional ``(H, W)`` ``float32`` or ``uint8`` map that
+    ///         receives the winning class's probability (``uint8`` scaled to
+    ///         255). Computed at the model's resolution and upsampled, so it
+    ///         is approximate and meant for overlays.
+    ///     mode: ``DecodeMode.Accurate`` or ``DecodeMode.Fast``; ``None``
+    ///         uses the model's ``decode_mode``.
+    ///     letterbox: Image content within the model input as normalized
+    ///         ``[xmin, ymin, xmax, ymax]``; ``None`` when the image fills
+    ///         the input.
+    ///
+    /// Raises:
+    ///     RuntimeError: The model has no semantic output, or the tensors
+    ///         do not match it.
+    #[pyo3(signature = (model_output, dst, confidence=None, *, mode=None, letterbox=None))]
+    pub fn decode_semantic<'py>(
+        self_: PyRef<'py, Self>,
+        model_output: Vec<Bound<'py, PyAny>>,
+        dst: &Bound<'py, PyAny>,
+        confidence: Option<&Bound<'py, PyAny>>,
+        mode: Option<PyDecodeMode>,
+        letterbox: Option<[f32; 4]>,
+    ) -> PyResult<()> {
+        let _span = tracing::trace_span!("python.decode_semantic").entered();
+        let py = self_.py();
+        let mut options = SemanticOptions::new();
+        if let Some(mode) = mode {
+            options = options.with_mode(mode.into());
+        }
+        if let Some(letterbox) = letterbox {
+            options = options.with_letterbox(letterbox);
+        }
+        let inputs: Vec<crate::interop::TensorArg> = model_output
+            .iter()
+            .map(|o| crate::interop::TensorArg::extract(o, None))
+            .collect::<PyResult<_>>()?;
+        let dst = crate::interop::TensorArg::extract_mut(dst, None)?;
+        let confidence = confidence
+            .map(|c| crate::interop::TensorArg::extract_mut(c, None))
+            .transpose()?;
+        let decoder = &self_.decoder;
+        let err = |e: edgefirst_decoder::DecoderError| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))
+        };
+        let detachable = inputs.iter().all(crate::interop::TensorArg::can_detach)
+            && dst.can_detach()
+            && confidence.as_ref().is_none_or(|c| c.can_detach());
+        if detachable {
+            let inputs: Vec<crate::interop::RawTensorAccess> = inputs
+                .into_iter()
+                .map(|t| t.into_raw_access())
+                .collect::<PyResult<_>>()?;
+            let mut dst = dst.into_raw_access()?;
+            let mut confidence = confidence.map(|c| c.into_raw_access()).transpose()?;
+            let (dst, confidence) = (&mut dst, &mut confidence);
+            py.detach(move || {
+                let refs: Vec<&edgefirst_tensor::TensorDyn> =
+                    inputs.iter().map(|t| t.as_ref()).collect();
+                decoder
+                    .decode_semantic(
+                        &refs,
+                        dst.as_mut(),
+                        confidence.as_mut().map(|c| c.as_mut()),
+                        &options,
+                    )
+                    .map_err(err)
+            })
+        } else {
+            let (mut dst, mut confidence) = (dst, confidence);
+            let refs: Vec<&edgefirst_tensor::TensorDyn> =
+                inputs.iter().map(|t| t.as_ref()).collect();
+            decoder
+                .decode_semantic(
+                    &refs,
+                    dst.as_mut(),
+                    confidence.as_mut().map(|c| c.as_mut()),
+                    &options,
+                )
+                .map_err(err)
+        }
+    }
+
+    /// Number of classes of the model's semantic output: the channel count,
+    /// ``2`` for a single thresholded channel, ``0`` for a class map, and
+    /// ``None`` when the model has no semantic output.
+    #[getter]
+    fn semantic_classes(&self) -> Option<usize> {
+        self.decoder.semantic().map(|s| s.classes())
+    }
+
+    /// Default decode mode of the model's semantic output, ``None`` when
+    /// the model has no semantic output.
+    #[getter]
+    fn semantic_mode(&self) -> Option<PyDecodeMode> {
+        self.decoder.semantic().map(|s| s.mode().into())
     }
 
     /// Decode model outputs into detection boxes and optional prototype data.

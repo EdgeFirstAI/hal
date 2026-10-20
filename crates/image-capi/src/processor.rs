@@ -199,10 +199,8 @@ pub(crate) fn cpu_access_from_code(code: u32) -> Option<CpuAccess> {
 /// `-capi` leaves link this crate's shared `libedgefirst_tensor.so` rather
 /// than embedding their own copy), so every handle is read the same way
 /// regardless of which library minted it -- no per-library dispatch table,
-/// no re-import from a foreign platform handle. `TensorDyn::with_raw` wraps
-/// the handle in `ManuallyDrop` so the closure's `&mut TensorDyn` never runs
-/// `Drop` (which would call `ef_tensor_free`); the caller still owns the
-/// handle's lifetime exactly as before.
+/// no re-import from a foreign platform handle. `TensorDyn::with_raw` borrows
+/// the handle without freeing it, so the caller still owns its lifetime.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle from an EdgeFirst library.

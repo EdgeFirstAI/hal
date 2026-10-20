@@ -19,20 +19,7 @@
 //! Fixtures are regenerated with
 //! ``scripts/decoder_generate_modelpack_fixture.py``.
 
-/// Emit a skip notice that survives libtest's output capture.
-///
-/// libtest captures `println!`/`eprintln!` and replays it only for **failing**
-/// tests, so a test that skips and returns prints `... ok` with its reason
-/// discarded — indistinguishable from one that did the work. Writing to
-/// `std::io::stderr()` directly bypasses that. See TESTING.md.
-macro_rules! skip_note {
-    ($($arg:tt)*) => {{
-        use std::io::Write;
-        let _ = write!(&mut std::io::stderr(), "WARNING: SKIPPED: ");
-        let _ = writeln!(&mut std::io::stderr(), $($arg)*);
-    }};
-}
-
+#[macro_use]
 mod common;
 
 use std::path::PathBuf;
@@ -40,19 +27,7 @@ use std::path::PathBuf;
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox, Segmentation};
 use edgefirst_tensor::TensorDyn;
 
-/// Root of the `testdata/` tree. `EDGEFIRST_TESTDATA_DIR` wins when set; the
-/// manifest-relative fallback is baked in at compile time and so is useless
-/// for a cross-compiled on-target run.
-fn testdata_root() -> PathBuf {
-    std::env::var("EDGEFIRST_TESTDATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("testdata")
-        })
-}
+use common::testdata_root;
 
 fn fixture_path(name: &str) -> PathBuf {
     testdata_root().join("decoder").join(name)

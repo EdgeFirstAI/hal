@@ -224,14 +224,14 @@ This runs, in order:
 
    **The excludes are load-bearing — do not "simplify" them away.** The
    tensor-linked `python-*` crates must be built with the dynamic tensor
-   backend (`--config .cargo/tensor-dynamic.toml`) and refuse to build
-   without it, and PyO3 cannot cross-compile without a target interpreter.
+   backend (from their crate directory, or with `--config
+   .cargo/tensor-dynamic.toml`) and refuse to build without it, and PyO3 cannot cross-compile without a target interpreter.
    `--exclude 'edgefirst-python-*'` is the short form. The same applies to
    `cargo build`, `cargo test` and `cargo clippy`; `make` carries the excludes.
 
    **Tensor backend:** Rust is always static. The dynamic backend exists only
-   for the C libraries and wheels, selected by `--config
-   .cargo/tensor-dynamic.toml` — never by `RUSTFLAGS`, which would replace
+   for the C libraries and wheels, selected by the `.cargo/config.toml` in
+   each leaf's crate directory — never by `RUSTFLAGS`, which would replace
    `.cargo/config.toml`'s per-target flags. No library crate may name the
    backend (`make lint-backend-scope`). See ARCHITECTURE.md § Tensor Backend
    Selection.

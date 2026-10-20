@@ -129,7 +129,7 @@ enum ef_decoder_type
   EF_DECODER_TYPE_ULTRALYTICS = 0,
   EF_DECODER_TYPE_MODEL_PACK = 1,
   /**
-   * Generic semantic segmentation; not decoded by this HAL version.
+   * Generic semantic segmentation, decoded by `ef_decoder_decode_semantic`.
    */
   EF_DECODER_TYPE_SEMANTIC = 2,
 };
@@ -138,6 +138,31 @@ enum ef_decoder_type
 typedef enum ef_decoder_type ef_decoder_type;
 #else
 typedef uint32_t ef_decoder_type;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Semantic segmentation decode mode, for `ef_semantic_options_set_mode`.
+ */
+enum ef_decode_mode
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Upsample the scores of every class, then take the argmax.
+   */
+  EF_DECODE_MODE_ACCURATE = 0,
+  /**
+   * Argmax at the model's output resolution, then nearest upsampling.
+   */
+  EF_DECODE_MODE_FAST = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_decode_mode ef_decode_mode;
+#else
+typedef uint32_t ef_decode_mode;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -321,6 +346,12 @@ typedef struct ef_infer_signals ef_infer_signals;
  * [`ef_inferred_schema_json`]/[`ef_inferred_schema_labels_json`].
  */
 typedef struct ef_inferred_schema ef_inferred_schema;
+
+/**
+ * Runtime options of a semantic decode. Build with
+ * [`ef_semantic_options_new`], free with [`ef_semantic_options_free`].
+ */
+typedef struct ef_semantic_options ef_semantic_options;
 
 /**
  * Accumulates detections from every tile of one frame.
@@ -981,6 +1012,81 @@ char *ef_inferred_schema_description(const struct ef_inferred_schema *r);
  * `r` must be `NULL` or have come from this library.
  */
 void ef_inferred_schema_free(struct ef_inferred_schema *r);
+
+/**
+ * New default options: the model's decode mode, no letterbox. `NULL` on
+ * allocation failure.
+ */
+struct ef_semantic_options *ef_semantic_options_new(void);
+
+/**
+ * Free options from [`ef_semantic_options_new`]. `NULL` is a no-op.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle, not used afterwards.
+ */
+void ef_semantic_options_free(struct ef_semantic_options *o);
+
+/**
+ * Override the model's decode mode: an `EF_DECODE_MODE_*` code.
+ *
+ * @return 0, or `EINVAL` for an unknown code or `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle.
+ */
+int ef_semantic_options_set_mode(struct ef_semantic_options *o, uint32_t mode);
+
+/**
+ * Image content within the model input as normalized
+ * `[xmin, ymin, xmax, ymax]`, as produced by a letterbox resize. `NULL`
+ * clears it: the image fills the input.
+ *
+ * @return 0, or `EINVAL` for a `NULL` handle.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle; `letterbox` `NULL` or four floats.
+ */
+int ef_semantic_options_set_letterbox(struct ef_semantic_options *o, const float *letterbox);
+
+/**
+ * Number of classes of the model's semantic output: the channel count, 2
+ * for a single thresholded channel, 0 for a class map.
+ *
+ * @return 0, `ENOENT` when the model has no semantic output, or `EINVAL`
+ *         for a `NULL` argument.
+ *
+ * # Safety
+ * `d` must be `NULL` or live; `out` `NULL` or writable.
+ */
+int ef_decoder_semantic_classes(const ef_decoder *d, uintptr_t *out);
+
+/**
+ * Decode the model's semantic segmentation output into `dst`, an `[H, W]`
+ * class map of `EF_DTYPE_U8` (up to 256 classes) or `EF_DTYPE_U16`, at any
+ * resolution. Each output pixel is mapped through the letterbox region, so
+ * the padding is cropped and `dst` covers the original image.
+ *
+ * `confidence`, when not `NULL`, receives the winning class's probability
+ * as an `[H, W]` map of `EF_DTYPE_F32` or `EF_DTYPE_U8` (scaled to 255),
+ * computed at the model's resolution and upsampled: approximate, for
+ * overlays. `options` may be `NULL` for the defaults.
+ *
+ * @return 0, `ENOENT` when the model has no semantic output, `EBADMSG` when
+ *         the tensors do not match it or cannot hold the result, or
+ *         `EINVAL` for a `NULL` argument.
+ *
+ * # Safety
+ * `outputs` must point to `count` live tensor handles; `dst` and
+ * `confidence` (when not `NULL`) must be live handles distinct from them
+ * and from each other; `options` `NULL` or live.
+ */
+int ef_decoder_decode_semantic(const ef_decoder *d,
+                               const ef_tensor *const *outputs,
+                               uintptr_t count,
+                               ef_tensor *dst,
+                               ef_tensor *confidence,
+                               const struct ef_semantic_options *options);
 
 /**
  * Fill `out` with the library's default merge configuration.

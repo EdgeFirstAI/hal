@@ -450,19 +450,20 @@ reason the probe check has to be real rather than emergent.
 - **Static** (always, for Rust): the implementation is compiled into the crate. Every Rust consumer uses it — crates.io users, `mobile-sdk`, the workspace's own tests and benches. There is no dynamic library, no feature to enable, and nothing to opt out of.
 - **Dynamic** (only for shared-library packaging): `TensorDyn` is a thin wrapper over an `ef_tensor*` handle and every operation calls into `libedgefirst_tensor`. Only the C libraries and Python wheels use it, so a process that loads several of them holds exactly one tensor implementation rather than one private copy per library.
 
-The backend is a packaging decision made by the final artifact, not a capability, so it is a build cfg rather than a Cargo feature: Cargo unifies features across a build, which would let one artifact's choice leak into every crate in the graph. The dynamic backend is selected with `--cfg edgefirst_tensor_dynamic`, injected only through a Cargo config fragment:
+The backend is a packaging decision made by the final artifact, not a capability, so it is a build cfg rather than a Cargo feature: Cargo unifies features across a build, which would let one artifact's choice leak into every crate in the graph. The dynamic backend is selected with `--cfg edgefirst_tensor_dynamic`, carried by Cargo config only. Each leaf that needs it (`image-capi`, `codec-capi`, `decoder-capi`, `python-tensor`, `python-codec`, `python-image`, `python-decoder`) has a `.cargo/config.toml` that sets it, an identical copy of `.cargo/tensor-dynamic.toml` (`make lint-backend-scope` checks the copies). Cargo reads config from its working directory, so a leaf is built from its own directory:
 
 ```bash
-cargo build --config .cargo/tensor-dynamic.toml --manifest-path crates/image-capi/Cargo.toml --target-dir target
-maturin build --config .cargo/tensor-dynamic.toml -m crates/python-image/Cargo.toml
+cd crates/image-capi && cargo build --target-dir ../../target
+cd crates/python-image && maturin build
+pip install crates/python-image/        # pip runs maturin from the crate directory
 ```
 
-`make capi-libs`, `make wheel` and `make install-python` pass it for you. Never select the backend through `RUSTFLAGS`: an environment `RUSTFLAGS` replaces every per-target `rustflags` table in `.cargo/config.toml`, including the Mach-O strip workaround shipped macOS libraries and wheels need in order to load. `make lint-backend-scope` rejects it.
+`make capi-libs`, `make wheel` and `make install-python` do this for you. From the repository root, pass the fragment explicitly instead (`cargo build --config .cargo/tensor-dynamic.toml --manifest-path crates/image-capi/Cargo.toml`); a root build without it is refused by the leaf's guard. The fragment alone is not enough for every build: on macOS (and for zig `windows-gnu` targets) maturin recomputes the rustflags from the config it reads for the crate, adds its own linker flags and passes the result as `CARGO_ENCODED_RUSTFLAGS`, which overrides every config table. It never reads a `--config` fragment, so only the crate's own config survives there. Never select the backend through `RUSTFLAGS`: an environment `RUSTFLAGS` replaces every per-target `rustflags` table in `.cargo/config.toml`, including the Mach-O strip workaround shipped macOS libraries and wheels need in order to load. `make lint-backend-scope` rejects it.
 
 Two consequences of carrying the cfg in a target table:
 
-- A build environment that already owns `RUSTFLAGS` (Yocto's cargo class, for example) makes Cargo ignore every target table, the fragment included. Add `--cfg edgefirst_tensor_dynamic` to that `RUSTFLAGS` for the C libraries and wheels instead.
-- A `target` table takes precedence over `build.rustflags`, so a user-level `build.rustflags` (a linker or `target-cpu` choice) does not apply under the fragment. Put such flags in a `[target.<triple>]` table, which Cargo joins with the fragment's.
+- A build environment that already owns `RUSTFLAGS` (Yocto's cargo class, for example) makes Cargo ignore every target table, the leaf configs and the fragment included. Add `--cfg edgefirst_tensor_dynamic` to that `RUSTFLAGS` for the C libraries and wheels instead.
+- A `target` table takes precedence over `build.rustflags`, so a user-level `build.rustflags` (a linker or `target-cpu` choice) does not apply to a leaf. Put such flags in a `[target.<triple>]` table, which Cargo joins with the leaf's.
 
 rustdoc does not read target tables, so doctests and `cargo doc` always describe the static backend.
 
@@ -876,7 +877,7 @@ macOS, and Android.
 | `decoder.<op>.<step>` | Sub-step within a decode phase | `decoder.nms_get_boxes.score_filter`, `decoder.nms_get_boxes.suppress`, `decoder.decode_proto.extract_proto_data` |
 | `decoder.tiled.` | SAHI tiling output side | `decoder.tiled.lift`, `decoder.tiled.merge` |
 | `tracker.` | ByteTrack association | `tracker.update`, `tracker.update.match_high_conf`, `tracker.update.predict` |
-| `python.` | Python binding entry point | `python.convert`, `python.convert_deferred`, `python.convert_with_fence`, `python.flush`, `python.decode`, `python.decode_proto`, `python.tile_into`, `python.tile_one`, `python.materialize_masks` |
+| `python.` | Python binding entry point | `python.convert`, `python.convert_deferred`, `python.convert_with_fence`, `python.flush`, `python.decode`, `python.decode_proto`, `python.decode_semantic`, `python.tile_into`, `python.tile_one`, `python.materialize_masks` |
 
 Every span site uses `tracing::trace_span!`, except `image.gl_init`, which
 uses `info_span!` so GL bring-up stays visible at a coarser filter level.

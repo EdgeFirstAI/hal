@@ -40,21 +40,23 @@ RUFF_PATHS := $(PYTHON_CRATES) crates/python-common $(TEST_DIR)
 # tensor-capi comes first: the dynamic leaves link the library it builds.
 CAPI_MODULAR_CRATES := tensor-capi image-capi codec-capi decoder-capi tracker-capi
 
-# Selects edgefirst-tensor's dynamic backend (see ARCHITECTURE.md, Tensor
-# Backend Selection). Never RUSTFLAGS: that replaces .cargo/config.toml's
+# Selects edgefirst-tensor's dynamic backend for checks of the libraries (see
+# ARCHITECTURE.md, Tensor Backend Selection). The leaves select it themselves
+# through their own .cargo/config.toml, so they are always built from their
+# crate directory. Never RUSTFLAGS: that replaces .cargo/config.toml's
 # per-target flags.
 TENSOR_DYNAMIC := --config $(CURDIR)/.cargo/tensor-dynamic.toml
-# An environment RUSTFLAGS suppresses the fragment's cfg, so a dynamic-backend lane would quietly build static.
+# An environment RUSTFLAGS suppresses every config rustflags, so a dynamic-backend lane would quietly build static.
 define require_fragment_rustflags
 	@if [ -n "$$RUSTFLAGS" ]; then \
-		echo "ERROR: RUSTFLAGS is set, which hides .cargo/tensor-dynamic.toml's cfg; use CARGO_TARGET_<TRIPLE>_RUSTFLAGS instead" >&2; \
+		echo "ERROR: RUSTFLAGS is set, which hides the tensor backend cfg; use CARGO_TARGET_<TRIPLE>_RUSTFLAGS instead" >&2; \
 		exit 1; \
 	fi
 endef
 # The C-API leaves that call into libedgefirst_tensor instead of embedding it.
 CAPI_DYNAMIC_CRATES := image-capi codec-capi decoder-capi
-# Expands, inside a `for c in $(CAPI_MODULAR_CRATES)` loop, to $(TENSOR_DYNAMIC) for a dynamic leaf.
-capi_cfg_sh = $$(case " $(CAPI_DYNAMIC_CRATES) " in *" $$c "*) echo "$(TENSOR_DYNAMIC)";; esac)
+# The leaves whose .cargo/config.toml selects the dynamic backend.
+DYNAMIC_LEAVES := $(addprefix crates/,$(CAPI_DYNAMIC_CRATES)) $(addprefix crates/python-,tensor codec image decoder)
 # Every library a shared-library leaf compiles in, checked under both backends.
 BACKEND_CHECK_CRATES := edgefirst-tensor edgefirst-codec edgefirst-image \
 	edgefirst-decoder edgefirst-tracker edgefirst-python-common
@@ -209,7 +211,7 @@ lint-rust:
 lint-python-abi3-py38:
 	@echo "Running clippy on the Python bindings under abi3-py38 (the ABI regular CI otherwise never compiles)..."
 	@for pkg in $(PYTHON_PACKAGES); do \
-		cargo clippy $(TENSOR_DYNAMIC) -p edgefirst-python-$$pkg --features abi3-py38 --all-targets -- -D warnings || exit 1; \
+		(cd crates/python-$$pkg && cargo clippy --features abi3-py38 --all-targets -- -D warnings) || exit 1; \
 	done
 	@echo "✓ abi3-py38 Python-bindings clippy passed"
 
@@ -229,7 +231,7 @@ lint-python:
 lint-capi-modular:
 	@echo "Running clippy on the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo clippy $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --all-targets --target-dir target -- -D warnings || exit 1; \
+		(cd crates/$$c && cargo clippy --all-targets --target-dir $(CURDIR)/target -- -D warnings) || exit 1; \
 	done
 	@echo "✓ Modular C-API clippy passed"
 
@@ -275,7 +277,11 @@ lint-backend-scope:
 		| grep -vE '$(BACKEND_SCOPE_ALLOWED)' || true); \
 	if [ -n "$$hits" ]; then echo "$$hits"; echo "ERROR: the tensor backend is named outside edgefirst-tensor and the leaves"; exit 1; fi
 	@hits=$$(git grep --untracked -nIiE 'RUSTFLAGS[^#]*edgefirst_tensor_dynamic' -- Makefile .github scripts || true); \
-	if [ -n "$$hits" ]; then echo "$$hits"; echo "ERROR: select the dynamic backend with $(TENSOR_DYNAMIC), never RUSTFLAGS"; exit 1; fi
+	if [ -n "$$hits" ]; then echo "$$hits"; echo "ERROR: select the dynamic backend with a .cargo/config.toml, never RUSTFLAGS"; exit 1; fi
+	@for d in $(DYNAMIC_LEAVES); do \
+		cmp -s .cargo/tensor-dynamic.toml $$d/.cargo/config.toml \
+			|| { echo "ERROR: $$d/.cargo/config.toml differs from .cargo/tensor-dynamic.toml"; exit 1; }; \
+	done
 	@echo "✓ Backend scope clean"
 
 # Each guard must reject the wrong backend with its own message; a build that
@@ -305,7 +311,7 @@ check-backend-guards:
 check-capi-modular:
 	@echo "Running cargo check on the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo check $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
+		(cd crates/$$c && cargo check --target-dir $(CURDIR)/target) || exit 1; \
 	done
 	@echo "✓ Modular C-API check passed"
 
@@ -325,7 +331,7 @@ build: capi-libs
 capi-libs:
 	@echo "Building the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo build $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
+		(cd crates/$$c && cargo build --target-dir $(CURDIR)/target) || exit 1; \
 	done
 	@echo "✓ Modular C-API build complete"
 	@$(MAKE) capi-symlinks
@@ -339,7 +345,7 @@ capi-libs:
 capi-libs-release capi-libs-profiling: capi-libs-%:
 	@echo "Building the five modular C-API crates ($*)..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		cargo build --profile $* $(if $(TARGET),--target $(TARGET)) $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target || exit 1; \
+		(cd crates/$$c && cargo build --profile $* $(if $(TARGET),--target $(TARGET)) --target-dir $(CURDIR)/target) || exit 1; \
 	done
 	@echo "✓ Modular C-API $* build complete"
 	@$(MAKE) capi-symlinks
@@ -400,7 +406,7 @@ build-python:
 	@echo "Building Python bindings..."
 	@if command -v maturin >/dev/null 2>&1; then \
 		for c in $(PYTHON_CRATES); do \
-			maturin build --auditwheel skip $(TENSOR_DYNAMIC) -m "$$c/Cargo.toml" $(CARGO_PROFILE) || exit 1; \
+			(cd "$$c" && maturin build --auditwheel skip $(CARGO_PROFILE)) || exit 1; \
 		done; \
 	else \
 		echo "ERROR: maturin not found (see README.md for installation)"; \
@@ -429,16 +435,16 @@ wheel:
 	@rm -rf target/wheels
 	@for c in $(PYTHON_CRATES); do \
 		if [ -f "venv/bin/activate" ]; then \
-			. venv/bin/activate && \
-				maturin build --release --zig --compatibility manylinux2014 --auditwheel skip $(TENSOR_DYNAMIC) \
+			. venv/bin/activate && (cd "$$c" && \
+				maturin build --release --zig --compatibility manylinux2014 --auditwheel skip \
 					$(if $(TARGET),--target $(TARGET)) \
-					-m "$$c/Cargo.toml" -i $(PYTHON_INTERPRETER) \
-					$(if $(PYABI),--features abi3-$(PYABI)) || exit 1; \
+					-i $(PYTHON_INTERPRETER) \
+					$(if $(PYABI),--features abi3-$(PYABI))) || exit 1; \
 		else \
-			maturin build --release --zig --compatibility manylinux2014 --auditwheel skip $(TENSOR_DYNAMIC) \
+			(cd "$$c" && maturin build --release --zig --compatibility manylinux2014 --auditwheel skip \
 				$(if $(TARGET),--target $(TARGET)) \
-				-m "$$c/Cargo.toml" -i $(PYTHON_INTERPRETER) \
-				$(if $(PYABI),--features abi3-$(PYABI)) || exit 1; \
+				-i $(PYTHON_INTERPRETER) \
+				$(if $(PYABI),--features abi3-$(PYABI))) || exit 1; \
 		fi; \
 	done
 	@$(PYTHON) scripts/check_wheel_layout.py target/wheels
@@ -537,14 +543,14 @@ install-python:
 	@#
 	@# Linux never hit this because maturin skips auditwheel entirely under the
 	@# `--compatibility off` that pip's invocation carries; the macOS dylib
-	@# repair path has no such opt-out. The same channel carries the dynamic
-	@# tensor backend's --config.
+	@# repair path has no such opt-out. pip runs maturin from the crate
+	@# directory, so the crate's .cargo/config.toml selects the dynamic backend.
 	@for c in $(PYTHON_CRATES); do \
 		if [ -f "venv/bin/activate" ]; then \
-			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling $(TENSOR_DYNAMIC)" \
+			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling" \
 				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		else \
-			MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling $(TENSOR_DYNAMIC)" \
+			MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling" \
 				pip install -q --no-deps --force-reinstall "$$c/" || exit 1; \
 		fi; \
 	done
@@ -583,7 +589,7 @@ test-python: install-python
 test-capi-modular: capi-libs
 	@echo "Running tests for the five modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test $(capi_cfg_sh) --manifest-path crates/$$c/Cargo.toml --target-dir target -- --test-threads=1 || exit 1; \
+		(cd crates/$$c && EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --target-dir $(CURDIR)/target -- --test-threads=1) || exit 1; \
 	done
 	@echo "✓ Modular C-API tests passed"
 
@@ -647,9 +653,10 @@ check-single-home: capi-libs capi-libs-release
 # supplied by PY_STATIC_VENV/PY_DYNAMIC_VENV -- building those two venvs is
 # packaging work, done here rather than by hand, so G13 can run in CI.
 #
-# Both venvs build from the same commit. The static side builds without
-# $(TENSOR_DYNAMIC) and sets EDGEFIRST_TENSOR_STATIC_COMPARISON=1, the only
-# opt-in that lets a tensor-linked wheel build static (build-support's guard).
+# Both venvs build from the same commit. The static side builds from the
+# repository root, outside the leaves' .cargo/config.toml, and sets
+# EDGEFIRST_TENSOR_STATIC_COMPARISON=1, the only opt-in that lets a
+# tensor-linked wheel build static (build-support's guard).
 DIFFERENTIAL_STATIC_VENV := $(CURDIR)/target/differential-static-venv
 DIFFERENTIAL_DYNAMIC_VENV := $(CURDIR)/target/differential-dynamic-venv
 # Matches venv's own pinned versions (`pip freeze`), not "latest" -- G13's
@@ -777,9 +784,9 @@ venv-dynamic:
 	@$(DIFFERENTIAL_DYNAMIC_VENV)/bin/pip install -q --upgrade pip
 	@$(DIFFERENTIAL_DYNAMIC_VENV)/bin/pip install -q maturin $(DIFFERENTIAL_TEST_DEPS)
 	@for c in $(PYTHON_CRATES); do \
-		$(DIFFERENTIAL_DYNAMIC_VENV)/bin/maturin build --profile profiling --auditwheel skip $(TENSOR_DYNAMIC) \
-			-o target/differential-wheels-dynamic \
-			-m "$$c/Cargo.toml" -i $(DIFFERENTIAL_DYNAMIC_VENV)/bin/python || exit 1; \
+		(cd "$$c" && $(DIFFERENTIAL_DYNAMIC_VENV)/bin/maturin build --profile profiling --auditwheel skip \
+			-o $(CURDIR)/target/differential-wheels-dynamic \
+			-i $(DIFFERENTIAL_DYNAMIC_VENV)/bin/python) || exit 1; \
 	done
 	@$(call DIFFERENTIAL_ASSERT_ARCH,target/differential-wheels-dynamic)
 	@$(PYTHON) scripts/check_wheel_layout.py target/differential-wheels-dynamic

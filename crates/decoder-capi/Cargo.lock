@@ -242,6 +242,7 @@ dependencies = [
  "errno",
  "libc",
  "log",
+ "rayon",
  "serde",
  "serde_json",
  "uuid",

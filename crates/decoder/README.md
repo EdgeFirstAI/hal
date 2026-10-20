@@ -25,6 +25,7 @@ side of the EdgeFirst HAL workspace:
 |--------|-----------|--------------|---------|
 | **YOLO** | YOLOv5, v8, v11, v26 | Instance seg | float32, int8, uint8 |
 | **ModelPack** | SSD-style | Semantic seg | float32, int8, uint8 |
+| **Semantic** (`decoder: semantic`) | — | Per-pixel scores or class maps (SegFormer, DeepLabV3, PIDNet, …) | float32, float16, int8, uint8, int16, uint16; class maps uint8, uint16, int32, int64 |
 
 ## Features
 
@@ -190,6 +191,22 @@ Models exported with `end2end=false` require external NMS, configurable via the 
   "shape": [1, 84, 8400]
 }
 ```
+
+## Semantic Segmentation API
+
+`decode_semantic()` writes the class map of a semantic segmentation model into a tensor you allocate: `[H, W]`, u8 for up to 256 classes or u16 beyond, at any resolution (usually the original image's). Pass the letterbox content region so the padding is cropped, and pick the decode mode per call.
+
+```rust,ignore
+use edgefirst_decoder::{schema::DecodeMode, semantic::SemanticOptions};
+
+let mut class_map = TensorDyn::new(&[image_h, image_w], DType::U8, Some(TensorMemory::Mem), None)?;
+let options = SemanticOptions::new()
+    .with_mode(DecodeMode::Fast)           // default: the model's decode_mode
+    .with_letterbox([0.0, 0.0, 1.0, 0.75]); // content region of the model input
+decoder.decode_semantic(&outputs, &mut class_map, None, &options)?;
+```
+
+`DecodeMode::Accurate` upsamples the class scores bilinearly and takes the argmax, matching the PyTorch reference; `DecodeMode::Fast` takes the argmax at the model's resolution and upsamples the class map. On SegFormer-B1 (ADE20K) fast costs about 0.12 mIoU points. An optional confidence tensor receives the winning class's probability for overlays.
 
 ## Proto Mask API
 

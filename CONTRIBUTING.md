@@ -82,19 +82,18 @@ cargo test --workspace --exclude 'edgefirst-python-*' -- --test-threads=1
 # commands above — each library resolves its own features and lockfile.
 # Build and test them per crate, sharing the workspace's target directory.
 # tensor-capi goes first; image/codec/decoder-capi link the library it builds
-# and take the dynamic tensor backend's config (ARCHITECTURE.md, Tensor
-# Backend Selection):
+# and are built from their own directory, whose .cargo/config.toml selects the
+# dynamic tensor backend (ARCHITECTURE.md, Tensor Backend Selection):
 cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
-cargo build --config .cargo/tensor-dynamic.toml \
-  --manifest-path crates/image-capi/Cargo.toml --target-dir target
+(cd crates/image-capi && cargo build --target-dir ../../target)
 EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --manifest-path crates/tensor-capi/Cargo.toml \
   --target-dir target -- --test-threads=1
 # ...or `make capi-libs` / `make test-capi-modular` to cover all five, as CI does.
 
-# Build Python bindings (optional). The tensor-linked wheels need the dynamic
-# tensor backend's config; `make wheel` and `make install-python` pass it.
+# Build Python bindings (optional), from the crate directory so its
+# .cargo/config.toml selects the dynamic tensor backend.
 pip install maturin
-maturin develop --config .cargo/tensor-dynamic.toml -m crates/python-tensor/Cargo.toml
+(cd crates/python-tensor && maturin develop)
 
 # Run Python tests (requires Python bindings)
 python -m pytest tests/

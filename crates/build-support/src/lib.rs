@@ -51,8 +51,9 @@ pub fn require_dynamic_tensor(package: &str) -> bool {
         Ok(dynamic) => dynamic,
         Err(()) => panic!(
             "{package} links libedgefirst_tensor and must be built with the dynamic tensor \
-             backend: pass `--config .cargo/tensor-dynamic.toml` to cargo/maturin (or use \
-             `make wheel`). Set {STATIC_COMPARISON_ENV}=1 only for the G13 static comparison build."
+             backend: build it from its crate directory, whose .cargo/config.toml selects it \
+             (as `make wheel` and `pip install crates/<crate>` do). Set {STATIC_COMPARISON_ENV}=1 \
+             only for the G13 static comparison build."
         ),
     }
 }
@@ -272,7 +273,7 @@ pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
     let profile_dir = profile_dir_from_out_dir(Path::new(&out_dir));
     let profile = profile_dir
         .file_name()
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .expect("the profile directory has a UTF-8 name")
         .to_string();
     let target = env::var("TARGET").unwrap_or_default();

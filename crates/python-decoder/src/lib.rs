@@ -32,6 +32,7 @@ fn _decoder(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<decoder::PyProtoData>()?;
     m.add_class::<decoder::PyNms>()?;
     m.add_class::<decoder::PyDecoderType>()?;
+    m.add_class::<decoder::PyDecodeMode>()?;
     m.add_class::<decoder::PyDecoderVersion>()?;
     m.add_class::<decoder::PyDimName>()?;
     m.add_class::<decoder::PyOutput>()?;

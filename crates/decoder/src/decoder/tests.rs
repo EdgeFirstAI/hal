@@ -4248,7 +4248,7 @@ outputs:
         }
 
         #[test]
-        fn v1_semantic_decoder_is_not_supported() {
+        fn v1_semantic_decoder_needs_a_dshape() {
             let yaml = r#"
 outputs:
   - decoder: semantic
@@ -4260,9 +4260,24 @@ outputs:
                 .build()
                 .unwrap_err();
             assert!(
-                matches!(err, DecoderError::NotSupported(_)),
-                "expected NotSupported, got {err:?}"
+                matches!(err, DecoderError::InvalidConfig(_)),
+                "expected InvalidConfig, got {err:?}"
             );
+
+            let yaml = r#"
+outputs:
+  - decoder: semantic
+    type: segmentation
+    shape: [1, 128, 128, 150]
+    dshape: [{batch: 1}, {height: 128}, {width: 128}, {num_classes: 150}]
+"#;
+            let decoder = DecoderBuilder::new()
+                .with_config_yaml_str(yaml.to_string())
+                .build()
+                .unwrap();
+            let semantic = decoder.semantic().unwrap();
+            assert_eq!(semantic.classes(), 150);
+            assert_eq!((semantic.height(), semantic.width()), (128, 128));
         }
 
         #[test]

@@ -785,6 +785,7 @@ where
 
     // NCHW path: read source bytes via TensorMap, transpose into the
     // per-dtype scratch, and pass an InputView over the scratch.
+    reject_padded_input(t, role, level)?;
     let n = h * w * c;
     let map_fail = |e: edgefirst_tensor::Error| {
         DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
@@ -792,7 +793,7 @@ where
     macro_rules! nchw {
         ($ty:ty, $ensure:ident, $variant:ident) => {{
             let tensor = t.as_typed::<$ty>().expect("dtype checked");
-            let m = tensor.map().map_err(map_fail)?;
+            let m = tensor.map_read().map_err(map_fail)?;
             let src = m.as_slice();
             if src.len() != n {
                 return Err(DecoderError::InvalidShape(format!(
@@ -821,16 +822,31 @@ where
     }
 }
 
-/// Map a `TensorDyn`'s underlying slice and call the closure with an
-/// `InputView`. The map is dropped when the closure returns.
+/// Refuse an input whose rows carry a padded pitch: the per-scale kernels
+/// read their inputs as tightly packed slices.
+fn reject_padded_input(t: &TensorDyn, role: &'static str, level: usize) -> DecoderResult<()> {
+    match crate::decoder::tensor_bridge::padded_strides(t)? {
+        None => Ok(()),
+        Some(_) => Err(DecoderError::NotSupported(format!(
+            "{role} (level {level}): per-scale decode requires a tightly packed input, \
+             got row stride {:?} for shape {:?}",
+            t.row_stride(),
+            t.shape()
+        ))),
+    }
+}
+
+/// Map a `TensorDyn`'s underlying slice read-only and call the closure with
+/// an `InputView`. The map is dropped when the closure returns.
 fn with_mapped_input<F>(t: &TensorDyn, role: &'static str, level: usize, f: F) -> DecoderResult<()>
 where
     F: FnOnce(InputView<'_>) -> DecoderResult<()>,
 {
+    reject_padded_input(t, role, level)?;
     macro_rules! mapped {
         ($ty:ty, $variant:ident) => {{
             let tensor = t.as_typed::<$ty>().expect("dtype checked");
-            let m = tensor.map().map_err(|e| {
+            let m = tensor.map_read().map_err(|e| {
                 DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
             })?;
             f(InputView::$variant(m.as_slice()))
@@ -1051,5 +1067,42 @@ mod tests {
                 assert!(b.is_finite(), "box[{i}] = {b} not finite");
             }
         }
+    }
+
+    #[test]
+    fn padded_row_input_is_rejected_on_both_layouts() {
+        let parent = edgefirst_tensor::Tensor::<i8>::image(
+            4,
+            2,
+            edgefirst_tensor::PixelFormat::Grey,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let view: TensorDyn = parent
+            .view(edgefirst_tensor::Region::new(0, 0, 3, 2))
+            .unwrap()
+            .into();
+        assert_eq!(view.row_stride(), Some(4));
+
+        let r = with_mapped_input(&view, "boxes", 0, |_| Ok(()));
+        assert!(matches!(r, Err(DecoderError::NotSupported(_))), "{r:?}");
+
+        let mut scratch = crate::per_scale::outputs::LayoutScratch::default();
+        let r = with_mapped_or_transposed_input(
+            &view,
+            "boxes",
+            0,
+            Layout::Nchw,
+            3,
+            1,
+            2,
+            &mut scratch,
+            |_| Ok(()),
+        );
+        assert!(matches!(r, Err(DecoderError::NotSupported(_))), "{r:?}");
+
+        let packed = mk_i8_tensor(&[2, 3, 1]);
+        assert!(with_mapped_input(&packed, "boxes", 0, |_| Ok(())).is_ok());
     }
 }

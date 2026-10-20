@@ -135,14 +135,13 @@ jobs:
           # profraw as pytest drives pyo3 into the real crates. python-common is
           # an rlib linked into each cdylib, so those .so files are the only
           # object carrying its lines.
+          # From each crate directory, whose .cargo/config.toml selects the dynamic tensor backend.
           for pkg in tensor codec image decoder tracker; do
-            venv/bin/maturin build \
-              --config "$PWD/.cargo/tensor-dynamic.toml" \
-              --manifest-path "crates/python-$pkg/Cargo.toml" \
-              --out target/wheels \
+            (cd "crates/python-$pkg" && "$GITHUB_WORKSPACE/venv/bin/maturin" build \
+              --out "$GITHUB_WORKSPACE/target/wheels" \
               --profile profiling \
               --features abi3-py311 \
-              --auditwheel skip
+              --auditwheel skip)
           done
           # --no-deps: every edgefirst-* sibling is in this same wheel set, so
           # resolving the pins could fetch a published sibling over the local one.
@@ -531,11 +530,14 @@ jobs:
       - name: Build modular C-API leaves
         shell: pwsh
         run: |
-          $dynamic = @('--config', "$PWD/.cargo/tensor-dynamic.toml")
+          # From each crate directory, whose .cargo/config.toml selects the dynamic tensor backend.
+          $root = $PWD
           foreach ($leaf in @('tensor','image','codec','decoder','tracker')) {
-            $cfg = if (@('image','codec','decoder') -contains $leaf) { $dynamic } else { @() }
-            cargo build --profile profiling @cfg --manifest-path "crates/${leaf}-capi/Cargo.toml" --target-dir target
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Push-Location "crates/${leaf}-capi"
+            cargo build --profile profiling --target-dir "$root/target"
+            $code = $LASTEXITCODE
+            Pop-Location
+            if ($code -ne 0) { exit $code }
           }
       - name: Package and smoke
         shell: bash
@@ -590,14 +592,13 @@ jobs:
           python3 -m venv venv
           venv/bin/pip install --upgrade pip
           venv/bin/pip install maturin pytest numpy pillow
+          # From each crate directory, whose .cargo/config.toml selects the dynamic tensor backend.
           for pkg in tensor codec image decoder tracker; do
-            venv/bin/maturin build \
-              --config "$PWD/.cargo/tensor-dynamic.toml" \
-              --manifest-path "crates/python-$pkg/Cargo.toml" \
-              --out target/wheels \
+            (cd "crates/python-$pkg" && "$GITHUB_WORKSPACE/venv/bin/maturin" build \
+              --out "$GITHUB_WORKSPACE/target/wheels" \
               --profile profiling \
               --features abi3-py311 \
-              --auditwheel skip
+              --auditwheel skip)
           done
           # rustc strips Apple binaries with its own in-process
           # Mach-O writer, which leaves the LINKEDIT string pool 4-byte

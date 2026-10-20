@@ -129,13 +129,24 @@ class DecoderType(enum.Enum):
 
     - ``Ultralytics``: Ultralytics YOLO models (YOLOv5, YOLOv8, YOLO11, YOLO26)
     - ``ModelPack``: ModelPack models
-    - ``Semantic``: generic semantic segmentation (not decoded by this HAL
-      version; building a decoder returns an error)
+    - ``Semantic``: generic semantic segmentation, decoded by
+      :meth:`Decoder.decode_semantic`
     """
 
     Ultralytics: DecoderType
     ModelPack: DecoderType
     Semantic: DecoderType
+
+class DecodeMode(enum.Enum):
+    """Semantic segmentation decode mode.
+
+    Accurate: Upsample the scores of every class, then take the argmax.
+    Fast: Take the argmax at the model's output resolution, then upsample the
+        class map with nearest-neighbour sampling.
+    """
+
+    Accurate: DecodeMode
+    Fast: DecodeMode
 
 class DecoderVersion(enum.Enum):
     """Decoder version for Ultralytics models.
@@ -580,6 +591,52 @@ class Decoder:
             max_boxes: Maximum number of detections to return (default: 100).
                 Effective limit is ``min(max_boxes, decoder.max_det)``.
         """
+
+    def decode_semantic(
+        self,
+        model_output: list[EdgeFirstTensorExportable],
+        dst: EdgeFirstTensorExportable,
+        confidence: EdgeFirstTensorExportable | None = None,
+        *,
+        mode: DecodeMode | None = None,
+        letterbox: tuple[float, float, float, float] | list[float] | None = None,
+    ) -> None:
+        """Decode the model's semantic segmentation output into a class map.
+
+        Each pixel of ``dst`` is mapped through the letterbox region of the
+        model input, so the padding is cropped and ``dst`` covers the
+        original image at any resolution.
+
+        Args:
+            model_output: The model's output tensors, from this or another
+                ``edgefirst.*`` package. The semantic output is found by
+                name, by shape, or by its position when all outputs are
+                passed.
+            dst: ``(H, W)`` class map to write, ``uint8`` (up to 256 classes)
+                or ``uint16``.
+            confidence: Optional ``(H, W)`` ``float32`` or ``uint8`` map that
+                receives the winning class's probability (``uint8`` scaled to
+                255). Computed at the model's resolution and upsampled, so it
+                is approximate and meant for overlays.
+            mode: ``DecodeMode.Accurate`` or ``DecodeMode.Fast``; ``None`` uses
+                the model's ``decode_mode``.
+            letterbox: Image content within the model input as normalized
+                ``[xmin, ymin, xmax, ymax]``; ``None`` when the image fills
+                the input.
+
+        Raises:
+            RuntimeError: The model has no semantic output, or the tensors do
+                not match it.
+        """
+
+    @property
+    def semantic_classes(self) -> int | None:
+        """Classes of the semantic output: the channel count, ``2`` for one
+        thresholded channel, ``0`` for a class map, ``None`` without one."""
+
+    @property
+    def semantic_mode(self) -> DecodeMode | None:
+        """Default decode mode of the semantic output, ``None`` without one."""
 
     def decode_proto(
         self, model_output: list[EdgeFirstTensorExportable], max_boxes: int = 100

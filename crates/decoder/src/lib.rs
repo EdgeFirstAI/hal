@@ -76,6 +76,7 @@ pub mod infer;
 pub mod modelpack;
 pub mod per_scale;
 pub mod schema;
+pub mod semantic;
 pub mod tiling;
 pub mod yolo;
 

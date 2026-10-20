@@ -12948,7 +12948,8 @@ mod image_tests {
             return;
         }
 
-        const W: usize = 16;
+        // 32 F16 pixels make a 64-byte row, the pitch IOSurface requires for a planar destination.
+        const W: usize = 32;
         const H: usize = 16;
         const TOL: f32 = 1.0 / 256.0; // 2^-8
 

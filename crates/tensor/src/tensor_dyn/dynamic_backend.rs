@@ -36,7 +36,7 @@ use crate::{
 /// The tensor handle, plus the facts this backend cannot re-derive from the
 /// handle alone on every call (see the module docs).
 pub struct TensorDyn {
-    handle: NonNull<EfTensor>,
+    handle: Handle,
     shape_cache: Vec<usize>,
     identity: BufferIdentity,
     /// Lazily-fetched quantization, read back through the two-call
@@ -115,10 +115,52 @@ pub struct TensorDyn {
 unsafe impl Send for TensorDyn {}
 unsafe impl Sync for TensorDyn {}
 
-impl Drop for TensorDyn {
+/// The C handle, released on drop only when this value owns a reference.
+struct Handle {
+    ptr: NonNull<EfTensor>,
+    owned: bool,
+}
+
+impl Handle {
+    fn as_ptr(&self) -> *mut EfTensor {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for Handle {
     fn drop(&mut self) {
-        // SAFETY: we hold one reference, taken at construction.
-        unsafe { edgefirst_tensor_ffi::ef_tensor_free(self.handle.as_ptr()) }
+        if self.owned {
+            // SAFETY: an owned handle carries one reference, taken at construction.
+            unsafe { edgefirst_tensor_ffi::ef_tensor_free(self.ptr.as_ptr()) }
+        }
+    }
+}
+
+/// A [`TensorDyn`] borrowed from a raw handle the caller keeps owning,
+/// returned by [`TensorDyn::borrow_raw`].
+///
+/// Dropping it releases the Rust-side caches but never the handle.
+pub struct BorrowedTensor<'a> {
+    tensor: TensorDyn,
+    _handle: std::marker::PhantomData<&'a mut EfTensor>,
+}
+
+impl std::ops::Deref for BorrowedTensor<'_> {
+    type Target = TensorDyn;
+    fn deref(&self) -> &TensorDyn {
+        &self.tensor
+    }
+}
+
+impl std::ops::DerefMut for BorrowedTensor<'_> {
+    fn deref_mut(&mut self) -> &mut TensorDyn {
+        &mut self.tensor
+    }
+}
+
+impl fmt::Debug for BorrowedTensor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.tensor, f)
     }
 }
 
@@ -129,10 +171,15 @@ pub type Raw = *mut EfTensor;
 impl TensorDyn {
     /// Wrap an already-live handle, deriving the cached facts fresh.
     fn from_handle(handle: NonNull<EfTensor>) -> Self {
+        Self::wrap(handle, true)
+    }
+
+    /// Wrap a live handle, freeing it on drop only when `owned`.
+    fn wrap(handle: NonNull<EfTensor>, owned: bool) -> Self {
         let shape_cache = Self::query_shape(handle);
         let identity = Self::derive_identity(handle);
         TensorDyn {
-            handle,
+            handle: Handle { ptr: handle, owned },
             shape_cache,
             identity,
             quantization_cache: std::sync::OnceLock::new(),
@@ -272,13 +319,12 @@ impl TensorDyn {
         }
     }
 
-    /// Give up ownership, yielding the handle itself. No allocation beyond
-    /// the cache this instance already carried, which is simply dropped: it
-    /// is derived state, not something `from_raw` needs handed back to it.
+    /// Give up ownership, yielding the handle itself. The caches are
+    /// dropped: they are derived state that `from_raw` re-derives.
     pub fn into_raw(self) -> Raw {
-        let p = self.handle.as_ptr();
-        std::mem::forget(self); // the caller owns the reference now
-        p
+        let TensorDyn { mut handle, .. } = self;
+        handle.owned = false;
+        handle.as_ptr()
     }
 
     /// # Safety
@@ -287,11 +333,27 @@ impl TensorDyn {
         Self::from_handle(unsafe { NonNull::new_unchecked(p) })
     }
 
+    /// Borrow a `TensorDyn` from a raw handle the caller keeps owning.
+    ///
+    /// The guard holds no reference of its own, so a writable map through it
+    /// is not refused as shared; dropping it releases only its caches.
+    ///
     /// # Safety
-    /// `p` must be a live handle from an EdgeFirst library.
+    /// `p` must be a live handle from an EdgeFirst library that outlives
+    /// `'a`, and the `TensorDyn` must not be moved out of the guard.
+    pub unsafe fn borrow_raw<'a>(p: Raw) -> BorrowedTensor<'a> {
+        BorrowedTensor {
+            tensor: Self::wrap(unsafe { NonNull::new_unchecked(p) }, false),
+            _handle: std::marker::PhantomData,
+        }
+    }
+
+    /// Borrow a `TensorDyn` from a raw handle for the duration of `f`.
+    ///
+    /// # Safety
+    /// Same as [`Self::borrow_raw`].
     pub unsafe fn with_raw<R>(p: Raw, f: impl FnOnce(&mut TensorDyn) -> R) -> R {
-        let mut t =
-            std::mem::ManuallyDrop::new(Self::from_handle(unsafe { NonNull::new_unchecked(p) }));
+        let mut t = unsafe { Self::borrow_raw(p) };
         f(&mut t)
     }
 
@@ -476,7 +538,7 @@ impl TensorDyn {
         }
         // `shape()` serves the cached vector, not the handle, so it would
         // keep reporting the OLD geometry the moment after this succeeded.
-        self.shape_cache = Self::query_shape(self.handle);
+        self.shape_cache = Self::query_shape(self.handle.ptr);
         // A PBO-backed handle keeps its geometry in ONE place now -- the
         // library's own `TensorStorage::Pbo` -- so there is no second copy
         // to sync. Before Stage B this had to mirror every shape change onto
@@ -1222,7 +1284,7 @@ impl TensorDyn {
         // it must be re-derived the same way `from_handle` derives it the
         // first time, or `Self::shape()`/`Self::width()`/`Self::height()`
         // would report the pre-reconfigure geometry forever after.
-        self.shape_cache = Self::query_shape(self.handle);
+        self.shape_cache = Self::query_shape(self.handle.ptr);
         Ok(())
     }
 

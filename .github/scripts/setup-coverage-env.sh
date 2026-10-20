@@ -24,7 +24,7 @@ cargo llvm-cov clean --workspace
 # Export coverage environment (filter out info/warning lines)
 cargo llvm-cov show-env --export-prefix 2>&1 | grep '^export ' > /tmp/coverage-env.sh
 
-# Older cargo-llvm-cov exports RUSTFLAGS, which hides .cargo/tensor-dynamic.toml's target table; the host-target variable joins with it.
+# Older cargo-llvm-cov exports RUSTFLAGS, which hides the leaves' .cargo/config.toml target table; the host-target variable joins with it.
 host_rustflags_var="CARGO_TARGET_$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
 sed -i "s/^export RUSTFLAGS=/export ${host_rustflags_var}=/" /tmp/coverage-env.sh
 

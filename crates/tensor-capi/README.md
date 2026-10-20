@@ -139,10 +139,9 @@ Release archives are built with `make package`. To build the libraries in a chec
 make capi-libs
 # or by hand, sharing the workspace target directory:
 cargo build --release --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
-cargo build --release --config .cargo/tensor-dynamic.toml \
-  --manifest-path crates/image-capi/Cargo.toml --target-dir target
+(cd crates/image-capi && cargo build --release --target-dir ../../target)
 ```
 
-`image`, `codec` and `decoder` call into this library instead of embedding their own tensor implementation, which is what `.cargo/tensor-dynamic.toml` selects; building one of them without it, or this library with it, is a compile error that says so. `tracker` does not use tensors and needs neither.
+`image`, `codec` and `decoder` call into this library instead of embedding their own tensor implementation, which the `.cargo/config.toml` in each of their directories selects; building one of them from the repository root without `--config .cargo/tensor-dynamic.toml`, or this library with it, is a compile error that says so. `tracker` does not use tensors and needs neither.
 
 <img referrerpolicy="no-referrer" src="https://px.edgefirst.ai/a.png?x-pxid=37aa7de2-6935-484e-b31d-9fd9a57fcd63" alt="" width="1" height="1" style="position:absolute; width:1px; height:1px; opacity:0; pointer-events:none;" />

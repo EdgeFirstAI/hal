@@ -11,13 +11,17 @@
 #[cfg(not(edgefirst_tensor_dynamic))]
 compile_error!(
     "edgefirst-decoder-capi links libedgefirst_tensor and must be built with the dynamic tensor backend: \
-     `cargo build --config .cargo/tensor-dynamic.toml` (or `make capi-libs`)."
+     build it from crates/decoder-capi, whose .cargo/config.toml selects it (as `make capi-libs` does)."
 );
 
 pub mod codes;
 pub mod decode;
 pub mod infer;
+pub mod semantic;
 pub mod tiling;
+
+#[cfg(test)]
+mod test_alloc;
 
 /// ABI version of this library's C surface.
 ///
