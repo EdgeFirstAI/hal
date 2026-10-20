@@ -38,11 +38,11 @@ Packages install under the [PEP 420](https://peps.python.org/pep-0420/) `edgefir
 `edgefirst-tensor` carries the shared `libedgefirst_tensor` the `codec`, `image` and `decoder` wheels link against, so these four are built with the dynamic tensor backend:
 
 ```bash
-make wheel            # or, per package:
-maturin build --release --config .cargo/tensor-dynamic.toml -m crates/python-tensor/Cargo.toml
+make wheel            # or, per package, from its directory:
+cd crates/python-tensor && maturin build --release
 ```
 
-A build without the config fails with a message naming it. `edgefirst.tensor.__tensor_backend__` reports `"dynamic"` for every wheel built this way.
+The crate's `.cargo/config.toml` selects the dynamic backend; a build from the repository root without `--config .cargo/tensor-dynamic.toml` fails with a message naming the fix. `edgefirst.tensor.__tensor_backend__` reports `"dynamic"` for every wheel built this way.
 
 ## Quick start
 

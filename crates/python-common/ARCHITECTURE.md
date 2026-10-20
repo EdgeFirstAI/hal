@@ -38,10 +38,11 @@ plain detection values. On Windows the same library is `edgefirst_tensor.dll`
 `__init__.py` call `os.add_dll_directory()` on `edgefirst/tensor/` before
 importing their `.pyd`.
 
-These four extensions are built with edgefirst-tensor's dynamic backend:
-every `maturin build` passes `--config .cargo/tensor-dynamic.toml` (`make
-wheel`, `make install-python` and release.yml do), and a build without it
-fails in `build.rs` rather than quietly producing a wheel with its own tensor
+These four extensions are built with edgefirst-tensor's dynamic backend,
+selected by the `.cargo/config.toml` in each crate directory: maturin and
+pip run from there (`make wheel`, `make install-python`), and release.yml,
+which runs maturin from the root, passes `--config .cargo/tensor-dynamic.toml`.
+A build without either fails in `build.rs` rather than quietly producing a wheel with its own tensor
 copy. Each extension reports `__tensor_backend__`. The one exception is G13's
 static comparison build, opted into with `EDGEFIRST_TENSOR_STATIC_COMPARISON=1`.
 The link, rpath and nested `tensor-capi` build logic lives in `crates/build-support`.

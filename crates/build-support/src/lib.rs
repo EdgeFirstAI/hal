@@ -51,8 +51,9 @@ pub fn require_dynamic_tensor(package: &str) -> bool {
         Ok(dynamic) => dynamic,
         Err(()) => panic!(
             "{package} links libedgefirst_tensor and must be built with the dynamic tensor \
-             backend: pass `--config .cargo/tensor-dynamic.toml` to cargo/maturin (or use \
-             `make wheel`). Set {STATIC_COMPARISON_ENV}=1 only for the G13 static comparison build."
+             backend: build it from its crate directory, whose .cargo/config.toml selects it \
+             (as `make wheel` and `pip install crates/<crate>` do). Set {STATIC_COMPARISON_ENV}=1 \
+             only for the G13 static comparison build."
         ),
     }
 }
