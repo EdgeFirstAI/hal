@@ -72,8 +72,9 @@ void ef_image_decoder_free(ef_image_decoder *d);
  * The container is detected from magic bytes. `dst` must be large enough;
  * a smaller allocation is an error rather than a truncated image.
  *
- * @return 0 on success, `ENOSPC` when `dst` is too small, otherwise an
- *         errno.
+ * @return 0 on success, `ENOSPC` when `dst` is too small, `EACCES` when the
+ *         CPU decoder must write a `dst` not declared CPU-writable, otherwise
+ *         an errno.
  *
  * # Safety
  * `data` must be readable for `len` bytes; `dst` must be a live handle.
@@ -152,6 +153,9 @@ int ef_codec_colorimetry_from_v4l2(uint32_t colorspace,
  * Encode a packed RGB/RGBA u8 tensor as JPEG.
  *
  * `quality` in 1–100; `0` or out-of-range uses 80.
+ *
+ * @return 0 on success, `EACCES` when `t` is not declared CPU-readable,
+ *         otherwise an errno.
  *
  * # Safety
  * `path` must be a NUL-terminated string; `t` must be a live handle.

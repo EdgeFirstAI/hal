@@ -267,10 +267,14 @@ declare_abi! {
     pub fn ef_tensor_capacity_bytes(t: *const EfTensor) -> i64;
     pub fn ef_tensor_row_stride(t: *const EfTensor) -> i64;
     pub fn ef_tensor_compression(t: *const EfTensor) -> u32;
+    pub fn ef_tensor_cpu_access(t: *const EfTensor) -> u32;
+    pub fn ef_tensor_restrict_cpu_access(t: *mut EfTensor, access: u32) -> c_int;
     pub fn ef_tensor_contiguity(t: *const EfTensor) -> u32;
     pub fn ef_tensor_colorimetry(t: *const EfTensor) -> u32;
     pub fn ef_tensor_set_colorimetry(t: *mut EfTensor, packed: u32) -> c_int;
     pub fn ef_tensor_view_origin(t: *const EfTensor, out: *mut EfViewOrigin) -> c_int;
+    pub fn ef_tensor_is_view(t: *const EfTensor) -> c_int;
+    pub fn ef_tensor_mark_view(t: *mut EfTensor) -> c_int;
 
     pub fn ef_tensor_new(dtype: u32, dims: *const u64, ndim: u32) -> *mut EfTensor;
     pub fn ef_tensor_free(t: *mut EfTensor);
@@ -283,7 +287,6 @@ declare_abi! {
     pub fn ef_is_shm_available() -> c_int;
     pub fn ef_platform_compression_support(format: *const c_char, dtype: u32) -> c_int;
     pub fn ef_compression_fallback_count() -> u64;
-    pub fn ef_unplanned_cpu_access_count() -> u64;
 
     pub fn ef_tensor_cuda_map(t: *const EfTensor) -> *mut std::ffi::c_void;
     pub fn ef_tensor_cuda_map_mut(t: *const EfTensor) -> *mut std::ffi::c_void;
@@ -560,7 +563,10 @@ mod tests {
     /// `ef_tensor_image_desc_contiguous`: the physically contiguous (CMA
     /// only) allocation request and the query of which heap a DMA-BUF
     /// tensor came from.
-    const HEADER_DECLARATION_COUNT: usize = 114;
+    /// **Now 117** with `ef_tensor_is_view` and `ef_tensor_mark_view`: a
+    /// tensor rebuilt from a view's descriptor has no view origin but must
+    /// still map `ReadWrite` for a CPU write.
+    const HEADER_DECLARATION_COUNT: usize = 117;
 
     #[test]
     fn declared_matches_the_header_derived_count() {

@@ -518,6 +518,14 @@ impl<'py> TensorArg<'py> {
         let (mut capsule_obj, mut parts) = Self::call_protocol(&method, access)?;
         if let Some(retry_access) = retry_access {
             if parts.desc.is_host() && parts.desc.ptr.is_null() {
+                // A producer that declared no reads is pinned write-only.
+                let declared = edgefirst_tensor::protocol::flags::cpu_access(parts.desc.flags);
+                let retry_access = match declared {
+                    Some(a) if retry_access == "readwrite" => {
+                        a.union(edgefirst_tensor::CpuAccess::Write).as_str()
+                    }
+                    _ => retry_access,
+                };
                 (capsule_obj, parts) = Self::call_protocol(&method, Some(retry_access))?;
             }
         }
@@ -720,7 +728,7 @@ impl<'py> TensorArg<'py> {
                 }
             }
             Self::NativeMut(guard) => {
-                let (tensor, pin) = reconstruct(&guard.0, CpuAccess::ReadWrite)?;
+                let (tensor, pin) = reconstruct(&guard.0, write_pin_access(&guard.0))?;
                 let py = guard.py();
                 let keepalive = guard.into_pyobject(py).unwrap().into_any().unbind();
                 RawTensorAccess {
@@ -740,6 +748,14 @@ impl<'py> TensorArg<'py> {
             },
         })
     }
+}
+
+/// The pin direction for a tensor about to be written: its declaration plus
+/// `Write`, so a write-only tensor can still be filled.
+pub(crate) fn write_pin_access(tensor: &TensorDyn) -> edgefirst_tensor::CpuAccess {
+    tensor
+        .cpu_access()
+        .union(edgefirst_tensor::CpuAccess::Write)
 }
 
 /// Build an independent `TensorDyn` aliasing the same backing memory as
@@ -765,9 +781,10 @@ pub(crate) fn reconstruct(
     let desc = tensor.descriptor_pinned(None);
     let (desc, pin) = if desc.is_host() && desc.ptr.is_null() {
         let pin = tensor.pin_host(access).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to resolve a tensor for a detached region: {e}"
-            ))
+            crate::tensor::runtime_or_permission_error(
+                e.cpu_access_denied().is_some(),
+                format!("failed to resolve a tensor for a detached region: {e}"),
+            )
         })?;
         let desc = tensor.descriptor_pinned(Some(&pin));
         (desc, Some(pin))

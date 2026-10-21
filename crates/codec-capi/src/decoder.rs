@@ -49,8 +49,9 @@ pub unsafe extern "C" fn ef_image_decoder_free(d: *mut EfImageDecoder) {
 /// The container is detected from magic bytes. `dst` must be large enough;
 /// a smaller allocation is an error rather than a truncated image.
 ///
-/// @return 0 on success, `ENOSPC` when `dst` is too small, otherwise an
-///         errno.
+/// @return 0 on success, `ENOSPC` when `dst` is too small, `EACCES` when the
+///         CPU decoder must write a `dst` not declared CPU-writable, otherwise
+///         an errno.
 ///
 /// # Safety
 /// `data` must be readable for `len` bytes; `dst` must be a live handle.
@@ -114,10 +115,22 @@ pub unsafe extern "C" fn ef_image_decoder_decode_file_into(
 /// destination from a header can act on that, whereas a generic EIO tells them
 /// nothing about what to do next.
 fn errno_for(e: &edgefirst_codec::CodecError) -> c_int {
+    if e.cpu_access_denied().is_some() {
+        return libc::EACCES;
+    }
     match e {
         edgefirst_codec::CodecError::InsufficientCapacity { .. } => libc::ENOSPC,
         _ => libc::EIO,
     }
+}
+
+/// `EACCES` for a tensor whose declared CPU access does not cover the work,
+/// else `EIO`.
+fn tensor_errno(e: &edgefirst_tensor::Error) -> c_int {
+    if e.cpu_access_denied().is_some() {
+        return libc::EACCES;
+    }
+    libc::EIO
 }
 
 /// Whether a hardware V4L2 JPEG decoder is present.
@@ -251,6 +264,9 @@ pub unsafe extern "C" fn ef_codec_colorimetry_from_v4l2(
 ///
 /// `quality` in 1–100; `0` or out-of-range uses 80.
 ///
+/// @return 0 on success, `EACCES` when `t` is not declared CPU-readable,
+///         otherwise an errno.
+///
 /// # Safety
 /// `path` must be a NUL-terminated string; `t` must be a live handle.
 #[no_mangle]
@@ -274,7 +290,7 @@ pub unsafe extern "C" fn ef_codec_save_jpeg(
             };
             match TensorDyn::with_raw(t as *mut EfTensor, |td| save_jpeg(td, p, quality)) {
                 Ok(()) => 0,
-                Err(_) => libc::EIO,
+                Err(e) => e,
             }
         }))
         .unwrap_or(libc::EINVAL)
@@ -298,7 +314,9 @@ fn save_jpeg(tensor: &TensorDyn, path: &str, quality: u8) -> Result<(), c_int> {
     };
     let w = tensor.width().ok_or(libc::EINVAL)?;
     let h = tensor.height().ok_or(libc::EINVAL)?;
-    let pin = tensor.pin_host(CpuAccess::Read).map_err(|_| libc::EIO)?;
+    let pin = tensor
+        .pin_host(CpuAccess::Read)
+        .map_err(|e| tensor_errno(&e))?;
     let bytes = unsafe { pin.as_slice() };
     let encoder = jpeg_encoder::Encoder::new_file(path, quality).map_err(|_| libc::EIO)?;
     encoder
@@ -340,6 +358,63 @@ mod tests {
                 libc::EINVAL
             );
             ef_image_decoder_free(d);
+        }
+    }
+
+    /// Decoding into a destination not declared CPU-writable, and saving one
+    /// not declared CPU-readable, are `EACCES`, as a tensor map is.
+    #[test]
+    fn a_cpu_access_refusal_is_eacces() {
+        use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorMemory};
+        let jpeg = include_bytes!("../../../testdata/coco_grey_odd.jpg");
+        let image = |access| {
+            TensorDyn::image(
+                640,
+                480,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                access,
+            )
+            .unwrap()
+            .into_raw()
+        };
+        // Both saves are refused before the file is created.
+        let path = std::ffi::CString::new("never-written.jpg").unwrap();
+        unsafe {
+            let d = ef_image_decoder_new();
+            let read_only = image(CpuAccess::Read);
+            assert_eq!(
+                ef_image_decoder_decode_into(d, jpeg.as_ptr(), jpeg.len(), read_only),
+                libc::EACCES
+            );
+            let write_only = image(CpuAccess::Write);
+            assert_eq!(
+                ef_image_decoder_decode_into(d, jpeg.as_ptr(), jpeg.len(), write_only),
+                0
+            );
+            assert_eq!(
+                ef_codec_save_jpeg(write_only, path.as_ptr(), 80),
+                libc::ENOTSUP,
+                "a GREY image is refused before any access is checked"
+            );
+            edgefirst_tensor_ffi::ef_tensor_free(read_only);
+            edgefirst_tensor_ffi::ef_tensor_free(write_only);
+            ef_image_decoder_free(d);
+        }
+        let rgb = TensorDyn::image(
+            8,
+            8,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::Write,
+        )
+        .unwrap()
+        .into_raw();
+        unsafe {
+            assert_eq!(ef_codec_save_jpeg(rgb, path.as_ptr(), 80), libc::EACCES);
+            edgefirst_tensor_ffi::ef_tensor_free(rgb);
         }
     }
 

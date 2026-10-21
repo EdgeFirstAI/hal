@@ -476,6 +476,62 @@ pub unsafe extern "C" fn ef_tensor_compression(t: *const EfTensor) -> u32 {
     }
 }
 
+/// The CPU access declared for this tensor, as an `ef_cpu_access` code: set
+/// at allocation, possibly narrowed by `ef_tensor_restrict_cpu_access`. A
+/// map, copy or sync bracket whose direction it does not cover fails with
+/// `EACCES`.
+///
+/// Returns `EF_CPU_ACCESS_NONE` (0) for a `NULL`/invalid handle, which no
+/// CPU access can be made through either.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_cpu_access(t: *const EfTensor) -> u32 {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(i) = imp(t) else {
+                return edgefirst_tensor::CpuAccess::None.code();
+            };
+            i.inner.cpu_access().code()
+        }))
+        .unwrap_or(edgefirst_tensor::CpuAccess::None.code())
+    }
+}
+
+/// Narrow this tensor's declared CPU access to the directions both it and
+/// `access` (an `ef_cpu_access` code) cover, on the chroma plane too.
+/// Never widens: a code wider than the declaration leaves it unchanged and
+/// is not an error. The descriptor import calls this with the producer's
+/// `CPU_ACCESS_*` flag bits, so an alias refuses what its producer refuses.
+///
+/// @return 0, or `EINVAL` for a `NULL`/invalid handle or an unknown code.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle with no concurrent `tensor-capi`
+/// calls on it.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_restrict_cpu_access(
+    t: *mut EfTensor,
+    access: u32,
+) -> std::ffi::c_int {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(access) = edgefirst_tensor::CpuAccess::from_code(access) else {
+                crate::last_error::set_last_error("restrict_cpu_access: unknown access code");
+                return libc::EINVAL;
+            };
+            let Some(i) = imp_mut(t) else {
+                crate::last_error::set_last_error("restrict_cpu_access: could not resolve handle");
+                return libc::EINVAL;
+            };
+            i.inner.restrict_cpu_access(access);
+            0
+        }))
+        .unwrap_or(libc::EINVAL)
+    }
+}
+
 /// Whether this tensor's memory is known to be physically contiguous, as an
 /// `ef_contiguity` code: contiguous for DMA-BUF allocated from the CMA heap,
 /// non-contiguous for the system heap, unknown for an imported fd and every
@@ -529,6 +585,48 @@ pub unsafe extern "C" fn ef_tensor_view_origin(
                 },
                 None => EfViewOrigin::default(),
             };
+            0
+        }))
+        .unwrap_or(libc::EINVAL)
+    }
+}
+
+/// Whether this tensor addresses part of a larger buffer: a `view`/`batch`
+/// sub-region, or a tensor rebuilt from one's descriptor and marked with
+/// `ef_tensor_mark_view`. A CPU write into such a tensor maps read-write.
+///
+/// Returns 1 for a view, 0 for a whole tensor or a `NULL`/invalid handle.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_is_view(t: *const EfTensor) -> std::ffi::c_int {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            imp(t).map_or(0, |i| std::ffi::c_int::from(i.inner.is_view()))
+        }))
+        .unwrap_or(0)
+    }
+}
+
+/// Record that this tensor addresses part of a larger buffer, which
+/// `ef_tensor_is_view` then reports. Never cleared. The descriptor import
+/// calls this for a producer whose descriptor carries the `VIEW` flag.
+///
+/// @return 0, or `EINVAL` for a `NULL`/invalid handle.
+///
+/// # Safety
+/// `t` must be `NULL` or a live handle with no concurrent `tensor-capi`
+/// calls on it.
+#[no_mangle]
+pub unsafe extern "C" fn ef_tensor_mark_view(t: *mut EfTensor) -> std::ffi::c_int {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(i) = imp_mut(t) else {
+                crate::last_error::set_last_error("mark_view: could not resolve handle");
+                return libc::EINVAL;
+            };
+            i.inner.mark_view();
             0
         }))
         .unwrap_or(libc::EINVAL)
@@ -1015,6 +1113,59 @@ pub(crate) mod tests {
     #[test]
     fn freeing_a_null_handle_is_survivable() {
         unsafe { ef_tensor_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn restrict_cpu_access_never_widens_and_rejects_bad_codes() {
+        use edgefirst_tensor::CpuAccess;
+        let t = edgefirst_tensor::TensorDyn::image(
+            4,
+            4,
+            edgefirst_tensor::PixelFormat::Rgba,
+            edgefirst_tensor::DType::U8,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+            CpuAccess::Read,
+        )
+        .expect("Read-declared image");
+        let h = into_handle(t);
+        unsafe {
+            assert_eq!(
+                ef_tensor_restrict_cpu_access(h, CpuAccess::ReadWrite.code()),
+                0
+            );
+            assert_eq!(ef_tensor_cpu_access(h), CpuAccess::Read.code());
+            assert_eq!(ef_tensor_restrict_cpu_access(h, 4), libc::EINVAL);
+            assert_eq!(ef_tensor_cpu_access(h), CpuAccess::Read.code());
+            assert_eq!(
+                ef_tensor_restrict_cpu_access(std::ptr::null_mut(), CpuAccess::Read.code()),
+                libc::EINVAL
+            );
+            assert_eq!(ef_tensor_restrict_cpu_access(h, CpuAccess::Write.code()), 0);
+            assert_eq!(ef_tensor_cpu_access(h), CpuAccess::None.code());
+            ef_tensor_free(h);
+        }
+    }
+
+    #[test]
+    fn mark_view_is_reported_and_rejects_a_null_handle() {
+        let t = edgefirst_tensor::TensorDyn::image(
+            4,
+            4,
+            edgefirst_tensor::PixelFormat::Rgba,
+            edgefirst_tensor::DType::U8,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::Write,
+        )
+        .expect("Write-declared image");
+        let h = into_handle(t);
+        unsafe {
+            assert_eq!(ef_tensor_is_view(h), 0);
+            assert_eq!(ef_tensor_mark_view(h), 0);
+            assert_eq!(ef_tensor_is_view(h), 1);
+            assert_eq!(ef_tensor_is_view(std::ptr::null()), 0);
+            assert_eq!(ef_tensor_mark_view(std::ptr::null_mut()), libc::EINVAL);
+            ef_tensor_free(h);
+        }
     }
 
     #[test]

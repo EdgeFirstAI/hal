@@ -84,17 +84,7 @@ let tensor = Tensor::<u8>::new(&[height, width, channels], Some(TensorMemory::Dm
 - `PboTensor<T>`: GL pixel-buffer objects (allocated via `create_image`)
 - Environment variable `EDGEFIRST_TENSOR_FORCE_MEM=1` forces heap allocation
 
-**Image tensors declare CPU access.** `Tensor::image(...)` and
-`ImageProcessor::create_image(...)` take a required `CpuAccess`
-(`None`/`Read`/`Write`/`ReadWrite`) — hardware (GPU/NPU) access is always
-implied, CPU mapping is the opt-in. `None` keeps Android allocations
-eligible for vendor tile compression (UBWC/AFBC/…); precise declarations
-buy cheaper mappings everywhere (read-only IOSurface locks, dma-buf sync
-direction, write-combined maps). Mapping beyond the declaration is
-best-effort: warn-once + `unplanned_cpu_access_count()`. The
-`ImageDesc` builder (`Tensor::image_desc`/`create_image_desc`) is the
-full-featured path and can request `Compression::Any`. See
-`crates/tensor/ARCHITECTURE.md` § CPU access declaration.
+**Image tensors declare CPU access.** `Tensor::image(...)` and `ImageProcessor::create_image(...)` take a `CpuAccess` (`None`/`Read`/`Write`/`ReadWrite`; `ReadWrite` is the default) covering all CPU access, the HAL's own included — hardware (GPU/NPU) access is always implied. `None` keeps Android allocations eligible for vendor tile compression (UBWC/AFBC/…); precise declarations buy cheaper mappings everywhere (read-only IOSurface locks, dma-buf sync direction, write-combined maps). A map, pin or sync beyond the declaration fails with `Error::CpuAccessDenied` on both tensor backends. A write-only map is valid only for a pass that overwrites the whole buffer: fill through `TensorTrait::map_for_write` (which maps a view `ReadWrite`) or `map_for_partial_write`. The `ImageDesc` builder (`Tensor::image_desc`/`create_image_desc`) is the full-featured path and can request `Compression::Any`. See `crates/tensor/ARCHITECTURE.md` § CPU access declaration.
 
 ### Error Handling
 
@@ -377,7 +367,7 @@ for details.
 8. **Don't run tests in parallel** - Always use `--test-threads=1` or `-j 1` (see above)
 9. **Don't skip `eglTerminate`** - Omitting it leaks EGL display connections
 10. **Don't `dlclose` GPU libraries** - Use `Box::leak` to keep driver code mapped
-11. **Don't over-declare CPU access** - `CpuAccess::ReadWrite` on image constructors pins a linear layout on Android and forfeits vendor tile compression; use `None` for GPU/NPU-only buffers, `Write` for decode targets, `Read` for readback paths
+11. **Declare the CPU access you use** - every CPU map, including the HAL's own, must be covered by the tensor's `CpuAccess`; `ReadWrite` (the default) covers everything, while `None` (GPU/NPU-only, required for tile compression), `Write` (decode targets) and `Read` (readback paths) are specialised modes
 
 ---
 

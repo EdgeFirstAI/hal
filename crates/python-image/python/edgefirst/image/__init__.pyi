@@ -417,6 +417,9 @@ class ImageProcessor:
                 backend, if ``background`` aliases ``dst``, if ``bbox``,
                 ``scores``, or ``classes`` lengths do not match, or if
                 ``bbox`` shape is not ``(N, 4)``.
+            PermissionError: If a CPU draw needs access the tensors'
+                declarations do not cover (``dst`` ``"readwrite"``,
+                ``background`` readable).
         """
 
     def materialize_masks(
@@ -493,6 +496,9 @@ class ImageProcessor:
         On Windows the destination's ``gpu_completion()`` reflects this draw
         afterwards, as it does after ``convert``. The same ``BGRA``
         ``background=`` restriction as :meth:`draw_decoded_masks` applies.
+
+        Raises:
+            PermissionError: As :meth:`draw_decoded_masks`.
         """
 
     def create_image(
@@ -501,7 +507,7 @@ class ImageProcessor:
         height: int,
         format: PixelFormat = PixelFormat.Rgba,
         dtype: DType = "uint8",
-        access: str = "none",
+        access: str = "readwrite",
         compression: str | None = None,
         contiguous: bool = False,
     ) -> Tensor:
@@ -525,13 +531,26 @@ class ImageProcessor:
                 ``"float32"`` (for GPU float model-input paths); other types
                 still prefer DMA-buf when available and otherwise use system
                 memory.
-            access: Declared CPU access — ``"none"`` (default), ``"read"``,
-                ``"write"``, or ``"readwrite"``. Hardware (GPU/NPU) access is
-                always implied; declare CPU access only when the script will
-                touch the pixels directly (``map()``, ``numpy()``, buffer
-                protocol). The strict ``"none"`` default keeps hardware
-                pipelines eligible for vendor tile compression; undeclared
-                CPU access still works best-effort but is logged and counted.
+            access: Declared CPU access — ``"readwrite"`` (default),
+                ``"read"``, ``"write"``, or ``"none"`` (hardware-only,
+                required for tile compression). Hardware (GPU/NPU) access is
+                always implied. A CPU map outside the declaration raises
+                ``PermissionError``. What this processor's own ``convert()``
+                may do to the image as a destination on the CPU is added, so
+                ``Tensor.declared_cpu_access`` may be wider than ``access``:
+                ``"write"`` when it may fill the whole image (CPU backend,
+                host memory, a format or float dtype the GPU does not
+                render), ``"readwrite"`` when a pass reads back what it wrote
+                or writes only part of it (an ``"int8"`` image through the
+                CPU or G2D, a ``Bgra`` image through the CPU, a G2D ``Rgb``
+                letterbox border). Nothing is added for use as a convert
+                source (declare ``"read"``) or for a CPU mask draw (declare
+                ``"readwrite"``). On Android, pass ``"none"`` for an image
+                you never map, so gralloc can keep a tiled or compressed
+                allocation. A ``"none"``
+                image the GPU renders needs the GPU to accept the source too:
+                when it declines, the CPU fallback raises ``PermissionError``
+                naming the GPU's reason.
             compression: Tile-compression request — ``None`` (default,
                 linear), ``"any"`` (device's native scheme when eligible,
                 counted linear fallback), or a specific scheme (``"ubwc"``,
@@ -592,6 +611,12 @@ class ImageProcessor:
 
         On Windows the destination's ``gpu_completion()`` reflects this
         convert afterwards.
+
+        Raises:
+            PermissionError: If a tensor's declared CPU access does not cover
+                the CPU work (``src`` ``"read"``; ``dst`` ``"write"``, or
+                ``"readwrite"`` for a view or a read-back pass), including
+                when the GPU declined and the CPU fallback was refused.
         """
 
     def convert_deferred(
@@ -623,6 +648,9 @@ class ImageProcessor:
         On Windows the destination's ``gpu_completion()`` reflects this
         convert afterwards — the value covers the queued render, so a device
         consumer waits on that fence rather than on :meth:`flush`.
+
+        Raises:
+            PermissionError: As :meth:`convert`.
         """
 
     def flush(self) -> None:
@@ -671,6 +699,9 @@ class ImageProcessor:
         On Windows the destination's ``gpu_completion()`` reflects this
         convert afterwards, so a device consumer can be handed the fence
         value instead of this event.
+
+        Raises:
+            PermissionError: As :meth:`convert`.
         """
 
     def alloc_tile_batch(
@@ -680,7 +711,7 @@ class ImageProcessor:
         format: PixelFormat = PixelFormat.Rgba,
         dtype: DType = "uint8",
         memory: TensorMemory | None = None,
-        access: str = "none",
+        access: str = "readwrite",
     ) -> Tensor:
         """Allocate the tall packed batch destination ``[tile_w, n*tile_h]``.
 
@@ -695,9 +726,11 @@ class ImageProcessor:
             dtype: Element data type string (default: ``"uint8"``).
             memory: Force a specific backing memory kind, or ``None`` to
                 auto-select.
-            access: Declared CPU access (``"none"``/``"read"``/``"write"``/
-                ``"readwrite"``). Default ``"none"``; pass ``"readwrite"``
-                when the batch will be CPU-mapped.
+            access: Declared CPU access (``"readwrite"``/``"read"``/
+                ``"write"``/``"none"``). Default ``"readwrite"``; widened as
+                for :meth:`create_image`, except that tiles are written
+                through views, so any predicted CPU write is added as
+                ``"readwrite"``.
 
         Returns:
             A new batched image ``Tensor`` sized ``[tile_w, n*tile_h]``.
@@ -741,6 +774,9 @@ class ImageProcessor:
 
         Returns:
             The per-tile :class:`TilePlacement` list in tile-index order.
+
+        Raises:
+            PermissionError: As :meth:`convert`.
         """
 
     def tile_one(
@@ -761,6 +797,9 @@ class ImageProcessor:
             dst_slot: A single model-input sized destination.
             placement: The tile's placement from :meth:`plan_tiles`.
             cfg: Tiling configuration.
+
+        Raises:
+            PermissionError: As :meth:`convert`.
         """
 
     if sys.platform == "linux":

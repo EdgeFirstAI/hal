@@ -505,11 +505,10 @@ fn a_pitch_that_is_not_a_whole_number_of_elements_is_exact() {
 
 #[test]
 fn flags_and_sync_are_reserved_and_clear() {
-    // Both fields exist so the layout is final before first release, but no
-    // producer in this build sets either. A consumer that waited on `sync`
-    // without first checking `SYNC_PRESENT` would be waiting on garbage, so
-    // the invariant asserted here is "clear unless explicitly set", not
-    // merely "the fields exist".
+    // A host producer sets only the CPU access report in `flags`, and never
+    // `sync`. A consumer that waited on `sync` without first checking
+    // `SYNC_PRESENT` would be waiting on garbage, so the invariant asserted
+    // here is "clear unless explicitly set", not merely "the fields exist".
     let t = Tensor::<u8>::image(
         32,
         16,
@@ -519,7 +518,11 @@ fn flags_and_sync_are_reserved_and_clear() {
     )
     .expect("alloc");
     let d = TensorDyn::from(t).descriptor();
-    assert_eq!(d.flags, 0, "no producer in this build sets flags");
+    assert_eq!(
+        d.flags,
+        edgefirst_tensor::protocol::flags::from_cpu_access(CpuAccess::ReadWrite),
+        "a host producer reports only its CPU access in flags"
+    );
     assert_eq!(d.sync, 0, "sync is reserved and must stay clear");
     assert_eq!(
         d.flags & edgefirst_tensor::protocol::flags::SYNC_PRESENT,

@@ -132,6 +132,91 @@ mod cpu_tests {
         DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
 
+    /// A convert writing part of a buffer (a view) needs a `ReadWrite`
+    /// destination; a letterbox writes the whole destination and takes `Write`.
+    #[test]
+    fn partial_destination_write_needs_readwrite() {
+        use edgefirst_tensor::{CpuAccess, Error as TensorError};
+        let image = |w, h, access| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                access,
+            )
+            .unwrap()
+        };
+        let src = image(32, 16, CpuAccess::ReadWrite);
+        let mut cpu = CPUProcessor::new();
+        let parent = image(64, 64, CpuAccess::Write);
+        let mut view = parent.view(Region::new(8, 8, 32, 32)).unwrap();
+        match cpu.convert(&src, &mut view, None) {
+            Err(Error::Tensor(TensorError::CpuAccessDenied { requested, .. })) => {
+                assert_eq!(requested, CpuAccess::ReadWrite)
+            }
+            other => panic!("expected CpuAccessDenied, got {other:?}"),
+        }
+        // Rebuilt from its descriptor the view has no `ViewOrigin`, and is refused alike.
+        let pin = view.pin_host(CpuAccess::Write).unwrap();
+        let mut rebuilt =
+            TensorDyn::import_descriptor(&view.descriptor_pinned(Some(&pin))).unwrap();
+        assert!(rebuilt.view_origin().is_none() && rebuilt.is_view());
+        match cpu.convert(&src, &mut rebuilt, None) {
+            Err(Error::Tensor(TensorError::CpuAccessDenied { requested, .. })) => {
+                assert_eq!(requested, CpuAccess::ReadWrite)
+            }
+            other => panic!("expected CpuAccessDenied, got {other:?}"),
+        }
+        let rw_parent = image(64, 64, CpuAccess::ReadWrite);
+        let mut rw_view = rw_parent.view(Region::new(8, 8, 32, 32)).unwrap();
+        cpu.convert(&src, &mut rw_view, None).unwrap();
+        let mut whole = image(64, 64, CpuAccess::Write);
+        let letterbox = crate::ConvertOptions::default().crop(Crop::letterbox([0, 0, 0, 255]));
+        cpu.convert(&src, &mut whole, Some(letterbox)).unwrap();
+    }
+
+    /// A padded destination resizes through a scratch seeded from it only when
+    /// pixels outside the placement survive, so a write-only one letterboxes.
+    #[test]
+    fn padded_write_only_destination_letterboxes() {
+        use edgefirst_tensor::CpuAccess;
+        let src = TensorDyn::image(
+            32,
+            16,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(200);
+        let letterbox = crate::ConvertOptions::default().crop(Crop::letterbox([10, 20, 30, 255]));
+        let mut cpu = CPUProcessor::new();
+        for access in [CpuAccess::Write, CpuAccess::ReadWrite] {
+            let mut dst = TensorDyn::image(
+                64,
+                40,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                access,
+            )
+            .unwrap();
+            dst.configure_image(40, 40, PixelFormat::Rgb).unwrap();
+            dst.set_row_stride(192).unwrap();
+            cpu.convert(&src, &mut dst, Some(letterbox)).unwrap();
+            if access.reads() {
+                let map = dst.as_u8().unwrap().map_read().unwrap();
+                let bytes = map.as_slice();
+                assert_eq!(&bytes[..3], &[10, 20, 30], "letterbox band");
+                let centre = 20 * 192 + 20 * 3;
+                assert_eq!(&bytes[centre..centre + 3], &[200, 200, 200], "interior");
+            }
+        }
+    }
+
     /// The buffer-geometry guards reject undersized/overflowing inputs with
     /// `InvalidShape` instead of panicking. Exercised directly on plain slices
     /// (the end-to-end malformed-tensor path needs an undersized `from_fd`/DMA
@@ -1546,8 +1631,13 @@ mod cpu_tests {
 
         // Fill outside a 2x2 crop in the center with red
         let crop = Rect::new(1, 1, 2, 2);
-        CPUProcessor::fill_image_outside_crop_u8(dst.as_u8_mut().unwrap(), [255, 0, 0, 255], crop)
-            .unwrap();
+        CPUProcessor::fill_image_outside_crop_u8(
+            dst.as_u8_mut().unwrap(),
+            [255, 0, 0, 255],
+            crop,
+            false,
+        )
+        .unwrap();
 
         let map = dst.as_u8().unwrap().map().unwrap();
         let data = map.as_slice();
@@ -1575,8 +1665,13 @@ mod cpu_tests {
         dst.as_u8().unwrap().map().unwrap().as_mut_slice().fill(0);
 
         let crop = Rect::new(1, 1, 2, 2);
-        CPUProcessor::fill_image_outside_crop_u8(dst.as_u8_mut().unwrap(), [0, 255, 0, 255], crop)
-            .unwrap();
+        CPUProcessor::fill_image_outside_crop_u8(
+            dst.as_u8_mut().unwrap(),
+            [0, 255, 0, 255],
+            crop,
+            false,
+        )
+        .unwrap();
 
         let map = dst.as_u8().unwrap().map().unwrap();
         let data = map.as_slice();
@@ -1608,6 +1703,7 @@ mod cpu_tests {
             dst.as_u8_mut().unwrap(),
             [128, 64, 32, 255],
             crop,
+            false,
         )
         .unwrap();
 
@@ -1683,7 +1779,8 @@ mod cpu_tests {
 
         // Content occupies columns 32..64 of rows 2..6; everything else is border.
         let crop = Rect::new(32, 2, 32, 4);
-        CPUProcessor::fill_image_outside_crop_u8(dst.as_u8_mut().unwrap(), rgba, crop).unwrap();
+        CPUProcessor::fill_image_outside_crop_u8(dst.as_u8_mut().unwrap(), rgba, crop, false)
+            .unwrap();
 
         let t = dst.as_u8().unwrap();
         let map = t.map().unwrap();
@@ -1786,7 +1883,8 @@ mod cpu_tests {
         // Crop covers rows 1..3, columns 0..4 — the trailing pixel (x = 4)
         // is outside the crop on every row.
         let crop = Rect::new(0, 1, 4, 2);
-        CPUProcessor::fill_image_outside_crop_u8(dst.as_u8_mut().unwrap(), rgba, crop).unwrap();
+        CPUProcessor::fill_image_outside_crop_u8(dst.as_u8_mut().unwrap(), rgba, crop, false)
+            .unwrap();
 
         let t = dst.as_u8().unwrap();
         let map = t.map().unwrap();
@@ -4050,6 +4148,98 @@ mod cpu_tests {
             matches!(err, Error::NotAnImage),
             "expected NotAnImage, got {err:?}"
         );
+        Ok(())
+    }
+
+    /// OpenCV `INTER_LINEAR` sample of a `ch`-channel u8 image: two taps per
+    /// axis at half-pixel centres, clamped at the borders.
+    fn inter_linear(
+        src: &[u8],
+        ch: usize,
+        (sw, sh): (usize, usize),
+        (dw, dh): (usize, usize),
+    ) -> Vec<f32> {
+        let taps = |d: usize, n: usize, out: usize| {
+            let s = ((d as f32 + 0.5) * (n as f32 / out as f32) - 0.5).clamp(0.0, (n - 1) as f32);
+            let lo = s.floor() as usize;
+            (lo, (lo + 1).min(n - 1), s - lo as f32)
+        };
+        let mut out = Vec::with_capacity(dw * dh * ch);
+        for y in 0..dh {
+            let (y0, y1, fy) = taps(y, sh, dh);
+            for x in 0..dw {
+                let (x0, x1, fx) = taps(x, sw, dw);
+                for c in 0..ch {
+                    let px = |yy: usize, xx: usize| f32::from(src[(yy * sw + xx) * ch + c]);
+                    let top = px(y0, x0) * (1.0 - fx) + px(y0, x1) * fx;
+                    let bottom = px(y1, x0) * (1.0 - fx) + px(y1, x1) * fx;
+                    out.push(top * (1.0 - fy) + bottom * fy);
+                }
+            }
+        }
+        out
+    }
+
+    /// The CPU bilinear keeps two taps on downscale too, as the GL backend
+    /// and `INTER_LINEAR` do, rather than widening its kernel: for one, three
+    /// and four channels, an exact 2:1 shrink and a mixed shrink/grow, from
+    /// both `new` and `set_interpolation(Bilinear)`.
+    #[test]
+    fn cpu_bilinear_matches_inter_linear_on_downscale_and_upscale() -> Result<()> {
+        const SW: usize = 40;
+        const SH: usize = 30;
+        for (fmt, ch) in [
+            (PixelFormat::Grey, 1),
+            (PixelFormat::Rgb, 3),
+            (PixelFormat::Rgba, 4),
+        ] {
+            // High-frequency content: a widened kernel would visibly smooth it.
+            let pixels: Vec<u8> = (0..SW * SH * ch)
+                .map(|i| ((i * 2_654_435_761usize) >> 7) as u8)
+                .collect();
+            let src = TensorDyn::image(
+                SW,
+                SH,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )?;
+            src.as_u8()
+                .unwrap()
+                .map()?
+                .as_mut_slice()
+                .copy_from_slice(&pixels);
+            for (dw, dh) in [(30, 22), (17, 13), (64, 48), (20, 15), (25, 45)] {
+                let mut switched = CPUProcessor::new_nearest();
+                switched.set_interpolation(crate::Interpolation::Bilinear);
+                for (which, mut cpu) in [("new", CPUProcessor::new()), ("set", switched)] {
+                    let mut dst = TensorDyn::image(
+                        dw,
+                        dh,
+                        fmt,
+                        DType::U8,
+                        Some(TensorMemory::Mem),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )?;
+                    cpu.convert(&src, &mut dst, None)?;
+                    let expected = inter_linear(&pixels, ch, (SW, SH), (dw, dh));
+                    let map = dst.as_u8().unwrap().map()?;
+                    assert_eq!(map.as_slice().len(), expected.len());
+                    let worst = map
+                        .as_slice()
+                        .iter()
+                        .zip(&expected)
+                        .map(|(&got, &want)| (f32::from(got) - want).abs())
+                        .fold(0.0f32, f32::max);
+                    // One level of rounding, plus the f32 reference's own error.
+                    assert!(
+                        worst <= 1.0 + 1e-3,
+                        "{fmt} {which} {SW}x{SH} -> {dw}x{dh}: worst difference {worst}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

@@ -590,6 +590,10 @@ class Decoder:
                 from this or another ``edgefirst.*`` package.
             max_boxes: Maximum number of detections to return (default: 100).
                 Effective limit is ``min(max_boxes, decoder.max_det)``.
+
+        Raises:
+            PermissionError: If an output tensor is not declared
+                CPU-readable.
         """
 
     def decode_semantic(
@@ -627,6 +631,8 @@ class Decoder:
         Raises:
             RuntimeError: The model has no semantic output, or the tensors do
                 not match it.
+            PermissionError: An output tensor is not declared CPU-readable,
+                or ``dst``/``confidence`` not CPU-writable.
         """
 
     @property
@@ -674,6 +680,10 @@ class Decoder:
         Returns:
             ``(boxes, scores, classes, proto_data)`` where ``proto_data`` is
             ``None`` for detection-only models.
+
+        Raises:
+            PermissionError: If an output tensor is not declared
+                CPU-readable.
         """
 
     def decode_tracked(
@@ -708,6 +718,10 @@ class Decoder:
                 from this or another ``edgefirst.*`` package.
             max_boxes: Maximum number of detections to return (default: 100).
                 Effective limit is ``min(max_boxes, decoder.max_det)``.
+
+        Raises:
+            PermissionError: If an output tensor is not declared
+                CPU-readable.
         """
 
     @property

@@ -73,6 +73,14 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
 /// actually needs a processor. The result is an ordinary `ef_tensor` — read it
 /// with `ef_tensor_shape`, release it with `ef_tensor_free`.
 ///
+/// The returned tensor's `ef_tensor_cpu_access` may be wider than `access`:
+/// what this processor's own convert may do to it as a destination on the
+/// CPU is added, `EF_CPU_ACCESS_WRITE` when it may fill the whole image and
+/// `EF_CPU_ACCESS_READ_WRITE` for passes that read back or write part of it
+/// (`EF_DTYPE_I8`, a CPU `bgra8` swizzle, a G2D `rgb8` letterbox border). A
+/// PBO image is always `EF_CPU_ACCESS_READ_WRITE`. Nothing is added for use
+/// as a convert source or for a CPU mask draw; declare those yourself.
+///
 /// @return a tensor the caller owns, or `NULL`.
 ///
 /// # Safety
@@ -153,6 +161,9 @@ fn image_desc_from_view(v: &EfImageDescView) -> Option<ImageDesc> {
 /// never dereferences the handle itself, only the scalar view
 /// `ef_tensor_image_desc_get` fills. The request is not consumed and may be
 /// reused, so one description can fill a pool.
+///
+/// The declared access is widened as for `ef_image_processor_create_image`,
+/// except for a compression request, which keeps `EF_CPU_ACCESS_NONE`.
 ///
 /// @return a tensor the caller owns, or `NULL`.
 ///
@@ -456,11 +467,24 @@ pub unsafe extern "C" fn ef_convert_options_set_normalization(
     unsafe { update(o, |c| Some(c.normalization(norm))) }
 }
 
-/// The errno for a failed convert: `EINVAL` for options that cannot apply to
-/// the destination, `EIO` otherwise.
-fn convert_errno(e: &edgefirst_image::Error) -> c_int {
+/// The errno for a failed image operation: `EACCES` for a tensor whose
+/// declared CPU access does not cover the work, `EINVAL` for arguments that
+/// cannot apply, `ENOTSUP` for work no backend supports, `EIO` otherwise.
+pub(crate) fn image_errno(e: &edgefirst_image::Error) -> c_int {
+    use edgefirst_image::Error as E;
+    if e.cpu_access_denied().is_some() {
+        return libc::EACCES;
+    }
     match e {
-        edgefirst_image::Error::InvalidOptions(_) => libc::EINVAL,
+        E::InvalidOptions(_)
+        | E::CropInvalid(_)
+        | E::InvalidShape(_)
+        | E::NotAnImage
+        | E::AliasedBuffers(_) => libc::EINVAL,
+        E::UnsupportedFormat(_) | E::NotSupported(_) | E::NotImplemented(_) | E::NoConverter => {
+            libc::ENOTSUP
+        }
+        E::Io(io) => io.raw_os_error().unwrap_or(libc::EIO),
         _ => libc::EIO,
     }
 }
@@ -472,9 +496,13 @@ fn convert_errno(e: &edgefirst_image::Error) -> c_int {
 /// way regardless of which one minted them. `options` may be `NULL` for the
 /// defaults.
 ///
-/// @return 0 on success, `EINVAL` for options that cannot apply to `dst`
+/// @return 0 on success; `EINVAL` for options that cannot apply to `dst`
 /// (such as a normalization on an integer destination without quantization),
-/// otherwise an errno.
+/// an invalid crop or shape, or a tensor with no pixel format; `ENOTSUP`
+/// when no backend supports the conversion; `EACCES` when a tensor's
+/// declared `ef_cpu_access` does not cover the CPU pass, including when
+/// GL/G2D declined the convert and the CPU fallback was refused; otherwise
+/// `EIO` or the backend's errno.
 ///
 /// # Safety
 /// `p`, `src` and `dst` must be live handles.
@@ -496,7 +524,7 @@ pub unsafe extern "C" fn ef_image_processor_convert(
             });
             match result {
                 Ok(Ok(Ok(()))) => 0,
-                Ok(Ok(Err(e))) => convert_errno(&e),
+                Ok(Ok(Err(e))) => image_errno(&e),
                 Ok(Err(e)) | Err(e) => e,
             }
         }))
@@ -505,6 +533,8 @@ pub unsafe extern "C" fn ef_image_processor_convert(
 }
 
 /// Like [`ef_image_processor_convert`], but does not wait for the GPU.
+///
+/// @return the codes [`ef_image_processor_convert`] returns.
 ///
 /// # Safety
 /// `p`, `src` and `dst` must be live handles.
@@ -528,7 +558,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_deferred(
             });
             match result {
                 Ok(Ok(Ok(()))) => 0,
-                Ok(Ok(Err(e))) => convert_errno(&e),
+                Ok(Ok(Err(e))) => image_errno(&e),
                 Ok(Err(e)) | Err(e) => e,
             }
         }))
@@ -706,7 +736,8 @@ pub unsafe extern "C" fn ef_image_processor_flush(p: *mut EfImageProcessor) -> c
 ///
 /// `options` as for [`ef_image_processor_convert`].
 ///
-/// @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
+/// @return the codes [`ef_image_processor_convert`] returns, and `ENOTSUP`
+/// off Unix.
 ///
 /// # Safety
 /// `p`, `src`, `dst` must be live handles; `fence_fd` must be writable.
@@ -747,7 +778,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
                     // No native fence here: the convert already completed, which the
                     // -1 reports. Not an error.
                     Ok(Ok(Ok(None))) => 0,
-                    Ok(Ok(Err(e))) => convert_errno(&e),
+                    Ok(Ok(Err(e))) => image_errno(&e),
                     Ok(Err(e)) | Err(e) => e,
                 }
             }
@@ -765,7 +796,8 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
 ///
 /// `options` as for [`ef_image_processor_convert`].
 ///
-/// @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
+/// @return the codes [`ef_image_processor_convert`] returns, and `ENOTSUP`
+/// off Windows.
 ///
 /// # Safety
 /// `p`, `src`, `dst` must be live handles; `fence` must be writable.
@@ -808,7 +840,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
                     // completed, which the NULL `*fence` reports. Not an
                     // error.
                     Ok(Ok(Ok(None))) => 0,
-                    Ok(Ok(Err(e))) => convert_errno(&e),
+                    Ok(Ok(Err(e))) => image_errno(&e),
                     Ok(Err(e)) | Err(e) => e,
                 }
             }
@@ -990,6 +1022,119 @@ mod tests {
             ef_convert_options_free(o);
             edgefirst_tensor_ffi::ef_tensor_free(src);
             edgefirst_tensor_ffi::ef_tensor_free(dst);
+            ef_image_processor_free(p);
+        }
+    }
+
+    /// A CPU convert into a destination declared read-only, and a CPU draw
+    /// into one declared write-only, are `EACCES`, as a tensor map is.
+    #[test]
+    fn a_cpu_access_refusal_is_eacces() {
+        let p = ef_image_processor_new_with_backend(1);
+        assert!(!p.is_null(), "the CPU backend exists everywhere");
+        let rgba = std::ffi::CString::new("rgba8").unwrap();
+        let image = |fmt, access| {
+            TensorDyn::image(16, 16, fmt, DType::U8, Some(TensorMemory::Mem), access)
+                .unwrap()
+                .into_raw()
+        };
+        unsafe {
+            let src = ef_image_processor_create_image(p, 16, 16, rgba.as_ptr(), 0, 0, 3);
+            let read_only = image(PixelFormat::Rgb, CpuAccess::Read);
+            let write_only = image(PixelFormat::Rgba, CpuAccess::Write);
+            assert_eq!(
+                ef_image_processor_convert(p, src, read_only, std::ptr::null()),
+                libc::EACCES
+            );
+            assert_eq!(
+                crate::draw::ef_image_processor_draw_decoded_masks(
+                    p,
+                    write_only,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    1.0,
+                    std::ptr::null(),
+                    0,
+                ),
+                libc::EACCES
+            );
+            edgefirst_tensor_ffi::ef_tensor_free(src);
+            edgefirst_tensor_ffi::ef_tensor_free(read_only);
+            edgefirst_tensor_ffi::ef_tensor_free(write_only);
+            ef_image_processor_free(p);
+        }
+        let fallback = edgefirst_image::Error::CpuFallbackDenied {
+            declined: "opengl: unsupported source".into(),
+            denied: edgefirst_tensor::Error::CpuAccessDenied {
+                declared: CpuAccess::None,
+                requested: CpuAccess::Write,
+            },
+        };
+        assert_eq!(image_errno(&fallback), libc::EACCES);
+        assert_eq!(
+            image_errno(&edgefirst_image::Error::NotSupported("x".into())),
+            libc::ENOTSUP
+        );
+    }
+
+    /// A `create_image` destination requested with no CPU access still takes
+    /// the CPU backend's convert: the processor adds the write it needs.
+    #[test]
+    fn create_image_none_then_cpu_convert_succeeds() {
+        let p = ef_image_processor_new_with_backend(1);
+        assert!(!p.is_null(), "the CPU backend exists everywhere");
+        let rgba = std::ffi::CString::new("rgba8").unwrap();
+        let rgb = std::ffi::CString::new("rgb8").unwrap();
+        unsafe {
+            let src = ef_image_processor_create_image(p, 16, 16, rgba.as_ptr(), 0, 0, 3);
+            let dst = ef_image_processor_create_image(p, 16, 16, rgb.as_ptr(), 0, 0, 0);
+            assert!(!src.is_null() && !dst.is_null());
+            assert_eq!(
+                edgefirst_tensor_ffi::ef_tensor_cpu_access(dst),
+                CpuAccess::Write.code()
+            );
+            assert_eq!(ef_image_processor_convert(p, src, dst, std::ptr::null()), 0);
+            edgefirst_tensor_ffi::ef_tensor_free(src);
+            edgefirst_tensor_ffi::ef_tensor_free(dst);
+            ef_image_processor_free(p);
+        }
+    }
+
+    /// `tile_into` reports its failure through `errno`, a refusal as `EACCES`.
+    #[test]
+    fn tile_into_refusal_sets_errno() {
+        use crate::tiling::{ef_image_processor_tile_into, ef_tiling_config_default};
+        let p = ef_image_processor_new_with_backend(1);
+        assert!(!p.is_null(), "the CPU backend exists everywhere");
+        let cfg = ef_tiling_config_default(16, 16);
+        let image = |access| {
+            TensorDyn::image(
+                16,
+                16,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                access,
+            )
+            .unwrap()
+            .into_raw()
+        };
+        unsafe {
+            let src = image(CpuAccess::ReadWrite);
+            let read_only = image(CpuAccess::Read);
+            errno::set_errno(errno::Errno(0));
+            assert!(ef_image_processor_tile_into(p, src, read_only, &cfg).is_null());
+            assert_eq!(errno::errno().0, libc::EACCES);
+            errno::set_errno(errno::Errno(0));
+            assert!(
+                ef_image_processor_tile_into(std::ptr::null_mut(), src, read_only, &cfg).is_null()
+            );
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            edgefirst_tensor_ffi::ef_tensor_free(src);
+            edgefirst_tensor_ffi::ef_tensor_free(read_only);
             ef_image_processor_free(p);
         }
     }

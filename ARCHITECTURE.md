@@ -135,22 +135,14 @@ responsibility ends at that — link-closure validation against the ANGLE
 + Apple frameworks and runtime execution on-device belong to
 `mobile-sdk`, which binds to these crates via boltffi.
 
-**Image allocation on every tier declares CPU access.** `Tensor::image`
-/ `ImageProcessor::create_image` take a required `CpuAccess`
-(`None`/`Read`/`Write`/`ReadWrite`): hardware access is implied, CPU
-mapping is the opt-in, and `None` keeps Android allocations eligible for
-vendor tile compression. The `ImageDesc` builder additionally requests
-compression metadata (`Compression::Any` / a specific scheme). This is a
-cross-crate contract (tensor → image → capi → python); the normative
-description lives in
-[crates/tensor/ARCHITECTURE.md § CPU access declaration](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#cpu-access-declaration-cpuaccess).
+**Image allocation on every tier declares CPU access.** `Tensor::image` / `ImageProcessor::create_image` take a `CpuAccess` (`None`/`Read`/`Write`/`ReadWrite`, default `ReadWrite`) covering all CPU access, the HAL's own included: hardware access is implied, a CPU map beyond the declaration fails with `CpuAccessDenied` on every backend, and `None` keeps Android allocations eligible for vendor tile compression. What `create_image` adds for the processor's own CPU passes is described in [crates/image/ARCHITECTURE.md § create_image()](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#create_image-and-zero-copy-memory-selection). The `ImageDesc` builder additionally requests compression metadata (`Compression::Any` / a specific scheme). This is a cross-crate contract (tensor → image → capi → python); the normative description lives in [crates/tensor/ARCHITECTURE.md § CPU access declaration](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#cpu-access-declaration-cpuaccess).
 
 ### Float preprocessing capability
 
 `ImageProcessor::supported_render_dtypes()` returns a `RenderDtypeSupport
 { f32, f16 }` struct after probing the GPU's float colour-buffer extensions
 at construction time. Use it once at startup to decide which destination
-dtype to request; `convert()` always succeeds (GPU or CPU fallback).
+dtype to request; `convert()` succeeds on the GPU or the CPU fallback, provided the destination's `CpuAccess` covers the CPU pass.
 
 **Per-platform capability**
 
@@ -162,7 +154,7 @@ dtype to request; `convert()` always succeeds (GPU or CPU fallback).
 | Tegra Orin / NVIDIA (orin-nano) | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** — `cuda_map()` registers the PBO with CUDA on the GL worker thread; the device pointer is usable from any thread via the per-device CUDA primary context |
 | macOS ANGLE (RGBA16F IOSurface) | F16 `PlanarRgb` zero-copy IOSurface | Not supported (ANGLE rejects `(GL_FLOAT, *)`) |
 | Windows ANGLE / Direct3D 11 | Zero-copy D3D11 texture for `PlanarRgb`, `PlanarRgba`, `Rgb` and `Rgba` destinations; PBO readback for `TensorMemory::Pbo` ones, `Rgba` to `PlanarRgb` only (gated on `GL_EXT_color_buffer_half_float`, probed at display init) | The same four zero-copy destinations (gated on `GL_EXT_color_buffer_float`); the PBO route here is `Rgba` to `Rgb` only |
-| CPU fallback | Always present — never errors | Always present — never errors |
+| CPU fallback | Always present — needs the destination's CPU access | Always present — needs the destination's CPU access |
 
 **Data layout produced by the GPU paths**
 
@@ -193,8 +185,8 @@ let support = proc.supported_render_dtypes();
 // Pick the best float dtype; fall back to U8 if the GPU cannot render floats.
 let dst_dtype = if support.f16 { DType::F16 } else if support.f32 { DType::F32 } else { DType::U8 };
 // memory: None → auto-selects float PBO when supported, else heap.
-// access: None → hardware-only destination, the cheapest declaration.
-// convert() always succeeds; GPU path used when available, CPU otherwise.
+// access: None → hardware-only; create_image adds Write when the CPU path may fill it.
+// A convert the GPU declines into a destination the CPU may not write returns CpuFallbackDenied.
 let mut dst = proc.create_image(
     640, 640, PixelFormat::PlanarRgb, dst_dtype, None, CpuAccess::None)?;
 # Ok(())

@@ -122,7 +122,7 @@ where
                 letterbox,
                 color_mode,
             };
-            body(proc, d, overlay).map_err(|e| draw_err(&e))
+            body(proc, d, overlay).map_err(|e| crate::processor::image_errno(&e))
         };
     unsafe {
         if background.is_null() {
@@ -142,13 +142,6 @@ where
     }
 }
 
-fn draw_err(e: &edgefirst_image::Error) -> c_int {
-    match e {
-        edgefirst_image::Error::AliasedBuffers(_) => libc::EINVAL,
-        _ => libc::EIO,
-    }
-}
-
 /// Draw boxes and decoded masks onto `dst`.
 ///
 /// On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
@@ -156,11 +149,16 @@ fn draw_err(e: &edgefirst_image::Error) -> c_int {
 /// drawn frame instead of the CPU.
 ///
 /// A `BGRA` background onto a zero-copy destination (a D3D11 texture, an
-/// IOSurface, a dma-buf) returns `EIO`: the GL base-layer draw has no `BGRA`
-/// arm and the CPU backend renders only `RGBA`/`RGB`. It previously returned
-/// 0 with the destination unwritten.
+/// IOSurface, a dma-buf) returns `ENOTSUP`: the GL base-layer draw has no
+/// `BGRA` arm and the CPU backend renders only `RGBA`/`RGB`.
 ///
 /// `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
+/// A CPU draw blends into `dst`, so one not declared `EF_CPU_ACCESS_READ_WRITE`
+/// (or a `background` not declared readable) is `EACCES`.
+///
+/// @return 0 on success, `EINVAL` for an invalid argument or aliased
+/// buffers, `ENOTSUP` for a format no backend draws, `EACCES` as above,
+/// otherwise `EIO` or the backend's errno.
 ///
 /// # Safety
 /// Pointers must be live or NULL as documented.
@@ -207,8 +205,8 @@ pub unsafe extern "C" fn ef_image_processor_draw_decoded_masks(
 /// On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
 /// afterwards, as it does after a convert.
 ///
-/// The same `BGRA` background restriction and `color_mode` validation as
-/// `ef_image_processor_draw_decoded_masks`.
+/// The same `BGRA` background restriction, `color_mode` validation, `EACCES`
+/// rule and return codes as `ef_image_processor_draw_decoded_masks`.
 ///
 /// # Safety
 /// Tensor handles must stay live for the call.

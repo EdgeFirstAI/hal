@@ -36,9 +36,9 @@ the platform provides, so portable code never branches on the mechanism.
 Images go through [`Tensor::image`] (or [`Tensor::image_desc`] for the full-featured request) rather
 than [`Tensor::new`]. Two things set them apart:
 
-- They take a required [`CpuAccess`] declaration. Hardware access — GPU, NPU, ISP, codec — is always
-  implied; what the CPU intends is the one thing the allocator cannot guess. Mapping beyond the
-  declaration is best-effort and always counted by [`unplanned_cpu_access_count`].
+- They take a [`CpuAccess`] declaration (`ReadWrite` is the default). Hardware access — GPU, NPU,
+  ISP, codec — is always implied; what the CPU intends is the one thing the allocator cannot guess.
+  A CPU map, pin or sync beyond the declaration fails with [`Error::CpuAccessDenied`].
 - DMA-backed images carry a 64-byte-aligned row stride in every layout, because Mali and Vivante
   reject an EGLImage import at an unaligned pitch. Read the real pitch from
   [`Tensor::effective_row_stride`]; don't assume `width * bpp`.
@@ -1155,45 +1155,6 @@ fn deserialize_opt_scalar_or_vec_i32<'de, D: serde::Deserializer<'de>>(
     de.deserialize_option(V)
 }
 
-/// Count of tensor maps requested beyond the buffer's declared
-/// [`CpuAccess`] (including any CPU map of a `CpuAccess::None` buffer).
-/// Undeclared CPU access is a pipeline smell: it forfeits layout
-/// optimizations (write-combined mappings, tile compression) and may be
-/// slow or refused on Android. Read via [`unplanned_cpu_access_count`];
-/// each offending buffer also logs one warning.
-static UNPLANNED_CPU_ACCESS: AtomicU64 = AtomicU64::new(0);
-
-/// Number of tensor maps that exceeded the buffer's declared
-/// [`CpuAccess`] since process start. A pipeline that declares its CPU
-/// access correctly holds this flat; see [`CpuAccess`] for the contract.
-pub fn unplanned_cpu_access_count() -> u64 {
-    UNPLANNED_CPU_ACCESS.load(Ordering::Relaxed)
-}
-
-/// Record an unplanned CPU access on `identity_id`, warning once per
-/// buffer (a steady-state pipeline maps the same buffer every frame — a
-/// per-map warn would flood the log; repeats count silently).
-///
-/// `static`-only: the sole caller is `impl<T> TensorMapTrait<T> for
-/// Tensor<T>` in `lib.rs`, itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
-/// [`unplanned_cpu_access_count`] stays available under `dynamic` too --
-/// it just always reads 0 there, honestly reflecting that this backend
-/// produces no such telemetry.
-#[cfg(not(edgefirst_tensor_dynamic))]
-pub(crate) fn note_unplanned_cpu_access(identity_id: u64, backend: &str, detail: &str) {
-    UNPLANNED_CPU_ACCESS.fetch_add(1, Ordering::Relaxed);
-    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
-        std::sync::OnceLock::new();
-    let warned = WARNED.get_or_init(Default::default);
-    if warned.lock().is_ok_and(|mut s| s.insert(identity_id)) {
-        log::warn!(
-            "unplanned CPU access on {backend} buffer (identity {identity_id}): {detail} — \
-             declare the intent at allocation (CpuAccess::Read/Write/ReadWrite) to make \
-             this a planned, optimized mapping"
-        );
-    }
-}
-
 /// Uniform guard for mutable access through a read-only map. Every
 /// `TensorMap` backend calls this from `as_mut_slice`/`deref_mut` so a
 /// `map_read()` misuse fails identically on all platforms instead of
@@ -1208,42 +1169,57 @@ pub(crate) fn assert_map_writable(writable: bool, backend: &str) {
 }
 
 crate::ef_vocabulary! {
-    /// Declared CPU involvement for an image tensor, chosen at allocation.
+    /// Declared CPU involvement for a tensor, chosen at allocation.
     ///
-    /// The HAL assumes buffers are produced and consumed by hardware (ISP,
-    /// codec, GPU, NPU) — hardware access needs no declaration. CPU access is
-    /// the opt-in: it selects the CPU usage/mapping mode at allocation
-    /// (write-combined for `Write`, cached for `Read`) and, on Android, pins
-    /// the layout linear (vendor tile compression requires `None`).
+    /// The declaration covers **all** CPU access to the buffer — the
+    /// caller's maps, pins and sync brackets, and the HAL's own CPU work
+    /// (the CPU image backend, codec decodes, decoder outputs). Hardware
+    /// access (ISP, codec, GPU, NPU) needs no declaration. It selects the CPU
+    /// usage/mapping mode at allocation (write-combined for `Write`, cached
+    /// for `Read`) and, on Android, pins the layout linear (vendor tile
+    /// compression requires `None`).
     ///
-    /// Mapping beyond the declared access is best-effort, never silent: it
-    /// may be refused ([`Error::NotImplemented`]) or take a slow path, and it
-    /// always increments [`unplanned_cpu_access_count`] with a once-per-buffer
-    /// warning.
+    /// A CPU map, pin or sync whose direction the declaration does not cover
+    /// fails with [`Error::CpuAccessDenied`] on every backend.
+    ///
+    /// On Android the `ReadWrite` default asks gralloc for
+    /// `CPU_READ_OFTEN | CPU_WRITE_OFTEN`, which may give linear, CPU-cached
+    /// memory. Pass `None` for a buffer that is never mapped on the CPU, so
+    /// gralloc can keep a tiled or compressed allocation. Linux DMA-BUF
+    /// allocation does not depend on the declaration.
     ///
     /// [`CpuAccess::code`] is the wire code the C header's `ef_cpu_access`
     /// enumerators are asserted against.
     #[derive(Default)]
     pub enum CpuAccess {
-        /// Hardware-only buffer (the default): no CPU mapping declared.
-        /// Compression-eligible on platforms with vendor tile layouts.
-        #[default]
+        /// Hardware-only buffer: no CPU access. Required for vendor tile
+        /// compression on platforms with compressed layouts.
         None = 0, "none", NONE,
-        /// CPU reads (verification, CPU consumers) — cached mapping.
+        /// CPU reads only (verification, CPU consumers) — cached mapping.
         Read = 1, "read", READ,
-        /// CPU writes (decode targets) — write-combined mapping where the
-        /// platform supports it; reading through a `Write` map is undeclared.
+        /// CPU writes only (decode targets) — write-combined mapping where
+        /// the platform supports it.
         Write = 2, "write", WRITE,
-        /// CPU reads and writes — the pre-CpuAccess implicit behavior.
+        /// CPU reads and writes (the default).
+        #[default]
         ReadWrite = 3, "readwrite", READ_WRITE,
     }
-    // `#[doc(hidden)]` for the same reason `dtype_wire` is: emission
-    // plumbing for `const`-only consumers, not a second documented API.
+    // Hidden like `dtype_wire`: emission plumbing, not a second documented API.
     #[doc(hidden)]
     pub mod cpu_access_wire;
 }
 
 impl CpuAccess {
+    /// The declaration with exactly the given directions.
+    pub(crate) const fn from_directions(read: bool, write: bool) -> CpuAccess {
+        match (read, write) {
+            (true, true) => CpuAccess::ReadWrite,
+            (true, false) => CpuAccess::Read,
+            (false, true) => CpuAccess::Write,
+            (false, false) => CpuAccess::None,
+        }
+    }
+
     /// Whether this declaration includes CPU reads.
     pub fn reads(self) -> bool {
         matches!(self, CpuAccess::Read | CpuAccess::ReadWrite)
@@ -1258,6 +1234,69 @@ impl CpuAccess {
     /// request needs is declared).
     pub fn covers(self, requested: CpuAccess) -> bool {
         (!requested.reads() || self.reads()) && (!requested.writes() || self.writes())
+    }
+
+    /// The declaration covering every direction of both `self` and `other`.
+    ///
+    /// ```
+    /// use edgefirst_tensor::CpuAccess;
+    /// assert_eq!(CpuAccess::Read.union(CpuAccess::Write), CpuAccess::ReadWrite);
+    /// assert_eq!(CpuAccess::None.union(CpuAccess::Write), CpuAccess::Write);
+    /// ```
+    pub fn union(self, other: CpuAccess) -> CpuAccess {
+        Self::from_directions(
+            self.reads() || other.reads(),
+            self.writes() || other.writes(),
+        )
+    }
+
+    /// The declaration covering only the directions both `self` and `other`
+    /// cover.
+    ///
+    /// ```
+    /// use edgefirst_tensor::CpuAccess;
+    /// assert_eq!(CpuAccess::ReadWrite.intersection(CpuAccess::Write), CpuAccess::Write);
+    /// assert_eq!(CpuAccess::Read.intersection(CpuAccess::Write), CpuAccess::None);
+    /// ```
+    pub fn intersection(self, other: CpuAccess) -> CpuAccess {
+        Self::from_directions(
+            self.reads() && other.reads(),
+            self.writes() && other.writes(),
+        )
+    }
+
+    /// `Ok` when this declaration covers `requested`, otherwise
+    /// [`Error::CpuAccessDenied`] naming both.
+    ///
+    /// ```
+    /// use edgefirst_tensor::{CpuAccess, Error};
+    /// assert!(CpuAccess::ReadWrite.require(CpuAccess::Write).is_ok());
+    /// assert!(matches!(
+    ///     CpuAccess::Read.require(CpuAccess::Write),
+    ///     Err(Error::CpuAccessDenied { .. })
+    /// ));
+    /// ```
+    pub fn require(self, requested: CpuAccess) -> Result<()> {
+        if self.covers(requested) {
+            Ok(())
+        } else {
+            Err(Error::CpuAccessDenied {
+                declared: self,
+                requested,
+            })
+        }
+    }
+
+    /// [`require`](Self::require) for a map, pin or sync, where
+    /// `CpuAccess::None` is no direction at all: [`Error::InvalidArgument`]
+    /// naming `what`.
+    pub(crate) fn require_direction(self, requested: CpuAccess, what: &str) -> Result<()> {
+        if requested == CpuAccess::None {
+            return Err(Error::InvalidArgument(format!(
+                "{what}: CpuAccess::None is not a CPU access direction"
+            )));
+        }
+        self.require(requested)
     }
 }
 
@@ -1416,8 +1455,8 @@ pub struct ImageDesc {
 }
 
 impl ImageDesc {
-    /// A new image request: auto-selected memory, [`CpuAccess::None`]
-    /// (hardware-only), no compression request.
+    /// A new image request: auto-selected memory, [`CpuAccess::ReadWrite`],
+    /// no compression request.
     pub fn new(width: usize, height: usize, format: PixelFormat, dtype: DType) -> Self {
         Self {
             width,
@@ -1425,7 +1464,7 @@ impl ImageDesc {
             format,
             dtype,
             memory: None,
-            access: CpuAccess::None,
+            access: CpuAccess::default(),
             compression: None,
             contiguous: false,
         }
@@ -1438,7 +1477,8 @@ impl ImageDesc {
     }
 
     /// Declare the CPU access (see [`CpuAccess`]). Any declaration other
-    /// than `None` makes a compression request invalid.
+    /// than `None` makes a compression request invalid, so a compression
+    /// request must also call `with_access(CpuAccess::None)`.
     pub fn with_access(mut self, access: CpuAccess) -> Self {
         self.access = access;
         self
@@ -1834,11 +1874,12 @@ where
     /// lock, dma-buf sync direction, AHardwareBuffer lock usage) and the
     /// map's mutability: a map obtained with [`CpuAccess::Read`] rejects
     /// `as_mut_slice`. [`CpuAccess::None`] is not a mappable direction
-    /// and returns [`Error::InvalidArgument`].
+    /// and returns [`Error::InvalidArgument`]; a direction the tensor's
+    /// declared [`CpuAccess`] does not cover returns
+    /// [`Error::CpuAccessDenied`].
     ///
     /// Prefer the typed wrappers [`map_read`](Self::map_read) /
     /// [`map_write`](Self::map_write) / [`map_mut`](Self::map_mut).
-    /// Map for CPU access.
     ///
     /// Like [`pin_host`](Tensor::pin_host), `'a` bounds how long the backing
     /// allocation lives rather than borrowing the tensor: the returned view
@@ -1872,8 +1913,11 @@ where
         T: 'a;
 
     /// Map the tensor read-write (equivalent to
-    /// `map_with(CpuAccess::ReadWrite)` — the historical `map()`
-    /// behavior).
+    /// `map_with(CpuAccess::ReadWrite)`).
+    ///
+    /// Fails with [`Error::CpuAccessDenied`] on a `Read`- or `Write`-declared
+    /// tensor: use [`map_read`](Self::map_read) to read one and
+    /// [`map_for_write`](Self::map_for_write) to fill one.
     fn map<'a>(&self) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a,
@@ -1884,7 +1928,8 @@ where
     /// Map the tensor for CPU reading only. The returned map rejects
     /// `as_mut_slice`; on macOS this takes the read-only IOSurface lock
     /// (skips the unlock flush), on Linux the dma-buf read-direction
-    /// sync.
+    /// sync. Fails with [`Error::CpuAccessDenied`] on a `Write`- or
+    /// `None`-declared tensor.
     fn map_read<'a>(&self) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a,
@@ -1894,6 +1939,9 @@ where
 
     /// Map the tensor for CPU writing (fill-only: reading through a
     /// write map may see write-combined memory — do not read the slice).
+    /// Valid only for a pass that overwrites the whole mapping; see
+    /// [`write_access`](Self::write_access). Fails with
+    /// [`Error::CpuAccessDenied`] on a `Read`- or `None`-declared tensor.
     fn map_write<'a>(&self) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a,
@@ -1902,8 +1950,73 @@ where
     }
 
     /// Map the tensor read-write (alias of [`map`](Self::map) with the
-    /// intent spelled out).
+    /// intent spelled out); refused on the same declarations.
     fn map_mut<'a>(&self) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.map_with(CpuAccess::ReadWrite)
+    }
+
+    /// The CPU access declared for this tensor (see [`CpuAccess`]). A bare
+    /// backing carries no declaration of its own and reports `ReadWrite`.
+    fn cpu_access(&self) -> CpuAccess {
+        CpuAccess::ReadWrite
+    }
+
+    /// The parent-image snapshot when this tensor is a sub-region of a larger
+    /// buffer (see [`ViewOrigin`]); a bare backing reports `None`.
+    fn view_origin(&self) -> Option<ViewOrigin> {
+        None
+    }
+
+    /// Whether this tensor addresses part of a larger buffer (see
+    /// [`Tensor::is_view`]); a bare backing reports `false`.
+    fn is_view(&self) -> bool {
+        self.view_origin().is_some()
+    }
+
+    /// The direction a CPU pass that overwrites every element of this tensor
+    /// maps with.
+    ///
+    /// A write-only map does not invalidate the CPU cache (on arm64,
+    /// `DMA_BUF_SYNC_START|WRITE` only orders), so a stale cache line the pass
+    /// writes only partly is written back over whatever a device left in the
+    /// rest of it. The map may therefore be `Write` only when the pass covers
+    /// the whole buffer: a whole tensor takes its declaration plus `Write`
+    /// (`Write` on a write-only declaration), a [`view`](Tensor::view), whose
+    /// rows share cache lines with bytes outside it, takes `ReadWrite`.
+    fn write_access(&self) -> CpuAccess {
+        if self.is_view() {
+            CpuAccess::ReadWrite
+        } else {
+            self.cpu_access().union(CpuAccess::Write)
+        }
+    }
+
+    /// Map for a CPU pass that overwrites every element, in
+    /// [`write_access`](Self::write_access)'s direction.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CpuAccessDenied`] when the declaration does not cover that
+    /// direction, otherwise whatever [`map_with`](Self::map_with) returns.
+    fn map_for_write<'a>(&self) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.map_with(self.write_access())
+    }
+
+    /// Map for a CPU pass that writes only part of the buffer and keeps the
+    /// rest (a letterbox border around a device-rendered interior): always
+    /// `ReadWrite`, see [`write_access`](Self::write_access).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CpuAccessDenied`] unless the declaration is `ReadWrite`,
+    /// otherwise whatever [`map_with`](Self::map_with) returns.
+    fn map_for_partial_write<'a>(&self) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a,
     {
@@ -2906,7 +3019,7 @@ where
     /// Declared CPU access (see [`CpuAccess`]). Image constructors set it
     /// from their `access` parameter; non-image tensors (`new`, imports,
     /// numpy) default to `ReadWrite` — they are CPU-centric by nature.
-    /// `map_with` counts requests beyond this declaration as unplanned.
+    /// Maps, pins and sync brackets beyond this declaration are refused.
     cpu_access: CpuAccess,
     /// Recorded vendor tile-compression scheme — best knowledge from
     /// allocation time (see [`Compression`]). `Some` only for Android
@@ -2921,6 +3034,11 @@ where
     /// backend key its import on the parent and render the view as a
     /// `glViewport`/`glScissor` ROI. See [`ViewOrigin`].
     view_origin: Option<ViewOrigin>,
+    /// Set by [`mark_view`](Self::mark_view) on a tensor rebuilt from a view's
+    /// descriptor, which addresses part of a larger buffer but has no
+    /// [`ViewOrigin`], and inherited by its sub-views. See
+    /// [`is_view`](Self::is_view).
+    view_marked: bool,
 }
 
 #[cfg(not(edgefirst_tensor_dynamic))]
@@ -2942,6 +3060,7 @@ where
             cpu_access: CpuAccess::ReadWrite,
             compression: None,
             view_origin: None,
+            view_marked: false,
         }
     }
 
@@ -3096,6 +3215,8 @@ where
     /// - [`Error::InvalidArgument`] when `access` is [`CpuAccess::None`]: a
     ///   pinned mapping is CPU access by definition, so this is an error
     ///   rather than a warn-and-stage.
+    /// - [`Error::CpuAccessDenied`] when the tensor's declared
+    ///   [`CpuAccess`] does not cover `access`.
     /// - [`Error::NotImplemented`] for the two backends that **cannot** pin,
     ///   rather than merely not having been wired yet: a PBO
     ///   (`glMapBufferRange` establishes the address and the visibility
@@ -3113,13 +3234,7 @@ where
     where
         T: 'a,
     {
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(
-                "pin_host: CpuAccess::None is not a valid pin; a pinned mapping \
-                 is CPU access by definition"
-                    .to_owned(),
-            ));
-        }
+        self.cpu_access.require_direction(access, "pin_host")?;
         // Backends yield everything addressable from the tensor's offset;
         // narrow to the logical extent so a consumer cannot mistake pitch
         // padding for data. A map guard keeps the wider window.
@@ -3210,9 +3325,10 @@ where
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] when `access` is [`CpuAccess::None`], which
-    /// describes no access to make coherent.
+    /// describes no access to make coherent; [`Error::CpuAccessDenied`] when
+    /// the tensor's declared [`CpuAccess`] does not cover `access`.
     pub fn sync_for_cpu(&self, access: CpuAccess) -> Result<()> {
-        Self::check_sync_access(access)?;
+        self.check_sync_access(access)?;
         match &self.storage {
             // Plain CPU memory: coherent by construction.
             TensorStorage::Mem(_) => Ok(()),
@@ -3256,7 +3372,7 @@ where
     /// Corresponds to `DMA_BUF_SYNC_END`. See
     /// [`sync_for_cpu`](Self::sync_for_cpu) for the pairing and cost.
     pub fn sync_for_device(&self, access: CpuAccess) -> Result<()> {
-        Self::check_sync_access(access)?;
+        self.check_sync_access(access)?;
         match &self.storage {
             TensorStorage::Mem(_) => Ok(()),
             #[cfg(unix)]
@@ -3284,15 +3400,9 @@ where
         }
     }
 
-    fn check_sync_access(access: CpuAccess) -> Result<()> {
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(
-                "sync_for_cpu/sync_for_device: CpuAccess::None describes no \
-                 access to synchronise"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
+    fn check_sync_access(&self, access: CpuAccess) -> Result<()> {
+        self.cpu_access
+            .require_direction(access, "sync_for_cpu/sync_for_device")
     }
 
     /// Construct a tensor from a 3-D ndarray view. Respects strides — one
@@ -4596,6 +4706,7 @@ where
             compression: luma.compression,
             // A composed multiplane tensor is a whole image, not a sub-view.
             view_origin: None,
+            view_marked: false,
         })
     }
 
@@ -4815,6 +4926,23 @@ where
         self.view_origin
     }
 
+    /// Whether this tensor addresses part of a larger buffer: a
+    /// [`view`](Self::view)/[`batch`](Self::batch) with a [`ViewOrigin`], or a
+    /// tensor rebuilt from such a view's descriptor, which carries none.
+    ///
+    /// A view's rows share cache lines with bytes outside it, so a CPU pass
+    /// that writes it maps `ReadWrite` (see [`TensorTrait::write_access`]).
+    pub fn is_view(&self) -> bool {
+        self.view_origin.is_some() || self.view_marked
+    }
+
+    /// Record that this tensor addresses part of a larger buffer, as
+    /// [`is_view`](Self::is_view) reports. The descriptor import calls this
+    /// for a producer that was a view; it is never cleared.
+    pub fn mark_view(&mut self) {
+        self.view_marked = true;
+    }
+
     /// Set the byte offset within the DMA-BUF where image data starts.
     ///
     /// Propagated to `EGL_DMA_BUF_PLANE0_OFFSET_EXT` on GPU import.
@@ -4888,27 +5016,49 @@ where
             // (`import_storage`'s DMABUF arm is `cfg(target_os = "linux")`),
             // so it is latent rather than silent. See
             // `edgefirst-python-common`'s `interop::apply_plane_offset` for
-            // the full per-backing accounting. PBO and Shm were on this list
-            // until Stage B of the client-side-state work gave them the arms
-            // above.
+            // the full per-backing accounting.
             #[cfg(target_os = "android")]
             TensorStorage::Dma(_) => {}
         }
     }
 
-    /// Colorimetry metadata (`None` = undefined; never auto-filled).
-    /// The CPU access declared for this tensor at allocation (see
-    /// [`CpuAccess`]). Views share their parent's declaration.
+    /// The CPU access declared for this tensor (see [`CpuAccess`]): set at
+    /// allocation, possibly narrowed by
+    /// [`restrict_cpu_access`](Self::restrict_cpu_access). A view copies its
+    /// parent's declaration when it is taken.
     pub fn cpu_access(&self) -> CpuAccess {
         self.cpu_access
+    }
+
+    /// Narrow the declared CPU access to the directions both it and `access`
+    /// cover, on the chroma plane too. Never widens: a declaration must not
+    /// exceed what the allocation was made for, so a wider `access` leaves
+    /// it unchanged. An importer uses this to carry a producer's declaration
+    /// onto an alias of the same buffer.
+    ///
+    /// ```
+    /// # use edgefirst_tensor::{CpuAccess, PixelFormat, Tensor, TensorMemory};
+    /// # fn main() -> Result<(), edgefirst_tensor::Error> {
+    /// let mut t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Mem), CpuAccess::ReadWrite)?;
+    /// t.restrict_cpu_access(CpuAccess::Read);
+    /// assert_eq!(t.cpu_access(), CpuAccess::Read);
+    /// t.restrict_cpu_access(CpuAccess::ReadWrite);
+    /// assert_eq!(t.cpu_access(), CpuAccess::Read);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn restrict_cpu_access(&mut self, access: CpuAccess) {
+        self.cpu_access = self.cpu_access.intersection(access);
+        if let Some(chroma) = self.chroma.as_mut() {
+            chroma.restrict_cpu_access(access);
+        }
     }
 
     /// Set the declared CPU access without re-allocating — crate-private:
     /// the declaration must reflect the underlying allocation's real
     /// capabilities (constructors and importers set it; arbitrary widening
     /// would defeat the contract).
-    // Only the Android AHardwareBuffer importer derives a declaration from
-    // an existing allocation's usage bits.
+    // Only the Android AHardwareBuffer importer derives a declaration from usage bits.
     #[cfg(target_os = "android")]
     pub(crate) fn set_cpu_access_unchecked(&mut self, access: CpuAccess) {
         self.cpu_access = access;
@@ -5023,6 +5173,7 @@ where
         // Likewise the recorded compression scheme: the view shares the
         // parent's physical layout.
         t.compression = self.compression;
+        t.view_marked = self.is_view();
         if abs_offset > 0 {
             t.set_plane_offset(abs_offset);
         }
@@ -5327,6 +5478,7 @@ where
             cpu_access: CpuAccess::ReadWrite,
             compression: None,
             view_origin: None,
+            view_marked: false,
         })
     }
 
@@ -5975,25 +6127,7 @@ where
             non_blocking,
         )
         .entered();
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(
-                "map_with(CpuAccess::None) is not a mappable direction — use \
-                 map_read()/map_write()/map_mut()"
-                    .into(),
-            ));
-        }
-        // Declared-vs-requested telemetry (all platforms): mapping beyond
-        // the allocation-time declaration is best-effort — tolerated where
-        // the backing is CPU-mappable regardless (Mem/Shm/dma-buf/
-        // IOSurface), refused by the Android backend for CpuAccess::None
-        // buffers — but always loud and counted, never silent.
-        if !self.cpu_access.covers(access) {
-            note_unplanned_cpu_access(
-                self.buffer_identity().id(),
-                &format!("{:?}", self.storage.memory()),
-                "map access exceeds the declared CpuAccess",
-            );
-        }
+        self.cpu_access.require_direction(access, "map_with")?;
         // CPU mapping of a strided tensor exposes the full padded buffer
         // (`row_stride × rows`) so callers can iterate rows via
         // `effective_row_stride()` without running past the slice. This is sound
@@ -6109,6 +6243,18 @@ impl<T> TensorTrait<T> for Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    fn cpu_access(&self) -> CpuAccess {
+        self.cpu_access
+    }
+
+    fn view_origin(&self) -> Option<ViewOrigin> {
+        self.view_origin
+    }
+
+    fn is_view(&self) -> bool {
+        Tensor::is_view(self)
+    }
+
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self>
     where
         Self: Sized,
@@ -7060,10 +7206,10 @@ mod compression_tests {
         assert_eq!(desc.access(), CpuAccess::Read);
         assert_eq!(desc.compression(), Some(Compression::Any));
 
-        // Defaults: auto memory, hardware-only, no request.
+        // Defaults: auto memory, CPU read/write, no request.
         let plain = ImageDesc::new(2, 2, PixelFormat::Grey, DType::U8);
         assert_eq!(plain.memory(), None);
-        assert_eq!(plain.access(), CpuAccess::None);
+        assert_eq!(plain.access(), CpuAccess::ReadWrite);
         assert_eq!(plain.compression(), None);
     }
 
@@ -7091,6 +7237,7 @@ mod compression_tests {
     #[test]
     fn scheme_request_off_android_is_not_implemented() {
         let desc = ImageDesc::new(4, 4, PixelFormat::Rgba, DType::U8)
+            .with_access(CpuAccess::None)
             .with_compression(Compression::Scheme(CompressionScheme::Ubwc));
         match Tensor::<u8>::image_desc(&desc) {
             Err(Error::NotImplemented(msg)) => assert!(msg.contains("Ubwc")),
@@ -7104,6 +7251,7 @@ mod compression_tests {
         let before = compression_fallback_count();
         let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8)
             .with_memory(Some(TensorMemory::Mem))
+            .with_access(CpuAccess::None)
             .with_compression(Compression::Any);
         let t = Tensor::<u8>::image_desc(&desc).unwrap();
         assert_eq!(t.compression(), None);
@@ -8118,8 +8266,9 @@ mod accessor_tests {
     #[test]
     fn any_compression_request_falls_back_when_zero_copy_cannot_serve() {
         let _lock = crate::tests::fd_lock_shared();
-        let desc =
-            ImageDesc::new(10, 10, PixelFormat::Rgb, DType::F32).with_compression(Compression::Any);
+        let desc = ImageDesc::new(10, 10, PixelFormat::Rgb, DType::F32)
+            .with_access(CpuAccess::None)
+            .with_compression(Compression::Any);
         let t = Tensor::<f32>::image_desc(&desc).expect("Any never fails for compression reasons");
         assert_eq!(t.shape(), &[10, 10, 3]);
         assert_eq!(t.compression(), None);
@@ -8147,6 +8296,25 @@ mod cpu_access_tests {
         assert!(!Read.covers(ReadWrite));
         assert!(!Write.covers(Read));
         assert!(!Write.covers(ReadWrite));
+    }
+
+    #[test]
+    fn union_covers_both_and_require_names_both() {
+        use CpuAccess::*;
+        for a in [None, Read, Write, ReadWrite] {
+            for b in [None, Read, Write, ReadWrite] {
+                let u = a.union(b);
+                assert!(u.covers(a) && u.covers(b), "{a:?} | {b:?} = {u:?}");
+                assert_eq!(a.require(b).is_ok(), a.covers(b));
+            }
+        }
+        match Read.require(Write) {
+            Err(Error::CpuAccessDenied {
+                declared: Read,
+                requested: Write,
+            }) => {}
+            other => panic!("expected CpuAccessDenied, got {other:?}"),
+        }
     }
 
     #[test]

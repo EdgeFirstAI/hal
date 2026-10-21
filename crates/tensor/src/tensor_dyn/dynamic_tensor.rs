@@ -265,6 +265,19 @@ impl<T: Element> Tensor<T> {
         self.inner.aliases(&other.inner)
     }
 
+    /// The CPU access declared for this tensor (see [`CpuAccess`]): set at
+    /// allocation, possibly narrowed by [`Self::restrict_cpu_access`].
+    pub fn cpu_access(&self) -> CpuAccess {
+        self.inner.cpu_access()
+    }
+
+    /// Narrow the declared CPU access to the directions both it and
+    /// `access` cover; never widens. See `static`'s
+    /// `Tensor::restrict_cpu_access` (`lib.rs`).
+    pub fn restrict_cpu_access(&mut self, access: CpuAccess) {
+        self.inner.restrict_cpu_access(access)
+    }
+
     /// Colorimetry metadata (`None` = undefined; never auto-filled).
     pub fn colorimetry(&self) -> Option<Colorimetry> {
         self.inner.colorimetry()
@@ -295,6 +308,18 @@ impl<T: Element> Tensor<T> {
     /// sub-region; `None` for a whole tensor.
     pub fn view_origin(&self) -> Option<ViewOrigin> {
         self.inner.view_origin()
+    }
+
+    /// Whether this tensor addresses part of a larger buffer. See `static`'s
+    /// `Tensor::is_view` (`lib.rs`).
+    pub fn is_view(&self) -> bool {
+        self.inner.is_view()
+    }
+
+    /// Record that this tensor addresses part of a larger buffer. See
+    /// `static`'s `Tensor::mark_view` (`lib.rs`).
+    pub fn mark_view(&mut self) {
+        self.inner.mark_view()
     }
 
     /// Byte offset within the DMA-BUF where image data starts (`None` = 0).
@@ -880,6 +905,18 @@ impl<T: Element> fmt::Debug for Tensor<T> {
 }
 
 impl<T: Element> TensorTrait<T> for Tensor<T> {
+    fn cpu_access(&self) -> CpuAccess {
+        Tensor::cpu_access(self)
+    }
+
+    fn view_origin(&self) -> Option<ViewOrigin> {
+        Tensor::view_origin(self)
+    }
+
+    fn is_view(&self) -> bool {
+        Tensor::is_view(self)
+    }
+
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self>
     where
         Self: Sized,

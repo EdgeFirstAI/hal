@@ -57,14 +57,6 @@ const ALLOWED: &[(&str, &str)] = &[
          consumer waits behind another's work.",
     ),
     (
-        "UNPLANNED_CPU_ACCESS",
-        "diagnostic counter; a per-artifact undercount misleads nobody",
-    ),
-    (
-        "WARNED",
-        "warn-once dedup set; N copies mean a warning may print once per artifact",
-    ),
-    (
         "COMPRESSION_FALLBACKS",
         "diagnostic counter; a per-artifact undercount misleads nobody",
     ),

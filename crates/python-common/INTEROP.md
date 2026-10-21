@@ -246,6 +246,12 @@ are valid in the producing process, other modules of the same process included,
 and the import duplicates whatever it keeps, exactly as the `DMABUF` kind does
 with its fd.
 
+### CPU access flags
+
+A producer reports its tensor's declared `CpuAccess` in three `flags` bits: `CPU_ACCESS_DECLARED` (bit 1) says the report is present, `CPU_READ` (bit 2) and `CPU_WRITE` (bit 3) carry the directions. `import_descriptor` narrows the imported alias to that declaration with `restrict_cpu_access`, so a CPU map the producer's tensor would refuse is refused on the alias too, and `Tensor.declared_cpu_access` on the alias reports it. A consumer that must pin a host descriptor for writing reads the bits first and asks for `access="write"` rather than `"readwrite"` when the producer declared no reads; a pin outside the producer's declaration raises `PermissionError`. A descriptor without `CPU_ACCESS_DECLARED`, from an older or third-party producer, imports with the default `ReadWrite` declaration.
+
+The narrowing is the consumer's to apply. An older consumer, one that predates these bits or does not read them, imports the alias as `ReadWrite` and so cannot enforce a newer producer's declaration: a CPU map through that alias succeeds where the producer's own tensor would refuse it. A producer that relies on its declaration being honoured (a `None` buffer nothing may touch on the CPU, a `Write` buffer nothing may read) needs consumers that read the bits.
+
 One consequence worth stating: an `access="read"` capsule over a texture tensor
 still pins host memory, but no consumer can reach the pixels through that
 address, because the pixels live in the texture. The pin is a keepalive and
@@ -261,6 +267,10 @@ PBO tensor keeps the buffer's map and unmap reachable even after the producing
 tensor and its capsule are gone. `retain` and `release` govern the channel
 only. The producer's own destructor stays the sole caller of `glDeleteBuffers`,
 and a reconstructed tensor's delete operation is a no-op.
+
+### View flag
+
+`VIEW` (bit 4) marks a producer that addresses part of a larger buffer: a `view()`, or a `batch()` element of a packed image, at any offset including zero. The descriptor cannot carry the view's parent geometry, so `import_descriptor` marks the alias as a view instead (`is_view`), and a CPU write into it maps `ReadWrite` exactly as the producer's view would: its rows share cache lines with bytes outside it, so a write-only map is refused for a `Write`-declared view on both sides. The bit is clear for a whole tensor, which is also what a producer that predates it reports.
 
 ### Carrying a texture between processes
 

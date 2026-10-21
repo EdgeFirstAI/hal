@@ -84,9 +84,3 @@ pub unsafe extern "C" fn ef_platform_compression_support(
 pub extern "C" fn ef_compression_fallback_count() -> u64 {
     catch_unwind(edgefirst_tensor::compression_fallback_count).unwrap_or(0)
 }
-
-/// Maps that exceeded a buffer's declared CPU access.
-#[no_mangle]
-pub extern "C" fn ef_unplanned_cpu_access_count() -> u64 {
-    catch_unwind(edgefirst_tensor::unplanned_cpu_access_count).unwrap_or(0)
-}

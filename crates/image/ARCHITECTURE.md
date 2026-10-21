@@ -206,19 +206,11 @@ Without PBO, every `convert()` would fall back to CPU `memcpy` for upload and
 readback. PBO keeps the data in GPU-accessible memory, enabling the same
 zero-copy shader pipeline used on DMA platforms.
 
-**CPU access and the ImageDesc path.** Every constructor takes a required
-`CpuAccess` declaration (hardware access is implied; see
-[`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#cpu-access-declaration-cpuaccess)).
-`create_image_desc(&ImageDesc)` is the full-featured variant: without a
-compression or contiguous request it is exactly `create_image` (the
-negotiation above applies). With `Compression::{Any, Scheme(..)}` the
-allocation goes straight to the platform allocator — the layout decision
-belongs to gralloc, and the request's guards and fallback counting live in
-`Tensor::image_desc`. A compression request with auto memory promotes to
-the platform's zero-copy allocation first. A contiguous request
-(`ImageDesc::with_contiguous`) also skips the negotiation: it is a DMA-BUF
-from the Linux CMA heap at the same 64-byte pitch, or an error naming the
-heap, with no fallback to the system heap, a PBO or host memory.
+**CPU access and the ImageDesc path.** Every constructor takes a `CpuAccess` declaration covering all CPU access, this crate's included (hardware access is implied; see [`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#cpu-access-declaration-cpuaccess)).
+
+`create_image` and `alloc_tile_batch` add to the caller's declaration what this processor's own convert may do to the destination on the CPU. Each backend reports its need through a `dst_cpu_access` (`gl/threaded.rs`, `g2d.rs`, `cpu::convert_dst_access`), and `ImageProcessor::producer_access` combines them through `predicted_cpu_access`; the rules are in the `create_image` rustdoc. A write-only map is valid only for a pass that overwrites the whole buffer, so partial writes (views, a G2D `Rgb` letterbox border, a placement with no fill colour) and read-back passes (`I8` bias, BGRA swizzle) need `ReadWrite`. A GPU-rendered destination keeps the caller's declaration, so `None` stays compression-eligible. The backends check caller tensors up front, and when GL or G2D declines a convert whose CPU fallback is refused, the auto chain returns `Error::CpuFallbackDenied` with the GPU's reasons.
+
+`create_image_desc(&ImageDesc)` is the full-featured variant: without a compression or contiguous request it is exactly `create_image` (the negotiation above applies). With `Compression::{Any, Scheme(..)}` the allocation goes straight to the platform allocator — the layout decision belongs to gralloc, and the request's guards and fallback counting live in `Tensor::image_desc`. A compression request with auto memory promotes to the platform's zero-copy allocation first. A contiguous request (`ImageDesc::with_contiguous`) also skips the negotiation: it is a DMA-BUF from the Linux CMA heap at the same 64-byte pitch, or an error naming the heap, with no fallback to the system heap, a PBO or host memory.
 
 ### Zero-copy telemetry
 
@@ -232,7 +224,6 @@ pipeline holds them flat after warmup.
 | `ConvertStats.src_uploads` (via `convert_stats()`) | GL backend | a convert fed its source by CPU map+upload instead of zero-copy import |
 | `egl_cache_stats().total_misses()` | GL backend | an EGLImage import was created rather than reused (per-frame re-import churn when it grows in steady state) |
 | `compression_fallback_count()` (mirror of `edgefirst_tensor::compression_fallback_count`) | process | a `Compression::Any` request resolved linear |
-| `edgefirst_tensor::unplanned_cpu_access_count()` (capi `ef_unplanned_cpu_access_count`) | process | a tensor map exceeded the buffer's declared `CpuAccess` (warn-once per buffer) |
 
 The Device Farm bench cells assert `src_uploads == 0` and
 `cache_misses == 0` across their steady-state windows; the same
@@ -641,7 +632,7 @@ Alpha maps to `x / 255` for float destinations and stays the raw byte for intege
 
   `Hardware` interpolates chroma on its own grid, centred on the luma pixels each sample covers (JPEG siting). `Shader` and the CPU backend instead replicate each chroma sample across its luma pixels before blending. The two agree closely on natural content and part on chroma that changes every one or two samples.
 - **G2D** scales with a fixed hardware filter. Under `Nearest` it declines converts that resize, so GL or the CPU backend runs them.
-- **CPU** uses `fast_image_resize`: `Nearest`, or `Convolution(Bilinear)` for `Bilinear`. The convolution widens its kernel on downscale (anti-aliased), so below 1× it is smoother than `INTER_LINEAR` and the GL paths.
+- **CPU** uses `fast_image_resize`: `Nearest`, or `Interpolation(Bilinear)` for `Bilinear`. Its kernel keeps two taps per axis at every scale, so it matches `INTER_LINEAR` and the GL paths on downscale as well as upscale (the adaptive `Convolution(Bilinear)` would anti-alias below 1×, as PIL does).
 
 **Source crops.** A crop's texture coordinates span its true edges, so a crop drawn 1:1 (a SAHI tile) samples exactly on its texels. What keeps a `LINEAR` kernel inside the crop is a clamp of each sample point to the crop's half-texel-inset rectangle (`render::sample_clamp_rect_within`, the `src_extent` uniform), not an inset of the coordinates. An inset changes the crop's scale: it shifts every sample of a 1:1 crop by up to half a texel and stretches a resized one. The NV programs clamp each tap to the crop in the same way.
 
@@ -1096,24 +1087,9 @@ Chroma scratch rows round up to an even byte count
 (`out_w.div_ceil(2) * 2`) for NV12/NV16, leaving room for the trailing U+V
 pair an odd-width crop still needs.
 
-**Adaptive resize halo.** For everything that does resize, the pre-resize
-intermediate is sized to the crop rather than the frame
-(`pre_resize_region` → `extract_nv_region`, the
-`image.convert.cpu.extract_region` span). `fast_image_resize` clamps its filter window to the
-*image* bounds, not the crop rect, so a cropped convert legitimately samples
-a margin of real neighbouring pixels; reproducing that margin — the halo — is
-what lets the intermediate shrink without changing a single output byte.
+**Resize halo.** For everything that does resize, the pre-resize intermediate is sized to the crop rather than the frame (`pre_resize_region` → `extract_nv_region`, the `image.convert.cpu.extract_region` span). `fast_image_resize` clamps its filter window to the *image* bounds, not the crop rect, so a cropped convert legitimately samples a margin of real neighbouring pixels; reproducing that margin — the halo — is what lets the intermediate shrink without changing a single output byte.
 
-The halo is computed, not assumed. A fixed radius is wrong in both
-directions: `Convolution` uses an adaptive kernel whose radius is
-`support · max(scale, 1)`, so a large downscale reaches much further than any
-constant, while `Interpolation` holds a fixed `support` regardless of scale.
-`filter_halo` reads the support from the configured `ResizeAlg` (`Box` 0.5,
-`Bilinear`/`Hamming` 1, `CatmullRom`/`Mitchell` 2, `Gaussian`/`Lanczos3` 3,
-`Custom` from the filter itself) and derives the reach as
-`ceil(radius − scale/2)`. An algorithm it cannot model (`SuperSampling`, or
-anything a future upstream release adds) returns `None` and the caller keeps
-the full-frame intermediate and its unchanged output.
+The halo is computed, not assumed. The HAL's `Bilinear` uses `Interpolation(Bilinear)`, which holds a fixed `support` regardless of scale; `Convolution`, whose adaptive radius is `support · max(scale, 1)`, is modelled for completeness, and shows why a fixed radius would be wrong. `filter_halo` reads the support from the configured `ResizeAlg` (`Box` 0.5, `Bilinear`/`Hamming` 1, `CatmullRom`/`Mitchell` 2, `Gaussian`/`Lanczos3` 3, `Custom` from the filter itself) and derives the reach as `ceil(radius − scale/2)`. An algorithm it cannot model (`SuperSampling`, or anything a future upstream release adds) returns `None` and the caller keeps the full-frame intermediate and its unchanged output.
 
 `HALO_SLACK = 1` is added to every modelled reach and is load-bearing, not
 padding. Growing the extracted rect beyond the filter's true reach cannot

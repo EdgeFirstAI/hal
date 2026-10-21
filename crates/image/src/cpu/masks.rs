@@ -363,14 +363,14 @@ impl CPUProcessor {
                 .mask_coefficients
                 .as_typed::<i8>()
                 .expect("I8 coefficients");
-            let coeff_m = coeff_t.map()?;
+            let coeff_m = coeff_t.map_read()?;
             let coeff_quant = coeff_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape(
                     "I8 mask_coefficients require quantization metadata".into(),
                 )
             })?;
             let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
-            let proto_m = proto_t.map()?;
+            let proto_m = proto_t.map_read()?;
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
             })?;
@@ -406,12 +406,12 @@ impl CPUProcessor {
                 .mask_coefficients
                 .as_typed::<i16>()
                 .expect("I16 coefficients");
-            let coeff_m = coeff_t.map()?;
+            let coeff_m = coeff_t.map_read()?;
             // Skip the integer fast path when coefficient quantization is
             // absent — the f32 fallback below handles raw i16 by widening.
             if let Some(coeff_quant) = coeff_t.quantization() {
                 let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
-                let proto_m = proto_t.map()?;
+                let proto_m = proto_t.map_read()?;
                 let proto_quant = proto_t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
@@ -458,7 +458,7 @@ impl CPUProcessor {
                     .mask_coefficients
                     .as_typed::<f32>()
                     .expect("dtype matched F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 coeff_f32_storage = m.as_slice().to_vec();
                 &coeff_f32_storage[..]
             }
@@ -467,7 +467,7 @@ impl CPUProcessor {
                     .mask_coefficients
                     .as_typed::<half::f16>()
                     .expect("dtype matched F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 coeff_f32_storage = m.as_slice().iter().map(|v| v.to_f32()).collect();
                 &coeff_f32_storage[..]
             }
@@ -476,7 +476,7 @@ impl CPUProcessor {
                     .mask_coefficients
                     .as_typed::<i8>()
                     .expect("dtype matched I8");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 coeff_f32_storage = if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
                     let (scale, zp) = match q.mode() {
@@ -502,7 +502,7 @@ impl CPUProcessor {
                     .mask_coefficients
                     .as_typed::<i16>()
                     .expect("dtype matched I16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 coeff_f32_storage = if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
                     let (scale, zp) = match q.mode() {
@@ -544,7 +544,7 @@ impl CPUProcessor {
                 let quant = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let src_slice = m.as_slice();
                 let transposed_storage = if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
                 {
@@ -611,7 +611,7 @@ impl CPUProcessor {
                     .protos
                     .as_typed::<f32>()
                     .expect("dtype matched F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let protos_slice = m.as_slice();
                 detect
                     .par_iter()
@@ -642,7 +642,7 @@ impl CPUProcessor {
                     .protos
                     .as_typed::<half::f16>()
                     .expect("dtype matched F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let protos_slice = m.as_slice();
                 detect
                     .par_iter()
@@ -754,14 +754,14 @@ impl CPUProcessor {
                 .mask_coefficients
                 .as_typed::<i8>()
                 .expect("I8 coefficients");
-            let coeff_m = coeff_t.map()?;
+            let coeff_m = coeff_t.map_read()?;
             let coeff_quant = coeff_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape(
                     "I8 mask_coefficients require quantization metadata".into(),
                 )
             })?;
             let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
-            let proto_m = proto_t.map()?;
+            let proto_m = proto_t.map_read()?;
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
             })?;
@@ -796,12 +796,12 @@ impl CPUProcessor {
                 .mask_coefficients
                 .as_typed::<i16>()
                 .expect("I16 coefficients");
-            let coeff_m = coeff_t.map()?;
+            let coeff_m = coeff_t.map_read()?;
             // Skip the integer fast path when coefficient quantization is
             // absent — the f32 fallback below handles raw i16 by widening.
             if let Some(coeff_quant) = coeff_t.quantization() {
                 let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
-                let proto_m = proto_t.map()?;
+                let proto_m = proto_t.map_read()?;
                 let proto_quant = proto_t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
@@ -838,7 +838,7 @@ impl CPUProcessor {
         let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_typed::<f32>().expect("F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 m.as_slice().to_vec()
             }
             DType::F16 => {
@@ -846,13 +846,13 @@ impl CPUProcessor {
                     .mask_coefficients
                     .as_typed::<half::f16>()
                     .expect("F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 m.as_slice().iter().map(|v| v.to_f32()).collect()
             }
             DType::I8 => {
                 // Dequantize I8 coefficients to f32 for the float proto path.
                 let t = proto_data.mask_coefficients.as_typed::<i8>().expect("I8");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let q = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape(
                         "I8 mask_coefficients require quantization metadata".into(),
@@ -875,7 +875,7 @@ impl CPUProcessor {
             }
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_typed::<i16>().expect("I16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
                     let (scale, zp) = match q.mode() {
@@ -905,7 +905,7 @@ impl CPUProcessor {
         match proto_data.protos.dtype() {
             DType::F32 => {
                 let t = proto_data.protos.as_typed::<f32>().expect("F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 scaled_segmentations_f32_slice(
                     detect,
                     &coeff_f32,
@@ -920,7 +920,7 @@ impl CPUProcessor {
             }
             DType::F16 => {
                 let t = proto_data.protos.as_typed::<half::f16>().expect("F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 scaled_segmentations_f16_slice(
                     detect,
                     &coeff_f32,
@@ -935,7 +935,7 @@ impl CPUProcessor {
             }
             DType::I8 => {
                 let t = proto_data.protos.as_typed::<i8>().expect("I8");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let quant = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;

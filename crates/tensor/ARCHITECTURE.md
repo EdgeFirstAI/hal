@@ -400,47 +400,22 @@ fails on imx95 and imx8mp.
 
 ### CPU access declaration (CpuAccess)
 
-There is no usage/role enum. The allocation model assumes what is true for
-this SDK's pipelines: image buffers are produced and consumed by hardware
-(ISP, codec, GPU, NPU). Every image tensor allocates GPU-readable **and**
-GPU-writable (`GPU_SAMPLED_IMAGE | GPU_FRAMEBUFFER` on Android) —
-simultaneously a valid convert source, destination, and intermediate, and
-compression-eligible on every vendor. Hardware access needs no declaration:
-NPU/DSP consumption rides the dma-buf share itself (layout knowledge, not
-gralloc permission, is the contract), so GPU/NPU read/write is safely
-implied.
+There is no usage/role enum. The allocation model assumes what is true for this SDK's pipelines: image buffers are produced and consumed by hardware (ISP, codec, GPU, NPU). Every image tensor allocates GPU-readable **and** GPU-writable (`GPU_SAMPLED_IMAGE | GPU_FRAMEBUFFER` on Android) — simultaneously a valid convert source, destination, and intermediate, and compression-eligible on every vendor. Hardware access needs no declaration: NPU/DSP consumption rides the dma-buf share itself (layout knowledge, not gralloc permission, is the contract), so GPU/NPU read/write is safely implied.
 
-CPU involvement is the one thing the caller must declare, as a required
-`CpuAccess` parameter on every image constructor (`Tensor::image`,
-`TensorDyn::image`, `ImageProcessor::create_image`, the capi and Python
-surfaces):
+CPU involvement is the one thing the caller declares, as a `CpuAccess` parameter on every image constructor (`Tensor::image`, `TensorDyn::image`, `ImageProcessor::create_image`, the capi and Python surfaces, where it defaults to `ReadWrite`):
 
-- `None` (default in `ImageDesc`) — hardware-only; on Android the
-  allocation carries no CPU usage bits, making it eligible for gralloc's
-  vendor tile compression.
-- `Read` — cached mapping; macOS takes the read-only IOSurface lock
-  (`kIOSurfaceLockReadOnly`, skips the unlock flush); Linux dma-buf syncs
-  the read direction only.
-- `Write` — decode targets; write-combined mapping where the platform
-  supports it, no cache clean on unlock.
-- `ReadWrite` — both directions (the pre-CpuAccess implicit behavior).
+- `None` — hardware-only; on Android the allocation carries no CPU usage bits, making it eligible for gralloc's vendor tile compression.
+- `Read` — cached mapping; macOS takes the read-only IOSurface lock (`kIOSurfaceLockReadOnly`, skips the unlock flush); Linux dma-buf syncs the read direction only.
+- `Write` — decode targets; write-combined mapping where the platform supports it, no cache clean on unlock.
+- `ReadWrite` — both directions; the default (`CpuAccess::default()`, `ImageDesc::new`, the Python and C builders).
 
-`map()` is access-typed: `map_with(access)` is the one required trait
-method, with `map()` (= ReadWrite, the historical behavior), `map_read()`,
-`map_write()`, and `map_mut()` provided. Every `TensorMap` variant carries
-a `writable` flag and rejects mutable access through a read map with one
-uniform assert on all platforms.
+**Android and the `ReadWrite` default.** A `ReadWrite` gralloc allocation requests `CPU_READ_OFTEN | CPU_WRITE_OFTEN`, which may give linear, CPU-cached memory and forfeits vendor tiling and compression. A caller that never maps a buffer on the CPU should pass `CpuAccess::None` so gralloc can keep a tiled or compressed allocation. Linux DMA-BUF allocation does not depend on the declaration.
 
-Mapping beyond the declaration is **best-effort, never silent**: the
-platform may refuse (Android refuses deterministically — locking an
-AHardwareBuffer with usage bits it was not allocated with is undefined
-behaviour per the NDK contract, host-tested as `lock_usage_for` /
-`LockDecision` in `ahardwarebuffer_layout.rs`) or may succeed on a slow
-path; either way it logs once per buffer and increments the process-wide
-`unplanned_cpu_access_count()`. Undeclared CPU access is a pipeline smell
-the telemetry surfaces, not hides. Combining `CpuAccess != None` with a
-compression request is `InvalidArgument` at creation — the contradiction
-fails loudly at allocation, not at first map.
+`map()` is access-typed: `map_with(access)` is the one required trait method, with `map()` and `map_mut()` (`ReadWrite`), `map_read()` and `map_write()` provided. Because `map()` asks for `ReadWrite`, it fails on a `Read`- or `Write`-declared tensor: read such a tensor with `map_read()` and fill it with `map_for_write()`. Every `TensorMap` variant carries a `writable` flag and rejects mutable access through a read map with one uniform assert on all platforms.
+
+**Write-only maps.** A write-only map does not invalidate the CPU cache, so it is valid only for a pass that overwrites the whole buffer. `TensorTrait::write_access` gives the direction such a pass maps with: the declaration plus `Write` for a whole tensor, `ReadWrite` for a view (`is_view`), whose rows share cache lines with bytes outside it. A view is a `view`/`batch` with a `ViewOrigin`, or a tensor rebuilt from a view's descriptor: the descriptor cannot carry the `ViewOrigin`, so it reports the `VIEW` flag bit and `import_descriptor` calls `mark_view` (C `ef_tensor_mark_view`, read back by `ef_tensor_is_view`). `TensorTrait::map_for_write` maps in that direction, and `map_for_partial_write` always maps `ReadWrite`.
+
+The declaration covers **all** CPU access, the HAL's own included, and is **enforced**: a map, pin or sync bracket whose direction it does not cover fails with `Error::CpuAccessDenied { declared, requested }` before the backing is touched. The static backend checks in `Tensor::map_impl`, `pin_host` and `sync_for_cpu`/`sync_for_device`; the dynamic backend checks the same declaration (read through `ef_tensor_cpu_access`) before calling `ef_tensor_map`/`ef_tensor_sync_*`, so both raise the identical error, and `ef_tensor_map` itself returns `EACCES` for C callers. A descriptor reports the declaration in its `CPU_ACCESS_DECLARED`/`CPU_READ`/`CPU_WRITE` flag bits and `import_descriptor` narrows the alias to it (`restrict_cpu_access`, which never widens), so an alias refuses what its producer refuses. A Windows D3D11 texture import opens the texture with that declaration, so a `Write`-declared texture keeps its host-buffer path instead of gaining a staging texture. Producers that fill caller tensors on the CPU (the CPU image backend, codec decodes, `decode_semantic`) check up front and map with `map_for_write` or `map_for_partial_write`. Combining `CpuAccess != None` with a compression request is `InvalidArgument` at creation — the contradiction fails loudly at allocation, not at first map.
 
 ### PBO tensors and the WeakSender pattern
 
@@ -571,11 +546,7 @@ allocated (`Tensor::compression() -> Option<CompressionScheme>`, one of
   mali/immortalis → AFBC, powervr → PVRIC, xclipse → DCC;
   emulation/angle/unknown → linear — there is deliberately no `Unknown`
   variant; a scheme is recorded only on positive identification).
-- `compression().is_some()` ⇒ the row-stride accessors describe no
-  meaningful linear layout (tiles are opaque) and CPU maps follow the
-  best-effort CpuAccess contract. `configure_image` **preserves** the
-  recorded scheme (physical layout, unlike colorimetry); views and
-  composed planes inherit it.
+- `compression().is_some()` ⇒ the row-stride accessors describe no meaningful linear layout (tiles are opaque), and every CPU map is refused with `CpuAccessDenied`, since a compression request requires `CpuAccess::None`. `configure_image` **preserves** the recorded scheme (physical layout, unlike colorimetry); views and composed planes inherit it.
 - `compression_support(format, dtype)` (capi
   `ef_platform_compression_support`) reports whether a request can be
   honored on this platform.

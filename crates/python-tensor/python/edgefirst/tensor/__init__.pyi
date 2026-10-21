@@ -337,6 +337,16 @@ class Tensor:
         """
 
     @property
+    def declared_cpu_access(self) -> str:
+        """The CPU access declared for this tensor.
+
+        ``"none"``, ``"read"``, ``"write"`` or ``"readwrite"``: the maps,
+        pins and syncs this tensor accepts. Set at allocation; a tensor
+        imported from another package carries its producer's declaration. See :meth:`cpu_access` for the
+        coherency bracket itself.
+        """
+
+    @property
     def memory(self) -> TensorMemory:
         """The memory type of the tensor."""
 
@@ -610,7 +620,7 @@ class Tensor:
             shape: list[int],
             dtype: DType,
             format: PixelFormat,
-            access: str = "none",
+            access: str = "readwrite",
             name: str | None = None,
         ) -> Tensor:
             """Wrap a texture created on the HAL device.
@@ -642,7 +652,7 @@ class Tensor:
             shape: list[int],
             dtype: DType,
             format: PixelFormat,
-            access: str = "none",
+            access: str = "readwrite",
             completion: tuple[int, int] | None = None,
             name: str | None = None,
         ) -> Tensor:
@@ -724,10 +734,13 @@ class Tensor:
 
         Raises:
             BufferError: If the tensor is already mapped or has been unmapped.
+            PermissionError: If ``access`` is outside the tensor's declared
+                CPU access (the default ``"readwrite"`` on a ``"read"``- or
+                ``"write"``-declared tensor included).
         """
 
     def try_map(
-        self, access: Literal["read", "write", "readwrite"] | None = None
+        self, access: Literal["read", "write", "readwrite"] = "readwrite"
     ) -> HostView:
         """Non-blocking :meth:`map`.
 
@@ -744,6 +757,7 @@ class Tensor:
         Raises:
             BlockingIOError: While a GPU copy the map depends on is in
                 flight.
+            PermissionError: As :meth:`map`.
         """
 
     def cuda_map(self) -> CudaMap | None:
@@ -806,7 +820,7 @@ class Tensor:
         height: int,
         format: PixelFormat,
         mem: TensorMemory | None = None,
-        access: str = "none",
+        access: str = "readwrite",
         contiguous: bool = False,
     ) -> Tensor:
         """Create an image tensor with the given dimensions and pixel format.
@@ -817,10 +831,12 @@ class Tensor:
             format: Pixel format for the image data.
             mem: Optional memory type override. If None, the best available
                 memory type is chosen automatically.
-            access: Declared CPU access — ``"none"`` (default), ``"read"``,
-                ``"write"``, or ``"readwrite"``. Hardware access is always
-                implied; pass ``"readwrite"`` (or the precise direction) when
-                the script will ``map()`` or ``numpy()`` the tensor.
+            access: Declared CPU access — ``"readwrite"`` (default),
+                ``"read"``, ``"write"``, or ``"none"`` (hardware-only).
+                Hardware access is always implied. A CPU map, pin or sync
+                outside the declaration raises ``PermissionError``, as does
+                HAL CPU work (a CPU convert, a decode) the declaration does
+                not cover.
             contiguous: Require physically contiguous memory: a DMA-BUF from
                 the Linux CMA heap, or an error naming the heap, never a
                 fallback. ``mem`` must be ``None`` or ``TensorMemory.DMABUF``.
@@ -853,6 +869,8 @@ class Tensor:
 
         Raises:
             ValueError: if ``access`` is not one of the values above.
+            PermissionError: if ``access`` pins outside the tensor's
+                declared CPU access (see :attr:`declared_cpu_access`).
         """
 
     def pin_host(self, access: Literal["read", "write", "readwrite"]) -> HostPin:
@@ -870,6 +888,8 @@ class Tensor:
             RuntimeError: on a backend that cannot separate addressing from
                 coherency (an OpenGL PBO, an Android AHardwareBuffer). Use
                 :meth:`map` there instead.
+            PermissionError: If ``access`` is outside the tensor's declared
+                CPU access (see :attr:`declared_cpu_access`).
         """
 
     def cpu_access(
@@ -882,6 +902,10 @@ class Tensor:
 
             with tensor.cpu_access("read"):
                 ...  # read through a pin or a raw address
+
+        Raises:
+            PermissionError: If ``access`` is outside the tensor's declared
+                CPU access (see :attr:`declared_cpu_access`).
         """
 
     def from_numpy(self, src: npt.NDArray) -> None:
@@ -925,6 +949,8 @@ class Tensor:
         Raises:
             RuntimeError: If the numpy dtype does not match the tensor
                 dtype, or the element count differs.
+            PermissionError: If the tensor's declared CPU access has no
+                write direction.
         """
 
     @property

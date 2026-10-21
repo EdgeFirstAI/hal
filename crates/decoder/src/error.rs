@@ -52,6 +52,9 @@ pub enum DecoderError {
         tier: &'static str,
         missing_feature: &'static str,
     },
+    /// A caller tensor refused the operation, e.g. a CPU access its declared
+    /// [`CpuAccess`](edgefirst_tensor::CpuAccess) does not cover.
+    Tensor(edgefirst_tensor::Error),
 }
 
 impl fmt::Display for DecoderError {
@@ -67,11 +70,43 @@ impl fmt::Display for DecoderError {
     /// println!("{}", err);
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            DecoderError::Tensor(e) => write!(f, "Tensor({e})"),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 
 impl std::error::Error for DecoderError {}
+
+impl DecoderError {
+    /// The [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied)
+    /// refusal this error carries, if any.
+    pub fn cpu_access_denied(&self) -> Option<&edgefirst_tensor::Error> {
+        match self {
+            DecoderError::Tensor(e) => e.cpu_access_denied(),
+            _ => None,
+        }
+    }
+
+    /// A failed map: a `CpuAccessDenied` refusal stays typed as
+    /// [`DecoderError::Tensor`], any other error goes through `other`.
+    pub(crate) fn from_map(
+        e: edgefirst_tensor::Error,
+        other: impl FnOnce(edgefirst_tensor::Error) -> DecoderError,
+    ) -> DecoderError {
+        match e {
+            e @ edgefirst_tensor::Error::CpuAccessDenied { .. } => DecoderError::Tensor(e),
+            e => other(e),
+        }
+    }
+}
+
+impl From<edgefirst_tensor::Error> for DecoderError {
+    fn from(err: edgefirst_tensor::Error) -> Self {
+        DecoderError::Tensor(err)
+    }
+}
 
 impl From<serde_yaml::Error> for DecoderError {
     fn from(err: serde_yaml::Error) -> Self {

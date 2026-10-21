@@ -189,3 +189,13 @@ def test_programmatic_semantic_output_decodes_like_json():
         decoder.decode_semantic(outputs, dst, mode=mode)
         reference.decode_semantic(outputs, expected, mode=mode)
         assert read(dst, np.uint8).tolist() == read(expected, np.uint8).tolist()
+
+
+@pytest.mark.parametrize("access", ["read", "none"])
+def test_decode_semantic_into_a_destination_declared_without_write(access):
+    decoder = ef.Decoder.new_from_json_str(json.dumps(SCHEMA))
+    dst = ef.Tensor.image(4, 4, ef.PixelFormat.Grey, access=access)
+    dst.reshape([4, 4])
+    outputs = [tensor(stripes())]
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        decoder.decode_semantic(outputs, dst)

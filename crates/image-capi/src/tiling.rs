@@ -220,21 +220,11 @@ pub unsafe extern "C" fn ef_tile_placement_list_free(list: *mut EfTilePlacementL
     }
 }
 
-fn image_err(e: &edgefirst_image::Error) -> c_int {
-    use edgefirst_image::Error as E;
-    match e {
-        E::CropInvalid(_) | E::InvalidShape(_) | E::NotAnImage | E::AliasedBuffers(_) => {
-            libc::EINVAL
-        }
-        E::UnsupportedFormat(_) | E::NotSupported(_) | E::NotImplemented(_) | E::NoConverter => {
-            libc::ENOTSUP
-        }
-        E::Io(io) => io.raw_os_error().unwrap_or(libc::EIO),
-        _ => libc::EIO,
-    }
-}
-
 /// Allocate a tall packed batch that stacks `n` tiles.
+///
+/// The declared access is widened as for `ef_image_processor_create_image`;
+/// tiles are written through views, so any predicted CPU write is added as
+/// `EF_CPU_ACCESS_READ_WRITE`.
 ///
 /// # Safety
 /// `format` is a NUL-terminated wire code.
@@ -308,6 +298,11 @@ pub unsafe extern "C" fn ef_image_processor_plan_tiles(
 
 /// Render every tile of `src` into `dst`.
 ///
+/// @return a placement list to free with [`ef_tile_placement_list_free`], or
+/// `NULL` with `errno` set: `EINVAL` for bad arguments, `EACCES` when a
+/// tensor's declared CPU access does not cover the CPU pass, otherwise the
+/// codes `ef_image_processor_convert` returns.
+///
 /// # Safety
 /// Pointers must be live or NULL as documented.
 #[no_mangle]
@@ -317,13 +312,17 @@ pub unsafe extern "C" fn ef_image_processor_tile_into(
     dst: *mut EfTensor,
     config: *const EfTilingConfig,
 ) -> *mut EfTilePlacementList {
+    let fail = |code: c_int| {
+        errno::set_errno(errno::Errno(code));
+        std::ptr::null_mut()
+    };
     unsafe {
         catch_unwind(AssertUnwindSafe(|| {
             if p.is_null() || config.is_null() {
-                return std::ptr::null_mut();
+                return fail(libc::EINVAL);
             }
             let Some(cfg) = tiling_config_from(&*config) else {
-                return std::ptr::null_mut();
+                return fail(libc::EINVAL);
             };
             let result = with_tensor(src, |s| {
                 with_tensor_mut(dst, |d| (*p).inner.tile_into(s, d, &cfg))
@@ -332,14 +331,18 @@ pub unsafe extern "C" fn ef_image_processor_tile_into(
                 Ok(Ok(Ok(placements))) => {
                     Box::into_raw(Box::new(EfTilePlacementList { placements }))
                 }
-                _ => std::ptr::null_mut(),
+                Ok(Ok(Err(e))) => fail(crate::processor::image_errno(&e)),
+                Ok(Err(code)) | Err(code) => fail(code),
             }
         }))
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|_| fail(libc::EINVAL))
     }
 }
 
 /// Render one planned tile of `src` into `dst`.
+///
+/// @return 0 on success, `EINVAL` for bad arguments, otherwise the codes
+/// `ef_image_processor_convert` returns (`EACCES` for a refused CPU access).
 ///
 /// # Safety
 /// Pointers must be live or NULL as documented.
@@ -365,7 +368,7 @@ pub unsafe extern "C" fn ef_image_processor_tile_one(
             });
             match result {
                 Ok(Ok(Ok(()))) => 0,
-                Ok(Ok(Err(e))) => image_err(&e),
+                Ok(Ok(Err(e))) => crate::processor::image_errno(&e),
                 Ok(Err(e)) | Err(e) => e,
             }
         }))

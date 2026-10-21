@@ -145,6 +145,45 @@ pub mod flags {
     ///
     /// Bit 0.
     pub const SYNC_PRESENT: u32 = 1;
+
+    /// The producer reports its declared [`crate::CpuAccess`] in
+    /// [`CPU_READ`] and [`CPU_WRITE`]. When clear the declaration is unknown
+    /// and an importer keeps its own default. Bit 1.
+    pub const CPU_ACCESS_DECLARED: u32 = 1 << 1;
+    /// The declaration includes CPU reads. Bit 2.
+    pub const CPU_READ: u32 = 1 << 2;
+    /// The declaration includes CPU writes. Bit 3.
+    pub const CPU_WRITE: u32 = 1 << 3;
+    /// The tensor addresses part of a larger buffer (a `view`/`batch`
+    /// sub-region, at any offset), so an importer must treat its rows as
+    /// sharing cache lines with bytes outside it. Clear means a whole
+    /// tensor, which is also what a producer that predates the bit reports.
+    /// Bit 4.
+    pub const VIEW: u32 = 1 << 4;
+
+    /// The flag bits reporting `access`.
+    pub fn from_cpu_access(access: crate::CpuAccess) -> u32 {
+        let mut bits = CPU_ACCESS_DECLARED;
+        if access.reads() {
+            bits |= CPU_READ;
+        }
+        if access.writes() {
+            bits |= CPU_WRITE;
+        }
+        bits
+    }
+
+    /// The declared access `flags` reports, or `None` when the producer did
+    /// not report one.
+    pub fn cpu_access(flags: u32) -> Option<crate::CpuAccess> {
+        if flags & CPU_ACCESS_DECLARED == 0 {
+            return None;
+        }
+        Some(crate::CpuAccess::from_directions(
+            flags & CPU_READ != 0,
+            flags & CPU_WRITE != 0,
+        ))
+    }
 }
 
 /// Backing store kind, as reported in [`TensorDesc::kind`].
@@ -708,6 +747,10 @@ pub(crate) struct DescParts<'a, 'p> {
     /// [`TensorDesc::sync`] under [`kind::D3D11_TEXTURE`]. `None` for every
     /// other kind and when nothing has been recorded.
     pub sync: Option<u64>,
+    /// The producer's declared CPU access, reported in [`TensorDesc::flags`].
+    pub cpu_access: crate::CpuAccess,
+    /// Whether the producer is a view, reported as [`flags::VIEW`].
+    pub view: bool,
 }
 
 /// Row-major byte strides for `shape`, with the row dimension replaced by
@@ -828,6 +871,8 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         pbo_vtable_ptr,
         fence_handle,
         sync,
+        cpu_access,
+        view,
     } = parts;
     let desc_kind = kind_of(memory);
     // Both fields are meaningful only under `D3D11_TEXTURE`, and only when
@@ -898,11 +943,13 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         colorimetry,
         // `D3D11_TEXTURE` is the one kind that fills these in; every other
         // producer in this build leaves them clear. See the field docs.
-        flags: if completion.is_some() {
-            flags::SYNC_PRESENT
-        } else {
-            0
-        },
+        flags: flags::from_cpu_access(cpu_access)
+            | if completion.is_some() {
+                flags::SYNC_PRESENT
+            } else {
+                0
+            }
+            | if view { flags::VIEW } else { 0 },
         capacity,
         sync: completion.map_or(0, |(_, value)| value),
     }
@@ -1274,7 +1321,21 @@ mod desc_tests {
             pbo_vtable_ptr: None,
             fence_handle,
             sync,
+            cpu_access: crate::CpuAccess::ReadWrite,
+            view: false,
         }
+    }
+
+    /// The `VIEW` bit reports exactly the producer's `view`.
+    #[test]
+    fn the_view_bit_reports_the_producer() {
+        let whole = from_parts(parts(TensorMemory::Mem, 0, None));
+        assert_eq!(whole.flags & super::flags::VIEW, 0);
+        let view = from_parts(DescParts {
+            view: true,
+            ..parts(TensorMemory::Mem, 0, None)
+        });
+        assert_eq!(view.flags & super::flags::VIEW, super::flags::VIEW);
     }
 
     /// Only a D3D11 texture has a fence to name. A completion handed to any
@@ -1282,7 +1343,7 @@ mod desc_tests {
     #[test]
     fn a_completion_on_a_kind_with_no_fence_is_not_advertised() {
         let d = from_parts(parts(TensorMemory::Mem, 5, Some(9)));
-        assert_eq!(d.flags, 0);
+        assert_eq!(d.flags & super::flags::SYNC_PRESENT, 0);
         assert_eq!(d.sync, 0);
         assert!(d.ptr.is_null());
     }
@@ -1294,13 +1355,14 @@ mod desc_tests {
     fn a_texture_completion_needs_a_fence_handle() {
         use super::flags;
         let d = from_parts(parts(TensorMemory::DmaBuf, 5, Some(9)));
-        assert_eq!(d.flags, flags::SYNC_PRESENT);
+        assert_eq!(d.flags & flags::SYNC_PRESENT, flags::SYNC_PRESENT);
         assert_eq!(d.sync, 9);
         assert_eq!(d.ptr.0 as usize, 5);
 
         let d = from_parts(parts(TensorMemory::DmaBuf, 0, Some(9)));
         assert_eq!(
-            d.flags, 0,
+            d.flags & flags::SYNC_PRESENT,
+            0,
             "a value with no fence handle cannot be waited on"
         );
         assert_eq!(d.sync, 0);

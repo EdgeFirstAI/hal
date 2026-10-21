@@ -170,6 +170,17 @@ impl std::error::Error for CodecError {
     }
 }
 
+impl CodecError {
+    /// The [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied)
+    /// refusal this error carries, if any.
+    pub fn cpu_access_denied(&self) -> Option<&edgefirst_tensor::Error> {
+        match self {
+            Self::Tensor(e) => e.cpu_access_denied(),
+            _ => None,
+        }
+    }
+}
+
 impl From<std::io::Error> for CodecError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)

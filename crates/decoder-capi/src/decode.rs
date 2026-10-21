@@ -565,7 +565,9 @@ pub unsafe extern "C" fn ef_decoder_string_free(s: *mut c_char) {
 ///
 /// `out_masks` may be `NULL` when masks are not wanted.
 ///
-/// @return 0 on success. Both out-parameters are written only on success, so a
+/// @return 0 on success, `EINVAL` for a `NULL` argument or zero `count`,
+///         `EACCES` when an output is not declared CPU-readable, otherwise
+///         `EBADMSG`. Both out-parameters are written only on success, so a
 ///         caller never has to free a partially-populated result.
 ///
 /// # Safety
@@ -590,8 +592,8 @@ pub unsafe extern "C" fn ef_decoder_decode(
 
             let mut boxes: Vec<DetectBox> = Vec::new();
             let mut masks: Vec<Segmentation> = Vec::new();
-            if (*d).inner.decode(&refs, &mut boxes, &mut masks).is_err() {
-                return libc::EBADMSG;
+            if let Err(e) = (*d).inner.decode(&refs, &mut boxes, &mut masks) {
+                return decode_errno(&e);
             }
 
             // Written last, together: an early return after writing `out_boxes`
@@ -1198,6 +1200,11 @@ pub(crate) unsafe fn borrow_outputs<'a>(
 
 /// Dequantize an integer tensor into a pre-allocated f32 tensor.
 ///
+/// @return 0 on success, `EINVAL` for a `NULL` argument, a non-f32 `output`,
+///         an unsupported `input` dtype or mismatched element counts,
+///         `EACCES` when `input` is not declared CPU-readable or `output`
+///         not CPU-writable, otherwise `EIO`.
+///
 /// # Safety
 /// `input` and `output` must be live handles.
 #[no_mangle]
@@ -1221,6 +1228,24 @@ pub unsafe extern "C" fn ef_dequantize(
     }
 }
 
+/// `EACCES` for a tensor whose declared CPU access does not cover the pin,
+/// else `EIO`.
+pub(crate) fn pin_errno(e: &edgefirst_tensor::Error) -> c_int {
+    if e.cpu_access_denied().is_some() {
+        return libc::EACCES;
+    }
+    libc::EIO
+}
+
+/// `EACCES` for a decode a tensor's declared CPU access refused, else
+/// `EBADMSG`.
+pub(crate) fn decode_errno(e: &edgefirst_decoder::DecoderError) -> c_int {
+    if e.cpu_access_denied().is_some() {
+        return libc::EACCES;
+    }
+    libc::EBADMSG
+}
+
 fn dequantize_dyn(input: &TensorDyn, quant: Quantization, output: &mut TensorDyn) -> c_int {
     use edgefirst_tensor::{CpuAccess, DType};
     if output.dtype() != DType::F32 {
@@ -1228,11 +1253,11 @@ fn dequantize_dyn(input: &TensorDyn, quant: Quantization, output: &mut TensorDyn
     }
     let in_pin = match input.pin_host(CpuAccess::Read) {
         Ok(p) => p,
-        Err(_) => return libc::EIO,
+        Err(e) => return pin_errno(&e),
     };
     let out_pin = match output.pin_host(CpuAccess::Write) {
         Ok(p) => p,
-        Err(_) => return libc::EIO,
+        Err(e) => return pin_errno(&e),
     };
     let in_bytes = unsafe { in_pin.as_slice() };
     let n = output.shape().iter().product::<usize>();
@@ -1461,6 +1486,8 @@ pub unsafe extern "C" fn ef_decoder_track_list_free(l: *mut EfDecoderTrackList) 
 
 /// Decode and update a decoder-owned tracker.
 ///
+/// @return the codes [`ef_decoder_decode`] returns.
+///
 /// # Safety
 /// `outputs` must point to `count` live handles.
 #[no_mangle]
@@ -1491,19 +1518,15 @@ pub unsafe extern "C" fn ef_decoder_decode_tracked(
             let mut boxes: Vec<DetectBox> = Vec::new();
             let mut masks: Vec<Segmentation> = Vec::new();
             let mut tracks: Vec<edgefirst_tracker::TrackInfo> = Vec::new();
-            if (*d)
-                .inner
-                .decode_tracked(
-                    &mut (*tracker).inner,
-                    timestamp,
-                    &refs,
-                    &mut boxes,
-                    &mut masks,
-                    &mut tracks,
-                )
-                .is_err()
-            {
-                return libc::EBADMSG;
+            if let Err(e) = (*d).inner.decode_tracked(
+                &mut (*tracker).inner,
+                timestamp,
+                &refs,
+                &mut boxes,
+                &mut masks,
+                &mut tracks,
+            ) {
+                return decode_errno(&e);
             }
             if !out_masks.is_null() {
                 *out_masks = Box::into_raw(Box::new(EfSegmentationList {
@@ -1957,6 +1980,40 @@ mod tests {
                 ef_detect_box_list_free(boxes);
             });
             assert!(grown < 1024, "heap grew {grown} bytes over {n} decodes");
+            drop(TensorDyn::from_raw(t));
+            ef_decoder_free(d);
+        }
+    }
+
+    #[test]
+    fn detection_decode_refusal_is_eacces() {
+        use edgefirst_tensor::{CpuAccess, DType, TensorMemory};
+        let cfg = serde_json::json!({
+            "outputs": [{
+                "decoder": "ultralytics",
+                "type": "detection",
+                "shape": [1, 84, 64],
+                "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 64]]
+            }]
+        });
+        let j = std::ffi::CString::new(cfg.to_string()).unwrap();
+        unsafe {
+            let p = ef_decoder_params_new();
+            assert_eq!(ef_decoder_params_set_config_json(p, j.as_ptr(), 0), 0);
+            let d = ef_decoder_new(p);
+            ef_decoder_params_free(p);
+            assert!(!d.is_null());
+            let mut t =
+                TensorDyn::new(&[1, 84, 64], DType::F32, Some(TensorMemory::Mem), None).unwrap();
+            t.restrict_cpu_access(CpuAccess::Write);
+            let t = t.into_raw();
+            let outputs = [t as *const EfTensor];
+            let mut boxes: *mut EfDetectBoxList = std::ptr::null_mut();
+            assert_eq!(
+                ef_decoder_decode(d, outputs.as_ptr(), 1, &mut boxes, std::ptr::null_mut()),
+                libc::EACCES
+            );
+            assert!(boxes.is_null());
             drop(TensorDyn::from_raw(t));
             ef_decoder_free(d);
         }

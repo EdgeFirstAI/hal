@@ -424,6 +424,7 @@ pub(crate) fn apply_int8_xor_bias_rows(tensor: &mut Tensor<u8>, fmt: PixelFormat
     } else {
         fmt
     };
+    // Read-modify-write: a write-only map would not make device writes visible.
     let mut map = tensor.map_mut()?;
     let buf = map.as_mut_slice();
     guard_plane(buf.len(), stride, rows, row_bytes, "int8 bias dst")?;
@@ -439,13 +440,27 @@ impl CPUProcessor {
         Self::new_bilinear()
     }
 
+    /// The resampler for `mode`. Bilinear takes two taps per axis at every
+    /// scale, as the GL backend and OpenCV `INTER_LINEAR` sample.
+    fn resize_alg(mode: crate::Interpolation) -> fast_image_resize::ResizeAlg {
+        match mode {
+            crate::Interpolation::Nearest => fast_image_resize::ResizeAlg::Nearest,
+            crate::Interpolation::Bilinear => {
+                fast_image_resize::ResizeAlg::Interpolation(fast_image_resize::FilterType::Bilinear)
+            }
+        }
+    }
+
     /// Creates a new CPUConverter with bilinear resizing.
     fn new_bilinear() -> Self {
+        Self::with_interpolation(crate::Interpolation::Bilinear)
+    }
+
+    /// Creates a new CPUConverter resampling with `mode`.
+    fn with_interpolation(mode: crate::Interpolation) -> Self {
         let resizer = fast_image_resize::Resizer::new();
         let options = fast_image_resize::ResizeOptions::new()
-            .resize_alg(fast_image_resize::ResizeAlg::Convolution(
-                fast_image_resize::FilterType::Bilinear,
-            ))
+            .resize_alg(Self::resize_alg(mode))
             .use_alpha(false);
 
         log::debug!("CPUConverter created");
@@ -472,40 +487,12 @@ impl CPUProcessor {
     /// Sets how resizing converts resample (see [`crate::Interpolation`]):
     /// nearest-neighbour, or the bilinear filter of [`Self::new`].
     pub fn set_interpolation(&mut self, mode: crate::Interpolation) {
-        let alg = match mode {
-            crate::Interpolation::Nearest => fast_image_resize::ResizeAlg::Nearest,
-            crate::Interpolation::Bilinear => {
-                fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Bilinear)
-            }
-        };
-        self.options = self.options.clone().resize_alg(alg);
+        self.options = self.options.clone().resize_alg(Self::resize_alg(mode));
     }
 
     /// Creates a new CPUConverter with nearest neighbor resizing.
     pub fn new_nearest() -> Self {
-        let resizer = fast_image_resize::Resizer::new();
-        let options = fast_image_resize::ResizeOptions::new()
-            .resize_alg(fast_image_resize::ResizeAlg::Nearest)
-            .use_alpha(false);
-        log::debug!("CPUConverter created");
-        Self {
-            resizer,
-            options,
-            colors: crate::DEFAULT_COLORS_U8,
-            widen_scratch: None,
-            resize_destride_scratch: Vec::new(),
-            resize_dst_destride_scratch: Vec::new(),
-            nv_strip_scratch: Vec::new(),
-            nv_strip_y_pack: Vec::new(),
-            nv_strip_uv_pack: Vec::new(),
-            #[cfg(test)]
-            fused_hits: 0,
-            #[cfg(test)]
-            last_tmp_dims: None,
-            convert_tmp: None,
-            convert_tmp2: None,
-            convert_src_sub: None,
-        }
+        Self::with_interpolation(crate::Interpolation::Nearest)
     }
 
     /// Test-only accessor for the `fused_hits` counter (see the field doc).
@@ -698,11 +685,13 @@ impl CPUProcessor {
         }
     }
 
-    /// Tensor<u8>-based fill_image_outside_crop.
+    /// Tensor<u8>-based fill_image_outside_crop. `device_interior` marks an
+    /// interior a device rendered, which makes this border a partial write.
     pub(crate) fn fill_image_outside_crop_u8(
         dst: &mut Tensor<u8>,
         rgba: [u8; 4],
         crop: Rect,
+        device_interior: bool,
     ) -> Result<()> {
         let dst_fmt = dst.format().unwrap();
         let dst_w = dst.width().unwrap();
@@ -720,7 +709,11 @@ impl CPUProcessor {
             dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
         };
         let dst_stride = tensor_row_stride(dst);
-        let mut dst_map = dst.map_mut()?;
+        let mut dst_map = if device_interior {
+            dst.map_for_partial_write()?
+        } else {
+            dst.map_for_write()?
+        };
         let dst_tup = (dst_map.as_mut_slice(), dst_w, dst_h, dst_stride);
         Self::fill_outside_crop_dispatch(dst_tup, dst_fmt, rgba, crop, cp)
     }
@@ -815,6 +808,50 @@ fn color_params(src: &TensorDyn, dst: &TensorDyn) -> (ColorParams, ColorParams) 
     (src_params, dst_params)
 }
 
+/// `ReadWrite` when a convert writes only part of `dst` and keeps the rest (a
+/// view, or a placement with no fill colour), else `None`: such a write needs
+/// a cache-invalidating map.
+fn partial_dst_access(dst: &TensorDyn, crop: &ResolvedCrop) -> edgefirst_tensor::CpuAccess {
+    let full = |r: &Rect| {
+        r.left == 0 && r.top == 0 && Some(r.width) == dst.width() && Some(r.height) == dst.height()
+    };
+    let keeps_outside = crop.dst_color.is_none() && crop.dst_rect.is_some_and(|r| !full(&r));
+    if dst.is_view() || keeps_outside {
+        edgefirst_tensor::CpuAccess::ReadWrite
+    } else {
+        edgefirst_tensor::CpuAccess::None
+    }
+}
+
+/// The CPU access a CPU convert from a `src` source needs on a `dst_fmt`/
+/// `dst_dtype` destination it writes directly (not through the normalization
+/// scratch): `ReadWrite` when a pass reads back what was written — the `I8`
+/// bias, the BGRA swizzle — else `Write`. `src: None` assumes any source.
+pub(crate) fn convert_dst_access(
+    src: Option<PixelFormat>,
+    dst_fmt: PixelFormat,
+    dst_dtype: DType,
+) -> edgefirst_tensor::CpuAccess {
+    use edgefirst_tensor::CpuAccess;
+    let swizzles = dst_fmt == PixelFormat::Bgra && src != Some(PixelFormat::Bgra);
+    match dst_dtype {
+        DType::I8 => CpuAccess::ReadWrite,
+        DType::U8 if swizzles => CpuAccess::ReadWrite,
+        _ => CpuAccess::Write,
+    }
+}
+
+/// Mask drawing blends into `dst`, so it needs both directions; the
+/// background is only read.
+fn require_draw_access(dst: &TensorDyn, background: Option<&TensorDyn>) -> Result<()> {
+    dst.cpu_access()
+        .require(edgefirst_tensor::CpuAccess::ReadWrite)?;
+    if let Some(bg) = background {
+        bg.cpu_access().require(edgefirst_tensor::CpuAccess::Read)?;
+    }
+    Ok(())
+}
+
 impl ImageProcessorTrait for CPUProcessor {
     fn convert(
         &mut self,
@@ -822,6 +859,10 @@ impl ImageProcessorTrait for CPUProcessor {
         dst: &mut TensorDyn,
         options: Option<crate::ConvertOptions>,
     ) -> Result<()> {
+        src.cpu_access()
+            .require(edgefirst_tensor::CpuAccess::Read)?;
+        dst.cpu_access()
+            .require(edgefirst_tensor::CpuAccess::Write)?;
         let options = options.unwrap_or_default();
         let (rotation, flip, crop) = (
             options.get_rotation(),
@@ -835,8 +876,18 @@ impl ImageProcessorTrait for CPUProcessor {
             dst.height().unwrap_or(0),
             options.get_placement(),
         )?;
+        dst.cpu_access().require(partial_dst_access(dst, &crop))?;
         match crate::options::output_map_for(&options, dst, crop.dst_rect.is_some())? {
-            None => self.convert_impl(src, dst, rotation, flip, crop),
+            None => {
+                if let Some(dst_fmt) = dst.format() {
+                    dst.cpu_access().require(convert_dst_access(
+                        src.format(),
+                        dst_fmt,
+                        dst.dtype(),
+                    ))?;
+                }
+                self.convert_impl(src, dst, rotation, flip, crop)
+            }
             Some((map, pad_output)) => {
                 self.convert_mapped(src, dst, rotation, flip, crop, &map, pad_output)
             }
@@ -853,6 +904,7 @@ impl ImageProcessorTrait for CPUProcessor {
         // CPU is the terminal fallback — it must always produce the full
         // output, never assume the caller cleared dst. Every call writes
         // the base layer first (bg copy or zero fill) and then the masks.
+        require_draw_access(dst, overlay.background)?;
         prepare_dst_base_cpu(dst, overlay.background)?;
         let dst = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
         self.draw_decoded_masks_impl(
@@ -871,6 +923,7 @@ impl ImageProcessorTrait for CPUProcessor {
         proto_data: &ProtoData,
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
+        require_draw_access(dst, overlay.background)?;
         prepare_dst_base_cpu(dst, overlay.background)?;
         let dst = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
         self.draw_proto_masks_impl(
@@ -1035,7 +1088,7 @@ impl CPUProcessor {
                     match d {
                         DType::F32 => {
                             let dst_t = dst.as_typed_mut::<f32>().unwrap();
-                            let mut dst_map = dst_t.map_mut()?;
+                            let mut dst_map = dst_t.map_for_write()?;
                             // Counted in elements, not bytes — same invariant.
                             guard_plane(
                                 dst_map.as_slice().len(),
@@ -1055,7 +1108,7 @@ impl CPUProcessor {
                         }
                         DType::F16 => {
                             let dst_t = dst.as_typed_mut::<half::f16>().unwrap();
-                            let mut dst_map = dst_t.map_mut()?;
+                            let mut dst_map = dst_t.map_for_write()?;
                             guard_plane(
                                 dst_map.as_slice().len(),
                                 dst_stride,
@@ -1541,7 +1594,7 @@ impl CPUProcessor {
                 height: dst_h,
             };
             if dst_rect != full_rect {
-                Self::fill_image_outside_crop_u8(dst, dst_color, dst_rect)?;
+                Self::fill_image_outside_crop_u8(dst, dst_color, dst_rect, false)?;
             }
         }
 

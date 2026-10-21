@@ -150,7 +150,8 @@ pub(crate) fn class_of(e: &edgefirst_tensor::Error) -> EfErrorClass {
         E::InvalidOperation(_)
         | E::PboDisconnected
         | E::PboMapped
-        | E::PartialWriteRequiresReadWrite(_) => EfErrorClass::InvalidOperation,
+        | E::PartialWriteRequiresReadWrite(_)
+        | E::CpuAccessDenied { .. } => EfErrorClass::InvalidOperation,
         E::QuantizationInvalid { .. } => EfErrorClass::QuantizationInvalid,
         E::IoError(_) => EfErrorClass::AllocationFailed,
         #[cfg(unix)]

@@ -200,6 +200,8 @@ class Tensor(_BaseTensor):
 
         Raises:
             RuntimeError: If the tensor is too small or the dtype is unsupported.
+            PermissionError: If the tensor's declared CPU access does not
+                cover the CPU decode's write.
         """
 
     def decode_image_file(self, filename: str) -> ImageInfo:
@@ -218,6 +220,8 @@ class Tensor(_BaseTensor):
 
         Raises:
             RuntimeError: If the tensor is too small or the dtype is unsupported.
+            PermissionError: If the tensor's declared CPU access does not
+                cover the CPU decode's write.
         """
 
 def decode_into(tensor: EdgeFirstTensorExportable, data: bytes) -> ImageInfo:
@@ -252,6 +256,8 @@ def decode_into(tensor: EdgeFirstTensorExportable, data: bytes) -> ImageInfo:
 
     Raises:
         RuntimeError: If the tensor is too small or the dtype is unsupported.
+        PermissionError: If the tensor's declared CPU access does not cover
+            the CPU decode's write.
         TypeError: If ``tensor`` does not implement the
             ``__edgefirst_tensor__`` protocol.
     """
@@ -271,6 +277,8 @@ def decode_file_into(tensor: EdgeFirstTensorExportable, filename: str) -> ImageI
 
     Raises:
         RuntimeError: If the tensor is too small or the dtype is unsupported.
+        PermissionError: If the tensor's declared CPU access does not cover
+            the CPU decode's write.
         TypeError: If ``tensor`` does not implement the
             ``__edgefirst_tensor__`` protocol.
     """

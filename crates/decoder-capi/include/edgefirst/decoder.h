@@ -598,7 +598,9 @@ void ef_decoder_string_free(char *s);
  *
  * `out_masks` may be `NULL` when masks are not wanted.
  *
- * @return 0 on success. Both out-parameters are written only on success, so a
+ * @return 0 on success, `EINVAL` for a `NULL` argument or zero `count`,
+ *         `EACCES` when an output is not declared CPU-readable, otherwise
+ *         `EBADMSG`. Both out-parameters are written only on success, so a
  *         caller never has to free a partially-populated result.
  *
  * # Safety
@@ -801,6 +803,11 @@ ef_tensor *ef_proto_data_take_mask_coefficients(ef_proto_data *proto);
 /**
  * Dequantize an integer tensor into a pre-allocated f32 tensor.
  *
+ * @return 0 on success, `EINVAL` for a `NULL` argument, a non-f32 `output`,
+ *         an unsupported `input` dtype or mismatched element counts,
+ *         `EACCES` when `input` is not declared CPU-readable or `output`
+ *         not CPU-writable, otherwise `EIO`.
+ *
  * # Safety
  * `input` and `output` must be live handles.
  */
@@ -852,6 +859,8 @@ void ef_decoder_track_list_free(ef_decoder_track_list *l);
 
 /**
  * Decode and update a decoder-owned tracker.
+ *
+ * @return the codes [`ef_decoder_decode`] returns.
  *
  * # Safety
  * `outputs` must point to `count` live handles.
@@ -1073,8 +1082,9 @@ int ef_decoder_semantic_classes(const ef_decoder *d, uintptr_t *out);
  * overlays. `options` may be `NULL` for the defaults.
  *
  * @return 0, `ENOENT` when the model has no semantic output, `EBADMSG` when
- *         the tensors do not match it or cannot hold the result, or
- *         `EINVAL` for a `NULL` argument.
+ *         the tensors do not match it or cannot hold the result, `EACCES`
+ *         when an output is not declared CPU-readable or `dst`/`confidence`
+ *         not CPU-writable, or `EINVAL` for a `NULL` argument.
  *
  * # Safety
  * `outputs` must point to `count` live tensor handles; `dst` and

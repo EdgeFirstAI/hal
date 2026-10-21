@@ -47,8 +47,8 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Image(e) => write!(f, "Image error: {e:?}"),
-            Error::Tensor(e) => write!(f, "Tensor error: {e:?}"),
+            Error::Image(e) => write!(f, "Image error: {e}"),
+            Error::Tensor(e) => write!(f, "Tensor error: {e}"),
             Error::NdArrayShape(e) => write!(f, "Ndarray shape error: {e:?}"),
             Error::Io(e) => write!(f, "Io error: {e:?}"),
             Error::Format(msg) => write!(f, "Format error: {msg}"),
@@ -83,12 +83,26 @@ impl From<ndarray::ShapeError> for Error {
     }
 }
 
+impl Error {
+    /// Whether this is a CPU access a tensor's declaration refuses.
+    pub(crate) fn is_cpu_access_denied(&self) -> bool {
+        match self {
+            Error::Image(e) => e.cpu_access_denied().is_some(),
+            Error::Tensor(e) => e.cpu_access_denied().is_some(),
+            _ => false,
+        }
+    }
+}
+
 impl From<Error> for PyErr {
     fn from(err: Error) -> PyErr {
         match err {
             // Already the right exception type -- pass through unchanged.
             Error::Py(e) => e,
-            other => pyo3::exceptions::PyRuntimeError::new_err(format!("{other:?}")),
+            other => crate::tensor::runtime_or_permission_error(
+                other.is_cpu_access_denied(),
+                other.to_string(),
+            ),
         }
     }
 }
@@ -285,7 +299,7 @@ fn normalize_to_uint8<'py>(
         ));
     }
     let mut dst = dst.as_array_mut();
-    let map = tensor.map()?;
+    let map = tensor.map_read()?;
     let data = map.as_slice();
     let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
@@ -341,7 +355,7 @@ fn normalize_to_int8<'py>(
         128
     };
     let mut dst = dst.as_array_mut();
-    let map = tensor.map()?;
+    let map = tensor.map_read()?;
     let data = map.as_slice();
     let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
     if is_rgba && dst_shape[2] == 3 && tight {
@@ -418,7 +432,7 @@ fn normalize_to_float_16<'py>(
         }
     };
 
-    let map = tensor.map()?;
+    let map = tensor.map_read()?;
     let data = map.as_slice();
     let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
     if is_rgba && dst_shape[2] == 3 && tight {
@@ -487,7 +501,7 @@ fn normalize_to_float_16<'py>(
 ) -> Result<()> {
     use half::slice::HalfFloatSliceExt;
     let mut dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
-    let map = tensor.map()?;
+    let map = tensor.map_read()?;
     let data = map.as_slice();
     let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
@@ -593,7 +607,7 @@ fn normalize_to_float_32<'py>(
     is_rgba: bool,
 ) -> Result<()> {
     let mut dst = dst.as_array_mut();
-    let map = tensor.map()?;
+    let map = tensor.map_read()?;
     let data = map.as_slice();
     let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
@@ -679,7 +693,7 @@ fn normalize_to_float_64<'py>(
     is_rgba: bool,
 ) -> Result<()> {
     let mut dst = dst.as_array_mut();
-    let map = tensor.map()?;
+    let map = tensor.map_read()?;
     let data = map.as_slice();
     let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
@@ -1530,14 +1544,12 @@ impl PyImageProcessor {
     /// DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
     /// from zero-copy GPU paths when used with this processor's convert().
     ///
-    /// ``access`` declares CPU involvement (``"none"`` — the default,
-    /// hardware-only — ``"read"``, ``"write"``, or ``"readwrite"``).
-    /// Scripts that touch the pixels from Python (``map()``, numpy
-    /// interop) must pass ``access="readwrite"`` (or ``"read"``/
-    /// ``"write"``): the strict ``"none"`` default keeps hardware
-    /// pipelines eligible for tile compression and skips CPU cache
-    /// maintenance, but mapping such a tensor is best-effort and counted
-    /// as unplanned.
+    /// ``access`` declares CPU access: ``"readwrite"`` (the default),
+    /// ``"read"``, ``"write"``, or ``"none"`` (hardware-only, required for
+    /// tile compression). A CPU map outside the declaration raises. When
+    /// this processor may fill the image on the CPU (CPU backend, host
+    /// memory, or a format the GPU does not render) ``"write"`` is added
+    /// to the declaration so its own ``convert`` succeeds.
     ///
     /// ``compression`` requests a vendor tile-compressed layout:
     /// ``None`` (default, linear), ``"any"`` (native scheme when
@@ -1550,7 +1562,7 @@ impl PyImageProcessor {
     /// DMA-BUF from the Linux CMA heap, or an error naming the heap,
     /// never a fallback to the system heap, a PBO or host memory. Read
     /// what any tensor got via ``Tensor.contiguity``.
-    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "none", compression = None, contiguous = false))]
+    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "readwrite", compression = None, contiguous = false))]
     #[allow(clippy::too_many_arguments)]
     pub fn create_image(
         &self,
@@ -1590,7 +1602,7 @@ impl PyImageProcessor {
     /// single GL-importable parent that stacks ``n`` tiles vertically. Uses
     /// the same DMA-pitch alignment and ``Dma>Pbo>Mem`` selection as
     /// :meth:`create_image`. Caller-owned for pool reuse.
-    #[pyo3(signature = (n, cfg, format = PyPixelFormat::Rgba, dtype = "uint8", memory = None, access = "none"))]
+    #[pyo3(signature = (n, cfg, format = PyPixelFormat::Rgba, dtype = "uint8", memory = None, access = "readwrite"))]
     pub fn alloc_tile_batch(
         &self,
         n: usize,

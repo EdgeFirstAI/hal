@@ -163,6 +163,10 @@ impl ImageDecoder {
     ///   format (JPEG NV12/NV16/NV24/RGB/GREY require `u8`)
     /// - [`CodecError::InvalidData`] if the data is not a valid JPEG or PNG,
     ///   including a JPEG whose entropy-coded scan is truncated
+    /// - [`CodecError::Tensor`] carrying
+    ///   [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied) when
+    ///   the CPU decoder must write a tensor whose declared
+    ///   [`CpuAccess`](edgefirst_tensor::CpuAccess) has no write direction
     pub fn decode_into<T: ImagePixel>(
         &mut self,
         data: &[u8],

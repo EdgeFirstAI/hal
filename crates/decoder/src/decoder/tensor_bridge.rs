@@ -118,7 +118,11 @@ macro_rules! map_input {
                     DecoderError::Internal(format!("{:?} is not {}", $t.dtype(), stringify!($ty)))
                 })?
                 .map_read()
-                .map_err(|e| DecoderError::InvalidConfig(format!("tensor map failed: {e}")))?,
+                .map_err(|e| {
+                    DecoderError::from_map(e, |e| {
+                        DecoderError::InvalidConfig(format!("tensor map failed: {e}"))
+                    })
+                })?,
         }
     };
 }

@@ -197,17 +197,9 @@ EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
 
 ### Golden fixtures for cropped convert
 
-[`tests/crop_golden.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/tests/crop_golden.rs)
-holds an 80-case matrix of CPU cropped-convert outputs, stored as CRC32s in
-`tests/data/crop_golden.<arch>.json`. It is the byte-exactness arbiter for the
-crop path: `cropped_convert_matches_golden` replays the matrix and fails on any
-change to a single output byte.
+[`tests/crop_golden.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/tests/crop_golden.rs) holds an 80-case matrix of CPU cropped-convert outputs, stored as CRC32s in `tests/data/crop_golden.<arch>.json`. It is the byte-exactness arbiter for the crop path: `cropped_convert_matches_golden` replays the matrix and fails on any change to a single output byte.
 
-**Never regenerate the fixtures.** `generate_golden` exists and is
-`#[ignore]`d, but both files were frozen from the pre-change implementation
-before any crop-contract work began — that is the whole point of them.
-Regenerating turns the guard into a rubber stamp for whatever the code
-currently does.
+**Regenerate the fixtures only for a deliberate change to the CPU resampling.** `generate_golden` exists and is `#[ignore]`d. A crop-path change must keep the existing fixtures green; regenerating to make it pass turns the guard into a rubber stamp for whatever the code currently does. When the resampling itself changes on purpose, regenerate both architecture files from the same tree and say so in the commit.
 
 The fixtures are **per architecture and per kernel path**. The `yuv` crate
 picks its NEON+RDM, plain-NEON, or AVX2 kernel by runtime CPU feature

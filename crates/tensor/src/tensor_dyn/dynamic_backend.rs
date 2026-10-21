@@ -650,11 +650,8 @@ impl TensorDyn {
         access: CpuAccess,
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'static>> {
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(
-                "map: CpuAccess::None is not a mappable direction".into(),
-            ));
-        }
+        // Checked here so the error matches the static backend's, not an errno.
+        self.cpu_access().require_direction(access, "map_with")?;
         let code = access.code();
         let mut view = edgefirst_tensor_ffi::EfTensorView {
             ptr: std::ptr::null_mut(),
@@ -912,6 +909,20 @@ impl TensorDyn {
             x: out.x as usize,
             y: out.y as usize,
         })
+    }
+
+    /// Whether this tensor addresses part of a larger buffer (see
+    /// [`crate::Tensor::is_view`]). Drives `ef_tensor_is_view`.
+    pub fn is_view(&self) -> bool {
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        unsafe { edgefirst_tensor_ffi::ef_tensor_is_view(self.handle.as_ptr()) != 0 }
+    }
+
+    /// Record that this tensor addresses part of a larger buffer (see
+    /// [`crate::Tensor::mark_view`]). Drives `ef_tensor_mark_view`.
+    pub fn mark_view(&mut self) {
+        // SAFETY: `self.handle` is live; a valid handle cannot be refused.
+        let _ = unsafe { edgefirst_tensor_ffi::ef_tensor_mark_view(self.handle.as_ptr()) };
     }
 
     /// Return the runtime element type discriminant. Already-exported
@@ -1523,6 +1534,25 @@ impl TensorDyn {
         scheme
     }
 
+    /// The CPU access declared at allocation (see
+    /// [`crate::Tensor::cpu_access`]). Drives `ef_tensor_cpu_access`; a code
+    /// this build does not recognise, from a newer library, is `None`.
+    pub fn cpu_access(&self) -> CpuAccess {
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        let code = unsafe { edgefirst_tensor_ffi::ef_tensor_cpu_access(self.handle.as_ptr()) };
+        CpuAccess::from_code(code).unwrap_or(CpuAccess::None)
+    }
+
+    /// Narrow the declared CPU access (see
+    /// [`crate::Tensor::restrict_cpu_access`]). Drives
+    /// `ef_tensor_restrict_cpu_access`.
+    pub fn restrict_cpu_access(&mut self, access: CpuAccess) {
+        // SAFETY: `self.handle` is live; a valid handle and code cannot be refused.
+        let _ = unsafe {
+            edgefirst_tensor_ffi::ef_tensor_restrict_cpu_access(self.handle.as_ptr(), access.code())
+        };
+    }
+
     /// Whether the memory is known to be physically contiguous (see
     /// [`crate::Tensor::contiguity`]). Drives `ef_tensor_contiguity`; a code
     /// this build does not recognise, from a newer library, is `Unknown`.
@@ -1569,11 +1599,7 @@ impl TensorDyn {
         // and its message -- which names "PBO" -- travels back through
         // `ffi_last_error` as a `NotImplemented`, the same error kind the
         // static backend raises.
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(format!(
-                "{what}: CpuAccess::None is not a sync direction"
-            )));
-        }
+        self.cpu_access().require_direction(access, what)?;
         let code = access.code();
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let rc = unsafe {
@@ -2290,9 +2316,8 @@ impl TensorDyn {
                 // SAFETY: the caller guarantees the producer's keepalive
                 // outlives the returned tensor -- the capsule contract
                 // `import_descriptor` documents -- so both handles are the
-                // producer's own and live for this call. `ReadWrite` is the
-                // widest access an import can ask for; the descriptor
-                // carries no access of its own.
+                // producer's own and live for this call. The producer's
+                // declaration picks the staging path; none declared is `ReadWrite`.
                 unsafe {
                     let (format, width, height) =
                         crate::protocol::descriptor_d3d11_geometry(desc, tex, shape)?;
@@ -2302,7 +2327,8 @@ impl TensorDyn {
                         height,
                         format,
                         dtype,
-                        CpuAccess::ReadWrite,
+                        crate::protocol::flags::cpu_access(desc.flags)
+                            .unwrap_or(CpuAccess::ReadWrite),
                         completion,
                         None,
                     )
@@ -2386,6 +2412,8 @@ impl TensorDyn {
             pbo_vtable_ptr: self.pbo_vtable_ptr(),
             fence_handle,
             sync,
+            cpu_access: self.cpu_access(),
+            view: self.is_view(),
         })
     }
 

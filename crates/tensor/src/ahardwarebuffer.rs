@@ -49,7 +49,7 @@
 //! maps can take a write-combined path) while the recorded VALUES
 //! (RARELY/OFTEN) replay exactly. A buffer allocated `CpuAccess::None`
 //! (hardware-only — NPU-direct targets, compressed layouts) refuses
-//! `map()` loudly (`InvalidOperation` + the `unplanned_cpu_access` counter),
+//! `map()` (`CpuAccessDenied` from the tensor's declaration check),
 //! and a read-only map or read-only import panics on `as_mut_slice()` —
 //! writing through a read-only lock is undefined behaviour per the NDK
 //! contract.
@@ -122,9 +122,7 @@ const USAGE_GPU_FRAMEBUFFER: u64 = 0x200;
 /// NNAPI/LiteRT zero-copy handoff.
 const USAGE_GPU_DATA_BUFFER: u64 = 0x1000000;
 
-/// CPU usage bits for a declared [`CpuAccess`](crate::CpuAccess) — the
-/// allocation-time half of the access contract (the lock-time half is
-/// `lock_usage_for` in `ahardwarebuffer_layout.rs`).
+/// CPU usage bits for a declared [`CpuAccess`](crate::CpuAccess).
 fn cpu_usage_bits_for(access: crate::CpuAccess) -> u64 {
     let mut bits = 0;
     if access.reads() {

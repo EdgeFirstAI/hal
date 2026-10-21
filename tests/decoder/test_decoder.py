@@ -422,6 +422,27 @@ def test_yolo_det():
     assert len(masks) == 0
 
 
+@pytest.mark.parametrize("access", ["write", "none"])
+def test_detection_decode_refusal_raises_permission_error(access):
+    """A model output the CPU may not read is refused as PermissionError."""
+    config = {
+        "outputs": [
+            {
+                "decoder": "ultralytics",
+                "quantization": [1.0 / 255.0, 0],
+                "shape": [1, 6, 8],
+                "type": "detection",
+                "dshape": [["batch", 1], ["num_features", 6], ["num_boxes", 8]],
+            },
+        ],
+    }
+    decoder = ef.Decoder(config, 0.5, 0.7)
+    output = ef.Tensor.image(8, 6, ef.PixelFormat.Grey, access=access)
+    output.reshape([1, 6, 8])
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        decoder.decode([output])
+
+
 def test_context_switch():
     """Test running multiple decoders concurrently"""
     import threading

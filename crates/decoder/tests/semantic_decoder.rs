@@ -993,3 +993,63 @@ fn programmatic_semantic_config_decodes_like_json() {
         )
     );
 }
+
+fn declared(shape: &[usize], access: edgefirst_tensor::CpuAccess) -> TensorDyn {
+    let mut t = TensorDyn::image(
+        shape[1],
+        shape[0],
+        edgefirst_tensor::PixelFormat::Grey,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        access,
+    )
+    .unwrap();
+    t.reshape(shape).unwrap();
+    t
+}
+
+#[test]
+fn outputs_without_write_and_inputs_without_read_are_refused() {
+    use edgefirst_tensor::{CpuAccess, Error};
+    let config = SemanticConfig::scores(&[1, 3, 2, 2], 1, 2, 3).unwrap();
+    let input = tensor(&[1, 3, 2, 2], &values(12, 3));
+    let opts = SemanticOptions::new();
+    let denied = |err: DecoderError, declared: CpuAccess, requested: CpuAccess| {
+        assert!(
+            matches!(
+                &err,
+                DecoderError::Tensor(Error::CpuAccessDenied { declared: d, requested: r })
+                    if *d == declared && *r == requested
+            ),
+            "{err:?}"
+        );
+    };
+    for access in [CpuAccess::Read, CpuAccess::None] {
+        let mut dst = declared(&[2, 2], access);
+        let err = decode_semantic(&input, &config, &mut dst, None, &opts).unwrap_err();
+        denied(err, access, CpuAccess::Write);
+
+        let mut dst = zeros(&[2, 2], DType::U8);
+        let mut conf = declared(&[2, 2], access);
+        let err = decode_semantic(&input, &config, &mut dst, Some(&mut conf), &opts).unwrap_err();
+        denied(err, access, CpuAccess::Write);
+    }
+
+    let mut scores = TensorDyn::image(
+        2,
+        6,
+        edgefirst_tensor::PixelFormat::Grey,
+        DType::F32,
+        Some(TensorMemory::Mem),
+        CpuAccess::Write,
+    )
+    .unwrap();
+    scores.reshape(&[1, 3, 2, 2]).unwrap();
+    let mut dst = zeros(&[2, 2], DType::U8);
+    let err = decode_semantic(&scores, &config, &mut dst, None, &opts).unwrap_err();
+    denied(err, CpuAccess::Write, CpuAccess::Read);
+
+    // A write-only class map is enough: the decoder never reads it back.
+    let mut dst = declared(&[2, 2], CpuAccess::Write);
+    decode_semantic(&input, &config, &mut dst, None, &opts).unwrap();
+}
