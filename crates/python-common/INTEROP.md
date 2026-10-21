@@ -268,6 +268,10 @@ tensor and its capsule are gone. `retain` and `release` govern the channel
 only. The producer's own destructor stays the sole caller of `glDeleteBuffers`,
 and a reconstructed tensor's delete operation is a no-op.
 
+### View flag
+
+`VIEW` (bit 4) marks a producer that addresses part of a larger buffer: a `view()`, or a `batch()` element of a packed image, at any offset including zero. The descriptor cannot carry the view's parent geometry, so `import_descriptor` marks the alias as a view instead (`is_view`), and a CPU write into it maps `ReadWrite` exactly as the producer's view would: its rows share cache lines with bytes outside it, so a write-only map is refused for a `Write`-declared view on both sides. The bit is clear for a whole tensor, which is also what a producer that predates it reports.
+
 ### Carrying a texture between processes
 
 The descriptor protocol is an in-process contract: its handle values mean

@@ -158,6 +158,17 @@ mod cpu_tests {
             }
             other => panic!("expected CpuAccessDenied, got {other:?}"),
         }
+        // Rebuilt from its descriptor the view has no `ViewOrigin`, and is refused alike.
+        let pin = view.pin_host(CpuAccess::Write).unwrap();
+        let mut rebuilt =
+            TensorDyn::import_descriptor(&view.descriptor_pinned(Some(&pin))).unwrap();
+        assert!(rebuilt.view_origin().is_none() && rebuilt.is_view());
+        match cpu.convert(&src, &mut rebuilt, None) {
+            Err(Error::Tensor(TensorError::CpuAccessDenied { requested, .. })) => {
+                assert_eq!(requested, CpuAccess::ReadWrite)
+            }
+            other => panic!("expected CpuAccessDenied, got {other:?}"),
+        }
         let rw_parent = image(64, 64, CpuAccess::ReadWrite);
         let mut rw_view = rw_parent.view(Region::new(8, 8, 32, 32)).unwrap();
         cpu.convert(&src, &mut rw_view, None).unwrap();

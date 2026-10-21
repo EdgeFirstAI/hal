@@ -816,7 +816,7 @@ fn partial_dst_access(dst: &TensorDyn, crop: &ResolvedCrop) -> edgefirst_tensor:
         r.left == 0 && r.top == 0 && Some(r.width) == dst.width() && Some(r.height) == dst.height()
     };
     let keeps_outside = crop.dst_color.is_none() && crop.dst_rect.is_some_and(|r| !full(&r));
-    if dst.view_origin().is_some() || keeps_outside {
+    if dst.is_view() || keeps_outside {
         edgefirst_tensor::CpuAccess::ReadWrite
     } else {
         edgefirst_tensor::CpuAccess::None

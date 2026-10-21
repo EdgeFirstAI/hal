@@ -1970,6 +1970,12 @@ where
         None
     }
 
+    /// Whether this tensor addresses part of a larger buffer (see
+    /// [`Tensor::is_view`]); a bare backing reports `false`.
+    fn is_view(&self) -> bool {
+        self.view_origin().is_some()
+    }
+
     /// The direction a CPU pass that overwrites every element of this tensor
     /// maps with.
     ///
@@ -1981,7 +1987,7 @@ where
     /// (`Write` on a write-only declaration), a [`view`](Tensor::view), whose
     /// rows share cache lines with bytes outside it, takes `ReadWrite`.
     fn write_access(&self) -> CpuAccess {
-        if self.view_origin().is_some() {
+        if self.is_view() {
             CpuAccess::ReadWrite
         } else {
             self.cpu_access().union(CpuAccess::Write)
@@ -3028,6 +3034,11 @@ where
     /// backend key its import on the parent and render the view as a
     /// `glViewport`/`glScissor` ROI. See [`ViewOrigin`].
     view_origin: Option<ViewOrigin>,
+    /// Set by [`mark_view`](Self::mark_view) on a tensor rebuilt from a view's
+    /// descriptor, which addresses part of a larger buffer but has no
+    /// [`ViewOrigin`], and inherited by its sub-views. See
+    /// [`is_view`](Self::is_view).
+    view_marked: bool,
 }
 
 #[cfg(not(edgefirst_tensor_dynamic))]
@@ -3049,6 +3060,7 @@ where
             cpu_access: CpuAccess::ReadWrite,
             compression: None,
             view_origin: None,
+            view_marked: false,
         }
     }
 
@@ -4694,6 +4706,7 @@ where
             compression: luma.compression,
             // A composed multiplane tensor is a whole image, not a sub-view.
             view_origin: None,
+            view_marked: false,
         })
     }
 
@@ -4911,6 +4924,23 @@ where
     /// `glViewport`/`glScissor` ROI at `(x, y, width, height)`. See [`ViewOrigin`].
     pub fn view_origin(&self) -> Option<ViewOrigin> {
         self.view_origin
+    }
+
+    /// Whether this tensor addresses part of a larger buffer: a
+    /// [`view`](Self::view)/[`batch`](Self::batch) with a [`ViewOrigin`], or a
+    /// tensor rebuilt from such a view's descriptor, which carries none.
+    ///
+    /// A view's rows share cache lines with bytes outside it, so a CPU pass
+    /// that writes it maps `ReadWrite` (see [`TensorTrait::write_access`]).
+    pub fn is_view(&self) -> bool {
+        self.view_origin.is_some() || self.view_marked
+    }
+
+    /// Record that this tensor addresses part of a larger buffer, as
+    /// [`is_view`](Self::is_view) reports. The descriptor import calls this
+    /// for a producer that was a view; it is never cleared.
+    pub fn mark_view(&mut self) {
+        self.view_marked = true;
     }
 
     /// Set the byte offset within the DMA-BUF where image data starts.
@@ -5143,6 +5173,7 @@ where
         // Likewise the recorded compression scheme: the view shares the
         // parent's physical layout.
         t.compression = self.compression;
+        t.view_marked = self.is_view();
         if abs_offset > 0 {
             t.set_plane_offset(abs_offset);
         }
@@ -5447,6 +5478,7 @@ where
             cpu_access: CpuAccess::ReadWrite,
             compression: None,
             view_origin: None,
+            view_marked: false,
         })
     }
 
@@ -6217,6 +6249,10 @@ where
 
     fn view_origin(&self) -> Option<ViewOrigin> {
         self.view_origin
+    }
+
+    fn is_view(&self) -> bool {
+        Tensor::is_view(self)
     }
 
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self>

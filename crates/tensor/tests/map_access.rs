@@ -345,3 +345,43 @@ fn an_undeclared_descriptor_imports_readwrite() {
     let alias = TensorDyn::import_descriptor(&desc).expect("import");
     assert_eq!(alias.cpu_access(), CpuAccess::ReadWrite);
 }
+
+// A view's descriptor reports `VIEW` at any offset, and its import maps a write
+// `ReadWrite` as the view itself does; a whole tensor's does neither.
+#[test]
+fn an_imported_view_keeps_its_write_access() {
+    use edgefirst_tensor::protocol::flags;
+    let parent = declared(CpuAccess::Write);
+    let whole = parent.pin_host(CpuAccess::Write).expect("write pin");
+    let desc = parent.descriptor_pinned(Some(&whole));
+    assert_eq!(desc.flags & flags::VIEW, 0);
+    let alias = TensorDyn::import_descriptor(&desc).expect("import");
+    assert!(!alias.is_view());
+    assert_eq!(alias.as_u8().expect("u8").write_access(), CpuAccess::Write);
+    for (x, y) in [(0, 0), (4, 2)] {
+        let view = parent
+            .view(edgefirst_tensor::Region::new(x, y, 8, 4))
+            .expect("view");
+        let pin = view.pin_host(CpuAccess::Write).expect("write pin");
+        let desc = view.descriptor_pinned(Some(&pin));
+        assert_eq!(desc.flags & flags::VIEW, flags::VIEW, "({x}, {y})");
+        let alias = TensorDyn::import_descriptor(&desc).expect("import");
+        assert!(
+            alias.view_origin().is_none() && alias.is_view(),
+            "({x}, {y})"
+        );
+        let typed = alias.as_u8().expect("u8");
+        assert_eq!(typed.write_access(), CpuAccess::ReadWrite, "({x}, {y})");
+        assert_denied(
+            typed.map_for_write(),
+            CpuAccess::Write,
+            CpuAccess::ReadWrite,
+        );
+        let again =
+            TensorDyn::import_descriptor(&alias.descriptor_pinned(Some(&pin))).expect("re-import");
+        assert!(
+            again.is_view(),
+            "a rebuilt view stays one through another import"
+        );
+    }
+}

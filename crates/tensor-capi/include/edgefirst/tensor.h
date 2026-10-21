@@ -1671,6 +1671,31 @@ uint32_t ef_tensor_contiguity(const ef_tensor *t);
 int ef_tensor_view_origin(const ef_tensor *t, struct EfViewOrigin *out);
 
 /**
+ * Whether this tensor addresses part of a larger buffer: a `view`/`batch`
+ * sub-region, or a tensor rebuilt from one's descriptor and marked with
+ * `ef_tensor_mark_view`. A CPU write into such a tensor maps read-write.
+ *
+ * Returns 1 for a view, 0 for a whole tensor or a `NULL`/invalid handle.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+int ef_tensor_is_view(const ef_tensor *t);
+
+/**
+ * Record that this tensor addresses part of a larger buffer, which
+ * `ef_tensor_is_view` then reports. Never cleared. The descriptor import
+ * calls this for a producer whose descriptor carries the `VIEW` flag.
+ *
+ * @return 0, or `EINVAL` for a `NULL`/invalid handle.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle with no concurrent `tensor-capi`
+ * calls on it.
+ */
+int ef_tensor_mark_view(ef_tensor *t);
+
+/**
  * Allocate a host-memory tensor.
  *
  * The simplest constructor: `edgefirst-tensor` handles `mem` allocation

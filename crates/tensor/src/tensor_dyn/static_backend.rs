@@ -381,6 +381,7 @@ impl TensorDyn {
             fence_handle,
             sync,
             cpu_access: self.cpu_access(),
+            view: self.is_view(),
         })
     }
 
@@ -614,6 +615,16 @@ impl TensorDyn {
     /// [`Tensor::view_origin`].
     pub fn view_origin(&self) -> Option<crate::ViewOrigin> {
         dispatch!(self, view_origin)
+    }
+
+    /// See [`Tensor::is_view`](crate::Tensor::is_view).
+    pub fn is_view(&self) -> bool {
+        dispatch!(self, is_view)
+    }
+
+    /// See [`Tensor::mark_view`](crate::Tensor::mark_view).
+    pub fn mark_view(&mut self) {
+        dispatch!(self, mark_view)
     }
 
     /// Set the byte offset within the DMA-BUF where image data starts.

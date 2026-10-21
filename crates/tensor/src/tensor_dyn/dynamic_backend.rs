@@ -911,6 +911,20 @@ impl TensorDyn {
         })
     }
 
+    /// Whether this tensor addresses part of a larger buffer (see
+    /// [`crate::Tensor::is_view`]). Drives `ef_tensor_is_view`.
+    pub fn is_view(&self) -> bool {
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        unsafe { edgefirst_tensor_ffi::ef_tensor_is_view(self.handle.as_ptr()) != 0 }
+    }
+
+    /// Record that this tensor addresses part of a larger buffer (see
+    /// [`crate::Tensor::mark_view`]). Drives `ef_tensor_mark_view`.
+    pub fn mark_view(&mut self) {
+        // SAFETY: `self.handle` is live; a valid handle cannot be refused.
+        let _ = unsafe { edgefirst_tensor_ffi::ef_tensor_mark_view(self.handle.as_ptr()) };
+    }
+
     /// Return the runtime element type discriminant. Already-exported
     /// (`ef_tensor_dtype`); needed by `derived.rs`'s pure functions of
     /// `dtype()`/`shape()`/`format()`.
@@ -2399,6 +2413,7 @@ impl TensorDyn {
             fence_handle,
             sync,
             cpu_access: self.cpu_access(),
+            view: self.is_view(),
         })
     }
 

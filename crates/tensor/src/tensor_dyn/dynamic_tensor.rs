@@ -310,6 +310,18 @@ impl<T: Element> Tensor<T> {
         self.inner.view_origin()
     }
 
+    /// Whether this tensor addresses part of a larger buffer. See `static`'s
+    /// `Tensor::is_view` (`lib.rs`).
+    pub fn is_view(&self) -> bool {
+        self.inner.is_view()
+    }
+
+    /// Record that this tensor addresses part of a larger buffer. See
+    /// `static`'s `Tensor::mark_view` (`lib.rs`).
+    pub fn mark_view(&mut self) {
+        self.inner.mark_view()
+    }
+
     /// Byte offset within the DMA-BUF where image data starts (`None` = 0).
     /// Forwards to [`TensorDyn::plane_offset`], which drives the real
     /// `ef_tensor_plane_offset` primitive.
@@ -899,6 +911,10 @@ impl<T: Element> TensorTrait<T> for Tensor<T> {
 
     fn view_origin(&self) -> Option<ViewOrigin> {
         Tensor::view_origin(self)
+    }
+
+    fn is_view(&self) -> bool {
+        Tensor::is_view(self)
     }
 
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self>

@@ -732,6 +732,34 @@ def test_imported_alias_keeps_declaration(monkeypatch, mem):
     assert dst.declared_cpu_access == "read"
 
 
+@pytest.mark.parametrize("origin", [(0, 0), (16, 8)])
+@pytest.mark.parametrize("mem", ["mem", "dma"])
+@pytest.mark.parametrize("package", ["image", "tensor"])
+def test_cpu_convert_refuses_a_write_only_view(monkeypatch, package, mem, origin):
+    """A view shares cache lines with pixels outside it, so the CPU convert
+    refuses one declared write-only, at any offset, whether the view is this
+    package's own or another package's."""
+    from edgefirst.tensor import PixelFormat as CorePixelFormat
+    from edgefirst.tensor import Region
+    from edgefirst.tensor import Tensor as CoreTensor
+
+    converter = _cpu_only_processor(monkeypatch)
+    cls, fmt = (
+        (Tensor, PixelFormat.Rgb)
+        if package == "image"
+        else (CoreTensor, CorePixelFormat.Rgb)
+    )
+    if mem == "mem":
+        parent = cls.image(64, 48, fmt, mem=TensorMemory.MEM, access="write")
+    else:
+        parent = _dma_or_skip(cls, 64, 48, fmt, access="write")
+    src = Tensor.image(64, 48, PixelFormat.Rgba, mem=TensorMemory.MEM)
+    view = parent.view(Region(*origin, 32, 24))
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        converter.convert(src, view)
+    converter.convert(src, parent)
+
+
 @pytest.mark.parametrize("dtype", [np.uint8, np.float32])
 def test_normalize_to_numpy_reads_a_read_only_tensor(dtype):
     """normalize_to_numpy only reads its tensor, so a read-only declaration

@@ -154,6 +154,12 @@ pub mod flags {
     pub const CPU_READ: u32 = 1 << 2;
     /// The declaration includes CPU writes. Bit 3.
     pub const CPU_WRITE: u32 = 1 << 3;
+    /// The tensor addresses part of a larger buffer (a `view`/`batch`
+    /// sub-region, at any offset), so an importer must treat its rows as
+    /// sharing cache lines with bytes outside it. Clear means a whole
+    /// tensor, which is also what a producer that predates the bit reports.
+    /// Bit 4.
+    pub const VIEW: u32 = 1 << 4;
 
     /// The flag bits reporting `access`.
     pub fn from_cpu_access(access: crate::CpuAccess) -> u32 {
@@ -743,6 +749,8 @@ pub(crate) struct DescParts<'a, 'p> {
     pub sync: Option<u64>,
     /// The producer's declared CPU access, reported in [`TensorDesc::flags`].
     pub cpu_access: crate::CpuAccess,
+    /// Whether the producer is a view, reported as [`flags::VIEW`].
+    pub view: bool,
 }
 
 /// Row-major byte strides for `shape`, with the row dimension replaced by
@@ -864,6 +872,7 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         fence_handle,
         sync,
         cpu_access,
+        view,
     } = parts;
     let desc_kind = kind_of(memory);
     // Both fields are meaningful only under `D3D11_TEXTURE`, and only when
@@ -939,7 +948,8 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
                 flags::SYNC_PRESENT
             } else {
                 0
-            },
+            }
+            | if view { flags::VIEW } else { 0 },
         capacity,
         sync: completion.map_or(0, |(_, value)| value),
     }
@@ -1312,7 +1322,20 @@ mod desc_tests {
             fence_handle,
             sync,
             cpu_access: crate::CpuAccess::ReadWrite,
+            view: false,
         }
+    }
+
+    /// The `VIEW` bit reports exactly the producer's `view`.
+    #[test]
+    fn the_view_bit_reports_the_producer() {
+        let whole = from_parts(parts(TensorMemory::Mem, 0, None));
+        assert_eq!(whole.flags & super::flags::VIEW, 0);
+        let view = from_parts(DescParts {
+            view: true,
+            ..parts(TensorMemory::Mem, 0, None)
+        });
+        assert_eq!(view.flags & super::flags::VIEW, super::flags::VIEW);
     }
 
     /// Only a D3D11 texture has a fence to name. A completion handed to any

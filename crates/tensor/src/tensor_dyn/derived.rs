@@ -169,6 +169,10 @@ fn restore_descriptor_metadata(
     if let Some(access) = crate::protocol::flags::cpu_access(desc.flags) {
         t.restrict_cpu_access(access);
     }
+    // The descriptor cannot carry a `ViewOrigin`, so a view's import is marked instead.
+    if desc.flags & crate::protocol::flags::VIEW != 0 {
+        t.mark_view();
+    }
 
     Ok(())
 }
