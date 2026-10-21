@@ -172,7 +172,13 @@ impl V4l2Probe {
                 ctx.drop_stream();
                 Err(V4l2Decode::Fallback(why))
             }
-            Err(DecodeErr::Fatal(e)) => Err(V4l2Decode::Fatal(e)),
+            Err(DecodeErr::Fatal(e)) => {
+                // A refusal after OUTPUT was queued leaves the stream unusable; reset it uncounted.
+                if ctx.m2m.output().queued_count() != 0 || ctx.m2m.capture().queued_count() != 0 {
+                    ctx.drop_stream();
+                }
+                Err(V4l2Decode::Fatal(e))
+            }
         };
 
         // Circuit breaker: a device that keeps failing is demoted so it stops
@@ -223,6 +229,14 @@ fn require_copy_out_access<T: ImagePixel>(
     let dma_capable = dst.memory() == TensorMemory::DmaBuf;
     let needed = dst_cpu_access(dma_capable, output_fmt, final_w, final_h);
     Ok(dst.cpu_access().require(needed)?)
+}
+
+/// Refuse a destination the scratch copy-out cannot write: one declared
+/// without `Write` that only a zero-copy decode could have filled.
+fn require_scratch_copy_out<T: ImagePixel>(dst: &Tensor<T>) -> Result<(), DecodeErr> {
+    dst.cpu_access()
+        .require(edgefirst_tensor::CpuAccess::Write)
+        .map_err(|e| DecodeErr::Fatal(e.into()))
 }
 
 /// A persistent, capability-verified V4L2 decode context.
@@ -359,6 +373,9 @@ impl V4l2Context {
         let reconfigure = !reuse && matches!(&self.stream, Some(s) if s.out_sizeimage >= needed);
 
         if reuse {
+            if matches!(&self.stream, Some(s) if matches!(s.cap.target, CaptureTarget::Scratch)) {
+                require_scratch_copy_out(dst)?;
+            }
             self.requeue_output(data)?;
         } else if reconfigure {
             if let Err(e) = self.reconfigure_capture(
@@ -991,9 +1008,7 @@ impl V4l2Context {
         }
 
         // The driver refused zero-copy, and the copy-out writes on the CPU.
-        dst.cpu_access()
-            .require(edgefirst_tensor::CpuAccess::Write)
-            .map_err(|e| DecodeErr::Fatal(e.into()))?;
+        require_scratch_copy_out(dst)?;
 
         // Persistent-scratch: the hardware decodes into the codec-owned DMA
         // buffer (single plane; QBUF length may exceed the format's
