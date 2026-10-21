@@ -195,15 +195,21 @@ use crate::per_scale::outputs::{
     DecodedOutputBuffers, DecodedOutputsRef, ProtoStorage, ProtosView,
 };
 use crate::per_scale::plan::Layout;
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+use crate::per_scale::prefilter::{gather_rows, raw_score_floor, select_anchors, LevelScratch};
+use edgefirst_tensor::{CpuAccess, TensorMapTrait, TensorTrait};
 
 /// Run the per-scale decode pipeline for one frame's inputs. Writes
 /// into `buffers` and returns a borrowed view.
+///
+/// With a `score_threshold` the prefilter decodes only the anchors that
+/// can reach it (see [`crate::per_scale::prefilter`]); frames it cannot
+/// bound, such as float score tensors, are decoded densely.
 #[allow(dead_code)] // Wired by Task 24.
 pub(crate) fn run<'a>(
     plan: &PerScalePlan,
     buffers: &'a mut DecodedOutputBuffers,
     inputs: &[&TensorDyn],
+    score_threshold: Option<f32>,
 ) -> DecoderResult<DecodedOutputsRef<'a>> {
     // Top-level span. The `n_levels` field gives at-a-glance shape in
     // Perfetto's flame graph; per-level / per-role child spans below
@@ -227,12 +233,22 @@ pub(crate) fn run<'a>(
     // NHWC (the common TFLite case). NCHW levels share `layout_scratch`
     // which would need per-level scratch buffers to parallelize safely;
     // for now we keep the sequential path for that case.
-    let all_nhwc = plan.levels.iter().all(|l| l.layout == Layout::Nhwc);
-    if all_nhwc {
-        run_levels_parallel(plan, &bind, buffers)?;
-    } else {
-        run_levels_sequential(plan, &bind, buffers)?;
-    }
+    let kept = match score_threshold {
+        Some(t) => run_levels_prefiltered(plan, &bind, buffers, t)?,
+        None => None,
+    };
+    let total_anchors = match kept {
+        Some(n) => n,
+        None => {
+            let all_nhwc = plan.levels.iter().all(|l| l.layout == Layout::Nhwc);
+            if all_nhwc {
+                run_levels_parallel(plan, &bind, buffers)?;
+            } else {
+                run_levels_sequential(plan, &bind, buffers)?;
+            }
+            plan.total_anchors
+        }
+    };
 
     // Protos — single tensor, no per-level structure. Always sequential.
     // When the schema declares NCHW protos, we transpose into the NHWC
@@ -279,7 +295,7 @@ pub(crate) fn run<'a>(
         }
     }
 
-    Ok(make_outputs_ref(buffers, plan))
+    Ok(make_outputs_ref(buffers, plan, total_anchors))
 }
 
 /// Dispatch the per-channel DFL kernel for the given `(input, dst)` dtype pair.
@@ -331,6 +347,177 @@ fn dispatch_dfl_per_channel(
             "dispatch_dfl_per_channel: float inputs do not support per-channel quant".into(),
         )),
     }
+}
+
+/// Run the box kernel for one level, choosing the per-channel DFL kernel
+/// when the box tensor carries per-channel quantization.
+fn run_box_kernel(
+    plan: &PerScalePlan,
+    level: &crate::per_scale::plan::LevelPlan,
+    boxes: &TensorDyn,
+    li: usize,
+    input: InputView<'_>,
+    dst: DstSliceMut<'_>,
+) -> DecoderResult<()> {
+    if plan.box_encoding == crate::schema::BoxEncoding::Dfl {
+        if let Some((scales, zps)) = box_per_channel_quant_from_tensor(boxes, li)? {
+            return dispatch_dfl_per_channel(input, scales, zps, level, dst);
+        }
+    }
+    let q = quant_from_tensor(boxes, "boxes", li)?;
+    plan.box_dispatch.run(input, q, level, dst)
+}
+
+/// Prefiltered per-level loop: select the anchors whose raw scores can
+/// reach `threshold`, gather their rows, and decode only those, packing
+/// each level's survivors after the previous level's in the output
+/// buffers. Returns the number of anchors kept, or `None` (with the
+/// buffers untouched) when the threshold cannot be mapped onto every
+/// level's raw scores and the caller must decode densely.
+///
+/// Runs on the calling thread: the kept set is a few percent of the
+/// anchors, too little work to repay a rayon scope.
+fn run_levels_prefiltered(
+    plan: &PerScalePlan,
+    bind: &FrameBindings<'_>,
+    buffers: &mut DecodedOutputBuffers,
+    threshold: f32,
+) -> DecoderResult<Option<usize>> {
+    let mut floors = Vec::with_capacity(bind.levels.len());
+    for (li, lvl_bind) in bind.levels.iter().enumerate() {
+        if !matches!(
+            lvl_bind.scores.dtype(),
+            DType::I8 | DType::U8 | DType::I16 | DType::U16
+        ) {
+            return Ok(None);
+        }
+        let q = quant_from_tensor(lvl_bind.scores, "scores", li)?;
+        match raw_score_floor(threshold, q, plan.score_activation) {
+            Some(floor) => floors.push((q, floor)),
+            None => return Ok(None),
+        }
+    }
+    // A level with no survivors never maps its boxes or mask coefficients,
+    // so check their declared access up front, as the dense decode's maps do.
+    for lvl_bind in &bind.levels {
+        lvl_bind.boxes.cpu_access().require(CpuAccess::Read)?;
+        if let Some(mc) = lvl_bind.mask_coefs {
+            mc.cpu_access().require(CpuAccess::Read)?;
+        }
+    }
+
+    let _span = tracing::trace_span!(
+        "decoder.per_scale_run.prefilter",
+        threshold,
+        kept = tracing::field::Empty,
+    )
+    .entered();
+    let DecodedOutputBuffers {
+        boxes,
+        scores,
+        mask_coefs,
+        layout_scratch,
+        prefilter,
+        ..
+    } = buffers;
+    if prefilter.len() != plan.levels.len() {
+        *prefilter = plan.levels.iter().map(LevelScratch::for_level).collect();
+    }
+
+    let nc = plan.num_classes;
+    let nm = plan.num_mask_coefs;
+    let mut offset = 0;
+    for (li, lvl_bind) in bind.levels.iter().enumerate() {
+        let lvl = &plan.levels[li];
+        let scratch = &mut prefilter[li];
+        let (score_q, floor) = floors[li];
+        let _level_span = tracing::trace_span!(
+            "decoder.per_scale_run.level",
+            li = li,
+            stride = lvl.stride,
+            anchors = lvl.h * lvl.w,
+            kept = tracing::field::Empty,
+        )
+        .entered();
+
+        with_mapped_or_transposed_input(
+            lvl_bind.scores,
+            "scores",
+            li,
+            lvl.layout,
+            lvl.h,
+            lvl.w,
+            nc,
+            layout_scratch,
+            |input| {
+                select_anchors(&input, nc, floor, &mut scratch.anchors)?;
+                if scratch.pack(lvl) == 0 {
+                    return Ok(());
+                }
+                let packed = gather_rows(&input, nc, &scratch.anchors, &mut scratch.scores);
+                let dst = scores_level_slice_of(scores, offset, scratch.anchors.len(), nc);
+                plan.score_dispatch.run(
+                    packed,
+                    score_q,
+                    nc,
+                    &scratch.plan,
+                    plan.score_activation,
+                    dst,
+                )
+            },
+        )?;
+        let k = scratch.kept;
+        _level_span.record("kept", k);
+        if k == 0 {
+            continue;
+        }
+        let packed_len = scratch.anchors.len();
+
+        let box_channels = box_channel_count_for_level(lvl);
+        with_mapped_or_transposed_input(
+            lvl_bind.boxes,
+            "boxes",
+            li,
+            lvl.layout,
+            lvl.h,
+            lvl.w,
+            box_channels,
+            layout_scratch,
+            |input| {
+                let packed =
+                    gather_rows(&input, box_channels, &scratch.anchors, &mut scratch.boxes);
+                let dst = boxes_level_slice_of(boxes, offset, packed_len);
+                run_box_kernel(plan, &scratch.plan, lvl_bind.boxes, li, packed, dst)
+            },
+        )?;
+
+        if let (Some(mc_input), Some(mc_dispatch), Some(mc_buf)) =
+            (lvl_bind.mask_coefs, plan.mc_dispatch, mask_coefs.as_mut())
+        {
+            if nm > 0 {
+                let q = quant_from_tensor(mc_input, "mask_coefs", li)?;
+                with_mapped_or_transposed_input(
+                    mc_input,
+                    "mask_coefs",
+                    li,
+                    lvl.layout,
+                    lvl.h,
+                    lvl.w,
+                    nm,
+                    layout_scratch,
+                    |input| {
+                        let packed =
+                            gather_rows(&input, nm, &scratch.anchors, &mut scratch.mask_coefs);
+                        let dst = mask_coefs_level_slice_of(mc_buf, offset, packed_len, nm);
+                        mc_dispatch.run(packed, q, nm, &scratch.plan, dst)
+                    },
+                )?;
+            }
+        }
+        offset += k;
+    }
+    _span.record("kept", offset);
+    Ok(Some(offset))
 }
 
 /// Sequential per-level loop (NCHW path: `layout_scratch` is shared).
@@ -871,23 +1058,23 @@ where
     }
 }
 
-/// Build a `DecodedOutputsRef` borrowing the buffers.
+/// Build a `DecodedOutputsRef` borrowing the first `total_anchors`
+/// anchors of the buffers.
 fn make_outputs_ref<'a>(
     buffers: &'a DecodedOutputBuffers,
     plan: &PerScalePlan,
+    total_anchors: usize,
 ) -> DecodedOutputsRef<'a> {
-    let boxes = match &buffers.boxes {
-        Buffer::F32(v) => BufferRef::F32(v),
-        Buffer::F16(v) => BufferRef::F16(v),
+    let prefix = |b: &'a Buffer, per_anchor: usize| match b {
+        Buffer::F32(v) => BufferRef::F32(&v[..total_anchors * per_anchor]),
+        Buffer::F16(v) => BufferRef::F16(&v[..total_anchors * per_anchor]),
     };
-    let scores = match &buffers.scores {
-        Buffer::F32(v) => BufferRef::F32(v),
-        Buffer::F16(v) => BufferRef::F16(v),
-    };
-    let mask_coefs = buffers.mask_coefs.as_ref().map(|b| match b {
-        Buffer::F32(v) => BufferRef::F32(v),
-        Buffer::F16(v) => BufferRef::F16(v),
-    });
+    let boxes = prefix(&buffers.boxes, 4);
+    let scores = prefix(&buffers.scores, plan.num_classes);
+    let mask_coefs = buffers
+        .mask_coefs
+        .as_ref()
+        .map(|b| prefix(b, plan.num_mask_coefs));
     let protos = buffers.protos.as_ref().map(|p| match p {
         ProtoStorage::F32(a) => ProtosView::F32(a.view()),
         ProtoStorage::F16(a) => ProtosView::F16(a.view()),
@@ -897,7 +1084,7 @@ fn make_outputs_ref<'a>(
         scores,
         mask_coefs,
         protos,
-        total_anchors: plan.total_anchors,
+        total_anchors,
         num_classes: plan.num_classes,
         num_mask_coefs: plan.num_mask_coefs,
     }
@@ -1005,7 +1192,12 @@ mod tests {
         let decoder = PerScaleDecoder::new(plan);
         // After new, buffers should be sized.
         match &decoder.buffers.boxes {
-            crate::per_scale::outputs::Buffer::F32(v) => assert_eq!(v.len(), 4 * 8400),
+            crate::per_scale::outputs::Buffer::F32(v) => {
+                assert_eq!(
+                    v.len(),
+                    4 * (8400 + crate::per_scale::prefilter::PACK_ANCHORS - 1)
+                )
+            }
             _ => panic!("expected F32 boxes buffer"),
         }
     }
@@ -1053,7 +1245,7 @@ mod tests {
         let inputs: Vec<&TensorDyn> = inputs_owned.iter().collect();
 
         let mut decoder = PerScaleDecoder::new(plan);
-        let result = decoder.run(&inputs);
+        let result = decoder.run(&inputs, None);
         assert!(
             result.is_ok(),
             "run should succeed on zero-i8 inputs: {result:?}"

@@ -1390,7 +1390,7 @@ impl Decoder {
             let mut ps = per_scale_mutex
                 .lock()
                 .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
-            let decoded = ps.run(outputs)?;
+            let decoded = ps.run(outputs, Some(self.score_threshold))?;
             return per_scale_bridge::per_scale_to_masks(
                 &decoded,
                 output_boxes,
@@ -1488,7 +1488,7 @@ impl Decoder {
             let mut ps = per_scale_mutex
                 .lock()
                 .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
-            let decoded = ps.run(outputs)?;
+            let decoded = ps.run(outputs, Some(self.score_threshold))?;
             return per_scale_bridge::per_scale_to_proto_data(
                 &decoded,
                 output_boxes,
@@ -1552,7 +1552,7 @@ impl Decoder {
         })?;
         // Drop the borrowed view immediately so we can reborrow buffers below.
         {
-            ps.run(outputs)?;
+            ps.run(outputs, None)?;
         }
         let total_anchors = ps.plan.total_anchors;
         let num_classes = ps.plan.num_classes;

@@ -35,6 +35,10 @@ pub(crate) struct DecodedOutputBuffers {
     /// risks under-sized allocations and out-of-bounds writes inside
     /// the transpose helper.
     pub(crate) layout_scratch: LayoutScratch,
+
+    /// Per-level compact-decode scratch for the score prefilter, built on
+    /// the first prefiltered frame.
+    pub(crate) prefilter: Vec<super::prefilter::LevelScratch>,
 }
 
 /// Per-dtype scratch for NCHW → NHWC transpose. Lazy allocation: the
@@ -145,12 +149,16 @@ impl DecodedOutputBuffers {
                 }
             })
         };
+        // The prefilter writes whole packs, so its last level can run up
+        // to one pack, less an anchor, past the kept count.
+        let capacity = total_anchors + super::prefilter::PACK_ANCHORS - 1;
         Self {
-            boxes: alloc_buf(4 * total_anchors),
-            scores: alloc_buf(num_classes * total_anchors),
-            mask_coefs: (num_mask_coefs > 0).then(|| alloc_buf(num_mask_coefs * total_anchors)),
+            boxes: alloc_buf(4 * capacity),
+            scores: alloc_buf(num_classes * capacity),
+            mask_coefs: (num_mask_coefs > 0).then(|| alloc_buf(num_mask_coefs * capacity)),
             protos: proto_shape.and_then(alloc_proto),
             layout_scratch: LayoutScratch::default(),
+            prefilter: Vec::new(),
         }
     }
 
@@ -366,6 +374,8 @@ pub(crate) struct DecodedOutputsRef<'a> {
     pub(crate) scores: BufferRef<'a>,
     pub(crate) mask_coefs: Option<BufferRef<'a>>,
     pub(crate) protos: Option<ProtosView<'a>>,
+    /// Anchors held in `boxes` / `scores` / `mask_coefs`: every anchor of
+    /// the plan, or only those the score prefilter kept.
     pub(crate) total_anchors: usize,
     pub(crate) num_classes: usize,
     pub(crate) num_mask_coefs: usize,
@@ -421,16 +431,17 @@ mod tests {
     #[test]
     fn buffers_alloc_f32_correct_sizes() {
         let b = DecodedOutputBuffers::new(DecodeDtype::F32, 8400, 80, 32, Some(&[1, 160, 160, 32]));
+        let n = 8400 + crate::per_scale::prefilter::PACK_ANCHORS - 1;
         match &b.boxes {
-            Buffer::F32(v) => assert_eq!(v.len(), 4 * 8400),
+            Buffer::F32(v) => assert_eq!(v.len(), 4 * n),
             _ => panic!(),
         }
         match &b.scores {
-            Buffer::F32(v) => assert_eq!(v.len(), 80 * 8400),
+            Buffer::F32(v) => assert_eq!(v.len(), 80 * n),
             _ => panic!(),
         }
         match b.mask_coefs.as_ref().unwrap() {
-            Buffer::F32(v) => assert_eq!(v.len(), 32 * 8400),
+            Buffer::F32(v) => assert_eq!(v.len(), 32 * n),
             _ => panic!(),
         }
         match b.protos.as_ref().unwrap() {
@@ -442,12 +453,13 @@ mod tests {
     #[test]
     fn buffers_alloc_f16_correct_sizes() {
         let b = DecodedOutputBuffers::new(DecodeDtype::F16, 100, 80, 0, None);
+        let n = 100 + crate::per_scale::prefilter::PACK_ANCHORS - 1;
         match &b.boxes {
-            Buffer::F16(v) => assert_eq!(v.len(), 400),
+            Buffer::F16(v) => assert_eq!(v.len(), 4 * n),
             _ => panic!(),
         }
         match &b.scores {
-            Buffer::F16(v) => assert_eq!(v.len(), 8000),
+            Buffer::F16(v) => assert_eq!(v.len(), 80 * n),
             _ => panic!(),
         }
         assert!(b.mask_coefs.is_none());

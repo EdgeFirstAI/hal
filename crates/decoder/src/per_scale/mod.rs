@@ -9,6 +9,7 @@ pub(crate) mod kernels;
 pub(crate) mod outputs;
 pub(crate) mod pipeline;
 pub(crate) mod plan;
+pub(crate) mod prefilter;
 
 pub use helper::apply_schema_quant;
 
@@ -80,12 +81,17 @@ impl PerScaleDecoder {
     }
 
     /// Decode one frame's worth of inputs.
+    ///
+    /// With a `score_threshold`, only anchors that can reach it are
+    /// decoded and the outputs hold just those, in anchor order; `None`
+    /// decodes every anchor.
     #[allow(dead_code)] // Wired by Task 24.
     pub(crate) fn run<'a>(
         &'a mut self,
         inputs: &[&edgefirst_tensor::TensorDyn],
+        score_threshold: Option<f32>,
     ) -> crate::DecoderResult<DecodedOutputsRef<'a>> {
-        pipeline::run(&self.plan, &mut self.buffers, inputs)
+        pipeline::run(&self.plan, &mut self.buffers, inputs, score_threshold)
     }
 }
 

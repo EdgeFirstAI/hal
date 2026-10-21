@@ -4854,3 +4854,244 @@ outputs:
         );
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod per_scale_prefilter_tests {
+    use crate::decoder::per_scale_bridge::per_scale_to_proto_data;
+    use crate::per_scale::{DecodeDtype, PerScaleDecoder, PerScalePlan};
+    use crate::schema::SchemaV2;
+    use crate::{DetectBox, Nms};
+    use edgefirst_tensor::{
+        CpuAccess, Quantization as TQ, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+    };
+
+    /// Deterministic int8 values: mostly far below any score threshold,
+    /// with a sparse spread of high values so a few percent of anchors
+    /// carry a class that can pass.
+    fn sparse_i8(len: usize, seed: u32) -> Vec<i8> {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let r = x >> 8;
+                if r.is_multiple_of(97) {
+                    (r >> 8) as u8 as i8
+                } else {
+                    -100 - ((r >> 8) % 28) as i8
+                }
+            })
+            .collect()
+    }
+
+    fn quantized(shape: &[usize], seed: u32, scale: f32, zp: i32) -> TensorDyn {
+        let mut t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+        t.map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&sparse_i8(t.len(), seed));
+        t.set_quantization(TQ::per_tensor(scale, zp)).unwrap();
+        t.into()
+    }
+
+    fn inputs_for(plan: &PerScalePlan) -> Vec<TensorDyn> {
+        let mut v = Vec::new();
+        for (li, lvl) in plan.levels.iter().enumerate() {
+            let s = li as u32 * 10;
+            v.push(quantized(&lvl.box_shape, s + 1, 0.15, -40));
+            v.push(quantized(&lvl.score_shape, s + 2, 0.1, 0));
+            if let Some(shape) = &lvl.mc_shape {
+                v.push(quantized(shape, s + 3, 0.02, 3));
+            }
+        }
+        if let Some(shape) = &plan.proto_shape {
+            v.push(quantized(shape, 99, 0.01, 0));
+        }
+        v
+    }
+
+    /// The schema with its score outputs re-declared for `nc` classes.
+    fn with_num_classes(json: &str, nc: usize) -> SchemaV2 {
+        let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+        for logical in v["outputs"].as_array_mut().unwrap() {
+            if logical["type"] != "scores" {
+                continue;
+            }
+            logical["shape"][1] = nc.into();
+            logical["dshape"][1]["num_classes"] = nc.into();
+            for child in logical["outputs"].as_array_mut().unwrap() {
+                child["shape"][3] = nc.into();
+                child["dshape"][3]["num_classes"] = nc.into();
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn mask_coefs_f32(t: &TensorDyn) -> Vec<f32> {
+        t.as_typed::<f32>()
+            .expect("f32 mask coefficients")
+            .map()
+            .unwrap()
+            .as_slice()
+            .to_vec()
+    }
+
+    fn decode(
+        decoder: &mut PerScaleDecoder,
+        inputs: &[&TensorDyn],
+        prefilter: Option<f32>,
+        threshold: f32,
+        multi_label: bool,
+    ) -> (usize, Vec<DetectBox>, Option<Vec<f32>>) {
+        let decoded = decoder.run(inputs, prefilter).unwrap();
+        let anchors = decoded.total_anchors;
+        let mut boxes = Vec::new();
+        let proto = per_scale_to_proto_data(
+            &decoded,
+            &mut boxes,
+            0.7,
+            threshold,
+            Some(Nms::ClassAware),
+            0,
+            300,
+            None,
+            None,
+            multi_label,
+        )
+        .unwrap();
+        (
+            anchors,
+            boxes,
+            proto.map(|p| mask_coefs_f32(&p.mask_coefficients)),
+        )
+    }
+
+    /// Prefiltered decode returns exactly the dense decode's detections and
+    /// mask coefficients, while decoding only a fraction of the anchors.
+    /// Ten classes leave most packed score slices off a NEON chunk
+    /// boundary, which is where an unpacked decode would round differently.
+    #[test]
+    fn prefiltered_decode_matches_dense_decode() {
+        for (schema_file, nc) in [
+            ("per_scale/synthetic_yolov8n_schema.json", 80),
+            ("per_scale/synthetic_yolov8n_schema.json", 10),
+            ("per_scale/synthetic_yolo26n_schema.json", 80),
+            ("per_scale/synthetic_yolo26n_schema.json", 10),
+        ] {
+            let json = edgefirst_bench::testdata::read_to_string(schema_file);
+            let schema = with_num_classes(&json, nc);
+            for dtype in [DecodeDtype::F32, DecodeDtype::F16] {
+                let plan = PerScalePlan::try_from_schema(&schema, dtype)
+                    .unwrap()
+                    .unwrap();
+                let owned = inputs_for(&plan);
+                let inputs: Vec<&TensorDyn> = owned.iter().collect();
+                let total = plan.total_anchors;
+                let mut decoder = PerScaleDecoder::new(plan);
+                for threshold in [0.001, 0.05, 0.25, 0.6] {
+                    for multi_label in [false, true] {
+                        let label =
+                            format!("{schema_file} {dtype:?} t={threshold} ml={multi_label}");
+                        let (dense_n, dense, dense_mc) =
+                            decode(&mut decoder, &inputs, None, threshold, multi_label);
+                        let (kept, filtered, filtered_mc) = decode(
+                            &mut decoder,
+                            &inputs,
+                            Some(threshold),
+                            threshold,
+                            multi_label,
+                        );
+                        assert_eq!(dense_n, total, "{label}");
+                        assert!(kept < total / 2, "{label}: kept {kept} of {total}");
+                        assert!(!dense.is_empty(), "{label}: scene has no detections");
+                        assert_eq!(filtered, dense, "{label}");
+                        assert_eq!(filtered_mc, dense_mc, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A frame where no score reaches the threshold leaves nothing to decode.
+    #[test]
+    fn prefilter_with_no_survivors_yields_no_detections() {
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+            .unwrap()
+            .unwrap();
+        let mut owned = inputs_for(&plan);
+        let score_shapes: Vec<_> = plan.levels.iter().map(|l| l.score_shape.clone()).collect();
+        for t in owned.iter_mut() {
+            if score_shapes.iter().any(|s| s.as_ref() == t.shape()) {
+                let mut m = t.as_typed_mut::<i8>().unwrap().map().unwrap();
+                m.as_mut_slice().fill(-128);
+            }
+        }
+        let inputs: Vec<&TensorDyn> = owned.iter().collect();
+        let mut decoder = PerScaleDecoder::new(plan);
+        let (kept, boxes, _) = decode(&mut decoder, &inputs, Some(0.001), 0.001, true);
+        assert_eq!(kept, 0);
+        assert!(boxes.is_empty());
+    }
+
+    /// A box tensor not declared CPU-readable is refused even when no anchor
+    /// survives the prefilter to read it, matching the dense decode.
+    #[test]
+    fn prefilter_refuses_unreadable_boxes_without_survivors() {
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+            .unwrap()
+            .unwrap();
+        let mut owned = inputs_for(&plan);
+        let score_shapes: Vec<_> = plan.levels.iter().map(|l| l.score_shape.clone()).collect();
+        let box_shape = plan.levels[0].box_shape.clone();
+        for t in owned.iter_mut() {
+            if score_shapes.iter().any(|s| s.as_ref() == t.shape()) {
+                let mut m = t.as_typed_mut::<i8>().unwrap().map().unwrap();
+                m.as_mut_slice().fill(-128);
+            } else if t.shape() == box_shape.as_ref() {
+                t.restrict_cpu_access(CpuAccess::Write);
+            }
+        }
+        let inputs: Vec<&TensorDyn> = owned.iter().collect();
+        let mut decoder = PerScaleDecoder::new(plan);
+        for prefilter in [None, Some(0.001)] {
+            let err = decoder
+                .run(&inputs, prefilter)
+                .expect_err("a Write-declared box tensor cannot be read on the CPU");
+            assert!(
+                matches!(
+                    err.cpu_access_denied(),
+                    Some(edgefirst_tensor::Error::CpuAccessDenied {
+                        declared: CpuAccess::Write,
+                        requested: CpuAccess::Read,
+                    })
+                ),
+                "prefilter={prefilter:?}: unexpected error {err:?}"
+            );
+        }
+    }
+
+    /// Thresholds the prefilter cannot bound fall back to the dense decode.
+    #[test]
+    fn unboundable_threshold_decodes_every_anchor() {
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+            .unwrap()
+            .unwrap();
+        let total = plan.total_anchors;
+        let owned = inputs_for(&plan);
+        let inputs: Vec<&TensorDyn> = owned.iter().collect();
+        let mut decoder = PerScaleDecoder::new(plan);
+        for t in [0.0, 1.0] {
+            let (kept, _, _) = decode(&mut decoder, &inputs, Some(t), t, false);
+            assert_eq!(kept, total, "t={t}");
+        }
+    }
+}
