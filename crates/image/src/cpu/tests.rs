@@ -177,6 +177,46 @@ mod cpu_tests {
         cpu.convert(&src, &mut whole, Some(letterbox)).unwrap();
     }
 
+    /// A padded destination resizes through a scratch seeded from it only when
+    /// pixels outside the placement survive, so a write-only one letterboxes.
+    #[test]
+    fn padded_write_only_destination_letterboxes() {
+        use edgefirst_tensor::CpuAccess;
+        let src = TensorDyn::image(
+            32,
+            16,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(200);
+        let letterbox = crate::ConvertOptions::default().crop(Crop::letterbox([10, 20, 30, 255]));
+        let mut cpu = CPUProcessor::new();
+        for access in [CpuAccess::Write, CpuAccess::ReadWrite] {
+            let mut dst = TensorDyn::image(
+                64,
+                40,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                access,
+            )
+            .unwrap();
+            dst.configure_image(40, 40, PixelFormat::Rgb).unwrap();
+            dst.set_row_stride(192).unwrap();
+            cpu.convert(&src, &mut dst, Some(letterbox)).unwrap();
+            if access.reads() {
+                let map = dst.as_u8().unwrap().map_read().unwrap();
+                let bytes = map.as_slice();
+                assert_eq!(&bytes[..3], &[10, 20, 30], "letterbox band");
+                let centre = 20 * 192 + 20 * 3;
+                assert_eq!(&bytes[centre..centre + 3], &[200, 200, 200], "interior");
+            }
+        }
+    }
+
     /// The buffer-geometry guards reject undersized/overflowing inputs with
     /// `InvalidShape` instead of panicking. Exercised directly on plain slices
     /// (the end-to-end malformed-tensor path needs an undersized `from_fd`/DMA

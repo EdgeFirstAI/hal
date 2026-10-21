@@ -215,7 +215,13 @@ impl CPUProcessor {
         } else {
             src_map.as_slice()
         };
-        let mut dst_map = dst.map_for_write()?;
+        // Pixels outside a placement with no fill colour survive the resize, so they are read back.
+        let keeps_outside = crop.dst_color.is_none() && !Self::covers(crop.dst_rect, dst_w, dst_h);
+        let mut dst_map = if keeps_outside {
+            dst.map_for_partial_write()?
+        } else {
+            dst.map_for_write()?
+        };
 
         // FIXME: fast_image_resize does not clamp its filter kernel at crop
         // boundaries — bilinear/bicubic taps can sample 1-2 pixels beyond the
@@ -247,22 +253,8 @@ impl CPUProcessor {
 
         let needs_resize = src_w != dst_w
             || src_h != dst_h
-            || crop.src_rect.is_some_and(|c| {
-                c != Rect {
-                    left: 0,
-                    top: 0,
-                    width: src_w,
-                    height: src_h,
-                }
-            })
-            || crop.dst_rect.is_some_and(|c| {
-                c != Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst_w,
-                    height: dst_h,
-                }
-            });
+            || !Self::covers(crop.src_rect, src_w, src_h)
+            || !Self::covers(crop.dst_rect, dst_w, dst_h);
 
         if needs_resize {
             // `ImageRef` (read-only) rather than `Image::from_slice_u8`, which
@@ -278,53 +270,18 @@ impl CPUProcessor {
             match (rotation, flip) {
                 (Rotation::None, Flip::None) => {
                     let tight_dst_stride = dst_w * channels;
-                    // `fast_image_resize` requires a tightly-packed output
-                    // buffer — it addresses rows by `row * width * bpp`, not
-                    // by the tensor's real row stride. Passing a padded
-                    // `dst_map` straight through (as the zero-copy path
-                    // below does) silently smears every row after the first
-                    // at the wrong offset. When the destination is padded
-                    // (a DMA pitch-aligned tensor, or a `view()` narrower
-                    // than its parent's stride), resize into a tight
-                    // scratch — seeded with the existing dst content so
-                    // pixels outside `dst_rect` (e.g. letterbox borders)
-                    // survive unchanged — then copy back row-by-row at the
-                    // real stride. Tight destinations keep the existing
-                    // zero-copy path unchanged.
+                    // A padded destination (a pitch-aligned DMA tensor, a narrow `view()`) resizes through a tight scratch.
                     if dst_rs != tight_dst_stride {
-                        let need = dst_h * tight_dst_stride;
-                        self.resize_dst_destride_scratch.clear();
-                        self.resize_dst_destride_scratch.resize(need, 0u8);
-                        for row in 0..dst_h {
-                            let dst_row = &dst_map[row * dst_rs..row * dst_rs + tight_dst_stride];
-                            self.resize_dst_destride_scratch
-                                [row * tight_dst_stride..(row + 1) * tight_dst_stride]
-                                .copy_from_slice(dst_row);
-                        }
-
-                        let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
-                            dst_w as u32,
-                            dst_h as u32,
+                        Self::resize_into_padded_dst(
+                            &mut self.resizer,
                             &mut self.resize_dst_destride_scratch,
-                            src_type,
+                            &src_view,
+                            &mut dst_map,
+                            (dst_w, dst_h, dst_rs, channels),
+                            dst_rect,
+                            &options,
+                            keeps_outside,
                         )?;
-
-                        let mut dst_view = fast_image_resize::images::CroppedImageMut::new(
-                            &mut dst_view,
-                            dst_rect.left as u32,
-                            dst_rect.top as u32,
-                            dst_rect.width as u32,
-                            dst_rect.height as u32,
-                        )?;
-
-                        self.resizer.resize(&src_view, &mut dst_view, &options)?;
-
-                        for row in 0..dst_h {
-                            let scratch_row = &self.resize_dst_destride_scratch
-                                [row * tight_dst_stride..(row + 1) * tight_dst_stride];
-                            dst_map[row * dst_rs..row * dst_rs + tight_dst_stride]
-                                .copy_from_slice(scratch_row);
-                        }
                     } else {
                         let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
                             dst_w as u32,
@@ -411,6 +368,57 @@ impl CPUProcessor {
                 rotation,
                 flip,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Whether `rect` is absent or spans the whole `w`×`h` image.
+    fn covers(rect: Option<Rect>, w: usize, h: usize) -> bool {
+        rect.is_none_or(|r| r.left == 0 && r.top == 0 && r.width == w && r.height == h)
+    }
+
+    /// Resize into the `dst_rect` of a padded destination through a tight
+    /// scratch, then copy it back at the real stride: `fast_image_resize`
+    /// addresses rows by `row * width * bpp`. `keep_outside` seeds the scratch
+    /// from `dst` so pixels outside `dst_rect` survive; otherwise they are
+    /// overwritten later and the scratch starts zeroed.
+    #[allow(clippy::too_many_arguments)]
+    fn resize_into_padded_dst(
+        resizer: &mut fast_image_resize::Resizer,
+        scratch: &mut Vec<u8>,
+        src_view: &fast_image_resize::images::ImageRef<'_>,
+        dst_map: &mut [u8],
+        (dst_w, dst_h, dst_rs, channels): (usize, usize, usize, usize),
+        dst_rect: Rect,
+        options: &fast_image_resize::ResizeOptions,
+        keep_outside: bool,
+    ) -> Result<()> {
+        let tight = dst_w * channels;
+        scratch.clear();
+        scratch.resize(dst_h * tight, 0u8);
+        if keep_outside {
+            for row in 0..dst_h {
+                scratch[row * tight..(row + 1) * tight]
+                    .copy_from_slice(&dst_map[row * dst_rs..row * dst_rs + tight]);
+            }
+        }
+        let mut image = fast_image_resize::images::Image::from_slice_u8(
+            dst_w as u32,
+            dst_h as u32,
+            scratch,
+            src_view.pixel_type(),
+        )?;
+        let mut cropped = fast_image_resize::images::CroppedImageMut::new(
+            &mut image,
+            dst_rect.left as u32,
+            dst_rect.top as u32,
+            dst_rect.width as u32,
+            dst_rect.height as u32,
+        )?;
+        resizer.resize(src_view, &mut cropped, options)?;
+        for row in 0..dst_h {
+            dst_map[row * dst_rs..row * dst_rs + tight]
+                .copy_from_slice(&scratch[row * tight..(row + 1) * tight]);
         }
         Ok(())
     }
