@@ -378,6 +378,8 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
     }
 
     // CPU decode: MCU loop writes NV12/GREY u8 directly into the tensor.
+    dst.cpu_access()
+        .require(edgefirst_tensor::CpuAccess::Write)?;
     match &mut state.mcu_scratch {
         Some(scratch) => scratch.ensure_capacity(headers),
         None => state.mcu_scratch = Some(mcu::McuScratch::new(headers)),

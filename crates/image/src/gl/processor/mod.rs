@@ -3203,11 +3203,10 @@ impl GLProcessorST {
             )));
         }
 
-        if !Self::check_dst_format_supported(
+        if !Self::dst_format_renderable(
             self.gl_context.transfer_backend,
-            dst,
+            dst.memory(),
             dst_fmt,
-            is_int8,
             self.has_bgra,
         ) {
             return Err(crate::Error::NotSupported(format!(
@@ -3814,17 +3813,18 @@ impl GLProcessorST {
         }
     }
 
-    pub(super) fn check_dst_format_supported(
+    /// Whether the GL backend renders a `fmt` destination held in `memory`;
+    /// a destination it declines is filled by the CPU fallback instead.
+    pub(crate) fn dst_format_renderable(
         backend: TransferBackend,
-        img: &Tensor<u8>,
+        memory: TensorMemory,
         fmt: PixelFormat,
-        _is_int8: bool,
         has_bgra: bool,
     ) -> bool {
         if fmt == PixelFormat::Bgra && !has_bgra {
             return false;
         }
-        if backend.is_zero_copy() && img.memory() == TensorMemory::DmaBuf {
+        if backend.is_zero_copy() && memory == TensorMemory::DmaBuf {
             matches!(
                 fmt,
                 PixelFormat::Rgba
@@ -4637,7 +4637,7 @@ impl GLProcessorST {
                  of this readback format is {tight_row} B"
             )));
         }
-        let mut dst_map = dst.map_mut()?;
+        let mut dst_map = dst.map_for_write()?;
         let out = dst_map.as_mut_slice();
         // `read_pixels_into` writes `tight_row` bytes at every `stride`, so the
         // last row's end is the far bound. It is checked before the read,
@@ -9777,6 +9777,7 @@ impl GLProcessorST {
             }),
             external_oes: Platform::EXTERNAL_OES,
             native_fence_sync: Platform::native_fence_sync(&self.gl_context),
+            has_bgra: self.has_bgra,
         }
     }
 }

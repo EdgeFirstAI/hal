@@ -158,11 +158,7 @@ def test_semi_planar_accepts_either_shape_spelling():
 @windows_only
 @pytest.mark.gpu
 def test_constructors_accept_the_documented_default_access():
-    """``access="none"`` is the documented default of both constructors.
-
-    It is a declaration ("provision no CPU staging"), not a map direction,
-    and the dynamic-backend wheel used to refuse it outright.
-    """
+    """``access="readwrite"`` is the documented default of both constructors."""
     if not is_gpu_buffer_available():
         pytest.skip("no D3D11 device")
     t = Tensor.image(64, 32, PixelFormat.Rgba, TensorMemory.DMABUF, "readwrite")

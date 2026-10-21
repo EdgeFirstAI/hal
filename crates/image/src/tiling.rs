@@ -198,7 +198,10 @@ impl ImageProcessor {
     ///
     /// `access` declares planned CPU involvement (see
     /// [`edgefirst_tensor::CpuAccess`]); use `None` for NPU-bound tile
-    /// batches and `ReadWrite` when the batch will be CPU-mapped.
+    /// batches and `ReadWrite` when the batch will be CPU-mapped. As for
+    /// `create_image`, what this processor's own convert may do on the CPU
+    /// is added; tiles are written through views, so any predicted CPU
+    /// write is added as `ReadWrite`.
     ///
     /// # Errors
     /// Returns an error if `cfg` is invalid (overlap not in `[0,1)`, or zero
@@ -213,13 +216,14 @@ impl ImageProcessor {
         access: CpuAccess,
     ) -> Result<TensorDyn> {
         cfg.validate()?;
-        self.create_image(
+        self.create_image_with(
             cfg.tile_w,
             n.saturating_mul(cfg.tile_h),
             format,
             dtype,
             memory,
             access,
+            true,
         )
     }
 

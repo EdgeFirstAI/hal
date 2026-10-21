@@ -415,7 +415,9 @@ fn find_axis_permutation(from: &[usize], to: &[usize]) -> Option<Vec<usize>> {
 fn tensor_to_f32(t: &TensorDyn, quant: Option<Quantization>) -> DecoderResult<ArrayD<f32>> {
     let shape = t.shape().to_vec();
     let strides = padded_strides(t)?;
-    let map_fail = |e: edgefirst_tensor::Error| DecoderError::Internal(format!("tensor map: {e}"));
+    let map_fail = |e: edgefirst_tensor::Error| {
+        DecoderError::from_map(e, |e| DecoderError::Internal(format!("tensor map: {e}")))
+    };
     let typed_fail = || DecoderError::Internal(format!("tensor is not {:?}", t.dtype()));
     match t.dtype() {
         DType::F16 => {
@@ -470,9 +472,9 @@ fn dequantize_integer_tensor(
             let tensor = t
                 .as_typed::<$ty>()
                 .ok_or_else(|| DecoderError::Internal(format!("tensor is not {:?}", t.dtype())))?;
-            let m = tensor
-                .map_read()
-                .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
+            let m = tensor.map_read().map_err(|e| {
+                DecoderError::from_map(e, |e| DecoderError::Internal(format!("tensor map: {e}")))
+            })?;
             match strides {
                 None => {
                     let src = m.as_slice().get(..total).ok_or_else(|| {

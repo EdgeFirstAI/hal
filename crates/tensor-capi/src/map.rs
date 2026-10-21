@@ -23,7 +23,7 @@ use edgefirst_tensor::{CpuAccess, TensorMapTrait};
 use edgefirst_tensor_abi::{EfErrorClass, EfTensorView};
 
 use crate::handle::{impl_of, EfTensor};
-use crate::last_error::{set_last_error, set_last_error_classified, shield_int};
+use crate::last_error::{class_of, set_last_error, set_last_error_classified, shield_int};
 
 /// The live state behind an outstanding `ef_tensor_map`.
 ///
@@ -72,6 +72,9 @@ pub(crate) mod test_support {
 /// later call site, not just the original three.
 pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
     use edgefirst_tensor::Error;
+    if e.cpu_access_denied().is_some() {
+        return libc::EACCES;
+    }
     match e {
         Error::QuantizationInvalid { .. } => libc::EINVAL,
         Error::RegionOutOfBounds { .. } | Error::BatchIndexOutOfBounds { .. } => libc::EINVAL,
@@ -89,9 +92,7 @@ pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
         // request needs wider access" (`ahardwarebuffer.rs`) -- a platform
         // lock declining the request, the same shape of failure as "this
         // access is not permitted right now". A future backend that hard
-        // -refuses a requested access outside the tensor's declared
-        // `CpuAccess` (most backends today only log that case as
-        // best-effort telemetry, never error) would fall in here too.
+        // -refuses a requested access would fall in here too.
         Error::InvalidOperation(_) => libc::EACCES,
         // A write-only D3D11 map refused only because this exact window
         // needs `CpuAccess::ReadWrite` to publish safely -- the same shape
@@ -148,13 +149,11 @@ pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
 /// @return 0 on success, `EINVAL` (null tensor/out, or bad access code),
 ///         `EBUSY` (a map is already outstanding on this tensor, or a
 ///         writable map was requested while the CPU-side handle count is
-///         greater than one -- see above), `EACCES` (a writable map was
-///         requested on a tensor whose declared CPU access is not writable
-///         -- enforced at this boundary; read-direction mismatches follow
-///         the Rust layer's warn-and-allow policy instead. Backend-level
-///         mapping refusals, e.g. AHardwareBuffer lock exclusivity, also
-///         surface as `EACCES`), or another errno translated from the
-///         backend's error.
+///         greater than one -- see above), `EACCES` (the requested direction
+///         is not covered by the tensor's declared CPU access -- reads and
+///         writes alike; see `ef_tensor_cpu_access`. Backend-level mapping
+///         refusals, e.g. AHardwareBuffer lock exclusivity, also surface as
+///         `EACCES`), or another errno translated from the backend's error.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle; `out` must be writable for one
@@ -205,7 +204,7 @@ pub unsafe extern "C" fn ef_tensor_try_map(
 ///
 /// Written once rather than twice: the two differ only in which `TensorDyn`
 /// mapping call they make at the end, and every gate before it -- the null
-/// checks, the access decode, the write-access refusal, the exclusive-write
+/// checks, the access decode, the declared-access refusal, the exclusive-write
 /// refcount gate, the outstanding-map check -- is a contract both must
 /// enforce identically. Two hand-written copies is exactly how one of those
 /// gates ends up applying to only one of them.
@@ -234,18 +233,10 @@ unsafe fn map_window(
                 set_last_error(&format!("{what}: could not resolve handle"));
                 return libc::EINVAL;
             };
-            // Narrow, write-only gate: a read request against a not-writable
-            // declaration is NOT refused here -- that mismatch is the Rust
-            // layer's own warn-and-allow territory (`note_unplanned_cpu_access`
-            // in `edgefirst-tensor`, best-effort telemetry, not an error on most
-            // backends). Only a *writable* request against a declaration that
-            // does not permit writes is refused, at this boundary, before ever
-            // reaching the backend.
-            if access.writes() && !imp.inner.cpu_access().writes() {
-                set_last_error(&format!(
-                    "{what}: write access requested on a non-writable tensor"
-                ));
-                return libc::EACCES;
+            // Ahead of the refcount and outstanding-map gates, so it names the declaration.
+            if let Err(e) = imp.inner.cpu_access().require(access) {
+                set_last_error_classified(class_of(&e), &format!("{what}: {e}"));
+                return errno_for(&e);
             }
             // A poisoned lock means a shielded panic unwound while the lock was
             // held. The slot is a single-assignment `Option` -- no intermediate
@@ -391,9 +382,11 @@ pub unsafe extern "C" fn ef_tensor_unmap(t: *mut EfTensor) -> c_int {
 /// `EINVAL`, exactly as it is for `ef_tensor_map`.
 ///
 /// @return 0 on success, `EINVAL` (null tensor, or a bad/`NONE` access
-///         code), `ENOTSUP` (a backing with no coherency window independent
-///         of its map -- PBO, and AHardwareBuffer on Android), or another
-///         errno translated from the backend's error.
+///         code), `EACCES` (the direction is not covered by the tensor's
+///         declared CPU access; see `ef_tensor_cpu_access`), `ENOTSUP` (a
+///         backing with no coherency window independent of its map -- PBO,
+///         and AHardwareBuffer on Android), or another errno translated
+///         from the backend's error.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -478,9 +471,10 @@ unsafe fn sync_bracket(t: *const EfTensor, access: u32, to_cpu: bool) -> c_int {
 /// `EACCES` or `EBUSY` depending on the backend), not a hardcoded one.
 ///
 /// @return bytes written (`>= 0`) on success, or a negative errno: `-EINVAL`
-///         (null tensor/out), `-ERANGE` (`cap` is smaller than the tensor's
-///         byte length), or another negative errno translated from the
-///         backend's error.
+///         (null tensor/out), `-EACCES` (the tensor's declared CPU access
+///         has no read direction), `-ERANGE` (`cap` is smaller than the
+///         tensor's byte length), or another negative errno translated from
+///         the backend's error.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle; `out` must be writable for `cap`
@@ -577,7 +571,7 @@ mod tests {
         let handle = crate::handle::into_handle(t);
 
         let mut view = empty_view();
-        // The gate is write-only: a read map on the same tensor must succeed.
+        // The read direction is declared, so a read map succeeds.
         assert_eq!(
             unsafe { ef_tensor_map(handle, 1, &mut view) }, // Read
             0,
@@ -586,7 +580,7 @@ mod tests {
         assert_eq!(unsafe { ef_tensor_unmap(handle) }, 0);
 
         // ReadWrite (3) needs the write bit, which this tensor did not
-        // declare -- EACCES, without ever reaching the backend's map.
+        // declare -- EACCES.
         assert_eq!(
             unsafe { ef_tensor_map(handle, 3, &mut view) },
             libc::EACCES,
@@ -596,6 +590,97 @@ mod tests {
         assert_eq!(unsafe { ef_tensor_unmap(handle) }, libc::EINVAL);
 
         unsafe { ef_tensor_free(handle) };
+    }
+
+    #[test]
+    fn a_read_map_on_a_write_or_none_declared_tensor_is_eacces() {
+        for declared in [CpuAccess::Write, CpuAccess::None] {
+            let t = edgefirst_tensor::TensorDyn::image(
+                4,
+                4,
+                edgefirst_tensor::PixelFormat::Rgba,
+                edgefirst_tensor::DType::U8,
+                Some(edgefirst_tensor::TensorMemory::Mem),
+                declared,
+            )
+            .expect("image tensor");
+            let handle = crate::handle::into_handle(t);
+            assert_eq!(
+                unsafe { crate::handle::ef_tensor_cpu_access(handle) },
+                declared.code()
+            );
+            let mut view = empty_view();
+            assert_eq!(
+                unsafe { ef_tensor_map(handle, 1, &mut view) }, // Read
+                libc::EACCES,
+                "a read map on a {declared:?}-declared tensor must be refused"
+            );
+            let msg = unsafe {
+                std::ffi::CStr::from_ptr(crate::last_error::ef_tensor_last_error_message())
+            };
+            assert!(
+                msg.to_str().unwrap().contains("CPU access denied"),
+                "{msg:?}"
+            );
+            assert_eq!(unsafe { ef_tensor_unmap(handle) }, libc::EINVAL);
+            unsafe { ef_tensor_free(handle) };
+        }
+    }
+
+    fn declared_handle(declared: CpuAccess) -> *mut EfTensor {
+        let t = edgefirst_tensor::TensorDyn::image(
+            4,
+            4,
+            edgefirst_tensor::PixelFormat::Rgba,
+            edgefirst_tensor::DType::U8,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+            declared,
+        )
+        .expect("image tensor");
+        crate::handle::into_handle(t)
+    }
+
+    #[test]
+    fn write_map_on_read_or_none_is_eacces() {
+        for declared in [CpuAccess::Read, CpuAccess::None] {
+            let handle = declared_handle(declared);
+            for access in [CpuAccess::Write, CpuAccess::ReadWrite] {
+                let mut view = empty_view();
+                assert_eq!(
+                    unsafe { ef_tensor_map(handle, access.code(), &mut view) },
+                    libc::EACCES,
+                    "{access:?} map on a {declared:?}-declared tensor"
+                );
+                assert_eq!(unsafe { ef_tensor_unmap(handle) }, libc::EINVAL);
+            }
+            unsafe { ef_tensor_free(handle) };
+        }
+    }
+
+    #[test]
+    fn sync_outside_declaration_is_eacces() {
+        let handle = declared_handle(CpuAccess::Read);
+        unsafe {
+            assert_eq!(
+                ef_tensor_sync_for_cpu(handle, CpuAccess::Write.code()),
+                libc::EACCES
+            );
+            assert_eq!(
+                ef_tensor_sync_for_device(handle, CpuAccess::ReadWrite.code()),
+                libc::EACCES
+            );
+            assert_eq!(ef_tensor_sync_for_cpu(handle, CpuAccess::Read.code()), 0);
+            assert_eq!(ef_tensor_sync_for_device(handle, CpuAccess::Read.code()), 0);
+            ef_tensor_free(handle);
+        }
+        let write_only = declared_handle(CpuAccess::Write);
+        unsafe {
+            assert_eq!(
+                ef_tensor_sync_for_cpu(write_only, CpuAccess::Read.code()),
+                libc::EACCES
+            );
+            ef_tensor_free(write_only);
+        }
     }
 
     #[test]

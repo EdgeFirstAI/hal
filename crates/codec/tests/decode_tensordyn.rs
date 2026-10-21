@@ -152,3 +152,46 @@ fn decode_file_path() {
     assert_eq!(info.height, 720);
     assert_eq!(info.format, PixelFormat::Nv12);
 }
+
+/// A CPU decode into a destination declared without writes is refused with
+/// the declaration, not a map error from inside the decoder.
+#[test]
+fn decode_into_a_destination_declared_without_writes_is_refused() {
+    use edgefirst_tensor::CpuAccess;
+    for (name, format) in [
+        ("zidane.jpg", PixelFormat::Nv12),
+        ("zidane_exif_1.png", PixelFormat::Rgb),
+    ] {
+        for declared in [CpuAccess::Read, CpuAccess::None] {
+            let mut tensor = TensorDyn::image(
+                1280,
+                720,
+                format,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                declared,
+            )
+            .unwrap();
+            let mut decoder = ImageDecoder::new();
+            match decoder.decode_into_dyn(&testdata(name), &mut tensor) {
+                Err(CodecError::Tensor(edgefirst_tensor::Error::CpuAccessDenied {
+                    declared: d,
+                    requested: CpuAccess::Write,
+                })) => assert_eq!(d, declared),
+                other => panic!("{name} into a {declared:?} tensor: {other:?}"),
+            }
+        }
+        let mut write_only = TensorDyn::image(
+            1280,
+            720,
+            format,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::Write,
+        )
+        .unwrap();
+        ImageDecoder::new()
+            .decode_into_dyn(&testdata(name), &mut write_only)
+            .unwrap_or_else(|e| panic!("{name} into a Write tensor: {e}"));
+    }
+}

@@ -327,11 +327,16 @@ uint32_t ef_image_abi_version(void);
  * drawn frame instead of the CPU.
  *
  * A `BGRA` background onto a zero-copy destination (a D3D11 texture, an
- * IOSurface, a dma-buf) returns `EIO`: the GL base-layer draw has no `BGRA`
- * arm and the CPU backend renders only `RGBA`/`RGB`. It previously returned
- * 0 with the destination unwritten.
+ * IOSurface, a dma-buf) returns `ENOTSUP`: the GL base-layer draw has no
+ * `BGRA` arm and the CPU backend renders only `RGBA`/`RGB`.
  *
  * `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
+ * A CPU draw blends into `dst`, so one not declared `EF_CPU_ACCESS_READ_WRITE`
+ * (or a `background` not declared readable) is `EACCES`.
+ *
+ * @return 0 on success, `EINVAL` for an invalid argument or aliased
+ * buffers, `ENOTSUP` for a format no backend draws, `EACCES` as above,
+ * otherwise `EIO` or the backend's errno.
  *
  * # Safety
  * Pointers must be live or NULL as documented.
@@ -353,8 +358,8 @@ int ef_image_processor_draw_decoded_masks(ef_image_processor *p,
  * On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
  * afterwards, as it does after a convert.
  *
- * The same `BGRA` background restriction and `color_mode` validation as
- * `ef_image_processor_draw_decoded_masks`.
+ * The same `BGRA` background restriction, `color_mode` validation, `EACCES`
+ * rule and return codes as `ef_image_processor_draw_decoded_masks`.
  *
  * # Safety
  * Tensor handles must stay live for the call.
@@ -433,6 +438,14 @@ void ef_image_processor_free(ef_image_processor *p);
  * actually needs a processor. The result is an ordinary `ef_tensor` — read it
  * with `ef_tensor_shape`, release it with `ef_tensor_free`.
  *
+ * The returned tensor's `ef_tensor_cpu_access` may be wider than `access`:
+ * what this processor's own convert may do to it as a destination on the
+ * CPU is added, `EF_CPU_ACCESS_WRITE` when it may fill the whole image and
+ * `EF_CPU_ACCESS_READ_WRITE` for passes that read back or write part of it
+ * (`EF_DTYPE_I8`, a CPU `bgra8` swizzle, a G2D `rgb8` letterbox border). A
+ * PBO image is always `EF_CPU_ACCESS_READ_WRITE`. Nothing is added for use
+ * as a convert source or for a CPU mask draw; declare those yourself.
+ *
  * @return a tensor the caller owns, or `NULL`.
  *
  * # Safety
@@ -454,6 +467,9 @@ ef_tensor *ef_image_processor_create_image(ef_image_processor *p,
  * never dereferences the handle itself, only the scalar view
  * `ef_tensor_image_desc_get` fills. The request is not consumed and may be
  * reused, so one description can fill a pool.
+ *
+ * The declared access is widened as for `ef_image_processor_create_image`,
+ * except for a compression request, which keeps `EF_CPU_ACCESS_NONE`.
  *
  * @return a tensor the caller owns, or `NULL`.
  *
@@ -578,9 +594,13 @@ int ef_convert_options_set_normalization(ef_convert_options *o,
  * way regardless of which one minted them. `options` may be `NULL` for the
  * defaults.
  *
- * @return 0 on success, `EINVAL` for options that cannot apply to `dst`
+ * @return 0 on success; `EINVAL` for options that cannot apply to `dst`
  * (such as a normalization on an integer destination without quantization),
- * otherwise an errno.
+ * an invalid crop or shape, or a tensor with no pixel format; `ENOTSUP`
+ * when no backend supports the conversion; `EACCES` when a tensor's
+ * declared `ef_cpu_access` does not cover the CPU pass, including when
+ * GL/G2D declined the convert and the CPU fallback was refused; otherwise
+ * `EIO` or the backend's errno.
  *
  * # Safety
  * `p`, `src` and `dst` must be live handles.
@@ -592,6 +612,8 @@ int ef_image_processor_convert(ef_image_processor *p,
 
 /**
  * Like [`ef_image_processor_convert`], but does not wait for the GPU.
+ *
+ * @return the codes [`ef_image_processor_convert`] returns.
  *
  * # Safety
  * `p`, `src` and `dst` must be live handles.
@@ -682,7 +704,8 @@ int ef_image_processor_flush(ef_image_processor *p);
  *
  * `options` as for [`ef_image_processor_convert`].
  *
- * @return 0 on success, `ENOTSUP` off Unix, otherwise an errno.
+ * @return the codes [`ef_image_processor_convert`] returns, and `ENOTSUP`
+ * off Unix.
  *
  * # Safety
  * `p`, `src`, `dst` must be live handles; `fence_fd` must be writable.
@@ -703,7 +726,8 @@ int ef_image_processor_convert_fence(ef_image_processor *p,
  *
  * `options` as for [`ef_image_processor_convert`].
  *
- * @return 0 on success, `ENOTSUP` off Windows, otherwise an errno.
+ * @return the codes [`ef_image_processor_convert`] returns, and `ENOTSUP`
+ * off Windows.
  *
  * # Safety
  * `p`, `src`, `dst` must be live handles; `fence` must be writable.
@@ -781,6 +805,10 @@ void ef_tile_placement_list_free(ef_tile_placement_list *list);
 /**
  * Allocate a tall packed batch that stacks `n` tiles.
  *
+ * The declared access is widened as for `ef_image_processor_create_image`;
+ * tiles are written through views, so any predicted CPU write is added as
+ * `EF_CPU_ACCESS_READ_WRITE`.
+ *
  * # Safety
  * `format` is a NUL-terminated wire code.
  */
@@ -806,6 +834,11 @@ ef_tile_placement_list *ef_image_processor_plan_tiles(ef_image_processor *p,
 /**
  * Render every tile of `src` into `dst`.
  *
+ * @return a placement list to free with [`ef_tile_placement_list_free`], or
+ * `NULL` with `errno` set: `EINVAL` for bad arguments, `EACCES` when a
+ * tensor's declared CPU access does not cover the CPU pass, otherwise the
+ * codes `ef_image_processor_convert` returns.
+ *
  * # Safety
  * Pointers must be live or NULL as documented.
  */
@@ -816,6 +849,9 @@ ef_tile_placement_list *ef_image_processor_tile_into(ef_image_processor *p,
 
 /**
  * Render one planned tile of `src` into `dst`.
+ *
+ * @return 0 on success, `EINVAL` for bad arguments, otherwise the codes
+ * `ef_image_processor_convert` returns (`EACCES` for a refused CPU access).
  *
  * # Safety
  * Pointers must be live or NULL as documented.

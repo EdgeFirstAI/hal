@@ -29,7 +29,7 @@ pub struct EfTensorImageDesc {
 ///
 /// `format` is the wire descriptor (`"NV12"`, `"rgb8"`), matching every other
 /// entry point rather than introducing a second vocabulary. `dtype` is the
-/// shared code.
+/// shared code. CPU access defaults to `EF_CPU_ACCESS_READ_WRITE`.
 ///
 /// @return `NULL` for an unknown format or dtype, or zero dimensions.
 ///
@@ -422,6 +422,20 @@ mod tests {
     }
 
     #[test]
+    fn a_new_request_declares_readwrite() {
+        unsafe {
+            let d = desc();
+            let mut view = EfImageDescView::default();
+            assert_eq!(ef_tensor_image_desc_get(d, &mut view), 0);
+            assert_eq!(
+                CpuAccess::from_code(view.access),
+                Some(CpuAccess::ReadWrite)
+            );
+            ef_tensor_image_desc_free(d);
+        }
+    }
+
+    #[test]
     fn the_view_round_trips_every_field() {
         // Builds a request with every field away from its default, reads it
         // back through `ef_tensor_image_desc_get`, and decodes every view
@@ -436,7 +450,7 @@ mod tests {
                 0
             );
             assert_eq!(
-                ef_tensor_image_desc_set_access(d, CpuAccess::ReadWrite.code()),
+                ef_tensor_image_desc_set_access(d, CpuAccess::Read.code()),
                 0
             );
             assert_eq!(
@@ -451,10 +465,7 @@ mod tests {
             assert_eq!(view.height, 48);
             assert_eq!(PixelFormat::from_code(view.format), Some(PixelFormat::Rgb));
             assert_eq!(DType::from_code(view.dtype), Some(DType::U8));
-            assert_eq!(
-                CpuAccess::from_code(view.access),
-                Some(CpuAccess::ReadWrite)
-            );
+            assert_eq!(CpuAccess::from_code(view.access), Some(CpuAccess::Read));
             assert_eq!(view.has_memory, 1);
             assert_eq!(
                 TensorMemory::from_code(view.memory),

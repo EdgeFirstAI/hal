@@ -3177,17 +3177,22 @@ mod gl_tests {
         }
     }
 
-    /// Sets `EDGEFIRST_GL_SERIALIZE` until dropped. The variable is process
-    /// state and tests run in parallel, so the guard also holds a lock: two
-    /// tests forcing different policies would otherwise each start their
+    /// The lock every GL-environment guard below holds while its variable is
+    /// set: the environment is process state and tests run in parallel.
+    fn lock_gl_env() -> std::sync::MutexGuard<'static, ()> {
+        static GL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GL_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sets `EDGEFIRST_GL_SERIALIZE` until dropped, holding [`lock_gl_env`]:
+    /// two tests forcing different policies would otherwise each start their
     /// processors under whichever value was written last.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     struct SerializeEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     impl SerializeEnvGuard {
         fn set(v: &str) -> Self {
-            static POLICY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let held = POLICY.lock().unwrap_or_else(|e| e.into_inner());
+            let held = lock_gl_env();
             std::env::set_var("EDGEFIRST_GL_SERIALIZE", v);
             SerializeEnvGuard(held)
         }
@@ -3788,7 +3793,7 @@ mod gl_tests {
     /// `ComputeBackend::OpenGl` leaves `forced_backend` at `None`, so a GL
     /// decline logs at debug and the CPU serves the same convert — and the
     /// CPU places the content band correctly, so a silent decline reads as
-    /// a pass here. `check_dst_format_supported` accepts both planar formats
+    /// a pass here. `dst_format_renderable` accepts both planar formats
     /// on the zero-copy DMA arm and the texture arm, so every leg must stay
     /// on GL and `convert_fallback_count()` must not move across it.
     #[test]
@@ -4035,7 +4040,7 @@ mod gl_tests {
     /// `DstLowering::TextureMem` — never a two-pass zero-copy plan — so this
     /// exercises the SinglePass `convert_to_planar` render + the new heap
     /// readback branch directly (Task 5, Component (a)). Before this task
-    /// `check_dst_format_supported`'s non-DMA arm rejected `PlanarRgb`
+    /// `dst_format_renderable`'s non-DMA arm rejected `PlanarRgb`
     /// outright and the whole convert fell back to CPU; the motivating
     /// profile showed 2485/2485 planar converts missing GL for exactly this
     /// reason on hosts without DMA destinations.
@@ -4562,11 +4567,12 @@ mod gl_tests {
     /// Forces `has_float_linear` off for processors created in scope —
     /// makes the f32→f16-repack proto fallback reachable on float-linear
     /// GPUs (no CI lane has a GPU without the extension).
-    struct FloatLinearEnvGuard;
+    struct FloatLinearEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
     impl FloatLinearEnvGuard {
         fn set() -> Self {
+            let held = lock_gl_env();
             std::env::set_var("EDGEFIRST_GL_NO_FLOAT_LINEAR", "1");
-            FloatLinearEnvGuard
+            FloatLinearEnvGuard(held)
         }
     }
     impl Drop for FloatLinearEnvGuard {
@@ -4578,11 +4584,12 @@ mod gl_tests {
     /// Opts processors created in scope into the GLES 3.1 compute-shader
     /// proto repack (otherwise env-gated off — it has zero coverage without
     /// this).
-    struct ProtoComputeEnvGuard;
+    struct ProtoComputeEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
     impl ProtoComputeEnvGuard {
         fn set() -> Self {
+            let held = lock_gl_env();
             std::env::set_var("EDGEFIRST_PROTO_COMPUTE", "1");
-            ProtoComputeEnvGuard
+            ProtoComputeEnvGuard(held)
         }
     }
     impl Drop for ProtoComputeEnvGuard {

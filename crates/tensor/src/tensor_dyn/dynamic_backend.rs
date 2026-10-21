@@ -650,11 +650,8 @@ impl TensorDyn {
         access: CpuAccess,
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'static>> {
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(
-                "map: CpuAccess::None is not a mappable direction".into(),
-            ));
-        }
+        // Checked here so the error matches the static backend's, not an errno.
+        self.cpu_access().require_direction(access, "map_with")?;
         let code = access.code();
         let mut view = edgefirst_tensor_ffi::EfTensorView {
             ptr: std::ptr::null_mut(),
@@ -1523,6 +1520,25 @@ impl TensorDyn {
         scheme
     }
 
+    /// The CPU access declared at allocation (see
+    /// [`crate::Tensor::cpu_access`]). Drives `ef_tensor_cpu_access`; a code
+    /// this build does not recognise, from a newer library, is `None`.
+    pub fn cpu_access(&self) -> CpuAccess {
+        // SAFETY: `self.handle` is live for as long as `self` exists.
+        let code = unsafe { edgefirst_tensor_ffi::ef_tensor_cpu_access(self.handle.as_ptr()) };
+        CpuAccess::from_code(code).unwrap_or(CpuAccess::None)
+    }
+
+    /// Narrow the declared CPU access (see
+    /// [`crate::Tensor::restrict_cpu_access`]). Drives
+    /// `ef_tensor_restrict_cpu_access`.
+    pub fn restrict_cpu_access(&mut self, access: CpuAccess) {
+        // SAFETY: `self.handle` is live; a valid handle and code cannot be refused.
+        let _ = unsafe {
+            edgefirst_tensor_ffi::ef_tensor_restrict_cpu_access(self.handle.as_ptr(), access.code())
+        };
+    }
+
     /// Whether the memory is known to be physically contiguous (see
     /// [`crate::Tensor::contiguity`]). Drives `ef_tensor_contiguity`; a code
     /// this build does not recognise, from a newer library, is `Unknown`.
@@ -1569,11 +1585,7 @@ impl TensorDyn {
         // and its message -- which names "PBO" -- travels back through
         // `ffi_last_error` as a `NotImplemented`, the same error kind the
         // static backend raises.
-        if access == CpuAccess::None {
-            return Err(Error::InvalidArgument(format!(
-                "{what}: CpuAccess::None is not a sync direction"
-            )));
-        }
+        self.cpu_access().require_direction(access, what)?;
         let code = access.code();
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let rc = unsafe {
@@ -2386,6 +2398,7 @@ impl TensorDyn {
             pbo_vtable_ptr: self.pbo_vtable_ptr(),
             fence_handle,
             sync,
+            cpu_access: self.cpu_access(),
         })
     }
 

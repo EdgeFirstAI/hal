@@ -122,8 +122,9 @@ pub unsafe extern "C" fn ef_decoder_semantic_classes(
 /// overlays. `options` may be `NULL` for the defaults.
 ///
 /// @return 0, `ENOENT` when the model has no semantic output, `EBADMSG` when
-///         the tensors do not match it or cannot hold the result, or
-///         `EINVAL` for a `NULL` argument.
+///         the tensors do not match it or cannot hold the result, `EACCES`
+///         when an output is not declared CPU-readable or `dst`/`confidence`
+///         not CPU-writable, or `EINVAL` for a `NULL` argument.
 ///
 /// # Safety
 /// `outputs` must point to `count` live tensor handles; `dst` and
@@ -168,7 +169,7 @@ pub unsafe extern "C" fn ef_decoder_decode_semantic(
             .decode_semantic(&refs, &mut dst, confidence.as_deref_mut(), &options)
         {
             Ok(()) => 0,
-            Err(_) => libc::EBADMSG,
+            Err(e) => crate::decode::decode_errno(&e),
         }
     }))
     .unwrap_or(libc::EINVAL)
@@ -293,6 +294,21 @@ mod tests {
                 libc::EBADMSG
             );
             drop(TensorDyn::from_raw(wrong));
+            let mut read_only = tensor(&[2, 6], DType::U8);
+            read_only.restrict_cpu_access(CpuAccess::Read);
+            let read_only = read_only.into_raw();
+            assert_eq!(
+                ef_decoder_decode_semantic(
+                    d,
+                    outputs.as_ptr(),
+                    1,
+                    read_only,
+                    std::ptr::null_mut(),
+                    o
+                ),
+                libc::EACCES
+            );
+            drop(TensorDyn::from_raw(read_only));
             let spare = tensor(&[2, 6], DType::U8).into_raw();
             assert_eq!(
                 ef_decoder_decode_semantic(d, std::ptr::null(), 1, spare, std::ptr::null_mut(), o),

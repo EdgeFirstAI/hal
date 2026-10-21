@@ -352,7 +352,7 @@ fn cpu_access_codes_and_strings_are_pinned() {
     }
     assert_eq!(CpuAccess::all().len(), expect.len());
     assert_eq!(CpuAccess::from_code(4), None);
-    assert_eq!(CpuAccess::default(), CpuAccess::None);
+    assert_eq!(CpuAccess::default(), CpuAccess::ReadWrite);
 }
 
 #[test]

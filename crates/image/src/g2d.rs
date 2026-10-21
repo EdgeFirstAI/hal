@@ -37,6 +37,73 @@ pub(crate) fn g2d_can_handle(cm: &Colorimetry, src_is_yuv: bool) -> bool {
         && cm.encoding != Some(ColorEncoding::Bt2020)
 }
 
+/// The source formats G2D blits from.
+const G2D_SOURCES: [PixelFormat; 4] = [
+    PixelFormat::Rgba,
+    PixelFormat::Yuyv,
+    PixelFormat::Nv12,
+    PixelFormat::Bgra,
+];
+
+/// Whether G2D blits a `src` image into a `dst` image. VYUY is absent: the
+/// i.MX8MP G2D rejects VYUY blits, so `ImageProcessor` falls through to CPU.
+fn g2d_supports(src: PixelFormat, dst: PixelFormat) -> bool {
+    use PixelFormat::*;
+    matches!(
+        (src, dst),
+        (Rgba | Yuyv | Nv12, Rgba | Yuyv | Rgb | Bgra) | (Bgra, Bgra)
+    )
+}
+
+/// The CPU access G2D needs on a `format`/`dtype` destination in `memory`,
+/// or `None` when G2D does not take it (see [`g2d_post_pass_access`]).
+pub(crate) fn dst_cpu_access(
+    memory: TensorMemory,
+    format: PixelFormat,
+    dtype: DType,
+) -> Option<edgefirst_tensor::CpuAccess> {
+    let takes = memory == TensorMemory::DmaBuf
+        && matches!(dtype, DType::U8 | DType::I8)
+        && G2D_SOURCES.iter().any(|&s| g2d_supports(s, format));
+    takes.then(|| g2d_post_pass_access(format, dtype, true))
+}
+
+/// The CPU access G2D's own post-passes need on a destination: `ReadWrite`
+/// for `I8` (the bias reads back the blit) and for an `Rgb` letterbox border
+/// (`g2d_clear` has no 3-byte formats, and a CPU write of part of a
+/// device-written buffer needs a cache-invalidating map), else `None`.
+pub(crate) fn g2d_post_pass_access(
+    format: PixelFormat,
+    dtype: DType,
+    fills_border: bool,
+) -> edgefirst_tensor::CpuAccess {
+    use edgefirst_tensor::CpuAccess;
+    if dtype == DType::I8 || (fills_border && format == PixelFormat::Rgb) {
+        CpuAccess::ReadWrite
+    } else {
+        CpuAccess::None
+    }
+}
+
+/// Whether `crop` fills a letterbox border around a partial placement in a
+/// `dst_w`x`dst_h` destination.
+fn fills_border(crop: &ResolvedCrop, dst_w: usize, dst_h: usize) -> bool {
+    crop.dst_color.is_some()
+        && crop
+            .dst_rect
+            .is_some_and(|r| r.left != 0 || r.top != 0 || r.width != dst_w || r.height != dst_h)
+}
+
+/// Refuse a destination whose declared CPU access does not cover G2D's
+/// post-passes, before anything is blitted.
+fn require_post_pass_access(dst: &TensorDyn, crop: &ResolvedCrop) -> Result<()> {
+    let (Some(fmt), Some(w), Some(h)) = (dst.format(), dst.width(), dst.height()) else {
+        return Ok(());
+    };
+    let needed = g2d_post_pass_access(fmt, dst.dtype(), fills_border(crop, w, h));
+    Ok(dst.cpu_access().require(needed)?)
+}
+
 /// Convert a PixelFormat to the G2D-compatible FourCharCode.
 fn pixelfmt_to_fourcc(fmt: PixelFormat) -> FourCharCode {
     use four_char_code::four_char_code;
@@ -144,31 +211,12 @@ impl G2DProcessor {
         let src_fmt = src_dyn.format().ok_or(Error::NotAnImage)?;
         let dst_fmt = dst_dyn.format().ok_or(Error::NotAnImage)?;
 
-        // Validate supported format pairs
-        use PixelFormat::*;
-        match (src_fmt, dst_fmt) {
-            (Rgba, Rgba) => {}
-            (Rgba, Yuyv) => {}
-            (Rgba, Rgb) => {}
-            (Yuyv, Rgba) => {}
-            (Yuyv, Yuyv) => {}
-            (Yuyv, Rgb) => {}
-            // VYUY: i.MX8MP G2D hardware rejects VYUY blits (only YUYV/UYVY
-            // among packed YUV 4:2:2). ImageProcessor falls through to CPU.
-            (Nv12, Rgba) => {}
-            (Nv12, Yuyv) => {}
-            (Nv12, Rgb) => {}
-            (Rgba, Bgra) => {}
-            (Yuyv, Bgra) => {}
-            (Nv12, Bgra) => {}
-            (Bgra, Bgra) => {}
-            (s, d) => {
-                return Err(Error::NotSupported(format!(
-                    "G2D does not support {} to {} conversion",
-                    s, d
-                )));
-            }
+        if !g2d_supports(src_fmt, dst_fmt) {
+            return Err(Error::NotSupported(format!(
+                "G2D does not support {src_fmt} to {dst_fmt} conversion"
+            )));
         }
+        require_post_pass_access(dst_dyn, &crop)?;
 
         // ── Per-conversion colorspace matrix ─────────────────────────
         // G2D is matrix-only (no range control, no BT.2020). Resolve the
@@ -254,15 +302,9 @@ impl G2DProcessor {
         //
         // g2d_clear does not support 3-byte-per-pixel formats (RGB888, BGR888).
         // For those formats, fall back to CPU fill after the blit.
-        let needs_clear = crop.dst_color.is_some()
-            && crop.dst_rect.is_some_and(|dst_rect| {
-                dst_rect.left != 0
-                    || dst_rect.top != 0
-                    || dst_rect.width != dst_w
-                    || dst_rect.height != dst_h
-            });
+        let needs_clear = fills_border(&crop, dst_w, dst_h);
 
-        if needs_clear && dst_fmt != Rgb {
+        if needs_clear && dst_fmt != PixelFormat::Rgb {
             if let Some(dst_color) = crop.dst_color {
                 let start = Instant::now();
                 self.g2d.clear(&mut dst_surface, dst_color)?;
@@ -349,10 +391,10 @@ impl G2DProcessor {
         log::trace!("G2D blit complete");
 
         // CPU fallback for RGB888 (unsupported by g2d_clear)
-        if needs_clear && dst_fmt == Rgb {
+        if needs_clear && dst_fmt == PixelFormat::Rgb {
             if let (Some(dst_color), Some(dst_rect)) = (crop.dst_color, crop.dst_rect) {
                 let start = Instant::now();
-                CPUProcessor::fill_image_outside_crop_u8(dst, dst_color, dst_rect)?;
+                CPUProcessor::fill_image_outside_crop_u8(dst, dst_color, dst_rect, true)?;
                 log::trace!("cpu fill takes {:?}", start.elapsed());
             }
         }
@@ -668,6 +710,108 @@ mod g2d_predicate_tests {
         assert!(g2d_can_handle(&lim, true)); // limited 709 YUV → ok
         assert!(!g2d_can_handle(&bt2020, true)); // BT.2020 → decline
         assert!(g2d_can_handle(&full, false)); // no YUV side → rule N/A → ok
+    }
+
+    #[test]
+    fn post_pass_access_covers_the_int8_bias_and_the_rgb_border() {
+        use edgefirst_tensor::CpuAccess;
+        let pass = g2d_post_pass_access;
+        assert_eq!(
+            pass(PixelFormat::Rgba, DType::I8, false),
+            CpuAccess::ReadWrite
+        );
+        assert_eq!(
+            pass(PixelFormat::Rgb, DType::I8, true),
+            CpuAccess::ReadWrite
+        );
+        assert_eq!(pass(PixelFormat::Rgb, DType::U8, false), CpuAccess::None);
+        assert_eq!(pass(PixelFormat::Rgba, DType::U8, true), CpuAccess::None);
+        let dma = TensorMemory::DmaBuf;
+        assert_eq!(
+            dst_cpu_access(dma, PixelFormat::Bgra, DType::I8),
+            Some(CpuAccess::ReadWrite)
+        );
+        assert_eq!(
+            dst_cpu_access(dma, PixelFormat::Rgba, DType::U8),
+            Some(CpuAccess::None)
+        );
+        assert_eq!(dst_cpu_access(dma, PixelFormat::Nv12, DType::U8), None);
+        assert_eq!(dst_cpu_access(dma, PixelFormat::Rgba, DType::F32), None);
+        assert_eq!(
+            dst_cpu_access(TensorMemory::Mem, PixelFormat::Rgba, DType::U8),
+            None
+        );
+        assert!(g2d_supports(PixelFormat::Nv12, PixelFormat::Rgb));
+        assert!(!g2d_supports(PixelFormat::Bgra, PixelFormat::Rgba));
+        assert!(!g2d_supports(PixelFormat::Vyuy, PixelFormat::Rgba));
+    }
+
+    /// A destination whose declaration cannot cover the post-passes is
+    /// refused before any blit.
+    #[test]
+    fn post_passes_are_checked_against_the_destination_up_front() {
+        use edgefirst_tensor::{CpuAccess, Error as TensorError};
+        let image = |fmt, dtype, access| {
+            TensorDyn::image(64, 48, fmt, dtype, Some(TensorMemory::Mem), access).unwrap()
+        };
+        let border = ResolvedCrop {
+            src_rect: None,
+            dst_rect: Some(crate::Rect::new(0, 8, 64, 32)),
+            dst_color: Some([0, 0, 0, 255]),
+        };
+        let denied = |r: Result<()>, requested| match r {
+            Err(Error::Tensor(TensorError::CpuAccessDenied { requested: r, .. })) => {
+                assert_eq!(r, requested)
+            }
+            other => panic!("expected CpuAccessDenied, got {other:?}"),
+        };
+        let int8 = image(PixelFormat::Rgba, DType::I8, CpuAccess::Write);
+        denied(
+            require_post_pass_access(&int8, &ResolvedCrop::no_crop()),
+            CpuAccess::ReadWrite,
+        );
+        let rgb = image(PixelFormat::Rgb, DType::U8, CpuAccess::None);
+        denied(
+            require_post_pass_access(&rgb, &border),
+            CpuAccess::ReadWrite,
+        );
+        require_post_pass_access(&rgb, &ResolvedCrop::no_crop()).unwrap();
+        let rgba = image(PixelFormat::Rgba, DType::U8, CpuAccess::None);
+        require_post_pass_access(&rgba, &border).unwrap();
+    }
+
+    /// The `Rgb` border is a CPU write of part of a G2D-written buffer, so a
+    /// write-only destination is refused: its map would not invalidate.
+    #[test]
+    fn rgb_border_post_pass_needs_readwrite() {
+        use edgefirst_tensor::CpuAccess;
+        assert_eq!(
+            g2d_post_pass_access(PixelFormat::Rgb, DType::U8, true),
+            CpuAccess::ReadWrite
+        );
+        let border = ResolvedCrop {
+            src_rect: None,
+            dst_rect: Some(crate::Rect::new(8, 0, 48, 48)),
+            dst_color: Some([0, 0, 0, 255]),
+        };
+        let image = |access| {
+            TensorDyn::image(
+                64,
+                48,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                access,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            require_post_pass_access(&image(CpuAccess::Write), &border),
+            Err(Error::Tensor(
+                edgefirst_tensor::Error::CpuAccessDenied { .. }
+            ))
+        ));
+        require_post_pass_access(&image(CpuAccess::ReadWrite), &border).unwrap();
     }
 }
 

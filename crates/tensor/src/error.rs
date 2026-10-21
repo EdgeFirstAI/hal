@@ -76,6 +76,26 @@ pub enum Error {
         /// The tensor's leading dimension `N`.
         batch: usize,
     },
+    /// A CPU map, pin or sync asked for a direction the tensor's
+    /// [`crate::CpuAccess`] declaration does not cover.
+    CpuAccessDenied {
+        /// The tensor's declaration: set at allocation, or as narrowed on
+        /// import by `restrict_cpu_access`.
+        declared: crate::CpuAccess,
+        /// The access the operation needed.
+        requested: crate::CpuAccess,
+    },
+}
+
+impl Error {
+    /// This error when it is a [`CpuAccessDenied`](Error::CpuAccessDenied)
+    /// refusal, else `None`.
+    pub fn cpu_access_denied(&self) -> Option<&Error> {
+        match self {
+            Error::CpuAccessDenied { .. } => Some(self),
+            _ => None,
+        }
+    }
 }
 
 impl From<std::io::Error> for Error {
@@ -113,6 +133,23 @@ impl std::fmt::Display for Error {
                 f,
                 "batch index {index} out of bounds for batch size {batch}"
             ),
+            Error::CpuAccessDenied {
+                declared,
+                requested,
+            } => {
+                let needed = declared.union(*requested);
+                write!(
+                    f,
+                    "CPU access denied: {} access requested on a tensor declared \
+                     CpuAccess::{declared:?}; declare CpuAccess::{needed:?}",
+                    requested.as_str()
+                )?;
+                if needed == crate::CpuAccess::ReadWrite {
+                    f.write_str(" (the default)")
+                } else {
+                    f.write_str(" or CpuAccess::ReadWrite (the default)")
+                }
+            }
             #[cfg(target_os = "linux")]
             Error::UnknownBufferType(magic) => write!(
                 f,
@@ -221,6 +258,30 @@ mod tests {
         assert!(
             msg.contains("IoError") && msg.contains("file missing"),
             "unexpected IoError message: {msg}"
+        );
+    }
+
+    #[test]
+    fn cpu_access_denied_message_names_both_accesses_and_the_fix() {
+        let e = Error::CpuAccessDenied {
+            declared: crate::CpuAccess::Write,
+            requested: crate::CpuAccess::Read,
+        };
+        let msg = e.to_string();
+        assert_eq!(
+            msg,
+            "CPU access denied: read access requested on a tensor declared \
+             CpuAccess::Write; declare CpuAccess::ReadWrite (the default)"
+        );
+
+        let e = Error::CpuAccessDenied {
+            declared: crate::CpuAccess::None,
+            requested: crate::CpuAccess::Read,
+        };
+        assert_eq!(
+            e.to_string(),
+            "CPU access denied: read access requested on a tensor declared \
+             CpuAccess::None; declare CpuAccess::Read or CpuAccess::ReadWrite (the default)"
         );
     }
 

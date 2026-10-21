@@ -282,16 +282,7 @@ performance requires tensors allocated by `ImageProcessor::create_image()`:
   zero-copy decode path
 - **PBO backing**: when GL is the active transfer path
 - **GPU pitch alignment**: row stride padded for Mali DMA-BUF import
-- **CPU access declaration**: decode targets are CPU-written — allocate
-  them with `CpuAccess::Write` (the decode loop maps via `map_write()`,
-  which selects a write-oriented mapping / dma-buf sync direction, and is
-  the cheapest correct choice on every backend, including a Windows D3D11
-  texture written to a partial window). `ReadWrite` also works — the decode
-  loop falls back to `map_mut()` only when `map_write()` reports
-  `Error::PartialWriteRequiresReadWrite` (a `CpuAccess::ReadWrite`-declared
-  D3D11 texture keeps a staging copy that a write-only partial window
-  cannot publish through safely) — but otherwise declares reads the
-  decoder never performs
+- **CPU access declaration**: decode targets are CPU-written — allocate them with `CpuAccess::Write` (the decode loop maps via `map_write()`, which selects a write-oriented mapping / dma-buf sync direction, and is the cheapest correct choice on every backend, including a Windows D3D11 texture written to a partial window). `ReadWrite` also works — the decode loop falls back to `map_mut()` only when `map_write()` reports `Error::PartialWriteRequiresReadWrite` (a `CpuAccess::ReadWrite`-declared D3D11 texture keeps a staging copy that a write-only partial window cannot publish through safely) — but otherwise declares reads the decoder never performs. A destination declared `Read` or `None` is refused before the CPU decoder runs, with `CodecError::Tensor(Error::CpuAccessDenied)` (`CodecError::cpu_access_denied()` finds it). When the V4L2 zero-copy decode is declined and the declaration refuses the scratch copy-out, the decode returns that refusal rather than falling back to the CPU decoder.
 
 Free-standing `Tensor::new()` or `Tensor::image()` works but:
 - Cannot produce PBO tensors (requires GL context)

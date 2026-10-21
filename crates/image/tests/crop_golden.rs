@@ -16,11 +16,10 @@
 //! NEON, and AVX2 (x86_64) kernels, selected at runtime by CPU feature
 //! detection — so every NV-source case's bytes differ between kernel paths
 //! (48 of 80 cases; the 32 RGB-source resize-only cases are identical —
-//! `fast_image_resize` is arch-consistent). Both fixture files were
-//! generated from the PRE-change implementation at the Task 1 freeze
-//! commit: aarch64 on an Apple M2 Max (RDM kernels — byte-identical on
-//! Linux aarch64 CI, i.MX 95 Cortex-A55, and RPi5 Cortex-A76, which all
-//! have `asimdrdm`), x86_64 in an AVX2 container from the same tree. On a
+//! `fast_image_resize` is arch-consistent). Both fixture files come from
+//! the same tree: aarch64 on an i.MX 95 Cortex-A55 (RDM kernels —
+//! byte-identical on Linux aarch64 CI, Apple M-series and RPi5 Cortex-A76,
+//! which all have `asimdrdm`), x86_64 on an AVX2 host. On a
 //! CPU without the fixture's feature (e.g. i.MX 8M Plus Cortex-A53, no
 //! RDM) the matrix test SKIPS: the same code picks a different, equally
 //! correct kernel whose bytes cannot match a frozen file. Cropped-convert
@@ -28,7 +27,8 @@
 //! (`fused_region_matches_general_path`, `left_edge_crop_zero_copy_*`,
 //! `crop_edge_matches_full_frame_intermediate`, …), which compare against
 //! references computed in the same run. Within one kernel path the frozen
-//! bytes are the byte-exactness arbiter; neither file is ever regenerated.
+//! bytes are the byte-exactness arbiter; regenerate both files only for a
+//! deliberate change to the CPU resampling, and only from the same tree.
 
 use edgefirst_image::{CPUProcessor, Crop, Fit, ImageProcessorTrait, Region};
 use edgefirst_tensor::{

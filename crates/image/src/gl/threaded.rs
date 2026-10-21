@@ -1484,6 +1484,10 @@ impl GLProcessorThreaded {
     }
 
     /// Create a PBO-backed [`Tensor<u8>`](edgefirst_tensor::Tensor) image on the GL thread.
+    ///
+    /// Declared [`CpuAccess::ReadWrite`](edgefirst_tensor::CpuAccess): the GL
+    /// readback maps the buffer on the CPU itself (repack, BGRA swap, row
+    /// spread), and a narrower declaration buys no cheaper PBO mapping.
     pub fn create_pbo_image(
         &self,
         width: usize,
@@ -1633,6 +1637,44 @@ impl GLProcessorThreaded {
     /// back to CPU float output (normalized to `[0, 1]`) for these targets.
     pub(crate) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
         self.caps.render_dtypes
+    }
+
+    /// The CPU access `convert` needs on a `format`/`dtype` destination held
+    /// in `memory` when it renders it from an RGBA or NV source (`Write` for
+    /// a host-memory readback, else `None`), or `None` when it declines it to
+    /// the CPU fallback.
+    pub(crate) fn dst_cpu_access(
+        &self,
+        memory: edgefirst_tensor::TensorMemory,
+        format: edgefirst_tensor::PixelFormat,
+        dtype: edgefirst_tensor::DType,
+    ) -> Option<edgefirst_tensor::CpuAccess> {
+        use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorMemory};
+        let renders = match dtype {
+            DType::U8 | DType::I8 => GLProcessorST::dst_format_renderable(
+                self.caps.transfer_backend,
+                memory,
+                format,
+                self.caps.has_bgra,
+            ),
+            DType::F16 | DType::F32 => {
+                super::float_dispatch::classify_float_render(
+                    PixelFormat::Rgba,
+                    format,
+                    dtype,
+                    memory,
+                    self.caps.render_dtypes,
+                    <super::platform::Platform as super::platform::GlPlatform>::ZERO_COPY_FLOAT,
+                ) != super::float_dispatch::FloatRenderPath::None
+            }
+            _ => false,
+        };
+        let readback = matches!(memory, TensorMemory::Mem | TensorMemory::Shm);
+        renders.then_some(if readback {
+            CpuAccess::Write
+        } else {
+            CpuAccess::None
+        })
     }
 }
 

@@ -152,6 +152,7 @@ impl V4l2Probe {
             // Single-planar M2M decode is a later increment.
             return Ok(None);
         }
+        require_copy_out_access(dst, output_fmt, final_w, final_h).map_err(V4l2Decode::Fatal)?;
 
         let result = ctx.decode::<T>(data, dst, output_fmt, final_w, final_h, dst_stride);
         let out = match result {
@@ -187,6 +188,41 @@ impl V4l2Probe {
         }
         out
     }
+}
+
+/// The CPU access the decode needs on `dst`: `None` when the hardware can
+/// decode straight into its DMA-BUF (a DMA destination, NV12/GREY output and
+/// MCU(16)-aligned dimensions), else `Write` for the scratch copy-out. The
+/// driver may still refuse zero-copy, so `None` is necessary but not
+/// sufficient.
+fn dst_cpu_access(
+    dma_capable: bool,
+    output_fmt: PixelFormat,
+    final_w: usize,
+    final_h: usize,
+) -> edgefirst_tensor::CpuAccess {
+    let zero_copy = dma_capable
+        && matches!(output_fmt, PixelFormat::Nv12 | PixelFormat::Grey)
+        && final_w.is_multiple_of(16)
+        && final_h.is_multiple_of(16);
+    if zero_copy {
+        edgefirst_tensor::CpuAccess::None
+    } else {
+        edgefirst_tensor::CpuAccess::Write
+    }
+}
+
+/// Refuse, before anything is submitted, a destination whose declaration
+/// does not cover the access the decode needs.
+fn require_copy_out_access<T: ImagePixel>(
+    dst: &Tensor<T>,
+    output_fmt: PixelFormat,
+    final_w: usize,
+    final_h: usize,
+) -> Result<(), CodecError> {
+    let dma_capable = dst.memory() == TensorMemory::DmaBuf;
+    let needed = dst_cpu_access(dma_capable, output_fmt, final_w, final_h);
+    Ok(dst.cpu_access().require(needed)?)
 }
 
 /// A persistent, capability-verified V4L2 decode context.
@@ -677,11 +713,9 @@ impl V4l2Context {
         // Zero-copy eligibility: DMA destination, NV12/GREY output, and
         // MCU(16)-aligned dims so the CAPTURE geometry equals the logical image
         // (the decoded data lands exactly at the tensor's layout).
-        let want_zc = dma_capable
-            && matches!(output_fmt, PixelFormat::Nv12 | PixelFormat::Grey)
-            && matches!(kind, CapKind::Nv12 | CapKind::Grey)
-            && final_w.is_multiple_of(16)
-            && final_h.is_multiple_of(16);
+        let want_zc = dst_cpu_access(dma_capable, output_fmt, final_w, final_h)
+            == edgefirst_tensor::CpuAccess::None
+            && matches!(kind, CapKind::Nv12 | CapKind::Grey);
 
         let mut dst_dma = false;
         if want_zc {
@@ -955,6 +989,11 @@ impl V4l2Context {
                 flip_horizontal: false,
             });
         }
+
+        // The driver refused zero-copy, and the copy-out writes on the CPU.
+        dst.cpu_access()
+            .require(edgefirst_tensor::CpuAccess::Write)
+            .map_err(|e| DecodeErr::Fatal(e.into()))?;
 
         // Persistent-scratch: the hardware decodes into the codec-owned DMA
         // buffer (single plane; QBUF length may exceed the format's
@@ -1354,6 +1393,42 @@ fn dequeue_within(queue: &Queue, timeout: Duration) -> edgefirst_v4l2::Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_copy_needs_dma_nv12_or_grey_and_mcu_aligned_dims() {
+        use edgefirst_tensor::CpuAccess::{None as ZeroCopy, Write as CopyOut};
+        assert_eq!(dst_cpu_access(true, PixelFormat::Nv12, 640, 480), ZeroCopy);
+        assert_eq!(dst_cpu_access(true, PixelFormat::Grey, 16, 16), ZeroCopy);
+        assert_eq!(dst_cpu_access(false, PixelFormat::Nv12, 640, 480), CopyOut);
+        assert_eq!(dst_cpu_access(true, PixelFormat::Nv24, 640, 480), CopyOut);
+        assert_eq!(dst_cpu_access(true, PixelFormat::Nv12, 650, 480), CopyOut);
+        assert_eq!(dst_cpu_access(true, PixelFormat::Nv12, 640, 470), CopyOut);
+    }
+
+    /// A destination the scratch copy-out would write on the CPU is refused
+    /// up front unless it is declared writable.
+    #[test]
+    fn copy_out_requires_a_declared_write() {
+        use edgefirst_tensor::{CpuAccess, Error as TensorError};
+        for (declared, refused) in [
+            (CpuAccess::None, true),
+            (CpuAccess::Read, true),
+            (CpuAccess::Write, false),
+            (CpuAccess::ReadWrite, false),
+        ] {
+            let dst =
+                Tensor::<u8>::image(64, 48, PixelFormat::Nv12, Some(TensorMemory::Mem), declared)
+                    .unwrap();
+            match require_copy_out_access(&dst, PixelFormat::Nv12, 64, 48) {
+                Err(CodecError::Tensor(TensorError::CpuAccessDenied {
+                    requested: CpuAccess::Write,
+                    ..
+                })) => assert!(refused, "{declared:?}"),
+                Ok(()) => assert!(!refused, "{declared:?}"),
+                other => panic!("{declared:?}: {other:?}"),
+            }
+        }
+    }
 
     /// `V4L2_YCBCR_ENC_709` — a non-601 encoding we must reject.
     const ENC_709: u8 = 2;

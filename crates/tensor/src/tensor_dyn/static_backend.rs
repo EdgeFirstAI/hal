@@ -380,6 +380,7 @@ impl TensorDyn {
             pbo_vtable_ptr: self.pbo_vtable_ptr(),
             fence_handle,
             sync,
+            cpu_access: self.cpu_access(),
         })
     }
 
@@ -488,6 +489,11 @@ impl TensorDyn {
     /// the tensor itself, before any map exists.
     pub fn cpu_access(&self) -> crate::CpuAccess {
         dispatch!(self, cpu_access)
+    }
+
+    /// See [`Tensor::restrict_cpu_access`](crate::Tensor::restrict_cpu_access).
+    pub fn restrict_cpu_access(&mut self, access: crate::CpuAccess) {
+        dispatch!(self, restrict_cpu_access, access)
     }
 
     /// Reshape this tensor. Total element count must remain the same.

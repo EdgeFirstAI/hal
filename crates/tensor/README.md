@@ -88,33 +88,24 @@ let fd = frame.clone_fd()?;
 
 ## CPU Access Is Declared, Hardware Access Is Assumed
 
-Every image constructor — `Tensor::image`, `TensorDyn::image`,
-`ImageProcessor::create_image`, and the C and Python equivalents — takes a
-required `CpuAccess` argument. There is no usage or role enum beyond it.
+Every image constructor — `Tensor::image`, `TensorDyn::image`, `ImageProcessor::create_image`, and the C and Python equivalents — takes a `CpuAccess` argument (in C and Python it defaults to `ReadWrite`). There is no usage or role enum beyond it.
 
-The crate assumes image buffers are produced and consumed by hardware (ISP,
-codec, GPU, NPU), so every image tensor allocates GPU-readable and
-GPU-writable and no declaration is needed for that. What the CPU intends to do
-is the one thing the allocator cannot guess:
+The crate assumes image buffers are produced and consumed by hardware (ISP, codec, GPU, NPU), so every image tensor allocates GPU-readable and GPU-writable and no declaration is needed for that. What the CPU intends to do is the one thing the allocator cannot guess:
 
 | Declaration | Meaning |
 |---|---|
 | `CpuAccess::None` | Hardware-only. On Android this keeps the allocation eligible for vendor tile compression (UBWC/AFBC/PVRIC/DCC) |
 | `CpuAccess::Read` | Cached mapping. macOS takes the read-only IOSurface lock and skips the unlock flush; Linux syncs the read direction only |
 | `CpuAccess::Write` | Decode targets. Write-combined where the platform offers it, no cache clean on unlock |
-| `CpuAccess::ReadWrite` | Both directions |
+| `CpuAccess::ReadWrite` | Both directions (the default) |
 
-Over-declaring is not free: any access other than `None` pins the layout
-linear and forfeits tile compression. Under-declaring is not silent: mapping
-beyond the declaration is best-effort, and either the platform refuses
-(Android refuses deterministically — locking an AHardwareBuffer with usage
-bits it was not allocated with is undefined behaviour per the NDK contract) or
-it succeeds on a slow path. Either way it logs once per buffer and increments
-the process-wide `unplanned_cpu_access_count()`, so undeclared CPU access
-shows up in telemetry instead of quietly costing you throughput.
+The declaration covers all CPU access, including the HAL's own CPU work. A map, pin or sync beyond the declaration fails with `Error::CpuAccessDenied`, naming the declared and requested access, on both the static and dynamic backends. `map()` asks for `ReadWrite`, so on a `Read`- or `Write`-declared tensor use `map_read()` to read and `TensorTrait::map_for_write()` to fill. A write-only map is valid only for a pass that overwrites the whole buffer; `map_for_write()` maps a view `ReadWrite` for that reason.
 
-For anything past the four common parameters — notably a compression request —
-use the `ImageDesc` builder and `Tensor::image_desc`.
+On Android any access other than `None` pins the layout linear and forfeits tile compression: the `ReadWrite` default asks gralloc for `CPU_READ_OFTEN | CPU_WRITE_OFTEN`, which may give linear, CPU-cached memory. Pass `CpuAccess::None` for a buffer you never map, so gralloc can keep a tiled or compressed allocation. Linux DMA-BUF allocation does not depend on the declaration.
+
+`restrict_cpu_access` narrows a declaration and never widens it; `import_descriptor` uses it to carry a producer's declaration onto an imported alias.
+
+For anything past the four common parameters — notably a compression request — use the `ImageDesc` builder and `Tensor::image_desc`.
 
 ## DMA Images Carry a 64-Byte-Aligned Row Stride
 

@@ -1002,20 +1002,25 @@ pub trait ImageProcessorTrait {
     ///   the output; pass a [`view`](edgefirst_tensor::TensorDyn::view) or
     ///   [`batch`](edgefirst_tensor::TensorDyn::batch) of a larger tensor to
     ///   render into one tile of a batch.
-    /// * `rotation` - Rotation applied to the output, in 90° steps.
-    /// * `flip` - Horizontal, vertical, or both.
-    /// * `crop` - Source-side geometry: which sub-rectangle of `src` to sample
-    ///   ([`Crop::source`]) and how to fit it into `dst`'s shape
-    ///   ([`Crop::fit`] — stretch, or letterbox with a pad colour). Destination
-    ///   placement lives on `dst`, not here.
+    /// * `options` - Rotation, flip, source crop, fit (stretch or letterbox),
+    ///   normalization and pad ([`ConvertOptions`]); `None` is the default
+    ///   convert. Destination placement lives on `dst`, not here.
     ///
     /// # Errors
     ///
-    /// - [`Error::CropInvalid`] if `crop.source` falls outside `src`.
+    /// - [`Error::CropInvalid`] if the source crop falls outside `src`.
     /// - [`Error::NotAnImage`] if either tensor carries no `PixelFormat`.
+    /// - [`Error::InvalidOptions`] if the options cannot apply to `dst`.
     /// - [`Error::NoConverter`] if no backend accepts the format pair — the
     ///   dispatch tries OpenGL, then G2D, then CPU, so this means all three
     ///   declined.
+    /// - [`Error::Tensor`] with [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied)
+    ///   if a CPU pass needs access a tensor's declaration does not cover
+    ///   (source `Read`; destination `Write`, or `ReadWrite` for a view or a
+    ///   read-back pass).
+    /// - [`Error::CpuFallbackDenied`] if GL or G2D declined the convert and
+    ///   the CPU fallback was refused for access. [`Error::cpu_access_denied`]
+    ///   finds the refusal in either form.
     ///
     /// Backend-specific failures (EGL import, G2D blit, allocation) surface as
     /// their own variants. A backend *declining* a pair is not an error while
@@ -1329,10 +1334,11 @@ pub enum Interpolation {
     /// fastest mode, at the cost of aliasing that lowers detection accuracy
     /// on resized inputs.
     Nearest,
-    /// Bilinear with half-pixel centres (default). The GL backend matches
-    /// OpenCV `INTER_LINEAR`, the preprocessing most detectors are trained
-    /// with; the CPU backend's bilinear widens its kernel when downscaling,
-    /// which smooths more than `INTER_LINEAR` below 1×.
+    /// Bilinear with half-pixel centres (default): two taps per axis at every
+    /// scale on both the CPU and GL backends, matching OpenCV `INTER_LINEAR`,
+    /// the preprocessing most detectors and segmenters are trained with. It
+    /// does not widen its kernel when downscaling, so it smooths less than
+    /// PIL's bilinear below 1×.
     #[default]
     Bilinear,
 }
@@ -1392,6 +1398,59 @@ pub(crate) enum ForcedBackend {
     Cpu,
     G2d,
     OpenGl,
+}
+
+/// The CPU fallback's error, carrying the GPU decline reasons when the CPU
+/// was refused for access: the decline is what the caller has to fix.
+/// `declined` pairs each declining backend's name with its error, formatted
+/// only here so a frame the fallback serves pays for no message.
+fn with_gpu_declines(e: Error, declined: Vec<(&'static str, Error)>) -> Error {
+    match e {
+        Error::Tensor(denied @ edgefirst_tensor::Error::CpuAccessDenied { .. })
+            if !declined.is_empty() =>
+        {
+            let declined: Vec<String> = declined
+                .iter()
+                .map(|(backend, e)| format!("{backend}: {e}"))
+                .collect();
+            Error::CpuFallbackDenied {
+                declined: declined.join("; "),
+                denied,
+            }
+        }
+        other => other,
+    }
+}
+
+/// The CPU access an [`ImageProcessor`]'s own convert may need on a
+/// destination, from what each present backend needs when it takes it
+/// (`Some`) or declines it (`None`).
+///
+/// A forced backend is the only one that runs. Otherwise a GL render that
+/// needs no CPU access ends the chain, while G2D and the CPU fallback may
+/// each still run, so their needs are all included.
+fn predicted_cpu_access(
+    forced: Option<ForcedBackend>,
+    gl: Option<Option<edgefirst_tensor::CpuAccess>>,
+    g2d: Option<Option<edgefirst_tensor::CpuAccess>>,
+    cpu: Option<Option<edgefirst_tensor::CpuAccess>>,
+) -> edgefirst_tensor::CpuAccess {
+    use edgefirst_tensor::CpuAccess;
+    let only = |b: Option<Option<CpuAccess>>| b.flatten().unwrap_or(CpuAccess::None);
+    match forced {
+        Some(ForcedBackend::Cpu) => return only(cpu),
+        Some(ForcedBackend::G2d) => return only(g2d),
+        Some(ForcedBackend::OpenGl) => return only(gl),
+        None => {}
+    }
+    let gl = gl.flatten();
+    if gl == Some(CpuAccess::None) {
+        return CpuAccess::None;
+    }
+    [gl, g2d.flatten(), cpu.flatten()]
+        .into_iter()
+        .flatten()
+        .fold(CpuAccess::None, CpuAccess::union)
 }
 
 /// Reports which float-color-buffer extensions the GPU backend detected.
@@ -2257,6 +2316,65 @@ impl ImageProcessor {
         Ok(())
     }
 
+    /// The declaration [`create_image`](Self::create_image) allocates a
+    /// `memory` destination with: the caller's `access` plus whatever this
+    /// processor's own convert may need on the CPU (see
+    /// [`predicted_cpu_access`]). `views` marks a destination written through
+    /// views, where any CPU write is partial and so needs `ReadWrite`.
+    fn producer_access(
+        &self,
+        access: edgefirst_tensor::CpuAccess,
+        format: PixelFormat,
+        dtype: DType,
+        memory: TensorMemory,
+        views: bool,
+    ) -> edgefirst_tensor::CpuAccess {
+        use edgefirst_tensor::CpuAccess;
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ),
+            feature = "opengl"
+        ))]
+        let gl = self
+            .opengl
+            .as_ref()
+            .map(|gl| gl.dst_cpu_access(memory, format, dtype));
+        #[cfg(not(all(
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ),
+            feature = "opengl"
+        )))]
+        let gl = None;
+        #[cfg(target_os = "linux")]
+        let g2d = self
+            .g2d
+            .as_ref()
+            .map(|_| g2d::dst_cpu_access(memory, format, dtype));
+        #[cfg(not(target_os = "linux"))]
+        let g2d = None;
+        let cpu = self
+            .cpu
+            .as_ref()
+            .map(|_| Some(cpu::convert_dst_access(None, format, dtype)));
+        let needed = predicted_cpu_access(self.forced_backend, gl, g2d, cpu);
+        let needed = if views && needed.writes() {
+            CpuAccess::ReadWrite
+        } else {
+            needed
+        };
+        access.union(needed)
+    }
+
     /// Allocate an image tensor from a declarative
     /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request — the
     /// full-featured variant of [`create_image`](Self::create_image).
@@ -2269,9 +2387,14 @@ impl ImageProcessor {
     /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)). A
     /// contiguous request is a CMA DMA-BUF at the same 64-byte GPU pitch
     /// `create_image` uses, or an error; it never falls back to a PBO or
-    /// host memory.
+    /// host memory. Its CPU access gets the same widening as `create_image`;
+    /// a compression request's `CpuAccess::None` does not.
     pub fn create_image_desc(&self, desc: &edgefirst_tensor::ImageDesc) -> Result<TensorDyn> {
-        if desc.compression().is_none() && !desc.contiguous() {
+        // Tile compression requires `CpuAccess::None`, so it gets no widening.
+        if desc.compression().is_some() {
+            return Ok(TensorDyn::image_desc(desc)?);
+        }
+        if !desc.contiguous() {
             return self.create_image(
                 desc.width(),
                 desc.height(),
@@ -2281,7 +2404,14 @@ impl ImageProcessor {
                 desc.access(),
             );
         }
-        Ok(TensorDyn::image_desc(desc)?)
+        let access = self.producer_access(
+            desc.access(),
+            desc.format(),
+            desc.dtype(),
+            TensorMemory::DmaBuf,
+            false,
+        );
+        Ok(TensorDyn::image_desc(&desc.clone().with_access(access))?)
     }
 
     /// Create a [`TensorDyn`] image with the best available memory backend.
@@ -2318,12 +2448,34 @@ impl ImageProcessor {
     /// * `dtype` - Element data type (e.g. `DType::U8`, `DType::F16`, `DType::F32`)
     /// * `memory` - Optional memory type override; when `None`, the best
     ///   available backend is selected automatically.
-    /// * `access` - Declares the CPU involvement you plan on. Use
-    ///   [`CpuAccess::None`](edgefirst_tensor::CpuAccess) for a destination
-    ///   that only hardware reads (an NPU input), and `ReadWrite` when you
-    ///   will map it. Hardware access is always implied. Mapping a tensor
-    ///   beyond its declaration is counted by
-    ///   [`unplanned_cpu_access_count`](edgefirst_tensor::unplanned_cpu_access_count).
+    /// * `access` - Declares the CPU access you plan on (`ReadWrite` is the
+    ///   natural choice). Use [`CpuAccess::None`](edgefirst_tensor::CpuAccess)
+    ///   for a destination that only hardware reads (an NPU input).
+    ///   Hardware access is always implied. What this processor's own
+    ///   convert may do to the image as a destination on the CPU is added
+    ///   to the declaration so that convert succeeds: `Write` when it may
+    ///   fill the whole destination on the CPU (the CPU backend, host
+    ///   memory, a format or float dtype the GPU path does not render),
+    ///   `ReadWrite` when a pass reads back what was written or writes only
+    ///   part of the buffer (an `I8` destination through the CPU or G2D, a
+    ///   `Bgra` destination through the CPU, a G2D `Rgb` letterbox border).
+    ///   The returned tensor's [`cpu_access`](edgefirst_tensor::TensorDyn::cpu_access)
+    ///   may therefore be wider than `access`. Any other CPU map beyond the
+    ///   declaration fails with
+    ///   [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied).
+    ///   The widening covers the destination role of convert only: a
+    ///   tensor later used as a convert source needs `Read` declared by the
+    ///   caller, and a CPU mask draw blends into its destination and needs
+    ///   `ReadWrite`, so declare it when the CPU may draw. A destination
+    ///   written through views (a batch) needs `ReadWrite` for a CPU convert,
+    ///   which [`alloc_tile_batch`](Self::alloc_tile_batch) predicts. A
+    ///   destination left without CPU access (`None` on a GPU-rendered
+    ///   format) is written only by the GPU, so a convert into it needs the
+    ///   GPU to accept the source as well; when it declines, the CPU fallback
+    ///   is refused with [`Error::CpuFallbackDenied`] carrying the GPU's
+    ///   reason. A PBO destination is always `ReadWrite`: the GL readback
+    ///   maps it on the CPU itself, and a narrower declaration would buy no
+    ///   cheaper mapping.
     ///
     /// # Returns
     ///
@@ -2383,6 +2535,22 @@ impl ImageProcessor {
         memory: Option<TensorMemory>,
         access: edgefirst_tensor::CpuAccess,
     ) -> Result<TensorDyn> {
+        self.create_image_with(width, height, format, dtype, memory, access, false)
+    }
+
+    /// [`create_image`](Self::create_image), for a destination written
+    /// through views when `views` is set (see `producer_access`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_image_with(
+        &self,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        memory: Option<TensorMemory>,
+        access: edgefirst_tensor::CpuAccess,
+        views: bool,
+    ) -> Result<TensorDyn> {
         // Compute the GPU-aligned row stride in bytes for this image.
         // `None` means either the format has no defined primary-plane bpp
         // (unknown future layout) or the stride calculation would overflow
@@ -2403,6 +2571,8 @@ impl ImageProcessor {
         // plain constructor (byte-identical result in the common case).
         #[cfg(target_os = "linux")]
         let try_dma = || -> Result<TensorDyn> {
+            let dma_access =
+                self.producer_access(access, format, dtype, TensorMemory::DmaBuf, views);
             // Stride padding is only meaningful for packed pixel layouts
             // (RGBA8, BGRA8, RGB888, Grey) — the formats the GL backend
             // renders into. Semi-planar (NV12, NV16) and planar (PlanarRgb,
@@ -2429,7 +2599,7 @@ impl ImageProcessor {
                         dtype,
                         stride,
                         Some(edgefirst_tensor::TensorMemory::DmaBuf),
-                        access,
+                        dma_access,
                     )?)
                 }
                 _ => Ok(TensorDyn::image(
@@ -2438,7 +2608,7 @@ impl ImageProcessor {
                     format,
                     dtype,
                     Some(edgefirst_tensor::TensorMemory::DmaBuf),
-                    access,
+                    dma_access,
                 )?),
             }
         };
@@ -2469,7 +2639,7 @@ impl ImageProcessor {
                     format,
                     dtype,
                     Some(mem),
-                    access,
+                    self.producer_access(access, format, dtype, mem, views),
                 )?);
             }
             None => {}
@@ -2504,7 +2674,7 @@ impl ImageProcessor {
                     format,
                     dtype,
                     Some(edgefirst_tensor::TensorMemory::DmaBuf),
-                    access,
+                    self.producer_access(access, format, dtype, TensorMemory::DmaBuf, views),
                 ) {
                     Ok(img) => return Ok(img),
                     Err(e) => {
@@ -2539,7 +2709,7 @@ impl ImageProcessor {
             }
         }
 
-        // Try PBO (if GL available).
+        // Try PBO (if GL available). A PBO stays ReadWrite: the GL readback maps it itself.
         // PBO buffers are u8-sized; the int8 shader emulates i8 output via
         // XOR 0x80 on the same underlying buffer, so both U8 and I8 work.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2595,7 +2765,7 @@ impl ImageProcessor {
             format,
             dtype,
             Some(edgefirst_tensor::TensorMemory::Mem),
-            access,
+            self.producer_access(access, format, dtype, TensorMemory::Mem, views),
         )?)
     }
 
@@ -3031,6 +3201,8 @@ impl ImageProcessorTrait for ImageProcessor {
         }
 
         // ── Auto fallback chain: OpenGL → G2D → CPU ──────────────────
+        #[allow(unused_mut)]
+        let mut declined: Vec<(&'static str, Error)> = Vec::new();
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
@@ -3057,6 +3229,7 @@ impl ImageProcessorTrait for ImageProcessor {
                         src.memory(),
                         dst.memory(),
                     );
+                    declined.push(("opengl", e));
                 }
             }
         }
@@ -3097,6 +3270,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     }
                     Err(e) => {
                         log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
+                        declined.push(("g2d", e));
                     }
                 }
             }
@@ -3113,7 +3287,7 @@ impl ImageProcessorTrait for ImageProcessor {
                 }
                 Err(e) => {
                     log::trace!("convert: auto cpu failed {src_fmt:?}→{dst_fmt:?}: {e}");
-                    return Err(e);
+                    return Err(with_gpu_declines(e, declined));
                 }
             }
         }
@@ -13371,6 +13545,373 @@ mod image_tests {
     // GAP-5: create_image F32 + DMA must return NotSupported
     // =========================================================================
 
+    fn access_test_src(w: usize, h: usize) -> TensorDyn {
+        use edgefirst_tensor::TensorMapTrait;
+        let t = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        for (i, b) in t
+            .as_u8()
+            .unwrap()
+            .map_mut()
+            .unwrap()
+            .as_mut_slice()
+            .iter_mut()
+            .enumerate()
+        {
+            *b = (i % 251) as u8;
+        }
+        t
+    }
+
+    /// With only the CPU backend, `create_image` declares `ReadWrite` for the
+    /// destinations whose CPU convert reads back what it wrote (the `I8`
+    /// bias, the BGRA swizzle), and the convert into them succeeds.
+    #[test]
+    fn create_image_adds_readwrite_for_read_modify_write_passes() {
+        use edgefirst_tensor::CpuAccess;
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+        unsafe {
+            std::env::remove_var("EDGEFIRST_FORCE_BACKEND");
+            std::env::remove_var("EDGEFIRST_DISABLE_CPU");
+            std::env::set_var("EDGEFIRST_DISABLE_GL", "1");
+            std::env::set_var("EDGEFIRST_DISABLE_G2D", "1");
+        }
+        let mut proc = ImageProcessor::new().unwrap();
+        let src = access_test_src(128, 96);
+        for (format, dtype) in [
+            (PixelFormat::Rgb, DType::I8),
+            (PixelFormat::Rgba, DType::I8),
+            (PixelFormat::Bgra, DType::U8),
+        ] {
+            for requested in [CpuAccess::None, CpuAccess::Write] {
+                let mut dst = proc
+                    .create_image(64, 48, format, dtype, None, requested)
+                    .unwrap();
+                assert_eq!(
+                    dst.cpu_access(),
+                    CpuAccess::ReadWrite,
+                    "{format:?}/{dtype:?} requested {requested:?}"
+                );
+                proc.convert(&src, &mut dst, None).unwrap_or_else(|e| {
+                    panic!("CPU convert into {format:?}/{dtype:?} {requested:?}: {e}")
+                });
+            }
+        }
+    }
+
+    /// The CPU convert refuses up front, asking for `ReadWrite`, a
+    /// `Write`-only destination it would read back (the `I8` bias, the BGRA
+    /// swizzle); a BGRA-to-BGRA copy has no swizzle and needs only `Write`.
+    #[test]
+    fn cpu_convert_refuses_a_write_only_destination_it_reads_back() {
+        use edgefirst_tensor::{CpuAccess, Error as TensorError};
+        let mut cpu = CPUProcessor::new();
+        let src = access_test_src(32, 24);
+        for (format, dtype) in [
+            (PixelFormat::Rgb, DType::I8),
+            (PixelFormat::Bgra, DType::U8),
+        ] {
+            let mut dst = TensorDyn::image(
+                32,
+                24,
+                format,
+                dtype,
+                Some(TensorMemory::Mem),
+                CpuAccess::Write,
+            )
+            .unwrap();
+            match cpu.convert(&src, &mut dst, None) {
+                Err(Error::Tensor(TensorError::CpuAccessDenied {
+                    declared: CpuAccess::Write,
+                    requested: CpuAccess::ReadWrite,
+                })) => {}
+                other => panic!("{format:?}/{dtype:?}: {other:?}"),
+            }
+        }
+        let bgra_src = TensorDyn::image(
+            32,
+            24,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut dst = TensorDyn::image(
+            32,
+            24,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::Write,
+        )
+        .unwrap();
+        cpu.convert(&bgra_src, &mut dst, None).unwrap();
+    }
+
+    /// The prediction `create_image` widens with, per backend mix: the CPU
+    /// and G2D post-passes when either may run, nothing when the GPU renders
+    /// the destination, `Write` for a host-memory readback.
+    #[test]
+    fn predicted_cpu_access_unions_the_backends_that_may_run() {
+        use edgefirst_tensor::CpuAccess::{self, None as No, Read, ReadWrite, Write};
+        let p = predicted_cpu_access;
+        let takes = |a: CpuAccess| Some(Some(a));
+        let declines = Some(None);
+        // A forced backend is the only one that runs.
+        assert_eq!(
+            p(
+                Some(ForcedBackend::G2d),
+                None,
+                takes(ReadWrite),
+                takes(Write)
+            ),
+            ReadWrite
+        );
+        assert_eq!(
+            p(Some(ForcedBackend::G2d), None, declines, takes(Write)),
+            No
+        );
+        assert_eq!(
+            p(
+                Some(ForcedBackend::OpenGl),
+                takes(Write),
+                None,
+                takes(ReadWrite)
+            ),
+            Write
+        );
+        assert_eq!(
+            p(Some(ForcedBackend::Cpu), takes(No), None, takes(Write)),
+            Write
+        );
+        // A GL render with no CPU access ends the chain.
+        assert_eq!(p(None, takes(No), takes(ReadWrite), takes(ReadWrite)), No);
+        // A host-memory readback leaves the fallbacks predicted.
+        assert_eq!(p(None, takes(Write), None, takes(ReadWrite)), ReadWrite);
+        // G2D may decline at run time, so the CPU stays predicted after it.
+        assert_eq!(p(None, declines, takes(No), takes(Write)), Write);
+        assert_eq!(p(None, declines, takes(ReadWrite), None), ReadWrite);
+        assert_eq!(p(None, None, None, takes(Read)), Read);
+        assert_eq!(p(None, None, None, None), No);
+    }
+
+    /// The GL prediction follows the float classifier: a float destination
+    /// GL cannot render (host memory, an unsupported format) is predicted
+    /// for the CPU fallback.
+    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    #[test]
+    fn float_destinations_gl_declines_are_predicted_for_the_cpu() {
+        use edgefirst_tensor::CpuAccess;
+        let Ok(processor) = ImageProcessor::new() else {
+            eprintln!("WARNING: SKIPPED: float prediction - no image processor");
+            return;
+        };
+        let Some(gl) = processor.opengl.as_ref() else {
+            eprintln!("WARNING: SKIPPED: float prediction - no OpenGL backend");
+            return;
+        };
+        assert_eq!(
+            gl.dst_cpu_access(TensorMemory::Mem, PixelFormat::PlanarRgb, DType::F16),
+            None
+        );
+        assert_eq!(
+            gl.dst_cpu_access(TensorMemory::DmaBuf, PixelFormat::Grey, DType::F32),
+            None
+        );
+        let image = processor
+            .create_image(
+                64,
+                64,
+                PixelFormat::Rgb,
+                DType::F32,
+                Some(TensorMemory::Mem),
+                CpuAccess::None,
+            )
+            .unwrap();
+        assert!(image.cpu_access().writes());
+    }
+
+    /// When a GPU backend declined and the CPU fallback is refused for
+    /// access, the error carries the decline; otherwise it is the CPU's.
+    #[test]
+    fn a_refused_cpu_fallback_reports_the_gpu_decline() {
+        use edgefirst_tensor::{CpuAccess, Error as TensorError};
+        let denied = || {
+            Error::Tensor(TensorError::CpuAccessDenied {
+                declared: CpuAccess::None,
+                requested: CpuAccess::Write,
+            })
+        };
+        let declined = || {
+            vec![(
+                "opengl",
+                Error::NotSupported("unsupported source format".into()),
+            )]
+        };
+        let e = with_gpu_declines(denied(), declined());
+        assert!(
+            matches!(
+                &e,
+                Error::CpuFallbackDenied {
+                    denied: TensorError::CpuAccessDenied { .. },
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("unsupported source format"), "{msg}");
+        assert!(msg.contains("CPU access denied"), "{msg}");
+        assert!(e.cpu_access_denied().is_some());
+        assert!(matches!(
+            with_gpu_declines(denied(), Vec::new()),
+            Error::Tensor(TensorError::CpuAccessDenied { .. })
+        ));
+        assert!(matches!(
+            with_gpu_declines(Error::NoConverter, declined()),
+            Error::NoConverter
+        ));
+    }
+
+    /// With only the CPU backend, `create_image` widens a `Read` request to
+    /// `ReadWrite` and a `None` request to `Write`, so the processor's own
+    /// convert can fill the image.
+    #[test]
+    fn create_image_adds_write_when_the_cpu_backend_fills_it() {
+        use edgefirst_tensor::CpuAccess;
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+        unsafe {
+            std::env::remove_var("EDGEFIRST_FORCE_BACKEND");
+            std::env::remove_var("EDGEFIRST_DISABLE_CPU");
+            std::env::set_var("EDGEFIRST_DISABLE_GL", "1");
+            std::env::set_var("EDGEFIRST_DISABLE_G2D", "1");
+        }
+        let mut proc = ImageProcessor::new().unwrap();
+        let src = access_test_src(128, 96);
+        for (requested, declared) in [
+            (CpuAccess::Read, CpuAccess::ReadWrite),
+            (CpuAccess::None, CpuAccess::Write),
+            (CpuAccess::Write, CpuAccess::Write),
+            (CpuAccess::ReadWrite, CpuAccess::ReadWrite),
+        ] {
+            let mut dst = proc
+                .create_image(64, 48, PixelFormat::Rgb, DType::U8, None, requested)
+                .unwrap();
+            assert_eq!(dst.cpu_access(), declared, "requested {requested:?}");
+            proc.convert(&src, &mut dst, None)
+                .unwrap_or_else(|e| panic!("CPU convert into a {requested:?} request: {e}"));
+        }
+    }
+
+    /// A CPU convert refuses up front a caller destination declared without
+    /// writes, and a source declared without reads, naming both accesses.
+    #[test]
+    fn cpu_convert_refuses_tensors_outside_their_declaration() {
+        use edgefirst_tensor::{CpuAccess, Error as TensorError};
+        let mut cpu = CPUProcessor::new();
+        let src = access_test_src(32, 24);
+        for declared in [CpuAccess::Read, CpuAccess::None] {
+            let mut dst = TensorDyn::image(
+                32,
+                24,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                declared,
+            )
+            .unwrap();
+            match cpu.convert(&src, &mut dst, None) {
+                Err(Error::Tensor(TensorError::CpuAccessDenied {
+                    declared: d,
+                    requested: CpuAccess::Write,
+                })) => assert_eq!(d, declared),
+                other => panic!("convert into a {declared:?} dst: {other:?}"),
+            }
+        }
+        let write_only = TensorDyn::image(
+            32,
+            24,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::Write,
+        )
+        .unwrap();
+        let mut dst = TensorDyn::image(
+            32,
+            24,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let err = cpu.convert(&write_only, &mut dst, None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Tensor(TensorError::CpuAccessDenied {
+                    declared: CpuAccess::Write,
+                    requested: CpuAccess::Read,
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(err
+            .to_string()
+            .contains("declare CpuAccess::ReadWrite (the default)"));
+    }
+
+    /// The CPU mask draw blends into its destination, so a `Write`-only
+    /// destination is refused before anything is drawn.
+    #[test]
+    fn cpu_draw_requires_readwrite_on_the_destination() {
+        use edgefirst_tensor::{CpuAccess, Error as TensorError};
+        let mut cpu = CPUProcessor::new();
+        let mut dst = TensorDyn::image(
+            32,
+            24,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::Write,
+        )
+        .unwrap();
+        let err = cpu
+            .draw_decoded_masks(&mut dst, &[], &[], MaskOverlay::default())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Tensor(TensorError::CpuAccessDenied {
+                    declared: CpuAccess::Write,
+                    requested: CpuAccess::ReadWrite,
+                })
+            ),
+            "{err:?}"
+        );
+    }
+
     /// `create_image_desc` without a compression request is exactly
     /// `create_image` (the processor's memory negotiation applies); with
     /// `Compression::Any` off-Android it resolves linear and counts the
@@ -13401,6 +13942,7 @@ mod image_tests {
             use edgefirst_tensor::Compression;
             let before = proc.compression_fallback_count();
             let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8)
+                .with_access(CpuAccess::None)
                 .with_compression(Compression::Any);
             let t = proc.create_image_desc(&desc).unwrap();
             assert_eq!(t.compression(), None, "no vendor tile scheme off-Android");

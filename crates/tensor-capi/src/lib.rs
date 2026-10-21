@@ -55,9 +55,14 @@ pub mod trace;
 /// *not* bump this: an existing consumer's header simply never names the new
 /// symbol, so linking against an older `libedgefirst_tensor.so` still
 /// resolves everything it actually calls.
+///
+/// 2: a map, copy or sync outside a tensor's declared `ef_cpu_access` fails
+/// with `EACCES` (reads included), `ef_tensor_image_desc_new` defaults to
+/// `EF_CPU_ACCESS_READ_WRITE`, and `ef_unplanned_cpu_access_count` is
+/// removed.
 #[no_mangle]
 pub extern "C" fn ef_tensor_abi_version() -> u32 {
-    1
+    2
 }
 
 // Test-support modules shared with the other modular C-API leaves. They are
@@ -724,6 +729,11 @@ mod tests {
             h.contains("ef_tensor_abi_version"),
             "the header must declare the ABI probe"
         );
+    }
+
+    #[test]
+    fn the_abi_probe_is_generation_2() {
+        assert_eq!(super::ef_tensor_abi_version(), 2);
     }
 
     #[test]

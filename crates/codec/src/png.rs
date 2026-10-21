@@ -103,6 +103,8 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
         n_bytes = data.len(),
     )
     .entered();
+    dst.cpu_access()
+        .require(edgefirst_tensor::CpuAccess::Write)?;
 
     let mut decoder = PngDecoder::new_with_options(
         zune_png::zune_core::bytestream::ZCursor::new(data),

@@ -27,6 +27,11 @@ pub enum Error {
     HostView(String),
     Format(String),
     Io(std::io::Error),
+    /// A CPU access refusal the image crate reported, kept typed.
+    #[cfg(feature = "image")]
+    Image(edgefirst_image::Error),
+    /// A Python exception raised underneath, passed through unchanged.
+    Py(PyErr),
 }
 
 impl fmt::Display for Error {
@@ -42,7 +47,19 @@ impl fmt::Display for Error {
             Error::HostView(msg) => write!(f, "Tensor map error: {msg}"),
             Error::Format(msg) => write!(f, "Format error: {msg}"),
             Error::Io(e) => write!(f, "IO error: {e:?}"),
+            #[cfg(feature = "image")]
+            Error::Image(e) => write!(f, "{e}"),
+            Error::Py(e) => write!(f, "{e}"),
         }
+    }
+}
+
+/// `PermissionError` (an `OSError`) when `denied`, else `RuntimeError`.
+pub(crate) fn runtime_or_permission_error(denied: bool, msg: String) -> PyErr {
+    if denied {
+        pyo3::exceptions::PyPermissionError::new_err(msg)
+    } else {
+        pyo3::exceptions::PyRuntimeError::new_err(msg)
     }
 }
 
@@ -61,6 +78,9 @@ impl From<std::io::Error> for Error {
 #[cfg(feature = "image")]
 impl From<edgefirst_image::Error> for Error {
     fn from(err: edgefirst_image::Error) -> Self {
+        if err.cpu_access_denied().is_some() {
+            return Error::Image(err);
+        }
         Error::Format(format!("{err:?}"))
     }
 }
@@ -68,20 +88,45 @@ impl From<edgefirst_image::Error> for Error {
 #[cfg(feature = "image")]
 impl From<crate::image::Error> for Error {
     fn from(err: crate::image::Error) -> Self {
-        Error::Format(format!("{err}"))
+        match err {
+            crate::image::Error::Image(e) if e.cpu_access_denied().is_some() => Error::Image(e),
+            crate::image::Error::Tensor(e) if e.cpu_access_denied().is_some() => Error::Tensor(e),
+            crate::image::Error::Py(e) => Error::Py(e),
+            err => Error::Format(format!("{err}")),
+        }
+    }
+}
+
+impl Error {
+    /// Whether this is a CPU access a tensor's declaration refuses.
+    pub(crate) fn is_cpu_access_denied(&self) -> bool {
+        match self {
+            Error::Tensor(e) => e.cpu_access_denied().is_some(),
+            #[cfg(feature = "image")]
+            Error::Image(e) => e.cpu_access_denied().is_some(),
+            _ => false,
+        }
     }
 }
 
 impl From<Error> for PyErr {
     fn from(err: Error) -> PyErr {
-        pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
+        match err {
+            Error::Py(e) => e,
+            other => runtime_or_permission_error(other.is_cpu_access_denied(), other.to_string()),
+        }
     }
 }
 
 #[cfg(feature = "codec")]
 impl From<edgefirst_codec::CodecError> for Error {
     fn from(err: edgefirst_codec::CodecError) -> Self {
-        Error::Format(format!("{err}"))
+        match err {
+            edgefirst_codec::CodecError::Tensor(e) if e.cpu_access_denied().is_some() => {
+                Error::Tensor(e)
+            }
+            err => Error::Format(format!("{err}")),
+        }
     }
 }
 
@@ -1100,7 +1145,7 @@ fn copy_numpy_typed<
         )));
     }
 
-    let mut map = tensor.map()?;
+    let mut map = tensor.map_for_write()?;
     let dst = map.as_mut_slice();
     let dst_len = dst.len();
     let nbytes = tensor_len * std::mem::size_of::<T>();
@@ -1588,6 +1633,13 @@ impl PyTensor {
         self.0.contiguity().as_str()
     }
 
+    /// The CPU access declared at allocation: ``"none"``, ``"read"``,
+    /// ``"write"`` or ``"readwrite"``.
+    #[getter]
+    fn declared_cpu_access(&self) -> &'static str {
+        self.0.cpu_access().as_str()
+    }
+
     #[getter]
     fn name(&self) -> String {
         self.0.name()
@@ -1842,7 +1894,7 @@ impl PyTensor {
     ///         device holding a ``format`` image.
     #[cfg(target_os = "windows")]
     #[staticmethod]
-    #[pyo3(signature = (texture, shape, dtype, format, access = "none", name = None))]
+    #[pyo3(signature = (texture, shape, dtype, format, access = "readwrite", name = None))]
     fn from_d3d11_texture(
         texture: usize,
         shape: Vec<usize>,
@@ -1903,7 +1955,7 @@ impl PyTensor {
     ///         ``format`` image, or the fence wait fails.
     #[cfg(target_os = "windows")]
     #[staticmethod]
-    #[pyo3(signature = (handle, shape, dtype, format, access = "none", completion = None, name = None))]
+    #[pyo3(signature = (handle, shape, dtype, format, access = "readwrite", completion = None, name = None))]
     fn from_d3d11_shared_handle(
         handle: usize,
         shape: Vec<usize>,
@@ -2243,15 +2295,15 @@ impl PyTensor {
 
     /// Create an image tensor with the given dimensions and pixel format.
     ///
-    /// `access` declares CPU access (`"none"`, `"read"`, `"write"`,
-    /// `"readwrite"`); hardware access is always implied. Scripts that
-    /// `map()` or `numpy()` the tensor should pass `access="readwrite"`.
+    /// `access` declares CPU access (`"readwrite"`, the default, `"read"`,
+    /// `"write"` or `"none"`); hardware access is always implied. A CPU map
+    /// outside the declaration raises.
     ///
     /// `contiguous=True` requires physically contiguous memory: a DMA-BUF
     /// from the Linux CMA heap, or an error naming the heap, never a
     /// fallback (see :attr:`contiguity`).
     #[staticmethod]
-    #[pyo3(signature = (width, height, format, mem = None, access = "none", contiguous = false))]
+    #[pyo3(signature = (width, height, format, mem = None, access = "readwrite", contiguous = false))]
     fn image(
         width: usize,
         height: usize,
@@ -2377,8 +2429,8 @@ impl PyTensor {
         // format/shape/colorimetry need writing back onto the real object
         // once `py.detach` returns (see `write_back_decode`).
         let (mut tensor, _pin) =
-            crate::interop::reconstruct(&self_.0, tensor::CpuAccess::ReadWrite)
-                .map_err(|e| Error::Format(e.to_string()))?;
+            crate::interop::reconstruct(&self_.0, crate::interop::write_pin_access(&self_.0))
+                .map_err(Error::Py)?;
         let self_bound: Py<Self> = self_.into_pyobject(py).unwrap().unbind();
         let (info, tensor, _pin) = py.detach(move || {
             decode_image_into(&mut tensor, &data).map(|info| (info, tensor, _pin))
@@ -2412,8 +2464,8 @@ impl PyTensor {
         // See `decode_image` for why this reconstructs rather than going
         // through `TensorArg::into_raw_access`.
         let (mut tensor, _pin) =
-            crate::interop::reconstruct(&self_.0, tensor::CpuAccess::ReadWrite)
-                .map_err(|e| Error::Format(e.to_string()))?;
+            crate::interop::reconstruct(&self_.0, crate::interop::write_pin_access(&self_.0))
+                .map_err(Error::Py)?;
         let self_bound: Py<Self> = self_.into_pyobject(py).unwrap().unbind();
         let (info, tensor, _pin) = py.detach(move || {
             let data = std::fs::read(&filename).map_err(Error::Io)?;

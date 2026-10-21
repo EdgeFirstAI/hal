@@ -567,6 +567,13 @@ type PyAssociatedDetections<'py> = (
     Vec<usize>,
 );
 
+/// The Python exception for a decoder error: `PermissionError` for a CPU
+/// access refusal, else `RuntimeError`.
+fn decode_err(e: impl Into<edgefirst_decoder::DecoderError>) -> PyErr {
+    let e = e.into();
+    crate::tensor::runtime_or_permission_error(e.cpu_access_denied().is_some(), e.to_string())
+}
+
 /// Decode to Rust boxes/masks. `self_` stays on the caller's stack so the
 /// PyO3 borrow flag remains set across `py.detach` (see `decode`).
 fn decode_native(
@@ -602,8 +609,7 @@ fn decode_native(
                 raw_inputs.iter().map(|t| t.as_ref()).collect();
             let mut output_boxes = Vec::with_capacity(max_boxes);
             let mut output_masks = Vec::with_capacity(max_boxes);
-            run(&tensor_refs, &mut output_boxes, &mut output_masks)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+            run(&tensor_refs, &mut output_boxes, &mut output_masks).map_err(decode_err)?;
             Ok::<_, PyErr>((output_boxes, output_masks))
         })?
     } else {
@@ -611,8 +617,7 @@ fn decode_native(
             model_output.iter().map(|t| t.as_ref()).collect();
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
-        run(&tensor_refs, &mut output_boxes, &mut output_masks)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+        run(&tensor_refs, &mut output_boxes, &mut output_masks).map_err(decode_err)?;
         (output_boxes, output_masks)
     };
     output_boxes.truncate(max_boxes);
@@ -729,9 +734,7 @@ fn tensor_capsule<'py>(
     tensor: &edgefirst_tensor::TensorDyn,
 ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
     use edgefirst_tensor::CpuAccess;
-    let pin = tensor
-        .pin_host(CpuAccess::Read)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+    let pin = tensor.pin_host(CpuAccess::Read).map_err(decode_err)?;
     let desc = tensor.descriptor_pinned(Some(&pin));
     // Cloned into an `Arc` the payload owns: `quant` borrows these arrays,
     // and the producing tensor may be dropped while the capsule lives.
@@ -857,8 +860,7 @@ impl PyDecoder {
             })?;
 
         let decoder = if schema_version.is_some_and(|v| v >= 2) {
-            let schema = SchemaV2::from_json_value(value)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+            let schema = SchemaV2::from_json_value(value).map_err(decode_err)?;
             builder.with_schema(schema).build()
         } else {
             let legacy: ConfigOutputs = serde_json::from_value(value)
@@ -1278,9 +1280,6 @@ impl PyDecoder {
             .map(|c| crate::interop::TensorArg::extract_mut(c, None))
             .transpose()?;
         let decoder = &self_.decoder;
-        let err = |e: edgefirst_decoder::DecoderError| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))
-        };
         let detachable = inputs.iter().all(crate::interop::TensorArg::can_detach)
             && dst.can_detach()
             && confidence.as_ref().is_none_or(|c| c.can_detach());
@@ -1302,7 +1301,7 @@ impl PyDecoder {
                         confidence.as_mut().map(|c| c.as_mut()),
                         &options,
                     )
-                    .map_err(err)
+                    .map_err(decode_err)
             })
         } else {
             let (mut dst, mut confidence) = (dst, confidence);
@@ -1315,7 +1314,7 @@ impl PyDecoder {
                     confidence.as_mut().map(|c| c.as_mut()),
                     &options,
                 )
-                .map_err(err)
+                .map_err(decode_err)
         }
     }
 
@@ -1399,7 +1398,7 @@ impl PyDecoder {
                 let mut output_boxes = Vec::with_capacity(max_boxes);
                 let proto_data = decoder
                     .decode_proto(&tensor_refs, &mut output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+                    .map_err(decode_err)?;
                 Ok::<_, PyErr>((output_boxes, proto_data))
             })?
         } else {
@@ -1411,7 +1410,7 @@ impl PyDecoder {
             let proto_data = self_
                 .decoder
                 .decode_proto(&tensor_refs, &mut output_boxes)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+                .map_err(decode_err)?;
             (output_boxes, proto_data)
         };
         // Note: output_boxes and proto_data.mask_coefficients must stay in sync

@@ -309,6 +309,7 @@ impl AngleDisplay {
             serialize_gl: true,
             external_oes: false,
             native_fence_sync: false,
+            has_bgra: false,
         }
     }
 }

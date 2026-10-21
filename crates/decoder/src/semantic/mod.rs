@@ -42,7 +42,7 @@
 
 mod kernels;
 
-use edgefirst_tensor::{DType, QuantMode, TensorDyn, TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{CpuAccess, DType, QuantMode, TensorDyn, TensorMapTrait, TensorTrait};
 use half::f16;
 
 use crate::configs::DimName;
@@ -615,6 +615,10 @@ pub fn select_output<'a>(
 ///   class count exceeds what the dtype of `dst` holds.
 /// - [`DecoderError::InvalidConfig`] for an invalid letterbox or
 ///   quantization, or a class-map value `dst` cannot hold.
+/// - [`DecoderError::Tensor`] carrying
+///   [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied) when
+///   `input` is not declared CPU-readable, or `dst` or `confidence` not
+///   CPU-writable.
 pub fn decode_semantic(
     input: &TensorDyn,
     config: &SemanticConfig,
@@ -659,6 +663,12 @@ pub fn decode_semantic(
             config.classes(),
             dst.dtype()
         )));
+    }
+
+    input.cpu_access().require(CpuAccess::Read)?;
+    dst.cpu_access().require(CpuAccess::Write)?;
+    if let Some(conf) = confidence.as_deref() {
+        conf.cpu_access().require(CpuAccess::Write)?;
     }
 
     let geometry = Geometry::new(config, options, out_h, out_w)?;
@@ -847,7 +857,11 @@ fn resolve_quant(
 }
 
 fn map_err(what: &str) -> impl FnOnce(edgefirst_tensor::Error) -> DecoderError + '_ {
-    move |e| DecoderError::InvalidConfig(format!("{what} map failed: {e}"))
+    move |e| {
+        DecoderError::from_map(e, |e| {
+            DecoderError::InvalidConfig(format!("{what} map failed: {e}"))
+        })
+    }
 }
 
 fn decode_scores(
@@ -978,7 +992,7 @@ fn write_classes<T: Score, O: ClassOut + edgefirst_tensor::Element>(
     let mut map = dst
         .as_typed_mut::<O>()
         .ok_or_else(|| DecoderError::Internal("class map dtype".to_string()))?
-        .map_mut()
+        .map_for_write()
         .map_err(map_err("class map"))?;
     let out = map.as_mut_slice();
     match (geometry.bilinear_scores(), winners) {
@@ -1012,7 +1026,7 @@ fn write_confidence<C: ConfOut + edgefirst_tensor::Element>(
     let mut map = conf
         .as_typed_mut::<C>()
         .ok_or_else(|| DecoderError::Internal("confidence dtype".to_string()))?
-        .map_mut()
+        .map_for_write()
         .map_err(map_err("confidence"))?;
     let out = map.as_mut_slice();
     if geometry.bilinear_scores() {
@@ -1089,7 +1103,7 @@ where
             let mut map = dst
                 .as_typed_mut::<$o>()
                 .ok_or_else(|| DecoderError::Internal("class map dtype".to_string()))?
-                .map_mut()
+                .map_for_write()
                 .map_err(map_err("class map"))?;
             kernels::upsample_nearest(
                 &classes,

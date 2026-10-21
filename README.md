@@ -121,13 +121,13 @@ let mut decoder = ImageDecoder::new();
 // load_image() reconfigures the tensor's shape and format to the decoded
 // content, so allocate at or above the largest frame you expect.
 let mut input =
-    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::Write)?;
+    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::ReadWrite)?;
 let _info = input.load_image(&mut decoder, &bytes)?;
 
 // convert() handles NV12 -> RGB and the letterbox resize in one call. The
 // decode never rotates; pass the EXIF rotation here if you want it applied.
 let mut output =
-    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::Read)?;
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 processor.convert(
     &input,
     &mut output,
@@ -481,18 +481,7 @@ The probe runs once at `ImageProcessor::new()` time. All subsequent
 every destination passed to `convert()`; direct `Tensor::new(memory=...)`
 bypasses the probe.
 
-**Declare CPU access.** Every image constructor takes a required
-`CpuAccess` parameter: hardware (GPU/NPU/ISP/codec) access is always
-implied, CPU access is the opt-in. Declare `Write` for decode targets,
-`Read` for buffers you verify/consume on the CPU, `ReadWrite` when both,
-and `CpuAccess::None` for pure hardware pipelines — on Android a
-hardware-only buffer is eligible for gralloc's vendor tile compression
-(UBWC/AFBC/PVRIC/DCC), and on every platform the declaration selects the
-cheapest mapping mode (write-combined for `Write`, read-only IOSurface
-locks / dma-buf sync direction for `Read`). Mapping beyond the
-declaration still works best-effort but warns once per buffer and counts
-in `unplanned_cpu_access_count()`; on Android hardware-only buffers
-refuse CPU maps deterministically.
+**Declare CPU access.** Every image constructor takes a `CpuAccess` declaration covering all CPU access to the buffer, including the HAL's own CPU work (the CPU image backend, codec decodes, decoder outputs). Hardware (GPU/NPU/ISP/codec) access is always implied. `ReadWrite` is the default and the natural choice; the specialised modes are `Write` for decode targets, `Read` for buffers only verified/consumed on the CPU, and `CpuAccess::None` for pure hardware pipelines. On Android the `ReadWrite` default asks gralloc for CPU-often usage, which may give linear, CPU-cached memory; pass `None` for a buffer you never map so gralloc can keep a tiled or compressed (UBWC/AFBC/PVRIC/DCC) allocation. On every platform the declaration selects the cheapest mapping mode (write-combined for `Write`, read-only IOSurface locks / dma-buf sync direction for `Read`). A CPU map, pin or sync beyond the declaration fails with `Error::CpuAccessDenied` (`EACCES` from C, `PermissionError` from Python) on every backend. `create_image()` adds to the declaration what the processor's own `convert()` may do to the image as a destination on the CPU (see `ImageProcessor::create_image`). It adds nothing for use as a convert source (declare `Read`) or for a CPU mask draw (declare `ReadWrite`). When GL or G2D declines a convert into a destination the CPU may not write, `convert()` returns `Error::CpuFallbackDenied` naming the GPU's reason.
 
 For DMA-buf access, the process needs `/dev/dma_heap/{linux,cma|system}`
 and a DRM render/card node — the GL backend probes
@@ -1388,7 +1377,7 @@ and the sibling `*-capi` READMEs.
 | `EDGEFIRST_FORCE_TRANSFER` | Force GL transfer: `pbo`, `dmabuf`, or `sync` |
 | `EDGEFIRST_NV_CONVERT_PATH` | NV12/16/24 GPU conversion path: `sampler`, `shader`, or `auto` (default). `auto` prefers the portable, colorimetry-exact in-shader `ShaderR8`, except BT.601-limited single-plane NV12 on Vivante (hardware sampler is ~12× faster and correct). `sampler`/`shader` force a path for benchmarking/bring-up |
 | `EDGEFIRST_COLORIMETRY` | `fast` (default) or `exact`. High-performance colour conversion is the default; `exact` opts into the colorimetry-exact path where it costs more. Takes precedence over the per-processor setting |
-| `EDGEFIRST_INTERPOLATION` | `nearest` or `bilinear` (default). How `convert()` resamples when it resizes, on every backend. Bilinear uses half-pixel centres; the GL backend matches OpenCV `INTER_LINEAR`, while the CPU backend's bilinear widens its kernel when downscaling. Nearest is faster and less accurate on resized inputs. Takes precedence over `ImageProcessorConfig::interpolation` |
+| `EDGEFIRST_INTERPOLATION` | `nearest` or `bilinear` (default). How `convert()` resamples when it resizes, on every backend. Bilinear uses half-pixel centres and two taps per axis on the CPU and GL backends, matching OpenCV `INTER_LINEAR`; G2D scales with its fixed hardware filter and declines resizing converts under `nearest`. Nearest is faster and less accurate on resized inputs. Takes precedence over `ImageProcessorConfig::interpolation` |
 | `EDGEFIRST_GL_SERIALIZE` | `full` or `lifecycle` — pin the GL command serialization policy instead of using the per-driver default (see [Rule 5](#rule-5--one-imageprocessor-per-pipeline)) |
 | `EDGEFIRST_ENABLE_NVJPEG` | `1` opts into the nvJPEG GPU JPEG decoder on CUDA hosts (off by default so it never silently contends with the inference engine) |
 | `EDGEFIRST_EGL_CACHE_CAPACITY` | Override the per-cache EGLImage capacity (default 64) for high-cardinality varied-geometry streams |

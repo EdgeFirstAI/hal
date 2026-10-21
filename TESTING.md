@@ -1420,7 +1420,7 @@ passed when the app harness completes; always pull the artifacts
 | Convert bench (fresh dst) | `_bench(fresh_dst=true)` | re-import churn recorded (expected misses == iters) |
 | CPU-usage sweep | `_usage_sweep` | per-`CpuAccess` map/render medians — the device's layout signature (reported) |
 | Write-combined mapping | `_wc_mapping_bench` | Write vs ReadWrite rewrite medians (reported) |
-| Hardware-only map contract | `_map_on_none` | deterministic refusal + unplanned-access counter increments |
+| Hardware-only map contract | `_map_on_none` | deterministic `CpuAccessDenied` refusal |
 | getId interning | `_getid_interning` | re-wrap window misses == 0 on API 31+; honest growth pre-31 |
 | Compressed render | `_compressed_render` | `Compression::Any` destination renders and samples back to pixel parity; scheme recorded |
 | QNN UBWC end-to-end | *(planned)* | UBWC-tagged context binary consumes a `Scheme(Ubwc)` destination (needs QAIRT SDK integration) |

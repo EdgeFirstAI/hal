@@ -787,9 +787,7 @@ where
     // per-dtype scratch, and pass an InputView over the scratch.
     reject_padded_input(t, role, level)?;
     let n = h * w * c;
-    let map_fail = |e: edgefirst_tensor::Error| {
-        DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
-    };
+    let map_fail = |e: edgefirst_tensor::Error| map_failure(e, role, level);
     macro_rules! nchw {
         ($ty:ty, $ensure:ident, $variant:ident) => {{
             let tensor = t.as_typed::<$ty>().expect("dtype checked");
@@ -836,6 +834,13 @@ fn reject_padded_input(t: &TensorDyn, role: &'static str, level: usize) -> Decod
     }
 }
 
+/// The error for a failed input map of `role` at `level`.
+fn map_failure(e: edgefirst_tensor::Error, role: &str, level: usize) -> DecoderError {
+    DecoderError::from_map(e, |e| {
+        DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
+    })
+}
+
 /// Map a `TensorDyn`'s underlying slice read-only and call the closure with
 /// an `InputView`. The map is dropped when the closure returns.
 fn with_mapped_input<F>(t: &TensorDyn, role: &'static str, level: usize, f: F) -> DecoderResult<()>
@@ -846,9 +851,7 @@ where
     macro_rules! mapped {
         ($ty:ty, $variant:ident) => {{
             let tensor = t.as_typed::<$ty>().expect("dtype checked");
-            let m = tensor.map_read().map_err(|e| {
-                DecoderError::Internal(format!("tensor map failed for {role} (level {level}): {e}"))
-            })?;
+            let m = tensor.map_read().map_err(|e| map_failure(e, role, level))?;
             f(InputView::$variant(m.as_slice()))
         }};
     }

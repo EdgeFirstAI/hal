@@ -5,16 +5,12 @@
 //! mapped read-only, and a padded row pitch is honoured rather than read as
 //! data.
 //!
-//! The static tensor backend tolerates a read-write map of a buffer declared
-//! `CpuAccess::Read` but counts it in `unplanned_cpu_access_count()`; this
-//! file runs as its own process, so the counter moves only when a test here
-//! maps beyond a declaration. Only the read-only test fills a `Read` tensor,
-//! and it snapshots the counter after doing so.
+//! A map outside a tensor's declared `CpuAccess` is refused, so decoding a
+//! `CpuAccess::Read` input at all proves it is never mapped for writing.
 
 use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, DetectBox, Nms};
 use edgefirst_tensor::{
-    unplanned_cpu_access_count, CpuAccess, PixelFormat, Region, Tensor, TensorDyn, TensorMapTrait,
-    TensorMemory, TensorTrait,
+    CpuAccess, PixelFormat, Region, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
 
 const NC: usize = 2;
@@ -75,32 +71,63 @@ fn assert_same_boxes(got: &[DetectBox], want: &[DetectBox]) {
 
 #[test]
 fn read_only_declared_input_decodes_without_a_write_map() {
-    let t = Tensor::<u8>::image(
+    let mut t = Tensor::<u8>::image(
         N,
         FEAT,
         PixelFormat::Grey,
         Some(TensorMemory::Mem),
-        CpuAccess::Read,
+        CpuAccess::ReadWrite,
     )
-    .expect("Read-declared Grey image");
-    {
-        let mut m = t.map_write().expect("fill map");
-        m.as_mut_slice()[..FEAT * N].copy_from_slice(&features());
-    }
-    let mut t = t;
+    .expect("Grey image");
+    t.map()
+        .expect("fill map")
+        .as_mut_slice()
+        .copy_from_slice(&features());
+    t.restrict_cpu_access(CpuAccess::Read);
+    assert!(
+        t.map_write().is_err(),
+        "a Read-declared tensor refuses a write map"
+    );
     t.reshape(&[1, FEAT, N])
         .expect("reshape to detection layout");
     assert_eq!(t.cpu_access(), CpuAccess::Read);
     let input: TensorDyn = t.into();
 
-    let before = unplanned_cpu_access_count();
     let boxes = decode(detection_config(vec![1, FEAT, N], vec![]), &input);
-    assert_eq!(
-        unplanned_cpu_access_count(),
-        before,
-        "decoding a CpuAccess::Read input must not map it for writing"
-    );
     assert_same_boxes(&boxes, &packed_reference());
+}
+
+#[test]
+fn detection_decode_refusal_is_typed() {
+    let mut t = Tensor::<u8>::image(
+        N,
+        FEAT,
+        PixelFormat::Grey,
+        Some(TensorMemory::Mem),
+        CpuAccess::Write,
+    )
+    .expect("Write-declared Grey image");
+    t.reshape(&[1, FEAT, N])
+        .expect("reshape to detection layout");
+    let input: TensorDyn = t.into();
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.5)
+        .add_output(detection_config(vec![1, FEAT, N], vec![]))
+        .build()
+        .expect("detection decoder builds");
+    let err = decoder
+        .decode(&[&input], &mut Vec::new(), &mut Vec::new())
+        .expect_err("a Write-declared input cannot be read on the CPU");
+    assert!(
+        matches!(
+            err.cpu_access_denied(),
+            Some(edgefirst_tensor::Error::CpuAccessDenied {
+                declared: CpuAccess::Write,
+                requested: CpuAccess::Read,
+            })
+        ),
+        "unexpected error {err:?}"
+    );
 }
 
 #[test]

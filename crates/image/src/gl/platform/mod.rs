@@ -78,6 +78,9 @@ pub(crate) struct PlatformCaps {
     /// fenced entry points silently take the blocking path and return
     /// no fd.
     pub(crate) native_fence_sync: bool,
+    /// Whether `GL_EXT_texture_format_BGRA8888` is available, so BGRA is a
+    /// renderable destination format.
+    pub(crate) has_bgra: bool,
 }
 
 /// Platform-neutral identity of a "packed" render surface: the float

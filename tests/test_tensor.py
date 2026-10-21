@@ -926,6 +926,59 @@ def test_map_rejects_access_none_and_garbage():
         t.map("readwrit")
 
 
+def test_image_access_defaults_to_readwrite():
+    """With no ``access`` the image is CPU readable and writable."""
+    t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM)
+    with t.map("read"):
+        pass
+    with t.map("write"):
+        pass
+    with t.map("readwrite"):
+        pass
+
+
+@pytest.mark.parametrize(
+    "declared,requested",
+    [
+        ("write", "read"),
+        ("none", "read"),
+        ("read", "write"),
+        ("none", "write"),
+        ("read", "readwrite"),
+        ("write", "readwrite"),
+    ],
+)
+def test_map_outside_the_declaration_raises(declared, requested):
+    """Reads and writes are refused alike, naming both accesses."""
+    t = Tensor.image(
+        8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access=declared
+    )
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        t.map(requested)
+
+
+@pytest.mark.parametrize("declared", ["none", "read", "write", "readwrite"])
+def test_declared_cpu_access_reports_the_declaration(declared):
+    t = Tensor.image(
+        8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access=declared
+    )
+    assert t.declared_cpu_access == declared
+    assert Tensor([4], dtype="uint8").declared_cpu_access == "readwrite"
+
+
+def test_from_numpy_only_needs_a_declared_write():
+    """from_numpy is a pure fill: a write-only tensor accepts it, a
+    read-only one refuses it."""
+    data = np.arange(96, dtype=np.uint8).reshape(4, 8, 3)
+    t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="write")
+    t.from_numpy(data)
+    read_only = Tensor.image(
+        8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="read"
+    )
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        read_only.from_numpy(data)
+
+
 # ---------------------------------------------------------------------------
 # The read-only contract, on every door that reaches the buffer.
 #

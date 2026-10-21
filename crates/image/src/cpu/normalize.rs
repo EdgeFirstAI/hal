@@ -259,7 +259,7 @@ pub(super) fn write_mapped(tmp: &Tensor<u8>, dst: &mut TensorDyn, map: &OutputMa
     let dst_stride = dst_stride_bytes / elem;
     match dtype {
         DType::F32 => {
-            let mut m = dst.as_typed_mut::<f32>().unwrap().map_mut()?;
+            let mut m = dst.as_typed_mut::<f32>().unwrap().map_for_write()?;
             guard_plane(m.as_slice().len(), dst_stride, rows, row_len, "map f32 dst")?;
             for (r, (s, d)) in src_rows
                 .zip(m.as_mut_slice().chunks_mut(dst_stride))
@@ -269,7 +269,7 @@ pub(super) fn write_mapped(tmp: &Tensor<u8>, dst: &mut TensorDyn, map: &OutputMa
             }
         }
         DType::F16 => {
-            let mut m = dst.as_typed_mut::<half::f16>().unwrap().map_mut()?;
+            let mut m = dst.as_typed_mut::<half::f16>().unwrap().map_for_write()?;
             guard_plane(m.as_slice().len(), dst_stride, rows, row_len, "map f16 dst")?;
             let mut scratch = Vec::with_capacity(row_len);
             for (r, (s, d)) in src_rows
@@ -302,13 +302,13 @@ pub(super) fn write_mapped(tmp: &Tensor<u8>, dst: &mut TensorDyn, map: &OutputMa
 /// The bytes of a u8 or i8 destination.
 fn int_map(dst: &mut TensorDyn) -> Result<edgefirst_tensor::HostView<'static, u8>> {
     match dst.dtype() {
-        DType::U8 => Ok(dst.as_typed_mut::<u8>().unwrap().map_mut()?),
+        DType::U8 => Ok(dst.as_typed_mut::<u8>().unwrap().map_for_write()?),
         DType::I8 => {
             let t = dst.as_typed_mut::<i8>().unwrap();
             // SAFETY: Tensor<i8> and Tensor<u8> are layout-identical (same
             // element size, no T-dependent drop glue).
             let t = unsafe { &mut *(t as *mut Tensor<i8> as *mut Tensor<u8>) };
-            Ok(t.map_mut()?)
+            Ok(t.map_for_write()?)
         }
         other => Err(Error::Internal(format!("int_map on {other}"))),
     }
@@ -375,12 +375,12 @@ pub(super) fn fill_outside(dst: &mut TensorDyn, rect: Rect, values: [f32; 4]) ->
     }
     match dtype {
         DType::F32 => {
-            let mut m = dst.as_typed_mut::<f32>().unwrap().map_mut()?;
+            let mut m = dst.as_typed_mut::<f32>().unwrap().map_for_write()?;
             guard_plane(m.as_slice().len(), dst_stride, rows, row_len, "pad f32")?;
             fill(m.as_mut_slice(), dst_stride, rows, lanes, spans, row_values);
         }
         DType::F16 => {
-            let mut m = dst.as_typed_mut::<half::f16>().unwrap().map_mut()?;
+            let mut m = dst.as_typed_mut::<half::f16>().unwrap().map_for_write()?;
             guard_plane(m.as_slice().len(), dst_stride, rows, row_len, "pad f16")?;
             fill(m.as_mut_slice(), dst_stride, rows, lanes, spans, |r| {
                 row_values(r).map(half::f16::from_f32)

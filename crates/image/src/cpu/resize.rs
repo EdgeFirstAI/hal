@@ -198,8 +198,10 @@ impl CPUProcessor {
         let destrided = actual_src_stride != tight_stride;
         if destrided {
             let need = src_h * tight_stride;
-            self.resize_destride_scratch.clear();
-            self.resize_destride_scratch.resize(need, 0u8);
+            // Only grown: the row copies below overwrite all of `[..need]`.
+            if self.resize_destride_scratch.len() < need {
+                self.resize_destride_scratch.resize(need, 0u8);
+            }
             let src_slice = src_map.as_slice();
             for row in 0..src_h {
                 let src_row =
@@ -213,7 +215,7 @@ impl CPUProcessor {
         } else {
             src_map.as_slice()
         };
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_for_write()?;
 
         // FIXME: fast_image_resize does not clamp its filter kernel at crop
         // boundaries — bilinear/bicubic taps can sample 1-2 pixels beyond the

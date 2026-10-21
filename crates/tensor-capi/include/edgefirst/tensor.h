@@ -732,6 +732,11 @@ extern "C" {
  * *not* bump this: an existing consumer's header simply never names the new
  * symbol, so linking against an older `libedgefirst_tensor.so` still
  * resolves everything it actually calls.
+ *
+ * 2: a map, copy or sync outside a tensor's declared `ef_cpu_access` fails
+ * with `EACCES` (reads included), `ef_tensor_image_desc_new` defaults to
+ * `EF_CPU_ACCESS_READ_WRITE`, and `ef_unplanned_cpu_access_count` is
+ * removed.
  */
 uint32_t ef_tensor_abi_version(void);
 
@@ -1343,7 +1348,7 @@ ef_tensor *ef_tensor_from_d3d11_shared_handle(void *handle,
  *
  * `format` is the wire descriptor (`"NV12"`, `"rgb8"`), matching every other
  * entry point rather than introducing a second vocabulary. `dtype` is the
- * shared code.
+ * shared code. CPU access defaults to `EF_CPU_ACCESS_READ_WRITE`.
  *
  * @return `NULL` for an unknown format or dtype, or zero dimensions.
  *
@@ -1608,6 +1613,35 @@ int64_t ef_tensor_row_stride(const ef_tensor *t);
  * `t` must be `NULL` or a live handle.
  */
 uint32_t ef_tensor_compression(const ef_tensor *t);
+
+/**
+ * The CPU access declared for this tensor, as an `ef_cpu_access` code: set
+ * at allocation, possibly narrowed by `ef_tensor_restrict_cpu_access`. A
+ * map, copy or sync bracket whose direction it does not cover fails with
+ * `EACCES`.
+ *
+ * Returns `EF_CPU_ACCESS_NONE` (0) for a `NULL`/invalid handle, which no
+ * CPU access can be made through either.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle.
+ */
+uint32_t ef_tensor_cpu_access(const ef_tensor *t);
+
+/**
+ * Narrow this tensor's declared CPU access to the directions both it and
+ * `access` (an `ef_cpu_access` code) cover, on the chroma plane too.
+ * Never widens: a code wider than the declaration leaves it unchanged and
+ * is not an error. The descriptor import calls this with the producer's
+ * `CPU_ACCESS_*` flag bits, so an alias refuses what its producer refuses.
+ *
+ * @return 0, or `EINVAL` for a `NULL`/invalid handle or an unknown code.
+ *
+ * # Safety
+ * `t` must be `NULL` or a live handle with no concurrent `tensor-capi`
+ * calls on it.
+ */
+int ef_tensor_restrict_cpu_access(ef_tensor *t, uint32_t access);
 
 /**
  * Whether this tensor's memory is known to be physically contiguous, as an
@@ -2062,13 +2096,11 @@ int ef_log_init_callback(EfLogCallback cb, void *userdata, uint32_t max_level);
  * @return 0 on success, `EINVAL` (null tensor/out, or bad access code),
  *         `EBUSY` (a map is already outstanding on this tensor, or a
  *         writable map was requested while the CPU-side handle count is
- *         greater than one -- see above), `EACCES` (a writable map was
- *         requested on a tensor whose declared CPU access is not writable
- *         -- enforced at this boundary; read-direction mismatches follow
- *         the Rust layer's warn-and-allow policy instead. Backend-level
- *         mapping refusals, e.g. AHardwareBuffer lock exclusivity, also
- *         surface as `EACCES`), or another errno translated from the
- *         backend's error.
+ *         greater than one -- see above), `EACCES` (the requested direction
+ *         is not covered by the tensor's declared CPU access -- reads and
+ *         writes alike; see `ef_tensor_cpu_access`. Backend-level mapping
+ *         refusals, e.g. AHardwareBuffer lock exclusivity, also surface as
+ *         `EACCES`), or another errno translated from the backend's error.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `out` must be writable for one
@@ -2138,9 +2170,11 @@ int ef_tensor_unmap(ef_tensor *t);
  * `EINVAL`, exactly as it is for `ef_tensor_map`.
  *
  * @return 0 on success, `EINVAL` (null tensor, or a bad/`NONE` access
- *         code), `ENOTSUP` (a backing with no coherency window independent
- *         of its map -- PBO, and AHardwareBuffer on Android), or another
- *         errno translated from the backend's error.
+ *         code), `EACCES` (the direction is not covered by the tensor's
+ *         declared CPU access; see `ef_tensor_cpu_access`), `ENOTSUP` (a
+ *         backing with no coherency window independent of its map -- PBO,
+ *         and AHardwareBuffer on Android), or another errno translated
+ *         from the backend's error.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -2175,9 +2209,10 @@ int ef_tensor_sync_for_device(const ef_tensor *t, uint32_t access);
  * `EACCES` or `EBUSY` depending on the backend), not a hardcoded one.
  *
  * @return bytes written (`>= 0`) on success, or a negative errno: `-EINVAL`
- *         (null tensor/out), `-ERANGE` (`cap` is smaller than the tensor's
- *         byte length), or another negative errno translated from the
- *         backend's error.
+ *         (null tensor/out), `-EACCES` (the tensor's declared CPU access
+ *         has no read direction), `-ERANGE` (`cap` is smaller than the
+ *         tensor's byte length), or another negative errno translated from
+ *         the backend's error.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `out` must be writable for `cap`
@@ -2598,11 +2633,6 @@ int ef_platform_compression_support(const char *format, uint32_t dtype);
  * `HAL_COMPRESSION_ANY` requests that fell back to a linear layout.
  */
 uint64_t ef_compression_fallback_count(void);
-
-/**
- * Maps that exceeded a buffer's declared CPU access.
- */
-uint64_t ef_unplanned_cpu_access_count(void);
 
 /**
  * Report whether a live handle carries quantization metadata, and how many

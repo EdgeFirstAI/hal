@@ -21,7 +21,7 @@ from edgefirst.image import (
 from edgefirst.tensor import ColorEncoding, Colorimetry, ColorRange, TensorMemory
 from PIL import Image
 
-from tests.dma_skip import skip_dma
+from tests.dma_skip import dma_unavailable, skip_dma
 from tests.gpu_policy import skip_unless_gpu_backed
 
 
@@ -631,6 +631,137 @@ def test_create_image():
     with img.map() as m:
         data = np.asarray(m.numpy())
         assert data.size == 320 * 240 * 4
+
+
+def _cpu_only_processor(monkeypatch):
+    monkeypatch.setenv("EDGEFIRST_DISABLE_GL", "1")
+    monkeypatch.setenv("EDGEFIRST_DISABLE_G2D", "1")
+    monkeypatch.delenv("EDGEFIRST_FORCE_BACKEND", raising=False)
+    monkeypatch.delenv("EDGEFIRST_DISABLE_CPU", raising=False)
+    return ImageProcessor()
+
+
+@pytest.mark.parametrize("access", ["read", "none", None])
+def test_cpu_convert_into_create_image(monkeypatch, access):
+    """The CPU backend fills a ``create_image`` destination whatever access
+    the caller requested: the processor adds the write it needs."""
+    converter = _cpu_only_processor(monkeypatch)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    decode_file_into(src, "testdata/zidane.jpg")
+    kwargs = {} if access is None else {"access": access}
+    dst = converter.create_image(320, 240, PixelFormat.Rgb, **kwargs)
+    converter.convert(src, dst)
+    if access == "none":
+        assert dst.declared_cpu_access == "write"
+        with pytest.raises(PermissionError, match="CPU access denied"):
+            dst.map("read")
+    else:
+        with dst.map("read") as m:
+            assert np.asarray(m.numpy()).any()
+
+
+def _dma_or_skip(cls, *args, **kwargs):
+    """``cls.image`` on DMA-BUF, skipping with a warning on hosts without a heap."""
+    try:
+        return cls.image(*args, mem=TensorMemory.DMABUF, **kwargs)
+    except Exception as exc:
+        if not dma_unavailable(exc):
+            raise
+        reason = f"no usable DMA heap: {exc}"
+        print(f"WARNING: SKIPPED: {reason}", file=sys.stderr)
+        skip_dma(reason)
+
+
+def test_gpu_declined_convert_raises_permission_error():
+    """A destination left without CPU access that the GPU declines (here for
+    its VYUY source) is refused as PermissionError, naming the decline."""
+    converter = ImageProcessor()
+    dst = converter.create_image(64, 48, PixelFormat.Rgba, access="none")
+    skip_unless_gpu_backed(dst)
+    if dst.declared_cpu_access != "none":
+        reason = f"{dst.memory} destinations always declare CPU access"
+        print(f"WARNING: SKIPPED: {reason}", file=sys.stderr)
+        pytest.skip(reason)
+    src = Tensor.image(64, 48, PixelFormat.Vyuy, mem=TensorMemory.MEM)
+    with pytest.raises(PermissionError, match="CPU access denied") as info:
+        converter.convert(src, dst)
+    assert "opengl" in str(info.value)
+
+
+def test_decode_image_method_on_read_dma_tensor_raises_permission_error():
+    """``Tensor.decode_image`` into a read-only tensor raises PermissionError,
+    on the DMA-BUF import path as on the host-pin path."""
+    from edgefirst.codec import Tensor as CodecTensor
+
+    with open("testdata/zidane.jpg", "rb") as fh:
+        data = fh.read()
+    w, h = _image_size("testdata/zidane.jpg")
+    host = CodecTensor.image(
+        w, h, PixelFormat.Nv12, mem=TensorMemory.MEM, access="read"
+    )
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        host.decode_image(data)
+    dma = _dma_or_skip(CodecTensor, w, h, PixelFormat.Nv12, access="read")
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        dma.decode_image(data)
+
+
+@pytest.mark.parametrize("mem", ["mem", "dma"])
+def test_imported_alias_keeps_declaration(monkeypatch, mem):
+    """A tensor from another EdgeFirst package keeps its declaration when this
+    package imports it, so its alias refuses what the producer refuses."""
+    from edgefirst.tensor import PixelFormat as CorePixelFormat
+    from edgefirst.tensor import Tensor as CoreTensor
+    from edgefirst.tensor import TensorMemory as CoreMemory
+
+    converter = _cpu_only_processor(monkeypatch)
+    src = Tensor.image(64, 48, PixelFormat.Rgba, mem=TensorMemory.MEM)
+    memory = CoreMemory.MEM if mem == "mem" else CoreMemory.DMABUF
+    try:
+        dst = CoreTensor.image(64, 48, CorePixelFormat.Rgb, mem=memory, access="read")
+    except Exception as exc:
+        if mem != "dma" or not dma_unavailable(exc):
+            raise
+        reason = f"no usable DMA heap: {exc}"
+        print(f"WARNING: SKIPPED: {reason}", file=sys.stderr)
+        skip_dma(reason)
+    assert dst.declared_cpu_access == "read"
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        converter.convert(src, dst)
+    assert dst.declared_cpu_access == "read"
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_normalize_to_numpy_reads_a_read_only_tensor(dtype):
+    """normalize_to_numpy only reads its tensor, so a read-only declaration
+    covers it."""
+    src = Tensor.image(8, 4, PixelFormat.Rgb, mem=TensorMemory.MEM, access="read")
+    out = np.full((4, 8, 3), 7, dtype=dtype)
+    src.normalize_to_numpy(out)
+    assert (out != 7).all()
+
+
+def test_writes_into_a_tensor_declared_without_write_raise(monkeypatch):
+    """A caller tensor declared without writes is refused by the CPU convert
+    and the codec, naming the access instead of an errno."""
+    converter = _cpu_only_processor(monkeypatch)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    decode_file_into(src, "testdata/zidane.jpg")
+    dst = Tensor.image(320, 240, PixelFormat.Rgb, mem=TensorMemory.MEM, access="read")
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        converter.convert(src, dst)
+
+    with open("testdata/zidane.jpg", "rb") as fh:
+        data = fh.read()
+    target = Tensor.image(w, h, PixelFormat.Nv12, mem=TensorMemory.MEM, access="read")
+    with pytest.raises(PermissionError, match="CPU access denied"):
+        decode_into(target, data)
+    write_only = Tensor.image(
+        w, h, PixelFormat.Nv12, mem=TensorMemory.MEM, access="write"
+    )
+    decode_into(write_only, data)
 
 
 def test_create_image_formats():

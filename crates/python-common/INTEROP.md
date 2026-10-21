@@ -246,6 +246,12 @@ are valid in the producing process, other modules of the same process included,
 and the import duplicates whatever it keeps, exactly as the `DMABUF` kind does
 with its fd.
 
+### CPU access flags
+
+A producer reports its tensor's declared `CpuAccess` in three `flags` bits: `CPU_ACCESS_DECLARED` (bit 1) says the report is present, `CPU_READ` (bit 2) and `CPU_WRITE` (bit 3) carry the directions. `import_descriptor` narrows the imported alias to that declaration with `restrict_cpu_access`, so a CPU map the producer's tensor would refuse is refused on the alias too, and `Tensor.declared_cpu_access` on the alias reports it. A consumer that must pin a host descriptor for writing reads the bits first and asks for `access="write"` rather than `"readwrite"` when the producer declared no reads; a pin outside the producer's declaration raises `PermissionError`. A descriptor without `CPU_ACCESS_DECLARED`, from an older or third-party producer, imports with the default `ReadWrite` declaration.
+
+The narrowing is the consumer's to apply. An older consumer, one that predates these bits or does not read them, imports the alias as `ReadWrite` and so cannot enforce a newer producer's declaration: a CPU map through that alias succeeds where the producer's own tensor would refuse it. A producer that relies on its declaration being honoured (a `None` buffer nothing may touch on the CPU, a `Write` buffer nothing may read) needs consumers that read the bits.
+
 One consequence worth stating: an `access="read"` capsule over a texture tensor
 still pins host memory, but no consumer can reach the pixels through that
 address, because the pixels live in the texture. The pin is a keepalive and

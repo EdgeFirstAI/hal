@@ -36,11 +36,12 @@ int main(void) {
     fprintf(stderr, "set_memory(Mem) unexpectedly failed\n");
     failures++;
   }
-  // Access stays at its default, `None`: `ImageDesc` itself makes a
-  // compression request invalid once CPU access is declared, so ReadWrite +
-  // Any is a genuinely invalid combination, not something this crossing
-  // should paper over. `access` is exercised on its own in
-  // `test_cross_library.c`'s `create_image` call.
+  // A compression request requires hardware-only access; the default is
+  // ReadWrite, so `None` is declared explicitly.
+  if (ef_tensor_image_desc_set_access(d, EF_CPU_ACCESS_NONE) != 0) {
+    fprintf(stderr, "set_access(None) unexpectedly failed\n");
+    failures++;
+  }
   if (ef_tensor_image_desc_set_compression(d, /* Any */ 1) != 0) {
     fprintf(stderr, "set_compression(Any) unexpectedly failed\n");
     failures++;

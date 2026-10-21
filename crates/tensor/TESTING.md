@@ -27,9 +27,8 @@ Per-backend unit tests live in the source files alongside the implementation. `t
 | File | Covers |
 |---|---|
 | `protocol.rs`, `protocol_roundtrip.rs` | Descriptor export/import, including a Shm fd relabelled as `kind::DMABUF` so the import path runs without a heap |
-| `pin.rs`, `identity.rs`, `map_access.rs`, `logical_shape.rs` | Host pins, `BufferIdentity`, CPU-access declarations, logical-shape narrowing |
+| `pin.rs`, `identity.rs`, `map_access.rs`, `logical_shape.rs` | Host pins, `BufferIdentity`, CPU-access declarations and their enforcement (both backends), logical-shape narrowing |
 | `image_geometry.rs` | Formatted `[N, H, W, C]` geometry: `width()`/`height()` describe one element, `batch()` pitch |
-| `unplanned_access.rs` | `unplanned_cpu_access_count()`, in its own binary because the counter is process-global |
 | `scenarios.rs` | Raw-handle aliasing scenarios for `TensorDyn`, run under Miri by `scripts/miri.sh` |
 | `vocabulary.rs` | `ef_vocabulary!` and the `DType`/`PixelFormat`/`TensorMemory` codes it pins |
 | `no_global_state.rs` | The crate carries no process-wide state that affects behaviour |
@@ -114,7 +113,8 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
   TESTING.md § Android On-Device Validation).
 - **CpuAccess map-contract tests** are host-portable: the declared-vs-
   requested map-mode table, the `writable` assert on read-only maps, and
-  the `unplanned_cpu_access_count()` warn-once telemetry.
+  the `CpuAccessDenied` refusal of maps, pins and syncs outside the
+  declaration.
 - **No LFS testdata.** All shapes and inputs are synthesized in-test.
   `tensor_benchmark` does not use `edgefirst_bench::testdata`; it
   generates its inputs in memory.

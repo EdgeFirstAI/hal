@@ -41,6 +41,15 @@ pub enum Error {
     /// coefficients, quantization).
     InvalidOptions(String),
     ForcedBackendUnavailable(String),
+    /// A GPU backend declined a convert and the CPU fallback was refused
+    /// because a tensor's declared CPU access does not cover it.
+    CpuFallbackDenied {
+        /// Why each GPU backend declined, as `backend: reason` entries.
+        declined: String,
+        /// The CPU backend's refusal, an
+        /// [`edgefirst_tensor::Error::CpuAccessDenied`].
+        denied: edgefirst_tensor::Error,
+    },
     NoConverter,
     NotAnImage,
     UnsupportedFormat(String),
@@ -152,9 +161,32 @@ impl From<fast_image_resize::CropBoxError> for Error {
     }
 }
 
+impl Error {
+    /// The [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied)
+    /// refusal this error carries, if any: directly, inside a
+    /// [`CpuFallbackDenied`](Error::CpuFallbackDenied), or from a codec.
+    pub fn cpu_access_denied(&self) -> Option<&edgefirst_tensor::Error> {
+        match self {
+            Error::Tensor(e) => e.cpu_access_denied(),
+            Error::CpuFallbackDenied { denied, .. } => Some(denied),
+            #[cfg(feature = "codec")]
+            Error::Codec(e) => e.cpu_access_denied(),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Error::Tensor(e) => write!(f, "Tensor({e})"),
+            Error::CpuFallbackDenied { declined, denied } => write!(
+                f,
+                "the GPU path declined this convert ({declined}) and the CPU fallback \
+                 was refused: {denied}"
+            ),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 
