@@ -196,5 +196,6 @@ def test_decode_semantic_into_a_destination_declared_without_write(access):
     decoder = ef.Decoder.new_from_json_str(json.dumps(SCHEMA))
     dst = ef.Tensor.image(4, 4, ef.PixelFormat.Grey, access=access)
     dst.reshape([4, 4])
+    outputs = [tensor(stripes())]
     with pytest.raises(PermissionError, match="CPU access denied"):
-        decoder.decode_semantic([tensor(stripes())], dst)
+        decoder.decode_semantic(outputs, dst)

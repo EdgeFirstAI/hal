@@ -2538,6 +2538,85 @@ impl ImageProcessor {
         self.create_image_with(width, height, format, dtype, memory, access, false)
     }
 
+    /// A DMA image for [`create_image_with`](Self::create_image_with), its
+    /// packed rows padded to the GPU pitch alignment when that exceeds the
+    /// natural pitch.
+    ///
+    /// Semi-planar and planar formats keep their natural layout: they are
+    /// imported from camera capture via `from_fd` far more often than
+    /// allocated here, and `Tensor::image_with_stride` rejects them.
+    #[cfg(target_os = "linux")]
+    fn create_dma_image(
+        &self,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        access: edgefirst_tensor::CpuAccess,
+        views: bool,
+    ) -> Result<TensorDyn> {
+        let dma_access = self.producer_access(access, format, dtype, TensorMemory::DmaBuf, views);
+        let natural =
+            primary_plane_bpp(format, dtype.size()).and_then(|bpp| width.checked_mul(bpp));
+        let padded = natural
+            .and_then(align_pitch_bytes_to_gpu_alignment)
+            .filter(|&stride| {
+                format.layout() == edgefirst_tensor::PixelLayout::Packed
+                    && natural.is_some_and(|n| stride > n)
+            });
+        let memory = Some(edgefirst_tensor::TensorMemory::DmaBuf);
+        match padded {
+            Some(stride) => {
+                log::debug!(
+                    "create_image: padding row stride for {format:?} {width}x{height} \
+                     from natural pitch to {stride} bytes for GPU alignment"
+                );
+                Ok(TensorDyn::image_with_stride(
+                    width, height, format, dtype, stride, memory, dma_access,
+                )?)
+            }
+            None => Ok(TensorDyn::image(
+                width, height, format, dtype, memory, dma_access,
+            )?),
+        }
+    }
+
+    /// A u8/i8 PBO image for [`create_image_with`](Self::create_image_with),
+    /// or `None` when the dtype is wider or there is no PBO to be had. A PBO
+    /// stays `ReadWrite`: the GL readback maps it itself.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(feature = "opengl")]
+    fn create_byte_pbo_image(
+        &self,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+    ) -> Option<TensorDyn> {
+        if dtype.size() != 1 {
+            return None;
+        }
+        let gl = self.opengl.as_ref()?;
+        let t = gl
+            .create_pbo_image(width, height, format)
+            .map_err(|e| log::debug!("PBO image creation failed, falling back to Mem: {e:?}"))
+            .ok()?;
+        if dtype != DType::I8 {
+            return Some(TensorDyn::from(t));
+        }
+        // The int8 shader emulates i8 output via XOR 0x80 on the same u8 buffer.
+        // Invariant: PBO tensors never have chroma (create_pbo_image → Tensor::wrap sets it None).
+        debug_assert!(
+            t.chroma().is_none(),
+            "PBO i8 transmute requires chroma == None"
+        );
+        // SAFETY: Tensor<u8> and Tensor<i8> are layout-identical (same element
+        // size, no T-dependent drop glue); same rationale as
+        // gl::processor::tensor_i8_as_u8_mut.
+        let t_i8: Tensor<i8> = unsafe { std::mem::transmute(t) };
+        Some(TensorDyn::from(t_i8))
+    }
+
     /// [`create_image`](Self::create_image), for a destination written
     /// through views when `views` is set (see `producer_access`).
     #[allow(clippy::too_many_arguments)]
@@ -2551,67 +2630,8 @@ impl ImageProcessor {
         access: edgefirst_tensor::CpuAccess,
         views: bool,
     ) -> Result<TensorDyn> {
-        // Compute the GPU-aligned row stride in bytes for this image.
-        // `None` means either the format has no defined primary-plane bpp
-        // (unknown future layout) or the stride calculation would overflow
-        // — in both cases we fall back to the natural layout via the plain
-        // `TensorDyn::image` constructor, and the slow-path warning inside
-        // `draw_*_masks` will fire if the subsequent GL import fails.
-        //
-        // DMA allocation is Linux-only (see `TensorMemory::DmaBuf` cfg gate),
-        // so both the stride computation and the helper closure are gated
-        // accordingly — the callers below are already Linux-only.
         #[cfg(target_os = "linux")]
-        let dma_stride_bytes: Option<usize> = primary_plane_bpp(format, dtype.size())
-            .and_then(|bpp| width.checked_mul(bpp))
-            .and_then(align_pitch_bytes_to_gpu_alignment);
-
-        // Helper: allocate a DMA image, using the padded-stride constructor
-        // when the computed stride exceeds the natural pitch, otherwise the
-        // plain constructor (byte-identical result in the common case).
-        #[cfg(target_os = "linux")]
-        let try_dma = || -> Result<TensorDyn> {
-            let dma_access =
-                self.producer_access(access, format, dtype, TensorMemory::DmaBuf, views);
-            // Stride padding is only meaningful for packed pixel layouts
-            // (RGBA8, BGRA8, RGB888, Grey) — the formats the GL backend
-            // renders into. Semi-planar (NV12, NV16) and planar (PlanarRgb,
-            // PlanarRgba) tensors go through `TensorDyn::image(...)` with
-            // their natural layout; they're imported from camera capture
-            // via `from_fd` far more often than allocated here, and
-            // `Tensor::image_with_stride` explicitly rejects them.
-            let packed = format.layout() == edgefirst_tensor::PixelLayout::Packed;
-            match dma_stride_bytes {
-                Some(stride)
-                    if packed
-                        && primary_plane_bpp(format, dtype.size())
-                            .and_then(|bpp| width.checked_mul(bpp))
-                            .is_some_and(|natural| stride > natural) =>
-                {
-                    log::debug!(
-                        "create_image: padding row stride for {format:?} {width}x{height} \
-                         from natural pitch to {stride} bytes for GPU alignment"
-                    );
-                    Ok(TensorDyn::image_with_stride(
-                        width,
-                        height,
-                        format,
-                        dtype,
-                        stride,
-                        Some(edgefirst_tensor::TensorMemory::DmaBuf),
-                        dma_access,
-                    )?)
-                }
-                _ => Ok(TensorDyn::image(
-                    width,
-                    height,
-                    format,
-                    dtype,
-                    Some(edgefirst_tensor::TensorMemory::DmaBuf),
-                    dma_access,
-                )?),
-            }
-        };
+        let try_dma = || self.create_dma_image(width, height, format, dtype, access, views);
 
         // If an explicit memory type is requested, honour it directly.
         // On Linux, `TensorMemory::DmaBuf` gets the padded-stride treatment;
@@ -2709,35 +2729,10 @@ impl ImageProcessor {
             }
         }
 
-        // Try PBO (if GL available). A PBO stays ReadWrite: the GL readback maps it itself.
-        // PBO buffers are u8-sized; the int8 shader emulates i8 output via
-        // XOR 0x80 on the same underlying buffer, so both U8 and I8 work.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         #[cfg(feature = "opengl")]
-        if dtype.size() == 1 {
-            if let Some(gl) = &self.opengl {
-                match gl.create_pbo_image(width, height, format) {
-                    Ok(t) => {
-                        if dtype == DType::I8 {
-                            // SAFETY: Tensor<u8> and Tensor<i8> are layout-
-                            // identical (same element size, no T-dependent
-                            // drop glue). The int8 shader applies XOR 0x80
-                            // on the same PBO buffer. Same rationale as
-                            // gl::processor::tensor_i8_as_u8_mut.
-                            // Invariant: PBO tensors never have chroma
-                            // (create_pbo_image → Tensor::wrap sets it None).
-                            debug_assert!(
-                                t.chroma().is_none(),
-                                "PBO i8 transmute requires chroma == None"
-                            );
-                            let t_i8: Tensor<i8> = unsafe { std::mem::transmute(t) };
-                            return Ok(TensorDyn::from(t_i8));
-                        }
-                        return Ok(TensorDyn::from(t));
-                    }
-                    Err(e) => log::debug!("PBO image creation failed, falling back to Mem: {e:?}"),
-                }
-            }
+        if let Some(img) = self.create_byte_pbo_image(width, height, format, dtype) {
+            return Ok(img);
         }
 
         // Try float PBO when the GPU backend reports support for this dtype.
