@@ -1202,9 +1202,8 @@ impl TensorDyn {
                 // SAFETY: the caller guarantees the producer's keepalive
                 // outlives the returned tensor -- the capsule contract
                 // `import_descriptor` documents -- so both handles are the
-                // producer's own and live for this call. `ReadWrite` is the
-                // widest access an import can ask for; the descriptor
-                // carries no access of its own.
+                // producer's own and live for this call. The producer's
+                // declaration picks the staging path; none declared is `ReadWrite`.
                 unsafe {
                     let (format, width, height) =
                         crate::protocol::descriptor_d3d11_geometry(desc, tex, shape)?;
@@ -1214,7 +1213,8 @@ impl TensorDyn {
                         height,
                         format,
                         dtype,
-                        crate::CpuAccess::ReadWrite,
+                        crate::protocol::flags::cpu_access(desc.flags)
+                            .unwrap_or(crate::CpuAccess::ReadWrite),
                         completion,
                         None,
                     )
