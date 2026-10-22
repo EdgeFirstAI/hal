@@ -195,7 +195,9 @@ use crate::per_scale::outputs::{
     DecodedOutputBuffers, DecodedOutputsRef, ProtoStorage, ProtosView,
 };
 use crate::per_scale::plan::Layout;
-use crate::per_scale::prefilter::{gather_rows, raw_score_floor, select_anchors, LevelScratch};
+use crate::per_scale::prefilter::{
+    gather_rows, raw_score_floor, select_anchors, LevelScratch, PACK_ANCHORS,
+};
 use edgefirst_tensor::{CpuAccess, TensorMapTrait, TensorTrait};
 
 /// Run the per-scale decode pipeline for one frame's inputs. Writes
@@ -372,8 +374,9 @@ fn run_box_kernel(
 /// reach `threshold`, gather their rows, and decode only those, packing
 /// each level's survivors after the previous level's in the output
 /// buffers. Returns the number of anchors kept, or `None` (with the
-/// buffers untouched) when the threshold cannot be mapped onto every
-/// level's raw scores and the caller must decode densely.
+/// outputs untouched) when the threshold cannot be mapped onto every
+/// level's raw scores, or a level's anchors are not a whole number of
+/// [`PACK_ANCHORS`] groups, and the caller must decode densely.
 ///
 /// Runs on the calling thread: the kept set is a few percent of the
 /// anchors, too little work to repay a rayon scope.
@@ -383,16 +386,33 @@ fn run_levels_prefiltered(
     buffers: &mut DecodedOutputBuffers,
     threshold: f32,
 ) -> DecoderResult<Option<usize>> {
+    if plan
+        .levels
+        .iter()
+        .any(|l| !(l.h * l.w).is_multiple_of(PACK_ANCHORS))
+    {
+        return Ok(None);
+    }
+    if buffers.prefilter.len() != plan.levels.len() {
+        buffers.prefilter = plan.levels.iter().map(LevelScratch::for_level).collect();
+    }
     let mut floors = Vec::with_capacity(bind.levels.len());
     for (li, lvl_bind) in bind.levels.iter().enumerate() {
-        if !matches!(
-            lvl_bind.scores.dtype(),
-            DType::I8 | DType::U8 | DType::I16 | DType::U16
-        ) {
+        let dtype = lvl_bind.scores.dtype();
+        if !matches!(dtype, DType::I8 | DType::U8 | DType::I16 | DType::U16) {
             return Ok(None);
         }
         let q = quant_from_tensor(lvl_bind.scores, "scores", li)?;
-        match raw_score_floor(threshold, q, plan.score_activation) {
+        let floor = raw_score_floor(
+            &mut buffers.prefilter[li],
+            &plan.score_dispatch,
+            dtype,
+            plan.out_dtype,
+            q,
+            plan.score_activation,
+            threshold,
+        )?;
+        match floor {
             Some(floor) => floors.push((q, floor)),
             None => return Ok(None),
         }
@@ -420,9 +440,6 @@ fn run_levels_prefiltered(
         prefilter,
         ..
     } = buffers;
-    if prefilter.len() != plan.levels.len() {
-        *prefilter = plan.levels.iter().map(LevelScratch::for_level).collect();
-    }
 
     let nc = plan.num_classes;
     let nm = plan.num_mask_coefs;

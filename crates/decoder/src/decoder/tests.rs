@@ -5076,7 +5076,174 @@ mod per_scale_prefilter_tests {
         }
     }
 
-    /// Thresholds the prefilter cannot bound fall back to the dense decode.
+    /// Raw u16 scores packed into the boundary windows `windows`, a few
+    /// percent of elements each, and the lowest raw value elsewhere.
+    fn boundary_u16(len: usize, seed: u32, windows: &[(u16, u16)]) -> Vec<u16> {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let r = x >> 8;
+                if !r.is_multiple_of(29) {
+                    return 0;
+                }
+                let (lo, hi) = windows[(r as usize >> 5) % windows.len()];
+                lo + ((r >> 12) % u32::from(hi - lo + 1)) as u16
+            })
+            .collect()
+    }
+
+    /// The schema with every per-scale child resized for a square input of
+    /// `size` pixels.
+    fn with_input_size(json: &str, size: usize) -> serde_json::Value {
+        let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["input"]["shape"][1] = size.into();
+        v["input"]["shape"][2] = size.into();
+        v["input"]["dshape"][1]["height"] = size.into();
+        v["input"]["dshape"][2]["width"] = size.into();
+        for logical in v["outputs"].as_array_mut().unwrap() {
+            let Some(children) = logical
+                .get_mut("outputs")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            let mut anchors = 0;
+            for child in children {
+                let Some(stride) = child["stride"].as_u64() else {
+                    continue;
+                };
+                let n = size / stride as usize;
+                child["shape"][1] = n.into();
+                child["shape"][2] = n.into();
+                child["dshape"][1]["height"] = n.into();
+                child["dshape"][2]["width"] = n.into();
+                anchors += n * n;
+            }
+            if anchors > 0 {
+                logical["shape"][2] = anchors.into();
+                logical["dshape"][2]["num_boxes"] = anchors.into();
+            }
+        }
+        v
+    }
+
+    /// The schema with its score children re-declared as `dtype` with the
+    /// given quantization, with or without a sigmoid.
+    fn with_scores(
+        mut v: serde_json::Value,
+        dtype: &str,
+        scale: f32,
+        zp: i32,
+        sigmoid: bool,
+    ) -> SchemaV2 {
+        for logical in v["outputs"].as_array_mut().unwrap() {
+            if logical["type"] != "scores" {
+                continue;
+            }
+            for child in logical["outputs"].as_array_mut().unwrap() {
+                child["dtype"] = dtype.into();
+                child["quantization"] =
+                    serde_json::json!({"scale": scale, "zero_point": zp, "dtype": dtype});
+                if sigmoid {
+                    child["activation_required"] = "sigmoid".into();
+                } else {
+                    child.as_object_mut().unwrap().remove("activation_required");
+                }
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Scores whose kernel output rounds up across the threshold, through
+    /// F16 output or near the ends of the sigmoid, pass in the dense decode
+    /// and so must survive the prefilter too.
+    #[test]
+    fn prefilter_keeps_scores_rounded_up_to_the_threshold() {
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let unit = (1.0 / 65535.0, 0, false, vec![0.5004, 0.25, 0.9]);
+        let logits = (20.0 / 65535.0, 32768, true, vec![0.9995, 0.5004, 0.00003]);
+        for (scale, zp, sigmoid, thresholds) in [unit, logits] {
+            let windows: Vec<(u16, u16)> = thresholds
+                .iter()
+                .map(|&t: &f32| {
+                    let x = if sigmoid { (t / (1.0 - t)).ln() } else { t };
+                    let raw = (x / scale + zp as f32).round() as i32;
+                    ((raw - 64).max(0) as u16, (raw + 64).min(65535) as u16)
+                })
+                .collect();
+            let schema = with_scores(with_input_size(&json, 640), "uint16", scale, zp, sigmoid);
+            for dtype in [DecodeDtype::F32, DecodeDtype::F16] {
+                let plan = PerScalePlan::try_from_schema(&schema, dtype)
+                    .unwrap()
+                    .unwrap();
+                let mut owned = inputs_for(&plan);
+                let mut seed = 7;
+                for t in owned.iter_mut() {
+                    if let Some(lvl) = plan
+                        .levels
+                        .iter()
+                        .find(|l| l.score_shape.as_ref() == t.shape())
+                    {
+                        let mut u =
+                            Tensor::<u16>::new(&lvl.score_shape, Some(TensorMemory::Mem), None)
+                                .unwrap();
+                        u.map()
+                            .unwrap()
+                            .as_mut_slice()
+                            .copy_from_slice(&boundary_u16(u.len(), seed, &windows));
+                        u.set_quantization(TQ::per_tensor(scale, zp)).unwrap();
+                        *t = u.into();
+                        seed += 1;
+                    }
+                }
+                let inputs: Vec<&TensorDyn> = owned.iter().collect();
+                let mut decoder = PerScaleDecoder::new(plan);
+                for &threshold in &thresholds {
+                    for multi_label in [false, true] {
+                        let label =
+                            format!("sigmoid={sigmoid} {dtype:?} t={threshold} ml={multi_label}");
+                        let (_, dense, dense_mc) =
+                            decode(&mut decoder, &inputs, None, threshold, multi_label);
+                        let (_, filtered, filtered_mc) = decode(
+                            &mut decoder,
+                            &inputs,
+                            Some(threshold),
+                            threshold,
+                            multi_label,
+                        );
+                        assert!(!dense.is_empty(), "{label}: scene has no detections");
+                        assert_eq!(filtered, dense, "{label}");
+                        assert_eq!(filtered_mc, dense_mc, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A level whose anchor count is not a whole number of packing groups
+    /// decodes part of it in a scalar tail, so the plan is decoded densely.
+    #[test]
+    fn unaligned_level_decodes_every_anchor() {
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_value(with_input_size(&json, 416)).unwrap();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+            .unwrap()
+            .unwrap();
+        assert!(plan.levels.iter().any(|l| !(l.h * l.w).is_multiple_of(16)));
+        let total = plan.total_anchors;
+        let owned = inputs_for(&plan);
+        let inputs: Vec<&TensorDyn> = owned.iter().collect();
+        let mut decoder = PerScaleDecoder::new(plan);
+        let (_, dense, _) = decode(&mut decoder, &inputs, None, 0.25, false);
+        let (kept, filtered, _) = decode(&mut decoder, &inputs, Some(0.25), 0.25, false);
+        assert_eq!(kept, total);
+        assert_eq!(filtered, dense);
+    }
+
+    /// Thresholds that keep every anchor fall back to the dense decode.
     #[test]
     fn unboundable_threshold_decodes_every_anchor() {
         let json =
@@ -5089,7 +5256,7 @@ mod per_scale_prefilter_tests {
         let owned = inputs_for(&plan);
         let inputs: Vec<&TensorDyn> = owned.iter().collect();
         let mut decoder = PerScaleDecoder::new(plan);
-        for t in [0.0, 1.0] {
+        for t in [0.0, -1.0, f32::NAN] {
             let (kept, _, _) = decode(&mut decoder, &inputs, Some(t), t, false);
             assert_eq!(kept, total, "t={t}");
         }
