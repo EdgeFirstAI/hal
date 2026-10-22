@@ -152,11 +152,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-build-support"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "edgefirst-codec"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "edgefirst-tensor",
  "edgefirst-v4l2",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-codec-capi"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "cbindgen",
  "edgefirst-build-support",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "dma-heap",
  "edgefirst-tensor-abi",
@@ -207,11 +207,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "edgefirst-tensor-abi",
 ]

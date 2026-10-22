@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-10-21
+
 ### Added
 
 - **Python: `__tensor_backend__` on `edgefirst.tensor`, `.codec`, `.image` and `.decoder`.** Reports the edgefirst-tensor backend the extension was built against: `"dynamic"` for every wheel, which shares the `libedgefirst_tensor` that `edgefirst-tensor` bundles.

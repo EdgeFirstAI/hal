@@ -4,7 +4,7 @@
 [package]
 name = "edgefirst-codec-capi"
 description = "C API for EdgeFirst image decode and encode"
-version = "0.35.0"
+version = "0.36.0"
 edition = "2021"
 rust-version = "1.94.0"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]
@@ -32,13 +32,13 @@ tracing = ["edgefirst-tensor/tracing"]
 # rather than embedding a private tensor copy.
 [dependencies]
 # The decoders this library ships, spelled out rather than inherited from codec's defaults.
-edgefirst-codec = { version = "0.35.0", path = "../codec", default-features = false, features = [
+edgefirst-codec = { version = "0.36.0", path = "../codec", default-features = false, features = [
     "v4l2",
     "nvjpeg",
     "png",
 ] }
 # Built with `--cfg edgefirst_tensor_dynamic` (this crate's .cargo/config.toml): calls into libedgefirst_tensor.
-edgefirst-tensor = { version = "0.35.0", path = "../tensor", default-features = false }
+edgefirst-tensor = { version = "0.36.0", path = "../tensor", default-features = false }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
 edgefirst-tensor-ffi = { path = "../tensor-ffi" }
 errno = "0.3"
