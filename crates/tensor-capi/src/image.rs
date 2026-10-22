@@ -532,7 +532,7 @@ mod tests {
         ) {
             return;
         }
-        let fmt = u8_c("Rgba");
+        let fmt = u8_c("rgba8");
         // Natural pitch is 64*4=256; pad to 320.
         let t = unsafe { ef_tensor_image_with_stride_alloc(64, 64, fmt.as_ptr(), 0, 320, 1, 2, 3) };
         assert!(

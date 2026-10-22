@@ -201,11 +201,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-build-support"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "argminmax",
  "edgefirst-decoder-abi",
@@ -225,11 +225,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "edgefirst-decoder-capi"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "cbindgen",
  "edgefirst-build-support",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "dma-heap",
  "edgefirst-tensor-abi",
@@ -272,18 +272,18 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "edgefirst-tensor-abi",
 ]
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "edgefirst-tensor",
  "enum_dispatch",
