@@ -71,14 +71,20 @@ pub enum VideoCodec {
     H264,
 }
 
-/// Target bitrate of an encoder.
+/// Bits per pixel [`Bitrate::Auto`] targets: about 10 Mbps at 1080p30.
+const AUTO_BITS_PER_PIXEL: f64 = 0.16;
+/// Lowest and highest target [`Bitrate::Auto`] chooses, in bits per second.
+const AUTO_BITRATE_RANGE: (f64, f64) = (1e6, 1e8);
+
+/// Target bitrate of an encoder. Either way the encoder uses constant-bitrate
+/// rate control where the device offers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Bitrate {
-    /// The device's default bitrate and rate control.
+    /// A target chosen from the frame size and rate: 0.16 bits per pixel,
+    /// within 1 to 100 Mbps. See [`EncoderConfig::target_bitrate`].
     #[default]
     Auto,
-    /// A constant target in bits per second. Selects constant-bitrate rate
-    /// control where the device offers a choice.
+    /// A constant target in bits per second.
     Bps(u32),
 }
 
@@ -153,8 +159,8 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
-    /// An H.264 configuration with the device's default bitrate, GOP,
-    /// profile and level, and headers repeated on every key frame.
+    /// An H.264 configuration with an automatic bitrate, the device's default
+    /// GOP, profile and level, and headers repeated on every key frame.
     pub fn h264(width: u32, height: u32, input_format: PixelFormat, frame_rate: f64) -> Self {
         Self {
             codec: VideoCodec::H264,
@@ -167,6 +173,22 @@ impl EncoderConfig {
             repeat_headers: true,
             profile: None,
             level: None,
+        }
+    }
+
+    /// The target bitrate in bits per second: the [`Bitrate::Bps`] value, or
+    /// for [`Bitrate::Auto`] one derived from the frame size and rate.
+    pub fn target_bitrate(&self) -> u32 {
+        match self.bitrate {
+            Bitrate::Bps(bps) => bps,
+            Bitrate::Auto => {
+                let bps = f64::from(self.width)
+                    * f64::from(self.height)
+                    * self.frame_rate
+                    * AUTO_BITS_PER_PIXEL;
+                let (lo, hi) = AUTO_BITRATE_RANGE;
+                bps.clamp(lo, hi) as u32
+            }
         }
     }
 
@@ -667,6 +689,21 @@ mod tests {
         c.gop = Some(1);
         c.bitrate = Bitrate::Bps(4_000_000);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_bitrate_scales_with_size_and_rate_within_its_range() {
+        let mut c = nv12_1080p();
+        assert_eq!(c.target_bitrate(), 9_953_280);
+        c.frame_rate = 60.0;
+        assert_eq!(c.target_bitrate(), 19_906_560);
+        let c = EncoderConfig::h264(320, 240, PixelFormat::Nv12, 15.0);
+        assert_eq!(c.target_bitrate(), 1_000_000);
+        let c = EncoderConfig::h264(7680, 4320, PixelFormat::Nv12, 120.0);
+        assert_eq!(c.target_bitrate(), 100_000_000);
+        let mut c = nv12_1080p();
+        c.bitrate = Bitrate::Bps(4_000_000);
+        assert_eq!(c.target_bitrate(), 4_000_000);
     }
 
     #[test]

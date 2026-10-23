@@ -384,14 +384,21 @@ impl V4l2Encoder {
 
     fn apply_controls(&self) -> Result<()> {
         let cfg = &self.config;
-        if let Bitrate::Bps(bps) = cfg.bitrate {
-            for (id, value) in rate_controls(cfg) {
-                if let Err(e) = self.set_control(id, value) {
-                    log::debug!("{}: rate control {id:#x} not set: {e}", self.path);
+        for (id, value) in RATE_CONTROLS {
+            if let Err(e) = self.set_control(id, value) {
+                log::debug!("{}: rate control {id:#x} not set: {e}", self.path);
+            }
+        }
+        let bps = i32::try_from(cfg.target_bitrate()).unwrap_or(i32::MAX);
+        match cfg.bitrate {
+            Bitrate::Bps(_) => {
+                self.require_control(uapi::V4L2_CID_MPEG_VIDEO_BITRATE, bps, "bitrate")?;
+            }
+            Bitrate::Auto => {
+                if !self.set_control(uapi::V4L2_CID_MPEG_VIDEO_BITRATE, bps)? {
+                    log::debug!("{}: no bitrate control, keeping its default", self.path);
                 }
             }
-            let bps = i32::try_from(bps).unwrap_or(i32::MAX);
-            self.require_control(uapi::V4L2_CID_MPEG_VIDEO_BITRATE, bps, "bitrate")?;
         }
         if let Some(gop) = cfg.gop {
             let gop = i32::try_from(gop).unwrap_or(i32::MAX);
@@ -982,23 +989,18 @@ fn dmabuf_size(fd: BorrowedFd<'_>) -> Result<usize> {
     Ok(file.seek(SeekFrom::End(0))? as usize)
 }
 
-/// The rate control `cfg` asks for, as `(control, value)`: constant bitrate,
-/// regulated per frame and per macroblock. Left to their defaults, drivers
-/// may encode at a fixed QP (`vsi_v4l2`) so the bitrate is not held, or
-/// control frames alone and code key frames coarser than their neighbours.
-fn rate_controls(cfg: &EncoderConfig) -> Vec<(u32, i32)> {
-    match cfg.bitrate {
-        Bitrate::Bps(_) => vec![
-            (
-                uapi::V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-                uapi::V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
-            ),
-            (uapi::V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1),
-            (uapi::V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 1),
-        ],
-        Bitrate::Auto => Vec::new(),
-    }
-}
+/// Rate control, as `(control, value)`: constant bitrate, regulated per frame
+/// and per macroblock. Left to their defaults, drivers may encode at a fixed
+/// QP (`vsi_v4l2`) so the bitrate is not held, or control frames alone and
+/// code key frames coarser than their neighbours.
+const RATE_CONTROLS: [(u32, i32); 3] = [
+    (
+        uapi::V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+        uapi::V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+    ),
+    (uapi::V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1),
+    (uapi::V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 1),
+];
 
 /// The profile and level `cfg` requires, as `(control, value, description)`.
 fn coding_controls(cfg: &EncoderConfig) -> Vec<(u32, i32, String)> {
@@ -1146,25 +1148,6 @@ mod tests {
         assert_eq!(level_value(H264Level::L1b), 1);
         assert_eq!(level_value(H264Level::L4_0), 11);
         assert_eq!(level_value(H264Level::L6_2), 19);
-    }
-
-    #[test]
-    fn a_bitrate_turns_on_constant_bitrate_frame_and_macroblock_control() {
-        let mut cfg = EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0);
-        cfg.bitrate = Bitrate::Auto;
-        assert!(rate_controls(&cfg).is_empty());
-        cfg.bitrate = Bitrate::Bps(4_000_000);
-        assert_eq!(
-            rate_controls(&cfg),
-            vec![
-                (
-                    uapi::V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-                    uapi::V4L2_MPEG_VIDEO_BITRATE_MODE_CBR
-                ),
-                (uapi::V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1),
-                (uapi::V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 1),
-            ]
-        );
     }
 
     #[test]

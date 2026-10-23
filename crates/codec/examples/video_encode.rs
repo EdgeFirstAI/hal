@@ -8,7 +8,8 @@
 //!   --size WxH           picture size (default 1920x1080)
 //!   --frames N           frames to encode (default 300)
 //!   --fps F              frame rate (default 30)
-//!   --bitrate BPS        target bitrate (default: the device's)
+//!   --bitrate BPS        target bitrate (default: automatic, about 10 Mbps
+//!                        at 1080p30)
 //!   --gop N              frames between key frames (default: the device's)
 //!   --keyframe-every N   also force a key frame every N frames
 //!   --input FILE         read raw NV12 frames from FILE instead of drawing
