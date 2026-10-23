@@ -28,6 +28,10 @@ fn read_varint(r: &mut impl Read, pos: &mut u64, end: u64) -> Result<u64, ModelC
         let mut b = [0u8; 1];
         r.read_exact(&mut b).map_err(|e| err(e.to_string()))?;
         *pos += 1;
+        // The tenth byte holds bit 63 only.
+        if shift == 63 && b[0] > 1 {
+            return Err(err("varint overflows 64 bits"));
+        }
         value |= u64::from(b[0] & 0x7f) << shift;
         if b[0] & 0x80 == 0 {
             return Ok(value);
@@ -192,6 +196,12 @@ pub(crate) mod tests {
         let mut bytes = model_proto(&[], 0);
         bytes.extend_from_slice(&[0x80; 11]);
         assert!(scan(&bytes).is_err(), "an overlong varint is refused");
+        let mut r =
+            std::io::Cursor::new([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        assert!(read_varint(&mut r, &mut 0, 10).is_err(), "2^64 is refused");
+        let mut r =
+            std::io::Cursor::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        assert_eq!(read_varint(&mut r, &mut 0, 10).unwrap(), u64::MAX);
         assert!(scan(&[0x0b]).is_err(), "group wire type is refused");
     }
 }
