@@ -2451,3 +2451,52 @@ fn warn_no_semantic(config: Result<SemanticConfig, DecoderError>) -> Option<Sema
         .map_err(|e| tracing::warn!("ModelPack segmentation has no semantic decode: {e}"))
         .ok()
 }
+
+impl Decoder {
+    /// The class count the outputs carry, computed as the builder checks it;
+    /// `None` for semantic models and layouts that carry none (end-to-end
+    /// detections).
+    pub(crate) fn class_count(&self) -> Option<usize> {
+        type B = DecoderBuilder;
+        let det = |d: &configs::Detection, protos: Option<usize>| {
+            if d.dshape.is_empty() {
+                B::get_class_count_no_dshape(d.into(), protos)
+            } else {
+                B::get_class_count(&d.dshape, protos, d.anchors.as_ref().map(Vec::len))
+            }
+        };
+        let scores = |s: &configs::Scores| {
+            if s.dshape.is_empty() {
+                B::get_class_count_no_dshape(s.into(), None)
+            } else {
+                B::get_class_count(&s.dshape, None, None)
+            }
+        };
+        let count = match self.model_type() {
+            ModelType::ModelPackSegDet { scores: s, .. }
+            | ModelType::ModelPackDet { scores: s, .. }
+            | ModelType::YoloSplitDet { scores: s, .. }
+            | ModelType::YoloSplitSegDet { scores: s, .. } => scores(s),
+            ModelType::ModelPackSegDetSplit { detection, .. }
+            | ModelType::ModelPackDetSplit { detection } => det(detection.first()?, None),
+            ModelType::YoloDet { boxes } | ModelType::YoloSegDet2Way { boxes, .. } => {
+                det(boxes, None)
+            }
+            ModelType::YoloSegDet { boxes, protos } => {
+                let k = B::get_protos_count(&protos.dshape)
+                    .or_else(|| Some(*protos.shape.get(1)?.min(protos.shape.get(3)?)))?;
+                det(boxes, Some(k))
+            }
+            ModelType::PerScale => {
+                return self
+                    .per_scale
+                    .as_ref()?
+                    .lock()
+                    .ok()
+                    .map(|d| d.plan.num_classes)
+            }
+            _ => return None,
+        };
+        count.ok().filter(|&n| n > 0)
+    }
+}

@@ -9,7 +9,7 @@
 //! a [`crate::schema::SchemaV2`] the decoder can act on, without requiring
 //! a hand-written `edgefirst.json` for every Ultralytics export.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::configs::DimName;
@@ -864,8 +864,82 @@ fn check_quantized_boundary(tensor: &TensorInfo) -> Result<(), InferError> {
 /// ));
 /// ```
 pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema, InferError> {
-    let meta = UltralyticsMeta::from_metadata(&signals.metadata)?;
+    infer_from_meta(signals, UltralyticsMeta::from_metadata(&signals.metadata)?)
+}
 
+/// Infers the schema, with no labels, from a class count other than the one
+/// `names` gives, and returns that count. `classes`, the count the caller
+/// states, is tried first; otherwise each anchor-shaped output proposes a
+/// count and exactly one must lay out, else the layout is ambiguous.
+pub(crate) fn infer_ultralytics_schema_ignoring_names(
+    signals: &ModelSignals,
+    classes: Option<usize>,
+) -> Result<(InferredSchema, usize), InferError> {
+    let meta = UltralyticsMeta::from_metadata(&signals.metadata)?;
+    let with_count = |nc: usize| {
+        let names = (0..nc).map(|i| format!("class{i}")).collect();
+        let candidate = UltralyticsMeta {
+            names,
+            task: meta.task,
+            end2end: meta.end2end,
+        };
+        infer_from_meta(signals, candidate)
+    };
+    let stated = classes.and_then(|nc| with_count(nc).ok());
+    let mut found: Option<InferredSchema> = stated;
+    if found.is_none() {
+        for nc in candidate_class_counts(signals)? {
+            let Ok(inferred) = with_count(nc) else {
+                continue;
+            };
+            if let Some(first) = &found {
+                return Err(InferError::AmbiguousLayout(format!(
+                    "`names` miscounts the classes and the outputs allow both {} and {nc}; \
+                     supply a labels override naming every class, or describe the outputs \
+                     in an edgefirst.json beside the model",
+                    first.labels.len()
+                )));
+            }
+            found = Some(inferred);
+        }
+    }
+    let mut inferred = found.ok_or_else(|| {
+        InferError::UnsupportedLayout("no output carries a usable class count".into())
+    })?;
+    let nc = std::mem::take(&mut inferred.labels).len();
+    Ok((inferred, nc))
+}
+
+/// The class counts the anchor-shaped outputs imply, ascending.
+fn candidate_class_counts(signals: &ModelSignals) -> Result<BTreeSet<usize>, InferError> {
+    let input = signals
+        .inputs
+        .iter()
+        .find(|t| t.shape.len() == 4)
+        .ok_or_else(|| InferError::UnsupportedLayout("no rank-4 model input found".into()))?;
+    let (h, w, _) = classify_input_layout(input)?;
+    let k = match signals.outputs.iter().find(|o| o.shape.len() == 4) {
+        Some(proto) => classify_proto(proto, h, w)?.0,
+        None => 0,
+    };
+    Ok(signals
+        .outputs
+        .iter()
+        .filter_map(|o| find_anchors_dim(&o.shape, anchor_count(h, w)))
+        .filter_map(|(features, _)| features.checked_sub(4 + k))
+        .filter(|&nc| nc > 0)
+        .collect())
+}
+
+/// Anchors over the stride 8, 16 and 32 grids.
+fn anchor_count(h: usize, w: usize) -> usize {
+    (h / 8) * (w / 8) + (h / 16) * (w / 16) + (h / 32) * (w / 32)
+}
+
+fn infer_from_meta(
+    signals: &ModelSignals,
+    meta: UltralyticsMeta,
+) -> Result<InferredSchema, InferError> {
     let proto = signals.outputs.iter().find(|o| o.shape.len() == 4);
     match (meta.task, proto.is_some()) {
         (Some(Task::Segment), false) => {
@@ -894,7 +968,7 @@ pub fn infer_ultralytics_schema(signals: &ModelSignals) -> Result<InferredSchema
         })?;
     let (h, w, input_dshape) = classify_input_layout(input)?;
 
-    let expected_anchors = (h / 8) * (w / 8) + (h / 16) * (w / 16) + (h / 32) * (w / 32);
+    let expected_anchors = anchor_count(h, w);
     let nc = meta.names.len();
 
     // Segmentation detection features carry `k` extra mask coefficients

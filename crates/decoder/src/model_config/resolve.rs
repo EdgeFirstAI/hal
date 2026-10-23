@@ -21,10 +21,14 @@ use super::{
     ModelTask, NormalizeOverride, Provenance, ResizeOverride,
 };
 use crate::configs::DimName;
-use crate::infer::{infer_ultralytics_schema, InferError, InferredSchema, ModelSignals};
+use crate::infer::{
+    infer_ultralytics_schema, infer_ultralytics_schema_ignoring_names, InferError, InferredSchema,
+    ModelSignals,
+};
 use crate::schema::{
     self, DecodeMode, DecoderKind, LogicalOutput, LogicalType, NormalizationConfig, SchemaV2,
 };
+use crate::DecoderBuilder;
 
 /// Everything discovery reads: the files in the model container, the files
 /// beside it, and the model's tensors as the runtime reports them.
@@ -548,8 +552,8 @@ impl State {
     }
 
     /// Step 5: Ultralytics metadata.
-    fn ultralytics(&mut self, signals: &ModelSignals) {
-        match self.infer_ultralytics(signals) {
+    fn ultralytics(&mut self, signals: &ModelSignals, classes: Option<usize>) {
+        match self.infer_ultralytics(signals, classes) {
             Ok(inferred) => {
                 let prov = Provenance::new(ConfigSource::UltralyticsMetadata, None);
                 self.fill_ultralytics_labels(inferred.labels, &prov);
@@ -564,33 +568,31 @@ impl State {
     }
 
     /// Ultralytics class names for a schema another source supplied.
-    fn ultralytics_labels(&mut self, signals: &ModelSignals) {
-        if let Ok(inferred) = self.infer_ultralytics(signals) {
+    fn ultralytics_labels(&mut self, signals: &ModelSignals, classes: Option<usize>) {
+        if let Ok(inferred) = self.infer_ultralytics(signals, classes) {
             let prov = Provenance::new(ConfigSource::UltralyticsMetadata, None);
             self.fill_ultralytics_labels(inferred.labels, &prov);
         }
     }
 
-    /// Infers the Ultralytics schema, laying it out from the output's class
-    /// count and ignoring `names` when the two disagree.
-    fn infer_ultralytics(&mut self, signals: &ModelSignals) -> Result<InferredSchema, InferError> {
+    /// Infers the Ultralytics schema; when `names` disagrees with the output,
+    /// lays it out from `classes` (the labels override's count) or the
+    /// output's class count and ignores `names`.
+    fn infer_ultralytics(
+        &mut self,
+        signals: &ModelSignals,
+        classes: Option<usize>,
+    ) -> Result<InferredSchema, InferError> {
         match infer_ultralytics_schema(signals) {
-            Err(InferError::ClassCountMismatch { expected, found }) if found > 0 => {
+            Err(InferError::ClassCountMismatch { expected, .. }) => {
+                let (inferred, found) = infer_ultralytics_schema_ignoring_names(signals, classes)?;
                 let note = format!(
                     "Ultralytics metadata: names lists {expected} classes but the output has \
                      {found}; its class names are ignored"
                 );
                 log::warn!("{note}");
                 self.notes.push(note);
-                let names: Vec<String> = (0..found).map(|i| format!("{i}: 'class{i}'")).collect();
-                let mut signals = signals.clone();
-                signals
-                    .metadata
-                    .insert("names".into(), format!("{{{}}}", names.join(", ")));
-                infer_ultralytics_schema(&signals).map(|mut inferred| {
-                    inferred.labels.clear();
-                    inferred
-                })
+                Ok(inferred)
             }
             r => r,
         }
@@ -702,43 +704,26 @@ fn semantic_outputs(schema: &mut SchemaV2) -> impl Iterator<Item = &mut LogicalO
     })
 }
 
-/// The class count the outputs state or imply; `None` for layouts that carry
-/// none, such as end-to-end detections and class maps.
-fn class_count(schema: &SchemaV2) -> Option<usize> {
-    let dim = |dshape: &[(DimName, usize)], name: DimName| {
-        dshape.iter().find(|(d, _)| *d == name).map(|(_, n)| *n)
-    };
-    let protos = schema
+fn semantic_classes(schema: &SchemaV2) -> Option<usize> {
+    schema
         .outputs
         .iter()
-        .filter(|o| o.type_ == Some(LogicalType::Protos))
-        .find_map(|o| dim(&o.dshape, DimName::NumProtos))
-        .unwrap_or(0);
-    schema.outputs.iter().find_map(|o| {
-        let dshape = match (o.dshape.as_slice(), o.outputs.first()) {
-            ([], Some(child)) => child.dshape.as_slice(),
-            (d, _) => d,
-        };
-        let classes = dim(dshape, DimName::NumClasses);
-        match o.type_? {
-            LogicalType::Segmentation | LogicalType::Scores => classes,
-            LogicalType::Detection => classes.or_else(|| match o.decoder? {
-                DecoderKind::Ultralytics => dim(dshape, DimName::NumFeatures)?
-                    .checked_sub(4 + protos)
-                    .filter(|&n| n > 0),
-                DecoderKind::ModelPack => {
-                    let anchors = o.anchors.as_ref()?.len();
-                    let features = dim(dshape, DimName::NumAnchorsXFeatures)?;
-                    (anchors > 0 && features % anchors == 0)
-                        .then(|| features / anchors)?
-                        .checked_sub(5)
-                        .filter(|&n| n > 0)
-                }
-                DecoderKind::Semantic => None,
-            }),
-            _ => None,
-        }
-    })
+        .find(|o| o.type_ == Some(LogicalType::Segmentation))
+        .and_then(|o| {
+            o.dshape
+                .iter()
+                .find(|(d, _)| *d == DimName::NumClasses)
+                .map(|(_, n)| *n)
+        })
+}
+
+/// The detection class count the decoder builder derives from `schema`.
+fn detection_classes(schema: &SchemaV2) -> Option<usize> {
+    DecoderBuilder::new()
+        .with_schema(schema.clone())
+        .build()
+        .ok()?
+        .class_count()
 }
 
 /// The letterbox `(placement, pad)` a bare `letterbox` override means for
@@ -803,11 +788,12 @@ pub fn resolve_sources(
     st.edgefirst(&sidecar, ConfigSource::SidecarEdgefirst)?;
     st.hugging_face(&embedded, ConfigSource::EmbeddedHf, signals.as_ref())?;
     st.hugging_face(&sidecar, ConfigSource::SidecarHf, signals.as_ref())?;
+    let override_classes = overrides.labels.as_ref().map(Vec::len);
     if let Some(s) = &signals {
         if st.schema.is_none() {
-            st.ultralytics(s);
+            st.ultralytics(s, override_classes);
         } else {
-            st.ultralytics_labels(s);
+            st.ultralytics_labels(s, override_classes);
         }
         if st.schema.is_none() {
             st.heuristics(s);
@@ -846,7 +832,6 @@ pub fn resolve_sources(
     }
     st.defaults();
     let size = st.size.or_else(|| input_size(&schema));
-    let classes = st.num_classes.or_else(|| class_count(&schema));
 
     let d = PreprocessSpec::new();
     let mut provenance = BTreeMap::new();
@@ -944,6 +929,10 @@ pub fn resolve_sources(
         }
         provenance.insert(ConfigField::DecodeMode, ov.clone());
     }
+    let classes = st
+        .num_classes
+        .or_else(|| detection_classes(&schema))
+        .or_else(|| (task == ModelTask::Semantic).then(|| semantic_classes(&schema))?);
     if let Some(l) = &overrides.labels {
         if let Some(i) = l.iter().position(|n| n.trim().is_empty()) {
             return Err(ModelConfigError::Override(format!(
@@ -1846,6 +1835,152 @@ mod tests {
                 "{outputs}: {:?}",
                 c.notes
             );
+        }
+    }
+
+    fn label_count_error(outputs: &str, labels: &[&str]) -> Option<(usize, usize)> {
+        let ef = format!(r#"{{"schema_version": 2, "outputs": {outputs}}}"#);
+        let embedded = ModelFiles {
+            edgefirst_json: file("edgefirst.json", &ef),
+            ..Default::default()
+        };
+        let mut o = ModelOverrides::new();
+        o.labels = Some(labels.iter().map(|&l| l.to_owned()).collect());
+        match resolve_sources(sources(embedded, Default::default(), None), &o) {
+            Err(ModelConfigError::LabelCountMismatch { expected, found }) => {
+                Some((expected, found))
+            }
+            Ok(_) => None,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// The count follows the decoder builder: an omitted `dshape` uses the
+    /// canonical shape and an omitted `decoder` means Ultralytics.
+    #[test]
+    fn class_count_without_dshape_or_decoder() {
+        let no_dshape = r#"[{"name": "output0", "type": "detection", "decoder": "ultralytics",
+            "shape": [1, 6, 8400]}]"#;
+        assert_eq!(label_count_error(no_dshape, &["a"]), Some((2, 1)));
+        assert_eq!(label_count_error(no_dshape, &["a", "b"]), None);
+        let no_decoder = r#"[{"name": "output0", "type": "detection",
+            "shape": [1, 6, 8400],
+            "dshape": [{"batch": 1}, {"num_features": 6}, {"num_boxes": 8400}]}]"#;
+        assert_eq!(label_count_error(no_decoder, &["a"]), Some((2, 1)));
+    }
+
+    /// Separate mask coefficients are not part of the detection features.
+    #[test]
+    fn two_way_segdet_counts_detection_features_only() {
+        let c = detection_with_classes(
+            r#"[{"name": "output0", "type": "detection", "decoder": "ultralytics",
+                "shape": [1, 6, 8400],
+                "dshape": [{"batch": 1}, {"num_features": 6}, {"num_boxes": 8400}]},
+               {"name": "coefs", "type": "mask_coefs", "decoder": "ultralytics",
+                "shape": [1, 32, 8400],
+                "dshape": [{"batch": 1}, {"num_protos": 32}, {"num_boxes": 8400}]},
+               {"name": "protos", "type": "protos", "decoder": "ultralytics",
+                "shape": [1, 32, 160, 160],
+                "dshape": [{"batch": 1}, {"num_protos": 32}, {"height": 160}, {"width": 160}]}]"#,
+        );
+        assert_eq!(c.labels, ["x", "y"], "{:?}", c.notes);
+    }
+
+    /// Legacy `detection` outputs that the builder classifies as end-to-end
+    /// carry no class count either.
+    #[test]
+    fn legacy_end_to_end_detection_labels_are_not_counted() {
+        for version in [r#""decoder_version": "yolo26","#, ""] {
+            let outputs = r#"[{"name": "output0", "type": "detection", "decoder": "ultralytics",
+                "shape": [1, 300, 6],
+                "dshape": [{"batch": 1}, {"num_boxes": 300}, {"num_features": 6}]}]"#;
+            let ef = format!(
+                r#"{{"schema_version": 2, {version} "dataset": {{"classes": ["a", "b", "c"]}},
+                     "outputs": {outputs}}}"#
+            );
+            let embedded = ModelFiles {
+                edgefirst_json: file("edgefirst.json", &ef),
+                ..Default::default()
+            };
+            let c = resolve(sources(embedded, Default::default(), None));
+            assert_eq!(c.labels, ["a", "b", "c"], "{version}: {:?}", c.notes);
+        }
+    }
+
+    /// A ModelPack multitask model counts its detection classes, not the
+    /// segmentation channels that add background, whatever the output order.
+    #[test]
+    fn modelpack_multitask_counts_detection_classes_in_any_order() {
+        let path = format!(
+            "{}/../../testdata/decoder/modelpack_multitask_logical.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut ef: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for _ in 0..2 {
+            let embedded = ModelFiles {
+                edgefirst_json: file("edgefirst.json", &ef.to_string()),
+                ..Default::default()
+            };
+            let c = resolve(sources(embedded, Default::default(), None));
+            assert_eq!(
+                c.labels,
+                ["cat", "dog", "person", "car", "truck"],
+                "{:?}",
+                c.notes
+            );
+            let outputs = ef["outputs"].as_array_mut().unwrap();
+            outputs.rotate_right(1);
+        }
+    }
+
+    fn ultralytics_with_outputs(names: &str, shapes: &[&[usize]]) -> ModelSources {
+        let mut s = ultralytics_signals();
+        s.metadata.insert("names".into(), names.into());
+        s.outputs = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, shape)| tensor(&format!("output{i}"), shape))
+            .collect();
+        sources(Default::default(), Default::default(), Some(s))
+    }
+
+    /// Recovery from stale `names` takes the one output that lays out, in
+    /// either order, and refuses a choice between two.
+    #[test]
+    fn stale_ultralytics_names_recover_only_from_one_candidate() {
+        let boxes: &[usize] = &[1, 4, 8400];
+        let detections: &[usize] = &[1, 6, 8400];
+        for shapes in [[boxes, detections], [detections, boxes]] {
+            let c = resolve(ultralytics_with_outputs("{0: 'person'}", &shapes));
+            assert_eq!(c.family, ModelFamily::Ultralytics);
+            assert!(c.labels.is_empty());
+            assert!(
+                c.notes
+                    .iter()
+                    .any(|n| n.contains("names lists 1 classes but the output has 2")),
+                "{:?}",
+                c.notes
+            );
+        }
+        let aux: &[usize] = &[1, 32, 8400];
+        let detections: &[usize] = &[1, 84, 8400];
+        for shapes in [[aux, detections], [detections, aux]] {
+            let e = resolve_sources(
+                ultralytics_with_outputs("{0: 'a', 1: 'b'}", &shapes),
+                &ModelOverrides::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, ModelConfigError::Infer(InferError::AmbiguousLayout(m))
+                    if m.contains("labels override") && m.contains("edgefirst.json")),
+                "{e}"
+            );
+            let mut o = ModelOverrides::new();
+            o.labels = Some((0..80).map(|i| format!("c{i}")).collect());
+            let c =
+                resolve_sources(ultralytics_with_outputs("{0: 'a', 1: 'b'}", &shapes), &o).unwrap();
+            assert_eq!(c.labels.len(), 80);
+            assert_eq!(c.schema.outputs[0].shape, detections, "{shapes:?}");
         }
     }
 

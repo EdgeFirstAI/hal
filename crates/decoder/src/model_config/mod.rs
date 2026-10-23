@@ -51,13 +51,16 @@
 //! that disagrees with `num_labels` or the output) is ignored with a warning
 //! and a note naming the source and the index (`id2label[7]`), and the next
 //! source supplies the labels. The count is checked against the class count
-//! the outputs state or imply (a `num_classes` dimension, Ultralytics
-//! `num_features` less the box and mask coefficients, or ModelPack anchor
-//! features) for every model type, so an earlier source that miscounts
-//! yields to a later one that fits; end-to-end detections and class maps
-//! carry no count, so there the first source wins. Ultralytics `names` that
-//! disagree with the output are ignored and the schema is laid out from the
-//! output. When no source fits, the labels are empty with a warning.
+//! the decoder builder derives from the outputs (the detection classes for a
+//! ModelPack multitask model), or the segmentation channels of a semantic
+//! model, so an earlier source that miscounts yields to a later one that
+//! fits; end-to-end detections and class maps carry no count, so there the
+//! first source wins. Ultralytics `names` that disagree with the output are
+//! ignored and the schema is laid out from the count a `labels` override
+//! gives, or else from the one output whose class count fits; when several
+//! could, the layout is ambiguous and resolution fails, naming the override
+//! and a sidecar `edgefirst.json` as the ways to settle it.
+//! When no source fits, the labels are empty with a warning.
 //! `labels.txt` skips blank lines, so it cannot name an empty class.
 //! Names that repeat ignoring case add a note, since they make matching
 //! classes by name ambiguous. The `labels` override is checked strictly.
