@@ -26,6 +26,18 @@ fn decoder_error(py: Python<'_>, name: &str, msg: String) -> PyErr {
     }
 }
 
+/// A `LabelCountMismatchError` carrying the model's class count and the
+/// override's.
+fn label_count_error(py: Python<'_>, msg: String, expected: usize, found: usize) -> PyErr {
+    let class = py
+        .import("edgefirst.decoder")
+        .and_then(|m| m.getattr("LabelCountMismatchError"));
+    match class.and_then(|c| c.call1((msg.clone(), expected, found))) {
+        Ok(e) => PyErr::from_value(e),
+        Err(_) => PyValueError::new_err(msg),
+    }
+}
+
 /// Maps a discovery error to the Python exception for its kind: `OSError`
 /// (with errno and filename) for I/O, else a `ModelConfigError` subclass
 /// (all `ValueError`s).
@@ -51,6 +63,9 @@ fn config_err(e: ModelConfigError) -> PyErr {
             "UnsupportedModelError"
         }
         ModelConfigError::Override(_) => "OverrideError",
+        &ModelConfigError::LabelCountMismatch { expected, found } => {
+            return Python::attach(|py| label_count_error(py, e.to_string(), expected, found));
+        }
         _ => "ModelConfigError",
     };
     Python::attach(|py| decoder_error(py, class, e.to_string()))
@@ -214,7 +229,10 @@ pub enum LabelsArg {
 ///   "letterbox-topleft"``; bare ``"letterbox"`` follows the model family
 /// - ``decode``: ``"accurate" | "fast"`` (or a :class:`DecodeMode`)
 /// - ``labels``: a list of non-empty class names, or one comma-separated
-///   string
+///   string. Resolution raises :class:`LabelCountMismatchError` when their
+///   number differs from a class count the model's outputs state;
+///   end-to-end detections and class maps state none, so any number is
+///   accepted there and the caller checks it.
 ///
 /// :meth:`ResolvedModelConfig.describe` prints these keys in the same
 /// grammar.
@@ -267,8 +285,8 @@ impl PyModelOverrides {
         }
         match labels {
             Some(LabelsArg::List(l)) => {
-                if l.iter().any(|n| n.trim().is_empty()) {
-                    let e = ModelConfigError::Override("labels has an empty name".into());
+                if let Some(i) = l.iter().position(|n| n.trim().is_empty()) {
+                    let e = ModelConfigError::Override(format!("labels has an empty name at {i}"));
                     return Err(config_err(e));
                 }
                 o.0.labels = Some(l);

@@ -17,6 +17,7 @@ from edgefirst.decoder import (
     ConfigSource,
     DecodeMode,
     Decoder,
+    LabelCountMismatchError,
     ModelConfigError,
     ModelFamily,
     ModelOverrides,
@@ -216,6 +217,24 @@ def test_hf_configs_without_signals_are_unresolved(sidecar_model: Path):
 def test_nothing_found_is_unresolved_naming_the_fix(bare_model: Path):
     with pytest.raises(UnresolvedConfigError, match="task=semantic"):
         resolve_model_config(bare_model, None, ModelOverrides(task="semantic"))
+
+
+def test_label_count_mismatch_has_its_own_error(sidecar_model: Path):
+    with pytest.raises(LabelCountMismatchError) as info:
+        resolve_model_config(
+            sidecar_model, SEGFORMER_SIGNALS, ModelOverrides(labels=["a", "b"])
+        )
+    assert isinstance(info.value, OverrideError)
+    assert (info.value.expected, info.value.found) == (150, 2)
+    assert "labels names 2 classes but the model has 150" in str(info.value)
+
+
+def test_empty_override_label_is_a_plain_override_error():
+    labels = ["a"] * 150
+    labels[3] = " "
+    with pytest.raises(OverrideError, match="empty name at 3") as info:
+        ModelOverrides(labels=labels)
+    assert not isinstance(info.value, LabelCountMismatchError)
 
 
 def test_untrimmed_hf_labels_are_trimmed(tmp_path: Path):

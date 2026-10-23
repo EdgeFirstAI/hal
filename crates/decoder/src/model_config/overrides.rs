@@ -202,7 +202,10 @@ pub struct ModelOverrides {
     pub resize: Option<ResizeOverride>,
     /// Semantic decode mode.
     pub decode: Option<DecodeMode>,
-    /// Class names, in channel order.
+    /// Class names, in channel order. Resolution checks their number only
+    /// against a class count the model's outputs state; end-to-end
+    /// detections and class maps state none, so any number is accepted
+    /// there and the caller checks it.
     pub labels: Option<Vec<String>>,
 }
 

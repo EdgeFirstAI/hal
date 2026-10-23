@@ -1143,7 +1143,10 @@ class ModelOverrides:
       "letterbox-topleft"``; bare ``"letterbox"`` follows the model family
     - ``decode``: ``"accurate" | "fast"`` or a :class:`DecodeMode`
     - ``labels``: a list of non-empty class names or one comma-separated
-      string
+      string. Resolution raises :class:`LabelCountMismatchError` when their
+      number differs from a class count the model's outputs state;
+      end-to-end detections and class maps state none, so any number is
+      accepted there and the caller checks it.
 
     :meth:`ResolvedModelConfig.describe` prints these keys in the same
     grammar.
@@ -1260,6 +1263,8 @@ def resolve_model_config(
         UnsupportedModelError: The configuration asks for something the
             library cannot run.
         OverrideError: An override cannot apply.
+        LabelCountMismatchError: The ``labels`` override names a different
+            number of classes than the model has (an ``OverrideError``).
         ModelConfigError: A configuration file is malformed. All four are
             ``ValueError`` subclasses.
     """
@@ -1269,6 +1274,15 @@ class ModelConfigError(ValueError):
 
 class OverrideError(ModelConfigError):
     """An override outside its grammar or one that does not apply."""
+
+class LabelCountMismatchError(OverrideError):
+    """A ``labels`` override naming a different number of classes than the
+    model has: ``expected`` is the model's class count, ``found`` the number
+    of names given."""
+
+    expected: int
+    found: int
+    def __init__(self, message: str, expected: int, found: int) -> None: ...
 
 class UnresolvedConfigError(ModelConfigError):
     """Nothing supplies a required piece of the configuration."""

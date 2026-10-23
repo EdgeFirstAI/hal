@@ -950,11 +950,11 @@ pub fn resolve_sources(
                 "labels has an empty name at {i}"
             )));
         }
-        if let Some(n) = classes.filter(|&n| n != l.len()) {
-            return Err(ModelConfigError::Override(format!(
-                "labels names {} classes but the model has {n}",
-                l.len()
-            )));
+        if let Some(expected) = classes.filter(|&n| n != l.len()) {
+            return Err(ModelConfigError::LabelCountMismatch {
+                expected,
+                found: l.len(),
+            });
         }
         labels = l.iter().map(|n| n.trim().to_owned()).collect();
         provenance.insert(ConfigField::Labels, ov);
@@ -1497,8 +1497,14 @@ mod tests {
             &o,
         );
         assert!(
-            matches!(e, Err(ModelConfigError::Override(_))),
-            "label count is checked"
+            matches!(
+                e,
+                Err(ModelConfigError::LabelCountMismatch {
+                    expected: 19,
+                    found: 2
+                })
+            ),
+            "label count is checked: {e:?}"
         );
     }
 
@@ -1656,17 +1662,18 @@ mod tests {
         );
         let mut o = ModelOverrides::new();
         o.labels = Some(vec!["a".into(), " ".into()]);
-        assert!(matches!(
-            resolve_sources(
-                sources(
-                    Default::default(),
-                    hf_sidecar("segformer-512"),
-                    Some(segformer_signals(150))
-                ),
-                &o
+        let e = resolve_sources(
+            sources(
+                Default::default(),
+                hf_sidecar("segformer-512"),
+                Some(segformer_signals(150)),
             ),
-            Err(ModelConfigError::Override(_))
-        ));
+            &o,
+        );
+        assert!(
+            matches!(&e, Err(ModelConfigError::Override(m)) if m.contains("empty name at 1")),
+            "an empty name is not a count mismatch: {e:?}"
+        );
     }
 
     #[test]
@@ -1775,6 +1782,18 @@ mod tests {
         o.labels = Some(vec!["a".into(), "b".into()]);
         let c = resolve_sources(ultralytics_with_names("{0: 'person'}"), &o).unwrap();
         assert_eq!(c.labels, ["a", "b"]);
+        o.labels = Some(vec!["a".into()]);
+        let e = resolve_sources(ultralytics_with_names("{0: 'person'}"), &o).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ModelConfigError::LabelCountMismatch {
+                    expected: 2,
+                    found: 1
+                }
+            ),
+            "{e}"
+        );
     }
 
     /// An `edgefirst.json` naming three classes for `outputs`, beside a

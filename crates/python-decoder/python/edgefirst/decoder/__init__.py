@@ -159,6 +159,17 @@ class OverrideError(ModelConfigError):
     """An override outside its grammar or one that does not apply."""
 
 
+class LabelCountMismatchError(OverrideError):
+    """A ``labels`` override naming a different number of classes than the
+    model has: ``expected`` is the model's class count, ``found`` the number
+    of names given."""
+
+    def __init__(self, message: str, expected: int, found: int) -> None:
+        super().__init__(message)
+        self.expected = expected
+        self.found = found
+
+
 class UnresolvedConfigError(ModelConfigError):
     """Nothing supplies a required piece of the configuration."""
 

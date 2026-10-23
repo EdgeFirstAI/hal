@@ -44,6 +44,7 @@ fn config_errno(e: &ModelConfigError) -> c_int {
         E::Container(_) | E::InvalidField { .. } | E::Infer(_) | E::Schema(_) => libc::EBADMSG,
         E::NotSupported { .. } | E::UnsupportedArchitecture(_) => libc::ENOTSUP,
         E::Unresolved { .. } => libc::ENODATA,
+        E::LabelCountMismatch { .. } => libc::ERANGE,
         _ => libc::EINVAL,
     }
 }
@@ -111,6 +112,10 @@ pub unsafe extern "C" fn ef_model_overrides_free(o: *mut EfModelOverrides) {
 ///
 /// A bare `letterbox` follows the model family's convention.
 /// `ef_model_config_describe` prints these keys in the same grammar.
+/// `ef_model_config_resolve` checks the number of `labels` only against a
+/// class count the model's outputs state (`ERANGE` when it differs);
+/// end-to-end detections and class maps state none, so any number is
+/// accepted there and the caller checks it.
 ///
 /// @return 0, or `EINVAL` for a `NULL` argument, an unknown key or a value
 /// outside the key's grammar; `*err_out` (when `err_out` is not `NULL`)
@@ -177,8 +182,10 @@ pub unsafe extern "C" fn ef_model_overrides_set(
 /// file does not exist, `ENODATA` when nothing configures a required piece
 /// (the message names it and the override that supplies it), `EBADMSG` for a malformed
 /// container or configuration file, `ENOTSUP` for a configuration the
-/// library cannot run, `EINVAL` for a `NULL` path or an override that does
-/// not apply, otherwise the errno of the failed read.
+/// library cannot run, `ERANGE` for a `labels` override that names a
+/// different number of classes than the model has, `EINVAL` for a `NULL`
+/// path or another override that does not apply, otherwise the errno of the
+/// failed read.
 ///
 /// # Safety
 /// `path` must be `NULL` or NUL-terminated; `signals` and `overrides` `NULL`
@@ -750,6 +757,11 @@ mod tests {
     fn the_error_codes_follow_the_error_kind() {
         let e = ModelConfigError::Override("x".into());
         assert_eq!(config_errno(&e), libc::EINVAL);
+        let e = ModelConfigError::LabelCountMismatch {
+            expected: 2,
+            found: 1,
+        };
+        assert_eq!(config_errno(&e), libc::ERANGE);
         let e = ModelConfigError::UnsupportedArchitecture("detr".into());
         assert_eq!(config_errno(&e), libc::ENOTSUP);
         let e = ModelConfigError::Container("x".into());
