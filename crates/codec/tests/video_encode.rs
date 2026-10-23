@@ -11,7 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use edgefirst_codec::video::{EncodedFrame, EncoderConfig, FrameOptions, VideoEncoder};
+use edgefirst_codec::video::{
+    EncodedFrame, EncoderConfig, FrameOptions, H264Level, H264Profile, VideoEncoder,
+};
 use edgefirst_codec::CodecError;
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
@@ -107,6 +109,54 @@ fn parameter_sets_and_idr(au: &[u8]) -> (bool, bool) {
         }
     }
     (types.contains(&7) && types.contains(&8), types.contains(&5))
+}
+
+/// `profile_idc` and `level_idc` of the first SPS in `au`. Neither byte can
+/// carry an emulation-prevention byte: `profile_idc` is never 0.
+fn sps_profile_and_level(au: &[u8]) -> Option<(u8, u8)> {
+    (0..au.len().saturating_sub(6))
+        .find(|&i| au[i..i + 3] == [0, 0, 1] && au[i + 3] & 0x1f == 7)
+        .map(|i| (au[i + 4], au[i + 6]))
+}
+
+#[test]
+fn the_stream_carries_the_requested_profile_and_level() {
+    const TEST: &str = "the_stream_carries_the_requested_profile_and_level";
+    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), TEST) {
+        return;
+    }
+    let src = nv12(1920, 1080);
+    for (profile, profile_idc) in [(H264Profile::High, 100), (H264Profile::Main, 77)] {
+        let mut config = EncoderConfig::h264(1920, 1080, PixelFormat::Nv12, 30.0);
+        config.profile = Some(profile);
+        config.level = Some(H264Level::L4_0);
+        let mut enc = match VideoEncoder::new(config) {
+            Ok(e) => e,
+            Err(CodecError::NoDevice(why)) => return skip(TEST, &why),
+            Err(CodecError::InvalidConfig(why)) => {
+                skip(TEST, &format!("{profile:?}: {why}"));
+                continue;
+            }
+            Err(e) => panic!("encoder open failed: {e}"),
+        };
+        let mut out = Vec::new();
+        for i in 0..3 {
+            paint(&src, i);
+            let opts = FrameOptions {
+                pts: i as u64,
+                ..FrameOptions::default()
+            };
+            out.extend(enc.encode(&src, &opts).unwrap());
+        }
+        out.extend(enc.flush().unwrap());
+        let sps = sps_profile_and_level(&out[0].data);
+        assert_eq!(
+            sps,
+            Some((profile_idc, 40)),
+            "{profile:?} level 4.0 from {}",
+            enc.device()
+        );
+    }
 }
 
 #[test]
