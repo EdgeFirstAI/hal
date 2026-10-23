@@ -413,11 +413,14 @@ impl V4l2Encoder {
             Bitrate::Bps(_) => {
                 self.require_control(uapi::V4L2_CID_MPEG_VIDEO_BITRATE, bps, "bitrate")?;
             }
-            Bitrate::Auto => {
-                if !self.set_control(uapi::V4L2_CID_MPEG_VIDEO_BITRATE, bps)? {
-                    log::debug!("{}: no bitrate control, keeping its default", self.path);
-                }
-            }
+            Bitrate::Auto => match self.set_control(uapi::V4L2_CID_MPEG_VIDEO_BITRATE, bps) {
+                Ok(true) => {}
+                Ok(false) => log::debug!("{}: no bitrate control, keeping its default", self.path),
+                Err(e) => log::debug!(
+                    "{}: bitrate {bps} not set, keeping its default: {e}",
+                    self.path
+                ),
+            },
         }
         if let Some(gop) = cfg.gop {
             let gop = i32::try_from(gop).unwrap_or(i32::MAX);

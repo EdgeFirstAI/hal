@@ -181,9 +181,9 @@ impl H264Level {
         }
     }
 
-    /// The lowest level whose frame size, macroblock rate and bitrate limits
-    /// cover a `width`x`height` stream at `frame_rate` and `bps` in
-    /// `profile`, or `None` when even level 6.2 does not.
+    /// The lowest level whose frame size, frame dimension, macroblock rate
+    /// and bitrate limits cover a `width`x`height` stream at `frame_rate` and
+    /// `bps` in `profile`, or `None` when even level 6.2 does not.
     pub fn lowest_for(
         profile: H264Profile,
         width: u32,
@@ -191,7 +191,11 @@ impl H264Level {
         frame_rate: f64,
         bps: u32,
     ) -> Option<Self> {
-        let mbs = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
+        let (width_mbs, height_mbs) = (
+            u64::from(width.div_ceil(16)),
+            u64::from(height.div_ceil(16)),
+        );
+        let mbs = width_mbs * height_mbs;
         let rate = (mbs as f64 * frame_rate).ceil();
         // cpbBrVclFactor of Table A-2: High allows 1.25 times the bitrate.
         let factor = match profile {
@@ -200,7 +204,13 @@ impl H264Level {
         };
         Self::ALL.into_iter().find(|level| {
             let (frame, mb_rate, max_br) = level.limits();
-            mbs <= frame && rate <= mb_rate as f64 && u64::from(bps) <= max_br * factor
+            // A.3.1: neither dimension may exceed sqrt(8 * MaxFS) macroblocks.
+            let side = (8 * frame).isqrt();
+            mbs <= frame
+                && width_mbs <= side
+                && height_mbs <= side
+                && rate <= mb_rate as f64
+                && u64::from(bps) <= max_br * factor
         })
     }
 }
@@ -842,6 +852,27 @@ mod tests {
             Some(L::L6_2)
         );
         assert_eq!(L::lowest_for(High, 7680, 4320, 240.0, 100_000_000), None);
+    }
+
+    #[test]
+    fn levels_cover_each_frame_dimension() {
+        use H264Level as L;
+        use H264Profile::High;
+        // 256 macroblocks wide fits level 3.2's frame size but not its
+        // sqrt(8 * 5120) = 202 macroblock side; level 4.0 allows 256.
+        assert_eq!(
+            L::lowest_for(High, 4096, 256, 30.0, 5_000_000),
+            Some(L::L4_0)
+        );
+        assert_eq!(
+            L::lowest_for(High, 256, 4096, 30.0, 5_000_000),
+            Some(L::L4_0)
+        );
+        // 257 macroblocks exceed level 4.1's side; 4.2 allows sqrt(8 * 8704) = 263.
+        assert_eq!(
+            L::lowest_for(High, 4112, 256, 30.0, 5_000_000),
+            Some(L::L4_2)
+        );
     }
 
     #[test]
