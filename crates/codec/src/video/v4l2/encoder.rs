@@ -363,21 +363,40 @@ impl V4l2Encoder {
     /// Sets the profile and level again where setting the CAPTURE format
     /// changed the value the device reports.
     fn confirm_coding_controls(&self) -> Result<()> {
-        for (id, value, what) in coding_controls(&self.config) {
-            let Some(info) = self.control(id) else {
+        for c in coding_controls(&self.config) {
+            let Some(info) = self.control(c.id) else {
                 continue;
             };
             match controls::get(&self.device.dev, info) {
-                Ok(ControlValue::Integer(v)) if v == value => {}
+                Ok(ControlValue::Integer(v)) if v == c.value => {}
                 Ok(other) => {
                     log::debug!(
-                        "{}: {what} reads {other:?} after the CAPTURE format, setting it again",
-                        self.path
+                        "{}: {} reads {other:?} after the CAPTURE format, setting it again",
+                        self.path,
+                        c.what
                     );
-                    self.require_control(id, value, &what)?;
+                    self.set_coding_control(&c)?;
                 }
-                Err(e) => log::debug!("{}: cannot read back the {what}: {e}", self.path),
+                Err(e) => log::debug!("{}: cannot read back the {}: {e}", self.path, c.what),
             }
+        }
+        Ok(())
+    }
+
+    /// Sets a profile or level: one the configuration asked for must take,
+    /// one chosen for it falls back to the device default.
+    fn set_coding_control(&self, c: &CodingControl) -> Result<()> {
+        if c.required {
+            return self.require_control(c.id, c.value, &c.what);
+        }
+        match self.set_control(c.id, c.value) {
+            Ok(true) => {}
+            Ok(false) => log::debug!("{}: no {} control, keeping its default", self.path, c.what),
+            Err(e) => log::debug!(
+                "{}: {} not set, keeping its default: {e}",
+                self.path,
+                c.what
+            ),
         }
         Ok(())
     }
@@ -405,8 +424,8 @@ impl V4l2Encoder {
             self.require_control(uapi::V4L2_CID_MPEG_VIDEO_GOP_SIZE, gop, "GOP size")?;
             self.set_control(uapi::V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, gop)?;
         }
-        for (id, value, what) in coding_controls(&self.config) {
-            self.require_control(id, value, &what)?;
+        for c in coding_controls(&self.config) {
+            self.set_coding_control(&c)?;
         }
         // Headers in a separate buffer are folded into the next access unit,
         // but joining them is cheaper where the device allows it.
@@ -1002,22 +1021,34 @@ const RATE_CONTROLS: [(u32, i32); 3] = [
     (uapi::V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 1),
 ];
 
-/// The profile and level `cfg` requires, as `(control, value, description)`.
-fn coding_controls(cfg: &EncoderConfig) -> Vec<(u32, i32, String)> {
-    let mut list = Vec::with_capacity(2);
-    if let Some(profile) = cfg.profile {
-        list.push((
-            uapi::V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-            profile_value(profile),
-            format!("H.264 profile {profile:?}"),
-        ));
-    }
-    if let Some(level) = cfg.level {
-        list.push((
-            uapi::V4L2_CID_MPEG_VIDEO_H264_LEVEL,
-            level_value(level),
-            format!("H.264 level {level:?}"),
-        ));
+/// A profile or level control to set.
+#[derive(Debug, PartialEq)]
+struct CodingControl {
+    id: u32,
+    value: i32,
+    what: String,
+    /// Asked for by the configuration rather than chosen for it.
+    required: bool,
+}
+
+/// The profile and level to set for `cfg`: the ones it asks for, or the ones
+/// [`EncoderConfig::target_profile`] and [`EncoderConfig::target_level`]
+/// choose.
+fn coding_controls(cfg: &EncoderConfig) -> Vec<CodingControl> {
+    let profile = cfg.target_profile();
+    let mut list = vec![CodingControl {
+        id: uapi::V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+        value: profile_value(profile),
+        what: format!("H.264 profile {profile:?}"),
+        required: cfg.profile.is_some(),
+    }];
+    if let Some(level) = cfg.target_level() {
+        list.push(CodingControl {
+            id: uapi::V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+            value: level_value(level),
+            what: format!("H.264 level {level:?}"),
+            required: cfg.level.is_some(),
+        });
     }
     list
 }
@@ -1152,22 +1183,19 @@ mod tests {
 
     #[test]
     fn coding_controls_carry_the_requested_profile_and_level() {
+        let summary = |cfg: &EncoderConfig| -> Vec<(u32, i32, bool)> {
+            coding_controls(cfg)
+                .into_iter()
+                .map(|c| (c.id, c.value, c.required))
+                .collect()
+        };
+        let profile = uapi::V4L2_CID_MPEG_VIDEO_H264_PROFILE;
+        let level = uapi::V4L2_CID_MPEG_VIDEO_H264_LEVEL;
         let mut cfg = EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0);
-        cfg.profile = None;
-        cfg.level = None;
-        assert!(coding_controls(&cfg).is_empty());
-        cfg.profile = Some(H264Profile::High);
+        // Unset: High at level 3.0, both best effort.
+        assert_eq!(summary(&cfg), vec![(profile, 4, false), (level, 8, false)]);
+        cfg.profile = Some(H264Profile::Main);
         cfg.level = Some(H264Level::L4_0);
-        let ids: Vec<(u32, i32)> = coding_controls(&cfg)
-            .into_iter()
-            .map(|(id, value, _)| (id, value))
-            .collect();
-        assert_eq!(
-            ids,
-            vec![
-                (uapi::V4L2_CID_MPEG_VIDEO_H264_PROFILE, 4),
-                (uapi::V4L2_CID_MPEG_VIDEO_H264_LEVEL, 11)
-            ]
-        );
+        assert_eq!(summary(&cfg), vec![(profile, 2, true), (level, 11, true)]);
     }
 }
