@@ -191,7 +191,7 @@ ef_infer_signals_add_output(s, "logits", out_shape, 4, EF_DTYPE_F32, NULL, NULL,
 
 ef_model_overrides *o = ef_model_overrides_new();
 char *err = NULL;
-if (ef_model_overrides_set(o, "resize", "letterbox-top_left", &err) != 0) { /* print err */ }
+if (ef_model_overrides_set(o, "resize", "letterbox-topleft", &err) != 0) { /* print err */ }
 
 ef_model_config *cfg = ef_model_config_resolve("segformer/model.onnx", s, o, &err);
 ef_model_overrides_free(o);
@@ -232,7 +232,7 @@ ef_decoder_decode_semantic(d, outputs, 1, class_map, NULL, so);
 
 `ef_model_config_preprocessing` gives the model's preprocessing as its configuration states it. The image library runs bicubic and area interpolation as bilinear, and `ef_model_config_notes` says so.
 
-`ef_model_config_resolve` returns `NULL` and sets `errno`: `ENOENT` for a missing file, `ENODATA` for a configuration nothing supplies (the message names the override that would), `EBADMSG` for a malformed container or config file, `ENOTSUP` for one the library cannot run, `EISDIR`, `EFBIG` or `EILSEQ` for a path that is a directory or a sidecar that is too large or not UTF-8, `EINVAL` for a bad argument or an override that does not apply.
+`ef_model_config_resolve` returns `NULL` and sets `errno`: `ENOENT` for a missing file, `ENODATA` for a configuration nothing supplies (the message names the override that would), `EBADMSG` for a malformed container or config file, `ENOTSUP` for one the library cannot run, `EISDIR`, `EFBIG` or `EILSEQ` for a path that is a directory or a sidecar that is too large or not UTF-8, `ERANGE` for a `labels` override that names a different number of classes than the model has, `EINVAL` for a bad argument or another override that does not apply.
 
 `ef_tile_placement.content_region` and `ef_semantic_options_set_content_region` name the normalized `[xmin, ymin, xmax, ymax]` rectangle the image occupies in the model input.
 

@@ -251,7 +251,7 @@ NormalizationArg: TypeAlias = (
 ``(mean, std)``."""
 
 PlacementArg: TypeAlias = LetterboxPlacement | str | int
-"""A :class:`LetterboxPlacement`, its name (``"center"``, ``"top_left"``) or
+"""A :class:`LetterboxPlacement`, its name (``"center"``, ``"topleft"``) or
 its integer code."""
 
 class Interpolation(enum.Enum):

@@ -99,7 +99,7 @@ def schema(shape, in_shape, resize, dtype, quant=None):
     }
     preprocessing = {"normalization": "imagenet", "resize": resize, "interpolation": "bilinear"}
     if resize == "letterbox":
-        preprocessing["letterbox"] = {"placement": "top_left", "pad": [0.0, 0.0, 0.0], "pad_space": "normalized"}
+        preprocessing["letterbox"] = {"placement": "topleft", "pad": [0.0, 0.0, 0.0], "pad_space": "normalized"}
     return {
         "schema_version": 2,
         "input": {

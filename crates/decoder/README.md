@@ -222,7 +222,7 @@ let mut overrides = ModelOverrides::default();
 overrides.set("resize", "letterbox")?; // a command line's --resize, parsed once here
 let config = resolve_model_config("segformer.onnx", signals, &overrides)?;
 for line in config.describe() {
-    tracing::info!("{line}"); // e.g. resize=letterbox-top_left [override]
+    tracing::info!("{line}"); // e.g. resize=letterbox-topleft [override]
 }
 let decoder = DecoderBuilder::new().with_schema(config.schema.clone()).build()?;
 let spec = config.preprocessing; // edgefirst_tensor::PreprocessSpec
@@ -247,7 +247,7 @@ Sources, highest priority first; each fills only what the ones before it left un
 |---|---|
 | `task` | `detect`, `segment`, `semantic` |
 | `normalize` | `unsigned`, `signed`, `raw`, `imagenet`, `R,G,B/R,G,B` (mean/std, 0–1 domain, std positive) |
-| `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-top_left` |
+| `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-topleft` |
 | `decode` | `accurate`, `fast` |
 | `labels` | comma-separated non-empty class names in channel order, e.g. `background,person` |
 

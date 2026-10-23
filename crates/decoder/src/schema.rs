@@ -210,7 +210,7 @@ impl InputSpec {
 ///   "preprocessing": {
 ///     "normalization": "imagenet",
 ///     "resize": "letterbox",
-///     "letterbox": {"placement": "top_left", "pad": [0, 0, 0], "pad_space": "normalized"}
+///     "letterbox": {"placement": "topleft", "pad": [0, 0, 0], "pad_space": "normalized"}
 ///   }
 /// }"#).unwrap();
 /// let pre = input.preprocessing.unwrap();
@@ -3364,7 +3364,7 @@ outputs:
           "normalization": {"mean": [123.675, 116.28, 103.53], "std": [58.395, 57.12, 57.375]},
           "resize": "letterbox",
           "interpolation": "bilinear",
-          "letterbox": {"placement": "top_left", "pad": [0.0, 0.0, 0.0], "pad_space": "normalized"}
+          "letterbox": {"placement": "topleft", "pad": [0.0, 0.0, 0.0], "pad_space": "normalized"}
         }
       },
       "outputs": [{

@@ -10,7 +10,7 @@
 #
 # Only ephemeral GitHub-hosted VMs are touched: loading a kernel module and
 # opening its nodes to every user would outlive the job on a persistent
-# machine. Never fails the job.
+# machine. Skipped under SKIP_PACKAGES. Never fails the job.
 #
 # Exports, via $GITHUB_ENV when it is set and to this shell otherwise:
 #   HAL_TEST_REQUIRE_VIVID=1          only when the vivid nodes appeared
@@ -39,9 +39,19 @@ if [[ "$(uname -s)" != Linux* || "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]
     exit 0
 fi
 
+if [[ "${SKIP_PACKAGES:-0}" == "1" ]]; then
+    report n/a "vivid: n/a (SKIP_PACKAGES)"
+    exit 0
+fi
+
 pkg="linux-modules-extra-$(uname -r)"
 if ! apt-cache show "${pkg}" > /dev/null 2>&1; then
     report unavailable "vivid: unavailable — vivid tests skipped (${pkg} is not in the archive)"
+    exit 0
+fi
+# A stalled mirror trickles data past apt's own timeouts; bound the download only so dpkg is never interrupted.
+if ! sudo timeout --kill-after=10 180 apt-get install -y -q --download-only "${pkg}"; then
+    report unavailable "vivid: unavailable — vivid tests skipped (downloading ${pkg} failed or timed out)"
     exit 0
 fi
 if ! sudo apt-get install -y -q "${pkg}" \

@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
+use super::error::invalid;
 use super::ModelConfigError;
 
 /// `edgefirst.json`, as a file name and the legacy ONNX metadata key.
@@ -136,7 +137,14 @@ pub fn read_embedded(path: impl AsRef<Path>) -> Result<ModelFiles, ModelConfigEr
         path: path.to_owned(),
         source,
     };
-    let mut file = File::open(path).map_err(io)?;
+    // Windows refuses to open a directory rather than reporting one.
+    let mut file = File::open(path).map_err(|e| {
+        io(if path.is_dir() {
+            std::io::ErrorKind::IsADirectory.into()
+        } else {
+            e
+        })
+    })?;
     let meta = file.metadata().map_err(io)?;
     if meta.is_dir() {
         return Err(io(std::io::ErrorKind::IsADirectory.into()));
@@ -232,13 +240,60 @@ fn read_capped(path: &Path) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// Non-empty trimmed lines of a `labels.txt`.
+/// Non-empty trimmed lines of a `labels.txt`. Blank lines are skipped, so a
+/// `labels.txt` cannot name an empty class.
 pub(crate) fn parse_labels(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// Class names with leading and trailing whitespace removed; `file` and
+/// `field` name the source in the error for a name that is empty after
+/// trimming.
+pub(crate) fn trim_labels(
+    file: &str,
+    field: &str,
+    labels: Vec<String>,
+) -> Result<Vec<String>, ModelConfigError> {
+    let mut trimmed = 0;
+    let labels = labels
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| match name.trim() {
+            "" => Err(invalid(
+                file,
+                &format!("{field}[{i}]"),
+                "is empty after trimming whitespace",
+            )),
+            t if t.len() == name.len() => Ok(name),
+            t => {
+                trimmed += 1;
+                Ok(t.to_owned())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if trimmed > 0 {
+        log::debug!("{file} {field}: trimmed whitespace from {trimmed} class names");
+    }
+    Ok(labels)
+}
+
+/// The class names in `parsed`, or `None` with a warning in `notes` when they
+/// are unusable.
+pub(crate) fn usable_labels(
+    parsed: Result<Vec<String>, ModelConfigError>,
+    notes: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    parsed
+        .map_err(|e| {
+            let note = format!("{e}; its class names are ignored");
+            log::warn!("{note}");
+            notes.push(note);
+        })
+        .ok()
 }
 
 #[cfg(test)]
@@ -329,5 +384,23 @@ mod tests {
         assert_eq!(parse_labels(&f.labels_txt.unwrap().text), ["a", "b"]);
         assert!(f.edgefirst_json.is_some());
         assert!(f.hf_config.is_none());
+    }
+
+    #[test]
+    fn labels_trim_outer_whitespace_only() {
+        let names = ["bed ", "\u{3000}wall", "chest of drawers", "\tsky\n"];
+        let got = trim_labels("f", "id2label", names.map(String::from).to_vec()).unwrap();
+        assert_eq!(got, ["bed", "wall", "chest of drawers", "sky"]);
+    }
+
+    #[test]
+    fn label_empty_after_trim_names_source_and_index() {
+        let names = vec!["a".to_owned(), " \u{a0}".to_owned()];
+        let e = trim_labels("config.json", "id2label", names).unwrap_err();
+        assert!(
+            matches!(&e, ModelConfigError::InvalidField { file, field, .. }
+                if file == "config.json" && field == "id2label[1]"),
+            "{e}"
+        );
     }
 }

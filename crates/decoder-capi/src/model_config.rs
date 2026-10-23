@@ -44,6 +44,7 @@ fn config_errno(e: &ModelConfigError) -> c_int {
         E::Container(_) | E::InvalidField { .. } | E::Infer(_) | E::Schema(_) => libc::EBADMSG,
         E::NotSupported { .. } | E::UnsupportedArchitecture(_) => libc::ENOTSUP,
         E::Unresolved { .. } => libc::ENODATA,
+        E::LabelCountMismatch { .. } => libc::ERANGE,
         _ => libc::EINVAL,
     }
 }
@@ -105,12 +106,16 @@ pub unsafe extern "C" fn ef_model_overrides_free(o: *mut EfModelOverrides) {
 /// |---|---|
 /// | `task` | `detect`, `segment`, `semantic` |
 /// | `normalize` | `unsigned`, `signed`, `raw`, `imagenet`, or `R,G,B/R,G,B` (mean/std on 0-1 values) |
-/// | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-top_left` |
+/// | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-topleft` |
 /// | `decode` | `accurate`, `fast` |
 /// | `labels` | comma-separated non-empty class names, e.g. `background,person` |
 ///
 /// A bare `letterbox` follows the model family's convention.
 /// `ef_model_config_describe` prints these keys in the same grammar.
+/// `ef_model_config_resolve` checks the number of `labels` only against a
+/// class count the model's outputs state (`ERANGE` when it differs);
+/// end-to-end detections and class maps state none, so any number is
+/// accepted there and the caller checks it.
 ///
 /// @return 0, or `EINVAL` for a `NULL` argument, an unknown key or a value
 /// outside the key's grammar; `*err_out` (when `err_out` is not `NULL`)
@@ -177,8 +182,10 @@ pub unsafe extern "C" fn ef_model_overrides_set(
 /// file does not exist, `ENODATA` when nothing configures a required piece
 /// (the message names it and the override that supplies it), `EBADMSG` for a malformed
 /// container or configuration file, `ENOTSUP` for a configuration the
-/// library cannot run, `EINVAL` for a `NULL` path or an override that does
-/// not apply, otherwise the errno of the failed read.
+/// library cannot run, `ERANGE` for a `labels` override that names a
+/// different number of classes than the model has, `EINVAL` for a `NULL`
+/// path or another override that does not apply, otherwise the errno of the
+/// failed read.
 ///
 /// # Safety
 /// `path` must be `NULL` or NUL-terminated; `signals` and `overrides` `NULL`
@@ -259,8 +266,9 @@ pub unsafe extern "C" fn ef_model_config_schema_json(c: *const EfModelConfig) ->
 }
 
 /// The class labels as a JSON array of strings in channel order, `[]` when
-/// no source names them. Freed with `ef_decoder_string_free`; `NULL` for a
-/// `NULL` handle.
+/// no source names them. Leading and trailing whitespace is trimmed from
+/// every source, and a source with unusable names is ignored with a note.
+/// Freed with `ef_decoder_string_free`; `NULL` for a `NULL` handle.
 ///
 /// # Safety
 /// `c` must be `NULL` or live.
@@ -642,12 +650,12 @@ mod tests {
             let rc = unsafe { ef_model_overrides_set(o, k.as_ptr(), v.as_ptr(), &mut err) };
             (rc, (!err.is_null()).then(|| take(err)))
         };
-        assert_eq!(set("resize", "letterbox-top_left"), (0, None));
+        assert_eq!(set("resize", "letterbox-topleft"), (0, None));
         assert_eq!(set("decode", "fast"), (0, None));
         let (rc, msg) = set("resize", "fill");
         assert_eq!(rc, libc::EINVAL);
         assert!(
-            msg.unwrap().contains("letterbox-top_left"),
+            msg.unwrap().contains("letterbox-topleft"),
             "lists the accepted forms"
         );
         let (rc, msg) = set("colour", "red");
@@ -749,6 +757,11 @@ mod tests {
     fn the_error_codes_follow_the_error_kind() {
         let e = ModelConfigError::Override("x".into());
         assert_eq!(config_errno(&e), libc::EINVAL);
+        let e = ModelConfigError::LabelCountMismatch {
+            expected: 2,
+            found: 1,
+        };
+        assert_eq!(config_errno(&e), libc::ERANGE);
         let e = ModelConfigError::UnsupportedArchitecture("detr".into());
         assert_eq!(config_errno(&e), libc::ENOTSUP);
         let e = ModelConfigError::Container("x".into());

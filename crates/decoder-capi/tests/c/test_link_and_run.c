@@ -12,6 +12,7 @@
  * Run from the repository root: the model-config case reads
  * testdata/hf/segformer-512. */
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
 #include <edgefirst/decoder.h>
 #include <errno.h>
 #include <stdint.h>

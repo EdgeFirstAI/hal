@@ -1224,12 +1224,16 @@ void ef_model_overrides_free(struct ef_model_overrides *o);
  * |---|---|
  * | `task` | `detect`, `segment`, `semantic` |
  * | `normalize` | `unsigned`, `signed`, `raw`, `imagenet`, or `R,G,B/R,G,B` (mean/std on 0-1 values) |
- * | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-top_left` |
+ * | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-topleft` |
  * | `decode` | `accurate`, `fast` |
  * | `labels` | comma-separated non-empty class names, e.g. `background,person` |
  *
  * A bare `letterbox` follows the model family's convention.
  * `ef_model_config_describe` prints these keys in the same grammar.
+ * `ef_model_config_resolve` checks the number of `labels` only against a
+ * class count the model's outputs state (`ERANGE` when it differs);
+ * end-to-end detections and class maps state none, so any number is
+ * accepted there and the caller checks it.
  *
  * @return 0, or `EINVAL` for a `NULL` argument, an unknown key or a value
  * outside the key's grammar; `*err_out` (when `err_out` is not `NULL`)
@@ -1263,8 +1267,10 @@ int ef_model_overrides_set(struct ef_model_overrides *o,
  * file does not exist, `ENODATA` when nothing configures a required piece
  * (the message names it and the override that supplies it), `EBADMSG` for a malformed
  * container or configuration file, `ENOTSUP` for a configuration the
- * library cannot run, `EINVAL` for a `NULL` path or an override that does
- * not apply, otherwise the errno of the failed read.
+ * library cannot run, `ERANGE` for a `labels` override that names a
+ * different number of classes than the model has, `EINVAL` for a `NULL`
+ * path or another override that does not apply, otherwise the errno of the
+ * failed read.
  *
  * # Safety
  * `path` must be `NULL` or NUL-terminated; `signals` and `overrides` `NULL`
@@ -1296,8 +1302,9 @@ char *ef_model_config_schema_json(const struct ef_model_config *c);
 
 /**
  * The class labels as a JSON array of strings in channel order, `[]` when
- * no source names them. Freed with `ef_decoder_string_free`; `NULL` for a
- * `NULL` handle.
+ * no source names them. Leading and trailing whitespace is trimmed from
+ * every source, and a source with unusable names is ignored with a note.
+ * Freed with `ef_decoder_string_free`; `NULL` for a `NULL` handle.
  *
  * # Safety
  * `c` must be `NULL` or live.

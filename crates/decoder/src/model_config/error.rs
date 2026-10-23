@@ -42,6 +42,14 @@ pub enum ModelConfigError {
     UnsupportedArchitecture(String),
     /// An override is malformed or cannot apply to this model.
     Override(String),
+    /// The `labels` override names a different number of classes than the
+    /// model has.
+    LabelCountMismatch {
+        /// The model's class count.
+        expected: usize,
+        /// The number of names the override gives.
+        found: usize,
+    },
     /// Nothing supplied a required piece of the configuration.
     Unresolved {
         /// What is missing.
@@ -73,6 +81,10 @@ impl fmt::Display for ModelConfigError {
                 "Hugging Face model_type `{t}` has no decoder; supported: *ForSemanticSegmentation"
             ),
             Self::Override(s) => write!(f, "invalid override: {s}"),
+            Self::LabelCountMismatch { expected, found } => write!(
+                f,
+                "invalid override: labels names {found} classes but the model has {expected}"
+            ),
             Self::Unresolved { missing, overrides } => {
                 write!(f, "missing {missing}; supply {overrides}")
             }

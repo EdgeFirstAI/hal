@@ -7,6 +7,7 @@ provenance and the preprocessing spec it hands to ``edgefirst.image``."""
 from __future__ import annotations
 
 import dataclasses
+import pickle
 import shutil
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from edgefirst.decoder import (
     ConfigSource,
     DecodeMode,
     Decoder,
+    LabelCountMismatchError,
     ModelConfigError,
     ModelFamily,
     ModelOverrides,
@@ -180,14 +182,14 @@ def test_heuristic_only_guesses_from_io_names(bare_model: Path):
 def test_overrides_apply_last_and_are_recorded(sidecar_model: Path):
     overrides = ModelOverrides(
         normalize="unsigned",
-        resize="letterbox-top_left",
+        resize="letterbox-topleft",
         decode=DecodeMode.Fast,
         labels=["a"] * 150,
     )
     cfg = resolve_model_config(sidecar_model, SEGFORMER_SIGNALS, overrides)
     spec = cfg.preprocessing
     assert spec.normalization == ((0.0, 0.0, 0.0), (255.0, 255.0, 255.0))
-    assert (spec.fit, spec.placement) == ("letterbox", "top_left")
+    assert (spec.fit, spec.placement) == ("letterbox", "topleft")
     assert cfg.decode_mode == DecodeMode.Fast
     assert cfg.labels == ["a"] * 150
     for field in (
@@ -216,6 +218,59 @@ def test_hf_configs_without_signals_are_unresolved(sidecar_model: Path):
 def test_nothing_found_is_unresolved_naming_the_fix(bare_model: Path):
     with pytest.raises(UnresolvedConfigError, match="task=semantic"):
         resolve_model_config(bare_model, None, ModelOverrides(task="semantic"))
+
+
+def test_label_count_mismatch_has_its_own_error(sidecar_model: Path):
+    with pytest.raises(LabelCountMismatchError) as info:
+        resolve_model_config(
+            sidecar_model, SEGFORMER_SIGNALS, ModelOverrides(labels=["a", "b"])
+        )
+    assert isinstance(info.value, OverrideError)
+    assert (info.value.expected, info.value.found) == (150, 2)
+    assert "labels names 2 classes but the model has 150" in str(info.value)
+    restored = pickle.loads(pickle.dumps(info.value))
+    assert type(restored) is LabelCountMismatchError
+    assert (str(restored), restored.expected, restored.found) == (
+        str(info.value),
+        150,
+        2,
+    )
+
+
+def test_empty_override_label_is_a_plain_override_error():
+    labels = ["a"] * 150
+    labels[3] = " "
+    with pytest.raises(OverrideError, match="empty name at 3") as info:
+        ModelOverrides(labels=labels)
+    assert not isinstance(info.value, LabelCountMismatchError)
+
+
+def test_untrimmed_hf_labels_are_trimmed(tmp_path: Path):
+    legacy = ROOT / "testdata/hf/segformer-legacy-512"
+    for name in ("config.json", "preprocessor_config.json"):
+        shutil.copy(legacy / name, tmp_path / name)
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"")
+    cfg = resolve_model_config(model, SEGFORMER_SIGNALS)
+    assert cfg.labels[7] == "bed"
+    assert cfg.labels[33] == "chest of drawers"
+
+    overridden = resolve_model_config(
+        model, SEGFORMER_SIGNALS, ModelOverrides(labels=[f" c{i} " for i in range(150)])
+    )
+    assert overridden.labels[0] == "c0"
+
+
+def test_empty_label_after_trim_is_noted_and_ignored(tmp_path: Path):
+    config = (SEGFORMER / "config.json").read_text().replace('"class_7"', '"  "', 1)
+    (tmp_path / "config.json").write_text(config)
+    shutil.copy(SEGFORMER / "preprocessor_config.json", tmp_path)
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"")
+    cfg = resolve_model_config(model, SEGFORMER_SIGNALS)
+    assert cfg.labels == []
+    assert any("id2label[7]" in n for n in cfg.notes), cfg.notes
+    assert any("labels unknown" in n for n in cfg.notes), cfg.notes
 
 
 def test_missing_model_is_an_os_error(tmp_path: Path):
@@ -263,7 +318,7 @@ def test_describe_round_trips_through_overrides(sidecar_model: Path):
         for line in cfg.describe()
         if line.split("=", 1)[0] in keys
     )
-    assert pairs["resize"] == "letterbox-top_left"
+    assert pairs["resize"] == "letterbox-topleft"
     again = resolve_model_config(
         sidecar_model, SEGFORMER_SIGNALS, ModelOverrides(**pairs)
     )
@@ -303,7 +358,7 @@ def test_signals_reject_dynamic_shapes(bare_model: Path):
         ("resize", "stretch"),
         ("resize", "letterbox"),
         ("resize", "letterbox-center"),
-        ("resize", "letterbox-top_left"),
+        ("resize", "letterbox-topleft"),
         ("decode", "accurate"),
         ("decode", "fast"),
     ],

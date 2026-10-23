@@ -1114,7 +1114,7 @@ class PreprocessSpec:
     fit: str = "letterbox"
     """``"stretch"`` or ``"letterbox"``."""
     placement: str = "center"
-    """``"center"`` or ``"top_left"``."""
+    """``"center"`` or ``"topleft"``."""
     pad: tuple[float, float, float] = (114.0, 114.0, 114.0)
     """Letterbox pad per RGB channel, in the space :attr:`pad_space` names."""
     pad_space: str = "pixel"
@@ -1140,10 +1140,13 @@ class ModelOverrides:
     - ``normalize``: ``"unsigned" | "signed" | "raw" | "imagenet" |
       "R,G,B/R,G,B"`` (mean/std in the 0-1 domain)
     - ``resize``: ``"stretch" | "letterbox" | "letterbox-center" |
-      "letterbox-top_left"``; bare ``"letterbox"`` follows the model family
+      "letterbox-topleft"``; bare ``"letterbox"`` follows the model family
     - ``decode``: ``"accurate" | "fast"`` or a :class:`DecodeMode`
     - ``labels``: a list of non-empty class names or one comma-separated
-      string
+      string. Resolution raises :class:`LabelCountMismatchError` when their
+      number differs from a class count the model's outputs state;
+      end-to-end detections and class maps state none, so any number is
+      accepted there and the caller checks it.
 
     :meth:`ResolvedModelConfig.describe` prints these keys in the same
     grammar.
@@ -1192,7 +1195,12 @@ class ResolvedModelConfig:
         for ``Decoder(schema)``."""
     @property
     def labels(self) -> list[str]:
-        """Class names in channel order; empty when no source names them."""
+        """Class names in channel order; empty when no source names them.
+
+        Leading and trailing whitespace is trimmed from every source
+        (ADE20K's ``"bed "`` is ``"bed"``). A source with unusable names, such
+        as one empty after trimming, is ignored with a note naming the source
+        and index, and names repeated ignoring case add a note."""
     @property
     def family(self) -> ModelFamily: ...
     @property
@@ -1223,7 +1231,7 @@ class ResolvedModelConfig:
         """Where ``field`` came from, or ``None``."""
     def describe(self) -> list[str]:
         """One ``key=value [source]`` line per resolved value, e.g.
-        ``"resize=letterbox-top_left [preprocessor_config.json]"``. Override
+        ``"resize=letterbox-topleft [preprocessor_config.json]"``. Override
         keys print in the :class:`ModelOverrides` grammar."""
 
 def resolve_model_config(
@@ -1255,6 +1263,8 @@ def resolve_model_config(
         UnsupportedModelError: The configuration asks for something the
             library cannot run.
         OverrideError: An override cannot apply.
+        LabelCountMismatchError: The ``labels`` override names a different
+            number of classes than the model has (an ``OverrideError``).
         ModelConfigError: A configuration file is malformed. All four are
             ``ValueError`` subclasses.
     """
@@ -1264,6 +1274,15 @@ class ModelConfigError(ValueError):
 
 class OverrideError(ModelConfigError):
     """An override outside its grammar or one that does not apply."""
+
+class LabelCountMismatchError(OverrideError):
+    """A ``labels`` override naming a different number of classes than the
+    model has: ``expected`` is the model's class count, ``found`` the number
+    of names given."""
+
+    expected: int
+    found: int
+    def __init__(self, message: str, expected: int, found: int) -> None: ...
 
 class UnresolvedConfigError(ModelConfigError):
     """Nothing supplies a required piece of the configuration."""

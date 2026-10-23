@@ -128,7 +128,7 @@ class PreprocessSpec:
     )
     #: ``"stretch"`` or ``"letterbox"``.
     fit: str = "letterbox"
-    #: Letterbox placement: ``"center"`` or ``"top_left"``.
+    #: Letterbox placement: ``"center"`` or ``"topleft"``.
     placement: str = "center"
     #: Letterbox pad per RGB channel, in the space :attr:`pad_space` names.
     pad: Tuple[float, float, float] = (114.0, 114.0, 114.0)  # noqa: FA100
@@ -157,6 +157,20 @@ class ModelConfigError(ValueError):
 
 class OverrideError(ModelConfigError):
     """An override outside its grammar or one that does not apply."""
+
+
+class LabelCountMismatchError(OverrideError):
+    """A ``labels`` override naming a different number of classes than the
+    model has: ``expected`` is the model's class count, ``found`` the number
+    of names given."""
+
+    def __init__(self, message: str, expected: int, found: int) -> None:
+        super().__init__(message)
+        self.expected = expected
+        self.found = found
+
+    def __reduce__(self):
+        return type(self), (str(self), self.expected, self.found)
 
 
 class UnresolvedConfigError(ModelConfigError):
