@@ -12,7 +12,7 @@ use edgefirst_tensor::{
 };
 use serde_json::Value;
 
-use super::container::parse_labels;
+use super::container::{parse_labels, trim_labels, usable_labels};
 use super::error::invalid;
 use super::heuristics::{hf_family_name, hf_semantic_by_names, semantic_schema, SemanticExport};
 use super::hf::{decoder_for_architecture, parse_hf_config, parse_hf_preprocessor, HfCheck};
@@ -88,7 +88,8 @@ pub struct ResolvedModelConfig {
     /// The output schema, with `input.preprocessing` filled with the
     /// resolved values when the schema has an input.
     pub schema: SchemaV2,
-    /// Class names in channel order; empty when no source names them.
+    /// Class names in channel order, with outer whitespace trimmed; empty
+    /// when no source names them.
     pub labels: Vec<String>,
     /// The family the configuration identifies.
     pub family: ModelFamily,
@@ -121,7 +122,7 @@ impl ResolvedModelConfig {
     /// One `key=value [source]` line per resolved value, for logging. Lines
     /// whose key is an override (`normalize`, `resize`, `task`, `decode`)
     /// print the value in the override grammar, e.g.
-    /// `resize=letterbox-top_left [preprocessor_config.json]` or
+    /// `resize=letterbox-topleft [preprocessor_config.json]` or
     /// `normalize=imagenet [guess: SegFormer default]`.
     #[must_use]
     pub fn describe(&self) -> Vec<String> {
@@ -244,6 +245,24 @@ fn take<T>(
         }
         None => default,
     }
+}
+
+/// Names that appear more than once ignoring case, as `"bed" at 7, 9`, or
+/// `None` when every name is distinct.
+fn repeated_labels(labels: &[String]) -> Option<String> {
+    let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, name) in labels.iter().enumerate() {
+        seen.entry(name.to_lowercase()).or_default().push(i);
+    }
+    let repeats: Vec<String> = seen
+        .values()
+        .filter(|at| at.len() > 1)
+        .map(|at| {
+            let index: Vec<String> = at.iter().map(ToString::to_string).collect();
+            format!("{:?} at {}", labels[at[0]], index.join(", "))
+        })
+        .collect();
+    (!repeats.is_empty()).then(|| repeats.join("; "))
 }
 
 fn at(source: ConfigSource, detail: impl Into<String>) -> Provenance {
@@ -374,6 +393,9 @@ impl State {
                 .pointer("/dataset/classes")
                 .and_then(Value::as_array)
                 .and_then(|a| a.iter().map(|c| c.as_str().map(str::to_owned)).collect());
+            let classes = classes.and_then(|c| {
+                usable_labels(trim_labels(&f.name, "dataset.classes", c), &mut self.notes)
+            });
             let name = value
                 .get("name")
                 .and_then(Value::as_str)
@@ -453,7 +475,8 @@ impl State {
                 }
             }
         }
-        if let Some((m, prov)) = model {
+        if let Some((mut m, prov)) = model {
+            self.notes.append(&mut m.notes);
             let file = files
                 .hf_config
                 .as_ref()
@@ -476,11 +499,12 @@ impl State {
                 let classes = export.num_classes;
                 if let Some(n) = m.labels.as_ref().map(Vec::len).or(m.num_labels) {
                     if n != classes {
-                        return Err(invalid(
+                        let e = invalid(
                             file,
                             "id2label",
                             format!("names {n} classes but the output has {classes}"),
-                        ));
+                        );
+                        m.labels = usable_labels(Err(e), &mut self.notes);
                     }
                 }
                 let description = format!(
@@ -535,9 +559,7 @@ impl State {
         match infer_ultralytics_schema(signals) {
             Ok(inferred) => {
                 let prov = Provenance::new(ConfigSource::UltralyticsMetadata, None);
-                if !inferred.labels.is_empty() {
-                    fill(&mut self.labels, inferred.labels, &prov);
-                }
+                self.fill_ultralytics_labels(inferred.labels, &prov);
                 self.description = Some(inferred.description);
                 self.set_schema(inferred.schema, prov, ModelFamily::Ultralytics);
                 let conv = Provenance::new(ConfigSource::Default, Some("Ultralytics convention"));
@@ -551,10 +573,18 @@ impl State {
     /// Ultralytics class names for a schema another source supplied.
     fn ultralytics_labels(&mut self, signals: &ModelSignals) {
         if let Ok(inferred) = infer_ultralytics_schema(signals) {
-            if !inferred.labels.is_empty() {
-                let prov = Provenance::new(ConfigSource::UltralyticsMetadata, None);
-                fill(&mut self.labels, inferred.labels, &prov);
-            }
+            let prov = Provenance::new(ConfigSource::UltralyticsMetadata, None);
+            self.fill_ultralytics_labels(inferred.labels, &prov);
+        }
+    }
+
+    fn fill_ultralytics_labels(&mut self, labels: Vec<String>, prov: &Provenance) {
+        if labels.is_empty() {
+            return;
+        }
+        let trimmed = trim_labels("Ultralytics metadata", "names", labels);
+        if let Some(labels) = usable_labels(trimmed, &mut self.notes) {
+            fill(&mut self.labels, labels, prov);
         }
     }
 
@@ -875,10 +905,10 @@ pub fn resolve_sources(
         .then_some(num_classes)
         .flatten();
     if let Some(l) = &overrides.labels {
-        if l.iter().any(|n| n.trim().is_empty()) {
-            return Err(ModelConfigError::Override(
-                "labels has an empty name".to_owned(),
-            ));
+        if let Some(i) = l.iter().position(|n| n.trim().is_empty()) {
+            return Err(ModelConfigError::Override(format!(
+                "labels has an empty name at {i}"
+            )));
         }
         if let Some(n) = classes.filter(|&n| n != l.len()) {
             return Err(ModelConfigError::Override(format!(
@@ -886,7 +916,7 @@ pub fn resolve_sources(
                 l.len()
             )));
         }
-        labels = l.clone();
+        labels = l.iter().map(|n| n.trim().to_owned()).collect();
         provenance.insert(ConfigField::Labels, ov);
     } else if let Some(n) = classes.filter(|&n| labels_found && n != labels.len()) {
         let note = format!(
@@ -901,7 +931,20 @@ pub fn resolve_sources(
         notes.push(note);
     }
     if labels.is_empty() {
-        notes.push("labels unknown; supply them with the labels override".into());
+        let note = "labels unknown; supply them with the labels override";
+        log::warn!("{note}");
+        notes.push(note.into());
+    }
+    if let Some(repeats) = repeated_labels(&labels) {
+        let note = format!(
+            "labels [{}] repeat names, so matching classes by name is ambiguous: {repeats}",
+            provenance
+                .get(&ConfigField::Labels)
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
+        log::warn!("{note}");
+        notes.push(note);
     }
 
     let mut preprocessing = PreprocessSpec::new();
@@ -1034,7 +1077,7 @@ mod tests {
       "dataset": {"classes": ["bg", "fg"]},
       "input": {"shape": [1, 3, 512, 512],
                 "dshape": [{"batch": 1}, {"num_features": 3}, {"height": 512}, {"width": 512}],
-                "preprocessing": {"letterbox": {"placement": "top_left", "pad": [0], "pad_space": "normalized"}}},
+                "preprocessing": {"letterbox": {"placement": "topleft", "pad": [0], "pad_space": "normalized"}}},
       "outputs": [{"name": "logits", "type": "segmentation", "decoder": "semantic",
                    "shape": [1, 2, 128, 128],
                    "dshape": [{"batch": 1}, {"num_classes": 2}, {"height": 128}, {"width": 128}],
@@ -1349,19 +1392,19 @@ mod tests {
     }
 
     #[test]
-    fn hf_label_count_must_match_the_output() {
-        let e = resolve_sources(
-            sources(
-                Default::default(),
-                hf_sidecar("segformer-512"),
-                Some(segformer_signals(19)),
-            ),
-            &ModelOverrides::default(),
-        )
-        .unwrap_err();
+    fn hf_labels_that_miscount_the_output_are_ignored() {
+        let c = resolve(sources(
+            Default::default(),
+            hf_sidecar("segformer-512"),
+            Some(segformer_signals(19)),
+        ));
+        assert!(c.labels.is_empty());
         assert!(
-            matches!(&e, ModelConfigError::InvalidField { field, .. } if field == "id2label"),
-            "{e}"
+            c.notes
+                .iter()
+                .any(|n| n.contains("names 150 classes but the output has 19")),
+            "{:?}",
+            c.notes
         );
     }
 
@@ -1440,7 +1483,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("decode=accurate")));
 
         let mut o = ModelOverrides::default();
-        o.set("resize", "letterbox-top_left").unwrap();
+        o.set("resize", "letterbox-topleft").unwrap();
         let c = resolve_sources(
             sources(
                 Default::default(),
@@ -1452,11 +1495,11 @@ mod tests {
         .unwrap();
         let lines = c.describe();
         assert!(
-            lines.contains(&"placement=top_left [override]".to_string()),
+            lines.contains(&"placement=topleft [override]".to_string()),
             "{lines:?}"
         );
         assert!(lines.contains(&"normalize=imagenet [guess: SegFormer default]".to_string()));
-        assert!(lines.contains(&"resize=letterbox-top_left [override]".to_string()));
+        assert!(lines.contains(&"resize=letterbox-topleft [override]".to_string()));
     }
 
     /// Every override key `describe()` prints parses back to the same value.
@@ -1576,6 +1619,94 @@ mod tests {
             ),
             Err(ModelConfigError::Override(_))
         ));
+    }
+
+    #[test]
+    fn legacy_segformer_resolves_trimmed_labels() {
+        let c = resolve(sources(
+            Default::default(),
+            hf_sidecar("segformer-legacy-512"),
+            Some(segformer_signals(150)),
+        ));
+        assert_eq!(c.labels.len(), 150);
+        assert_eq!(c.labels[7], "bed");
+        assert_eq!(c.labels[33], "chest of drawers");
+        assert_eq!(c.preprocessing.fit, FitMode::Stretch);
+        assert_eq!(c.preprocessing.size, Some((512, 512)));
+        assert_eq!(c.reduce_labels, Some(true));
+        assert!(
+            !c.notes.iter().any(|n| n.contains("repeat")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    fn edgefirst_with_classes(classes: &str) -> ModelSources {
+        let ef = SEGFORMER_EF.replace(r#"["bg", "fg"]"#, classes);
+        let embedded = ModelFiles {
+            edgefirst_json: file("edgefirst.json", &ef),
+            ..Default::default()
+        };
+        sources(embedded, Default::default(), None)
+    }
+
+    fn ultralytics_with_names(names: &str) -> ModelSources {
+        let mut s = ultralytics_signals();
+        s.metadata.insert("names".into(), names.into());
+        sources(Default::default(), Default::default(), Some(s))
+    }
+
+    /// Asserts that the labels were ignored with a note naming `field`.
+    fn assert_ignored_labels(c: &ResolvedModelConfig, field: &str) {
+        let ignored = format!("field `{field}` is empty after trimming whitespace; its class");
+        assert!(
+            c.notes.iter().any(|n| n.contains(&ignored)),
+            "{:?}",
+            c.notes
+        );
+        assert!(
+            c.notes.iter().any(|n| n.contains("labels unknown")),
+            "{:?}",
+            c.notes
+        );
+        assert!(c.labels.is_empty());
+    }
+
+    #[test]
+    fn labels_are_trimmed_from_every_source() {
+        let none = ModelOverrides::default();
+        let c = resolve(edgefirst_with_classes(r#"[" bg", "fg\t"]"#));
+        assert_eq!(c.labels, ["bg", "fg"]);
+        let c = resolve(edgefirst_with_classes(r#"["bg", " "]"#));
+        assert_ignored_labels(&c, "dataset.classes[1]");
+
+        let c = resolve(ultralytics_with_names("{0: ' person', 1: 'car '}"));
+        assert_eq!(c.labels, ["person", "car"]);
+        let c = resolve(ultralytics_with_names("{0: ' ', 1: 'car'}"));
+        assert_ignored_labels(&c, "names[0]");
+
+        let mut s = edgefirst_with_classes(r#"["bg", " "]"#);
+        s.sidecar.labels_txt = file("labels.txt", "a\nb\n");
+        let c = resolve_sources(s, &none).unwrap();
+        assert_eq!(c.labels, ["a", "b"]);
+
+        let mut o = ModelOverrides::new();
+        o.labels = Some(vec![" a".into(), "b c ".into()]);
+        let c = resolve_sources(ultralytics_with_names("{0: 'x', 1: 'y'}"), &o).unwrap();
+        assert_eq!(c.labels, ["a", "b c"]);
+    }
+
+    #[test]
+    fn repeated_labels_are_noted() {
+        let c = resolve(ultralytics_with_names("{0: 'bed', 1: 'Bed '}"));
+        assert_eq!(c.labels, ["bed", "Bed"]);
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.contains("ultralytics metadata") && n.contains(r#""bed" at 0, 1"#)),
+            "{:?}",
+            c.notes
+        );
     }
 
     /// A reference size that differs in one axis is noted.

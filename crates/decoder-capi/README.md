@@ -191,7 +191,7 @@ ef_infer_signals_add_output(s, "logits", out_shape, 4, EF_DTYPE_F32, NULL, NULL,
 
 ef_model_overrides *o = ef_model_overrides_new();
 char *err = NULL;
-if (ef_model_overrides_set(o, "resize", "letterbox-top_left", &err) != 0) { /* print err */ }
+if (ef_model_overrides_set(o, "resize", "letterbox-topleft", &err) != 0) { /* print err */ }
 
 ef_model_config *cfg = ef_model_config_resolve("segformer/model.onnx", s, o, &err);
 ef_model_overrides_free(o);

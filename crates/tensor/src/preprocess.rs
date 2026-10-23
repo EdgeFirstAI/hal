@@ -25,7 +25,7 @@ crate::ef_vocabulary! {
         #[default]
         Center = 0, "center", CENTER,
         /// Anchored at the top-left corner, padding on the right and bottom.
-        TopLeft = 1, "top_left", TOP_LEFT,
+        TopLeft = 1, "topleft", TOP_LEFT,
     }
     #[doc(hidden)]
     pub mod letterbox_placement_code;
@@ -577,6 +577,11 @@ mod tests {
             serde_json::to_string(&PadSpace::Normalized).unwrap(),
             "\"normalized\""
         );
+        assert_eq!(
+            serde_json::to_string(&LetterboxPlacement::TopLeft).unwrap(),
+            "\"topleft\""
+        );
+        assert!(serde_json::from_str::<LetterboxPlacement>("\"top_left\"").is_err());
         let e = serde_json::from_str::<Interpolation>("\"lanczos\"").unwrap_err();
         assert!(e.to_string().contains("bicubic"), "{e}");
     }

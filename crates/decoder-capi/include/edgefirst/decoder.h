@@ -1224,7 +1224,7 @@ void ef_model_overrides_free(struct ef_model_overrides *o);
  * |---|---|
  * | `task` | `detect`, `segment`, `semantic` |
  * | `normalize` | `unsigned`, `signed`, `raw`, `imagenet`, or `R,G,B/R,G,B` (mean/std on 0-1 values) |
- * | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-top_left` |
+ * | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-topleft` |
  * | `decode` | `accurate`, `fast` |
  * | `labels` | comma-separated non-empty class names, e.g. `background,person` |
  *
@@ -1296,8 +1296,9 @@ char *ef_model_config_schema_json(const struct ef_model_config *c);
 
 /**
  * The class labels as a JSON array of strings in channel order, `[]` when
- * no source names them. Freed with `ef_decoder_string_free`; `NULL` for a
- * `NULL` handle.
+ * no source names them. Leading and trailing whitespace is trimmed from
+ * every source, and a source with unusable names is ignored with a note.
+ * Freed with `ef_decoder_string_free`; `NULL` for a `NULL` handle.
  *
  * # Safety
  * `c` must be `NULL` or live.

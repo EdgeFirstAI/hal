@@ -211,7 +211,7 @@ pub enum LabelsArg {
 /// - ``normalize``: ``"unsigned" | "signed" | "raw" | "imagenet" |
 ///   "R,G,B/R,G,B"`` (mean/std in the 0-1 domain)
 /// - ``resize``: ``"stretch" | "letterbox" | "letterbox-center" |
-///   "letterbox-top_left"``; bare ``"letterbox"`` follows the model family
+///   "letterbox-topleft"``; bare ``"letterbox"`` follows the model family
 /// - ``decode``: ``"accurate" | "fast"`` (or a :class:`DecodeMode`)
 /// - ``labels``: a list of non-empty class names, or one comma-separated
 ///   string
@@ -423,7 +423,8 @@ impl PyResolvedModelConfig {
             .map_err(|e| PyRuntimeError::new_err(format!("failed to convert schema: {e}")))
     }
 
-    /// Class names in channel order; empty when no source names them.
+    /// Class names in channel order, with outer whitespace trimmed; empty
+    /// when no source names them.
     #[getter]
     fn labels(&self) -> Vec<String> {
         self.0.labels.clone()
@@ -494,7 +495,7 @@ impl PyResolvedModelConfig {
     }
 
     /// One ``key=value [source]`` line per resolved value, for logging, e.g.
-    /// ``"resize=letterbox-top_left [preprocessor_config.json]"``. Override
+    /// ``"resize=letterbox-topleft [preprocessor_config.json]"``. Override
     /// keys print in the :class:`ModelOverrides` grammar.
     fn describe(&self) -> Vec<String> {
         self.0.describe()

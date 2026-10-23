@@ -5,6 +5,7 @@
 
 use serde_json::{Map, Value};
 
+use super::container::{trim_labels, usable_labels};
 use super::error::invalid;
 use super::ModelConfigError;
 use edgefirst_tensor::{Interpolation, Normalization};
@@ -26,6 +27,8 @@ pub(crate) struct HfModel {
     /// Class names in channel order, from `id2label` or `label2id`.
     pub labels: Option<Vec<String>>,
     pub num_labels: Option<usize>,
+    /// Unusable class names, which are ignored.
+    pub notes: Vec<String>,
 }
 
 /// What `preprocessor_config.json` says about the input.
@@ -94,9 +97,10 @@ pub(crate) fn parse_hf_config(
             ))
         }
     };
+    let mut notes = Vec::new();
     let labels = match (m.get("id2label"), m.get("label2id")) {
-        (Some(v), _) if !v.is_null() => Some(id2label(file, v)?),
-        (_, Some(v)) if !v.is_null() => Some(label2id(file, v)?),
+        (Some(v), _) if !v.is_null() => usable_labels(id2label(file, v), &mut notes),
+        (_, Some(v)) if !v.is_null() => usable_labels(label2id(file, v), &mut notes),
         _ => None,
     };
     let num_labels = match m.get("num_labels") {
@@ -107,24 +111,27 @@ pub(crate) fn parse_hf_config(
                 .ok_or_else(|| invalid(file, "num_labels", "is not a non-negative integer"))?,
         ),
     };
-    if let (Some(l), Some(n)) = (&labels, num_labels) {
-        if l.len() != n {
-            return Err(invalid(
+    let labels = match (labels, num_labels) {
+        (Some(l), Some(n)) if l.len() != n => usable_labels(
+            Err(invalid(
                 file,
                 "num_labels",
                 format!("is {n} but id2label has {} classes", l.len()),
-            ));
-        }
-    }
+            )),
+            &mut notes,
+        ),
+        (labels, _) => labels,
+    };
     Ok(HfCheck::Valid(HfModel {
         model_type: model_type.to_owned(),
         architectures,
         labels,
         num_labels,
+        notes,
     }))
 }
 
-/// Class names indexed `0..n`, from pairs of (index, name).
+/// Class names indexed `0..n`, from pairs of (index, name), trimmed.
 fn dense(
     file: &str,
     field: &str,
@@ -143,11 +150,12 @@ fn dense(
             return Err(invalid(file, field, format!("repeats index {i}")));
         }
     }
-    slots
+    let names = slots
         .into_iter()
         .enumerate()
         .map(|(i, s)| s.ok_or_else(|| invalid(file, field, format!("has no class {i}"))))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    trim_labels(file, field, names)
 }
 
 fn id2label(file: &str, v: &Value) -> Result<Vec<String>, ModelConfigError> {
@@ -474,6 +482,62 @@ mod tests {
     }
 
     #[test]
+    fn legacy_segformer_fixture_trims_labels() {
+        let text = fixture("segformer-legacy-512", "config.json");
+        let labels = valid(parse_hf_config(&text, "config.json").unwrap())
+            .labels
+            .unwrap();
+        assert_eq!(labels.len(), 150);
+        assert_eq!(labels[7], "bed");
+        assert_eq!(labels[33], "chest of drawers");
+
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        v.as_object_mut().unwrap().remove("id2label");
+        let from_label2id = valid(parse_hf_config(&v.to_string(), "config.json").unwrap());
+        assert_eq!(from_label2id.labels.unwrap(), labels);
+
+        let p = valid(
+            parse_hf_preprocessor(
+                &fixture("segformer-legacy-512", "preprocessor_config.json"),
+                "preprocessor_config.json",
+                true,
+            )
+            .unwrap(),
+        );
+        assert_eq!(p.size, Some((512, 512)));
+        assert_eq!(p.reduce_labels, Some(true));
+    }
+
+    #[test]
+    fn untrimmed_label_collision_and_empty_name() {
+        let base =
+            r#""model_type": "segformer", "architectures": ["SegformerForSemanticSegmentation"]"#;
+        let m = valid(
+            parse_hf_config(
+                &format!(r#"{{{base}, "id2label": {{"0": "a", "1": "  "}}}}"#),
+                "config.json",
+            )
+            .unwrap(),
+        );
+        assert_eq!(m.labels, None);
+        assert_eq!(
+            m.notes,
+            [
+                "config.json: field `id2label[1]` is empty after trimming whitespace; its class \
+              names are ignored"
+            ]
+        );
+        let m = valid(
+            parse_hf_config(
+                &format!(r#"{{{base}, "label2id": {{"bed": 0, "bed ": 1}}}}"#),
+                "config.json",
+            )
+            .unwrap(),
+        );
+        assert_eq!(m.labels.unwrap(), ["bed", "bed"]);
+    }
+
+    #[test]
     fn foreign_config_json_is_skipped() {
         for text in [
             r#"{"name": "x"}"#,
@@ -502,10 +566,14 @@ mod tests {
     }
 
     #[test]
-    fn bad_id2label_names_field() {
-        let field_of = |text: &str| match parse_hf_config(text, "config.json") {
-            Err(ModelConfigError::InvalidField { field, .. }) => field,
-            other => panic!("{other:?}"),
+    fn bad_id2label_is_noted_and_ignored() {
+        let field_of = |text: &str| {
+            let m = valid(parse_hf_config(text, "config.json").unwrap());
+            assert_eq!(m.labels, None, "{text}");
+            let [note] = m.notes.as_slice() else {
+                panic!("{:?}", m.notes)
+            };
+            note.split('`').nth(1).unwrap_or_default().to_owned()
         };
         let base =
             r#""model_type": "segformer", "architectures": ["SegformerForSemanticSegmentation"]"#;

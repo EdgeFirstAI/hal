@@ -105,7 +105,7 @@ pub unsafe extern "C" fn ef_model_overrides_free(o: *mut EfModelOverrides) {
 /// |---|---|
 /// | `task` | `detect`, `segment`, `semantic` |
 /// | `normalize` | `unsigned`, `signed`, `raw`, `imagenet`, or `R,G,B/R,G,B` (mean/std on 0-1 values) |
-/// | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-top_left` |
+/// | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-topleft` |
 /// | `decode` | `accurate`, `fast` |
 /// | `labels` | comma-separated non-empty class names, e.g. `background,person` |
 ///
@@ -259,8 +259,9 @@ pub unsafe extern "C" fn ef_model_config_schema_json(c: *const EfModelConfig) ->
 }
 
 /// The class labels as a JSON array of strings in channel order, `[]` when
-/// no source names them. Freed with `ef_decoder_string_free`; `NULL` for a
-/// `NULL` handle.
+/// no source names them. Leading and trailing whitespace is trimmed from
+/// every source, and a source with unusable names is ignored with a note.
+/// Freed with `ef_decoder_string_free`; `NULL` for a `NULL` handle.
 ///
 /// # Safety
 /// `c` must be `NULL` or live.
@@ -642,12 +643,12 @@ mod tests {
             let rc = unsafe { ef_model_overrides_set(o, k.as_ptr(), v.as_ptr(), &mut err) };
             (rc, (!err.is_null()).then(|| take(err)))
         };
-        assert_eq!(set("resize", "letterbox-top_left"), (0, None));
+        assert_eq!(set("resize", "letterbox-topleft"), (0, None));
         assert_eq!(set("decode", "fast"), (0, None));
         let (rc, msg) = set("resize", "fill");
         assert_eq!(rc, libc::EINVAL);
         assert!(
-            msg.unwrap().contains("letterbox-top_left"),
+            msg.unwrap().contains("letterbox-topleft"),
             "lists the accepted forms"
         );
         let (rc, msg) = set("colour", "red");

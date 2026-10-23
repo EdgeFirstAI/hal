@@ -39,6 +39,22 @@
 //! config (a string `model_type` and `architectures` or
 //! `transformers_version`); any other `config.json` is skipped and noted.
 //!
+//! # Class labels
+//!
+//! Every label source — `edgefirst.json` `dataset.classes`, `labels.txt` and
+//! the ONNX `labels` key, Hugging Face `id2label` / `label2id`, Ultralytics
+//! `names` and the `labels` override — has leading and trailing whitespace
+//! removed from each name ([`str::trim`]), so ADE20K's `"bed "` resolves to
+//! `"bed"`. Whitespace inside a name (`"chest of drawers"`) is kept.
+//! Discovered class names never fail resolution: a source whose names are
+//! unusable (a name empty after trimming, a malformed `id2label`, or a count
+//! that disagrees with `num_labels` or the output) is ignored with a warning
+//! and a note naming the source and the index (`id2label[7]`), and the next
+//! source supplies the labels. When none does, the labels are empty with a
+//! warning. `labels.txt` skips blank lines, so it cannot name an empty class.
+//! Names that repeat ignoring case add a note, since they make matching
+//! classes by name ambiguous. The `labels` override is checked strictly.
+//!
 //! [`infer_ultralytics_schema`]: crate::infer_ultralytics_schema
 
 mod container;

@@ -128,7 +128,7 @@ class PreprocessSpec:
     )
     #: ``"stretch"`` or ``"letterbox"``.
     fit: str = "letterbox"
-    #: Letterbox placement: ``"center"`` or ``"top_left"``.
+    #: Letterbox placement: ``"center"`` or ``"topleft"``.
     placement: str = "center"
     #: Letterbox pad per RGB channel, in the space :attr:`pad_space` names.
     pad: Tuple[float, float, float] = (114.0, 114.0, 114.0)  # noqa: FA100

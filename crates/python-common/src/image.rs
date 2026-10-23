@@ -2414,7 +2414,7 @@ impl PyConvertOptions {
     }
 
     /// Where a letterboxed image sits: a `LetterboxPlacement`, its name
-    /// (``"center"``, ``"top_left"``) or its integer code.
+    /// (``"center"``, ``"topleft"``) or its integer code.
     fn placement(&self, placement: &Bound<'_, PyAny>) -> Result<Self> {
         Ok(Self(self.0.placement(placement_from_py(placement)?)))
     }

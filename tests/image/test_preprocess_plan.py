@@ -74,7 +74,7 @@ def painted_rect(img: np.ndarray) -> tuple[int, int, int, int]:
 
 @pytest.mark.parametrize("src", [(641, 479), (479, 641), (1, 3), (3, 1)])
 @pytest.mark.parametrize("dst", [(640, 640), (320, 256)])
-@pytest.mark.parametrize("placement", ["center", "top_left"])
+@pytest.mark.parametrize("placement", ["center", "topleft"])
 def test_content_region_matches_the_painted_rect(monkeypatch, src, dst, placement):
     proc = cpu_processor(monkeypatch)
     options = ConvertOptions(letterbox=PAD, placement=placement)
@@ -90,7 +90,7 @@ def test_content_region_matches_the_painted_rect(monkeypatch, src, dst, placemen
     assert y0 == pytest.approx(region.y / dst[1])
     assert x1 == pytest.approx((region.x + region.width) / dst[0])
     assert y1 == pytest.approx((region.y + region.height) / dst[1])
-    if placement == "top_left":
+    if placement == "topleft":
         assert (region.x, region.y) == (0, 0)
 
 
@@ -135,7 +135,7 @@ def test_content_region_rejects_a_zero_size(sizes):
 # --- placement spellings -------------------------------------------------------
 
 
-@pytest.mark.parametrize("spelling", [LetterboxPlacement.TopLeft, "top_left", 1])
+@pytest.mark.parametrize("spelling", [LetterboxPlacement.TopLeft, "topleft", 1])
 def test_top_left_placement_spellings_agree(monkeypatch, spelling):
     proc = cpu_processor(monkeypatch)
     src = image(64, 32)
@@ -155,13 +155,13 @@ def test_top_left_placement_spellings_agree(monkeypatch, spelling):
     np.testing.assert_array_equal(read(got), read(want))
     assert ConvertOptions(letterbox=PAD, placement=spelling).content_region(
         64, 32, 48, 48
-    ) == ConvertOptions(letterbox=PAD, placement="top_left").content_region(
+    ) == ConvertOptions(letterbox=PAD, placement="topleft").content_region(
         64, 32, 48, 48
     )
 
 
 def test_bad_placement_is_rejected():
-    with pytest.raises(ValueError, match="center, top_left"):
+    with pytest.raises(ValueError, match="center, topleft"):
         ConvertOptions(placement="bottom")
     with pytest.raises(ValueError):
         ConvertOptions().placement(7)
@@ -288,7 +288,7 @@ def test_from_spec_matches_manual_options(monkeypatch):
     imagenet = ((123.675, 116.28, 103.53), (58.395, 57.12, 57.375))
     s = spec(
         normalization=imagenet,
-        placement="top_left",
+        placement="topleft",
         pad=(0.0, 0.0, 0.0),
         pad_space="normalized",
     )
@@ -315,13 +315,13 @@ def test_from_spec_accepts_enums_codes_and_mean_std(monkeypatch):
         interpolation=Interpolation.Nearest,
     )
     by_code = spec(fit=1, placement=1, pad_space=0, interpolation=1)
-    by_name = spec(placement="top_left", interpolation="nearest")
+    by_name = spec(placement="topleft", interpolation="nearest")
     want = converted(proc, ConvertOptions.from_spec(by_name), src)
     for s in (by_enum, by_code):
         np.testing.assert_array_equal(
             converted(proc, ConvertOptions.from_spec(s), src), want
         )
-    mean_std = spec(placement="top_left", interpolation="nearest")
+    mean_std = spec(placement="topleft", interpolation="nearest")
     del mean_std.normalization
     mean_std.mean = (0.0, 0.0, 0.0)
     mean_std.std = (255.0, 255.0, 255.0)
@@ -429,7 +429,7 @@ def test_from_spec_from_a_resolved_config(monkeypatch, tmp_path):
 
     fields = ("normalization", "fit", "pad", "pad_space", "interpolation", "size")
     topleft = SimpleNamespace(
-        **{f: getattr(plan, f) for f in fields}, placement="top_left"
+        **{f: getattr(plan, f) for f in fields}, placement="topleft"
     )
     topleft.fit = "letterbox"
     region = ConvertOptions.from_spec(topleft).content_region(640, 480, 512, 512)
@@ -440,7 +440,7 @@ def test_from_spec_from_a_resolved_config(monkeypatch, tmp_path):
 
 
 def test_tiling_config_takes_convert_options():
-    options = ConvertOptions(letterbox=PAD, placement="top_left")
+    options = ConvertOptions(letterbox=PAD, placement="topleft")
     cfg = TilingConfig(640, 640, options=options)
     assert repr(cfg.options) == repr(options)
     assert repr(TilingConfig(640, 640).with_options(options).options) == repr(options)

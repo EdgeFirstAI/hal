@@ -1114,7 +1114,7 @@ class PreprocessSpec:
     fit: str = "letterbox"
     """``"stretch"`` or ``"letterbox"``."""
     placement: str = "center"
-    """``"center"`` or ``"top_left"``."""
+    """``"center"`` or ``"topleft"``."""
     pad: tuple[float, float, float] = (114.0, 114.0, 114.0)
     """Letterbox pad per RGB channel, in the space :attr:`pad_space` names."""
     pad_space: str = "pixel"
@@ -1140,7 +1140,7 @@ class ModelOverrides:
     - ``normalize``: ``"unsigned" | "signed" | "raw" | "imagenet" |
       "R,G,B/R,G,B"`` (mean/std in the 0-1 domain)
     - ``resize``: ``"stretch" | "letterbox" | "letterbox-center" |
-      "letterbox-top_left"``; bare ``"letterbox"`` follows the model family
+      "letterbox-topleft"``; bare ``"letterbox"`` follows the model family
     - ``decode``: ``"accurate" | "fast"`` or a :class:`DecodeMode`
     - ``labels``: a list of non-empty class names or one comma-separated
       string
@@ -1192,7 +1192,12 @@ class ResolvedModelConfig:
         for ``Decoder(schema)``."""
     @property
     def labels(self) -> list[str]:
-        """Class names in channel order; empty when no source names them."""
+        """Class names in channel order; empty when no source names them.
+
+        Leading and trailing whitespace is trimmed from every source
+        (ADE20K's ``"bed "`` is ``"bed"``). A source with unusable names, such
+        as one empty after trimming, is ignored with a note naming the source
+        and index, and names repeated ignoring case add a note."""
     @property
     def family(self) -> ModelFamily: ...
     @property
@@ -1223,7 +1228,7 @@ class ResolvedModelConfig:
         """Where ``field`` came from, or ``None``."""
     def describe(self) -> list[str]:
         """One ``key=value [source]`` line per resolved value, e.g.
-        ``"resize=letterbox-top_left [preprocessor_config.json]"``. Override
+        ``"resize=letterbox-topleft [preprocessor_config.json]"``. Override
         keys print in the :class:`ModelOverrides` grammar."""
 
 def resolve_model_config(

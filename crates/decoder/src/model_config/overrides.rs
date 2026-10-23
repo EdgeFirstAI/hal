@@ -17,7 +17,7 @@ fn bad(what: &str, value: &str, grammar: &str) -> ModelConfigError {
 }
 
 const NORMALIZE_GRAMMAR: &str = "unsigned | signed | raw | imagenet | R,G,B/R,G,B";
-const RESIZE_GRAMMAR: &str = "stretch | letterbox | letterbox-center | letterbox-top_left";
+const RESIZE_GRAMMAR: &str = "stretch | letterbox | letterbox-center | letterbox-topleft";
 const TASK_GRAMMAR: &str = "detect | segment | semantic";
 const DECODE_GRAMMAR: &str = "accurate | fast";
 
@@ -105,7 +105,7 @@ impl fmt::Display for NormalizeOverride {
 }
 
 /// A `resize` override: `stretch`, or `letterbox` with an optional
-/// placement (`letterbox-center`, `letterbox-top_left`). A bare `letterbox`
+/// placement (`letterbox-center`, `letterbox-topleft`). A bare `letterbox`
 /// follows the model family's convention; an explicit placement keeps the
 /// family's pad.
 ///
@@ -113,7 +113,7 @@ impl fmt::Display for NormalizeOverride {
 /// use edgefirst_decoder::model_config::ResizeOverride;
 /// use edgefirst_tensor::LetterboxPlacement;
 ///
-/// let r: ResizeOverride = "letterbox-top_left".parse().unwrap();
+/// let r: ResizeOverride = "letterbox-topleft".parse().unwrap();
 /// assert_eq!(r, ResizeOverride::Letterbox(Some(LetterboxPlacement::TopLeft)));
 /// assert_eq!(ResizeOverride::Letterbox(None).to_string(), "letterbox");
 /// ```
@@ -185,7 +185,7 @@ fn parse_labels(value: &str) -> Result<Vec<String>, ModelConfigError> {
 /// use edgefirst_tensor::LetterboxPlacement;
 ///
 /// let mut o = ModelOverrides::default();
-/// o.set("resize", "letterbox-top_left").unwrap();
+/// o.set("resize", "letterbox-topleft").unwrap();
 /// o.set("labels", "background, person").unwrap();
 /// assert_eq!(o.resize, Some(ResizeOverride::Letterbox(Some(LetterboxPlacement::TopLeft))));
 /// assert_eq!(o.labels.as_deref(), Some(&["background".to_string(), "person".to_string()][..]));
@@ -270,7 +270,7 @@ mod tests {
             "stretch",
             "letterbox",
             "letterbox-center",
-            "letterbox-top_left",
+            "letterbox-topleft",
         ] {
             assert_eq!(s.parse::<ResizeOverride>().unwrap().to_string(), s);
         }
@@ -293,8 +293,8 @@ mod tests {
     #[test]
     fn bad_override_lists_accepted_forms() {
         let e = "fill".parse::<ResizeOverride>().unwrap_err().to_string();
-        assert!(e.contains("letterbox-top_left"), "{e}");
-        assert!("letterbox-topleft".parse::<ResizeOverride>().is_err());
+        assert!(e.contains("letterbox-topleft"), "{e}");
+        assert!("letterbox-top_left".parse::<ResizeOverride>().is_err());
         assert!("unit".parse::<NormalizeOverride>().is_err());
         let e = "0.1,0.2/0.3"
             .parse::<NormalizeOverride>()
