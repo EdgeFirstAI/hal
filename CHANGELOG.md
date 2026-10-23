@@ -50,6 +50,7 @@ This release breaks the API: the preprocessing types move to `edgefirst-tensor`,
 ### Fixed
 
 - **Tiling lost the content region and ignored placement.** A letterboxed tile away from the frame origin had no content region recorded, because its crop was checked against the tile size instead of the frame, so its boxes lifted to the wrong place. Tile content regions were also always computed centred.
+- **V4L2 H.264 encoder ignored the requested profile on the i.MX 8M Plus.** `edgefirst-codec` now applies the encoder controls before setting the CAPTURE (coded) format, because the `vsi_v4l2` driver reset the profile to Constrained Baseline when that format was set. The profile and level are read back after the format is set and applied again where a driver changed them. With a bitrate set, the encoder also turns on frame- and macroblock-level rate control alongside constant bitrate; `vsi_v4l2` left both off and encoded every frame at a fixed QP, so the requested bitrate was not held.
 
 ## [0.36.0] - 2026-10-21
 

@@ -66,7 +66,7 @@ edgefirst-tensor = { version = "0.36.0", path = "crates/tensor", default-feature
 edgefirst-tensor-abi = { version = "0.36.0", path = "crates/tensor-abi" }
 edgefirst-tensor-ffi = { version = "0.36.0", path = "crates/tensor-ffi" }
 edgefirst-tracker = { version = "0.36.0", path = "crates/tracker", default-features = false }
-edgefirst-v4l2 = "0.2.2"
+edgefirst-v4l2 = "0.2.3"
 enum_dispatch = "0.3.13"
 # `regex` (a default feature, via env_filter) pulls regex + regex_syntax +
 # aho_corasick -- ~530 KB of every published wheel, to support regex RUST_LOG

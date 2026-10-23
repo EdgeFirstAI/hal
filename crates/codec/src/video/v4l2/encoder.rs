@@ -217,11 +217,17 @@ impl V4l2Encoder {
         })
     }
 
-    /// Sets the coded format, checks the picture size and applies the
-    /// controls. Buffers wait for the first frame.
+    /// Applies the controls, sets the coded format and checks the picture
+    /// size. Buffers wait for the first frame.
     fn configure(&mut self) -> Result<()> {
         let (w, h) = (self.config.width, self.config.height);
         let dev = &self.device.dev;
+
+        // The i.MX 8M Plus vsi_v4l2 encoder resets its H.264 profile to
+        // Constrained Baseline when the CAPTURE format is set, and does not
+        // take a profile set afterwards, so the controls go first.
+        self.controls = controls::query_all(dev).map_err(device_error)?;
+        self.apply_controls()?;
 
         let mut cap = dev.format(self.device.capture).map_err(device_error)?;
         // SAFETY: the buffer type selects the union member.
@@ -242,6 +248,7 @@ impl V4l2Encoder {
             }
         }
         dev.set_format(&mut cap).map_err(device_error)?;
+        self.confirm_coding_controls()?;
 
         let mut out = dev.format(self.device.output).map_err(device_error)?;
         self.fill_output_format(&mut out, None);
@@ -263,9 +270,6 @@ impl V4l2Encoder {
         if let Err(e) = dev.set_frame_interval(self.device.output, interval) {
             log::debug!("{}: frame interval not set: {e}", self.path);
         }
-
-        self.controls = controls::query_all(dev).map_err(device_error)?;
-        self.apply_controls()?;
 
         let mut cmd = uapi::v4l2_encoder_cmd {
             cmd: uapi::V4L2_ENC_CMD_STOP,
@@ -356,13 +360,36 @@ impl V4l2Encoder {
         }
     }
 
+    /// Sets the profile and level again where setting the CAPTURE format
+    /// changed the value the device reports.
+    fn confirm_coding_controls(&self) -> Result<()> {
+        for (id, value, what) in coding_controls(&self.config) {
+            let Some(info) = self.control(id) else {
+                continue;
+            };
+            match controls::get(&self.device.dev, info) {
+                Ok(ControlValue::Integer(v)) if v == value => {}
+                Ok(other) => {
+                    log::debug!(
+                        "{}: {what} reads {other:?} after the CAPTURE format, setting it again",
+                        self.path
+                    );
+                    self.require_control(id, value, &what)?;
+                }
+                Err(e) => log::debug!("{}: cannot read back the {what}: {e}", self.path),
+            }
+        }
+        Ok(())
+    }
+
     fn apply_controls(&self) -> Result<()> {
         let cfg = &self.config;
         if let Bitrate::Bps(bps) = cfg.bitrate {
-            let _ = self.set_control(
-                uapi::V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-                uapi::V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
-            );
+            for (id, value) in rate_controls(cfg) {
+                if let Err(e) = self.set_control(id, value) {
+                    log::debug!("{}: rate control {id:#x} not set: {e}", self.path);
+                }
+            }
             let bps = i32::try_from(bps).unwrap_or(i32::MAX);
             self.require_control(uapi::V4L2_CID_MPEG_VIDEO_BITRATE, bps, "bitrate")?;
         }
@@ -371,19 +398,8 @@ impl V4l2Encoder {
             self.require_control(uapi::V4L2_CID_MPEG_VIDEO_GOP_SIZE, gop, "GOP size")?;
             self.set_control(uapi::V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, gop)?;
         }
-        if let Some(profile) = cfg.profile {
-            self.require_control(
-                uapi::V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-                profile_value(profile),
-                &format!("H.264 profile {profile:?}"),
-            )?;
-        }
-        if let Some(level) = cfg.level {
-            self.require_control(
-                uapi::V4L2_CID_MPEG_VIDEO_H264_LEVEL,
-                level_value(level),
-                &format!("H.264 level {level:?}"),
-            )?;
+        for (id, value, what) in coding_controls(&self.config) {
+            self.require_control(id, value, &what)?;
         }
         // Headers in a separate buffer are folded into the next access unit,
         // but joining them is cheaper where the device allows it.
@@ -966,6 +982,44 @@ fn dmabuf_size(fd: BorrowedFd<'_>) -> Result<usize> {
     Ok(file.seek(SeekFrom::End(0))? as usize)
 }
 
+/// The rate control `cfg` asks for, as `(control, value)`: constant bitrate,
+/// regulated per frame and per macroblock. Left to their defaults, drivers
+/// may encode at a fixed QP (`vsi_v4l2`) so the bitrate is not held, or
+/// control frames alone and code key frames coarser than their neighbours.
+fn rate_controls(cfg: &EncoderConfig) -> Vec<(u32, i32)> {
+    match cfg.bitrate {
+        Bitrate::Bps(_) => vec![
+            (
+                uapi::V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+                uapi::V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+            ),
+            (uapi::V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1),
+            (uapi::V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 1),
+        ],
+        Bitrate::Auto => Vec::new(),
+    }
+}
+
+/// The profile and level `cfg` requires, as `(control, value, description)`.
+fn coding_controls(cfg: &EncoderConfig) -> Vec<(u32, i32, String)> {
+    let mut list = Vec::with_capacity(2);
+    if let Some(profile) = cfg.profile {
+        list.push((
+            uapi::V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+            profile_value(profile),
+            format!("H.264 profile {profile:?}"),
+        ));
+    }
+    if let Some(level) = cfg.level {
+        list.push((
+            uapi::V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+            level_value(level),
+            format!("H.264 level {level:?}"),
+        ));
+    }
+    list
+}
+
 /// The `V4L2_CID_MPEG_VIDEO_H264_PROFILE` menu value of `profile`.
 fn profile_value(profile: H264Profile) -> i32 {
     match profile {
@@ -1092,5 +1146,45 @@ mod tests {
         assert_eq!(level_value(H264Level::L1b), 1);
         assert_eq!(level_value(H264Level::L4_0), 11);
         assert_eq!(level_value(H264Level::L6_2), 19);
+    }
+
+    #[test]
+    fn a_bitrate_turns_on_constant_bitrate_frame_and_macroblock_control() {
+        let mut cfg = EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0);
+        cfg.bitrate = Bitrate::Auto;
+        assert!(rate_controls(&cfg).is_empty());
+        cfg.bitrate = Bitrate::Bps(4_000_000);
+        assert_eq!(
+            rate_controls(&cfg),
+            vec![
+                (
+                    uapi::V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+                    uapi::V4L2_MPEG_VIDEO_BITRATE_MODE_CBR
+                ),
+                (uapi::V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1),
+                (uapi::V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn coding_controls_carry_the_requested_profile_and_level() {
+        let mut cfg = EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0);
+        cfg.profile = None;
+        cfg.level = None;
+        assert!(coding_controls(&cfg).is_empty());
+        cfg.profile = Some(H264Profile::High);
+        cfg.level = Some(H264Level::L4_0);
+        let ids: Vec<(u32, i32)> = coding_controls(&cfg)
+            .into_iter()
+            .map(|(id, value, _)| (id, value))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (uapi::V4L2_CID_MPEG_VIDEO_H264_PROFILE, 4),
+                (uapi::V4L2_CID_MPEG_VIDEO_H264_LEVEL, 11)
+            ]
+        );
     }
 }

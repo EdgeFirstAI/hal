@@ -218,9 +218,9 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-v4l2"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec730dcf678b52005889adae2de18b0acd898eb1b729b1b2cd357535057123ef"
+checksum = "06a5e0a89f38d939883ca01392d4da6385f053644e30c61d16171b9bec58a044"
 dependencies = [
  "libc",
  "nix",
