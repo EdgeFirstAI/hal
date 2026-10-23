@@ -91,7 +91,7 @@ impl<'a> Fixture<'a> {
         let letterbox: [f32; 4] = serde_json::from_str(&self.metadata["letterbox"]).unwrap();
         let options = SemanticOptions::new()
             .with_mode(mode)
-            .with_letterbox(letterbox);
+            .with_content_region(letterbox);
         let shape = self.shape("ref.accurate");
         let mut dst = TensorDyn::new(&shape, DType::U8, Some(TensorMemory::Mem), None).unwrap();
         decoder

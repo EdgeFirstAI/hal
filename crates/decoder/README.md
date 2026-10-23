@@ -194,19 +194,74 @@ Models exported with `end2end=false` require external NMS, configurable via the 
 
 ## Semantic Segmentation API
 
-`decode_semantic()` writes the class map of a semantic segmentation model into a tensor you allocate: `[H, W]`, u8 for up to 256 classes or u16 beyond, at any resolution (usually the original image's). Pass the letterbox content region so the padding is cropped, and pick the decode mode per call.
+`decode_semantic()` writes the class map of a semantic segmentation model into a tensor you allocate: `[H, W]`, u8 for up to 256 classes or u16 beyond, at any resolution (usually the original image's). Give it the content region of the model input (where the image sits inside the letterbox padding) so the padding is cropped, and pick the decode mode per call. `with_convert` takes the region from the options of the convert that prepared the input, so the decode uses exactly the geometry the convert painted.
 
 ```rust,ignore
 use edgefirst_decoder::{schema::DecodeMode, semantic::SemanticOptions};
 
 let mut class_map = TensorDyn::new(&[image_h, image_w], DType::U8, Some(TensorMemory::Mem), None)?;
 let options = SemanticOptions::new()
-    .with_mode(DecodeMode::Fast)           // default: the model's decode_mode
-    .with_letterbox([0.0, 0.0, 1.0, 0.75]); // content region of the model input
+    .with_mode(DecodeMode::Fast) // default: the model's decode_mode
+    .with_convert(&convert_options, (image_w, image_h), (model_w, model_h))?;
 decoder.decode_semantic(&outputs, &mut class_map, None, &options)?;
 ```
 
 `DecodeMode::Accurate` upsamples the class scores bilinearly and takes the argmax, matching the PyTorch reference; `DecodeMode::Fast` takes the argmax at the model's resolution and upsamples the class map. On SegFormer-B1 (ADE20K) fast costs about 0.12 mIoU points. An optional confidence tensor receives the winning class's probability for overlays.
+
+## Model Configuration Discovery
+
+`model_config::resolve_model_config` finds what a model needs to be run and decoded — output schema, class labels, input preprocessing — from whatever the model carries, and records where each value came from.
+
+```rust,ignore
+use edgefirst_decoder::model_config::{resolve_model_config, ModelOverrides};
+use edgefirst_decoder::{DecoderBuilder, ModelSignals};
+
+// The model's tensors as the runtime reports them; None when unavailable.
+let signals: Option<ModelSignals> = runtime_signals();
+let mut overrides = ModelOverrides::default();
+overrides.set("resize", "letterbox")?; // a command line's --resize, parsed once here
+let config = resolve_model_config("segformer.onnx", signals, &overrides)?;
+for line in config.describe() {
+    tracing::info!("{line}"); // e.g. resize=letterbox-top_left [override]
+}
+let decoder = DecoderBuilder::new().with_schema(config.schema.clone()).build()?;
+let spec = config.preprocessing; // edgefirst_tensor::PreprocessSpec
+// edgefirst-image: let options = ConvertOptions::from_spec(&spec)?;
+```
+
+`describe()` prints `normalize`, `resize`, `task` and `decode` in the override grammar below, so a logged line can be passed back as an override. `preprocessing` carries the reference pipeline's interpolation; `edgefirst-image` runs bicubic and area as bilinear and the config's `notes` say so. `resolve_sources` takes already-read files: `ModelSources::new().with_embedded(..).with_sidecar(..).with_signals(..)`.
+
+Sources, highest priority first; each fills only what the ones before it left unset, so `edgefirst.json` wins over a Hugging Face config field by field:
+
+1. `edgefirst.json` embedded in the model (`input.preprocessing`, then the legacy `validation.normalization` / `validation.preprocessing`)
+2. `edgefirst.json` and `labels.txt` beside the model
+3. Hugging Face `config.json` + `preprocessor_config.json` embedded in the model
+4. the same files beside the model (the `optimum` export layout)
+5. Ultralytics export metadata (`infer_ultralytics_schema`)
+6. a Hugging Face export recognised by its tensor names (`pixel_values` → `logits`), as guesses
+7. the documented defaults: unsigned normalization, centred letterbox padded with 114, bilinear
+
+`ModelOverrides` apply last. Their string grammar, shared with the Python and C APIs:
+
+| Override | Values |
+|---|---|
+| `task` | `detect`, `segment`, `semantic` |
+| `normalize` | `unsigned`, `signed`, `raw`, `imagenet`, `R,G,B/R,G,B` (mean/std, 0–1 domain, std positive) |
+| `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-top_left` |
+| `decode` | `accurate`, `fast` |
+| `labels` | comma-separated non-empty class names in channel order, e.g. `background,person` |
+
+Preset, placement and decode names are the shared vocabulary names (`NormalizationPreset`, `LetterboxPlacement`, `DecodeMode`). A bare `letterbox` follows the model family: Ultralytics centres with pixel pad 114; Hugging Face anchors top-left with an output pad of 0 (the mean colour); an `edgefirst.json` that declares a placement keeps it; anything else centres with pad 114. The explicit forms force the placement and keep the family's pad.
+
+Embedding conventions:
+
+| Container | Where | Names |
+|---|---|---|
+| ONNX | `ModelProto.metadata_props` | `edgefirst` (legacy `edgefirst.json`), `labels`, `hf_config`, `hf_preprocessor_config` |
+| TFLite, HEF, DVM, TensorRT, any file | appended ZIP (TFLite associated files) | `edgefirst.json`, `labels.txt`, `config.json`, `preprocessor_config.json` |
+| any | the model's directory | as for ZIP |
+
+ONNX files are read by walking the top-level protobuf fields and seeking past the graph. ZIP trailers need the `model-files` feature (off by default; the C library and Python wheel enable it). A `config.json` counts as a Hugging Face config only with a string `model_type` and an `architectures` list or `transformers_version`; anything else is skipped and noted. Hugging Face `*ForSemanticSegmentation` architectures map to the semantic decoder; other architectures are refused with `UnsupportedArchitecture`. An `edgefirst.json` without outputs supplies preprocessing and labels but leaves the schema to a later source. Discovered labels whose count differs from a semantic model's classes are kept with a note; a `labels` override with the wrong count is an error. Sidecar files over 16 MiB and ZIP entries over 1 MiB are not read, and only the last 64 KiB of a model, its ZIP central directory and its text entries are read to find a trailer.
 
 ## Proto Mask API
 

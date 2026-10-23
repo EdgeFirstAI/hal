@@ -160,6 +160,8 @@ other, so a disagreement is reported rather than resolved by preference.
 | `Decoder.new_from_json_str()` / `new_from_yaml_str()` | Configuration from JSON or YAML |
 | `infer_ultralytics_schema()` | Schema derived from a vanilla Ultralytics export's own metadata and shapes |
 | `InferredSchema` | Named tuple returned by `infer_ultralytics_schema()` |
+| `resolve_model_config()`, `ModelSignals`, `ModelOverrides` | Model configuration discovery (`edgefirst.json`, Hugging Face configs, Ultralytics metadata) with string overrides |
+| `ResolvedModelConfig`, `PreprocessSpec` | Resolved schema, labels and preprocessing with per-field provenance (`ConfigField`, `ConfigSource`, `ModelFamily`, `ModelTask`) |
 | `Output`, `DimName` | Output shape and semantics description |
 | `Nms`, `DecoderType`, `DecoderVersion` | NMS mode and model family selection |
 | `ProtoData` | Mask prototypes and coefficients |

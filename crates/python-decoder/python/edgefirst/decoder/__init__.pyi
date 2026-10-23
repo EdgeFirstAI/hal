@@ -4,8 +4,10 @@ Split from the pre-0.29 monolithic ``edgefirst_hal.pyi``; assignment
 mirrors the pymodule registrations in crates/python-decoder/src/lib.rs.
 """
 
+import dataclasses
 import enum
-from typing import Any, NamedTuple, Protocol
+import os
+from typing import Any, NamedTuple, Protocol, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -73,6 +75,19 @@ class Nms(enum.Enum):
     Auto: Nms
     ClassAware: Nms
     ClassAgnostic: Nms
+
+class HasNormalizedRegion(Protocol):
+    """Anything with a normalized ``(xmin, ymin, xmax, ymax)`` content
+    region, such as ``edgefirst.image.ContentRegion``."""
+
+    @property
+    def normalized(self) -> tuple[float, float, float, float]: ...
+
+ContentRegionLike: TypeAlias = (
+    tuple[float, float, float, float] | list[float] | HasNormalizedRegion
+)
+"""A ``content_region=`` argument: normalized ``(xmin, ymin, xmax, ymax)``
+or an object with a ``normalized`` attribute."""
 
 DetectionOutput: TypeAlias = tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
@@ -603,12 +618,12 @@ class Decoder:
         confidence: EdgeFirstTensorExportable | None = None,
         *,
         mode: DecodeMode | None = None,
-        letterbox: tuple[float, float, float, float] | list[float] | None = None,
+        content_region: ContentRegionLike | None = None,
     ) -> None:
         """Decode the model's semantic segmentation output into a class map.
 
-        Each pixel of ``dst`` is mapped through the letterbox region of the
-        model input, so the padding is cropped and ``dst`` covers the
+        Each pixel of ``dst`` is mapped through the content region of the
+        model input, so letterbox padding is cropped and ``dst`` covers the
         original image at any resolution.
 
         Args:
@@ -624,9 +639,11 @@ class Decoder:
                 is approximate and meant for overlays.
             mode: ``DecodeMode.Accurate`` or ``DecodeMode.Fast``; ``None`` uses
                 the model's ``decode_mode``.
-            letterbox: Image content within the model input as normalized
-                ``[xmin, ymin, xmax, ymax]``; ``None`` when the image fills
-                the input.
+            content_region: Where the image content sits in the model input:
+                normalized ``(xmin, ymin, xmax, ymax)``, or an object with a
+                ``normalized`` attribute such as the ``ContentRegion`` from
+                ``edgefirst.image.ConvertOptions.content_region``. ``None``
+                when the image fills the input.
 
         Raises:
             RuntimeError: The model has no semantic output, or the tensors do
@@ -831,7 +848,7 @@ class Decoder:
         dst: EdgeFirstTensorExportable,
         background: EdgeFirstTensorExportable | None = None,
         opacity: float = 1.0,
-        letterbox: tuple[float, float, float, float] | None = None,
+        content_region: ContentRegionLike | None = None,
         color_mode: object | None = None,
     ) -> DetectionOutput:
         """Decode and draw onto an ``edgefirst.image.ImageProcessor``.
@@ -1021,3 +1038,235 @@ def infer_ultralytics_schema(
             quantization), or a dtype/source string isn't one of the values
             listed above.
     """
+
+class ConfigSource(enum.Enum):
+    """The source that supplied a resolved value. The integer values are the
+    C ``EF_CONFIG_SOURCE_*`` codes."""
+
+    EmbeddedEdgefirst: ConfigSource
+    """``edgefirst.json`` embedded in the model file."""
+    SidecarEdgefirst: ConfigSource
+    """``edgefirst.json`` (and ``labels.txt``) beside the model file."""
+    EmbeddedHf: ConfigSource
+    """Hugging Face configs embedded in the model file."""
+    SidecarHf: ConfigSource
+    """Hugging Face configs beside the model file."""
+    UltralyticsMetadata: ConfigSource
+    """Ultralytics export metadata."""
+    Heuristic: ConfigSource
+    """Guessed from the model's input and output names and shapes."""
+    Default: ConfigSource
+    """The documented default."""
+    Override: ConfigSource
+    """A caller override (:class:`ModelOverrides`)."""
+
+class ModelFamily(enum.Enum):
+    """The family a model's configuration identifies; it selects the
+    convention a bare ``letterbox`` resize override follows. The integer
+    values are the C ``EF_MODEL_FAMILY_*`` codes."""
+
+    EdgeFirst: ModelFamily
+    Ultralytics: ModelFamily
+    HuggingFace: ModelFamily
+    Unknown: ModelFamily
+
+class ModelTask(enum.Enum):
+    """What a model's outputs decode to. The integer values are the C
+    ``EF_MODEL_TASK_*`` codes."""
+
+    Detect: ModelTask
+    Segment: ModelTask
+    Semantic: ModelTask
+
+class ConfigField(enum.Enum):
+    """A resolved value whose source is recorded. The integer values are the
+    C ``EF_CONFIG_FIELD_*`` codes."""
+
+    Normalization: ConfigField
+    Resize: ConfigField
+    Placement: ConfigField
+    Pad: ConfigField
+    Interpolation: ConfigField
+    Task: ConfigField
+    DecodeMode: ConfigField
+    Labels: ConfigField
+    Size: ConfigField
+
+class ModelSignals(NamedTuple):
+    """A model's inputs, outputs and metadata, as a runtime reports them.
+
+    Passed to :func:`resolve_model_config`. The fields take the same forms
+    as :func:`infer_ultralytics_schema`'s arguments.
+    """
+
+    source: str
+    inputs: Sequence[tuple[Any, ...]]
+    outputs: Sequence[tuple[Any, ...]]
+    metadata: dict[str, str] | None = None
+
+@dataclasses.dataclass(frozen=True)
+class PreprocessSpec:
+    """A model's input preprocessing as plain values, consumed by
+    ``edgefirst.image.ConvertOptions.from_spec``."""
+
+    normalization: tuple[tuple[float, float, float], tuple[float, float, float]] = ...
+    """``(mean, std)``, each an RGB triple on the 0-255 scale."""
+    fit: str = "letterbox"
+    """``"stretch"`` or ``"letterbox"``."""
+    placement: str = "center"
+    """``"center"`` or ``"top_left"``."""
+    pad: tuple[float, float, float] = (114.0, 114.0, 114.0)
+    """Letterbox pad per RGB channel, in the space :attr:`pad_space` names."""
+    pad_space: str = "pixel"
+    """``"pixel"`` or ``"normalized"``."""
+    interpolation: str = "bilinear"
+    """``"bilinear"``, ``"nearest"``, ``"bicubic"`` or ``"area"``."""
+    size: tuple[int, int] | None = None
+    """Model input ``(width, height)``, when known."""
+    @property
+    def mean(self) -> tuple[float, float, float]:
+        """The per-channel mean, RGB order, on the 0-255 scale."""
+    @property
+    def std(self) -> tuple[float, float, float]:
+        """The per-channel standard deviation, RGB order, on the 0-255 scale."""
+
+class ModelOverrides:
+    """Values that replace what discovery found, applied last and recorded
+    as :attr:`ConfigSource.Override`.
+
+    Grammar (shared with the C API and command lines):
+
+    - ``task``: ``"detect" | "segment" | "semantic"`` or a :class:`ModelTask`
+    - ``normalize``: ``"unsigned" | "signed" | "raw" | "imagenet" |
+      "R,G,B/R,G,B"`` (mean/std in the 0-1 domain)
+    - ``resize``: ``"stretch" | "letterbox" | "letterbox-center" |
+      "letterbox-top_left"``; bare ``"letterbox"`` follows the model family
+    - ``decode``: ``"accurate" | "fast"`` or a :class:`DecodeMode`
+    - ``labels``: a list of non-empty class names or one comma-separated
+      string
+
+    :meth:`ResolvedModelConfig.describe` prints these keys in the same
+    grammar.
+
+    Raises:
+        OverrideError: A value outside its grammar; the message lists the
+            accepted forms.
+    """
+
+    def __init__(
+        self,
+        task: str | ModelTask | None = None,
+        normalize: str | None = None,
+        resize: str | None = None,
+        decode: str | DecodeMode | None = None,
+        labels: list[str] | str | None = None,
+    ) -> None: ...
+    def set(self, key: str, value: str) -> None:
+        """Set the override ``key`` (``task``, ``normalize``, ``resize``,
+        ``decode`` or ``labels``) from its string form.
+
+        Raises:
+            OverrideError: An unknown key or a value outside its grammar.
+        """
+    @property
+    def task(self) -> str | None: ...
+    @property
+    def normalize(self) -> str | None: ...
+    @property
+    def resize(self) -> str | None: ...
+    @property
+    def decode(self) -> str | None: ...
+    @property
+    def labels(self) -> list[str] | None: ...
+    @property
+    def is_empty(self) -> bool:
+        """Whether no override is set."""
+
+class ResolvedModelConfig:
+    """A model's configuration as resolved from every source, with where
+    each value came from. Returned by :func:`resolve_model_config`."""
+
+    @property
+    def schema(self) -> dict[str, Any]:
+        """The output schema as an ``edgefirst.json`` schema v2 dict, ready
+        for ``Decoder(schema)``."""
+    @property
+    def labels(self) -> list[str]:
+        """Class names in channel order; empty when no source names them."""
+    @property
+    def family(self) -> ModelFamily: ...
+    @property
+    def task(self) -> ModelTask: ...
+    @property
+    def decode_mode(self) -> DecodeMode | None:
+        """The semantic decode mode; ``None`` for other tasks."""
+    @property
+    def description(self) -> str:
+        """A one-line summary of the model."""
+    @property
+    def notes(self) -> list[str]:
+        """Deviations and skipped files worth logging."""
+    @property
+    def reduce_labels(self) -> bool | None:
+        """Hugging Face ``do_reduce_labels``, exposed but not applied."""
+    @property
+    def provenance(self) -> dict[ConfigField, tuple[ConfigSource, str | None]]:
+        """Where each value came from, with a detail naming the file or the
+        reason for a guess."""
+    @property
+    def preprocessing(self) -> PreprocessSpec:
+        """The model's input preprocessing, for
+        ``edgefirst.image.ConvertOptions.from_spec``. Its interpolation is
+        the reference pipeline's; ``edgefirst.image`` runs bicubic and area
+        as bilinear, and :attr:`notes` says so."""
+    def source(self, field: ConfigField) -> tuple[ConfigSource, str | None] | None:
+        """Where ``field`` came from, or ``None``."""
+    def describe(self) -> list[str]:
+        """One ``key=value [source]`` line per resolved value, e.g.
+        ``"resize=letterbox-top_left [preprocessor_config.json]"``. Override
+        keys print in the :class:`ModelOverrides` grammar."""
+
+def resolve_model_config(
+    path: str | os.PathLike[str],
+    signals: ModelSignals | None = None,
+    overrides: ModelOverrides | None = None,
+) -> ResolvedModelConfig:
+    """Resolve the configuration of the model file at ``path``.
+
+    Sources, each filling only what earlier ones left unset: an embedded
+    ``edgefirst.json``, one beside the model (with ``labels.txt``), embedded
+    then sidecar Hugging Face ``config.json`` + ``preprocessor_config.json``,
+    Ultralytics metadata in ``signals``, Hugging Face input/output names in
+    ``signals``, then the documented defaults. ``overrides`` apply last.
+    The file reads run with the GIL released.
+
+    Args:
+        path: The model file.
+        signals: The model's inputs, outputs and metadata; needed to build
+            a schema from Hugging Face configs, Ultralytics metadata or
+            input/output names.
+        overrides: Caller overrides.
+
+    Raises:
+        OSError: The model or a file beside it cannot be read, or the path
+            is a directory.
+        UnresolvedConfigError: Nothing supplies a required piece; the
+            message names it and the override that supplies it.
+        UnsupportedModelError: The configuration asks for something the
+            library cannot run.
+        OverrideError: An override cannot apply.
+        ModelConfigError: A configuration file is malformed. All four are
+            ``ValueError`` subclasses.
+    """
+
+class ModelConfigError(ValueError):
+    """A model configuration that is malformed or cannot be resolved."""
+
+class OverrideError(ModelConfigError):
+    """An override outside its grammar or one that does not apply."""
+
+class UnresolvedConfigError(ModelConfigError):
+    """Nothing supplies a required piece of the configuration."""
+
+class UnsupportedModelError(ModelConfigError, NotImplementedError):
+    """A configuration that asks for something the library cannot run."""

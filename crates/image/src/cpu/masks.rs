@@ -292,7 +292,7 @@ impl CPUProcessor {
         &self,
         detect: &[crate::DetectBox],
         proto_data: &crate::ProtoData,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<[f32; 4]>,
     ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
         use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
 
@@ -336,7 +336,7 @@ impl CPUProcessor {
         }
 
         // Precompute inverse letterbox scale for output-coord conversion.
-        let (lx0, inv_lw, ly0, inv_lh) = match letterbox {
+        let (lx0, inv_lw, ly0, inv_lh) = match content_region {
             Some([lx0, ly0, lx1, ly1]) => {
                 let lw = lx1 - lx0;
                 let lh = ly1 - ly0;
@@ -690,7 +690,7 @@ impl CPUProcessor {
         &self,
         detect: &[crate::DetectBox],
         proto_data: &crate::ProtoData,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<[f32; 4]>,
         width: u32,
         height: u32,
     ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
@@ -774,7 +774,7 @@ impl CPUProcessor {
                 proto_h,
                 proto_w,
                 num_protos,
-                letterbox,
+                content_region,
                 width,
                 height,
                 proto_data.layout,
@@ -814,7 +814,7 @@ impl CPUProcessor {
                     proto_h,
                     proto_w,
                     num_protos,
-                    letterbox,
+                    content_region,
                     width,
                     height,
                     proto_data.layout,
@@ -913,7 +913,7 @@ impl CPUProcessor {
                     proto_h,
                     proto_w,
                     num_protos,
-                    letterbox,
+                    content_region,
                     width,
                     height,
                 )
@@ -928,7 +928,7 @@ impl CPUProcessor {
                     proto_h,
                     proto_w,
                     num_protos,
-                    letterbox,
+                    content_region,
                     width,
                     height,
                 )
@@ -983,7 +983,7 @@ impl CPUProcessor {
                     proto_w,
                     num_protos,
                     quant,
-                    letterbox,
+                    content_region,
                     width,
                     height,
                 )
@@ -1815,7 +1815,7 @@ fn scaled_segmentations_f32_slice(
     proto_h: usize,
     proto_w: usize,
     num_protos: usize,
-    letterbox: Option<[f32; 4]>,
+    content_region: Option<[f32; 4]>,
     width: u32,
     height: u32,
 ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
@@ -1826,7 +1826,7 @@ fn scaled_segmentations_f32_slice(
         proto_h,
         proto_w,
         num_protos,
-        letterbox,
+        content_region,
         width,
         height,
         1.0,
@@ -1842,7 +1842,7 @@ fn scaled_segmentations_f16_slice(
     proto_h: usize,
     proto_w: usize,
     num_protos: usize,
-    letterbox: Option<[f32; 4]>,
+    content_region: Option<[f32; 4]>,
     width: u32,
     height: u32,
 ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
@@ -1853,7 +1853,7 @@ fn scaled_segmentations_f16_slice(
         proto_h,
         proto_w,
         num_protos,
-        letterbox,
+        content_region,
         width,
         height,
         1.0,
@@ -1870,7 +1870,7 @@ fn scaled_segmentations_i8_slice(
     proto_w: usize,
     num_protos: usize,
     quant: &edgefirst_tensor::Quantization,
-    letterbox: Option<[f32; 4]>,
+    content_region: Option<[f32; 4]>,
     width: u32,
     height: u32,
 ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
@@ -1895,7 +1895,7 @@ fn scaled_segmentations_i8_slice(
         proto_h,
         proto_w,
         num_protos,
-        letterbox,
+        content_region,
         width,
         height,
         scale,
@@ -2148,7 +2148,7 @@ fn scaled_segmentations_i8_i8(
     proto_h: usize,
     proto_w: usize,
     num_protos: usize,
-    letterbox: Option<[f32; 4]>,
+    content_region: Option<[f32; 4]>,
     width: u32,
     height: u32,
     layout: edgefirst_tensor::ProtoLayout,
@@ -2186,7 +2186,7 @@ fn scaled_segmentations_i8_i8(
         }
     };
 
-    let (lx0, lw, ly0, lh) = match letterbox {
+    let (lx0, lw, ly0, lh) = match content_region {
         Some([lx0, ly0, lx1, ly1]) => {
             // Unit scale on a degenerate axis, matching the canonical
             // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
@@ -2457,7 +2457,7 @@ fn scaled_segmentations_i16_i8(
     proto_h: usize,
     proto_w: usize,
     num_protos: usize,
-    letterbox: Option<[f32; 4]>,
+    content_region: Option<[f32; 4]>,
     width: u32,
     height: u32,
     layout: edgefirst_tensor::ProtoLayout,
@@ -2495,7 +2495,7 @@ fn scaled_segmentations_i16_i8(
         }
     };
 
-    let (lx0, lw, ly0, lh) = match letterbox {
+    let (lx0, lw, ly0, lh) = match content_region {
         Some([lx0, ly0, lx1, ly1]) => {
             // Unit scale on a degenerate axis, matching the canonical
             // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
@@ -2744,13 +2744,13 @@ fn scaled_run<P: Copy + Sync>(
     proto_h: usize,
     proto_w: usize,
     num_protos: usize,
-    letterbox: Option<[f32; 4]>,
+    content_region: Option<[f32; 4]>,
     width: u32,
     height: u32,
     acc_scale: f32,
     load_f32: impl Fn(&P, f32) -> f32 + Copy + Sync,
 ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
-    let (lx0, lw, ly0, lh) = match letterbox {
+    let (lx0, lw, ly0, lh) = match content_region {
         Some([lx0, ly0, lx1, ly1]) => {
             // Unit scale on a degenerate axis, matching the canonical
             // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation

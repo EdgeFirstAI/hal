@@ -1186,7 +1186,7 @@ impl PyDecoder {
     /// image. Prefers ``draw_proto_masks`` when the model yields prototype
     /// data; otherwise ``draw_decoded_masks``.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (processor, model_output, dst, background=None, opacity=1.0, letterbox=None, color_mode=None))]
+    #[pyo3(signature = (processor, model_output, dst, background=None, opacity=1.0, content_region=None, color_mode=None))]
     pub fn draw_onto<'py>(
         self_: PyRef<'py, Self>,
         processor: &Bound<'py, PyAny>,
@@ -1194,7 +1194,7 @@ impl PyDecoder {
         dst: &Bound<'py, PyAny>,
         background: Option<&Bound<'py, PyAny>>,
         opacity: f32,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<crate::content_region::ContentRegionArg>,
         color_mode: Option<&Bound<'py, PyAny>>,
         py: Python<'py>,
     ) -> PyResult<PyDetOutput<'py>> {
@@ -1204,8 +1204,8 @@ impl PyDecoder {
         if let Some(bg) = background {
             kwargs.set_item("background", bg)?;
         }
-        if let Some(lb) = letterbox {
-            kwargs.set_item("letterbox", lb)?;
+        if let Some(region) = crate::content_region::normalized(content_region) {
+            kwargs.set_item("content_region", region)?;
         }
         if let Some(cm) = color_mode {
             kwargs.set_item("color_mode", cm)?;
@@ -1229,8 +1229,8 @@ impl PyDecoder {
 
     /// Decode the model's semantic segmentation output into a class map.
     ///
-    /// Each pixel of ``dst`` is mapped through the letterbox region of the
-    /// model input, so the padding is cropped and ``dst`` covers the
+    /// Each pixel of ``dst`` is mapped through the content region of the
+    /// model input, so letterbox padding is cropped and ``dst`` covers the
     /// original image at any resolution.
     ///
     /// Args:
@@ -1246,21 +1246,23 @@ impl PyDecoder {
     ///         is approximate and meant for overlays.
     ///     mode: ``DecodeMode.Accurate`` or ``DecodeMode.Fast``; ``None``
     ///         uses the model's ``decode_mode``.
-    ///     letterbox: Image content within the model input as normalized
-    ///         ``[xmin, ymin, xmax, ymax]``; ``None`` when the image fills
-    ///         the input.
+    ///     content_region: Where the image content sits in the model input:
+    ///         normalized ``(xmin, ymin, xmax, ymax)``, or an object with a
+    ///         ``normalized`` attribute such as the ``ContentRegion`` from
+    ///         ``edgefirst.image.ConvertOptions.content_region``. ``None``
+    ///         when the image fills the input.
     ///
     /// Raises:
     ///     RuntimeError: The model has no semantic output, or the tensors
     ///         do not match it.
-    #[pyo3(signature = (model_output, dst, confidence=None, *, mode=None, letterbox=None))]
+    #[pyo3(signature = (model_output, dst, confidence=None, *, mode=None, content_region=None))]
     pub fn decode_semantic<'py>(
         self_: PyRef<'py, Self>,
         model_output: Vec<Bound<'py, PyAny>>,
         dst: &Bound<'py, PyAny>,
         confidence: Option<&Bound<'py, PyAny>>,
         mode: Option<PyDecodeMode>,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<crate::content_region::ContentRegionArg>,
     ) -> PyResult<()> {
         let _span = tracing::trace_span!("python.decode_semantic").entered();
         let py = self_.py();
@@ -1268,8 +1270,8 @@ impl PyDecoder {
         if let Some(mode) = mode {
             options = options.with_mode(mode.into());
         }
-        if let Some(letterbox) = letterbox {
-            options = options.with_letterbox(letterbox);
+        if let Some(region) = crate::content_region::normalized(content_region) {
+            options = options.with_content_region(region);
         }
         let inputs: Vec<crate::interop::TensorArg> = model_output
             .iter()

@@ -99,7 +99,7 @@ def test_int8_needs_quantization_and_uses_it():
 
 
 def test_unknown_normalization_name_is_refused():
-    with pytest.raises(RuntimeError, match="unknown normalization"):
+    with pytest.raises(ValueError, match="unknown normalization"):
         ConvertOptions(normalization="bogus")
 
 

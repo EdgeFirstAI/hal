@@ -84,7 +84,19 @@ let opts = ConvertOptions::new()
 processor.convert(&src, &mut model_input, Some(opts))?;
 ```
 
-Float destinations (F32, F16; NHWC `Rgb` or NCHW `PlanarRgb`) receive the normalized values. A u8 or i8 destination with a non-default normalization must carry quantization (`set_quantization`); the result is quantized with it as `clamp(floor(y / scale + 0.5) + zero_point)`, so normalization and the NPU input quantization happen in one pass. Without normalization an i8 destination keeps the plain `x - 128` mapping. The pad is the RGBA pixel given to `letterbox` mapped like the image, or the `pad_output` values as written. With the `decode` feature, `ConvertOptions::with_preprocessing` reads all of this from a model's `input.preprocessing`.
+Float destinations (F32, F16; NHWC `Rgb` or NCHW `PlanarRgb`) receive the normalized values. A u8 or i8 destination with a non-default normalization must carry quantization (`set_quantization`); the result is quantized with it as `clamp(floor(y / scale + 0.5) + zero_point)`, so normalization and the NPU input quantization happen in one pass. Without normalization an i8 destination keeps the plain `x - 128` mapping. The pad is the RGBA pixel given to `letterbox` mapped like the image, or the `pad_output` values as written.
+
+Interpolation is per convert too: `ConvertOptions::interpolation` resamples that convert with its own filter, and options without one use the processor's (`ImageProcessorConfig::interpolation` / `set_interpolation`). One processor can therefore serve models with different filters without either clobbering the other. `Bicubic` and `Area` run as `Bilinear`, with a warning logged once per mode.
+
+A model's whole preprocessing can come from its metadata: `edgefirst_decoder::model_config` resolves it into an `edgefirst_tensor::PreprocessSpec` (re-exported here), and `ConvertOptions::from_spec` returns the matching options — normalization, fit, placement, pad and interpolation. `content_region` reports where the convert puts the image, for mapping detections and class maps back to the source.
+
+```rust,ignore
+let spec = config.preprocessing; // from edgefirst-decoder's model_config
+let opts = ConvertOptions::from_spec(&spec)?;
+processor.convert(&src, &mut model_input, Some(opts))?;
+let region = opts.content_region(src_w, src_h, model_w, model_h)?;
+// region.normalized feeds SemanticOptions::with_content_region / unletter_norm
+```
 
 The CPU path (NEON on aarch64) and the GL path apply the mapping; G2D does not, and declines such converts.
 
@@ -139,7 +151,7 @@ Memory and transfer:
 
 Conversion behaviour:
 
-- `EDGEFIRST_INTERPOLATION` — `bilinear` (default) or `nearest`: how `convert()` resamples when it resizes, overriding `ImageProcessorConfig::interpolation`. See [ARCHITECTURE.md § Resampling and source crops](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#resampling-and-source-crops).
+- `EDGEFIRST_INTERPOLATION` — `bilinear` (default) or `nearest`: how `convert()` resamples when it resizes, overriding `ImageProcessorConfig::interpolation` and every per-convert `ConvertOptions::interpolation`. Read when the processor is created. See [ARCHITECTURE.md § Resampling and source crops](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#resampling-and-source-crops).
 - `EDGEFIRST_COLORIMETRY` — `fast` (default) or `exact`. `fast` keeps single-plane NV12 on the driver's YUV sampler even when its colorimetry does not match; `exact` forces the in-shader matrix. See [ARCHITECTURE.md § Colorimetry](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#colorimetry-1).
 - `EDGEFIRST_NV_CONVERT_PATH` — `auto` (default), `sampler`, or `shader`. Pins the NV12 GPU conversion path for A/B measurement.
 - `EDGEFIRST_GL_SERIALIZE` — `full` or `lifecycle`. Overrides the per-driver GL serialization policy.
@@ -170,7 +182,7 @@ let overlay = MaskOverlay {
 Fields:
 - `background: Option<&TensorDyn>` — Optional tensor to blit into `dst` before drawing masks. Must match `dst`'s shape and format, and must not alias `dst` (an aliased pair returns `Error::AliasedBuffers`). `None` clears `dst` instead.
 - `opacity: f32` — Scales mask alpha in the range `0.0` (invisible) to `1.0` (fully opaque, default).
-- `letterbox: Option<[f32; 4]>` — `[xmin, ymin, xmax, ymax]` in model-input normalized space. When set, decoder output is mapped back to the original image's coordinates. Build it from the same `ConvertOptions` you gave `convert()` with `MaskOverlay::with_convert_options`.
+- `content_region: Option<[f32; 4]>` — where the image content sits in the model input, `[xmin, ymin, xmax, ymax]` normalized (`None` when it fills the input). When set, decoder output is mapped back to the original image's coordinates. Build it from the same `ConvertOptions` you gave `convert()` with `MaskOverlay::with_convert_options`.
 - `color_mode: ColorMode` — `Class` (default, colour per class label), `Instance` (colour per detection index), or `Track` (reserved for track IDs; behaves like `Instance` today).
 
 ### draw_masks()
@@ -223,7 +235,7 @@ use edgefirst_image::MaskResolution;
 let masks = processor.materialize_masks(
     &detections,
     &proto_data,
-    overlay.letterbox,
+    overlay.content_region,
     MaskResolution::Scaled { width: dst_w, height: dst_h },
 )?;
 drop(proto_data); // free the proto tensor immediately

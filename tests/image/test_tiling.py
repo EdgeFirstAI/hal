@@ -10,7 +10,7 @@ The grid geometry and config validation are pure (no GPU). The
 import numpy as np
 import pytest
 from edgefirst.image import (
-    Fit,
+    ConvertOptions,
     ImageProcessor,
     PixelFormat,
     TilingConfig,
@@ -73,21 +73,26 @@ def test_tiling_config_getters_and_chaining():
     assert cfg.tile_w == 640
     assert cfg.tile_h == 480
     assert cfg.overlap == pytest.approx(0.3)
-    assert cfg.fit == Fit.Stretch
-    assert cfg.pad == (114, 114, 114, 255)
+    assert repr(cfg.options) == repr(ConvertOptions())
 
-    cfg2 = cfg.with_overlap(0.1).with_fit(Fit.Letterbox)
+    letterbox = ConvertOptions(letterbox=(114, 114, 114, 255))
+    cfg2 = cfg.with_overlap(0.1).with_options(letterbox)
     assert cfg2.overlap == pytest.approx(0.1)
-    assert cfg2.fit == Fit.Letterbox
+    assert repr(cfg2.options) == repr(letterbox)
     # Original is unchanged (chainable returns copies).
     assert cfg.overlap == pytest.approx(0.3)
-    assert cfg.fit == Fit.Stretch
+    assert repr(cfg.options) == repr(ConvertOptions())
 
 
-def test_tiling_config_custom_pad():
-    cfg = TilingConfig(640, 640, fit=Fit.Letterbox, pad=(0, 1, 2, 3))
-    assert cfg.fit == Fit.Letterbox
-    assert cfg.pad == (0, 1, 2, 3)
+def test_tiling_config_letterbox_options():
+    options = ConvertOptions(letterbox=(0, 1, 2, 3))
+    cfg = TilingConfig(640, 640, options=options)
+    assert repr(cfg.options) == repr(options)
+    # A frame shorter than the tile letterboxes it; stretch leaves no region.
+    (placement,) = ImageProcessor().plan_tiles(640, 320, cfg)
+    assert placement.content_region == pytest.approx((0.0, 0.25, 1.0, 0.75))
+    (stretched,) = ImageProcessor().plan_tiles(640, 320, TilingConfig(640, 640))
+    assert stretched.content_region is None
 
 
 def test_plan_tiles_counts_match_grid():

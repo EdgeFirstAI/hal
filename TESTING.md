@@ -1137,7 +1137,7 @@ from edgefirst.image import MaskResolution
 
 masks = proc.materialize_masks(
     boxes, scores, classes, proto_data,
-    letterbox=letterbox_norm,
+    content_region=region,
     resolution=MaskResolution.Scaled(orig_w, orig_h),
 )
 # Smoke-check the contract: tile shape (h, w, 1) uint8 at orig-image

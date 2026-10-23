@@ -14,6 +14,8 @@
 
 #[cfg(feature = "tensor")]
 pub mod colorimetry;
+#[cfg(any(feature = "image", feature = "decoder"))]
+pub mod content_region;
 #[cfg(feature = "decoder")]
 pub mod decoder;
 #[cfg(any(feature = "image", feature = "decoder"))]
@@ -24,6 +26,8 @@ pub mod image;
 pub mod infer;
 #[cfg(feature = "tensor")]
 pub mod interop;
+#[cfg(feature = "decoder")]
+pub mod model_config;
 #[cfg(feature = "tensor")]
 pub mod tensor;
 #[cfg(feature = "image")]

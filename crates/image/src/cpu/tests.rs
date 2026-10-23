@@ -5749,4 +5749,134 @@ mod cpu_tests {
             guarded[2]
         );
     }
+
+    /// The content region reported for a convert is exactly the rectangle the
+    /// convert paints, for odd slack in either axis and both placements.
+    #[test]
+    fn content_region_matches_painted_rect() {
+        use crate::{ConvertOptions, LetterboxPlacement};
+        use edgefirst_tensor::CpuAccess;
+        let pad = [10u8, 20, 30];
+        let mut cpu = CPUProcessor::new();
+        for (sw, sh) in [(641, 479), (479, 641), (1, 3), (3, 1)] {
+            let src = TensorDyn::image(
+                sw,
+                sh,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(200);
+            for (dw, dh) in [(640, 640), (320, 256)] {
+                for placement in [LetterboxPlacement::Center, LetterboxPlacement::TopLeft] {
+                    let opts = ConvertOptions::new()
+                        .letterbox([pad[0], pad[1], pad[2], 255])
+                        .placement(placement);
+                    let mut dst = TensorDyn::image(
+                        dw,
+                        dh,
+                        PixelFormat::Rgb,
+                        DType::U8,
+                        Some(TensorMemory::Mem),
+                        CpuAccess::ReadWrite,
+                    )
+                    .unwrap();
+                    cpu.convert(&src, &mut dst, Some(opts)).unwrap();
+                    let map = dst.as_u8().unwrap().map_read().unwrap();
+                    let px = map.as_slice();
+                    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+                    for y in 0..dh {
+                        for x in 0..dw {
+                            let i = (y * dw + x) * 3;
+                            if px[i..i + 3] != pad {
+                                (x0, y0) = (x0.min(x), y0.min(y));
+                                (x1, y1) = (x1.max(x + 1), y1.max(y + 1));
+                            }
+                        }
+                    }
+                    let painted = Region::new(x0, y0, x1 - x0, y1 - y0);
+                    let region = opts.content_region(sw, sh, dw, dh).unwrap();
+                    assert_eq!(
+                        region.pixels, painted,
+                        "{sw}x{sh} -> {dw}x{dh} {placement:?}"
+                    );
+                }
+            }
+        }
+        let stretch = ConvertOptions::new()
+            .content_region(641, 479, 640, 640)
+            .unwrap();
+        assert!(stretch.is_full());
+    }
+
+    #[test]
+    fn from_spec_matches_manual_options() {
+        use crate::{
+            ConvertOptions, FitMode, Interpolation, LetterboxPlacement, Normalization, PadSpace,
+            PreprocessSpec,
+        };
+        let mut spec = PreprocessSpec::new();
+        assert_eq!(
+            ConvertOptions::from_spec(&spec).unwrap(),
+            ConvertOptions::new()
+                .letterbox([114, 114, 114, 255])
+                .interpolation(Interpolation::Bilinear)
+        );
+        spec.normalization = Normalization::imagenet();
+        spec.placement = LetterboxPlacement::TopLeft;
+        spec.pad = [0.0; 3];
+        spec.pad_space = PadSpace::Normalized;
+        let manual = ConvertOptions::new()
+            .letterbox([0, 0, 0, 255])
+            .placement(LetterboxPlacement::TopLeft)
+            .pad_output([0.0, 0.0, 0.0, 1.0])
+            .normalization(Normalization::imagenet())
+            .interpolation(Interpolation::Bilinear);
+        assert_eq!(ConvertOptions::from_spec(&spec).unwrap(), manual);
+        spec.fit = FitMode::Stretch;
+        assert_eq!(
+            ConvertOptions::from_spec(&spec).unwrap(),
+            ConvertOptions::new()
+                .normalization(Normalization::imagenet())
+                .interpolation(Interpolation::Bilinear)
+        );
+        let rotated = ConvertOptions::new().rotation(Rotation::Clockwise90);
+        assert_eq!(
+            rotated.with_spec(&spec).unwrap().get_rotation(),
+            Rotation::Clockwise90
+        );
+        spec.fit = FitMode::Letterbox;
+        spec.pad_space = PadSpace::Pixel;
+        spec.pad = [300.0; 3];
+        assert!(matches!(
+            ConvertOptions::from_spec(&spec),
+            Err(Error::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_interpolation_falls_back_to_bilinear() {
+        use crate::Interpolation;
+        assert_eq!(
+            crate::runnable_interpolation(Interpolation::Bicubic),
+            Interpolation::Bilinear
+        );
+        assert_eq!(
+            crate::runnable_interpolation(Interpolation::Area),
+            Interpolation::Bilinear
+        );
+        assert_eq!(
+            crate::runnable_interpolation(Interpolation::Nearest),
+            Interpolation::Nearest
+        );
+        let opts = crate::ConvertOptions::from_spec(&crate::PreprocessSpec::new()).unwrap();
+        assert_eq!(
+            opts,
+            crate::ConvertOptions::new()
+                .letterbox([114, 114, 114, 255])
+                .interpolation(Interpolation::Bilinear)
+        );
+    }
 }

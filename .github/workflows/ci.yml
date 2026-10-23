@@ -104,8 +104,8 @@ jobs:
       #
       cross-clippy-args: --workspace --all-targets --locked --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
       pre-command: bash .github/scripts/ci-setup.sh
-      clippy-args: --workspace --all-targets --locked --features default --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
-      nextest-args: --workspace --locked --features default --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      clippy-args: --workspace --all-targets --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -- -D warnings
+      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       cache-key: quick-x86_64
 
   # `make sbom` resolves the dependency graph for every target that reaches a
@@ -236,7 +236,7 @@ jobs:
       # A floor, not a target. Guards against a selection that matches nothing
       # and reports success; tighten once a green run reports the real count.
       board-min-tests: "100"
-      nextest-args: --workspace --locked --features default --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
       # The boards are storage-constrained (the smallest root filesystem is
       # 12 GB). profiling is thin-LTO with debug = "line-tables-only", which is
       # what kept the on-target payload shippable before the migration; the

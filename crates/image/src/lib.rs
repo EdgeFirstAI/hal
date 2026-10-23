@@ -324,13 +324,17 @@ pub use edgefirst_codec as codec;
 
 #[cfg(test)]
 use edgefirst_tensor::ProtoLayout;
-#[doc(inline)]
-pub use edgefirst_tensor::Region;
 #[cfg(any(
     test,
     all(any(target_os = "linux", target_os = "windows"), feature = "opengl")
 ))]
 use edgefirst_tensor::Tensor;
+#[doc(inline)]
+pub use edgefirst_tensor::{
+    fit_code, interpolation_code, letterbox_placement_code, normalization_code, ContentRegion,
+    ContentRegionSource, Fit, FitMode, Interpolation, LetterboxPlacement, Normalization,
+    NormalizationPreset, PadSpace, PreprocessSpec, Region,
+};
 use edgefirst_tensor::{
     DType, PixelFormat, PixelLayout, TensorDyn, TensorMemory, TensorTrait as _,
 };
@@ -406,7 +410,7 @@ mod g2d;
 #[path = "gl/mod.rs"]
 mod opengl_headless;
 mod options;
-pub use options::{ConvertOptions, LetterboxPlacement, Normalization, NormalizationPreset};
+pub use options::ConvertOptions;
 #[cfg(test)]
 mod test_support;
 mod tiling;
@@ -519,8 +523,8 @@ impl ColorMode {
 ///   pixel resolution by upsampling the full proto plane once and cropping by
 ///   bbox after sigmoid. The upsample uses bilinear interpolation with
 ///   edge-clamp sampling — semantically equivalent to Ultralytics'
-///   `process_masks_retina` reference. When a `letterbox` is also passed to
-///   [`materialize_masks`], the inverse letterbox transform is applied during
+///   `process_masks_retina` reference. When a `content_region` is also passed
+///   to [`materialize_masks`], the inverse letterbox transform is applied during
 ///   the upsample so mask pixels land in original-content coordinates
 ///   (drop-in for overlay on the original image). Mask values are binary
 ///   `uint8 {0, 255}` after thresholding sigmoid > 0.5 — interchangeable
@@ -533,7 +537,7 @@ pub enum MaskResolution {
     #[default]
     Proto,
     /// Per-detection tile at `(width, height)` pixel resolution in the
-    /// coordinate frame determined by the `letterbox` parameter of
+    /// coordinate frame determined by the `content_region` parameter of
     /// [`ImageProcessor::materialize_masks`].
     Scaled {
         /// Target pixel width of the output coordinate frame.
@@ -565,16 +569,17 @@ pub struct MaskOverlay<'a> {
     /// When `None`, `dst` is cleared to `0x00000000` before masks are drawn.
     pub background: Option<&'a TensorDyn>,
     pub opacity: f32,
-    /// Normalized letterbox region `[xmin, ymin, xmax, ymax]` in model-input
-    /// space that contains actual image content (the rest is padding).
+    /// The image content within the model input, as normalized
+    /// `[xmin, ymin, xmax, ymax]` ([`ContentRegion::normalized`]); the rest is
+    /// letterbox padding.
     ///
     /// When set, bounding boxes and mask coordinates from the decoder (which
     /// are in model-input normalized space) are mapped back to the original
     /// image coordinate space before rendering.
     ///
     /// Use [`with_convert_options`](Self::with_convert_options) to compute this
-    /// from the [`Crop`] that was used in the model input [`convert`](crate::ImageProcessorTrait::convert) call.
-    pub letterbox: Option<[f32; 4]>,
+    /// from the options of the model input [`convert`](crate::ImageProcessorTrait::convert) call.
+    pub content_region: Option<[f32; 4]>,
     pub color_mode: ColorMode,
 }
 
@@ -583,7 +588,7 @@ impl Default for MaskOverlay<'_> {
         Self {
             background: None,
             opacity: 1.0,
-            letterbox: None,
+            content_region: None,
             color_mode: ColorMode::Class,
         }
     }
@@ -616,16 +621,14 @@ impl<'a> MaskOverlay<'a> {
         self
     }
 
-    /// Set the letterbox transform from the [`ConvertOptions`] used when
+    /// Set the content region from the [`ConvertOptions`] used when
     /// preparing the model input, so that bounding boxes and masks are
-    /// correctly mapped back to the original image coordinate space during
-    /// rendering.
+    /// mapped back to the original image when rendering.
     ///
     /// Pass the same options that were given to
-    /// [`convert`](crate::ImageProcessorTrait::convert) along with the model
-    /// input dimensions (`model_w` × `model_h`).
-    ///
-    /// Has no effect without a letterbox fit.
+    /// [`convert`](crate::ImageProcessorTrait::convert) along with the source
+    /// and model input dimensions. Has no effect without a letterbox fit, or
+    /// when the geometry does not resolve.
     pub fn with_convert_options(
         mut self,
         options: &ConvertOptions,
@@ -634,19 +637,8 @@ impl<'a> MaskOverlay<'a> {
         model_w: usize,
         model_h: usize,
     ) -> Self {
-        // The letterbox placement is resolved from the same source/destination
-        // dimensions `convert()` used, so the inverse map matches the render.
-        let crop = options.get_crop();
-        if let Ok(resolved) = crop.resolve(src_w, src_h, model_w, model_h, options.get_placement())
-        {
-            if let Some(r) = resolved.dst_rect {
-                self.letterbox = Some([
-                    r.left as f32 / model_w as f32,
-                    r.top as f32 / model_h as f32,
-                    (r.left + r.width) as f32 / model_w as f32,
-                    (r.top + r.height) as f32 / model_h as f32,
-                ]);
-            }
+        if let Ok(region) = options.content_region(src_w, src_h, model_w, model_h) {
+            self.content_region = region.letterboxed();
         }
         self
     }
@@ -692,8 +684,7 @@ fn copy_segmentation(s: &Segmentation, bbox: [f32; 4]) -> Result<Segmentation> {
 /// Apply the inverse letterbox transform to a bounding box.
 ///
 /// `lb` is `[lx0, ly0, lx1, ly1]` — the normalized region of the model input
-/// that contains actual image content (output of
-/// [`MaskOverlay::with_letterbox_crop`]). Converts model-input-normalized
+/// that contains actual image content ([`MaskOverlay::content_region`]). Converts model-input-normalized
 /// coords to output-image-normalized coords, clamped to `[0.0, 1.0]`, and
 /// canonicalises the bbox (ensures xmin <= xmax).
 ///
@@ -706,50 +697,6 @@ fn unletter_bbox(bbox: DetectBox, lb: [f32; 4]) -> DetectBox {
     DetectBox {
         bbox: edgefirst_tensor::unletter_norm(bbox.bbox, lb),
         ..bbox
-    }
-}
-
-edgefirst_tensor::ef_vocabulary! {
-    /// The kind of a [`Fit`], without its letterbox pad colour.
-    ///
-    /// [`Fit`] carries data, so it cannot carry a code itself; this is the
-    /// code the C `ef_tiling_config.fit` field and the Python `Fit` enum use.
-    pub enum FitMode {
-        Stretch = 0, "stretch", STRETCH,
-        Letterbox = 1, "letterbox", LETTERBOX,
-    }
-    #[doc(hidden)]
-    pub mod fit_code;
-}
-
-/// How a source is fit into the requested destination shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Fit {
-    /// Stretch the source (or source crop) to fill the whole destination.
-    #[default]
-    Stretch,
-    /// Preserve the *source* aspect ratio, centring it in the destination and
-    /// padding the remainder with `pad` (RGBA — e.g. `[114, 114, 114, 255]` for
-    /// YOLO-style preprocessing).
-    Letterbox { pad: [u8; 4] },
-}
-
-impl Fit {
-    /// The kind of this fit, as a shared code-carrying [`FitMode`].
-    pub fn mode(&self) -> FitMode {
-        match self {
-            Fit::Stretch => FitMode::Stretch,
-            Fit::Letterbox { .. } => FitMode::Letterbox,
-        }
-    }
-
-    /// Build a fit from its kind. `pad` is used only by
-    /// [`FitMode::Letterbox`].
-    pub fn from_mode(mode: FitMode, pad: [u8; 4]) -> Self {
-        match mode {
-            FitMode::Stretch => Fit::Stretch,
-            FitMode::Letterbox => Fit::Letterbox { pad },
-        }
     }
 }
 
@@ -932,9 +879,7 @@ fn region_to_rect(r: Region) -> Rect {
     }
 }
 
-/// Aspect-preserving placement of an `sw`×`sh` source within a `dw`×`dh`
-/// destination — the canonical letterbox rectangle (one home, replacing the
-/// per-caller `calculate_letterbox` copies).
+/// [`edgefirst_tensor::letterbox_rect`] as the backends' [`Rect`].
 fn letterbox_rect(
     sw: usize,
     sh: usize,
@@ -942,21 +887,8 @@ fn letterbox_rect(
     dh: usize,
     placement: LetterboxPlacement,
 ) -> Rect {
-    if sw == 0 || sh == 0 {
-        return Rect::new(0, 0, dw, dh);
-    }
-    let src_aspect = sw as f64 / sh as f64;
-    let dst_aspect = dw as f64 / dh as f64;
-    let (new_w, new_h) = if src_aspect > dst_aspect {
-        (dw, ((dw as f64 / src_aspect).round() as usize).max(1))
-    } else {
-        (((dh as f64 * src_aspect).round() as usize).max(1), dh)
-    };
-    let (left, top) = match placement {
-        LetterboxPlacement::Center => (dw.saturating_sub(new_w) / 2, dh.saturating_sub(new_h) / 2),
-        LetterboxPlacement::TopLeft => (0, 0),
-    };
-    Rect::new(left, top, new_w, new_h)
+    let r = edgefirst_tensor::letterbox_rect(sw, sh, dw, dh, placement);
+    Rect::new(r.x, r.y, r.width, r.height)
 }
 
 /// Internal placement rectangle (top-left + size). The **public** pixel
@@ -1224,9 +1156,11 @@ pub struct ImageProcessorConfig {
     pub colorimetry: ColorimetryMode,
 
     /// How `convert()` resamples when the source (or source crop) and the
-    /// destination differ in size (see [`Interpolation`]). Defaults to
-    /// [`Interpolation::Bilinear`]. The `EDGEFIRST_INTERPOLATION` environment
-    /// variable (`nearest` | `bilinear`) overrides this setting when present.
+    /// destination differ in size (see [`Interpolation`]), for converts whose
+    /// options do not choose their own ([`ConvertOptions::interpolation`]).
+    /// Defaults to [`Interpolation::Bilinear`]. The `EDGEFIRST_INTERPOLATION`
+    /// environment variable (`nearest` | `bilinear`), read when the processor
+    /// is created, overrides this setting and every per-convert choice.
     pub interpolation: Interpolation,
 
     /// How many buffer imports the OpenGL backend keeps cached, per cache.
@@ -1316,51 +1250,47 @@ pub enum ColorimetryMode {
     Exact,
 }
 
-/// How `convert()` resamples when it resizes.
-///
-/// Every backend honours it: the CPU backend through its resizer, the
-/// OpenGL backend through its texture filtering and NV shader choice, and
-/// G2D, which has a fixed hardware filter, by declining resizing converts
-/// under [`Interpolation::Nearest`] so another backend runs them. Converts
-/// that do not resize read each source pixel exactly in either mode.
-///
-/// Override at runtime with `EDGEFIRST_INTERPOLATION=nearest|bilinear`,
-/// which takes precedence over [`ImageProcessorConfig::interpolation`] and
-/// [`ImageProcessor::set_interpolation`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Interpolation {
-    /// Nearest-neighbour: each output pixel copies one source pixel. The
-    /// fastest mode, at the cost of aliasing that lowers detection accuracy
-    /// on resized inputs.
-    Nearest,
-    /// Bilinear with half-pixel centres (default): two taps per axis at every
-    /// scale on both the CPU and GL backends, matching OpenCV `INTER_LINEAR`,
-    /// the preprocessing most detectors and segmenters are trained with. It
-    /// does not widen its kernel when downscaling, so it smooths less than
-    /// PIL's bilinear below 1×.
-    #[default]
-    Bilinear,
+/// `mode` if the backends run it, else [`Interpolation::supported`] with a
+/// warning logged once per mode: bicubic and area describe reference
+/// pipelines this crate does not implement.
+pub(crate) fn runnable_interpolation(mode: Interpolation) -> Interpolation {
+    let run = mode.supported();
+    if run != mode && warn_first_fallback(mode) {
+        log::warn!(
+            "{} interpolation is not implemented; using {}",
+            mode.as_str(),
+            run.as_str()
+        );
+    }
+    run
 }
 
-impl Interpolation {
-    /// The mode selected by `EDGEFIRST_INTERPOLATION`, if it is set to a
-    /// recognised value. An unrecognised value is logged and ignored.
-    pub(crate) fn from_env() -> Option<Self> {
-        let value = std::env::var("EDGEFIRST_INTERPOLATION").ok()?;
-        match value.trim().to_ascii_lowercase().as_str() {
-            "nearest" => Some(Self::Nearest),
-            "bilinear" => Some(Self::Bilinear),
-            "" => None,
-            other => {
-                log::warn!(
-                    "EDGEFIRST_INTERPOLATION={other:?} is not recognised \
-                     (expected nearest or bilinear); ignoring it"
-                );
-                None
-            }
-        }
+/// Unsupported interpolations already warned about, one bit per code.
+static INTERPOLATION_FALLBACKS_WARNED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Whether this is the first fallback from `mode` in the process.
+fn warn_first_fallback(mode: Interpolation) -> bool {
+    let bit = 1u32 << (mode.code() % 32);
+    INTERPOLATION_FALLBACKS_WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
+}
+
+/// The interpolation selected by `EDGEFIRST_INTERPOLATION`, if it is set to
+/// a recognised value. An unrecognised value is logged and ignored.
+pub(crate) fn interpolation_from_env() -> Option<Interpolation> {
+    let value = std::env::var("EDGEFIRST_INTERPOLATION").ok()?;
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
     }
+    let mode = Interpolation::from_str_code(&value);
+    if mode.is_none() {
+        log::warn!(
+            "EDGEFIRST_INTERPOLATION={value:?} is not recognised \
+             (expected nearest or bilinear); ignoring it"
+        );
+    }
+    mode
 }
 
 edgefirst_tensor::ef_vocabulary! {
@@ -1573,6 +1503,12 @@ pub struct ImageProcessor {
     /// `GLProcessorThreaded::convert_stats`. Read via
     /// [`convert_fallback_count`](Self::convert_fallback_count).
     pub(crate) convert_fallbacks: std::sync::atomic::AtomicU64,
+
+    /// The interpolation a convert without its own uses, as the backends run it.
+    pub(crate) interpolation: Interpolation,
+
+    /// `EDGEFIRST_INTERPOLATION`, read once at construction; it pins every convert.
+    pub(crate) env_interpolation: Option<Interpolation>,
 }
 
 unsafe impl Send for ImageProcessor {}
@@ -1659,7 +1595,7 @@ impl ImageProcessor {
         dst: &mut TensorDyn,
         options: Option<ConvertOptions>,
     ) -> Result<Option<CompletionFence>> {
-        let options = options.unwrap_or_default();
+        let options = self.resolve_interpolation(options.unwrap_or_default());
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
@@ -1742,6 +1678,7 @@ impl ImageProcessor {
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
         let interpolation = config.interpolation;
         let mut processor = Self::with_config_backends(config)?;
+        processor.env_interpolation = interpolation_from_env().map(runnable_interpolation);
         processor.set_interpolation(interpolation)?;
         Ok(processor)
     }
@@ -1771,6 +1708,8 @@ impl ImageProcessor {
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                    interpolation: Interpolation::Bilinear,
+                    env_interpolation: None,
                     forced_backend: None,
                 });
             }
@@ -1791,6 +1730,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl: None,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        interpolation: Interpolation::Bilinear,
+                        env_interpolation: None,
                         forced_backend: None,
                     });
                 }
@@ -1808,6 +1749,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl: None,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        interpolation: Interpolation::Bilinear,
+                        env_interpolation: None,
                         forced_backend: None,
                     });
                 }
@@ -1833,6 +1776,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        interpolation: Interpolation::Bilinear,
+                        env_interpolation: None,
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
@@ -1860,6 +1805,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        interpolation: Interpolation::Bilinear,
+                        env_interpolation: None,
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
@@ -1885,6 +1832,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        interpolation: Interpolation::Bilinear,
+                        env_interpolation: None,
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
@@ -1913,6 +1862,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        interpolation: Interpolation::Bilinear,
+                        env_interpolation: None,
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
@@ -1929,6 +1880,8 @@ impl ImageProcessor {
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        interpolation: Interpolation::Bilinear,
+                        env_interpolation: None,
                         forced_backend: None,
                     });
                 }
@@ -1972,6 +1925,8 @@ impl ImageProcessor {
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                    interpolation: Interpolation::Bilinear,
+                    env_interpolation: None,
                     forced_backend: Some(ForcedBackend::Cpu),
                 }),
                 ForcedBackend::G2d => {
@@ -1988,6 +1943,8 @@ impl ImageProcessor {
                             #[cfg(feature = "opengl")]
                             opengl: None,
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            interpolation: Interpolation::Bilinear,
+                            env_interpolation: None,
                             forced_backend: Some(ForcedBackend::G2d),
                         })
                     }
@@ -2016,6 +1973,8 @@ impl ImageProcessor {
                             g2d: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            interpolation: Interpolation::Bilinear,
+                            env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
@@ -2036,6 +1995,8 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            interpolation: Interpolation::Bilinear,
+                            env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
@@ -2056,6 +2017,8 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            interpolation: Interpolation::Bilinear,
+                            env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
@@ -2076,6 +2039,8 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            interpolation: Interpolation::Bilinear,
+                            env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
@@ -2194,6 +2159,8 @@ impl ImageProcessor {
             #[cfg(feature = "opengl")]
             opengl,
             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+            interpolation: Interpolation::Bilinear,
+            env_interpolation: None,
             forced_backend: None,
         }
         .apply_colorimetry_mode(config.colorimetry))
@@ -2258,22 +2225,28 @@ impl ImageProcessor {
     }
 
     /// Sets how `convert()` resamples when it resizes (see [`Interpolation`])
-    /// on every backend this processor holds. The `EDGEFIRST_INTERPOLATION`
-    /// environment variable takes precedence: when it is set, this call logs
-    /// and keeps the env-selected mode.
+    /// on every backend this processor holds, for converts whose options do
+    /// not choose their own ([`ConvertOptions::interpolation`]). Bicubic and
+    /// area run as [`Interpolation::supported`], with a warning logged once
+    /// per mode. The `EDGEFIRST_INTERPOLATION` environment variable, read
+    /// when the processor is created, takes precedence: when it is set, this
+    /// call keeps the env-selected mode.
     pub fn set_interpolation(&mut self, mode: Interpolation) -> Result<()> {
-        let mode = match Interpolation::from_env() {
+        let mode = match self.env_interpolation {
             Some(env) => {
-                if env != mode {
-                    log::info!(
+                if env != mode.supported() {
+                    log::debug!(
                         "EDGEFIRST_INTERPOLATION pins Interpolation::{env:?}; \
                          ignoring Interpolation::{mode:?}"
                     );
                 }
                 env
             }
-            None => mode,
+            None => runnable_interpolation(mode),
         };
+        if mode == self.interpolation {
+            return Ok(());
+        }
         if let Some(cpu) = self.cpu.as_mut() {
             cpu.set_interpolation(mode);
         }
@@ -2294,7 +2267,26 @@ impl ImageProcessor {
         if let Some(gl) = self.opengl.as_mut() {
             gl.set_interpolation(mode)?;
         }
+        self.interpolation = mode;
         Ok(())
+    }
+
+    /// The interpolation the processor uses for converts that do not choose
+    /// their own, as the backends run it.
+    pub fn interpolation(&self) -> Interpolation {
+        self.interpolation
+    }
+
+    /// `options` with the interpolation this convert runs: the
+    /// `EDGEFIRST_INTERPOLATION` pin, else the options' own (as
+    /// [`runnable_interpolation`] maps it), else the processor's.
+    fn resolve_interpolation(&self, options: ConvertOptions) -> ConvertOptions {
+        let mode = match (self.env_interpolation, options.get_interpolation()) {
+            (Some(env), _) => env,
+            (None, Some(mode)) => runnable_interpolation(mode),
+            (None, None) => self.interpolation,
+        };
+        options.with_interpolation(Some(mode))
     }
 
     /// Sets the interpolation mode for int8 proto textures on the OpenGL
@@ -3094,15 +3086,21 @@ impl ImageProcessor {
         &mut self,
         detect: &[DetectBox],
         proto_data: &ProtoData,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<[f32; 4]>,
         resolution: MaskResolution,
     ) -> Result<Vec<Segmentation>> {
         let cpu = self.cpu.as_mut().ok_or(Error::NoConverter)?;
         match resolution {
-            MaskResolution::Proto => cpu.materialize_segmentations(detect, proto_data, letterbox),
-            MaskResolution::Scaled { width, height } => {
-                cpu.materialize_scaled_segmentations(detect, proto_data, letterbox, width, height)
+            MaskResolution::Proto => {
+                cpu.materialize_segmentations(detect, proto_data, content_region)
             }
+            MaskResolution::Scaled { width, height } => cpu.materialize_scaled_segmentations(
+                detect,
+                proto_data,
+                content_region,
+                width,
+                height,
+            ),
         }
     }
 }
@@ -3119,7 +3117,7 @@ impl ImageProcessorTrait for ImageProcessor {
         dst: &mut TensorDyn,
         options: Option<ConvertOptions>,
     ) -> Result<()> {
-        let options = options.unwrap_or_default();
+        let options = self.resolve_interpolation(options.unwrap_or_default());
         let (rotation, flip) = (options.get_rotation(), options.get_flip());
         let start = Instant::now();
         let src_fmt = src.format();
@@ -3295,7 +3293,7 @@ impl ImageProcessorTrait for ImageProcessor {
         dst: &mut TensorDyn,
         options: Option<ConvertOptions>,
     ) -> Result<()> {
-        let options = options.unwrap_or_default();
+        let options = self.resolve_interpolation(options.unwrap_or_default());
         // Deferred batching is an OpenGL optimization (shared parent EGLImage +
         // no per-tile glFinish). Route to the GL backend's deferred path when GL
         // is forced or auto-selectable; on a GL decline fall back to an eager
@@ -3375,7 +3373,7 @@ impl ImageProcessorTrait for ImageProcessor {
         // a letterbox was applied to prepare the model input.
         let lb_boxes: Vec<DetectBox>;
         let lb_segs: Vec<Segmentation>;
-        let (detect, segmentation) = if let Some(lb) = overlay.letterbox {
+        let (detect, segmentation) = if let Some(lb) = overlay.content_region {
             lb_boxes = detect.iter().map(|&d| unletter_bbox(d, lb)).collect();
             // Keep segmentation bboxes in sync with the transformed detect boxes
             // when we have a 1:1 correspondence (instance segmentation).
@@ -3528,10 +3526,10 @@ impl ImageProcessorTrait for ImageProcessor {
         // Un-letterbox detect boxes for rendering when a letterbox was applied
         // to prepare the model input.  The original `detect` coords are still
         // passed to `materialize_segmentations` (which needs model-space coords
-        // to correctly crop the proto tensor) alongside `overlay.letterbox` so
+        // to correctly crop the proto tensor) alongside `overlay.content_region` so
         // it can emit `Segmentation` structs in output-image space.
         let lb_boxes: Vec<DetectBox>;
-        let render_detect = if let Some(lb) = overlay.letterbox {
+        let render_detect = if let Some(lb) = overlay.content_region {
             lb_boxes = detect.iter().map(|&d| unletter_bbox(d, lb)).collect();
             lb_boxes.as_slice()
         } else {
@@ -3614,7 +3612,7 @@ impl ImageProcessorTrait for ImageProcessor {
                         "draw_proto_masks started with hybrid (cpu+opengl) in {:?}",
                         start.elapsed()
                     );
-                    cpu.materialize_segmentations(detect, proto_data, overlay.letterbox)?
+                    cpu.materialize_segmentations(detect, proto_data, overlay.content_region)?
                 }
                 None => unreachable!("cpu presence checked above"),
             };
@@ -4517,7 +4515,7 @@ mod image_tests {
         assert_eq!(plan.len(), 32);
         assert!(plan.iter().all(|p| p.count == 32));
         assert!(plan.iter().all(|p| p.crop_size == (640.0, 640.0)));
-        assert!(plan.iter().all(|p| p.letterbox.is_none())); // stretch fit
+        assert!(plan.iter().all(|p| p.content_region.is_none())); // stretch fit
         assert!(plan.iter().all(|p| p.frame_dims == (3840.0, 2160.0)));
         assert_eq!(plan[0].origin, (0.0, 0.0));
     }
@@ -11841,7 +11839,7 @@ mod image_tests {
                 None => unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") },
             }
             assert_eq!(
-                Interpolation::from_env(),
+                interpolation_from_env(),
                 want,
                 "EDGEFIRST_INTERPOLATION={value:?}"
             );
@@ -11917,6 +11915,184 @@ mod image_tests {
             nearest,
             "the env pin outlives set_interpolation"
         );
+    }
+
+    /// A per-convert interpolation overrides the processor's for that
+    /// convert only, so two option sets on one processor do not interfere;
+    /// `EDGEFIRST_INTERPOLATION` pins both.
+    #[test]
+    fn test_per_convert_interpolation_overrides_processor() {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
+        let mut checker = Vec::with_capacity(8 * 8 * 4);
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = if (x + y) % 2 == 0 { 0u8 } else { 255 };
+                checker.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let resize = |processor: &mut dyn ImageProcessorTrait, options: Option<ConvertOptions>| {
+            let mut src = TensorDyn::image(
+                8,
+                8,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            src.as_u8_mut()
+                .unwrap()
+                .map_mut()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(&checker);
+            let mut dst = TensorDyn::image(
+                12,
+                12,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            processor.convert(&src, &mut dst, options).unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        let nearest = resize(&mut CPUProcessor::new_nearest(), None);
+        let bilinear = resize(&mut CPUProcessor::new(), None);
+        assert_ne!(nearest, bilinear, "the checker must tell the filters apart");
+        let cpu_only = || {
+            ImageProcessor::with_config(ImageProcessorConfig {
+                backend: ComputeBackend::Cpu,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let model_a = ConvertOptions::new().interpolation(Interpolation::Nearest);
+        let model_b = ConvertOptions::new().interpolation(Interpolation::Bicubic);
+
+        unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") };
+        let mut p = cpu_only();
+        assert_eq!(p.interpolation(), Interpolation::Bilinear);
+        for _ in 0..2 {
+            assert_eq!(resize(&mut p, Some(model_a)), nearest, "model A: nearest");
+            assert_eq!(resize(&mut p, Some(model_b)), bilinear, "model B: bicubic");
+            assert_eq!(resize(&mut p, None), bilinear, "processor setting kept");
+        }
+        p.set_interpolation(Interpolation::Nearest).unwrap();
+        assert_eq!(resize(&mut p, Some(model_b)), bilinear, "options win");
+        assert_eq!(resize(&mut p, None), nearest, "processor fallback");
+
+        let mut spec = PreprocessSpec::new();
+        spec.interpolation = Interpolation::Nearest;
+        let from_spec = ConvertOptions::from_spec(&spec).unwrap();
+        assert_eq!(from_spec.get_interpolation(), Some(Interpolation::Nearest));
+        let mut p = cpu_only();
+        let stretch = from_spec.crop(Crop::default());
+        assert_eq!(
+            resize(&mut p, Some(stretch)),
+            nearest,
+            "from_spec carries it"
+        );
+
+        let cpu = p.cpu.as_mut().unwrap();
+        cpu.set_interpolation(Interpolation::Nearest);
+        p.set_interpolation(Interpolation::Bilinear).unwrap();
+        assert_eq!(
+            resize(p.cpu.as_mut().unwrap(), None),
+            nearest,
+            "an unchanged mode does not reach the backends"
+        );
+
+        unsafe { std::env::set_var("EDGEFIRST_INTERPOLATION", "bilinear") };
+        let mut p = cpu_only();
+        assert_eq!(resize(&mut p, Some(model_a)), bilinear, "the env pin wins");
+    }
+
+    /// The threaded GL worker honours a per-convert interpolation and keeps
+    /// the processor's for converts without one.
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn test_per_convert_interpolation_reaches_gl_worker() {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
+        unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") };
+        let mut p = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) if p.opengl.is_some() => p,
+            _ => {
+                crate::test_support::report_skip(&format!(
+                    "{} — GL backend unavailable",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (sw, sh, dw, dh) = (40usize, 30usize, 56usize, 42usize);
+        let mut rgba = Vec::with_capacity(sw * sh * 4);
+        for y in 0..sh {
+            for x in 0..sw {
+                let v = if (x + y) % 2 == 0 { 16u8 } else { 235 };
+                rgba.extend_from_slice(&[v, 128, 255 - v, 255]);
+            }
+        }
+        let mut src = TensorDyn::image(
+            sw,
+            sh,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        src.as_u8_mut()
+            .unwrap()
+            .map_mut()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&rgba);
+        let gl_convert = |p: &mut ImageProcessor, options: Option<ConvertOptions>| {
+            let mut dst = TensorDyn::image(
+                dw,
+                dh,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let options = p.resolve_interpolation(options.unwrap_or_default());
+            p.opengl
+                .as_mut()
+                .unwrap()
+                .convert(&src, &mut dst, Some(options))
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        let nearest = ConvertOptions::new().interpolation(Interpolation::Nearest);
+        let per_convert = gl_convert(&mut p, Some(nearest));
+        let processor_bilinear = gl_convert(&mut p, None);
+        p.set_interpolation(Interpolation::Nearest).unwrap();
+        let processor_nearest = gl_convert(&mut p, None);
+        assert_ne!(processor_bilinear, processor_nearest);
+        assert_eq!(per_convert, processor_nearest, "per-convert Nearest");
+        let bilinear = ConvertOptions::new().interpolation(Interpolation::Bilinear);
+        assert_eq!(gl_convert(&mut p, Some(bilinear)), processor_bilinear);
+    }
+
+    /// Each unsupported interpolation warns at most once per process.
+    #[test]
+    fn test_interpolation_fallback_warns_once() {
+        runnable_interpolation(Interpolation::Area);
+        assert!(!warn_first_fallback(Interpolation::Area));
+        assert_eq!(
+            runnable_interpolation(Interpolation::Area),
+            Interpolation::Bilinear
+        );
+        assert!(!warn_first_fallback(Interpolation::Area));
     }
 
     /// Run `body` with `EDGEFIRST_FORCE_BACKEND` temporarily set (or

@@ -13,9 +13,12 @@
 use edgefirst_decoder::configs::{
     DecoderType, DecoderVersion, DimName, Nms, OutputType, NMS_OFF_CODE,
 };
+use edgefirst_decoder::model_config::{ConfigField, ConfigSource, ModelFamily, ModelTask};
 use edgefirst_decoder::schema::DecodeMode;
 use edgefirst_decoder::tiling::{MatchMetric, MergeMode};
 use edgefirst_decoder::ModelSource;
+use edgefirst_decoder_abi::{EfFit, EfInterpolation, EfLetterboxPlacement, EfPadSpace};
+use edgefirst_tensor::{FitMode, Interpolation, LetterboxPlacement, PadSpace};
 
 /// NMS mode, for `ef_decoder_params_set_nms`.
 #[repr(u32)]
@@ -128,6 +131,80 @@ pub enum EfModelSource {
     CoreMl = 3,
 }
 
+/// The source of a resolved model configuration value, from
+/// `ef_model_config_source`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfConfigSource {
+    /// `edgefirst.json` embedded in the model file.
+    EmbeddedEdgefirst = 0,
+    /// `edgefirst.json` (and `labels.txt`) beside the model file.
+    SidecarEdgefirst = 1,
+    /// Hugging Face configs embedded in the model file.
+    EmbeddedHf = 2,
+    /// Hugging Face configs beside the model file.
+    SidecarHf = 3,
+    /// Ultralytics export metadata.
+    UltralyticsMetadata = 4,
+    /// Guessed from the model's input and output names and shapes.
+    Heuristic = 5,
+    /// The documented default.
+    Default = 6,
+    /// A caller override (`ef_model_overrides_set`).
+    Override = 7,
+}
+
+/// The family a model configuration identifies, from
+/// `ef_model_config_family`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfModelFamily {
+    /// Described by an `edgefirst.json`.
+    EdgeFirst = 0,
+    /// An Ultralytics export.
+    Ultralytics = 1,
+    /// A Hugging Face export.
+    HuggingFace = 2,
+    /// Configured only by overrides.
+    Unknown = 3,
+}
+
+/// What a model's outputs decode to, from `ef_model_config_task`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfModelTask {
+    /// Bounding boxes.
+    Detect = 0,
+    /// Bounding boxes with instance masks.
+    Segment = 1,
+    /// A per-pixel class map.
+    Semantic = 2,
+}
+
+/// A resolved value whose source is recorded, for `ef_model_config_source`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfConfigField {
+    /// Input normalization.
+    Normalization = 0,
+    /// Resize mode.
+    Resize = 1,
+    /// Letterbox placement.
+    Placement = 2,
+    /// Letterbox pad value and its space.
+    Pad = 3,
+    /// Resampling filter.
+    Interpolation = 4,
+    /// Model task.
+    Task = 5,
+    /// Semantic decode mode.
+    DecodeMode = 6,
+    /// Class labels.
+    Labels = 7,
+    /// Model input size.
+    Size = 8,
+}
+
 const _: () = {
     assert!(EfNms::Off as u32 == NMS_OFF_CODE);
     assert!(EfNms::Auto as u32 == Nms::Auto.code());
@@ -178,6 +255,45 @@ const _: () = {
     assert!(EfModelSource::TfLite as u32 == ModelSource::TfLite.code());
     assert!(EfModelSource::Other as u32 == ModelSource::Other.code());
     assert!(EfModelSource::CoreMl as u32 == ModelSource::CoreMl.code());
+
+    assert!(EfConfigSource::EmbeddedEdgefirst as u32 == ConfigSource::EmbeddedEdgefirst.code());
+    assert!(EfConfigSource::SidecarEdgefirst as u32 == ConfigSource::SidecarEdgefirst.code());
+    assert!(EfConfigSource::EmbeddedHf as u32 == ConfigSource::EmbeddedHf.code());
+    assert!(EfConfigSource::SidecarHf as u32 == ConfigSource::SidecarHf.code());
+    assert!(EfConfigSource::UltralyticsMetadata as u32 == ConfigSource::UltralyticsMetadata.code());
+    assert!(EfConfigSource::Heuristic as u32 == ConfigSource::Heuristic.code());
+    assert!(EfConfigSource::Default as u32 == ConfigSource::Default.code());
+    assert!(EfConfigSource::Override as u32 == ConfigSource::Override.code());
+
+    assert!(EfModelFamily::EdgeFirst as u32 == ModelFamily::EdgeFirst.code());
+    assert!(EfModelFamily::Ultralytics as u32 == ModelFamily::Ultralytics.code());
+    assert!(EfModelFamily::HuggingFace as u32 == ModelFamily::HuggingFace.code());
+    assert!(EfModelFamily::Unknown as u32 == ModelFamily::Unknown.code());
+
+    assert!(EfModelTask::Detect as u32 == ModelTask::Detect.code());
+    assert!(EfModelTask::Segment as u32 == ModelTask::Segment.code());
+    assert!(EfModelTask::Semantic as u32 == ModelTask::Semantic.code());
+
+    assert!(EfConfigField::Normalization as u32 == ConfigField::Normalization.code());
+    assert!(EfConfigField::Resize as u32 == ConfigField::Resize.code());
+    assert!(EfConfigField::Placement as u32 == ConfigField::Placement.code());
+    assert!(EfConfigField::Pad as u32 == ConfigField::Pad.code());
+    assert!(EfConfigField::Interpolation as u32 == ConfigField::Interpolation.code());
+    assert!(EfConfigField::Task as u32 == ConfigField::Task.code());
+    assert!(EfConfigField::DecodeMode as u32 == ConfigField::DecodeMode.code());
+    assert!(EfConfigField::Labels as u32 == ConfigField::Labels.code());
+    assert!(EfConfigField::Size as u32 == ConfigField::Size.code());
+
+    assert!(EfFit::Stretch as u32 == FitMode::Stretch.code());
+    assert!(EfFit::Letterbox as u32 == FitMode::Letterbox.code());
+    assert!(EfLetterboxPlacement::Center as u32 == LetterboxPlacement::Center.code());
+    assert!(EfLetterboxPlacement::TopLeft as u32 == LetterboxPlacement::TopLeft.code());
+    assert!(EfPadSpace::Pixel as u32 == PadSpace::Pixel.code());
+    assert!(EfPadSpace::Normalized as u32 == PadSpace::Normalized.code());
+    assert!(EfInterpolation::Bilinear as u32 == Interpolation::Bilinear.code());
+    assert!(EfInterpolation::Nearest as u32 == Interpolation::Nearest.code());
+    assert!(EfInterpolation::Bicubic as u32 == Interpolation::Bicubic.code());
+    assert!(EfInterpolation::Area as u32 == Interpolation::Area.code());
 };
 
 #[cfg(test)]
@@ -239,6 +355,34 @@ mod tests {
             4,
             "add the EfModelSource enumerator"
         );
+        assert_eq!(
+            ConfigSource::all().len(),
+            8,
+            "add the EfConfigSource enumerator"
+        );
+        assert_eq!(
+            ModelFamily::all().len(),
+            4,
+            "add the EfModelFamily enumerator"
+        );
+        assert_eq!(ModelTask::all().len(), 3, "add the EfModelTask enumerator");
+        assert_eq!(
+            ConfigField::all().len(),
+            9,
+            "add the EfConfigField enumerator"
+        );
+        assert_eq!(FitMode::all().len(), 2, "add the EfFit enumerator");
+        assert_eq!(
+            LetterboxPlacement::all().len(),
+            2,
+            "add the EfLetterboxPlacement enumerator"
+        );
+        assert_eq!(PadSpace::all().len(), 2, "add the EfPadSpace enumerator");
+        assert_eq!(
+            Interpolation::all().len(),
+            4,
+            "add the EfInterpolation enumerator"
+        );
     }
 
     #[test]
@@ -290,6 +434,26 @@ mod tests {
                 .iter()
                 .map(|&v| (enumerator("EF_DECODE_MODE", v), v.code())),
         );
+        expected.extend(
+            ConfigSource::all()
+                .iter()
+                .map(|&v| (enumerator("EF_CONFIG_SOURCE", v), v.code())),
+        );
+        expected.extend(
+            ModelFamily::all()
+                .iter()
+                .map(|&v| (enumerator("EF_MODEL_FAMILY", v), v.code())),
+        );
+        expected.extend(
+            ModelTask::all()
+                .iter()
+                .map(|&v| (enumerator("EF_MODEL_TASK", v), v.code())),
+        );
+        expected.extend(
+            ConfigField::all()
+                .iter()
+                .map(|&v| (enumerator("EF_CONFIG_FIELD", v), v.code())),
+        );
         for (name, code) in expected {
             let line = format!("{name} = {code},");
             assert!(
@@ -310,5 +474,9 @@ mod tests {
         assert_eq!(MatchMetric::from_code(2), None);
         assert_eq!(MergeMode::from_code(2), None);
         assert_eq!(ModelSource::from_code(4), None);
+        assert_eq!(ConfigSource::from_code(8), None);
+        assert_eq!(ModelFamily::from_code(4), None);
+        assert_eq!(ModelTask::from_code(3), None);
+        assert_eq!(ConfigField::from_code(9), None);
     }
 }

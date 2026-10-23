@@ -160,14 +160,14 @@ def test_lift_tile_boxes_origin_plus_scale():
     np.testing.assert_allclose(b[1], [260, 520, 580, 840])
 
 
-def test_lift_tile_boxes_inverts_letterbox():
+def test_lift_tile_boxes_inverts_content_region():
     p = TilePlacement(
         index=0,
         count=1,
         origin=(0.0, 0.0),
         crop_size=(640.0, 640.0),
         frame_dims=(640.0, 640.0),
-        letterbox=(0.1, 0.1, 0.9, 0.9),
+        content_region=(0.1, 0.1, 0.9, 0.9),
     )
     bbox, sc, cl = _triple([[0.1, 0.1, 0.9, 0.9]], [0.9], [0])
     b, _, _ = lift_tile_boxes(bbox, sc, cl, p)
@@ -181,17 +181,17 @@ def test_tile_placement_getters():
         origin=(10.0, 20.0),
         crop_size=(640.0, 480.0),
         frame_dims=(1920.0, 1080.0),
-        letterbox=(0.0, 0.1, 1.0, 0.9),
+        content_region=(0.0, 0.1, 1.0, 0.9),
     )
     assert p.index == 2
     assert p.count == 4
     assert p.origin == (10.0, 20.0)
     assert p.crop_size == (640.0, 480.0)
     assert p.frame_dims == (1920.0, 1080.0)
-    assert p.letterbox == pytest.approx((0.0, 0.1, 1.0, 0.9))
+    assert p.content_region == pytest.approx((0.0, 0.1, 1.0, 0.9))
 
-    no_lb = TilePlacement(0, 1, (0.0, 0.0), (1.0, 1.0), (1.0, 1.0))
-    assert no_lb.letterbox is None
+    stretched = TilePlacement(0, 1, (0.0, 0.0), (1.0, 1.0), (1.0, 1.0))
+    assert stretched.content_region is None
 
 
 # --- accumulator fan-in --------------------------------------------------

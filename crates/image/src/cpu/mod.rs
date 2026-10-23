@@ -443,9 +443,9 @@ impl CPUProcessor {
     /// The resampler for `mode`. Bilinear takes two taps per axis at every
     /// scale, as the GL backend and OpenCV `INTER_LINEAR` sample.
     fn resize_alg(mode: crate::Interpolation) -> fast_image_resize::ResizeAlg {
-        match mode {
+        match mode.supported() {
             crate::Interpolation::Nearest => fast_image_resize::ResizeAlg::Nearest,
-            crate::Interpolation::Bilinear => {
+            _ => {
                 fast_image_resize::ResizeAlg::Interpolation(fast_image_resize::FilterType::Bilinear)
             }
         }
@@ -877,21 +877,25 @@ impl ImageProcessorTrait for CPUProcessor {
             options.get_placement(),
         )?;
         dst.cpu_access().require(partial_dst_access(dst, &crop))?;
-        match crate::options::output_map_for(&options, dst, crop.dst_rect.is_some())? {
-            None => {
-                if let Some(dst_fmt) = dst.format() {
-                    dst.cpu_access().require(convert_dst_access(
-                        src.format(),
-                        dst_fmt,
-                        dst.dtype(),
-                    ))?;
-                }
-                self.convert_impl(src, dst, rotation, flip, crop)
+        let output_map = crate::options::output_map_for(&options, dst, crop.dst_rect.is_some())?;
+        if output_map.is_none() {
+            if let Some(dst_fmt) = dst.format() {
+                dst.cpu_access()
+                    .require(convert_dst_access(src.format(), dst_fmt, dst.dtype()))?;
             }
+        }
+        let processor_options = self.options;
+        if let Some(mode) = options.get_interpolation() {
+            self.options = self.options.resize_alg(Self::resize_alg(mode));
+        }
+        let result = match output_map {
+            None => self.convert_impl(src, dst, rotation, flip, crop),
             Some((map, pad_output)) => {
                 self.convert_mapped(src, dst, rotation, flip, crop, &map, pad_output)
             }
-        }
+        };
+        self.options = processor_options;
+        result
     }
 
     fn draw_decoded_masks(
@@ -931,7 +935,7 @@ impl ImageProcessorTrait for CPUProcessor {
             detect,
             proto_data,
             overlay.opacity,
-            overlay.letterbox,
+            overlay.content_region,
             overlay.color_mode,
         )
     }
@@ -1687,7 +1691,7 @@ impl CPUProcessor {
         detect: &[DetectBox],
         proto_data: &ProtoData,
         opacity: f32,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<[f32; 4]>,
         color_mode: crate::ColorMode,
     ) -> Result<()> {
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
@@ -1807,7 +1811,7 @@ impl CPUProcessor {
         };
 
         // Precompute letterbox scale/offset for output-pixel → proto-pixel mapping.
-        let (lx0, lx_range, ly0, ly_range) = match letterbox {
+        let (lx0, lx_range, ly0, ly_range) = match content_region {
             Some([lx0, ly0, lx1, ly1]) => (lx0, lx1 - lx0, ly0, ly1 - ly0),
             None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
         };

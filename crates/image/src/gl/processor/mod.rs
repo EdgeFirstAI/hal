@@ -2777,9 +2777,9 @@ impl GLProcessorST {
 
     /// `MIN`/`MAG` filter for a source texture that a draw resamples.
     pub(super) fn source_filter(&self) -> u32 {
-        match self.interpolation {
+        match self.interpolation.supported() {
             crate::Interpolation::Nearest => edgefirst_gl::gl::NEAREST,
-            crate::Interpolation::Bilinear => edgefirst_gl::gl::LINEAR,
+            _ => edgefirst_gl::gl::LINEAR,
         }
     }
 
@@ -2819,8 +2819,25 @@ impl GLProcessorST {
     /// The body of [`ImageProcessorTrait::convert`], separated out so the
     /// trait method can record GPU completion on `dst` after every call
     /// (see [`GlPlatform::record_completion`]) without every early return
-    /// in this function having to do it itself.
+    /// in this function having to do it itself. A per-convert interpolation
+    /// in `options` replaces the processor's for this call only.
     fn convert_inner(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        options: &crate::ConvertOptions,
+    ) -> crate::Result<()> {
+        let processor_mode = self.interpolation;
+        if let Some(mode) = options.get_interpolation() {
+            self.interpolation = mode;
+        }
+        let result = self.convert_resampling(src, dst, options);
+        self.interpolation = processor_mode;
+        result
+    }
+
+    /// [`Self::convert_inner`] with `self.interpolation` already chosen.
+    fn convert_resampling(
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
@@ -7301,7 +7318,8 @@ impl GLProcessorST {
         // bilinearly filters through the texture units when the chroma plane
         // can be bound on its own. An upload always can be; an import only
         // where the GPU takes the chroma plane's offset.
-        let bilinear = src_rect.resample && self.interpolation == crate::Interpolation::Bilinear;
+        let bilinear =
+            src_rect.resample && self.interpolation.supported() == crate::Interpolation::Bilinear;
         let uv_import = if bilinear && self.nv_hw_filter && r8_src.is_some() {
             self.get_or_create_nv_uv_egl_image(src, src_fmt)
                 .inspect_err(|e| log::debug!("NV chroma view unavailable ({e}); shader-filtered"))

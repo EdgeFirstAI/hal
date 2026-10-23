@@ -153,31 +153,6 @@ typedef uint32_t ef_color_mode;
 #endif // __cplusplus
 
 /**
- * How a tile crop is fit into the model input, for `ef_tiling_config.fit`.
- */
-enum ef_fit
-#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
- {
-  /**
-   * Stretch the crop to fill the model input.
-   */
-  EF_FIT_STRETCH = 0,
-  /**
-   * Preserve aspect ratio and pad with `ef_tiling_config.pad`.
-   */
-  EF_FIT_LETTERBOX = 1,
-};
-#ifndef __cplusplus
-#if __STDC_VERSION__ >= 202311L
-typedef enum ef_fit ef_fit;
-#else
-typedef uint32_t ef_fit;
-#endif // __STDC_VERSION__ >= 202311L
-#endif // __cplusplus
-
-/**
  * The backend `ef_image_processor_new_with_backend` forces.
  */
 enum ef_compute_backend
@@ -207,31 +182,6 @@ enum ef_compute_backend
 typedef enum ef_compute_backend ef_compute_backend;
 #else
 typedef uint32_t ef_compute_backend;
-#endif // __STDC_VERSION__ >= 202311L
-#endif // __cplusplus
-
-/**
- * Where a letterboxed image sits, for `ef_convert_options_set_letterbox_placement`.
- */
-enum ef_letterbox_placement
-#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
- {
-  /**
-   * Centred, padding split between both sides.
-   */
-  EF_LETTERBOX_PLACEMENT_CENTER = 0,
-  /**
-   * Anchored at the top-left corner, padding on the right and bottom.
-   */
-  EF_LETTERBOX_PLACEMENT_TOP_LEFT = 1,
-};
-#ifndef __cplusplus
-#if __STDC_VERSION__ >= 202311L
-typedef enum ef_letterbox_placement ef_letterbox_placement;
-#else
-typedef uint32_t ef_letterbox_placement;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -270,18 +220,16 @@ typedef uint32_t ef_normalization;
 #endif // __cplusplus
 
 /**
- * Static tiling configuration. Seed with [`ef_tiling_config_default`].
+ * Static tiling geometry. Seed with [`ef_tiling_config_default`].
+ *
+ * How each tile is converted (fit, letterbox placement and pad,
+ * normalization) is the `const ef_convert_options *` the tiling functions
+ * take beside it; `NULL` stretches each tile with the default mapping.
  */
 typedef struct ef_tiling_config {
   uintptr_t tile_w;
   uintptr_t tile_h;
   float overlap_ratio;
-  uint8_t pad[4];
-  /**
-   * An `EF_FIT_*` code. Any other value makes the functions taking this
-   * config fail (`EINVAL`, or `NULL` where they return a pointer).
-   */
-  int fit;
 } ef_tiling_config;
 
 /**
@@ -303,6 +251,15 @@ extern "C" {
 
 /**
  * ABI version of this library's C surface.
+ *
+ * 4: `ef_tiling_config` lost `pad` and `fit` (24 bytes, was 32) and
+ * `ef_image_processor_plan_tiles`, `ef_image_processor_tile_into` and
+ * `ef_image_processor_tile_one` take a trailing `const ef_convert_options *`
+ * that says how each tile is converted. `EF_FIT_*` and
+ * `EF_LETTERBOX_PLACEMENT_*` moved to `edgefirst/detect.h` with their values
+ * unchanged, `ef_image_processor_set_interpolation` accepts
+ * `EF_INTERPOLATION_BICUBIC` and `EF_INTERPOLATION_AREA`, and
+ * `ef_convert_options_set_interpolation` sets a per-convert interpolation.
  *
  * 3: the convert functions take a `const ef_convert_options *` (built with
  * the `ef_convert_options_*` setters) in place of `rotation`, `flip` and a
@@ -330,6 +287,11 @@ uint32_t ef_image_abi_version(void);
  * IOSurface, a dma-buf) returns `ENOTSUP`: the GL base-layer draw has no
  * `BGRA` arm and the CPU backend renders only `RGBA`/`RGB`.
  *
+ * `content_region` is `NULL` or four floats: where the image sits in the
+ * model input as normalized `[xmin, ymin, xmax, ymax]`
+ * (`ef_convert_options_content_region`), used to map boxes and masks back
+ * to the image.
+ *
  * `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
  * A CPU draw blends into `dst`, so one not declared `EF_CPU_ACCESS_READ_WRITE`
  * (or a `background` not declared readable) is `EACCES`.
@@ -349,7 +311,7 @@ int ef_image_processor_draw_decoded_masks(ef_image_processor *p,
                                           uintptr_t n_masks,
                                           const ef_tensor *background,
                                           float opacity,
-                                          const float *letterbox,
+                                          const float *content_region,
                                           uint32_t color_mode);
 
 /**
@@ -358,8 +320,9 @@ int ef_image_processor_draw_decoded_masks(ef_image_processor *p,
  * On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
  * afterwards, as it does after a convert.
  *
- * The same `BGRA` background restriction, `color_mode` validation, `EACCES`
- * rule and return codes as `ef_image_processor_draw_decoded_masks`.
+ * The same `BGRA` background restriction, `content_region`, `color_mode`
+ * validation, `EACCES` rule and return codes as
+ * `ef_image_processor_draw_decoded_masks`.
  *
  * # Safety
  * Tensor handles must stay live for the call.
@@ -373,11 +336,12 @@ int ef_image_processor_draw_proto_masks(ef_image_processor *p,
                                         uint32_t layout,
                                         const ef_tensor *background,
                                         float opacity,
-                                        const float *letterbox,
+                                        const float *content_region,
                                         uint32_t color_mode);
 
 /**
  * Materialize per-instance masks from proto tensors. Caller frees the list.
+ * `content_region` as for `ef_image_processor_draw_decoded_masks`.
  *
  * # Safety
  * Handles must be live.
@@ -388,7 +352,7 @@ ef_mask_list *ef_image_processor_materialize_masks(ef_image_processor *p,
                                                    ef_tensor *protos,
                                                    ef_tensor *coeffs,
                                                    uint32_t layout,
-                                                   const float *letterbox);
+                                                   const float *content_region);
 
 /**
  * Number of masks. Zero for NULL.
@@ -587,6 +551,61 @@ int ef_convert_options_set_normalization(ef_convert_options *o,
                                          uintptr_t n);
 
 /**
+ * Resample with this interpolation when a convert with `o` resizes, instead
+ * of the processor's (see [`ef_image_processor_set_interpolation`]): an
+ * `EF_INTERPOLATION_*` code. `EF_INTERPOLATION_BICUBIC` and
+ * `EF_INTERPOLATION_AREA` run as bilinear, logged once per mode. The
+ * `EDGEFIRST_INTERPOLATION` environment variable, when set, overrides it.
+ *
+ * @return 0, or `EINVAL` for an unknown code or `NULL`.
+ *
+ * # Safety
+ * `o` must be `NULL` or a live handle.
+ */
+int ef_convert_options_set_interpolation(ef_convert_options *o, uint32_t mode);
+
+/**
+ * Options that apply a model's preprocessing: its normalization, fit,
+ * letterbox placement, pad and interpolation (bicubic and area run as
+ * bilinear). `spec` usually comes from the decoder library's
+ * `ef_model_config_preprocessing`.
+ *
+ * @return options to free with [`ef_convert_options_free`], or `NULL` with
+ * `errno` `EINVAL` for a `NULL` spec, an unknown code, a zero or non-finite
+ * `std`, or a pad outside 0-255 in pixel space.
+ *
+ * # Safety
+ * `spec` must be `NULL` or valid for reads.
+ */
+ef_convert_options *ef_convert_options_from_spec(const ef_preprocess_spec *spec);
+
+/**
+ * Where a convert with `o` puts the image content in a `dst_w`x`dst_h`
+ * destination for a `src_w`x`src_h` source: the whole destination for a
+ * stretch, the letterbox rectangle otherwise, the same pixels the convert
+ * paints. Pass `normalized_out` to `ef_semantic_options_set_content_region`
+ * or the draw functions' `content_region`.
+ *
+ * `pixels_out` (`NULL` to skip) receives `[x, y, width, height]` in
+ * destination pixels; `normalized_out` (`NULL` to skip) receives
+ * `[xmin, ymin, xmax, ymax]` normalized by the destination size.
+ *
+ * @return 0, or `EINVAL` for a `NULL` handle, a zero size, or a source
+ * crop outside the source.
+ *
+ * # Safety
+ * `o` must be `NULL` or live; `pixels_out` and `normalized_out` `NULL` or
+ * four writable elements.
+ */
+int ef_convert_options_content_region(const ef_convert_options *o,
+                                      uintptr_t src_w,
+                                      uintptr_t src_h,
+                                      uintptr_t dst_w,
+                                      uintptr_t dst_h,
+                                      uint32_t *pixels_out,
+                                      float *normalized_out);
+
+/**
  * Convert `src` into `dst`, scaling, converting colour and rotating as needed.
  *
  * `src`/`dst` may have been minted by any EdgeFirst library -- every library
@@ -667,12 +686,17 @@ int ef_image_processor_set_class_colors(ef_image_processor *p,
                                         uintptr_t count);
 
 /**
- * Set how `ef_image_processor_convert` resamples when it resizes.
+ * Set how `ef_image_processor_convert` resamples when it resizes, for
+ * converts whose options do not set their own
+ * ([`ef_convert_options_set_interpolation`]).
  *
- * `mode`: 0 = bilinear (the default; half-pixel centres, as OpenCV
- * `INTER_LINEAR`), 1 = nearest. Applies to every backend the processor
- * holds; the `EDGEFIRST_INTERPOLATION` environment variable (`nearest` |
- * `bilinear`) overrides it.
+ * `mode` is an `EF_INTERPOLATION_*` code: `EF_INTERPOLATION_BILINEAR` (the
+ * default; half-pixel centres, as OpenCV `INTER_LINEAR`) or
+ * `EF_INTERPOLATION_NEAREST`. `EF_INTERPOLATION_BICUBIC` and
+ * `EF_INTERPOLATION_AREA` are accepted and run as bilinear, logged once per
+ * mode. Applies to every backend the processor holds; the
+ * `EDGEFIRST_INTERPOLATION` environment variable (`nearest` | `bilinear`),
+ * read when the processor is created, overrides it.
  *
  * @return 0 on success, `EINVAL` for a null processor or unknown mode,
  * `EIO` when a backend cannot apply the mode.
@@ -739,7 +763,7 @@ int ef_image_processor_convert_fence_handle(ef_image_processor *p,
                                             void **fence);
 
 /**
- * Deploy defaults: overlap 0.2, stretch, pad `[114,114,114,255]`.
+ * Deploy defaults: tile size = model input, overlap 0.2.
  */
 struct ef_tiling_config ef_tiling_config_default(uintptr_t tile_w, uintptr_t tile_h);
 
@@ -823,21 +847,33 @@ ef_tensor *ef_image_processor_alloc_tile_batch(ef_image_processor *p,
 /**
  * Plan tile placements for a frame. Free with [`ef_tile_placement_list_free`].
  *
+ * `options` (`NULL` for a plain stretch) are the convert options every tile
+ * is rendered with; a letterboxing one gives each placement a content
+ * region. Pass the same options to [`ef_image_processor_tile_into`] or
+ * [`ef_image_processor_tile_one`].
+ *
+ * @return the list, or `NULL` with `errno` `EINVAL` for a `NULL` argument,
+ * a zero tile size, an overlap outside `[0, 1)`, or options that rotate or
+ * flip.
+ *
  * # Safety
- * `p` and `config` must be live or NULL as documented.
+ * `p` and `config` must be live or NULL as documented; `options` `NULL` or
+ * live.
  */
 ef_tile_placement_list *ef_image_processor_plan_tiles(ef_image_processor *p,
                                                       uintptr_t src_w,
                                                       uintptr_t src_h,
-                                                      const struct ef_tiling_config *config);
+                                                      const struct ef_tiling_config *config,
+                                                      const ef_convert_options *options);
 
 /**
- * Render every tile of `src` into `dst`.
+ * Render every tile of `src` into `dst`, each converted with `options`
+ * (`NULL` for a plain stretch) sampling the tile's crop.
  *
  * @return a placement list to free with [`ef_tile_placement_list_free`], or
- * `NULL` with `errno` set: `EINVAL` for bad arguments, `EACCES` when a
- * tensor's declared CPU access does not cover the CPU pass, otherwise the
- * codes `ef_image_processor_convert` returns.
+ * `NULL` with `errno` set: `EINVAL` for bad arguments or options that rotate
+ * or flip, `EACCES` when a tensor's declared CPU access does not cover the
+ * CPU pass, otherwise the codes `ef_image_processor_convert` returns.
  *
  * # Safety
  * Pointers must be live or NULL as documented.
@@ -845,13 +881,16 @@ ef_tile_placement_list *ef_image_processor_plan_tiles(ef_image_processor *p,
 ef_tile_placement_list *ef_image_processor_tile_into(ef_image_processor *p,
                                                      const ef_tensor *src,
                                                      ef_tensor *dst,
-                                                     const struct ef_tiling_config *config);
+                                                     const struct ef_tiling_config *config,
+                                                     const ef_convert_options *options);
 
 /**
- * Render one planned tile of `src` into `dst`.
+ * Render one planned tile of `src` into `dst`, converted with `options`
+ * (`NULL` for a plain stretch) sampling the tile's crop.
  *
- * @return 0 on success, `EINVAL` for bad arguments, otherwise the codes
- * `ef_image_processor_convert` returns (`EACCES` for a refused CPU access).
+ * @return 0 on success, `EINVAL` for bad arguments or options that rotate
+ * or flip, otherwise the codes `ef_image_processor_convert` returns
+ * (`EACCES` for a refused CPU access).
  *
  * # Safety
  * Pointers must be live or NULL as documented.
@@ -860,7 +899,8 @@ int ef_image_processor_tile_one(ef_image_processor *p,
                                 const ef_tensor *src,
                                 ef_tensor *dst,
                                 const ef_tile_placement *placement,
-                                const struct ef_tiling_config *config);
+                                const struct ef_tiling_config *config,
+                                const ef_convert_options *options);
 
 #ifdef __cplusplus
 }  // extern "C"

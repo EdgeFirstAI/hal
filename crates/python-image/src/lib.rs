@@ -22,7 +22,6 @@ fn _image(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<tensor::PyTensor>()?;
     m.add_class::<image::PyPixelFormat>()?;
     m.add_class::<tensor::PyTensorMemory>()?;
-    m.add_class::<image::Normalization>()?;
     m.add_class::<image::PyRegion>()?;
     m.add_class::<colorimetry::PyColorimetry>()?;
     m.add_class::<colorimetry::PyColorSpace>()?;
@@ -32,7 +31,11 @@ fn _image(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<image::PyRotation>()?;
     m.add_class::<image::PyFlip>()?;
     m.add_class::<image::PyLetterboxPlacement>()?;
+    m.add_class::<image::PyFit>()?;
     m.add_class::<image::PyNormalizationPreset>()?;
+    m.add_class::<image::PyInterpolation>()?;
+    m.add_class::<image::PyPadSpace>()?;
+    m.add_class::<image::PyContentRegion>()?;
     m.add_class::<image::PyConvertOptions>()?;
     m.add_class::<image::PyColorMode>()?;
     m.add_class::<image::PyMaskResolution>()?;
@@ -50,7 +53,6 @@ fn _image(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(image::probe_egl_displays, m)?)?;
     }
 
-    m.add_class::<tiling::PyFit>()?;
     m.add_class::<tiling::PyTilingConfig>()?;
     m.add_class::<tiling::PyTileSpec>()?;
     m.add_class::<tiling::PyTilePlacement>()?;

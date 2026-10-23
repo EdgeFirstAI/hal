@@ -17,6 +17,7 @@ compile_error!(
 pub mod codes;
 pub mod decode;
 pub mod infer;
+pub mod model_config;
 pub mod semantic;
 pub mod tiling;
 
@@ -25,6 +26,11 @@ mod test_alloc;
 
 /// ABI version of this library's C surface.
 ///
+/// 4: `ef_tile_placement.has_letterbox`/`letterbox` are
+/// `has_content_region`/`content_region` (same offsets and meaning), and
+/// `ef_semantic_options_set_letterbox` is `ef_semantic_options_set_content_region`.
+/// A caller built against generation 3 fails to compile or link.
+///
 /// 3: the `dtype` argument of `ef_infer_signals_add_input` and
 /// `ef_infer_signals_add_output` is an `EF_DTYPE_*` code (it was a
 /// `0x100`-based `EF_INFER_DTYPE_*` code), and `ef_decoder_params_add_output`
@@ -32,12 +38,12 @@ mod test_alloc;
 ///
 /// 2: `ef_merge_config` gained a `mode` field in its old tail pad.
 ///
-/// Neither change alters a symbol or a layout, so a caller built against an
+/// Generations 2 and 3 alter no symbol or layout, so a caller built against an
 /// older generation gets no link error and no size mismatch; the probe is
 /// the only signal. Changed defaults do not move it.
 #[no_mangle]
 pub extern "C" fn ef_decoder_abi_version() -> u32 {
-    3
+    4
 }
 
 #[cfg(test)]
@@ -124,8 +130,8 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_probe_is_generation_3() {
-        assert_eq!(super::ef_decoder_abi_version(), 3);
+    fn the_abi_probe_is_generation_4() {
+        assert_eq!(super::ef_decoder_abi_version(), 4);
     }
 
     #[test]
@@ -156,6 +162,15 @@ mod tests {
             "EfProtoData",
             "EfDecoderTracker",
             "EfDecoderTrackList",
+            "EfSemanticOptions",
+            "EfInferSignals",
+            "EfModelOverrides",
+            "EfModelConfig",
+            "EfPreprocessSpec",
+            "EfConfigSource",
+            "EfModelFamily",
+            "EfModelTask",
+            "EfConfigField",
         ] {
             assert!(
                 !h.contains(rust_name),
@@ -166,9 +181,26 @@ mod tests {
     }
 
     #[test]
+    fn the_preprocess_vocabulary_is_declared_only_in_detect_h() {
+        let h = header_text();
+        for ty in [
+            "enum ef_fit",
+            "enum ef_letterbox_placement",
+            "enum ef_pad_space",
+            "enum ef_interpolation",
+            "struct ef_preprocess_spec {",
+        ] {
+            assert!(
+                !h.contains(ty),
+                "`{ty}` belongs to detect.h; decoder.h must not redeclare it"
+            );
+        }
+    }
+
+    #[test]
     fn the_layout_goldens_hold() {
         // By-value structs in `detect.h` (`ef_detect_box`, `ef_segmentation`,
-        // `ef_merge_config`, `ef_tile_placement`) are the
+        // `ef_merge_config`, `ef_tile_placement`, `ef_preprocess_spec`) are the
         // drift class no name-level check can see, and are identical on
         // every LP64 target this header ships for.
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/test_layout_goldens.c");

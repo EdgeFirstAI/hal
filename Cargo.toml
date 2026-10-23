@@ -137,7 +137,7 @@ tracing-chrome = "0.7"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 uuid = { version = "1.23.3", features = ["v4"] }
 yuv = { version = "0.8.16", features = ["fast_mode"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false }
 zune-jpeg = "0.5.15"
 zune-png = "0.5.2"
 safetensors = "0.8.0"

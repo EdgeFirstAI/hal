@@ -3,7 +3,8 @@
 
 /**
  * @file detect.h
- * @brief Header-only detection vocabulary (boxes, masks, tile placement).
+ * @brief Header-only detection vocabulary (boxes, masks, tile placement,
+ * input preprocessing).
  *
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
@@ -87,11 +88,152 @@ typedef struct ef_tile_placement {
     float origin_y;
     float crop_width;
     float crop_height;
-    int has_letterbox;
-    float letterbox[4];
+    int has_content_region;
+    float content_region[4];
     float frame_width;
     float frame_height;
 } ef_tile_placement;
+
+/*
+ * Option codes are fixed-width: a C23 or C++ compiler sees a `uint32_t`
+ * enum, an older C compiler a `uint32_t` typedef beside the enumerators.
+ */
+
+/** How a source is fit into the model input. */
+enum ef_fit
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif
+{
+  /** Stretch the source to fill the model input. */
+  EF_FIT_STRETCH = 0,
+  /** Keep the aspect ratio and pad the rest (a letterbox). */
+  EF_FIT_LETTERBOX = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_fit ef_fit;
+#else
+typedef uint32_t ef_fit;
+#endif
+#endif
+
+/** Where a letterboxed image sits. */
+enum ef_letterbox_placement
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif
+{
+  /** Centred, padding split between both sides. */
+  EF_LETTERBOX_PLACEMENT_CENTER = 0,
+  /** Anchored at the top-left corner, padding on the right and bottom. */
+  EF_LETTERBOX_PLACEMENT_TOP_LEFT = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_letterbox_placement ef_letterbox_placement;
+#else
+typedef uint32_t ef_letterbox_placement;
+#endif
+#endif
+
+/** The space a letterbox pad value is expressed in. */
+enum ef_pad_space
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif
+{
+  /** A 0-255 pixel value, normalized like the image. */
+  EF_PAD_SPACE_PIXEL = 0,
+  /** A value written as-is into the normalized destination. */
+  EF_PAD_SPACE_NORMALIZED = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_pad_space ef_pad_space;
+#else
+typedef uint32_t ef_pad_space;
+#endif
+#endif
+
+/**
+ * A resampling filter. The image library runs bilinear and nearest;
+ * bicubic and area name reference pipelines and run as bilinear.
+ */
+enum ef_interpolation
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif
+{
+  /** Bilinear, half-pixel centres (the default). */
+  EF_INTERPOLATION_BILINEAR = 0,
+  /** Nearest neighbour. */
+  EF_INTERPOLATION_NEAREST = 1,
+  /** Bicubic. */
+  EF_INTERPOLATION_BICUBIC = 2,
+  /** Pixel-area averaging. */
+  EF_INTERPOLATION_AREA = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_interpolation ef_interpolation;
+#else
+typedef uint32_t ef_interpolation;
+#endif
+#endif
+
+/**
+ * A model's input preprocessing as plain values: produced by
+ * `ef_model_config_preprocessing` (libedgefirst_decoder) and consumed by
+ * `ef_convert_options_from_spec` (libedgefirst_image), so neither library
+ * links the other. Start a hand-built one from `ef_preprocess_spec_default()`:
+ * a zeroed struct has a zero `std` and is refused.
+ *
+ * `mean` and `std` normalize as `(x - mean) / std` on 0-255 values (ImageNet
+ * is mean 123.675,116.28,103.53, std 58.395,57.12,57.375). `pad` is in the
+ * space `pad_space` names.
+ */
+typedef struct ef_preprocess_spec {
+    /** Model input width in pixels, 0 when unknown. */
+    uint32_t width;
+    /** Model input height in pixels, 0 when unknown. */
+    uint32_t height;
+    /** An `EF_FIT_*` code. */
+    uint32_t fit;
+    /** An `EF_LETTERBOX_PLACEMENT_*` code; ignored by a stretch. */
+    uint32_t placement;
+    /** An `EF_PAD_SPACE_*` code for `pad`. */
+    uint32_t pad_space;
+    /** Letterbox pad per RGB channel. */
+    float pad[3];
+    /** Normalization mean per RGB channel, 0-255 domain. */
+    float mean[3];
+    /** Normalization standard deviation per RGB channel, 0-255 domain. */
+    float std[3];
+    /** An `EF_INTERPOLATION_*` code. */
+    uint32_t interpolation;
+} ef_preprocess_spec;
+
+/**
+ * The default preprocessing: unsigned normalization (`x / 255`), a centred
+ * letterbox padded with pixel value 114, bilinear, size unknown.
+ */
+static inline ef_preprocess_spec ef_preprocess_spec_default(void) {
+    ef_preprocess_spec s;
+    int i;
+    s.width = 0;
+    s.height = 0;
+    s.fit = EF_FIT_LETTERBOX;
+    s.placement = EF_LETTERBOX_PLACEMENT_CENTER;
+    s.pad_space = EF_PAD_SPACE_PIXEL;
+    for (i = 0; i < 3; i++) {
+        s.pad[i] = 114.0f;
+        s.mean[i] = 0.0f;
+        s.std[i] = 255.0f;
+    }
+    s.interpolation = EF_INTERPOLATION_BILINEAR;
+    return s;
+}
 
 #ifdef __cplusplus
 } /* extern "C" */

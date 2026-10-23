@@ -11,9 +11,10 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use edgefirst_decoder_abi::EfPreprocessSpec;
 use edgefirst_image::{
-    ConvertOptions, Crop, Fit, Flip, ImageProcessor, LetterboxPlacement, Normalization,
-    NormalizationPreset, Rotation,
+    ConvertOptions, Crop, Fit, FitMode, Flip, ImageProcessor, Interpolation, LetterboxPlacement,
+    Normalization, NormalizationPreset, PadSpace, PreprocessSpec, Rotation,
 };
 use edgefirst_tensor::{
     Compression, CpuAccess, DType, ImageDesc, PixelFormat, TensorDyn, TensorMemory,
@@ -254,7 +255,7 @@ pub struct EfConvertOptions {
 ///
 /// # Safety
 /// `o` must be `NULL` or a live handle.
-unsafe fn options_from(o: *const EfConvertOptions) -> Option<ConvertOptions> {
+pub(crate) unsafe fn options_from(o: *const EfConvertOptions) -> Option<ConvertOptions> {
     // SAFETY: the caller's contract.
     unsafe { o.as_ref() }.map(|o| o.inner)
 }
@@ -467,6 +468,133 @@ pub unsafe extern "C" fn ef_convert_options_set_normalization(
     unsafe { update(o, |c| Some(c.normalization(norm))) }
 }
 
+/// Resample with this interpolation when a convert with `o` resizes, instead
+/// of the processor's (see [`ef_image_processor_set_interpolation`]): an
+/// `EF_INTERPOLATION_*` code. `EF_INTERPOLATION_BICUBIC` and
+/// `EF_INTERPOLATION_AREA` run as bilinear, logged once per mode. The
+/// `EDGEFIRST_INTERPOLATION` environment variable, when set, overrides it.
+///
+/// @return 0, or `EINVAL` for an unknown code or `NULL`.
+///
+/// # Safety
+/// `o` must be `NULL` or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_set_interpolation(
+    o: *mut EfConvertOptions,
+    mode: u32,
+) -> c_int {
+    unsafe {
+        update(o, |c| {
+            Some(c.interpolation(Interpolation::from_code(mode)?))
+        })
+    }
+}
+
+/// Read a caller's `ef_preprocess_spec`.
+///
+/// # Safety
+/// `spec` must be `NULL` or valid for reads.
+pub(crate) unsafe fn spec_from_c(spec: *const EfPreprocessSpec) -> Result<PreprocessSpec, c_int> {
+    // SAFETY: the caller's contract.
+    let c = unsafe { spec.as_ref() }.ok_or(libc::EINVAL)?;
+    let mut out = PreprocessSpec::new();
+    out.fit = FitMode::from_code(c.fit).ok_or(libc::EINVAL)?;
+    out.placement = LetterboxPlacement::from_code(c.placement).ok_or(libc::EINVAL)?;
+    out.pad_space = PadSpace::from_code(c.pad_space).ok_or(libc::EINVAL)?;
+    out.interpolation = Interpolation::from_code(c.interpolation).ok_or(libc::EINVAL)?;
+    out.normalization = Normalization::mean_std(&c.mean, &c.std).map_err(|_| libc::EINVAL)?;
+    out.pad = c.pad;
+    out.size = (c.width != 0 && c.height != 0).then_some((c.width as usize, c.height as usize));
+    Ok(out)
+}
+
+/// Options that apply a model's preprocessing: its normalization, fit,
+/// letterbox placement, pad and interpolation (bicubic and area run as
+/// bilinear). `spec` usually comes from the decoder library's
+/// `ef_model_config_preprocessing`.
+///
+/// @return options to free with [`ef_convert_options_free`], or `NULL` with
+/// `errno` `EINVAL` for a `NULL` spec, an unknown code, a zero or non-finite
+/// `std`, or a pad outside 0-255 in pixel space.
+///
+/// # Safety
+/// `spec` must be `NULL` or valid for reads.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_from_spec(
+    spec: *const EfPreprocessSpec,
+) -> *mut EfConvertOptions {
+    let fail = |code: c_int| {
+        errno::set_errno(errno::Errno(code));
+        std::ptr::null_mut()
+    };
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the caller's contract.
+        let spec = match unsafe { spec_from_c(spec) } {
+            Ok(s) => s,
+            Err(code) => return fail(code),
+        };
+        match ConvertOptions::from_spec(&spec) {
+            Ok(inner) => Box::into_raw(Box::new(EfConvertOptions { inner })),
+            Err(e) => fail(image_errno(&e)),
+        }
+    }))
+    .unwrap_or_else(|_| fail(libc::EINVAL))
+}
+
+/// Where a convert with `o` puts the image content in a `dst_w`x`dst_h`
+/// destination for a `src_w`x`src_h` source: the whole destination for a
+/// stretch, the letterbox rectangle otherwise, the same pixels the convert
+/// paints. Pass `normalized_out` to `ef_semantic_options_set_content_region`
+/// or the draw functions' `content_region`.
+///
+/// `pixels_out` (`NULL` to skip) receives `[x, y, width, height]` in
+/// destination pixels; `normalized_out` (`NULL` to skip) receives
+/// `[xmin, ymin, xmax, ymax]` normalized by the destination size.
+///
+/// @return 0, or `EINVAL` for a `NULL` handle, a zero size, or a source
+/// crop outside the source.
+///
+/// # Safety
+/// `o` must be `NULL` or live; `pixels_out` and `normalized_out` `NULL` or
+/// four writable elements.
+#[no_mangle]
+pub unsafe extern "C" fn ef_convert_options_content_region(
+    o: *const EfConvertOptions,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    pixels_out: *mut u32,
+    normalized_out: *mut f32,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the caller's contract.
+        let Some(o) = (unsafe { o.as_ref() }) else {
+            return libc::EINVAL;
+        };
+        if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            return libc::EINVAL;
+        }
+        let region = match o.inner.content_region(src_w, src_h, dst_w, dst_h) {
+            Ok(r) => r,
+            Err(e) => return image_errno(&e),
+        };
+        let r = region.pixels;
+        let pixels = [r.x, r.y, r.width, r.height].map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+        // SAFETY: the caller's contract: four writable elements when non-null.
+        unsafe {
+            if let Some(px) = pixels_out.cast::<[u32; 4]>().as_mut() {
+                *px = pixels;
+            }
+            if let Some(n) = normalized_out.cast::<[f32; 4]>().as_mut() {
+                *n = region.normalized;
+            }
+        }
+        0
+    }))
+    .unwrap_or(libc::EINVAL)
+}
+
 /// The errno for a failed image operation: `EACCES` for a tensor whose
 /// declared CPU access does not cover the work, `EINVAL` for arguments that
 /// cannot apply, `ENOTSUP` for work no backend supports, `EIO` otherwise.
@@ -666,12 +794,17 @@ pub unsafe extern "C" fn ef_image_processor_set_class_colors(
     }
 }
 
-/// Set how `ef_image_processor_convert` resamples when it resizes.
+/// Set how `ef_image_processor_convert` resamples when it resizes, for
+/// converts whose options do not set their own
+/// ([`ef_convert_options_set_interpolation`]).
 ///
-/// `mode`: 0 = bilinear (the default; half-pixel centres, as OpenCV
-/// `INTER_LINEAR`), 1 = nearest. Applies to every backend the processor
-/// holds; the `EDGEFIRST_INTERPOLATION` environment variable (`nearest` |
-/// `bilinear`) overrides it.
+/// `mode` is an `EF_INTERPOLATION_*` code: `EF_INTERPOLATION_BILINEAR` (the
+/// default; half-pixel centres, as OpenCV `INTER_LINEAR`) or
+/// `EF_INTERPOLATION_NEAREST`. `EF_INTERPOLATION_BICUBIC` and
+/// `EF_INTERPOLATION_AREA` are accepted and run as bilinear, logged once per
+/// mode. Applies to every backend the processor holds; the
+/// `EDGEFIRST_INTERPOLATION` environment variable (`nearest` | `bilinear`),
+/// read when the processor is created, overrides it.
 ///
 /// @return 0 on success, `EINVAL` for a null processor or unknown mode,
 /// `EIO` when a backend cannot apply the mode.
@@ -688,10 +821,8 @@ pub unsafe extern "C" fn ef_image_processor_set_interpolation(
             if p.is_null() {
                 return libc::EINVAL;
             }
-            let mode = match mode {
-                0 => edgefirst_image::Interpolation::Bilinear,
-                1 => edgefirst_image::Interpolation::Nearest,
-                _ => return libc::EINVAL,
+            let Some(mode) = Interpolation::from_code(mode) else {
+                return libc::EINVAL;
             };
             match (*p).inner.set_interpolation(mode) {
                 Ok(()) => 0,
@@ -888,21 +1019,6 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_accepts_the_two_modes_and_refuses_others() {
-        let p = processor();
-        unsafe {
-            assert_eq!(ef_image_processor_set_interpolation(p, 1), 0, "nearest");
-            assert_eq!(ef_image_processor_set_interpolation(p, 0), 0, "bilinear");
-            assert_eq!(ef_image_processor_set_interpolation(p, 2), libc::EINVAL);
-            assert_eq!(
-                ef_image_processor_set_interpolation(std::ptr::null_mut(), 0),
-                libc::EINVAL
-            );
-            ef_image_processor_free(p);
-        }
-    }
-
-    #[test]
     fn class_colors_are_copied_not_borrowed() {
         let p = processor();
         unsafe {
@@ -1003,6 +1119,198 @@ mod tests {
             assert_eq!(ef_convert_options_set_letterbox(o, std::ptr::null()), 0);
             assert_eq!((*o).inner.get_crop().fit, Fit::Stretch);
             ef_convert_options_free(o);
+        }
+    }
+
+    /// The spec a C caller fills for a centred letterbox with ImageNet.
+    fn c_spec() -> EfPreprocessSpec {
+        EfPreprocessSpec {
+            width: 640,
+            height: 640,
+            fit: FitMode::Letterbox.code(),
+            placement: LetterboxPlacement::Center.code(),
+            pad_space: PadSpace::Pixel.code(),
+            pad: [114.0; 3],
+            mean: Normalization::imagenet().mean(),
+            std: Normalization::imagenet().std(),
+            interpolation: Interpolation::Bilinear.code(),
+        }
+    }
+
+    #[test]
+    fn a_spec_builds_the_options_the_rust_api_does() {
+        let c = c_spec();
+        let mut want = PreprocessSpec::new();
+        want.normalization = Normalization::imagenet();
+        want.size = Some((640, 640));
+        assert_eq!(unsafe { spec_from_c(&c) }, Ok(want));
+        unsafe {
+            let o = ef_convert_options_from_spec(&c);
+            assert!(!o.is_null());
+            assert_eq!((*o).inner, ConvertOptions::from_spec(&want).unwrap());
+            ef_convert_options_free(o);
+        }
+    }
+
+    #[test]
+    fn an_invalid_spec_is_einval() {
+        let bad = |edit: &dyn Fn(&mut EfPreprocessSpec)| {
+            let mut c = c_spec();
+            edit(&mut c);
+            errno::set_errno(errno::Errno(0));
+            let o = unsafe { ef_convert_options_from_spec(&c) };
+            assert!(o.is_null());
+            assert_eq!(errno::errno().0, libc::EINVAL);
+        };
+        bad(&|c| c.fit = 2);
+        bad(&|c| c.placement = 2);
+        bad(&|c| c.pad_space = 2);
+        bad(&|c| c.interpolation = 4);
+        bad(&|c| c.std = [0.0; 3]);
+        bad(&|c| c.pad = [300.0; 3]);
+        assert!(unsafe { ef_convert_options_from_spec(std::ptr::null()) }.is_null());
+    }
+
+    #[test]
+    fn the_spec_interpolation_is_a_convert_option() {
+        let mut c = c_spec();
+        c.interpolation = Interpolation::Nearest.code();
+        unsafe {
+            let o = ef_convert_options_from_spec(&c);
+            assert!(!o.is_null());
+            assert_eq!((*o).inner.get_interpolation(), Some(Interpolation::Nearest));
+            ef_convert_options_free(o);
+        }
+    }
+
+    #[test]
+    fn the_interpolation_setter_takes_every_code() {
+        unsafe {
+            let o = ef_convert_options_new();
+            assert_eq!((*o).inner.get_interpolation(), None);
+            for &mode in Interpolation::all() {
+                assert_eq!(ef_convert_options_set_interpolation(o, mode.code()), 0);
+                assert_eq!((*o).inner.get_interpolation(), Some(mode));
+            }
+            assert_eq!(ef_convert_options_set_interpolation(o, 4), libc::EINVAL);
+            assert_eq!(
+                (*o).inner.get_interpolation(),
+                Some(Interpolation::Area),
+                "a refused code leaves the options unchanged"
+            );
+            assert_eq!(
+                ef_convert_options_set_interpolation(std::ptr::null_mut(), 0),
+                libc::EINVAL
+            );
+            ef_convert_options_free(o);
+        }
+    }
+
+    #[test]
+    fn every_interpolation_code_is_accepted() {
+        let p = ef_image_processor_new_with_backend(1);
+        assert!(!p.is_null());
+        unsafe {
+            for &mode in Interpolation::all() {
+                assert_eq!(ef_image_processor_set_interpolation(p, mode.code()), 0);
+            }
+            assert_eq!(ef_image_processor_set_interpolation(p, 4), libc::EINVAL);
+            assert_eq!(
+                ef_image_processor_set_interpolation(std::ptr::null_mut(), 0),
+                libc::EINVAL
+            );
+            ef_image_processor_free(p);
+        }
+    }
+
+    #[test]
+    fn content_region_matches_the_rust_options() {
+        let c = c_spec();
+        unsafe {
+            let o = ef_convert_options_from_spec(&c);
+            let mut px = [0u32; 4];
+            let mut norm = [0f32; 4];
+            assert_eq!(
+                ef_convert_options_content_region(
+                    o,
+                    1920,
+                    1080,
+                    640,
+                    640,
+                    px.as_mut_ptr(),
+                    norm.as_mut_ptr()
+                ),
+                0
+            );
+            let want = (*o).inner.content_region(1920, 1080, 640, 640).unwrap();
+            assert_eq!(px, [0, 140, 640, 360]);
+            assert_eq!(norm, want.normalized);
+            assert_eq!(
+                ef_convert_options_content_region(
+                    o,
+                    1920,
+                    1080,
+                    640,
+                    640,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            assert_eq!(
+                ef_convert_options_content_region(
+                    o,
+                    0,
+                    1080,
+                    640,
+                    640,
+                    px.as_mut_ptr(),
+                    std::ptr::null_mut()
+                ),
+                libc::EINVAL
+            );
+            assert_eq!(ef_convert_options_set_source(o, 1900, 0, 100, 100), 0);
+            assert_eq!(
+                ef_convert_options_content_region(
+                    o,
+                    1920,
+                    1080,
+                    640,
+                    640,
+                    px.as_mut_ptr(),
+                    std::ptr::null_mut()
+                ),
+                libc::EINVAL,
+                "a crop outside the source"
+            );
+            ef_convert_options_free(o);
+            let stretch = ef_convert_options_new();
+            assert_eq!(
+                ef_convert_options_content_region(
+                    stretch,
+                    1920,
+                    1080,
+                    640,
+                    640,
+                    px.as_mut_ptr(),
+                    norm.as_mut_ptr()
+                ),
+                0
+            );
+            assert_eq!((px, norm), ([0, 0, 640, 640], [0.0, 0.0, 1.0, 1.0]));
+            ef_convert_options_free(stretch);
+            assert_eq!(
+                ef_convert_options_content_region(
+                    std::ptr::null(),
+                    1,
+                    1,
+                    1,
+                    1,
+                    px.as_mut_ptr(),
+                    norm.as_mut_ptr()
+                ),
+                libc::EINVAL
+            );
         }
     }
 
@@ -1126,12 +1434,19 @@ mod tests {
             let src = image(CpuAccess::ReadWrite);
             let read_only = image(CpuAccess::Read);
             errno::set_errno(errno::Errno(0));
-            assert!(ef_image_processor_tile_into(p, src, read_only, &cfg).is_null());
+            assert!(
+                ef_image_processor_tile_into(p, src, read_only, &cfg, std::ptr::null()).is_null()
+            );
             assert_eq!(errno::errno().0, libc::EACCES);
             errno::set_errno(errno::Errno(0));
-            assert!(
-                ef_image_processor_tile_into(std::ptr::null_mut(), src, read_only, &cfg).is_null()
-            );
+            assert!(ef_image_processor_tile_into(
+                std::ptr::null_mut(),
+                src,
+                read_only,
+                &cfg,
+                std::ptr::null()
+            )
+            .is_null());
             assert_eq!(errno::errno().0, libc::EINVAL);
             edgefirst_tensor_ffi::ef_tensor_free(src);
             edgefirst_tensor_ffi::ef_tensor_free(read_only);

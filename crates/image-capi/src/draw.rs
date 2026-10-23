@@ -16,7 +16,8 @@ use edgefirst_tensor_ffi::EfTensor;
 
 use crate::processor::{with_tensor, with_tensor_mut, EfImageProcessor};
 
-unsafe fn letterbox_from(ptr: *const f32) -> Option<[f32; 4]> {
+/// A normalized `[xmin, ymin, xmax, ymax]` content region, or `None` for `NULL`.
+unsafe fn content_region_from(ptr: *const f32) -> Option<[f32; 4]> {
     if ptr.is_null() {
         None
     } else {
@@ -103,7 +104,7 @@ fn draw_with_overlay<F>(
     dst: *mut EfTensor,
     background: *const EfTensor,
     opacity: f32,
-    letterbox: Option<[f32; 4]>,
+    content_region: Option<[f32; 4]>,
     color_mode: ColorMode,
     body: F,
 ) -> c_int
@@ -119,7 +120,7 @@ where
             let overlay = MaskOverlay {
                 background: bg,
                 opacity: opacity.clamp(0.0, 1.0),
-                letterbox,
+                content_region,
                 color_mode,
             };
             body(proc, d, overlay).map_err(|e| crate::processor::image_errno(&e))
@@ -152,6 +153,11 @@ where
 /// IOSurface, a dma-buf) returns `ENOTSUP`: the GL base-layer draw has no
 /// `BGRA` arm and the CPU backend renders only `RGBA`/`RGB`.
 ///
+/// `content_region` is `NULL` or four floats: where the image sits in the
+/// model input as normalized `[xmin, ymin, xmax, ymax]`
+/// (`ef_convert_options_content_region`), used to map boxes and masks back
+/// to the image.
+///
 /// `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
 /// A CPU draw blends into `dst`, so one not declared `EF_CPU_ACCESS_READ_WRITE`
 /// (or a `background` not declared readable) is `EACCES`.
@@ -172,7 +178,7 @@ pub unsafe extern "C" fn ef_image_processor_draw_decoded_masks(
     n_masks: usize,
     background: *const EfTensor,
     opacity: f32,
-    letterbox: *const f32,
+    content_region: *const f32,
     color_mode: u32,
 ) -> c_int {
     unsafe {
@@ -188,13 +194,19 @@ pub unsafe extern "C" fn ef_image_processor_draw_decoded_masks(
                 Ok(s) => s,
                 Err(e) => return e,
             };
-            let lb = letterbox_from(letterbox);
+            let region = content_region_from(content_region);
             let Some(mode) = ColorMode::from_code(color_mode) else {
                 return libc::EINVAL;
             };
-            draw_with_overlay(p, dst, background, opacity, lb, mode, |proc, d, overlay| {
-                proc.draw_decoded_masks(d, &detect, &segs, overlay)
-            })
+            draw_with_overlay(
+                p,
+                dst,
+                background,
+                opacity,
+                region,
+                mode,
+                |proc, d, overlay| proc.draw_decoded_masks(d, &detect, &segs, overlay),
+            )
         }))
         .unwrap_or(libc::EINVAL)
     }
@@ -205,8 +217,9 @@ pub unsafe extern "C" fn ef_image_processor_draw_decoded_masks(
 /// On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
 /// afterwards, as it does after a convert.
 ///
-/// The same `BGRA` background restriction, `color_mode` validation, `EACCES`
-/// rule and return codes as `ef_image_processor_draw_decoded_masks`.
+/// The same `BGRA` background restriction, `content_region`, `color_mode`
+/// validation, `EACCES` rule and return codes as
+/// `ef_image_processor_draw_decoded_masks`.
 ///
 /// # Safety
 /// Tensor handles must stay live for the call.
@@ -221,7 +234,7 @@ pub unsafe extern "C" fn ef_image_processor_draw_proto_masks(
     layout: u32,
     background: *const EfTensor,
     opacity: f32,
-    letterbox: *const f32,
+    content_region: *const f32,
     color_mode: u32,
 ) -> c_int {
     unsafe {
@@ -237,13 +250,19 @@ pub unsafe extern "C" fn ef_image_processor_draw_proto_masks(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let lb = letterbox_from(letterbox);
+            let region = content_region_from(content_region);
             let Some(mode) = ColorMode::from_code(color_mode) else {
                 return libc::EINVAL;
             };
-            draw_with_overlay(p, dst, background, opacity, lb, mode, |proc, d, overlay| {
-                proc.draw_proto_masks(d, &detect, &proto, overlay)
-            })
+            draw_with_overlay(
+                p,
+                dst,
+                background,
+                opacity,
+                region,
+                mode,
+                |proc, d, overlay| proc.draw_proto_masks(d, &detect, &proto, overlay),
+            )
         }))
         .unwrap_or(libc::EINVAL)
     }
@@ -257,6 +276,7 @@ pub struct EfMaskList {
 }
 
 /// Materialize per-instance masks from proto tensors. Caller frees the list.
+/// `content_region` as for `ef_image_processor_draw_decoded_masks`.
 ///
 /// # Safety
 /// Handles must be live.
@@ -268,7 +288,7 @@ pub unsafe extern "C" fn ef_image_processor_materialize_masks(
     protos: *mut EfTensor,
     coeffs: *mut EfTensor,
     layout: u32,
-    letterbox: *const f32,
+    content_region: *const f32,
 ) -> *mut EfMaskList {
     unsafe {
         catch_unwind(AssertUnwindSafe(|| {
@@ -280,10 +300,10 @@ pub unsafe extern "C" fn ef_image_processor_materialize_masks(
                 Ok(p) => p,
                 Err(_) => return std::ptr::null_mut(),
             };
-            let lb = letterbox_from(letterbox);
-            let masks = (*p)
-                .inner
-                .materialize_masks(&detect, &proto, lb, MaskResolution::Proto);
+            let region = content_region_from(content_region);
+            let masks =
+                (*p).inner
+                    .materialize_masks(&detect, &proto, region, MaskResolution::Proto);
             match masks {
                 Ok(masks) => Box::into_raw(Box::new(EfMaskList {
                     masks,

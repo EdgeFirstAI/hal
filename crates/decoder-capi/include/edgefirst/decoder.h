@@ -326,6 +326,172 @@ typedef uint32_t ef_model_source;
 #endif // __cplusplus
 
 /**
+ * The source of a resolved model configuration value, from
+ * `ef_model_config_source`.
+ */
+enum ef_config_source
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * `edgefirst.json` embedded in the model file.
+   */
+  EF_CONFIG_SOURCE_EMBEDDED_EDGEFIRST = 0,
+  /**
+   * `edgefirst.json` (and `labels.txt`) beside the model file.
+   */
+  EF_CONFIG_SOURCE_SIDECAR_EDGEFIRST = 1,
+  /**
+   * Hugging Face configs embedded in the model file.
+   */
+  EF_CONFIG_SOURCE_EMBEDDED_HF = 2,
+  /**
+   * Hugging Face configs beside the model file.
+   */
+  EF_CONFIG_SOURCE_SIDECAR_HF = 3,
+  /**
+   * Ultralytics export metadata.
+   */
+  EF_CONFIG_SOURCE_ULTRALYTICS_METADATA = 4,
+  /**
+   * Guessed from the model's input and output names and shapes.
+   */
+  EF_CONFIG_SOURCE_HEURISTIC = 5,
+  /**
+   * The documented default.
+   */
+  EF_CONFIG_SOURCE_DEFAULT = 6,
+  /**
+   * A caller override (`ef_model_overrides_set`).
+   */
+  EF_CONFIG_SOURCE_OVERRIDE = 7,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_config_source ef_config_source;
+#else
+typedef uint32_t ef_config_source;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * The family a model configuration identifies, from
+ * `ef_model_config_family`.
+ */
+enum ef_model_family
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Described by an `edgefirst.json`.
+   */
+  EF_MODEL_FAMILY_EDGE_FIRST = 0,
+  /**
+   * An Ultralytics export.
+   */
+  EF_MODEL_FAMILY_ULTRALYTICS = 1,
+  /**
+   * A Hugging Face export.
+   */
+  EF_MODEL_FAMILY_HUGGING_FACE = 2,
+  /**
+   * Configured only by overrides.
+   */
+  EF_MODEL_FAMILY_UNKNOWN = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_model_family ef_model_family;
+#else
+typedef uint32_t ef_model_family;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * What a model's outputs decode to, from `ef_model_config_task`.
+ */
+enum ef_model_task
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Bounding boxes.
+   */
+  EF_MODEL_TASK_DETECT = 0,
+  /**
+   * Bounding boxes with instance masks.
+   */
+  EF_MODEL_TASK_SEGMENT = 1,
+  /**
+   * A per-pixel class map.
+   */
+  EF_MODEL_TASK_SEMANTIC = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_model_task ef_model_task;
+#else
+typedef uint32_t ef_model_task;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A resolved value whose source is recorded, for `ef_model_config_source`.
+ */
+enum ef_config_field
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Input normalization.
+   */
+  EF_CONFIG_FIELD_NORMALIZATION = 0,
+  /**
+   * Resize mode.
+   */
+  EF_CONFIG_FIELD_RESIZE = 1,
+  /**
+   * Letterbox placement.
+   */
+  EF_CONFIG_FIELD_PLACEMENT = 2,
+  /**
+   * Letterbox pad value and its space.
+   */
+  EF_CONFIG_FIELD_PAD = 3,
+  /**
+   * Resampling filter.
+   */
+  EF_CONFIG_FIELD_INTERPOLATION = 4,
+  /**
+   * Model task.
+   */
+  EF_CONFIG_FIELD_TASK = 5,
+  /**
+   * Semantic decode mode.
+   */
+  EF_CONFIG_FIELD_DECODE_MODE = 6,
+  /**
+   * Class labels.
+   */
+  EF_CONFIG_FIELD_LABELS = 7,
+  /**
+   * Model input size.
+   */
+  EF_CONFIG_FIELD_SIZE = 8,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ef_config_field ef_config_field;
+#else
+typedef uint32_t ef_config_field;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * An owned list of detections.
  *
  * Opaque and heap-owned rather than a `(ptr, len)` pair, so a consumer cannot
@@ -346,6 +512,17 @@ typedef struct ef_infer_signals ef_infer_signals;
  * [`ef_inferred_schema_json`]/[`ef_inferred_schema_labels_json`].
  */
 typedef struct ef_inferred_schema ef_inferred_schema;
+
+/**
+ * A resolved model configuration. Free with [`ef_model_config_free`].
+ */
+typedef struct ef_model_config ef_model_config;
+
+/**
+ * Overrides applied after every discovered source. Build with
+ * [`ef_model_overrides_new`], free with [`ef_model_overrides_free`].
+ */
+typedef struct ef_model_overrides ef_model_overrides;
 
 /**
  * Runtime options of a semantic decode. Build with
@@ -379,6 +556,11 @@ extern "C" {
 /**
  * ABI version of this library's C surface.
  *
+ * 4: `ef_tile_placement.has_letterbox`/`letterbox` are
+ * `has_content_region`/`content_region` (same offsets and meaning), and
+ * `ef_semantic_options_set_letterbox` is `ef_semantic_options_set_content_region`.
+ * A caller built against generation 3 fails to compile or link.
+ *
  * 3: the `dtype` argument of `ef_infer_signals_add_input` and
  * `ef_infer_signals_add_output` is an `EF_DTYPE_*` code (it was a
  * `0x100`-based `EF_INFER_DTYPE_*` code), and `ef_decoder_params_add_output`
@@ -386,7 +568,7 @@ extern "C" {
  *
  * 2: `ef_merge_config` gained a `mode` field in its old tail pad.
  *
- * Neither change alters a symbol or a layout, so a caller built against an
+ * Generations 2 and 3 alter no symbol or layout, so a caller built against an
  * older generation gets no link error and no size mismatch; the probe is
  * the only signal. Changed defaults do not move it.
  */
@@ -1023,8 +1205,213 @@ char *ef_inferred_schema_description(const struct ef_inferred_schema *r);
 void ef_inferred_schema_free(struct ef_inferred_schema *r);
 
 /**
- * New default options: the model's decode mode, no letterbox. `NULL` on
- * allocation failure.
+ * New empty overrides.
+ */
+struct ef_model_overrides *ef_model_overrides_new(void);
+
+/**
+ * Free overrides. `NULL` is a no-op.
+ *
+ * # Safety
+ * `o` must be `NULL` or have come from [`ef_model_overrides_new`].
+ */
+void ef_model_overrides_free(struct ef_model_overrides *o);
+
+/**
+ * Set the override named `key` from its string form:
+ *
+ * | key | values |
+ * |---|---|
+ * | `task` | `detect`, `segment`, `semantic` |
+ * | `normalize` | `unsigned`, `signed`, `raw`, `imagenet`, or `R,G,B/R,G,B` (mean/std on 0-1 values) |
+ * | `resize` | `stretch`, `letterbox`, `letterbox-center`, `letterbox-top_left` |
+ * | `decode` | `accurate`, `fast` |
+ * | `labels` | comma-separated non-empty class names, e.g. `background,person` |
+ *
+ * A bare `letterbox` follows the model family's convention.
+ * `ef_model_config_describe` prints these keys in the same grammar.
+ *
+ * @return 0, or `EINVAL` for a `NULL` argument, an unknown key or a value
+ * outside the key's grammar; `*err_out` (when `err_out` is not `NULL`)
+ * then receives a message listing the accepted forms, freed with
+ * `ef_decoder_string_free`. The overrides are unchanged on failure.
+ *
+ * # Safety
+ * `o` must be `NULL` or live; `key` and `value` `NULL` or NUL-terminated;
+ * `err_out` `NULL` or writable.
+ */
+int ef_model_overrides_set(struct ef_model_overrides *o,
+                           const char *key,
+                           const char *value,
+                           char **err_out);
+
+/**
+ * Resolve the configuration of the model at `path` from, in order: an
+ * `edgefirst.json` embedded in it, `edgefirst.json`/`labels.txt` beside it,
+ * Hugging Face configs embedded in it, `config.json` and
+ * `preprocessor_config.json` beside it, Ultralytics metadata in `signals`,
+ * Hugging Face input/output names in `signals`, and the defaults; then
+ * `overrides`. Each source fills only what the ones before it left unset.
+ *
+ * `signals` (`NULL` for none) are the model's tensors as the runtime
+ * reports them, built as for `ef_infer_ultralytics_schema`; a Hugging Face
+ * config needs them to build a schema. `overrides` may be `NULL`.
+ *
+ * @return the configuration, or `NULL` with `errno` set and, when `err_out`
+ * is not `NULL`, a message in `*err_out` freed with `ef_decoder_string_free`
+ * (initialise it to `NULL`; it is untouched on success): `ENOENT` when the
+ * file does not exist, `ENODATA` when nothing configures a required piece
+ * (the message names it and the override that supplies it), `EBADMSG` for a malformed
+ * container or configuration file, `ENOTSUP` for a configuration the
+ * library cannot run, `EINVAL` for a `NULL` path or an override that does
+ * not apply, otherwise the errno of the failed read.
+ *
+ * # Safety
+ * `path` must be `NULL` or NUL-terminated; `signals` and `overrides` `NULL`
+ * or live; `err_out` `NULL` or writable.
+ */
+struct ef_model_config *ef_model_config_resolve(const char *path,
+                                                const struct ef_infer_signals *signals,
+                                                const struct ef_model_overrides *overrides,
+                                                char **err_out);
+
+/**
+ * Free a configuration. `NULL` is a no-op.
+ *
+ * # Safety
+ * `c` must be `NULL` or have come from [`ef_model_config_resolve`].
+ */
+void ef_model_config_free(struct ef_model_config *c);
+
+/**
+ * The output schema as `edgefirst.json` schema v2 JSON, ready for
+ * `ef_decoder_params_set_config_json`. Its `input.preprocessing` carries
+ * the resolved values when the schema has an input. Freed with
+ * `ef_decoder_string_free`; `NULL` for a `NULL` handle.
+ *
+ * # Safety
+ * `c` must be `NULL` or live.
+ */
+char *ef_model_config_schema_json(const struct ef_model_config *c);
+
+/**
+ * The class labels as a JSON array of strings in channel order, `[]` when
+ * no source names them. Freed with `ef_decoder_string_free`; `NULL` for a
+ * `NULL` handle.
+ *
+ * # Safety
+ * `c` must be `NULL` or live.
+ */
+char *ef_model_config_labels_json(const struct ef_model_config *c);
+
+/**
+ * A one-line summary of the model. Freed with `ef_decoder_string_free`;
+ * `NULL` for a `NULL` handle.
+ *
+ * # Safety
+ * `c` must be `NULL` or live.
+ */
+char *ef_model_config_description(const struct ef_model_config *c);
+
+/**
+ * One line per resolved value with its source, newline-separated, for
+ * logging, e.g. `resize=stretch [preprocessor_config.json]`. Freed
+ * with `ef_decoder_string_free`; `NULL` for a `NULL` handle.
+ *
+ * # Safety
+ * `c` must be `NULL` or live.
+ */
+char *ef_model_config_describe(const struct ef_model_config *c);
+
+/**
+ * Deviations and skipped files worth logging, newline-separated; empty when
+ * there are none. Freed with `ef_decoder_string_free`; `NULL` for a `NULL`
+ * handle.
+ *
+ * # Safety
+ * `c` must be `NULL` or live.
+ */
+char *ef_model_config_notes(const struct ef_model_config *c);
+
+/**
+ * The model family: an `EF_MODEL_FAMILY_*` code.
+ *
+ * @return 0, or `EINVAL` for a `NULL` argument.
+ *
+ * # Safety
+ * `c` must be `NULL` or live; `out` `NULL` or writable.
+ */
+int ef_model_config_family(const struct ef_model_config *c, uint32_t *out);
+
+/**
+ * What the outputs decode to: an `EF_MODEL_TASK_*` code.
+ *
+ * @return 0, or `EINVAL` for a `NULL` argument.
+ *
+ * # Safety
+ * `c` must be `NULL` or live; `out` `NULL` or writable.
+ */
+int ef_model_config_task(const struct ef_model_config *c, uint32_t *out);
+
+/**
+ * The semantic decode mode: an `EF_DECODE_MODE_*` code.
+ *
+ * @return 0, `ENOENT` for a model with no semantic output, or `EINVAL` for
+ * a `NULL` argument.
+ *
+ * # Safety
+ * `c` must be `NULL` or live; `out` `NULL` or writable.
+ */
+int ef_model_config_decode_mode(const struct ef_model_config *c, uint32_t *out);
+
+/**
+ * Where the value of `field` (an `EF_CONFIG_FIELD_*` code) came from:
+ * `*source_out` receives an `EF_CONFIG_SOURCE_*` code and, when
+ * `detail_out` is not `NULL`, `*detail_out` the file or field it was read
+ * from or the reason for a guess (freed with `ef_decoder_string_free`), or
+ * `NULL` when there is none. Neither is written on failure.
+ *
+ * @return 0, `ENOENT` for a field with no value (such as the decode mode of
+ * a detection model), or `EINVAL` for a `NULL` argument or unknown field.
+ *
+ * # Safety
+ * `c` must be `NULL` or live; `source_out` `NULL` or writable; `detail_out`
+ * `NULL` or writable.
+ */
+int ef_model_config_source(const struct ef_model_config *c,
+                           uint32_t field,
+                           uint32_t *source_out,
+                           char **detail_out);
+
+/**
+ * Hugging Face `do_reduce_labels`: `*out` is 1 when the reference dataset
+ * drops its background class and shifts the rest down, else 0. Reported,
+ * not applied.
+ *
+ * @return 0, `ENOENT` when no source says, or `EINVAL` for a `NULL`
+ * argument.
+ *
+ * # Safety
+ * `c` must be `NULL` or live; `out` `NULL` or writable.
+ */
+int ef_model_config_reduce_labels(const struct ef_model_config *c, int *out);
+
+/**
+ * The model's input preprocessing, for `ef_convert_options_from_spec` in
+ * libedgefirst_image. Its interpolation is the reference pipeline's; the
+ * image library runs bicubic and area as bilinear, and
+ * `ef_model_config_notes` says so.
+ *
+ * @return 0, or `EINVAL` for a `NULL` argument.
+ *
+ * # Safety
+ * `c` must be `NULL` or live; `out` `NULL` or valid for writes.
+ */
+int ef_model_config_preprocessing(const struct ef_model_config *c, ef_preprocess_spec *out);
+
+/**
+ * New default options: the model's decode mode, content filling the model
+ * input. `NULL` on allocation failure.
  */
 struct ef_semantic_options *ef_semantic_options_new(void);
 
@@ -1047,16 +1434,19 @@ void ef_semantic_options_free(struct ef_semantic_options *o);
 int ef_semantic_options_set_mode(struct ef_semantic_options *o, uint32_t mode);
 
 /**
- * Image content within the model input as normalized
- * `[xmin, ymin, xmax, ymax]`, as produced by a letterbox resize. `NULL`
- * clears it: the image fills the input.
+ * Where the image content sits in the model input, as normalized
+ * `[xmin, ymin, xmax, ymax]`: the content region of the convert that made
+ * the input (`ef_convert_options_content_region` in libedgefirst_image).
+ * `NULL` clears it: the image fills the input.
  *
  * @return 0, or `EINVAL` for a `NULL` handle.
  *
  * # Safety
- * `o` must be `NULL` or a live handle; `letterbox` `NULL` or four floats.
+ * `o` must be `NULL` or a live handle; `content_region` `NULL` or four
+ * floats.
  */
-int ef_semantic_options_set_letterbox(struct ef_semantic_options *o, const float *letterbox);
+int ef_semantic_options_set_content_region(struct ef_semantic_options *o,
+                                           const float *content_region);
 
 /**
  * Number of classes of the model's semantic output: the channel count, 2
@@ -1073,8 +1463,8 @@ int ef_decoder_semantic_classes(const ef_decoder *d, uintptr_t *out);
 /**
  * Decode the model's semantic segmentation output into `dst`, an `[H, W]`
  * class map of `EF_DTYPE_U8` (up to 256 classes) or `EF_DTYPE_U16`, at any
- * resolution. Each output pixel is mapped through the letterbox region, so
- * the padding is cropped and `dst` covers the original image.
+ * resolution. Each output pixel is mapped through the content region, so
+ * letterbox padding is cropped and `dst` covers the original image.
  *
  * `confidence`, when not `NULL`, receives the winning class's probability
  * as an `[H, W]` map of `EF_DTYPE_F32` or `EF_DTYPE_U8` (scaled to 255),

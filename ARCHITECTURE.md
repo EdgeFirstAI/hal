@@ -28,10 +28,10 @@ this document does not reproduce it.
 
 Each sub-crate has a single responsibility in the inference pipeline:
 
-- [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with interchangeable backends — the `TensorMemory::DmaBuf` zero-copy slot maps to DMA-BUF on Linux, IOSurface on macOS/iOS, and AHardwareBuffer on Android, alongside SHM / Mem / PBO — plus multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key (interned on `AHardwareBuffer_getId` on Android), the required `CpuAccess` declaration and tile-compression metadata on image tensors, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
+- [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with interchangeable backends — the `TensorMemory::DmaBuf` zero-copy slot maps to DMA-BUF on Linux, IOSurface on macOS/iOS, and AHardwareBuffer on Android, alongside SHM / Mem / PBO — plus multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key (interned on `AHardwareBuffer_getId` on Android), the required `CpuAccess` declaration and tile-compression metadata on image tensors, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel. Also holds the values the image and decoder crates share without depending on each other: detection boxes and `unletter_norm`, and the preprocessing vocabulary ([listed in the tensor ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md)).
 - [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) — Image decoding (JPEG, PNG) into pre-allocated tensor buffers with support for u8, u16, i8, i16, and f32 pixel types. Supports strided output for GPU pitch-aligned DMA-BUF/PBO tensors. Designed for the allocate-once, decode-in-loop pattern. Its `video` module encodes tensors to H.264 on V4L2 memory-to-memory encoders.
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface, Android uses native EGL + AHardwareBuffer EGLImage import (iOS builds ride the ANGLE platform) — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch. Also owns the input half of SAHI tiling (`tiling.rs`) — `TilingConfig`, `plan_tiles`, `alloc_tile_batch`, `tile_into`, `tile_one` — which rides that same batch engine to render an overlapping tile grid with one import and one flush.
-- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time. Owns the output half of SAHI tiling (`tiling` module) — `TilePlacement` (the record shared with `edgefirst-image`), `lift_tile_boxes`, greedy `merge_tiled_detections` (keep-best suppression by default, enclosing union opt-in via `MergeMode`), and the streaming `TiledFrameAccumulator`.
+- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time. Discovers a model's configuration (`model_config`: embedded or sidecar `edgefirst.json`, Hugging Face configs, Ultralytics metadata, overrides, per-field provenance) and produces the `PreprocessSpec` the image crate applies. Owns the output half of SAHI tiling (`tiling` module) — `TilePlacement` (the record shared with `edgefirst-image`), `lift_tile_boxes`, greedy `merge_tiled_detections` (keep-best suppression by default, enclosing union opt-in via `MergeMode`), and the streaming `TiledFrameAccumulator`.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
 - [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) — C ABI for tensors (`libedgefirst_tensor`, `edgefirst/tensor.h`). Sibling leaves cover codec, image, decoder, and tracker. Detection layouts are header-only in `edgefirst/detect.h`.
 - [`crates/python-common`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/) — the shared PyO3 binding rlib, plus four thin `cdylib` crates (`python-tensor`, `python-codec`, `python-image`, `python-decoder`) published as the independent `edgefirst-tensor` / `edgefirst-codec` / `edgefirst-image` / `edgefirst-decoder` wheels under the `edgefirst.` PEP 420 namespace. Contains the three-path numpy copy dispatcher.
@@ -342,13 +342,13 @@ This yields the rule:
 convention (`clone_args`, `sched_attr`), Win32's `cbSize` — is the one
 mechanism that would let a struct grow *in place* within a minor post-1.0.
 It was considered for this codebase and **declined**, because it only works
-as a convention and this vocabulary cannot adopt it as one. Of the thirteen
-by-value structs across the five libraries, only two are caller-filled
+as a convention and this vocabulary cannot adopt it as one. Of the fourteen
+by-value structs across the five libraries, only three are caller-filled
 configuration where the handshake means anything:
 
 | Class | Structs | Verdict |
 |---|---|---|
-| Caller-filled config | `ef_merge_config`, `ef_tiling_config` | the handshake would work |
+| Caller-filled config | `ef_merge_config`, `ef_tiling_config`, `ef_preprocess_spec` | the handshake would work |
 | Library-filled `*out` | `ef_tensor_view`, `ef_tensor_plane`, `ef_image_desc_view`, `EfViewOrigin`, `ef_quantization_info`, `ef_tile_spec`, `ef_decoder_track`, `ef_track_info` | inverts the contract — the caller would be declaring its buffer size, paid per call on hot accessors |
 | Arrayed elements | `ef_detect_box`, `ef_segmentation`, `ef_tile_placement` | actively harmful |
 
@@ -402,7 +402,7 @@ currently partial:
 | Library | By-value structs in its header | Layout goldens |
 |---|---|---|
 | `tensor` | `ef_tensor_view`, `ef_tensor_plane`, `ef_image_desc_view`, `ef_quantization_info`, … | yes |
-| `decoder` | `ef_detect_box`, `ef_segmentation`, `ef_merge_config`, `ef_tile_placement` (via `detect.h`) | yes |
+| `decoder` | `ef_detect_box`, `ef_segmentation`, `ef_merge_config`, `ef_tile_placement`, `ef_preprocess_spec` (via `detect.h`) | yes |
 | `image` | `ef_tiling_config`, `ef_tile_spec` | **none — gap** |
 | `tracker` | `ef_track_info` | **none — gap** |
 | `codec` | none (opaque handles only) | not needed |

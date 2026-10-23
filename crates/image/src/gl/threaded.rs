@@ -43,7 +43,7 @@ enum GLProcessorMessage {
         SendablePtr<Segmentation>,
         f32,                            // opacity
         Option<SendablePtr<TensorDyn>>, // background
-        Option<[f32; 4]>,               // letterbox
+        Option<[f32; 4]>,               // content region
         crate::ColorMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
@@ -53,7 +53,7 @@ enum GLProcessorMessage {
         SendablePtr<ProtoData>,
         f32,                            // opacity
         Option<SendablePtr<TensorDyn>>, // background
-        Option<[f32; 4]>,               // letterbox
+        Option<[f32; 4]>,               // content region
         crate::ColorMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
@@ -757,7 +757,7 @@ fn handle_gl_message(
             seg,
             opacity,
             bg,
-            letterbox,
+            content_region,
             color_mode,
             resp,
         ) => {
@@ -765,7 +765,7 @@ fn handle_gl_message(
                 dst,
                 det,
                 seg,
-                (opacity, bg, letterbox, color_mode),
+                (opacity, bg, content_region, color_mode),
                 resp,
                 gl_converter,
                 poisoned,
@@ -777,7 +777,7 @@ fn handle_gl_message(
             proto_data,
             opacity,
             bg,
-            letterbox,
+            content_region,
             color_mode,
             resp,
         ) => {
@@ -785,7 +785,7 @@ fn handle_gl_message(
                 dst,
                 det,
                 proto_data,
-                (opacity, bg, letterbox, color_mode),
+                (opacity, bg, content_region, color_mode),
                 resp,
                 gl_converter,
                 poisoned,
@@ -929,7 +929,7 @@ fn handle_draw_decoded_masks(
     gl_converter: &mut GLProcessorST,
     poisoned: &mut bool,
 ) {
-    let (opacity, bg, letterbox, color_mode) = overlay;
+    let (opacity, bg, content_region, color_mode) = overlay;
     // SAFETY: This is safe because the draw_decoded_masks() function waits for the
     // resp to be sent before dropping the borrow for dst, detect,
     // segmentation, and background
@@ -945,7 +945,7 @@ fn handle_draw_decoded_masks(
             crate::MaskOverlay {
                 background: bg_ref,
                 opacity,
-                letterbox,
+                content_region,
                 color_mode,
             },
         )
@@ -967,7 +967,7 @@ fn handle_draw_proto_masks(
     gl_converter: &mut GLProcessorST,
     poisoned: &mut bool,
 ) {
-    let (opacity, bg, letterbox, color_mode) = overlay;
+    let (opacity, bg, content_region, color_mode) = overlay;
     // SAFETY: Same safety invariant as DrawDecodedMasks — caller
     // blocks on resp before dropping borrows.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -982,7 +982,7 @@ fn handle_draw_proto_masks(
             crate::MaskOverlay {
                 background: bg_ref,
                 opacity,
-                letterbox,
+                content_region,
                 color_mode,
             },
         )
@@ -1277,7 +1277,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::from(bg).cast::<TensorDyn>(),
                     len: 1,
                 }),
-                overlay.letterbox,
+                overlay.content_region,
                 overlay.color_mode,
                 err_send,
             ))
@@ -1316,7 +1316,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::from(bg).cast::<TensorDyn>(),
                     len: 1,
                 }),
-                overlay.letterbox,
+                overlay.content_region,
                 overlay.color_mode,
                 err_send,
             ))

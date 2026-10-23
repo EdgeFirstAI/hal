@@ -885,7 +885,7 @@ fn bench_semantic(suite: &mut BenchSuite) {
         ] {
             let options = SemanticOptions::new()
                 .with_mode(mode)
-                .with_letterbox(letterbox);
+                .with_content_region(letterbox);
             let name = format!("decoder/semantic/{label}/{mode_label}");
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 decode_semantic(input, config, &mut dst, None, &options).unwrap();
@@ -894,7 +894,7 @@ fn bench_semantic(suite: &mut BenchSuite) {
             suite.record(&result);
         }
     }
-    let options = SemanticOptions::new().with_letterbox(letterbox);
+    let options = SemanticOptions::new().with_content_region(letterbox);
     let result = run_bench(
         "decoder/semantic/f32_nchw/accurate_confidence",
         WARMUP,

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This release breaks the API: the preprocessing types move to `edgefirst-tensor`, "letterbox" now only means a fit with a pad colour, interpolation becomes a convert option, and several old APIs are removed. Consumers must move as a set; the C ABI versions are bumped.
+
+### Added
+
+- **Model configuration discovery (`edgefirst-decoder` `model_config`, EDGEAI-2357).** `resolve_model_config(path, signals, overrides)` returns a `ResolvedModelConfig`: schema, labels, model family, task, semantic decode mode, a `PreprocessSpec`, and where each value came from (`provenance`, `describe()`).
+  - Sources, highest first, each filling only unset fields:
+    1. embedded `edgefirst.json`, then its sidecar plus `labels.txt` (the legacy `validation.normalization` / `validation.preprocessing` now back `input.preprocessing`); an `edgefirst.json` without outputs leaves the schema to a later source;
+    2. embedded, then sidecar, Hugging Face `config.json` + `preprocessor_config.json`;
+    3. Ultralytics metadata;
+    4. Hugging Face tensor names (`pixel_values` → `logits`), as guesses;
+    5. defaults.
+  - Containers are read without a runtime. ONNX `metadata_props` (`edgefirst`, legacy `edgefirst.json`, `labels`, `hf_config`, `hf_preprocessor_config`) are read by a protobuf field walk that skips the graph. ZIP trailers (TFLite associated files, HEF, DVM, TensorRT) are read behind the opt-in `model-files` feature, which the C library and Python wheel enable; only the file's tail, the central directory and the text entries are read.
+  - A `config.json` is used only when it is a Hugging Face config. `*ForSemanticSegmentation` architectures map to the semantic decoder; other architectures are `UnsupportedArchitecture`.
+  - `ModelOverrides` (`task`, `normalize`, `resize`, `decode`, `labels`) parse one grammar built on the shared vocabulary names (`normalize=unsigned|signed|raw|imagenet|R,G,B/R,G,B`, `resize=stretch|letterbox|letterbox-center|letterbox-top_left`), and `describe()` prints those keys in it. A bare `letterbox` follows the model family's convention.
+  - `ModelSources::new().with_embedded(..).with_sidecar(..).with_signals(..)` feeds `resolve_sources` from already-read files.
+  - Python: `resolve_model_config`, `ModelSignals`, `ModelOverrides`, `ResolvedModelConfig`, `PreprocessSpec`, `ConfigSource`, `ModelFamily`, `ModelTask`, `ConfigField`, and the `ModelConfigError` (`ValueError`) exceptions `OverrideError`, `UnresolvedConfigError` and `UnsupportedModelError` (also `NotImplementedError`). C: `ef_model_config_*`, `ef_model_overrides_*`, `ef_preprocess_spec` and `ef_preprocess_spec_default()`; `ef_model_config_resolve` sets `ENODATA` when nothing supplies a required piece.
+- **Shared preprocessing values (`edgefirst-tensor`).** `PreprocessSpec`, `ContentRegion`, the `ContentRegionSource` trait, `letterbox_rect`, `broadcast_rgb`, `Normalization::unit_mean_std`, `PadSpace` and `Interpolation::{Bicubic, Area}`. `ConvertOptions::from_spec`/`with_spec` build convert options from a spec, interpolation included. Python: `ConvertOptions.from_spec`, `Interpolation`, `PadSpace`. C: `ef_convert_options_from_spec`, `EF_INTERPOLATION_*`, `EF_PAD_SPACE_*`.
+- **Per-convert interpolation.** `ConvertOptions::interpolation` overrides the processor's setting for one convert, so models sharing a processor keep their own resampling. Bicubic and area log one warning per mode and run bilinear. Python: `ConvertOptions(interpolation=)`. C: `ef_convert_options_set_interpolation`.
+- **Content region.** `ConvertOptions::content_region` reports where a convert puts the image, computed by the code that paints it, and `SemanticOptions::with_convert` takes it for semantic decode. Python: `ConvertOptions.content_region`, `ContentRegion`. C: `ef_convert_options_content_region`.
+- **Tiling with preprocessing.** `TilingConfig::with_options` converts every tile with the given options. Python: `TilingConfig(options=)`. C: `plan_tiles`, `tile_into` and `tile_one` take an `ef_convert_options *`.
+
+### Changed
+
+- **Preprocessing types live in `edgefirst-tensor`.** `Normalization`, `NormalizationPreset`, `LetterboxPlacement`, `Fit`, `FitMode` and `Interpolation` moved there; `edgefirst-image` re-exports them at the same paths. They are `#[non_exhaustive]`, like `ConfigSource`, `ModelFamily`, `ModelTask`, `ConfigField` and `DecodeMode`. `Normalization::mean_std` returns the tensor error and requires a positive `std`.
+- **Decoder schema.** `schema::Normalization` is renamed `NormalizationConfig`; `schema::ResizeMode` is replaced by the tensor `FitMode`; `DecodeMode` gains `as_str`/`from_str_code`. The schema uses the shared `NormalizationPreset`, `LetterboxPlacement`, `Interpolation` and `PadSpace`.
+- **"Letterbox" means the fit and its pad; the image rectangle is a content region.** `ConvertOptions::letterbox(pad)` and `ef_convert_options_set_letterbox` keep their names and select the fit.
+  - Rust: `SemanticOptions::with_letterbox` → `with_content_region`; `MaskOverlay::letterbox`, `TilePlacement::letterbox` and the `materialize_masks` argument → `content_region`.
+  - Python: `decode_semantic`, the mask-drawing APIs and `TilePlacement` take `content_region=`; the old `letterbox=` keyword is not accepted there (`convert(letterbox=<pad colour>)` is unchanged).
+  - C: `ef_semantic_options_set_content_region`, `ef_tile_placement.has_content_region`/`content_region`, and the draw APIs' `content_region` parameter.
+- **C ABI versions.** `ef_decoder_abi_version` 4, `ef_image_abi_version` 4. `ef_tiling_config` is now `{tile_w, tile_h, overlap_ratio}`; callers move `fit`, `pad` and placement into an `ef_convert_options` passed to `plan_tiles`, `tile_into` and `tile_one`.
+- **Python placements.** Placement arguments accept `"center"`/`"top_left"` and their codes, and `set_interpolation` accepts all four interpolations.
+
+### Removed
+
+- `ConvertOptions::with_preprocessing` (feature `decode`); use `ConvertOptions::from_spec` with a `PreprocessSpec`.
+- `TilingConfig::fit`, `pad` and `with_fit` (Python `TilingConfig(fit=, pad=)`, C `ef_tiling_config.fit`/`pad`); use `with_options`.
+- Python `edgefirst.image.Normalization`. `Tensor.normalize_to_numpy` takes a `NormalizationPreset`, and `ConvertOptions(normalization=)` and `convert(normalization=)` take a `NormalizationPreset`, its name, or `(mean, std)`.
+
+### Fixed
+
+- **Tiling lost the content region and ignored placement.** A letterboxed tile away from the frame origin had no content region recorded, because its crop was checked against the tile size instead of the frame, so its boxes lifted to the wrong place. Tile content regions were also always computed centred.
+
 ## [0.36.0] - 2026-10-21
 
 ### Added

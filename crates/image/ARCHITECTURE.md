@@ -49,7 +49,8 @@ shutdown quirks of each driver stack.
 - [`ConvertOptions`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.ConvertOptions.html) — everything `convert(src, dst, Option<ConvertOptions>)` takes beyond the two tensors: rotation, flip, the `Crop`, the letterbox placement (`LetterboxPlacement::{Center, TopLeft}`), an output-domain pad, and the `Normalization`. `None` is the default. See [Output mapping](#output-mapping).
 - [`Rotation`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Rotation.html), [`Flip`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Flip.html), [`Crop`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.Crop.html) — **source-side** geometry: `Crop { source: Option<Region>, fit: Fit }` selects the sampled source sub-rectangle and the fit mode. `Fit = Stretch | Letterbox { pad: [u8; 4] }`; **letterbox** preserves the *source* aspect ratio while filling the requested *destination* shape, padding the remainder with `pad` (`Crop::letterbox([114, 114, 114, 255])` is the YOLO-style shorthand). When a source crop is set, the preserved aspect ratio is the *crop's*, not the full frame's. Destination placement is the destination itself (a tensor or a `view`/`batch` of one), never a `Crop` field.
 - **Destination / source regions** (`dst.view(rect)` / `dst.batch(n)`, `src.view(rect)`) — a sub-region of a tensor used to target a batch tile or select a sampling window in `convert()`. The `view`/`batch` primitive is a **raw tensor** concept (it shares the parent's `BufferIdentity` and carries the sub-region — defined in [`crates/tensor/ARCHITECTURE.md` § Views and sub-regions](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#views-and-sub-regions)); the *mechanics* of consuming one live here. A region lowers to `glViewport`/`glScissor` (GL dst), the destination crop (G2D dst), an offset+stride (CPU dst), or `Crop.source` sampling (src). It is render state, not a buffer attribute, so it never re-keys the EGLImage. See [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert).
-- [`MaskOverlay`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.MaskOverlay.html) — composite control for mask-rendering APIs (`background`, `opacity`).
+- [`MaskOverlay`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.MaskOverlay.html) — composite control for mask-rendering APIs (`background`, `opacity`, `content_region`).
+- **Preprocessing values** — `Normalization`, `NormalizationPreset`, `LetterboxPlacement`, `Fit`/`FitMode`, `Interpolation`, `PadSpace`, `PreprocessSpec` and `ContentRegion` are defined in `edgefirst-tensor` (`preprocess.rs`) and re-exported here, so the decoder can produce a `PreprocessSpec` from model metadata without this crate depending on it. `ConvertOptions::from_spec`/`with_spec` turn a spec into options, its interpolation included. `ConvertOptions::content_region` reports where a convert puts the image (the same `letterbox_rect` the backends paint) and implements `ContentRegionSource`, which the decoder's `SemanticOptions::with_convert` takes. "Letterbox" always means the fit and its pad; the normalized image rectangle is a content region.
 - [`codec::ImageLoad`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/trait.ImageLoad.html) + [`codec::ImageDecoder`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/struct.ImageDecoder.html) — decode JPEG/PNG into a pre-allocated tensor at its native format (JPEG → `Nv12`/`Nv16`/`Nv24` by subsampling, or `Grey`; PNG → `Rgb`/`Rgba`/`Grey`); EXIF orientation is reported in `ImageInfo`, never applied (apply it via `convert()`). [`save_jpeg`](https://docs.rs/edgefirst-image/latest/edgefirst_image/fn.save_jpeg.html) — encode a `u8` tensor to JPEG.
 
 ## Internal Architecture
@@ -618,7 +619,7 @@ Alpha maps to `x / 255` for float destinations and stays the raw byte for intege
 
 ### Resampling and source crops
 
-`ImageProcessorConfig::interpolation` (`Interpolation::{Nearest, Bilinear}`, default `Bilinear`; env `EDGEFIRST_INTERPOLATION` overrides it) selects how a convert resamples when the source region and the destination differ in size. Bilinear uses half-pixel centres, the OpenCV `INTER_LINEAR` convention that detectors are trained with. A convert that does not resize reads each source pixel exactly in either mode.
+`ConvertOptions::interpolation` (`Interpolation::{Nearest, Bilinear}`; `Bicubic` and `Area`, which describe reference pipelines, run `Bilinear` with a warning logged once per mode) selects how a convert resamples when the source region and the destination differ in size. Options without one use the processor's setting, `ImageProcessorConfig::interpolation` or `set_interpolation` (default `Bilinear`). `EDGEFIRST_INTERPOLATION`, read once when the processor is created, overrides both. The dispatcher resolves the mode into the options it hands each backend, and each backend applies it for that convert only (the GL worker receives it with the convert message), so processors shared by models with different filters need no per-model reconfiguration. `set_interpolation` reaches the backends only when the mode changes. Bilinear uses half-pixel centres, the OpenCV `INTER_LINEAR` convention that detectors are trained with. A convert that does not resize reads each source pixel exactly in either mode.
 
 - **GL texture paths** (packed sources, the external sampler, the float path) set the source texture's `MIN`/`MAG` filter to `LINEAR` or `NEAREST`.
 - **GL NV Path B** picks one of three program families per draw, on the CPU from the draw geometry. There is no uniform branch: Vivante GC7000UL does not reliably honour one, and on V3D and Adreno the untaken half slows every draw.
@@ -1040,8 +1041,15 @@ extent is no larger than the tile yields a single whole-frame crop.
 | `tile_into(&src, &mut batch, &cfg)` | one deferred convert per tile, then a single `flush` | row-band `view` of the tall parent | Whole frame in one batch |
 | `tile_one(&src, &mut slot, &placement, &cfg)` | one deferred convert, caller flushes | a caller-owned model-input slot | Overlap preprocessing with inference |
 
+**Preprocessing.** `TilingConfig::with_options` sets the `ConvertOptions`
+every tile is converted with (fit, placement, pad, normalization; rotation
+and flip are refused); each tile replaces the source crop with its own.
+`plan_tiles` takes each tile's `TilePlacement::content_region` from
+`ConvertOptions::content_region` against the frame, so the decoder's lift
+inverts exactly the rectangle the tile convert paints, for either placement.
+
 **The zero-copy property rests on how the source crop is selected.** Each
-tile passes its crop as `Crop::with_source(region)` — sampling the whole-frame
+tile passes its crop as `ConvertOptions::source(region)` — sampling the whole-frame
 tensor through texture coordinates — and **never** as `src.view(region)`. A
 viewed source would mint one EGLImage import per tile and turn `N` tiles into
 `N` imports. The destination side is the mirror image: sibling row-bands of
@@ -1229,7 +1237,7 @@ mask APIs:
 pub struct MaskOverlay<'a> {
     pub background: Option<&'a TensorDyn>, // blit before drawing masks
     pub opacity: f32,                       // 0.0 invisible, 1.0 opaque
-    pub letterbox: Option<[f32; 4]>,       // [xmin, ymin, xmax, ymax] in
+    pub content_region: Option<[f32; 4]>,  // [xmin, ymin, xmax, ymax] in
                                             // model-input normalized space;
                                             // maps decoder output back to
                                             // original image coords when set

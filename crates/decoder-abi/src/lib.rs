@@ -104,9 +104,10 @@ pub struct TilePlacement {
     /// Native crop size `(cw, ch)` in full-frame pixels. Equals the tile size
     /// for the full-size tiles the EvenDist grid produces.
     pub crop_size: (f32, f32),
-    /// Normalized letterbox content bounds `[lx0, ly0, lx1, ly1]` on the model
-    /// input, or `None` when the crop was stretched to fill it (the hot path).
-    pub letterbox: Option<[f32; 4]>,
+    /// The image content on the model input as normalized
+    /// `[xmin, ymin, xmax, ymax]` (a letterbox's content region), or `None`
+    /// when the crop was stretched to fill it (the hot path).
+    pub content_region: Option<[f32; 4]>,
     /// Full-frame dimensions `(frame_w, frame_h)` in pixels.
     pub frame_dims: (f32, f32),
 }
@@ -124,15 +125,15 @@ pub struct EfTilePlacement {
     pub origin_y: f32,
     pub crop_width: f32,
     pub crop_height: f32,
-    pub has_letterbox: c_int,
-    pub letterbox: [f32; 4],
+    pub has_content_region: c_int,
+    pub content_region: [f32; 4],
     pub frame_width: f32,
     pub frame_height: f32,
 }
 
 impl From<&TilePlacement> for EfTilePlacement {
     fn from(p: &TilePlacement) -> Self {
-        let (has_letterbox, letterbox) = match p.letterbox {
+        let (has_content_region, content_region) = match p.content_region {
             Some(lb) => (1, lb),
             None => (0, [0.0; 4]),
         };
@@ -143,8 +144,8 @@ impl From<&TilePlacement> for EfTilePlacement {
             origin_y: p.origin.1,
             crop_width: p.crop_size.0,
             crop_height: p.crop_size.1,
-            has_letterbox,
-            letterbox,
+            has_content_region,
+            content_region,
             frame_width: p.frame_dims.0,
             frame_height: p.frame_dims.1,
         }
@@ -158,14 +159,84 @@ impl From<&EfTilePlacement> for TilePlacement {
             count: p.count,
             origin: (p.origin_x, p.origin_y),
             crop_size: (p.crop_width, p.crop_height),
-            letterbox: if p.has_letterbox != 0 {
-                Some(p.letterbox)
+            content_region: if p.has_content_region != 0 {
+                Some(p.content_region)
             } else {
                 None
             },
             frame_dims: (p.frame_width, p.frame_height),
         }
     }
+}
+
+/// How a source is fit into the model input. C `ef_fit` in `detect.h`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfFit {
+    /// Stretch the source to fill the model input.
+    Stretch = 0,
+    /// Keep the aspect ratio and pad the rest (a letterbox).
+    Letterbox = 1,
+}
+
+/// Where a letterboxed image sits. C `ef_letterbox_placement` in `detect.h`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfLetterboxPlacement {
+    /// Centred, padding split between both sides.
+    Center = 0,
+    /// Anchored at the top-left corner, padding on the right and bottom.
+    TopLeft = 1,
+}
+
+/// The space a letterbox pad is expressed in. C `ef_pad_space` in `detect.h`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfPadSpace {
+    /// A 0-255 pixel value, normalized like the image.
+    Pixel = 0,
+    /// A value written as-is into the normalized destination.
+    Normalized = 1,
+}
+
+/// A resampling filter. C `ef_interpolation` in `detect.h`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EfInterpolation {
+    /// Bilinear (the default).
+    Bilinear = 0,
+    /// Nearest neighbour.
+    Nearest = 1,
+    /// Bicubic; the image library runs bilinear in its place.
+    Bicubic = 2,
+    /// Pixel-area averaging; the image library runs bilinear in its place.
+    Area = 3,
+}
+
+/// A model's input preprocessing as plain values. C `ef_preprocess_spec` in
+/// `detect.h`, produced by the decoder library and consumed by the image
+/// library.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EfPreprocessSpec {
+    /// Model input width in pixels, 0 when unknown.
+    pub width: u32,
+    /// Model input height in pixels, 0 when unknown.
+    pub height: u32,
+    /// An `EF_FIT_*` code.
+    pub fit: u32,
+    /// An `EF_LETTERBOX_PLACEMENT_*` code; ignored by a stretch.
+    pub placement: u32,
+    /// An `EF_PAD_SPACE_*` code for `pad`.
+    pub pad_space: u32,
+    /// Letterbox pad per RGB channel.
+    pub pad: [f32; 3],
+    /// Normalization mean per RGB channel, on 0-255 values.
+    pub mean: [f32; 3],
+    /// Normalization standard deviation per RGB channel, on 0-255 values.
+    pub std: [f32; 3],
+    /// An `EF_INTERPOLATION_*` code.
+    pub interpolation: u32,
 }
 
 #[cfg(test)]
@@ -230,5 +301,62 @@ mod tests {
         // 60 bytes of fields, align 8 -> 64. Matches `detect.h`.
         assert_eq!(std::mem::size_of::<EfTilePlacement>(), 64);
         assert_eq!(std::mem::align_of::<EfTilePlacement>(), 8);
+    }
+
+    #[test]
+    fn preprocess_spec_layout_is_pinned() {
+        // Five u32, three [f32; 3], one u32: 60 bytes, align 4. Matches
+        // `detect.h`.
+        type S = EfPreprocessSpec;
+        assert_eq!(std::mem::size_of::<S>(), 60);
+        assert_eq!(std::mem::align_of::<S>(), 4);
+        assert_eq!(std::mem::offset_of!(S, width), 0);
+        assert_eq!(std::mem::offset_of!(S, height), 4);
+        assert_eq!(std::mem::offset_of!(S, fit), 8);
+        assert_eq!(std::mem::offset_of!(S, placement), 12);
+        assert_eq!(std::mem::offset_of!(S, pad_space), 16);
+        assert_eq!(std::mem::offset_of!(S, pad), 20);
+        assert_eq!(std::mem::offset_of!(S, mean), 32);
+        assert_eq!(std::mem::offset_of!(S, std), 44);
+        assert_eq!(std::mem::offset_of!(S, interpolation), 56);
+    }
+
+    #[test]
+    fn tile_placement_offsets_are_pinned() {
+        type P = EfTilePlacement;
+        assert_eq!(std::mem::offset_of!(P, has_content_region), 32);
+        assert_eq!(std::mem::offset_of!(P, content_region), 36);
+        assert_eq!(std::mem::offset_of!(P, frame_width), 52);
+    }
+
+    #[test]
+    fn detect_h_declares_the_preprocess_vocabulary() {
+        let h = include_str!("../include/edgefirst/detect.h");
+        let codes = [
+            ("EF_FIT_STRETCH", EfFit::Stretch as u32),
+            ("EF_FIT_LETTERBOX", EfFit::Letterbox as u32),
+            (
+                "EF_LETTERBOX_PLACEMENT_CENTER",
+                EfLetterboxPlacement::Center as u32,
+            ),
+            (
+                "EF_LETTERBOX_PLACEMENT_TOP_LEFT",
+                EfLetterboxPlacement::TopLeft as u32,
+            ),
+            ("EF_PAD_SPACE_PIXEL", EfPadSpace::Pixel as u32),
+            ("EF_PAD_SPACE_NORMALIZED", EfPadSpace::Normalized as u32),
+            (
+                "EF_INTERPOLATION_BILINEAR",
+                EfInterpolation::Bilinear as u32,
+            ),
+            ("EF_INTERPOLATION_NEAREST", EfInterpolation::Nearest as u32),
+            ("EF_INTERPOLATION_BICUBIC", EfInterpolation::Bicubic as u32),
+            ("EF_INTERPOLATION_AREA", EfInterpolation::Area as u32),
+        ];
+        for (name, code) in codes {
+            let line = format!("{name} = {code},");
+            assert!(h.contains(&line), "detect.h does not declare `{line}`");
+        }
+        assert!(h.contains("typedef struct ef_preprocess_spec {"));
     }
 }

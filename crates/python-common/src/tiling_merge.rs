@@ -120,19 +120,20 @@ impl From<MergeMode> for PyMergeMode {
 
 fn extract_placement(obj: &Bound<'_, PyAny>) -> PyResult<TilePlacement> {
     if let Ok(packed) = obj.call_method0("__getnewargs__") {
-        if let Ok((index, count, origin, crop_size, frame_dims, letterbox)) = packed.extract() {
+        if let Ok((index, count, origin, crop_size, frame_dims, content_region)) = packed.extract()
+        {
             return Ok(TilePlacement {
                 index,
                 count,
                 origin,
                 crop_size,
-                letterbox,
+                content_region,
                 frame_dims,
             });
         }
     }
-    let letterbox = obj
-        .getattr("letterbox")?
+    let content_region = obj
+        .getattr("content_region")?
         .extract::<Option<(f32, f32, f32, f32)>>()?
         .map(|(a, b, c, d)| [a, b, c, d]);
     Ok(TilePlacement {
@@ -140,7 +141,7 @@ fn extract_placement(obj: &Bound<'_, PyAny>) -> PyResult<TilePlacement> {
         count: obj.getattr("count")?.extract()?,
         origin: obj.getattr("origin")?.extract()?,
         crop_size: obj.getattr("crop_size")?.extract()?,
-        letterbox,
+        content_region,
         frame_dims: obj.getattr("frame_dims")?.extract()?,
     })
 }
@@ -333,7 +334,8 @@ impl PyTiledFrameAccumulator {
 }
 
 /// Lift tile-local **normalized** ``[0,1]`` xyxy detections (over the model
-/// input) to full-frame **pixel** xyxy, inverting the letterbox if present.
+/// input) to full-frame **pixel** xyxy, mapping through the tile's content
+/// region when it was letterboxed.
 #[pyfunction]
 #[pyo3(name = "lift_tile_boxes")]
 pub fn py_lift_tile_boxes<'py>(

@@ -11,8 +11,14 @@
 //! undefined behaviour for a value no variant names.
 
 use edgefirst_image::{
-    ColorMode, ComputeBackend, FitMode, Flip, LetterboxPlacement, NormalizationPreset, Rotation,
+    ColorMode, ComputeBackend, FitMode, Flip, Interpolation, LetterboxPlacement,
+    NormalizationPreset, PadSpace, Rotation,
 };
+
+/// The preprocessing vocabularies `ef_preprocess_spec` carries, declared once
+/// in header-only `edgefirst/detect.h` so `decoder.h` and `image.h` share
+/// them; asserted against this library's codes below.
+pub use edgefirst_decoder_abi::{EfFit, EfInterpolation, EfLetterboxPlacement, EfPadSpace};
 
 /// A quarter-turn rotation, for `ef_image_processor_convert` and friends.
 #[repr(u32)]
@@ -47,16 +53,6 @@ pub enum EfColorMode {
     Track = 2,
 }
 
-/// How a tile crop is fit into the model input, for `ef_tiling_config.fit`.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EfFit {
-    /// Stretch the crop to fill the model input.
-    Stretch = 0,
-    /// Preserve aspect ratio and pad with `ef_tiling_config.pad`.
-    Letterbox = 1,
-}
-
 /// The backend `ef_image_processor_new_with_backend` forces.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,16 +65,6 @@ pub enum EfComputeBackend {
     G2d = 2,
     /// OpenGL only.
     OpenGl = 3,
-}
-
-/// Where a letterboxed image sits, for `ef_convert_options_set_letterbox_placement`.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EfLetterboxPlacement {
-    /// Centred, padding split between both sides.
-    Center = 0,
-    /// Anchored at the top-left corner, padding on the right and bottom.
-    TopLeft = 1,
 }
 
 /// A named normalization, `(x - mean) / std` on 0-255 values, for
@@ -125,6 +111,14 @@ const _: () = {
     assert!(EfNormalization::Signed as u32 == NormalizationPreset::Signed.code());
     assert!(EfNormalization::Raw as u32 == NormalizationPreset::Raw.code());
     assert!(EfNormalization::Imagenet as u32 == NormalizationPreset::Imagenet.code());
+
+    assert!(EfPadSpace::Pixel as u32 == PadSpace::Pixel.code());
+    assert!(EfPadSpace::Normalized as u32 == PadSpace::Normalized.code());
+
+    assert!(EfInterpolation::Bilinear as u32 == Interpolation::Bilinear.code());
+    assert!(EfInterpolation::Nearest as u32 == Interpolation::Nearest.code());
+    assert!(EfInterpolation::Bicubic as u32 == Interpolation::Bicubic.code());
+    assert!(EfInterpolation::Area as u32 == Interpolation::Area.code());
 };
 
 #[cfg(test)]
@@ -185,6 +179,16 @@ mod tests {
                 .iter()
                 .map(|&v| (enumerator("EF_NORMALIZATION", v), v.code())),
         );
+        out.extend(
+            PadSpace::all()
+                .iter()
+                .map(|&v| (enumerator("EF_PAD_SPACE", v), v.code())),
+        );
+        out.extend(
+            Interpolation::all()
+                .iter()
+                .map(|&v| (enumerator("EF_INTERPOLATION", v), v.code())),
+        );
         out
     }
 
@@ -211,18 +215,35 @@ mod tests {
             4,
             "add the EfNormalization enumerator"
         );
+        assert_eq!(PadSpace::all().len(), 2, "add the EfPadSpace enumerator");
+        assert_eq!(
+            Interpolation::all().len(),
+            4,
+            "add the EfInterpolation enumerator"
+        );
     }
 
-    #[test]
-    fn the_header_declares_every_option_code() {
-        let header = std::fs::read_to_string(concat!(
+    /// `image.h` and the `detect.h` it includes: the preprocessing
+    /// vocabularies are declared in the latter.
+    fn headers_text() -> String {
+        let image = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/include/edgefirst/image.h"
         ))
         .expect("cbindgen wrote include/edgefirst/image.h");
+        let detect = include_str!("../../decoder-abi/include/edgefirst/detect.h");
+        image + detect
+    }
+
+    #[test]
+    fn the_header_declares_every_option_code() {
+        let header = headers_text();
         for (name, code) in expected_enumerators() {
             let line = format!("{name} = {code},");
-            assert!(header.contains(&line), "image.h does not declare `{line}`");
+            assert!(
+                header.contains(&line),
+                "image.h (with detect.h) does not declare `{line}`"
+            );
         }
         for ty in [
             "ef_rotation",
@@ -232,10 +253,33 @@ mod tests {
             "ef_compute_backend",
             "ef_letterbox_placement",
             "ef_normalization",
+            "ef_pad_space",
+            "ef_interpolation",
         ] {
             assert!(
                 header.contains(&format!("enum {ty}")),
-                "image.h does not declare `enum {ty}`"
+                "image.h (with detect.h) does not declare `enum {ty}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shared_vocabularies_are_declared_once() {
+        let image = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/include/edgefirst/image.h"
+        ))
+        .expect("cbindgen wrote include/edgefirst/image.h");
+        for ty in [
+            "enum ef_fit",
+            "enum ef_letterbox_placement",
+            "enum ef_pad_space",
+            "enum ef_interpolation",
+            "struct ef_preprocess_spec {",
+        ] {
+            assert!(
+                !image.contains(ty),
+                "`{ty}` belongs to detect.h; image.h must not redeclare it"
             );
         }
     }
@@ -249,6 +293,8 @@ mod tests {
         assert_eq!(ComputeBackend::from_code(4), None);
         assert_eq!(LetterboxPlacement::from_code(2), None);
         assert_eq!(NormalizationPreset::from_code(4), None);
+        assert_eq!(PadSpace::from_code(2), None);
+        assert_eq!(Interpolation::from_code(4), None);
         assert_eq!(Rotation::from_code(u32::MAX), None);
     }
 }

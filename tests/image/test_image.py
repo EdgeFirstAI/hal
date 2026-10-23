@@ -13,7 +13,7 @@ from edgefirst.image import (
     ColorMode,
     Flip,
     ImageProcessor,
-    Normalization,
+    NormalizationPreset,
     PixelFormat,
     Rotation,
     Tensor,
@@ -119,11 +119,11 @@ def test_normalize():
     dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     n = np.zeros((640, 640, 3), dtype=np.int8)
-    dst.normalize_to_numpy(n, normalization=Normalization.SIGNED)
+    dst.normalize_to_numpy(n, normalization=NormalizationPreset.Signed)
     unique_vals = np.unique(n)
     assert (unique_vals == np.array(range(-128, 128))).all()
 
-    dst.normalize_to_numpy(n, normalization=Normalization.SIGNED, zero_point=127)
+    dst.normalize_to_numpy(n, normalization=NormalizationPreset.Signed, zero_point=127)
     unique_vals0 = np.unique(n)
     assert (unique_vals0 == np.array(range(-127, 128))).all()
 
@@ -203,7 +203,7 @@ def test_interpolation(monkeypatch):
     processor = ImageProcessor()
     processor.set_interpolation("nearest")
     assert blended(resize(processor)) == 0
-    with pytest.raises(RuntimeError, match="Unknown interpolation"):
+    with pytest.raises(ValueError, match="unknown interpolation"):
         ImageProcessor(interpolation="lanczos")
 
     monkeypatch.setenv("EDGEFIRST_INTERPOLATION", "nearest")
@@ -455,7 +455,7 @@ def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
     if channels == 3:
         t.from_numpy(ref)
         out = np.zeros((h, w, 3), dtype=np.uint8)
-        t.normalize_to_numpy(out, Normalization.RAW, None)
+        t.normalize_to_numpy(out, NormalizationPreset.Raw, None)
         assert np.array_equal(out, ref), "normalize_to_numpy sheared the padded buffer"
 
 

@@ -63,7 +63,7 @@ def test_decode_semantic_upsamples(mode):
     assert (out[:, 11] == 2).all()
 
 
-def test_decode_semantic_letterbox_and_confidence():
+def test_decode_semantic_content_region_and_confidence():
     decoder = ef.Decoder.new_from_json_str(json.dumps(SCHEMA))
     dst = ef.Tensor([4, 4], dtype="uint16")
     conf = ef.Tensor([4, 4], dtype="float32")
@@ -73,7 +73,7 @@ def test_decode_semantic_letterbox_and_confidence():
         dst,
         conf,
         mode=ef.DecodeMode.Fast,
-        letterbox=[0.0, 0.0, 4 / 6, 1.0],
+        content_region=[0.0, 0.0, 4 / 6, 1.0],
     )
     out = read(dst, np.uint16)
     assert out.tolist() == [[0, 0, 1, 1]] * 4
@@ -90,7 +90,7 @@ def test_decode_semantic_errors():
         decoder.decode_semantic(scores, float_dst)
     dst = ef.Tensor([4, 4], dtype="uint8")
     with pytest.raises(RuntimeError):
-        decoder.decode_semantic(scores, dst, letterbox=[0.5, 0.0, 0.5, 1.0])
+        decoder.decode_semantic(scores, dst, content_region=[0.5, 0.0, 0.5, 1.0])
     with pytest.raises(RuntimeError):
         decoder.decode(scores)
 
@@ -159,14 +159,14 @@ def test_segformer_outputs_match_the_reference_decode(name, suffix):
     tensors, metadata = load_safetensors(path)
     decoder = ef.Decoder.new_from_json_str(metadata["edgefirst_json" + suffix])
     logits = tensor(tensors["logits" + suffix])
-    letterbox = json.loads(metadata["letterbox"])
+    content_region = json.loads(metadata["letterbox"])
     for key, mode, floor in (
         ("accurate", ef.DecodeMode.Accurate, 0.998),
         ("fast", ef.DecodeMode.Fast, 0.97),
     ):
         reference = tensors[f"ref.{key}{suffix}"]
         dst = ef.Tensor(list(reference.shape), dtype="uint8")
-        decoder.decode_semantic([logits], dst, mode=mode, letterbox=letterbox)
+        decoder.decode_semantic([logits], dst, mode=mode, content_region=content_region)
         agreement = (read(dst, np.uint8) == reference).mean()
         assert agreement >= floor, f"{key}: {agreement:.4%}"
 

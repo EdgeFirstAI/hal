@@ -72,7 +72,7 @@ CARGO_PROFILE := --profile profiling
 LLVM_COV_PROFILE := --cargo-profile profiling
 
 # Rust features (all except opencv, which requires libclang at build time)
-RUST_FEATURES := --features opengl,ndarray
+RUST_FEATURES := --features opengl,ndarray,edgefirst-decoder/model-files
 
 # Interpreter used to RUN this repo's helper scripts (check_wheel_layout,
 # check_macho_alignment, generate_notice, ...). `python3` first, as on Linux,
@@ -252,6 +252,7 @@ check-standalone:
 	@for c in $(PUBLISHED_CRATES); do \
 		cargo check -p $$c || exit 1; \
 	done
+	@cargo check -p edgefirst-decoder --features model-files
 	@echo "✓ Standalone check passed"
 	@$(MAKE) --no-print-directory check-backends
 
