@@ -42,58 +42,11 @@ class EdgeFirstProtoDataExportable(Protocol):
 
     def __edgefirst_protodata__(self) -> tuple[object, object, str]: ...
 
-# `Protocol` must not remain bound: stub-parity treats every top-level name
-# as this package's public surface.
-del Protocol
-
 # "dynamic" in every wheel; "static" only in the G13 comparison build.
 __tensor_backend__: str
 
 def version() -> str:
     """Return the HAL version string (matches ``Cargo.toml``)."""
-
-class Normalization(enum.Enum):
-    DEFAULT: Normalization
-    """Default normalization
-    | Output Type  | Default |
-    |--------------|---------|
-    | `np.uint8`   | RAW     |
-    | `np.int8`    | SIGNED  |
-    | `np.float16` | SIGNED  |
-    | `np.float32` | SIGNED  |
-    | `np.float64` | SIGNED  |
-    """
-
-    SIGNED: Normalization
-    """Signed normalization
-    | Output Type  | SIGNED Normalization  | Default Zero Point (zp) |
-    |--------------|-----------------------|-------------------------|
-    | `np.uint8`   | Not supported         | -                       |
-    | `np.int8`    | (value - zp)          | 128                     |
-    | `np.float16` | (value - zp) / 127.5) | 127.5                   |
-    | `np.float32` | (value - zp) / 127.5) | 127.5                   |
-    | `np.float64` | (value - zp) / 127.5) | 127.5                   |
-    """
-    UNSIGNED: Normalization
-    """Unsigned normalization
-    | Output Type  | UNSIGNED Normalization |
-    |--------------|------------------------|
-    | `np.uint8`   | value                  |
-    | `np.int8`    | Not supported          |
-    | `np.float16` | value / 255.0          |
-    | `np.float32` | value / 255.0          |
-    | `np.float64` | value / 255.0          |
-    """
-    RAW: Normalization
-    """Raw normalization
-    | Output Type  | RAW Normalization |
-    |--------------|-------------------|
-    | `np.uint8`   | Not supported     |
-    | `np.int8`    | Not supported     |
-    | `np.float16` | value             |
-    | `np.float32` | value             |
-    | `np.float64` | value             |
-    """
 
 class ColorMode(enum.Enum):
     """Controls how mask colors are assigned to detections."""
@@ -119,7 +72,7 @@ class MaskResolution:
       proto plane once (correct edge-clamp bilinear) and cropping by bbox
       after sigmoid. Mask values are binary ``uint8 {0, 255}`` —
       interchangeable with the continuous sigmoid output via the same
-      ``> 127`` test. If a ``letterbox`` is also passed to
+      ``> 127`` test. If a ``content_region`` is also passed to
       ``materialize_masks``, ``(width, height)`` are interpreted as
       original-content pixel dims and the inverse letterbox transform is
       applied during the upsample.
@@ -266,6 +219,17 @@ class LetterboxPlacement(enum.Enum):
     TopLeft: LetterboxPlacement
     """Anchored at the top-left corner, padding on the right and bottom."""
 
+class Fit(enum.Enum):
+    """How a source is fit into the destination. The integer values are the
+    C ``EF_FIT_*`` codes."""
+
+    Stretch: Fit
+    """Scale each axis to fill the destination (the hot path; identity for
+    the full-square tiles the grid produces)."""
+
+    Letterbox: Fit
+    """Preserve aspect ratio and pad the rest."""
+
 class NormalizationPreset(enum.Enum):
     """A named convert normalization, ``(x - mean) / std`` on 0-255 values.
     The integer values are the C ``EF_NORMALIZATION_*`` codes; the names match
@@ -281,9 +245,99 @@ class NormalizationPreset(enum.Enum):
     """ImageNet mean ``(123.675, 116.28, 103.53)`` and std ``(58.395, 57.12, 57.375)``."""
 
 NormalizationArg: TypeAlias = (
-    NormalizationPreset | str | tuple[Sequence[float], Sequence[float]]
+    NormalizationPreset | str | int | tuple[Sequence[float], Sequence[float]]
 )
-"""A :class:`NormalizationPreset`, its name, or ``(mean, std)``."""
+"""A :class:`NormalizationPreset`, its name or integer code, or
+``(mean, std)``."""
+
+PlacementArg: TypeAlias = LetterboxPlacement | str | int
+"""A :class:`LetterboxPlacement`, its name (``"center"``, ``"top_left"``) or
+its integer code."""
+
+class Interpolation(enum.Enum):
+    """Resampling filter for resizing converts. The integer values are the C
+    ``EF_INTERPOLATION_*`` codes; the names (``"bilinear"``, ``"nearest"``,
+    ``"bicubic"``, ``"area"``) are accepted wherever an interpolation is."""
+
+    Bilinear: Interpolation
+    """Bilinear with half-pixel centres (the default)."""
+    Nearest: Interpolation
+    """Nearest neighbour."""
+    Bicubic: Interpolation
+    """Bicubic; not implemented, runs as bilinear with a warning."""
+    Area: Interpolation
+    """Pixel-area averaging; not implemented, runs as bilinear with a
+    warning."""
+
+InterpolationArg: TypeAlias = Interpolation | str | int
+"""An :class:`Interpolation`, its name (``"bilinear"``, ``"nearest"``,
+``"bicubic"``, ``"area"``) or its integer code."""
+
+class PadSpace(enum.Enum):
+    """The space a letterbox pad value is expressed in. The integer values
+    are the C ``EF_PAD_SPACE_*`` codes."""
+
+    Pixel: PadSpace
+    """A 0-255 pixel value, normalized like the image (the default)."""
+    Normalized: PadSpace
+    """A value written as-is into the normalized destination."""
+
+class PreprocessSpecLike(Protocol):
+    """Anything with the attributes of ``edgefirst.decoder.PreprocessSpec``,
+    as read by :meth:`ConvertOptions.from_spec`. Every attribute is required:
+    ``normalization`` (or, when it is missing or ``None``, ``mean`` and
+    ``std``), ``fit``, ``placement``, ``pad``, ``pad_space``,
+    ``interpolation`` and ``size`` (``None`` when unknown). Enum-valued
+    attributes take a name, an enum member or an integer code."""
+
+    @property
+    def normalization(self) -> NormalizationArg | None: ...
+    @property
+    def fit(self) -> Fit | str | int: ...
+    @property
+    def placement(self) -> PlacementArg: ...
+    @property
+    def pad(self) -> Sequence[float]: ...
+    @property
+    def pad_space(self) -> PadSpace | str | int: ...
+    @property
+    def interpolation(self) -> InterpolationArg: ...
+    @property
+    def size(self) -> tuple[int, int] | None: ...
+
+class ContentRegion:
+    """Where the image content sits in a convert destination, in pixels and
+    normalized by the destination size. Returned by
+    :meth:`ConvertOptions.content_region`; pass it as ``content_region=`` to
+    the drawing methods or ``edgefirst.decoder.Decoder.decode_semantic``."""
+
+    @property
+    def x(self) -> int:
+        """Left edge in destination pixels."""
+    @property
+    def y(self) -> int:
+        """Top edge in destination pixels."""
+    @property
+    def width(self) -> int:
+        """Width in destination pixels."""
+    @property
+    def height(self) -> int:
+        """Height in destination pixels."""
+    @property
+    def pixels(self) -> Region:
+        """The rectangle in destination pixels."""
+    @property
+    def normalized(self) -> tuple[float, float, float, float]:
+        """``(xmin, ymin, xmax, ymax)`` normalized by the destination size."""
+    @property
+    def is_full(self) -> bool:
+        """Whether the content fills the destination (a stretch)."""
+
+ContentRegionArg: TypeAlias = (
+    ContentRegion | tuple[float, float, float, float] | list[float]
+)
+"""A ``content_region=`` argument: a :class:`ContentRegion`, any object with
+a ``normalized`` attribute, or normalized ``(xmin, ymin, xmax, ymax)``."""
 
 class ConvertOptions:
     """Options for :meth:`ImageProcessor.convert`. Every method returns a new
@@ -305,10 +359,13 @@ class ConvertOptions:
         flip: Flip | None = None,
         source: Region | None = None,
         letterbox: tuple[int, int, int, int] | None = None,
-        placement: LetterboxPlacement | None = None,
+        placement: PlacementArg | None = None,
         pad_output: tuple[float, float, float, float] | None = None,
         normalization: NormalizationArg | None = None,
-    ) -> None: ...
+        interpolation: InterpolationArg | None = None,
+    ) -> None:
+        """``interpolation`` resamples this convert when it resizes, instead
+        of the processor's setting (see :meth:`interpolation`)."""
     def rotation(self, rotation: Rotation) -> ConvertOptions:
         """Rotate the output, in 90° steps."""
     def flip(self, flip: Flip) -> ConvertOptions:
@@ -317,12 +374,47 @@ class ConvertOptions:
         """Sample only ``source`` of the input; ``None`` samples all of it."""
     def letterbox(self, pad: tuple[int, int, int, int]) -> ConvertOptions:
         """Letterbox, padding with the RGBA pixel ``pad``, mapped like the image."""
-    def placement(self, placement: LetterboxPlacement) -> ConvertOptions:
+    def placement(self, placement: PlacementArg) -> ConvertOptions:
         """Where a letterboxed image sits."""
     def pad_output(self, pad: tuple[float, float, float, float]) -> ConvertOptions:
         """Pad with these values as written to the destination."""
     def normalization(self, normalization: NormalizationArg) -> ConvertOptions:
         """How pixel values map to the destination."""
+    def interpolation(self, interpolation: InterpolationArg) -> ConvertOptions:
+        """Resample with this interpolation when the convert resizes, instead
+        of the processor's (:meth:`ImageProcessor.set_interpolation`).
+        Bicubic and area run as bilinear, with a warning logged once per
+        mode. ``EDGEFIRST_INTERPOLATION``, when set, takes precedence."""
+    @staticmethod
+    def from_spec(spec: PreprocessSpecLike) -> ConvertOptions:
+        """Options that apply a model's preprocessing: normalization, fit,
+        letterbox placement, pad and interpolation. ``spec`` is an
+        ``edgefirst.decoder.PreprocessSpec`` (e.g. from
+        ``ResolvedModelConfig.preprocessing``) or any object with all of
+        its attributes (see :class:`PreprocessSpecLike`).
+
+        Raises:
+            TypeError: ``spec`` lacks one of the attributes (e.g. ``None`` or
+                a ``dict``), or one has the wrong type.
+            ValueError: A pixel-space pad outside 0-255, a non-finite pad, an
+                unknown name, or a size that is not positive.
+        """
+    def with_spec(self, spec: PreprocessSpecLike) -> ConvertOptions:
+        """These options with a model's preprocessing applied (see
+        :meth:`from_spec`); rotation, flip and the source crop are kept."""
+    def content_region(
+        self, src_w: int, src_h: int, dst_w: int, dst_h: int
+    ) -> ContentRegion:
+        """Where ``convert`` puts the image content when converting a
+        ``src_w`` x ``src_h`` source into a ``dst_w`` x ``dst_h``
+        destination with these options: the letterbox rectangle, or the
+        whole destination for a stretch. Computed by the code the convert
+        paints with, so mapping results back through it is exact.
+
+        Raises:
+            ValueError: A zero size, or the source crop falls outside the
+                source.
+        """
 
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
@@ -330,7 +422,7 @@ class ImageProcessor:
     def __init__(
         self,
         egl_display: EglDisplayKind | None = None,
-        interpolation: str | None = None,
+        interpolation: InterpolationArg | None = None,
     ) -> None:
         """Create an ImageProcessor with optional EGL display override.
 
@@ -338,8 +430,10 @@ class ImageProcessor:
             egl_display: Force OpenGL to use this display type instead of
                 auto-detecting. Use probe_egl_displays() to discover
                 available displays. Ignored if EDGEFIRST_DISABLE_GL=1.
-            interpolation: How convert() resamples when it resizes:
-                "nearest" or "bilinear" (the default). The
+            interpolation: How convert() resamples when it resizes, for
+                converts whose options do not choose their own:
+                "bilinear" (the default), "nearest", "bicubic" or "area"
+                (the last two run as bilinear with a warning). The
                 EDGEFIRST_INTERPOLATION environment variable overrides it.
         """
 
@@ -352,7 +446,7 @@ class ImageProcessor:
         seg: list[npt.NDArray[np.uint8]] = [],
         background: EdgeFirstTensorExportable | None = None,
         opacity: float = 1.0,
-        letterbox: tuple[float, float, float, float] | None = None,
+        content_region: ContentRegionArg | None = None,
         color_mode: ColorMode = ColorMode.Class,
     ) -> None:
         """
@@ -405,9 +499,11 @@ class ImageProcessor:
             opacity: Scales the alpha of rendered mask and box colors.
                 ``1.0`` (default) preserves the class color's alpha unchanged;
                 ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
-            letterbox: Optional ``(x0, y0, x1, y1)`` letterbox region in
-                normalized coordinates for mapping model-space boxes back to
-                image space. ``None`` (default) means no letterbox correction.
+            content_region: Where the image content sits in the model input
+                (:meth:`ConvertOptions.content_region`, or normalized
+                ``(x0, y0, x1, y1)``), for mapping model-space boxes back to
+                image space. ``None`` (default) means the image fills the
+                input.
             color_mode: How to assign colors to detections.
                 ``ColorMode.Class`` (default) colors by class label,
                 ``ColorMode.Instance`` colors by detection index.
@@ -428,7 +524,7 @@ class ImageProcessor:
         scores: npt.NDArray[np.float32],
         classes: npt.NDArray[np.uintp],
         proto_data: EdgeFirstProtoDataExportable,
-        letterbox: tuple[float, float, float, float] | None = None,
+        content_region: ContentRegionArg | None = None,
         resolution: MaskResolution | None = None,
     ) -> list[npt.NDArray[np.uint8]]:
         """Materialize per-instance segmentation masks from prototype data.
@@ -464,8 +560,9 @@ class ImageProcessor:
             classes: ``(N,)`` uintp array of class indices.
             proto_data: Prototype data from :meth:`Decoder.decode_proto`,
                 from this or another ``edgefirst.*`` package.
-            letterbox: Optional ``(x0, y0, x1, y1)`` letterbox region in
-                normalized model-input coordinates. When set with
+            content_region: Where the image content sits in the model input
+                (:meth:`ConvertOptions.content_region`, or normalized
+                ``(x0, y0, x1, y1)``). When set with
                 ``MaskResolution.Scaled``, ``(width, height)`` are
                 interpreted as original-content pixel dims and the inverse
                 letterbox transform is applied during the upsample.
@@ -486,7 +583,7 @@ class ImageProcessor:
         proto_data: EdgeFirstProtoDataExportable,
         background: EdgeFirstTensorExportable | None = None,
         opacity: float = 1.0,
-        letterbox: tuple[float, float, float, float] | None = None,
+        content_region: ContentRegionArg | None = None,
         color_mode: ColorMode = ColorMode.Class,
     ) -> None:
         """Draw prototype masks onto ``dst`` without materialising per-instance
@@ -577,7 +674,7 @@ class ImageProcessor:
         letterbox: tuple[int, int, int, int] | None = None,
         *,
         options: ConvertOptions | None = None,
-        letterbox_placement: LetterboxPlacement | None = None,
+        letterbox_placement: PlacementArg | None = None,
         pad_output: tuple[float, float, float, float] | None = None,
         normalization: NormalizationArg | None = None,
     ) -> None:
@@ -629,7 +726,7 @@ class ImageProcessor:
         letterbox: tuple[int, int, int, int] | None = None,
         *,
         options: ConvertOptions | None = None,
-        letterbox_placement: LetterboxPlacement | None = None,
+        letterbox_placement: PlacementArg | None = None,
         pad_output: tuple[float, float, float, float] | None = None,
         normalization: NormalizationArg | None = None,
     ) -> None:
@@ -672,7 +769,7 @@ class ImageProcessor:
         letterbox: tuple[int, int, int, int] | None = None,
         *,
         options: ConvertOptions | None = None,
-        letterbox_placement: LetterboxPlacement | None = None,
+        letterbox_placement: PlacementArg | None = None,
         pad_output: tuple[float, float, float, float] | None = None,
         normalization: NormalizationArg | None = None,
     ) -> int | None:
@@ -867,15 +964,19 @@ class ImageProcessor:
             RuntimeError: If the backend rejects the palette.
         """
 
-    def set_interpolation(self, mode: str) -> None:
-        """Sets how convert() resamples when it resizes.
+    def set_interpolation(self, mode: InterpolationArg) -> None:
+        """Sets how convert() resamples when it resizes, for converts whose
+        options do not choose their own (``ConvertOptions(interpolation=...)``,
+        which :meth:`ConvertOptions.from_spec` sets from a model's spec).
 
-        Accepts "nearest" or "bilinear" (the default). Applies to every
-        backend; the EDGEFIRST_INTERPOLATION environment variable overrides
-        it.
+        Accepts "bilinear" (the default), "nearest", "bicubic" or "area", an
+        :class:`Interpolation`, or its integer code. Bicubic and area are not
+        implemented: they run bilinear, with a warning logged once per mode.
+        Applies to every backend; the EDGEFIRST_INTERPOLATION environment
+        variable overrides it.
 
         Args:
-            mode: Interpolation mode string.
+            mode: Interpolation mode.
         """
 
     def set_int8_interpolation(self, mode: str) -> None:
@@ -889,17 +990,6 @@ class ImageProcessor:
             mode: Interpolation mode string.
         """
 
-class Fit(enum.Enum):
-    """How a tile crop is fit into the model input."""
-
-    Stretch: Fit
-    """Stretch the crop to fill the model input (the hot path; identity for
-    the full-square tiles the grid produces)."""
-
-    Letterbox: Fit
-    """Preserve aspect ratio and pad with the :class:`TilingConfig` ``pad``
-    colour."""
-
 class TilingConfig:
     """Static tiling configuration for one model. Independent of frame size."""
 
@@ -908,8 +998,7 @@ class TilingConfig:
         tile_w: int,
         tile_h: int,
         overlap: float = 0.2,
-        fit: Fit = Fit.Stretch,
-        pad: tuple[int, int, int, int] = (114, 114, 114, 255),
+        options: ConvertOptions | None = None,
     ) -> None:
         """Create a tiling config.
 
@@ -919,18 +1008,20 @@ class TilingConfig:
             overlap: Minimum overlap ratio between adjacent tiles, in
                 ``[0.0, 1.0)`` (default ``0.2``). The realized overlap is
                 redistributed evenly and is always ``>=`` this.
-            fit: How a tile crop is fit into the model input
-                (default ``Fit.Stretch``).
-            pad: Letterbox pad colour (RGBA), used only when
-                ``fit == Fit.Letterbox`` (default ``(114, 114, 114, 255)``).
+            options: The :class:`ConvertOptions` every tile is converted
+                with (fit, letterbox placement and pad, normalization,
+                interpolation), e.g. from :meth:`ConvertOptions.from_spec`.
+                Each tile replaces
+                the source crop with its own; options that rotate or flip are
+                refused when tiles are planned. ``None`` stretches each tile
+                with the default pixel mapping.
         """
 
     def with_overlap(self, overlap: float) -> TilingConfig:
         """Return a copy with the minimum overlap ratio set (chainable)."""
 
-    def with_fit(self, fit: Fit) -> TilingConfig:
-        """Return a copy with the fit mode set (chainable). ``Fit.Letterbox``
-        uses the configured pad."""
+    def with_options(self, options: ConvertOptions) -> TilingConfig:
+        """Return a copy with the per-tile convert options set (chainable)."""
 
     @property
     def tile_w(self) -> int: ...
@@ -939,9 +1030,8 @@ class TilingConfig:
     @property
     def overlap(self) -> float: ...
     @property
-    def fit(self) -> Fit: ...
-    @property
-    def pad(self) -> tuple[int, int, int, int]: ...
+    def options(self) -> ConvertOptions:
+        """The options every tile is converted with."""
 
 class TileSpec:
     """One tile's native-frame crop rectangle and its grid coordinates."""
@@ -967,7 +1057,8 @@ class TilePlacement:
     shared input/output contract produced by the tiling grid and consumed by
     :func:`edgefirst.decoder.lift_tile_boxes` and
     :class:`edgefirst.decoder.TiledFrameAccumulator`. All fields are
-    full-frame **pixels** except ``letterbox`` (normalized model-input bounds).
+    full-frame **pixels** except ``content_region`` (the normalized image
+    content of a letterboxed tile on the model input).
     """
 
     def __init__(
@@ -977,7 +1068,7 @@ class TilePlacement:
         origin: tuple[float, float],
         crop_size: tuple[float, float],
         frame_dims: tuple[float, float],
-        letterbox: tuple[float, float, float, float] | None = None,
+        content_region: ContentRegionArg | None = None,
     ) -> None:
         """Create a tile placement.
 
@@ -987,9 +1078,9 @@ class TilePlacement:
             origin: Native crop origin ``(ox, oy)`` in full-frame pixels.
             crop_size: Native crop size ``(cw, ch)`` in full-frame pixels.
             frame_dims: Full-frame dimensions ``(frame_w, frame_h)`` in pixels.
-            letterbox: Normalized letterbox content bounds
-                ``(lx0, ly0, lx1, ly1)`` on the model input, or ``None`` when
-                the crop was stretched to fill it.
+            content_region: The image content on the model input as
+                normalized ``(xmin, ymin, xmax, ymax)``, or ``None`` when the
+                crop was stretched to fill it.
         """
 
     @property
@@ -1001,7 +1092,7 @@ class TilePlacement:
     @property
     def crop_size(self) -> tuple[float, float]: ...
     @property
-    def letterbox(self) -> tuple[float, float, float, float] | None: ...
+    def content_region(self) -> tuple[float, float, float, float] | None: ...
     @property
     def frame_dims(self) -> tuple[float, float]: ...
 
@@ -1038,3 +1129,7 @@ def tile_grid(
         RuntimeError: If ``overlap`` is not in ``[0.0, 1.0)`` or a tile
             dimension is zero.
     """
+
+# `Protocol` must not remain bound: stub-parity treats every top-level name
+# as this package's public surface.
+del Protocol

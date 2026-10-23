@@ -160,7 +160,7 @@ def test_scaled_output_is_binary_0_or_255():
         scores,
         classes,
         proto_data,
-        letterbox=None,
+        content_region=None,
         resolution=efi.MaskResolution.Scaled(W, H),
     )
     assert len(masks) == len(boxes)

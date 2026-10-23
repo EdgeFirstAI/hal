@@ -2,148 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Convert options: geometry (rotation, flip, crop, letterbox placement and
-//! pad) and the pixel value mapping (normalization, output quantization).
+//! pad), resampling, and the pixel value mapping (normalization, output
+//! quantization).
 
 use crate::{Crop, Error, Flip, Region, Result, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, QuantMode, Quantization};
-
-edgefirst_tensor::ef_vocabulary! {
-    /// Where a letterboxed image sits inside the destination. The code is the
-    /// one the C `EF_LETTERBOX_PLACEMENT_*` enumerators and the Python
-    /// `LetterboxPlacement` enum use.
-    #[derive(Default)]
-    pub enum LetterboxPlacement {
-        /// Centred, padding split between both sides (the default).
-        #[default]
-        Center = 0, "center", CENTER,
-        /// Anchored at the top-left corner, padding on the right and bottom.
-        TopLeft = 1, "top_left", TOP_LEFT,
-    }
-    #[doc(hidden)]
-    pub mod letterbox_placement_code;
-}
-
-edgefirst_tensor::ef_vocabulary! {
-    /// A named [`Normalization`]. The code is the one the C
-    /// `EF_NORMALIZATION_*` enumerators and the Python `Normalization` enum
-    /// use; the names match the `edgefirst.json` presets.
-    #[derive(Default)]
-    pub enum NormalizationPreset {
-        /// `x / 255`, giving `[0, 1]` (the default).
-        #[default]
-        Unsigned = 0, "unsigned", UNSIGNED,
-        /// `x / 127.5 - 1`, giving `[-1, 1]`.
-        Signed = 1, "signed", SIGNED,
-        /// `x`, giving `[0, 255]`.
-        Raw = 2, "raw", RAW,
-        /// ImageNet mean and standard deviation.
-        Imagenet = 3, "imagenet", IMAGENET,
-    }
-    #[doc(hidden)]
-    pub mod normalization_code;
-}
-
-const IMAGENET_MEAN: [f32; 3] = [123.675, 116.28, 103.53];
-const IMAGENET_STD: [f32; 3] = [58.395, 57.12, 57.375];
-
-/// Per-channel `(x - mean) / std` on 0–255 pixel values, in RGB order.
-///
-/// It applies to the colour channels of the destination; an alpha channel
-/// always maps as [`NormalizationPreset::Unsigned`]. A `Grey` destination uses
-/// the first channel's coefficients.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Normalization {
-    mean: [f32; 3],
-    std: [f32; 3],
-}
-
-impl Default for Normalization {
-    fn default() -> Self {
-        Self::preset(NormalizationPreset::Unsigned)
-    }
-}
-
-impl From<NormalizationPreset> for Normalization {
-    fn from(p: NormalizationPreset) -> Self {
-        Self::preset(p)
-    }
-}
-
-impl Normalization {
-    /// The coefficients of a named preset.
-    pub const fn preset(p: NormalizationPreset) -> Self {
-        let (mean, std) = match p {
-            NormalizationPreset::Unsigned => ([0.0; 3], [255.0; 3]),
-            NormalizationPreset::Signed => ([127.5; 3], [127.5; 3]),
-            NormalizationPreset::Raw => ([0.0; 3], [1.0; 3]),
-            NormalizationPreset::Imagenet => (IMAGENET_MEAN, IMAGENET_STD),
-        };
-        Self { mean, std }
-    }
-
-    /// `x / 255`.
-    pub const fn unsigned() -> Self {
-        Self::preset(NormalizationPreset::Unsigned)
-    }
-
-    /// `x / 127.5 - 1`.
-    pub const fn signed() -> Self {
-        Self::preset(NormalizationPreset::Signed)
-    }
-
-    /// `x` unchanged.
-    pub const fn raw() -> Self {
-        Self::preset(NormalizationPreset::Raw)
-    }
-
-    /// ImageNet mean `[123.675, 116.28, 103.53]`, std `[58.395, 57.12, 57.375]`.
-    pub const fn imagenet() -> Self {
-        Self::preset(NormalizationPreset::Imagenet)
-    }
-
-    /// Explicit coefficients: one value (every channel) or three (RGB).
-    /// `std` must be finite and non-zero, `mean` finite.
-    pub fn mean_std(mean: &[f32], std: &[f32]) -> Result<Self> {
-        let mean = broadcast3("mean", mean)?;
-        let std = broadcast3("std", std)?;
-        if mean.iter().any(|m| !m.is_finite()) {
-            return Err(Error::InvalidOptions(format!(
-                "normalization mean {mean:?} must be finite"
-            )));
-        }
-        if std.iter().any(|s| !s.is_finite() || *s == 0.0) {
-            return Err(Error::InvalidOptions(format!(
-                "normalization std {std:?} must be finite and non-zero"
-            )));
-        }
-        Ok(Self { mean, std })
-    }
-
-    /// The per-channel mean, RGB order.
-    pub fn mean(&self) -> [f32; 3] {
-        self.mean
-    }
-
-    /// The per-channel standard deviation, RGB order.
-    pub fn std(&self) -> [f32; 3] {
-        self.std
-    }
-}
-
-fn broadcast3(name: &str, v: &[f32]) -> Result<[f32; 3]> {
-    match v {
-        [x] => Ok([*x; 3]),
-        [r, g, b] => Ok([*r, *g, *b]),
-        _ => Err(Error::InvalidOptions(format!(
-            "normalization {name} needs 1 or 3 values, got {}",
-            v.len()
-        ))),
-    }
-}
+use edgefirst_tensor::{
+    ContentRegion, ContentRegionSource, DType, FitMode, Interpolation, LetterboxPlacement,
+    Normalization, PadSpace, PixelFormat, PreprocessSpec, QuantMode, Quantization,
+};
 
 /// Options for [`convert`](crate::ImageProcessorTrait::convert). The default
-/// converts the whole source, stretched, with no rotation or flip, and maps
-/// pixels as [`Normalization::unsigned`] for float destinations.
+/// converts the whole source, stretched, with no rotation or flip, resamples
+/// with the processor's interpolation, and maps pixels as
+/// [`Normalization::unsigned`] for float destinations.
 ///
 /// ```
 /// # use edgefirst_image::{ConvertOptions, LetterboxPlacement, Normalization, Rotation};
@@ -163,6 +34,7 @@ pub struct ConvertOptions {
     placement: LetterboxPlacement,
     pad_output: Option<[f32; 4]>,
     normalization: Normalization,
+    interpolation: Option<Interpolation>,
 }
 
 impl ConvertOptions {
@@ -222,6 +94,17 @@ impl ConvertOptions {
         self
     }
 
+    /// Resample with `interpolation` when this convert resizes, instead of
+    /// the processor's setting (see
+    /// [`ImageProcessor::set_interpolation`](crate::ImageProcessor::set_interpolation)).
+    /// [`Interpolation::Bicubic`] and [`Interpolation::Area`] run as
+    /// [`Interpolation::supported`], with a warning logged once per mode.
+    /// `EDGEFIRST_INTERPOLATION`, when set, takes precedence.
+    pub fn interpolation(mut self, interpolation: Interpolation) -> Self {
+        self.interpolation = Some(interpolation);
+        self
+    }
+
     /// The output rotation.
     pub fn get_rotation(&self) -> Rotation {
         self.rotation
@@ -251,76 +134,137 @@ impl ConvertOptions {
     pub fn get_normalization(&self) -> Normalization {
         self.normalization
     }
+
+    /// The per-convert interpolation, or `None` for the processor's.
+    pub fn get_interpolation(&self) -> Option<Interpolation> {
+        self.interpolation
+    }
+
+    /// These options with the per-convert interpolation set to `mode`, or
+    /// cleared by `None`.
+    pub(crate) fn with_interpolation(mut self, mode: Option<Interpolation>) -> Self {
+        self.interpolation = mode;
+        self
+    }
 }
 
-#[cfg(feature = "decode")]
 impl ConvertOptions {
-    /// Apply a model's `input.preprocessing` from `edgefirst.json`:
-    /// normalization, letterbox fit, placement and pad. `resize: stretch`
-    /// clears a letterbox; with no `resize` and no `letterbox` the fit is left
-    /// as it is. `interpolation` is a processor setting
-    /// ([`ImageProcessor::set_interpolation`](crate::ImageProcessor)) and is
-    /// not read here.
-    pub fn with_preprocessing(
-        mut self,
-        pre: &edgefirst_decoder::schema::Preprocessing,
-    ) -> Result<Self> {
-        use edgefirst_decoder::schema::{LetterboxPlacement as P, PadSpace, ResizeMode};
-        if let Some(n) = &pre.normalization {
-            let (mean, std) = n
-                .mean_std(3)
-                .map_err(|e| Error::InvalidOptions(e.to_string()))?;
-            self.normalization = Normalization::mean_std(&mean, &std)?;
+    /// Options that apply a model's preprocessing: its normalization, fit,
+    /// letterbox placement, pad and interpolation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidOptions`] for a pixel-space pad outside 0–255 or a
+    /// non-finite pad.
+    ///
+    /// ```
+    /// use edgefirst_image::{ConvertOptions, LetterboxPlacement, PadSpace, PreprocessSpec};
+    ///
+    /// let mut spec = PreprocessSpec::new();
+    /// spec.placement = LetterboxPlacement::TopLeft;
+    /// spec.pad = [0.0; 3];
+    /// spec.pad_space = PadSpace::Normalized;
+    /// let opts = ConvertOptions::from_spec(&spec)?;
+    /// assert_eq!(opts.get_placement(), LetterboxPlacement::TopLeft);
+    /// assert_eq!(opts.get_pad_output(), Some([0.0, 0.0, 0.0, 1.0]));
+    /// assert_eq!(opts.get_interpolation(), Some(spec.interpolation));
+    /// # Ok::<(), edgefirst_image::Error>(())
+    /// ```
+    pub fn from_spec(spec: &PreprocessSpec) -> Result<Self> {
+        Self::new().with_spec(spec)
+    }
+
+    /// These options with a model's preprocessing applied; rotation, flip
+    /// and the source crop are kept. See [`from_spec`](Self::from_spec).
+    ///
+    /// # Errors
+    ///
+    /// As [`from_spec`](Self::from_spec).
+    pub fn with_spec(mut self, spec: &PreprocessSpec) -> Result<Self> {
+        if spec.pad.iter().any(|v| !v.is_finite()) {
+            return Err(Error::InvalidOptions(format!(
+                "letterbox pad {:?} must be finite",
+                spec.pad
+            )));
         }
-        let letterbox = match pre.resize {
-            Some(ResizeMode::Stretch) => false,
-            Some(ResizeMode::Letterbox) => true,
-            Some(other) => {
-                return Err(Error::NotSupported(format!("resize mode {other:?}")));
+        self.normalization = spec.normalization;
+        self.interpolation = Some(spec.interpolation);
+        self.pad_output = None;
+        // Comparisons, not a match: an unknown fit stretches and an unknown pad space is pixel.
+        self.crop.fit = if spec.fit != FitMode::Letterbox {
+            crate::Fit::Stretch
+        } else if spec.pad_space == PadSpace::Normalized {
+            let [r, g, b] = spec.pad;
+            self.pad_output = Some([r, g, b, 1.0]);
+            crate::Fit::Letterbox {
+                pad: [0, 0, 0, 255],
             }
-            None => pre.letterbox.is_some(),
-        };
-        if pre.resize == Some(ResizeMode::Stretch) {
-            self.crop.fit = crate::Fit::Stretch;
-        }
-        if !letterbox {
-            return Ok(self);
-        }
-        let lb = pre.letterbox.clone().unwrap_or_default();
-        self.placement = match lb.placement {
-            None | Some(P::Center) => LetterboxPlacement::Center,
-            Some(P::TopLeft) => LetterboxPlacement::TopLeft,
-            Some(other) => {
-                return Err(Error::NotSupported(format!(
-                    "letterbox placement {other:?}"
+        } else {
+            if spec.pad.iter().any(|v| !(0.0..=255.0).contains(v)) {
+                return Err(Error::InvalidOptions(format!(
+                    "pixel letterbox pad {:?} must be within 0-255",
+                    spec.pad
                 )));
             }
+            let [r, g, b] = spec.pad.map(|v| v.round() as u8);
+            crate::Fit::Letterbox {
+                pad: [r, g, b, 255],
+            }
         };
-        let pad: [f32; 3] = match lb.pad.as_deref() {
-            None => [114.0; 3],
-            Some(p) => broadcast3("letterbox pad", p)?,
-        };
-        match lb.pad_space {
-            None | Some(PadSpace::Pixel) => {
-                let [r, g, b] = pad.map(|v| v.round().clamp(0.0, 255.0) as u8);
-                self.crop.fit = crate::Fit::Letterbox {
-                    pad: [r, g, b, 255],
-                };
-                self.pad_output = None;
-            }
-            Some(PadSpace::Normalized) => {
-                self.crop.fit = crate::Fit::Letterbox {
-                    pad: [0, 0, 0, 255],
-                };
-                self.pad_output = Some([pad[0], pad[1], pad[2], 1.0]);
-            }
-            Some(other) => {
-                return Err(Error::NotSupported(format!(
-                    "letterbox pad space {other:?}"
-                )));
-            }
+        if spec.fit == FitMode::Letterbox {
+            self.placement = spec.placement;
         }
         Ok(self)
+    }
+
+    /// Where `convert` puts the image content when converting an
+    /// `src_w`×`src_h` source into a `dst_w`×`dst_h` destination with these
+    /// options: the letterbox rectangle, or the whole destination for a
+    /// stretch. It is computed by the same code the convert paints with, so
+    /// mapping results back through it is exact.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CropInvalid`] when the source crop falls outside the source.
+    ///
+    /// ```
+    /// use edgefirst_image::{ConvertOptions, Region};
+    ///
+    /// let opts = ConvertOptions::new().letterbox([114, 114, 114, 255]);
+    /// let r = opts.content_region(1280, 720, 640, 640)?;
+    /// assert_eq!(r.pixels, Region::new(0, 140, 640, 360));
+    /// assert_eq!(r.normalized, [0.0, 0.21875, 1.0, 0.78125]);
+    /// # Ok::<(), edgefirst_image::Error>(())
+    /// ```
+    pub fn content_region(
+        &self,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> Result<ContentRegion> {
+        let resolved = self
+            .crop
+            .resolve(src_w, src_h, dst_w, dst_h, self.placement)?;
+        Ok(match resolved.dst_rect {
+            Some(r) => {
+                ContentRegion::new(Region::new(r.left, r.top, r.width, r.height), dst_w, dst_h)
+            }
+            None => ContentRegion::full(dst_w, dst_h),
+        })
+    }
+}
+
+impl ContentRegionSource for ConvertOptions {
+    fn content_region(
+        &self,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> edgefirst_tensor::Result<ContentRegion> {
+        ConvertOptions::content_region(self, src_w, src_h, dst_w, dst_h)
+            .map_err(|e| edgefirst_tensor::Error::InvalidArgument(e.to_string()))
     }
 }
 
@@ -510,7 +454,7 @@ fn channel_affine(n: &Normalization, order: [usize; 4], qscale: [f32; 4]) -> ([f
         let (mean, std) = if src == 3 {
             (0.0, 255.0)
         } else {
-            (n.mean[src] as f64, n.std[src] as f64)
+            (n.mean()[src] as f64, n.std()[src] as f64)
         };
         let qs = qscale[c] as f64;
         scale[c] = (1.0 / (std * qs)) as f32;
@@ -619,54 +563,6 @@ mod tests {
         assert_eq!(m.apply(0, 0), -128.0);
         assert_eq!(m.apply(0, 255), 127.0, "128 clamps to the i8 range");
         assert_eq!(m.apply(0, 191), 64.0);
-    }
-
-    #[test]
-    fn mean_std_broadcasts_and_validates() {
-        assert_eq!(
-            Normalization::mean_std(&[0.0], &[255.0]).unwrap(),
-            Normalization::unsigned()
-        );
-        assert!(Normalization::mean_std(&[0.0, 0.0], &[1.0]).is_err());
-        assert!(Normalization::mean_std(&[0.0], &[0.0]).is_err());
-        assert!(Normalization::mean_std(&[f32::NAN], &[1.0]).is_err());
-    }
-
-    #[test]
-    fn presets_parse_from_their_names() {
-        for &p in NormalizationPreset::all() {
-            assert_eq!(NormalizationPreset::from_str_code(p.as_str()), Some(p));
-        }
-        assert_eq!(
-            LetterboxPlacement::from_str_code("top_left"),
-            Some(LetterboxPlacement::TopLeft)
-        );
-    }
-
-    #[cfg(feature = "decode")]
-    #[test]
-    fn segformer_preprocessing_maps_to_options() {
-        let pre: edgefirst_decoder::schema::Preprocessing = serde_json::from_str(
-            r#"{"normalization": "imagenet", "resize": "letterbox",
-                "letterbox": {"placement": "top_left", "pad": [0.0], "pad_space": "normalized"}}"#,
-        )
-        .unwrap();
-        let o = ConvertOptions::new().with_preprocessing(&pre).unwrap();
-        assert_eq!(o.get_normalization(), Normalization::imagenet());
-        assert_eq!(o.get_placement(), LetterboxPlacement::TopLeft);
-        assert_eq!(o.get_pad_output(), Some([0.0, 0.0, 0.0, 1.0]));
-        assert!(matches!(o.get_crop().fit, crate::Fit::Letterbox { .. }));
-
-        let pre: edgefirst_decoder::schema::Preprocessing =
-            serde_json::from_str(r#"{"resize": "letterbox"}"#).unwrap();
-        let o = ConvertOptions::new().with_preprocessing(&pre).unwrap();
-        assert_eq!(
-            o.get_crop().fit,
-            crate::Fit::Letterbox {
-                pad: [114, 114, 114, 255]
-            }
-        );
-        assert_eq!(o.get_normalization(), Normalization::unsigned());
     }
 
     #[test]

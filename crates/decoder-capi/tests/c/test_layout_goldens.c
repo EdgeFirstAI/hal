@@ -40,7 +40,7 @@ _Static_assert(offsetof(ef_merge_config, score_threshold) == 24, "");
    without it and every earlier offset is unmoved. */
 _Static_assert(offsetof(ef_merge_config, mode) == 28, "");
 
-/* Two uintptr_t, four f32, c_int, letterbox[4], two f32: 60, align 8 -> 64. */
+/* Two uintptr_t, four f32, c_int, content_region[4], two f32: 60, align 8 -> 64. */
 _Static_assert(sizeof(ef_tile_placement) == 64, "tile placement frozen at 64");
 _Static_assert(offsetof(ef_tile_placement, index) == 0, "");
 _Static_assert(offsetof(ef_tile_placement, count) == 8, "");
@@ -48,9 +48,22 @@ _Static_assert(offsetof(ef_tile_placement, origin_x) == 16, "");
 _Static_assert(offsetof(ef_tile_placement, origin_y) == 20, "");
 _Static_assert(offsetof(ef_tile_placement, crop_width) == 24, "");
 _Static_assert(offsetof(ef_tile_placement, crop_height) == 28, "");
-_Static_assert(offsetof(ef_tile_placement, has_letterbox) == 32, "");
-_Static_assert(offsetof(ef_tile_placement, letterbox) == 36, "");
+_Static_assert(offsetof(ef_tile_placement, has_content_region) == 32, "");
+_Static_assert(offsetof(ef_tile_placement, content_region) == 36, "");
 _Static_assert(offsetof(ef_tile_placement, frame_width) == 52, "");
 _Static_assert(offsetof(ef_tile_placement, frame_height) == 56, "");
+
+/* Five u32, three float[3], one u32: 60, align 4. */
+_Static_assert(sizeof(ef_preprocess_spec) == 60, "preprocess spec is 60 bytes");
+_Static_assert(_Alignof(ef_preprocess_spec) == 4, "");
+_Static_assert(offsetof(ef_preprocess_spec, width) == 0, "");
+_Static_assert(offsetof(ef_preprocess_spec, height) == 4, "");
+_Static_assert(offsetof(ef_preprocess_spec, fit) == 8, "");
+_Static_assert(offsetof(ef_preprocess_spec, placement) == 12, "");
+_Static_assert(offsetof(ef_preprocess_spec, pad_space) == 16, "");
+_Static_assert(offsetof(ef_preprocess_spec, pad) == 20, "");
+_Static_assert(offsetof(ef_preprocess_spec, mean) == 32, "");
+_Static_assert(offsetof(ef_preprocess_spec, std) == 44, "");
+_Static_assert(offsetof(ef_preprocess_spec, interpolation) == 56, "");
 
 int main(void) { return 0; }

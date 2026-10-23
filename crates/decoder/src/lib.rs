@@ -73,6 +73,7 @@ pub mod byte;
 pub mod error;
 pub mod float;
 pub mod infer;
+pub mod model_config;
 pub mod modelpack;
 pub mod per_scale;
 pub mod schema;

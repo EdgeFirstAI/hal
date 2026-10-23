@@ -54,6 +54,15 @@ pub mod tiling;
 
 /// ABI version of this library's C surface.
 ///
+/// 4: `ef_tiling_config` lost `pad` and `fit` (24 bytes, was 32) and
+/// `ef_image_processor_plan_tiles`, `ef_image_processor_tile_into` and
+/// `ef_image_processor_tile_one` take a trailing `const ef_convert_options *`
+/// that says how each tile is converted. `EF_FIT_*` and
+/// `EF_LETTERBOX_PLACEMENT_*` moved to `edgefirst/detect.h` with their values
+/// unchanged, `ef_image_processor_set_interpolation` accepts
+/// `EF_INTERPOLATION_BICUBIC` and `EF_INTERPOLATION_AREA`, and
+/// `ef_convert_options_set_interpolation` sets a per-convert interpolation.
+///
 /// 3: the convert functions take a `const ef_convert_options *` (built with
 /// the `ef_convert_options_*` setters) in place of `rotation`, `flip` and a
 /// `const ef_crop *`, and `ef_crop` is gone. A caller built against
@@ -68,7 +77,7 @@ pub mod tiling;
 /// probe is the only signal.
 #[no_mangle]
 pub extern "C" fn ef_image_abi_version() -> u32 {
-    3
+    4
 }
 
 // Test-support modules that live in the tensor leaf. They are included here,
@@ -554,8 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_probe_is_generation_3() {
-        assert_eq!(super::ef_image_abi_version(), 3);
+    fn the_abi_probe_is_generation_4() {
+        assert_eq!(super::ef_image_abi_version(), 4);
     }
 
     #[test]
@@ -576,6 +585,9 @@ mod tests {
             "ef_tile_grid",
             "ef_tile_spec_list_len",
             "ef_tile_placement_list_len",
+            "ef_convert_options_from_spec",
+            "ef_convert_options_set_interpolation",
+            "ef_convert_options_content_region",
         ] {
             assert!(
                 h.contains(sym),

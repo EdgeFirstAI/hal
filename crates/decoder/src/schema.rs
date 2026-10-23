@@ -47,6 +47,10 @@ use crate::configs::{self, deserialize_dshape, DimName, QuantTuple};
 use crate::{ConfigOutput, ConfigOutputs, DecoderError, DecoderResult};
 use serde::{Deserialize, Serialize};
 
+pub use edgefirst_tensor::{
+    FitMode, Interpolation, LetterboxPlacement, NormalizationPreset, PadSpace,
+};
+
 /// Highest `schema_version` this parser accepts. Files with a higher
 /// version are rejected rather than silently parsed against the wrong
 /// grammar.
@@ -199,7 +203,7 @@ impl InputSpec {
 /// than a specific default, so consumers can apply their own fallback.
 ///
 /// ```
-/// use edgefirst_decoder::schema::{InputSpec, NormalizationPreset, Normalization};
+/// use edgefirst_decoder::schema::{InputSpec, NormalizationPreset, NormalizationConfig};
 ///
 /// let input: InputSpec = serde_json::from_str(r#"{
 ///   "shape": [1, 3, 512, 512],
@@ -210,18 +214,18 @@ impl InputSpec {
 ///   }
 /// }"#).unwrap();
 /// let pre = input.preprocessing.unwrap();
-/// assert_eq!(pre.normalization, Some(Normalization::Preset(NormalizationPreset::Imagenet)));
+/// assert_eq!(pre.normalization, Some(NormalizationConfig::Preset(NormalizationPreset::Imagenet)));
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Preprocessing {
     /// Per-channel normalization applied to 0–255 input values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub normalization: Option<Normalization>,
+    pub normalization: Option<NormalizationConfig>,
 
     /// How a frame is fitted to the fixed model input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resize: Option<ResizeMode>,
+    pub resize: Option<FitMode>,
 
     /// Resampling filter of the reference pipeline. Informational: a
     /// runtime may use a different filter and should report the deviation.
@@ -237,7 +241,7 @@ pub struct Preprocessing {
 /// `mean`/`std`, both defined as `(x - mean) / std` on 0–255 values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Normalization {
+pub enum NormalizationConfig {
     /// Named preset shared with `validation.normalization`.
     Preset(NormalizationPreset),
     /// Explicit coefficients on the 0–255 scale. A single element applies
@@ -250,26 +254,7 @@ pub enum Normalization {
     },
 }
 
-/// Named normalization presets, matching the `validation.normalization`
-/// vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum NormalizationPreset {
-    /// `x / 255` → `[0, 1]`.
-    Unsigned,
-    /// `x / 127.5 - 1` → `[-1, 1]`.
-    Signed,
-    /// Identity: 0–255 values, or normalization performed in the graph.
-    Raw,
-    /// ImageNet RGB mean/std (0.485/0.456/0.406, 0.229/0.224/0.225).
-    Imagenet,
-}
-
-const IMAGENET_MEAN: [f32; 3] = [123.675, 116.28, 103.53];
-const IMAGENET_STD: [f32; 3] = [58.395, 57.12, 57.375];
-
-impl Normalization {
+impl NormalizationConfig {
     /// Resolve to per-channel `(mean, std)` vectors on the 0–255 scale,
     /// each of length `channels`.
     ///
@@ -280,9 +265,9 @@ impl Normalization {
     /// `imagenet` preset is used with a channel count other than 3.
     ///
     /// ```
-    /// use edgefirst_decoder::schema::{Normalization, NormalizationPreset};
+    /// use edgefirst_decoder::schema::{NormalizationConfig, NormalizationPreset};
     ///
-    /// let (mean, std) = Normalization::Preset(NormalizationPreset::Signed)
+    /// let (mean, std) = NormalizationConfig::Preset(NormalizationPreset::Signed)
     ///     .mean_std(3)
     ///     .unwrap();
     /// assert_eq!(mean, vec![127.5; 3]);
@@ -290,18 +275,21 @@ impl Normalization {
     /// ```
     pub fn mean_std(&self, channels: usize) -> DecoderResult<(Vec<f32>, Vec<f32>)> {
         let (mean, std): (&[f32], &[f32]) = match self {
-            Normalization::Preset(NormalizationPreset::Unsigned) => (&[0.0], &[255.0]),
-            Normalization::Preset(NormalizationPreset::Signed) => (&[127.5], &[127.5]),
-            Normalization::Preset(NormalizationPreset::Raw) => (&[0.0], &[1.0]),
-            Normalization::Preset(NormalizationPreset::Imagenet) => {
-                if channels != 3 {
-                    return Err(DecoderError::InvalidConfig(format!(
-                        "imagenet normalization needs 3 channels, got {channels}"
-                    )));
-                }
-                (&IMAGENET_MEAN, &IMAGENET_STD)
+            NormalizationConfig::Preset(NormalizationPreset::Imagenet) if channels != 3 => {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "imagenet normalization needs 3 channels, got {channels}"
+                )));
             }
-            Normalization::MeanStd { mean, std } => (mean, std),
+            NormalizationConfig::Preset(p) => {
+                // Every preset but imagenet (3 channels only) is uniform.
+                let table = edgefirst_tensor::Normalization::preset(*p);
+                let n = if channels == 3 { 3 } else { 1 };
+                return Ok((
+                    broadcast_channels("mean", &table.mean()[..n], channels)?,
+                    broadcast_channels("std", &table.std()[..n], channels)?,
+                ));
+            }
+            NormalizationConfig::MeanStd { mean, std } => (mean, std),
         };
         let mean = broadcast_channels("mean", mean, channels)?;
         let std = broadcast_channels("std", std, channels)?;
@@ -310,9 +298,9 @@ impl Normalization {
                 "normalization mean must be finite, got {bad}"
             )));
         }
-        if let Some(bad) = std.iter().find(|s| **s == 0.0 || !s.is_finite()) {
+        if let Some(bad) = std.iter().find(|s| **s <= 0.0 || !s.is_finite()) {
             return Err(DecoderError::InvalidConfig(format!(
-                "normalization std must be finite and non-zero, got {bad}"
+                "normalization std must be finite and positive, got {bad}"
             )));
         }
         Ok((mean, std))
@@ -327,28 +315,6 @@ fn broadcast_channels(field: &str, values: &[f32], channels: usize) -> DecoderRe
             "normalization {field} has {n} values; expected 1 or {channels}"
         ))),
     }
-}
-
-/// How a frame is fitted to the fixed model input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ResizeMode {
-    /// Scale each axis independently to the input size.
-    Stretch,
-    /// Preserve aspect ratio and pad to the input size.
-    Letterbox,
-}
-
-/// Resampling filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum Interpolation {
-    Bilinear,
-    Nearest,
-    Bicubic,
-    Area,
 }
 
 /// Letterbox geometry for `resize: letterbox`.
@@ -367,28 +333,6 @@ pub struct Letterbox {
     /// Space `pad` is expressed in. Absent means pixel space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pad_space: Option<PadSpace>,
-}
-
-/// Letterbox placement of the scaled image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum LetterboxPlacement {
-    /// Centred; padding split between both sides of each axis.
-    Center,
-    /// Anchored top-left; padding on the bottom and right only.
-    TopLeft,
-}
-
-/// Space a letterbox pad value is expressed in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum PadSpace {
-    /// 0–255 pixel value, normalized like image content.
-    Pixel,
-    /// Value written as-is into the normalized model input.
-    Normalized,
 }
 
 /// Logical output: the semantic contract the model exposes.
@@ -554,34 +498,21 @@ pub enum UpsampleMethod {
     Bicubic,
 }
 
-/// Semantic decode mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DecodeMode {
-    /// Upsample class scores, then argmax (reference).
-    Accurate,
-    /// Argmax at output resolution, then nearest upsample of the class map.
-    Fast,
-}
-
-impl DecodeMode {
-    /// Numeric code shared by the C and Python bindings.
-    pub const fn code(self) -> u32 {
-        match self {
-            Self::Accurate => 0,
-            Self::Fast => 1,
-        }
+edgefirst_tensor::ef_vocabulary! {
+    /// Semantic decode mode. The code is the one the C `EF_DECODE_MODE_*`
+    /// enumerators and the Python `DecodeMode` enum use; the string is the
+    /// `edgefirst.json` name and the `decode` override grammar.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[non_exhaustive]
+    pub enum DecodeMode {
+        /// Upsample class scores, then argmax (reference).
+        Accurate = 0, "accurate", ACCURATE,
+        /// Argmax at output resolution, then nearest upsample of the class map.
+        Fast = 1, "fast", FAST,
     }
-
-    /// The mode with this [`code`](Self::code).
-    pub const fn from_code(code: u32) -> Option<Self> {
-        match code {
-            0 => Some(Self::Accurate),
-            1 => Some(Self::Fast),
-            _ => None,
-        }
-    }
+    #[doc(hidden)]
+    pub mod decode_mode_code;
 }
 
 /// Activation over mask-classification mask logits.
@@ -1401,7 +1332,7 @@ impl SchemaV2 {
 fn validate_preprocessing(input: &InputSpec, pre: &Preprocessing) -> DecoderResult<()> {
     let channels = input.channels();
     let mut vectors: Vec<(&str, &[f32])> = Vec::new();
-    if let Some(Normalization::MeanStd { mean, std }) = &pre.normalization {
+    if let Some(NormalizationConfig::MeanStd { mean, std }) = &pre.normalization {
         vectors.push(("normalization mean", mean));
         vectors.push(("normalization std", std));
     }
@@ -1438,7 +1369,7 @@ fn validate_preprocessing(input: &InputSpec, pre: &Preprocessing) -> DecoderResu
             (_, Some(n)) => n,
             // Presets other than imagenet and scalar coefficients are
             // channel-agnostic; imagenet is RGB.
-            (Normalization::Preset(NormalizationPreset::Imagenet), None) => 3,
+            (NormalizationConfig::Preset(NormalizationPreset::Imagenet), None) => 3,
             (_, None) => 1,
         };
         norm.mean_std(n)?;
@@ -3458,14 +3389,20 @@ outputs:
             .preprocessing
             .as_ref()
             .unwrap();
-        assert_eq!(pre.resize, Some(ResizeMode::Letterbox));
+        assert_eq!(pre.resize, Some(FitMode::Letterbox));
         assert_eq!(pre.interpolation, Some(Interpolation::Bilinear));
         let lb = pre.letterbox.as_ref().unwrap();
         assert_eq!(lb.placement, Some(LetterboxPlacement::TopLeft));
         assert_eq!(lb.pad_space, Some(PadSpace::Normalized));
         let (mean, std) = pre.normalization.as_ref().unwrap().mean_std(3).unwrap();
-        assert_eq!(mean, IMAGENET_MEAN.to_vec());
-        assert_eq!(std, IMAGENET_STD.to_vec());
+        assert_eq!(
+            mean,
+            edgefirst_tensor::Normalization::imagenet().mean().to_vec()
+        );
+        assert_eq!(
+            std,
+            edgefirst_tensor::Normalization::imagenet().std().to_vec()
+        );
 
         let out = &schema.outputs[0];
         assert_eq!(out.decoder, Some(DecoderKind::Semantic));
@@ -3530,11 +3467,11 @@ outputs:
             (NormalizationPreset::Raw, 0.0, 1.0),
         ];
         for (preset, m, s) in cases {
-            let (mean, std) = Normalization::Preset(preset).mean_std(4).unwrap();
+            let (mean, std) = NormalizationConfig::Preset(preset).mean_std(4).unwrap();
             assert_eq!(mean, vec![m; 4], "{preset:?}");
             assert_eq!(std, vec![s; 4], "{preset:?}");
         }
-        let imagenet = Normalization::Preset(NormalizationPreset::Imagenet);
+        let imagenet = NormalizationConfig::Preset(NormalizationPreset::Imagenet);
         assert!(imagenet.mean_std(3).is_ok());
         assert!(imagenet.mean_std(1).is_err());
     }
@@ -3547,27 +3484,30 @@ outputs:
             ("raw", NormalizationPreset::Raw),
             ("imagenet", NormalizationPreset::Imagenet),
         ] {
-            let norm: Normalization = serde_json::from_value(serde_json::json!(text)).unwrap();
-            assert_eq!(norm, Normalization::Preset(preset));
+            let norm: NormalizationConfig =
+                serde_json::from_value(serde_json::json!(text)).unwrap();
+            assert_eq!(norm, NormalizationConfig::Preset(preset));
         }
-        assert!(serde_json::from_value::<Normalization>(serde_json::json!("zscore")).is_err());
+        assert!(
+            serde_json::from_value::<NormalizationConfig>(serde_json::json!("zscore")).is_err()
+        );
     }
 
     #[test]
     fn mean_std_broadcasts_and_rejects_bad_input() {
-        let one = Normalization::MeanStd {
+        let one = NormalizationConfig::MeanStd {
             mean: vec![127.5],
             std: vec![127.5],
         };
         assert_eq!(one.mean_std(3).unwrap().0, vec![127.5; 3]);
 
-        let mismatched = Normalization::MeanStd {
+        let mismatched = NormalizationConfig::MeanStd {
             mean: vec![0.0, 0.0],
             std: vec![1.0; 3],
         };
         assert!(mismatched.mean_std(3).is_err());
 
-        let zero_std = Normalization::MeanStd {
+        let zero_std = NormalizationConfig::MeanStd {
             mean: vec![0.0; 3],
             std: vec![1.0, 0.0, 1.0],
         };
@@ -3597,7 +3537,7 @@ outputs:
     #[test]
     fn non_finite_mean_is_rejected() {
         for bad in [f32::NAN, f32::INFINITY] {
-            let norm = Normalization::MeanStd {
+            let norm = NormalizationConfig::MeanStd {
                 mean: vec![bad],
                 std: vec![1.0],
             };
@@ -3682,9 +3622,9 @@ input:
         let pre = schema.input.unwrap().preprocessing.unwrap();
         assert_eq!(
             pre.normalization,
-            Some(Normalization::Preset(NormalizationPreset::Unsigned))
+            Some(NormalizationConfig::Preset(NormalizationPreset::Unsigned))
         );
-        assert_eq!(pre.resize, Some(ResizeMode::Stretch));
+        assert_eq!(pre.resize, Some(FitMode::Stretch));
         assert!(pre.letterbox.is_none());
     }
 

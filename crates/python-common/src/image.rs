@@ -122,7 +122,8 @@ pub enum ImageDest3<'py> {
     Float64(PyReadwriteArray3<'py, f64>),
 }
 
-#[pyclass(eq, eq_int, from_py_object, module = "edgefirst.image")]
+/// How `Tensor.normalize_to_numpy` maps pixel values; `DEFAULT` is `RAW`
+/// for a `uint8` destination and `SIGNED` otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum Normalization {
@@ -132,11 +133,27 @@ pub enum Normalization {
     RAW,
 }
 
-/// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
-#[pymethods]
-impl Normalization {
-    fn __hash__(&self) -> isize {
-        *self as isize
+/// A `normalize_to_numpy` normalization: a `NormalizationPreset`, its name
+/// or its integer code. `None` keeps the destination-dependent default.
+#[derive(FromPyObject)]
+pub struct NumpyNormalizationArg<'py>(Bound<'py, PyAny>);
+
+impl NumpyNormalizationArg<'_> {
+    pub(crate) fn resolve(arg: Option<Self>) -> Result<Normalization> {
+        let preset = match arg {
+            None => return Ok(Normalization::DEFAULT),
+            Some(Self(p)) => preset_from_py(&p)?,
+        };
+        match preset {
+            image::NormalizationPreset::Signed => Ok(Normalization::SIGNED),
+            image::NormalizationPreset::Unsigned => Ok(Normalization::UNSIGNED),
+            image::NormalizationPreset::Raw => Ok(Normalization::RAW),
+            other => Err(Error::Py(pyo3::exceptions::PyValueError::new_err(format!(
+                "normalize_to_numpy does not support the `{}` normalization; \
+                 use ConvertOptions(normalization=...) with convert",
+                other.as_str()
+            )))),
+        }
     }
 }
 
@@ -926,16 +943,52 @@ pub fn gpu_dma_buf_pitch_alignment_bytes() -> usize {
     image::GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES
 }
 
-/// `"nearest"` or `"bilinear"` as an [`image::Interpolation`].
-fn parse_interpolation(mode: &str) -> Result<image::Interpolation> {
-    match mode {
-        "nearest" => Ok(image::Interpolation::Nearest),
-        "bilinear" => Ok(image::Interpolation::Bilinear),
-        _ => Err(Error::InvalidArg(format!(
-            "Unknown interpolation '{mode}'. Expected 'nearest' or 'bilinear'"
-        ))),
-    }
+/// The names of a vocabulary, comma-separated, for error messages.
+fn names<T: Copy>(all: &[T], as_str: impl Fn(T) -> &'static str) -> String {
+    all.iter()
+        .map(|&v| as_str(v))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
+
+/// Reads a vocabulary value given as its name, an `edgefirst.*` enum member
+/// from any package, or its integer code.
+macro_rules! vocab_from_py {
+    ($fn_name:ident, $ty:ty, $what:literal) => {
+        pub(crate) fn $fn_name(obj: &Bound<'_, PyAny>) -> Result<$ty> {
+            let bad = |v: String| {
+                Error::Py(pyo3::exceptions::PyValueError::new_err(format!(
+                    concat!("unknown ", $what, " {}, expected one of: {}"),
+                    v,
+                    names(<$ty>::all(), |x| x.as_str())
+                )))
+            };
+            if let Ok(name) = obj.extract::<String>() {
+                return <$ty>::from_str_code(&name).ok_or_else(|| bad(format!("`{name}`")));
+            }
+            let code: u32 = obj
+                .call_method0("__int__")
+                .and_then(|c| c.extract())
+                .map_err(|_| {
+                    Error::Py(pyo3::exceptions::PyTypeError::new_err(concat!(
+                        $what,
+                        " must be a name, an enum member or an integer code"
+                    )))
+                })?;
+            <$ty>::from_code(code).ok_or_else(|| bad(format!("code {code}")))
+        }
+    };
+}
+
+vocab_from_py!(
+    placement_from_py,
+    image::LetterboxPlacement,
+    "letterbox placement"
+);
+vocab_from_py!(fit_from_py, image::FitMode, "fit");
+vocab_from_py!(interpolation_from_py, image::Interpolation, "interpolation");
+vocab_from_py!(pad_space_from_py, image::PadSpace, "pad space");
+vocab_from_py!(preset_from_py, image::NormalizationPreset, "normalization");
 
 #[pyclass(name = "ImageProcessor", module = "edgefirst.image")]
 pub struct PyImageProcessor(pub(crate) Mutex<image::ImageProcessor>);
@@ -947,10 +1000,13 @@ unsafe impl Sync for PyImageProcessor {}
 impl PyImageProcessor {
     #[new]
     #[pyo3(signature = (egl_display=None, interpolation=None))]
-    pub fn new(egl_display: Option<PyEglDisplayKind>, interpolation: Option<&str>) -> Result<Self> {
+    pub fn new(
+        egl_display: Option<PyEglDisplayKind>,
+        interpolation: Option<&Bound<'_, PyAny>>,
+    ) -> Result<Self> {
         let mut _config = ImageProcessorConfig::default();
         if let Some(mode) = interpolation {
-            _config.interpolation = parse_interpolation(mode)?;
+            _config.interpolation = interpolation_from_py(mode)?;
         }
         #[cfg(target_os = "linux")]
         {
@@ -1004,9 +1060,9 @@ impl PyImageProcessor {
         source: Option<PyRegion>,
         letterbox: Option<[u8; 4]>,
         options: Option<PyConvertOptions>,
-        letterbox_placement: Option<PyLetterboxPlacement>,
+        letterbox_placement: Option<&Bound<'py, PyAny>>,
         pad_output: Option<[f32; 4]>,
-        normalization: Option<NormalizationArg>,
+        normalization: Option<NormalizationArg<'py>>,
     ) -> Result<()> {
         let _span = tracing::trace_span!("python.convert").entered();
         // `access=None`: this runs on the GPU/DMA path and must not force a
@@ -1022,7 +1078,7 @@ impl PyImageProcessor {
             flip,
             source,
             letterbox,
-            letterbox_placement,
+            letterbox_placement.map(placement_from_py).transpose()?,
             pad_output,
             normalization,
         )?;
@@ -1104,9 +1160,9 @@ impl PyImageProcessor {
         source: Option<PyRegion>,
         letterbox: Option<[u8; 4]>,
         options: Option<PyConvertOptions>,
-        letterbox_placement: Option<PyLetterboxPlacement>,
+        letterbox_placement: Option<&Bound<'py, PyAny>>,
         pad_output: Option<[f32; 4]>,
-        normalization: Option<NormalizationArg>,
+        normalization: Option<NormalizationArg<'py>>,
     ) -> Result<Option<usize>> {
         let _span = tracing::trace_span!("python.convert_with_fence").entered();
         // See `convert`: GPU/DMA path, no host pin forced.
@@ -1120,7 +1176,7 @@ impl PyImageProcessor {
             flip,
             source,
             letterbox,
-            letterbox_placement,
+            letterbox_placement.map(placement_from_py).transpose()?,
             pad_output,
             normalization,
         )?;
@@ -1208,9 +1264,9 @@ impl PyImageProcessor {
         source: Option<PyRegion>,
         letterbox: Option<[u8; 4]>,
         options: Option<PyConvertOptions>,
-        letterbox_placement: Option<PyLetterboxPlacement>,
+        letterbox_placement: Option<&Bound<'py, PyAny>>,
         pad_output: Option<[f32; 4]>,
-        normalization: Option<NormalizationArg>,
+        normalization: Option<NormalizationArg<'py>>,
     ) -> Result<()> {
         let _span = tracing::trace_span!("python.convert_deferred").entered();
         // See `convert`: GPU/DMA path, no host pin forced.
@@ -1224,7 +1280,7 @@ impl PyImageProcessor {
             flip,
             source,
             letterbox,
-            letterbox_placement,
+            letterbox_placement.map(placement_from_py).transpose()?,
             pad_output,
             normalization,
         )?;
@@ -1302,7 +1358,7 @@ impl PyImageProcessor {
     /// OpenGL base-layer draw has no ``BGRA`` arm and the CPU backend renders
     /// only ``RGBA``/``RGB``. It previously returned without writing ``dst``.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0, letterbox=None, color_mode=PyColorMode::Class))]
+    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0, content_region=None, color_mode=PyColorMode::Class))]
     pub fn draw_decoded_masks<'py>(
         &mut self,
         dst: &Bound<'py, PyAny>,
@@ -1312,7 +1368,7 @@ impl PyImageProcessor {
         seg: Vec<PyReadonlyArray3<u8>>,
         background: Option<&Bound<'py, PyAny>>,
         opacity: f32,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<crate::content_region::ContentRegionArg>,
         color_mode: PyColorMode,
     ) -> Result<()> {
         // GPU render target, same as `convert`'s dst: no host pin forced.
@@ -1378,7 +1434,7 @@ impl PyImageProcessor {
         let overlay = image::MaskOverlay {
             background: background.as_ref().map(|b| b.as_ref()),
             opacity: opacity.clamp(0.0, 1.0),
-            letterbox,
+            content_region: crate::content_region::normalized(content_region),
             color_mode: color_mode.into(),
         };
         l.draw_decoded_masks(dst.as_mut(), &detect, &seg, overlay)?;
@@ -1421,8 +1477,10 @@ impl PyImageProcessor {
     ///     May come from another ``edgefirst.*`` package (e.g.
     ///     ``edgefirst.decoder``) -- see the ``__edgefirst_protodata__``
     ///     capsule protocol.
-    /// :param letterbox: optional letterbox region ``(x0, y0, x1, y1)`` in
-    ///     normalized coordinates, or ``None`` if no letterboxing was applied
+    /// :param content_region: where the image content sits in the model
+    ///     input: normalized ``(x0, y0, x1, y1)`` or a :class:`ContentRegion`
+    ///     (from :meth:`ConvertOptions.content_region`); ``None`` when the
+    ///     image fills the input
     /// :param resolution: optional mask materialization mode. When ``None`` or
     ///     :class:`MaskResolution.Proto`, returns per-detection tiles at
     ///     proto-plane resolution with binary mask values ``{0, 255}``. When
@@ -1433,7 +1491,7 @@ impl PyImageProcessor {
     /// :returns: list of ``(H, W, 1)`` uint8 numpy arrays with binary
     ///     ``{0, 255}`` mask values.
     /// :rtype: list[numpy.ndarray]
-    #[pyo3(signature = (bbox, scores, classes, proto_data, letterbox=None, resolution=None))]
+    #[pyo3(signature = (bbox, scores, classes, proto_data, content_region=None, resolution=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn materialize_masks<'py>(
         &self,
@@ -1441,7 +1499,7 @@ impl PyImageProcessor {
         scores: PyReadonlyArray1<f32>,
         classes: PyReadonlyArray1<usize>,
         proto_data: &Bound<'py, PyAny>,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<crate::content_region::ContentRegionArg>,
         resolution: Option<PyMaskResolution>,
         py: Python<'py>,
     ) -> Result<Vec<Bound<'py, numpy::PyArray3<u8>>>> {
@@ -1453,6 +1511,7 @@ impl PyImageProcessor {
         let detect = numpy_to_detect_boxes(&bbox, &scores, &classes)?;
         let proto_data = crate::interop::ProtoDataArg::extract(proto_data)?;
         let resolution = resolution.map(|r| r.0).unwrap_or(MaskResolution::Proto);
+        let content_region = crate::content_region::normalized(content_region);
         let masks = if proto_data.can_detach() {
             // Reconstructs `proto_data`'s two tensors independently -- see
             // `RawProtoDataAccess`'s doc comment for why that (not holding
@@ -1467,7 +1526,7 @@ impl PyImageProcessor {
                     .0
                     .lock()
                     .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-                Ok(l.materialize_masks(&detect, proto_data.as_ref(), letterbox, resolution)?)
+                Ok(l.materialize_masks(&detect, proto_data.as_ref(), content_region, resolution)?)
             })?
         } else {
             // A GL-PBO-backed proto tensor: `ProtoDataArg::can_detach` (see
@@ -1479,7 +1538,7 @@ impl PyImageProcessor {
                 .0
                 .lock()
                 .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-            l.materialize_masks(&detect, proto_data.as_ref(), letterbox, resolution)?
+            l.materialize_masks(&detect, proto_data.as_ref(), content_region, resolution)?
         };
         Ok(convert_seg_mask(py, &masks))
     }
@@ -1492,7 +1551,7 @@ impl PyImageProcessor {
     /// afterwards, as it does after ``convert``. The same ``BGRA``
     /// ``background=`` restriction as :meth:`draw_decoded_masks` applies.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (dst, bbox, scores, classes, proto_data, background=None, opacity=1.0, letterbox=None, color_mode=PyColorMode::Class))]
+    #[pyo3(signature = (dst, bbox, scores, classes, proto_data, background=None, opacity=1.0, content_region=None, color_mode=PyColorMode::Class))]
     pub fn draw_proto_masks<'py>(
         &self,
         dst: &Bound<'py, PyAny>,
@@ -1502,7 +1561,7 @@ impl PyImageProcessor {
         proto_data: &Bound<'py, PyAny>,
         background: Option<&Bound<'py, PyAny>>,
         opacity: f32,
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<crate::content_region::ContentRegionArg>,
         color_mode: PyColorMode,
     ) -> Result<()> {
         // The caller's object is kept under its own name: the extraction
@@ -1518,7 +1577,7 @@ impl PyImageProcessor {
         let overlay = image::MaskOverlay {
             background: background.as_ref().map(|b| b.as_ref()),
             opacity: opacity.clamp(0.0, 1.0),
-            letterbox,
+            content_region: crate::content_region::normalized(content_region),
             color_mode: color_mode.into(),
         };
         let mut l = self
@@ -1833,11 +1892,15 @@ impl PyImageProcessor {
         Ok(())
     }
 
-    /// Set how ``convert`` resamples when it resizes: ``"nearest"`` or
-    /// ``"bilinear"`` (the default). ``EDGEFIRST_INTERPOLATION`` overrides it.
+    /// Set how ``convert`` resamples when it resizes, for converts whose
+    /// options do not choose their own (``ConvertOptions(interpolation=...)``):
+    /// ``"bilinear"`` (the default), ``"nearest"``, ``"bicubic"`` or
+    /// ``"area"``, an :class:`Interpolation`, or its integer code. Bicubic and
+    /// area are not implemented: they run bilinear, with a warning logged once
+    /// per mode. ``EDGEFIRST_INTERPOLATION`` overrides it.
     #[pyo3(signature = (mode))]
-    pub fn set_interpolation(&mut self, mode: &str) -> Result<()> {
-        let mode = parse_interpolation(mode)?;
+    pub fn set_interpolation(&mut self, mode: &Bound<'_, PyAny>) -> Result<()> {
+        let mode = interpolation_from_py(mode)?;
         self.0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
@@ -1971,6 +2034,31 @@ impl From<PyLetterboxPlacement> for image::LetterboxPlacement {
     }
 }
 
+/// How a source is fit into the destination.
+///
+/// - ``Stretch`` — scale each axis to fill the destination (identity for the
+///   full-square tiles the grid produces; the hot path).
+/// - ``Letterbox`` — preserve aspect ratio and pad the rest.
+#[pyclass(name = "Fit", eq, eq_int, from_py_object, module = "edgefirst.image")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyFit {
+    Stretch = 0,
+    Letterbox = 1,
+}
+
+const _: () = {
+    assert!(PyFit::Stretch as u32 == image::FitMode::Stretch.code());
+    assert!(PyFit::Letterbox as u32 == image::FitMode::Letterbox.code());
+};
+
+/// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
+#[pymethods]
+impl PyFit {
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
 /// A named convert normalization, `(x - mean) / std` on 0-255 values.
 #[pyclass(
     name = "NormalizationPreset",
@@ -2018,33 +2106,242 @@ impl From<PyNormalizationPreset> for image::NormalizationPreset {
     }
 }
 
-/// A normalization argument: a preset, a preset name, or `(mean, std)`.
-#[derive(FromPyObject)]
-pub enum NormalizationArg {
-    Preset(PyNormalizationPreset),
-    Name(String),
-    MeanStd(Vec<f32>, Vec<f32>),
+/// Resampling filter for resizing converts. ``Bicubic`` and ``Area``
+/// describe reference pipelines; the processor runs them as ``Bilinear``
+/// with a warning.
+#[pyclass(
+    name = "Interpolation",
+    eq,
+    eq_int,
+    from_py_object,
+    module = "edgefirst.image"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyInterpolation {
+    /// Bilinear with half-pixel centres (the default).
+    Bilinear = 0,
+    /// Nearest neighbour.
+    Nearest = 1,
+    /// Bicubic (runs as bilinear).
+    Bicubic = 2,
+    /// Pixel-area averaging (runs as bilinear).
+    Area = 3,
 }
 
-impl NormalizationArg {
+const _: () = {
+    use image::Interpolation as I;
+    assert!(PyInterpolation::Bilinear as u32 == I::Bilinear.code());
+    assert!(PyInterpolation::Nearest as u32 == I::Nearest.code());
+    assert!(PyInterpolation::Bicubic as u32 == I::Bicubic.code());
+    assert!(PyInterpolation::Area as u32 == I::Area.code());
+};
+
+/// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
+#[pymethods]
+impl PyInterpolation {
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
+/// The space a letterbox pad value is expressed in.
+#[pyclass(
+    name = "PadSpace",
+    eq,
+    eq_int,
+    from_py_object,
+    module = "edgefirst.image"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyPadSpace {
+    /// A 0-255 pixel value, normalized like the image (the default).
+    Pixel = 0,
+    /// A value written as-is into the normalized destination.
+    Normalized = 1,
+}
+
+const _: () = {
+    assert!(PyPadSpace::Pixel as u32 == image::PadSpace::Pixel.code());
+    assert!(PyPadSpace::Normalized as u32 == image::PadSpace::Normalized.code());
+};
+
+/// Single-package; see `PyEglDisplayKind`'s `__hash__` comment.
+#[pymethods]
+impl PyPadSpace {
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
+/// `e` as a Python `ValueError`.
+fn value_err(e: impl fmt::Display) -> Error {
+    Error::Py(pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// `e` as a Python `TypeError`.
+fn type_err(e: impl fmt::Display) -> Error {
+    Error::Py(pyo3::exceptions::PyTypeError::new_err(e.to_string()))
+}
+
+/// `obj.name`, which every preprocessing spec has.
+fn spec_attr<'py>(obj: &Bound<'py, PyAny>, name: &str) -> Result<Bound<'py, PyAny>> {
+    obj.getattr_opt(name)?.ok_or_else(|| {
+        let ty = obj
+            .get_type()
+            .name()
+            .map_or_else(|_| "?".to_string(), |n| n.to_string());
+        type_err(format!(
+            "a preprocessing spec needs a `{name}` attribute (as \
+             edgefirst.decoder.PreprocessSpec has); `{ty}` has none"
+        ))
+    })
+}
+
+/// A model input dimension: a positive integer.
+fn spec_dim(v: &Bound<'_, PyAny>) -> Result<usize> {
+    let bad = || value_err("spec size dimensions must be positive integers");
+    match v.extract::<usize>() {
+        Ok(0) => Err(bad()),
+        Ok(n) => Ok(n),
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyOverflowError>(v.py()) => Err(bad()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A preprocessing spec read from an `edgefirst.decoder.PreprocessSpec` or
+/// any object with its attributes: `normalization` (or `mean` and `std`),
+/// `fit`, `placement`, `pad`, `pad_space`, `interpolation` and `size`
+/// (`None` when unknown). A missing attribute is a `TypeError`.
+pub(crate) fn spec_from_py(obj: &Bound<'_, PyAny>) -> Result<image::PreprocessSpec> {
+    let mut spec = image::PreprocessSpec::new();
+    let normalization = obj.getattr_opt("normalization")?.filter(|v| !v.is_none());
+    spec.normalization = match normalization {
+        Some(v) => v
+            .extract::<NormalizationArg>()?
+            .resolve()
+            .map_err(|e| match e {
+                Error::Py(e) => Error::Py(e),
+                other => value_err(other),
+            })?,
+        None => {
+            let mean: Vec<f32> = spec_attr(obj, "mean")?.extract()?;
+            let std: Vec<f32> = spec_attr(obj, "std")?.extract()?;
+            image::Normalization::mean_std(&mean, &std).map_err(value_err)?
+        }
+    };
+    spec.fit = fit_from_py(&spec_attr(obj, "fit")?)?;
+    spec.placement = placement_from_py(&spec_attr(obj, "placement")?)?;
+    spec.pad = match spec_attr(obj, "pad")?.extract::<Vec<f32>>()?[..] {
+        [x] => [x; 3],
+        [r, g, b] => [r, g, b],
+        ref other => {
+            return Err(value_err(format!(
+                "spec pad needs 1 or 3 values, got {}",
+                other.len()
+            )))
+        }
+    };
+    spec.pad_space = pad_space_from_py(&spec_attr(obj, "pad_space")?)?;
+    spec.interpolation = interpolation_from_py(&spec_attr(obj, "interpolation")?)?;
+    let size = spec_attr(obj, "size")?;
+    spec.size = if size.is_none() {
+        None
+    } else {
+        let (w, h): (Bound<'_, PyAny>, Bound<'_, PyAny>) = size.extract()?;
+        Some((spec_dim(&w)?, spec_dim(&h)?))
+    };
+    Ok(spec)
+}
+
+/// Where the image content sits in a convert destination: in pixels and
+/// normalized by the destination size. Returned by
+/// :meth:`ConvertOptions.content_region`; pass it as ``content_region=`` to
+/// the drawing methods or ``edgefirst.decoder.Decoder.decode_semantic``.
+#[pyclass(
+    name = "ContentRegion",
+    frozen,
+    eq,
+    from_py_object,
+    module = "edgefirst.image"
+)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PyContentRegion(pub(crate) image::ContentRegion);
+
+#[pymethods]
+impl PyContentRegion {
+    /// Left edge in destination pixels.
+    #[getter]
+    fn x(&self) -> usize {
+        self.0.pixels.x
+    }
+
+    /// Top edge in destination pixels.
+    #[getter]
+    fn y(&self) -> usize {
+        self.0.pixels.y
+    }
+
+    /// Width in destination pixels.
+    #[getter]
+    fn width(&self) -> usize {
+        self.0.pixels.width
+    }
+
+    /// Height in destination pixels.
+    #[getter]
+    fn height(&self) -> usize {
+        self.0.pixels.height
+    }
+
+    /// The rectangle in destination pixels as a :class:`Region`.
+    #[getter]
+    fn pixels(&self) -> PyRegion {
+        let r = self.0.pixels;
+        PyRegion {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        }
+    }
+
+    /// ``(xmin, ymin, xmax, ymax)`` normalized by the destination size.
+    #[getter]
+    fn normalized(&self) -> (f32, f32, f32, f32) {
+        let [a, b, c, d] = self.0.normalized;
+        (a, b, c, d)
+    }
+
+    /// Whether the content fills the destination (a stretch).
+    #[getter]
+    fn is_full(&self) -> bool {
+        self.0.is_full()
+    }
+
+    fn __repr__(&self) -> String {
+        let r = self.0.pixels;
+        format!(
+            "ContentRegion(x={}, y={}, width={}, height={}, normalized={:?})",
+            r.x, r.y, r.width, r.height, self.0.normalized
+        )
+    }
+}
+
+/// A normalization argument: `(mean, std)`, or a preset as a
+/// `NormalizationPreset` member, its name or its integer code.
+#[derive(FromPyObject)]
+pub enum NormalizationArg<'py> {
+    MeanStd(Vec<f32>, Vec<f32>),
+    Preset(Bound<'py, PyAny>),
+}
+
+impl NormalizationArg<'_> {
     fn resolve(self) -> Result<image::Normalization> {
         match self {
-            NormalizationArg::Preset(p) => Ok(image::NormalizationPreset::from(p).into()),
-            NormalizationArg::Name(name) => image::NormalizationPreset::from_str_code(&name)
-                .map(Into::into)
-                .ok_or_else(|| {
-                    let names: Vec<&str> = image::NormalizationPreset::all()
-                        .iter()
-                        .map(|p| p.as_str())
-                        .collect();
-                    Error::InvalidArg(format!(
-                        "unknown normalization `{name}`, expected one of: {}",
-                        names.join(", ")
-                    ))
-                }),
             NormalizationArg::MeanStd(mean, std) => {
                 Ok(image::Normalization::mean_std(&mean, &std)?)
             }
+            NormalizationArg::Preset(p) => Ok(preset_from_py(&p)?.into()),
         }
     }
 }
@@ -2068,26 +2365,31 @@ pub struct PyConvertOptions(pub image::ConvertOptions);
 impl PyConvertOptions {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (rotation = None, flip = None, source = None, letterbox = None, placement = None, pad_output = None, normalization = None))]
+    #[pyo3(signature = (rotation = None, flip = None, source = None, letterbox = None, placement = None, pad_output = None, normalization = None, interpolation = None))]
     fn new(
         rotation: Option<PyRotation>,
         flip: Option<PyFlip>,
         source: Option<PyRegion>,
         letterbox: Option<[u8; 4]>,
-        placement: Option<PyLetterboxPlacement>,
+        placement: Option<&Bound<'_, PyAny>>,
         pad_output: Option<[f32; 4]>,
-        normalization: Option<NormalizationArg>,
+        normalization: Option<NormalizationArg<'_>>,
+        interpolation: Option<&Bound<'_, PyAny>>,
     ) -> Result<Self> {
-        Ok(Self(resolve_convert_options(
+        let options = resolve_convert_options(
             None,
             rotation,
             flip,
             source,
             letterbox,
-            placement,
+            placement.map(placement_from_py).transpose()?,
             pad_output,
             normalization,
-        )?))
+        )?;
+        Ok(Self(match interpolation {
+            Some(mode) => options.interpolation(interpolation_from_py(mode)?),
+            None => options,
+        }))
     }
 
     /// Rotate the output, in 90° steps.
@@ -2111,9 +2413,10 @@ impl PyConvertOptions {
         Self(self.0.letterbox(pad))
     }
 
-    /// Where a letterboxed image sits.
-    fn placement(&self, placement: PyLetterboxPlacement) -> Self {
-        Self(self.0.placement(placement.into()))
+    /// Where a letterboxed image sits: a `LetterboxPlacement`, its name
+    /// (``"center"``, ``"top_left"``) or its integer code.
+    fn placement(&self, placement: &Bound<'_, PyAny>) -> Result<Self> {
+        Ok(Self(self.0.placement(placement_from_py(placement)?)))
     }
 
     /// Pad with these values as written to the destination, after
@@ -2123,9 +2426,69 @@ impl PyConvertOptions {
     }
 
     /// How pixel values map to the destination: a `NormalizationPreset`, a
-    /// preset name, or `(mean, std)` with one or three values each.
-    fn normalization(&self, normalization: NormalizationArg) -> Result<Self> {
+    /// preset name or code, or `(mean, std)` with one or three values each.
+    fn normalization(&self, normalization: NormalizationArg<'_>) -> Result<Self> {
         Ok(Self(self.0.normalization(normalization.resolve()?)))
+    }
+
+    /// Resample with this interpolation when the convert resizes, instead of
+    /// the processor's: an `Interpolation`, its name or its integer code.
+    /// Bicubic and area run as bilinear.
+    fn interpolation(&self, interpolation: &Bound<'_, PyAny>) -> Result<Self> {
+        Ok(Self(
+            self.0.interpolation(interpolation_from_py(interpolation)?),
+        ))
+    }
+
+    /// Options that apply a model's preprocessing: normalization, fit,
+    /// letterbox placement, pad and interpolation. ``spec`` is an
+    /// ``edgefirst.decoder.PreprocessSpec`` (e.g. from
+    /// ``ResolvedModelConfig.preprocessing``) or any object with all of
+    /// its attributes: ``normalization`` (or ``mean`` and ``std``), ``fit``,
+    /// ``placement``, ``pad``, ``pad_space``, ``interpolation`` and ``size``.
+    ///
+    /// Raises:
+    ///     TypeError: ``spec`` lacks one of the attributes, or one has the
+    ///         wrong type.
+    ///     ValueError: A pixel-space pad outside 0-255, a non-finite pad, an
+    ///         unknown name, or a size that is not positive.
+    #[staticmethod]
+    fn from_spec(spec: &Bound<'_, PyAny>) -> Result<Self> {
+        Self::default().with_spec(spec)
+    }
+
+    /// These options with a model's preprocessing applied (see
+    /// :meth:`from_spec`); rotation, flip and the source crop are kept.
+    fn with_spec(&self, spec: &Bound<'_, PyAny>) -> Result<Self> {
+        let spec = spec_from_py(spec)?;
+        Ok(Self(self.0.with_spec(&spec).map_err(value_err)?))
+    }
+
+    /// Where ``convert`` puts the image content when converting a
+    /// ``src_w``×``src_h`` source into a ``dst_w``×``dst_h`` destination
+    /// with these options: the letterbox rectangle, or the whole destination
+    /// for a stretch. Computed by the code the convert paints with.
+    ///
+    /// Raises:
+    ///     ValueError: A zero size, or the source crop falls outside the
+    ///         source.
+    fn content_region(
+        &self,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> Result<PyContentRegion> {
+        if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            return Err(value_err(format!(
+                "content_region sizes must be non-zero, got source \
+                 {src_w}x{src_h} and destination {dst_w}x{dst_h}"
+            )));
+        }
+        self.0
+            .content_region(src_w, src_h, dst_w, dst_h)
+            .map(PyContentRegion)
+            .map_err(value_err)
     }
 
     fn __repr__(&self) -> String {
@@ -2141,9 +2504,9 @@ pub(crate) fn resolve_convert_options(
     flip: Option<PyFlip>,
     source: Option<PyRegion>,
     letterbox: Option<[u8; 4]>,
-    placement: Option<PyLetterboxPlacement>,
+    placement: Option<image::LetterboxPlacement>,
     pad_output: Option<[f32; 4]>,
-    normalization: Option<NormalizationArg>,
+    normalization: Option<NormalizationArg<'_>>,
 ) -> Result<image::ConvertOptions> {
     let mut o = options.map(|o| o.0).unwrap_or_default();
     if let Some(r) = rotation {
@@ -2159,7 +2522,7 @@ pub(crate) fn resolve_convert_options(
         o = o.letterbox(pad);
     }
     if let Some(p) = placement {
-        o = o.placement(p.into());
+        o = o.placement(p);
     }
     if let Some(pad) = pad_output {
         o = o.pad_output(pad);
@@ -2226,8 +2589,8 @@ impl From<PyColorMode> for image::ColorMode {
 ///   caller-specified pixel resolution, produced by upsampling the full
 ///   proto plane once (correct edge-clamp bilinear) and cropping by bbox.
 ///   Mask values are binary ``uint8 {0, 255}``.
-///   Both modes use ``> 127`` as the threshold convention. If a ``letterbox``
-///   is also passed to ``materialize_masks``, ``(width, height)`` are
+///   Both modes use ``> 127`` as the threshold convention. If a
+///   ``content_region`` is also passed to ``materialize_masks``, ``(width, height)`` are
 ///   interpreted as original-content pixel dims and the inverse letterbox
 ///   transform is applied during the upsample.
 #[pyclass(name = "MaskResolution", from_py_object, module = "edgefirst.image")]

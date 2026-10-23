@@ -94,6 +94,7 @@ pub mod lens;
 mod mem;
 mod pbo;
 pub mod pin;
+mod preprocess;
 pub mod protocol;
 // `static`-only, same reasoning as `mem` above: `ShmTensor` backs
 // `TensorStorage::Shm`, `impl<T> Tensor<T>` only.
@@ -162,6 +163,12 @@ pub use cuda::{
 };
 pub use detect::{unletter_norm, BoundingBox, DetectBox, ProtoData, ProtoLayout, Segmentation};
 pub use error::{Error, Result};
+pub use preprocess::{
+    broadcast_rgb, fit_code, interpolation_code, letterbox_placement_code, letterbox_rect,
+    normalization_code, pad_space_code, ContentRegion, ContentRegionSource, Fit, FitMode,
+    Interpolation, LetterboxPlacement, Normalization, NormalizationPreset, PadSpace,
+    PreprocessSpec,
+};
 // Static-backend-implementation code: backs `tensor-capi`'s own
 // `ef_tensor_export`/`ef_tensor_import` (the static cdylib's `TensorDyn`
 // serialization), the one caller in the whole workspace. It calls

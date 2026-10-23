@@ -21,10 +21,16 @@ crates/decoder/
 │   │       └── level_box.rs / level_score.rs / level_mc.rs
 │   ├── tiling.rs                       # SAHI lift/merge unit + doc-tests
 │   ├── schema.rs                       # SchemaV2 round-trip + fixture tests
-│   └── infer.rs                        # Ultralytics schema inference:
+│   ├── infer.rs                        # Ultralytics schema inference:
 │                                       #   metadata parsing, layout rules,
 │                                       #   and per-fixture expectations over
 │                                       #   testdata/infer/*.signals.json
+│   └── model_config/                   # Config discovery: ONNX/ZIP readers
+│                                       #   (hand-built and adversarial
+│                                       #   containers), HF configs from
+│                                       #   testdata/hf/, override
+│                                       #   grammar round-trips, precedence,
+│                                       #   heuristics and describe() lines
 ├── tests/                              # Cross-cutting integration suites
 │   ├── decoder_capacity.rs
 │   ├── decoder_decode_vs_proto_parity.rs

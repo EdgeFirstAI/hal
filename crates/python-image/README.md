@@ -67,7 +67,10 @@ Use `create_image()` rather than allocating tensors yourself: it supplies DMA-BU
 | `ImageProcessor` | The engine; owns the GPU context and caches |
 | `create_image()` | Allocate a GPU-backed, pitch-aligned image tensor |
 | `convert()` | Colour conversion, resize, letterbox, rotation, crop in one pass |
-| `Normalization`, `ColorMode` | Model input scaling and channel order |
+| `NormalizationPreset`, `ColorMode` | Model input scaling and channel order |
+| `ConvertOptions.from_spec()` | Apply a model's preprocessing spec, interpolation included (e.g. `edgefirst.decoder.ResolvedModelConfig.preprocessing`) |
+| `ConvertOptions.content_region()`, `ContentRegion` | Where a convert puts the image content, for mapping results back (`content_region=`) |
+| `Interpolation`, `PadSpace` | Resampling filter (per convert with `ConvertOptions(interpolation=...)`, else the processor's) and letterbox pad space |
 | `Flip`, `Rotation`, `Fit` | Geometry controls |
 | `TilingConfig`, `TileSpec`, `tile_grid()` | Tiled (SAHI) inference layout. Merge (`TiledFrameAccumulator`, `lift_tile_boxes`) lives on `edgefirst-decoder`. |
 | `MaskResolution`, drawing APIs | Segmentation mask and bounding box annotation |

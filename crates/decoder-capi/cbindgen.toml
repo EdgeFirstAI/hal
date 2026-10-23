@@ -120,8 +120,9 @@ prefix = ""
 # get declared.
 # The option vocabularies are not reachable from any signature (the
 # functions and fields take `uint32_t`), so they are named here.
-include = ["EfNms", "EfDecoderType", "EfDecodeMode", "EfDecoderVersion", "EfOutputType", "EfDimName", "EfMatchMetric", "EfMergeMode", "EfModelSource"]
-exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderParams", "EfSegmentationList", "EfDetectBox", "EfSegmentation", "EfMergeConfig", "TilePlacement", "EfTilePlacement", "EfProtoData", "EfDecoderTracker", "EfDecoderTrackList"]
+include = ["EfNms", "EfDecoderType", "EfDecodeMode", "EfDecoderVersion", "EfOutputType", "EfDimName", "EfMatchMetric", "EfMergeMode", "EfModelSource", "EfConfigSource", "EfModelFamily", "EfModelTask", "EfConfigField"]
+# The preprocessing vocabulary is declared in detect.h, shared with image.h.
+exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderParams", "EfSegmentationList", "EfDetectBox", "EfSegmentation", "EfMergeConfig", "TilePlacement", "EfTilePlacement", "EfProtoData", "EfDecoderTracker", "EfDecoderTrackList", "EfPreprocessSpec", "EfFit", "EfLetterboxPlacement", "EfPadSpace", "EfInterpolation"]
 
 
 [export.rename]
@@ -151,6 +152,13 @@ exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDecoder", "EfDecoderP
 "EfModelSource" = "ef_model_source"
 "EfDecodeMode" = "ef_decode_mode"
 "EfSemanticOptions" = "ef_semantic_options"
+"EfModelOverrides" = "ef_model_overrides"
+"EfModelConfig" = "ef_model_config"
+"EfPreprocessSpec" = "ef_preprocess_spec"
+"EfConfigSource" = "ef_config_source"
+"EfModelFamily" = "ef_model_family"
+"EfModelTask" = "ef_model_task"
+"EfConfigField" = "ef_config_field"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

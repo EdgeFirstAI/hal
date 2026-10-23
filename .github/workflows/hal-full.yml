@@ -151,7 +151,7 @@ jobs:
         run: |
           # No source here: cargo llvm-cov manages its own environment.
           # --exclude the python-* crates: they are built and measured as wheels above.
-          cargo llvm-cov nextest --cargo-profile profiling --features default --workspace \
+          cargo llvm-cov nextest --cargo-profile profiling --features default,edgefirst-decoder/model-files --workspace \
             --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common \
             --no-report -j 1 \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
@@ -352,7 +352,7 @@ jobs:
         run: |
           cargo llvm-cov clean --workspace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo llvm-cov nextest --no-report --workspace --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+          cargo llvm-cov nextest --no-report --features edgefirst-decoder/model-files --workspace --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Audit test warnings
         if: always()

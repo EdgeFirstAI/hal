@@ -191,7 +191,7 @@ impl Default for MergeConfig {
 /// let placement = TilePlacement {
 ///     index: 0, count: 1,
 ///     origin: (100.0, 200.0), crop_size: (640.0, 640.0),
-///     letterbox: None, frame_dims: (3840.0, 2160.0),
+///     content_region: None, frame_dims: (3840.0, 2160.0),
 /// };
 /// let tile_local = DetectBox { bbox: BoundingBox::new(0.0, 0.0, 1.0, 1.0), score: 0.9, label: 0 };
 /// let lifted = lift_tile_boxes(vec![tile_local], &placement);
@@ -203,7 +203,7 @@ pub fn lift_tile_boxes(mut boxes: Vec<DetectBox>, placement: &TilePlacement) -> 
     let (ox, oy) = placement.origin;
     let (cw, ch) = placement.crop_size;
     for d in &mut boxes {
-        let n = match placement.letterbox {
+        let n = match placement.content_region {
             Some(lb) => unletter_norm(d.bbox, lb),
             None => d.bbox,
         };
@@ -510,7 +510,7 @@ mod tests {
             count: 1,
             origin,
             crop_size: crop,
-            letterbox: None,
+            content_region: None,
             frame_dims: (3840.0, 2160.0),
         }
     }
@@ -534,7 +534,7 @@ mod tests {
         // A box filling the letterbox content region should, after un-padding,
         // fill the crop and lift identically to the no-letterbox full-crop box.
         let mut p = placement((0.0, 0.0), (640.0, 640.0));
-        p.letterbox = Some([0.1, 0.1, 0.9, 0.9]);
+        p.content_region = Some([0.1, 0.1, 0.9, 0.9]);
         let lifted = lift_tile_boxes(vec![det([0.1, 0.1, 0.9, 0.9], 0.9, 0)], &p);
         let b = lifted[0].bbox;
         assert!((b.xmin - 0.0).abs() < 1e-3);
@@ -558,7 +558,7 @@ mod tests {
             count: 1,
             origin: (100.0, 200.0),
             crop_size: (640.0, 640.0),
-            letterbox: Some([0.1, 0.1, 0.9, 0.9]),
+            content_region: Some([0.1, 0.1, 0.9, 0.9]),
             frame_dims: (1920.0, 1080.0),
         };
         // Full-frame target [228,328,420,520] -> crop-normalized (subtract origin,
@@ -597,7 +597,7 @@ mod tests {
             count: 1,
             origin: (0.0, 0.0),
             crop_size: (640.0, 640.0),
-            letterbox: Some([0.1, 0.1, 0.9, 0.9]),
+            content_region: Some([0.1, 0.1, 0.9, 0.9]),
             frame_dims: (640.0, 640.0),
         };
         // Box at the very top-left, outside [0.1,0.1] content origin.
@@ -607,7 +607,7 @@ mod tests {
 
         // Degenerate letterbox (lx0 == lx1): unit scale, finite result.
         let pd = TilePlacement {
-            letterbox: Some([0.5, 0.1, 0.5, 0.9]),
+            content_region: Some([0.5, 0.1, 0.5, 0.9]),
             ..p
         };
         let out = lift_tile_boxes(vec![det([0.2, 0.2, 0.8, 0.8], 0.9, 0)], &pd);
@@ -873,7 +873,7 @@ mod tests {
             count,
             origin: (0.0, 0.0),
             crop_size: (640.0, 640.0),
-            letterbox: None,
+            content_region: None,
             frame_dims: (640.0, 640.0),
         }
     }
@@ -932,7 +932,7 @@ mod tests {
             count: 2,
             origin: (0.0, 0.0),
             crop_size: (640.0, 640.0),
-            letterbox: None,
+            content_region: None,
             frame_dims: frame,
         };
         let p1 = TilePlacement {
@@ -940,7 +940,7 @@ mod tests {
             count: 2,
             origin: (640.0, 0.0),
             crop_size: (640.0, 640.0),
-            letterbox: None,
+            content_region: None,
             frame_dims: frame,
         };
         let t0 = vec![det([0.9, 0.4, 1.0, 0.6], 0.8, 0)];
@@ -972,7 +972,7 @@ mod tests {
             count: 1,
             origin: (100.0, 50.0),
             crop_size: (640.0, 640.0),
-            letterbox: None,
+            content_region: None,
             frame_dims: frame,
         };
         let boxes = vec![det([0.1, 0.1, 0.4, 0.4], 0.9, 0)];
@@ -1010,7 +1010,7 @@ mod tests {
                 count: 1,
                 origin: (0.0, 0.0),
                 crop_size: (640.0, 640.0),
-                letterbox: None,
+                content_region: None,
                 frame_dims: frame,
             };
             let mut acc = TiledFrameAccumulator::new(frame, 1, cfg, 8);
@@ -1042,7 +1042,7 @@ mod tests {
             count: 2,
             origin: (0.0, 0.0),
             crop_size: (640.0, 640.0),
-            letterbox: None,
+            content_region: None,
             frame_dims: (640.0, 640.0),
         };
         let p1 = TilePlacement { index: 1, ..p0 };

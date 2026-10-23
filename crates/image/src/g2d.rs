@@ -451,7 +451,11 @@ impl ImageProcessorTrait for G2DProcessor {
                 "G2D does not normalize or quantize; GL or CPU maps the output".into(),
             ));
         }
-        if self.interpolation == crate::Interpolation::Nearest
+        if options
+            .get_interpolation()
+            .unwrap_or(self.interpolation)
+            .supported()
+            == crate::Interpolation::Nearest
             && crop.resizes(
                 (src.width().unwrap_or(0), src.height().unwrap_or(0)),
                 (dst.width().unwrap_or(0), dst.height().unwrap_or(0)),

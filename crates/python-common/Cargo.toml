@@ -47,7 +47,8 @@ edgefirst-codec = { workspace = true, optional = true, default-features = false,
 edgefirst-image = { workspace = true, optional = true, default-features = false, features = [
     "opengl",
 ] }
-edgefirst-decoder = { workspace = true, optional = true, default-features = false }
+# `model-files` reads model configs from ZIP trailers (TFLite associated files).
+edgefirst-decoder = { workspace = true, optional = true, default-features = false, features = ["model-files"] }
 edgefirst-decoder-abi = { workspace = true, optional = true }
 edgefirst-tracker = { workspace = true, optional = true, default-features = false }
 env_logger = { workspace = true }

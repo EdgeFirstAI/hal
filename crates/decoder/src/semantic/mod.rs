@@ -34,7 +34,7 @@
 //! let mut class_map = TensorDyn::new(&[480, 640], DType::U8, Some(TensorMemory::Mem), None)?;
 //! let options = SemanticOptions::new()
 //!     .with_mode(DecodeMode::Fast)
-//!     .with_letterbox([0.0, 0.0, 1.0, 0.75]);
+//!     .with_content_region([0.0, 0.0, 1.0, 0.75]);
 //! decode_semantic(&logits, &config, &mut class_map, None, &options)?;
 //! # Ok(())
 //! # }
@@ -535,11 +535,11 @@ pub struct SemanticOptions {
     /// `[xmin, ymin, xmax, ymax]`, as produced by a letterbox resize. The
     /// region is cropped and stretched over the whole class map. `None`
     /// means the image fills the input.
-    pub letterbox: Option<[f32; 4]>,
+    pub content_region: Option<[f32; 4]>,
 }
 
 impl SemanticOptions {
-    /// Default options: the model's decode mode, no letterbox.
+    /// Default options: the model's decode mode, the image filling the input.
     pub fn new() -> Self {
         Self::default()
     }
@@ -550,10 +550,41 @@ impl SemanticOptions {
         self
     }
 
-    /// Sets the letterbox content region.
-    pub fn with_letterbox(mut self, letterbox: [f32; 4]) -> Self {
-        self.letterbox = Some(letterbox);
+    /// Sets the content region: where the image sits in the model input.
+    pub fn with_content_region(mut self, region: [f32; 4]) -> Self {
+        self.content_region = Some(region);
         self
+    }
+
+    /// Sets the content region from the options of the convert that
+    /// prepared the model input, so the class map uses exactly the geometry
+    /// the convert painted. `src` is the source image and `dst` the model
+    /// input, each `(width, height)`. A stretch leaves the region unset.
+    ///
+    /// # Errors
+    ///
+    /// [`DecoderError::InvalidConfig`] when the convert geometry does not
+    /// resolve.
+    ///
+    /// ```
+    /// use edgefirst_decoder::semantic::SemanticOptions;
+    /// use edgefirst_tensor::PreprocessSpec;
+    ///
+    /// let options = SemanticOptions::new().with_convert(&PreprocessSpec::new(), (1280, 720), (640, 640))?;
+    /// assert_eq!(options.content_region, Some([0.0, 0.21875, 1.0, 0.78125]));
+    /// # Ok::<(), edgefirst_decoder::DecoderError>(())
+    /// ```
+    pub fn with_convert(
+        mut self,
+        convert: &impl edgefirst_tensor::ContentRegionSource,
+        src: (usize, usize),
+        dst: (usize, usize),
+    ) -> DecoderResult<Self> {
+        let region = convert
+            .content_region(src.0, src.1, dst.0, dst.1)
+            .map_err(|e| DecoderError::InvalidConfig(format!("content region: {e}")))?;
+        self.content_region = region.letterboxed();
+        Ok(self)
     }
 }
 
@@ -715,12 +746,12 @@ impl Geometry {
         out_h: usize,
         out_w: usize,
     ) -> DecoderResult<Self> {
-        let [x0, y0, x1, y1] = options.letterbox.unwrap_or([0.0, 0.0, 1.0, 1.0]);
+        let [x0, y0, x1, y1] = options.content_region.unwrap_or([0.0, 0.0, 1.0, 1.0]);
         let valid =
             |a: f32, b: f32| a.is_finite() && b.is_finite() && 0.0 <= a && a < b && b <= 1.0;
         if !valid(x0, x1) || !valid(y0, y1) {
             return Err(DecoderError::InvalidConfig(format!(
-                "letterbox {:?} must satisfy 0 <= min < max <= 1",
+                "content region {:?} must satisfy 0 <= min < max <= 1",
                 [x0, y0, x1, y1]
             )));
         }

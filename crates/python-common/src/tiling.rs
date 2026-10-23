@@ -4,46 +4,18 @@
 //! Input-side tiling: grid geometry and config (`edgefirst_image`).
 //! Cross-tile merge / lift / accumulator live on `edgefirst.decoder`.
 
-use crate::image::Result;
+use crate::image::{PyConvertOptions, Result};
 use crate::tensor::PyRegion;
-use edgefirst_image::{tile_grid, Fit, FitMode, TilePlacement, TileSpec, TilingConfig};
+use edgefirst_image::{tile_grid, TilePlacement, TileSpec, TilingConfig};
 use pyo3::prelude::*;
 
-/// How a tile crop is fit into the model input.
-///
-/// - ``Stretch`` — stretch the crop to fill the model input (identity for the
-///   full-square tiles the grid produces; the hot path).
-/// - ``Letterbox`` — preserve aspect ratio and pad with the
-///   :class:`TilingConfig` ``pad`` colour.
-#[pyclass(name = "Fit", eq, eq_int, from_py_object, module = "edgefirst.image")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyFit {
-    Stretch = 0,
-    Letterbox = 1,
-}
-
-const _: () = {
-    assert!(PyFit::Stretch as u32 == FitMode::Stretch.code());
-    assert!(PyFit::Letterbox as u32 == FitMode::Letterbox.code());
-};
-
-impl From<PyFit> for FitMode {
-    fn from(val: PyFit) -> Self {
-        match val {
-            PyFit::Stretch => FitMode::Stretch,
-            PyFit::Letterbox => FitMode::Letterbox,
-        }
-    }
-}
-
-#[pymethods]
-impl PyFit {
-    fn __hash__(&self) -> isize {
-        *self as isize
-    }
-}
-
 /// Static tiling configuration for one model. Independent of frame size.
+///
+/// ``options`` is the :class:`ConvertOptions` every tile is converted with
+/// (fit, letterbox placement and pad, normalization, interpolation), e.g.
+/// from :meth:`ConvertOptions.from_spec`; each tile replaces the source crop
+/// with its own. Options that rotate or flip are refused when tiles are
+/// planned. The default stretches each tile with the default pixel mapping.
 #[pyclass(name = "TilingConfig", from_py_object, module = "edgefirst.image")]
 #[derive(Debug, Clone, Copy)]
 pub struct PyTilingConfig(pub(crate) TilingConfig);
@@ -51,22 +23,17 @@ pub struct PyTilingConfig(pub(crate) TilingConfig);
 #[pymethods]
 impl PyTilingConfig {
     #[new]
-    #[pyo3(signature = (tile_w, tile_h, overlap = 0.2, fit = PyFit::Stretch, pad = (114, 114, 114, 255)))]
+    #[pyo3(signature = (tile_w, tile_h, overlap = 0.2, options = None))]
     pub fn new(
         tile_w: usize,
         tile_h: usize,
         overlap: f32,
-        fit: PyFit,
-        pad: (u8, u8, u8, u8),
+        options: Option<PyConvertOptions>,
     ) -> Self {
-        let pad = [pad.0, pad.1, pad.2, pad.3];
-        let fit = Fit::from_mode(fit.into(), pad);
-        let cfg = TilingConfig {
-            pad,
-            ..TilingConfig::new(tile_w, tile_h)
-                .with_overlap(overlap)
-                .with_fit(fit)
-        };
+        let mut cfg = TilingConfig::new(tile_w, tile_h).with_overlap(overlap);
+        if let Some(o) = options {
+            cfg = cfg.with_options(o.0);
+        }
         PyTilingConfig(cfg)
     }
 
@@ -75,13 +42,9 @@ impl PyTilingConfig {
         PyTilingConfig(self.0.with_overlap(overlap))
     }
 
-    /// Set the fit mode (chainable). ``Fit.Letterbox`` uses the configured pad.
-    pub fn with_fit(&self, fit: PyFit) -> Self {
-        let fit = match fit {
-            PyFit::Stretch => Fit::Stretch,
-            PyFit::Letterbox => Fit::Letterbox { pad: self.0.pad },
-        };
-        PyTilingConfig(self.0.with_fit(fit))
+    /// Set the options every tile is converted with (chainable).
+    pub fn with_options(&self, options: PyConvertOptions) -> Self {
+        PyTilingConfig(self.0.with_options(options.0))
     }
 
     #[getter]
@@ -99,28 +62,19 @@ impl PyTilingConfig {
         self.0.overlap_ratio
     }
 
+    /// The options every tile is converted with.
     #[getter]
-    fn fit(&self) -> PyFit {
-        match self.0.fit {
-            Fit::Stretch => PyFit::Stretch,
-            Fit::Letterbox { .. } => PyFit::Letterbox,
-        }
-    }
-
-    #[getter]
-    fn pad(&self) -> (u8, u8, u8, u8) {
-        let [r, g, b, a] = self.0.pad;
-        (r, g, b, a)
+    fn options(&self) -> PyConvertOptions {
+        PyConvertOptions(self.0.options())
     }
 
     fn __repr__(&self) -> String {
-        let fit = match self.0.fit {
-            Fit::Stretch => "Fit.Stretch",
-            Fit::Letterbox { .. } => "Fit.Letterbox",
-        };
         format!(
-            "TilingConfig(tile_w={}, tile_h={}, overlap={}, fit={fit})",
-            self.0.tile_w, self.0.tile_h, self.0.overlap_ratio
+            "TilingConfig(tile_w={}, tile_h={}, overlap={}, options={:?})",
+            self.0.tile_w,
+            self.0.tile_h,
+            self.0.overlap_ratio,
+            self.0.options()
         )
     }
 }
@@ -177,7 +131,9 @@ impl PyTileSpec {
 
 /// How one tile was cut from the full frame and fed to the model. Produced by
 /// the tiling grid; consumed by :func:`edgefirst.decoder.lift_tile_boxes`.
-/// All fields are full-frame **pixels** except ``letterbox``.
+/// All fields are full-frame **pixels** except ``content_region``, the
+/// normalized ``(xmin, ymin, xmax, ymax)`` image content of a letterboxed
+/// tile on the model input (``None`` when the tile was stretched).
 #[pyclass(name = "TilePlacement", from_py_object, module = "edgefirst.image")]
 #[derive(Debug, Clone, Copy)]
 pub struct PyTilePlacement(pub(crate) TilePlacement);
@@ -185,21 +141,21 @@ pub struct PyTilePlacement(pub(crate) TilePlacement);
 #[pymethods]
 impl PyTilePlacement {
     #[new]
-    #[pyo3(signature = (index, count, origin, crop_size, frame_dims, letterbox = None))]
+    #[pyo3(signature = (index, count, origin, crop_size, frame_dims, content_region = None))]
     pub fn new(
         index: usize,
         count: usize,
         origin: (f32, f32),
         crop_size: (f32, f32),
         frame_dims: (f32, f32),
-        letterbox: Option<[f32; 4]>,
+        content_region: Option<crate::content_region::ContentRegionArg>,
     ) -> Self {
         PyTilePlacement(TilePlacement {
             index,
             count,
             origin,
             crop_size,
-            letterbox,
+            content_region: crate::content_region::normalized(content_region),
             frame_dims,
         })
     }
@@ -225,8 +181,8 @@ impl PyTilePlacement {
     }
 
     #[getter]
-    fn letterbox(&self) -> Option<(f32, f32, f32, f32)> {
-        self.0.letterbox.map(|[a, b, c, d]| (a, b, c, d))
+    fn content_region(&self) -> Option<(f32, f32, f32, f32)> {
+        self.0.content_region.map(|[a, b, c, d]| (a, b, c, d))
     }
 
     #[getter]
@@ -236,8 +192,8 @@ impl PyTilePlacement {
 
     fn __repr__(&self) -> String {
         format!(
-            "TilePlacement(index={}, count={}, origin={:?}, crop_size={:?}, letterbox={:?}, frame_dims={:?})",
-            self.0.index, self.0.count, self.0.origin, self.0.crop_size, self.0.letterbox, self.0.frame_dims,
+            "TilePlacement(index={}, count={}, origin={:?}, crop_size={:?}, content_region={:?}, frame_dims={:?})",
+            self.0.index, self.0.count, self.0.origin, self.0.crop_size, self.0.content_region, self.0.frame_dims,
         )
     }
 
@@ -262,7 +218,7 @@ impl PyTilePlacement {
             self.0.origin,
             self.0.crop_size,
             self.0.frame_dims,
-            self.0.letterbox,
+            self.0.content_region,
         )
     }
 }

@@ -7,11 +7,18 @@
  * scripts/check-headers.sh compiles and runs exactly this file per modular
  * library, so it is the only lane that proves the exported symbols resolve
  * at runtime from a real C consumer -- the Rust `#[cfg(test)]` tests in
- * src/infer.rs call the same functions, but statically, within the crate. */
+ * src/infer.rs call the same functions, but statically, within the crate.
+ *
+ * Run from the repository root: the model-config case reads
+ * testdata/hf/segformer-512. */
+#define _POSIX_C_SOURCE 200809L
 #include <edgefirst/decoder.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Ultralytics schema inference, end to end: accumulate the signals an
  * inference runtime would report, infer a schema, and build a real decoder
@@ -108,9 +115,109 @@ static int infer_reports_failure(void) {
     return 0;
 }
 
+/* Copy `name` from the SegFormer fixture into `dir`. */
+static int copy_fixture(const char *dir, const char *name) {
+    char src[512], dst[512];
+    snprintf(src, sizeof src, "testdata/hf/segformer-512/%s", name);
+    snprintf(dst, sizeof dst, "%s/%s", dir, name);
+    FILE *in = fopen(src, "rb");
+    if (!in) { fprintf(stderr, "FAIL: cannot open %s (run from the repo root)\n", src); return 1; }
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); fprintf(stderr, "FAIL: cannot create %s\n", dst); return 1; }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+    fclose(in);
+    return fclose(out) != 0;
+}
+
+/* Model configuration discovery: a model with Hugging Face configs beside it
+ * resolves to a semantic schema and a preprocessing spec the image library
+ * takes as-is (ef_convert_options_from_spec). */
+static int model_config_round_trip(void) {
+    const char *tmp = getenv("TMPDIR");
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/ef_model_config_XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    if (!mkdtemp(dir)) { fprintf(stderr, "FAIL: mkdtemp\n"); return 1; }
+    char model[600];
+    snprintf(model, sizeof model, "%s/model.bin", dir);
+    int rc = copy_fixture(dir, "config.json") || copy_fixture(dir, "preprocessor_config.json");
+    FILE *f = fopen(model, "wb");
+    if (f) { fputs("model bytes", f); fclose(f); } else { rc = 1; }
+
+    ef_infer_signals *s = ef_infer_signals_new(EF_MODEL_SOURCE_ONNX);
+    const uintptr_t in_shape[4] = { 1, 3, 512, 512 };
+    const uintptr_t out_shape[4] = { 1, 150, 128, 128 };
+    ef_infer_signals_add_input(s, "pixel_values", in_shape, 4, EF_DTYPE_F32);
+    ef_infer_signals_add_output(s, "logits", out_shape, 4, EF_DTYPE_F32, NULL, NULL, 0);
+
+    ef_model_overrides *o = ef_model_overrides_new();
+    char *err = NULL;
+    if (ef_model_overrides_set(o, "resize", "fill", &err) != EINVAL || !err) {
+        fprintf(stderr, "FAIL: a bad override was accepted\n"); rc = 1;
+    }
+    ef_decoder_string_free(err);
+    err = NULL;
+
+    ef_model_config *c = rc ? NULL : ef_model_config_resolve(model, s, o, &err);
+    ef_model_overrides_free(o);
+    ef_infer_signals_free(s);
+    if (!rc && !c) {
+        fprintf(stderr, "FAIL: resolve: %s\n", err ? err : "(no message)"); rc = 1;
+    }
+    ef_decoder_string_free(err);
+
+    if (c) {
+        uint32_t task = 0, family = 0, source = 0;
+        char *detail = NULL;
+        ef_preprocess_spec spec;
+        memset(&spec, 0, sizeof spec);
+        if (ef_model_config_task(c, &task) != 0 || task != EF_MODEL_TASK_SEMANTIC) {
+            fprintf(stderr, "FAIL: task %u\n", (unsigned) task); rc = 1;
+        } else if (ef_model_config_family(c, &family) != 0 || family != EF_MODEL_FAMILY_HUGGING_FACE) {
+            fprintf(stderr, "FAIL: family %u\n", (unsigned) family); rc = 1;
+        } else if (ef_model_config_source(c, EF_CONFIG_FIELD_NORMALIZATION, &source, &detail) != 0
+                   || source != EF_CONFIG_SOURCE_SIDECAR_HF) {
+            fprintf(stderr, "FAIL: normalization source %u\n", (unsigned) source); rc = 1;
+        } else if (ef_model_config_preprocessing(c, &spec) != 0 || spec.width != 512
+                   || spec.fit != EF_FIT_STRETCH || spec.interpolation != EF_INTERPOLATION_BILINEAR
+                   || spec.mean[0] < 123.0f || spec.mean[0] > 124.0f) {
+            fprintf(stderr, "FAIL: preprocess spec\n"); rc = 1;
+        }
+        ef_decoder_string_free(detail);
+
+        char *describe = ef_model_config_describe(c);
+        if (!describe || !strstr(describe, "normalize=")) {
+            fprintf(stderr, "FAIL: describe: %s\n", describe ? describe : "(null)"); rc = 1;
+        }
+        ef_decoder_string_free(describe);
+
+        /* The resolved schema builds a decoder for the semantic output. */
+        char *schema = ef_model_config_schema_json(c);
+        ef_decoder_params *p = ef_decoder_params_new();
+        ef_decoder_params_set_config_json(p, schema, 0);
+        ef_decoder *d = ef_decoder_new(p);
+        ef_decoder_params_free(p);
+        ef_decoder_string_free(schema);
+        uintptr_t classes = 0;
+        if (!d || ef_decoder_semantic_classes(d, &classes) != 0 || classes != 150) {
+            fprintf(stderr, "FAIL: schema did not build a 150-class semantic decoder\n"); rc = 1;
+        }
+        ef_decoder_free(d);
+        ef_model_config_free(c);
+    }
+
+    char path[600];
+    snprintf(path, sizeof path, "%s/config.json", dir); remove(path);
+    snprintf(path, sizeof path, "%s/preprocessor_config.json", dir); remove(path);
+    remove(model);
+    rmdir(dir);
+    return rc;
+}
+
 int main(void) {
-    if (ef_decoder_abi_version() != 3) {
-        fprintf(stderr, "FAIL: ef_decoder_abi_version() = %u, expected 3\n",
+    if (ef_decoder_abi_version() != 4) {
+        fprintf(stderr, "FAIL: ef_decoder_abi_version() = %u, expected 4\n",
                 (unsigned) ef_decoder_abi_version());
         return 1;
     }
@@ -121,6 +228,7 @@ int main(void) {
 
     if (infer_round_trip() != 0) return 1;
     if (infer_reports_failure() != 0) return 1;
+    if (model_config_round_trip() != 0) return 1;
 
     printf("PASS: decoder links and runs\n");
     return 0;

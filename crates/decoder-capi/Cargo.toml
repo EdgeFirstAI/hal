@@ -32,6 +32,7 @@ tracing = ["edgefirst-tensor/tracing"]
 # rather than embedding a private tensor copy.
 [dependencies]
 edgefirst-decoder = { version = "0.36.0", path = "../decoder", default-features = false, features = [
+    "model-files",
     "tracker",
 ] }
 uuid = { version = "1.23.3", features = ["v4"] }

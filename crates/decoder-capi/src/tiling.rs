@@ -408,8 +408,8 @@ mod tests {
             origin_y: 0.0,
             crop_width: 1.0,
             crop_height: 1.0,
-            has_letterbox: 0,
-            letterbox: [0.0; 4],
+            has_content_region: 0,
+            content_region: [0.0; 4],
             frame_width: 640.0,
             frame_height: 480.0,
         }

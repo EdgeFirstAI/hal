@@ -40,6 +40,28 @@ class EdgeFirstProtoDataExportable(Protocol):
     def __edgefirst_protodata__(self) -> tuple: ...
 
 
+class PreprocessSpecLike(Protocol):
+    """Structural type for :meth:`ConvertOptions.from_spec`: anything with
+    all of the attributes of ``edgefirst.decoder.PreprocessSpec``.
+    ``normalization`` may instead be given as ``mean`` and ``std``.
+    """
+
+    @property
+    def normalization(self) -> object: ...
+    @property
+    def fit(self) -> object: ...
+    @property
+    def placement(self) -> object: ...
+    @property
+    def pad(self) -> object: ...
+    @property
+    def pad_space(self) -> object: ...
+    @property
+    def interpolation(self) -> object: ...
+    @property
+    def size(self) -> object: ...
+
+
 # `os`/`sys`/`Protocol` must not remain bound as module attributes: both
 # tests/packaging/test_stub_parity.py (via `dir()`) and
 # tests/packaging/test_namespace.py's `test_pyclass_modules_are_named` (via

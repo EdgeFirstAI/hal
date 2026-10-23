@@ -401,7 +401,8 @@ pub(super) fn fill_outside(dst: &mut TensorDyn, rect: Rect, values: [f32; 4]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{Normalization, OutputMap};
+    use crate::options::OutputMap;
+    use crate::Normalization;
     use edgefirst_tensor::PixelFormat;
 
     fn scalar_f32(src: &[u8], p: &Pattern) -> Vec<f32> {

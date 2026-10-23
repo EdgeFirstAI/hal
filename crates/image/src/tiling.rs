@@ -15,7 +15,7 @@
 //! [`TilePlacement`] is produced here and consumed there.
 
 use crate::Error;
-use crate::{Crop, Fit, ImageProcessor, ImageProcessorTrait, Result};
+use crate::{ConvertOptions, Flip, ImageProcessor, ImageProcessorTrait, Result, Rotation};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
 pub use edgefirst_decoder_abi::TilePlacement;
@@ -44,24 +44,19 @@ pub struct TilingConfig {
     /// (default 0.2). The realized overlap is redistributed evenly and is
     /// always `>=` this.
     pub overlap_ratio: f32,
-    /// Letterbox pad colour (RGBA), used only when `fit == Fit::Letterbox`.
-    pub pad: [u8; 4],
-    /// How a tile crop is fit into the model input. Defaults to
-    /// [`Fit::Stretch`], which is identity for the full square tiles the grid
-    /// produces (`crop == model input`).
-    pub fit: Fit,
+    options: ConvertOptions,
 }
 
 impl TilingConfig {
-    /// Tile size = model input; deploy defaults (overlap 0.2, stretch fit,
-    /// `[114,114,114,255]` pad).
+    /// Tile size = model input; overlap 0.2, tiles stretched to the model
+    /// input (identity for the full-size tiles the grid produces) with the
+    /// default pixel mapping.
     pub fn new(tile_w: usize, tile_h: usize) -> Self {
         Self {
             tile_w,
             tile_h,
             overlap_ratio: 0.2,
-            pad: [114, 114, 114, 255],
-            fit: Fit::Stretch,
+            options: ConvertOptions::new(),
         }
     }
 
@@ -71,23 +66,29 @@ impl TilingConfig {
         self
     }
 
-    /// Set the fit mode (builder). When switching to [`Fit::Letterbox`], also
-    /// copies that variant's pad into [`Self::pad`] so the two stay in sync.
-    pub fn with_fit(mut self, fit: Fit) -> Self {
-        if let Fit::Letterbox { pad } = fit {
-            self.pad = pad;
-        }
-        self.fit = fit;
+    /// Set the options every tile is converted with: fit, letterbox
+    /// placement and pad, normalization and interpolation, e.g. from
+    /// [`ConvertOptions::from_spec`]. Each tile replaces the source crop
+    /// with its own. Rotation and flip are refused by [`validate`](Self::validate),
+    /// since tiles could not be lifted back to the frame.
+    pub fn with_options(mut self, options: ConvertOptions) -> Self {
+        self.options = options;
         self
     }
 
-    /// Validate the config: `overlap_ratio` in `[0.0, 1.0)` and non-zero tile
-    /// size. Called by every tiling method, and exposed so callers (e.g. the
-    /// language bindings) can reject bad input before generating a grid.
+    /// The options every tile is converted with.
+    pub fn options(&self) -> ConvertOptions {
+        self.options
+    }
+
+    /// Validate the config: `overlap_ratio` in `[0.0, 1.0)`, non-zero tile
+    /// size, and options without rotation or flip. Called by every tiling
+    /// method, and exposed so callers (e.g. the language bindings) can reject
+    /// bad input before generating a grid.
     ///
     /// # Errors
     /// Returns [`Error::CropInvalid`] if the overlap is out of range or a tile
-    /// dimension is zero.
+    /// dimension is zero, and [`Error::InvalidOptions`] for a rotation or flip.
     pub fn validate(&self) -> Result<()> {
         if !(self.overlap_ratio >= 0.0 && self.overlap_ratio < 1.0) {
             return Err(Error::CropInvalid(format!(
@@ -98,6 +99,11 @@ impl TilingConfig {
         if self.tile_w == 0 || self.tile_h == 0 {
             return Err(Error::CropInvalid(
                 "tiling tile size must be non-zero".into(),
+            ));
+        }
+        if self.options.get_rotation() != Rotation::None || self.options.get_flip() != Flip::None {
+            return Err(Error::InvalidOptions(
+                "tiling options cannot rotate or flip".into(),
             ));
         }
         Ok(())
@@ -159,35 +165,6 @@ pub fn tile_grid(
         }
     }
     tiles
-}
-
-/// Normalize a resolved letterbox dst-rect to `[lx0, ly0, lx1, ly1]` on the
-/// model input, or `None` for a stretched (whole-destination) placement.
-fn placement_letterbox(
-    crop: &Crop,
-    src_w: usize,
-    src_h: usize,
-    tile_w: usize,
-    tile_h: usize,
-) -> Option<[f32; 4]> {
-    let resolved = crop
-        .resolve(
-            src_w,
-            src_h,
-            tile_w,
-            tile_h,
-            crate::LetterboxPlacement::Center,
-        )
-        .ok()?;
-    resolved.dst_rect.map(|r| {
-        let (dw, dh) = (tile_w as f32, tile_h as f32);
-        [
-            r.left as f32 / dw,
-            r.top as f32 / dh,
-            (r.left + r.width) as f32 / dw,
-            (r.top + r.height) as f32 / dh,
-        ]
-    })
 }
 
 impl ImageProcessor {
@@ -258,34 +235,29 @@ impl ImageProcessor {
         let grid = tile_grid(src_h, src_w, cfg.tile_h, cfg.tile_w, cfg.overlap_ratio);
         let count = grid.len();
         span.record("tiles", count);
-        let crop = Crop::default().with_fit(cfg.fit);
-        Ok(grid
-            .iter()
+        grid.iter()
             .map(|t| {
-                let lb = placement_letterbox(
-                    &crop.with_source(Some(t.source)),
-                    t.source.width,
-                    t.source.height,
-                    cfg.tile_w,
-                    cfg.tile_h,
-                );
-                TilePlacement {
+                let region = cfg
+                    .options
+                    .source(Some(t.source))
+                    .content_region(src_w, src_h, cfg.tile_w, cfg.tile_h)?;
+                Ok(TilePlacement {
                     index: t.index,
                     count,
                     origin: (t.source.x as f32, t.source.y as f32),
                     crop_size: (t.source.width as f32, t.source.height as f32),
-                    letterbox: lb,
+                    content_region: region.letterboxed(),
                     frame_dims: (src_w as f32, src_h as f32),
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Render every tile of `src` into `dst_batched` (a tall packed parent from
     /// [`Self::alloc_tile_batch`]), one deferred convert per tile, then a single
     /// `flush`. Returns the per-tile [`TilePlacement`] in tile-index order.
     ///
-    /// The source crop is selected via [`Crop::with_source`] (a sampled
+    /// The source crop is selected via [`ConvertOptions::source`] (a sampled
     /// sub-rect of the whole-frame `src`) — **not** `src.view()` — so all tiles
     /// share one source import. Each destination tile is a `view` row-band of
     /// the shared parent.
@@ -393,8 +365,9 @@ impl ImageProcessor {
         placement: &TilePlacement,
         cfg: &TilingConfig,
     ) -> Result<()> {
-        let source = placement_to_source_region(placement)?;
-        let crop = Crop::default().with_source(Some(source)).with_fit(cfg.fit);
+        let options = cfg
+            .options
+            .source(Some(placement_to_source_region(placement)?));
 
         // Destination is a row-band of the tall parent (packed) or the slot
         // itself. Decide batched vs slot from capacity vs. `placement.count`,
@@ -409,13 +382,9 @@ impl ImageProcessor {
                 cfg.tile_w,
                 cfg.tile_h,
             ))?;
-            self.convert_deferred(
-                src,
-                &mut band,
-                Some(crate::ConvertOptions::new().crop(crop)),
-            )?;
+            self.convert_deferred(src, &mut band, Some(options))?;
         } else {
-            self.convert_deferred(src, dst, Some(crate::ConvertOptions::new().crop(crop)))?;
+            self.convert_deferred(src, dst, Some(options))?;
         }
         Ok(())
     }
@@ -578,11 +547,200 @@ mod tests {
     }
 
     #[test]
-    fn with_fit_letterbox_syncs_pad() {
-        let pad = [1, 2, 3, 4];
-        let cfg = TilingConfig::new(640, 640).with_fit(Fit::Letterbox { pad });
-        assert_eq!(cfg.fit, Fit::Letterbox { pad });
-        assert_eq!(cfg.pad, pad);
+    fn tiling_options_refuse_rotation_and_flip() {
+        let cfg = TilingConfig::new(640, 640);
+        assert!(cfg.validate().is_ok());
+        let rotated = cfg.with_options(ConvertOptions::new().rotation(Rotation::Clockwise90));
+        assert!(matches!(rotated.validate(), Err(Error::InvalidOptions(_))));
+        let flipped = cfg.with_options(ConvertOptions::new().flip(Flip::Horizontal));
+        assert!(matches!(flipped.validate(), Err(Error::InvalidOptions(_))));
+    }
+
+    fn cpu() -> ImageProcessor {
+        ImageProcessor::with_config(crate::ImageProcessorConfig {
+            backend: crate::ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// A frame shorter than the tile letterboxes every tile; tiles away from
+    /// the frame origin carry the same content region as the first.
+    #[test]
+    fn plan_tiles_content_region_on_every_tile() {
+        let options = ConvertOptions::new()
+            .letterbox([114, 114, 114, 255])
+            .placement(crate::LetterboxPlacement::TopLeft);
+        let cfg = TilingConfig::new(640, 640).with_options(options);
+        let plan = cpu().plan_tiles(1500, 400, &cfg).unwrap();
+        assert!(plan.len() >= 3);
+        for p in &plan {
+            assert_eq!(
+                p.content_region,
+                Some([0.0, 0.0, 1.0, 0.625]),
+                "tile {}",
+                p.index
+            );
+        }
+        let centred = cfg.with_options(options.placement(crate::LetterboxPlacement::Center));
+        let plan = cpu().plan_tiles(1500, 400, &centred).unwrap();
+        assert!(plan
+            .iter()
+            .all(|p| p.content_region == Some([0.0, 0.1875, 1.0, 0.8125])));
+    }
+
+    /// Lifting a box over a tile's whole content region gives back the
+    /// tile's crop in frame pixels.
+    #[test]
+    fn top_left_tile_boxes_lift_exactly() {
+        use edgefirst_tensor::{BoundingBox, DetectBox};
+        let cfg = TilingConfig::new(640, 640).with_options(
+            ConvertOptions::new()
+                .letterbox([0, 0, 0, 255])
+                .placement(crate::LetterboxPlacement::TopLeft),
+        );
+        for p in cpu().plan_tiles(1500, 400, &cfg).unwrap() {
+            let [x0, y0, x1, y1] = p.content_region.unwrap();
+            let b = DetectBox {
+                bbox: BoundingBox {
+                    xmin: x0,
+                    ymin: y0,
+                    xmax: x1,
+                    ymax: y1,
+                },
+                score: 1.0,
+                label: 0,
+            };
+            let lifted = edgefirst_decoder::tiling::lift_tile_boxes(vec![b], &p);
+            let l = lifted[0].bbox;
+            let want = [p.origin.0, 0.0, p.origin.0 + p.crop_size.0, 400.0];
+            for (got, want) in [l.xmin, l.ymin, l.xmax, l.ymax].iter().zip(want) {
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "tile {}: {l:?} vs {want:?}",
+                    p.index
+                );
+            }
+        }
+    }
+
+    /// A tile is converted with the base options plus its own crop.
+    #[test]
+    fn tile_render_applies_options() {
+        use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+        let mut proc = cpu();
+        let src = TensorDyn::image(
+            1500,
+            400,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            for (i, v) in m.as_mut_slice().iter_mut().enumerate() {
+                *v = (i * 7 % 251) as u8;
+            }
+        }
+        let options = ConvertOptions::new()
+            .letterbox([0, 0, 0, 255])
+            .placement(crate::LetterboxPlacement::TopLeft)
+            .pad_output([0.0; 4])
+            .normalization(crate::Normalization::imagenet());
+        let cfg = TilingConfig::new(320, 320).with_options(options);
+        let plan = proc.plan_tiles(1500, 400, &cfg).unwrap();
+        let p = plan[plan.len() / 2];
+        let image = || {
+            TensorDyn::image(
+                320,
+                320,
+                PixelFormat::PlanarRgb,
+                DType::F32,
+                Some(TensorMemory::Mem),
+                CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let mut tile = image();
+        proc.tile_one(&src, &mut tile, &p, &cfg).unwrap();
+        proc.flush().unwrap();
+        let mut direct = image();
+        let source = Region::new(
+            p.origin.0 as usize,
+            p.origin.1 as usize,
+            p.crop_size.0 as usize,
+            p.crop_size.1 as usize,
+        );
+        proc.convert(&src, &mut direct, Some(options.source(Some(source))))
+            .unwrap();
+        let a = tile
+            .as_f32()
+            .unwrap()
+            .map_read()
+            .unwrap()
+            .as_slice()
+            .to_vec();
+        let b = direct
+            .as_f32()
+            .unwrap()
+            .map_read()
+            .unwrap()
+            .as_slice()
+            .to_vec();
+        assert_eq!(a, b);
+        assert!(a.iter().any(|v| *v < 0.0), "imagenet normalization applied");
+    }
+
+    /// A tile resamples with the base options' interpolation, not the
+    /// processor's.
+    #[test]
+    fn tile_render_applies_interpolation() {
+        use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+        let mut proc = cpu();
+        let src = TensorDyn::image(
+            200,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            for (i, v) in m.as_mut_slice().iter_mut().enumerate() {
+                *v = (i * 7 % 251) as u8;
+            }
+        }
+        let base = ConvertOptions::new().letterbox([0, 0, 0, 255]);
+        let options = base.interpolation(crate::Interpolation::Nearest);
+        let cfg = TilingConfig::new(320, 320).with_options(options);
+        let plan = proc.plan_tiles(200, 100, &cfg).unwrap();
+        let read = |t: &TensorDyn| t.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+        let image = || {
+            TensorDyn::image(
+                320,
+                320,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let mut tile = image();
+        proc.tile_one(&src, &mut tile, &plan[0], &cfg).unwrap();
+        proc.flush().unwrap();
+        let mut nearest = image();
+        proc.convert(&src, &mut nearest, Some(options)).unwrap();
+        let mut bilinear = image();
+        proc.convert(&src, &mut bilinear, Some(base)).unwrap();
+        assert_ne!(read(&nearest), read(&bilinear));
+        assert_eq!(read(&tile), read(&nearest));
     }
 
     #[test]
@@ -592,7 +750,7 @@ mod tests {
             count: 1,
             origin: (10.0, 20.0),
             crop_size: (640.0, 640.0),
-            letterbox: None,
+            content_region: None,
             frame_dims: (3840.0, 2160.0),
         };
         assert!(placement_to_source_region(&good).is_ok());
@@ -676,6 +834,8 @@ mod tests {
             next_id: std::sync::atomic::AtomicU64::new(0),
         };
 
+        // A second dispatcher stops tracing-core using another thread's default to rebuild interest.
+        let _other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         tracing::subscriber::with_default(subscriber, || {
             let mut proc = ImageProcessor::new().expect("processor");
             let cfg = TilingConfig::new(320, 240);

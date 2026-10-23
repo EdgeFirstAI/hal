@@ -160,7 +160,7 @@ ef_image_processor *proc = ef_image_processor_new();
 ef_tensor *src = /* ... */;
 ef_tensor *dst = ef_image_processor_create_image(
     proc, 640, 640, /* format/dtype/access: see image.h */);
-ef_image_processor_convert(proc, src, dst, /* rotation, flip, crop */);
+ef_image_processor_convert(proc, src, dst, NULL /* options; NULL stretches */);
 ```
 
 ### Zero-copy CUDA (TensorRT) input
@@ -525,7 +525,7 @@ if (!tensor) {
     if (!tensor) { perror("ef_tensor_builder_wrap"); continue; }
     insert_tensor(cache, &key, tensor);
 }
-ef_image_processor_convert(proc, tensor, dst, /* rotation, flip, crop */);
+ef_image_processor_convert(proc, tensor, dst, NULL /* options; NULL stretches */);
 ```
 
 ```python
@@ -680,14 +680,14 @@ parameter:
 from edgefirst.image import MaskResolution
 
 # Wrong: threshold then upsample → blocky edges, mAP regression.
-tiles = proc.materialize_masks(boxes, scores, classes, proto_data, letterbox=lb)
+tiles = proc.materialize_masks(boxes, scores, classes, proto_data, content_region=region)
 for tile, box in zip(tiles, boxes):
     binary = (tile[:, :, 0] > 127).astype(np.uint8)
     canvas[y:y+h, x:x+w] = cv2.resize(binary, (W, H), cv2.INTER_NEAREST)
 
 # Right: HAL upsamples-then-thresholds inside its batched-GEMM kernel.
 tiles = proc.materialize_masks(boxes, scores, classes, proto_data,
-                               letterbox=lb,
+                               content_region=region,
                                resolution=MaskResolution.Scaled(W, H))
 for tile, box in zip(tiles, boxes):
     canvas[y:y+h, x:x+w] = (tile[:, :, 0] > 127).astype(np.uint8)
@@ -1274,8 +1274,7 @@ ANeuralNetworksMemory_createFromAHardwareBuffer(ahb, &mem);   // NNAPI
 
 // Per frame: when convert() returns, the GPU has finished writing and
 // the handle contents are safe to execute against.
-ef_image_processor_convert(proc, src, dst, 0 /* rotation none */,
-                            0 /* flip none */, &letterbox);
+ef_image_processor_convert(proc, src, dst, opts); /* ef_convert_options *, e.g. from ef_convert_options_from_spec */
 // ... ANeuralNetworksExecution_setInputFromMemory(exec, 0, NULL, mem, 0, bytes);
 ```
 

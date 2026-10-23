@@ -8741,6 +8741,25 @@ mod gl_tests {
                 "{mode:?}: nearest copy expected = {exact}"
             );
         }
+
+        // A per-convert interpolation overrides the processor's (Bilinear,
+        // set last above) for that convert only.
+        let mut convert = |options: Option<crate::ConvertOptions>| {
+            let mut dst = TensorDyn::image(
+                dw,
+                dh,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            gl.convert(&src, &mut dst, options).unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        let nearest = crate::ConvertOptions::new().interpolation(crate::Interpolation::Nearest);
+        assert_eq!(convert(Some(nearest)), want, "per-convert Nearest");
+        assert_ne!(convert(None), want, "the processor's Bilinear is restored");
     }
 
     /// A source crop drawn 1:1 must read each crop pixel exactly on the

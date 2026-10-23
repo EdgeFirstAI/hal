@@ -172,4 +172,68 @@ disagreement — a class count that does not fit the output width, a `segment`
 task with no prototype tensor, an unsupported task such as pose or OBB — is
 reported through `err_out` rather than resolved by preference.
 
+## Model configuration
+
+`ef_model_config_resolve` finds what a model needs to be run and decoded — output schema, labels, input preprocessing — from what it carries: an `edgefirst.json` embedded in the model or beside it, Hugging Face `config.json`/`preprocessor_config.json` embedded or beside it, Ultralytics metadata, Hugging Face input/output names, and the documented defaults, in that order, field by field. String overrides apply last, and every value records its source.
+
+The preprocessing crosses to `libedgefirst_image` as an `ef_preprocess_spec`, declared in `edgefirst/detect.h` which both headers include, so the two libraries never link each other:
+
+```c
+#include <edgefirst/decoder.h>
+#include <edgefirst/image.h>
+
+/* Signals as for schema inference; a Hugging Face config needs them. */
+ef_infer_signals *s = ef_infer_signals_new(EF_MODEL_SOURCE_ONNX);
+const uintptr_t in_shape[4] = { 1, 3, 512, 512 };
+const uintptr_t out_shape[4] = { 1, 150, 128, 128 };
+ef_infer_signals_add_input(s, "pixel_values", in_shape, 4, EF_DTYPE_F32);
+ef_infer_signals_add_output(s, "logits", out_shape, 4, EF_DTYPE_F32, NULL, NULL, 0);
+
+ef_model_overrides *o = ef_model_overrides_new();
+char *err = NULL;
+if (ef_model_overrides_set(o, "resize", "letterbox-top_left", &err) != 0) { /* print err */ }
+
+ef_model_config *cfg = ef_model_config_resolve("segformer/model.onnx", s, o, &err);
+ef_model_overrides_free(o);
+ef_infer_signals_free(s);
+if (!cfg) {
+    fprintf(stderr, "%s\n", err ? err : "(no message)"); /* errno says why */
+    ef_decoder_string_free(err);
+    return 1;
+}
+
+char *lines = ef_model_config_describe(cfg); /* "normalize=imagenet [preprocessor_config.json]" ... */
+puts(lines);
+ef_decoder_string_free(lines);
+
+/* Decoder: the resolved schema. */
+char *schema = ef_model_config_schema_json(cfg);
+ef_decoder_params *p = ef_decoder_params_new();
+ef_decoder_params_set_config_json(p, schema, 0);
+ef_decoder *d = ef_decoder_new(p);
+ef_decoder_params_free(p);
+ef_decoder_string_free(schema);
+
+/* Image: the preprocessing, as plain values. */
+ef_preprocess_spec spec = ef_preprocess_spec_default();
+ef_model_config_preprocessing(cfg, &spec);
+ef_convert_options *conv = ef_convert_options_from_spec(&spec); /* interpolation too */
+ef_image_processor_convert(proc, frame, input, conv);
+
+/* Semantic decode over the content the convert painted. */
+float region[4];
+ef_convert_options_content_region(conv, frame_w, frame_h, spec.width, spec.height, NULL, region);
+ef_semantic_options *so = ef_semantic_options_new();
+ef_semantic_options_set_content_region(so, region);
+ef_decoder_decode_semantic(d, outputs, 1, class_map, NULL, so);
+```
+
+`ef_model_config_source(cfg, EF_CONFIG_FIELD_*, &source, &detail)` reports where a value came from as an `EF_CONFIG_SOURCE_*` code and a detail string; `_family`, `_task` and `_decode_mode` report codes, and `_labels_json`, `_description` and `_notes` strings, all freed with `ef_decoder_string_free`. Override keys are `task`, `normalize`, `resize`, `decode` and `labels` (comma-separated names, e.g. `ef_model_overrides_set(o, "labels", "background,person", &err)`); the grammar is documented on `ef_model_overrides_set`, and `ef_model_config_describe` prints those keys in it. A bad key or value is `EINVAL` with the accepted forms in `err`.
+
+`ef_model_config_preprocessing` gives the model's preprocessing as its configuration states it. The image library runs bicubic and area interpolation as bilinear, and `ef_model_config_notes` says so.
+
+`ef_model_config_resolve` returns `NULL` and sets `errno`: `ENOENT` for a missing file, `ENODATA` for a configuration nothing supplies (the message names the override that would), `EBADMSG` for a malformed container or config file, `ENOTSUP` for one the library cannot run, `EISDIR`, `EFBIG` or `EILSEQ` for a path that is a directory or a sidecar that is too large or not UTF-8, `EINVAL` for a bad argument or an override that does not apply.
+
+`ef_tile_placement.content_region` and `ef_semantic_options_set_content_region` name the normalized `[xmin, ymin, xmax, ymax]` rectangle the image occupies in the model input.
+
 <img referrerpolicy="no-referrer" src="https://px.edgefirst.ai/a.png?x-pxid=37aa7de2-6935-484e-b31d-9fd9a57fcd63" alt="" width="1" height="1" style="position:absolute; width:1px; height:1px; opacity:0; pointer-events:none;" />

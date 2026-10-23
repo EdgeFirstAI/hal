@@ -22,6 +22,18 @@ pub struct EfInferSignals {
     metadata: BTreeMap<String, String>,
 }
 
+impl EfInferSignals {
+    /// The accumulated signals as the decoder takes them.
+    pub(crate) fn to_signals(&self) -> ModelSignals {
+        ModelSignals {
+            source: self.source,
+            inputs: self.inputs.clone(),
+            outputs: self.outputs.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
 /// An inferred Ultralytics schema. Its JSON views are rendered on demand by
 /// [`ef_inferred_schema_json`]/[`ef_inferred_schema_labels_json`].
 pub struct EfInferredSchema {
@@ -233,7 +245,7 @@ pub unsafe extern "C" fn ef_infer_signals_add_metadata(
 ///
 /// # Safety
 /// `err_out` must be `NULL` or writable.
-unsafe fn set_err(err_out: *mut *mut c_char, msg: &str) {
+pub(crate) unsafe fn set_err(err_out: *mut *mut c_char, msg: &str) {
     unsafe {
         if err_out.is_null() {
             return;
@@ -278,14 +290,7 @@ pub unsafe extern "C" fn ef_infer_ultralytics_schema(
                 set_err(err_out, "null signals handle");
                 return std::ptr::null_mut();
             }
-            let s = &*s;
-            let signals = ModelSignals {
-                source: s.source,
-                inputs: s.inputs.clone(),
-                outputs: s.outputs.clone(),
-                metadata: s.metadata.clone(),
-            };
-            match infer_ultralytics_schema(&signals) {
+            match infer_ultralytics_schema(&(*s).to_signals()) {
                 Ok(inner) => Box::into_raw(Box::new(EfInferredSchema { inner })),
                 Err(e) => {
                     set_err(err_out, &e.to_string());
@@ -306,7 +311,7 @@ pub unsafe extern "C" fn ef_infer_ultralytics_schema(
 }
 
 /// Serializes `v` to a NUL-terminated JSON string, or `NULL` on failure.
-fn to_json_c_string<T: serde::Serialize>(v: &T) -> *mut c_char {
+pub(crate) fn to_json_c_string<T: serde::Serialize>(v: &T) -> *mut c_char {
     let Ok(json) = serde_json::to_string(v) else {
         return std::ptr::null_mut();
     };

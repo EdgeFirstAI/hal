@@ -120,6 +120,12 @@ exclude = [
   "EfTilePlacement",
   "EfDetectBox",
   "EfSegmentation",
+  # Declared in detect.h, shared with decoder.h.
+  "EfPreprocessSpec",
+  "EfFit",
+  "EfLetterboxPlacement",
+  "EfPadSpace",
+  "EfInterpolation",
 ]
 # The option vocabularies are not reachable from any signature (the
 # functions take `uint32_t`), so they are named here.
@@ -127,9 +133,7 @@ include = [
   "EfRotation",
   "EfFlip",
   "EfColorMode",
-  "EfFit",
   "EfComputeBackend",
-  "EfLetterboxPlacement",
   "EfNormalization",
 ]
 
@@ -154,6 +158,9 @@ include = [
 "EfComputeBackend" = "ef_compute_backend"
 "EfLetterboxPlacement" = "ef_letterbox_placement"
 "EfNormalization" = "ef_normalization"
+"EfPadSpace" = "ef_pad_space"
+"EfInterpolation" = "ef_interpolation"
+"EfPreprocessSpec" = "ef_preprocess_spec"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

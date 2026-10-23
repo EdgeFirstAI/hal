@@ -42,7 +42,7 @@ one from `ef_tensor_new()` works here just as well.
 
 ## Convert options
 
-`NULL` options convert the whole source, stretched, with float outputs mapped as `x / 255`. An `ef_convert_options` handle adds rotation, flip, a source rectangle, a letterbox with its placement and pad, and normalization:
+`NULL` options convert the whole source, stretched, with float outputs mapped as `x / 255`. An `ef_convert_options` handle adds rotation, flip, a source rectangle, a letterbox with its placement and pad, normalization, and interpolation:
 
 ```c
 ef_convert_options *o = ef_convert_options_new();
@@ -52,11 +52,37 @@ ef_convert_options_set_letterbox(o, pad);
 ef_convert_options_set_letterbox_placement(o, EF_LETTERBOX_PLACEMENT_TOP_LEFT);
 ef_convert_options_set_pad_output(o, pad_out);
 ef_convert_options_set_normalization_preset(o, EF_NORMALIZATION_IMAGENET);
+ef_convert_options_set_interpolation(o, EF_INTERPOLATION_NEAREST);
 ef_image_processor_convert(p, src, dst, o);
 ef_convert_options_free(o);
 ```
 
+`ef_convert_options_content_region(o, src_w, src_h, dst_w, dst_h, pixels, normalized)` reports where a convert with `o` puts the image: `[x, y, width, height]` in destination pixels and `[xmin, ymin, xmax, ymax]` normalized, the exact rectangle the convert paints. The normalized form is what the draw functions' `content_region` argument and the decoder's `ef_semantic_options_set_content_region` take.
+
+Options without an interpolation resample with the processor's (`ef_image_processor_set_interpolation`); `EF_INTERPOLATION_BICUBIC` and `EF_INTERPOLATION_AREA` run as bilinear, logged once per mode, and `EDGEFIRST_INTERPOLATION` overrides both. Because the filter travels with the options, one processor can serve several models without reconfiguring it between them.
+
 Normalization is `(x - mean) / std` on 0-255 values (`ef_convert_options_set_normalization` takes explicit coefficients). A u8 or i8 destination with a non-default normalization must carry quantization (`ef_tensor_quantization_set`); the result is quantized with it, and the convert returns `EINVAL` without it. The setters return `EINVAL` for an unknown code and leave the options unchanged.
+
+## Model preprocessing
+
+A model's preprocessing arrives as an `ef_preprocess_spec` — fit, letterbox placement and pad, normalization mean/std on 0-255 values, interpolation, input size — declared in header-only `edgefirst/detect.h`. `libedgefirst_decoder`'s `ef_model_config_preprocessing` fills one from the model's own configuration (see that library's README); a caller may also start from `ef_preprocess_spec_default()` (unsigned normalization, centred letterbox padded with pixel 114, bilinear) and set fields by hand.
+
+```c
+ef_preprocess_spec spec;
+ef_model_config_preprocessing(cfg, &spec);        /* libedgefirst_decoder */
+
+ef_convert_options *o = ef_convert_options_from_spec(&spec);
+if (o) {
+    ef_image_processor_convert(p, frame, input, o);
+    ef_convert_options_free(o);
+}
+```
+
+`ef_convert_options_from_spec` builds the options — normalization, fit, placement, pad and interpolation. It returns `NULL` with `errno` `EINVAL` for an unknown code, a zero `std` or a pixel pad outside 0-255.
+
+## Tiling
+
+`ef_tiling_config` holds the tile geometry. How each tile is converted is the `const ef_convert_options *` that `ef_image_processor_plan_tiles`, `_tile_into` and `_tile_one` take beside it (`NULL` stretches each tile); pass the same options to the plan and the render. With a letterbox, every `ef_tile_placement` carries its `content_region`. Options that rotate or flip are `EINVAL`.
 
 ## What actually needs a processor
 

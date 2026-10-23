@@ -19,8 +19,8 @@ pub struct EfSemanticOptions {
     inner: SemanticOptions,
 }
 
-/// New default options: the model's decode mode, no letterbox. `NULL` on
-/// allocation failure.
+/// New default options: the model's decode mode, content filling the model
+/// input. `NULL` on allocation failure.
 #[no_mangle]
 pub extern "C" fn ef_semantic_options_new() -> *mut EfSemanticOptions {
     catch_unwind(|| {
@@ -62,25 +62,27 @@ pub unsafe extern "C" fn ef_semantic_options_set_mode(
     0
 }
 
-/// Image content within the model input as normalized
-/// `[xmin, ymin, xmax, ymax]`, as produced by a letterbox resize. `NULL`
-/// clears it: the image fills the input.
+/// Where the image content sits in the model input, as normalized
+/// `[xmin, ymin, xmax, ymax]`: the content region of the convert that made
+/// the input (`ef_convert_options_content_region` in libedgefirst_image).
+/// `NULL` clears it: the image fills the input.
 ///
 /// @return 0, or `EINVAL` for a `NULL` handle.
 ///
 /// # Safety
-/// `o` must be `NULL` or a live handle; `letterbox` `NULL` or four floats.
+/// `o` must be `NULL` or a live handle; `content_region` `NULL` or four
+/// floats.
 #[no_mangle]
-pub unsafe extern "C" fn ef_semantic_options_set_letterbox(
+pub unsafe extern "C" fn ef_semantic_options_set_content_region(
     o: *mut EfSemanticOptions,
-    letterbox: *const f32,
+    content_region: *const f32,
 ) -> c_int {
     // SAFETY: the caller's contract.
     let Some(o) = (unsafe { o.as_mut() }) else {
         return libc::EINVAL;
     };
     // SAFETY: the caller's contract.
-    o.inner.letterbox = unsafe { letterbox.cast::<[f32; 4]>().as_ref() }.copied();
+    o.inner.content_region = unsafe { content_region.cast::<[f32; 4]>().as_ref() }.copied();
     0
 }
 
@@ -113,8 +115,8 @@ pub unsafe extern "C" fn ef_decoder_semantic_classes(
 
 /// Decode the model's semantic segmentation output into `dst`, an `[H, W]`
 /// class map of `EF_DTYPE_U8` (up to 256 classes) or `EF_DTYPE_U16`, at any
-/// resolution. Each output pixel is mapped through the letterbox region, so
-/// the padding is cropped and `dst` covers the original image.
+/// resolution. Each output pixel is mapped through the content region, so
+/// letterbox padding is cropped and `dst` covers the original image.
 ///
 /// `confidence`, when not `NULL`, receives the winning class's probability
 /// as an `[H, W]` map of `EF_DTYPE_F32` or `EF_DTYPE_U8` (scaled to 255),
@@ -244,10 +246,13 @@ mod tests {
                 libc::EINVAL
             );
             let lb = [0.0f32, 0.0, 1.0, 0.5];
-            assert_eq!(ef_semantic_options_set_letterbox(o, lb.as_ptr()), 0);
-            assert_eq!(ef_semantic_options_set_letterbox(o, std::ptr::null()), 0);
+            assert_eq!(ef_semantic_options_set_content_region(o, lb.as_ptr()), 0);
             assert_eq!(
-                ef_semantic_options_set_letterbox(std::ptr::null_mut(), lb.as_ptr()),
+                ef_semantic_options_set_content_region(o, std::ptr::null()),
+                0
+            );
+            assert_eq!(
+                ef_semantic_options_set_content_region(std::ptr::null_mut(), lb.as_ptr()),
                 libc::EINVAL
             );
             ef_semantic_options_free(o);
@@ -280,7 +285,7 @@ mod tests {
 
             // Keep the left third of the model input.
             let lb = [0.0f32, 0.0, 1.0 / 3.0, 1.0];
-            assert_eq!(ef_semantic_options_set_letterbox(o, lb.as_ptr()), 0);
+            assert_eq!(ef_semantic_options_set_content_region(o, lb.as_ptr()), 0);
             let narrow = tensor(&[2, 2], DType::U8).into_raw();
             assert_eq!(
                 ef_decoder_decode_semantic(d, outputs.as_ptr(), 1, narrow, std::ptr::null_mut(), o),

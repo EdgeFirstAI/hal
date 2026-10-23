@@ -868,7 +868,7 @@ impl TensorMapT {
             return Err(PyBufferError::new_err("Index out of bounds"));
         }
         match self {
-            TensorMapT::TensorU8(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorU8(m) => Ok(m.as_slice()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorI8(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorU16(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorI16(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
@@ -909,7 +909,7 @@ impl TensorMapT {
     /// Get a raw pointer to the mapped data (for Python buffer protocol).
     fn data_ptr(&self) -> *mut c_void {
         match self {
-            TensorMapT::TensorU8(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorU8(m) => m.as_slice().as_ptr() as *mut c_void,
             TensorMapT::TensorI8(m) => m.as_ref().as_ptr() as *mut c_void,
             TensorMapT::TensorU16(m) => m.as_ref().as_ptr() as *mut c_void,
             TensorMapT::TensorI16(m) => m.as_ref().as_ptr() as *mut c_void,
@@ -2518,19 +2518,24 @@ impl PyTensor {
     }
 
     /// Normalize image data and write to a numpy array.
-    /// Normalize into a numpy array.
+    ///
+    /// ``normalization`` is a ``NormalizationPreset`` (or its name):
+    /// ``Unsigned`` (``x / 255``), ``Signed`` (``(x - zp) / 127.5``, or
+    /// ``x - zp`` into ``int8``) or ``Raw``. ``None`` is ``Raw`` for a
+    /// ``uint8`` destination and ``Signed`` otherwise.
     ///
     /// Gated on the `image` feature: normalization lives in the image module,
     /// and gating it keeps `edgefirst.tensor` and `edgefirst.codec` from
     /// linking the OpenGL stack they never use.
     #[cfg(feature = "image")]
-    #[pyo3(signature = (dst, normalization=crate::image::Normalization::DEFAULT, zero_point=None))]
+    #[pyo3(signature = (dst, normalization=None, zero_point=None))]
     fn normalize_to_numpy(
         &self,
         dst: crate::image::ImageDest3,
-        normalization: crate::image::Normalization,
+        normalization: Option<crate::image::NumpyNormalizationArg>,
         zero_point: Option<i64>,
     ) -> Result<()> {
+        let normalization = crate::image::NumpyNormalizationArg::resolve(normalization)?;
         Ok(crate::image::normalize_tensor_to_numpy(
             &self.0,
             dst,

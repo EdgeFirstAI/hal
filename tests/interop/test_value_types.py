@@ -44,7 +44,7 @@ enums, the field tuple for `Region`), so equal cross-package values hash
 equal too -- required by Python's data model, and doubly so now that
 equality is structural rather than identity-based. The single-package
 `eq_int` enums the equality sweep also turned up (`Nms`, `DecoderType`,
-`DecoderVersion`, `DimName`, `Normalization`, `EglDisplayKind`, `Rotation`,
+`DecoderVersion`, `DimName`, `NormalizationPreset`, `EglDisplayKind`, `Rotation`,
 `Flip`, `ColorMode`, `Fit`, `MatchMetric`, `MergeMode`) get the same
 discriminant-hash
 treatment for the same reason, even though they have no cross-package
@@ -410,7 +410,9 @@ def test_colorimetry_hash_is_still_objects_identity_default():
         ("decoder", "DecoderType", ("Ultralytics", "ModelPack")),
         ("decoder", "DecoderVersion", ("Yolov5", "Yolov8")),
         ("decoder", "DimName", ("Batch", "Height")),
-        ("image", "Normalization", ("DEFAULT", "SIGNED")),
+        ("image", "NormalizationPreset", ("Unsigned", "Signed")),
+        ("image", "Interpolation", ("Bilinear", "Nearest")),
+        ("image", "PadSpace", ("Pixel", "Normalized")),
         ("image", "EglDisplayKind", ("Gbm", "Default")),
         ("image", "Rotation", ("Rotate0", "Clockwise90")),
         ("image", "Flip", ("NoFlip", "Horizontal")),
@@ -418,6 +420,10 @@ def test_colorimetry_hash_is_still_objects_identity_default():
         ("image", "Fit", ("Stretch", "Letterbox")),
         ("decoder", "MatchMetric", ("Iou", "Ios")),
         ("decoder", "MergeMode", ("KeepBest", "Union")),
+        ("decoder", "ConfigSource", ("Heuristic", "Override")),
+        ("decoder", "ModelFamily", ("EdgeFirst", "HuggingFace")),
+        ("decoder", "ModelTask", ("Detect", "Semantic")),
+        ("decoder", "ConfigField", ("Normalization", "Labels")),
     ],
 )
 def test_single_package_eq_int_enum_hashable(mod, name, members):

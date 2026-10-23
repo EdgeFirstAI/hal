@@ -148,7 +148,7 @@ fn reference(
 fn options(mode: DecodeMode, letterbox: [f32; 4]) -> SemanticOptions {
     SemanticOptions::new()
         .with_mode(mode)
-        .with_letterbox(letterbox)
+        .with_content_region(letterbox)
 }
 
 fn upsample(align_corners: bool) -> Upsample {
@@ -504,7 +504,7 @@ fn class_map_input_resizes_with_nearest() {
     );
     // A letterbox keeping the left two columns.
     let mut dst = zeros(&[2, 4], DType::U16);
-    let opts = SemanticOptions::new().with_letterbox([0.0, 0.0, 2.0 / 3.0, 1.0]);
+    let opts = SemanticOptions::new().with_content_region([0.0, 0.0, 2.0 / 3.0, 1.0]);
     decode_semantic(&tensor(&[1, 2, 3], &map), &config, &mut dst, None, &opts).unwrap();
     assert_eq!(classes(&dst), vec![0, 0, 1, 1, 3, 3, 4, 4]);
 
@@ -545,7 +545,7 @@ fn centred_letterbox_crops_both_sides() {
     let config = SemanticConfig::scores(&[1, 2, 2, 4], 1, 2, 3).unwrap();
     let opts = SemanticOptions::new()
         .with_mode(DecodeMode::Fast)
-        .with_letterbox([0.25, 0.0, 0.75, 1.0]);
+        .with_content_region([0.25, 0.0, 0.75, 1.0]);
     let mut dst = zeros(&[2, 4], DType::U8);
     decode_semantic(&tensor(&[1, 2, 2, 4], &v), &config, &mut dst, None, &opts).unwrap();
     assert_eq!(classes(&dst), vec![0, 0, 1, 1, 0, 0, 1, 1]);
@@ -585,7 +585,7 @@ fn rejects_invalid_requests() {
         [0.0, 0.0, 1.5, 1.0],
         [f32::NAN, 0.0, 1.0, 1.0],
     ] {
-        let bad = SemanticOptions::new().with_letterbox(lb);
+        let bad = SemanticOptions::new().with_content_region(lb);
         assert!(matches!(
             err(&mut zeros(&[4, 4], DType::U16), &bad),
             DecoderError::InvalidConfig(_)
@@ -646,7 +646,10 @@ fn decoder_from_schema_decodes_semantic_output() {
     let aux = named(&[1, 4, 8, 12], &vec![0.0f32; 384], Some("aux"));
     let lb = [0.0, 0.0, 1.0, 0.75];
     for (mode, opts) in [
-        (DecodeMode::Fast, SemanticOptions::new().with_letterbox(lb)),
+        (
+            DecodeMode::Fast,
+            SemanticOptions::new().with_content_region(lb),
+        ),
         (DecodeMode::Accurate, options(DecodeMode::Accurate, lb)),
     ] {
         let mut dst = zeros(&[30, 60], DType::U8);

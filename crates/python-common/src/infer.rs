@@ -135,6 +135,55 @@ fn tensor_info(
     })
 }
 
+/// Builds `ModelSignals` from the Python argument forms of
+/// :func:`infer_ultralytics_schema`.
+pub(crate) fn model_signals(
+    source: &str,
+    inputs: Vec<TensorArg>,
+    outputs: Vec<TensorArg>,
+    metadata: BTreeMap<String, String>,
+) -> PyResult<ModelSignals> {
+    let source = source_from_str(source)?;
+    let inputs = inputs
+        .into_iter()
+        .map(|t| {
+            // A model input's own quantization plays no part in
+            // output-layout inference, so the slot is accepted and ignored
+            // rather than rejected -- callers build input and output specs
+            // from the same runtime dict, and an arity difference between
+            // the two arguments is a trap, not a safeguard.
+            let (name, shape, dtype, _) = t.into_parts();
+            tensor_info(name, shape, &dtype, None)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let outputs = outputs
+        .into_iter()
+        .map(|o| {
+            let (name, shape, dtype, quant) = o.into_parts();
+            tensor_info(name, shape, &dtype, quant)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(ModelSignals {
+        source,
+        inputs,
+        outputs,
+        metadata,
+    })
+}
+
+/// Builds `ModelSignals` from an `edgefirst.decoder.ModelSignals` or any
+/// object with `source`, `inputs`, `outputs` and (optionally) `metadata`.
+pub(crate) fn model_signals_from_object(obj: &Bound<'_, PyAny>) -> PyResult<ModelSignals> {
+    let source: String = obj.getattr("source")?.extract()?;
+    let inputs: Vec<TensorArg> = obj.getattr("inputs")?.extract()?;
+    let outputs: Vec<TensorArg> = obj.getattr("outputs")?.extract()?;
+    let metadata: Option<BTreeMap<String, String>> = match obj.getattr_opt("metadata")? {
+        Some(m) => m.extract()?,
+        None => None,
+    };
+    model_signals(&source, inputs, outputs, metadata.unwrap_or_default())
+}
+
 /// Infers an Ultralytics YOLO schema from raw model I/O signals and
 /// metadata. Supports detection and segmentation, both Ultralytics v8/v11
 /// pre-NMS heads and YOLO26 end-to-end heads.
@@ -176,33 +225,7 @@ pub fn py_infer_ultralytics_schema(
     outputs: Vec<TensorArg>,
     metadata: BTreeMap<String, String>,
 ) -> PyResult<Py<PyAny>> {
-    let source = source_from_str(source)?;
-    let inputs = inputs
-        .into_iter()
-        .map(|t| {
-            // A model input's own quantization plays no part in
-            // output-layout inference, so the slot is accepted and ignored
-            // rather than rejected -- callers build input and output specs
-            // from the same runtime dict, and an arity difference between
-            // the two arguments is a trap, not a safeguard.
-            let (name, shape, dtype, _) = t.into_parts();
-            tensor_info(name, shape, &dtype, None)
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    let outputs = outputs
-        .into_iter()
-        .map(|o| {
-            let (name, shape, dtype, quant) = o.into_parts();
-            tensor_info(name, shape, &dtype, quant)
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-
-    let signals = ModelSignals {
-        source,
-        inputs,
-        outputs,
-        metadata,
-    };
+    let signals = model_signals(source, inputs, outputs, metadata)?;
 
     let result =
         infer_ultralytics_schema(&signals).map_err(|e| PyValueError::new_err(e.to_string()))?;
