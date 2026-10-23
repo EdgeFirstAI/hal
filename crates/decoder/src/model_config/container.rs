@@ -137,7 +137,14 @@ pub fn read_embedded(path: impl AsRef<Path>) -> Result<ModelFiles, ModelConfigEr
         path: path.to_owned(),
         source,
     };
-    let mut file = File::open(path).map_err(io)?;
+    // Windows refuses to open a directory rather than reporting one.
+    let mut file = File::open(path).map_err(|e| {
+        io(if path.is_dir() {
+            std::io::ErrorKind::IsADirectory.into()
+        } else {
+            e
+        })
+    })?;
     let meta = file.metadata().map_err(io)?;
     if meta.is_dir() {
         return Err(io(std::io::ErrorKind::IsADirectory.into()));
