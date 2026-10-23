@@ -71,14 +71,20 @@ pub enum VideoCodec {
     H264,
 }
 
-/// Target bitrate of an encoder.
+/// Bits per pixel [`Bitrate::Auto`] targets: about 10 Mbps at 1080p30.
+const AUTO_BITS_PER_PIXEL: f64 = 0.16;
+/// Lowest and highest target [`Bitrate::Auto`] chooses, in bits per second.
+const AUTO_BITRATE_RANGE: (f64, f64) = (1e6, 1e8);
+
+/// Target bitrate of an encoder. Either way the encoder uses constant-bitrate
+/// rate control where the device offers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Bitrate {
-    /// The device's default bitrate and rate control.
+    /// A target chosen from the frame size and rate: 0.16 bits per pixel,
+    /// within 1 to 100 Mbps. See [`EncoderConfig::target_bitrate`].
     #[default]
     Auto,
-    /// A constant target in bits per second. Selects constant-bitrate rate
-    /// control where the device offers a choice.
+    /// A constant target in bits per second.
     Bps(u32),
 }
 
@@ -122,6 +128,93 @@ pub enum H264Level {
     L6_2,
 }
 
+impl H264Level {
+    /// Every level, lowest first.
+    const ALL: [Self; 20] = [
+        Self::L1_0,
+        Self::L1b,
+        Self::L1_1,
+        Self::L1_2,
+        Self::L1_3,
+        Self::L2_0,
+        Self::L2_1,
+        Self::L2_2,
+        Self::L3_0,
+        Self::L3_1,
+        Self::L3_2,
+        Self::L4_0,
+        Self::L4_1,
+        Self::L4_2,
+        Self::L5_0,
+        Self::L5_1,
+        Self::L5_2,
+        Self::L6_0,
+        Self::L6_1,
+        Self::L6_2,
+    ];
+
+    /// Table A-1 limits: frame size in macroblocks, macroblocks per second,
+    /// and `MaxBR`, which [`Self::lowest_for`] scales by the profile's
+    /// `cpbBrVclFactor` into bits per second.
+    const fn limits(self) -> (u64, u64, u64) {
+        match self {
+            Self::L1_0 => (99, 1_485, 64),
+            Self::L1b => (99, 1_485, 128),
+            Self::L1_1 => (396, 3_000, 192),
+            Self::L1_2 => (396, 6_000, 384),
+            Self::L1_3 => (396, 11_880, 768),
+            Self::L2_0 => (396, 11_880, 2_000),
+            Self::L2_1 => (792, 19_800, 4_000),
+            Self::L2_2 => (1_620, 20_250, 4_000),
+            Self::L3_0 => (1_620, 40_500, 10_000),
+            Self::L3_1 => (3_600, 108_000, 14_000),
+            Self::L3_2 => (5_120, 216_000, 20_000),
+            Self::L4_0 => (8_192, 245_760, 20_000),
+            Self::L4_1 => (8_192, 245_760, 50_000),
+            Self::L4_2 => (8_704, 522_240, 50_000),
+            Self::L5_0 => (22_080, 589_824, 135_000),
+            Self::L5_1 => (36_864, 983_040, 240_000),
+            Self::L5_2 => (36_864, 2_073_600, 240_000),
+            Self::L6_0 => (139_264, 4_177_920, 240_000),
+            Self::L6_1 => (139_264, 8_355_840, 480_000),
+            Self::L6_2 => (139_264, 16_711_680, 800_000),
+        }
+    }
+
+    /// The lowest level whose frame size, frame dimension, macroblock rate
+    /// and bitrate limits cover a `width`x`height` stream at `frame_rate` and
+    /// `bps` in `profile`, or `None` when even level 6.2 does not.
+    pub fn lowest_for(
+        profile: H264Profile,
+        width: u32,
+        height: u32,
+        frame_rate: f64,
+        bps: u32,
+    ) -> Option<Self> {
+        let (width_mbs, height_mbs) = (
+            u64::from(width.div_ceil(16)),
+            u64::from(height.div_ceil(16)),
+        );
+        let mbs = width_mbs * height_mbs;
+        let rate = (mbs as f64 * frame_rate).ceil();
+        // cpbBrVclFactor of Table A-2: High allows 1.25 times the bitrate.
+        let factor = match profile {
+            H264Profile::High => 1_250,
+            _ => 1_000,
+        };
+        Self::ALL.into_iter().find(|level| {
+            let (frame, mb_rate, max_br) = level.limits();
+            // A.3.1: neither dimension may exceed sqrt(8 * MaxFS) macroblocks.
+            let side = (8 * frame).isqrt();
+            mbs <= frame
+                && width_mbs <= side
+                && height_mbs <= side
+                && rate <= mb_rate as f64
+                && u64::from(bps) <= max_br * factor
+        })
+    }
+}
+
 /// Configuration of a [`VideoEncoder`].
 ///
 /// Start from [`EncoderConfig::h264`] and set the fields to change.
@@ -146,15 +239,19 @@ pub struct EncoderConfig {
     /// Emit the SPS and PPS with every key frame, so a receiver can start
     /// decoding at any key frame.
     pub repeat_headers: bool,
-    /// Profile. `None` keeps the device default.
+    /// Profile. `None` selects High where the device offers it, and keeps
+    /// the device default where it does not. See
+    /// [`EncoderConfig::target_profile`].
     pub profile: Option<H264Profile>,
-    /// Level. `None` keeps the device default.
+    /// Level. `None` selects the lowest level that covers the stream where
+    /// the device offers it, and keeps the device default where it does not.
+    /// See [`EncoderConfig::target_level`].
     pub level: Option<H264Level>,
 }
 
 impl EncoderConfig {
-    /// An H.264 configuration with the device's default bitrate, GOP,
-    /// profile and level, and headers repeated on every key frame.
+    /// An H.264 configuration with an automatic bitrate, profile and level,
+    /// the device's default GOP, and headers repeated on every key frame.
     pub fn h264(width: u32, height: u32, input_format: PixelFormat, frame_rate: f64) -> Self {
         Self {
             codec: VideoCodec::H264,
@@ -168,6 +265,43 @@ impl EncoderConfig {
             profile: None,
             level: None,
         }
+    }
+
+    /// The target bitrate in bits per second: the [`Bitrate::Bps`] value, or
+    /// for [`Bitrate::Auto`] one derived from the frame size and rate.
+    pub fn target_bitrate(&self) -> u32 {
+        match self.bitrate {
+            Bitrate::Bps(bps) => bps,
+            Bitrate::Auto => {
+                let bps = f64::from(self.width)
+                    * f64::from(self.height)
+                    * self.frame_rate
+                    * AUTO_BITS_PER_PIXEL;
+                let (lo, hi) = AUTO_BITRATE_RANGE;
+                bps.clamp(lo, hi) as u32
+            }
+        }
+    }
+
+    /// The profile to request: [`EncoderConfig::profile`], or High.
+    pub fn target_profile(&self) -> H264Profile {
+        self.profile.unwrap_or(H264Profile::High)
+    }
+
+    /// The level to request: [`EncoderConfig::level`], or the lowest that
+    /// covers the size, frame rate and [target bitrate](Self::target_bitrate)
+    /// in the [target profile](Self::target_profile). `None` when no level
+    /// covers them.
+    pub fn target_level(&self) -> Option<H264Level> {
+        self.level.or_else(|| {
+            H264Level::lowest_for(
+                self.target_profile(),
+                self.width,
+                self.height,
+                self.frame_rate,
+                self.target_bitrate(),
+            )
+        })
     }
 
     /// Checks the values that do not depend on a device.
@@ -667,6 +801,91 @@ mod tests {
         c.gop = Some(1);
         c.bitrate = Bitrate::Bps(4_000_000);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_bitrate_scales_with_size_and_rate_within_its_range() {
+        let mut c = nv12_1080p();
+        assert_eq!(c.target_bitrate(), 9_953_280);
+        c.frame_rate = 60.0;
+        assert_eq!(c.target_bitrate(), 19_906_560);
+        let c = EncoderConfig::h264(320, 240, PixelFormat::Nv12, 15.0);
+        assert_eq!(c.target_bitrate(), 1_000_000);
+        let c = EncoderConfig::h264(7680, 4320, PixelFormat::Nv12, 120.0);
+        assert_eq!(c.target_bitrate(), 100_000_000);
+        let mut c = nv12_1080p();
+        c.bitrate = Bitrate::Bps(4_000_000);
+        assert_eq!(c.target_bitrate(), 4_000_000);
+    }
+
+    #[test]
+    fn levels_cover_size_rate_and_bitrate() {
+        use H264Level as L;
+        use H264Profile::{High, Main};
+        assert_eq!(
+            L::lowest_for(High, 1920, 1080, 30.0, 10_000_000),
+            Some(L::L4_0)
+        );
+        assert_eq!(
+            L::lowest_for(High, 1920, 1080, 60.0, 20_000_000),
+            Some(L::L4_2)
+        );
+        assert_eq!(
+            L::lowest_for(High, 1920, 1080, 30.0, 40_000_000),
+            Some(L::L4_1)
+        );
+        // Main has no 1.25 bitrate allowance: 24 Mbps exceeds level 4.0's 20.
+        assert_eq!(
+            L::lowest_for(Main, 1920, 1080, 30.0, 24_000_000),
+            Some(L::L4_1)
+        );
+        assert_eq!(
+            L::lowest_for(High, 640, 480, 30.0, 2_000_000),
+            Some(L::L3_0)
+        );
+        assert_eq!(
+            L::lowest_for(High, 3840, 2160, 30.0, 40_000_000),
+            Some(L::L5_1)
+        );
+        assert_eq!(
+            L::lowest_for(High, 7680, 4320, 120.0, 100_000_000),
+            Some(L::L6_2)
+        );
+        assert_eq!(L::lowest_for(High, 7680, 4320, 240.0, 100_000_000), None);
+    }
+
+    #[test]
+    fn levels_cover_each_frame_dimension() {
+        use H264Level as L;
+        use H264Profile::High;
+        // 256 macroblocks wide fits level 3.2's frame size but not its
+        // sqrt(8 * 5120) = 202 macroblock side; level 4.0 allows 256.
+        assert_eq!(
+            L::lowest_for(High, 4096, 256, 30.0, 5_000_000),
+            Some(L::L4_0)
+        );
+        assert_eq!(
+            L::lowest_for(High, 256, 4096, 30.0, 5_000_000),
+            Some(L::L4_0)
+        );
+        // 257 macroblocks exceed level 4.1's side; 4.2 allows sqrt(8 * 8704) = 263.
+        assert_eq!(
+            L::lowest_for(High, 4112, 256, 30.0, 5_000_000),
+            Some(L::L4_2)
+        );
+    }
+
+    #[test]
+    fn unset_profile_and_level_resolve_to_high_at_the_lowest_level() {
+        let mut c = nv12_1080p();
+        assert_eq!(c.target_profile(), H264Profile::High);
+        assert_eq!(c.target_level(), Some(H264Level::L4_0));
+        c.frame_rate = 60.0;
+        assert_eq!(c.target_level(), Some(H264Level::L4_2));
+        c.profile = Some(H264Profile::Main);
+        c.level = Some(H264Level::L5_1);
+        assert_eq!(c.target_profile(), H264Profile::Main);
+        assert_eq!(c.target_level(), Some(H264Level::L5_1));
     }
 
     #[test]
