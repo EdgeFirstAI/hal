@@ -51,11 +51,12 @@
 //! that disagrees with `num_labels` or the output) is ignored with a warning
 //! and a note naming the source and the index (`id2label[7]`), and the next
 //! source supplies the labels. The count is checked against the class count
-//! the decoder builder derives from the outputs (the detection classes for a
-//! ModelPack multitask model), or the segmentation channels of a semantic
-//! model, so an earlier source that miscounts yields to a later one that
-//! fits; end-to-end detections and class maps carry no count, so there the
-//! first source wins. Ultralytics `names` that disagree with the output are
+//! the decoder builder derives from the outputs, or the segmentation
+//! channels of a semantic model, so an earlier source that miscounts yields
+//! to a later one that fits; end-to-end detections and class maps carry no
+//! count, so there the first source wins. A ModelPack segmentation output
+//! has one channel more than its classes: the last is background and has no
+//! label, so a multitask model's masks and boxes share class indices. Ultralytics `names` that disagree with the output are
 //! ignored and the schema is laid out from the count a `labels` override
 //! gives, or else from the one output whose class count fits; when several
 //! could, the layout is ambiguous and resolution fails, naming the override

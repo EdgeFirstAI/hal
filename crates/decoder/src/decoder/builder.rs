@@ -2454,8 +2454,8 @@ fn warn_no_semantic(config: Result<SemanticConfig, DecoderError>) -> Option<Sema
 
 impl Decoder {
     /// The class count the outputs carry, computed as the builder checks it;
-    /// `None` for semantic models and layouts that carry none (end-to-end
-    /// detections).
+    /// `None` for generic semantic models and layouts that carry none
+    /// (end-to-end detections).
     pub(crate) fn class_count(&self) -> Option<usize> {
         type B = DecoderBuilder;
         let det = |d: &configs::Detection, protos: Option<usize>| {
@@ -2486,6 +2486,12 @@ impl Decoder {
                 let k = B::get_protos_count(&protos.dshape)
                     .or_else(|| Some(*protos.shape.get(1)?.min(protos.shape.get(3)?)))?;
                 det(boxes, Some(k))
+            }
+            ModelType::ModelPackSeg { segmentation } => {
+                // The last channel is background, which has no label.
+                return B::modelpack_seg_num_classes(segmentation)
+                    .checked_sub(1)
+                    .filter(|&n| n > 0);
             }
             ModelType::PerScale => {
                 return self

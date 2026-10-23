@@ -717,8 +717,8 @@ fn semantic_classes(schema: &SchemaV2) -> Option<usize> {
         })
 }
 
-/// The detection class count the decoder builder derives from `schema`.
-fn detection_classes(schema: &SchemaV2) -> Option<usize> {
+/// The class count the decoder builder derives from `schema`.
+fn decoder_classes(schema: &SchemaV2) -> Option<usize> {
     DecoderBuilder::new()
         .with_schema(schema.clone())
         .build()
@@ -931,7 +931,7 @@ pub fn resolve_sources(
     }
     let classes = st
         .num_classes
-        .or_else(|| detection_classes(&schema))
+        .or_else(|| decoder_classes(&schema))
         .or_else(|| (task == ModelTask::Semantic).then(|| semantic_classes(&schema))?);
     if let Some(l) = &overrides.labels {
         if let Some(i) = l.iter().position(|n| n.trim().is_empty()) {
@@ -1936,6 +1936,7 @@ mod tests {
     fn ultralytics_with_outputs(names: &str, shapes: &[&[usize]]) -> ModelSources {
         let mut s = ultralytics_signals();
         s.metadata.insert("names".into(), names.into());
+        s.metadata.insert("end2end".into(), "False".into());
         s.outputs = shapes
             .iter()
             .enumerate()
@@ -1981,6 +1982,78 @@ mod tests {
                 resolve_sources(ultralytics_with_outputs("{0: 'a', 1: 'b'}", &shapes), &o).unwrap();
             assert_eq!(c.labels.len(), 80);
             assert_eq!(c.schema.outputs[0].shape, detections, "{shapes:?}");
+        }
+    }
+
+    /// An empty override states no count, so recovery finds the real one and
+    /// the override is then rejected against it.
+    #[test]
+    fn empty_labels_override_does_not_pick_the_layout() {
+        let boxes: &[usize] = &[1, 4, 8400];
+        let detections: &[usize] = &[1, 84, 8400];
+        let mut o = ModelOverrides::new();
+        o.labels = Some(Vec::new());
+        let e = resolve_sources(
+            ultralytics_with_outputs("{0: 'a'}", &[boxes, detections]),
+            &o,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ModelConfigError::LabelCountMismatch {
+                    expected: 80,
+                    found: 0
+                }
+            ),
+            "{e}"
+        );
+    }
+
+    /// Two identical candidates for one count are ambiguous, not skipped in
+    /// favour of another count; a labels override naming the count settles it.
+    #[test]
+    fn ambiguity_within_one_count_is_reported() {
+        let small: &[usize] = &[1, 6, 8400];
+        let large: &[usize] = &[1, 84, 8400];
+        let shapes = [small, small, large];
+        let e = resolve_sources(
+            ultralytics_with_outputs("{0: 'a'}", &shapes),
+            &ModelOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, ModelConfigError::Infer(InferError::AmbiguousLayout(m))
+                if m.contains("labels override")),
+            "{e}"
+        );
+        let mut o = ModelOverrides::new();
+        o.labels = Some((0..80).map(|i| format!("c{i}")).collect());
+        let c = resolve_sources(ultralytics_with_outputs("{0: 'a'}", &shapes), &o).unwrap();
+        assert_eq!(c.schema.outputs[0].shape, large);
+    }
+
+    /// ModelPack segmentation-only models are counted from their channel
+    /// axis, with or without a `dshape`, less the trailing background channel.
+    #[test]
+    fn modelpack_segmentation_is_counted_without_background() {
+        for outputs in [
+            r#"[{"name": "seg", "type": "segmentation", "decoder": "modelpack",
+                "shape": [1, 160, 160, 5]}]"#,
+            r#"[{"name": "seg", "type": "segmentation", "decoder": "modelpack",
+                "shape": [1, 160, 160, 5],
+                "dshape": [{"batch": 1}, {"height": 160}, {"width": 160}, {"num_classes": 5}]}]"#,
+        ] {
+            assert_eq!(
+                label_count_error(outputs, &["a", "b"]),
+                Some((4, 2)),
+                "{outputs}"
+            );
+            assert_eq!(
+                label_count_error(outputs, &["a", "b", "c", "d"]),
+                None,
+                "{outputs}"
+            );
         }
     }
 

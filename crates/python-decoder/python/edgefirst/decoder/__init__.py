@@ -169,6 +169,9 @@ class LabelCountMismatchError(OverrideError):
         self.expected = expected
         self.found = found
 
+    def __reduce__(self):
+        return type(self), (str(self), self.expected, self.found)
+
 
 class UnresolvedConfigError(ModelConfigError):
     """Nothing supplies a required piece of the configuration."""

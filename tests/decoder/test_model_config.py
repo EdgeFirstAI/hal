@@ -7,6 +7,7 @@ provenance and the preprocessing spec it hands to ``edgefirst.image``."""
 from __future__ import annotations
 
 import dataclasses
+import pickle
 import shutil
 from pathlib import Path
 
@@ -227,6 +228,13 @@ def test_label_count_mismatch_has_its_own_error(sidecar_model: Path):
     assert isinstance(info.value, OverrideError)
     assert (info.value.expected, info.value.found) == (150, 2)
     assert "labels names 2 classes but the model has 150" in str(info.value)
+    restored = pickle.loads(pickle.dumps(info.value))
+    assert type(restored) is LabelCountMismatchError
+    assert (str(restored), restored.expected, restored.found) == (
+        str(info.value),
+        150,
+        2,
+    )
 
 
 def test_empty_override_label_is_a_plain_override_error():

@@ -885,18 +885,25 @@ pub(crate) fn infer_ultralytics_schema_ignoring_names(
         };
         infer_from_meta(signals, candidate)
     };
-    let stated = classes.and_then(|nc| with_count(nc).ok());
+    const REMEDY: &str = "supply a labels override naming every class, or describe the \
+                          outputs in an edgefirst.json beside the model";
+    let stated = classes
+        .filter(|&nc| nc > 0)
+        .and_then(|nc| with_count(nc).ok());
     let mut found: Option<InferredSchema> = stated;
     if found.is_none() {
         for nc in candidate_class_counts(signals)? {
-            let Ok(inferred) = with_count(nc) else {
-                continue;
+            let inferred = match with_count(nc) {
+                Ok(inferred) => inferred,
+                Err(InferError::AmbiguousLayout(why)) => {
+                    return Err(InferError::AmbiguousLayout(format!("{why}; {REMEDY}")))
+                }
+                Err(_) => continue,
             };
             if let Some(first) = &found {
                 return Err(InferError::AmbiguousLayout(format!(
                     "`names` miscounts the classes and the outputs allow both {} and {nc}; \
-                     supply a labels override naming every class, or describe the outputs \
-                     in an edgefirst.json beside the model",
+                     {REMEDY}",
                     first.labels.len()
                 )));
             }
