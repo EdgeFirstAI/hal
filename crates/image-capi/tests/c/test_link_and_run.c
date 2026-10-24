@@ -66,8 +66,8 @@ static int spec_to_content_region(ef_image_processor *p) {
 }
 
 int main(void) {
-    if (ef_image_abi_version() != 4) {
-        fprintf(stderr, "FAIL: ef_image_abi_version() = %u, expected 4\n",
+    if (ef_image_abi_version() != 5) {
+        fprintf(stderr, "FAIL: ef_image_abi_version() = %u, expected 5\n",
                 (unsigned) ef_image_abi_version());
         return 1;
     }

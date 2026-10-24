@@ -12,7 +12,9 @@ use edgefirst_decoder::{
     schema::SchemaV2,
     ConfigOutput, DecoderBuilder, Nms, Quantization, XYWH,
 };
-use edgefirst_tensor::{Quantization as TQ, Tensor, TensorDyn, TensorMemory};
+use edgefirst_tensor::{
+    Quantization as TQ, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+};
 use ndarray::s;
 
 const WARMUP: usize = 10;
@@ -794,6 +796,279 @@ fn bench_per_scale_ltrb_i8_to_f32(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
+/// Process CPU time (all threads) consumed so far, where the platform
+/// reports it.
+#[cfg(unix)]
+fn process_cpu_time() -> Option<std::time::Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer; the clock id is a constant
+    // every supported Unix defines.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    (rc == 0).then(|| std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_time() -> Option<std::time::Duration> {
+    None
+}
+
+/// `run_bench`, also printing the process CPU time per iteration, which
+/// counts rayon workers (including their idle spinning) alongside the
+/// calling thread.
+fn run_bench_cpu<F: FnMut()>(
+    suite: &mut BenchSuite,
+    name: &str,
+    warmup: usize,
+    iterations: usize,
+    f: F,
+) {
+    let cpu0 = process_cpu_time();
+    let result = run_bench(name, warmup, iterations, f);
+    let cpu1 = process_cpu_time();
+    result.print_summary();
+    if let (Some(cpu0), Some(cpu1)) = (cpu0, cpu1) {
+        let cpu = (cpu1 - cpu0) / (warmup + iterations) as u32;
+        println!("  {:50} cpu/iter={cpu:>10.1?}", "");
+    }
+    suite.record(&result);
+}
+
+/// Deterministic xorshift generator for synthetic model outputs.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 32) as u32
+    }
+
+    fn below(&mut self, n: u32) -> u32 {
+        self.next() % n
+    }
+}
+
+/// Per-scale int8 DFL detection model with a `width x height` input, three
+/// levels at strides 8/16/32 and `nc` classes, as the EdgeFirst converter
+/// declares it. Quantization matches captures of yolov8n smart exports on
+/// the i.MX 95 (boxes about 0.12-0.15 per step, scores about 0.2).
+fn realistic_per_scale_schema(width: usize, height: usize, nc: usize) -> SchemaV2 {
+    let strides = [8usize, 16, 32];
+    let total: usize = strides.iter().map(|s| (width / s) * (height / s)).sum();
+    let child = |role: &str, i: usize, s: usize, c: usize, q: (f32, i32)| {
+        let (h, w) = (height / s, width / s);
+        let last = if role == "boxes" {
+            serde_json::json!({"num_features": c})
+        } else {
+            serde_json::json!({"num_classes": c})
+        };
+        let mut v = serde_json::json!({
+            "name": format!("{role}_{i}"), "type": role, "stride": s, "scale_index": i,
+            "shape": [1, h, w, c],
+            "dshape": [{"batch": 1}, {"height": h}, {"width": w}, last],
+            "dtype": "int8",
+            "quantization": {"scale": q.0, "zero_point": q.1, "dtype": "int8"}
+        });
+        if role == "scores" {
+            v["activation_required"] = "sigmoid".into();
+        }
+        v
+    };
+    let boxes: Vec<_> = strides
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| child("boxes", i, s, 64, (0.147, 8)))
+        .collect();
+    let scores: Vec<_> = strides
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| child("scores", i, s, nc, (0.2, 110)))
+        .collect();
+    let schema = serde_json::json!({
+        "schema_version": 2,
+        "nms": "class_agnostic",
+        "input": {
+            "shape": [1, height, width, 3],
+            "dshape": [{"batch": 1}, {"height": height}, {"width": width}, {"num_features": 3}],
+            "cameraadaptor": "rgb"
+        },
+        "outputs": [
+            {
+                "name": "boxes", "type": "boxes", "shape": [1, 4, total],
+                "dshape": [{"batch": 1}, {"box_coords": 4}, {"num_boxes": total}],
+                "encoding": "dfl", "decoder": "ultralytics", "normalized": true,
+                "outputs": boxes
+            },
+            {
+                "name": "scores", "type": "scores", "shape": [1, nc, total],
+                "dshape": [{"batch": 1}, {"num_classes": nc}, {"num_boxes": total}],
+                "score_format": "per_class", "decoder": "ultralytics",
+                "outputs": scores
+            }
+        ]
+    });
+    serde_json::from_value(schema).expect("schema parse")
+}
+
+/// Synthetic int8 outputs for [`realistic_per_scale_schema`], shaped like
+/// captured yolov8n frames: each DFL side peaks at one bin and falls off
+/// by about 0.4-1.2 logits per bin, about 0.3% of anchors carry a class
+/// above 0.25, another 2% sit between about 0.05 and 0.25, and the rest
+/// score below 0.02.
+fn realistic_per_scale_inputs(schema: &SchemaV2) -> Vec<TensorDyn> {
+    let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+    let mut tensors = Vec::new();
+    for logical in &schema.outputs {
+        use edgefirst_decoder::schema::LogicalType;
+        let role = match logical.type_ {
+            Some(LogicalType::Boxes) => "boxes",
+            Some(LogicalType::Scores) => "scores",
+            _ => continue,
+        };
+        for child in &logical.outputs {
+            let shape = child.shape.clone();
+            let c = shape[3];
+            let mut t = Tensor::<i8>::new(&shape, Some(TensorMemory::Mem), None).unwrap();
+            {
+                let mut m = t.map().unwrap();
+                let v = m.as_mut_slice();
+                for row in v.chunks_exact_mut(c) {
+                    if role == "boxes" {
+                        for side in row.chunks_exact_mut(16) {
+                            let peak = rng.below(16) as i32;
+                            let top = 20 + rng.below(50) as i32;
+                            let fall = 3 + rng.below(6) as i32;
+                            for (i, b) in side.iter_mut().enumerate() {
+                                let noise = rng.below(9) as i32 - 4;
+                                let x = top - fall * (i as i32 - peak).abs() + noise;
+                                *b = x.clamp(-128, 127) as i8;
+                            }
+                        }
+                    } else {
+                        for b in row.iter_mut() {
+                            *b = (40 + rng.below(50)) as i8;
+                        }
+                        let r = rng.below(1000);
+                        let class = rng.below(c as u32) as usize;
+                        if r < 3 {
+                            row[class] = (106 + rng.below(22)) as i8;
+                        } else if r < 23 {
+                            row[class] = (96 + rng.below(9)) as i8;
+                        }
+                    }
+                }
+            }
+            let q = child.quantization.as_ref().expect("child quantization");
+            t.set_quantization(TQ::per_tensor(
+                q.scale[0],
+                q.zero_point.as_ref().map_or(0, |z| z[0]),
+            ))
+            .unwrap();
+            tensors.push(TensorDyn::I8(t));
+        }
+    }
+    tensors
+}
+
+/// The per-scale DFL pipeline on realistic int8 outputs, for the 960x544
+/// four-class model (levels of 8160/2040/510 anchors, none a multiple of
+/// the prefilter's pack) and the 640x640 COCO model. `dense` decodes every
+/// anchor; `prefilter` passes the 0.25 score threshold the way `decode`
+/// does; `decode` adds the candidate filter and NMS.
+fn bench_per_scale_realistic(suite: &mut BenchSuite) {
+    for (label, width, height, nc) in [("960x544", 960, 544, 4), ("640x640", 640, 640, 80)] {
+        let schema = realistic_per_scale_schema(width, height, nc);
+        let tensors = realistic_per_scale_inputs(&schema);
+        let inputs: Vec<&TensorDyn> = tensors.iter().collect();
+        let decoder = DecoderBuilder::default()
+            .with_schema(schema)
+            .with_decode_dtype(DecodeDtype::F32)
+            .with_iou_threshold(0.7)
+            .with_score_threshold(0.25)
+            .with_nms(Some(Nms::ClassAgnostic))
+            .build()
+            .expect("decoder build");
+
+        let kept = decoder._bench_run_per_scale(&inputs, Some(0.25)).unwrap();
+        let mut boxes = Vec::new();
+        decoder
+            .decode(&inputs, &mut boxes, &mut Vec::new())
+            .unwrap();
+        println!(
+            "  per_scale {label}: prefilter keeps {kept} anchors, {} detections",
+            boxes.len()
+        );
+
+        for (mode, threshold) in [("dense", None), ("prefilter", Some(0.25))] {
+            run_bench_cpu(
+                suite,
+                &format!("decoder/per_scale/{label}/{mode}"),
+                WARMUP,
+                ITERATIONS * 3,
+                || {
+                    decoder._bench_run_per_scale(&inputs, threshold).unwrap();
+                },
+            );
+        }
+        run_bench_cpu(
+            suite,
+            &format!("decoder/per_scale/{label}/decode"),
+            WARMUP,
+            ITERATIONS * 3,
+            || {
+                let mut output_boxes = Vec::with_capacity(50);
+                decoder
+                    .decode(&inputs, &mut output_boxes, &mut Vec::new())
+                    .unwrap();
+            },
+        );
+    }
+}
+
+/// One 120x68 level (the largest of a 960x544 input) of realistic DFL bins
+/// through each 8-bit DFL box kernel, reported per anchor.
+fn bench_per_scale_dfl_kernels(suite: &mut BenchSuite) {
+    use edgefirst_decoder::per_scale::bench::{DflKernel, DflLevel};
+    let level = DflLevel::new(120, 68, 8.0, 0.147, 8);
+    let n = level.anchors();
+    let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+    let mut input = vec![0i8; n * 64];
+    for side in input.chunks_exact_mut(16) {
+        let peak = rng.below(16) as i32;
+        let top = 20 + rng.below(50) as i32;
+        let fall = 3 + rng.below(6) as i32;
+        for (i, b) in side.iter_mut().enumerate() {
+            let noise = rng.below(9) as i32 - 4;
+            *b = (top - fall * (i as i32 - peak).abs() + noise).clamp(-128, 127) as i8;
+        }
+    }
+    let mut reference = vec![0f32; n * 4];
+    level.decode(DflKernel::Softmax, &input, &mut reference);
+    let mut dst = vec![0f32; n * 4];
+    for kernel in DflKernel::available() {
+        let name = format!("decoder/per_scale/dfl_kernel/{kernel:?}");
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            level.decode(kernel, &input, &mut dst);
+        });
+        let err = dst
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        result.print_summary();
+        println!(
+            "  {:50} ns/anchor={:>7.1}  max |Δ| vs Softmax={err:.2e} px",
+            "",
+            result.median().as_nanos() as f64 / n as f64
+        );
+        suite.record(&result);
+    }
+}
+
 /// SegFormer-B1-shaped logits (150 classes, 128x168, NCHW) over a Voronoi
 /// class field. Calibrated to SegFormer-B1 on ADE20K val: about 7% of
 /// low-resolution cells straddle a class boundary, where a few classes score
@@ -907,6 +1182,9 @@ fn bench_semantic(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
+/// One benchmark function.
+type Bench = fn(&mut BenchSuite);
+
 fn main() {
     env_logger::init();
 
@@ -914,41 +1192,58 @@ fn main() {
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
     let mut suite = BenchSuite::from_args();
-
-    println!("\n== YOLO ==\n");
-    bench_yolo_quant(&mut suite);
-    bench_yolo_f32(&mut suite);
-
-    println!("\n== Quant ==\n");
-    bench_quant_decode_boxes(&mut suite);
-    bench_quant_decode_boxes_multilabel(&mut suite);
-    bench_quant_nms(&mut suite);
-
-    println!("\n== Dequantize ==\n");
-    bench_dequantize_i8(&mut suite);
-    bench_dequantize_i8_chunked(&mut suite);
-    bench_dequantize_i16(&mut suite);
-    bench_dequantize_i16_chunked(&mut suite);
-
-    println!("\n== Float ==\n");
-    bench_f32_decode_boxes(&mut suite);
-    bench_f32_nms(&mut suite);
-
-    println!("\n== ModelPack ==\n");
-    bench_modelpack_u8(&mut suite);
-    bench_modelpack_split_u8(&mut suite);
-
-    println!("\n== Masks ==\n");
-    bench_masks_f32(&mut suite);
-    bench_masks_i8(&mut suite);
-
-    println!("\n== Semantic ==\n");
-    bench_semantic(&mut suite);
-
-    println!("\n== Per-Scale ==\n");
-    bench_per_scale_dfl_i8_to_f32(&mut suite);
-    bench_per_scale_dfl_i8_to_f16(&mut suite);
-    bench_per_scale_ltrb_i8_to_f32(&mut suite);
+    // `--section <name>` runs one section, matched case-insensitively.
+    let only = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--section")
+        .map(|w| w[1].to_ascii_lowercase());
+    let sections: [(&str, &[Bench]); 10] = [
+        ("YOLO", &[bench_yolo_quant, bench_yolo_f32]),
+        (
+            "Quant",
+            &[
+                bench_quant_decode_boxes,
+                bench_quant_decode_boxes_multilabel,
+                bench_quant_nms,
+            ],
+        ),
+        (
+            "Dequantize",
+            &[
+                bench_dequantize_i8,
+                bench_dequantize_i8_chunked,
+                bench_dequantize_i16,
+                bench_dequantize_i16_chunked,
+            ],
+        ),
+        ("Float", &[bench_f32_decode_boxes, bench_f32_nms]),
+        ("ModelPack", &[bench_modelpack_u8, bench_modelpack_split_u8]),
+        ("Masks", &[bench_masks_f32, bench_masks_i8]),
+        ("Semantic", &[bench_semantic]),
+        (
+            "Per-Scale",
+            &[
+                bench_per_scale_dfl_i8_to_f32,
+                bench_per_scale_dfl_i8_to_f16,
+                bench_per_scale_ltrb_i8_to_f32,
+            ],
+        ),
+        ("Per-Scale-Realistic", &[bench_per_scale_realistic]),
+        ("DFL-Kernels", &[bench_per_scale_dfl_kernels]),
+    ];
+    for (name, benches) in sections {
+        if only
+            .as_ref()
+            .is_some_and(|o| *o != name.to_ascii_lowercase())
+        {
+            continue;
+        }
+        println!("\n== {name} ==\n");
+        for bench in benches {
+            bench(&mut suite);
+        }
+    }
 
     suite.finish();
     println!("\nDone.");

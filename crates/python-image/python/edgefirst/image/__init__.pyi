@@ -629,10 +629,16 @@ class ImageProcessor:
                 still prefer DMA-buf when available and otherwise use system
                 memory.
             access: Declared CPU access — ``"readwrite"`` (default),
-                ``"read"``, ``"write"``, or ``"none"`` (hardware-only,
-                required for tile compression). Hardware (GPU/NPU) access is
-                always implied. A CPU map outside the declaration raises
-                ``PermissionError``. What this processor's own ``convert()``
+                ``"read"``, ``"write"`` (whole-buffer writes only), or
+                ``"none"`` (hardware-only, required for tile compression).
+                Hardware (GPU/NPU/G2D/compositor) access is always implied.
+                The declaration is enforced on every CPU map, the HAL's own
+                included: a map outside it raises ``PermissionError``, and so
+                does HAL CPU work (a CPU convert or draw) it does not cover.
+                On Linux a ``"none"`` or ``"write"`` DMA-BUF image comes from
+                the uncached CMA heap where available: devices mapping it
+                need no CPU cache maintenance, and nothing reads it on the
+                CPU. What this processor's own ``convert()``
                 may do to the image as a destination on the CPU is added, so
                 ``Tensor.declared_cpu_access`` may be wider than ``access``:
                 ``"write"`` when it may fill the whole image (CPU backend,
@@ -662,6 +668,24 @@ class ImageProcessor:
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.
+
+        Example: a display canvas the GPU renders and a Wayland compositor
+        shows (linux-dmabuf), and an overlay the CPU writes. Neither is read
+        on the CPU, so on Linux both come from uncached CMA where available,
+        and the compositor's per-frame mapping costs no cache maintenance::
+
+            proc = ImageProcessor()
+            frame = proc.create_image(1920, 1080, PixelFormat.Rgba, access="none")
+            canvas = proc.create_image(1920, 1080, PixelFormat.Rgba, access="none")
+            proc.set_class_colors([(255, 96, 0, 160)])  # translucent boxes
+            proc.set_box_line_width(2)
+            proc.convert(camera, frame)
+            proc.draw_decoded_masks(canvas, boxes, scores, classes, background=frame)
+            fd, stride = canvas.fd, canvas.row_stride  # to zwp_linux_dmabuf_v1
+
+            overlay = proc.create_image(640, 64, PixelFormat.Rgba, access="write")
+            with overlay.map("write") as m:  # map("read") raises PermissionError
+                ...  # write every byte
         """
 
     def convert(
@@ -951,17 +975,39 @@ class ImageProcessor:
             """
 
     def set_class_colors(self, colors: list[tuple[int, int, int, int]]) -> None:
-        """Set the colours used to render segmentation masks by class label.
+        """Set the colours used to render segmentation masks and boxes by
+        class label.
 
         The palette holds 20 entries and a class index wraps around it. Only
         the leading entries this call supplies are replaced; the rest keep
         the defaults, and anything past the twentieth is ignored.
+
+        The alpha channel sets the coverage of both the mask fill and the box
+        outline: each is blended over the image with ``a / 255`` scaled by
+        the draw's ``opacity``, so ``255`` draws opaque boxes and lower
+        values translucent ones.
 
         Args:
             colors: ``(r, g, b, a)`` tuples, indexed by class label.
 
         Raises:
             RuntimeError: If the backend rejects the palette.
+        """
+
+    def set_box_line_width(self, width: int) -> None:
+        """Set the thickness of the box outlines drawn by
+        :meth:`draw_decoded_masks` and :meth:`draw_proto_masks`, in image
+        pixels.
+
+        The outline is drawn outside the box edges. The default is 3.
+
+        Args:
+            width: Outline thickness in pixels, at least 1.
+
+        Raises:
+            ValueError: If ``width`` is 0.
+            OverflowError: If ``width`` is negative or does not fit in 32 bits.
+            RuntimeError: If the backend rejects the width.
         """
 
     def set_interpolation(self, mode: InterpolationArg) -> None:

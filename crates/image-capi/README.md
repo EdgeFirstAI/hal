@@ -40,6 +40,21 @@ Tensors from here are ordinary tensors — read them with `ef_tensor_shape`,
 release them with `ef_tensor_free`. There is no separate image-tensor type, and
 one from `ef_tensor_new()` works here just as well.
 
+## Example: a display pipeline
+
+[`examples/display_pipeline.c`](examples/display_pipeline.c) renders a camera frame and detection boxes into a hardware-only (`EF_CPU_ACCESS_NONE`) DMA-BUF canvas, ready to hand to a Wayland compositor by fd, keeps a CPU-written overlay in an `EF_CPU_ACCESS_WRITE` image, decodes captured model outputs with the decoder library, and checks that the library refuses CPU reads of both images. It prints each check and the decode and draw timings. Build it against the tensor, image and decoder libraries, for example cross-compiled for an aarch64 board with the libraries from `cargo-zigbuild build --release --target aarch64-unknown-linux-gnu` (see `scripts/on-target-bundle.sh`):
+
+```sh
+zig cc -std=c11 -O2 -target aarch64-linux-gnu.2.35 -o display_pipeline \
+    crates/image-capi/examples/display_pipeline.c \
+    -Icrates/image-capi/include -Icrates/tensor-capi/include \
+    -Icrates/decoder-capi/include -Icrates/decoder-abi/include \
+    -L$LIBDIR -ledgefirst_image -ledgefirst_decoder -ledgefirst_tensor \
+    -Wl,-rpath,'$ORIGIN'
+```
+
+`crates/python-image/examples/display_pipeline.py` is the same walk-through in Python.
+
 ## Convert options
 
 `NULL` options convert the whole source, stretched, with float outputs mapped as `x / 255`. An `ef_convert_options` handle adds rotation, flip, a source rectangle, a letterbox with its placement and pad, normalization, and interpolation:

@@ -557,9 +557,9 @@ pub enum MaskResolution {
 ///   preserved.** Callers who used to pre-load an image into `dst` before
 ///   calling `draw_decoded_masks` / `draw_proto_masks` must now supply that
 ///   image via `background` instead (behaviour changed in v0.16.4).
-/// - `opacity`: scales the alpha of rendered mask colors. `1.0` (default)
-///   preserves the class color's alpha unchanged; `0.5` makes masks
-///   semi-transparent.
+/// - `opacity`: scales the alpha of rendered mask and box colors. `1.0`
+///   (default) preserves the class color's alpha unchanged; `0.5` makes
+///   masks and boxes twice as transparent.
 /// - `color_mode`: controls whether colors are assigned by class label,
 ///   instance index, or track ID. Defaults to [`ColorMode::Class`].
 #[derive(Debug, Clone, Copy)]
@@ -1002,7 +1002,10 @@ pub trait ImageProcessorTrait {
     /// An empty `segmentation` slice is valid — only bounding boxes are drawn.
     ///
     /// `overlay` controls compositing: `background` is the compositing source
-    /// (must match `dst` in size and format); `opacity` scales mask alpha.
+    /// (must match `dst` in size and format); `opacity` scales mask and box
+    /// alpha. Box outlines are [`set_box_line_width`](Self::set_box_line_width)
+    /// pixels thick and use the [`set_class_colors`](Self::set_class_colors)
+    /// palette, alpha included.
     ///
     /// A `Bgra` background onto a zero-copy destination (a D3D11 texture, an
     /// IOSurface, a dma-buf) returns [`Error::NotSupported`]: the GL
@@ -1062,14 +1065,38 @@ pub trait ImageProcessorTrait {
         overlay: MaskOverlay<'_>,
     ) -> Result<()>;
 
-    /// Sets the colors used for rendering segmentation masks. Up to 20 colors
-    /// can be set.
+    /// Sets the RGBA colors used for rendering segmentation masks and
+    /// bounding boxes. Up to 20 colors can be set; entries past the slice
+    /// keep their previous value.
+    ///
+    /// The alpha channel is the coverage of both masks and box outlines:
+    /// each is blended over the destination with `alpha / 255` scaled by
+    /// [`MaskOverlay::opacity`], so `255` draws opaque boxes and lower
+    /// values draw translucent ones. The destination's own alpha channel is
+    /// left as the base layer set it. The default palette's alpha is `0.7`.
     ///
     /// On [`ImageProcessor`] with no forced backend this reaches every
     /// available backend rather than the first that accepts, because a
     /// later draw may land on any of them. A forced backend receives the
     /// colors alone.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
+
+    /// Sets the thickness, in destination pixels, of the bounding-box
+    /// outlines drawn by [`draw_decoded_masks`](Self::draw_decoded_masks)
+    /// and [`draw_proto_masks`](Self::draw_proto_masks). The default is
+    /// [`DEFAULT_BOX_LINE_WIDTH`] (3 px).
+    ///
+    /// The outline is drawn outside the box edges, so the box interior is
+    /// never covered. It is clipped at the image border.
+    ///
+    /// Reaches every available backend, as
+    /// [`set_class_colors`](Self::set_class_colors) does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidOptions`] when `width` is 0, and
+    /// [`Error::NotImplemented`] from a backend that does not draw (G2D).
+    fn set_box_line_width(&mut self, width: u32) -> Result<()>;
 
     /// Like [`convert`](Self::convert), but does not wait for the GPU to finish.
     ///
@@ -2491,6 +2518,48 @@ impl ImageProcessor {
     /// # }
     /// ```
     ///
+    /// A display canvas the GPU renders and a Wayland compositor shows
+    /// (linux-dmabuf), with a CPU-written overlay. Neither is read by the
+    /// CPU, so on Linux both come from uncached CMA where available: the
+    /// compositor's per-frame mapping of the canvas then costs no cache
+    /// maintenance.
+    ///
+    /// ```rust,no_run
+    /// # use edgefirst_image::{ImageProcessor, ImageProcessorTrait, MaskOverlay};
+    /// # use edgefirst_tensor::{CpuAccess, DType, DetectBox, PixelFormat, TensorDyn, TensorMemory, TensorMapTrait, TensorTrait};
+    /// # fn main() -> Result<(), edgefirst_image::Error> {
+    /// # let camera: TensorDyn = unimplemented!();
+    /// # let boxes: Vec<DetectBox> = Vec::new();
+    /// let mut processor = ImageProcessor::new()?;
+    /// let dma = Some(TensorMemory::DmaBuf);
+    /// let frame = processor.create_image(1920, 1080, PixelFormat::Rgba, DType::U8, dma, CpuAccess::None)?;
+    /// let mut canvas = processor.create_image(1920, 1080, PixelFormat::Rgba, DType::U8, dma, CpuAccess::None)?;
+    ///
+    /// // Translucent orange boxes, 2 px wide.
+    /// processor.set_class_colors(&[[255, 96, 0, 160]])?;
+    /// processor.set_box_line_width(2)?;
+    ///
+    /// let mut frame = frame;
+    /// processor.convert(&camera, &mut frame, None)?;
+    /// processor.draw_decoded_masks(&mut canvas, &boxes, &[], MaskOverlay::new().with_background(&frame))?;
+    ///
+    /// // Hand the canvas to the compositor: its fd, pitch and format.
+    /// let fd = canvas.clone_fd()?;
+    /// let stride = canvas.effective_row_stride();
+    /// # let _ = (fd, stride);
+    ///
+    /// // A label strip the CPU renders: written whole, never read back.
+    /// let overlay = processor.create_image(640, 64, PixelFormat::Rgba, DType::U8, dma, CpuAccess::Write)?;
+    /// overlay.as_u8().unwrap().map_for_write()?.as_mut_slice().fill(0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The returned image's [`cpu_access`](TensorDyn::cpu_access) may be
+    /// wider than `access` when this processor's own convert may need the
+    /// CPU on it (a CPU-only processor, or a format the GPU does not
+    /// render); a wider declaration selects cached memory.
+    ///
     /// # Pitch alignment for DMA-backed allocations
     ///
     /// DMA-BUF imports into the GL backend (Mali Valhall on i.MX 95
@@ -3722,6 +3791,69 @@ impl ImageProcessorTrait for ImageProcessor {
             None => Err(Error::NoConverter),
         }
     }
+
+    fn set_box_line_width(&mut self, width: u32) -> Result<()> {
+        check_box_line_width(width)?;
+
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.set_box_line_width(width);
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => Err(Error::NotSupported(
+                    "g2d does not support set_box_line_width".into(),
+                )),
+                ForcedBackend::OpenGl => {
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android",
+                        target_os = "windows"
+                    ))]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.set_box_line_width(width);
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
+        }
+
+        // Every drawing backend, for the reason `set_class_colors` gives.
+        let mut backends = 0usize;
+        let mut first_err = None;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
+        #[cfg(feature = "opengl")]
+        if let Some(opengl) = self.opengl.as_mut() {
+            backends += 1;
+            if let Err(e) = opengl.set_box_line_width(width) {
+                log::trace!("box line width didn't set with opengl: {e:?}");
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(cpu) = self.cpu.as_mut() {
+            backends += 1;
+            if let Err(e) = cpu.set_box_line_width(width) {
+                log::trace!("box line width didn't set with cpu: {e:?}");
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None if backends > 0 => Ok(()),
+            None => Err(Error::NoConverter),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3914,6 +4046,20 @@ const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N
 }
 
 const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
+
+/// Default bounding-box outline thickness in pixels, used until
+/// [`ImageProcessorTrait::set_box_line_width`] sets another.
+pub const DEFAULT_BOX_LINE_WIDTH: u32 = 3;
+
+/// Validates a [`ImageProcessorTrait::set_box_line_width`] argument.
+pub(crate) fn check_box_line_width(width: u32) -> Result<()> {
+    if width == 0 {
+        return Err(Error::InvalidOptions(
+            "box line width must be at least 1 pixel".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -4228,6 +4374,37 @@ mod image_tests {
             }
         }
         load_bytes_to_tensor(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap()
+    }
+
+    /// `set_box_line_width` validates before reaching any backend and the
+    /// width reaches whichever backend draws: the default chain (GL where
+    /// available, else CPU) and a forced CPU backend.
+    #[test]
+    fn set_box_line_width_reaches_the_drawing_backend() {
+        use crate::test_support::{box_drawn_columns, box_expected_span, BOX_DIM};
+        let configs = [
+            ImageProcessorConfig::default(),
+            ImageProcessorConfig {
+                backend: ComputeBackend::Cpu,
+                ..Default::default()
+            },
+        ];
+        for config in configs {
+            let backend = config.backend;
+            let mut proc = ImageProcessor::with_config(config).unwrap();
+            let err = proc.set_box_line_width(0).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidOptions(_)),
+                "{backend:?}: {err:?}"
+            );
+            let flat =
+                crate::test_support::draw_box_fixture(&mut proc, [200, 100, 50, 255], Some(4), 1.0);
+            assert_eq!(
+                box_drawn_columns(&flat, BOX_DIM / 2),
+                box_expected_span(4),
+                "{backend:?}"
+            );
+        }
     }
 
     /// `tile_into` band == standalone crop-convert of the same source region,

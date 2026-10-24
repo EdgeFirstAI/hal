@@ -107,3 +107,103 @@ pub struct PreNmsCapture {
     pub mask_coefs: Option<ndarray::Array2<f32>>,
     pub protos: Option<ndarray::Array4<f32>>,
 }
+
+/// Kernel-level hooks for the decoder benchmark. Not a stable API.
+#[doc(hidden)]
+pub mod bench {
+    use super::kernels::dfl_lut::{decode_dfl_lut, DflExpTable};
+    use super::kernels::grids::make_anchor_grid;
+    use super::kernels::level_box;
+    use super::plan::{Layout, LevelPlan};
+    use crate::Quantization;
+
+    /// A DFL box kernel for 8-bit bins.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DflKernel {
+        /// Dequantize, then f32 libm softmax per side (portable).
+        Softmax,
+        /// Exp table, portable.
+        Lut,
+        /// Dequantize, then fused NEON f32 softmax and weighted sum.
+        NeonFused,
+        /// Dequantize, then fused NEON softmax with an FP16 exp.
+        NeonFusedFp16,
+        /// Exp table with the four sides in NEON lanes.
+        LutNeon,
+    }
+
+    impl DflKernel {
+        /// Every kernel this CPU can run.
+        pub fn available() -> Vec<Self> {
+            let v = vec![Self::Softmax, Self::Lut];
+            #[cfg(target_arch = "aarch64")]
+            let v = {
+                let mut v = v;
+                v.extend([Self::NeonFused, Self::LutNeon]);
+                if std::arch::is_aarch64_feature_detected!("fp16") {
+                    v.push(Self::NeonFusedFp16);
+                }
+                v
+            };
+            v
+        }
+    }
+
+    /// One DFL level (`reg_max` 16) and its quantization.
+    pub struct DflLevel {
+        plan: LevelPlan,
+        q: Quantization,
+        table: DflExpTable,
+    }
+
+    impl DflLevel {
+        pub fn new(w: usize, h: usize, stride: f32, scale: f32, zero_point: i32) -> Self {
+            let (grid_x, grid_y) = make_anchor_grid(h, w);
+            Self {
+                plan: LevelPlan {
+                    stride,
+                    h,
+                    w,
+                    reg_max: 16,
+                    anchor_offset: 0,
+                    grid_x,
+                    grid_y,
+                    box_shape: vec![1, h, w, 64].into_boxed_slice(),
+                    score_shape: vec![1, h, w, 1].into_boxed_slice(),
+                    mc_shape: None,
+                    layout: Layout::Nhwc,
+                },
+                q: Quantization::new(scale, zero_point),
+                table: DflExpTable::new(scale),
+            }
+        }
+
+        pub fn anchors(&self) -> usize {
+            self.plan.h * self.plan.w
+        }
+
+        /// Decode `input` (`anchors() * 64` bins) into `dst` (`anchors() * 4`).
+        pub fn decode(&self, kernel: DflKernel, input: &[i8], dst: &mut [f32]) {
+            let (p, q) = (&self.plan, self.q);
+            match kernel {
+                DflKernel::Softmax => level_box::decode_box_level_dfl_i8_to_f32(input, q, p, dst),
+                DflKernel::Lut => decode_dfl_lut(input, &self.table, p, dst),
+                #[cfg(target_arch = "aarch64")]
+                DflKernel::NeonFused => {
+                    level_box::decode_box_level_dfl_i8_to_f32_neon_fused(input, q, p, dst)
+                }
+                #[cfg(target_arch = "aarch64")]
+                DflKernel::NeonFusedFp16 => {
+                    assert!(std::arch::is_aarch64_feature_detected!("fp16"));
+                    level_box::decode_box_level_dfl_i8_to_f32_neon_fused_fp16(input, q, p, dst)
+                }
+                #[cfg(target_arch = "aarch64")]
+                DflKernel::LutNeon => {
+                    super::kernels::dfl_lut::decode_dfl_lut_neon(input, &self.table, p, dst)
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                _ => panic!("{kernel:?} is not available on this CPU"),
+            }
+        }
+    }
+}

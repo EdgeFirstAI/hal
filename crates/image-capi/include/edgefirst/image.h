@@ -252,6 +252,11 @@ extern "C" {
 /**
  * ABI version of this library's C surface.
  *
+ * 5: the alpha byte of each `ef_image_processor_set_class_colors` colour now
+ * sets the box outline's coverage as well as the mask's, where boxes were
+ * drawn opaque after that call. Same symbols and layouts, read differently.
+ * `ef_image_processor_set_box_line_width` sets the outline thickness.
+ *
  * 4: `ef_tiling_config` lost `pad` and `fit` (24 bytes, was 32) and
  * `ef_image_processor_plan_tiles`, `ef_image_processor_tile_into` and
  * `ef_image_processor_tile_one` take a trailing `const ef_convert_options *`
@@ -409,6 +414,37 @@ void ef_image_processor_free(ef_image_processor *p);
  * (`EF_DTYPE_I8`, a CPU `bgra8` swizzle, a G2D `rgb8` letterbox border). A
  * PBO image is always `EF_CPU_ACCESS_READ_WRITE`. Nothing is added for use
  * as a convert source or for a CPU mask draw; declare those yourself.
+ *
+ * `EF_CPU_ACCESS_NONE` and `EF_CPU_ACCESS_WRITE` DMA-BUF images come from
+ * the uncached CMA heap where available (see `ef_cpu_access`). A display
+ * canvas the GPU renders and a compositor shows, and an overlay the CPU
+ * writes whole, are both such images:
+ *
+ * ```c
+ * ef_image_processor *p = ef_image_processor_new();
+ * ef_tensor *frame = ef_image_processor_create_image(
+ *     p, 1920, 1080, "rgba8", EF_DTYPE_U8, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_NONE);
+ * ef_tensor *canvas = ef_image_processor_create_image(
+ *     p, 1920, 1080, "rgba8", EF_DTYPE_U8, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_NONE);
+ *
+ * const uint8_t colors[1][4] = {{255, 96, 0, 160}}; // translucent boxes
+ * ef_image_processor_set_class_colors(p, colors, 1);
+ * ef_image_processor_set_box_line_width(p, 2);
+ *
+ * ef_image_processor_convert(p, camera, frame, NULL);
+ * ef_image_processor_draw_decoded_masks(p, canvas, boxes, n_boxes, NULL, 0, frame,
+ *                                       1.0f, NULL, 0);
+ *
+ * // Hand the canvas to the compositor (Wayland linux-dmabuf).
+ * int fd = ef_tensor_clone_fd(canvas);
+ * int64_t stride = ef_tensor_row_stride(canvas);
+ *
+ * // A label strip the CPU renders: written whole, never read back.
+ * ef_tensor *overlay = ef_image_processor_create_image(
+ *     p, 640, 64, "rgba8", EF_DTYPE_U8, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_WRITE);
+ * struct ef_tensor_view v;
+ * ef_tensor_map(overlay, EF_CPU_ACCESS_WRITE, &v); // EF_CPU_ACCESS_READ fails: EACCES
+ * ```
  *
  * @return a tensor the caller owns, or `NULL`.
  *
@@ -672,9 +708,14 @@ uintptr_t ef_align_width_for_pixel_format(uintptr_t width, const char *format, u
 ef_image_processor *ef_image_processor_new_with_backend(uint32_t backend);
 
 /**
- * Set the RGBA palette used when drawing class masks.
+ * Set the RGBA palette used when drawing class masks and boxes.
  *
  * Copied, not borrowed, so the caller may free its array immediately.
+ *
+ * The alpha byte sets the coverage of both the mask fill and the box
+ * outline: each is blended over `dst` with `alpha / 255` scaled by the
+ * draw's `opacity`, so `255` draws opaque boxes and lower values translucent
+ * ones. The destination's alpha channel is left as the base layer set it.
  *
  * @return 0 on success, `EINVAL` for a null argument or zero colours.
  *
@@ -684,6 +725,23 @@ ef_image_processor *ef_image_processor_new_with_backend(uint32_t backend);
 int ef_image_processor_set_class_colors(ef_image_processor *p,
                                         const uint8_t (*colors)[4],
                                         uintptr_t count);
+
+/**
+ * Set the thickness, in `dst` pixels, of the box outlines drawn by
+ * `ef_image_processor_draw_decoded_masks` and
+ * `ef_image_processor_draw_proto_masks`.
+ *
+ * The outline is drawn outside the box edges and clipped at the image
+ * border. The default is 3. Applies to every drawing backend the processor
+ * holds.
+ *
+ * @return 0 on success, `EINVAL` for a null processor or a zero `width`,
+ * `ENOTSUP` when the processor's backend does not draw (G2D).
+ *
+ * # Safety
+ * `p` must be a processor from `ef_image_processor_new*` or `NULL`.
+ */
+int ef_image_processor_set_box_line_width(ef_image_processor *p, uint32_t width);
 
 /**
  * Set how `ef_image_processor_convert` resamples when it resizes, for

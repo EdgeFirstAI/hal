@@ -17,24 +17,25 @@ use edgefirst_tensor::DType;
 /// `Dfl*` variants run dequant → softmax → weighted-sum → dist2bbox.
 /// `Ltrb*` variants run dequant → dist2bbox.
 ///
-/// DFL NEON tiers: NeonBase (f32 exp) and NeonFp16 (fp16 exp via fused
-/// softmax+weighted_sum). DotProd/I8MM are not needed for DFL because
-/// the fused kernel computes weighted_sum as part of the exp loop
-/// using simple FMAs, which is faster than the quantize→integer_dot→
-/// dequantize roundtrip that DotProd/I8MM would provide.
+/// 8-bit DFL inputs take the `*Lut` cells, which find each side's maximum
+/// over the raw bins and weigh bins through an exp table (see
+/// [`super::dfl_lut`]); `*LutNeon` is the same arithmetic with the four sides
+/// in NEON lanes. 16-bit DFL inputs keep the dequant-then-softmax kernels:
+/// NeonBase (f32 exp) and NeonFp16 (fp16 exp via fused softmax and weighted
+/// sum).
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // Wired by Task 15.
 #[allow(clippy::enum_variant_names)] // tier suffix is meaningful
 pub(crate) enum BoxLevelDispatch {
     // ── DFL encoding (yolov8, yolo11) ────────────────────
-    DflI8ToF32Scalar,
-    DflU8ToF32Scalar,
+    DflI8ToF32Lut,
+    DflU8ToF32Lut,
     DflI16ToF32Scalar,
     DflU16ToF32Scalar,
     DflF16ToF32Scalar,
     DflF32ToF32Scalar,
-    DflI8ToF16Scalar,
-    DflU8ToF16Scalar,
+    DflI8ToF16Lut,
+    DflU8ToF16Lut,
     DflI16ToF16Scalar,
     DflU16ToF16Scalar,
     DflF16ToF16Scalar,
@@ -58,9 +59,13 @@ pub(crate) enum BoxLevelDispatch {
     // CpuFeatures::neon_baseline is true. f16 outputs and float inputs
     // fall through to scalar.
     #[cfg(target_arch = "aarch64")]
-    DflI8ToF32NeonBase,
+    DflI8ToF32LutNeon,
     #[cfg(target_arch = "aarch64")]
-    DflU8ToF32NeonBase,
+    DflU8ToF32LutNeon,
+    #[cfg(target_arch = "aarch64")]
+    DflI8ToF16LutNeon,
+    #[cfg(target_arch = "aarch64")]
+    DflU8ToF16LutNeon,
     #[cfg(target_arch = "aarch64")]
     DflI16ToF32NeonBase,
     #[cfg(target_arch = "aarch64")]
@@ -78,10 +83,6 @@ pub(crate) enum BoxLevelDispatch {
     // is true. Same dequant + dist2bbox path as NeonBase but DFL softmax
     // runs in 8-lane f16. LTRB has no softmax → no FP16 variant needed.
     #[cfg(target_arch = "aarch64")]
-    DflI8ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
-    DflU8ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
     DflI16ToF32NeonFp16,
     #[cfg(target_arch = "aarch64")]
     DflU16ToF32NeonFp16,
@@ -97,13 +98,21 @@ impl BoxLevelDispatch {
     ) -> DecoderResult<Self> {
         use BoxLevelDispatch::*;
 
-        // Tier 2: FP16 (DFL only — LTRB has no softmax, fused kernel
+        #[cfg(target_arch = "aarch64")]
+        if features.neon_baseline {
+            match (encoding, input, output) {
+                (BoxEncoding::Dfl, DType::I8, DecodeDtype::F32) => return Ok(DflI8ToF32LutNeon),
+                (BoxEncoding::Dfl, DType::U8, DecodeDtype::F32) => return Ok(DflU8ToF32LutNeon),
+                (BoxEncoding::Dfl, DType::I8, DecodeDtype::F16) => return Ok(DflI8ToF16LutNeon),
+                (BoxEncoding::Dfl, DType::U8, DecodeDtype::F16) => return Ok(DflU8ToF16LutNeon),
+                _ => {}
+            }
+        }
+        // Tier 2: FP16 (16-bit DFL only — LTRB has no softmax, fused kernel
         // with fp16 exp is the best DFL path on cores with fp16).
         #[cfg(target_arch = "aarch64")]
         if features.neon_fp16 {
             match (encoding, input, output) {
-                (BoxEncoding::Dfl, DType::I8, DecodeDtype::F32) => return Ok(DflI8ToF32NeonFp16),
-                (BoxEncoding::Dfl, DType::U8, DecodeDtype::F32) => return Ok(DflU8ToF32NeonFp16),
                 (BoxEncoding::Dfl, DType::I16, DecodeDtype::F32) => return Ok(DflI16ToF32NeonFp16),
                 (BoxEncoding::Dfl, DType::U16, DecodeDtype::F32) => return Ok(DflU16ToF32NeonFp16),
                 _ => {} // fall through to NeonBase
@@ -112,8 +121,6 @@ impl BoxLevelDispatch {
         #[cfg(target_arch = "aarch64")]
         if features.neon_baseline {
             match (encoding, input, output) {
-                (BoxEncoding::Dfl, DType::I8, DecodeDtype::F32) => return Ok(DflI8ToF32NeonBase),
-                (BoxEncoding::Dfl, DType::U8, DecodeDtype::F32) => return Ok(DflU8ToF32NeonBase),
                 (BoxEncoding::Dfl, DType::I16, DecodeDtype::F32) => return Ok(DflI16ToF32NeonBase),
                 (BoxEncoding::Dfl, DType::U16, DecodeDtype::F32) => return Ok(DflU16ToF32NeonBase),
                 (BoxEncoding::Direct, DType::I8, DecodeDtype::F32) => {
@@ -135,14 +142,14 @@ impl BoxLevelDispatch {
         let _ = features;
 
         let cell = match (encoding, input, output) {
-            (BoxEncoding::Dfl, DType::I8, DecodeDtype::F32) => DflI8ToF32Scalar,
-            (BoxEncoding::Dfl, DType::U8, DecodeDtype::F32) => DflU8ToF32Scalar,
+            (BoxEncoding::Dfl, DType::I8, DecodeDtype::F32) => DflI8ToF32Lut,
+            (BoxEncoding::Dfl, DType::U8, DecodeDtype::F32) => DflU8ToF32Lut,
             (BoxEncoding::Dfl, DType::I16, DecodeDtype::F32) => DflI16ToF32Scalar,
             (BoxEncoding::Dfl, DType::U16, DecodeDtype::F32) => DflU16ToF32Scalar,
             (BoxEncoding::Dfl, DType::F16, DecodeDtype::F32) => DflF16ToF32Scalar,
             (BoxEncoding::Dfl, DType::F32, DecodeDtype::F32) => DflF32ToF32Scalar,
-            (BoxEncoding::Dfl, DType::I8, DecodeDtype::F16) => DflI8ToF16Scalar,
-            (BoxEncoding::Dfl, DType::U8, DecodeDtype::F16) => DflU8ToF16Scalar,
+            (BoxEncoding::Dfl, DType::I8, DecodeDtype::F16) => DflI8ToF16Lut,
+            (BoxEncoding::Dfl, DType::U8, DecodeDtype::F16) => DflU8ToF16Lut,
             (BoxEncoding::Dfl, DType::I16, DecodeDtype::F16) => DflI16ToF16Scalar,
             (BoxEncoding::Dfl, DType::U16, DecodeDtype::F16) => DflU16ToF16Scalar,
             (BoxEncoding::Dfl, DType::F16, DecodeDtype::F16) => DflF16ToF16Scalar,
@@ -200,16 +207,6 @@ pub(crate) enum ScoreLevelDispatch {
     #[cfg(target_arch = "aarch64")]
     U16ToF32NeonBase,
 
-    // Tier 2 NEON FP16 (Cortex-A55+). Same dequant; sigmoid in 8-lane f16.
-    #[cfg(target_arch = "aarch64")]
-    I8ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
-    U8ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
-    I16ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
-    U16ToF32NeonFp16,
-
     // Tier 1-fused: NEON fused dequant+sigmoid in one pass (no intermediate
     // store/reload). Same CpuFeatures gate as NeonBase.
     #[cfg(target_arch = "aarch64")]
@@ -231,15 +228,8 @@ impl ScoreLevelDispatch {
         #[cfg(target_arch = "aarch64")]
         {
             use ScoreLevelDispatch::*;
-            if features.neon_fp16 {
-                match (input, output) {
-                    (DType::I8, DecodeDtype::F32) => return Ok(I8ToF32NeonFp16),
-                    (DType::U8, DecodeDtype::F32) => return Ok(U8ToF32NeonFp16),
-                    (DType::I16, DecodeDtype::F32) => return Ok(I16ToF32NeonFp16),
-                    (DType::U16, DecodeDtype::F32) => return Ok(U16ToF32NeonFp16),
-                    _ => {} // fall through to NeonBase
-                }
-            }
+            // No FP16 tier: on Cortex-A55 a separate f16 sigmoid pass is
+            // slower than the fused f32 pass, which is also more accurate.
             if features.neon_baseline {
                 match (input, output) {
                     // Fused dequant+sigmoid: preferred for score tensors.
@@ -358,6 +348,20 @@ pub(crate) enum InputView<'a> {
     F32(&'a [f32]),
 }
 
+impl<'a> InputView<'a> {
+    /// The elements `range` of the view.
+    pub(crate) fn slice(&self, range: std::ops::Range<usize>) -> InputView<'a> {
+        match *self {
+            InputView::I8(s) => InputView::I8(&s[range]),
+            InputView::U8(s) => InputView::U8(&s[range]),
+            InputView::I16(s) => InputView::I16(&s[range]),
+            InputView::U16(s) => InputView::U16(&s[range]),
+            InputView::F16(s) => InputView::F16(&s[range]),
+            InputView::F32(s) => InputView::F32(&s[range]),
+        }
+    }
+}
+
 /// Mutable destination slice, dtype-tagged. The dispatch arm matches
 /// on this to pick the f32 vs f16 output cell.
 #[derive(Debug)]
@@ -369,6 +373,9 @@ pub(crate) enum DstSliceMut<'a> {
 
 // ── BoxLevelDispatch::run ───────────────────────────────────────────────
 
+#[cfg(target_arch = "aarch64")]
+use super::dfl_lut::decode_dfl_lut_neon;
+use super::dfl_lut::{decode_dfl_lut, DflExpTable};
 use super::level_box::{
     decode_box_level_dfl_f16_to_f16, decode_box_level_dfl_f16_to_f32,
     decode_box_level_dfl_f32_to_f16, decode_box_level_dfl_f32_to_f32,
@@ -386,9 +393,7 @@ use super::level_box::{
 #[cfg(target_arch = "aarch64")]
 use super::level_box::{
     decode_box_level_dfl_i16_to_f32_neon_fused, decode_box_level_dfl_i16_to_f32_neon_fused_fp16,
-    decode_box_level_dfl_i8_to_f32_neon_fused, decode_box_level_dfl_i8_to_f32_neon_fused_fp16,
     decode_box_level_dfl_u16_to_f32_neon_fused, decode_box_level_dfl_u16_to_f32_neon_fused_fp16,
-    decode_box_level_dfl_u8_to_f32_neon_fused, decode_box_level_dfl_u8_to_f32_neon_fused_fp16,
     decode_box_level_ltrb_i16_to_f32_neon, decode_box_level_ltrb_i8_to_f32_neon,
     decode_box_level_ltrb_u16_to_f32_neon, decode_box_level_ltrb_u8_to_f32_neon,
 };
@@ -396,26 +401,86 @@ use crate::per_scale::plan::LevelPlan;
 use crate::Quantization;
 
 impl BoxLevelDispatch {
-    /// Run this dispatch's concrete kernel.
-    /// Returns `KernelDispatchUnreachable` if the variant tag and
-    /// (input, dst) dtypes disagree — this would indicate an internal
-    /// logic bug at construction time.
-    #[allow(dead_code)] // Wired in Task 21.
-    pub(crate) fn run(
+    /// The max-subtracted softmax decode of an exp-table cell's 8-bit bins,
+    /// for a scale the table cannot stand for (see [`DflExpTable::supports`]).
+    fn run_softmax(
         &self,
         input: InputView<'_>,
         q: Quantization,
         level: &LevelPlan,
         dst: DstSliceMut<'_>,
     ) -> DecoderResult<()> {
-        use BoxLevelDispatch::*;
-        match (self, input, dst) {
-            // DFL × f32 output
-            (DflI8ToF32Scalar, InputView::I8(i), DstSliceMut::F32(d)) => {
+        match (input, dst) {
+            (InputView::I8(i), DstSliceMut::F32(d)) => {
                 decode_box_level_dfl_i8_to_f32(i, q, level, d)
             }
-            (DflU8ToF32Scalar, InputView::U8(i), DstSliceMut::F32(d)) => {
+            (InputView::U8(i), DstSliceMut::F32(d)) => {
                 decode_box_level_dfl_u8_to_f32(i, q, level, d)
+            }
+            (InputView::I8(i), DstSliceMut::F16(d)) => {
+                decode_box_level_dfl_i8_to_f16(i, q, level, d)
+            }
+            (InputView::U8(i), DstSliceMut::F16(d)) => {
+                decode_box_level_dfl_u8_to_f16(i, q, level, d)
+            }
+            _ => {
+                return Err(DecoderError::KernelDispatchUnreachable(format!(
+                    "BoxLevelDispatch::run_softmax mismatched arms for {self:?}"
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this cell weighs DFL bins through a [`DflExpTable`].
+    pub(crate) fn uses_exp_table(&self) -> bool {
+        use BoxLevelDispatch::*;
+        #[cfg(target_arch = "aarch64")]
+        if matches!(
+            self,
+            DflI8ToF32LutNeon | DflU8ToF32LutNeon | DflI8ToF16LutNeon | DflU8ToF16LutNeon
+        ) {
+            return true;
+        }
+        matches!(
+            self,
+            DflI8ToF32Lut | DflU8ToF32Lut | DflI8ToF16Lut | DflU8ToF16Lut
+        )
+    }
+
+    /// Run this dispatch's concrete kernel.
+    /// Returns `KernelDispatchUnreachable` if the variant tag and
+    /// (input, dst) dtypes disagree — this would indicate an internal
+    /// logic bug at construction time.
+    #[allow(dead_code)] // Wired in Task 21.
+    ///
+    /// The `*Lut` cells weigh bins through `table` when it was built for
+    /// `q.scale`, and build their own otherwise.
+    pub(crate) fn run(
+        &self,
+        input: InputView<'_>,
+        q: Quantization,
+        level: &LevelPlan,
+        table: Option<&DflExpTable>,
+        dst: DstSliceMut<'_>,
+    ) -> DecoderResult<()> {
+        use BoxLevelDispatch::*;
+        if self.uses_exp_table() && !DflExpTable::supports(q.scale) {
+            return self.run_softmax(input, q, level, dst);
+        }
+        let built = match table {
+            Some(t) if t.is_for(q.scale) => None,
+            _ => self.uses_exp_table().then(|| DflExpTable::new(q.scale)),
+        };
+        let table = built.as_ref().or(table);
+        let table = || table.ok_or_else(|| DecoderError::Internal("DFL exp table missing".into()));
+        match (self, input, dst) {
+            // DFL × f32 output
+            (DflI8ToF32Lut, InputView::I8(i), DstSliceMut::F32(d)) => {
+                decode_dfl_lut(i, table()?, level, d)
+            }
+            (DflU8ToF32Lut, InputView::U8(i), DstSliceMut::F32(d)) => {
+                decode_dfl_lut(i, table()?, level, d)
             }
             (DflI16ToF32Scalar, InputView::I16(i), DstSliceMut::F32(d)) => {
                 decode_box_level_dfl_i16_to_f32(i, q, level, d)
@@ -430,11 +495,11 @@ impl BoxLevelDispatch {
                 decode_box_level_dfl_f32_to_f32(i, q, level, d)
             }
             // DFL × f16 output
-            (DflI8ToF16Scalar, InputView::I8(i), DstSliceMut::F16(d)) => {
-                decode_box_level_dfl_i8_to_f16(i, q, level, d)
+            (DflI8ToF16Lut, InputView::I8(i), DstSliceMut::F16(d)) => {
+                decode_dfl_lut(i, table()?, level, d)
             }
-            (DflU8ToF16Scalar, InputView::U8(i), DstSliceMut::F16(d)) => {
-                decode_box_level_dfl_u8_to_f16(i, q, level, d)
+            (DflU8ToF16Lut, InputView::U8(i), DstSliceMut::F16(d)) => {
+                decode_dfl_lut(i, table()?, level, d)
             }
             (DflI16ToF16Scalar, InputView::I16(i), DstSliceMut::F16(d)) => {
                 decode_box_level_dfl_i16_to_f16(i, q, level, d)
@@ -487,15 +552,23 @@ impl BoxLevelDispatch {
                 decode_box_level_ltrb_f32_to_f16(i, q, level, d)
             }
 
+            #[cfg(target_arch = "aarch64")]
+            (DflI8ToF32LutNeon, InputView::I8(i), DstSliceMut::F32(d)) => {
+                decode_dfl_lut_neon(i, table()?, level, d)
+            }
+            #[cfg(target_arch = "aarch64")]
+            (DflU8ToF32LutNeon, InputView::U8(i), DstSliceMut::F32(d)) => {
+                decode_dfl_lut_neon(i, table()?, level, d)
+            }
+            #[cfg(target_arch = "aarch64")]
+            (DflI8ToF16LutNeon, InputView::I8(i), DstSliceMut::F16(d)) => {
+                decode_dfl_lut_neon(i, table()?, level, d)
+            }
+            #[cfg(target_arch = "aarch64")]
+            (DflU8ToF16LutNeon, InputView::U8(i), DstSliceMut::F16(d)) => {
+                decode_dfl_lut_neon(i, table()?, level, d)
+            }
             // Tier-1 NEON-base arms (fused softmax+weighted_sum).
-            #[cfg(target_arch = "aarch64")]
-            (DflI8ToF32NeonBase, InputView::I8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_i8_to_f32_neon_fused(i, q, level, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (DflU8ToF32NeonBase, InputView::U8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_u8_to_f32_neon_fused(i, q, level, d)
-            }
             #[cfg(target_arch = "aarch64")]
             (DflI16ToF32NeonBase, InputView::I16(i), DstSliceMut::F32(d)) => {
                 decode_box_level_dfl_i16_to_f32_neon_fused(i, q, level, d)
@@ -522,14 +595,6 @@ impl BoxLevelDispatch {
             }
 
             // Tier-2 NEON FP16 DFL arms (fused softmax+weighted_sum, fp16 exp).
-            #[cfg(target_arch = "aarch64")]
-            (DflI8ToF32NeonFp16, InputView::I8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_i8_to_f32_neon_fused_fp16(i, q, level, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (DflU8ToF32NeonFp16, InputView::U8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_u8_to_f32_neon_fused_fp16(i, q, level, d)
-            }
             #[cfg(target_arch = "aarch64")]
             (DflI16ToF32NeonFp16, InputView::I16(i), DstSliceMut::F32(d)) => {
                 decode_box_level_dfl_i16_to_f32_neon_fused_fp16(i, q, level, d)
@@ -559,12 +624,10 @@ use super::level_score::{
 };
 #[cfg(target_arch = "aarch64")]
 use super::level_score::{
-    decode_score_level_i16_to_f32_neon, decode_score_level_i16_to_f32_neon_fp16,
-    decode_score_level_i16_to_f32_neon_fused, decode_score_level_i8_to_f32_neon,
-    decode_score_level_i8_to_f32_neon_fp16, decode_score_level_i8_to_f32_neon_fused,
-    decode_score_level_u16_to_f32_neon, decode_score_level_u16_to_f32_neon_fp16,
-    decode_score_level_u16_to_f32_neon_fused, decode_score_level_u8_to_f32_neon,
-    decode_score_level_u8_to_f32_neon_fp16, decode_score_level_u8_to_f32_neon_fused,
+    decode_score_level_i16_to_f32_neon, decode_score_level_i16_to_f32_neon_fused,
+    decode_score_level_i8_to_f32_neon, decode_score_level_i8_to_f32_neon_fused,
+    decode_score_level_u16_to_f32_neon, decode_score_level_u16_to_f32_neon_fused,
+    decode_score_level_u8_to_f32_neon, decode_score_level_u8_to_f32_neon_fused,
 };
 use crate::per_scale::Activation;
 
@@ -638,22 +701,6 @@ impl ScoreLevelDispatch {
             }
 
             // Tier-2 NEON FP16 score arms.
-            #[cfg(target_arch = "aarch64")]
-            (I8ToF32NeonFp16, InputView::I8(i), DstSliceMut::F32(d)) => {
-                decode_score_level_i8_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (U8ToF32NeonFp16, InputView::U8(i), DstSliceMut::F32(d)) => {
-                decode_score_level_u8_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (I16ToF32NeonFp16, InputView::I16(i), DstSliceMut::F32(d)) => {
-                decode_score_level_i16_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (U16ToF32NeonFp16, InputView::U16(i), DstSliceMut::F32(d)) => {
-                decode_score_level_u16_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
 
             // Tier 1-fused: fused dequant+sigmoid NEON arms.
             #[cfg(target_arch = "aarch64")]
@@ -861,7 +908,155 @@ mod tests {
         let f = CpuFeatures::default();
         let d =
             BoxLevelDispatch::select(BoxEncoding::Dfl, DType::I8, DecodeDtype::F32, &f).unwrap();
-        assert!(matches!(d, BoxLevelDispatch::DflI8ToF32Scalar));
+        assert!(matches!(d, BoxLevelDispatch::DflI8ToF32Lut));
+        assert!(d.uses_exp_table());
+        let d =
+            BoxLevelDispatch::select(BoxEncoding::Dfl, DType::I16, DecodeDtype::F32, &f).unwrap();
+        assert!(!d.uses_exp_table());
+    }
+
+    /// A scale the exp table cannot represent (negative, zero, NaN) decodes
+    /// through the max-subtracted softmax instead, finite and equal to it.
+    #[test]
+    fn box_dispatch_lut_falls_back_for_unusable_scales() {
+        use crate::per_scale::kernels::level_box::{
+            decode_box_level_dfl_i8_to_f16, decode_box_level_dfl_i8_to_f32,
+        };
+        let (gx, gy) = crate::per_scale::kernels::grids::make_anchor_grid(1, 1);
+        let level = LevelPlan {
+            stride: 8.0,
+            h: 1,
+            w: 1,
+            reg_max: 16,
+            anchor_offset: 0,
+            grid_x: gx,
+            grid_y: gy,
+            box_shape: vec![1, 1, 1, 64].into_boxed_slice(),
+            score_shape: vec![1, 1, 1, 1].into_boxed_slice(),
+            mc_shape: None,
+            layout: crate::per_scale::plan::Layout::Nhwc,
+        };
+        // Per side: bin 0 at 127, then fifteen bins at -128.
+        let bins: Vec<i8> = (0..64)
+            .map(|i| if i % 16 == 0 { 127 } else { -128 })
+            .collect();
+        let mut tiers = vec![CpuFeatures::default()];
+        if let Ok(f) = CpuFeatures::from_env_or_probe() {
+            tiers.push(f);
+        }
+        for scale in [-0.5_f32, 0.0, f32::NAN, f32::NEG_INFINITY] {
+            let q = Quantization::new(scale, 0);
+            let mut want = [0.0_f32; 4];
+            decode_box_level_dfl_i8_to_f32(&bins, q, &level, &mut want);
+            let mut want16 = [half::f16::ZERO; 4];
+            decode_box_level_dfl_i8_to_f16(&bins, q, &level, &mut want16);
+            for f in &tiers {
+                let d = BoxLevelDispatch::select(BoxEncoding::Dfl, DType::I8, DecodeDtype::F32, f)
+                    .unwrap();
+                let mut got = [0.0_f32; 4];
+                d.run(
+                    InputView::I8(&bins),
+                    q,
+                    &level,
+                    None,
+                    DstSliceMut::F32(&mut got),
+                )
+                .unwrap();
+                if scale.is_finite() {
+                    assert!(
+                        got.iter().all(|v| v.is_finite()),
+                        "{d:?} scale {scale}: {got:?}"
+                    );
+                    for (g, w) in got.iter().zip(want) {
+                        assert!(
+                            (g - w).abs() < 1e-3,
+                            "{d:?} scale {scale}: {got:?} vs {want:?}"
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        got.map(f32::to_bits),
+                        want.map(f32::to_bits),
+                        "{d:?} scale {scale}"
+                    );
+                }
+                let d = BoxLevelDispatch::select(BoxEncoding::Dfl, DType::I8, DecodeDtype::F16, f)
+                    .unwrap();
+                let mut got16 = [half::f16::ZERO; 4];
+                d.run(
+                    InputView::I8(&bins),
+                    q,
+                    &level,
+                    None,
+                    DstSliceMut::F16(&mut got16),
+                )
+                .unwrap();
+                assert_eq!(
+                    got16.map(half::f16::to_bits),
+                    want16.map(half::f16::to_bits),
+                    "{d:?} scale {scale}"
+                );
+            }
+        }
+        // The reviewer's case: the softmax puts every side at distance 8.
+        let q = Quantization::new(-0.5, 0);
+        let mut got = [0.0_f32; 4];
+        BoxLevelDispatch::select(
+            BoxEncoding::Dfl,
+            DType::I8,
+            DecodeDtype::F32,
+            &CpuFeatures::default(),
+        )
+        .unwrap()
+        .run(
+            InputView::I8(&bins),
+            q,
+            &level,
+            None,
+            DstSliceMut::F32(&mut got),
+        )
+        .unwrap();
+        assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
+    }
+
+    /// A table built for another scale is not used: the kernel builds one
+    /// for the scale it is given.
+    #[test]
+    fn box_dispatch_lut_ignores_a_stale_table() {
+        let f = CpuFeatures::default();
+        let d =
+            BoxLevelDispatch::select(BoxEncoding::Dfl, DType::U8, DecodeDtype::F32, &f).unwrap();
+        let (gx, gy) = crate::per_scale::kernels::grids::make_anchor_grid(1, 1);
+        let level = LevelPlan {
+            stride: 8.0,
+            h: 1,
+            w: 1,
+            reg_max: 16,
+            anchor_offset: 0,
+            grid_x: gx,
+            grid_y: gy,
+            box_shape: vec![1, 1, 1, 64].into_boxed_slice(),
+            score_shape: vec![1, 1, 1, 1].into_boxed_slice(),
+            mc_shape: None,
+            layout: crate::per_scale::plan::Layout::Nhwc,
+        };
+        let bins: Vec<u8> = (0..64).map(|i| (i * 37 % 251) as u8).collect();
+        let q = Quantization::new(0.2, 0);
+        let run = |table: Option<&DflExpTable>| {
+            let mut out = [0.0_f32; 4];
+            d.run(
+                InputView::U8(&bins),
+                q,
+                &level,
+                table,
+                DstSliceMut::F32(&mut out),
+            )
+            .unwrap();
+            out
+        };
+        let fresh = run(None);
+        assert_eq!(run(Some(&DflExpTable::new(0.2))), fresh);
+        assert_eq!(run(Some(&DflExpTable::new(0.7))), fresh);
     }
 
     #[test]
@@ -951,6 +1146,7 @@ mod tests {
                 InputView::F32(&logits),
                 Quantization::identity(),
                 &level,
+                None,
                 DstSliceMut::F32(&mut out),
             )
             .unwrap();

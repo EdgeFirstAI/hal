@@ -54,6 +54,11 @@ pub mod tiling;
 
 /// ABI version of this library's C surface.
 ///
+/// 5: the alpha byte of each `ef_image_processor_set_class_colors` colour now
+/// sets the box outline's coverage as well as the mask's, where boxes were
+/// drawn opaque after that call. Same symbols and layouts, read differently.
+/// `ef_image_processor_set_box_line_width` sets the outline thickness.
+///
 /// 4: `ef_tiling_config` lost `pad` and `fit` (24 bytes, was 32) and
 /// `ef_image_processor_plan_tiles`, `ef_image_processor_tile_into` and
 /// `ef_image_processor_tile_one` take a trailing `const ef_convert_options *`
@@ -77,7 +82,7 @@ pub mod tiling;
 /// probe is the only signal.
 #[no_mangle]
 pub extern "C" fn ef_image_abi_version() -> u32 {
-    4
+    5
 }
 
 // Test-support modules that live in the tensor leaf. They are included here,
@@ -564,7 +569,7 @@ mod tests {
 
     #[test]
     fn the_abi_probe_is_generation_4() {
-        assert_eq!(super::ef_image_abi_version(), 4);
+        assert_eq!(super::ef_image_abi_version(), 5);
     }
 
     #[test]

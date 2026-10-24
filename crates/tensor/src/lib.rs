@@ -1178,34 +1178,76 @@ pub(crate) fn assert_map_writable(writable: bool, backend: &str) {
 crate::ef_vocabulary! {
     /// Declared CPU involvement for a tensor, chosen at allocation.
     ///
-    /// The declaration covers **all** CPU access to the buffer — the
-    /// caller's maps, pins and sync brackets, and the HAL's own CPU work
-    /// (the CPU image backend, codec decodes, decoder outputs). Hardware
-    /// access (ISP, codec, GPU, NPU) needs no declaration. It selects the CPU
-    /// usage/mapping mode at allocation (write-combined for `Write`, cached
-    /// for `Read`) and, on Android, pins the layout linear (vendor tile
-    /// compression requires `None`).
+    /// The declaration covers **all** CPU access to the buffer: the caller's
+    /// maps, pins and sync brackets, and the HAL's own CPU work (the CPU
+    /// image backend's converts and draws, codec decodes, decoder reads and
+    /// writes). Hardware access (ISP, codec, GPU, NPU, G2D, a compositor)
+    /// needs no declaration and is always allowed.
     ///
-    /// A CPU map, pin or sync whose direction the declaration does not cover
-    /// fails with [`Error::CpuAccessDenied`] on every backend.
+    /// The HAL **enforces** it. A CPU map, pin or sync whose direction the
+    /// declaration does not cover fails with [`Error::CpuAccessDenied`] on
+    /// every backend, before the memory is touched. The HAL's own CPU passes
+    /// go through the same check, so, for example, a CPU draw that would
+    /// blend over a `Write` image, or a CPU convert that would read a `None`
+    /// source, is refused instead of running.
+    ///
+    /// | Level | CPU may | Memory selected |
+    /// |---|---|---|
+    /// | `None` | nothing | Linux DMA-BUF: uncached CMA where available. Android: no CPU usage bits, so tile compression stays possible. |
+    /// | `Read` | read | cached; read-direction syncs only |
+    /// | `Write` | write whole passes | Linux DMA-BUF: uncached CMA where available, written write-combined |
+    /// | `ReadWrite` (default) | read and write | cached |
+    ///
+    /// **Why uncached.** A device that maps a cached buffer has to clean and
+    /// invalidate the CPU cache over all of it on every access: a compositor
+    /// blitting a client's buffer every frame pays that for the whole buffer
+    /// each time. An uncached buffer needs no cache maintenance. CPU reads
+    /// of uncached memory are slow, which is why only declarations that
+    /// exclude CPU reads select it; with the declaration enforced, nothing
+    /// reads such a buffer on the CPU. On Linux a `None` or `Write` DMA-BUF
+    /// comes from `/dev/dma_heap/linux,cma-uncached` when the system has it,
+    /// and from the cached heaps otherwise. A write-only pass must write the
+    /// whole buffer (see [`TensorTrait::map_for_write`]).
     ///
     /// On Android the `ReadWrite` default asks gralloc for
     /// `CPU_READ_OFTEN | CPU_WRITE_OFTEN`, which may give linear, CPU-cached
     /// memory. Pass `None` for a buffer that is never mapped on the CPU, so
-    /// gralloc can keep a tiled or compressed allocation. Linux DMA-BUF
-    /// allocation does not depend on the declaration.
+    /// gralloc can keep a tiled or compressed allocation.
+    ///
+    /// # Examples
+    ///
+    /// A CPU-drawn overlay: written whole every frame, never read back.
+    ///
+    /// ```rust,no_run
+    /// use edgefirst_tensor::{
+    ///     CpuAccess, Error, PixelFormat, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
+    /// };
+    ///
+    /// let overlay = Tensor::<u8>::image(
+    ///     640,
+    ///     480,
+    ///     PixelFormat::Rgba,
+    ///     Some(TensorMemory::DmaBuf),
+    ///     CpuAccess::Write,
+    /// )?;
+    /// overlay.map_for_write()?.as_mut_slice().fill(0);
+    /// assert!(matches!(overlay.map_read(), Err(Error::CpuAccessDenied { .. })));
+    /// # Ok::<(), Error>(())
+    /// ```
     ///
     /// [`CpuAccess::code`] is the wire code the C header's `ef_cpu_access`
     /// enumerators are asserted against.
     #[derive(Default)]
     pub enum CpuAccess {
         /// Hardware-only buffer: no CPU access. Required for vendor tile
-        /// compression on platforms with compressed layouts.
+        /// compression on platforms with compressed layouts; uncached CMA
+        /// for a Linux DMA-BUF where available.
         None = 0, "none", NONE,
         /// CPU reads only (verification, CPU consumers) — cached mapping.
         Read = 1, "read", READ,
-        /// CPU writes only (decode targets) — write-combined mapping where
-        /// the platform supports it.
+        /// CPU writes only, whole-buffer passes (decode targets, CPU-drawn
+        /// overlays) — write-combined mapping; uncached CMA for a Linux
+        /// DMA-BUF where available.
         Write = 2, "write", WRITE,
         /// CPU reads and writes (the default).
         #[default]
@@ -2606,17 +2648,17 @@ where
     /// buffers that will be imported as GPU textures via EGLImage. PBO,
     /// Shm, and Mem storage doesn't benefit from pitch alignment and
     /// shouldn't pay the memory cost.
-    /// With `contiguous`, the memory comes from the CMA heap only (see
-    /// [`ImageDesc::with_contiguous`]).
+    /// `policy` picks the heaps (see [`crate::dma::HeapPolicy`]): with
+    /// `contiguous` the CMA heaps only (see [`ImageDesc::with_contiguous`]),
+    /// and with `uncached` the uncached CMA heap first.
     #[cfg(target_os = "linux")]
     pub(crate) fn new_dma_with_byte_size(
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
-        contiguous: bool,
+        policy: crate::dma::HeapPolicy,
     ) -> Result<Self> {
-        DmaTensor::<T>::new_with_byte_size(shape, byte_size, name, contiguous)
-            .map(TensorStorage::Dma)
+        DmaTensor::<T>::new_with_byte_size(shape, byte_size, name, policy).map(TensorStorage::Dma)
     }
 
     // No non-Linux stub: the only caller (`Tensor::image_with_stride`)
@@ -4109,7 +4151,7 @@ where
                     &shape,
                     dma_byte_size,
                     None,
-                    contiguous,
+                    crate::dma::HeapPolicy::for_access(access, contiguous),
                 )?,
                 aligned_stride,
             ),
@@ -4145,7 +4187,7 @@ where
                         &shape,
                         dma_byte_size,
                         None,
-                        false,
+                        crate::dma::HeapPolicy::for_access(access, false),
                     ) {
                         Ok(s) => (s, aligned_stride),
                         Err(_) => (
@@ -4290,7 +4332,7 @@ where
                     &shape,
                     total_byte_size,
                     None,
-                    false,
+                    crate::dma::HeapPolicy::for_access(access, false),
                 )?,
                 Some(other) => {
                     return Err(Error::NotImplemented(format!(
@@ -7085,7 +7127,7 @@ mod image_tests {
                 &[usize::MAX, 2, 2],
                 usize::MAX,
                 None,
-                false,
+                crate::dma::HeapPolicy::default(),
             );
             assert!(
                 matches!(err, Err(Error::InvalidArgument(_))),

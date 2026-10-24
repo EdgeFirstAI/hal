@@ -54,6 +54,8 @@ pub struct CPUProcessor {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,
     colors: [[u8; 4]; 20],
+    /// Bounding-box outline thickness in pixels; never 0.
+    box_line_width: usize,
     /// Reusable scratch tensor for the U8→float widen path.
     ///
     /// Holds a U8 image in the destination's pixel format and dimensions.
@@ -145,6 +147,7 @@ impl Clone for CPUProcessor {
             resizer: self.resizer.clone(),
             options: self.options,
             colors: self.colors,
+            box_line_width: self.box_line_width,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
             resize_dst_destride_scratch: Vec::new(),
@@ -468,6 +471,7 @@ impl CPUProcessor {
             resizer,
             options,
             colors: crate::DEFAULT_COLORS_U8,
+            box_line_width: crate::DEFAULT_BOX_LINE_WIDTH as usize,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
             resize_dst_destride_scratch: Vec::new(),
@@ -944,6 +948,12 @@ impl ImageProcessorTrait for CPUProcessor {
         for (c, new_c) in self.colors.iter_mut().zip(colors.iter()) {
             *c = *new_c;
         }
+        Ok(())
+    }
+
+    fn set_box_line_width(&mut self, width: u32) -> Result<()> {
+        crate::check_box_line_width(width)?;
+        self.box_line_width = usize::try_from(width).unwrap_or(usize::MAX);
         Ok(())
     }
 }
@@ -1630,7 +1640,9 @@ impl CPUProcessor {
         let mut map = dst.map_mut()?;
         let dst_slice = map.as_mut_slice();
 
-        self.render_box(dst_w, dst_h, dst_rs, dst_c, dst_slice, detect, color_mode)?;
+        self.render_box(
+            dst_w, dst_h, dst_rs, dst_c, dst_slice, detect, opacity, color_mode,
+        )?;
 
         if segmentation.is_empty() {
             return Ok(());
@@ -1712,7 +1724,7 @@ impl CPUProcessor {
         let dst_slice = map.as_mut_slice();
 
         self.render_box(
-            dst_w, dst_h, dst_rs, channels, dst_slice, detect, color_mode,
+            dst_w, dst_h, dst_rs, channels, dst_slice, detect, opacity, color_mode,
         )?;
 
         if detect.is_empty() {

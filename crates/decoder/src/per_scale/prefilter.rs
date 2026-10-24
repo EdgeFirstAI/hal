@@ -14,10 +14,14 @@
 //! raw value, so it accounts for the kernel's rounding and approximations:
 //! the kept set is a superset of the anchors that pass, the float
 //! candidate filter downstream still makes the exact decision, and the
-//! detections match the dense decode bit for bit. Levels whose anchor
-//! count is not a whole number of [`PACK_ANCHORS`] groups decode some
-//! scores in a scalar tail, which packing would move onto the vector path,
-//! so a plan with such a level is always decoded densely.
+//! detections match the dense decode bit for bit.
+//!
+//! A level whose anchor count is not a whole number of [`PACK_ANCHORS`]
+//! groups ends in a partial group, whose elements the level kernels may
+//! decode in a scalar tail that rounds differently from their vector path.
+//! Only the whole groups (the body) are packed; the trailing partial group
+//! is always decoded as one contiguous slice, so every element in it takes
+//! the same path it takes in the dense decode.
 
 use super::kernels::dispatch::{DstSliceMut, InputView, ScoreLevelDispatch};
 use super::outputs::LayoutScratch;
@@ -40,10 +44,15 @@ pub(crate) struct LevelScratch {
     /// Copy of the level's plan whose grid holds the kept anchors' grid
     /// cells; `h * w` is the packed count, as the level kernels expect.
     pub(crate) plan: LevelPlan,
-    /// Kept anchor indices within the level, ascending, then padded by
-    /// [`LevelScratch::pack`].
+    /// Anchors in the level's whole [`PACK_ANCHORS`] groups. The anchors
+    /// from here to the end of the level form the tail.
+    pub(crate) body: usize,
+    /// The level's plan cut down to its tail anchors, decoded whole.
+    pub(crate) tail: LevelPlan,
+    /// Kept body anchor indices within the level, ascending, then padded
+    /// by [`LevelScratch::pack`].
     pub(crate) anchors: Vec<u32>,
-    /// Anchors kept this frame, before padding.
+    /// Body anchors kept this frame, before padding.
     pub(crate) kept: usize,
     /// Last floor from [`raw_score_floor`], keyed by the score quantization
     /// and threshold bits it was found for.
@@ -56,6 +65,7 @@ pub(crate) struct LevelScratch {
 impl LevelScratch {
     pub(crate) fn for_level(level: &LevelPlan) -> Self {
         let n = level.h * level.w;
+        let body = n - n % PACK_ANCHORS;
         Self {
             plan: LevelPlan {
                 stride: level.stride,
@@ -70,7 +80,21 @@ impl LevelScratch {
                 mc_shape: level.mc_shape.clone(),
                 layout: Layout::Nhwc,
             },
-            anchors: Vec::with_capacity(n),
+            body,
+            tail: LevelPlan {
+                stride: level.stride,
+                h: 1,
+                w: n - body,
+                reg_max: level.reg_max,
+                anchor_offset: 0,
+                grid_x: level.grid_x[body..].into(),
+                grid_y: level.grid_y[body..].into(),
+                box_shape: level.box_shape.clone(),
+                score_shape: level.score_shape.clone(),
+                mc_shape: level.mc_shape.clone(),
+                layout: Layout::Nhwc,
+            },
+            anchors: Vec::with_capacity(body),
             kept: 0,
             floor: None,
             boxes: LayoutScratch::default(),
@@ -79,11 +103,11 @@ impl LevelScratch {
         }
     }
 
-    /// Pad the kept anchors to a whole number of [`PACK_ANCHORS`] groups
-    /// by repeating the last one, and point the compact plan at their grid
-    /// cells in `level`. Returns the kept count before padding, also left
-    /// in `kept`; the padded anchors' outputs are scratch that the next
-    /// level overwrites.
+    /// Pad the kept body anchors to a whole number of [`PACK_ANCHORS`]
+    /// groups by repeating the last one, and point the compact plan at
+    /// their grid cells in `level`. Returns the kept count before padding,
+    /// also left in `kept`; the padded anchors' outputs are scratch that
+    /// the tail or the next level overwrites.
     pub(crate) fn pack(&mut self, level: &LevelPlan) -> usize {
         let kept = self.anchors.len();
         self.kept = kept;
@@ -194,19 +218,60 @@ pub(crate) fn raw_score_floor(
     Ok(Some(floor))
 }
 
+/// An integer raw score type.
+trait RawScore: Copy + Ord + TryFrom<i32> {
+    const LOWEST: Self;
+}
+
+impl RawScore for i8 {
+    const LOWEST: Self = i8::MIN;
+}
+impl RawScore for u8 {
+    const LOWEST: Self = u8::MIN;
+}
+impl RawScore for i16 {
+    const LOWEST: Self = i16::MIN;
+}
+impl RawScore for u16 {
+    const LOWEST: Self = u16::MIN;
+}
+
+/// Raw scores are tested for a value at the floor this many at a time; only
+/// a block that holds one has its rows examined.
+const SCAN_BLOCK: usize = 64;
+
 /// Append to `anchors` every anchor whose largest raw class score is at or
-/// above `floor`. `input` is one level's NHWC `[h * w, num_classes]` scores.
+/// above `floor`. `input` holds NHWC `[anchors, num_classes]` score rows.
 pub(crate) fn select_anchors(
     input: &InputView<'_>,
     num_classes: usize,
     floor: i32,
     anchors: &mut Vec<u32>,
 ) -> DecoderResult<()> {
-    fn scan<T: Copy + Into<i32>>(rows: &[T], nc: usize, floor: i32, anchors: &mut Vec<u32>) {
-        for (a, row) in rows.chunks_exact(nc).enumerate() {
-            if row.iter().any(|&v| v.into() >= floor) {
-                anchors.push(a as u32);
+    fn scan<T: RawScore>(rows: &[T], nc: usize, floor: i32, anchors: &mut Vec<u32>) {
+        let floor = match T::try_from(floor) {
+            Ok(f) => f,
+            Err(_) if floor > 0 => return,
+            Err(_) => {
+                anchors.extend(0..(rows.len() / nc) as u32);
+                return;
             }
+        };
+        // The first row not yet examined: a row spanning two blocks that
+        // both hold a passing value is examined once.
+        let mut next = 0;
+        for (b, block) in rows.chunks(SCAN_BLOCK).enumerate() {
+            if block.iter().fold(T::LOWEST, |m, &v| m.max(v)) < floor {
+                continue;
+            }
+            let start = b * SCAN_BLOCK;
+            let last = (start + block.len() - 1) / nc;
+            for a in (start / nc).max(next)..=last {
+                if rows[a * nc..(a + 1) * nc].iter().any(|&v| v >= floor) {
+                    anchors.push(a as u32);
+                }
+            }
+            next = last + 1;
         }
     }
     anchors.clear();
@@ -423,6 +488,49 @@ mod tests {
         let mut anchors = vec![42];
         select_anchors(&InputView::I8(&scores), 3, -5, &mut anchors).unwrap();
         assert_eq!(anchors, vec![0, 2]);
+    }
+
+    /// The block scan keeps exactly the rows a row-by-row scan keeps, for
+    /// rows that straddle blocks, blocks holding several rows, and floors
+    /// outside the raw type's range.
+    #[test]
+    fn select_matches_a_row_by_row_scan() {
+        let mut x = 0x1234_5678_u32;
+        let mut next = move || {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            x >> 8
+        };
+        for nc in [1, 3, 4, 10, 80, 100] {
+            let rows = 37;
+            let scores: Vec<i8> = (0..rows * nc)
+                .map(|_| {
+                    if next() % 61 == 0 {
+                        (next() % 128) as i8
+                    } else {
+                        -100
+                    }
+                })
+                .collect();
+            for floor in [-200, -100, -99, 0, 50, 127, 128, 500] {
+                let want: Vec<u32> = (0..rows as u32)
+                    .filter(|&a| {
+                        let a = a as usize;
+                        scores[a * nc..(a + 1) * nc]
+                            .iter()
+                            .any(|&v| i32::from(v) >= floor)
+                    })
+                    .collect();
+                let mut got = Vec::new();
+                select_anchors(&InputView::I8(&scores), nc, floor, &mut got).unwrap();
+                assert_eq!(got, want, "nc={nc} floor={floor}");
+                let unsigned: Vec<u16> = scores
+                    .iter()
+                    .map(|&v| (i32::from(v) + 128) as u16)
+                    .collect();
+                select_anchors(&InputView::U16(&unsigned), nc, floor + 128, &mut got).unwrap();
+                assert_eq!(got, want, "u16 nc={nc} floor={floor}");
+            }
+        }
     }
 
     #[test]

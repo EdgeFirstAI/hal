@@ -163,6 +163,51 @@ def test_render():
         )
 
 
+def _draw_box(converter, color, opacity=1.0):
+    bg_px = np.array([10, 20, 30, 200], dtype=np.uint8)
+    bg = Tensor.image(32, 32, format=PixelFormat.Rgba, access="readwrite")
+    with bg.map() as m:
+        np.asarray(m.numpy())[:] = bg_px
+    converter.set_class_colors([color])
+    dst = converter.create_image(32, 32, PixelFormat.Rgba, access="readwrite")
+    converter.draw_decoded_masks(
+        dst,
+        bbox=np.array([[0.25, 0.25, 0.75, 0.75]], dtype=np.float32),
+        scores=np.array([0.9], dtype=np.float32),
+        classes=np.array([0], dtype=np.uintp),
+        background=bg,
+        opacity=opacity,
+    )
+    with dst.map() as m:
+        img = np.asarray(m.numpy()).copy()
+    drawn = np.flatnonzero((img[16] != bg_px).any(axis=-1))
+    return img, drawn
+
+
+def test_box_line_width():
+    converter = ImageProcessor()
+    _, drawn = _draw_box(converter, [200, 100, 50, 255])
+    assert drawn.tolist() == [5, 6, 7, 24, 25, 26]
+    converter.set_box_line_width(5)
+    _, drawn = _draw_box(converter, [200, 100, 50, 255])
+    assert drawn.tolist() == [3, 4, 5, 6, 7, 24, 25, 26, 27, 28]
+    with pytest.raises(ValueError):
+        converter.set_box_line_width(0)
+    with pytest.raises(OverflowError):
+        converter.set_box_line_width(-1)
+
+
+def test_box_colour_alpha():
+    converter = ImageProcessor()
+    img, _ = _draw_box(converter, [200, 100, 50, 255])
+    assert img[16, 7].tolist() == [200, 100, 50, 200]
+    img, _ = _draw_box(converter, [200, 100, 50, 128])
+    # 50% coverage over (10, 20, 30); the destination alpha is untouched.
+    expected = np.array([105, 60, 40, 200])
+    assert np.abs(img[16, 7].astype(int) - expected).max() <= 2
+    assert img[16, 16].tolist() == [10, 20, 30, 200]
+
+
 def test_rgb_resize(monkeypatch):
     # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")

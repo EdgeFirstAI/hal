@@ -207,6 +207,11 @@ impl CPUProcessor {
         Ok(())
     }
 
+    /// Draws each box's outline, `box_line_width` pixels thick, outside the
+    /// box edges. The outline is blended over `dst_slice` with the colour's
+    /// alpha scaled by `opacity`, as the mask fills are; each outline pixel
+    /// is written once so a translucent outline has uniform coverage. The
+    /// destination alpha channel is not touched.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_box(
         &mut self,
@@ -216,15 +221,40 @@ impl CPUProcessor {
         dst_c: usize,
         dst_slice: &mut [u8],
         detect: &[DetectBox],
+        opacity: f32,
         color_mode: crate::ColorMode,
     ) -> Result<()> {
-        const LINE_THICKNESS: usize = 3;
+        let thickness = self.box_line_width;
 
         for (idx, d) in detect.iter().enumerate() {
             use edgefirst_tensor::BoundingBox;
 
             let color_index = color_mode.index(idx, d.label);
-            let [r, g, b, _] = self.colors[color_index % self.colors.len()];
+            let color = self.colors[color_index % self.colors.len()];
+            let alpha = if opacity == 1.0 {
+                color[3] as u16
+            } else {
+                (color[3] as f32 * opacity).round() as u16
+            };
+            if alpha == 0 {
+                continue;
+            }
+            let mut fill = |y: usize, x_range: std::ops::Range<usize>| {
+                let row = y * dst_rs;
+                for x in x_range {
+                    let index = row + x * dst_c;
+                    let px = &mut dst_slice[index..index + 3];
+                    if alpha == 255 {
+                        px.copy_from_slice(&color[..3]);
+                    } else {
+                        for c in 0..3 {
+                            px[c] = ((color[c] as u16 * alpha + px[c] as u16 * (255 - alpha)) / 255)
+                                as u8;
+                        }
+                    }
+                }
+            };
+
             let bbox = d.bbox.to_canonical();
             let bbox = BoundingBox {
                 xmin: bbox.xmin.clamp(0.0, 1.0),
@@ -232,47 +262,31 @@ impl CPUProcessor {
                 xmax: bbox.xmax.clamp(0.0, 1.0),
                 ymax: bbox.ymax.clamp(0.0, 1.0),
             };
-            let inner = [
-                ((dst_w - 1) as f32 * bbox.xmin - 0.5).round() as usize,
-                ((dst_h - 1) as f32 * bbox.ymin - 0.5).round() as usize,
-                ((dst_w - 1) as f32 * bbox.xmax + 0.5).round() as usize,
-                ((dst_h - 1) as f32 * bbox.ymax + 0.5).round() as usize,
-            ];
+            // The last column of the left line, the last row of the top line,
+            // and the first column and row of the right and bottom lines. The
+            // lines lie outside the box, so these may fall outside the image
+            // (a left edge at 0 puts the left line at -1 and before).
+            let left = ((dst_w - 1) as f32 * bbox.xmin - 0.5).round() as i64;
+            let top = ((dst_h - 1) as f32 * bbox.ymin - 0.5).round() as i64;
+            let right = ((dst_w - 1) as f32 * bbox.xmax + 0.5).round() as i64;
+            let bottom = ((dst_h - 1) as f32 * bbox.ymax + 0.5).round() as i64;
+            let t = thickness as i64;
+            let clip = |lo: i64, hi: i64, len: usize| {
+                let len = len as i64;
+                lo.clamp(0, len) as usize..hi.clamp(0, len) as usize
+            };
+            let full = clip(left + 1 - t, right + t, dst_w);
 
-            let outer = [
-                inner[0].saturating_sub(LINE_THICKNESS),
-                inner[1].saturating_sub(LINE_THICKNESS),
-                (inner[2] + LINE_THICKNESS).min(dst_w),
-                (inner[3] + LINE_THICKNESS).min(dst_h),
-            ];
-
-            // top line
-            for y in outer[1] + 1..=inner[1] {
-                for x in outer[0] + 1..outer[2] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
+            for y in clip(top + 1 - t, top + 1, dst_h) {
+                fill(y, full.clone());
             }
-
-            // left and right lines
-            for y in inner[1]..inner[3] {
-                for x in outer[0] + 1..=inner[0] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
-
-                for x in inner[2]..outer[2] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
+            // Left and right lines, between the top and bottom lines.
+            for y in clip(top + 1, bottom, dst_h) {
+                fill(y, clip(left + 1 - t, left + 1, dst_w));
+                fill(y, clip(right, right + t, dst_w));
             }
-
-            // bottom line
-            for y in inner[3]..outer[3] {
-                for x in outer[0] + 1..outer[2] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
+            for y in clip(bottom, bottom + t, dst_h) {
+                fill(y, full.clone());
             }
         }
         Ok(())
