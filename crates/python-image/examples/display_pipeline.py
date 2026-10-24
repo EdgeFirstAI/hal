@@ -231,7 +231,7 @@ def load_outputs(capture: str) -> list[Tensor]:
     outputs = []
     for m in meta:
         data = np.fromfile(
-            os.path.join(capture, f"out{m['index']}.bin"), dtype=m["dtype"]
+            os.path.join(capture, f"out{int(m['index'])}.bin"), dtype=m["dtype"]
         )
         t = Tensor(m["shape"], dtype=m["dtype"])
         with t.map("write") as view:
@@ -268,6 +268,9 @@ def main() -> int:
     parser.add_argument("capture", nargs="?")
     parser.add_argument("--iters", type=int, default=1000)
     args = parser.parse_args()
+    capture = os.path.realpath(args.capture) if args.capture else None
+    if capture and not os.path.isdir(capture):
+        parser.error(f"capture_dir {args.capture!r} is not a directory")
 
     proc = ImageProcessor()
     check_box_style(proc, "default backend")
@@ -279,8 +282,8 @@ def main() -> int:
         del os.environ["EDGEFIRST_FORCE_BACKEND"]
     check_box_style(cpu, "cpu backend")
     check_cpu_refusals()
-    if args.capture:
-        time_decode(args.capture, args.iters)
+    if capture:
+        time_decode(capture, args.iters)
 
     print(f"{'FAILED: ' + ', '.join(FAILED) if FAILED else 'all checks passed'}")
     return 1 if FAILED else 0
