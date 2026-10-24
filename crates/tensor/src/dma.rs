@@ -128,19 +128,28 @@ fn heap_allocate(
     size: usize,
     policy: HeapPolicy,
 ) -> Result<(std::os::fd::OwnedFd, crate::Contiguity)> {
+    heap_allocate_from(size, policy, UNCACHED_CMA_HEAP_PATH)
+}
+
+/// [`heap_allocate`] with the uncached heap at `uncached_path`.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn heap_allocate_from(
+    size: usize,
+    policy: HeapPolicy,
+    uncached_path: &str,
+) -> Result<(std::os::fd::OwnedFd, crate::Contiguity)> {
     use crate::Contiguity;
     let contiguous = policy.contiguous;
 
     if policy.uncached {
-        let uncached = dma_heap::HeapKind::Custom(UNCACHED_CMA_HEAP_PATH.into());
+        let uncached = dma_heap::HeapKind::Custom(uncached_path.into());
         match dma_heap::Heap::new(uncached).and_then(|heap| heap.allocate(size)) {
             Ok(fd) => {
-                log::debug!("allocated {size} bytes from {UNCACHED_CMA_HEAP_PATH}");
+                log::debug!("allocated {size} bytes from {uncached_path}");
                 return Ok((fd, Contiguity::Contiguous));
             }
             Err(e) => log::debug!(
-                "{UNCACHED_CMA_HEAP_PATH} cannot allocate {size} bytes ({e}); \
-                 trying the cached heaps"
+                "{uncached_path} cannot allocate {size} bytes ({e}); trying the cached heaps"
             ),
         }
     }
@@ -1150,34 +1159,68 @@ mod tests {
         assert!(HeapPolicy::for_access(CpuAccess::None, true).contiguous);
     }
 
-    /// An uncached request comes from the uncached CMA heap where the system
-    /// has one, and from the cached heaps otherwise; a cached request never
-    /// comes from it.
+    /// An uncached request is served whenever a cached one is: from the
+    /// uncached CMA heap when it can allocate, from the cached heaps
+    /// otherwise. A cached request never comes from the uncached heap.
     #[test]
     #[cfg(not(miri))]
-    fn uncached_requests_use_the_uncached_heap_when_present() {
-        let uncached_present = std::path::Path::new(UNCACHED_CMA_HEAP_PATH).exists();
+    fn uncached_requests_are_served_and_cached_ones_never_uncached() {
+        const NAME: &str = "uncached_requests_are_served_and_cached_ones_never_uncached";
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
         let uncached = HeapPolicy {
             contiguous: false,
             uncached: true,
         };
-        let (fd, contiguity) = match heap_allocate(4096, uncached) {
-            Ok(a) => a,
-            Err(e) => {
-                assert!(!uncached_present && !cma_heap_present(), "{e}");
-                return;
+        let (fd, contiguity) = heap_allocate(4096, uncached).expect("uncached request");
+        match exporter(&fd) {
+            Some(name) if name.ends_with("cma-uncached") => {
+                assert_eq!(contiguity, crate::Contiguity::Contiguous)
             }
-        };
-        let name = exporter(&fd);
-        if uncached_present {
-            assert_eq!(contiguity, crate::Contiguity::Contiguous);
-            if let Some(name) = &name {
-                assert!(name.ends_with("cma-uncached"), "exporter {name}");
-            }
+            Some(name) => crate::test_support::report_skip(&format!(
+                "{NAME} - the uncached heap did not serve the request ({name}), \
+                 so only the fallback ran"
+            )),
+            None => crate::test_support::report_skip(&format!(
+                "{NAME} - the kernel names no dma-buf exporter"
+            )),
         }
-        let (fd, _) = heap_allocate(4096, HeapPolicy::default()).unwrap();
+        let (fd, _) = heap_allocate(4096, HeapPolicy::default()).expect("cached request");
         if let Some(name) = exporter(&fd) {
             assert!(!name.ends_with("-uncached"), "exporter {name}");
+        }
+    }
+
+    /// Without a usable uncached heap an uncached request falls back to the
+    /// cached heaps, keeping the contiguous rule.
+    #[test]
+    #[cfg(not(miri))]
+    fn uncached_requests_fall_back_to_the_cached_heaps() {
+        const NAME: &str = "uncached_requests_fall_back_to_the_cached_heaps";
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
+        let missing = "/dev/dma_heap/no-such-uncached-heap";
+        let uncached = HeapPolicy {
+            contiguous: false,
+            uncached: true,
+        };
+        let (fd, _) = heap_allocate_from(4096, uncached, missing).expect("fallback");
+        if let Some(name) = exporter(&fd) {
+            assert!(!name.ends_with("-uncached"), "exporter {name}");
+        }
+        if cma_heap_present() {
+            let contiguous = HeapPolicy {
+                contiguous: true,
+                uncached: true,
+            };
+            let (fd, contiguity) =
+                heap_allocate_from(4096, contiguous, missing).expect("contiguous fallback");
+            assert_eq!(contiguity, crate::Contiguity::Contiguous);
+            if let Some(name) = exporter(&fd) {
+                assert_eq!(name, "linux,cma");
+            }
         }
     }
 

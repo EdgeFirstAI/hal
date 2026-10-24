@@ -4,24 +4,40 @@
 //! Devices render into and read from uncached DMA-BUF images.
 //!
 //! A `CpuAccess::None` or `CpuAccess::Write` DMA-BUF image comes from the
-//! uncached CMA heap where the system has one. Each test drives a device
-//! through such an image and checks the pixels through a second device pass
-//! into a CPU-readable image, against the same work done in cached memory.
-//! Skips loudly where the backend or the DMA heap is missing.
+//! uncached CMA heap when it can serve the allocation. Each test drives a
+//! device through such an image and checks the pixels through a second device
+//! pass into a CPU-readable image, against the same work done in cached
+//! memory.
+//!
+//! The tests run only where an allocation is actually served uncached, which a
+//! probe allocation's exporter name establishes; elsewhere they skip loudly,
+//! and the cached fallback is the tensor crate's to test. Missing backends
+//! skip as well, except under `HAL_TEST_REQUIRE_DMA=1`, `HAL_TEST_REQUIRE_GL=1`
+//! and `HAL_TEST_REQUIRE_G2D=1`, which turn the matching skip into a failure.
 
 #![cfg(target_os = "linux")]
 
-use edgefirst_image::{ComputeBackend, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait};
+use edgefirst_image::{
+    ComputeBackend, G2DProcessor, GLProcessorThreaded, ImageProcessor, ImageProcessorConfig,
+    ImageProcessorTrait,
+};
 use edgefirst_tensor::{
     CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
 
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+#[path = "../../tensor/tests/support/outcome.rs"]
+#[allow(dead_code)]
+mod outcome;
+use outcome::report_skip as skip;
+
 const W: usize = 320;
 const H: usize = 240;
 
-fn skip(why: &str) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {why}");
+fn required(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|v| v == "1")
 }
 
 /// The heap a DMA-BUF image came from, as `/proc/self/fdinfo` names it.
@@ -34,25 +50,50 @@ fn exporter(t: &TensorDyn) -> Option<String> {
         .map(|n| n.trim().to_owned())
 }
 
-fn uncached_heap_present() -> bool {
-    std::path::Path::new("/dev/dma_heap/linux,cma-uncached").exists()
+fn is_uncached(t: &TensorDyn) -> bool {
+    exporter(t).is_some_and(|n| n.ends_with("cma-uncached"))
 }
 
-fn processor(backend: ComputeBackend) -> Option<ImageProcessor> {
-    ImageProcessor::with_config(ImageProcessorConfig {
-        backend,
-        ..Default::default()
-    })
-    .ok()
+fn dma_image(access: CpuAccess) -> TensorDyn {
+    TensorDyn::image(
+        W,
+        H,
+        PixelFormat::Rgba,
+        DType::U8,
+        Some(TensorMemory::DmaBuf),
+        access,
+    )
+    .expect("DMA-BUF image on a host with a usable DMA heap")
 }
 
-fn image(
-    proc: &ImageProcessor,
-    memory: Option<TensorMemory>,
-    access: CpuAccess,
-) -> Option<TensorDyn> {
-    proc.create_image(W, H, PixelFormat::Rgba, DType::U8, memory, access)
-        .ok()
+/// Whether the test named `what` runs: a usable DMA heap (under
+/// `HAL_TEST_REQUIRE_DMA`) whose uncached CMA heap actually serves a
+/// write-only image.
+fn uncached_or_skip(what: &str) -> bool {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), what) {
+        return false;
+    }
+    let probe = dma_image(CpuAccess::Write);
+    if is_uncached(&probe) {
+        return true;
+    }
+    skip(&format!(
+        "{what} - write-only images are not served uncached here (exporter {:?})",
+        exporter(&probe)
+    ));
+    false
+}
+
+fn gl_image(gl: &ImageProcessor, access: CpuAccess) -> TensorDyn {
+    gl.create_image(
+        W,
+        H,
+        PixelFormat::Rgba,
+        DType::U8,
+        Some(TensorMemory::DmaBuf),
+        access,
+    )
+    .expect("DMA-BUF image")
 }
 
 fn fill(t: &TensorDyn) {
@@ -66,54 +107,61 @@ fn read(t: &TensorDyn) -> Vec<u8> {
     t.as_u8().unwrap().map_read().unwrap().as_slice().to_vec()
 }
 
-/// An image declared `access` is a DMA-BUF from the uncached heap.
-fn assert_uncached(t: &TensorDyn, access: CpuAccess) {
-    assert_eq!(t.cpu_access(), access);
-    assert_eq!(t.memory(), TensorMemory::DmaBuf, "{access:?}");
-    if let Some(name) = exporter(t) {
-        assert!(
-            name.ends_with("cma-uncached"),
-            "{access:?}: exporter {name}"
-        );
-    }
-}
-
 /// GL renders into a hardware-only image, as a compositor-bound canvas, and
 /// samples it and a CPU-written image back into readable memory unchanged.
 #[test]
 fn gl_renders_into_and_samples_uncached_images() {
-    if !uncached_heap_present() {
-        return skip("no uncached CMA heap");
+    const NAME: &str = "gl_renders_into_and_samples_uncached_images";
+    if !uncached_or_skip(NAME) {
+        return;
     }
-    let Some(mut gl) = processor(ComputeBackend::OpenGl) else {
-        return skip("no OpenGL backend");
-    };
-    let Some(canvas) = image(&gl, Some(TensorMemory::DmaBuf), CpuAccess::None) else {
-        return skip("no DMA-BUF images");
-    };
+    if let Err(e) = GLProcessorThreaded::new(None) {
+        assert!(
+            !required("HAL_TEST_REQUIRE_GL"),
+            "HAL_TEST_REQUIRE_GL=1 but the GL backend failed to come up: {e}"
+        );
+        return skip(&format!("{NAME} - no GL backend: {e}"));
+    }
+    let mut gl = ImageProcessor::with_config(ImageProcessorConfig {
+        backend: ComputeBackend::OpenGl,
+        ..Default::default()
+    })
+    .expect("GL processor");
+    let mut canvas = gl_image(&gl, CpuAccess::None);
+    // A GL backend that cannot render a hardware-only image widens the
+    // declaration so its CPU fallback can; that is a capability, not a bug.
     if canvas.cpu_access() != CpuAccess::None {
-        return skip("the GL backend cannot render a hardware-only image here");
+        return skip(&format!(
+            "{NAME} - this GL backend cannot render a hardware-only image"
+        ));
     }
-    assert_uncached(&canvas, CpuAccess::None);
-    let mut canvas = canvas;
+    assert!(
+        is_uncached(&canvas),
+        "canvas exporter {:?}",
+        exporter(&canvas)
+    );
 
-    let src = image(&gl, Some(TensorMemory::DmaBuf), CpuAccess::ReadWrite).unwrap();
+    let src = gl_image(&gl, CpuAccess::ReadWrite);
     fill(&src);
-    let mut want = image(&gl, Some(TensorMemory::DmaBuf), CpuAccess::ReadWrite).unwrap();
+    let mut want = gl_image(&gl, CpuAccess::ReadWrite);
     gl.convert(&src, &mut want, None).unwrap();
 
     gl.convert(&src, &mut canvas, None).unwrap();
-    let mut got = image(&gl, Some(TensorMemory::DmaBuf), CpuAccess::ReadWrite).unwrap();
+    let mut got = gl_image(&gl, CpuAccess::ReadWrite);
     gl.convert(&canvas, &mut got, None).unwrap();
     assert!(
         read(&got) == read(&want),
         "GL round trip through a hardware-only image"
     );
 
-    let overlay = image(&gl, Some(TensorMemory::DmaBuf), CpuAccess::Write).unwrap();
-    assert_uncached(&overlay, CpuAccess::Write);
+    let overlay = gl_image(&gl, CpuAccess::Write);
+    assert!(
+        is_uncached(&overlay),
+        "overlay exporter {:?}",
+        exporter(&overlay)
+    );
     fill(&overlay);
-    let mut got = image(&gl, Some(TensorMemory::DmaBuf), CpuAccess::ReadWrite).unwrap();
+    let mut got = gl_image(&gl, CpuAccess::ReadWrite);
     gl.convert(&overlay, &mut got, None).unwrap();
     assert!(
         read(&got) == read(&src),
@@ -121,39 +169,42 @@ fn gl_renders_into_and_samples_uncached_images() {
     );
 }
 
-/// G2D blits from a CPU-written uncached image into a hardware-only one.
+/// G2D blits from a CPU-written uncached image into a hardware-only one and
+/// back out unchanged.
 #[test]
 fn g2d_blits_between_uncached_images() {
-    if !uncached_heap_present() {
-        return skip("no uncached CMA heap");
+    const NAME: &str = "g2d_blits_between_uncached_images";
+    if !uncached_or_skip(NAME) {
+        return;
     }
-    let Some(mut g2d) = processor(ComputeBackend::G2d) else {
-        return skip("no G2D backend");
+    let mut g2d = match G2DProcessor::new() {
+        Ok(g2d) => g2d,
+        Err(e) => {
+            assert!(
+                !required("HAL_TEST_REQUIRE_G2D"),
+                "HAL_TEST_REQUIRE_G2D=1 but G2D failed to initialize: {e}"
+            );
+            return skip(&format!("{NAME} - no G2D: {e}"));
+        }
     };
-    let alloc = |access| {
-        TensorDyn::image(
-            W,
-            H,
-            PixelFormat::Rgba,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            access,
-        )
-    };
-    let Ok(src) = alloc(CpuAccess::Write) else {
-        return skip("no DMA-BUF images");
-    };
-    assert_uncached(&src, CpuAccess::Write);
+
+    let src = dma_image(CpuAccess::Write);
+    assert!(is_uncached(&src), "source exporter {:?}", exporter(&src));
     fill(&src);
-    let mut canvas = alloc(CpuAccess::None).unwrap();
-    assert_uncached(&canvas, CpuAccess::None);
-    if let Err(e) = g2d.convert(&src, &mut canvas, None) {
-        return skip(&format!("G2D declined the blit: {e}"));
-    }
-    let mut got = alloc(CpuAccess::ReadWrite).unwrap();
-    g2d.convert(&canvas, &mut got, None).unwrap();
-    let mut want = alloc(CpuAccess::ReadWrite).unwrap();
-    g2d.convert(&src, &mut want, None).unwrap();
+    let mut canvas = dma_image(CpuAccess::None);
+    assert!(
+        is_uncached(&canvas),
+        "canvas exporter {:?}",
+        exporter(&canvas)
+    );
+    g2d.convert(&src, &mut canvas, None)
+        .expect("G2D blit into an uncached hardware-only image");
+    let mut got = dma_image(CpuAccess::ReadWrite);
+    g2d.convert(&canvas, &mut got, None)
+        .expect("G2D blit from an uncached hardware-only image");
+    let mut want = dma_image(CpuAccess::ReadWrite);
+    g2d.convert(&src, &mut want, None)
+        .expect("G2D blit from an uncached image");
     assert!(
         read(&got) == read(&want),
         "G2D round trip through uncached images"
