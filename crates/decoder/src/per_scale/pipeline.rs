@@ -317,7 +317,11 @@ fn update_dfl_tables(
         return Ok(());
     }
     for (li, lvl_bind) in bind.levels.iter().enumerate() {
-        let scale = quant_from_tensor(lvl_bind.boxes, "boxes", li)?.scale;
+        let mut scale = quant_from_tensor(lvl_bind.boxes, "boxes", li)?.scale;
+        if !DflExpTable::supports(scale) {
+            // The box kernel falls back to the softmax; keep a valid table.
+            scale = 1.0;
+        }
         match tables.get_mut(li) {
             Some(t) => t.update(scale),
             None => tables.push(DflExpTable::new(scale)),

@@ -380,7 +380,9 @@ use super::level_box::{
     decode_box_level_dfl_f16_to_f16, decode_box_level_dfl_f16_to_f32,
     decode_box_level_dfl_f32_to_f16, decode_box_level_dfl_f32_to_f32,
     decode_box_level_dfl_i16_to_f16, decode_box_level_dfl_i16_to_f32,
+    decode_box_level_dfl_i8_to_f16, decode_box_level_dfl_i8_to_f32,
     decode_box_level_dfl_u16_to_f16, decode_box_level_dfl_u16_to_f32,
+    decode_box_level_dfl_u8_to_f16, decode_box_level_dfl_u8_to_f32,
     decode_box_level_ltrb_f16_to_f16, decode_box_level_ltrb_f16_to_f32,
     decode_box_level_ltrb_f32_to_f16, decode_box_level_ltrb_f32_to_f32,
     decode_box_level_ltrb_i16_to_f16, decode_box_level_ltrb_i16_to_f32,
@@ -399,6 +401,37 @@ use crate::per_scale::plan::LevelPlan;
 use crate::Quantization;
 
 impl BoxLevelDispatch {
+    /// The max-subtracted softmax decode of an exp-table cell's 8-bit bins,
+    /// for a scale the table cannot stand for (see [`DflExpTable::supports`]).
+    fn run_softmax(
+        &self,
+        input: InputView<'_>,
+        q: Quantization,
+        level: &LevelPlan,
+        dst: DstSliceMut<'_>,
+    ) -> DecoderResult<()> {
+        match (input, dst) {
+            (InputView::I8(i), DstSliceMut::F32(d)) => {
+                decode_box_level_dfl_i8_to_f32(i, q, level, d)
+            }
+            (InputView::U8(i), DstSliceMut::F32(d)) => {
+                decode_box_level_dfl_u8_to_f32(i, q, level, d)
+            }
+            (InputView::I8(i), DstSliceMut::F16(d)) => {
+                decode_box_level_dfl_i8_to_f16(i, q, level, d)
+            }
+            (InputView::U8(i), DstSliceMut::F16(d)) => {
+                decode_box_level_dfl_u8_to_f16(i, q, level, d)
+            }
+            _ => {
+                return Err(DecoderError::KernelDispatchUnreachable(format!(
+                    "BoxLevelDispatch::run_softmax mismatched arms for {self:?}"
+                )))
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this cell weighs DFL bins through a [`DflExpTable`].
     pub(crate) fn uses_exp_table(&self) -> bool {
         use BoxLevelDispatch::*;
@@ -432,6 +465,9 @@ impl BoxLevelDispatch {
         dst: DstSliceMut<'_>,
     ) -> DecoderResult<()> {
         use BoxLevelDispatch::*;
+        if self.uses_exp_table() && !DflExpTable::supports(q.scale) {
+            return self.run_softmax(input, q, level, dst);
+        }
         let built = match table {
             Some(t) if t.is_for(q.scale) => None,
             _ => self.uses_exp_table().then(|| DflExpTable::new(q.scale)),
@@ -877,6 +913,110 @@ mod tests {
         let d =
             BoxLevelDispatch::select(BoxEncoding::Dfl, DType::I16, DecodeDtype::F32, &f).unwrap();
         assert!(!d.uses_exp_table());
+    }
+
+    /// A scale the exp table cannot represent (negative, zero, NaN) decodes
+    /// through the max-subtracted softmax instead, finite and equal to it.
+    #[test]
+    fn box_dispatch_lut_falls_back_for_unusable_scales() {
+        use crate::per_scale::kernels::level_box::{
+            decode_box_level_dfl_i8_to_f16, decode_box_level_dfl_i8_to_f32,
+        };
+        let (gx, gy) = crate::per_scale::kernels::grids::make_anchor_grid(1, 1);
+        let level = LevelPlan {
+            stride: 8.0,
+            h: 1,
+            w: 1,
+            reg_max: 16,
+            anchor_offset: 0,
+            grid_x: gx,
+            grid_y: gy,
+            box_shape: vec![1, 1, 1, 64].into_boxed_slice(),
+            score_shape: vec![1, 1, 1, 1].into_boxed_slice(),
+            mc_shape: None,
+            layout: crate::per_scale::plan::Layout::Nhwc,
+        };
+        // Per side: bin 0 at 127, then fifteen bins at -128.
+        let bins: Vec<i8> = (0..64)
+            .map(|i| if i % 16 == 0 { 127 } else { -128 })
+            .collect();
+        let mut tiers = vec![CpuFeatures::default()];
+        if let Ok(f) = CpuFeatures::from_env_or_probe() {
+            tiers.push(f);
+        }
+        for scale in [-0.5_f32, 0.0, f32::NAN, f32::NEG_INFINITY] {
+            let q = Quantization::new(scale, 0);
+            let mut want = [0.0_f32; 4];
+            decode_box_level_dfl_i8_to_f32(&bins, q, &level, &mut want);
+            let mut want16 = [half::f16::ZERO; 4];
+            decode_box_level_dfl_i8_to_f16(&bins, q, &level, &mut want16);
+            for f in &tiers {
+                let d = BoxLevelDispatch::select(BoxEncoding::Dfl, DType::I8, DecodeDtype::F32, f)
+                    .unwrap();
+                let mut got = [0.0_f32; 4];
+                d.run(
+                    InputView::I8(&bins),
+                    q,
+                    &level,
+                    None,
+                    DstSliceMut::F32(&mut got),
+                )
+                .unwrap();
+                if scale.is_finite() {
+                    assert!(
+                        got.iter().all(|v| v.is_finite()),
+                        "{d:?} scale {scale}: {got:?}"
+                    );
+                    for (g, w) in got.iter().zip(want) {
+                        assert!(
+                            (g - w).abs() < 1e-3,
+                            "{d:?} scale {scale}: {got:?} vs {want:?}"
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        got.map(f32::to_bits),
+                        want.map(f32::to_bits),
+                        "{d:?} scale {scale}"
+                    );
+                }
+                let d = BoxLevelDispatch::select(BoxEncoding::Dfl, DType::I8, DecodeDtype::F16, f)
+                    .unwrap();
+                let mut got16 = [half::f16::ZERO; 4];
+                d.run(
+                    InputView::I8(&bins),
+                    q,
+                    &level,
+                    None,
+                    DstSliceMut::F16(&mut got16),
+                )
+                .unwrap();
+                assert_eq!(
+                    got16.map(half::f16::to_bits),
+                    want16.map(half::f16::to_bits),
+                    "{d:?} scale {scale}"
+                );
+            }
+        }
+        // The reviewer's case: the softmax puts every side at distance 8.
+        let q = Quantization::new(-0.5, 0);
+        let mut got = [0.0_f32; 4];
+        BoxLevelDispatch::select(
+            BoxEncoding::Dfl,
+            DType::I8,
+            DecodeDtype::F32,
+            &CpuFeatures::default(),
+        )
+        .unwrap()
+        .run(
+            InputView::I8(&bins),
+            q,
+            &level,
+            None,
+            DstSliceMut::F32(&mut got),
+        )
+        .unwrap();
+        assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
     }
 
     /// A table built for another scale is not used: the kernel builds one

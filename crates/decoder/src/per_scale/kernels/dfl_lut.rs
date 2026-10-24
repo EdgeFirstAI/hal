@@ -46,6 +46,14 @@ impl DflExpTable {
         }
     }
 
+    /// Whether a table can stand for `scale`: the weights `exp(-k * scale)`
+    /// are at most 1 only for a finite, positive scale. Any other scale
+    /// overflows the table, and the bins are decoded by the max-subtracted
+    /// softmax instead.
+    pub(crate) fn supports(scale: f32) -> bool {
+        scale.is_finite() && scale > 0.0
+    }
+
     pub(crate) fn is_for(&self, scale: f32) -> bool {
         self.scale_bits == scale.to_bits()
     }
