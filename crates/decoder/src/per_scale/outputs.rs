@@ -43,6 +43,10 @@ pub(crate) struct DecodedOutputBuffers {
     /// Per-level exp tables for the 8-bit DFL box kernels, built on the
     /// first frame and rebuilt when a level's box scale changes.
     pub(crate) dfl_tables: Vec<super::kernels::dfl_lut::DflExpTable>,
+
+    /// The dense parallel path's pieces and the thread count they were cut
+    /// for, rebuilt when the count changes.
+    pub(crate) pieces: (usize, Vec<super::pipeline::Piece>),
 }
 
 /// Per-dtype scratch for NCHW → NHWC transpose. Lazy allocation: the
@@ -164,6 +168,7 @@ impl DecodedOutputBuffers {
             layout_scratch: LayoutScratch::default(),
             prefilter: Vec::new(),
             dfl_tables: Vec::new(),
+            pieces: (0, Vec::new()),
         }
     }
 

@@ -196,7 +196,9 @@ use crate::per_scale::outputs::{
     DecodedOutputBuffers, DecodedOutputsRef, ProtoStorage, ProtosView,
 };
 use crate::per_scale::plan::Layout;
-use crate::per_scale::prefilter::{gather_rows, raw_score_floor, select_anchors, LevelScratch};
+use crate::per_scale::prefilter::{
+    gather_rows, raw_score_floor, select_anchors, LevelScratch, PACK_ANCHORS,
+};
 use edgefirst_tensor::{CpuAccess, TensorMapTrait, TensorTrait};
 
 /// Run the per-scale decode pipeline for one frame's inputs. Writes
@@ -228,12 +230,11 @@ pub(crate) fn run<'a>(
         resolve_bindings(plan, inputs)?
     };
 
-    // Per-level work is independent: each level writes to disjoint
-    // anchor ranges of `boxes` / `scores` / `mask_coefs`. We
-    // parallelize across levels via rayon::scope when all levels are
-    // NHWC (the common TFLite case). NCHW levels share `layout_scratch`
-    // which would need per-level scratch buffers to parallelize safely;
-    // for now we keep the sequential path for that case.
+    // Anchors are independent: each writes disjoint ranges of `boxes` /
+    // `scores` / `mask_coefs`. The dense NHWC decode (the common TFLite
+    // case) splits the levels into pieces for the rayon pool. NCHW levels
+    // share `layout_scratch`, which would need per-level scratch buffers
+    // to parallelize safely, so they decode sequentially.
     let mut tables = std::mem::take(&mut buffers.dfl_tables);
     let levels = update_dfl_tables(plan, &bind, &mut tables).and_then(|()| {
         let kept = match score_threshold {
@@ -750,229 +751,216 @@ fn run_levels_sequential(
     Ok(())
 }
 
-/// Parallel per-level loop (NHWC-only path). Disjoint mutable slices
-/// of `boxes` / `scores` / `mask_coefs` are pre-split per level so
-/// each rayon worker can write independently. NCHW would need
-/// per-level `layout_scratch` to parallelize; that's deferred.
+/// Frames with fewer anchors than this decode on the calling thread: waking
+/// the rayon workers, and their spinning once the work runs out, costs more
+/// than the split saves.
+const PARALLEL_MIN_ANCHORS: usize = 2048;
+
+/// A run of one level's anchors, decoded as one task of the dense parallel
+/// path. `start` is a multiple of [`PACK_ANCHORS`], so each element takes
+/// the same kernel path as in a decode of the whole level.
+#[derive(Debug)]
+pub(crate) struct Piece {
+    level: usize,
+    start: usize,
+    /// The level's plan cut down to the piece's anchors.
+    plan: crate::per_scale::plan::LevelPlan,
+}
+
+/// The pieces of every level for `threads` rayon threads, in anchor order.
+/// Each level is cut into pieces of about `total / (2 * threads)` anchors,
+/// so the workers share the frame evenly however its anchors are spread
+/// over the levels; a single thread takes each level whole.
+pub(crate) fn split_into_pieces(plan: &PerScalePlan, threads: usize) -> Vec<Piece> {
+    let target = plan
+        .total_anchors
+        .div_ceil(2 * threads.max(1))
+        .next_multiple_of(PACK_ANCHORS);
+    let mut pieces = Vec::new();
+    for (li, lvl) in plan.levels.iter().enumerate() {
+        let n = lvl.h * lvl.w;
+        let count = if threads > 1 {
+            (n + target / 2) / target
+        } else {
+            1
+        };
+        let len = n.div_ceil(count.max(1)).next_multiple_of(PACK_ANCHORS);
+        let mut start = 0;
+        while start < n {
+            let end = (start + len).min(n);
+            pieces.push(Piece {
+                level: li,
+                start,
+                plan: crate::per_scale::plan::LevelPlan {
+                    stride: lvl.stride,
+                    h: 1,
+                    w: end - start,
+                    reg_max: lvl.reg_max,
+                    anchor_offset: lvl.anchor_offset + start,
+                    grid_x: lvl.grid_x[start..end].into(),
+                    grid_y: lvl.grid_y[start..end].into(),
+                    box_shape: lvl.box_shape.clone(),
+                    score_shape: lvl.score_shape.clone(),
+                    mc_shape: lvl.mc_shape.clone(),
+                    layout: Layout::Nhwc,
+                },
+            });
+            start = end;
+        }
+    }
+    pieces
+}
+
+/// One level's inputs, mapped for the duration of a frame.
+struct LevelMaps<'a> {
+    boxes: MappedInput<'a>,
+    scores: MappedInput<'a>,
+    mask_coefs: Option<MappedInput<'a>>,
+}
+
+/// One piece's work: its outputs and the inputs it reads.
+struct PieceWork<'p, 'o> {
+    piece: &'p Piece,
+    boxes: DstSliceMut<'o>,
+    scores: DstSliceMut<'o>,
+    mask_coefs: Option<DstSliceMut<'o>>,
+}
+
+/// Dense loop for NHWC levels. Every input is mapped once on the calling
+/// thread and the levels are decoded in [`Piece`]s, on the rayon pool when
+/// the frame has at least [`PARALLEL_MIN_ANCHORS`] anchors.
 fn run_levels_parallel(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
     buffers: &mut DecodedOutputBuffers,
     tables: &[DflExpTable],
 ) -> DecoderResult<()> {
-    let n_levels = plan.levels.len();
-    if n_levels == 0 {
-        return Ok(());
+    let threads = if plan.total_anchors < PARALLEL_MIN_ANCHORS {
+        1
+    } else {
+        rayon::current_num_threads()
+    };
+    if buffers.pieces.0 != threads {
+        buffers.pieces = (threads, split_into_pieces(plan, threads));
     }
-
-    // Per-level (start_elem, len_elem) spans for each output buffer.
-    // Levels are contiguous and disjoint by anchor_offset construction.
-    let box_spans: Vec<(usize, usize)> = plan
+    let maps = bind
         .levels
         .iter()
-        .map(|l| (l.anchor_offset * 4, l.h * l.w * 4))
-        .collect();
-    let score_spans: Vec<(usize, usize)> = plan
-        .levels
-        .iter()
-        .map(|l| {
-            (
-                l.anchor_offset * plan.num_classes,
-                l.h * l.w * plan.num_classes,
-            )
+        .enumerate()
+        .map(|(li, lvl_bind)| {
+            Ok(LevelMaps {
+                boxes: map_input(lvl_bind.boxes, "boxes", li)?,
+                scores: map_input(lvl_bind.scores, "scores", li)?,
+                mask_coefs: match (lvl_bind.mask_coefs, plan.num_mask_coefs) {
+                    (Some(mc), nm) if nm > 0 => Some(map_input(mc, "mask_coefs", li)?),
+                    _ => None,
+                },
+            })
         })
-        .collect();
-    let mc_spans: Vec<(usize, usize)> = plan
-        .levels
-        .iter()
-        .map(|l| {
-            (
-                l.anchor_offset * plan.num_mask_coefs,
-                l.h * l.w * plan.num_mask_coefs,
-            )
-        })
-        .collect();
+        .collect::<DecoderResult<Vec<_>>>()?;
 
     let DecodedOutputBuffers {
         boxes,
         scores,
         mask_coefs,
+        pieces,
         ..
     } = buffers;
-
-    let box_dsts = split_buffer_into_levels(boxes, &box_spans);
-    let score_dsts = split_buffer_into_levels(scores, &score_spans);
-    let mc_dsts = if plan.num_mask_coefs > 0 {
-        mask_coefs
-            .as_mut()
-            .map(|mc| split_buffer_into_levels(mc, &mc_spans))
-    } else {
-        None
+    let pieces = &pieces.1;
+    let spans = |per_anchor: usize| -> Vec<(usize, usize)> {
+        pieces
+            .iter()
+            .map(|p| (p.plan.anchor_offset * per_anchor, p.plan.w * per_anchor))
+            .collect()
     };
+    let nm = plan.num_mask_coefs;
+    let box_dsts = split_buffer_into_levels(boxes, &spans(4));
+    let score_dsts = split_buffer_into_levels(scores, &spans(plan.num_classes));
+    let mut mc_dsts = match mask_coefs.as_mut() {
+        Some(mc) if nm > 0 => split_buffer_into_levels(mc, &spans(nm))
+            .into_iter()
+            .map(Some)
+            .collect(),
+        _ => Vec::new(),
+    };
+    mc_dsts.resize_with(pieces.len(), || None);
+    let work: Vec<PieceWork<'_, '_>> = pieces
+        .iter()
+        .zip(box_dsts)
+        .zip(score_dsts)
+        .zip(mc_dsts)
+        .map(|(((piece, boxes), scores), mask_coefs)| PieceWork {
+            piece,
+            boxes,
+            scores,
+            mask_coefs,
+        })
+        .collect();
 
-    // Collect first error from any worker. Spawn closures can't return
-    // Result, so we funnel errors through a Mutex<Option<_>>.
-    let first_error: std::sync::Mutex<Option<DecoderError>> = std::sync::Mutex::new(None);
-
-    // Pre-collect all per-level dst slices into Option holders indexed by
-    // level. We later `take()` them out one at a time (in a non-sequential
-    // order: spawn levels 1..N first, then process level 0 on the
-    // calling thread). Levels share a vec but each `take()` is disjoint.
-    let mut box_dst_opts: Vec<Option<_>> = box_dsts.into_iter().map(Some).collect();
-    let mut score_dst_opts: Vec<Option<_>> = score_dsts.into_iter().map(Some).collect();
-    let mut mc_dst_opts: Option<Vec<Option<_>>> =
-        mc_dsts.map(|v| v.into_iter().map(Some).collect());
-
-    // Process the heaviest level (index 0 in YOLO-style FPN, 80x80 grid)
-    // on the calling thread; spawn the smaller levels onto rayon
-    // workers. This eliminates one barrier-wait round-trip vs spawning
-    // every level — rayon's scope() overhead is ~4 ms / frame on
-    // imx95-evk (Cortex-A55), so saving even one trip matters.
-    rayon::scope(|s| {
-        let bind_levels = &bind.levels;
-        let plan_levels = &plan.levels;
-        let plan_ref = plan;
-        let first_error = &first_error;
-
-        // Spawn levels 1..N onto workers.
-        for li in 1..n_levels {
-            let lvl_bind = &bind_levels[li];
-            let lvl = &plan_levels[li];
-            let box_dst = box_dst_opts[li].take().unwrap();
-            let score_dst = score_dst_opts[li].take().unwrap();
-            let mc_dst = mc_dst_opts.as_mut().and_then(|v| v[li].take());
-
-            s.spawn(move |_| {
-                if let Err(e) = process_one_level_nhwc(
-                    plan_ref,
-                    lvl,
-                    li,
-                    lvl_bind,
-                    tables.get(li),
-                    box_dst,
-                    score_dst,
-                    mc_dst,
-                ) {
-                    let mut g = first_error.lock().unwrap();
-                    if g.is_none() {
-                        *g = Some(e);
-                    }
-                }
-            });
-        }
-
-        // Process level 0 in the calling thread. This overlaps with the
-        // spawned workers' execution; the scope's join point waits for
-        // both to finish.
-        let lvl_bind = &bind_levels[0];
-        let lvl = &plan_levels[0];
-        let box_dst = box_dst_opts[0].take().unwrap();
-        let score_dst = score_dst_opts[0].take().unwrap();
-        let mc_dst = mc_dst_opts.as_mut().and_then(|v| v[0].take());
-        if let Err(e) = process_one_level_nhwc(
-            plan_ref,
-            lvl,
-            0,
-            lvl_bind,
-            tables.first(),
-            box_dst,
-            score_dst,
-            mc_dst,
-        ) {
-            let mut g = first_error.lock().unwrap();
-            if g.is_none() {
-                *g = Some(e);
-            }
-        }
-    });
-
-    if let Some(e) = first_error.into_inner().unwrap() {
-        return Err(e);
+    let run = |w: PieceWork<'_, '_>| {
+        let li = w.piece.level;
+        decode_piece(plan, &bind.levels[li], &maps[li], tables.get(li), w)
+    };
+    if threads == 1 {
+        work.into_iter().try_for_each(run)
+    } else {
+        use rayon::prelude::*;
+        work.into_par_iter().try_for_each(run)
     }
-    Ok(())
 }
 
-/// Per-level box + score + mc work for the NHWC parallel path. Mirrors
-/// the body of the sequential loop but takes pre-split disjoint
-/// destination slices instead of slicing live from the buffers struct.
-#[allow(clippy::too_many_arguments)]
-fn process_one_level_nhwc(
+/// Box, score and mask-coefficient decode of one [`Piece`].
+fn decode_piece(
     plan: &PerScalePlan,
-    lvl: &crate::per_scale::plan::LevelPlan,
-    li: usize,
     lvl_bind: &LevelBindings<'_>,
+    maps: &LevelMaps<'_>,
     table: Option<&DflExpTable>,
-    box_dst: crate::per_scale::kernels::dispatch::DstSliceMut<'_>,
-    score_dst: crate::per_scale::kernels::dispatch::DstSliceMut<'_>,
-    mc_dst: Option<crate::per_scale::kernels::dispatch::DstSliceMut<'_>>,
+    work: PieceWork<'_, '_>,
 ) -> DecoderResult<()> {
-    let _level_span = tracing::trace_span!(
+    let PieceWork {
+        piece,
+        boxes,
+        scores,
+        mask_coefs,
+    } = work;
+    let (li, lvl) = (piece.level, &piece.plan);
+    fn rows<'v>(view: InputView<'v>, piece: &Piece, per_anchor: usize) -> InputView<'v> {
+        let start = piece.start * per_anchor;
+        view.slice(start..start + piece.plan.w * per_anchor)
+    }
+    let _span = tracing::trace_span!(
         "decoder.per_scale_run.level",
         li = li,
-        stride = lvl.stride,
-        h = lvl.h,
-        w = lvl.w,
-        anchors = lvl.h * lvl.w,
-        layout = ?lvl.layout,
+        start = piece.start,
+        anchors = lvl.w,
     )
     .entered();
-
     {
         let _s = tracing::trace_span!("decoder.per_scale_run.level.boxes", encoding = ?plan.box_encoding)
             .entered();
-        if plan.box_encoding == crate::schema::BoxEncoding::Dfl {
-            match box_per_channel_quant_from_tensor(lvl_bind.boxes, li)? {
-                Some((scales, zps)) => {
-                    with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
-                        dispatch_dfl_per_channel(input, scales, zps, lvl, box_dst)
-                    })?;
-                }
-                None => {
-                    // Per-tensor fallback (tensor has per-tensor quant or is float).
-                    let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
-                    with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
-                        plan.box_dispatch.run(input, q, lvl, table, box_dst)
-                    })?;
-                }
-            }
-        } else {
-            let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
-            with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
-                plan.box_dispatch.run(input, q, lvl, table, box_dst)
-            })?;
-        }
+        let input = rows(maps.boxes.view(), piece, box_channel_count_for_level(lvl));
+        run_box_kernel(plan, lvl, lvl_bind.boxes, li, table, input, boxes)?;
     }
-
     {
-        let _s =
-            tracing::trace_span!("decoder.per_scale_run.level.scores", activation = ?plan.score_activation)
-                .entered();
+        let _s = tracing::trace_span!("decoder.per_scale_run.level.scores", activation = ?plan.score_activation)
+            .entered();
         let q = quant_from_tensor(lvl_bind.scores, "scores", li)?;
-        with_mapped_input(lvl_bind.scores, "scores", li, |input| {
-            plan.score_dispatch.run(
-                input,
-                q,
-                plan.num_classes,
-                lvl,
-                plan.score_activation,
-                score_dst,
-            )
-        })?;
+        let nc = plan.num_classes;
+        let input = rows(maps.scores.view(), piece, nc);
+        plan.score_dispatch
+            .run(input, q, nc, lvl, plan.score_activation, scores)?;
     }
-
-    if let (Some(mc_input), Some(mc_dispatch), Some(num_mc_gt0), Some(mc_dst)) = (
+    if let (Some(mc_input), Some(mc_map), Some(mc_dispatch), Some(dst)) = (
         lvl_bind.mask_coefs,
+        maps.mask_coefs.as_ref(),
         plan.mc_dispatch,
-        Some(plan.num_mask_coefs).filter(|&n| n > 0),
-        mc_dst,
+        mask_coefs,
     ) {
         let _s = tracing::trace_span!("decoder.per_scale_run.level.mask_coefs").entered();
         let q = quant_from_tensor(mc_input, "mask_coefs", li)?;
-        with_mapped_input(mc_input, "mask_coefs", li, |input| {
-            mc_dispatch.run(input, q, num_mc_gt0, lvl, mc_dst)
-        })?;
+        let nm = plan.num_mask_coefs;
+        mc_dispatch.run(rows(mc_map.view(), piece, nm), q, nm, lvl, dst)?;
     }
-
     Ok(())
 }
 
@@ -1117,18 +1105,41 @@ fn map_failure(e: edgefirst_tensor::Error, role: &str, level: usize) -> DecoderE
     })
 }
 
-/// Map a `TensorDyn`'s underlying slice read-only and call the closure with
-/// an `InputView`. The map is dropped when the closure returns.
-fn with_mapped_input<F>(t: &TensorDyn, role: &'static str, level: usize, f: F) -> DecoderResult<()>
-where
-    F: FnOnce(InputView<'_>) -> DecoderResult<()>,
-{
+/// A tensor mapped read-only, holding its map for as long as it lives.
+enum MappedInput<'a> {
+    I8(edgefirst_tensor::HostView<'a, i8>),
+    U8(edgefirst_tensor::HostView<'a, u8>),
+    I16(edgefirst_tensor::HostView<'a, i16>),
+    U16(edgefirst_tensor::HostView<'a, u16>),
+    F16(edgefirst_tensor::HostView<'a, half::f16>),
+    F32(edgefirst_tensor::HostView<'a, f32>),
+}
+
+impl MappedInput<'_> {
+    fn view(&self) -> InputView<'_> {
+        match self {
+            MappedInput::I8(m) => InputView::I8(m.as_slice()),
+            MappedInput::U8(m) => InputView::U8(m.as_slice()),
+            MappedInput::I16(m) => InputView::I16(m.as_slice()),
+            MappedInput::U16(m) => InputView::U16(m.as_slice()),
+            MappedInput::F16(m) => InputView::F16(m.as_slice()),
+            MappedInput::F32(m) => InputView::F32(m.as_slice()),
+        }
+    }
+}
+
+/// Map a `TensorDyn` read-only as an [`InputView`] source.
+fn map_input<'a>(
+    t: &'a TensorDyn,
+    role: &'static str,
+    level: usize,
+) -> DecoderResult<MappedInput<'a>> {
     reject_padded_input(t, role, level)?;
     macro_rules! mapped {
         ($ty:ty, $variant:ident) => {{
             let tensor = t.as_typed::<$ty>().expect("dtype checked");
             let m = tensor.map_read().map_err(|e| map_failure(e, role, level))?;
-            f(InputView::$variant(m.as_slice()))
+            Ok(MappedInput::$variant(m))
         }};
     }
     match t.dtype() {
@@ -1145,6 +1156,15 @@ where
             level,
         }),
     }
+}
+
+/// Map a `TensorDyn`'s underlying slice read-only and call the closure with
+/// an `InputView`. The map is dropped when the closure returns.
+fn with_mapped_input<F>(t: &TensorDyn, role: &'static str, level: usize, f: F) -> DecoderResult<()>
+where
+    F: FnOnce(InputView<'_>) -> DecoderResult<()>,
+{
+    f(map_input(t, role, level)?.view())
 }
 
 /// Build a `DecodedOutputsRef` borrowing the first `total_anchors`
@@ -1349,6 +1369,58 @@ mod tests {
         if let BufferRef::F32(v) = &outputs.boxes {
             for (i, &b) in v.iter().enumerate() {
                 assert!(b.is_finite(), "box[{i}] = {b} not finite");
+            }
+        }
+    }
+
+    /// Pieces tile every level in order from pack-aligned starts, and cut
+    /// a 960x544 frame's 8160/2040/510 levels into pieces of similar size.
+    #[test]
+    fn pieces_tile_each_level_from_pack_aligned_starts() {
+        use crate::per_scale::DecodeDtype;
+        use crate::schema::SchemaV2;
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for logical in v["outputs"].as_array_mut().unwrap() {
+            if let Some(children) = logical.get_mut("outputs").and_then(|c| c.as_array_mut()) {
+                for child in children {
+                    let stride = child["stride"].as_u64().unwrap() as usize;
+                    child["shape"][1] = (544 / stride).into();
+                    child["shape"][2] = (960 / stride).into();
+                    child["dshape"][1]["height"] = (544 / stride).into();
+                    child["dshape"][2]["width"] = (960 / stride).into();
+                }
+            }
+        }
+        let schema: SchemaV2 = serde_json::from_value(v).unwrap();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.total_anchors, 10710);
+        for threads in [1, 2, 6, 8] {
+            let pieces = split_into_pieces(&plan, threads);
+            let mut next = 0;
+            for p in &pieces {
+                let lvl = &plan.levels[p.level];
+                assert_eq!(p.start % PACK_ANCHORS, 0);
+                assert_eq!(p.plan.anchor_offset, next, "{threads} threads");
+                assert_eq!(p.plan.anchor_offset, lvl.anchor_offset + p.start);
+                assert_eq!(p.plan.grid_x[..], lvl.grid_x[p.start..p.start + p.plan.w]);
+                assert_eq!(p.plan.grid_y[..], lvl.grid_y[p.start..p.start + p.plan.w]);
+                next += p.plan.w;
+            }
+            assert_eq!(next, plan.total_anchors);
+            let largest = pieces.iter().map(|p| p.plan.w).max().unwrap();
+            if threads == 1 {
+                assert_eq!(pieces.len(), plan.levels.len());
+            } else {
+                assert!(
+                    pieces.len() >= threads,
+                    "{threads} threads: {}",
+                    pieces.len()
+                );
+                assert!(largest <= 2 * plan.total_anchors / pieces.len());
             }
         }
     }

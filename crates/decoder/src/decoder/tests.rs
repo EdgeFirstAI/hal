@@ -5069,6 +5069,61 @@ mod per_scale_prefilter_tests {
         }
     }
 
+    /// The bit patterns of a decoded output buffer.
+    fn buffer_bits(b: &crate::per_scale::outputs::BufferRef<'_>) -> Vec<u32> {
+        match b {
+            crate::per_scale::outputs::BufferRef::F32(v) => v.iter().map(|x| x.to_bits()).collect(),
+            crate::per_scale::outputs::BufferRef::F16(v) => {
+                v.iter().map(|x| u32::from(x.to_bits())).collect()
+            }
+        }
+    }
+
+    /// The dense decode cuts levels into pieces by the rayon thread count;
+    /// every count decodes the same bits, including a single thread, which
+    /// takes no rayon pool at all.
+    #[test]
+    fn dense_decode_is_the_same_on_any_thread_count() {
+        for schema_file in [
+            "per_scale/synthetic_yolov8n_schema.json",
+            "per_scale/synthetic_yolo26n_schema.json",
+        ] {
+            let json = edgefirst_bench::testdata::read_to_string(schema_file);
+            let resized = with_input_size(&json, 960, 544).to_string();
+            let schema = with_num_classes(&resized, 10);
+            for dtype in [DecodeDtype::F32, DecodeDtype::F16] {
+                let plan = PerScalePlan::try_from_schema(&schema, dtype)
+                    .unwrap()
+                    .unwrap();
+                let owned = inputs_for(&plan);
+                let inputs: Vec<&TensorDyn> = owned.iter().collect();
+                let mut decoder = PerScaleDecoder::new(plan);
+                let mut first: Option<[Vec<u32>; 3]> = None;
+                for threads in [1, 2, 3, 6] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let bits = pool.install(|| {
+                        let out = decoder.run(&inputs, None).unwrap();
+                        [
+                            buffer_bits(&out.boxes),
+                            buffer_bits(&out.scores),
+                            out.mask_coefs.as_ref().map(buffer_bits).unwrap_or_default(),
+                        ]
+                    });
+                    match &first {
+                        None => first = Some(bits),
+                        Some(f) => assert!(
+                            *f == bits,
+                            "{schema_file} {dtype:?}: {threads} threads differ"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     /// A frame where no score reaches the threshold leaves nothing to decode.
     #[test]
     fn prefilter_with_no_survivors_yields_no_detections() {
