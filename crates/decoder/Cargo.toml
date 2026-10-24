@@ -46,6 +46,7 @@ tracing = { workspace = true }
 mutants = { workspace = true }
 edgefirst-bench = { workspace = true }
 env_logger = { workspace = true }
+libc = { workspace = true }
 image = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
