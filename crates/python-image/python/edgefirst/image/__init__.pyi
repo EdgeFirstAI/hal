@@ -951,11 +951,17 @@ class ImageProcessor:
             """
 
     def set_class_colors(self, colors: list[tuple[int, int, int, int]]) -> None:
-        """Set the colours used to render segmentation masks by class label.
+        """Set the colours used to render segmentation masks and boxes by
+        class label.
 
         The palette holds 20 entries and a class index wraps around it. Only
         the leading entries this call supplies are replaced; the rest keep
         the defaults, and anything past the twentieth is ignored.
+
+        The alpha channel sets the coverage of both the mask fill and the box
+        outline: each is blended over the image with ``a / 255`` scaled by
+        the draw's ``opacity``, so ``255`` draws opaque boxes and lower
+        values translucent ones.
 
         Args:
             colors: ``(r, g, b, a)`` tuples, indexed by class label.

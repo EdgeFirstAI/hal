@@ -1164,7 +1164,7 @@ impl ImageProcessorTrait for GLProcessorST {
         if colors.is_empty() {
             return Ok(());
         }
-        let mut colors_f32 = colors
+        let colors_f32 = colors
             .iter()
             .map(|c| {
                 [
@@ -1189,10 +1189,6 @@ impl ImageProcessorTrait for GLProcessorST {
             .load_uniform_4fv(c"colors", &colors_f32)?;
         self.proto_segmentation_f32_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
-
-        colors_f32.iter_mut().for_each(|c| {
-            c[3] = 1.0; // set alpha to 1.0 for color rendering
-        });
         self.color_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
 

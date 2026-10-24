@@ -207,6 +207,11 @@ impl CPUProcessor {
         Ok(())
     }
 
+    /// Draws each box's outline, `box_line_width` pixels thick, outside the
+    /// box edges. The outline is blended over `dst_slice` with the colour's
+    /// alpha scaled by `opacity`, as the mask fills are; each outline pixel
+    /// is written once so a translucent outline has uniform coverage. The
+    /// destination alpha channel is not touched.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_box(
         &mut self,
@@ -216,6 +221,7 @@ impl CPUProcessor {
         dst_c: usize,
         dst_slice: &mut [u8],
         detect: &[DetectBox],
+        opacity: f32,
         color_mode: crate::ColorMode,
     ) -> Result<()> {
         let thickness = self.box_line_width;
@@ -224,7 +230,31 @@ impl CPUProcessor {
             use edgefirst_tensor::BoundingBox;
 
             let color_index = color_mode.index(idx, d.label);
-            let [r, g, b, _] = self.colors[color_index % self.colors.len()];
+            let color = self.colors[color_index % self.colors.len()];
+            let alpha = if opacity == 1.0 {
+                color[3] as u16
+            } else {
+                (color[3] as f32 * opacity).round() as u16
+            };
+            if alpha == 0 {
+                continue;
+            }
+            let mut fill = |y: usize, x_range: std::ops::Range<usize>| {
+                let row = y * dst_rs;
+                for x in x_range {
+                    let index = row + x * dst_c;
+                    let px = &mut dst_slice[index..index + 3];
+                    if alpha == 255 {
+                        px.copy_from_slice(&color[..3]);
+                    } else {
+                        for c in 0..3 {
+                            px[c] = ((color[c] as u16 * alpha + px[c] as u16 * (255 - alpha)) / 255)
+                                as u8;
+                        }
+                    }
+                }
+            };
+
             let bbox = d.bbox.to_canonical();
             let bbox = BoundingBox {
                 xmin: bbox.xmin.clamp(0.0, 1.0),
@@ -248,31 +278,18 @@ impl CPUProcessor {
 
             // top line
             for y in outer[1] + 1..=inner[1] {
-                for x in outer[0] + 1..outer[2] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
+                fill(y, outer[0] + 1..outer[2]);
             }
 
-            // left and right lines
-            for y in inner[1]..inner[3] {
-                for x in outer[0] + 1..=inner[0] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
-
-                for x in inner[2]..outer[2] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
+            // left and right lines, between the top and bottom lines
+            for y in inner[1] + 1..inner[3].min(dst_h) {
+                fill(y, outer[0] + 1..inner[0] + 1);
+                fill(y, inner[2]..outer[2]);
             }
 
             // bottom line
             for y in inner[3]..outer[3] {
-                for x in outer[0] + 1..outer[2] {
-                    let index = (y * dst_rs) + (x * dst_c);
-                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
-                }
+                fill(y, outer[0] + 1..outer[2]);
             }
         }
         Ok(())

@@ -197,6 +197,17 @@ def test_box_line_width():
         converter.set_box_line_width(-1)
 
 
+def test_box_colour_alpha():
+    converter = ImageProcessor()
+    img, _ = _draw_box(converter, [200, 100, 50, 255])
+    assert img[16, 7].tolist() == [200, 100, 50, 200]
+    img, _ = _draw_box(converter, [200, 100, 50, 128])
+    # 50% coverage over (10, 20, 30); the destination alpha is untouched.
+    expected = np.array([105, 60, 40, 200])
+    assert np.abs(img[16, 7].astype(int) - expected).max() <= 2
+    assert img[16, 16].tolist() == [10, 20, 30, 200]
+
+
 def test_rgb_resize(monkeypatch):
     # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")

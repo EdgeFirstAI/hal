@@ -1248,7 +1248,7 @@ pub struct MaskOverlay<'a> {
 }
 ```
 
-### Box outlines
+### Box outlines and palette
 
 Both draw calls render each detection's box before its mask. Box style is
 processor state, set alongside the palette rather than per call, so it reaches
@@ -1260,7 +1260,13 @@ GL wrapper and CPU; G2D refuses both) and the C draw signatures stay fixed:
   `Error::InvalidOptions`). The outline lies outside the box edges, so the box
   interior is never covered, and is clipped at the image border. GL draws it
   as a quad ring `width` pixels beyond the normalized box; CPU rounds the box
-  to pixel edges and fills the same `width` pixels on each side.
+  to pixel edges and fills the same `width` pixels on each side, writing each
+  outline pixel once.
+- **Alpha.** Masks and boxes read the same 20-entry palette, and both blend
+  over the destination with the colour's alpha × `MaskOverlay::opacity`
+  (GL `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` on RGB, destination alpha kept; CPU
+  the same integer blend as the mask fill). The default palette's alpha is
+  0.7, so default boxes are 70% opaque on every backend.
 
 ### Fused proto→pixel algorithm (`draw_proto_masks`)
 

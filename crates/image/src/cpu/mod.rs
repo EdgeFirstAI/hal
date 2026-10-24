@@ -1640,7 +1640,9 @@ impl CPUProcessor {
         let mut map = dst.map_mut()?;
         let dst_slice = map.as_mut_slice();
 
-        self.render_box(dst_w, dst_h, dst_rs, dst_c, dst_slice, detect, color_mode)?;
+        self.render_box(
+            dst_w, dst_h, dst_rs, dst_c, dst_slice, detect, opacity, color_mode,
+        )?;
 
         if segmentation.is_empty() {
             return Ok(());
@@ -1722,7 +1724,7 @@ impl CPUProcessor {
         let dst_slice = map.as_mut_slice();
 
         self.render_box(
-            dst_w, dst_h, dst_rs, channels, dst_slice, detect, color_mode,
+            dst_w, dst_h, dst_rs, channels, dst_slice, detect, opacity, color_mode,
         )?;
 
         if detect.is_empty() {

@@ -764,9 +764,14 @@ pub extern "C" fn ef_image_processor_new_with_backend(backend: u32) -> *mut EfIm
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Set the RGBA palette used when drawing class masks.
+/// Set the RGBA palette used when drawing class masks and boxes.
 ///
 /// Copied, not borrowed, so the caller may free its array immediately.
+///
+/// The alpha byte sets the coverage of both the mask fill and the box
+/// outline: each is blended over `dst` with `alpha / 255` scaled by the
+/// draw's `opacity`, so `255` draws opaque boxes and lower values translucent
+/// ones. The destination's alpha channel is left as the base layer set it.
 ///
 /// @return 0 on success, `EINVAL` for a null argument or zero colours.
 ///

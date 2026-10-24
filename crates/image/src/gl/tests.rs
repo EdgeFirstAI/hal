@@ -185,6 +185,11 @@ mod gl_tests {
         compare_images(&image, &expected, 0.95, function!());
     }
 
+    /// `a` and `b` agree to within the GPU's blend rounding.
+    fn px_close(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= 2)
+    }
+
     #[test]
     fn test_box_line_width_matches_cpu() {
         use crate::test_support::{box_drawn_columns, box_drawn_rows, box_expected_span, BOX_DIM};
@@ -220,6 +225,44 @@ mod gl_tests {
         }
         let err = gl.set_box_line_width(0).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidOptions(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_box_colour_alpha_matches_cpu() {
+        use crate::test_support::{box_blend, box_expected_span, box_px, BOX_BG, BOX_DIM};
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mid = BOX_DIM / 2;
+        let corner = BOX_DIM / 4 - 1;
+        for (color, opacity, alpha) in [
+            ([200u8, 100, 50, 255u8], 1.0f32, 255u16),
+            ([200, 100, 50, 128], 1.0, 128),
+            ([200, 100, 50, 255], 0.5, 128),
+        ] {
+            let want = box_blend(color, alpha);
+            let flat = crate::test_support::draw_box_fixture(&mut gl, color, Some(3), opacity);
+            for x in box_expected_span(3) {
+                let got = box_px(&flat, x, mid);
+                assert!(
+                    px_close(got, want),
+                    "{color:?}@{opacity} x={x}: {got:?} != {want:?}"
+                );
+            }
+            let got = box_px(&flat, corner, corner);
+            assert!(
+                px_close(got, want),
+                "{color:?}@{opacity} corner: {got:?} != {want:?}"
+            );
+            assert_eq!(
+                box_px(&flat, mid, mid),
+                BOX_BG,
+                "box interior must not be drawn"
+            );
+        }
     }
 
     #[test]

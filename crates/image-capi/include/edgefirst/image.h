@@ -252,6 +252,11 @@ extern "C" {
 /**
  * ABI version of this library's C surface.
  *
+ * 5: the alpha byte of each `ef_image_processor_set_class_colors` colour now
+ * sets the box outline's coverage as well as the mask's, where boxes were
+ * drawn opaque after that call. Same symbols and layouts, read differently.
+ * `ef_image_processor_set_box_line_width` sets the outline thickness.
+ *
  * 4: `ef_tiling_config` lost `pad` and `fit` (24 bytes, was 32) and
  * `ef_image_processor_plan_tiles`, `ef_image_processor_tile_into` and
  * `ef_image_processor_tile_one` take a trailing `const ef_convert_options *`
@@ -672,9 +677,14 @@ uintptr_t ef_align_width_for_pixel_format(uintptr_t width, const char *format, u
 ef_image_processor *ef_image_processor_new_with_backend(uint32_t backend);
 
 /**
- * Set the RGBA palette used when drawing class masks.
+ * Set the RGBA palette used when drawing class masks and boxes.
  *
  * Copied, not borrowed, so the caller may free its array immediately.
+ *
+ * The alpha byte sets the coverage of both the mask fill and the box
+ * outline: each is blended over `dst` with `alpha / 255` scaled by the
+ * draw's `opacity`, so `255` draws opaque boxes and lower values translucent
+ * ones. The destination's alpha channel is left as the base layer set it.
  *
  * @return 0 on success, `EINVAL` for a null argument or zero colours.
  *

@@ -177,6 +177,18 @@ pub(crate) fn box_drawn_rows(flat: &[u8], x: usize) -> Vec<usize> {
         .collect()
 }
 
+/// `color` blended over [`BOX_BG`] with coverage `alpha / 255`, keeping the
+/// background's alpha.
+pub(crate) fn box_blend(color: [u8; 4], alpha: u16) -> [u8; 4] {
+    let mix = |c: u8, d: u8| ((c as u16 * alpha + d as u16 * (255 - alpha)) / 255) as u8;
+    [
+        mix(color[0], BOX_BG[0]),
+        mix(color[1], BOX_BG[1]),
+        mix(color[2], BOX_BG[2]),
+        BOX_BG[3],
+    ]
+}
+
 /// The columns (on a middle row) or rows (in a middle column) a `width`-pixel
 /// outline of the fixture's box covers: `width` pixels outside each edge.
 pub(crate) fn box_expected_span(width: usize) -> Vec<usize> {

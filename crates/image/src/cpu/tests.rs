@@ -5927,4 +5927,47 @@ mod cpu_tests {
             "a rejected width must leave the previous one in place"
         );
     }
+
+    #[test]
+    fn test_box_colour_alpha() {
+        use crate::test_support::{box_blend, box_expected_span, box_px, BOX_BG, BOX_DIM};
+        let color = [200, 100, 50, 255];
+        let mid = BOX_DIM / 2;
+        let mut cpu = CPUProcessor::new();
+
+        // Opaque: the colour itself, the destination alpha untouched.
+        let flat = crate::test_support::draw_box_fixture(&mut cpu, color, Some(3), 1.0);
+        let left = box_expected_span(3)[0];
+        assert_eq!(box_px(&flat, left, mid), [200, 100, 50, BOX_BG[3]]);
+        assert_eq!(
+            box_px(&flat, mid, mid),
+            BOX_BG,
+            "box interior must not be drawn"
+        );
+
+        // Translucent: blended with the colour's alpha. Every outline pixel,
+        // corners included, gets the same single blend.
+        let translucent = [200, 100, 50, 128];
+        let want = box_blend(translucent, 128);
+        let flat = crate::test_support::draw_box_fixture(&mut cpu, translucent, Some(3), 1.0);
+        for x in box_expected_span(3) {
+            assert_eq!(box_px(&flat, x, mid), want, "row pixel x={x}");
+            assert_eq!(box_px(&flat, mid, x), want, "column pixel y={x}");
+        }
+        let corner = BOX_DIM / 4 - 1;
+        assert_eq!(box_px(&flat, corner, corner), want, "top-left corner");
+        assert_eq!(
+            box_px(&flat, BOX_DIM * 3 / 4, corner),
+            want,
+            "top-right corner"
+        );
+
+        // Opacity scales the colour's alpha, as it does for masks.
+        let flat = crate::test_support::draw_box_fixture(&mut cpu, color, Some(3), 0.5);
+        assert_eq!(box_px(&flat, left, mid), box_blend(color, 128));
+
+        // Alpha 0 draws nothing.
+        let flat = crate::test_support::draw_box_fixture(&mut cpu, [200, 100, 50, 0], Some(3), 1.0);
+        assert!(crate::test_support::box_drawn_columns(&flat, mid).is_empty());
+    }
 }

@@ -557,9 +557,9 @@ pub enum MaskResolution {
 ///   preserved.** Callers who used to pre-load an image into `dst` before
 ///   calling `draw_decoded_masks` / `draw_proto_masks` must now supply that
 ///   image via `background` instead (behaviour changed in v0.16.4).
-/// - `opacity`: scales the alpha of rendered mask colors. `1.0` (default)
-///   preserves the class color's alpha unchanged; `0.5` makes masks
-///   semi-transparent.
+/// - `opacity`: scales the alpha of rendered mask and box colors. `1.0`
+///   (default) preserves the class color's alpha unchanged; `0.5` makes
+///   masks and boxes twice as transparent.
 /// - `color_mode`: controls whether colors are assigned by class label,
 ///   instance index, or track ID. Defaults to [`ColorMode::Class`].
 #[derive(Debug, Clone, Copy)]
@@ -1002,9 +1002,10 @@ pub trait ImageProcessorTrait {
     /// An empty `segmentation` slice is valid — only bounding boxes are drawn.
     ///
     /// `overlay` controls compositing: `background` is the compositing source
-    /// (must match `dst` in size and format); `opacity` scales mask alpha.
-    /// Box outlines are [`set_box_line_width`](Self::set_box_line_width)
-    /// pixels thick.
+    /// (must match `dst` in size and format); `opacity` scales mask and box
+    /// alpha. Box outlines are [`set_box_line_width`](Self::set_box_line_width)
+    /// pixels thick and use the [`set_class_colors`](Self::set_class_colors)
+    /// palette, alpha included.
     ///
     /// A `Bgra` background onto a zero-copy destination (a D3D11 texture, an
     /// IOSurface, a dma-buf) returns [`Error::NotSupported`]: the GL
@@ -1064,8 +1065,15 @@ pub trait ImageProcessorTrait {
         overlay: MaskOverlay<'_>,
     ) -> Result<()>;
 
-    /// Sets the colors used for rendering segmentation masks. Up to 20 colors
-    /// can be set.
+    /// Sets the RGBA colors used for rendering segmentation masks and
+    /// bounding boxes. Up to 20 colors can be set; entries past the slice
+    /// keep their previous value.
+    ///
+    /// The alpha channel is the coverage of both masks and box outlines:
+    /// each is blended over the destination with `alpha / 255` scaled by
+    /// [`MaskOverlay::opacity`], so `255` draws opaque boxes and lower
+    /// values draw translucent ones. The destination's own alpha channel is
+    /// left as the base layer set it. The default palette's alpha is `0.7`.
     ///
     /// On [`ImageProcessor`] with no forced backend this reaches every
     /// available backend rather than the first that accepts, because a
