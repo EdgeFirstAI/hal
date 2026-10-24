@@ -58,6 +58,7 @@ pub(crate) mod box_primitives;
 
 pub(crate) mod grids;
 
+pub(crate) mod dfl_lut;
 pub(crate) mod dispatch;
 
 pub(crate) mod level_box;

@@ -39,6 +39,10 @@ pub(crate) struct DecodedOutputBuffers {
     /// Per-level compact-decode scratch for the score prefilter, built on
     /// the first prefiltered frame.
     pub(crate) prefilter: Vec<super::prefilter::LevelScratch>,
+
+    /// Per-level exp tables for the 8-bit DFL box kernels, built on the
+    /// first frame and rebuilt when a level's box scale changes.
+    pub(crate) dfl_tables: Vec<super::kernels::dfl_lut::DflExpTable>,
 }
 
 /// Per-dtype scratch for NCHW → NHWC transpose. Lazy allocation: the
@@ -159,6 +163,7 @@ impl DecodedOutputBuffers {
             protos: proto_shape.and_then(alloc_proto),
             layout_scratch: LayoutScratch::default(),
             prefilter: Vec::new(),
+            dfl_tables: Vec::new(),
         }
     }
 

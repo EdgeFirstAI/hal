@@ -1029,6 +1029,46 @@ fn bench_per_scale_realistic(suite: &mut BenchSuite) {
     }
 }
 
+/// One 120x68 level (the largest of a 960x544 input) of realistic DFL bins
+/// through each 8-bit DFL box kernel, reported per anchor.
+fn bench_per_scale_dfl_kernels(suite: &mut BenchSuite) {
+    use edgefirst_decoder::per_scale::bench::{DflKernel, DflLevel};
+    let level = DflLevel::new(120, 68, 8.0, 0.147, 8);
+    let n = level.anchors();
+    let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+    let mut input = vec![0i8; n * 64];
+    for side in input.chunks_exact_mut(16) {
+        let peak = rng.below(16) as i32;
+        let top = 20 + rng.below(50) as i32;
+        let fall = 3 + rng.below(6) as i32;
+        for (i, b) in side.iter_mut().enumerate() {
+            let noise = rng.below(9) as i32 - 4;
+            *b = (top - fall * (i as i32 - peak).abs() + noise).clamp(-128, 127) as i8;
+        }
+    }
+    let mut reference = vec![0f32; n * 4];
+    level.decode(DflKernel::Softmax, &input, &mut reference);
+    let mut dst = vec![0f32; n * 4];
+    for kernel in DflKernel::available() {
+        let name = format!("decoder/per_scale/dfl_kernel/{kernel:?}");
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            level.decode(kernel, &input, &mut dst);
+        });
+        let err = dst
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        result.print_summary();
+        println!(
+            "  {:50} ns/anchor={:>7.1}  max |Δ| vs Softmax={err:.2e} px",
+            "",
+            result.median().as_nanos() as f64 / n as f64
+        );
+        suite.record(&result);
+    }
+}
+
 /// SegFormer-B1-shaped logits (150 classes, 128x168, NCHW) over a Voronoi
 /// class field. Calibrated to SegFormer-B1 on ADE20K val: about 7% of
 /// low-resolution cells straddle a class boundary, where a few classes score
@@ -1188,6 +1228,7 @@ fn main() {
                 bench_per_scale_dfl_i8_to_f16,
                 bench_per_scale_ltrb_i8_to_f32,
                 bench_per_scale_realistic,
+                bench_per_scale_dfl_kernels,
             ],
         ),
     ];

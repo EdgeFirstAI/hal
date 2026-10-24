@@ -182,6 +182,7 @@ pub(crate) fn resolve_bindings<'a>(
     Ok(FrameBindings { levels, protos })
 }
 
+use crate::per_scale::kernels::dfl_lut::DflExpTable;
 use crate::per_scale::kernels::dispatch::{DstSliceMut, InputView};
 use crate::per_scale::kernels::level_box::{
     decode_box_level_dfl_i16_to_f16_per_channel, decode_box_level_dfl_i16_to_f32_per_channel,
@@ -233,22 +234,27 @@ pub(crate) fn run<'a>(
     // NHWC (the common TFLite case). NCHW levels share `layout_scratch`
     // which would need per-level scratch buffers to parallelize safely;
     // for now we keep the sequential path for that case.
-    let kept = match score_threshold {
-        Some(t) => run_levels_prefiltered(plan, &bind, buffers, t)?,
-        None => None,
-    };
-    let total_anchors = match kept {
-        Some(n) => n,
-        None => {
-            let all_nhwc = plan.levels.iter().all(|l| l.layout == Layout::Nhwc);
-            if all_nhwc {
-                run_levels_parallel(plan, &bind, buffers)?;
-            } else {
-                run_levels_sequential(plan, &bind, buffers)?;
+    let mut tables = std::mem::take(&mut buffers.dfl_tables);
+    let levels = update_dfl_tables(plan, &bind, &mut tables).and_then(|()| {
+        let kept = match score_threshold {
+            Some(t) => run_levels_prefiltered(plan, &bind, buffers, &tables, t)?,
+            None => None,
+        };
+        Ok(match kept {
+            Some(n) => n,
+            None => {
+                let all_nhwc = plan.levels.iter().all(|l| l.layout == Layout::Nhwc);
+                if all_nhwc {
+                    run_levels_parallel(plan, &bind, buffers, &tables)?;
+                } else {
+                    run_levels_sequential(plan, &bind, buffers, &tables)?;
+                }
+                plan.total_anchors
             }
-            plan.total_anchors
-        }
-    };
+        })
+    });
+    buffers.dfl_tables = tables;
+    let total_anchors = levels?;
 
     // Protos — single tensor, no per-level structure. Always sequential.
     // When the schema declares NCHW protos, we transpose into the NHWC
@@ -296,6 +302,27 @@ pub(crate) fn run<'a>(
     }
 
     Ok(make_outputs_ref(buffers, plan, total_anchors))
+}
+
+/// Point each level's DFL exp table at its box tensor's scale, when the box
+/// kernel weighs bins through one. A table is rebuilt only when the scale
+/// changes, so a steady stream of frames builds each one once.
+fn update_dfl_tables(
+    plan: &PerScalePlan,
+    bind: &FrameBindings<'_>,
+    tables: &mut Vec<DflExpTable>,
+) -> DecoderResult<()> {
+    if !plan.box_dispatch.uses_exp_table() {
+        return Ok(());
+    }
+    for (li, lvl_bind) in bind.levels.iter().enumerate() {
+        let scale = quant_from_tensor(lvl_bind.boxes, "boxes", li)?.scale;
+        match tables.get_mut(li) {
+            Some(t) => t.update(scale),
+            None => tables.push(DflExpTable::new(scale)),
+        }
+    }
+    Ok(())
 }
 
 /// Dispatch the per-channel DFL kernel for the given `(input, dst)` dtype pair.
@@ -356,6 +383,7 @@ fn run_box_kernel(
     level: &crate::per_scale::plan::LevelPlan,
     boxes: &TensorDyn,
     li: usize,
+    table: Option<&DflExpTable>,
     input: InputView<'_>,
     dst: DstSliceMut<'_>,
 ) -> DecoderResult<()> {
@@ -365,7 +393,7 @@ fn run_box_kernel(
         }
     }
     let q = quant_from_tensor(boxes, "boxes", li)?;
-    plan.box_dispatch.run(input, q, level, dst)
+    plan.box_dispatch.run(input, q, level, table, dst)
 }
 
 /// Prefiltered per-level loop: select the anchors whose raw scores can
@@ -383,6 +411,7 @@ fn run_levels_prefiltered(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
     buffers: &mut DecodedOutputBuffers,
+    tables: &[DflExpTable],
     threshold: f32,
 ) -> DecoderResult<Option<usize>> {
     if buffers.prefilter.len() != plan.levels.len() {
@@ -512,12 +541,14 @@ fn run_levels_prefiltered(
                     let packed =
                         gather_rows(&input, box_channels, &scratch.anchors, &mut scratch.boxes);
                     let dst = boxes_level_slice_of(boxes, offset, packed_len);
-                    run_box_kernel(plan, &scratch.plan, lvl_bind.boxes, li, packed, dst)?;
+                    let table = tables.get(li);
+                    run_box_kernel(plan, &scratch.plan, lvl_bind.boxes, li, table, packed, dst)?;
                 }
                 if tail > 0 {
                     let rows = input.slice(body * box_channels..(body + tail) * box_channels);
                     let dst = boxes_level_slice_of(boxes, offset + kept, tail);
-                    run_box_kernel(plan, &scratch.tail, lvl_bind.boxes, li, rows, dst)?;
+                    let table = tables.get(li);
+                    run_box_kernel(plan, &scratch.tail, lvl_bind.boxes, li, table, rows, dst)?;
                 }
                 Ok(())
             },
@@ -565,6 +596,7 @@ fn run_levels_sequential(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
     buffers: &mut DecodedOutputBuffers,
+    tables: &[DflExpTable],
 ) -> DecoderResult<()> {
     // Iterate levels by index so we can carve disjoint mutable slices
     // out of the buffers per level. Each iteration maps the bound
@@ -636,7 +668,7 @@ fn run_levels_sequential(
                             lvl.w,
                             box_channels,
                             layout_scratch,
-                            |input| plan.box_dispatch.run(input, q, lvl, dst),
+                            |input| plan.box_dispatch.run(input, q, lvl, tables.get(li), dst),
                         )?;
                     }
                 }
@@ -651,7 +683,7 @@ fn run_levels_sequential(
                     lvl.w,
                     box_channels,
                     layout_scratch,
-                    |input| plan.box_dispatch.run(input, q, lvl, dst),
+                    |input| plan.box_dispatch.run(input, q, lvl, tables.get(li), dst),
                 )?;
             }
         }
@@ -726,6 +758,7 @@ fn run_levels_parallel(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
     buffers: &mut DecodedOutputBuffers,
+    tables: &[DflExpTable],
 ) -> DecoderResult<()> {
     let n_levels = plan.levels.len();
     if n_levels == 0 {
@@ -810,9 +843,16 @@ fn run_levels_parallel(
             let mc_dst = mc_dst_opts.as_mut().and_then(|v| v[li].take());
 
             s.spawn(move |_| {
-                if let Err(e) =
-                    process_one_level_nhwc(plan_ref, lvl, li, lvl_bind, box_dst, score_dst, mc_dst)
-                {
+                if let Err(e) = process_one_level_nhwc(
+                    plan_ref,
+                    lvl,
+                    li,
+                    lvl_bind,
+                    tables.get(li),
+                    box_dst,
+                    score_dst,
+                    mc_dst,
+                ) {
                     let mut g = first_error.lock().unwrap();
                     if g.is_none() {
                         *g = Some(e);
@@ -829,9 +869,16 @@ fn run_levels_parallel(
         let box_dst = box_dst_opts[0].take().unwrap();
         let score_dst = score_dst_opts[0].take().unwrap();
         let mc_dst = mc_dst_opts.as_mut().and_then(|v| v[0].take());
-        if let Err(e) =
-            process_one_level_nhwc(plan_ref, lvl, 0, lvl_bind, box_dst, score_dst, mc_dst)
-        {
+        if let Err(e) = process_one_level_nhwc(
+            plan_ref,
+            lvl,
+            0,
+            lvl_bind,
+            tables.first(),
+            box_dst,
+            score_dst,
+            mc_dst,
+        ) {
             let mut g = first_error.lock().unwrap();
             if g.is_none() {
                 *g = Some(e);
@@ -848,11 +895,13 @@ fn run_levels_parallel(
 /// Per-level box + score + mc work for the NHWC parallel path. Mirrors
 /// the body of the sequential loop but takes pre-split disjoint
 /// destination slices instead of slicing live from the buffers struct.
+#[allow(clippy::too_many_arguments)]
 fn process_one_level_nhwc(
     plan: &PerScalePlan,
     lvl: &crate::per_scale::plan::LevelPlan,
     li: usize,
     lvl_bind: &LevelBindings<'_>,
+    table: Option<&DflExpTable>,
     box_dst: crate::per_scale::kernels::dispatch::DstSliceMut<'_>,
     score_dst: crate::per_scale::kernels::dispatch::DstSliceMut<'_>,
     mc_dst: Option<crate::per_scale::kernels::dispatch::DstSliceMut<'_>>,
@@ -882,14 +931,14 @@ fn process_one_level_nhwc(
                     // Per-tensor fallback (tensor has per-tensor quant or is float).
                     let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
                     with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
-                        plan.box_dispatch.run(input, q, lvl, box_dst)
+                        plan.box_dispatch.run(input, q, lvl, table, box_dst)
                     })?;
                 }
             }
         } else {
             let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
             with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
-                plan.box_dispatch.run(input, q, lvl, box_dst)
+                plan.box_dispatch.run(input, q, lvl, table, box_dst)
             })?;
         }
     }
@@ -1218,7 +1267,7 @@ mod tests {
         // PerScaleDecoder::new() produces buffers of the right size.
         //
         // Note: the plan was built expecting i8 tensors (per the schema's
-        // quantization), so the box_dispatch is selected as DflI8ToF32Scalar.
+        // quantization), so the box_dispatch is selected as DflI8ToF32Lut.
         // Feeding f32 tensors would hit the dispatch's mismatched-arm path
         // → KernelDispatchUnreachable. End-to-end run() integration is
         // exercised separately via the int8-with-attached-quant test below.

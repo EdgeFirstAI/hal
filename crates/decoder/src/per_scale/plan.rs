@@ -718,14 +718,13 @@ mod tests {
             .unwrap()
             .unwrap();
         use crate::per_scale::kernels::dispatch::BoxLevelDispatch;
-        // Tier-aware: scalar host picks `DflI8ToF32Scalar`, aarch64
-        // hosts pick `DflI8ToF32NeonBase` (or `*NeonFp16` on A55+).
-        // The test asserts shape (DFL i8 → f32), not the SIMD tier.
-        // NEON variants are aarch64-only; gate the arms accordingly.
+        // Tier-aware: scalar hosts pick `DflI8ToF32Lut`, aarch64 hosts
+        // `DflI8ToF32LutNeon`. The test asserts shape (DFL i8 → f32), not
+        // the SIMD tier. NEON variants are aarch64-only.
         let ok = match plan.box_dispatch {
-            BoxLevelDispatch::DflI8ToF32Scalar => true,
+            BoxLevelDispatch::DflI8ToF32Lut => true,
             #[cfg(target_arch = "aarch64")]
-            BoxLevelDispatch::DflI8ToF32NeonBase | BoxLevelDispatch::DflI8ToF32NeonFp16 => true,
+            BoxLevelDispatch::DflI8ToF32LutNeon => true,
             _ => false,
         };
         assert!(ok, "unexpected dispatch: {:?}", plan.box_dispatch);

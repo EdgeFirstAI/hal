@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The per-scale score prefilter runs for every level size (`edgefirst-decoder`).** A level whose anchor count is not a multiple of the 16-anchor pack, such as the 60x34 and 30x17 levels of a 960x544 input, used to send the whole frame to the dense decode. The prefilter now packs the level's whole groups and decodes its trailing partial group whole, with the same detections as the dense decode.
+- **8-bit DFL boxes decode through an exp table (`edgefirst-decoder`).** Per-scale int8 and uint8 DFL box tensors with per-tensor quantization find each side's largest bin in the integer domain and weigh the bins through a 256-entry `exp` table built once per level, with the four sides in NEON lanes on aarch64. On an i.MX 95 (Cortex-A55) the box kernel takes about 116 ns per anchor, down from about 740 ns for the FP16 softmax kernel, and its boxes are within 4e-6 grid units of an f64 softmax where the FP16 kernel's were up to 8e-3 off. f16 decode output now uses the same kernel; 16-bit and per-channel quantized boxes are unchanged.
 
 ## [0.37.0] - 2026-10-23
 
