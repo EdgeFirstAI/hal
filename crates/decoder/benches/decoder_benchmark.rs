@@ -1198,7 +1198,7 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--section")
         .map(|w| w[1].to_ascii_lowercase());
-    let sections: [(&str, &[Bench]); 8] = [
+    let sections: [(&str, &[Bench]); 10] = [
         ("YOLO", &[bench_yolo_quant, bench_yolo_f32]),
         (
             "Quant",
@@ -1227,10 +1227,10 @@ fn main() {
                 bench_per_scale_dfl_i8_to_f32,
                 bench_per_scale_dfl_i8_to_f16,
                 bench_per_scale_ltrb_i8_to_f32,
-                bench_per_scale_realistic,
-                bench_per_scale_dfl_kernels,
             ],
         ),
+        ("Per-Scale-Realistic", &[bench_per_scale_realistic]),
+        ("DFL-Kernels", &[bench_per_scale_dfl_kernels]),
     ];
     for (name, benches) in sections {
         if only
