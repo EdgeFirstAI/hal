@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The per-scale score prefilter runs for every level size (`edgefirst-decoder`).** A level whose anchor count is not a multiple of the 16-anchor pack, such as the 60x34 and 30x17 levels of a 960x544 input, used to send the whole frame to the dense decode. The prefilter now packs the level's whole groups and decodes its trailing partial group whole, with the same detections as the dense decode.
+
 ## [0.37.0] - 2026-10-23
 
 This release breaks the API: the preprocessing types move to `edgefirst-tensor`, "letterbox" now only means a fit with a pad colour, interpolation becomes a convert option, and several old APIs are removed. Consumers must move as a set; the C ABI versions are bumped.

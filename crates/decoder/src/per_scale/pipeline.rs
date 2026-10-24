@@ -195,9 +195,7 @@ use crate::per_scale::outputs::{
     DecodedOutputBuffers, DecodedOutputsRef, ProtoStorage, ProtosView,
 };
 use crate::per_scale::plan::Layout;
-use crate::per_scale::prefilter::{
-    gather_rows, raw_score_floor, select_anchors, LevelScratch, PACK_ANCHORS,
-};
+use crate::per_scale::prefilter::{gather_rows, raw_score_floor, select_anchors, LevelScratch};
 use edgefirst_tensor::{CpuAccess, TensorMapTrait, TensorTrait};
 
 /// Run the per-scale decode pipeline for one frame's inputs. Writes
@@ -373,10 +371,11 @@ fn run_box_kernel(
 /// Prefiltered per-level loop: select the anchors whose raw scores can
 /// reach `threshold`, gather their rows, and decode only those, packing
 /// each level's survivors after the previous level's in the output
-/// buffers. Returns the number of anchors kept, or `None` (with the
-/// outputs untouched) when the threshold cannot be mapped onto every
-/// level's raw scores, or a level's anchors are not a whole number of
-/// [`PACK_ANCHORS`] groups, and the caller must decode densely.
+/// buffers. A level's tail (the anchors after its last whole
+/// [`crate::per_scale::prefilter::PACK_ANCHORS`] group) is decoded whole after its packed survivors.
+/// Returns the number of anchors decoded, or `None` (with the outputs
+/// untouched) when the threshold cannot be mapped onto every level's raw
+/// scores and the caller must decode densely.
 ///
 /// Runs on the calling thread: the kept set is a few percent of the
 /// anchors, too little work to repay a rayon scope.
@@ -386,13 +385,6 @@ fn run_levels_prefiltered(
     buffers: &mut DecodedOutputBuffers,
     threshold: f32,
 ) -> DecoderResult<Option<usize>> {
-    if plan
-        .levels
-        .iter()
-        .any(|l| !(l.h * l.w).is_multiple_of(PACK_ANCHORS))
-    {
-        return Ok(None);
-    }
     if buffers.prefilter.len() != plan.levels.len() {
         buffers.prefilter = plan.levels.iter().map(LevelScratch::for_level).collect();
     }
@@ -448,6 +440,8 @@ fn run_levels_prefiltered(
         let lvl = &plan.levels[li];
         let scratch = &mut prefilter[li];
         let (score_q, floor) = floors[li];
+        let body = scratch.body;
+        let tail = scratch.tail.w;
         let _level_span = tracing::trace_span!(
             "decoder.per_scale_run.level",
             li = li,
@@ -467,23 +461,36 @@ fn run_levels_prefiltered(
             nc,
             layout_scratch,
             |input| {
-                select_anchors(&input, nc, floor, &mut scratch.anchors)?;
-                if scratch.pack(lvl) == 0 {
-                    return Ok(());
+                select_anchors(&input.slice(0..body * nc), nc, floor, &mut scratch.anchors)?;
+                let kept = scratch.pack(lvl);
+                if kept > 0 {
+                    let packed = gather_rows(&input, nc, &scratch.anchors, &mut scratch.scores);
+                    let dst = scores_level_slice_of(scores, offset, scratch.anchors.len(), nc);
+                    plan.score_dispatch.run(
+                        packed,
+                        score_q,
+                        nc,
+                        &scratch.plan,
+                        plan.score_activation,
+                        dst,
+                    )?;
                 }
-                let packed = gather_rows(&input, nc, &scratch.anchors, &mut scratch.scores);
-                let dst = scores_level_slice_of(scores, offset, scratch.anchors.len(), nc);
-                plan.score_dispatch.run(
-                    packed,
-                    score_q,
-                    nc,
-                    &scratch.plan,
-                    plan.score_activation,
-                    dst,
-                )
+                if tail > 0 {
+                    let dst = scores_level_slice_of(scores, offset + kept, tail, nc);
+                    plan.score_dispatch.run(
+                        input.slice(body * nc..(body + tail) * nc),
+                        score_q,
+                        nc,
+                        &scratch.tail,
+                        plan.score_activation,
+                        dst,
+                    )?;
+                }
+                Ok(())
             },
         )?;
-        let k = scratch.kept;
+        let kept = scratch.kept;
+        let k = kept + tail;
         _level_span.record("kept", k);
         if k == 0 {
             continue;
@@ -501,10 +508,18 @@ fn run_levels_prefiltered(
             box_channels,
             layout_scratch,
             |input| {
-                let packed =
-                    gather_rows(&input, box_channels, &scratch.anchors, &mut scratch.boxes);
-                let dst = boxes_level_slice_of(boxes, offset, packed_len);
-                run_box_kernel(plan, &scratch.plan, lvl_bind.boxes, li, packed, dst)
+                if kept > 0 {
+                    let packed =
+                        gather_rows(&input, box_channels, &scratch.anchors, &mut scratch.boxes);
+                    let dst = boxes_level_slice_of(boxes, offset, packed_len);
+                    run_box_kernel(plan, &scratch.plan, lvl_bind.boxes, li, packed, dst)?;
+                }
+                if tail > 0 {
+                    let rows = input.slice(body * box_channels..(body + tail) * box_channels);
+                    let dst = boxes_level_slice_of(boxes, offset + kept, tail);
+                    run_box_kernel(plan, &scratch.tail, lvl_bind.boxes, li, rows, dst)?;
+                }
+                Ok(())
             },
         )?;
 
@@ -523,10 +538,18 @@ fn run_levels_prefiltered(
                     nm,
                     layout_scratch,
                     |input| {
-                        let packed =
-                            gather_rows(&input, nm, &scratch.anchors, &mut scratch.mask_coefs);
-                        let dst = mask_coefs_level_slice_of(mc_buf, offset, packed_len, nm);
-                        mc_dispatch.run(packed, q, nm, &scratch.plan, dst)
+                        if kept > 0 {
+                            let packed =
+                                gather_rows(&input, nm, &scratch.anchors, &mut scratch.mask_coefs);
+                            let dst = mask_coefs_level_slice_of(mc_buf, offset, packed_len, nm);
+                            mc_dispatch.run(packed, q, nm, &scratch.plan, dst)?;
+                        }
+                        if tail > 0 {
+                            let rows = input.slice(body * nm..(body + tail) * nm);
+                            let dst = mask_coefs_level_slice_of(mc_buf, offset + kept, tail, nm);
+                            mc_dispatch.run(rows, q, nm, &scratch.tail, dst)?;
+                        }
+                        Ok(())
                     },
                 )?;
             }

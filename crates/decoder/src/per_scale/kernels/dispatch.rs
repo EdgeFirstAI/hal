@@ -358,6 +358,20 @@ pub(crate) enum InputView<'a> {
     F32(&'a [f32]),
 }
 
+impl<'a> InputView<'a> {
+    /// The elements `range` of the view.
+    pub(crate) fn slice(&self, range: std::ops::Range<usize>) -> InputView<'a> {
+        match *self {
+            InputView::I8(s) => InputView::I8(&s[range]),
+            InputView::U8(s) => InputView::U8(&s[range]),
+            InputView::I16(s) => InputView::I16(&s[range]),
+            InputView::U16(s) => InputView::U16(&s[range]),
+            InputView::F16(s) => InputView::F16(&s[range]),
+            InputView::F32(s) => InputView::F32(&s[range]),
+        }
+    }
+}
+
 /// Mutable destination slice, dtype-tagged. The dispatch arm matches
 /// on this to pick the f32 vs f16 output cell.
 #[derive(Debug)]

@@ -5012,6 +5012,63 @@ mod per_scale_prefilter_tests {
         }
     }
 
+    /// Levels whose anchor count is not a whole number of packs, such as
+    /// a 960x544 input's 60x34 and 30x17 grids and a 3x3 grid smaller than
+    /// one pack, still take the prefilter and decode exactly the dense
+    /// decode's detections and mask coefficients.
+    #[test]
+    fn prefiltered_decode_matches_dense_decode_on_unaligned_levels() {
+        use crate::per_scale::prefilter::PACK_ANCHORS;
+        for schema_file in [
+            "per_scale/synthetic_yolov8n_schema.json",
+            "per_scale/synthetic_yolo26n_schema.json",
+        ] {
+            let json = edgefirst_bench::testdata::read_to_string(schema_file);
+            for nc in [80, 10, 4] {
+                for (width, height) in [(960, 544), (416, 416), (96, 96)] {
+                    let resized = with_input_size(&json, width, height).to_string();
+                    let schema = with_num_classes(&resized, nc);
+                    for dtype in [DecodeDtype::F32, DecodeDtype::F16] {
+                        let plan = PerScalePlan::try_from_schema(&schema, dtype)
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            plan.levels
+                                .iter()
+                                .any(|l| !(l.h * l.w).is_multiple_of(PACK_ANCHORS)),
+                            "{width}x{height} has no unaligned level"
+                        );
+                        let owned = inputs_for(&plan);
+                        let inputs: Vec<&TensorDyn> = owned.iter().collect();
+                        let total = plan.total_anchors;
+                        let mut decoder = PerScaleDecoder::new(plan);
+                        for threshold in [0.001, 0.25, 0.6] {
+                            for multi_label in [false, true] {
+                                let label = format!(
+                                    "{schema_file} nc={nc} {width}x{height} {dtype:?} \
+                                     t={threshold} ml={multi_label}"
+                                );
+                                let (dense_n, dense, dense_mc) =
+                                    decode(&mut decoder, &inputs, None, threshold, multi_label);
+                                let (kept, filtered, filtered_mc) = decode(
+                                    &mut decoder,
+                                    &inputs,
+                                    Some(threshold),
+                                    threshold,
+                                    multi_label,
+                                );
+                                assert_eq!(dense_n, total, "{label}");
+                                assert!(kept < total, "{label}: kept {kept} of {total}");
+                                assert_eq!(filtered, dense, "{label}");
+                                assert_eq!(filtered_mc, dense_mc, "{label}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A frame where no score reaches the threshold leaves nothing to decode.
     #[test]
     fn prefilter_with_no_survivors_yields_no_detections() {
@@ -5093,14 +5150,14 @@ mod per_scale_prefilter_tests {
             .collect()
     }
 
-    /// The schema with every per-scale child resized for a square input of
-    /// `size` pixels.
-    fn with_input_size(json: &str, size: usize) -> serde_json::Value {
+    /// The schema with every per-scale child resized for a `width x height`
+    /// input.
+    fn with_input_size(json: &str, width: usize, height: usize) -> serde_json::Value {
         let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
-        v["input"]["shape"][1] = size.into();
-        v["input"]["shape"][2] = size.into();
-        v["input"]["dshape"][1]["height"] = size.into();
-        v["input"]["dshape"][2]["width"] = size.into();
+        v["input"]["shape"][1] = height.into();
+        v["input"]["shape"][2] = width.into();
+        v["input"]["dshape"][1]["height"] = height.into();
+        v["input"]["dshape"][2]["width"] = width.into();
         for logical in v["outputs"].as_array_mut().unwrap() {
             let Some(children) = logical
                 .get_mut("outputs")
@@ -5113,12 +5170,12 @@ mod per_scale_prefilter_tests {
                 let Some(stride) = child["stride"].as_u64() else {
                     continue;
                 };
-                let n = size / stride as usize;
-                child["shape"][1] = n.into();
-                child["shape"][2] = n.into();
-                child["dshape"][1]["height"] = n.into();
-                child["dshape"][2]["width"] = n.into();
-                anchors += n * n;
+                let (h, w) = (height / stride as usize, width / stride as usize);
+                child["shape"][1] = h.into();
+                child["shape"][2] = w.into();
+                child["dshape"][1]["height"] = h.into();
+                child["dshape"][2]["width"] = w.into();
+                anchors += h * w;
             }
             if anchors > 0 {
                 logical["shape"][2] = anchors.into();
@@ -5173,7 +5230,13 @@ mod per_scale_prefilter_tests {
                     ((raw - 64).max(0) as u16, (raw + 64).min(65535) as u16)
                 })
                 .collect();
-            let schema = with_scores(with_input_size(&json, 640), "uint16", scale, zp, sigmoid);
+            let schema = with_scores(
+                with_input_size(&json, 640, 640),
+                "uint16",
+                scale,
+                zp,
+                sigmoid,
+            );
             for dtype in [DecodeDtype::F32, DecodeDtype::F16] {
                 let plan = PerScalePlan::try_from_schema(&schema, dtype)
                     .unwrap()
@@ -5220,27 +5283,6 @@ mod per_scale_prefilter_tests {
                 }
             }
         }
-    }
-
-    /// A level whose anchor count is not a whole number of packing groups
-    /// decodes part of it in a scalar tail, so the plan is decoded densely.
-    #[test]
-    fn unaligned_level_decodes_every_anchor() {
-        let json =
-            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
-        let schema: SchemaV2 = serde_json::from_value(with_input_size(&json, 416)).unwrap();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
-            .unwrap()
-            .unwrap();
-        assert!(plan.levels.iter().any(|l| !(l.h * l.w).is_multiple_of(16)));
-        let total = plan.total_anchors;
-        let owned = inputs_for(&plan);
-        let inputs: Vec<&TensorDyn> = owned.iter().collect();
-        let mut decoder = PerScaleDecoder::new(plan);
-        let (_, dense, _) = decode(&mut decoder, &inputs, None, 0.25, false);
-        let (kept, filtered, _) = decode(&mut decoder, &inputs, Some(0.25), 0.25, false);
-        assert_eq!(kept, total);
-        assert_eq!(filtered, dense);
     }
 
     /// Thresholds that keep every anchor fall back to the dense decode.

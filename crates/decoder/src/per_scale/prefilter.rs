@@ -14,10 +14,14 @@
 //! raw value, so it accounts for the kernel's rounding and approximations:
 //! the kept set is a superset of the anchors that pass, the float
 //! candidate filter downstream still makes the exact decision, and the
-//! detections match the dense decode bit for bit. Levels whose anchor
-//! count is not a whole number of [`PACK_ANCHORS`] groups decode some
-//! scores in a scalar tail, which packing would move onto the vector path,
-//! so a plan with such a level is always decoded densely.
+//! detections match the dense decode bit for bit.
+//!
+//! A level whose anchor count is not a whole number of [`PACK_ANCHORS`]
+//! groups ends in a partial group, whose elements the level kernels may
+//! decode in a scalar tail that rounds differently from their vector path.
+//! Only the whole groups (the body) are packed; the trailing partial group
+//! is always decoded as one contiguous slice, so every element in it takes
+//! the same path it takes in the dense decode.
 
 use super::kernels::dispatch::{DstSliceMut, InputView, ScoreLevelDispatch};
 use super::outputs::LayoutScratch;
@@ -40,10 +44,15 @@ pub(crate) struct LevelScratch {
     /// Copy of the level's plan whose grid holds the kept anchors' grid
     /// cells; `h * w` is the packed count, as the level kernels expect.
     pub(crate) plan: LevelPlan,
-    /// Kept anchor indices within the level, ascending, then padded by
-    /// [`LevelScratch::pack`].
+    /// Anchors in the level's whole [`PACK_ANCHORS`] groups. The anchors
+    /// from here to the end of the level form the tail.
+    pub(crate) body: usize,
+    /// The level's plan cut down to its tail anchors, decoded whole.
+    pub(crate) tail: LevelPlan,
+    /// Kept body anchor indices within the level, ascending, then padded
+    /// by [`LevelScratch::pack`].
     pub(crate) anchors: Vec<u32>,
-    /// Anchors kept this frame, before padding.
+    /// Body anchors kept this frame, before padding.
     pub(crate) kept: usize,
     /// Last floor from [`raw_score_floor`], keyed by the score quantization
     /// and threshold bits it was found for.
@@ -56,6 +65,7 @@ pub(crate) struct LevelScratch {
 impl LevelScratch {
     pub(crate) fn for_level(level: &LevelPlan) -> Self {
         let n = level.h * level.w;
+        let body = n - n % PACK_ANCHORS;
         Self {
             plan: LevelPlan {
                 stride: level.stride,
@@ -70,7 +80,21 @@ impl LevelScratch {
                 mc_shape: level.mc_shape.clone(),
                 layout: Layout::Nhwc,
             },
-            anchors: Vec::with_capacity(n),
+            body,
+            tail: LevelPlan {
+                stride: level.stride,
+                h: 1,
+                w: n - body,
+                reg_max: level.reg_max,
+                anchor_offset: 0,
+                grid_x: level.grid_x[body..].into(),
+                grid_y: level.grid_y[body..].into(),
+                box_shape: level.box_shape.clone(),
+                score_shape: level.score_shape.clone(),
+                mc_shape: level.mc_shape.clone(),
+                layout: Layout::Nhwc,
+            },
+            anchors: Vec::with_capacity(body),
             kept: 0,
             floor: None,
             boxes: LayoutScratch::default(),
@@ -79,11 +103,11 @@ impl LevelScratch {
         }
     }
 
-    /// Pad the kept anchors to a whole number of [`PACK_ANCHORS`] groups
-    /// by repeating the last one, and point the compact plan at their grid
-    /// cells in `level`. Returns the kept count before padding, also left
-    /// in `kept`; the padded anchors' outputs are scratch that the next
-    /// level overwrites.
+    /// Pad the kept body anchors to a whole number of [`PACK_ANCHORS`]
+    /// groups by repeating the last one, and point the compact plan at
+    /// their grid cells in `level`. Returns the kept count before padding,
+    /// also left in `kept`; the padded anchors' outputs are scratch that
+    /// the tail or the next level overwrites.
     pub(crate) fn pack(&mut self, level: &LevelPlan) -> usize {
         let kept = self.anchors.len();
         self.kept = kept;
@@ -195,7 +219,7 @@ pub(crate) fn raw_score_floor(
 }
 
 /// Append to `anchors` every anchor whose largest raw class score is at or
-/// above `floor`. `input` is one level's NHWC `[h * w, num_classes]` scores.
+/// above `floor`. `input` holds NHWC `[anchors, num_classes]` score rows.
 pub(crate) fn select_anchors(
     input: &InputView<'_>,
     num_classes: usize,
