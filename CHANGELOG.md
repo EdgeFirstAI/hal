@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-10-23
+
 This release breaks the API: the preprocessing types move to `edgefirst-tensor`, "letterbox" now only means a fit with a pad colour, interpolation becomes a convert option, and several old APIs are removed. Consumers must move as a set; the C ABI versions are bumped.
 
 ### Added

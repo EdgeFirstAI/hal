@@ -27,7 +27,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
-    "edgefirst-tensor ~= 0.36.0",
+    "edgefirst-tensor ~= 0.37.0",
 ]
 
 [project.urls]

@@ -52,6 +52,8 @@ jobs:
           filters: |
             code:
               - 'crates/**'
+              - 'benchmarks/**/*.rs'
+              - 'benchmarks/**/Cargo.*'
               - 'src/**'
               - 'tests/**'
               - 'Cargo.*'
@@ -137,7 +139,9 @@ jobs:
 
   # The C-API crates build the library crates over the dynamic tensor backend,
   # which every other Quick pass leaves uncompiled. On the Quick trigger for
-  # the reason NOTICE is: hal-full runs only with the ci:full label.
+  # the reason NOTICE is: hal-full runs only with the ci:full label. The
+  # benchmarks workspace, excluded from the root workspace like the leaves,
+  # is type-checked here too.
   capi-lint:
     name: C-API lint
     needs: changes
@@ -164,6 +168,9 @@ jobs:
         run: make lint-backend-scope
       - name: Each leaf rejects the wrong tensor backend
         run: make check-backend-guards
+      # Type-check only: the benchmarks are built and run by hand, not in CI.
+      - name: The workspace-excluded benchmarks compile against the libraries
+        run: make check-benchmarks
 
   full:
     needs: changes
