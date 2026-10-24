@@ -415,6 +415,37 @@ void ef_image_processor_free(ef_image_processor *p);
  * PBO image is always `EF_CPU_ACCESS_READ_WRITE`. Nothing is added for use
  * as a convert source or for a CPU mask draw; declare those yourself.
  *
+ * `EF_CPU_ACCESS_NONE` and `EF_CPU_ACCESS_WRITE` DMA-BUF images come from
+ * the uncached CMA heap where available (see `ef_cpu_access`). A display
+ * canvas the GPU renders and a compositor shows, and an overlay the CPU
+ * writes whole, are both such images:
+ *
+ * ```c
+ * ef_image_processor *p = ef_image_processor_new();
+ * ef_tensor *frame = ef_image_processor_create_image(
+ *     p, 1920, 1080, "rgba8", EF_DTYPE_U8, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_NONE);
+ * ef_tensor *canvas = ef_image_processor_create_image(
+ *     p, 1920, 1080, "rgba8", EF_DTYPE_U8, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_NONE);
+ *
+ * const uint8_t colors[1][4] = {{255, 96, 0, 160}}; // translucent boxes
+ * ef_image_processor_set_class_colors(p, colors, 1);
+ * ef_image_processor_set_box_line_width(p, 2);
+ *
+ * ef_image_processor_convert(p, camera, frame, NULL);
+ * ef_image_processor_draw_decoded_masks(p, canvas, boxes, n_boxes, NULL, 0, frame,
+ *                                       1.0f, NULL, 0);
+ *
+ * // Hand the canvas to the compositor (Wayland linux-dmabuf).
+ * int fd = ef_tensor_clone_fd(canvas);
+ * int64_t stride = ef_tensor_row_stride(canvas);
+ *
+ * // A label strip the CPU renders: written whole, never read back.
+ * ef_tensor *overlay = ef_image_processor_create_image(
+ *     p, 640, 64, "rgba8", EF_DTYPE_U8, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_WRITE);
+ * struct ef_tensor_view v;
+ * ef_tensor_map(overlay, EF_CPU_ACCESS_WRITE, &v); // EF_CPU_ACCESS_READ fails: EACCES
+ * ```
+ *
  * @return a tensor the caller owns, or `NULL`.
  *
  * # Safety

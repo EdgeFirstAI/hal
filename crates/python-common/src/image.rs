@@ -1604,8 +1604,13 @@ impl PyImageProcessor {
     /// from zero-copy GPU paths when used with this processor's convert().
     ///
     /// ``access`` declares CPU access: ``"readwrite"`` (the default),
-    /// ``"read"``, ``"write"``, or ``"none"`` (hardware-only, required for
-    /// tile compression). A CPU map outside the declaration raises. When
+    /// ``"read"``, ``"write"`` (whole-buffer writes only), or ``"none"``
+    /// (hardware-only, required for tile compression). The declaration is
+    /// enforced on every CPU map, the HAL's own included: a map outside it
+    /// raises ``PermissionError``, as does HAL CPU work (a CPU convert or
+    /// draw) it does not cover. On Linux a ``"none"`` or ``"write"`` DMA-BUF
+    /// image comes from the uncached CMA heap where available: devices
+    /// mapping it need no CPU cache maintenance. When
     /// this processor may fill the image on the CPU (CPU backend, host
     /// memory, or a format the GPU does not render) ``"write"`` is added
     /// to the declaration so its own ``convert`` succeeds.
@@ -1621,6 +1626,24 @@ impl PyImageProcessor {
     /// DMA-BUF from the Linux CMA heap, or an error naming the heap,
     /// never a fallback to the system heap, a PBO or host memory. Read
     /// what any tensor got via ``Tensor.contiguity``.
+    ///
+    /// Example: a display canvas the GPU renders and a Wayland compositor
+    /// shows (linux-dmabuf), and an overlay the CPU writes. Neither is read
+    /// on the CPU, so on Linux both come from uncached CMA where available,
+    /// and the compositor's per-frame mapping costs no cache maintenance::
+    ///
+    ///     proc = ImageProcessor()
+    ///     frame = proc.create_image(1920, 1080, PixelFormat.Rgba, access="none")
+    ///     canvas = proc.create_image(1920, 1080, PixelFormat.Rgba, access="none")
+    ///     proc.set_class_colors([(255, 96, 0, 160)])  # translucent boxes
+    ///     proc.set_box_line_width(2)
+    ///     proc.convert(camera, frame)
+    ///     proc.draw_decoded_masks(canvas, boxes, scores, classes, background=frame)
+    ///     fd, stride = canvas.fd, canvas.row_stride  # to zwp_linux_dmabuf_v1
+    ///
+    ///     overlay = proc.create_image(640, 64, PixelFormat.Rgba, access="write")
+    ///     with overlay.map("write") as m:  # map("read") raises PermissionError
+    ///         ...  # write every byte
     #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "readwrite", compression = None, contiguous = false))]
     #[allow(clippy::too_many_arguments)]
     pub fn create_image(

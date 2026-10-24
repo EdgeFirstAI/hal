@@ -832,11 +832,15 @@ class Tensor:
             mem: Optional memory type override. If None, the best available
                 memory type is chosen automatically.
             access: Declared CPU access — ``"readwrite"`` (default),
-                ``"read"``, ``"write"``, or ``"none"`` (hardware-only).
-                Hardware access is always implied. A CPU map, pin or sync
-                outside the declaration raises ``PermissionError``, as does
-                HAL CPU work (a CPU convert, a decode) the declaration does
-                not cover.
+                ``"read"``, ``"write"`` (whole-buffer writes only), or
+                ``"none"`` (hardware-only). Hardware access is always
+                implied. A CPU map, pin or sync outside the declaration
+                raises ``PermissionError``, as does HAL CPU work (a CPU
+                convert or draw, a decode) the declaration does not cover.
+                ``"readwrite"`` and ``"read"`` use cached memory; on Linux a
+                ``"none"`` or ``"write"`` DMA-BUF comes from the uncached CMA
+                heap where available, which devices map without CPU cache
+                maintenance.
             contiguous: Require physically contiguous memory: a DMA-BUF from
                 the Linux CMA heap, or an error naming the heap, never a
                 fallback. ``mem`` must be ``None`` or ``TensorMemory.DMABUF``.

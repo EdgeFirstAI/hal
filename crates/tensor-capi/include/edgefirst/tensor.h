@@ -157,11 +157,32 @@ typedef uint32_t ef_storage_kind;
 #endif // __cplusplus
 
 /**
- * CPU access direction for a map window.
+ * CPU access: a tensor's declaration, or the direction of a map window.
  *
- * Mirrors `edgefirst_tensor::CpuAccess`'s semantics; the values are the wire
- * codes. `None` names the no-CPU-access declaration and is never a valid map
+ * Mirrors `edgefirst_tensor::CpuAccess`; the values are the wire codes.
+ * `None` names the no-CPU-access declaration and is never a valid map
  * direction.
+ *
+ * The declaration, fixed when an image is allocated, covers all CPU access
+ * to it, the library's own included, and is enforced: `ef_tensor_map`,
+ * `ef_tensor_sync_*` and the copies fail with `EACCES` outside it, and a
+ * library CPU pass (a CPU convert or draw, a decode) that would need more
+ * fails instead of running. Hardware (GPU, NPU, G2D, a compositor) access is
+ * always allowed.
+ *
+ * - `EF_CPU_ACCESS_NONE`: no CPU access. On Linux a DMA-BUF comes from the
+ *   uncached CMA heap where available.
+ * - `EF_CPU_ACCESS_READ`: CPU reads; cached memory.
+ * - `EF_CPU_ACCESS_WRITE`: CPU writes that cover the whole buffer (decode
+ *   targets, CPU-drawn overlays). On Linux a DMA-BUF comes from the uncached
+ *   CMA heap where available, and CPU writes are write-combined.
+ * - `EF_CPU_ACCESS_READ_WRITE`: both; cached memory. The default.
+ *
+ * A device that maps a cached buffer cleans and invalidates the CPU cache
+ * over all of it on every access (a compositor blitting the buffer every
+ * frame, for example); an uncached buffer needs no cache maintenance. CPU
+ * reads of uncached memory are slow, so only declarations without CPU reads
+ * select it.
  */
 enum ef_cpu_access
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L

@@ -2518,6 +2518,48 @@ impl ImageProcessor {
     /// # }
     /// ```
     ///
+    /// A display canvas the GPU renders and a Wayland compositor shows
+    /// (linux-dmabuf), with a CPU-written overlay. Neither is read by the
+    /// CPU, so on Linux both come from uncached CMA where available: the
+    /// compositor's per-frame mapping of the canvas then costs no cache
+    /// maintenance.
+    ///
+    /// ```rust,no_run
+    /// # use edgefirst_image::{ImageProcessor, ImageProcessorTrait, MaskOverlay};
+    /// # use edgefirst_tensor::{CpuAccess, DType, DetectBox, PixelFormat, TensorDyn, TensorMemory, TensorMapTrait, TensorTrait};
+    /// # fn main() -> Result<(), edgefirst_image::Error> {
+    /// # let camera: TensorDyn = unimplemented!();
+    /// # let boxes: Vec<DetectBox> = Vec::new();
+    /// let mut processor = ImageProcessor::new()?;
+    /// let dma = Some(TensorMemory::DmaBuf);
+    /// let frame = processor.create_image(1920, 1080, PixelFormat::Rgba, DType::U8, dma, CpuAccess::None)?;
+    /// let mut canvas = processor.create_image(1920, 1080, PixelFormat::Rgba, DType::U8, dma, CpuAccess::None)?;
+    ///
+    /// // Translucent orange boxes, 2 px wide.
+    /// processor.set_class_colors(&[[255, 96, 0, 160]])?;
+    /// processor.set_box_line_width(2)?;
+    ///
+    /// let mut frame = frame;
+    /// processor.convert(&camera, &mut frame, None)?;
+    /// processor.draw_decoded_masks(&mut canvas, &boxes, &[], MaskOverlay::new().with_background(&frame))?;
+    ///
+    /// // Hand the canvas to the compositor: its fd, pitch and format.
+    /// let fd = canvas.clone_fd()?;
+    /// let stride = canvas.effective_row_stride();
+    /// # let _ = (fd, stride);
+    ///
+    /// // A label strip the CPU renders: written whole, never read back.
+    /// let overlay = processor.create_image(640, 64, PixelFormat::Rgba, DType::U8, dma, CpuAccess::Write)?;
+    /// overlay.as_u8().unwrap().map_for_write()?.as_mut_slice().fill(0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The returned image's [`cpu_access`](TensorDyn::cpu_access) may be
+    /// wider than `access` when this processor's own convert may need the
+    /// CPU on it (a CPU-only processor, or a format the GPU does not
+    /// render); a wider declaration selects cached memory.
+    ///
     /// # Pitch alignment for DMA-backed allocations
     ///
     /// DMA-BUF imports into the GL backend (Mali Valhall on i.MX 95

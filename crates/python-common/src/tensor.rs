@@ -2296,8 +2296,11 @@ impl PyTensor {
     /// Create an image tensor with the given dimensions and pixel format.
     ///
     /// `access` declares CPU access (`"readwrite"`, the default, `"read"`,
-    /// `"write"` or `"none"`); hardware access is always implied. A CPU map
-    /// outside the declaration raises.
+    /// `"write"` for whole-buffer writes, or `"none"`); hardware access is
+    /// always implied. A CPU map outside the declaration raises, as does HAL
+    /// CPU work it does not cover. On Linux a `"none"` or `"write"` DMA-BUF
+    /// comes from the uncached CMA heap where available, which devices map
+    /// without CPU cache maintenance.
     ///
     /// `contiguous=True` requires physically contiguous memory: a DMA-BUF
     /// from the Linux CMA heap, or an error naming the heap, never a
