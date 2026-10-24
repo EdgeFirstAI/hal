@@ -262,34 +262,31 @@ impl CPUProcessor {
                 xmax: bbox.xmax.clamp(0.0, 1.0),
                 ymax: bbox.ymax.clamp(0.0, 1.0),
             };
-            let inner = [
-                ((dst_w - 1) as f32 * bbox.xmin - 0.5).round() as usize,
-                ((dst_h - 1) as f32 * bbox.ymin - 0.5).round() as usize,
-                ((dst_w - 1) as f32 * bbox.xmax + 0.5).round() as usize,
-                ((dst_h - 1) as f32 * bbox.ymax + 0.5).round() as usize,
-            ];
+            // The last column of the left line, the last row of the top line,
+            // and the first column and row of the right and bottom lines. The
+            // lines lie outside the box, so these may fall outside the image
+            // (a left edge at 0 puts the left line at -1 and before).
+            let left = ((dst_w - 1) as f32 * bbox.xmin - 0.5).round() as i64;
+            let top = ((dst_h - 1) as f32 * bbox.ymin - 0.5).round() as i64;
+            let right = ((dst_w - 1) as f32 * bbox.xmax + 0.5).round() as i64;
+            let bottom = ((dst_h - 1) as f32 * bbox.ymax + 0.5).round() as i64;
+            let t = thickness as i64;
+            let clip = |lo: i64, hi: i64, len: usize| {
+                let len = len as i64;
+                lo.clamp(0, len) as usize..hi.clamp(0, len) as usize
+            };
+            let full = clip(left + 1 - t, right + t, dst_w);
 
-            let outer = [
-                inner[0].saturating_sub(thickness),
-                inner[1].saturating_sub(thickness),
-                inner[2].saturating_add(thickness).min(dst_w),
-                inner[3].saturating_add(thickness).min(dst_h),
-            ];
-
-            // top line
-            for y in outer[1] + 1..=inner[1] {
-                fill(y, outer[0] + 1..outer[2]);
+            for y in clip(top + 1 - t, top + 1, dst_h) {
+                fill(y, full.clone());
             }
-
-            // left and right lines, between the top and bottom lines
-            for y in inner[1] + 1..inner[3].min(dst_h) {
-                fill(y, outer[0] + 1..inner[0] + 1);
-                fill(y, inner[2]..outer[2]);
+            // Left and right lines, between the top and bottom lines.
+            for y in clip(top + 1, bottom, dst_h) {
+                fill(y, clip(left + 1 - t, left + 1, dst_w));
+                fill(y, clip(right, right + t, dst_w));
             }
-
-            // bottom line
-            for y in inner[3]..outer[3] {
-                fill(y, outer[0] + 1..outer[2]);
+            for y in clip(bottom, bottom + t, dst_h) {
+                fill(y, full.clone());
             }
         }
         Ok(())

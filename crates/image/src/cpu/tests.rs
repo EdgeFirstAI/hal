@@ -5888,7 +5888,9 @@ mod cpu_tests {
     fn test_box_line_width_is_honoured() {
         use crate::test_support::{box_drawn_columns, box_drawn_rows, box_expected_span};
         let mut cpu = CPUProcessor::new();
-        for width in [1u32, 3, 6] {
+        // 8 reaches the left and top borders and 9 the right and bottom
+        // ones; 12 and 40 cross them all.
+        for width in [1u32, 3, 6, 7, 8, 9, 12, 40] {
             let flat = crate::test_support::draw_box_fixture(
                 &mut cpu,
                 [200, 100, 50, 255],

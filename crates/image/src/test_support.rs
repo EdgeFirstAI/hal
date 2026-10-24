@@ -190,8 +190,11 @@ pub(crate) fn box_blend(color: [u8; 4], alpha: u16) -> [u8; 4] {
 }
 
 /// The columns (on a middle row) or rows (in a middle column) a `width`-pixel
-/// outline of the fixture's box covers: `width` pixels outside each edge.
+/// outline of the fixture's box covers: `width` pixels outside each edge,
+/// clipped at the image border.
 pub(crate) fn box_expected_span(width: usize) -> Vec<usize> {
     let (lo, hi) = (BOX_DIM / 4, BOX_DIM * 3 / 4);
-    (lo - width..lo).chain(hi..hi + width).collect()
+    (lo.saturating_sub(width)..lo)
+        .chain(hi..(hi + width).min(BOX_DIM))
+        .collect()
 }

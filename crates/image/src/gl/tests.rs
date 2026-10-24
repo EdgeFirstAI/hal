@@ -201,7 +201,15 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         let mut cpu = crate::CPUProcessor::new();
         let mid = BOX_DIM / 2;
-        for width in [None, Some(1u32), Some(6)] {
+        for width in [
+            None,
+            Some(1u32),
+            Some(6),
+            Some(8),
+            Some(9),
+            Some(12),
+            Some(40),
+        ] {
             let expected =
                 box_expected_span(width.unwrap_or(crate::DEFAULT_BOX_LINE_WIDTH) as usize);
             let g = crate::test_support::draw_box_fixture(&mut gl, [200, 100, 50, 255], width, 1.0);
@@ -222,6 +230,12 @@ mod gl_tests {
                 expected,
                 "cpu width {width:?} row"
             );
+            assert_eq!(
+                box_drawn_rows(&c, mid),
+                expected,
+                "cpu width {width:?} column"
+            );
+            assert_eq!(g, c, "gl and cpu width {width:?}");
         }
         let err = gl.set_box_line_width(0).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidOptions(_)), "{err:?}");
