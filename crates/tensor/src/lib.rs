@@ -2606,17 +2606,17 @@ where
     /// buffers that will be imported as GPU textures via EGLImage. PBO,
     /// Shm, and Mem storage doesn't benefit from pitch alignment and
     /// shouldn't pay the memory cost.
-    /// With `contiguous`, the memory comes from the CMA heap only (see
-    /// [`ImageDesc::with_contiguous`]).
+    /// `policy` picks the heaps (see [`crate::dma::HeapPolicy`]): with
+    /// `contiguous` the CMA heaps only (see [`ImageDesc::with_contiguous`]),
+    /// and with `uncached` the uncached CMA heap first.
     #[cfg(target_os = "linux")]
     pub(crate) fn new_dma_with_byte_size(
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
-        contiguous: bool,
+        policy: crate::dma::HeapPolicy,
     ) -> Result<Self> {
-        DmaTensor::<T>::new_with_byte_size(shape, byte_size, name, contiguous)
-            .map(TensorStorage::Dma)
+        DmaTensor::<T>::new_with_byte_size(shape, byte_size, name, policy).map(TensorStorage::Dma)
     }
 
     // No non-Linux stub: the only caller (`Tensor::image_with_stride`)
@@ -4109,7 +4109,7 @@ where
                     &shape,
                     dma_byte_size,
                     None,
-                    contiguous,
+                    crate::dma::HeapPolicy::for_access(access, contiguous),
                 )?,
                 aligned_stride,
             ),
@@ -4145,7 +4145,7 @@ where
                         &shape,
                         dma_byte_size,
                         None,
-                        false,
+                        crate::dma::HeapPolicy::for_access(access, false),
                     ) {
                         Ok(s) => (s, aligned_stride),
                         Err(_) => (
@@ -4290,7 +4290,7 @@ where
                     &shape,
                     total_byte_size,
                     None,
-                    false,
+                    crate::dma::HeapPolicy::for_access(access, false),
                 )?,
                 Some(other) => {
                     return Err(Error::NotImplemented(format!(
@@ -7085,7 +7085,7 @@ mod image_tests {
                 &[usize::MAX, 2, 2],
                 usize::MAX,
                 None,
-                false,
+                crate::dma::HeapPolicy::default(),
             );
             assert!(
                 matches!(err, Err(Error::InvalidArgument(_))),
