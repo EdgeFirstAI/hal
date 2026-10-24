@@ -39,6 +39,7 @@
 #define W 640
 #define H 480
 #define MAX_OUTPUTS 16
+#define MAX_RANK 8
 
 static int failures;
 
@@ -124,7 +125,12 @@ static size_t load_outputs(const char *dir, ef_tensor **outs)
     size_t n = 0;
     unsigned index, ndim;
     while (n < MAX_OUTPUTS && fscanf(m, "%u %u", &index, &ndim) == 2) {
-        uint64_t dims[8];
+        uint64_t dims[MAX_RANK];
+        if (ndim == 0 || ndim > MAX_RANK) {
+            fprintf(stderr, "manifest.txt: output %u has rank %u, outside 1..%d\n", index, ndim,
+                    MAX_RANK);
+            goto out;
+        }
         size_t len = 1;
         for (unsigned i = 0; i < ndim; i++) {
             unsigned long long d;
