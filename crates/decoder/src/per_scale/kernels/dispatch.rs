@@ -207,16 +207,6 @@ pub(crate) enum ScoreLevelDispatch {
     #[cfg(target_arch = "aarch64")]
     U16ToF32NeonBase,
 
-    // Tier 2 NEON FP16 (Cortex-A55+). Same dequant; sigmoid in 8-lane f16.
-    #[cfg(target_arch = "aarch64")]
-    I8ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
-    U8ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
-    I16ToF32NeonFp16,
-    #[cfg(target_arch = "aarch64")]
-    U16ToF32NeonFp16,
-
     // Tier 1-fused: NEON fused dequant+sigmoid in one pass (no intermediate
     // store/reload). Same CpuFeatures gate as NeonBase.
     #[cfg(target_arch = "aarch64")]
@@ -238,15 +228,8 @@ impl ScoreLevelDispatch {
         #[cfg(target_arch = "aarch64")]
         {
             use ScoreLevelDispatch::*;
-            if features.neon_fp16 {
-                match (input, output) {
-                    (DType::I8, DecodeDtype::F32) => return Ok(I8ToF32NeonFp16),
-                    (DType::U8, DecodeDtype::F32) => return Ok(U8ToF32NeonFp16),
-                    (DType::I16, DecodeDtype::F32) => return Ok(I16ToF32NeonFp16),
-                    (DType::U16, DecodeDtype::F32) => return Ok(U16ToF32NeonFp16),
-                    _ => {} // fall through to NeonBase
-                }
-            }
+            // No FP16 tier: on Cortex-A55 a separate f16 sigmoid pass is
+            // slower than the fused f32 pass, which is also more accurate.
             if features.neon_baseline {
                 match (input, output) {
                     // Fused dequant+sigmoid: preferred for score tensors.
@@ -605,12 +588,10 @@ use super::level_score::{
 };
 #[cfg(target_arch = "aarch64")]
 use super::level_score::{
-    decode_score_level_i16_to_f32_neon, decode_score_level_i16_to_f32_neon_fp16,
-    decode_score_level_i16_to_f32_neon_fused, decode_score_level_i8_to_f32_neon,
-    decode_score_level_i8_to_f32_neon_fp16, decode_score_level_i8_to_f32_neon_fused,
-    decode_score_level_u16_to_f32_neon, decode_score_level_u16_to_f32_neon_fp16,
-    decode_score_level_u16_to_f32_neon_fused, decode_score_level_u8_to_f32_neon,
-    decode_score_level_u8_to_f32_neon_fp16, decode_score_level_u8_to_f32_neon_fused,
+    decode_score_level_i16_to_f32_neon, decode_score_level_i16_to_f32_neon_fused,
+    decode_score_level_i8_to_f32_neon, decode_score_level_i8_to_f32_neon_fused,
+    decode_score_level_u16_to_f32_neon, decode_score_level_u16_to_f32_neon_fused,
+    decode_score_level_u8_to_f32_neon, decode_score_level_u8_to_f32_neon_fused,
 };
 use crate::per_scale::Activation;
 
@@ -684,22 +665,6 @@ impl ScoreLevelDispatch {
             }
 
             // Tier-2 NEON FP16 score arms.
-            #[cfg(target_arch = "aarch64")]
-            (I8ToF32NeonFp16, InputView::I8(i), DstSliceMut::F32(d)) => {
-                decode_score_level_i8_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (U8ToF32NeonFp16, InputView::U8(i), DstSliceMut::F32(d)) => {
-                decode_score_level_u8_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (I16ToF32NeonFp16, InputView::I16(i), DstSliceMut::F32(d)) => {
-                decode_score_level_i16_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
-            #[cfg(target_arch = "aarch64")]
-            (U16ToF32NeonFp16, InputView::U16(i), DstSliceMut::F32(d)) => {
-                decode_score_level_u16_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
-            }
 
             // Tier 1-fused: fused dequant+sigmoid NEON arms.
             #[cfg(target_arch = "aarch64")]

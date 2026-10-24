@@ -147,37 +147,6 @@ impl_score_level_f32_neon!(
     sigmoid_slice_f32_neon
 );
 
-// FP16 variants — same dequant path, FP16 sigmoid. Gated to be reached
-// only when CpuFeatures::neon_fp16 is true.
-#[cfg(target_arch = "aarch64")]
-impl_score_level_f32_neon!(
-    decode_score_level_i8_to_f32_neon_fp16,
-    i8,
-    dequant_i8_to_f32_neon,
-    sigmoid_slice_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_score_level_f32_neon!(
-    decode_score_level_u8_to_f32_neon_fp16,
-    u8,
-    dequant_u8_to_f32_neon,
-    sigmoid_slice_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_score_level_f32_neon!(
-    decode_score_level_i16_to_f32_neon_fp16,
-    i16,
-    dequant_i16_to_f32_neon,
-    sigmoid_slice_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_score_level_f32_neon!(
-    decode_score_level_u16_to_f32_neon_fp16,
-    u16,
-    dequant_u16_to_f32_neon,
-    sigmoid_slice_f32_neon_fp16
-);
-
 // ────────────────────────────────────────────────────────────────────────
 // Fused dequant+sigmoid NEON score-level kernels
 //
