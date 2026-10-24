@@ -13,7 +13,6 @@ description = "Shared helpers for EdgeFirst Article-1 JPEG→letterbox benchmark
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 edgefirst-codec = { path = "../../crates/codec" }
-edgefirst-hal = { path = "../../crates/hal", default-features = false, features = ["tracing"] }
 edgefirst-image = { path = "../../crates/image" }
-edgefirst-tensor = { path = "../../crates/tensor" }
+edgefirst-tensor = { path = "../../crates/tensor", features = ["tracing"] }
 libc = "0.2"

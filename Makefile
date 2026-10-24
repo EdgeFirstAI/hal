@@ -131,6 +131,7 @@ help:
 	@echo "    make format         - Format all source code (Rust nightly + Python ruff)"
 	@echo "    make lint           - Run all linters (clippy + ruff)"
 	@echo "    make check          - Run cargo check (fast compilation check)"
+	@echo "    make check-benchmarks - Type-check the excluded benchmarks workspace"
 	@echo ""
 	@echo "  Building & Testing:"
 	@echo "    make build          - Build with coverage instrumentation (profiling profile)"
@@ -240,7 +241,7 @@ lint-capi-modular:
 # ===========================================================================
 
 .PHONY: check
-check: check-capi-modular check-standalone check-backend-guards
+check: check-capi-modular check-standalone check-backend-guards check-benchmarks
 	@echo "Running cargo check..."
 	@cargo check $(RUST_FEATURES) --workspace \
 		$(foreach c,$(PYTHON_CRATE_NAMES),--exclude $(c))
@@ -315,6 +316,16 @@ check-capi-modular:
 		(cd crates/$$c && cargo check --target-dir $(CURDIR)/target) || exit 1; \
 	done
 	@echo "✓ Modular C-API check passed"
+
+# The root workspace excludes benchmarks/, so no workspace build, lint or
+# test compiles it. Type-check it against the current library APIs; the
+# benchmarks themselves are built and run by hand (see benchmarks/README.md).
+.PHONY: check-benchmarks
+check-benchmarks:
+	@echo "Running cargo check on the benchmarks workspace..."
+	@cargo check --manifest-path benchmarks/Cargo.toml --workspace --all-targets --locked \
+		--target-dir $(CURDIR)/target
+	@echo "✓ Benchmarks check passed"
 
 .PHONY: build
 build: capi-libs

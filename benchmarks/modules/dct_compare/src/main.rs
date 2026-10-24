@@ -159,8 +159,6 @@ fn main() -> Result<()> {
         sum_psnr / n_images as f64,
         worst_psnr
     );
-    println!(
-        "  max|d|:  {global_max_diff}  (images with max|d| > 8: {exceeds_8}/{n_images})"
-    );
+    println!("  max|d|:  {global_max_diff}  (images with max|d| > 8: {exceeds_8}/{n_images})");
     Ok(())
 }

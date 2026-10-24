@@ -11,8 +11,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 use edgefirst_image::{
-    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Region,
-    Rotation,
+    ComputeBackend, ConvertOptions, Crop, ImageProcessor, ImageProcessorConfig,
+    ImageProcessorTrait, Region,
 };
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 use std::fs::{self, File};
@@ -471,7 +471,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match edgefirst_hal::trace::start_tracing(
+        match edgefirst_tensor::trace::start_tracing(
             path.to_str().unwrap_or("/tmp/hal-bench-trace.json"),
         ) {
             Ok(()) => {
@@ -603,13 +603,13 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
                        crop: Crop,
                        fallbacks: &mut usize|
      -> Result<()> {
-        match proc.convert(input, output, Rotation::None, Flip::None, crop) {
+        match proc.convert(input, output, Some(ConvertOptions::new().crop(crop))) {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(cpu_proc) = cpu.as_mut() {
                     *fallbacks += 1;
                     cpu_proc
-                        .convert(input, output, Rotation::None, Flip::None, crop)
+                        .convert(input, output, Some(ConvertOptions::new().crop(crop)))
                         .with_context(|| format!("CPU fallback after: {e}"))?;
                     Ok(())
                 } else {
@@ -766,7 +766,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
     }
 
     if tracing_active {
-        edgefirst_hal::trace::stop_tracing();
+        edgefirst_tensor::trace::stop_tracing();
     }
 
     Ok(stats)
