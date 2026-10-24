@@ -569,6 +569,8 @@ pub struct GLProcessorST {
     proto_dequant_int8_program: GlProgram,
     proto_segmentation_f32_program: GlProgram,
     color_program: GlProgram,
+    /// Bounding-box outline thickness in destination pixels; never 0.
+    box_line_width: f32,
     /// Last opacity value set on shader uniforms (avoids redundant GL calls).
     cached_opacity: f32,
     /// Allocated proto texture dimensions for SubImage3D fast path: (w, h, layers, internal_fmt).
@@ -1194,6 +1196,12 @@ impl ImageProcessorTrait for GLProcessorST {
         self.color_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
 
+        Ok(())
+    }
+
+    fn set_box_line_width(&mut self, width: u32) -> crate::Result<()> {
+        crate::check_box_line_width(width)?;
+        self.box_line_width = width as f32;
         Ok(())
     }
 }
@@ -2506,6 +2514,7 @@ impl GLProcessorST {
             instanced_segmentation_program,
             proto_segmentation_program,
             color_program,
+            box_line_width: crate::DEFAULT_BOX_LINE_WIDTH as f32,
             cached_opacity: f32::NAN, // sentinel: forces first set_opacity_uniform to initialize all shaders
             proto_tex_dims: (0, 0, 0, 0),
             proto_repack_compute_program: None,
@@ -9535,7 +9544,7 @@ impl GLProcessorST {
         unsafe {
             edgefirst_gl::gl::UseProgram(self.color_program.id);
             let rescale = |x: f32| x * 2.0 - 1.0;
-            let thickness = 3.0;
+            let thickness = self.box_line_width;
             for (idx, d) in detect.iter().enumerate() {
                 let color_index = color_mode.index(idx, d.label);
                 self.color_program

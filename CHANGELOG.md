@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Box line width.** `ImageProcessorTrait::set_box_line_width(width)` sets the thickness, in destination pixels, of the box outlines drawn by `draw_decoded_masks` and `draw_proto_masks` on the GL and CPU backends; the default stays 3 (`DEFAULT_BOX_LINE_WIDTH`) and 0 is `Error::InvalidOptions`. G2D returns `NotImplemented`, as it does for `set_class_colors`. Python: `ImageProcessor.set_box_line_width(width)` (`ValueError` for 0). C: `ef_image_processor_set_box_line_width` (`EINVAL` for 0).
+
 ### Changed
 
 - **The per-scale score prefilter runs for every level size (`edgefirst-decoder`).** A level whose anchor count is not a multiple of the 16-anchor pack, such as the 60x34 and 30x17 levels of a 960x544 input, used to send the whole frame to the dense decode. The prefilter now packs the level's whole groups and decodes its trailing partial group whole, with the same detections as the dense decode.

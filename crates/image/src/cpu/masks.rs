@@ -218,7 +218,7 @@ impl CPUProcessor {
         detect: &[DetectBox],
         color_mode: crate::ColorMode,
     ) -> Result<()> {
-        const LINE_THICKNESS: usize = 3;
+        let thickness = self.box_line_width;
 
         for (idx, d) in detect.iter().enumerate() {
             use edgefirst_tensor::BoundingBox;
@@ -240,10 +240,10 @@ impl CPUProcessor {
             ];
 
             let outer = [
-                inner[0].saturating_sub(LINE_THICKNESS),
-                inner[1].saturating_sub(LINE_THICKNESS),
-                (inner[2] + LINE_THICKNESS).min(dst_w),
-                (inner[3] + LINE_THICKNESS).min(dst_h),
+                inner[0].saturating_sub(thickness),
+                inner[1].saturating_sub(thickness),
+                inner[2].saturating_add(thickness).min(dst_w),
+                inner[3].saturating_add(thickness).min(dst_h),
             ];
 
             // top line

@@ -186,6 +186,43 @@ mod gl_tests {
     }
 
     #[test]
+    fn test_box_line_width_matches_cpu() {
+        use crate::test_support::{box_drawn_columns, box_drawn_rows, box_expected_span, BOX_DIM};
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut cpu = crate::CPUProcessor::new();
+        let mid = BOX_DIM / 2;
+        for width in [None, Some(1u32), Some(6)] {
+            let expected =
+                box_expected_span(width.unwrap_or(crate::DEFAULT_BOX_LINE_WIDTH) as usize);
+            let g = crate::test_support::draw_box_fixture(&mut gl, [200, 100, 50, 255], width, 1.0);
+            let c =
+                crate::test_support::draw_box_fixture(&mut cpu, [200, 100, 50, 255], width, 1.0);
+            assert_eq!(
+                box_drawn_columns(&g, mid),
+                expected,
+                "gl width {width:?} row"
+            );
+            assert_eq!(
+                box_drawn_rows(&g, mid),
+                expected,
+                "gl width {width:?} column"
+            );
+            assert_eq!(
+                box_drawn_columns(&c, mid),
+                expected,
+                "cpu width {width:?} row"
+            );
+        }
+        let err = gl.set_box_line_width(0).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidOptions(_)), "{err:?}");
+    }
+
+    #[test]
     fn test_boxes() {
         use edgefirst_tensor::DetectBox;
 

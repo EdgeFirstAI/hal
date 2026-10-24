@@ -794,6 +794,39 @@ pub unsafe extern "C" fn ef_image_processor_set_class_colors(
     }
 }
 
+/// Set the thickness, in `dst` pixels, of the box outlines drawn by
+/// `ef_image_processor_draw_decoded_masks` and
+/// `ef_image_processor_draw_proto_masks`.
+///
+/// The outline is drawn outside the box edges and clipped at the image
+/// border. The default is 3. Applies to every drawing backend the processor
+/// holds.
+///
+/// @return 0 on success, `EINVAL` for a null processor or a zero `width`,
+/// `ENOTSUP` when the processor's backend does not draw (G2D).
+///
+/// # Safety
+/// `p` must be a processor from `ef_image_processor_new*` or `NULL`.
+#[no_mangle]
+pub unsafe extern "C" fn ef_image_processor_set_box_line_width(
+    p: *mut EfImageProcessor,
+    width: u32,
+) -> c_int {
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            if p.is_null() {
+                return libc::EINVAL;
+            }
+            use edgefirst_image::ImageProcessorTrait as _;
+            match (*p).inner.set_box_line_width(width) {
+                Ok(()) => 0,
+                Err(e) => image_errno(&e),
+            }
+        }))
+        .unwrap_or(libc::EINVAL)
+    }
+}
+
 /// Set how `ef_image_processor_convert` resamples when it resizes, for
 /// converts whose options do not set their own
 /// ([`ef_convert_options_set_interpolation`]).
@@ -1016,6 +1049,20 @@ mod tests {
         let p = ef_image_processor_new_with_backend(0);
         assert!(!p.is_null());
         unsafe { ef_image_processor_free(p) };
+    }
+
+    #[test]
+    fn box_line_width_is_validated() {
+        unsafe {
+            assert_eq!(
+                ef_image_processor_set_box_line_width(std::ptr::null_mut(), 3),
+                libc::EINVAL
+            );
+            let p = processor();
+            assert_eq!(ef_image_processor_set_box_line_width(p, 0), libc::EINVAL);
+            assert_eq!(ef_image_processor_set_box_line_width(p, 5), 0);
+            ef_image_processor_free(p);
+        }
     }
 
     #[test]

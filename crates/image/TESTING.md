@@ -7,6 +7,8 @@ crates/image/
 ├── src/
 │   ├── lib.rs              # Doc-tests on the public API surface
 │   ├── tiling.rs           # SAHI grid geometry unit tests + span assertions (no GPU)
+│   ├── test_support.rs     # DMA/G2D skip policy; box-outline fixture shared by
+│   │                       # the CPU, GL and ImageProcessor box width/alpha tests
 │   ├── cpu/
 │   │   ├── tests.rs        # CPU backend conversion + mask tests
 │   │   ├── convert.rs      # fast_image_resize-based format conversion

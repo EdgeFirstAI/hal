@@ -67,6 +67,7 @@ classDiagram
         +draw_decoded_masks(dst, detections, segmentations)
         +draw_proto_masks(dst, detections, proto_data)
         +set_class_colors(colors)
+        +set_box_line_width(width)
     }
 
     class ImageProcessor {
@@ -1246,6 +1247,20 @@ pub struct MaskOverlay<'a> {
                                             //  like Instance — see below)
 }
 ```
+
+### Box outlines
+
+Both draw calls render each detection's box before its mask. Box style is
+processor state, set alongside the palette rather than per call, so it reaches
+every drawing backend the same way `set_class_colors` does (GL, the threaded
+GL wrapper and CPU; G2D refuses both) and the C draw signatures stay fixed:
+
+- **Width.** `set_box_line_width(width)` sets the outline thickness in
+  destination pixels (default `DEFAULT_BOX_LINE_WIDTH`, 3; 0 is
+  `Error::InvalidOptions`). The outline lies outside the box edges, so the box
+  interior is never covered, and is clipped at the image border. GL draws it
+  as a quad ring `width` pixels beyond the normalized box; CPU rounds the box
+  to pixel edges and fills the same `width` pixels on each side.
 
 ### Fused proto→pixel algorithm (`draw_proto_masks`)
 

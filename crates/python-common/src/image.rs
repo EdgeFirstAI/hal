@@ -1861,6 +1861,31 @@ impl PyImageProcessor {
         Ok(())
     }
 
+    /// Set the thickness of the box outlines drawn by
+    /// ``draw_decoded_masks`` and ``draw_proto_masks``, in image pixels.
+    ///
+    /// The outline is drawn outside the box edges. The default is 3.
+    ///
+    /// Args:
+    ///     width: Outline thickness in pixels, at least 1.
+    ///
+    /// Raises:
+    ///     ValueError: If ``width`` is 0.
+    ///     OverflowError: If ``width`` is negative or does not fit in 32 bits.
+    ///     RuntimeError: If the backend rejects the width.
+    pub fn set_box_line_width(&mut self, width: u32) -> Result<()> {
+        if width == 0 {
+            return Err(Error::Py(pyo3::exceptions::PyValueError::new_err(
+                "box line width must be at least 1 pixel",
+            )));
+        }
+        self.0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .set_box_line_width(width)?;
+        Ok(())
+    }
+
     /// Sets the interpolation mode for int8 proto textures.
     ///
     /// Accepts "nearest", "bilinear", or "twopass". Default is "bilinear".

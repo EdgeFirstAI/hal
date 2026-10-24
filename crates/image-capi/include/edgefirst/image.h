@@ -686,6 +686,23 @@ int ef_image_processor_set_class_colors(ef_image_processor *p,
                                         uintptr_t count);
 
 /**
+ * Set the thickness, in `dst` pixels, of the box outlines drawn by
+ * `ef_image_processor_draw_decoded_masks` and
+ * `ef_image_processor_draw_proto_masks`.
+ *
+ * The outline is drawn outside the box edges and clipped at the image
+ * border. The default is 3. Applies to every drawing backend the processor
+ * holds.
+ *
+ * @return 0 on success, `EINVAL` for a null processor or a zero `width`,
+ * `ENOTSUP` when the processor's backend does not draw (G2D).
+ *
+ * # Safety
+ * `p` must be a processor from `ef_image_processor_new*` or `NULL`.
+ */
+int ef_image_processor_set_box_line_width(ef_image_processor *p, uint32_t width);
+
+/**
  * Set how `ef_image_processor_convert` resamples when it resizes, for
  * converts whose options do not set their own
  * ([`ef_convert_options_set_interpolation`]).

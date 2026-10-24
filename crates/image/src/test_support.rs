@@ -93,3 +93,93 @@ fn g2d_policy_skips_unless_required() {
     let required_but_missing = std::panic::catch_unwind(|| g2d_decide(false, true, "t"));
     assert!(required_but_missing.is_err());
 }
+
+/// Background of the box-outline fixture; its alpha is not 255 so a test
+/// can tell whether a draw wrote the destination's alpha channel.
+pub(crate) const BOX_BG: [u8; 4] = [10, 20, 30, 200];
+/// Side of the square box-outline fixture.
+pub(crate) const BOX_DIM: usize = 32;
+
+/// Draws one box over [`BOX_BG`] with `processor` using `color`, `width`
+/// (`None` keeps the processor's) and `opacity`, and returns the RGBA
+/// pixels. The box is the middle half of
+/// a [`BOX_DIM`]-square image, so its outline sits well inside the border.
+pub(crate) fn draw_box_fixture(
+    processor: &mut dyn crate::ImageProcessorTrait,
+    color: [u8; 4],
+    width: Option<u32>,
+    opacity: f32,
+) -> Vec<u8> {
+    use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
+
+    let image = || {
+        TensorDyn::image(
+            BOX_DIM,
+            BOX_DIM,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            CpuAccess::ReadWrite,
+        )
+        .unwrap()
+    };
+    let bg = image();
+    {
+        let bg_u8 = bg.as_typed::<u8>().unwrap();
+        let mut map = bg_u8.map_mut().unwrap();
+        for px in map.as_mut_slice().chunks_exact_mut(4) {
+            px.copy_from_slice(&BOX_BG);
+        }
+    }
+    let mut dst = image();
+    processor.set_class_colors(&[color]).unwrap();
+    if let Some(width) = width {
+        processor.set_box_line_width(width).unwrap();
+    }
+    let detect = edgefirst_tensor::DetectBox {
+        bbox: [0.25, 0.25, 0.75, 0.75].into(),
+        score: 0.9,
+        label: 0,
+    };
+    processor
+        .draw_decoded_masks(
+            &mut dst,
+            &[detect],
+            &[],
+            crate::MaskOverlay::new()
+                .with_background(&bg)
+                .with_opacity(opacity),
+        )
+        .unwrap();
+    let dst_u8 = dst.as_typed::<u8>().unwrap();
+    let mut flat = vec![0u8; BOX_DIM * BOX_DIM * 4];
+    dst_u8.copy_to_flat(&mut flat).unwrap();
+    flat
+}
+
+/// The fixture's pixel at `(x, y)`.
+pub(crate) fn box_px(flat: &[u8], x: usize, y: usize) -> [u8; 4] {
+    let o = (y * BOX_DIM + x) * 4;
+    flat[o..o + 4].try_into().unwrap()
+}
+
+/// The x coordinates on row `y` whose pixel differs from [`BOX_BG`].
+pub(crate) fn box_drawn_columns(flat: &[u8], y: usize) -> Vec<usize> {
+    (0..BOX_DIM)
+        .filter(|&x| box_px(flat, x, y) != BOX_BG)
+        .collect()
+}
+
+/// The y coordinates in column `x` whose pixel differs from [`BOX_BG`].
+pub(crate) fn box_drawn_rows(flat: &[u8], x: usize) -> Vec<usize> {
+    (0..BOX_DIM)
+        .filter(|&y| box_px(flat, x, y) != BOX_BG)
+        .collect()
+}
+
+/// The columns (on a middle row) or rows (in a middle column) a `width`-pixel
+/// outline of the fixture's box covers: `width` pixels outside each edge.
+pub(crate) fn box_expected_span(width: usize) -> Vec<usize> {
+    let (lo, hi) = (BOX_DIM / 4, BOX_DIM * 3 / 4);
+    (lo - width..lo).chain(hi..hi + width).collect()
+}

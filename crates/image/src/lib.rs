@@ -1003,6 +1003,8 @@ pub trait ImageProcessorTrait {
     ///
     /// `overlay` controls compositing: `background` is the compositing source
     /// (must match `dst` in size and format); `opacity` scales mask alpha.
+    /// Box outlines are [`set_box_line_width`](Self::set_box_line_width)
+    /// pixels thick.
     ///
     /// A `Bgra` background onto a zero-copy destination (a D3D11 texture, an
     /// IOSurface, a dma-buf) returns [`Error::NotSupported`]: the GL
@@ -1070,6 +1072,23 @@ pub trait ImageProcessorTrait {
     /// later draw may land on any of them. A forced backend receives the
     /// colors alone.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
+
+    /// Sets the thickness, in destination pixels, of the bounding-box
+    /// outlines drawn by [`draw_decoded_masks`](Self::draw_decoded_masks)
+    /// and [`draw_proto_masks`](Self::draw_proto_masks). The default is
+    /// [`DEFAULT_BOX_LINE_WIDTH`] (3 px).
+    ///
+    /// The outline is drawn outside the box edges, so the box interior is
+    /// never covered. It is clipped at the image border.
+    ///
+    /// Reaches every available backend, as
+    /// [`set_class_colors`](Self::set_class_colors) does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidOptions`] when `width` is 0, and
+    /// [`Error::NotImplemented`] from a backend that does not draw (G2D).
+    fn set_box_line_width(&mut self, width: u32) -> Result<()>;
 
     /// Like [`convert`](Self::convert), but does not wait for the GPU to finish.
     ///
@@ -3722,6 +3741,69 @@ impl ImageProcessorTrait for ImageProcessor {
             None => Err(Error::NoConverter),
         }
     }
+
+    fn set_box_line_width(&mut self, width: u32) -> Result<()> {
+        check_box_line_width(width)?;
+
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.set_box_line_width(width);
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => Err(Error::NotSupported(
+                    "g2d does not support set_box_line_width".into(),
+                )),
+                ForcedBackend::OpenGl => {
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android",
+                        target_os = "windows"
+                    ))]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.set_box_line_width(width);
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
+        }
+
+        // Every drawing backend, for the reason `set_class_colors` gives.
+        let mut backends = 0usize;
+        let mut first_err = None;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
+        #[cfg(feature = "opengl")]
+        if let Some(opengl) = self.opengl.as_mut() {
+            backends += 1;
+            if let Err(e) = opengl.set_box_line_width(width) {
+                log::trace!("box line width didn't set with opengl: {e:?}");
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(cpu) = self.cpu.as_mut() {
+            backends += 1;
+            if let Err(e) = cpu.set_box_line_width(width) {
+                log::trace!("box line width didn't set with cpu: {e:?}");
+                first_err.get_or_insert(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None if backends > 0 => Ok(()),
+            None => Err(Error::NoConverter),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3914,6 +3996,20 @@ const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N
 }
 
 const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
+
+/// Default bounding-box outline thickness in pixels, used until
+/// [`ImageProcessorTrait::set_box_line_width`] sets another.
+pub const DEFAULT_BOX_LINE_WIDTH: u32 = 3;
+
+/// Validates a [`ImageProcessorTrait::set_box_line_width`] argument.
+pub(crate) fn check_box_line_width(width: u32) -> Result<()> {
+    if width == 0 {
+        return Err(Error::InvalidOptions(
+            "box line width must be at least 1 pixel".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -4228,6 +4324,37 @@ mod image_tests {
             }
         }
         load_bytes_to_tensor(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap()
+    }
+
+    /// `set_box_line_width` validates before reaching any backend and the
+    /// width reaches whichever backend draws: the default chain (GL where
+    /// available, else CPU) and a forced CPU backend.
+    #[test]
+    fn set_box_line_width_reaches_the_drawing_backend() {
+        use crate::test_support::{box_drawn_columns, box_expected_span, BOX_DIM};
+        let configs = [
+            ImageProcessorConfig::default(),
+            ImageProcessorConfig {
+                backend: ComputeBackend::Cpu,
+                ..Default::default()
+            },
+        ];
+        for config in configs {
+            let backend = config.backend;
+            let mut proc = ImageProcessor::with_config(config).unwrap();
+            let err = proc.set_box_line_width(0).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidOptions(_)),
+                "{backend:?}: {err:?}"
+            );
+            let flat =
+                crate::test_support::draw_box_fixture(&mut proc, [200, 100, 50, 255], Some(4), 1.0);
+            assert_eq!(
+                box_drawn_columns(&flat, BOX_DIM / 2),
+                box_expected_span(4),
+                "{backend:?}"
+            );
+        }
     }
 
     /// `tile_into` band == standalone crop-convert of the same source region,

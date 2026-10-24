@@ -37,6 +37,7 @@ enum GLProcessorMessage {
         Vec<[u8; 4]>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    SetBoxLineWidth(u32, tokio::sync::oneshot::Sender<Result<(), Error>>),
     DrawDecodedMasks(
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
@@ -488,6 +489,9 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
         GLProcessorMessage::SetColors(_, resp) => {
             let _ = resp.send(Err(poison_err));
         }
+        GLProcessorMessage::SetBoxLineWidth(_, resp) => {
+            let _ = resp.send(Err(poison_err));
+        }
         GLProcessorMessage::SetInt8Interpolation(_, resp) => {
             let _ = resp.send(Err(poison_err));
         }
@@ -796,6 +800,12 @@ fn handle_gl_message(
                 gl_converter.set_class_colors(&colors)
             }));
             reply_caught(result, resp, poisoned, "SetColors");
+        }
+        GLProcessorMessage::SetBoxLineWidth(width, resp) => {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                gl_converter.set_box_line_width(width)
+            }));
+            reply_caught(result, resp, poisoned, "SetBoxLineWidth");
         }
         GLProcessorMessage::SetColorimetryMode(mode, resp) => {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1332,6 +1342,19 @@ impl ImageProcessorTrait for GLProcessorThreaded {
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::SetColors(colors.to_vec(), err_send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    fn set_box_line_width(&mut self, width: u32) -> Result<(), crate::Error> {
+        crate::check_box_line_width(width)?;
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::SetBoxLineWidth(width, err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())

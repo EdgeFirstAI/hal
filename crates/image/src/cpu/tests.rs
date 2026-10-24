@@ -5879,4 +5879,52 @@ mod cpu_tests {
                 .interpolation(Interpolation::Bilinear)
         );
     }
+
+    // =========================================================================
+    // Box outline width and colour alpha
+    // =========================================================================
+
+    #[test]
+    fn test_box_line_width_is_honoured() {
+        use crate::test_support::{box_drawn_columns, box_drawn_rows, box_expected_span};
+        let mut cpu = CPUProcessor::new();
+        for width in [1u32, 3, 6] {
+            let flat = crate::test_support::draw_box_fixture(
+                &mut cpu,
+                [200, 100, 50, 255],
+                Some(width),
+                1.0,
+            );
+            let mid = crate::test_support::BOX_DIM / 2;
+            let expected = box_expected_span(width as usize);
+            assert_eq!(box_drawn_columns(&flat, mid), expected, "width {width} row");
+            assert_eq!(box_drawn_rows(&flat, mid), expected, "width {width} column");
+        }
+    }
+
+    #[test]
+    fn test_box_line_width_defaults_to_three() {
+        let mut cpu = CPUProcessor::new();
+        let flat = crate::test_support::draw_box_fixture(&mut cpu, [200, 100, 50, 255], None, 1.0);
+        let mid = crate::test_support::BOX_DIM / 2;
+        assert_eq!(
+            crate::test_support::box_drawn_columns(&flat, mid),
+            crate::test_support::box_expected_span(crate::DEFAULT_BOX_LINE_WIDTH as usize)
+        );
+    }
+
+    #[test]
+    fn test_box_line_width_rejects_zero() {
+        let mut cpu = CPUProcessor::new();
+        cpu.set_box_line_width(5).unwrap();
+        let err = cpu.set_box_line_width(0).unwrap_err();
+        assert!(matches!(err, Error::InvalidOptions(_)), "{err:?}");
+        let flat = crate::test_support::draw_box_fixture(&mut cpu, [200, 100, 50, 255], None, 1.0);
+        let mid = crate::test_support::BOX_DIM / 2;
+        assert_eq!(
+            crate::test_support::box_drawn_columns(&flat, mid),
+            crate::test_support::box_expected_span(5),
+            "a rejected width must leave the previous one in place"
+        );
+    }
 }

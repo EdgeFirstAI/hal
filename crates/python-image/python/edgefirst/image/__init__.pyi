@@ -964,6 +964,22 @@ class ImageProcessor:
             RuntimeError: If the backend rejects the palette.
         """
 
+    def set_box_line_width(self, width: int) -> None:
+        """Set the thickness of the box outlines drawn by
+        :meth:`draw_decoded_masks` and :meth:`draw_proto_masks`, in image
+        pixels.
+
+        The outline is drawn outside the box edges. The default is 3.
+
+        Args:
+            width: Outline thickness in pixels, at least 1.
+
+        Raises:
+            ValueError: If ``width`` is 0.
+            OverflowError: If ``width`` is negative or does not fit in 32 bits.
+            RuntimeError: If the backend rejects the width.
+        """
+
     def set_interpolation(self, mode: InterpolationArg) -> None:
         """Sets how convert() resamples when it resizes, for converts whose
         options do not choose their own (``ConvertOptions(interpolation=...)``,
