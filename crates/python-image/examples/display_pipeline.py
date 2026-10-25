@@ -263,10 +263,21 @@ def time_decode(capture: str, iters: int) -> None:
     )
 
 
+def positive_int(text: str) -> int:
+    """An argparse type: an integer of at least 1."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("capture", nargs="?")
-    parser.add_argument("--iters", type=int, default=1000)
+    parser.add_argument("--iters", type=positive_int, default=1000)
     args = parser.parse_args()
     capture = os.path.realpath(args.capture) if args.capture else None
     if capture and not os.path.isdir(capture):

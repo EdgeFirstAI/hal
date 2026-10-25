@@ -190,7 +190,19 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *dir = argv[1];
-    int iters = argc > 2 ? atoi(argv[2]) : 1000;
+    int iters = 1000;
+    if (argc > 2) {
+        char *end;
+        errno = 0;
+        long v = strtol(argv[2], &end, 10);
+        if (errno != 0 || end == argv[2] || *end != '\0' || v <= 0 || v > 1000000) {
+            fprintf(stderr, "%s: iters must be an integer from 1 to 1000000, got '%s'\n",
+                    argv[0], argv[2]);
+            fprintf(stderr, "usage: %s <capture_dir> [iters]\n", argv[0]);
+            return 2;
+        }
+        iters = (int)v;
+    }
     char detail[256];
     uint8_t px[4];
 
