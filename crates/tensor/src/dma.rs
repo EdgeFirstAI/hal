@@ -1210,17 +1210,25 @@ mod tests {
         if let Some(name) = exporter(&fd) {
             assert!(!name.ends_with("-uncached"), "exporter {name}");
         }
-        if cma_heap_present() {
-            let contiguous = HeapPolicy {
-                contiguous: true,
-                uncached: true,
-            };
-            let (fd, contiguity) =
-                heap_allocate_from(4096, contiguous, missing).expect("contiguous fallback");
-            assert_eq!(contiguity, crate::Contiguity::Contiguous);
-            if let Some(name) = exporter(&fd) {
-                assert_eq!(name, "linux,cma");
+        // A contiguous request falls back to the cached CMA heap only: it is
+        // served from there, or refused naming that heap (no CMA heap, or its
+        // pool exhausted), never served from the system heap.
+        let contiguous = HeapPolicy {
+            contiguous: true,
+            uncached: true,
+        };
+        match heap_allocate_from(4096, contiguous, missing) {
+            Ok((fd, contiguity)) => {
+                assert!(cma_heap_present(), "contiguous memory without a CMA heap");
+                assert_eq!(contiguity, crate::Contiguity::Contiguous);
+                if let Some(name) = exporter(&fd) {
+                    assert_eq!(name, "linux,cma");
+                }
             }
+            Err(e) => assert!(
+                e.to_string().contains(CMA_HEAP_PATH),
+                "error does not name the CMA heap: {e}"
+            ),
         }
     }
 
