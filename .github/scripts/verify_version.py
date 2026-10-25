@@ -10,6 +10,7 @@
 #   3. Cargo.lock versions for all workspace crates
 #   3a. Standalone C-API leaves: internal path-dependency requirements and the
 #       path crates in each leaf's own Cargo.lock
+#   3b. The HAL path crates in the excluded benchmarks workspace's Cargo.lock
 #   4. pyproject.toml Python package version
 #   5. CHANGELOG.md has an entry for the version
 #   6. NOTICE has correct versions for internal crates (no stale entries)
@@ -186,25 +187,53 @@ def check_standalone_leaves(version: str) -> list[str]:
                     f"expected '{version}'"
                 )
 
-        # Path packages are the lock entries without a `source` line.
-        lock_path = f"{crate_dir}/Cargo.lock"
-        for block in read_file(lock_path).split("[[package]]")[1:]:
-            name = re.search(r'^name = "([^"]+)"', block, re.MULTILINE)
-            found = re.search(r'^version = "([^"]+)"', block, re.MULTILINE)
-            if not name or not found or name.group(1) == crate:
-                continue
-            if not name.group(1).startswith("edgefirst-"):
-                continue
-            if re.search(r'^source = ', block, re.MULTILINE):
-                continue
-            if found.group(1) != version:
-                errors.append(
-                    f"{lock_path}: {name.group(1)} version is '{found.group(1)}', "
-                    f"expected '{version}' (re-lock with `cargo metadata "
-                    f"--format-version 1` in {crate_dir})"
-                )
+        errors.extend(stale_path_crates(crate_dir, version, skip=crate))
 
     return errors
+
+
+def lock_path_packages(lock: str):
+    """Yield (name, version) for the `edgefirst-*` path packages in a lock.
+
+    Path packages are the lock entries without a `source` line.
+    """
+    for block in lock.split("[[package]]")[1:]:
+        name = re.search(r'^name = "([^"]+)"', block, re.MULTILINE)
+        found = re.search(r'^version = "([^"]+)"', block, re.MULTILINE)
+        if not name or not found or not name.group(1).startswith("edgefirst-"):
+            continue
+        if re.search(r'^source = ', block, re.MULTILINE):
+            continue
+        yield name.group(1), found.group(1)
+
+
+def stale_path_crates(
+    lock_dir: str, version: str, skip: str = "", only: set[str] | None = None
+) -> list[str]:
+    """Report path crates in `lock_dir/Cargo.lock` not at `version`."""
+    errors = []
+    lock_path = f"{lock_dir}/Cargo.lock"
+    for name, found in lock_path_packages(read_file(lock_path)):
+        if name == skip or (only is not None and name not in only):
+            continue
+        if found != version:
+            errors.append(
+                f"{lock_path}: {name} version is '{found}', "
+                f"expected '{version}' (re-lock with `cargo metadata "
+                f"--format-version 1` in {lock_dir})"
+            )
+    return errors
+
+
+def check_benchmarks_lock(version: str) -> list[str]:
+    """Check the excluded benchmarks workspace's lock on the HAL crates.
+
+    `make check-benchmarks` builds it with `--locked`, so a lock still
+    naming the previous version fails CI. The benchmarks' own crates keep
+    their own versions; only the root workspace's crates are checked.
+    """
+    hal_crates = {name for name, _ in lock_path_packages(read_file("Cargo.lock"))}
+    return stale_path_crates("benchmarks", version, only=hal_crates)
 
 
 def check_pyproject_toml(version: str) -> list[str]:
@@ -414,6 +443,7 @@ def main():
         ("Cargo.toml (workspace)", check_cargo_toml),
         ("Cargo.lock", check_cargo_lock),
         ("Standalone C-API leaves", check_standalone_leaves),
+        ("Benchmarks workspace", check_benchmarks_lock),
         ("Crate Cargo.toml files", check_crate_cargo_tomls),
         ("pyproject.toml", check_pyproject_toml),
         ("CHANGELOG.md", check_changelog),

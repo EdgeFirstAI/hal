@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-10-25
+
 ### Added
 
 - **Box line width.** `ImageProcessorTrait::set_box_line_width(width)` sets the thickness, in destination pixels, of the box outlines drawn by `draw_decoded_masks` and `draw_proto_masks` on the GL and CPU backends; the default stays 3 (`DEFAULT_BOX_LINE_WIDTH`) and 0 is `Error::InvalidOptions`. G2D returns `NotImplemented`, as it does for `set_class_colors`. Python: `ImageProcessor.set_box_line_width(width)` (`ValueError` for 0). C: `ef_image_processor_set_box_line_width` (`EINVAL` for 0).
+- **Display pipeline examples for C and Python.** `crates/image-capi/examples/display_pipeline.c` and `crates/python-image/examples/display_pipeline.py` build the display path on a device: the GPU renders the frame and boxes into a hardware-only DMA-BUF canvas for the compositor, a CPU-written overlay uses a write-only image, and the decoder turns a captured model's outputs into boxes. Each step prints PASS or FAIL, with decode and draw timings.
 
 ### Changed
 
@@ -21,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Per-scale integer scores take the fused f32 sigmoid on FP16 cores (`edgefirst-decoder`).** CPUs with FP16 arithmetic dequantized scores and then ran an FP16 sigmoid in a second pass; they now use the single fused f32 pass that other NEON CPUs use, which is also more accurate. On an i.MX 95 a dense 640x640 80-class decode drops from 1.7 ms to 1.1 ms of wall time and from 9.3 ms to 6.2 ms of CPU time.
 - **The score prefilter scans raw scores in blocks (`edgefirst-decoder`).** It tests 64 raw scores at a time for one at the threshold's floor and examines only the rows of blocks that hold one; a prefiltered 640x640 80-class frame takes 0.24 ms on an i.MX 95 (1.7 ms before).
 - **Small float candidate filters run on the calling thread (`edgefirst-decoder`).** `postprocess_boxes_float`, `postprocess_boxes_index_float` and `postprocess_boxes_multilabel_index_float` (and their callers, including the per-scale decode) filter fewer than 65,536 score elements without rayon, whose workers spent several times the filter's own CPU time waking and spinning. On an i.MX 95 this removes about 440 µs of CPU time per prefiltered 960x544 `decode`, which now takes 60 µs of wall and CPU time (8.6 ms of wall and 12 ms of CPU in 0.37.0, with the other changes above).
+- **Dependencies updated.** `argminmax` moves from 0.6 to 0.7 and `zip` from 8 to 9 (the `model-files` feature of `edgefirst-decoder`; a ZIP trailer entry whose name is not valid UTF-8 is now skipped). Every lockfile, including the standalone C API crates', takes the latest semver-compatible releases; `pyo3` stays on 0.29 to keep the Python 3.8 abi3 wheels.
 
 ## [0.37.0] - 2026-10-23
 
