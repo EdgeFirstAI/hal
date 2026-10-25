@@ -7,6 +7,8 @@ crates/image/
 ├── src/
 │   ├── lib.rs              # Doc-tests on the public API surface
 │   ├── tiling.rs           # SAHI grid geometry unit tests + span assertions (no GPU)
+│   ├── test_support.rs     # DMA/G2D skip policy; box-outline fixture shared by
+│   │                       # the CPU, GL and ImageProcessor box width/alpha tests
 │   ├── cpu/
 │   │   ├── tests.rs        # CPU backend conversion + mask tests
 │   │   ├── convert.rs      # fast_image_resize-based format conversion
@@ -23,6 +25,14 @@ crates/image/
 │   │                       #  callsite interest per PROCESS, so a scoped one
 │   │                       #  among parallel tests is a coin flip)
 │   ├── odd_dim_cpu.rs      # End-to-end odd-dimension CPU conversion
+│   ├── write_only_destinations.rs  # CPU convert never reads a Write destination
+│   │                       # (pre-filled two ways through a ReadWrite alias);
+│   │                       # CPU draw/convert refuse None/Write images;
+│   │                       # honours HAL_TEST_REQUIRE_DMA
+│   ├── uncached_device_import.rs   # GL and G2D render into / read from uncached
+│   │                       # None/Write DMA-BUF images; runs where a probe
+│   │                       # allocation is served uncached, honours
+│   │                       # HAL_TEST_REQUIRE_{DMA,GL,G2D}
 │   └── data/               # crop_golden.{aarch64,x86_64}.json
 └── benches/
     ├── image_benchmark.rs       # Convert/resize/rotate throughput

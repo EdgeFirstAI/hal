@@ -18,12 +18,33 @@
 //! materializing the ratio.
 
 use crate::{arg_max, BBoxTypeTrait, BoundingBox, DetectBox};
-use ndarray::{
-    parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
-    Array1, ArrayView2, Zip,
-};
+use ndarray::{ArrayView1, ArrayView2};
 use num_traits::{AsPrimitive, Float};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
+
+/// Candidate filters over fewer score elements than this run on the calling
+/// thread: handing a few hundred rows to rayon costs more CPU, in waking and
+/// then spinning workers, than filtering them.
+const PAR_MIN_SCORES: usize = 1 << 16;
+
+/// `f` over every `(index, score row, box row)`, keeping the `Some`s in row
+/// order, on the rayon pool when the score array is large.
+fn filter_rows<BOX, SCORE, T, F>(boxes: ArrayView2<BOX>, scores: ArrayView2<SCORE>, f: F) -> Vec<T>
+where
+    BOX: Sync,
+    SCORE: Sync,
+    T: Send,
+    F: Fn(usize, ArrayView1<SCORE>, ArrayView1<BOX>) -> Option<T> + Sync + Send,
+{
+    let (n, nc) = scores.dim();
+    let row = |i: usize| f(i, scores.row(i), boxes.row(i));
+    if n * nc < PAR_MIN_SCORES {
+        (0..n).filter_map(row).collect()
+    } else {
+        (0..n).into_par_iter().filter_map(row).collect()
+    }
+}
 
 /// Post processes boxes and scores tensors into detection boxes, filtering out
 /// any boxes below the score threshold. The boxes tensor is converted to XYXY
@@ -39,23 +60,19 @@ pub fn postprocess_boxes_float<
 ) -> Vec<DetectBox> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    Zip::from(scores.rows())
-        .and(boxes.rows())
-        .into_par_iter()
-        .filter_map(|(score, bbox)| {
-            let (score_, label) = arg_max(score);
-            if score_ < threshold {
-                return None;
-            }
+    filter_rows(boxes, scores, |_, score, bbox| {
+        let (score_, label) = arg_max(score);
+        if score_ < threshold {
+            return None;
+        }
 
-            let bbox = B::ndarray_to_xyxy_float(bbox);
-            Some(DetectBox {
-                label,
-                score: score_.as_(),
-                bbox: bbox.into(),
-            })
+        let bbox = B::ndarray_to_xyxy_float(bbox);
+        Some(DetectBox {
+            label,
+            score: score_.as_(),
+            bbox: bbox.into(),
         })
-        .collect()
+    })
 }
 
 /// Post processes boxes and scores tensors into detection boxes, filtering out
@@ -75,28 +92,22 @@ pub fn postprocess_boxes_index_float<
 ) -> Vec<(DetectBox, usize)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    let indices: Array1<usize> = (0..boxes.dim().0).collect();
-    Zip::from(scores.rows())
-        .and(boxes.rows())
-        .and(&indices)
-        .into_par_iter()
-        .filter_map(|(score, bbox, i)| {
-            let (score_, label) = arg_max(score);
-            if score_ < threshold {
-                return None;
-            }
+    filter_rows(boxes, scores, |i, score, bbox| {
+        let (score_, label) = arg_max(score);
+        if score_ < threshold {
+            return None;
+        }
 
-            let bbox = B::ndarray_to_xyxy_float(bbox);
-            Some((
-                DetectBox {
-                    label,
-                    score: score_.as_(),
-                    bbox: bbox.into(),
-                },
-                *i,
-            ))
-        })
-        .collect()
+        let bbox = B::ndarray_to_xyxy_float(bbox);
+        Some((
+            DetectBox {
+                label,
+                score: score_.as_(),
+                bbox: bbox.into(),
+            },
+            i,
+        ))
+    })
 }
 
 /// Multi-label variant of [`postprocess_boxes_index_float`].
@@ -125,21 +136,19 @@ pub fn postprocess_boxes_multilabel_index_float<
 ) -> Vec<(DetectBox, usize)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    let n = boxes.dim().0;
-    let indices: Array1<usize> = (0..n).collect();
-    Zip::from(scores.rows())
-        .and(boxes.rows())
-        .and(&indices)
-        .into_par_iter()
-        .flat_map(|(score_row, bbox_row, &anchor_idx)| {
-            // Compute bbox once; clone into each per-class candidate.
-            let bbox = B::ndarray_to_xyxy_float(bbox_row);
-            let bbox: crate::BoundingBox = bbox.into();
+    filter_rows(boxes, scores, |anchor_idx, score_row, bbox_row| {
+        if !score_row.iter().any(|&s| s >= threshold) {
+            return None;
+        }
+        // Compute bbox once; clone into each per-class candidate.
+        let bbox = B::ndarray_to_xyxy_float(bbox_row);
+        let bbox: crate::BoundingBox = bbox.into();
+        Some(
             score_row
                 .iter()
                 .enumerate()
                 .filter(|(_, &s)| s >= threshold)
-                .map(move |(c, &s)| {
+                .map(|(c, &s)| {
                     (
                         DetectBox {
                             label: c,
@@ -149,9 +158,12 @@ pub fn postprocess_boxes_multilabel_index_float<
                         anchor_idx,
                     )
                 })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+                .collect::<Vec<_>>(),
+        )
+    })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// [`postprocess_boxes_multilabel_index_float`] without anchor indices.

@@ -73,13 +73,46 @@ where
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
-/// Path of the CMA heap, the only physically contiguous DMA heap used.
+/// Path of the CMA heap, the physically contiguous DMA heap the CPU maps
+/// cached.
 #[cfg(all(target_os = "linux", not(miri)))]
 const CMA_HEAP_PATH: &str = "/dev/dma_heap/linux,cma";
 
-/// Allocate `size` bytes of DMA-BUF: from the CMA heap when there is one,
-/// and from the system heap when there is none or the CMA pool cannot fit
-/// the buffer. With `contiguous`, from the CMA heap only.
+/// Path of the CMA heap the CPU maps uncached (write-combined).
+#[cfg(all(target_os = "linux", not(miri)))]
+const UNCACHED_CMA_HEAP_PATH: &str = "/dev/dma_heap/linux,cma-uncached";
+
+/// Which heaps a DMA-BUF allocation may come from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HeapPolicy {
+    /// Physically contiguous memory only: the CMA heaps, never the system
+    /// heap.
+    pub(crate) contiguous: bool,
+    /// Prefer the uncached CMA heap. For buffers the CPU never reads: a
+    /// device mapping a cached buffer cleans and invalidates the CPU cache
+    /// over all of it on every access, while an uncached one needs no cache
+    /// maintenance, and CPU writes to it go out write-combined.
+    pub(crate) uncached: bool,
+}
+
+impl HeapPolicy {
+    /// The policy for a buffer declared with `access`: uncached when the
+    /// declaration excludes CPU reads (`None`, `Write`). The declaration is
+    /// enforced on every CPU map, the HAL's own included, so such a buffer is
+    /// never read through a slow uncached mapping.
+    pub(crate) fn for_access(access: crate::CpuAccess, contiguous: bool) -> Self {
+        Self {
+            contiguous,
+            uncached: !access.reads(),
+        }
+    }
+}
+
+/// Allocate `size` bytes of DMA-BUF: from the uncached CMA heap first when
+/// `policy.uncached` and the system has one, then from the CMA heap when
+/// there is one, and from the system heap when there is none or the CMA
+/// pool cannot fit the buffer. With `policy.contiguous`, from the CMA heaps
+/// only.
 ///
 /// CMA memory is physically contiguous, which some consumers need (G2D,
 /// GPUs and capture engines without an IOMMU); system-heap memory is not.
@@ -93,13 +126,39 @@ const CMA_HEAP_PATH: &str = "/dev/dma_heap/linux,cma";
 #[cfg(all(target_os = "linux", not(miri)))]
 fn heap_allocate(
     size: usize,
-    contiguous: bool,
+    policy: HeapPolicy,
+) -> Result<(std::os::fd::OwnedFd, crate::Contiguity)> {
+    heap_allocate_from(size, policy, UNCACHED_CMA_HEAP_PATH)
+}
+
+/// [`heap_allocate`] with the uncached heap at `uncached_path`.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn heap_allocate_from(
+    size: usize,
+    policy: HeapPolicy,
+    uncached_path: &str,
 ) -> Result<(std::os::fd::OwnedFd, crate::Contiguity)> {
     use crate::Contiguity;
+    let contiguous = policy.contiguous;
 
+    if policy.uncached {
+        let uncached = dma_heap::HeapKind::Custom(uncached_path.into());
+        match dma_heap::Heap::new(uncached).and_then(|heap| heap.allocate(size)) {
+            Ok(fd) => {
+                log::debug!("allocated {size} bytes from {uncached_path}");
+                return Ok((fd, Contiguity::Contiguous));
+            }
+            Err(e) => log::debug!(
+                "{uncached_path} cannot allocate {size} bytes ({e}); trying the cached heaps"
+            ),
+        }
+    }
     let cma_error = match dma_heap::Heap::new(dma_heap::HeapKind::Cma) {
         Ok(cma) => match cma.allocate(size) {
-            Ok(fd) => return Ok((fd, Contiguity::Contiguous)),
+            Ok(fd) => {
+                log::debug!("allocated {size} bytes from {CMA_HEAP_PATH}");
+                return Ok((fd, Contiguity::Contiguous));
+            }
             Err(e) => Some(e),
         },
         Err(e) if contiguous => {
@@ -127,7 +186,11 @@ fn heap_allocate(
     }
     let system = dma_heap::Heap::new(dma_heap::HeapKind::System);
     match (system, cma_error) {
-        (Ok(system), None) => Ok((system.allocate(size)?, Contiguity::NonContiguous)),
+        (Ok(system), None) => {
+            let fd = system.allocate(size)?;
+            log::debug!("allocated {size} bytes from the system heap");
+            Ok((fd, Contiguity::NonContiguous))
+        }
         (Ok(system), Some(cma_error)) => match system.allocate(size) {
             Ok(fd) => {
                 log::debug!(
@@ -171,7 +234,7 @@ where
             }
         };
 
-        let (dma_fd, contiguity) = heap_allocate(logical_size, false)?;
+        let (dma_fd, contiguity) = heap_allocate(logical_size, HeapPolicy::default())?;
         let stat = fstat(&dma_fd)?;
         debug!("DMA memory stat: {stat:?}");
         let buf_size = if stat.st_size > 0 {
@@ -432,7 +495,7 @@ where
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
-        contiguous: bool,
+        policy: HeapPolicy,
     ) -> Result<Self> {
         use log::debug;
         use nix::sys::stat::fstat;
@@ -475,7 +538,7 @@ where
             }
         };
 
-        let (dma_fd, contiguity) = heap_allocate(byte_size, contiguous)?;
+        let (dma_fd, contiguity) = heap_allocate(byte_size, policy)?;
         let stat = fstat(&dma_fd)?;
         debug!("DMA padded memory stat: {stat:?}");
         let buf_size = if stat.st_size > 0 {
@@ -505,7 +568,7 @@ where
         _shape: &[usize],
         _byte_size: usize,
         _name: Option<&str>,
-        _contiguous: bool,
+        _policy: HeapPolicy,
     ) -> Result<Self> {
         Err(Error::NotImplemented(
             "DMA tensor allocation is unavailable (not Linux, or running \
@@ -997,11 +1060,11 @@ mod tests {
     #[cfg(not(miri))]
     fn new_with_byte_size_refuses_a_byte_size_below_the_shape() {
         assert!(matches!(
-            DmaTensor::<u32>::new_with_byte_size(&[10], 39, None, false),
+            DmaTensor::<u32>::new_with_byte_size(&[10], 39, None, HeapPolicy::default()),
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(
-            DmaTensor::<u8>::new_with_byte_size(&[usize::MAX, 2], 1, None, false),
+            DmaTensor::<u8>::new_with_byte_size(&[usize::MAX, 2], 1, None, HeapPolicy::default()),
             Err(Error::InvalidArgument(_))
         ));
     }
@@ -1059,6 +1122,116 @@ mod tests {
         dma_heap::Heap::new(dma_heap::HeapKind::Cma).is_ok()
     }
 
+    const CONTIGUOUS: HeapPolicy = HeapPolicy {
+        contiguous: true,
+        uncached: false,
+    };
+
+    /// The exporter a dma-buf fd reports in `/proc/self/fdinfo` (the heap's
+    /// name), or `None` on a kernel that does not report one.
+    fn exporter(fd: &OwnedFd) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+        info.lines()
+            .find_map(|l| l.strip_prefix("exp_name:"))
+            .map(|n| n.trim().to_owned())
+    }
+
+    /// Hardware-only and write-only declarations select the uncached heap;
+    /// declarations that read do not.
+    #[test]
+    fn only_declarations_without_reads_are_uncached() {
+        for (access, uncached) in [
+            (CpuAccess::None, true),
+            (CpuAccess::Write, true),
+            (CpuAccess::Read, false),
+            (CpuAccess::ReadWrite, false),
+        ] {
+            assert_eq!(
+                HeapPolicy::for_access(access, false),
+                HeapPolicy {
+                    contiguous: false,
+                    uncached
+                },
+                "{access:?}"
+            );
+        }
+        assert!(HeapPolicy::for_access(CpuAccess::None, true).contiguous);
+    }
+
+    /// An uncached request is served whenever a cached one is: from the
+    /// uncached CMA heap when it can allocate, from the cached heaps
+    /// otherwise. A cached request never comes from the uncached heap.
+    #[test]
+    #[cfg(not(miri))]
+    fn uncached_requests_are_served_and_cached_ones_never_uncached() {
+        const NAME: &str = "uncached_requests_are_served_and_cached_ones_never_uncached";
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
+        let uncached = HeapPolicy {
+            contiguous: false,
+            uncached: true,
+        };
+        let (fd, contiguity) = heap_allocate(4096, uncached).expect("uncached request");
+        match exporter(&fd) {
+            Some(name) if name.ends_with("cma-uncached") => {
+                assert_eq!(contiguity, crate::Contiguity::Contiguous)
+            }
+            Some(name) => crate::test_support::report_skip(&format!(
+                "{NAME} - the uncached heap did not serve the request ({name}), \
+                 so only the fallback ran"
+            )),
+            None => crate::test_support::report_skip(&format!(
+                "{NAME} - the kernel names no dma-buf exporter"
+            )),
+        }
+        let (fd, _) = heap_allocate(4096, HeapPolicy::default()).expect("cached request");
+        if let Some(name) = exporter(&fd) {
+            assert!(!name.ends_with("-uncached"), "exporter {name}");
+        }
+    }
+
+    /// Without a usable uncached heap an uncached request falls back to the
+    /// cached heaps, keeping the contiguous rule.
+    #[test]
+    #[cfg(not(miri))]
+    fn uncached_requests_fall_back_to_the_cached_heaps() {
+        const NAME: &str = "uncached_requests_fall_back_to_the_cached_heaps";
+        if !crate::test_support::dma_or_skip(NAME) {
+            return;
+        }
+        let missing = "/dev/dma_heap/no-such-uncached-heap";
+        let uncached = HeapPolicy {
+            contiguous: false,
+            uncached: true,
+        };
+        let (fd, _) = heap_allocate_from(4096, uncached, missing).expect("fallback");
+        if let Some(name) = exporter(&fd) {
+            assert!(!name.ends_with("-uncached"), "exporter {name}");
+        }
+        // A contiguous request falls back to the cached CMA heap only: it is
+        // served from there, or refused naming that heap (no CMA heap, or its
+        // pool exhausted), never served from the system heap.
+        let contiguous = HeapPolicy {
+            contiguous: true,
+            uncached: true,
+        };
+        match heap_allocate_from(4096, contiguous, missing) {
+            Ok((fd, contiguity)) => {
+                assert!(cma_heap_present(), "contiguous memory without a CMA heap");
+                assert_eq!(contiguity, crate::Contiguity::Contiguous);
+                if let Some(name) = exporter(&fd) {
+                    assert_eq!(name, "linux,cma");
+                }
+            }
+            Err(e) => assert!(
+                e.to_string().contains(CMA_HEAP_PATH),
+                "error does not name the CMA heap: {e}"
+            ),
+        }
+    }
+
     /// A contiguous request never falls back to the system heap: past the
     /// CMA pool it fails, and the error names the CMA heap.
     #[test]
@@ -1076,7 +1249,7 @@ mod tests {
             return;
         };
         let size = cma_total + (4 << 20);
-        let err = DmaTensor::<u8>::new_with_byte_size(&[size], size, None, true)
+        let err = DmaTensor::<u8>::new_with_byte_size(&[size], size, None, CONTIGUOUS)
             .expect_err("a contiguous buffer past the CMA pool must not be allocated");
         assert!(
             err.to_string().contains(CMA_HEAP_PATH),
@@ -1094,7 +1267,7 @@ mod tests {
         if !crate::test_support::dma_or_skip(NAME) {
             return;
         }
-        match DmaTensor::<u8>::new_with_byte_size(&[4096], 4096, None, true) {
+        match DmaTensor::<u8>::new_with_byte_size(&[4096], 4096, None, CONTIGUOUS) {
             Ok(t) => {
                 assert!(cma_heap_present(), "contiguous memory without a CMA heap");
                 assert_eq!(t.contiguity, crate::Contiguity::Contiguous);
@@ -1178,7 +1351,8 @@ mod tests {
         assert!(t.capacity_bytes() >= 1000);
 
         let padded =
-            DmaTensor::<u32>::new_with_byte_size(&[10, 25], 1000, None, false).expect("alloc");
+            DmaTensor::<u32>::new_with_byte_size(&[10, 25], 1000, None, HeapPolicy::default())
+                .expect("alloc");
         assert_eq!(padded.shape(), &[10, 25]);
         assert_eq!(padded.capacity_bytes(), fstat_size(&padded.fd));
         assert!(padded.capacity_bytes() > 1000, "page rounding");

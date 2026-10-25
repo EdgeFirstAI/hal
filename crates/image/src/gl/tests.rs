@@ -185,6 +185,100 @@ mod gl_tests {
         compare_images(&image, &expected, 0.95, function!());
     }
 
+    /// `a` and `b` agree to within the GPU's blend rounding.
+    fn px_close(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= 2)
+    }
+
+    #[test]
+    fn test_box_line_width_matches_cpu() {
+        use crate::test_support::{box_drawn_columns, box_drawn_rows, box_expected_span, BOX_DIM};
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut cpu = crate::CPUProcessor::new();
+        let mid = BOX_DIM / 2;
+        for width in [
+            None,
+            Some(1u32),
+            Some(6),
+            Some(8),
+            Some(9),
+            Some(12),
+            Some(40),
+        ] {
+            let expected =
+                box_expected_span(width.unwrap_or(crate::DEFAULT_BOX_LINE_WIDTH) as usize);
+            let g = crate::test_support::draw_box_fixture(&mut gl, [200, 100, 50, 255], width, 1.0);
+            let c =
+                crate::test_support::draw_box_fixture(&mut cpu, [200, 100, 50, 255], width, 1.0);
+            assert_eq!(
+                box_drawn_columns(&g, mid),
+                expected,
+                "gl width {width:?} row"
+            );
+            assert_eq!(
+                box_drawn_rows(&g, mid),
+                expected,
+                "gl width {width:?} column"
+            );
+            assert_eq!(
+                box_drawn_columns(&c, mid),
+                expected,
+                "cpu width {width:?} row"
+            );
+            assert_eq!(
+                box_drawn_rows(&c, mid),
+                expected,
+                "cpu width {width:?} column"
+            );
+            assert_eq!(g, c, "gl and cpu width {width:?}");
+        }
+        let err = gl.set_box_line_width(0).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidOptions(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_box_colour_alpha_matches_cpu() {
+        use crate::test_support::{box_blend, box_expected_span, box_px, BOX_BG, BOX_DIM};
+
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mid = BOX_DIM / 2;
+        let corner = BOX_DIM / 4 - 1;
+        for (color, opacity, alpha) in [
+            ([200u8, 100, 50, 255u8], 1.0f32, 255u16),
+            ([200, 100, 50, 128], 1.0, 128),
+            ([200, 100, 50, 255], 0.5, 128),
+        ] {
+            let want = box_blend(color, alpha);
+            let flat = crate::test_support::draw_box_fixture(&mut gl, color, Some(3), opacity);
+            for x in box_expected_span(3) {
+                let got = box_px(&flat, x, mid);
+                assert!(
+                    px_close(got, want),
+                    "{color:?}@{opacity} x={x}: {got:?} != {want:?}"
+                );
+            }
+            let got = box_px(&flat, corner, corner);
+            assert!(
+                px_close(got, want),
+                "{color:?}@{opacity} corner: {got:?} != {want:?}"
+            );
+            assert_eq!(
+                box_px(&flat, mid, mid),
+                BOX_BG,
+                "box interior must not be drawn"
+            );
+        }
+    }
+
     #[test]
     fn test_boxes() {
         use edgefirst_tensor::DetectBox;

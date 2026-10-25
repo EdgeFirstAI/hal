@@ -510,6 +510,13 @@ impl ImageProcessorTrait for G2DProcessor {
                 .to_string(),
         ))
     }
+
+    fn set_box_line_width(&mut self, _: u32) -> Result<()> {
+        Err(Error::NotImplemented(
+            "G2D does not support setting the box line width for rendering detection overlays"
+                .to_string(),
+        ))
+    }
 }
 
 /// Produce the zero-detection frame on `dst` using G2D hardware ops.

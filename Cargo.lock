@@ -556,6 +556,7 @@ dependencies = [
  "env_logger",
  "half",
  "image",
+ "libc",
  "log",
  "mutants",
  "ndarray 0.17.2",

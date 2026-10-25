@@ -18,6 +18,8 @@ crates/decoder/
 │   │       ├── neon_baseline.rs        # Scalar reference + NEON parity
 │   │       ├── dequant.rs              # Quant → float dequant kernels
 │   │       ├── sigmoid.rs / softmax.rs # Activation kernels
+│   │       ├── dfl_lut.rs              # Exp-table DFL kernel vs f64 reference;
+│   │       │                           #   NEON vs portable bit for bit
 │   │       └── level_box.rs / level_score.rs / level_mc.rs
 │   ├── tiling.rs                       # SAHI lift/merge unit + doc-tests
 │   ├── schema.rs                       # SchemaV2 round-trip + fixture tests
@@ -112,6 +114,8 @@ cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
 | Benchmark | Source | What it measures |
 |-----------|--------|------------------|
 | `decoder_benchmark` | [`benches/decoder_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/benches/decoder_benchmark.rs) | End-to-end decode latency: detection-only, segmentation, proto-data, per-scale split-tensor; both quantized and float paths |
+
+`--section <name>` runs one section (for example `--section per-scale-realistic`). The `Per-Scale-Realistic` section decodes synthetic int8 outputs shaped like captured yolov8n frames for a 960x544 four-class model and a 640x640 COCO model, densely, through the score prefilter, and end to end, and prints process CPU time per iteration (rayon workers included) beside the wall time. `DFL-Kernels` (`decoder/per_scale/dfl_kernel/*`) times each 8-bit DFL box kernel on one 120x68 level through the hidden `per_scale::bench` hooks and prints nanoseconds per anchor.
 
 The benchmark uses the project's standard `--bench` flag for host runs.
 The aarch64 cross-compile flow plus `scp` + on-target run procedure is

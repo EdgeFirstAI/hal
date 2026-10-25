@@ -1533,6 +1533,26 @@ impl Decoder {
         result
     }
 
+    /// Run only the per-scale pipeline (no candidate filter, no NMS) and
+    /// return the number of anchors it decoded.
+    ///
+    /// Benchmark entry point: `Some(threshold)` runs the score prefilter
+    /// as [`Decoder::decode`] does, `None` decodes every anchor.
+    #[doc(hidden)]
+    pub fn _bench_run_per_scale(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        score_threshold: Option<f32>,
+    ) -> Result<usize, crate::error::DecoderError> {
+        let mutex = self.per_scale.as_ref().ok_or_else(|| {
+            crate::error::DecoderError::Internal("decoder not configured for per-scale".into())
+        })?;
+        let mut ps = mutex.lock().map_err(|e| {
+            crate::error::DecoderError::Internal(format!("per_scale mutex poisoned: {e}"))
+        })?;
+        Ok(ps.run(outputs, score_threshold)?.total_anchors)
+    }
+
     /// Run the per-scale pipeline and return pre-NMS buffers as owned f32.
     ///
     /// Test-only entry point used by the parity-fixture tests to compare
