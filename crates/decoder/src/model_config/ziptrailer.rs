@@ -170,12 +170,14 @@ pub(crate) fn read_trailer<R: Read + Seek>(
         let Ok(mut file) = archive.by_index(i) else {
             continue;
         };
+        let Ok(name) = file.name().map(|n| n.into_owned()) else {
+            continue;
+        };
         if file.is_dir() || file.size() > MAX_TEXT_ENTRY || file.compressed_size() > MAX_TEXT_ENTRY
         {
-            log::debug!("ZIP entry {} skipped", file.name());
+            log::debug!("ZIP entry {name} skipped");
             continue;
         }
-        let name = file.name().to_owned();
         // The declared size is not trusted: inflation stops past the limit.
         let mut bytes = Vec::new();
         let read = (&mut file).take(MAX_TEXT_ENTRY + 1).read_to_end(&mut bytes);

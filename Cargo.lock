@@ -134,9 +134,9 @@ dependencies = [
 
 [[package]]
 name = "argminmax"
-version = "0.6.3"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70f13d10a41ac8d2ec79ee34178d61e6f47a29c2edfe7ef1721c7383b0359e65"
+checksum = "088a9c28ca36500c581f9f54b63460492d2b4f71e1e61d176e8fb79565109b01"
 dependencies = [
  "num-traits",
 ]
@@ -515,18 +515,18 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edgefirst-bench"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "edgefirst-build-support"
-version = "0.37.0"
+version = "0.38.0"
 
 [[package]]
 name = "edgefirst-codec"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "argminmax",
  "edgefirst-bench",
@@ -576,11 +576,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.37.0"
+version = "0.38.0"
 
 [[package]]
 name = "edgefirst-egl"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "libc",
  "libloading",
@@ -611,14 +611,14 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gl"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "edgefirst-image"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "crc32fast",
  "ctor",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-codec"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-common"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-codec",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-decoder"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-image"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-tensor"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-tracker"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "ctor",
  "dma-heap",
@@ -778,18 +778,18 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.37.0"
+version = "0.38.0"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-tensor-abi",
 ]
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor",
@@ -1038,9 +1038,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1086,7 +1088,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gpu-probe"
-version = "0.37.0"
+version = "0.38.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-egl",
@@ -2593,9 +2595,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.4"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typenum"
@@ -2905,15 +2907,18 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "2886b00003a72c4ccee3f42cfc34908d33b2508a74d827dc2a4244706475c704"
 dependencies = [
  "crc32fast",
  "flate2",
+ "getrandom 0.4.3",
  "indexmap",
  "memchr",
+ "nix",
  "typed-path",
+ "windows-sys",
  "zopfli",
 ]
 
