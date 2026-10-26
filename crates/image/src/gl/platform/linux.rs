@@ -75,6 +75,7 @@ impl GlPlatform for LinuxEgl {
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = true;
     const NV_CHROMA_IMPORT: bool = true;
+    const PACKED_R8_IMPORT: bool = true;
 
     fn init_display(kind: Option<EglDisplayKind>) -> crate::Result<GlContext> {
         GlContext::new(kind)
@@ -255,6 +256,10 @@ impl GlPlatform for LinuxEgl {
         Ok(image)
     }
 
+    fn lists_packed_rgb_import(display: &GlContext) -> bool {
+        dma_buf_import_formats(display).contains(&(drm_fourcc::DrmFourcc::Bgr888 as u32))
+    }
+
     fn import_buffer_nv_r8(
         display: &GlContext,
         img: &Tensor<u8>,
@@ -272,6 +277,38 @@ impl GlPlatform for LinuxEgl {
         let attrs = DmaImportAttrs::from_tensor_nv_chroma_gr88(img, fmt)?;
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
     }
+}
+
+/// The DRM fourccs `eglQueryDmaBufFormatsEXT` lists for this display; empty
+/// where the entry point (`EGL_EXT_image_dma_buf_import_modifiers`) is absent
+/// or the query fails.
+fn dma_buf_import_formats(display: &GlContext) -> Vec<u32> {
+    let Some(f) = display.egl.get_proc_address("eglQueryDmaBufFormatsEXT") else {
+        return Vec::new();
+    };
+    type QueryFormats = unsafe extern "system" fn(
+        dpy: *mut std::ffi::c_void,
+        max_formats: egl::Int,
+        formats: *mut egl::Int,
+        num_formats: *mut egl::Int,
+    ) -> egl::Boolean;
+    // SAFETY: `eglQueryDmaBufFormatsEXT` has exactly this signature
+    // (EGL_EXT_image_dma_buf_import_modifiers), and the pointer came from
+    // this display's `eglGetProcAddress`.
+    let query: QueryFormats = unsafe { std::mem::transmute(f) };
+    let dpy = display.display.as_ptr();
+    let mut n: egl::Int = 0;
+    // SAFETY: a size query (max 0, null list) on a live display.
+    if unsafe { query(dpy, 0, std::ptr::null_mut(), &mut n) } == 0 || n <= 0 {
+        return Vec::new();
+    }
+    let mut formats = vec![0 as egl::Int; n as usize];
+    // SAFETY: `formats` holds `n` elements, the most the call writes.
+    if unsafe { query(dpy, n, formats.as_mut_ptr(), &mut n) } == 0 {
+        return Vec::new();
+    }
+    formats.truncate(n.max(0) as usize);
+    formats.into_iter().map(|f| f as u32).collect()
 }
 
 /// Create an owned EGLImage from raw EGL import attributes.

@@ -84,8 +84,8 @@ pub(super) enum ConvertPlan {
     /// upload/import path for everything else), pass 2 deinterleaves RGBA
     /// into the planar destination (`bind_dst` classifies pass 2's target
     /// the same way `SinglePass` does, so a texture lowering reads back
-    /// same as `SinglePass` would). Selected on EVERY lowering for NV*
-    /// sources, and additionally on texture lowerings for every source:
+    /// same as `SinglePass` would). Selected on EVERY lowering for NV* and
+    /// packed Rgb sources, and additionally on texture lowerings for every source:
     /// the single-pass planar shader (`draw_camera_texture_to_rgb_planar`)
     /// exists only where `Platform::EXTERNAL_OES` is true (false on
     /// ANGLE/Android — `texture_program_planar` is `None` there,
@@ -96,6 +96,14 @@ pub(super) enum ConvertPlan {
     /// takes this plan there too. Also the Vivante GC7000UL single-pass
     /// GPU-hang workaround for NV* (EDGEAI-1180).
     TwoPassNvPlanar,
+    /// Grey destination from an RGB-family source: pass 1 renders RGBA into
+    /// an intermediate texture through the ordinary packed convert, pass 2
+    /// writes its BT.601 luma into the destination. A Grey render target
+    /// keeps only the red channel of what a single pass draws, and the luma
+    /// cannot come from the source programs themselves: they reach it
+    /// through several routes (driver samplers, uploads, R8 views). YUV
+    /// sources stay single-pass, drawing their own luma plane.
+    TwoPassGrey,
 }
 
 /// Decide the render plan. Pure (src format, src residence, dst format, dst
@@ -115,6 +123,14 @@ pub(super) fn plan_convert(
     // / `setup_renderbuffer_from_pbo`, so they stay single-pass.
     if lowering == DstLowering::ZeroCopy && dst_fmt == PixelFormat::Rgb {
         return ConvertPlan::TwoPassPackedRgb;
+    }
+    if dst_fmt == PixelFormat::Grey
+        && matches!(
+            src_fmt,
+            PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Bgra
+        )
+    {
+        return ConvertPlan::TwoPassGrey;
     }
     // A texture-lowered (Mem/Pbo) planar destination has NO single-pass
     // route for any source format: `texture_program_planar` (the
@@ -139,13 +155,14 @@ pub(super) fn plan_convert(
     }
     // Zero-copy NV*→planar still needs the two-pass ShaderR8 route: the
     // single-pass planar shader has no multi-plane EGLImage/IOSurface
-    // binding for semi-planar NV even when EXTERNAL_OES is available.
-    // Zero-copy non-NV→planar stays single-pass (proven EXTERNAL_OES +
-    // DMA-source route).
+    // binding for semi-planar NV even when EXTERNAL_OES is available. Packed
+    // Rgb likewise: most GPUs read it only through the R8 view, which the
+    // single-pass planar shader cannot sample. Zero-copy non-NV→planar
+    // otherwise stays single-pass (proven EXTERNAL_OES + DMA-source route).
     if dst_fmt.layout() == PixelLayout::Planar
         && matches!(
             src_fmt,
-            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 | PixelFormat::Rgb
         )
     {
         return ConvertPlan::TwoPassNvPlanar;
@@ -613,11 +630,12 @@ mod tests {
     fn plan_convert_full_table() {
         use DstLowering::*;
         use PixelFormat::*;
-        let nv = [Nv12, Nv16, Nv24];
+        // Sources read through an R8 view on some GPU: NV* and packed Rgb.
+        let nv = [Nv12, Nv16, Nv24, Rgb];
         let non_nv = [Rgba, Bgra, Grey, Yuyv];
-        // Zero-copy: packed RGB always two-pass; NV→planar two-pass; the rest
-        // single-pass (incl. non-NV → planar, which the planar shader handles
-        // in one pass).
+        // Zero-copy: packed RGB destination always two-pass; NV/Rgb→planar
+        // two-pass; the rest single-pass (incl. non-NV → planar, which the
+        // planar shader handles in one pass).
         for src in nv.iter().chain(&non_nv) {
             assert_eq!(
                 plan_convert(*src, false, Rgb, ZeroCopy),
@@ -686,11 +704,31 @@ mod tests {
                         "{src:?}->{dst:?} via {lowering:?}"
                     );
                 }
-                for dst in [Rgba, Bgra, Rgb, Grey] {
+                for dst in [Rgba, Bgra, Rgb] {
                     assert_eq!(
                         plan_convert(*src, false, dst, lowering),
                         ConvertPlan::SinglePass,
                         "{src:?}->{dst:?} via {lowering:?}"
+                    );
+                }
+            }
+        }
+        // Grey destination: RGB-family sources take the luma pass on every
+        // lowering and residence; YUV and Grey sources draw it in one pass.
+        for lowering in [ZeroCopy, TextureMem, TexturePbo] {
+            for host in [false, true] {
+                for src in [Rgb, Rgba, Bgra] {
+                    assert_eq!(
+                        plan_convert(src, host, Grey, lowering),
+                        ConvertPlan::TwoPassGrey,
+                        "{src:?}->Grey via {lowering:?}"
+                    );
+                }
+                for src in [Nv12, Nv16, Nv24, Yuyv, Grey] {
+                    assert_eq!(
+                        plan_convert(src, host, Grey, lowering),
+                        ConvertPlan::SinglePass,
+                        "{src:?}->Grey via {lowering:?}"
                     );
                 }
             }

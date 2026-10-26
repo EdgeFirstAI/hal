@@ -310,7 +310,9 @@ pub(super) trait GlPlatform {
 
     /// Import an NV12/NV16/NV24 tensor's combined semi-planar plane as ONE
     /// R8 buffer (luma + interleaved chroma addressed by the shader — the
-    /// "Path B" NV sampling strategy). On Linux a single-plane R8 EGLImage
+    /// "Path B" NV sampling strategy). Where [`Self::PACKED_R8_IMPORT`] is
+    /// set, also a packed `Rgb` or `Yuyv` tensor, whose bytes the packed R8
+    /// programs address the same way. On Linux a single-plane R8 EGLImage
     /// at the buffer's physical pitch; on macOS the same shape as an R8
     /// (`L008`) IOSurface pbuffer binding.
     fn import_buffer_nv_r8(
@@ -318,6 +320,21 @@ pub(super) trait GlPlatform {
         img: &Tensor<u8>,
         fmt: PixelFormat,
     ) -> crate::Result<Self::Import>;
+
+    /// Whether [`Self::import_buffer_nv_r8`] also imports a packed `Rgb` or
+    /// `Yuyv` buffer (as `height` rows of `row_stride` bytes). Where it does
+    /// not, such a source has no zero-copy route through the packed R8
+    /// programs.
+    const PACKED_R8_IMPORT: bool = false;
+
+    /// Whether the display lists the 24-bit `DRM_FORMAT_BGR888` (`BG24`,
+    /// memory order R, G, B: the HAL's packed `Rgb`) among its importable
+    /// buffer formats, so a packed `Rgb` source can be imported as one RGB
+    /// texel per pixel. Listing is necessary, not sufficient: the engine
+    /// still excludes GPUs known to misread such an import.
+    fn lists_packed_rgb_import(_display: &Self::Display) -> bool {
+        false
+    }
 
     /// Whether [`Self::import_buffer_nv_chroma`] is implemented. Where it is
     /// not, bilinear NV resizes of imported sources take the shader-filtered

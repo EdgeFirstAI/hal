@@ -955,6 +955,38 @@ pub(super) fn generate_nv_to_rgba_y2y_int8_shader() -> &'static str {
     super::shaders_common::NV_RGBA_Y2Y_INT8_FRAGMENT
 }
 
+/// Packed RGB → RGBA from an R8 view of the buffer, for draws that do not
+/// rescale. See `shaders_common::RGB_R8_RGBA_FRAGMENT`.
+pub(super) fn generate_rgb_r8_to_rgba_shader_2d() -> &'static str {
+    super::shaders_common::RGB_R8_RGBA_FRAGMENT
+}
+
+/// Int8 variant of [`generate_rgb_r8_to_rgba_shader_2d`].
+pub(super) fn generate_rgb_r8_to_rgba_int8_shader_2d() -> &'static str {
+    super::shaders_common::RGB_R8_RGBA_INT8_FRAGMENT
+}
+
+/// Shader-filtered bilinear variant of [`generate_rgb_r8_to_rgba_shader_2d`].
+pub(super) fn generate_rgb_r8_to_rgba_bilinear_shader_2d() -> &'static str {
+    super::shaders_common::RGB_R8_RGBA_BILINEAR_FRAGMENT
+}
+
+/// Int8 variant of [`generate_rgb_r8_to_rgba_bilinear_shader_2d`].
+pub(super) fn generate_rgb_r8_to_rgba_bilinear_int8_shader_2d() -> &'static str {
+    super::shaders_common::RGB_R8_RGBA_BILINEAR_INT8_FRAGMENT
+}
+
+/// Hardware-assisted bilinear variant of
+/// [`generate_rgb_r8_to_rgba_shader_2d`]: rows blended by the texture unit.
+pub(super) fn generate_rgb_r8_to_rgba_hw_bilinear_shader_2d() -> &'static str {
+    super::shaders_common::RGB_R8_RGBA_HW_BILINEAR_FRAGMENT
+}
+
+/// Int8 variant of [`generate_rgb_r8_to_rgba_hw_bilinear_shader_2d`].
+pub(super) fn generate_rgb_r8_to_rgba_hw_bilinear_int8_shader_2d() -> &'static str {
+    super::shaders_common::RGB_R8_RGBA_HW_BILINEAR_INT8_FRAGMENT
+}
+
 /// HWC → layer-first (CHW) repack compute shader for int8 protos.
 ///
 /// Reads proto data from an SSBO in row-major HWC layout `(H, W, num_protos)`.
@@ -1173,6 +1205,30 @@ mod tc_precision {
                 super::generate_nv_to_rgba_y2y_int8_shader(),
             ),
             (
+                "generate_rgb_r8_to_rgba_shader_2d",
+                super::generate_rgb_r8_to_rgba_shader_2d(),
+            ),
+            (
+                "generate_rgb_r8_to_rgba_int8_shader_2d",
+                super::generate_rgb_r8_to_rgba_int8_shader_2d(),
+            ),
+            (
+                "generate_rgb_r8_to_rgba_bilinear_shader_2d",
+                super::generate_rgb_r8_to_rgba_bilinear_shader_2d(),
+            ),
+            (
+                "generate_rgb_r8_to_rgba_bilinear_int8_shader_2d",
+                super::generate_rgb_r8_to_rgba_bilinear_int8_shader_2d(),
+            ),
+            (
+                "generate_rgb_r8_to_rgba_hw_bilinear_shader_2d",
+                super::generate_rgb_r8_to_rgba_hw_bilinear_shader_2d(),
+            ),
+            (
+                "generate_rgb_r8_to_rgba_hw_bilinear_int8_shader_2d",
+                super::generate_rgb_r8_to_rgba_hw_bilinear_int8_shader_2d(),
+            ),
+            (
                 "generate_proto_repack_compute_shader",
                 super::generate_proto_repack_compute_shader(),
             ),
@@ -1216,6 +1272,62 @@ mod tc_precision {
             (
                 "NV_RGBA_Y2Y_INT8_FRAGMENT",
                 super::super::shaders_common::NV_RGBA_Y2Y_INT8_FRAGMENT,
+            ),
+            (
+                "RGB_R8_RGBA_FRAGMENT",
+                super::super::shaders_common::RGB_R8_RGBA_FRAGMENT,
+            ),
+            (
+                "RGB_R8_RGBA_INT8_FRAGMENT",
+                super::super::shaders_common::RGB_R8_RGBA_INT8_FRAGMENT,
+            ),
+            (
+                "RGB_R8_RGBA_BILINEAR_FRAGMENT",
+                super::super::shaders_common::RGB_R8_RGBA_BILINEAR_FRAGMENT,
+            ),
+            (
+                "RGB_R8_RGBA_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::RGB_R8_RGBA_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "RGB_R8_RGBA_HW_BILINEAR_FRAGMENT",
+                super::super::shaders_common::RGB_R8_RGBA_HW_BILINEAR_FRAGMENT,
+            ),
+            (
+                "RGB_R8_RGBA_HW_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::RGB_R8_RGBA_HW_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_INT8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_INT8_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_BILINEAR_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_BILINEAR_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_HW_BILINEAR_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_HW_BILINEAR_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_HW_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_HW_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "LUMA_2D_FRAGMENT",
+                super::super::shaders_common::LUMA_2D_FRAGMENT,
+            ),
+            (
+                "LUMA_2D_INT8_FRAGMENT",
+                super::super::shaders_common::LUMA_2D_INT8_FRAGMENT,
             ),
         ]
     }

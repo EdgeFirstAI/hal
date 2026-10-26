@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Packed RGB DMA-BUF sources convert on the GPU (`edgefirst-image`, Linux).** A packed `Rgb` source in DMA-BUF memory, such as a fused RGB JPEG decode, used to convert on the CPU. The GL backend now imports it natively where the GPU reads the 24-bit `BG24` format (Mali-G310), and elsewhere as an R8 view of the buffer that a shader assembles three bytes per pixel (Vivante GC7000UL, V3D, Adreno, where the `BG24` import reads past the end of the buffer). A buffer neither import accepts (a 4K row on Vivante, an unaligned plane offset on Mali or Adreno) still converts on the CPU, which is faster than uploading it. Bilinear resizes blend rows in the texture unit and columns in the shader by default (`EDGEFIRST_GL_NO_NV_HW_FILTER=1` selects the exact shader blend). Crop, letterbox, rotation, flip and packed, planar, int8 and F16 destinations are covered. Other platforms still convert such a source on the CPU. Decoding a JPEG to its native NV12 and converting that on the GPU remains faster overall on every board measured (for example 3.7 ms against 5.2 ms per 720p frame on a Raspberry Pi 5, and 5.9 ms against 14.3 ms on an i.MX 95, whose hardware decoder has no RGB output), so clients should keep favouring the NV12 workflow and reserve the fused RGB decode for when they need RGB pixels from the decode itself.
+
+### Fixed
+
+- **GL `convert()` into a `Grey` destination writes luma (`edgefirst-image`).** A colour source converted into `Grey` on the OpenGL backend produced its red channel; it now produces the same luma as the CPU backend (see `crates/image/ARCHITECTURE.md`, Grey destinations).
+
 ## [0.38.0] - 2026-10-25
 
 ### Added

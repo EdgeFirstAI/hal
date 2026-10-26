@@ -531,6 +531,73 @@ impl GpuContext {
         )
     }
 
+    /// DRM fourccs the display accepts for DMA-BUF import
+    /// (`eglQueryDmaBufFormatsEXT`), or `None` when the entry point is absent.
+    pub fn query_dmabuf_formats(&self) -> Option<Vec<u32>> {
+        let f = self.egl.get_proc_address("eglQueryDmaBufFormatsEXT")?;
+        let query: unsafe extern "system" fn(
+            dpy: *mut c_void,
+            max_formats: egl::Int,
+            formats: *mut egl::Int,
+            num_formats: *mut egl::Int,
+        ) -> egl::Boolean = unsafe { std::mem::transmute(f) };
+        let mut n: egl::Int = 0;
+        if unsafe { query(self.display.as_ptr(), 0, null_mut(), &mut n) } == 0 {
+            return None;
+        }
+        let mut formats = vec![0 as egl::Int; n.max(0) as usize];
+        if unsafe { query(self.display.as_ptr(), n, formats.as_mut_ptr(), &mut n) } == 0 {
+            return None;
+        }
+        formats.truncate(n.max(0) as usize);
+        Some(formats.into_iter().map(|f| f as u32).collect())
+    }
+
+    /// `(modifier, external_only)` pairs the display accepts for `fourcc`
+    /// (`eglQueryDmaBufModifiersEXT`), or `None` when the entry point is
+    /// absent. An empty list means the driver lists no explicit modifiers,
+    /// which leaves the implicit (linear) layout as the only import.
+    pub fn query_dmabuf_modifiers(&self, fourcc: u32) -> Option<Vec<(u64, bool)>> {
+        let f = self.egl.get_proc_address("eglQueryDmaBufModifiersEXT")?;
+        let query: unsafe extern "system" fn(
+            dpy: *mut c_void,
+            format: egl::Int,
+            max_modifiers: egl::Int,
+            modifiers: *mut u64,
+            external_only: *mut egl::Boolean,
+            num_modifiers: *mut egl::Int,
+        ) -> egl::Boolean = unsafe { std::mem::transmute(f) };
+        let dpy = self.display.as_ptr();
+        let mut n: egl::Int = 0;
+        let ok = unsafe { query(dpy, fourcc as egl::Int, 0, null_mut(), null_mut(), &mut n) };
+        if ok == 0 {
+            return None;
+        }
+        let mut mods = vec![0u64; n.max(0) as usize];
+        let mut ext = vec![0 as egl::Boolean; n.max(0) as usize];
+        let ok = unsafe {
+            query(
+                dpy,
+                fourcc as egl::Int,
+                n,
+                mods.as_mut_ptr(),
+                ext.as_mut_ptr(),
+                &mut n,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let n = n.max(0) as usize;
+        Some(
+            mods.into_iter()
+                .zip(ext)
+                .take(n)
+                .map(|(m, e)| (m, e != 0))
+                .collect(),
+        )
+    }
+
     /// Destroy a previously-created EGLImage.
     pub fn destroy_egl_image(&self, image: egl::Image) -> Result<(), String> {
         egl_destroy_image_with_fallback(&self.egl, self.display, image)
