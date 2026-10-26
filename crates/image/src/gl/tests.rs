@@ -13754,4 +13754,226 @@ mod gl_tests {
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
+
+    /// Tight bytes of a `w`x`h` `fmt` image whose channels differ, so a Grey
+    /// destination that keeps one channel instead of the luma shows: packed
+    /// RGB(A) from [`rgb_test_pixel`]; YUV with luma that crosses both
+    /// limited-range bounds and chroma that varies on both axes.
+    fn grey_test_bytes(w: usize, h: usize, fmt: PixelFormat) -> Vec<u8> {
+        // A smooth ramp over 0..=255, so a resize compares filters rather
+        // than the edges of a wrapping pattern.
+        let luma = |x: usize, y: usize| (x * 191 / w + y * 64 / h) as u8;
+        let cb = |x: usize, y: usize| ((x * 7 + y * 2) % 256) as u8;
+        let cr = |x: usize, y: usize| ((x * 3 + y * 11 + 64) % 256) as u8;
+        let mut out = Vec::new();
+        match fmt {
+            PixelFormat::Rgb | PixelFormat::Rgba => {
+                for y in 0..h {
+                    for x in 0..w {
+                        out.extend_from_slice(&rgb_test_pixel(x, y, w, h));
+                        if fmt == PixelFormat::Rgba {
+                            out.push(255);
+                        }
+                    }
+                }
+            }
+            PixelFormat::Grey => {
+                for y in 0..h {
+                    out.extend((0..w).map(|x| luma(x, y)));
+                }
+            }
+            PixelFormat::Yuyv => {
+                for y in 0..h {
+                    for x in (0..w).step_by(2) {
+                        out.extend_from_slice(&[luma(x, y), cb(x, y), luma(x + 1, y), cr(x, y)]);
+                    }
+                }
+            }
+            _ => {
+                let layout = fmt.chroma_layout().expect("semi-planar format");
+                for y in 0..h {
+                    out.extend((0..w).map(|x| luma(x, y)));
+                }
+                let cw = w.div_ceil(1 << layout.shift_x);
+                let ch = h.div_ceil(1 << layout.shift_y);
+                for y in 0..ch {
+                    for x in 0..cw {
+                        out.extend_from_slice(&[cb(x, y), cr(x, y)]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every source format the GL backend takes, into a Grey destination,
+    /// renders what the CPU renders: the BT.601 luma of an RGB-family source
+    /// (`ConvertPlan::TwoPassGrey`), the range-expanded Y of a YUV source
+    /// (luma-only single pass), at 1:1 and letterboxed with a coloured pad
+    /// (whose luma fills the band), u8 and int8, from host and DMA-BUF
+    /// memory. A GPU route that keeps the red channel misses by tens.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_grey_dst_matches_cpu() {
+        use crate::{ConvertOptions, ImageProcessorTrait};
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
+        let zero_copy = gl.gl_context.transfer_backend.is_zero_copy() && is_dma_available();
+        let mut mems = vec![TensorMemory::Mem];
+        if zero_copy {
+            mems.push(TensorMemory::DmaBuf);
+        }
+        let full = edgefirst_tensor::Colorimetry::default()
+            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+            .with_range(edgefirst_tensor::ColorRange::Full);
+        let mut failures = Vec::new();
+        let (w, h) = (322usize, 242usize);
+        for fmt in [
+            PixelFormat::Rgb,
+            PixelFormat::Rgba,
+            PixelFormat::Grey,
+            PixelFormat::Nv12,
+            PixelFormat::Nv16,
+            PixelFormat::Nv24,
+            PixelFormat::Yuyv,
+        ] {
+            let ranges: &[Option<edgefirst_tensor::Colorimetry>] = if fmt.is_yuv() {
+                &[None, Some(full)]
+            } else {
+                &[None]
+            };
+            for &mem in &mems {
+                // A host YUYV source uploads only where nothing imports; on a
+                // zero-copy backend it is the CPU's.
+                if fmt == PixelFormat::Yuyv && mem == TensorMemory::Mem && zero_copy {
+                    continue;
+                }
+                for &cm in ranges {
+                    let mut src =
+                        load_raw_image(w, h, fmt, Some(mem), &grey_test_bytes(w, h, fmt)).unwrap();
+                    src.set_colorimetry(cm);
+                    // The CPU has no NV16 -> Grey; NV12 carries the same luma
+                    // plane, which is all a Grey destination reads.
+                    let ref_fmt = if fmt == PixelFormat::Nv16 {
+                        PixelFormat::Nv12
+                    } else {
+                        fmt
+                    };
+                    let mut reference = load_raw_image(
+                        w,
+                        h,
+                        ref_fmt,
+                        Some(TensorMemory::Mem),
+                        &grey_test_bytes(w, h, ref_fmt),
+                    )
+                    .unwrap();
+                    reference.set_colorimetry(cm);
+                    for (opts_name, (dw, dh), options) in [
+                        ("1:1", (w, h), ConvertOptions::new()),
+                        (
+                            "letterbox",
+                            (480, 480),
+                            ConvertOptions::new().letterbox([200, 30, 90, 255]),
+                        ),
+                    ] {
+                        for dtype in [DType::U8, DType::I8] {
+                            let label = format!(
+                                "{fmt:?}@{mem:?} {} {opts_name} {dtype:?}",
+                                if cm.is_some() { "full" } else { "default" }
+                            );
+                            let image = |m| {
+                                TensorDyn::image(
+                                    dw,
+                                    dh,
+                                    PixelFormat::Grey,
+                                    dtype,
+                                    Some(m),
+                                    edgefirst_tensor::CpuAccess::ReadWrite,
+                                )
+                                .unwrap()
+                            };
+                            let mut got = image(mem);
+                            if let Err(e) = gl.convert(&src, &mut got, Some(options)) {
+                                failures.push(format!("{label}: GL declined: {e}"));
+                                continue;
+                            }
+                            let mut want = image(TensorMemory::Mem);
+                            crate::CPUProcessor::new()
+                                .convert(&reference, &mut want, Some(options))
+                                .unwrap();
+                            let (got, want) =
+                                (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want));
+                            let diffs: Vec<u8> =
+                                got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).collect();
+                            let max = diffs.iter().copied().max().unwrap_or(0);
+                            let mean =
+                                diffs.iter().map(|&d| d as f64).sum::<f64>() / diffs.len() as f64;
+                            // 1:1 is the same arithmetic up to rounding; a
+                            // resize is two filters, held to a mean.
+                            let ok = if opts_name == "1:1" {
+                                max <= 1
+                            } else {
+                                // The pad band (row 0 lies in it) is exact.
+                                got[0] == want[0] && mean <= 2.0
+                            };
+                            if !ok {
+                                failures.push(format!(
+                                    "{label}: max {max}, mean {mean:.3}, pad {} vs {}",
+                                    got[0], want[0]
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A Grey destination zeroes the NV programs' chroma terms; the next
+    /// colour convert through the same program must restore them.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_nv_luma_only_does_not_leak_into_colour() {
+        use crate::ImageProcessorTrait;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
+        let (w, h) = (322usize, 242usize);
+        let src = load_raw_image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            &grey_test_bytes(w, h, PixelFormat::Nv12),
+        )
+        .unwrap();
+        let image = |fmt| {
+            TensorDyn::image(
+                w,
+                h,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let mut before = image(PixelFormat::Rgba);
+        gl.convert(&src, &mut before, None).unwrap();
+        let mut grey = image(PixelFormat::Grey);
+        gl.convert(&src, &mut grey, None).unwrap();
+        let mut after = image(PixelFormat::Rgba);
+        gl.convert(&src, &mut after, None).unwrap();
+        assert_eq!(
+            rgb_test_tight_bytes(&before),
+            rgb_test_tight_bytes(&after),
+            "an NV -> Rgba convert after an NV -> Grey one lost its chroma"
+        );
+    }
 }

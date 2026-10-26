@@ -75,7 +75,7 @@ impl GlPlatform for LinuxEgl {
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = true;
     const NV_CHROMA_IMPORT: bool = true;
-    const PACKED_RGB_R8_IMPORT: bool = true;
+    const PACKED_R8_IMPORT: bool = true;
 
     fn init_display(kind: Option<EglDisplayKind>) -> crate::Result<GlContext> {
         GlContext::new(kind)

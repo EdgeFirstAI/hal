@@ -541,10 +541,14 @@ impl DmaImportAttrs {
 
         if !matches!(
             src_fmt,
-            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 | PixelFormat::Rgb
+            PixelFormat::Nv12
+                | PixelFormat::Nv16
+                | PixelFormat::Nv24
+                | PixelFormat::Rgb
+                | PixelFormat::Yuyv
         ) {
             return Err(Error::NotSupported(format!(
-                "from_tensor_nv_r8 only supports NV12/NV16/NV24/Rgb, got {src_fmt:?}"
+                "from_tensor_nv_r8 only supports NV12/NV16/NV24/Rgb/Yuyv, got {src_fmt:?}"
             )));
         }
 
@@ -575,7 +579,7 @@ impl DmaImportAttrs {
         // 3H-1 for NV24, so the imported R8 texture MUST be 3H tall — a 2H import
         // leaves the NV24 chroma rows out of bounds (reads garbage on strict tiled
         // GPUs like Mali/V3D, tolerated on Vivante/Tegra).
-        let combined_h = if src_fmt == PixelFormat::Rgb {
+        let combined_h = if matches!(src_fmt, PixelFormat::Rgb | PixelFormat::Yuyv) {
             src_h
         } else {
             src_fmt.combined_plane_height(src_h).ok_or_else(|| {
@@ -1627,28 +1631,30 @@ mod tests {
         );
     }
 
-    /// An Rgb buffer imports as an R8 view of `height` rows of `row_stride`
-    /// bytes, which is how the GPUs without a `BG24` import read it.
+    /// A packed Rgb or YUYV buffer imports as an R8 view of `height` rows of
+    /// `row_stride` bytes, the view the packed R8 programs read.
     #[test]
-    fn test_from_tensor_nv_r8_takes_rgb_as_stride_by_height() {
+    fn test_from_tensor_nv_r8_takes_packed_as_stride_by_height() {
         if !crate::test_support::is_dma_available() {
-            crate::test_support::report_skip("test_from_tensor_nv_r8_takes_rgb - no DMA-BUF");
+            crate::test_support::report_skip("test_from_tensor_nv_r8_takes_packed - no DMA-BUF");
             return;
         }
-        let t = Tensor::<u8>::image(
-            321,
-            241,
-            PixelFormat::Rgb,
-            Some(edgefirst_tensor::TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        let stride = t.effective_row_stride().unwrap();
-        let attrs = DmaImportAttrs::from_tensor_nv_r8(&t, PixelFormat::Rgb).unwrap();
-        assert_eq!(attrs.drm_fourcc, DrmFourcc::R8);
-        assert_eq!((attrs.width, attrs.height), (stride, 241));
-        assert_eq!(attrs.plane0_pitch, stride);
-        assert!(attrs.plane1.is_none());
+        for fmt in [PixelFormat::Rgb, PixelFormat::Yuyv] {
+            let t = Tensor::<u8>::image(
+                322,
+                241,
+                fmt,
+                Some(edgefirst_tensor::TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let stride = t.effective_row_stride().unwrap();
+            let attrs = DmaImportAttrs::from_tensor_nv_r8(&t, fmt).unwrap();
+            assert_eq!(attrs.drm_fourcc, DrmFourcc::R8, "{fmt:?}");
+            assert_eq!((attrs.width, attrs.height), (stride, 241), "{fmt:?}");
+            assert_eq!(attrs.plane0_pitch, stride, "{fmt:?}");
+            assert!(attrs.plane1.is_none(), "{fmt:?}");
+        }
     }
 
     /// 1-bpp (Grey) likewise still requires width%4 — natural pitch is

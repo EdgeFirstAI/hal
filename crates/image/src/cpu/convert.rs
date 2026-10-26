@@ -2168,7 +2168,7 @@ impl CPUProcessor {
         [r, g, b]
     }
 
-    pub(super) fn rgba_to_grey(rgba: [u8; 4]) -> [u8; 1] {
+    pub(crate) fn rgba_to_grey(rgba: [u8; 4]) -> [u8; 1] {
         const BIAS: i32 = 20;
         // Conventional BT.601 luma weights (Rec.601 is the standard luma basis
         // for RGB→grayscale; full-range, no 16/235 expansion).

@@ -100,6 +100,21 @@ pub(crate) struct YuvToRgbCoeffs {
     pub c_ub: f32,
 }
 
+#[cfg_attr(not(feature = "opengl"), allow(dead_code))]
+impl YuvToRgbCoeffs {
+    /// The same luma expansion with the chroma terms zeroed: every channel
+    /// becomes the range-expanded Y, the CPU's YUV -> Grey conversion.
+    pub(crate) fn luma_only(self) -> Self {
+        Self {
+            c_vr: 0.0,
+            c_ug: 0.0,
+            c_vg: 0.0,
+            c_ub: 0.0,
+            ..self
+        }
+    }
+}
+
 /// Compute the in-shader YUV→RGB coefficients for a resolved
 /// `(ColorEncoding, ColorRange)`. Pure; platform-neutral.
 #[cfg_attr(not(feature = "opengl"), allow(dead_code))]

@@ -96,6 +96,14 @@ pub(super) enum ConvertPlan {
     /// takes this plan there too. Also the Vivante GC7000UL single-pass
     /// GPU-hang workaround for NV* (EDGEAI-1180).
     TwoPassNvPlanar,
+    /// Grey destination from an RGB-family source: pass 1 renders RGBA into
+    /// an intermediate texture through the ordinary packed convert, pass 2
+    /// writes its BT.601 luma into the destination. A Grey render target
+    /// keeps only the red channel of what a single pass draws, and the luma
+    /// cannot come from the source programs themselves: they reach it
+    /// through several routes (driver samplers, uploads, R8 views). YUV
+    /// sources stay single-pass, drawing their own luma plane.
+    TwoPassGrey,
 }
 
 /// Decide the render plan. Pure (src format, src residence, dst format, dst
@@ -115,6 +123,14 @@ pub(super) fn plan_convert(
     // / `setup_renderbuffer_from_pbo`, so they stay single-pass.
     if lowering == DstLowering::ZeroCopy && dst_fmt == PixelFormat::Rgb {
         return ConvertPlan::TwoPassPackedRgb;
+    }
+    if dst_fmt == PixelFormat::Grey
+        && matches!(
+            src_fmt,
+            PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Bgra
+        )
+    {
+        return ConvertPlan::TwoPassGrey;
     }
     // A texture-lowered (Mem/Pbo) planar destination has NO single-pass
     // route for any source format: `texture_program_planar` (the
@@ -688,11 +704,31 @@ mod tests {
                         "{src:?}->{dst:?} via {lowering:?}"
                     );
                 }
-                for dst in [Rgba, Bgra, Rgb, Grey] {
+                for dst in [Rgba, Bgra, Rgb] {
                     assert_eq!(
                         plan_convert(*src, false, dst, lowering),
                         ConvertPlan::SinglePass,
                         "{src:?}->{dst:?} via {lowering:?}"
+                    );
+                }
+            }
+        }
+        // Grey destination: RGB-family sources take the luma pass on every
+        // lowering and residence; YUV and Grey sources draw it in one pass.
+        for lowering in [ZeroCopy, TextureMem, TexturePbo] {
+            for host in [false, true] {
+                for src in [Rgb, Rgba, Bgra] {
+                    assert_eq!(
+                        plan_convert(src, host, Grey, lowering),
+                        ConvertPlan::TwoPassGrey,
+                        "{src:?}->Grey via {lowering:?}"
+                    );
+                }
+                for src in [Nv12, Nv16, Nv24, Yuyv, Grey] {
+                    assert_eq!(
+                        plan_convert(src, host, Grey, lowering),
+                        ConvertPlan::SinglePass,
+                        "{src:?}->Grey via {lowering:?}"
                     );
                 }
             }

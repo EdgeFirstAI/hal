@@ -1297,6 +1297,38 @@ mod tc_precision {
                 "RGB_R8_RGBA_HW_BILINEAR_INT8_FRAGMENT",
                 super::super::shaders_common::RGB_R8_RGBA_HW_BILINEAR_INT8_FRAGMENT,
             ),
+            (
+                "YUYV_LUMA_R8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_INT8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_INT8_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_BILINEAR_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_BILINEAR_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_HW_BILINEAR_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_HW_BILINEAR_FRAGMENT,
+            ),
+            (
+                "YUYV_LUMA_R8_HW_BILINEAR_INT8_FRAGMENT",
+                super::super::shaders_common::YUYV_LUMA_R8_HW_BILINEAR_INT8_FRAGMENT,
+            ),
+            (
+                "LUMA_2D_FRAGMENT",
+                super::super::shaders_common::LUMA_2D_FRAGMENT,
+            ),
+            (
+                "LUMA_2D_INT8_FRAGMENT",
+                super::super::shaders_common::LUMA_2D_INT8_FRAGMENT,
+            ),
         ]
     }
 

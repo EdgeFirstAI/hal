@@ -12,7 +12,7 @@ in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
 
-vec3 rgb_px(int x, int y) {
+vec3 src_px(int x, int y) {
     float b = float(x * 3) + 0.5;
     float v = (float(y) + 0.5) * inv_tex.y;
     return vec3(texture(src, vec2(b * inv_tex.x, v)).r,
@@ -24,7 +24,7 @@ vec3 rgb_px(int x, int y) {
 // texel right of its byte's centre so the horizontal weight quantizes to zero:
 // a tap computed exactly at the centre can land a hair left of it and blend
 // in a fraction of the previous byte, which belongs to another channel.
-vec3 rgb_col(int x, float v) {
+vec3 src_col(int x, float v) {
     float b = float(x * 3) + 0.5 + 1.0 / 1024.0;
     return vec3(texture(src, vec2(b * inv_tex.x, v)).r,
                 texture(src, vec2((b + 1.0) * inv_tex.x, v)).r,
@@ -33,6 +33,6 @@ vec3 rgb_col(int x, float v) {
 
 void main() {
     ivec2 i = clamp(ivec2(tc * vec2(img_size)), src_rect.xy, src_rect.zw);
-    vec3 rgb = rgb_px(i.x, i.y);
+    vec3 rgb = src_px(i.x, i.y);
     color = vec4(rgb, 1.0);
 }

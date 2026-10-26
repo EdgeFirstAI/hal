@@ -622,17 +622,17 @@ pub(crate) const NV_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
 );
 
 // ---------------------------------------------------------------------------
-// Packed RGB (3 bytes per pixel) -> RGBA from an R8 view of the buffer. No GPU
-// texel format holds a packed 24-bit pixel, so the buffer is presented as one
-// R8 texture `row_stride` texels wide and `height` rows tall, and each pixel
-// is assembled from its three bytes. Taps go through `texture()` at texel
-// centres rather than `texelFetch`: same bytes under NEAREST, and Vivante
-// GC7000UL runs it about 1.8x faster.
+// Packed sources from an R8 view of the buffer. No GPU texel format holds a
+// packed 24-bit pixel, so the buffer is presented as one R8 texture
+// `row_stride` texels wide and `height` rows tall, and each pixel is assembled
+// from its bytes. Taps go through `texture()` at texel centres rather than
+// `texelFetch`: same bytes under NEAREST, and Vivante GC7000UL runs it about
+// 1.8x faster. A header supplies `src_px(x, y)`, the exact pixel, and
+// `src_col(x, v)`, the pixel's bytes blended between rows by a LINEAR sampler;
+// the sampling bodies below are shared by every header.
 
-/// Declarations shared by the packed-RGB programs: the layout uniforms and
-/// `rgb_px(x, y)`, the exact pixel, and `rgb_col(x, v)`, the pixel's bytes
-/// blended between rows by a LINEAR sampler.
-macro_rules! rgb_r8_header {
+/// Declarations every packed R8-view program shares: the layout uniforms.
+macro_rules! packed_r8_uniforms {
     () => {
         "#version 300 es
 precision highp float;
@@ -644,11 +644,20 @@ uniform vec2 inv_tex;
 // Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
 // clamped to them, so a crop never reads pixels from outside itself.
 uniform ivec4 src_rect;
-in vec3 fragPos;
+"
+    };
+}
+
+/// Packed RGB, three bytes per pixel.
+macro_rules! rgb_r8_header {
+    () => {
+        concat!(
+            packed_r8_uniforms!(),
+            "in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
 
-vec3 rgb_px(int x, int y) {
+vec3 src_px(int x, int y) {
     float b = float(x * 3) + 0.5;
     float v = (float(y) + 0.5) * inv_tex.y;
     return vec3(texture(src, vec2(b * inv_tex.x, v)).r,
@@ -660,7 +669,7 @@ vec3 rgb_px(int x, int y) {
 // texel right of its byte's centre so the horizontal weight quantizes to zero:
 // a tap computed exactly at the centre can land a hair left of it and blend
 // in a fraction of the previous byte, which belongs to another channel.
-vec3 rgb_col(int x, float v) {
+vec3 src_col(int x, float v) {
     float b = float(x * 3) + 0.5 + 1.0 / 1024.0;
     return vec3(texture(src, vec2(b * inv_tex.x, v)).r,
                 texture(src, vec2((b + 1.0) * inv_tex.x, v)).r,
@@ -668,41 +677,77 @@ vec3 rgb_col(int x, float v) {
 }
 
 "
+        )
     };
 }
 
-/// `main()` statements of the single-tap packed-RGB programs (a draw that
-/// maps the crop 1:1, or nearest interpolation): the pixel under `tc`.
-macro_rules! rgb_r8_nearest_body {
+/// YUYV luma only, for a Grey destination: each pixel's Y byte (byte `2x`),
+/// range-expanded as the CPU's luma copy does, in every channel.
+macro_rules! yuyv_luma_r8_header {
+    () => {
+        concat!(
+            packed_r8_uniforms!(),
+            "// Luma range expansion from the source's colorimetry, as in the NV
+// programs: limited range maps 16..235 onto 0..1, full range is unchanged.
+uniform float y_offset;
+uniform float y_scale;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
+
+vec3 luma(float y) {
+    return vec3(clamp((y - y_offset) * y_scale, 0.0, 1.0));
+}
+
+vec3 src_px(int x, int y) {
+    float b = float(x * 2) + 0.5;
+    return luma(texture(src, vec2(b * inv_tex.x, (float(y) + 0.5) * inv_tex.y)).r);
+}
+
+// Under LINEAR filtering, at texture row coordinate `v`, nudged off the byte
+// centre as in the packed-RGB header so no chroma byte blends in.
+vec3 src_col(int x, float v) {
+    float b = float(x * 2) + 0.5 + 1.0 / 1024.0;
+    return luma(texture(src, vec2(b * inv_tex.x, v)).r);
+}
+
+"
+        )
+    };
+}
+
+/// `main()` statements of the single-tap packed programs (a draw that maps
+/// the crop 1:1, or nearest interpolation): the pixel under `tc`.
+macro_rules! packed_r8_nearest_body {
     () => {
         "    ivec2 i = clamp(ivec2(tc * vec2(img_size)), src_rect.xy, src_rect.zw);
-    vec3 rgb = rgb_px(i.x, i.y);
+    vec3 rgb = src_px(i.x, i.y);
 "
     };
 }
 
-/// `main()` statements of the shader-filtered bilinear packed-RGB programs:
+/// `main()` statements of the shader-filtered bilinear packed programs:
 /// half-pixel-centred bilinear from four exact pixels, every tap clamped to
 /// the crop — the convention of the NV bilinear programs.
-macro_rules! rgb_r8_bilinear_body {
+macro_rules! packed_r8_bilinear_body {
     () => {
         "    vec2 p = tc * vec2(img_size) - 0.5;
     vec2 p0 = floor(p);
     vec2 f = p - p0;
     ivec2 i0 = clamp(ivec2(p0), src_rect.xy, src_rect.zw);
     ivec2 i1 = clamp(ivec2(p0) + 1, src_rect.xy, src_rect.zw);
-    vec3 rgb = mix(mix(rgb_px(i0.x, i0.y), rgb_px(i1.x, i0.y), f.x),
-                   mix(rgb_px(i0.x, i1.y), rgb_px(i1.x, i1.y), f.x), f.y);
+    vec3 rgb = mix(mix(src_px(i0.x, i0.y), src_px(i1.x, i0.y), f.x),
+                   mix(src_px(i0.x, i1.y), src_px(i1.x, i1.y), f.x), f.y);
 "
     };
 }
 
-/// `main()` statements of the hardware-assisted bilinear packed-RGB
-/// programs: the texture unit's LINEAR filter blends rows within each byte
-/// column, the shader blends the two columns, six fetches instead of twelve.
-/// The row coordinate is clamped to the crop's row centres so the filter
-/// never reaches a row outside it.
-macro_rules! rgb_r8_hw_bilinear_body {
+/// `main()` statements of the hardware-assisted bilinear packed programs:
+/// the texture unit's LINEAR filter blends rows within each byte column, the
+/// shader blends the two columns, half the fetches of the shader-filtered
+/// program. The row coordinate is clamped to the crop's row centres so the
+/// filter never reaches a row outside it.
+macro_rules! packed_r8_hw_bilinear_body {
     () => {
         "    vec2 p = tc * vec2(img_size) - 0.5;
     float x0 = floor(p.x);
@@ -710,7 +755,7 @@ macro_rules! rgb_r8_hw_bilinear_body {
     int xa = clamp(int(x0), src_rect.x, src_rect.z);
     int xb = clamp(int(x0) + 1, src_rect.x, src_rect.z);
     float v = (clamp(p.y, float(src_rect.y), float(src_rect.w)) + 0.5) * inv_tex.y;
-    vec3 rgb = mix(rgb_col(xa, v), rgb_col(xb, v), fx);
+    vec3 rgb = mix(src_col(xa, v), src_col(xb, v), fx);
 "
     };
 }
@@ -719,7 +764,7 @@ macro_rules! rgb_r8_hw_bilinear_body {
 pub(crate) const RGB_R8_RGBA_FRAGMENT: &str = concat!(
     rgb_r8_header!(),
     "void main() {\n",
-    rgb_r8_nearest_body!(),
+    packed_r8_nearest_body!(),
     "    color = vec4(rgb, 1.0);\n}\n"
 );
 
@@ -728,7 +773,7 @@ pub(crate) const RGB_R8_RGBA_INT8_FRAGMENT: &str = concat!(
     rgb_r8_header!(),
     int_quantize!(),
     "void main() {\n",
-    rgb_r8_nearest_body!(),
+    packed_r8_nearest_body!(),
     "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
@@ -738,7 +783,7 @@ pub(crate) const RGB_R8_RGBA_INT8_FRAGMENT: &str = concat!(
 pub(crate) const RGB_R8_RGBA_BILINEAR_FRAGMENT: &str = concat!(
     rgb_r8_header!(),
     "void main() {\n",
-    rgb_r8_bilinear_body!(),
+    packed_r8_bilinear_body!(),
     "    color = vec4(rgb, 1.0);\n}\n"
 );
 
@@ -747,7 +792,7 @@ pub(crate) const RGB_R8_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
     rgb_r8_header!(),
     int_quantize!(),
     "void main() {\n",
-    rgb_r8_bilinear_body!(),
+    packed_r8_bilinear_body!(),
     "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
@@ -756,7 +801,7 @@ pub(crate) const RGB_R8_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
 pub(crate) const RGB_R8_RGBA_HW_BILINEAR_FRAGMENT: &str = concat!(
     rgb_r8_header!(),
     "void main() {\n",
-    rgb_r8_hw_bilinear_body!(),
+    packed_r8_hw_bilinear_body!(),
     "    color = vec4(rgb, 1.0);\n}\n"
 );
 
@@ -765,7 +810,102 @@ pub(crate) const RGB_R8_RGBA_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
     rgb_r8_header!(),
     int_quantize!(),
     "void main() {\n",
-    rgb_r8_hw_bilinear_body!(),
+    packed_r8_hw_bilinear_body!(),
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
+);
+
+/// YUYV->Grey fragment shader for draws that do not rescale.
+pub(crate) const YUYV_LUMA_R8_FRAGMENT: &str = concat!(
+    yuyv_luma_r8_header!(),
+    "void main() {\n",
+    packed_r8_nearest_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`YUYV_LUMA_R8_FRAGMENT`].
+pub(crate) const YUYV_LUMA_R8_INT8_FRAGMENT: &str = concat!(
+    yuyv_luma_r8_header!(),
+    int_quantize!(),
+    "void main() {\n",
+    packed_r8_nearest_body!(),
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
+);
+
+/// YUYV->Grey fragment shader for draws that rescale, filtered in the shader.
+pub(crate) const YUYV_LUMA_R8_BILINEAR_FRAGMENT: &str = concat!(
+    yuyv_luma_r8_header!(),
+    "void main() {\n",
+    packed_r8_bilinear_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`YUYV_LUMA_R8_BILINEAR_FRAGMENT`].
+pub(crate) const YUYV_LUMA_R8_BILINEAR_INT8_FRAGMENT: &str = concat!(
+    yuyv_luma_r8_header!(),
+    int_quantize!(),
+    "void main() {\n",
+    packed_r8_bilinear_body!(),
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
+);
+
+/// YUYV->Grey fragment shader for draws that rescale, with the rows blended
+/// by the texture unit.
+pub(crate) const YUYV_LUMA_R8_HW_BILINEAR_FRAGMENT: &str = concat!(
+    yuyv_luma_r8_header!(),
+    "void main() {\n",
+    packed_r8_hw_bilinear_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`YUYV_LUMA_R8_HW_BILINEAR_FRAGMENT`].
+pub(crate) const YUYV_LUMA_R8_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
+    yuyv_luma_r8_header!(),
+    int_quantize!(),
+    "void main() {\n",
+    packed_r8_hw_bilinear_body!(),
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
+);
+
+// ---------------------------------------------------------------------------
+// RGBA -> Grey: the second pass of a colour source into a Grey destination.
+// The first pass rendered the converted image into an RGBA texture at the
+// destination's size; this one samples it 1:1 (NEAREST) and writes BT.601
+// full-range luma, the weights the CPU's RGB -> Grey conversion uses.
+
+macro_rules! luma_2d_header {
+    () => {
+        "#version 300 es
+precision highp float;
+uniform highp sampler2D tex;
+in vec3 fragPos;
+in highp vec2 tc;
+out vec4 color;
+
+"
+    };
+}
+
+macro_rules! luma_2d_body {
+    () => {
+        "    vec3 rgb = vec3(dot(texture(tex, tc).rgb, vec3(0.299, 0.587, 0.114)));
+"
+    };
+}
+
+/// RGBA->Grey fragment shader (BT.601 luma in every channel).
+pub(crate) const LUMA_2D_FRAGMENT: &str = concat!(
+    luma_2d_header!(),
+    "void main() {\n",
+    luma_2d_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`LUMA_2D_FRAGMENT`].
+pub(crate) const LUMA_2D_INT8_FRAGMENT: &str = concat!(
+    luma_2d_header!(),
+    int_quantize!(),
+    "void main() {\n",
+    luma_2d_body!(),
     "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
@@ -827,6 +967,31 @@ mod nv_shader_golden {
             super::RGB_R8_RGBA_HW_BILINEAR_FRAGMENT,
             golden(include_str!("golden/rgb_r8_rgba_hw_bilinear_linux.glsl")).as_str(),
             "hardware-bilinear packed-RGB shader bytes drifted from the on-target-validated golden"
+        );
+    }
+
+    /// The YUYV luma and RGBA->Grey shader sources, frozen like the others.
+    #[test]
+    fn grey_fragment_byte_identical() {
+        assert_eq!(
+            super::YUYV_LUMA_R8_FRAGMENT,
+            golden(include_str!("golden/yuyv_luma_r8_linux.glsl")).as_str(),
+            "YUYV luma shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::YUYV_LUMA_R8_BILINEAR_FRAGMENT,
+            golden(include_str!("golden/yuyv_luma_r8_bilinear_linux.glsl")).as_str(),
+            "bilinear YUYV luma shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::YUYV_LUMA_R8_HW_BILINEAR_FRAGMENT,
+            golden(include_str!("golden/yuyv_luma_r8_hw_bilinear_linux.glsl")).as_str(),
+            "hardware-bilinear YUYV luma shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::LUMA_2D_FRAGMENT,
+            golden(include_str!("golden/luma_2d_linux.glsl")).as_str(),
+            "RGBA->Grey shader bytes drifted from the on-target-validated golden"
         );
     }
 

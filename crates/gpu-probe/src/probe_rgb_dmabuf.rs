@@ -862,11 +862,12 @@ pub fn run(ctx: &GpuContext) {
     }
 
     println!("  -- rescale vs r8-texture: max byte diff, bytes off by >1 --");
-    for (src, dst) in [
+    let rescales = vec![
         ((1920, 1080), (640, 640)),
         ((321, 241), (640, 640)),
         ((789, 384), (640, 640)),
-    ] {
+    ];
+    for (src, dst) in selected(rescales, "RGB_PROBE_SIZES", |(s, _)| size_key(s)) {
         for &p in paths
             .iter()
             .filter(|&&p| p != Path::R8Tex && p != Path::R8Nearest)
