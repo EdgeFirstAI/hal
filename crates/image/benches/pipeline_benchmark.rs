@@ -364,11 +364,17 @@ fn bench_letterbox_pipeline(
         (PixelFormat::Nv12, PixelFormat::Rgba, DType::U8),
         (PixelFormat::Nv12, PixelFormat::Rgb, DType::U8),
         (PixelFormat::Nv12, PixelFormat::PlanarRgb, DType::U8),
+        // packed RGB source: a fused RGB JPEG decode
+        (PixelFormat::Rgb, PixelFormat::Rgba, DType::U8),
+        (PixelFormat::Rgb, PixelFormat::Rgb, DType::U8),
+        (PixelFormat::Rgb, PixelFormat::PlanarRgb, DType::U8),
         // i8 output (int8 model input)
         (PixelFormat::Yuyv, PixelFormat::Rgb, DType::I8),
         (PixelFormat::Yuyv, PixelFormat::PlanarRgb, DType::I8),
         (PixelFormat::Nv12, PixelFormat::Rgb, DType::I8),
         (PixelFormat::Nv12, PixelFormat::PlanarRgb, DType::I8),
+        (PixelFormat::Rgb, PixelFormat::Rgb, DType::I8),
+        (PixelFormat::Rgb, PixelFormat::PlanarRgb, DType::I8),
     ];
     let combos: Vec<_> = all_combos
         .into_iter()

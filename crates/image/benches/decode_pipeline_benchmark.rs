@@ -95,30 +95,44 @@ fn bench_decode_strided(suite: &mut BenchSuite) {
 }
 
 /// Benchmark: full pipeline (decode + letterbox convert) with strided input.
+///
+/// `decode_fmt` is what the JPEG decodes to: `Nv12`, the native layout,
+/// leaves the colour conversion to the convert; `Rgb` fuses it into the
+/// decode (`ImageDecoder::set_output_format`), as the profiler does where no
+/// hardware decoder takes the frame. The NV12 cells keep their historical
+/// names; the fused ones are prefixed `rgb_`.
 fn bench_decode_convert(
     proc: &mut ImageProcessor,
+    decode_fmt: PixelFormat,
     output_fmt: PixelFormat,
     layout_name: &str,
     suite: &mut BenchSuite,
 ) {
+    let prefix = if decode_fmt == PixelFormat::Rgb {
+        "rgb_"
+    } else {
+        ""
+    };
     println!(
-        "\n== Pipeline: decode → letterbox {} (strided input) ==\n",
+        "\n== Pipeline: decode to {} → letterbox {} (strided input) ==\n",
+        common::format_name(decode_fmt),
         layout_name
     );
 
     let mut decoder = ImageDecoder::new();
+    if decode_fmt == PixelFormat::Rgb {
+        decoder.set_output_format(Some(PixelFormat::Rgb));
+    }
 
     let max_w = TEST_IMAGES.iter().map(|i| i.width).max().unwrap();
     let max_h = TEST_IMAGES.iter().map(|i| i.height).max().unwrap();
 
-    // Auto-select memory type: DMA if available, else Mem. Colour JPEGs decode
-    // to native NV12; the convert step below handles the NV12 -> RGB/RGBA
-    // colour conversion as part of the realistic decode + letterbox pipeline.
+    // Auto-select memory type: DMA if available, else Mem.
     let mut input = proc
         .create_image(
             max_w,
             max_h,
-            PixelFormat::Nv12,
+            decode_fmt,
             DType::U8,
             None,
             edgefirst_tensor::CpuAccess::ReadWrite,
@@ -152,14 +166,14 @@ fn bench_decode_convert(
         }
 
         // Decode only
-        let decode_name = format!("pipeline_decode/{}/{}", layout_name, img.name);
+        let decode_name = format!("{prefix}pipeline_decode/{}/{}", layout_name, img.name);
         let decode_result = run_bench(&decode_name, 0, ITERATIONS, || {
             input.load_image(&mut decoder, &data).unwrap();
         });
 
         // Convert only (from last decoded image)
         input.load_image(&mut decoder, &data).unwrap();
-        let convert_name = format!("pipeline_convert/{}/{}", layout_name, img.name);
+        let convert_name = format!("{prefix}pipeline_convert/{}/{}", layout_name, img.name);
         let convert_result = run_bench(&convert_name, 0, ITERATIONS, || {
             proc.convert(
                 &input,
@@ -170,7 +184,7 @@ fn bench_decode_convert(
         });
 
         // Full pipeline
-        let pipeline_name = format!("pipeline_full/{}/{}", layout_name, img.name);
+        let pipeline_name = format!("{prefix}pipeline_full/{}/{}", layout_name, img.name);
         let throughput = (img.width * img.height * 3) as u64;
         let pipeline_result = run_bench(&pipeline_name, 0, ITERATIONS, || {
             input.load_image(&mut decoder, &data).unwrap();
@@ -214,8 +228,16 @@ fn main() {
     // Full pipeline benchmarks
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 
-    bench_decode_convert(&mut proc, PixelFormat::Rgb, "HWC", &mut suite);
-    bench_decode_convert(&mut proc, PixelFormat::PlanarRgb, "CHW", &mut suite);
+    for decode_fmt in [PixelFormat::Nv12, PixelFormat::Rgb] {
+        bench_decode_convert(&mut proc, decode_fmt, PixelFormat::Rgb, "HWC", &mut suite);
+        bench_decode_convert(
+            &mut proc,
+            decode_fmt,
+            PixelFormat::PlanarRgb,
+            "CHW",
+            &mut suite,
+        );
+    }
 
     suite.finish();
 }

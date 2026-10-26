@@ -116,7 +116,7 @@ fn native_chroma_pitch(fmt: PixelFormat, luma_stride: usize) -> usize {
 }
 
 /// Query whether the current GL context advertises an extension.
-fn gl_has_extension(name: &str) -> bool {
+pub(crate) fn gl_has_extension(name: &str) -> bool {
     unsafe {
         let mut count: i32 = 0;
         edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::NUM_EXTENSIONS, &mut count);
@@ -135,7 +135,7 @@ fn gl_has_extension(name: &str) -> bool {
 }
 
 /// Drain and return the first pending GL error as a readable string, if any.
-fn gl_error(stage: &str) -> Result<(), String> {
+pub(crate) fn gl_error(stage: &str) -> Result<(), String> {
     let err = unsafe { edgefirst_gl::gl::GetError() };
     if err == edgefirst_gl::gl::NO_ERROR {
         return Ok(());

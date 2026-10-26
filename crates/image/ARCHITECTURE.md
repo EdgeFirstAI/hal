@@ -534,6 +534,27 @@ imx95 Neutron), or the RGBA8→PlanarRgb-F16 packer for the F16 targets
 (`ExternalSampler`/`ShaderR8`/`Cpu`) so tests and the profiler can assert no silent CPU
 fallback for a DMA NV* source.
 
+### Linux packed RGB source → GPU (native `BG24` / R8 view)
+
+A packed `Rgb` DMA-BUF source (three bytes per pixel, as the fused RGB JPEG decode writes) has no GPU texel format on most drivers, so `draw_rgb_dma_source` takes the first zero-copy import the GPU allows:
+
+1. **Native `BG24` import** (`RgbSourcePath::Native`) where `eglQueryDmaBufFormatsEXT` lists `DRM_FORMAT_BGR888` and the GPU reads it correctly (`rgb_native_import`): one RGB texel per pixel through `samplerExternalOES`, filtered by the texture unit. Mali-G310 today. Adreno lists `BG24` but its sampler reads past the end of the buffer, raising kgsl GPU page faults and multi-millisecond stalls whenever the buffer ends on a page boundary, so it is excluded. Vivante GC7000UL and V3D do not list it.
+2. **R8 view** (`RgbSourcePath::R8Import`): the buffer imported as one R8 texture `row_stride` texels wide and `height` rows tall (`DmaImportAttrs::from_tensor_nv_r8`, cached with the NV imports), each pixel assembled from its three bytes by the `RGB_R8_RGBA_*` programs (`gl/shaders_common.rs`). The program follows the `NvSampling` the draw needs:
+
+   | `NvSampling` | When | Fetches per pixel |
+   |---|---|---|
+   | `Single` | No resize, or `Interpolation::Nearest` | 3 `NEAREST` |
+   | `Hardware` | Bilinear resize (default) | 6 `LINEAR`: each byte column sampled at its centre so only rows blend; the shader blends the two columns |
+   | `Shader` | Bilinear resize with `EDGEFIRST_GL_NO_NV_HW_FILTER=1` | 12 `NEAREST`: four exact pixels blended in the shader |
+
+   Taps use `texture()` at texel centres rather than `texelFetch`, which Vivante runs about 1.8× faster; a 1/1024-texel nudge keeps the `Hardware` column taps off the previous byte, which is another channel. An EGL import is not bound by `GL_MAX_TEXTURE_SIZE` the way an upload is: V3D (limit 4096) imports and samples a 1080p row's 5760 bytes exactly.
+
+Where the driver refuses both imports (Vivante refuses a 4K row, 11520 bytes against its 8192-texel limit; Mali and Adreno an unaligned plane offset), the GL convert returns `NotSupported` and the CPU converts the buffer. It does not upload: uploading a 4K frame on Vivante costs 75 ms against 16 ms for the CPU convert.
+
+**Prefer JPEG → NV12 → `convert()`.** This route keeps an RGB source off the CPU, but it does not make the fused RGB decode the faster workflow: decoding to native NV12 and converting on the GPU stays faster end to end on every board measured (`decode_pipeline_benchmark`, BENCHMARKS.md § *Packed RGB Sources*). The NV12 decode writes half the bytes, runs on the V4L2 hardware decoder where there is one (i.MX 95, which has no RGB output), and leaves YUV→RGB to the same draw as the resize, where the fused decode does it on the CPU. HAL clients should keep decoding to NV12 and use the fused RGB decode only when they need RGB pixels from the decode itself.
+
+`last_rgb_source_path` records the route for tests. A planar or float destination renders the RGBA intermediate first (`TwoPassNvPlanar`, `convert_nv_to_float_two_pass`), as for NV sources. Other platforms store packed RGB as an RGBA8888 surface `W·3/4` texels wide, which has no import route yet, so an `Rgb` surface source there converts on the CPU.
+
 ### macOS GL backend (unified engine over ANGLE)
 
 macOS runs the SAME `GLProcessorThreaded` engine as Linux: each
@@ -633,6 +654,7 @@ Alpha maps to `x / 255` for float destinations and stays the raw byte for intege
   | `Shader` | Bilinear resize, chroma view refused (unaligned chroma offset on Mali/Adreno, non-Linux platforms), or `EDGEFIRST_GL_NO_NV_HW_FILTER=1` | 12: four `Single` conversions blended in RGB |
 
   `Hardware` interpolates chroma on its own grid, centred on the luma pixels each sample covers (JPEG siting). `Shader` and the CPU backend instead replicate each chroma sample across its luma pixels before blending. The two agree closely on natural content and part on chroma that changes every one or two samples.
+- **GL packed RGB sources** read through the R8 view take the same three samplings with their own programs (see *Linux packed RGB source → GPU*); the hardware-assisted one blends rows in the texture unit and columns in the shader.
 - **G2D** scales with a fixed hardware filter. Under `Nearest` it declines converts that resize, so GL or the CPU backend runs them.
 - **CPU** uses `fast_image_resize`: `Nearest`, or `Interpolation(Bilinear)` for `Bilinear`. Its kernel keeps two taps per axis at every scale, so it matches `INTER_LINEAR` and the GL paths on downscale as well as upscale (the adaptive `Convolution(Bilinear)` would anti-alias below 1×, as PIL does).
 
@@ -1859,7 +1881,7 @@ in the project README for the user-facing rules and validation patterns.
 
 | Platform | Backends available | Float preprocessing | Notes |
 |----------|--------------------|---------------------|-------|
-| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12/NV16/NV24 → PlanarRgb requires the two-pass workaround; NV16/NV24 use the Path B R8 shader (NV12 uses Path A); GPU float disabled (170–320 ms readback) |
+| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12/NV16/NV24 → PlanarRgb requires the two-pass workaround; NV16/NV24 use the Path B R8 shader (NV12 uses Path A); packed RGB sources use the R8 view (libg2d rejects 24-bit sources); GPU float disabled (170–320 ms readback) |
 | Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations |
 | Linux RPi 5 (V3D / Broadcom) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | |
 | Linux Tegra Orin / NVIDIA (orin-nano) | OpenGL (PBO path), CPU | F16 PBO; F32 PBO — **PBO → CUDA zero-copy implemented** (`cuda_map()` maps the PBO to a device pointer on the GL worker thread; TensorRT reads directly from device memory) | DMA-buf import unsupported; PBO path provides zero-copy to CUDA |

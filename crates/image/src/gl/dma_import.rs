@@ -306,12 +306,17 @@ impl DmaImportAttrs {
                 }
             }
         } else {
-            // For 3-bpp (Rgb) and 1-bpp (Grey) packed formats the natural
-            // row pitch is `width * bpp`, which is only 4-byte aligned
-            // when `width % 4 == 0`. EGL DMA-BUF import via
-            // `eglCreateImage` requires word-aligned row reads on every
-            // tested platform (Mali G310, Vivante GC7000UL, V3D, Tegra),
-            // so we keep the blanket width%4 check for those.
+            // For the 1-bpp Grey format the natural row pitch is `width`,
+            // which is only 4-byte aligned when `width % 4 == 0`. EGL
+            // DMA-BUF import via `eglCreateImage` requires word-aligned row
+            // reads on every tested platform (Mali G310, Vivante GC7000UL,
+            // V3D, Tegra), so we keep the blanket width%4 check for it.
+            //
+            // Rgb is exempt: the only GPU that imports it natively
+            // (`BG24`, Mali-G310) samples it exactly at odd widths such as
+            // 321 and 789 once the pitch is the 64-byte-aligned stride
+            // `Tensor::image` allocates (gpu-probe `--rgb-only`), and every
+            // other GPU reads Rgb through the R8 view instead.
             //
             // It is the TIGHT pitch this protects, and the aligned-base
             // rebase (issue #170) never changes that pitch: the rebase
@@ -331,7 +336,10 @@ impl DmaImportAttrs {
             // rpi5-hailo, and orin-nano. If a driver fails the import,
             // `egl_create_image_with_fallback` downgrades to the CPU
             // texture upload path with a one-shot slow-path warning.
-            let needs_width_mod_4 = !matches!(src_fmt, PixelFormat::Rgba | PixelFormat::Bgra);
+            let needs_width_mod_4 = !matches!(
+                src_fmt,
+                PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
+            );
             if needs_width_mod_4 && !src_w.is_multiple_of(4) {
                 return Err(Error::NotSupported(format!(
                     "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
@@ -508,8 +516,10 @@ impl DmaImportAttrs {
         })
     }
 
-    /// Build `DmaImportAttrs` for importing an NV* semi-planar buffer as a
-    /// **single-plane R8** EGLImage (Path B, GL ES 3.0 texelFetch shader).
+    /// Build `DmaImportAttrs` for importing an NV* semi-planar buffer, or a
+    /// packed `Rgb` buffer, as a **single-plane R8** EGLImage (Path B, GL ES
+    /// 3.0 texelFetch shader). A packed `Rgb` buffer imports as its `height`
+    /// rows of `effective_row_stride` bytes, three per pixel.
     ///
     /// The combined buffer (luma + chroma rows stacked) is imported as one R8
     /// plane of size `(effective_row_stride, luma_h + chroma_h)`.  This is
@@ -531,10 +541,10 @@ impl DmaImportAttrs {
 
         if !matches!(
             src_fmt,
-            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 | PixelFormat::Rgb
         ) {
             return Err(Error::NotSupported(format!(
-                "from_tensor_nv_r8 only supports NV12/NV16/NV24, got {src_fmt:?}"
+                "from_tensor_nv_r8 only supports NV12/NV16/NV24/Rgb, got {src_fmt:?}"
             )));
         }
 
@@ -565,9 +575,13 @@ impl DmaImportAttrs {
         // 3H-1 for NV24, so the imported R8 texture MUST be 3H tall — a 2H import
         // leaves the NV24 chroma rows out of bounds (reads garbage on strict tiled
         // GPUs like Mali/V3D, tolerated on Vivante/Tegra).
-        let combined_h = src_fmt.combined_plane_height(src_h).ok_or_else(|| {
-            Error::NotImplemented(format!("Path-B R8 import: {src_fmt:?} is not semi-planar"))
-        })?;
+        let combined_h = if src_fmt == PixelFormat::Rgb {
+            src_h
+        } else {
+            src_fmt.combined_plane_height(src_h).ok_or_else(|| {
+                Error::NotImplemented(format!("Path-B R8 import: {src_fmt:?} is not semi-planar"))
+            })?
+        };
 
         // See the EGLImage import above for why this is `dmabuf()` and not
         // `as_dma().fd`.
@@ -1591,13 +1605,12 @@ mod tests {
             .expect("BGRA width 375 must pass the pre-check");
     }
 
-    /// 3-bpp (Rgb) still requires width%4 — its natural pitch is
-    /// `width × 3`, which is 4-byte aligned only when `width % 4 == 0`.
+    /// 3-bpp (Rgb) imports at any width: the import uses the tensor's
+    /// 64-byte-aligned stride as its pitch, and Mali-G310 samples `BG24`
+    /// exactly at odd widths. The width gate must not refuse it; this Mem
+    /// tensor is then refused only for having no DMA-BUF.
     #[test]
-    fn test_from_tensor_rejects_non_4_aligned_rgb() {
-        // We need a tensor with width=375 to hit the pre-check. Mem-backed
-        // works for this — from_tensor only reads width/height/memory
-        // metadata and the pre-check fires before the DMA fd lookup.
+    fn test_from_tensor_does_not_gate_rgb_width() {
         let t = Tensor::<u8>::image(
             375,
             64,
@@ -1607,13 +1620,35 @@ mod tests {
         )
         .unwrap();
         let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgb, false)
-            .expect_err("RGB width 375 must still be rejected");
-        match err {
-            crate::Error::NotSupported(msg) => {
-                assert!(msg.contains("divisible by 4"), "got: {msg}");
-            }
-            other => panic!("expected NotSupported, got {other:?}"),
+            .expect_err("a Mem tensor has no DMA-BUF to import");
+        assert!(
+            !err.to_string().contains("divisible by 4"),
+            "Rgb width 375 hit the width gate: {err}"
+        );
+    }
+
+    /// An Rgb buffer imports as an R8 view of `height` rows of `row_stride`
+    /// bytes, which is how the GPUs without a `BG24` import read it.
+    #[test]
+    fn test_from_tensor_nv_r8_takes_rgb_as_stride_by_height() {
+        if !crate::test_support::is_dma_available() {
+            crate::test_support::report_skip("test_from_tensor_nv_r8_takes_rgb - no DMA-BUF");
+            return;
         }
+        let t = Tensor::<u8>::image(
+            321,
+            241,
+            PixelFormat::Rgb,
+            Some(edgefirst_tensor::TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let stride = t.effective_row_stride().unwrap();
+        let attrs = DmaImportAttrs::from_tensor_nv_r8(&t, PixelFormat::Rgb).unwrap();
+        assert_eq!(attrs.drm_fourcc, DrmFourcc::R8);
+        assert_eq!((attrs.width, attrs.height), (stride, 241));
+        assert_eq!(attrs.plane0_pitch, stride);
+        assert!(attrs.plane1.is_none());
     }
 
     /// 1-bpp (Grey) likewise still requires width%4 — natural pitch is

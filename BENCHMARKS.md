@@ -173,6 +173,47 @@ Source-width constraint for the `Sampler` (NV12 EGLImage) path: **even width**
 that are even but not 4-aligned (e.g. 1282) take the zero-copy sampler path; a
 driver that still rejects falls back automatically.
 
+### Packed RGB Sources (fused RGB JPEG decode → model input)
+
+A packed `Rgb` DMA-BUF source (what `ImageDecoder::set_output_format(Some(PixelFormat::Rgb))` writes) converts on the GPU on Linux. Each GPU takes the first route it supports (see `crates/image/ARCHITECTURE.md` § *Linux packed RGB source → GPU*):
+
+| Platform | GPU | Route | Why |
+|----------|-----|-------|-----|
+| imx95-evk | Mali-G310 | native `BG24` import | the driver lists and samples `DRM_FORMAT_BGR888` exactly, odd widths included |
+| imx8mpevk-08 | Vivante GC7000UL | R8 view + shader; a 4K row (11520 bytes, past its 8192-texel limit) is refused and converts on the CPU | `BG24` not listed; libg2d rejects 24-bit sources |
+| rpi5-hailo | V3D 7.1 | R8 view + shader | `BG24` not listed |
+| iq9075-evk | Adreno 663 | R8 view + shader | `BG24` is listed, but its sampler reads past the end of the buffer (kgsl GPU page faults, ~8 ms stalls when the buffer ends on a page boundary) |
+
+**Latency (letterbox to 640×640, median of 100, `pipeline_benchmark` `pipeline/<res>/RGB->…` cells, GL forced vs CPU forced, 2026-10-25):**
+
+| Platform | Source | → RGBA (GL / CPU) | → RGB (GL / CPU) | → planar RGB (GL / CPU) | → RGB i8 (GL / CPU) |
+|----------|--------|-------------------|------------------|-------------------------|---------------------|
+| imx95-evk | 720p | 0.86 / 7.78 ms | 1.80 / 6.18 ms | 1.84 / 7.69 ms | 2.54 / 7.67 ms |
+| imx95-evk | 1080p | 0.82 / 7.86 ms | 2.43 / 6.35 ms | 2.44 / 7.87 ms | 2.50 / 7.71 ms |
+| imx95-evk | 4K | 1.75 / 12.40 ms | 3.18 / 10.87 ms | 3.28 / 12.38 ms | 2.55 / 12.65 ms |
+| imx8mpevk-08 | 720p | 7.81 / 9.58 ms | 16.23 / 7.59 ms | 10.92 / 9.38 ms | 19.50 / 9.85 ms |
+| imx8mpevk-08 | 1080p | 7.78 / 10.37 ms | 16.29 / 7.97 ms | 10.96 / 10.16 ms | 19.42 / 10.81 ms |
+| imx8mpevk-08 | 4K | CPU: 15.89 ms | CPU: 14.11 ms | CPU: 15.69 ms | CPU: 15.85 ms |
+| rpi5-hailo | 720p | 1.26 / 2.39 ms | 2.00 / 1.71 ms | 2.40 / 2.50 ms | 2.21 / 1.99 ms |
+| rpi5-hailo | 1080p | 2.51 / 2.64 ms | 3.27 / 1.95 ms | 4.37 / 2.88 ms | 3.47 / 2.27 ms |
+| rpi5-hailo | 4K | 7.82 / 4.55 ms | 8.53 / 3.99 ms | 8.97 / 4.84 ms | 8.82 / 4.34 ms |
+| iq9075-evk | 720p | 2.55 / 4.97 ms | 2.97 / 3.77 ms | 3.28 / 4.59 ms | 2.99 / 4.98 ms |
+| iq9075-evk | 1080p | 2.67 / 5.92 ms | 2.74 / 4.97 ms | 3.35 / 5.59 ms | 3.01 / 5.29 ms |
+| iq9075-evk | 4K | 3.73 / 7.29 ms | 3.86 / 6.37 ms | 3.91 / 6.54 ms | 3.85 / 7.37 ms |
+
+The GPU route is the default even where the CPU is as fast or faster (V3D, whose Cortex-A76 cores run the CPU letterbox quickly): it keeps the CPU free for decode and post-processing. A buffer the GPU cannot import zero-copy converts on the CPU instead of being uploaded: on Vivante an upload of a 4K frame cost 75 ms against 16 ms on the CPU. Vivante's packed RGB *destinations* cost about 9 ms more than RGBA ones for every source format (NV12 → RGB is 14.1 ms on the GL path at 1080p), so its RGB and int8 RGB columns carry that pass rather than the source import. `EDGEFIRST_FORCE_BACKEND=cpu` selects the CPU. The R8 programs blend rows in the texture unit by default; `EDGEFIRST_GL_NO_NV_HW_FILTER=1` selects the exact 12-fetch shader blend.
+
+**Decode strategy (`decode_pipeline_benchmark`, `zidane.jpg` 1280×720 → 640×640 letterbox HWC, auto backend, median ms):**
+
+| Platform | NV12 decode + convert | fused RGB decode + convert |
+|----------|-----------------------|----------------------------|
+| imx8mpevk-08 | 8.32 + 12.76 = **23.52** | 9.91 + 16.20 = 29.10 |
+| imx95-evk | 2.97 + 2.54 = **5.89** | 9.38 + 2.52 = 14.29 |
+| rpi5-hailo | 2.11 + 1.52 = **3.65** | 2.95 + 2.19 = 5.21 |
+| iq9075-evk | 2.00 + 2.18 = **5.86** | 2.69 + 3.08 = 7.22 |
+
+With both converts on the GPU, decoding to native NV12 stays faster than the fused RGB decode on every board measured. On the i.MX 95 the NV12 decode runs on the V4L2 hardware decoder, which has no RGB output, so the fused decode falls to the CPU. On the others both decode on the CPU, and the fused decode's colour conversion costs more there than the GPU's YUV→RGB, which the NV path performs in the same draw as the resize.
+
 ### Buffer Infrastructure Benchmarks
 
 In addition to compute benchmarks, we separately measure:
@@ -250,9 +291,9 @@ See [README.md § Benchmarking](README.md#benchmarking) for full instructions on
 |--------|-------|-----------------|
 | `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA) |
 | `image_benchmark` | `edgefirst-image` | JPEG loading, format convert, resize operations across buffer backends |
-| `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
+| `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input), from YUYV, NV12 and packed RGB sources |
 | `nv_path_benchmark` | `edgefirst-image` | NV12/16/24 sampler-vs-shader A/B (set `EDGEFIRST_NV_CONVERT_PATH=sampler\|shader`); synthesized sources, no testdata |
-| `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert end-to-end (strided input, HWC/CHW output) |
+| `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert end-to-end (strided input, HWC/CHW output), decoding to native NV12 and, as `rgb_*` cells, fused to packed RGB |
 | `nvjpeg_benchmark` | `edgefirst-image` | nvJPEG GPU decode into CUDA-backed PBO (`codec/jpeg/nvjpeg/rgbi/*` cells); on-target only, skips cleanly without CUDA |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_decoded_masks, draw_proto_masks, hybrid path |
 | `mask_decode_benchmark` | `edgefirst-image` | Focused mask decode on the RETINA (scaled) path |

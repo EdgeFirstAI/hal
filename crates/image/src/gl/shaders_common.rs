@@ -621,6 +621,154 @@ pub(crate) const NV_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
+// ---------------------------------------------------------------------------
+// Packed RGB (3 bytes per pixel) -> RGBA from an R8 view of the buffer. No GPU
+// texel format holds a packed 24-bit pixel, so the buffer is presented as one
+// R8 texture `row_stride` texels wide and `height` rows tall, and each pixel
+// is assembled from its three bytes. Taps go through `texture()` at texel
+// centres rather than `texelFetch`: same bytes under NEAREST, and Vivante
+// GC7000UL runs it about 1.8x faster.
+
+/// Declarations shared by the packed-RGB programs: the layout uniforms and
+/// `rgb_px(x, y)`, the exact pixel, and `rgb_col(x, v)`, the pixel's bytes
+/// blended between rows by a LINEAR sampler.
+macro_rules! rgb_r8_header {
+    () => {
+        "#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D src;
+uniform ivec2 img_size;
+// Reciprocal of the R8 texture's size: (row stride in bytes, rows).
+uniform vec2 inv_tex;
+// Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
+// clamped to them, so a crop never reads pixels from outside itself.
+uniform ivec4 src_rect;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
+
+vec3 rgb_px(int x, int y) {
+    float b = float(x * 3) + 0.5;
+    float v = (float(y) + 0.5) * inv_tex.y;
+    return vec3(texture(src, vec2(b * inv_tex.x, v)).r,
+                texture(src, vec2((b + 1.0) * inv_tex.x, v)).r,
+                texture(src, vec2((b + 2.0) * inv_tex.x, v)).r);
+}
+
+// Under LINEAR filtering, at texture row coordinate `v`. Each tap sits 1/1024
+// texel right of its byte's centre so the horizontal weight quantizes to zero:
+// a tap computed exactly at the centre can land a hair left of it and blend
+// in a fraction of the previous byte, which belongs to another channel.
+vec3 rgb_col(int x, float v) {
+    float b = float(x * 3) + 0.5 + 1.0 / 1024.0;
+    return vec3(texture(src, vec2(b * inv_tex.x, v)).r,
+                texture(src, vec2((b + 1.0) * inv_tex.x, v)).r,
+                texture(src, vec2((b + 2.0) * inv_tex.x, v)).r);
+}
+
+"
+    };
+}
+
+/// `main()` statements of the single-tap packed-RGB programs (a draw that
+/// maps the crop 1:1, or nearest interpolation): the pixel under `tc`.
+macro_rules! rgb_r8_nearest_body {
+    () => {
+        "    ivec2 i = clamp(ivec2(tc * vec2(img_size)), src_rect.xy, src_rect.zw);
+    vec3 rgb = rgb_px(i.x, i.y);
+"
+    };
+}
+
+/// `main()` statements of the shader-filtered bilinear packed-RGB programs:
+/// half-pixel-centred bilinear from four exact pixels, every tap clamped to
+/// the crop — the convention of the NV bilinear programs.
+macro_rules! rgb_r8_bilinear_body {
+    () => {
+        "    vec2 p = tc * vec2(img_size) - 0.5;
+    vec2 p0 = floor(p);
+    vec2 f = p - p0;
+    ivec2 i0 = clamp(ivec2(p0), src_rect.xy, src_rect.zw);
+    ivec2 i1 = clamp(ivec2(p0) + 1, src_rect.xy, src_rect.zw);
+    vec3 rgb = mix(mix(rgb_px(i0.x, i0.y), rgb_px(i1.x, i0.y), f.x),
+                   mix(rgb_px(i0.x, i1.y), rgb_px(i1.x, i1.y), f.x), f.y);
+"
+    };
+}
+
+/// `main()` statements of the hardware-assisted bilinear packed-RGB
+/// programs: the texture unit's LINEAR filter blends rows within each byte
+/// column, the shader blends the two columns, six fetches instead of twelve.
+/// The row coordinate is clamped to the crop's row centres so the filter
+/// never reaches a row outside it.
+macro_rules! rgb_r8_hw_bilinear_body {
+    () => {
+        "    vec2 p = tc * vec2(img_size) - 0.5;
+    float x0 = floor(p.x);
+    float fx = p.x - x0;
+    int xa = clamp(int(x0), src_rect.x, src_rect.z);
+    int xb = clamp(int(x0) + 1, src_rect.x, src_rect.z);
+    float v = (clamp(p.y, float(src_rect.y), float(src_rect.w)) + 0.5) * inv_tex.y;
+    vec3 rgb = mix(rgb_col(xa, v), rgb_col(xb, v), fx);
+"
+    };
+}
+
+/// Packed-RGB->RGBA fragment shader for draws that do not rescale.
+pub(crate) const RGB_R8_RGBA_FRAGMENT: &str = concat!(
+    rgb_r8_header!(),
+    "void main() {\n",
+    rgb_r8_nearest_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`RGB_R8_RGBA_FRAGMENT`].
+pub(crate) const RGB_R8_RGBA_INT8_FRAGMENT: &str = concat!(
+    rgb_r8_header!(),
+    int_quantize!(),
+    "void main() {\n",
+    rgb_r8_nearest_body!(),
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
+);
+
+/// Packed-RGB->RGBA fragment shader for draws that rescale, filtered in the
+/// shader: the exact program, and the fallback when the texture units may
+/// not filter.
+pub(crate) const RGB_R8_RGBA_BILINEAR_FRAGMENT: &str = concat!(
+    rgb_r8_header!(),
+    "void main() {\n",
+    rgb_r8_bilinear_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`RGB_R8_RGBA_BILINEAR_FRAGMENT`].
+pub(crate) const RGB_R8_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
+    rgb_r8_header!(),
+    int_quantize!(),
+    "void main() {\n",
+    rgb_r8_bilinear_body!(),
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
+);
+
+/// Packed-RGB->RGBA fragment shader for draws that rescale, with the rows
+/// blended by the texture unit.
+pub(crate) const RGB_R8_RGBA_HW_BILINEAR_FRAGMENT: &str = concat!(
+    rgb_r8_header!(),
+    "void main() {\n",
+    rgb_r8_hw_bilinear_body!(),
+    "    color = vec4(rgb, 1.0);\n}\n"
+);
+
+/// Int8 variant of [`RGB_R8_RGBA_HW_BILINEAR_FRAGMENT`].
+pub(crate) const RGB_R8_RGBA_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
+    rgb_r8_header!(),
+    int_quantize!(),
+    "void main() {\n",
+    rgb_r8_hw_bilinear_body!(),
+    "    color = vec4(quantize(rgb), 1.0);\n}\n"
+);
+
 #[cfg(test)]
 mod nv_shader_golden {
     /// The golden with CRLF normalized to LF. A checkout made with
@@ -658,6 +806,27 @@ mod nv_shader_golden {
             super::NV_RGBA_HW_BILINEAR_FRAGMENT,
             golden(include_str!("golden/nv_rgba_hw_bilinear_linux.glsl")).as_str(),
             "hardware-bilinear NV->RGBA shader bytes drifted from the on-target-validated golden"
+        );
+    }
+
+    /// The packed-RGB R8 shader sources, validated on-target (Vivante,
+    /// Mali, V3D, Adreno), frozen like the NV ones.
+    #[test]
+    fn rgb_r8_fragment_byte_identical() {
+        assert_eq!(
+            super::RGB_R8_RGBA_FRAGMENT,
+            golden(include_str!("golden/rgb_r8_rgba_linux.glsl")).as_str(),
+            "packed-RGB shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::RGB_R8_RGBA_BILINEAR_FRAGMENT,
+            golden(include_str!("golden/rgb_r8_rgba_bilinear_linux.glsl")).as_str(),
+            "bilinear packed-RGB shader bytes drifted from the on-target-validated golden"
+        );
+        assert_eq!(
+            super::RGB_R8_RGBA_HW_BILINEAR_FRAGMENT,
+            golden(include_str!("golden/rgb_r8_rgba_hw_bilinear_linux.glsl")).as_str(),
+            "hardware-bilinear packed-RGB shader bytes drifted from the on-target-validated golden"
         );
     }
 

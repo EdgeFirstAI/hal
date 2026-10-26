@@ -19,6 +19,7 @@ mod probe_int_textures;
 mod probe_min_sizes;
 mod probe_nv_dmabuf;
 mod probe_nvbufsurface;
+mod probe_rgb_dmabuf;
 mod probe_rgb_fbo;
 
 use egl_context::GpuContext;
@@ -30,6 +31,7 @@ fn main() {
     let bench_only = std::env::args().any(|a| a == "--bench-only");
     let skip_pipeline = std::env::args().any(|a| a == "--skip-pipeline");
     let skip_mask_pool = std::env::args().any(|a| a == "--skip-mask-pool");
+    let rgb_only = std::env::args().any(|a| a == "--rgb-only");
 
     println!("gpu-probe: Low-level GPU platform exploration tool");
     println!("  arch: {}", std::env::consts::ARCH);
@@ -48,6 +50,11 @@ fn main() {
         }
     };
 
+    if rgb_only {
+        probe_rgb_dmabuf::run(&ctx);
+        return;
+    }
+
     // Capability probe
     let has_rgb8_fbo = if !bench_only {
         probe::run_probes(&ctx);
@@ -58,6 +65,7 @@ fn main() {
         // Path A (native YUV) and Path B (R8) at odd-logical/even-stride dims,
         // with 64-aligned vs packed destination strides.
         probe_nv_dmabuf::run(&ctx);
+        probe_rgb_dmabuf::run(&ctx);
         probe_float_render::run(&ctx);
         // Jetson NvBufSurface dma-buf probe (O1-O3). Gated: SKIPs cleanly when
         // libnvbufsurface.so is absent, so non-Jetson runs are unaffected.

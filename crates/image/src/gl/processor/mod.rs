@@ -35,7 +35,11 @@ use super::shaders::{
     generate_planar_rgb_shader, generate_planar_rgb_shader_2d, generate_proto_dequant_shader_int8,
     generate_proto_repack_compute_shader, generate_proto_segmentation_shader,
     generate_proto_segmentation_shader_f32, generate_proto_segmentation_shader_int8_bilinear,
-    generate_proto_segmentation_shader_int8_nearest, generate_segmentation_shader,
+    generate_proto_segmentation_shader_int8_nearest,
+    generate_rgb_r8_to_rgba_bilinear_int8_shader_2d, generate_rgb_r8_to_rgba_bilinear_shader_2d,
+    generate_rgb_r8_to_rgba_hw_bilinear_int8_shader_2d,
+    generate_rgb_r8_to_rgba_hw_bilinear_shader_2d, generate_rgb_r8_to_rgba_int8_shader_2d,
+    generate_rgb_r8_to_rgba_shader_2d, generate_segmentation_shader,
     generate_texture_fragment_shader, generate_texture_fragment_shader_yuv,
     generate_texture_int8_shader, generate_texture_int8_shader_yuv, generate_vertex_shader,
     quant_mapped,
@@ -259,6 +263,9 @@ struct Int8Set {
     nv_r8: [GlProgram; 3],
     nv_r8_uniforms: [NvUniformState; 3],
     nv_y2y: Option<(GlProgram, NvUniformState)>,
+    /// In [`NvSampling::program`] order, int8 entries only.
+    rgb_r8: [GlProgram; 3],
+    rgb_r8_locs: [RgbUniformLocs; 3],
     texture_src_extent_loc: i32,
     yuv_src_extent_loc: i32,
     planar_src_extent_loc: i32,
@@ -292,6 +299,12 @@ impl Int8Set {
             build(generate_nv_to_rgba_hw_bilinear_int8_shader_2d())?,
         ];
         let nv_r8_uniforms = nv_r8.each_ref().map(NvUniformState::resolve);
+        let rgb_r8 = [
+            build(generate_rgb_r8_to_rgba_int8_shader_2d())?,
+            build(generate_rgb_r8_to_rgba_bilinear_int8_shader_2d())?,
+            build(generate_rgb_r8_to_rgba_hw_bilinear_int8_shader_2d())?,
+        ];
+        let rgb_r8_locs = rgb_r8.each_ref().map(RgbUniformLocs::resolve);
         let nv_y2y = if y2y {
             match build(generate_nv_to_rgba_y2y_int8_shader()) {
                 Ok(p) => {
@@ -327,6 +340,8 @@ impl Int8Set {
             nv_r8,
             nv_r8_uniforms,
             nv_y2y,
+            rgb_r8,
+            rgb_r8_locs,
         })
     }
 }
@@ -552,6 +567,47 @@ impl NvSampling {
     fn program(self, is_int8: bool) -> usize {
         self as usize * 2 + usize::from(is_int8)
     }
+}
+
+/// Uniform locations for one packed-RGB R8 program, resolved once at link
+/// time (see [`NvUniformLocs`]).
+#[derive(Clone, Copy)]
+struct RgbUniformLocs {
+    img_size: i32,
+    inv_tex: i32,
+    src_rect: i32,
+}
+
+impl RgbUniformLocs {
+    fn resolve(program: &GlProgram) -> Self {
+        // SAFETY: `program` is linked on this thread's current context and
+        // each name is a `c"..."` literal.
+        unsafe {
+            edgefirst_gl::gl::UseProgram(program.id);
+            let loc = |name: &std::ffi::CStr| {
+                edgefirst_gl::gl::GetUniformLocation(program.id, name.as_ptr())
+            };
+            // Constant: the RGB programs always sample `src` from unit 0.
+            edgefirst_gl::gl::Uniform1i(loc(c"src"), 0);
+            RgbUniformLocs {
+                img_size: loc(c"img_size"),
+                inv_tex: loc(c"inv_tex"),
+                src_rect: loc(c"src_rect"),
+            }
+        }
+    }
+}
+
+/// How the most recent packed-`Rgb` DMA-BUF source reached the GPU (test
+/// observable, like [`GLProcessorST::last_nv_convert_path`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RgbSourcePath {
+    /// Imported as `BG24`, one RGB texel per pixel, filtered by the texture
+    /// unit.
+    Native,
+    /// Imported as an R8 view and assembled by the RGB program named by the
+    /// sampling ([`NvSampling::Single`], `Shader` or `Hardware`).
+    R8Import(NvSampling),
 }
 
 /// OpenGL single-threaded image converter.
@@ -790,7 +846,22 @@ pub struct GLProcessorST {
     /// Set once the driver refuses a chroma-plane import, so later resizes
     /// take the shader-filtered program instead of retrying it every frame.
     nv_uv_import_refused: bool,
-    /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
+    /// Packed-RGB shaders: an R8 view of a packed `Rgb` source → RGBA8,
+    /// indexed by [`NvSampling::program`] like `nv_r8_programs` (no
+    /// `HardwareYuv`).
+    rgb_r8_programs: [GlProgram; 6],
+    rgb_r8_locs: [RgbUniformLocs; 6],
+    /// Whether a packed `Rgb` DMA-BUF source imports natively (`BG24`): the
+    /// display lists the format and the GPU reads it correctly. Elsewhere
+    /// it takes the R8 view.
+    rgb_native_import: bool,
+    /// Whether a packed `Rgb` DMA-BUF source may be imported as an R8 view
+    /// ([`GlPlatform::PACKED_RGB_R8_IMPORT`]).
+    rgb_r8_import: bool,
+    /// How the most recent packed-`Rgb` DMA-BUF source reached the GPU.
+    pub(super) last_rgb_source_path: Option<RgbSourcePath>,
+    /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not
+    /// EXTERNAL_OES): an NV combined plane or a packed `Rgb` buffer.
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
     nv_r8_egl_cache: ImportCache<PlatformImport>,
@@ -2321,6 +2392,8 @@ impl GLProcessorST {
             nv_r8: [nv_int8, nv_bilinear_int8, nv_hw_bilinear_int8],
             nv_r8_uniforms: [nv_int8_u, nv_bilinear_int8_u, nv_hw_bilinear_int8_u],
             nv_y2y: y2y_int8,
+            rgb_r8: [rgb_int8, rgb_bilinear_int8, rgb_hw_bilinear_int8],
+            rgb_r8_locs: [rgb_int8_l, rgb_bilinear_int8_l, rgb_hw_bilinear_int8_l],
             ..
         } = int8;
         let [nv, nv_bilinear, nv_hw_bilinear] = [
@@ -2350,6 +2423,32 @@ impl GLProcessorST {
             nv_bilinear_int8_u,
             nv_hw_bilinear_u,
             nv_hw_bilinear_int8_u,
+        ];
+        // Packed RGB from an R8 view, indexed like `nv_r8_programs`.
+        let [rgb, rgb_bilinear, rgb_hw_bilinear] = [
+            generate_rgb_r8_to_rgba_shader_2d(),
+            generate_rgb_r8_to_rgba_bilinear_shader_2d(),
+            generate_rgb_r8_to_rgba_hw_bilinear_shader_2d(),
+        ]
+        .map(|src| GlProgram::new(generate_vertex_shader(), src));
+        let [rgb, rgb_bilinear, rgb_hw_bilinear] = [rgb?, rgb_bilinear?, rgb_hw_bilinear?];
+        let [rgb_l, rgb_bilinear_l, rgb_hw_bilinear_l] =
+            [&rgb, &rgb_bilinear, &rgb_hw_bilinear].map(RgbUniformLocs::resolve);
+        let rgb_r8_programs = [
+            rgb,
+            rgb_int8,
+            rgb_bilinear,
+            rgb_bilinear_int8,
+            rgb_hw_bilinear,
+            rgb_hw_bilinear_int8,
+        ];
+        let rgb_r8_locs = [
+            rgb_l,
+            rgb_int8_l,
+            rgb_bilinear_l,
+            rgb_bilinear_int8_l,
+            rgb_hw_bilinear_l,
+            rgb_hw_bilinear_int8_l,
         ];
         let nv_y2y_programs = if has_yuv_target {
             match (
@@ -2384,6 +2483,16 @@ impl GLProcessorST {
         let proto_dequant_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
+
+        // Native packed-RGB import where the display lists `BG24` and the
+        // GPU reads it correctly. Adreno lists it but its sampler reads past
+        // the end of the buffer: kgsl GPU page faults and multi-millisecond
+        // stalls whenever the buffer ends on a page boundary. The native
+        // import is sampled through `samplerExternalOES`, so it needs that
+        // too.
+        let rgb_native_import =
+            Platform::EXTERNAL_OES && !is_adreno && Platform::lists_packed_rgb_import(&gl_context);
+        log::debug!("packed Rgb DMA-BUF sources import natively: {rgb_native_import}");
 
         // EGLImage cache capacity (per cache: src / dst / nv_r8 / nv_uv). What the
         // number MEANS -- a buffer count and not a size, its scope, and the
@@ -2519,6 +2628,11 @@ impl GLProcessorST {
             proto_ssbo_size: 0,
             nv_r8_programs,
             nv_r8_uniforms,
+            rgb_r8_programs,
+            rgb_r8_locs,
+            rgb_native_import,
+            rgb_r8_import: Platform::PACKED_RGB_R8_IMPORT,
+            last_rgb_source_path: None,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
             nv_uv_texture: Texture::new(),
@@ -2774,6 +2888,22 @@ impl GLProcessorST {
         self.nv_y2y_programs.is_some()
     }
 
+    /// Whether a packed `Rgb` DMA-BUF source imports natively here.
+    #[cfg(test)]
+    pub(super) fn rgb_native_import(&self) -> bool {
+        self.rgb_native_import
+    }
+
+    /// Withhold routes from packed `Rgb` DMA-BUF sources, so tests reach the
+    /// R8 import, and the CPU decline, on GPUs that would take an earlier
+    /// route.
+    /// Only narrows: a route this GPU lacks is not granted.
+    #[cfg(test)]
+    pub(super) fn restrict_rgb_source_routes(&mut self, native: bool, r8_import: bool) {
+        self.rgb_native_import &= native;
+        self.rgb_r8_import &= r8_import;
+    }
+
     /// Allow or forbid [`NvSampling::Hardware`] (see `nv_hw_filter`).
     #[cfg(test)]
     pub(super) fn set_nv_hw_filter(&mut self, enabled: bool) {
@@ -2949,11 +3079,16 @@ impl GLProcessorST {
             // NV→RGBA full-res into a cached intermediate, then the packed
             // float render with the caller's crop/letterbox. The float
             // classifier runs on the RGBA intermediate rather than the NV
-            // source, so the verdict is pass 2's.
+            // source, so the verdict is pass 2's. A packed Rgb DMA-BUF source
+            // takes the same route: the float programs sample one RGBA texel
+            // per pixel, which most GPUs cannot import Rgb as.
             let nv_src = matches!(
                 src_fmt,
                 PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-            );
+            ) || (src_fmt == PixelFormat::Rgb
+                && Platform::PACKED_RGB_R8_IMPORT
+                && src.memory() == TensorMemory::DmaBuf
+                && self.gl_context.transfer_backend.is_zero_copy());
             let path = classify_float_render(
                 if nv_src { PixelFormat::Rgba } else { src_fmt },
                 dst_fmt,
@@ -3799,15 +3934,23 @@ impl GLProcessorST {
             // NV16/NV24 use Path B — the contiguous-only check is enforced at
             // EGLImage creation time in `from_tensor_nv_r8`; multiplane
             // sources fall back to CPU via the error path.
-            matches!(
-                fmt,
-                PixelFormat::Rgba
-                    | PixelFormat::Grey
-                    | PixelFormat::Yuyv
-                    | PixelFormat::Nv12
-                    | PixelFormat::Nv16
-                    | PixelFormat::Nv24
-            )
+            // Packed Rgb, where the platform imports it as an R8 view (Linux
+            // DMA-BUF): natively where the GPU takes `BG24`, else as the R8
+            // view (`draw_rgb_dma_source`), which declines to the CPU when
+            // the driver refuses both.
+            // Elsewhere an Rgb buffer is an RGBA8888 surface W*3/4 texels
+            // wide, which has no import route here yet, so it stays on the
+            // CPU.
+            (fmt == PixelFormat::Rgb && Platform::PACKED_RGB_R8_IMPORT)
+                || matches!(
+                    fmt,
+                    PixelFormat::Rgba
+                        | PixelFormat::Grey
+                        | PixelFormat::Yuyv
+                        | PixelFormat::Nv12
+                        | PixelFormat::Nv16
+                        | PixelFormat::Nv24
+                )
         } else {
             // Non-DMA (PBO/Sync): packed RGB(A)/Grey upload via
             // draw_src_texture, plus single-plane NV12/NV16/NV24 via the
@@ -4393,6 +4536,7 @@ impl GLProcessorST {
         if let Some((programs, _)) = &self.nv_y2y_programs {
             ids.push(programs[1].id);
         }
+        ids.extend(self.rgb_r8_programs.iter().skip(1).step_by(2).map(|p| p.id));
         ids.into_iter()
             .map(|id| {
                 // SAFETY: on the GL thread with this processor's context
@@ -4478,6 +4622,15 @@ impl GLProcessorST {
         {
             swap(&mut self.nv_r8_programs[2 * i + 1], program);
             swap(&mut self.nv_r8_uniforms[2 * i + 1], uniforms);
+        }
+        for (i, (program, locs)) in set
+            .rgb_r8
+            .iter_mut()
+            .zip(set.rgb_r8_locs.iter_mut())
+            .enumerate()
+        {
+            swap(&mut self.rgb_r8_programs[2 * i + 1], program);
+            swap(&mut self.rgb_r8_locs[2 * i + 1], locs);
         }
         if let (Some((programs, uniforms)), Some((program, u))) =
             (self.nv_y2y_programs.as_mut(), set.nv_y2y.as_mut())
@@ -5571,7 +5724,23 @@ impl GLProcessorST {
             (dst_w, dst_h),
             rotation,
         );
-        if self.gl_context.transfer_backend.is_zero_copy() && src.memory() == TensorMemory::DmaBuf {
+        if self.gl_context.transfer_backend.is_zero_copy()
+            && src.memory() == TensorMemory::DmaBuf
+            && src_fmt == PixelFormat::Rgb
+        {
+            self.draw_rgb_dma_source(
+                src,
+                src_roi,
+                nv_rect,
+                dst_roi,
+                rotation_offset,
+                flip,
+                is_int8,
+                convert_span,
+            )?;
+        } else if self.gl_context.transfer_backend.is_zero_copy()
+            && src.memory() == TensorMemory::DmaBuf
+        {
             // Choose the NV* path (ShaderR8 vs ExternalSampler) honoring the
             // EDGEFIRST_NV_CONVERT_PATH preference. See `select_nv_path`: Auto
             // prefers the portable, colorimetry-exact in-shader ShaderR8 for
@@ -7285,7 +7454,7 @@ impl GLProcessorST {
         src_fmt: PixelFormat,
         r8_src: Option<PlatformHandle>,
         src_rect: NvSampleRect,
-        mut dst_roi: RegionOfInterest,
+        dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
         is_int8: bool,
@@ -7529,6 +7698,188 @@ impl GLProcessorST {
                 edgefirst_gl::gl::Uniform1f(locs.c_ub, coeffs.c_ub);
             }
 
+            self.draw_sample_rect_quad(src_rect, (src_w, src_h), dst_roi, rotation_offset, flip);
+            if sampling == NvSampling::Hardware {
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE1);
+                edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, 0);
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            }
+        }
+        self.last_nv_sampling = Some(sampling);
+        check_gl_error(function!(), line!())?;
+        // The draw (and its colorimetry upload, when taken) succeeded — only
+        // now record the program's uploaded (encoding, range).
+        if upload_colorimetry {
+            self.nv_r8_uniforms[program].last_colorimetry = Some(colorimetry);
+        }
+        Ok(())
+    }
+
+    /// Render a packed `Rgb` DMA-BUF source into the bound FBO through a
+    /// zero-copy import: native `BG24` where [`Self::rgb_native_import`]
+    /// holds, else an R8 view of the buffer. An EGL import is not bound by
+    /// `GL_MAX_TEXTURE_SIZE` the way an upload is: V3D (4096) imports and
+    /// samples a 1080p row's 5760 bytes exactly. Where neither import is
+    /// possible the convert returns `NotSupported` and the CPU converts the
+    /// buffer: an upload costs more than the CPU convert it would replace
+    /// (Vivante, 4K: 75 ms uploaded, 16 ms on the CPU).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_rgb_dma_source(
+        &mut self,
+        src: &Tensor<u8>,
+        src_roi: RegionOfInterest,
+        src_rect: NvSampleRect,
+        dst_roi: RegionOfInterest,
+        rotation_offset: usize,
+        flip: Flip,
+        is_int8: bool,
+        convert_span: &tracing::Span,
+    ) -> Result<(), Error> {
+        self.last_rgb_source_path = None;
+        if self.rgb_native_import {
+            match self.get_or_create_egl_image(CacheKind::Src, src, PixelFormat::Rgb) {
+                Ok(img) => {
+                    self.convert_stats.src_imports += 1;
+                    convert_span.record("src_feed", "import");
+                    self.draw_camera_texture_eglimage(
+                        src,
+                        PixelFormat::Rgb,
+                        img,
+                        src_roi,
+                        dst_roi,
+                        rotation_offset,
+                        flip,
+                        is_int8,
+                        None,
+                    )?;
+                    self.last_rgb_source_path = Some(RgbSourcePath::Native);
+                    return Ok(());
+                }
+                Err(e) => log::debug!("native Rgb import declined ({e}); using the R8 view"),
+            }
+        }
+        let import = if self.rgb_r8_import {
+            self.get_or_create_nv_r8_egl_image(src, PixelFormat::Rgb)
+        } else {
+            Err(Error::NotSupported(
+                "no packed-RGB R8 import on this platform".into(),
+            ))
+        };
+        let r8_src = match import {
+            Ok(img) => img,
+            Err(e) => {
+                self.convert_stats.zero_copy_declines += 1;
+                let (w, h) = (src.width().unwrap_or(0), src.height().unwrap_or(0));
+                // Debug, not warn: a refusal is a capability (Vivante refuses
+                // a 4K row, wider than its 8192-texel limit; Mali and Adreno
+                // an unaligned plane offset), and a pooled buffer that
+                // declines once declines every frame.
+                log::debug!("R8 import of an Rgb source ({w}x{h}) declined: {e}");
+                return Err(Error::NotSupported(format!(
+                    "packed Rgb source ({w}x{h}) cannot be imported zero-copy ({e}); \
+                     converting on the CPU"
+                )));
+            }
+        };
+        self.convert_stats.src_imports += 1;
+        convert_span.record("src_feed", "import");
+        let sampling = self.draw_rgb_texture_2d(
+            src,
+            r8_src,
+            src_rect,
+            dst_roi,
+            rotation_offset,
+            flip,
+            is_int8,
+        )?;
+        self.last_rgb_source_path = Some(RgbSourcePath::R8Import(sampling));
+        Ok(())
+    }
+
+    /// Render a packed `Rgb` source → RGBA8 through the R8 programs from its
+    /// R8 import `r8_src`: one R8 texture `row_stride` texels wide and
+    /// `height` rows tall, each pixel its three bytes. Renders into the
+    /// currently-bound FBO and returns the sampling drawn.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_rgb_texture_2d(
+        &mut self,
+        src: &Tensor<u8>,
+        r8_src: PlatformHandle,
+        src_rect: NvSampleRect,
+        dst_roi: RegionOfInterest,
+        rotation_offset: usize,
+        flip: Flip,
+        is_int8: bool,
+    ) -> Result<NvSampling, Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let tex_width = src.effective_row_stride().unwrap_or(src_w * 3);
+        let src_key = BufferImportKey::from_tensor(src, PixelFormat::Rgb, false);
+
+        // The same three samplings as the NV programs. `Hardware` blends
+        // rows through the texture unit's LINEAR filter, so it follows the
+        // switch that lets the NV programs filter in hardware.
+        let bilinear =
+            src_rect.resample && self.interpolation.supported() == crate::Interpolation::Bilinear;
+        let sampling = if !bilinear {
+            NvSampling::Single
+        } else if self.nv_hw_filter {
+            NvSampling::Hardware
+        } else {
+            NvSampling::Shader
+        };
+        let filter = if sampling == NvSampling::Hardware {
+            edgefirst_gl::gl::LINEAR
+        } else {
+            edgefirst_gl::gl::NEAREST
+        };
+        let program = sampling.program(is_int8);
+        let prog_id = self.rgb_r8_programs[program].id;
+        let locs = self.rgb_r8_locs[program];
+
+        unsafe {
+            edgefirst_gl::gl::UseProgram(prog_id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.nv_r8_texture.id);
+            super::core::set_tex_filter_clamp(edgefirst_gl::gl::TEXTURE_2D, filter);
+            if self
+                .nv_r8_texture
+                .bind_egl_image(&self.gl_context, src_key, r8_src)?
+            {
+                check_gl_error(function!(), line!())?;
+            }
+            edgefirst_gl::gl::Uniform2i(locs.img_size, src_w as i32, src_h as i32);
+            edgefirst_gl::gl::Uniform2f(locs.inv_tex, 1.0 / tex_width as f32, 1.0 / src_h as f32);
+            edgefirst_gl::gl::Uniform4i(
+                locs.src_rect,
+                src_rect.left as i32,
+                src_rect.top as i32,
+                src_rect.right as i32 - 1,
+                src_rect.bottom as i32 - 1,
+            );
+            self.draw_sample_rect_quad(src_rect, (src_w, src_h), dst_roi, rotation_offset, flip);
+        }
+        check_gl_error(function!(), line!())?;
+        Ok(sampling)
+    }
+
+    /// Draw the quad of an R8-view draw (NV or packed RGB) with its program
+    /// and source texture already bound: `dst_roi` on the bound target,
+    /// flipped as asked, sampling `src_rect` of a `src_w`x`src_h` source
+    /// turned by `rotation_offset` quarter turns.
+    ///
+    /// # Safety
+    /// On the GL thread with this processor's context current.
+    unsafe fn draw_sample_rect_quad(
+        &self,
+        src_rect: NvSampleRect,
+        (src_w, src_h): (usize, usize),
+        mut dst_roi: RegionOfInterest,
+        rotation_offset: usize,
+        flip: Flip,
+    ) {
+        // SAFETY: the caller's contract.
+        unsafe {
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
@@ -7604,23 +7955,11 @@ impl GLProcessorST {
                 edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
-            if sampling == NvSampling::Hardware {
-                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE1);
-                edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, 0);
-                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
-            }
         }
-        self.last_nv_sampling = Some(sampling);
-        check_gl_error(function!(), line!())?;
-        // The draw (and its colorimetry upload, when taken) succeeded — only
-        // now record the program's uploaded (encoding, range).
-        if upload_colorimetry {
-            self.nv_r8_uniforms[program].last_colorimetry = Some(colorimetry);
-        }
-        Ok(())
     }
 
-    /// Look up or create the Path-B R8 EGLImage for an NV* source tensor.
+    /// Look up or create the Path-B R8 EGLImage for an NV* or packed `Rgb`
+    /// source tensor.
     ///
     /// Uses a dedicated cache (`nv_r8_egl_cache`) that is keyed identically to
     /// `src_egl_cache` but stores R8 imports so that the two don't interfere.
@@ -9618,7 +9957,8 @@ impl GLProcessorST {
         )
     }
 
-    /// Fused NV12/NV16/NV24 → zero-copy float destination: two GPU passes
+    /// Fused NV12/NV16/NV24 (or packed Rgb DMA-BUF) → zero-copy float
+    /// destination: two GPU passes
     /// under one call with a **GPU-resident intermediate** — the pixel path is
     /// zero-copy src → GPU → texture → GPU → zero-copy dst, never touching
     /// host memory. Pass 1 renders the YUV source with the caller's full
