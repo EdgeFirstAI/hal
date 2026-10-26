@@ -568,7 +568,9 @@ A `Grey` render target (`GL_RED`) keeps only the red channel of a draw, so a col
 | `Grey` | a copy | one pass |
 | multiplane `Nv12` | as NV | declines to the CPU: only the external sampler reads it |
 
-The letterbox colour of a `Grey` destination becomes its luma (`CPUProcessor::rgba_to_grey`) in every channel before the output mapping is resolved, so the pad matches the CPU's whichever pass clears it, quantized destinations included. Integer mapping uses channel 0's parameters, the only channel a `Grey` destination has.
+A limited-range bilinear luma resize (NV or YUYV) filters in the shader, never through `NvSampling::Hardware`: the texture unit blends raw Y before the range expansion clamps its footroom to black, so rows of Y=0 and Y=32 would blend to 0 where the CPU gives about 10. Full-range luma needs no clamp and keeps the hardware filter.
+
+The letterbox colour of a `Grey` destination becomes its luma (`CPUProcessor::rgba_to_grey`) in every channel before the output mapping is resolved, so the pad matches the CPU's whichever pass clears it, quantized destinations included; an output-domain pad (`pad_output`) recovers channel 0's sample into all three. Integer mapping uses channel 0's parameters, the only channel a `Grey` destination has.
 
 ### macOS GL backend (unified engine over ANGLE)
 

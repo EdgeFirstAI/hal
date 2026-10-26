@@ -13759,6 +13759,7 @@ mod gl_tests {
     /// destination that keeps one channel instead of the luma shows: packed
     /// RGB(A) from [`rgb_test_pixel`]; YUV with luma that crosses both
     /// limited-range bounds and chroma that varies on both axes.
+    #[cfg(target_os = "linux")]
     fn grey_test_bytes(w: usize, h: usize, fmt: PixelFormat) -> Vec<u8> {
         // A smooth ramp over 0..=255, so a resize compares filters rather
         // than the edges of a wrapping pattern.
@@ -13810,8 +13811,9 @@ mod gl_tests {
     /// renders what the CPU renders: the BT.601 luma of an RGB-family source
     /// (`ConvertPlan::TwoPassGrey`), the range-expanded Y of a YUV source
     /// (luma-only single pass), at 1:1 and letterboxed with a coloured pad
-    /// (whose luma fills the band), u8 and int8, from host and DMA-BUF
-    /// memory. A GPU route that keeps the red channel misses by tens.
+    /// (whose luma fills the band) or an output-domain pad, u8 and int8, from
+    /// host and DMA-BUF memory. A GPU route that keeps the red channel misses
+    /// by tens.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_grey_dst_matches_cpu() {
@@ -13877,6 +13879,13 @@ mod gl_tests {
                             "letterbox",
                             (480, 480),
                             ConvertOptions::new().letterbox([200, 30, 90, 255]),
+                        ),
+                        (
+                            "pad-output",
+                            (480, 480),
+                            ConvertOptions::new()
+                                .letterbox([200, 30, 90, 255])
+                                .pad_output([1.0; 4]),
                         ),
                     ] {
                         for dtype in [DType::U8, DType::I8] {
@@ -13975,5 +13984,74 @@ mod gl_tests {
             rgb_test_tight_bytes(&after),
             "an NV -> Rgba convert after an NV -> Grey one lost its chroma"
         );
+    }
+
+    /// A limited-range luma resize clamps each sample's footroom to black
+    /// before blending, as the CPU's luma copy does: rows alternating Y=0
+    /// and Y=32 halve to about 10, where blending the raw bytes first (the
+    /// texture unit's filter) gives 16, which expands to 0. Checked on every
+    /// luma route that resamples bilinearly, with hardware filtering allowed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_grey_dst_limited_luma_resize_clamps_each_sample() {
+        use crate::ImageProcessorTrait;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
+        gl.set_nv_hw_filter(true);
+        let zero_copy = gl.gl_context.transfer_backend.is_zero_copy() && is_dma_available();
+        let (w, h) = (320usize, 240usize);
+        let row = |y: usize| if y.is_multiple_of(2) { 0u8 } else { 32 };
+        let mut sources = vec![(PixelFormat::Nv12, TensorMemory::Mem)];
+        if zero_copy {
+            sources.push((PixelFormat::Nv12, TensorMemory::DmaBuf));
+            sources.push((PixelFormat::Yuyv, TensorMemory::DmaBuf));
+        }
+        let mut failures = Vec::new();
+        for (fmt, mem) in sources {
+            let bytes: Vec<u8> = if fmt == PixelFormat::Yuyv {
+                (0..h)
+                    .flat_map(|y| (0..w).flat_map(move |_| [row(y), 128]))
+                    .collect()
+            } else {
+                let luma = (0..h).flat_map(|y| std::iter::repeat_n(row(y), w));
+                luma.chain(std::iter::repeat_n(128, w * h / 2)).collect()
+            };
+            let src = load_raw_image(w, h, fmt, Some(mem), &bytes).unwrap();
+            let image = |m| {
+                TensorDyn::image(
+                    w,
+                    h / 2,
+                    PixelFormat::Grey,
+                    DType::U8,
+                    Some(m),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap()
+            };
+            let mut got = image(mem);
+            gl.convert(&src, &mut got, None).unwrap();
+            let mut want = image(TensorMemory::Mem);
+            crate::CPUProcessor::new()
+                .convert(&src, &mut want, None)
+                .unwrap();
+            let (got, want) = (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want));
+            let max = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            if max > 2 {
+                failures.push(format!(
+                    "{fmt:?}@{mem:?}: max {max} (gl {}, cpu {})",
+                    got[w * 10],
+                    want[w * 10]
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

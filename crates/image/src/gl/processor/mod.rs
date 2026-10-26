@@ -3116,11 +3116,17 @@ impl GLProcessorST {
                 // An output pad that some sample maps to exactly is that pixel
                 // pad, which every route (two-pass included) can render.
                 if let (Some(p), Some([_, _, _, a])) = (pad, crop.dst_color) {
-                    let samples = [
-                        map.sample_for(0, p[0]),
-                        map.sample_for(1, p[1]),
-                        map.sample_for(2, p[2]),
-                    ];
+                    // A Grey destination has one channel; its other map
+                    // channels are alpha's, so the grey sample fills all three.
+                    let samples = if dst.format() == Some(PixelFormat::Grey) {
+                        [map.sample_for(0, p[0]); 3]
+                    } else {
+                        [
+                            map.sample_for(0, p[0]),
+                            map.sample_for(1, p[1]),
+                            map.sample_for(2, p[2]),
+                        ]
+                    };
                     if let [Some(sr), Some(sg), Some(sb)] = samples {
                         crop.dst_color = Some([sr, sg, sb, a]);
                         pad_output_exact = true;
@@ -7789,7 +7795,14 @@ impl GLProcessorST {
         // where the GPU takes the chroma plane's offset.
         let bilinear =
             src_rect.resample && self.interpolation.supported() == crate::Interpolation::Bilinear;
-        let uv_import = if bilinear && self.nv_hw_filter && r8_src.is_some() {
+        let colorimetry = nv_colorimetry(src.colorimetry(), src.height());
+        // The texture unit blends raw samples, before the range expansion and
+        // its clamp. A colour draw accepts that; a limited-range luma draw
+        // filters in the shader, which clamps each sample first, as the CPU's
+        // luma copy does, so footroom does not drag a blend below black.
+        let hw_filter = self.nv_hw_filter
+            && !(luma_only && colorimetry.1 == edgefirst_tensor::ColorRange::Limited);
+        let uv_import = if bilinear && hw_filter && r8_src.is_some() {
             self.get_or_create_nv_uv_egl_image(src, src_fmt)
                 .inspect_err(|e| log::debug!("NV chroma view unavailable ({e}); shader-filtered"))
                 .ok()
@@ -7800,7 +7813,7 @@ impl GLProcessorST {
         // whose matrix comes with the external sampler, never luma-only.
         let mut sampling = NvSampling::choose(NvSamplingInputs {
             bilinear,
-            hw_filter: self.nv_hw_filter,
+            hw_filter,
             imported: r8_src.is_some(),
             chroma_view: uv_import.is_some(),
             y2y: self.nv_y2y_programs.is_some()
@@ -7808,7 +7821,6 @@ impl GLProcessorST {
                 && src_fmt == PixelFormat::Nv12
                 && y2y_pays_off(src_w * src_h, src_rect.dst_pixels),
         });
-        let colorimetry = nv_colorimetry(src.colorimetry(), src.height());
         if sampling == NvSampling::HardwareYuv {
             match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
                 Ok(img) => {
@@ -8182,14 +8194,21 @@ impl GLProcessorST {
             }
         };
 
+        let colorimetry =
+            (src_fmt == PixelFormat::Yuyv).then(|| nv_colorimetry(src.colorimetry(), src.height()));
         // The same three samplings as the NV programs. `Hardware` blends
         // rows through the texture unit's LINEAR filter, so it follows the
-        // switch that lets the NV programs filter in hardware.
+        // switch that lets the NV programs filter in hardware, except for
+        // limited-range luma: the unit would blend raw Y before the range
+        // expansion clamps it (see `draw_nv_texture_2d`).
         let bilinear =
             src_rect.resample && self.interpolation.supported() == crate::Interpolation::Bilinear;
+        let hw_filter = self.nv_hw_filter
+            && !colorimetry
+                .is_some_and(|(_, range)| range == edgefirst_tensor::ColorRange::Limited);
         let sampling = if !bilinear {
             NvSampling::Single
-        } else if self.nv_hw_filter {
+        } else if hw_filter {
             NvSampling::Hardware
         } else {
             NvSampling::Shader
@@ -8202,10 +8221,8 @@ impl GLProcessorST {
         let program = sampling.program(is_int8);
         let prog_id = programs[program].id;
         let locs = locs[program];
-        let luma = (src_fmt == PixelFormat::Yuyv).then(|| {
-            let (encoding, range) = nv_colorimetry(src.colorimetry(), src.height());
-            crate::colorimetry::yuv_to_rgb_coeffs(encoding, range)
-        });
+        let luma = colorimetry
+            .map(|(encoding, range)| crate::colorimetry::yuv_to_rgb_coeffs(encoding, range));
 
         unsafe {
             edgefirst_gl::gl::UseProgram(prog_id);
