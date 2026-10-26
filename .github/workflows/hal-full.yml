@@ -73,7 +73,7 @@ jobs:
           name: testdata-lfs
           path: testdata/
       - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config nasm
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Python venv
@@ -86,7 +86,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview, clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-x86_64-extras
           cache-on-failure: true
@@ -94,7 +94,7 @@ jobs:
       # cargo llvm-cov. The split of test.yml into this file dropped the tool
       # install that the original build-and-test-x86 lane had, and Full had
       # never run, so nothing caught it. Same pin as the old lane.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91  # v2.87.31
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
       # Folded in from the old doc-tests job: same runner, deps and toolchain,
@@ -220,11 +220,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-x86_64
           cache-on-failure: true
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91  # v2.87.31
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
       - name: Probe software-GL
@@ -274,12 +274,12 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt, llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-macos
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91  # v2.87.31
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - run: bash scripts/fetch-angle.sh
@@ -332,12 +332,12 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt, llvm-tools-preview
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-windows
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91  # v2.87.31
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - name: Clippy
@@ -385,7 +385,7 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-ios
           cache-on-failure: true
@@ -419,7 +419,7 @@ jobs:
         uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779  # v1.6.0
         with:
           ndk-version: r27c
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-android
           cache-on-failure: true
@@ -463,12 +463,12 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt, llvm-tools-preview
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-windows-warp
           cache-on-failure: true
           cache-bin: false
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283  # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91  # v2.87.31
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
       - name: Fetch ANGLE
@@ -519,7 +519,7 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-windows-capi
           cache-on-failure: true
@@ -569,7 +569,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-macos-package
           cache-on-failure: true
@@ -582,7 +582,7 @@ jobs:
           fi
           make package PACKAGE_PROFILE=profiling
           ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.zip
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: GPU Python tests
