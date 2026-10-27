@@ -402,17 +402,29 @@ jobs:
         run: |
           set -euo pipefail
           publish_one() {
-            local crate="$1"
+            local crate="$1" attempt
             echo "==> ${crate}"
-            if output=$(cargo publish --no-verify -p "${crate}" 2>&1); then
+            for attempt in 1 2 3 4 5 6; do
+              if output=$(cargo publish --no-verify -p "${crate}" 2>&1); then
+                echo "${output}"
+                return 0
+              fi
               echo "${output}"
-              return 0
-            fi
-            echo "${output}"
-            if echo "${output}" | grep -qE "already uploaded|already exists on crates.io"; then
-              echo "::warning::${crate} already published — skipping"
-              return 0
-            fi
+              if echo "${output}" | grep -qE "already uploaded|already exists on crates.io"; then
+                echo "::warning::${crate} already published — skipping"
+                return 0
+              fi
+              # A just-published sibling can lag in the index the next cargo process reads.
+              if echo "${output}" | grep -q 'failed to select a version for the requirement `edgefirst-'; then
+                echo "::warning::${crate}: a sibling crate is not in the index yet (attempt ${attempt}/6)"
+                if [ "${attempt}" -lt 6 ]; then
+                  sleep $((attempt * 30))
+                fi
+                continue
+              fi
+              return 1
+            done
+            echo "::error::${crate}: sibling crates still missing from the index after 6 attempts"
             return 1
           }
           # Leaves first so dependents can resolve the new version on crates.io.
