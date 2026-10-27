@@ -11129,38 +11129,7 @@ mod image_tests {
             crop,
         );
         result.unwrap();
-        compare_images_convert_to_rgb(
-            &cpu_nv16_dst,
-            &cpu_rgb_dst,
-            yuv_threshold(0.99),
-            function!(),
-        );
-    }
-
-    /// Similarity threshold for a comparison whose path runs a YUV↔RGB
-    /// conversion.
-    ///
-    /// [`crate::cpu::convert`]'s `yuv_mode()` deliberately selects
-    /// `YuvConversionMode::Fast` on cores without Armv8.1 `rdm`
-    /// (Cortex-A53/A35 class, e.g. the i.MX 8M Plus), because `Balanced`
-    /// emulates `SQRDMLAH` there and costs roughly 2×. `Fast` is a
-    /// lower-precision integer approximation with a documented error of up to
-    /// ~2/255, so a threshold calibrated on an `rdm`-capable core is
-    /// unreachable on those cores **by design**: NV16 measures 0.9885 against
-    /// 0.99 on an A53, while every `rdm` core passes.
-    ///
-    /// No CI runner is A53-class, so this only reproduces on target.
-    ///
-    /// Relaxing per-core keeps the assertion tight where the precise path
-    /// runs, instead of loosening it everywhere to accommodate one core.
-    fn yuv_threshold(balanced: f64) -> f64 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            if !std::arch::is_aarch64_feature_detected!("rdm") {
-                return balanced - 0.01;
-            }
-        }
-        balanced
+        compare_images_convert_to_rgb(&cpu_nv16_dst, &cpu_rgb_dst, 0.99, function!());
     }
 
     fn load_bytes_to_tensor(

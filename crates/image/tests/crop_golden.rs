@@ -11,24 +11,15 @@
 //! keep green — any behavioural change to cropped-convert byte output shows
 //! up here first.
 //!
-//! The fixtures are **per-architecture and per-kernel-path**: the `yuv`
-//! crate rounds YUV→RGB differently between its NEON+RDM (aarch64), plain
-//! NEON, and AVX2 (x86_64) kernels, selected at runtime by CPU feature
-//! detection — so every NV-source case's bytes differ between kernel paths
-//! (48 of 80 cases; the 32 RGB-source resize-only cases are identical —
-//! `fast_image_resize` is arch-consistent). Both fixture files come from
-//! the same tree: aarch64 on an i.MX 95 Cortex-A55 (RDM kernels —
-//! byte-identical on Linux aarch64 CI, Apple M-series and RPi5 Cortex-A76,
-//! which all have `asimdrdm`), x86_64 on an AVX2 host. On a
-//! CPU without the fixture's feature (e.g. i.MX 8M Plus Cortex-A53, no
-//! RDM) the matrix test SKIPS: the same code picks a different, equally
-//! correct kernel whose bytes cannot match a frozen file. Cropped-convert
-//! correctness there is proven by the oracle-based tests in the lib suite
-//! (`fused_region_matches_general_path`, `left_edge_crop_zero_copy_*`,
-//! `crop_edge_matches_full_frame_intermediate`, …), which compare against
-//! references computed in the same run. Within one kernel path the frozen
+//! The fixtures are **per architecture**, and the `yuv` crate's exact
+//! (`Professional`) kernels are selected at runtime: one NEON kernel on
+//! aarch64, AVX2 or SSE4.1 on x86_64. The two checked-in files hold the same
+//! checksums, verified on an AVX2 host and on i.MX 95 (Cortex-A55) and
+//! i.MX 8M Plus (Cortex-A53) hardware. An x86_64 CPU without AVX2 skips the
+//! matrix test, since only the AVX2 kernel has been compared. The frozen
 //! bytes are the byte-exactness arbiter; regenerate both files only for a
-//! deliberate change to the CPU resampling, and only from the same tree.
+//! deliberate change to the CPU conversion or resampling, and only from the
+//! same tree.
 
 use edgefirst_image::{CPUProcessor, Crop, Fit, ImageProcessorTrait, Region};
 use edgefirst_tensor::{
@@ -212,7 +203,7 @@ const GOLDEN_JSON: &str = include_str!("data/crop_golden.x86_64.json");
 fn cpu_matches_fixture_kernel_path() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        std::arch::is_aarch64_feature_detected!("rdm")
+        true
     }
     #[cfg(target_arch = "x86_64")]
     {

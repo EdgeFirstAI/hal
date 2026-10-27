@@ -211,22 +211,9 @@ EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
 
 **Regenerate the fixtures only for a deliberate change to the CPU resampling.** `generate_golden` exists and is `#[ignore]`d. A crop-path change must keep the existing fixtures green; regenerating to make it pass turns the guard into a rubber stamp for whatever the code currently does. When the resampling itself changes on purpose, regenerate both architecture files from the same tree and say so in the commit.
 
-The fixtures are **per architecture and per kernel path**. The `yuv` crate
-picks its NEON+RDM, plain-NEON, or AVX2 kernel by runtime CPU feature
-detection, and the three round YUV→RGB differently, so the 48 NV-source cases
-differ between them (the 32 RGB-source resize-only cases are identical —
-`fast_image_resize` is arch-consistent). Two files are checked in: aarch64,
-generated on an Apple M2 Max and byte-identical on Linux aarch64 CI, i.MX 95
-(Cortex-A55), and RPi 5 (Cortex-A76); and x86_64, generated in an AVX2
-container from the same tree.
+The fixtures are **per architecture**. The `yuv` crate's exact (`Professional`) YUV→RGB kernels are picked at runtime, one NEON kernel on aarch64 and AVX2 or SSE4.1 on x86_64, and the two files currently hold the same checksums: verified on an AVX2 host and on i.MX 95 (Cortex-A55) and i.MX 8M Plus (Cortex-A53) hardware. An x86_64 CPU without AVX2 **skips** the matrix test, because only the AVX2 kernel has been compared; cropped-convert correctness there is covered by the oracle-based lib tests (`fused_region_matches_general_path`, `left_edge_crop_zero_copy_*`, `crop_edge_matches_full_frame_intermediate`), which compare against references computed in the same run.
 
-On a CPU without the fixture's feature — i.MX 8M Plus (Cortex-A53) has no
-`asimdrdm` — the matrix test **skips**. The same code picks a different,
-equally correct kernel whose bytes cannot match a file frozen on RDM hardware.
-Cropped-convert correctness there is covered instead by the oracle-based lib
-tests (`fused_region_matches_general_path`, `left_edge_crop_zero_copy_*`,
-`crop_edge_matches_full_frame_intermediate`), which compare against references
-computed in the same run rather than against frozen bytes.
+`nv_to_rgb_is_unbiased_and_within_one_level` (lib suite) pins the conversion's precision independently of any frozen bytes: every CPU NV12/NV24→RGB output must sit within one level of the exact BT.601/BT.709 matrix, in full and limited range, with a mean bias under 0.01 per channel.
 
 ### LFS testdata
 

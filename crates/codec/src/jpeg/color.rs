@@ -530,18 +530,15 @@ unsafe fn ycbcr_to_rgb_row_avx2(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], 
 mod tests {
     use super::*;
 
-    /// Real-valued reference for the JFIF equations.
-    fn reference(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    /// Real-valued JFIF equations, unclamped.
+    fn reference(y: u8, cb: u8, cr: u8) -> [f64; 3] {
         let yf = y as f64;
         let cbf = cb as f64 - 128.0;
         let crf = cr as f64 - 128.0;
-        let r = yf + 1.40200 * crf;
-        let g = yf - 0.34414 * cbf - 0.71414 * crf;
-        let b = yf + 1.77200 * cbf;
         [
-            r.round().clamp(0.0, 255.0) as u8,
-            g.round().clamp(0.0, 255.0) as u8,
-            b.round().clamp(0.0, 255.0) as u8,
+            yf + 1.402 * crf,
+            yf - 0.344_136 * cbf - 0.714_136 * crf,
+            yf + 1.772 * cbf,
         ]
     }
 
@@ -555,27 +552,33 @@ mod tests {
             .collect()
     }
 
+    /// Every (Y, Cb, Cr) triple lands within one level of the real-valued
+    /// equations, with no systematic bias on any channel.
     #[test]
-    fn scalar_matches_float_reference_within_1() {
-        let n = 4096;
-        let y = lcg_bytes(1, n);
-        let cb = lcg_bytes(2, n);
-        let cr = lcg_bytes(3, n);
-        let mut out = vec![0u8; n * 3];
-        ycbcr_to_rgb_row_scalar(&y, &cb, &cr, &mut out, 0, n);
-        for i in 0..n {
-            let exp = reference(y[i], cb[i], cr[i]);
-            for c in 0..3 {
-                let got = out[i * 3 + c] as i32;
-                let want = exp[c] as i32;
-                assert!(
-                    (got - want).abs() <= 1,
-                    "pixel {i} ch {c}: got {got} want {want} (y={} cb={} cr={})",
-                    y[i],
-                    cb[i],
-                    cr[i]
-                );
+    fn scalar_matches_float_reference_within_1_unbiased() {
+        let y: Vec<u8> = (0..=255).collect();
+        let mut out = vec![0u8; 256 * 3];
+        let mut bias = [0i64; 3];
+        for cbv in 0..=255u8 {
+            for crv in 0..=255u8 {
+                ycbcr_to_rgb_row_scalar(&y, &[cbv; 256], &[crv; 256], &mut out, 0, 256);
+                for (i, &yv) in y.iter().enumerate() {
+                    let exp = reference(yv, cbv, crv);
+                    for c in 0..3 {
+                        let want = exp[c].round().clamp(0.0, 255.0) as i64;
+                        let got = out[i * 3 + c] as i64;
+                        assert!(
+                            (got - want).abs() <= 1,
+                            "ch {c}: got {got} want {want} (y={yv} cb={cbv} cr={crv})"
+                        );
+                        bias[c] += got - want;
+                    }
+                }
             }
+        }
+        for (c, b) in bias.iter().enumerate() {
+            let mean = *b as f64 / (1u64 << 24) as f64;
+            assert!(mean.abs() < 0.01, "ch {c}: mean error {mean:+.4}");
         }
     }
 

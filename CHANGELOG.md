@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CPU YUV→RGB conversion is exact (`edgefirst-image`).** NV12, NV16 and NV24 sources convert to RGB on the CPU within one level of the exact BT.601/BT.709 matrix, with no bias. Previously the output was off by up to two levels and biased by up to half a level per channel, in opposite directions on Cortex-A53 cores and on everything else, so CPU and GL preprocessing disagreed. On COCO val2017 with yolov8n-seg, CPU-preprocessed box AP50-95 changes by +0.021 pp, and CPU and GL agree on all but 0.41% of confident boxes (1.06% before). The conversion is 5–9% faster on i.MX 8M Plus; on newer Arm cores a 720p letterbox takes 0.3–1.5 ms longer (Orin Nano 2.9 → 3.6 ms).
 - **GL `convert()` into a `Grey` destination writes luma (`edgefirst-image`).** A colour source converted into `Grey` on the OpenGL backend produced its red channel; it now produces the same luma as the CPU backend (see `crates/image/ARCHITECTURE.md`, Grey destinations).
 
 ## [0.38.0] - 2026-10-25
