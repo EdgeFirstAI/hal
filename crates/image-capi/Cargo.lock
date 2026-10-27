@@ -391,15 +391,15 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-build-support"
-version = "0.38.0"
+version = "0.38.1"
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.38.0"
+version = "0.38.1"
 
 [[package]]
 name = "edgefirst-egl"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "libc",
  "libloading",
@@ -430,14 +430,14 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gl"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "edgefirst-image"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "dma-heap",
  "drm-fourcc",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-image-capi"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "cbindgen",
  "edgefirst-build-support",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "dma-heap",
  "edgefirst-tensor-abi",
@@ -504,11 +504,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.38.0"
+version = "0.38.1"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-tensor-abi",
 ]
@@ -1338,9 +1338,9 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",

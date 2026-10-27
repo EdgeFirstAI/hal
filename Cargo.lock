@@ -515,18 +515,18 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edgefirst-bench"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "edgefirst-build-support"
-version = "0.38.0"
+version = "0.38.1"
 
 [[package]]
 name = "edgefirst-codec"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "argminmax",
  "edgefirst-bench",
@@ -576,11 +576,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.38.0"
+version = "0.38.1"
 
 [[package]]
 name = "edgefirst-egl"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "libc",
  "libloading",
@@ -611,14 +611,14 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gl"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "edgefirst-image"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "crc32fast",
  "ctor",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-codec"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-common"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-codec",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-decoder"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-image"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-tensor"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-tracker"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "ctor",
  "dma-heap",
@@ -778,18 +778,18 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.38.0"
+version = "0.38.1"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-tensor-abi",
 ]
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor",
@@ -1088,7 +1088,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gpu-probe"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-egl",
@@ -2235,9 +2235,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
@@ -2907,9 +2907,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.0"
+version = "9.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2886b00003a72c4ccee3f42cfc34908d33b2508a74d827dc2a4244706475c704"
+checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
 dependencies = [
  "crc32fast",
  "flate2",
