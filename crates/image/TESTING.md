@@ -134,7 +134,7 @@ gated the same way under `HAL_TEST_REQUIRE_CUDA=1` via
 `scripts/test-windows.ps1 -RequireCuda` — see
 [`crates/tensor/TESTING.md § Windows D3D11 CUDA interop tests`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md#windows-d3d11-cuda-interop-tests).
 
-The `test_opengl_*` integration tests in `src/lib.rs` (resize, grey,
+The `test_opengl_*` integration tests in `src/lib.rs` (resize, grey, a zero-copy grey source to every RGB layout,
 src/dst crop, the rotation × flip × backing matrix, 10-thread bring-up,
 the YUYV/VYUY zero-copy imports and the F16 GL/CPU parity check) follow the
 same rules: they are gated on every GL platform (Linux, macOS, iOS,

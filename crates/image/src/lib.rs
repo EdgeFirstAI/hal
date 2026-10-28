@@ -6048,6 +6048,144 @@ mod image_tests {
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
 
+    /// A `Grey` source in zero-copy GPU memory converts to `Rgba`, `Rgb` and
+    /// `PlanarRgb` with its luma in every colour channel, matching the CPU.
+    /// The Linux import is R8, which samples as (l, 0, 0, 1) until the
+    /// sampler replicates it, so this runs on every GL platform and fails
+    /// rather than skips wherever a zero-copy `Grey` source exists. 62 is a
+    /// width that is not a multiple of 4 but whose pitch is aligned.
+    #[test]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
+    #[cfg(feature = "opengl")]
+    fn test_opengl_grey_zero_copy_source_to_rgb() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        if !crate::test_support::is_gpu_buffer_available() {
+            crate::test_support::report_skip(&format!(
+                "{} - zero-copy GPU buffer not available on this host",
+                function!()
+            ));
+            return;
+        }
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let h = 40usize;
+        for w in [64usize, 62] {
+            let grey = |memory| -> Option<TensorDyn> {
+                let t = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Grey,
+                    DType::U8,
+                    Some(memory),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .ok()?;
+                let stride = t.effective_row_stride().unwrap_or(w);
+                {
+                    let mut map = t.as_u8().unwrap().map().unwrap();
+                    let buf = map.as_mut_slice();
+                    for r in 0..h {
+                        for c in 0..w {
+                            buf[r * stride + c] = ((r * 13 + c * 7) as u8).wrapping_add(3);
+                        }
+                    }
+                }
+                Some(t)
+            };
+            let Some(src_gpu) = grey(TensorMemory::DmaBuf) else {
+                crate::test_support::report_skip(&format!(
+                    "{} - no zero-copy Grey {w}x{h} buffer on this host",
+                    function!()
+                ));
+                return;
+            };
+            let src_mem = grey(TensorMemory::Mem).unwrap();
+            for fmt in [PixelFormat::Rgba, PixelFormat::Rgb, PixelFormat::PlanarRgb] {
+                if fmt == PixelFormat::Rgb && (w * 3) % 4 != 0 {
+                    continue;
+                }
+                let dst = || {
+                    TensorDyn::image(
+                        w,
+                        h,
+                        fmt,
+                        DType::U8,
+                        None,
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap()
+                };
+                let mut cpu_dst = dst();
+                CPUProcessor::new()
+                    .convert(&src_mem, &mut cpu_dst, None)
+                    .unwrap();
+                let mut gl_dst = dst();
+                let before = gl.convert_stats().unwrap();
+                gl.convert(&src_gpu, &mut gl_dst, None).unwrap();
+                let after = gl.convert_stats().unwrap();
+                let imports = after.src_imports - before.src_imports;
+                let uploads = after.src_uploads - before.src_uploads;
+                log::info!(
+                    "{}: {w}x{h} Grey -> {fmt:?} imports={imports} uploads={uploads}",
+                    function!()
+                );
+                // Linux imports a zero-copy Grey source as an R8 EGLImage,
+                // the route whose sampler has to replicate the luma. A forced
+                // upload transfer (`EDGEFIRST_FORCE_TRANSFER=pbo` or `sync`)
+                // uploads it on purpose.
+                #[cfg(target_os = "linux")]
+                if gl.transfer_backend().is_zero_copy() {
+                    assert_eq!(
+                        imports, 1,
+                        "{w}x{h} Grey -> {fmt:?}: the DMA-BUF source was not imported"
+                    );
+                }
+                assert_grey_rgb_rows_match(&gl_dst, &cpu_dst, fmt, w, h);
+            }
+        }
+    }
+
+    /// Compare every image row of a GL and a CPU `Rgba`/`Rgb`/`PlanarRgb`
+    /// destination within ±4: V3D samples a step of 249 between neighbouring
+    /// texels up to 2 off, while a missing channel is off by up to 255.
+    #[cfg(feature = "opengl")]
+    fn assert_grey_rgb_rows_match(
+        gl_dst: &TensorDyn,
+        cpu_dst: &TensorDyn,
+        fmt: PixelFormat,
+        w: usize,
+        h: usize,
+    ) {
+        let (rows, row_bytes) = match fmt {
+            PixelFormat::PlanarRgb => (3 * h, w),
+            _ => (h, w * fmt.channels()),
+        };
+        let gl_t = gl_dst.as_u8().unwrap();
+        let cpu_t = cpu_dst.as_u8().unwrap();
+        let gl_stride = gl_t.effective_row_stride().unwrap_or(row_bytes);
+        let cpu_stride = cpu_t.effective_row_stride().unwrap_or(row_bytes);
+        let gl_map = gl_t.map().unwrap();
+        let cpu_map = cpu_t.map().unwrap();
+        for r in 0..rows {
+            let g = &gl_map.as_slice()[r * gl_stride..][..row_bytes];
+            let c = &cpu_map.as_slice()[r * cpu_stride..][..row_bytes];
+            if let Some(i) = (0..row_bytes).find(|&i| g[i].abs_diff(c[i]) > 4) {
+                panic!(
+                    "{w}x{h} Grey -> {fmt:?}: row {r} byte {i} is {} on GL, {} on CPU",
+                    g[i], c[i]
+                );
+            }
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_src_crop() {
