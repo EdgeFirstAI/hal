@@ -4,7 +4,7 @@
 [package]
 name = "edgefirst-decoder-capi"
 description = "C API for EdgeFirst model output decoding"
-version = "0.38.1"
+version = "0.38.2"
 edition = "2021"
 rust-version = "1.94.0"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]
@@ -31,17 +31,17 @@ tracing = ["edgefirst-tensor/tracing"]
 # Links libedgefirst_tensor.so (dynamic backend + tensor-ffi declarations)
 # rather than embedding a private tensor copy.
 [dependencies]
-edgefirst-decoder = { version = "0.38.1", path = "../decoder", default-features = false, features = [
+edgefirst-decoder = { version = "0.38.2", path = "../decoder", default-features = false, features = [
     "model-files",
     "tracker",
 ] }
 uuid = { version = "1.23.3", features = ["v4"] }
 # Built with `--cfg edgefirst_tensor_dynamic` (this crate's .cargo/config.toml): calls into libedgefirst_tensor.
-edgefirst-tensor = { version = "0.38.1", path = "../tensor", default-features = false }
+edgefirst-tensor = { version = "0.38.2", path = "../tensor", default-features = false }
 edgefirst-tensor-abi = { path = "../tensor-abi" }
 edgefirst-tensor-ffi = { path = "../tensor-ffi" }
 edgefirst-decoder-abi = { path = "../decoder-abi" }
-edgefirst-tracker = { version = "0.38.1", path = "../tracker", default-features = false, features = [
+edgefirst-tracker = { version = "0.38.2", path = "../tracker", default-features = false, features = [
     "tensor-boxes",
 ] }
 errno = "0.3"
