@@ -6138,35 +6138,50 @@ mod image_tests {
                     function!()
                 );
                 // Linux imports a zero-copy Grey source as an R8 EGLImage,
-                // the route whose sampler has to replicate the luma.
+                // the route whose sampler has to replicate the luma. A forced
+                // upload transfer (`EDGEFIRST_FORCE_TRANSFER=pbo` or `sync`)
+                // uploads it on purpose.
                 #[cfg(target_os = "linux")]
-                assert_eq!(
-                    imports, 1,
-                    "{w}x{h} Grey -> {fmt:?}: the DMA-BUF source was not imported"
-                );
-
-                let (rows, row_bytes) = match fmt {
-                    PixelFormat::PlanarRgb => (3 * h, w),
-                    _ => (h, w * fmt.channels()),
-                };
-                let gl_t = gl_dst.as_u8().unwrap();
-                let cpu_t = cpu_dst.as_u8().unwrap();
-                let gl_stride = gl_t.effective_row_stride().unwrap_or(row_bytes);
-                let cpu_stride = cpu_t.effective_row_stride().unwrap_or(row_bytes);
-                let gl_map = gl_t.map().unwrap();
-                let cpu_map = cpu_t.map().unwrap();
-                for r in 0..rows {
-                    let g = &gl_map.as_slice()[r * gl_stride..][..row_bytes];
-                    let c = &cpu_map.as_slice()[r * cpu_stride..][..row_bytes];
-                    // ±4: V3D samples a step of 249 between neighbouring
-                    // texels up to 2 off; a missing channel is off by up to 255.
-                    if let Some(i) = (0..row_bytes).find(|&i| g[i].abs_diff(c[i]) > 4) {
-                        panic!(
-                            "{w}x{h} Grey -> {fmt:?}: row {r} byte {i} is {} on GL, {} on CPU",
-                            g[i], c[i]
-                        );
-                    }
+                if gl.transfer_backend().is_zero_copy() {
+                    assert_eq!(
+                        imports, 1,
+                        "{w}x{h} Grey -> {fmt:?}: the DMA-BUF source was not imported"
+                    );
                 }
+                assert_grey_rgb_rows_match(&gl_dst, &cpu_dst, fmt, w, h);
+            }
+        }
+    }
+
+    /// Compare every image row of a GL and a CPU `Rgba`/`Rgb`/`PlanarRgb`
+    /// destination within ±4: V3D samples a step of 249 between neighbouring
+    /// texels up to 2 off, while a missing channel is off by up to 255.
+    #[cfg(feature = "opengl")]
+    fn assert_grey_rgb_rows_match(
+        gl_dst: &TensorDyn,
+        cpu_dst: &TensorDyn,
+        fmt: PixelFormat,
+        w: usize,
+        h: usize,
+    ) {
+        let (rows, row_bytes) = match fmt {
+            PixelFormat::PlanarRgb => (3 * h, w),
+            _ => (h, w * fmt.channels()),
+        };
+        let gl_t = gl_dst.as_u8().unwrap();
+        let cpu_t = cpu_dst.as_u8().unwrap();
+        let gl_stride = gl_t.effective_row_stride().unwrap_or(row_bytes);
+        let cpu_stride = cpu_t.effective_row_stride().unwrap_or(row_bytes);
+        let gl_map = gl_t.map().unwrap();
+        let cpu_map = cpu_t.map().unwrap();
+        for r in 0..rows {
+            let g = &gl_map.as_slice()[r * gl_stride..][..row_bytes];
+            let c = &cpu_map.as_slice()[r * cpu_stride..][..row_bytes];
+            if let Some(i) = (0..row_bytes).find(|&i| g[i].abs_diff(c[i]) > 4) {
+                panic!(
+                    "{w}x{h} Grey -> {fmt:?}: row {r} byte {i} is {} on GL, {} on CPU",
+                    g[i], c[i]
+                );
             }
         }
     }

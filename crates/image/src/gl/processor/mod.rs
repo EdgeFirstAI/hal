@@ -7677,11 +7677,6 @@ impl GLProcessorST {
             // leaves `GL_TEXTURE_SWIZZLE_*` undefined on external textures,
             // but every driver this runs on honours it, as the planar draw
             // (`draw_camera_texture_to_rgb_planar`) also relies on.
-            let luma = src_fmt == PixelFormat::Grey;
-            if luma {
-                set_external_gb_swizzle(edgefirst_gl::gl::RED, edgefirst_gl::gl::RED);
-            }
-
             if self.camera_eglimage_texture.bind_egl_image_external(
                 &self.gl_context,
                 src_key,
@@ -7691,6 +7686,12 @@ impl GLProcessorST {
                 log::trace!("draw_camera: bound new src EGLImage id={luma_id:#x}");
             } else {
                 log::trace!("draw_camera: reusing bound src EGLImage id={luma_id:#x}");
+            }
+            // Set only once nothing below can return early, so the identity
+            // restore after the draw always runs.
+            let luma = src_fmt == PixelFormat::Grey;
+            if luma {
+                set_external_gb_swizzle(edgefirst_gl::gl::RED, edgefirst_gl::gl::RED);
             }
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
