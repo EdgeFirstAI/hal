@@ -210,11 +210,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-build-support"
-version = "0.38.1"
+version = "0.38.2"
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
  "argminmax",
  "edgefirst-decoder-abi",
@@ -235,11 +235,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.38.1"
+version = "0.38.2"
 
 [[package]]
 name = "edgefirst-decoder-capi"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
  "cbindgen",
  "edgefirst-build-support",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
  "dma-heap",
  "edgefirst-tensor-abi",
@@ -282,18 +282,18 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.38.1"
+version = "0.38.2"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
  "edgefirst-tensor-abi",
 ]
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.38.1"
+version = "0.38.2"
 dependencies = [
  "edgefirst-tensor",
  "enum_dispatch",
@@ -1388,9 +1388,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.2"
+version = "9.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
+checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
 dependencies = [
  "crc32fast",
  "flate2",

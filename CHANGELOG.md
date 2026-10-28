@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.2] - 2026-10-28
+
 ### Fixed
 
 - **GL `convert()` of a `Grey` DMA-BUF source fills every colour channel (`edgefirst-image`, Linux).** It produced red-only output on every GPU and now matches the CPU; odd-width `Grey` sources at an aligned pitch also stay on the GPU.
