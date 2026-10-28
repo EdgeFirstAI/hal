@@ -306,11 +306,12 @@ impl DmaImportAttrs {
                 }
             }
         } else {
-            // For the 1-bpp Grey format the natural row pitch is `width`,
-            // which is only 4-byte aligned when `width % 4 == 0`. EGL
-            // DMA-BUF import via `eglCreateImage` requires word-aligned row
-            // reads on every tested platform (Mali G310, Vivante GC7000UL,
-            // V3D, Tegra), so we keep the blanket width%4 check for it.
+            // EGL DMA-BUF import via `eglCreateImage` requires word-aligned
+            // rows on every tested platform (Mali G310, Vivante GC7000UL,
+            // V3D, Adreno 663, Tegra). For the 1-bpp Grey format that is the
+            // pitch the import uses, not the width: a tight Grey pitch is
+            // `width` and needs `width % 4 == 0`, while a pool tensor keeps
+            // its 64-byte-aligned pitch at any width (638 at pitch 640).
             //
             // Rgb is exempt: the only GPU that imports it natively
             // (`BG24`, Mali-G310) samples it exactly at odd widths such as
@@ -340,9 +341,16 @@ impl DmaImportAttrs {
                 src_fmt,
                 PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
             );
-            if needs_width_mod_4 && !src_w.is_multiple_of(4) {
+            let pitch = match view_origin {
+                Some(vo) => vo.parent_row_stride,
+                None => src
+                    .effective_row_stride()
+                    .unwrap_or_else(|| tight_plane0_pitch(src_fmt, src_w, src_channels)),
+            };
+            if needs_width_mod_4 && !pitch.is_multiple_of(4) {
                 return Err(Error::NotSupported(format!(
-                    "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
+                    "EGLImage requires a row pitch divisible by 4 for {src_fmt}, got {pitch} \
+                     at width {src_w}"
                 )));
             }
             (src_w, src_h, pixel_format_to_drm(src_fmt)?, src_channels)
@@ -1657,8 +1665,8 @@ mod tests {
         }
     }
 
-    /// 1-bpp (Grey) likewise still requires width%4 — natural pitch is
-    /// `width × 1`, which is 4-byte aligned only when `width % 4 == 0`.
+    /// 1-bpp (Grey) needs a 4-byte-aligned pitch: a tight pitch is
+    /// `width × 1`, which is aligned only when `width % 4 == 0`.
     #[test]
     fn test_from_tensor_rejects_non_4_aligned_grey() {
         let t = Tensor::<u8>::image(
@@ -1672,6 +1680,29 @@ mod tests {
         let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Grey, false)
             .expect_err("Grey width 375 must still be rejected");
         assert!(matches!(err, crate::Error::NotSupported(_)));
+    }
+
+    /// The same width at an aligned pitch, as a pool tensor decodes into,
+    /// passes the gate. A Mem tensor has no fd, so the import itself then
+    /// fails for that reason instead.
+    #[test]
+    fn test_from_tensor_accepts_grey_at_aligned_pitch() {
+        let t = Tensor::<u8>::image(
+            375,
+            64,
+            PixelFormat::Grey,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap()
+        .with_row_stride(384)
+        .unwrap();
+        let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Grey, false)
+            .expect_err("a Mem tensor has no DMA-BUF");
+        assert!(
+            matches!(err, crate::Error::NotImplemented(_)),
+            "Grey 375 at pitch 384 was refused by the pitch gate: {err:?}"
+        );
     }
 
     // ─── aligned_source_base tests ───────────────────────────────────

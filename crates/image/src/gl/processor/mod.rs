@@ -2030,6 +2030,26 @@ unsafe fn read_pixels_into(
     }
 }
 
+/// Set the green and blue swizzles of the `TEXTURE_EXTERNAL_OES` texture
+/// bound to the active unit.
+///
+/// # Safety
+/// A GL context must be current with the external texture bound.
+unsafe fn set_external_gb_swizzle(g: u32, b: u32) {
+    for (swizzle, comp) in [
+        (edgefirst_gl::gl::TEXTURE_SWIZZLE_G, g),
+        (edgefirst_gl::gl::TEXTURE_SWIZZLE_B, b),
+    ] {
+        unsafe {
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_EXTERNAL_OES,
+                swizzle,
+                comp as i32,
+            )
+        };
+    }
+}
+
 /// Classify a GL_RENDERER string into driver-policy traits. Pure —
 /// unit-testable without a GL context.
 fn classify_renderer(renderer: &str) -> RendererTraits {
@@ -6360,6 +6380,7 @@ impl GLProcessorST {
             flip,
             alpha,
             is_int8,
+            src_fmt == PixelFormat::Grey,
         )?;
         unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())?;
@@ -6925,6 +6946,8 @@ impl GLProcessorST {
         flip: Flip,
         alpha: bool,
         int8: bool,
+        // An R8 (Grey) import: every colour plane draws its red channel.
+        luma: bool,
     ) -> Result<(), Error> {
         let texture_target = edgefirst_gl::gl::TEXTURE_EXTERNAL_OES;
         match flip {
@@ -6988,12 +7011,21 @@ impl GLProcessorST {
                 vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
             };
             let planes = y_centers.len() as f32;
-            let swizzles = [
-                edgefirst_gl::gl::RED,
-                edgefirst_gl::gl::GREEN,
-                edgefirst_gl::gl::BLUE,
-                edgefirst_gl::gl::ALPHA,
-            ];
+            let swizzles = if luma {
+                [
+                    edgefirst_gl::gl::RED,
+                    edgefirst_gl::gl::RED,
+                    edgefirst_gl::gl::RED,
+                    edgefirst_gl::gl::ALPHA,
+                ]
+            } else {
+                [
+                    edgefirst_gl::gl::RED,
+                    edgefirst_gl::gl::GREEN,
+                    edgefirst_gl::gl::BLUE,
+                    edgefirst_gl::gl::ALPHA,
+                ]
+            };
             // starts from bottom
             for (i, y_center) in y_centers.iter().enumerate() {
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -7639,11 +7671,16 @@ impl GLProcessorST {
             edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter_clamp(texture_target, self.source_filter());
 
-            // Note: GL_TEXTURE_SWIZZLE_* is not supported for
-            // GL_TEXTURE_EXTERNAL_OES in GLES. YUV→RGB conversion is
-            // handled by the driver when sampling from an external texture,
-            // and greyscale EGLImages replicate luma to all channels
-            // automatically via the YUV shader.
+            // YUV→RGB conversion is handled by the driver when sampling an
+            // external texture. A Grey source is an R8 import, which samples
+            // as (l, 0, 0, 1): point G and B at its red channel. The GLES spec
+            // leaves `GL_TEXTURE_SWIZZLE_*` undefined on external textures,
+            // but every driver this runs on honours it, as the planar draw
+            // (`draw_camera_texture_to_rgb_planar`) also relies on.
+            let luma = src_fmt == PixelFormat::Grey;
+            if luma {
+                set_external_gb_swizzle(edgefirst_gl::gl::RED, edgefirst_gl::gl::RED);
+            }
 
             if self.camera_eglimage_texture.bind_egl_image_external(
                 &self.gl_context,
@@ -7724,6 +7761,11 @@ impl GLProcessorST {
                 edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
+            // Back to identity: the swizzle persists on the shared external
+            // texture and would permute the next source's colours.
+            if luma {
+                set_external_gb_swizzle(edgefirst_gl::gl::GREEN, edgefirst_gl::gl::BLUE);
+            }
         }
         check_gl_error(function!(), line!())?;
         if let (Some(colorimetry), Some((_, uniforms))) = (y2y, self.nv_y2y_programs.as_mut()) {
