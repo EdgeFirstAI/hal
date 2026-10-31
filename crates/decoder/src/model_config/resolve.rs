@@ -1087,11 +1087,7 @@ mod tests {
     }
 
     fn fixture(model: &str, name: &str) -> String {
-        let path = format!(
-            "{}/../../testdata/hf/{model}/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        std::fs::read_to_string(path).unwrap()
+        crate::model_config::read_testdata(&format!("hf/{model}/{name}"))
     }
 
     fn hf_sidecar(model: &str) -> ModelFiles {
@@ -1911,11 +1907,8 @@ mod tests {
     /// segmentation channels that add background, whatever the output order.
     #[test]
     fn modelpack_multitask_counts_detection_classes_in_any_order() {
-        let path = format!(
-            "{}/../../testdata/decoder/modelpack_multitask_logical.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let mut ef: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let text = crate::model_config::read_testdata("decoder/modelpack_multitask_logical.json");
+        let mut ef: Value = serde_json::from_str(&text).unwrap();
         for _ in 0..2 {
             let embedded = ModelFiles {
                 edgefirst_json: file("edgefirst.json", &ef.to_string()),

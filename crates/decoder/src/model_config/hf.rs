@@ -359,11 +359,7 @@ mod tests {
     use super::*;
 
     fn fixture(model: &str, file: &str) -> String {
-        let path = format!(
-            "{}/../../testdata/hf/{model}/{file}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+        crate::model_config::read_testdata(&format!("hf/{model}/{file}"))
     }
 
     fn valid<T>(c: HfCheck<T>) -> T {
