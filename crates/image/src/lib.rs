@@ -5264,8 +5264,8 @@ mod image_tests {
     static G2D_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
     #[cfg(target_os = "linux")]
-    fn is_g2d_available() -> bool {
-        crate::test_support::g2d_required_or(
+    fn g2d_skip_reason() -> Option<&'static str> {
+        crate::test_support::g2d_skip_reason(
             *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok()),
         )
     }
@@ -5814,10 +5814,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_resize() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_g2d_resize - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_g2d_resize - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -6189,10 +6187,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_src_crop() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_g2d_src_crop - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_g2d_src_crop - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -6257,10 +6253,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_dst_crop() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_g2d_dst_crop - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_g2d_dst_crop - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -6325,10 +6319,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_all_rgba() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_g2d_all_rgba - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_g2d_all_rgba - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -7963,10 +7955,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_rotate() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_g2d_rotate - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_g2d_rotate - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -8213,10 +8203,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_rgba_to_yuyv_resize_g2d() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_rgba_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_rgba_to_yuyv_resize_g2d - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -8431,10 +8419,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgba_g2d() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_yuyv_to_rgba_g2d - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_yuyv_to_rgba_g2d - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -10051,10 +10037,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgb_g2d() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_yuyv_to_rgb_g2d - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_yuyv_to_rgb_g2d - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -10124,10 +10108,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_yuyv_resize_g2d() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_yuyv_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_yuyv_to_yuyv_resize_g2d - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -10268,10 +10250,8 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgba_crop_flip_g2d() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_yuyv_to_rgba_crop_flip_g2d - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_yuyv_to_rgba_crop_flip_g2d - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -10564,10 +10544,8 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[ignore = "G2D does not support VYUY; re-enable when hardware support is added"]
     fn test_vyuy_to_rgba_g2d() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_vyuy_to_rgba_g2d - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_vyuy_to_rgba_g2d - {why}"));
             return;
         }
         if !is_dma_available() {
@@ -10640,10 +10618,8 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[ignore = "G2D does not support VYUY; re-enable when hardware support is added"]
     fn test_vyuy_to_rgb_g2d() {
-        if !is_g2d_available() {
-            crate::test_support::report_skip(
-                "test_vyuy_to_rgb_g2d - G2D library (libg2d.so.2) not available",
-            );
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("test_vyuy_to_rgb_g2d - {why}"));
             return;
         }
         if !is_dma_available() {
