@@ -844,8 +844,8 @@ mod g2d_tests {
     /// these tests must gate on G2D, not just DMA, or they panic/fail on
     /// non-G2D hardware instead of skipping.
     #[cfg(target_os = "linux")]
-    fn is_g2d_available() -> bool {
-        crate::test_support::g2d_required_or(G2DProcessor::new().is_ok())
+    fn g2d_skip_reason() -> Option<&'static str> {
+        crate::test_support::g2d_skip_reason(G2DProcessor::new().is_ok())
     }
 
     /// Whether this host has a usable DMA heap and G2D; reports a skip when it has not.
@@ -853,8 +853,8 @@ mod g2d_tests {
     fn dma_and_g2d_or_skip() -> bool {
         let why = if !is_dma_available() {
             "DMA not available"
-        } else if !is_g2d_available() {
-            "G2D not available"
+        } else if let Some(why) = g2d_skip_reason() {
+            why
         } else {
             return true;
         };
@@ -2056,6 +2056,10 @@ mod g2d_tests {
             crate::test_support::report_skip("d01_nv12_odd_w_g2d_vs_cpu - DMA not available");
             return;
         }
+        if let Some(why) = crate::test_support::g2d_skip_reason(true) {
+            crate::test_support::report_skip(&format!("d01_nv12_odd_w_g2d_vs_cpu - {why}"));
+            return;
+        }
         let (w, h) = (65usize, 64usize);
 
         let src_dma = TensorDyn::image(
@@ -2169,6 +2173,10 @@ mod g2d_tests {
     fn d03_nv12_odd_both_g2d_vs_cpu() {
         if !is_dma_available() {
             crate::test_support::report_skip("d03_nv12_odd_both_g2d_vs_cpu - DMA not available");
+            return;
+        }
+        if let Some(why) = crate::test_support::g2d_skip_reason(true) {
+            crate::test_support::report_skip(&format!("d03_nv12_odd_both_g2d_vs_cpu - {why}"));
             return;
         }
         let (w, h) = (65usize, 63usize);

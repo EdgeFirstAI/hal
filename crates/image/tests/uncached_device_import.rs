@@ -177,6 +177,11 @@ fn g2d_blits_between_uncached_images() {
     if !uncached_or_skip(NAME) {
         return;
     }
+    if required("HAL_TEST_SKIP_G2D") {
+        return skip(&format!(
+            "{NAME} - G2D not supported on this SoC (HAL_TEST_SKIP_G2D=1)"
+        ));
+    }
     let mut g2d = match G2DProcessor::new() {
         Ok(g2d) => g2d,
         Err(e) => {

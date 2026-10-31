@@ -785,7 +785,9 @@ A few details worth knowing:
   run time and report `SKIPPED` without it; on a board the require gates turn
   that skip into a failure: `HAL_TEST_REQUIRE_DMA=1` when the DMA heap
   allocates, `HAL_TEST_REQUIRE_G2D=1` when `libg2d.so.2` is installed. Both are
-  armed automatically by `scripts/on-target-run.sh` and the CI board lane.
+  armed automatically by `scripts/on-target-run.sh` and the CI board lane. On
+  i.MX 95 they arm `HAL_TEST_SKIP_G2D=1` instead: its `libg2d.so.2` loads, but
+  G2D is not supported there, so the G2D suites skip.
   `FEATURES` still reaches any other feature-gated test; spell a feature that
   is not shared by every selected package as `<pkg>/<feature>`. It applies to
   the test build only, not to the C-API leaves.

@@ -168,8 +168,9 @@ G2D tests live in
 [`crates/image/src/g2d.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/g2d.rs)
 and always build on Linux. They check DMA and G2D availability at run time
 and skip without them; `HAL_TEST_REQUIRE_G2D=1` (armed on boards that ship
-`libg2d.so.2`) turns a G2D skip into a failure. To exercise them locally on
-i.MX hardware:
+`libg2d.so.2`) turns a G2D skip into a failure. `HAL_TEST_SKIP_G2D=1` (armed
+on i.MX 95, where `libg2d.so.2` loads but G2D is not supported) skips them
+even when G2D initializes. To exercise them locally on i.MX hardware:
 
 ```bash
 HAL_TEST_REQUIRE_DMA=1 HAL_TEST_REQUIRE_G2D=1 cargo test -p edgefirst-image g2d -- --test-threads=1
