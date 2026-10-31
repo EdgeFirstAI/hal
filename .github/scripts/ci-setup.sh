@@ -17,8 +17,9 @@
 #   BOARD=1           arm the on-target gates from what the board has, as
 #                     scripts/on-target-test.sh does: HAL_TEST_REQUIRE_GL=1
 #                     with a DRM render node, HAL_TEST_REQUIRE_G2D=1 with
-#                     libg2d.so.2 installed, EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1
-#                     with /dev/galcore.
+#                     libg2d.so.2 installed (HAL_TEST_SKIP_G2D=1 instead on
+#                     i.MX 95), EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1 with
+#                     /dev/galcore.
 set -euo pipefail
 
 persist() {
@@ -82,12 +83,17 @@ case "${os}" in
             if [[ -e /dev/galcore ]]; then
                 persist EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS 1
             fi
-            # A board that ships libg2d must be able to use it.
-            if compgen -G "/usr/lib/libg2d.so.2*" >/dev/null || compgen -G "/usr/lib/*/libg2d.so.2*" >/dev/null; then
+            # A board that ships libg2d must be able to use it, except an
+            # i.MX 95: its libg2d loads, but G2D is not supported there, so
+            # its tests skip.
+            if [[ "$(cat /sys/devices/soc0/soc_id 2>/dev/null)" == "i.MX95" ]]; then
+                persist HAL_TEST_SKIP_G2D 1
+            elif compgen -G "/usr/lib/libg2d.so.2*" >/dev/null || compgen -G "/usr/lib/*/libg2d.so.2*" >/dev/null; then
                 persist HAL_TEST_REQUIRE_G2D 1
             fi
             echo "ci-setup: board gates HAL_TEST_REQUIRE_GL=${HAL_TEST_REQUIRE_GL:-unset}" \
                 "HAL_TEST_REQUIRE_G2D=${HAL_TEST_REQUIRE_G2D:-unset}" \
+                "HAL_TEST_SKIP_G2D=${HAL_TEST_SKIP_G2D:-unset}" \
                 "EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=${EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS:-unset}"
         fi
         ;;

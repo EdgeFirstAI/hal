@@ -79,6 +79,20 @@ mod resolve;
 #[cfg(feature = "model-files")]
 mod ziptrailer;
 
+/// Reads `rel` from the workspace `testdata/` tree. `EDGEFIRST_TESTDATA_DIR`
+/// wins when set: the manifest-relative fallback is baked in at compile time,
+/// so a cross-compiled test binary run on a board cannot reach it.
+#[cfg(test)]
+fn read_testdata(rel: &str) -> String {
+    let root = std::env::var("EDGEFIRST_TESTDATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
+        });
+    let path = root.join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
 pub use container::{
     read_embedded, read_embedded_bytes, read_sidecars, ConfigFile, ModelFiles, EDGEFIRST_JSON,
     HF_CONFIG, HF_PREPROCESSOR, LABELS_TXT, ONNX_EDGEFIRST, ONNX_HF_CONFIG, ONNX_HF_PREPROCESSOR,

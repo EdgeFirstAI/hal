@@ -65,6 +65,37 @@ pub(crate) fn gpu_buffer_allocated<T, E: std::fmt::Debug>(
     }
 }
 
+/// Why a G2D test skips on this host, or `None` when it runs.
+///
+/// `HAL_TEST_SKIP_G2D=1` skips G2D on a SoC where `libg2d.so.2` loads but G2D
+/// is not supported (i.MX 95). Otherwise applies the `HAL_TEST_REQUIRE_G2D=1`
+/// policy to `available`.
+///
+/// # Panics
+///
+/// When `HAL_TEST_REQUIRE_G2D=1` and `available` is `false`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn g2d_skip_reason(available: bool) -> Option<&'static str> {
+    let skip = std::env::var("HAL_TEST_SKIP_G2D").as_deref() == Ok("1");
+    let required = std::env::var("HAL_TEST_REQUIRE_G2D").as_deref() == Ok("1");
+    g2d_skip_decide(available, skip, required, &current_test())
+}
+
+const G2D_UNSUPPORTED: &str = "G2D not supported on this SoC (HAL_TEST_SKIP_G2D=1)";
+const G2D_MISSING: &str = "G2D library (libg2d.so.2) not available";
+
+fn g2d_skip_decide(
+    available: bool,
+    skip: bool,
+    required: bool,
+    what: &str,
+) -> Option<&'static str> {
+    if skip {
+        return Some(G2D_UNSUPPORTED);
+    }
+    (!g2d_decide(available, required, what)).then_some(G2D_MISSING)
+}
+
 /// Applies the `HAL_TEST_REQUIRE_G2D=1` policy to a G2D availability probe.
 ///
 /// # Panics
@@ -92,6 +123,20 @@ fn g2d_policy_skips_unless_required() {
     assert!(!g2d_decide(false, false, "t"));
     let required_but_missing = std::panic::catch_unwind(|| g2d_decide(false, true, "t"));
     assert!(required_but_missing.is_err());
+}
+
+#[test]
+fn g2d_skip_wins_over_availability() {
+    assert_eq!(
+        g2d_skip_decide(true, true, false, "t"),
+        Some(G2D_UNSUPPORTED)
+    );
+    assert_eq!(
+        g2d_skip_decide(false, true, true, "t"),
+        Some(G2D_UNSUPPORTED)
+    );
+    assert_eq!(g2d_skip_decide(true, false, true, "t"), None);
+    assert_eq!(g2d_skip_decide(false, false, false, "t"), Some(G2D_MISSING));
 }
 
 /// Background of the box-outline fixture; its alpha is not 255 so a test
