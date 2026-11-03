@@ -13,20 +13,19 @@
 //!   these, which is what keeps its IoS metric numerically identical to the
 //!   IoU used by ordinary NMS.
 //!
-//! [`jaccard`] and [`jaccard_batch4`] are the threshold-test forms used on the
-//! suppression hot path; they answer "do these overlap past `iou`?" without
-//! materializing the ratio.
+//! [`jaccard`] is the threshold test the suppression loops use: it answers "do
+//! these overlap past `iou`?" without materializing the ratio. [`jaccard_batch4`]
+//! is the public batch form of it, one box against four.
 
-use crate::{arg_max, BBoxTypeTrait, BoundingBox, DetectBox};
+use crate::neon_dispatch::{
+    column_argmax, column_hits, ge_indices_kernel, jaccard4_kernel, keep_unflagged, nms_dead,
+    nms_isa, row_arg_max, score_columns, Isa, Ran, PAR_MIN_SCORES, ROWS_PER_TASK,
+};
+use crate::{BBoxTypeTrait, BoundingBox, DetectBox};
 use ndarray::{ArrayView1, ArrayView2};
 use num_traits::{AsPrimitive, Float};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
-
-/// Candidate filters over fewer score elements than this run on the calling
-/// thread: handing a few hundred rows to rayon costs more CPU, in waking and
-/// then spinning workers, than filtering them.
-const PAR_MIN_SCORES: usize = 1 << 16;
 
 /// `f` over every `(index, score row, box row)`, keeping the `Some`s in row
 /// order, on the rayon pool when the score array is large.
@@ -42,13 +41,20 @@ where
     if n * nc < PAR_MIN_SCORES {
         (0..n).filter_map(row).collect()
     } else {
-        (0..n).into_par_iter().filter_map(row).collect()
+        (0..n)
+            .into_par_iter()
+            .with_min_len(ROWS_PER_TASK)
+            .filter_map(row)
+            .collect()
     }
 }
 
 /// Post processes boxes and scores tensors into detection boxes, filtering out
 /// any boxes below the score threshold. The boxes tensor is converted to XYXY
 /// using the given BBoxTypeTrait. The order of the boxes is preserved.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 pub fn postprocess_boxes_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -60,19 +66,10 @@ pub fn postprocess_boxes_float<
 ) -> Vec<DetectBox> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    filter_rows(boxes, scores, |_, score, bbox| {
-        let (score_, label) = arg_max(score);
-        if score_ < threshold {
-            return None;
-        }
-
-        let bbox = B::ndarray_to_xyxy_float(bbox);
-        Some(DetectBox {
-            label,
-            score: score_.as_(),
-            bbox: bbox.into(),
-        })
-    })
+    argmax_candidates::<B, _, _>(Isa::current_or_scalar(), threshold, boxes, scores)
+        .into_iter()
+        .map(|(b, _)| b)
+        .collect()
 }
 
 /// Post processes boxes and scores tensors into detection boxes, filtering out
@@ -81,6 +78,9 @@ pub fn postprocess_boxes_float<
 ///
 /// This function is very similar to `postprocess_boxes_float` but will also
 /// return the index of the box. The boxes will be in ascending index order.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 pub fn postprocess_boxes_index_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -92,21 +92,65 @@ pub fn postprocess_boxes_index_float<
 ) -> Vec<(DetectBox, usize)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    filter_rows(boxes, scores, |i, score, bbox| {
-        let (score_, label) = arg_max(score);
-        if score_ < threshold {
-            return None;
-        }
+    argmax_candidates::<B, _, _>(Isa::current_or_scalar(), threshold, boxes, scores)
+}
 
-        let bbox = B::ndarray_to_xyxy_float(bbox);
-        Some((
+/// [`postprocess_boxes_index_float`] on `isa`.
+pub(crate) fn argmax_candidates<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    isa: Isa,
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+) -> Vec<(DetectBox, usize)> {
+    let detect = |i: usize, score: SCORE, label: usize| {
+        let bbox = B::ndarray_to_xyxy_float(boxes.row(i));
+        (
             DetectBox {
                 label,
-                score: score_.as_(),
+                score: score.as_(),
                 bbox: bbox.into(),
             },
             i,
-        ))
+        )
+    };
+    let columns = (!isa.is_scalar()).then(|| score_columns(&scores)).flatten();
+    if let Some(kept) = columns.and_then(|cols| column_argmax(isa, &cols, threshold)) {
+        return kept
+            .into_iter()
+            .filter_map(|(i, c)| scores.get((i, c)).map(|&s| detect(i, s, c)))
+            .collect();
+    }
+    filter_rows(boxes, scores, |i, score, _| {
+        let (score_, label) = row_arg_max(isa, score);
+        if score_ < threshold {
+            return None;
+        }
+        Some(detect(i, score_, label))
+    })
+}
+
+/// The argmax or multi-label candidates of a decode on `isa`, with an error instead of a panic
+/// for mismatched shapes.
+pub(crate) fn decode_candidates<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    isa: Isa,
+    multi_label: bool,
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+) -> crate::DecoderResult<Vec<(DetectBox, usize)>> {
+    crate::byte::check_candidate_shapes(boxes.dim(), scores.dim())?;
+    Ok(if multi_label {
+        multilabel_candidates::<B, _, _>(isa, threshold, boxes, scores)
+    } else {
+        argmax_candidates::<B, _, _>(isa, threshold, boxes, scores)
     })
 }
 
@@ -125,6 +169,9 @@ pub fn postprocess_boxes_index_float<
 /// convention).  Deployment must use the argmax variant
 /// [`postprocess_boxes_index_float`] so trackers see at most one box per
 /// anchor.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 pub fn postprocess_boxes_multilabel_index_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -136,27 +183,83 @@ pub fn postprocess_boxes_multilabel_index_float<
 ) -> Vec<(DetectBox, usize)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
+    multilabel_candidates::<B, _, _>(Isa::current_or_scalar(), threshold, boxes, scores)
+}
+
+/// [`postprocess_boxes_multilabel_index_float`] on `isa`.
+pub(crate) fn multilabel_candidates<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    isa: Isa,
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+) -> Vec<(DetectBox, usize)> {
+    if !isa.is_scalar() {
+        if let Some(hits) =
+            score_columns(&scores).and_then(|cols| column_hits(isa, &cols, threshold))
+        {
+            let mut out = Vec::with_capacity(hits.len());
+            let mut current: Option<(usize, BoundingBox)> = None;
+            for (anchor, label) in hits {
+                let bbox = match current {
+                    Some((a, bbox)) if a == anchor => bbox,
+                    _ => {
+                        let bbox = B::ndarray_to_xyxy_float(boxes.row(anchor)).into();
+                        current = Some((anchor, bbox));
+                        bbox
+                    }
+                };
+                if let Some(&score) = scores.get((anchor, label)) {
+                    out.push((
+                        DetectBox {
+                            label,
+                            score: score.as_(),
+                            bbox,
+                        },
+                        anchor,
+                    ));
+                }
+            }
+            return out;
+        }
+    }
     filter_rows(boxes, scores, |anchor_idx, score_row, bbox_row| {
-        if !score_row.iter().any(|&s| s >= threshold) {
+        let mut classes = Vec::new();
+        let row = score_row.as_slice();
+        let ran = row.map_or(Ran::Scalar, |r| {
+            ge_indices_kernel(isa, r, threshold, |c| classes.push(c))
+        });
+        if ran == Ran::Scalar {
+            classes.extend(
+                score_row
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &s)| s >= threshold)
+                    .map(|(c, _)| c),
+            );
+        }
+        if classes.is_empty() {
             return None;
         }
         // Compute bbox once; clone into each per-class candidate.
         let bbox = B::ndarray_to_xyxy_float(bbox_row);
         let bbox: crate::BoundingBox = bbox.into();
         Some(
-            score_row
-                .iter()
-                .enumerate()
-                .filter(|(_, &s)| s >= threshold)
-                .map(|(c, &s)| {
-                    (
+            classes
+                .into_iter()
+                .filter_map(|c| {
+                    let &s = score_row.get(c)?;
+                    Some((
                         DetectBox {
                             label: c,
                             score: s.as_(),
                             bbox,
                         },
                         anchor_idx,
-                    )
+                    ))
                 })
                 .collect::<Vec<_>>(),
         )
@@ -167,6 +270,9 @@ pub fn postprocess_boxes_multilabel_index_float<
 }
 
 /// [`postprocess_boxes_multilabel_index_float`] without anchor indices.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 ///
 /// # Errors
 /// [`crate::DecoderError::InvalidShape`] unless boxes are `[N, 4]` and scores
@@ -196,8 +302,22 @@ pub fn postprocess_boxes_multilabel_float<
 /// have been confirmed. Because the input is sorted descending, the first `n`
 /// survivors are the highest-scoring `n`, so the post-NMS top-`n` is preserved
 /// without iterating the full O(N²) suppression loop.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[must_use]
-pub fn nms_float(iou: f32, max_det: Option<usize>, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+pub fn nms_float(iou: f32, max_det: Option<usize>, boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+    nms_float_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_float`] on `isa`.
+#[must_use]
+pub(crate) fn nms_float_on(
+    isa: Isa,
+    iou: f32,
+    max_det: Option<usize>,
+    mut boxes: Vec<DetectBox>,
+) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -215,6 +335,18 @@ pub fn nms_float(iou: f32, max_det: Option<usize>, mut boxes: Vec<DetectBox>) ->
     }
 
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.bbox,
+        false,
+        |b| b.label,
+        |b| b.score < 0.0,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.score >= 0.0, cap);
+    }
     let mut survivors: usize = 0;
 
     // Outer loop over all boxes.
@@ -236,10 +368,6 @@ pub fn nms_float(iou: f32, max_det: Option<usize>, mut boxes: Vec<DetectBox>) ->
             }
         }
 
-        // NOTE: jaccard_batch4_neon is available for callers that can
-        // batch unsuppressed candidates externally. It is not used
-        // inline here because score=-1 marking creates sparse gaps
-        // that prevent contiguous 4-box batching.
         survivors += 1;
         if survivors >= cap {
             break;
@@ -259,8 +387,22 @@ pub fn nms_float(iou: f32, max_det: Option<usize>, mut boxes: Vec<DetectBox>) ->
 ///
 /// This is same as `nms_float` but will also include extra information along
 /// with each box, such as the index
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[must_use]
 pub fn nms_extra_float<E: Send + Sync>(
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<(DetectBox, E)>,
+) -> Vec<(DetectBox, E)> {
+    nms_extra_float_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_extra_float`] on `isa`.
+#[must_use]
+pub(crate) fn nms_extra_float_on<E: Send + Sync>(
+    isa: Isa,
     iou: f32,
     max_det: Option<usize>,
     mut boxes: Vec<(DetectBox, E)>,
@@ -282,6 +424,18 @@ pub fn nms_extra_float<E: Send + Sync>(
     }
 
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.0.bbox,
+        false,
+        |b| b.0.label,
+        |b| b.0.score < 0.0,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.0.score >= 0.0, cap);
+    }
     let mut survivors: usize = 0;
 
     // Outer loop over all boxes.
@@ -342,8 +496,22 @@ pub fn nms_extra_float<E: Send + Sync>(
 /// let result = nms_class_aware_float(0.3, None, boxes);
 /// assert_eq!(result.len(), 2);
 /// ```
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[must_use]
 pub fn nms_class_aware_float(
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<DetectBox>,
+) -> Vec<DetectBox> {
+    nms_class_aware_float_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_class_aware_float`] on `isa`.
+#[must_use]
+pub(crate) fn nms_class_aware_float_on(
+    isa: Isa,
     iou: f32,
     max_det: Option<usize>,
     mut boxes: Vec<DetectBox>,
@@ -361,6 +529,18 @@ pub fn nms_class_aware_float(
     }
 
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.bbox,
+        true,
+        |b| b.label,
+        |b| b.score < 0.0,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.score >= 0.0, cap);
+    }
     let mut survivors: usize = 0;
 
     for i in 0..boxes.len() {
@@ -392,8 +572,22 @@ pub fn nms_class_aware_float(
 ///
 /// This is same as `nms_class_aware_float` but will also include extra
 /// information along with each box, such as the index.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[must_use]
 pub fn nms_extra_class_aware_float<E: Send + Sync>(
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<(DetectBox, E)>,
+) -> Vec<(DetectBox, E)> {
+    nms_extra_class_aware_float_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_extra_class_aware_float`] on `isa`.
+#[must_use]
+pub(crate) fn nms_extra_class_aware_float_on<E: Send + Sync>(
+    isa: Isa,
     iou: f32,
     max_det: Option<usize>,
     mut boxes: Vec<(DetectBox, E)>,
@@ -413,6 +607,18 @@ pub fn nms_extra_class_aware_float<E: Send + Sync>(
     }
 
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.0.bbox,
+        true,
+        |b| b.0.label,
+        |b| b.0.score < 0.0,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.0.score >= 0.0, cap);
+    }
     let mut survivors: usize = 0;
 
     for i in 0..boxes.len() {
@@ -486,7 +692,7 @@ pub fn ios_value(a: &BoundingBox, b: &BoundingBox) -> f32 {
 /// threshold
 ///
 /// Kept as a standalone inline (NOT routed through [`iou_value`]) so this hot
-/// NMS primitive stays byte-identical to its NEON sibling
+/// NMS primitive stays bit-identical to the NEON NMS kernel and
 /// [`jaccard_batch4`]; the value helpers above are additive and used by the
 /// tiled-detection merge.
 ///
@@ -517,107 +723,21 @@ pub fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
 
 /// Batch IoU check: test one reference box `a` against 4 candidate boxes.
 ///
-/// Returns a 4-element array of booleans: `result[i]` is true if
-/// `jaccard(a, boxes[i], iou)` would return true.
+/// Returns a 4-element array of booleans: `result[i]` is `jaccard(a, boxes[i], iou)`, on every
+/// input; on NEON tiers the four tests run as one vector.
 ///
-/// On aarch64, uses NEON `vmaxq_f32`/`vminq_f32` for vectorized
-/// intersection computation. On other architectures falls back to
-/// 4 scalar `jaccard` calls.
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[inline]
 pub fn jaccard_batch4(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [bool; 4] {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is mandatory on aarch64.
-        unsafe { jaccard_batch4_neon(a, boxes, iou) }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
+    jaccard4_kernel(Isa::current_or_scalar(), a, boxes, iou).unwrap_or_else(|| {
         [
             jaccard(a, &boxes[0], iou),
             jaccard(a, &boxes[1], iou),
             jaccard(a, &boxes[2], iou),
             jaccard(a, &boxes[3], iou),
         ]
-    }
-}
-
-/// NEON-vectorized batch IoU for 4 candidate boxes against one reference.
-///
-/// Loads xmin/ymin/xmax/ymax of the 4 candidates into separate NEON
-/// registers (AoS→SoA transpose), then computes intersection, union,
-/// and the `intersection > iou * union` test in 4-wide SIMD.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn jaccard_batch4_neon(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [bool; 4] {
-    unsafe {
-        use std::arch::aarch64::*; // NOSONAR
-
-        let zero = vdupq_n_f32(0.0);
-        let iou_v = vdupq_n_f32(iou);
-
-        // Reference box broadcast.
-        let a_xmin = vdupq_n_f32(a.xmin);
-        let a_ymin = vdupq_n_f32(a.ymin);
-        let a_xmax = vdupq_n_f32(a.xmax);
-        let a_ymax = vdupq_n_f32(a.ymax);
-        let area_a = vmulq_f32(vsubq_f32(a_xmax, a_xmin), vsubq_f32(a_ymax, a_ymin));
-
-        // Load 4 boxes (each BoundingBox is [xmin, ymin, xmax, ymax]).
-        let b0 = vld1q_f32(&boxes[0].xmin as *const f32);
-        let b1 = vld1q_f32(&boxes[1].xmin as *const f32);
-        let b2 = vld1q_f32(&boxes[2].xmin as *const f32);
-        let b3 = vld1q_f32(&boxes[3].xmin as *const f32);
-
-        // AoS → SoA transpose (4×4).
-        let t01_lo = vtrn1q_f32(b0, b1); // xmin0,xmin1,xmax0,xmax1
-        let t01_hi = vtrn2q_f32(b0, b1); // ymin0,ymin1,ymax0,ymax1
-        let t23_lo = vtrn1q_f32(b2, b3);
-        let t23_hi = vtrn2q_f32(b2, b3);
-
-        let b_xmin = vreinterpretq_f32_f64(vtrn1q_f64(
-            vreinterpretq_f64_f32(t01_lo),
-            vreinterpretq_f64_f32(t23_lo),
-        ));
-        let b_ymin = vreinterpretq_f32_f64(vtrn1q_f64(
-            vreinterpretq_f64_f32(t01_hi),
-            vreinterpretq_f64_f32(t23_hi),
-        ));
-        let b_xmax = vreinterpretq_f32_f64(vtrn2q_f64(
-            vreinterpretq_f64_f32(t01_lo),
-            vreinterpretq_f64_f32(t23_lo),
-        ));
-        let b_ymax = vreinterpretq_f32_f64(vtrn2q_f64(
-            vreinterpretq_f64_f32(t01_hi),
-            vreinterpretq_f64_f32(t23_hi),
-        ));
-
-        // Intersection.
-        let left = vmaxq_f32(a_xmin, b_xmin);
-        let top = vmaxq_f32(a_ymin, b_ymin);
-        let right = vminq_f32(a_xmax, b_xmax);
-        let bottom = vminq_f32(a_ymax, b_ymax);
-        let w = vmaxq_f32(vsubq_f32(right, left), zero);
-        let h = vmaxq_f32(vsubq_f32(bottom, top), zero);
-        let intersection = vmulq_f32(w, h);
-
-        // Area B.
-        let area_b = vmulq_f32(vsubq_f32(b_xmax, b_xmin), vsubq_f32(b_ymax, b_ymin));
-
-        // Union = area_a + area_b - intersection.
-        let union = vsubq_f32(vaddq_f32(area_a, area_b), intersection);
-
-        // Test: intersection > iou * union (equivalent to IoU > threshold).
-        let iou_union = vmulq_f32(iou_v, union);
-        let mask = vcgtq_f32(intersection, iou_union);
-
-        // Extract per-lane results.
-        [
-            vgetq_lane_u32(mask, 0) != 0,
-            vgetq_lane_u32(mask, 1) != 0,
-            vgetq_lane_u32(mask, 2) != 0,
-            vgetq_lane_u32(mask, 3) != 0,
-        ]
-    }
+    })
 }
 
 #[cfg(test)]

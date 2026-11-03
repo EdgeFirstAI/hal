@@ -59,6 +59,11 @@ case "${os}" in
             sudo apt-get update
             sudo apt-get install -y clang libclang-dev pkg-config nasm
         fi
+        # Hosted images ship SDKs HAL never uses; the workspace's debug test build needs that disk.
+        if [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h / | tail -1
+        fi
         merge_testdata
         # Opens the DMA heap to the job user and, only when a probe allocation
         # succeeds, exports HAL_TEST_REQUIRE_DMA=1 through $GITHUB_ENV so the

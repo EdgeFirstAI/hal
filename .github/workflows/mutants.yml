@@ -44,12 +44,12 @@ on:
         required: false
         default: "2"
       other_shards:
-        description: Shards the decoder + tracker corpus is divided into.
+        description: Shards the decoder + tracker + kernels corpus is divided into.
         type: string
         required: false
         default: "48"
       other_window:
-        description: Decoder + tracker shards to run tonight, on the Linux legs.
+        description: Decoder + tracker + kernels shards to run tonight, on the Linux legs.
         type: string
         required: false
         default: "6"
@@ -93,7 +93,7 @@ jobs:
           #
           # edgefirst-tensor carries the target_os code (d3d11 on Windows,
           # IOSurface on macOS, DMA on Linux), so it runs on all four legs.
-          # The decoder and tracker have no target_os code, only
+          # The decoder, tracker and kernels have no target_os code, only
           # target_arch, so re-running them on macOS and Windows would only
           # repeat Linux; they run on the two Linux legs.
           #
@@ -193,7 +193,7 @@ jobs:
                 jq -cn --arg runner "${leg}" --argjson shard "${shard}" \
                   --argjson total "${other_total}" --argjson timeout "$(timeout_for "${leg}")" \
                   '{corpus: "other", shard: $shard, total: $total, runner: $runner,
-                    packages: "--package edgefirst-decoder --package edgefirst-tracker",
+                    packages: "--package edgefirst-decoder --package edgefirst-tracker --package edgefirst-kernels",
                     timeout: $timeout}'
               done
             done | jq -cs '{include: .}'
@@ -205,7 +205,7 @@ jobs:
             echo "| corpus | shards | of | legs |"
             echo "| --- | --- | ---: | --- |"
             echo "| edgefirst-tensor | ${tensor_list} | ${tensor_total} | ${legs//,/, } |"
-            echo "| decoder + tracker | ${other_list} | ${other_total} | Linux legs only |"
+            echo "| decoder + tracker + kernels | ${other_list} | ${other_total} | Linux legs only |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "tonight: ${matrix}"
 

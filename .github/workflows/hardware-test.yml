@@ -2,7 +2,7 @@
 #
 # Where the CI hardware lane runs a selection of GPU/DMA binaries on four
 # boards, this runs HAL's whole on-target suite -- every test binary of the
-# five crates plus the C-API gates (scripts/check-single-home.sh G1/G2/G4/G9/
+# workspace crates plus the C-API gates (scripts/check-single-home.sh G1/G2/G2t/G4/G9/
 # G11 and the G3 two-library user) -- on every board named, one job per board
 # entry. It is the same bundle and board-side script scripts/on-target-test.sh
 # runs over ssh, so a result here and a result from a desk reproduce each

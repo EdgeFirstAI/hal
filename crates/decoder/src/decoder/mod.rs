@@ -1390,9 +1390,10 @@ impl Decoder {
             let mut ps = per_scale_mutex
                 .lock()
                 .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
-            let decoded = ps.run(outputs, Some(self.score_threshold))?;
+            let (decoded, widen) = ps.run_with_widen(outputs, Some(self.score_threshold))?;
             return per_scale_bridge::per_scale_to_masks(
                 &decoded,
+                widen,
                 output_boxes,
                 output_masks,
                 self.iou_threshold,
@@ -1488,9 +1489,10 @@ impl Decoder {
             let mut ps = per_scale_mutex
                 .lock()
                 .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
-            let decoded = ps.run(outputs, Some(self.score_threshold))?;
+            let (decoded, widen) = ps.run_with_widen(outputs, Some(self.score_threshold))?;
             return per_scale_bridge::per_scale_to_proto_data(
                 &decoded,
+                widen,
                 output_boxes,
                 self.iou_threshold,
                 self.score_threshold,

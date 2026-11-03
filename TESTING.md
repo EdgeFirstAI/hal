@@ -16,8 +16,9 @@ lives in each sub-crate's `TESTING.md`:
 | `image` | [crates/image/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md) — GL gating, fp16 benches |
 | `decoder` | [crates/decoder/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md) |
 | `tracker` | [crates/tracker/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/TESTING.md) |
-| `tensor` / `codec` / `image` / `decoder` / `tracker` C APIs | [crates/tensor-capi/](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) and sibling `*-capi` crates — C suite, header link-and-run |
-| `python-*` (five wheels) | [crates/python-common/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md) — maturin develop, slipcover, packaging gates |
+| `kernels` | [crates/kernels/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/TESTING.md) — TFLite fixture parity, forced-tier matrix, strided views, pool concurrency |
+| `tensor` / `codec` / `image` / `decoder` / `tracker` / `kernels` C APIs | [crates/tensor-capi/](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) and sibling `*-capi` crates — C suite, header link-and-run |
+| `python-*` (six wheels) | [crates/python-common/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md) — maturin develop, slipcover, packaging gates |
 
 ---
 
@@ -35,7 +36,7 @@ lives in each sub-crate's `TESTING.md`:
 | `make test-rust` | Run Rust tests only with `cargo-llvm-cov nextest` |
 | `make test-python` | Run Python tests with pytest (and slipcover if available) |
 | `make install-python` | Install the bindings from their source directories (the PEP 517 path `make test-python` uses). `PYTHON_PACKAGES=tensor` narrows it to one package — hal-full.yml's macOS job runs exactly that as the regression gate for issue #199 |
-| `make test-capi-modular` | Build and test the five modular C libraries |
+| `make test-capi-modular` | Build and test the modular C libraries |
 | `make test-capi-link` | Compile headers as C11/C++17 and link-run one consumer per library |
 | `make test-ontarget` | Run the suite on the board fleet over SSH. Not part of `make test` — needs the boards reachable — but it is the **only** evidence that counts for DMA, G2D and embedded-GL work. `BOARDS='imx95-frdm rpi5-hailo'` selects a subset |
 | `make test-cuda` | CUDA device-pointer tests. Not part of `make test` — needs a CUDA GPU and `libcudart` at runtime, and skips cleanly without them |
@@ -44,7 +45,7 @@ lives in each sub-crate's `TESTING.md`:
 | `make check-macho` | Assert every shipped Mach-O has an 8-byte-aligned LINKEDIT string pool (issue #200). Pure file parsing, so it is meaningful on any OS; `make wheel` and `make package` already run it over what they produce |
 | `make format lint check` | Pre-commit gate — required before every commit |
 
-Each modular C library also has C tests under `crates/{tensor,codec,image,decoder,tracker}-capi/tests/`.
+Each modular C library also has C tests under `crates/{tensor,codec,image,decoder,tracker,kernels}-capi/tests/`.
 
 ---
 
@@ -384,7 +385,7 @@ mod tests {
 ```
 
 Most crates under `crates/` carry their own Rust tests: `tensor`, `image`,
-`decoder`, `tracker`, `hal`, `capi`, and `bench`. The `gpu-probe` crate
+`decoder`, `tracker`, `kernels`, `hal`, `capi`, and `bench`. The `gpu-probe` crate
 ships no `#[test]` modules — it is a runtime probe binary and is exercised
 indirectly through the tensor/image suites it informs. The Python
 extension crates are excluded from most workspace runs because they
@@ -490,7 +491,7 @@ make test-python
 # 4. Rust tests manually with nextest
 cargo nextest run --workspace --exclude edgefirst-python-tensor \
   --exclude edgefirst-python-codec --exclude edgefirst-python-image \
-  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker -j 1
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels -j 1
 
 # 5. Tests for a specific crate
 cargo test -p edgefirst-image -- --test-threads=1
@@ -505,8 +506,8 @@ Python: see
 [`crates/python-common/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md)
 for the `maturin develop` + `pytest` + `slipcover` workflow.
 
-C API: `make test-capi-modular` and `make test-capi-link` cover the five
-libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`). Headers
+C API: `make test-capi-modular` and `make test-capi-link` cover the six
+libraries (`libedgefirst_{tensor,codec,image,decoder,tracker,kernels}`). Headers
 live in each leaf's `include/edgefirst/*.h`.
 
 On Windows the leaf tests compile, link and run the C programs under
@@ -665,12 +666,12 @@ A mutant is a property of the code as compiled, so the sweep runs on four legs:
 
 | Leg | Runner | Packages | What only this leg compiles |
 |-----|--------|----------|-----------------------------|
-| linux-x86_64 | `ubuntu-24.04` | tensor, decoder, tracker | x86_64 arms |
-| linux-arm64 | `ubuntu-24.04-arm` | tensor, decoder, tracker | the decoder's NEON kernels |
+| linux-x86_64 | `ubuntu-24.04` | tensor, decoder, tracker, kernels | x86_64 arms |
+| linux-arm64 | `ubuntu-24.04-arm` | tensor, decoder, tracker, kernels | the NEON kernels in `edgefirst-kernels` |
 | macos-arm64 | `macos-latest` | tensor | `iosurface*.rs` and the Apple arms |
 | windows-x86_64 | `windows-latest` | tensor | `d3d11/**` (on the WARP adapter) and the Windows arms |
 
-The decoder and tracker have no `target_os` code, so they run on the Linux legs only. That makes two corpora, each cut into shards: `edgefirst-tensor` (16 shards, 2 a night, on all four legs) and decoder + tracker (48 shards, 6 a night, on the Linux legs). Every leg runs the same shard indices of a corpus on the same night, so the roll-up can compare legs mutant by mutant. Both sweep their corpus in 8 nights. The Linux legs run `.github/scripts/dma-heap-setup.sh` first, so DMA tests run and are required wherever the runner's heap allocates.
+The decoder, tracker and kernels have no `target_os` code, so they run on the Linux legs only. That makes two corpora, each cut into shards: `edgefirst-tensor` (16 shards, 2 a night, on all four legs) and decoder + tracker + kernels (48 shards, 6 a night, on the Linux legs). Every leg runs the same shard indices of a corpus on the same night, so the roll-up can compare legs mutant by mutant. Both sweep their corpus in 8 nights. The Linux legs run `.github/scripts/dma-heap-setup.sh` first, so DMA tests run and are required wherever the runner's heap allocates.
 
 ### How the roll-up decides
 
@@ -749,7 +750,7 @@ CRATES="edgefirst-tensor" ./scripts/on-target-test.sh imx95-frdm
 [`scripts/on-target-test.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-test.sh)
 probes each host, cross-builds one bundle per architecture with
 [`scripts/on-target-bundle.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-bundle.sh)
-(test binaries, the five C-API libraries and the G3 binary, merged
+(test binaries, the C-API libraries and the G3 binary, merged
 `testdata/`), copies it to each host (rsync, or tar over ssh on an image
 without rsync), and runs the bundle's own
 [`scripts/on-target-run.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-run.sh)
@@ -908,7 +909,7 @@ references.
 
 ```bash
 cargo clippy --target aarch64-apple-ios --workspace \
-  --exclude gpu-probe --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-bench \
+  --exclude gpu-probe --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common --exclude edgefirst-bench \
   -- -D warnings
 cargo build --target aarch64-apple-ios --release \
   -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
@@ -1294,7 +1295,7 @@ To run the on-target CUDA tests manually:
 cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
   --workspace --exclude edgefirst-python-tensor \
   --exclude edgefirst-python-codec --exclude edgefirst-python-image \
-  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
 
 # Deploy and run on orin-nano
 scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_tensor-* \

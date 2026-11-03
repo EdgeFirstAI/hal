@@ -31,6 +31,7 @@ WORKSPACE_CRATES = [
     "edgefirst-decoder",
     "edgefirst-decoder-abi",
     "edgefirst-image",
+    "edgefirst-kernels",
     "edgefirst-tensor",
     "edgefirst-tensor-abi",
     "edgefirst-tensor-ffi",
@@ -42,8 +43,8 @@ WORKSPACE_CRATES = [
 # STANDALONE_LEAF_CRATES (workspace-excluded).
 WORKSPACE_LEAF_CRATES = []
 
-# Python extension crates. Four self-contained modules since 0.29; their
-# distributions take the version dynamically from Cargo.toml.
+# Python extension crates, one self-contained module per distribution since
+# 0.29; their distributions take the version dynamically from Cargo.toml.
 PYTHON_CRATES = [
     "edgefirst-python-common",
     "edgefirst-python-tensor",
@@ -51,12 +52,13 @@ PYTHON_CRATES = [
     "edgefirst-python-image",
     "edgefirst-python-decoder",
     "edgefirst-python-tracker",
+    "edgefirst-python-kernels",
 ]
 
 # Crates with independent versions (not checked against workspace version)
 INDEPENDENT_CRATES = {}
 
-# The five modular C-API leaves (Plan R2): standalone packages excluded from
+# The modular C-API leaves: standalone packages excluded from
 # the root workspace, so their versions never show up in the root Cargo.lock.
 # Each carries its own Cargo.lock next to its manifest.
 STANDALONE_LEAF_CRATES = [
@@ -65,6 +67,7 @@ STANDALONE_LEAF_CRATES = [
     "edgefirst-codec-capi",
     "edgefirst-decoder-capi",
     "edgefirst-tracker-capi",
+    "edgefirst-kernels-capi",
 ]
 
 
@@ -237,7 +240,7 @@ def check_benchmarks_lock(version: str) -> list[str]:
 
 
 def check_pyproject_toml(version: str) -> list[str]:
-    """Check the five Python distributions.
+    """Check the Python distributions.
 
     Since 0.29 they take their version dynamically from Cargo.toml, so there is
     no literal to drift. What CAN drift is each dependent's `~=` pin on
@@ -245,7 +248,7 @@ def check_pyproject_toml(version: str) -> list[str]:
     install, which PyPI will not let you correct in place.
     """
     errors = []
-    packages = ["tensor", "codec", "image", "decoder", "tracker"]
+    packages = ["tensor", "codec", "image", "decoder", "tracker", "kernels"]
 
     for pkg in packages:
         pyproject = Path(f"crates/python-{pkg}/pyproject.toml")
@@ -275,7 +278,7 @@ def check_pyproject_toml(version: str) -> list[str]:
                     f"{pyproject}: pins edgefirst-tensor ~= {pinned}, "
                     f"expected ~= {version}"
                 )
-        elif pkg not in ("tensor", "tracker"):
+        elif pkg not in ("tensor", "tracker", "kernels"):
             errors.append(f"{pyproject}: no edgefirst-tensor pin found")
 
     return errors

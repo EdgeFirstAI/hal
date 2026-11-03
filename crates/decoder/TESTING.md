@@ -14,13 +14,21 @@ crates/decoder/
 │   │   ├── pipeline.rs                 # Per-scale pipeline correctness tests
 │   │   ├── plan.rs                     # Schema → Plan validation tests
 │   │   ├── helper.rs                   # Per-scale helper math unit tests
-│   │   └── kernels/                    # NEON kernel unit tests
-│   │       ├── neon_baseline.rs        # Scalar reference + NEON parity
-│   │       ├── dequant.rs              # Quant → float dequant kernels
-│   │       ├── sigmoid.rs / softmax.rs # Activation kernels
-│   │       ├── dfl_lut.rs              # Exp-table DFL kernel vs f64 reference;
-│   │       │                           #   NEON vs portable bit for bit
+│   │   └── kernels/                    # Level orchestrators over edgefirst-kernels
+│   │       ├── dispatch.rs             # Kernel selection per encoding/dtype/tier
+│   │       ├── dfl_lut_tests.rs        # Exp-table DFL decode vs the softmax
+│   │       │                           #   level kernels and an f64 reference
+│   │       ├── tier_tests.rs           # Score/mask-coef/proto cells per tier
+│   │       ├── box_tier_tests.rs       # DFL (per-tensor, per-channel) and
+│   │       │                           #   LTRB box cells per tier
 │   │       └── level_box.rs / level_score.rs / level_mc.rs
+│   ├── instance_mask/tests.rs          # Materialised masks, proto dequant,
+│   │                                   #   conversions and threshold per tier
+│   ├── neon_dispatch/                  # Candidate filters, dequantize, NMS,
+│   │   │                               #   ModelPack and semantic per tier
+│   │   ├── nms/tests.rs                # Every public NMS function vs scalar
+│   │   ├── modelpack/tests.rs          # Split decode, seg maps, argmax
+│   │   └── semantic/tests.rs           # Semantic decodes vs the scalar tier
 │   ├── tiling.rs                       # SAHI lift/merge unit + doc-tests
 │   ├── schema.rs                       # SchemaV2 round-trip + fixture tests
 │   ├── infer.rs                        # Ultralytics schema inference:
@@ -115,7 +123,7 @@ cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
 |-----------|--------|------------------|
 | `decoder_benchmark` | [`benches/decoder_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/benches/decoder_benchmark.rs) | End-to-end decode latency: detection-only, segmentation, proto-data, per-scale split-tensor; both quantized and float paths |
 
-`--section <name>` runs one section (for example `--section per-scale-realistic`). The `Per-Scale-Realistic` section decodes synthetic int8 outputs shaped like captured yolov8n frames for a 960x544 four-class model and a 640x640 COCO model, densely, through the score prefilter, and end to end, and prints process CPU time per iteration (rayon workers included) beside the wall time. `DFL-Kernels` (`decoder/per_scale/dfl_kernel/*`) times each 8-bit DFL box kernel on one 120x68 level through the hidden `per_scale::bench` hooks and prints nanoseconds per anchor.
+`--section <name>` runs one section (for example `--section per-scale-realistic`). The `Per-Scale-Realistic` section decodes synthetic int8 outputs shaped like captured yolov8n frames for a 960x544 four-class model and a 640x640 COCO model, densely, through the score prefilter, and end to end, and prints process CPU time per iteration (rayon workers included) beside the wall time. `DFL-Kernels` (`decoder/per_scale/dfl_kernel/*`) times each 8-bit DFL box kernel on one 120x68 level through the hidden `per_scale::bench` hooks and prints nanoseconds per anchor. `Per-Scale-Seg` runs the 640x640 yolov8-seg model through `decode_proto` with f32 and f16 outputs, the f16 run including the widen to f32. `Per-Scale-Cells` times every score, mask-coefficient and proto cell (`decoder/per_scale/cell/<role>/<in>_<out>/<tier>`, 8400x80 scores, 8400x32 mask coefficients, 160x160x32 protos), the f16 widen (`widen_f16/*`) and the prefilter's anchor selection (`select_anchors/*`) on each tier the CPU has, and prints the kernel cell each tier selects. `Per-Scale-Boxes` does the same for every box cell (`decoder/per_scale/box/<encoding>/<in>_<out>/<tier>` over one 105x80 level: DFL `reg_max` 16 per-tensor and per-channel, DFL `reg_max` 8, and LTRB). `Masks` times `decode` with materialised masks on the yolov8-seg fixture (`decoder/masks/{i8,f32}`) and on synthetic outputs with exactly 10, 50 and 100 surviving 0.2 x 0.2 detections over the fixture's 160x160x32 protos (`decoder/masks/{i8,u8,f32}/n<count>`), plus `decode_proto` at 50 detections with i8 protos (kept raw) and u8 protos (dequantized to f32) (`decoder/masks/decode_proto/{i8,u8}/n50`); set `EDGEFIRST_DECODER_FORCE_KERNEL` to time one tier. `Quant` also times NMS over 6 and 300 synthetic candidates (`decoder/nms/*`: clustered class-agnostic, class-aware and `i8`, and disjoint boxes that all survive), and `ModelPack` the split decode of one 40×40×3×85 output (`split_{u8,f32}_40x40x255`), segmentation decodes of a 8×240×320 NCHW output (`seg_{i8,f32,f16}_8x240x320`) and `segmentation_to_mask` (`seg_to_mask_*`).
 
 The benchmark uses the project's standard `--bench` flag for host runs.
 The aarch64 cross-compile flow plus `scp` + on-target run procedure is
@@ -129,6 +137,31 @@ documented in
 - The split-tensor framework's NEON kernels are exercised by
   `per_scale_parity` against a scalar reference implementation in the same
   test file — this is the primary correctness gate for the optimized path.
+- `per_scale::kernels::tier_tests` and `box_tier_tests` run every score,
+  mask-coefficient, proto and box cell on every tier the CPU has (forced
+  through `EDGEFIRST_DECODER_FORCE_KERNEL` names), check that NEON tiers
+  select no scalar cell, and compare each cell with the scalar tier, the
+  decoder's earlier NEON composition or the float64 reference, with the
+  bounds stated at the top of each file; box cells must also reject
+  quantization and slice lengths that do not match the level before
+  writing anything.
+- `instance_mask::tests` decodes materialised masks on every tier for
+  every pair of `i8`/`u8`/`i16`/`u16` coefficients and protos (plus `i32`,
+  which runs scalar), `f32`/`f16`/`f64`, NHWC and NCHW protos, K of 32, 7
+  and 40, and boxes covering the frame, its edges, single cells, empty,
+  inverted and out-of-frame crops. It checks the kernel each tier selects,
+  that NEON masks are within 1 of the scalar tier, and that the scalar
+  tier's quantized masks equal an ndarray `mapv` + `dot` reference bit for
+  bit; zero points outside the type's range and other proto strides must
+  run scalar. Proto dequantize (NHWC and NCHW), `dequant_3d!`/`dequant_4d!`
+  (values and strides, contiguous, permuted, sliced and reversed views) and
+  the mask threshold must equal the scalar tier bit for bit.
+- `neon_dispatch::nms::tests` runs the eight public NMS functions on every tier against the scalar tier, box for box and in order (12 box counts up to 333, clustered, identical, zero-area, inverted and NaN/infinite boxes, negative, NaN and minimum scores, mixed classes, six thresholds, four caps) checks that NEON tiers run the kernel from 16 boxes on (20 in a direct call) and that `jaccard_batch4` follows the forced tier. `neon_dispatch::modelpack::tests` compares the ModelPack split decode (`f32`/`f16`/`f64` arrays, the fused `u8`/`i8`/`u16`/`i16` dequantize, and a full 40×40 + 20×20 × 3 × 85 decode with NMS), the segmentation conversions and normalization (every type, planar, Fortran and reversed layouts) and `segmentation_to_mask` (2–21, 32, 33, 255 and 300 channels, against `argminmax`) with the scalar tier bit for bit, checks the kernel each tier selects, and that ModelPack decodes fail on an unavailable forced tier while `segmentation_to_mask` runs scalar.
+- `neon_dispatch::semantic::tests` decodes on every tier against the scalar tier: every score type (`u8`, `i8`, `u16`, `i16`, `f32`, `f16`, with NaN, infinite and signed-zero floats and tie-heavy maps) in NCHW, NHWC, NHCW and NWHC order, 1–300 classes, random map and output sizes (odd widths, up- and downsampling), per-tensor and per-channel quantization, both modes and upsampling methods, `align_corners`, a letterbox region, `u8`/`u16` class maps and `f32`/`u8` confidence of every kind. Class maps and confidence must be equal, except the sigmoid confidence: within 2⁻²⁰ (`f32`), or 1 (`u8`) only where the scalar value rounds within that bound of a boundary. It also compares class-map inputs (`u8`, `u16`, `i32`, `u32`, `i64`, values out of range included, same error), checks that a decode gives the same bytes on 1, 2 and 5 rayon threads, the kernel each tier selects, and that a semantic decode fails with `ForcedKernelUnavailable` on an unavailable or unknown forced tier.
+- The compute primitives themselves (dequant, sigmoid, softmax, DFL, box
+  decode, transpose, the NEON tiers) live in `edgefirst-kernels`, whose
+  scalar-vs-NEON parity tests are described in
+  [`../kernels/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/TESTING.md).
 - Doc-tests on the public API surface (e.g. `DecoderBuilder` methods) are
   marked `no_run` because they require model fixtures to load. The
   underlying logic is exercised by the unit tests in `decoder/tests.rs`.

@@ -26,6 +26,8 @@ pub mod image;
 pub mod infer;
 #[cfg(feature = "tensor")]
 pub mod interop;
+#[cfg(feature = "kernels")]
+pub mod kernels;
 #[cfg(feature = "decoder")]
 pub mod model_config;
 #[cfg(feature = "tensor")]

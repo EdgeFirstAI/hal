@@ -13,6 +13,7 @@ MODULES = [
     "edgefirst.image",
     "edgefirst.decoder",
     "edgefirst.tracker",
+    "edgefirst.kernels",
 ]
 
 
@@ -32,10 +33,10 @@ def test_no_namespace_init_anywhere():
 
 
 def test_importing_all_modules_does_not_panic():
-    """env_logger::Builder::init() panics on a second logger. With four
+    """env_logger::Builder::init() panics on a second logger. With several
     pymodule_init functions in one process, anything but try_init crashes
     every user on their second import."""
-    code = "import edgefirst.tensor, edgefirst.codec, edgefirst.image, edgefirst.decoder, edgefirst.tracker"
+    code = "import edgefirst.tensor, edgefirst.codec, edgefirst.image, edgefirst.decoder, edgefirst.tracker, edgefirst.kernels"
     r = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=False
     )
@@ -73,7 +74,9 @@ def test_cross_package_handoff_uses_the_capsule():
     assert "edgefirst_tensor_v2" in repr(cap)
 
 
-@pytest.mark.parametrize("name", ["tensor", "codec", "image", "decoder", "tracker"])
+@pytest.mark.parametrize(
+    "name", ["tensor", "codec", "image", "decoder", "tracker", "kernels"]
+)
 def test_each_package_ships_stubs_and_marker(name):
     """The pre-0.29 wheel shipped no stubs at all (the .pyi was sdist-only);
     the split must not repeat that."""

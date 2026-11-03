@@ -9,12 +9,14 @@ exclude = [
     "crates/codec-capi",
     "crates/decoder-capi",
     "crates/tracker-capi",
+    "crates/kernels-capi",
 ]
 default-members = [
     "crates/tensor",
     "crates/codec",
     "crates/image",
     "crates/decoder",
+    "crates/kernels",
 ]
 
 [workspace.package]
@@ -61,6 +63,7 @@ edgefirst-egl = { version = "0.38.2", path = "crates/egl", features = ["dynamic"
 # Vendored trimmed fork of the abandoned `gls`; imported as `edgefirst_gl`.
 edgefirst-gl = { version = "0.38.2", path = "crates/gl" }
 edgefirst-image = { version = "0.38.2", path = "crates/image", default-features = false }
+edgefirst-kernels = { version = "0.38.2", path = "crates/kernels" }
 edgefirst-python-common = { path = "crates/python-common" }
 edgefirst-tensor = { version = "0.38.2", path = "crates/tensor", default-features = false }
 edgefirst-tensor-abi = { version = "0.38.2", path = "crates/tensor-abi" }

@@ -100,7 +100,7 @@ are not optional extras; each one corresponds to a bug already hit once.
   [the root TESTING.md on-target section](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#on-target-tests);
   run them for real with `./scripts/on-target-test.sh`.
 - **abi3 wheels** — CI builds with `--features abi3-py311`; the release
-  pipeline additionally builds an `abi3-py38` variant. All five packages
+  pipeline additionally builds an `abi3-py38` variant. All six packages
   must agree.
 
 ## Benchmarks

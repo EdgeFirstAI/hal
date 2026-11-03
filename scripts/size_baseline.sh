@@ -24,7 +24,8 @@ for f in \
     target/release/libedgefirst_codec.so target/release/libedgefirst_codec.dylib \
     target/release/libedgefirst_image.so target/release/libedgefirst_image.dylib \
     target/release/libedgefirst_decoder.so target/release/libedgefirst_decoder.dylib \
-    target/release/libedgefirst_tracker.so target/release/libedgefirst_tracker.dylib
+    target/release/libedgefirst_tracker.so target/release/libedgefirst_tracker.dylib \
+    target/release/libedgefirst_kernels.so target/release/libedgefirst_kernels.dylib
 do
     [[ -f "$f" ]] || continue
     [[ $first -eq 1 ]] || printf ',\n' >> "$OUT"

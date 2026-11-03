@@ -54,7 +54,7 @@ jobs:
         --exclude-features opencv,turbojpeg --exclude edgefirst-egl
         --exclude edgefirst-python-tensor --exclude edgefirst-python-codec
         --exclude edgefirst-python-image --exclude edgefirst-python-decoder
-        --exclude edgefirst-python-tracker --exclude edgefirst-python-common
+        --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common
       # One job per board identity, each run on that specific board: the NXP
       # EVKs carry the vendor BSP (G2D, galcore on the 8M Plus) the hardware
       # tests are written against, where a bare family label could land on a
@@ -107,7 +107,7 @@ jobs:
       # A floor, not a target. Guards against a selection that matches nothing
       # and reports success; tighten once a green run reports the real count.
       board-min-tests: "100"
-      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-common -j 1
+      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -j 1
       # The boards are storage-constrained (the smallest root filesystem is
       # 12 GB). profiling is thin-LTO with debug = "line-tables-only", which is
       # what kept the on-target payload shippable before the migration; the

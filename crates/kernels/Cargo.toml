@@ -1,0 +1,30 @@
+[package]
+name = "edgefirst-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Quantized and floating-point compute kernels (softmax, LUT, sigmoid, DFL) for edge AI inference"
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+license.workspace = true
+keywords = ["kernels", "quantization", "neon", "softmax", "edge-ai"]
+categories = ["science", "algorithms"]
+documentation = "https://docs.rs/edgefirst-kernels"
+
+[lints]
+workspace = true
+
+[dependencies]
+half = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+edgefirst-bench = { workspace = true }
+rand = { workspace = true }
+safetensors = { workspace = true }
+
+[[bench]]
+name = "kernels_benchmark"
+harness = false

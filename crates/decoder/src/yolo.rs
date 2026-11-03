@@ -9,27 +9,24 @@
 //! (split paths, dispatch tables, NEON tiers) without breaking semver.
 //! See `CHANGELOG.md` for the 0.20.0 narrowing.
 
-use std::fmt::Debug;
-
 use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator},
-    s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
+    s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis,
 };
-use num_traits::{AsPrimitive, Float, PrimInt, Signed};
+use num_traits::{AsPrimitive, Float, PrimInt, Signed, WrappingAdd, WrappingMul, WrappingSub};
 
 use crate::{
     byte::{
-        nms_class_aware_int, nms_extra_class_aware_int, nms_extra_int, nms_int,
-        postprocess_boxes_index_quant, postprocess_boxes_multilabel_index_quant,
-        postprocess_boxes_multilabel_quant, postprocess_boxes_quant, quantize_score_threshold,
+        decode_candidates_quant, nms_class_aware_int_on, nms_extra_class_aware_int_on,
+        nms_extra_int_on, nms_int_on, quantize_score_threshold,
     },
     configs::Nms,
     dequant_detect_box,
     float::{
-        nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
-        postprocess_boxes_float, postprocess_boxes_index_float, postprocess_boxes_multilabel_float,
-        postprocess_boxes_multilabel_index_float,
+        decode_candidates, nms_class_aware_float_on, nms_extra_class_aware_float_on,
+        nms_extra_float_on, nms_float_on,
     },
+    instance_mask::{dequant_protos, threshold_mask, FloatPlan, Isa, QuantPlan},
     BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, ProtoLayout,
     Quantization, Segmentation, XYWH, XYXY,
 };
@@ -72,8 +69,8 @@ pub(crate) trait ScoredCandidate: Sized + Send + Sync {
     /// Ascending comparison of two scores.
     fn cmp_score(a: &Self::Score, b: &Self::Score) -> std::cmp::Ordering;
 
-    /// Run NMS in `mode` over `boxes`, stopping once `max_det` survive.
-    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self>;
+    /// Run NMS in `mode` over `boxes` on `isa`, stopping once `max_det` survive.
+    fn suppress(isa: Isa, mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self>;
 }
 
 impl ScoredCandidate for DetectBox {
@@ -84,8 +81,8 @@ impl ScoredCandidate for DetectBox {
     fn cmp_score(a: &f32, b: &f32) -> std::cmp::Ordering {
         a.total_cmp(b)
     }
-    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
-        dispatch_nms_float(Some(mode), iou, Some(max_det), boxes)
+    fn suppress(isa: Isa, mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_float(isa, Some(mode), iou, Some(max_det), boxes)
     }
 }
 
@@ -97,8 +94,8 @@ impl<S: PrimInt + AsPrimitive<f32> + Send + Sync> ScoredCandidate for DetectBoxQ
     fn cmp_score(a: &S, b: &S) -> std::cmp::Ordering {
         a.cmp(b)
     }
-    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
-        dispatch_nms_int(Some(mode), iou, Some(max_det), boxes)
+    fn suppress(isa: Isa, mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_int(isa, Some(mode), iou, Some(max_det), boxes)
     }
 }
 
@@ -110,8 +107,8 @@ impl<E: Send + Sync> ScoredCandidate for (DetectBox, E) {
     fn cmp_score(a: &f32, b: &f32) -> std::cmp::Ordering {
         a.total_cmp(b)
     }
-    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
-        dispatch_nms_extra_float(Some(mode), iou, Some(max_det), boxes)
+    fn suppress(isa: Isa, mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_extra_float(isa, Some(mode), iou, Some(max_det), boxes)
     }
 }
 
@@ -125,8 +122,8 @@ impl<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync> ScoredCandidat
     fn cmp_score(a: &S, b: &S) -> std::cmp::Ordering {
         a.cmp(b)
     }
-    fn suppress(mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
-        dispatch_nms_extra_int(Some(mode), iou, Some(max_det), boxes)
+    fn suppress(isa: Isa, mode: Nms, iou: f32, max_det: usize, boxes: Vec<Self>) -> Vec<Self> {
+        dispatch_nms_extra_int(isa, Some(mode), iou, Some(max_det), boxes)
     }
 }
 
@@ -160,7 +157,8 @@ pub(crate) fn truncate_to_top_k_by_score<T: ScoredCandidate>(boxes: &mut Vec<T>,
     });
 }
 
-/// Cap, suppress and cap again: the shared tail of every NMS decode path.
+/// Cap, suppress and cap again on `isa`, the decode's tier: the shared tail of every NMS decode
+/// path.
 ///
 /// With NMS enabled, keeps the `pre_nms_top_k` highest-scoring candidates
 /// (0 = unbounded), runs NMS in `nms`'s mode, and returns at most `max_det`
@@ -168,6 +166,7 @@ pub(crate) fn truncate_to_top_k_by_score<T: ScoredCandidate>(boxes: &mut Vec<T>,
 /// returns the `max_det` highest-scoring candidates in descending score
 /// order. Equal scores keep candidate (anchor) order throughout.
 pub(crate) fn nms_and_cap<T: ScoredCandidate>(
+    isa: Isa,
     mut boxes: Vec<T>,
     nms: Option<Nms>,
     iou_threshold: f32,
@@ -187,7 +186,7 @@ pub(crate) fn nms_and_cap<T: ScoredCandidate>(
             }
             let _s =
                 tracing::trace_span!("decoder.nms_get_boxes.suppress", n = boxes.len()).entered();
-            T::suppress(mode, iou_threshold, max_det, boxes)
+            T::suppress(isa, mode, iou_threshold, max_det, boxes)
         }
         None => {
             truncate_to_top_k_by_score(&mut boxes, max_det);
@@ -209,6 +208,7 @@ pub(crate) fn nms_and_cap<T: ScoredCandidate>(
 /// `nms` must be a concrete mode: the builder resolves `Nms::Auto` before a
 /// `Decoder` exists.
 pub(crate) fn dispatch_nms_float(
+    isa: Isa,
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
@@ -220,8 +220,8 @@ pub(crate) fn dispatch_nms_float(
         "Nms::Auto must be resolved by the builder"
     );
     match nms {
-        Some(Nms::ClassAgnostic) => nms_float(iou, max_det, boxes),
-        Some(Nms::ClassAware | Nms::Auto) => nms_class_aware_float(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic) => nms_float_on(isa, iou, max_det, boxes),
+        Some(Nms::ClassAware | Nms::Auto) => nms_class_aware_float_on(isa, iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
 }
@@ -229,6 +229,7 @@ pub(crate) fn dispatch_nms_float(
 /// Dispatches to the appropriate NMS function based on mode for float boxes
 /// with extra data. `nms` must be a concrete mode (see [`dispatch_nms_float`]).
 pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
+    isa: Isa,
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
@@ -240,8 +241,10 @@ pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
         "Nms::Auto must be resolved by the builder"
     );
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_float(iou, max_det, boxes),
-        Some(Nms::ClassAware | Nms::Auto) => nms_extra_class_aware_float(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic) => nms_extra_float_on(isa, iou, max_det, boxes),
+        Some(Nms::ClassAware | Nms::Auto) => {
+            nms_extra_class_aware_float_on(isa, iou, max_det, boxes)
+        }
         None => boxes, // bypass NMS
     }
 }
@@ -249,6 +252,7 @@ pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
 /// Dispatches to the appropriate NMS function based on mode for quantized
 /// boxes. `nms` must be a concrete mode (see [`dispatch_nms_float`]).
 pub(crate) fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    isa: Isa,
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
@@ -260,8 +264,8 @@ pub(crate) fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
         "Nms::Auto must be resolved by the builder"
     );
     match nms {
-        Some(Nms::ClassAgnostic) => nms_int(iou, max_det, boxes),
-        Some(Nms::ClassAware | Nms::Auto) => nms_class_aware_int(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic) => nms_int_on(isa, iou, max_det, boxes),
+        Some(Nms::ClassAware | Nms::Auto) => nms_class_aware_int_on(isa, iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
 }
@@ -269,6 +273,7 @@ pub(crate) fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 /// Dispatches to the appropriate NMS function based on mode for quantized boxes
 /// with extra data. `nms` must be a concrete mode (see [`dispatch_nms_float`]).
 fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
+    isa: Isa,
     nms: Option<Nms>,
     iou: f32,
     max_det: Option<usize>,
@@ -280,8 +285,8 @@ fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Se
         "Nms::Auto must be resolved by the builder"
     );
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_int(iou, max_det, boxes),
-        Some(Nms::ClassAware | Nms::Auto) => nms_extra_class_aware_int(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic) => nms_extra_int_on(isa, iou, max_det, boxes),
+        Some(Nms::ClassAware | Nms::Auto) => nms_extra_class_aware_int_on(isa, iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
 }
@@ -474,9 +479,6 @@ where
 /// - boxes: (4, num_boxes)
 /// - scores: (num_classes, num_boxes)
 ///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
-///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
@@ -519,9 +521,6 @@ where
 /// Expected shapes of inputs:
 /// - boxes: (4, num_boxes)
 /// - scores: (num_classes, num_boxes)
-///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
@@ -591,8 +590,13 @@ where
     let boxes = output.slice(s![0..4, ..]).reversed_axes();
     let scores = output.slice(s![4..5, ..]).reversed_axes();
     let classes = output.slice(s![5, ..]);
-    let mut boxes =
-        postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
+    let mut boxes = decode_candidates::<XYXY, _, _>(
+        Isa::current()?,
+        false,
+        score_threshold.as_(),
+        boxes,
+        scores,
+    )?;
     boxes.truncate(max_det);
     output_boxes.clear();
     for (mut b, i) in boxes.into_iter() {
@@ -641,7 +645,7 @@ where
         classes,
         score_threshold,
         cap,
-    );
+    )?;
 
     // No NMS — model output is already post-NMS
 
@@ -726,7 +730,7 @@ where
         classes,
         score_threshold,
         cap,
-    );
+    )?;
 
     impl_yolo_split_segdet_process_masks(boxes, mask_coeff, protos, output_boxes, output_masks)
 }
@@ -935,26 +939,21 @@ where
     let (boxes, quant_boxes) = output;
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&boxes);
 
+    let isa = Isa::current()?;
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
-        if multi_label {
-            postprocess_boxes_multilabel_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )?
-        } else {
-            postprocess_boxes_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )
-        }
+        decode_candidates_quant::<B, _, _, _>(
+            isa,
+            multi_label,
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+            |b, _| b,
+        )?
     };
 
-    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
+    let boxes = nms_and_cap(isa, boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     output_boxes.clear();
     output_boxes.extend(boxes.iter().map(|b| dequant_detect_box(b, quant_boxes)));
     Ok(())
@@ -984,17 +983,20 @@ where
 {
     let _span = tracing::trace_span!("decoder.decode.yolo_float_flat").entered();
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
-    let boxes = if multi_label {
-        postprocess_boxes_multilabel_float::<B, _, _>(
-            score_threshold.as_(),
-            boxes_tensor,
-            scores_tensor,
-        )?
-    } else {
-        postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
-    };
+    let isa = Isa::current()?;
+    let boxes: Vec<DetectBox> = decode_candidates::<B, _, _>(
+        isa,
+        multi_label,
+        score_threshold.as_(),
+        boxes_tensor,
+        scores_tensor,
+    )?
+    .into_iter()
+    .map(|(b, _)| b)
+    .collect();
     output_boxes.clear();
     output_boxes.extend(nms_and_cap(
+        isa,
         boxes,
         nms,
         iou_threshold,
@@ -1010,9 +1012,6 @@ where
 /// Expected shapes of inputs:
 /// - boxes: (4, num_boxes)
 /// - scores: (num_classes, num_boxes)
-///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
@@ -1043,26 +1042,21 @@ where
     let boxes_tensor = boxes_tensor.reversed_axes();
     let scores_tensor = scores_tensor.reversed_axes();
 
+    let isa = Isa::current()?;
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
-        if multi_label {
-            postprocess_boxes_multilabel_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )?
-        } else {
-            postprocess_boxes_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )
-        }
+        decode_candidates_quant::<B, _, _, _>(
+            isa,
+            multi_label,
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+            |b, _| b,
+        )?
     };
 
-    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
+    let boxes = nms_and_cap(isa, boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     output_boxes.clear();
     output_boxes.extend(boxes.iter().map(|b| dequant_detect_box(b, quant_scores)));
     Ok(())
@@ -1073,9 +1067,6 @@ where
 /// Expected shapes of inputs:
 /// - boxes: (4, num_boxes)
 /// - scores: (num_classes, num_boxes)
-///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`](crate::DecoderError::InvalidShape)
@@ -1102,17 +1093,20 @@ where
     let _span = tracing::trace_span!("decoder.decode.yolo_float_split").entered();
     let boxes_tensor = boxes_tensor.reversed_axes();
     let scores_tensor = scores_tensor.reversed_axes();
-    let boxes = if multi_label {
-        postprocess_boxes_multilabel_float::<B, _, _>(
-            score_threshold.as_(),
-            boxes_tensor,
-            scores_tensor,
-        )?
-    } else {
-        postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
-    };
+    let isa = Isa::current()?;
+    let boxes: Vec<DetectBox> = decode_candidates::<B, _, _>(
+        isa,
+        multi_label,
+        score_threshold.as_(),
+        boxes_tensor,
+        scores_tensor,
+    )?
+    .into_iter()
+    .map(|(b, _)| b)
+    .collect();
     output_boxes.clear();
     output_boxes.extend(nms_and_cap(
+        isa,
         boxes,
         nms,
         iou_threshold,
@@ -1292,25 +1286,20 @@ where
 
     // Multi-label emits one candidate per (anchor, class) above threshold;
     // argmax emits one per anchor.
+    let isa = Isa::current()?;
     let boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.score_filter").entered();
-        if multi_label {
-            postprocess_boxes_multilabel_index_float::<B, _, _>(
-                score_threshold.as_(),
-                boxes_tensor,
-                scores_tensor,
-            )
-        } else {
-            postprocess_boxes_index_float::<B, _, _>(
-                score_threshold.as_(),
-                boxes_tensor,
-                scores_tensor,
-            )
-        }
+        decode_candidates::<B, _, _>(
+            isa,
+            multi_label,
+            score_threshold.as_(),
+            boxes_tensor,
+            scores_tensor,
+        )?
     };
     span.record("n_candidates", boxes.len());
 
-    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
+    let boxes = nms_and_cap(isa, boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     span.record("n_detections", boxes.len());
 
     Ok(boxes)
@@ -1327,16 +1316,17 @@ pub(crate) fn impl_yolo_end_to_end_segdet_get_boxes<
     classes: ArrayView1<CLASS>,
     score_threshold: f32,
     max_boxes: usize,
-) -> Vec<(DetectBox, usize)>
+) -> crate::DecoderResult<Vec<(DetectBox, usize)>>
 where
     f32: AsPrimitive<SCORE>,
 {
-    let mut boxes = postprocess_boxes_index_float::<B, _, _>(score_threshold.as_(), boxes, scores);
+    let isa = Isa::current()?;
+    let mut boxes = decode_candidates::<B, _, _>(isa, false, score_threshold.as_(), boxes, scores)?;
     boxes.truncate(max_boxes);
     for (b, ind) in &mut boxes {
         b.label = classes[*ind].as_().round() as usize;
     }
-    boxes
+    Ok(boxes)
 }
 
 pub(crate) fn impl_yolo_split_segdet_process_masks<
@@ -1408,29 +1398,23 @@ where
     );
     let _guard = span.enter();
 
+    let isa = Isa::current()?;
     let boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.score_filter").entered();
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
-        if multi_label {
-            postprocess_boxes_multilabel_index_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )?
-        } else {
-            crate::byte::check_candidate_shapes(boxes_tensor.dim(), scores_tensor.dim())?;
-            postprocess_boxes_index_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )
-        }
+        decode_candidates_quant::<B, _, _, _>(
+            isa,
+            multi_label,
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+            |b, i| (b, i),
+        )?
     };
     span.record("n_candidates", boxes.len());
 
-    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
+    let boxes = nms_and_cap(isa, boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     let result: Vec<_> = {
         let _s =
             tracing::trace_span!("decoder.nms_get_boxes.dequant_boxes", n = boxes.len()).entered();
@@ -1598,6 +1582,7 @@ where
     maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
     Ok(extract_proto_data_quant(
+        Isa::current()?,
         det_indices,
         mask_tensor,
         quant_boxes,
@@ -1731,7 +1716,7 @@ where
         classes,
         score_threshold,
         cap,
-    );
+    )?;
 
     Ok(extract_proto_data_float(
         boxes,
@@ -1766,7 +1751,7 @@ where
         classes,
         score_threshold,
         cap,
-    );
+    )?;
 
     Ok(extract_proto_data_float(
         boxes,
@@ -1841,6 +1826,7 @@ pub(crate) fn extract_proto_data_quant<
     MASK: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
     PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
 >(
+    isa: Isa,
     det_indices: Vec<(DetectBox, usize)>,
     mask_tensor: ArrayView2<MASK>,
     quant_masks: Quantization,
@@ -1964,9 +1950,12 @@ pub(crate) fn extract_proto_data_quant<
             .expect("allocating protos tensor");
         if n > 0 {
             let mut m = protos_tensor.map().expect("mapping protos tensor");
-            for (d, s) in m.as_mut_slice().iter_mut().zip(protos.iter()) {
-                let v: f32 = s.as_();
-                *d = (v - zp) * scale;
+            let dst = m.as_mut_slice();
+            if !dequant_protos(isa, &protos, quant_protos, dst) {
+                for (d, s) in dst.iter_mut().zip(protos.iter()) {
+                    let v: f32 = s.as_();
+                    *d = (v - zp) * scale;
+                }
             }
         }
         span.record("layout", tracing::field::debug(&ProtoLayout::Nhwc));
@@ -2146,8 +2135,8 @@ pub(crate) fn postprocess_yolo_split_segdet<'a, 'b, 'c, BOX, SCORE, MASK>(
 }
 
 fn decode_segdet_f32<
-    MASK: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+    MASK: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync + 'static,
 >(
     boxes: Vec<(DetectBox, usize)>,
     masks: ArrayView2<MASK>,
@@ -2162,6 +2151,29 @@ fn decode_segdet_f32<
             masks.shape()[1],
             protos.shape()[2],
         )));
+    }
+    decode_segdet_f32_on(Isa::current()?, boxes, masks, protos)
+}
+
+/// [`decode_segdet_f32`] on `isa`, after its checks.
+pub(crate) fn decode_segdet_f32_on<
+    MASK: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync + 'static,
+>(
+    isa: Isa,
+    boxes: Vec<(DetectBox, usize)>,
+    masks: ArrayView2<MASK>,
+    protos: ArrayView3<PROTO>,
+) -> Result<Vec<(DetectBox, BoundingBox, Array3<u8>)>, crate::DecoderError> {
+    if let Some(plan) = FloatPlan::new::<PROTO>(isa, &protos) {
+        let (h, w, _) = protos.dim();
+        return boxes
+            .into_par_iter()
+            .map(|b| {
+                let (crop, roi) = proto_crop(h, w, &b.0.bbox)?;
+                Ok((b.0, roi, plan.mask(masks.row(b.1), crop)?))
+            })
+            .collect();
     }
     boxes
         .into_par_iter()
@@ -2178,8 +2190,8 @@ fn decode_segdet_f32<
 }
 
 pub(crate) fn decode_segdet_quant<
-    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync + 'static,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync + 'static,
 >(
     boxes: Vec<(DetectBox, usize)>,
     masks: ArrayView2<MASK>,
@@ -2197,6 +2209,38 @@ pub(crate) fn decode_segdet_quant<
             protos.shape()[2],
         )));
     }
+    decode_segdet_quant_on(
+        Isa::current()?,
+        boxes,
+        masks,
+        protos,
+        quant_masks,
+        quant_protos,
+    )
+}
+
+/// [`decode_segdet_quant`] on `isa`, after its checks.
+pub(crate) fn decode_segdet_quant_on<
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync + 'static,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync + 'static,
+>(
+    isa: Isa,
+    boxes: Vec<(DetectBox, usize)>,
+    masks: ArrayView2<MASK>,
+    protos: ArrayView3<PROTO>,
+    quant_masks: Quantization,
+    quant_protos: Quantization,
+) -> Result<Vec<(DetectBox, BoundingBox, Array3<u8>)>, crate::DecoderError> {
+    if let Some(plan) = QuantPlan::new::<MASK, PROTO>(isa, &protos, quant_masks, quant_protos) {
+        let (h, w, _) = protos.dim();
+        return boxes
+            .into_iter()
+            .map(|b| {
+                let (crop, roi) = proto_crop(h, w, &b.0.bbox.to_canonical())?;
+                Ok((b.0, roi, plan.mask(masks.row(b.1), crop)?))
+            })
+            .collect();
+    }
 
     let total_bits = MASK::zero().count_zeros() + PROTO::zero().count_zeros() + 5; // 32 protos is 2^5
     boxes
@@ -2213,13 +2257,13 @@ pub(crate) fn decode_segdet_quant<
                     protos.view(),
                     quant_masks,
                     quant_protos,
-                ),
+                )?,
                 65..=128 => make_segmentation_quant::<MASK, PROTO, i128>(
                     masks.row(i),
                     protos.view(),
                     quant_masks,
                     quant_protos,
-                ),
+                )?,
                 _ => {
                     return Err(crate::DecoderError::NotSupported(format!(
                         "Unsupported bit width ({total_bits}) for segmentation computation"
@@ -2235,8 +2279,19 @@ fn protobox<'a, T>(
     protos: &'a ArrayView3<T>,
     roi: &BoundingBox,
 ) -> Result<(ArrayView3<'a, T>, BoundingBox), crate::DecoderError> {
-    let width = protos.dim().1 as f32;
-    let height = protos.dim().0 as f32;
+    let (crop, roi_norm) = proto_crop(protos.dim().0, protos.dim().1, roi)?;
+    let cropped = protos.slice(s![crop.y0..crop.y1, crop.x0..crop.x1, ..]);
+    Ok((cropped, roi_norm))
+}
+
+/// The proto-grid cells under `roi` (normalized), and that rectangle snapped to the grid.
+pub(crate) fn proto_crop(
+    proto_h: usize,
+    proto_w: usize,
+    roi: &BoundingBox,
+) -> Result<(crate::instance_mask::Crop, BoundingBox), crate::DecoderError> {
+    let width = proto_w as f32;
+    let height = proto_h as f32;
 
     // Detect un-normalized bounding boxes (pixel-space coordinates).
     // protobox expects normalized coordinates in [0, 1]. The decoder will
@@ -2268,24 +2323,30 @@ fn protobox<'a, T>(
         )));
     }
 
-    let roi = [
+    let cells = [
         (roi.xmin * width).clamp(0.0, width) as usize,
         (roi.ymin * height).clamp(0.0, height) as usize,
         (roi.xmax * width).clamp(0.0, width).ceil() as usize,
         (roi.ymax * height).clamp(0.0, height).ceil() as usize,
     ];
+    let [x0, y0, x1, y1] = cells;
 
     let roi_norm = [
-        roi[0] as f32 / width,
-        roi[1] as f32 / height,
-        roi[2] as f32 / width,
-        roi[3] as f32 / height,
+        x0 as f32 / width,
+        y0 as f32 / height,
+        x1 as f32 / width,
+        y1 as f32 / height,
     ]
     .into();
 
-    let cropped = protos.slice(s![roi[1]..roi[3], roi[0]..roi[2], ..]);
-
-    Ok((cropped, roi_norm))
+    // An inverted box crops nothing, as an ndarray slice whose end precedes its start.
+    let crop = crate::instance_mask::Crop {
+        x0,
+        y0,
+        x1: x1.max(x0),
+        y1: y1.max(y0),
+    };
+    Ok((crop, roi_norm))
 }
 
 /// Compute a single instance segmentation mask from mask coefficients and
@@ -2324,50 +2385,71 @@ fn make_segmentation<
 /// Compute a single instance segmentation mask from quantized mask
 /// coefficients and proto maps.
 ///
-/// Dequantizes both inputs (subtracting zero-points), computes the dot
-/// product, applies sigmoid, and maps to `[0, 255]`.
-/// Returns an `(H, W, 1)` u8 array.
+/// Computes `Σ (m − zm)(p − zp)` per pixel in `DEST`, applies the combined
+/// scale and the sigmoid, and maps to `[0, 255]`. The arithmetic wraps modulo
+/// `DEST`'s width; zero points within their element type's range never reach
+/// that. Returns an `(H, W, 1)` u8 array.
 fn make_segmentation_quant<
     MASK: PrimInt + AsPrimitive<DEST> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<DEST> + Send + Sync,
-    DEST: PrimInt + 'static + Signed + AsPrimitive<f32> + Debug,
+    DEST: PrimInt + 'static + Signed + AsPrimitive<f32> + WrappingAdd + WrappingSub + WrappingMul,
 >(
     mask: ArrayView1<MASK>,
     protos: ArrayView3<PROTO>,
     quant_masks: Quantization,
     quant_protos: Quantization,
-) -> Array3<u8>
+) -> Result<Array3<u8>, crate::DecoderError>
 where
     i32: AsPrimitive<DEST>,
-    f32: AsPrimitive<DEST>,
 {
-    let shape = protos.shape();
-
-    // Safe to unwrap since the shapes will always be compatible
-    let mask = mask.to_shape((1, mask.len())).unwrap();
-
-    let protos = protos.to_shape([shape[0] * shape[1], shape[2]]).unwrap();
-    let protos = protos.reversed_axes();
-
-    let zp = quant_masks.zero_point.as_();
-
-    let mask = mask.mapv(|x| x.as_() - zp);
-
-    let zp = quant_protos.zero_point.as_();
-    let protos = protos.mapv(|x| x.as_() - zp);
-
-    // Safe to unwrap since the shapes will always be compatible
-    let segmentation = mask
-        .dot(&protos)
-        .into_shape_with_order((shape[0], shape[1], 1))
-        .unwrap();
-
+    /// Coefficients converted on the stack; more channels take a heap copy.
+    const STACK_K: usize = 256;
+    let (h, w, k) = protos.dim();
+    let zm: DEST = quant_masks.zero_point.as_();
+    let zp: DEST = quant_protos.zero_point.as_();
     let combined_scale = quant_masks.scale * quant_protos.scale;
-    segmentation.map(|x| {
-        let val: f32 = (*x).as_() * combined_scale;
+    let mut stack = [DEST::zero(); STACK_K];
+    let heap: Vec<DEST>;
+    let coeff: &[DEST] = if k <= STACK_K {
+        for (d, &m) in stack.iter_mut().zip(mask.iter()) {
+            *d = m.as_().wrapping_sub(&zm);
+        }
+        &stack[..k]
+    } else {
+        heap = mask.iter().map(|&m| m.as_().wrapping_sub(&zm)).collect();
+        &heap
+    };
+    let term = |c: DEST, p: PROTO| c.wrapping_mul(&p.as_().wrapping_sub(&zp));
+    let mut values = Vec::with_capacity(h * w);
+    for px in protos.lanes(Axis(2)) {
+        let dot = match px.as_slice() {
+            Some(p) => {
+                // Four partial sums: integer addition wraps the same in any order.
+                let mut acc = [DEST::zero(); 4];
+                let (cv, pv) = (coeff.chunks_exact(4), p.chunks_exact(4));
+                let (ct, pt) = (cv.remainder(), pv.remainder());
+                for (c, p) in cv.zip(pv) {
+                    for ((a, &c), &p) in acc.iter_mut().zip(c).zip(p) {
+                        *a = a.wrapping_add(&term(c, p));
+                    }
+                }
+                let tail = ct
+                    .iter()
+                    .zip(pt)
+                    .fold(DEST::zero(), |s, (&c, &p)| s.wrapping_add(&term(c, p)));
+                acc.iter().fold(tail, |s, a| s.wrapping_add(a))
+            }
+            None => coeff
+                .iter()
+                .zip(px.iter())
+                .fold(DEST::zero(), |s, (&c, &p)| s.wrapping_add(&term(c, p))),
+        };
+        let val: f32 = dot.as_() * combined_scale;
         let sigmoid = 1.0 / (1.0 + (-val).exp());
-        (sigmoid * 255.0).round() as u8
-    })
+        values.push((sigmoid * 255.0).round() as u8);
+    }
+    Array3::from_shape_vec((h, w, 1), values)
+        .map_err(|e| crate::DecoderError::Internal(format!("mask shape: {e}")))
 }
 
 /// Converts Yolo Instance Segmentation into a 2D mask.
@@ -2381,6 +2463,8 @@ where
 ///
 /// Returns `DecoderError::InvalidShape` if the input segmentation does not
 /// have shape (H, W, 1).
+///
+/// The CPU tier (`EDGEFIRST_DECODER_FORCE_KERNEL`) is resolved on each call.
 pub(crate) fn yolo_segmentation_to_mask(
     segmentation: ArrayView3<u8>,
     threshold: u8,
@@ -2390,6 +2474,9 @@ pub(crate) fn yolo_segmentation_to_mask(
             "Yolo Instance Segmentation should have shape (H, W, 1), got (H, W, {})",
             segmentation.shape()[2]
         )));
+    }
+    if let Some(mask) = threshold_mask(Isa::current_or_scalar(), &segmentation, threshold) {
+        return Ok(mask);
     }
     Ok(segmentation
         .slice(s![.., .., 0])
@@ -3473,9 +3560,23 @@ mod tests {
         for (b, _) in &mut low {
             b.score = 0.5;
         }
-        let kept = nms_and_cap(low, Some(Nms::ClassAware), 0.5, 10, 300);
+        let kept = nms_and_cap(
+            Isa::current_or_scalar(),
+            low,
+            Some(Nms::ClassAware),
+            0.5,
+            10,
+            300,
+        );
         assert_eq!(kept.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![0]);
-        let kept = nms_and_cap(boxes, Some(Nms::ClassAware), 0.5, 10, 300);
+        let kept = nms_and_cap(
+            Isa::current_or_scalar(),
+            boxes,
+            Some(Nms::ClassAware),
+            0.5,
+            10,
+            300,
+        );
         assert_eq!(kept.iter().map(|(_, a)| *a).collect::<Vec<_>>(), vec![150]);
     }
 
@@ -3484,16 +3585,16 @@ mod tests {
         // Anchor order is not score order: the cap must keep scores, not the
         // first anchors, and return them in descending score order.
         let boxes = make_float_boxes(&[0.1, 0.2, 0.9, 0.3, 0.8, 0.8]);
-        let kept = nms_and_cap(boxes.clone(), None, 0.5, 0, 3);
+        let kept = nms_and_cap(Isa::current_or_scalar(), boxes.clone(), None, 0.5, 0, 3);
         let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
         assert_eq!(labels, vec![2, 4, 5]);
         // Without truncation every candidate stays, still in score order.
-        let kept = nms_and_cap(boxes, None, 0.5, 0, 300);
+        let kept = nms_and_cap(Isa::current_or_scalar(), boxes, None, 0.5, 0, 300);
         let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
         assert_eq!(labels, vec![2, 4, 5, 3, 1, 0]);
 
         let q = make_quant_boxes(&[10, 20, 90, 30, 80, 80]);
-        let kept = nms_and_cap(q, None, 0.5, 0, 2);
+        let kept = nms_and_cap(Isa::current_or_scalar(), q, None, 0.5, 0, 2);
         let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
         assert_eq!(labels, vec![2, 4]);
     }
@@ -3519,9 +3620,23 @@ mod tests {
                 )
             })
             .collect();
-        let capped = nms_and_cap(boxes.clone(), Some(Nms::ClassAware), 0.5, 300, 1000);
+        let capped = nms_and_cap(
+            Isa::current_or_scalar(),
+            boxes.clone(),
+            Some(Nms::ClassAware),
+            0.5,
+            300,
+            1000,
+        );
         assert_eq!(capped.len(), 300);
-        let all = nms_and_cap(boxes, Some(Nms::ClassAware), 0.5, 0, 1000);
+        let all = nms_and_cap(
+            Isa::current_or_scalar(),
+            boxes,
+            Some(Nms::ClassAware),
+            0.5,
+            0,
+            1000,
+        );
         assert_eq!(all.len(), 400);
     }
 
@@ -3529,13 +3644,25 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "Nms::Auto must be resolved by the builder")]
     fn dispatch_nms_float_rejects_unresolved_auto() {
-        dispatch_nms_float(Some(Nms::Auto), 0.5, None, Vec::new());
+        dispatch_nms_float(
+            Isa::current_or_scalar(),
+            Some(Nms::Auto),
+            0.5,
+            None,
+            Vec::new(),
+        );
     }
 
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "Nms::Auto must be resolved by the builder")]
     fn dispatch_nms_int_rejects_unresolved_auto() {
-        dispatch_nms_int::<i8>(Some(Nms::Auto), 0.5, None, Vec::new());
+        dispatch_nms_int::<i8>(
+            Isa::current_or_scalar(),
+            Some(Nms::Auto),
+            0.5,
+            None,
+            Vec::new(),
+        );
     }
 }

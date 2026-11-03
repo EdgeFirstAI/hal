@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# Relocatable: ${pcfiledir} is <prefix>/lib/pkgconfig, so ../.. is the prefix
+# wherever the tarball was extracted. No dependency on any sibling library.
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: edgefirst-kernels
+Description: EdgeFirst quantized compute kernels
+Version: @VERSION@
+Libs: -L${libdir} -ledgefirst_kernels
+Libs.private: -lm -ldl -lpthread
+Cflags: -I${includedir}

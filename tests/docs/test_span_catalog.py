@@ -60,7 +60,16 @@ SPAN_MACRO = re.compile(r'(?:trace_span|info_span|debug_span)!\(\s*"([a-zA-Z0-9_
 # The documented naming convention is `<crate>.<operation>[...]`, so anchoring
 # on the known leading segments is what distinguishes a span name from the
 # other dotted tokens in the prose -- `context.rs` is a file, not a span.
-SPAN_SEGMENTS = ("codec", "tensor", "image", "decoder", "tracker", "python", "hal")
+SPAN_SEGMENTS = (
+    "codec",
+    "tensor",
+    "image",
+    "decoder",
+    "tracker",
+    "kernels",
+    "python",
+    "hal",
+)
 SPAN_NAME = re.compile(r"^(?:" + "|".join(SPAN_SEGMENTS) + r")(?:\.[a-z0-9_]+)+$")
 
 

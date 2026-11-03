@@ -44,6 +44,7 @@ CASES=(
   "codec||codec_benchmark"
   "decoder||decoder_benchmark"
   "tracker||tracker_benchmark"
+  "kernels||kernels_benchmark"
   "pipeline-opengl|EDGEFIRST_FORCE_BACKEND=opengl|pipeline_benchmark"
   "pipeline-cpu|EDGEFIRST_FORCE_BACKEND=cpu|pipeline_benchmark"
   "image-opengl|EDGEFIRST_FORCE_BACKEND=opengl|image_benchmark"

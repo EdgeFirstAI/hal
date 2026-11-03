@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Cross-build a tests bundle (scripts/on-target-bundle.sh: the Rust test
-# binaries, the five modular C-API libraries and the G3 two-library-user C
+# binaries, the modular C-API libraries and the G3 two-library-user C
 # binary), deploy it to SSH hosts, and run the suite -- plus
 # scripts/check-single-home.sh's G1/G2/G4/G9/G11 -- on real hardware through
 # the bundle's own scripts/on-target-run.sh.
@@ -24,9 +24,9 @@
 #
 # Env:
 #   EDGEFIRST_TARGETS  space-separated SSH hosts (alternative to arguments)
-#   CRATES             cargo packages to test  (default: the five with tests)
-#   CAPI_CRATES        the five -capi leaves to build+deploy for G1/G2/G3/G4/
-#                      G9/G11 (default: all five; each is its own standalone
+#   CRATES             cargo packages to test  (default: every crate with tests)
+#   CAPI_CRATES        the -capi leaves to build+deploy for G1/G2/G3/G4/
+#                      G9/G11 (default: all of them; each is its own standalone
 #                      workspace, see each crate's own Cargo.toml comment)
 #   GLIBC              glibc floor for the build (default: the project floor,
 #                      see README "Toolchain and Platform Floors")
@@ -66,11 +66,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-CRATES="${CRATES:-edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker}"
-# The five modular C-API leaves (single-tensor-home, task 12 / G8): each is
+CRATES="${CRATES:-edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker edgefirst-kernels}"
+# The modular C-API leaves: each is
 # its own standalone `[workspace]` (see each Cargo.toml's own comment), so
 # these are built by `--manifest-path`, not `-p`, unlike CRATES above.
-CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi tracker-capi}"
+CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi tracker-capi kernels-capi}"
 # The project's chosen glibc floor, not a probed value: binaries are built
 # against it so one set runs on every supported target. Declared alongside the
 # MSRV in the README -- change it there and here together.

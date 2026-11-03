@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # EdgeFirst HAL — C libraries
 
-Five independently linkable libraries from the [EdgeFirst Hardware Abstraction Layer](https://github.com/EdgeFirstAI/hal). Siblings load `libedgefirst_tensor` at runtime instead of embedding a second copy.
+Six independently linkable libraries from the [EdgeFirst Hardware Abstraction Layer](https://github.com/EdgeFirstAI/hal). Siblings that use tensors load `libedgefirst_tensor` at runtime instead of embedding a second copy; tracker and kernels link no sibling.
 
 | Library | Header | Role |
 |---|---|---|
@@ -14,6 +14,7 @@ Five independently linkable libraries from the [EdgeFirst Hardware Abstraction L
 | `libedgefirst_image` | `edgefirst/image.h` | Convert, resize, letterbox, draw |
 | `libedgefirst_decoder` | `edgefirst/decoder.h` | YOLO / ModelPack post-process |
 | `libedgefirst_tracker` | `edgefirst/tracker.h` | ByteTrack |
+| `libedgefirst_kernels` | `edgefirst/kernels.h` | Quantized CPU kernels: int8/int16 softmax, sigmoid, 8-bit LUT, DFL, dist2bbox |
 
 Detection boxes live in header-only `edgefirst/detect.h`. See `INSTALL.txt` for extract, pkg-config, runtime search path, and a JPEG→tensor example.
 
@@ -21,4 +22,4 @@ Detection boxes live in header-only `edgefirst/detect.h`. See `INSTALL.txt` for 
 
 The archive is the C ABI only: headers plus shared libraries. Linux ships a `.tar.gz`; Windows and macOS ship a `.zip`. Linux and macOS put the `.so` / `.dylib` in `lib/`. Windows ships `bin/edgefirst_*.dll` and `lib/edgefirst_*.lib` import libraries (never cargo's `*.dll.lib`, never the Rust staticlib). See `INSTALL.txt`.
 
-The five per-crate READMEs (`crates/*-capi/README.md` in the source tree) document each library's API. This file is the archive index.
+The per-crate READMEs (`crates/*-capi/README.md` in the source tree) document each library's API. This file is the archive index.

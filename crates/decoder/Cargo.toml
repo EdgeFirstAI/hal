@@ -29,6 +29,7 @@ argminmax = { workspace = true }
 # `ndarray` lets the decoder materialise its masks into the TensorDyn that `Segmentation` carries.
 edgefirst-tensor = { workspace = true, default-features = false, features = ["ndarray"] }
 edgefirst-decoder-abi = { workspace = true }
+edgefirst-kernels = { workspace = true }
 edgefirst-tracker = { workspace = true, optional = true, default-features = false }
 half = { workspace = true }
 log = { workspace = true }

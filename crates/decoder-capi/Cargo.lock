@@ -218,6 +218,7 @@ version = "0.38.2"
 dependencies = [
  "argminmax",
  "edgefirst-decoder-abi",
+ "edgefirst-kernels",
  "edgefirst-tensor",
  "edgefirst-tracker",
  "half",
@@ -256,6 +257,14 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "edgefirst-kernels"
+version = "0.38.2"
+dependencies = [
+ "half",
+ "tracing",
 ]
 
 [[package]]

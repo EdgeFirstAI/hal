@@ -15,8 +15,9 @@ sub-crate's `ARCHITECTURE.md`:
 | `image` | [crates/image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) — unified GL engine (one `GLProcessorST`; Linux DMA-BUF, macOS/iOS ANGLE + IOSurface, Android AHardwareBuffer), `GlPlatform` porting seam, EGL image cache, batch engine (`convert_deferred`/`flush`), G2D, CPU, Vivante workarounds, shutdown safety |
 | `decoder` | [crates/decoder/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) — model-type selection, dshape contract, per-scale framework, fused proto path |
 | `tracker` | [crates/tracker/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) — ByteTrack two-pass association, Kalman state |
-| `tensor-capi` / `codec-capi` / `image-capi` / `decoder-capi` / `tracker-capi` | Five modular C libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`). Detection layouts live in header-only `edgefirst/detect.h`. |
-| `python-*` (five wheels) | [crates/python-common/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/ARCHITECTURE.md) — PyO3 bindings, five extension modules linking `libedgefirst_tensor.so` (tracker does not), PEP 420 namespace, capsule handoff |
+| `kernels` | [crates/kernels/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/ARCHITECTURE.md) — plan/run CPU kernels over strided views, NEON tiers, per-op numerics, the recipe for adding an operator |
+| `tensor-capi` / `codec-capi` / `image-capi` / `decoder-capi` / `tracker-capi` / `kernels-capi` | Six modular C libraries (`libedgefirst_{tensor,codec,image,decoder,tracker,kernels}`). Detection layouts live in header-only `edgefirst/detect.h`. |
+| `python-*` (six wheels) | [crates/python-common/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/ARCHITECTURE.md) — PyO3 bindings, six extension modules, four linking `libedgefirst_tensor.so` (tracker and kernels do not), PEP 420 namespace, capsule handoff |
 
 The high-level system diagram lives at the top of
 [README.md § System Architecture](https://github.com/EdgeFirstAI/hal/blob/main/README.md#system-architecture);
@@ -33,7 +34,8 @@ Each sub-crate has a single responsibility in the inference pipeline:
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface, Android uses native EGL + AHardwareBuffer EGLImage import (iOS builds ride the ANGLE platform) — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch. Also owns the input half of SAHI tiling (`tiling.rs`) — `TilingConfig`, `plan_tiles`, `alloc_tile_batch`, `tile_into`, `tile_one` — which rides that same batch engine to render an overlapping tile grid with one import and one flush.
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time. Discovers a model's configuration (`model_config`: embedded or sidecar `edgefirst.json`, Hugging Face configs, Ultralytics metadata, overrides, per-field provenance) and produces the `PreprocessSpec` the image crate applies. Owns the output half of SAHI tiling (`tiling` module) — `TilePlacement` (the record shared with `edgefirst-image`), `lift_tile_boxes`, greedy `merge_tiled_detections` (keep-best suppression by default, enclosing union opt-in via `MergeMode`), and the streaming `TiledFrameAccumulator`.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
-- [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) — C ABI for tensors (`libedgefirst_tensor`, `edgefirst/tensor.h`). Sibling leaves cover codec, image, decoder, and tracker. Detection layouts are header-only in `edgefirst/detect.h`.
+- [`edgefirst-kernels`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/) — framework-neutral CPU kernels at the bottom of the graph (depends only on `half` and `tracing`). Plans validate once and run allocation-free over caller-owned strided views: int8/int16 softmax matching TFLite, sigmoid and 8-bit lookup tables, DFL and dist2bbox box decode, with runtime NEON tier selection. The decoder's compute primitives live here, and on aarch64 the image crate's CPU mask dot products; the decoder keeps the model and schema logic.
+- [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) — C ABI for tensors (`libedgefirst_tensor`, `edgefirst/tensor.h`). Sibling leaves cover codec, image, decoder, tracker and kernels. Detection layouts are header-only in `edgefirst/detect.h`.
 - [`crates/python-common`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/) — the shared PyO3 binding rlib, plus four thin `cdylib` crates (`python-tensor`, `python-codec`, `python-image`, `python-decoder`) published as the independent `edgefirst-tensor` / `edgefirst-codec` / `edgefirst-image` / `edgefirst-decoder` wheels under the `edgefirst.` PEP 420 namespace. Contains the three-path numpy copy dispatcher.
 
 There is no umbrella crate. `edgefirst-hal` was deleted in 0.29 — every
@@ -197,7 +199,7 @@ let mut dst = proc.create_image(
 
 ## C ABI Stability and Versioning
 
-The five C libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`)
+The six C libraries (`libedgefirst_{tensor,codec,image,decoder,tracker,kernels}`)
 are independently versioned artifacts that a consumer links, ships and
 upgrades separately. This section is the contract that governs them: what a
 version number promises, what mixing versions is allowed to do, and which
@@ -405,10 +407,11 @@ currently partial:
 | `decoder` | `ef_detect_box`, `ef_segmentation`, `ef_merge_config`, `ef_tile_placement`, `ef_preprocess_spec` (via `detect.h`) | yes |
 | `image` | `ef_tiling_config`, `ef_tile_spec` | **none — gap** |
 | `tracker` | `ef_track_info` | **none — gap** |
+| `kernels` | `ef_kernel_quant`, `ef_kernel_view`, `ef_kernel_pool`, `ef_kernel_level`, the `ef_*_params` structs | **none — gap** |
 | `codec` | none (opaque handles only) | not needed |
 
-The two gaps are the same drift class the goldens exist to catch, in headers
-that have it: `image` and `tracker` should gain goldens before 1.0, when a
+The three gaps are the same drift class the goldens exist to catch, in headers
+that have it: `image`, `tracker` and `kernels` should gain goldens before 1.0, when a
 layout move stops being a permitted minor-bump event and becomes a major one.
 `crates/tensor-capi/tests/check_abi.rs` covers the complementary drift class
 — the exported `ef_*` symbol set, the `DECLARED` list in `tensor-ffi`, and
@@ -464,14 +467,16 @@ rustdoc does not read target tables, so doctests and `cargo doc` always describe
 | `libedgefirst_tensor` | `tensor-capi` | static — the one implementation | refuses the dynamic cfg (`compile_error!`) |
 | `libedgefirst_{image,codec,decoder}` | `{image,codec,decoder}-capi` | dynamic, links `libedgefirst_tensor` | refuses static (`compile_error!`) |
 | `libedgefirst_tracker` | `tracker-capi` | none (no tensor) | — |
+| `libedgefirst_kernels` | `kernels-capi` | none (no tensor) | — |
 | `edgefirst.tensor` wheel | `python-tensor` | dynamic, bundles `libedgefirst_tensor` | refuses static outside the G13 comparison |
 | `edgefirst.{codec,image,decoder}` wheels | `python-{codec,image,decoder}` | dynamic, rpath `../tensor` | refuses static outside the G13 comparison |
 | `edgefirst.tracker` wheel | `python-tracker` | none (no tensor) | — |
+| `edgefirst.kernels` wheel | `python-kernels` | none (no tensor) | — |
 | Rust crates | `edgefirst-*` | static | — |
 
 The guards turn a mis-built artifact into a compile error rather than a silently wrong binary: a C library built static would reinterpret another library's `ef_tensor*` handles, and a wheel built static would quietly carry its own tensor copy. Each Python extension reports its backend as `__tensor_backend__`.
 
-Library crates (codec, image, decoder, tracker, python-common) never name the backend; they compile against whichever `TensorDyn` the build selects. `make check-backends` compiles all of them against both, and `make check-single-home` proves on the built artifacts that the implementation exists once. The link and rpath logic every leaf shares lives in `crates/build-support`.
+Library crates (codec, image, decoder, tracker, python-common) never name the backend; they compile against whichever `TensorDyn` the build selects. `edgefirst-kernels` has no tensor dependency, so no backend applies to it. `make check-backends` compiles all of them against both, and `make check-single-home` proves on the built artifacts that the implementation exists once. The link and rpath logic every leaf shares lives in `crates/build-support`.
 
 Each C library is built by its own cargo invocation outside the workspace, so its feature set, lockfile and output path belong to that artifact alone; each wheel is its own maturin invocation.
 
@@ -765,7 +770,7 @@ The `Send + Sync` story across the workspace:
 ### 9. Error handling
 
 Each crate defines its own `Error` / `Result` pair (`DecoderError`,
-`edgefirst_image::Error`, `edgefirst_tensor::Error`). Both
+`edgefirst_image::Error`, `edgefirst_tensor::Error`, `KernelError`). Both
 `edgefirst_image::Error` and `edgefirst_tensor::Error` implement
 `From<std::io::Error>` so `?` propagates cleanly from file I/O and from
 DMA-BUF / SHM syscalls. `DecoderError` does not, because the decoder
@@ -773,7 +778,7 @@ crate never opens files or fds — its inputs are already-loaded tensors
 and JSON/YAML configuration strings.
 
 The C API translates all errors into POSIX `errno` codes; see each leaf's
-header (`edgefirst/tensor.h`, `codec.h`, `image.h`, `decoder.h`, `tracker.h`).
+header (`edgefirst/tensor.h`, `codec.h`, `image.h`, `decoder.h`, `tracker.h`, `kernels.h`).
 
 ### 10. Authoritative in the library, or a re-derivable cache — never both
 
@@ -869,6 +874,7 @@ macOS, and Android.
 | `decoder.<op>.<step>` | Sub-step within a decode phase | `decoder.nms_get_boxes.score_filter`, `decoder.nms_get_boxes.suppress`, `decoder.decode_proto.extract_proto_data` |
 | `decoder.tiled.` | SAHI tiling output side | `decoder.tiled.lift`, `decoder.tiled.merge` |
 | `tracker.` | ByteTrack association | `tracker.update`, `tracker.update.match_high_conf`, `tracker.update.predict` |
+| `kernels.` | One span per kernel plan `run` | `kernels.softmax_i8`, `kernels.softmax_i16`, `kernels.lut_i8`, `kernels.sigmoid`, `kernels.dfl`, `kernels.dist2bbox`, `kernels.dfl_box` |
 | `python.` | Python binding entry point | `python.convert`, `python.convert_deferred`, `python.convert_with_fence`, `python.flush`, `python.decode`, `python.decode_proto`, `python.decode_semantic`, `python.tile_into`, `python.tile_one`, `python.materialize_masks` |
 
 Every span site uses `tracing::trace_span!`, except `image.gl_init`, which
@@ -886,6 +892,7 @@ Field conventions:
 - `platform` — `"macos"` / `"ios"` / `"android"` / `"windows"`, recorded by the GL platform layer's shared-display bring-up. There is deliberately no Linux value: Linux brings its display up through `context.rs` and emits no `image.gl_init` at all (`crates/image/ARCHITECTURE.md` § What each span measures)
 - `backend` — on `image.gl_init`, the platform's zero-copy import mechanism, fixed per platform: `"iosurface"` (macOS/iOS), `"ahardwarebuffer"` (Android), `"d3d11"` (Windows). This is bring-up, not a per-convert choice — for how an individual convert fed its source, read `src_feed` on `image.convert.gl` (`import` / `pbo` / `upload`)
 - `tiles`, `index`, `count`, `overlap` — SAHI tiling geometry on the `image.*_tile*` and `decoder.tiled.*` spans
+- `tier` — on every `kernels.*` span, the CPU tier the plan was built for (`scalar` / `neon` / `neon_fp16` / `neon_dotprod`)
 
 Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
 
@@ -903,14 +910,15 @@ Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
 │  edgefirst-decoder │ edgefirst-image   │ edgefirst-      │
 │  (decode spans)    │ (convert spans)   │ tracker         │
 │                    │                   │ (update spans)  │
-├────────────────────┴───────────────────┴────────────────┤
-│  edgefirst-tensor  (alloc / map spans)                   │
-├─────────────────────────────────────────────────────────┤
+├────────────────────┴─────────────┬─────┴────────────────┤
+│  edgefirst-tensor                │  edgefirst-kernels   │
+│  (alloc / map spans)             │  (per-run spans)     │
+├──────────────────────────────────┴──────────────────────┤
 │  tracing crate (span macros, callsite interest cache)    │
 └─────────────────────────────────────────────────────────┘
 ```
 
-- **Inner crates** (`tensor`, `image`, `decoder`, `tracker`) depend on
+- **Inner crates** (`tensor`, `image`, `decoder`, `tracker`, `kernels`) depend on
   `tracing` as a **required** (non-optional) dependency. The span
   macros are always compiled. Cost when disabled: one `Relaxed` atomic
   load per span site.
@@ -1021,21 +1029,24 @@ hal/
 │   ├── image/              # edgefirst-image
 │   ├── decoder/            # edgefirst-decoder
 │   ├── tracker/            # edgefirst-tracker
+│   ├── kernels/            # edgefirst-kernels (framework-neutral CPU kernels; no tensor dependency)
 │   ├── tensor-abi/         # edgefirst-tensor-abi (plain C value types shared by tensor and its FFI)
 │   ├── tensor-ffi/         # edgefirst-tensor-ffi (the `ef_tensor_*` declarations the dynamic backend calls)
 │   ├── decoder-abi/        # edgefirst-decoder-abi (header-only `edgefirst/detect.h` values: boxes, masks, tile placements)
 │   ├── build-support/      # build-script helpers the shared-library leaves use to link libedgefirst_tensor
-│   ├── tensor-capi/        # libedgefirst_tensor (C ABI; the five -capi leaves are workspace-excluded)
+│   ├── tensor-capi/        # libedgefirst_tensor (C ABI; the -capi leaves are workspace-excluded)
 │   ├── codec-capi/         # libedgefirst_codec
 │   ├── image-capi/         # libedgefirst_image
 │   ├── decoder-capi/       # libedgefirst_decoder
 │   ├── tracker-capi/       # libedgefirst_tracker
+│   ├── kernels-capi/       # libedgefirst_kernels
 │   ├── python-common/      # shared PyO3 binding code (rlib)
 │   ├── python-tensor/      # -> edgefirst.tensor   wheel
 │   ├── python-codec/       # -> edgefirst.codec    wheel
 │   ├── python-image/       # -> edgefirst.image    wheel
 │   ├── python-decoder/     # -> edgefirst.decoder  wheel
 │   ├── python-tracker/     # -> edgefirst.tracker  wheel
+│   ├── python-kernels/     # -> edgefirst.kernels  wheel
 │   ├── egl/                # edgefirst-egl (trimmed khronos-egl fork, dynamic load only)
 │   ├── gl/                 # edgefirst-gl (trimmed gls fork)
 │   ├── bench/              # edgefirst-bench (workspace dev-dep)

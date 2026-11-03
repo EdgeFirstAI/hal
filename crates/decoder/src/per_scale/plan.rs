@@ -9,13 +9,14 @@
 //! per role across all FPN levels, so the plan stores one dispatch per
 //! role, not one per level. Dispatch fields are added in Task 15.
 
-use super::kernels::grids::make_anchor_grid;
 use super::kernels::CpuFeatures;
 use super::{Activation, DecodeDtype};
 use crate::configs::DimName;
 use crate::schema::BoxEncoding;
 use crate::schema::{last_feature_axis, LogicalOutput, LogicalType, PhysicalOutput, SchemaV2};
 use crate::{DecoderError, DecoderResult};
+use edgefirst_kernels::prim::dfl_lut::DflGeom;
+use edgefirst_kernels::prim::grids::make_anchor_grid;
 
 /// Memory layout of a per-scale child tensor, derived from its dshape.
 ///
@@ -76,9 +77,13 @@ pub(crate) struct PerScalePlan {
     // Pre-selected dispatch — one per role. Reused across all levels
     // because dtype is uniform per role.
     pub(crate) box_dispatch: super::kernels::dispatch::BoxLevelDispatch,
+    /// The box kernel of levels whose box tensor carries per-channel quantization.
+    pub(crate) box_per_channel: super::kernels::dispatch::DflPerChannelDispatch,
     pub(crate) score_dispatch: super::kernels::dispatch::ScoreLevelDispatch,
     pub(crate) mc_dispatch: Option<super::kernels::dispatch::MaskCoefDispatch>,
     pub(crate) proto_dispatch: Option<super::kernels::dispatch::ProtoDispatch>,
+    /// The transpose of NCHW inputs.
+    pub(crate) transpose: super::kernels::dispatch::TransposeDispatch,
 
     /// Protos: a single tensor (no per-scale structure). Only the
     /// expected shape is retained — for binding by shape match. The
@@ -155,6 +160,20 @@ pub(crate) struct LevelPlan {
     /// match in `try_from_schema`). NHWC is the canonical case;
     /// NCHW triggers a per-frame transpose to scratch in `pipeline::run`.
     pub(crate) layout: Layout,
+}
+
+impl LevelPlan {
+    /// This level's anchor geometry for the exp-table DFL decode.
+    #[inline]
+    pub(crate) fn dfl_geom(&self) -> DflGeom<'_> {
+        DflGeom {
+            reg_max: self.reg_max,
+            anchors: self.h * self.w,
+            grid_x: &self.grid_x,
+            grid_y: &self.grid_y,
+            stride: self.stride,
+        }
+    }
 }
 
 impl PerScalePlan {
@@ -268,7 +287,7 @@ impl PerScalePlan {
             _ => proto_shape.clone(),
         };
 
-        let cpu_features = CpuFeatures::from_env_or_probe()?;
+        let cpu_features = super::kernels::decoder_cpu_features()?;
 
         // All children of a given role share dtype (by construction in the
         // TFLite-converter). Read the first child to pre-select dispatches.
@@ -302,6 +321,8 @@ impl PerScalePlan {
             out_dtype,
             &cpu_features,
         )?;
+        let box_per_channel =
+            super::kernels::dispatch::DflPerChannelDispatch::select(out_dtype, &cpu_features);
         let score_dispatch = super::kernels::dispatch::ScoreLevelDispatch::select(
             score_dtype,
             out_dtype,
@@ -363,9 +384,11 @@ impl PerScalePlan {
             out_dtype,
             cpu_features,
             box_dispatch,
+            box_per_channel,
             score_dispatch,
             mc_dispatch,
             proto_dispatch,
+            transpose: super::kernels::dispatch::TransposeDispatch::select(&cpu_features),
             proto_shape,
             proto_nhwc_shape,
             proto_layout,
@@ -789,5 +812,35 @@ mod tests {
             plan.proto_nhwc_shape.as_deref(),
             Some(&[1, 160, 160, 32][..])
         );
+    }
+
+    /// An NCHW plan transposes with NEON on NEON tiers and with the element loop on the
+    /// scalar tier.
+    #[test]
+    fn nchw_transpose_follows_the_forced_tier() {
+        use crate::per_scale::kernels::dispatch::TransposeDispatch;
+        use crate::per_scale::kernels::forced_for_test;
+        let mut schema = fixture_yolo26n_schema();
+        for out in &mut schema.outputs {
+            if out.type_ == Some(LogicalType::Protos) {
+                out.shape = vec![1, 32, 160, 160];
+                out.dshape = vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumProtos, 32),
+                    (DimName::Height, 160),
+                    (DimName::Width, 160),
+                ];
+            }
+        }
+        for (name, isa) in crate::neon_dispatch::tiers() {
+            let plan = forced_for_test::with(name, || {
+                PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(plan.proto_layout, Some(Layout::Nchw), "{name}");
+            let neon = plan.transpose == TransposeDispatch::Neon;
+            assert_eq!(neon, !isa.is_scalar(), "{name}: {:?}", plan.transpose);
+        }
     }
 }

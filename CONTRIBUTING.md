@@ -77,8 +77,8 @@ cargo build --workspace --exclude 'edgefirst-python-*'
 # Run tests — single-threaded, always (see below)
 cargo test --workspace --exclude 'edgefirst-python-*' -- --test-threads=1
 
-# The five C-API leaves (tensor-capi, image-capi, codec-capi, decoder-capi,
-# tracker-capi) are excluded from the workspace and untouched by the two
+# The C-API leaves (tensor-capi, image-capi, codec-capi, decoder-capi,
+# tracker-capi, kernels-capi) are excluded from the workspace and untouched by the two
 # commands above — each library resolves its own features and lockfile.
 # Build and test them per crate, sharing the workspace's target directory.
 # tensor-capi goes first; image/codec/decoder-capi link the library it builds
@@ -88,7 +88,7 @@ cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
 (cd crates/image-capi && cargo build --target-dir ../../target)
 EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --manifest-path crates/tensor-capi/Cargo.toml \
   --target-dir target -- --test-threads=1
-# ...or `make capi-libs` / `make test-capi-modular` to cover all five, as CI does.
+# ...or `make capi-libs` / `make test-capi-modular` to cover all of them, as CI does.
 
 # Build Python bindings (optional), from the crate directory so its
 # .cargo/config.toml selects the dynamic tensor backend.
@@ -164,7 +164,7 @@ cargo test --workspace -- --test-threads=1
 # Linting, exactly as CI runs it (plain `cargo clippy` will let CI failures through)
 cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
 
-# The five excluded C-API leaves need their own clippy pass, per crate,
+# The excluded C-API leaves need their own clippy pass, per crate,
 # with the workspace's target directory (see `make lint`):
 cargo clippy --manifest-path crates/tensor-capi/Cargo.toml --all-targets \
   --target-dir target -- -D warnings
@@ -239,12 +239,12 @@ cargo fmt --all
 cargo clippy --workspace --exclude 'edgefirst-python-*'
 ```
 
-The five excluded C-API leaves (`tensor-capi`, `image-capi`, `codec-capi`,
-`decoder-capi`, `tracker-capi`) need their own clippy pass, per crate, with
+The excluded C-API leaves (`tensor-capi`, `image-capi`, `codec-capi`,
+`decoder-capi`, `tracker-capi`, `kernels-capi`) need their own clippy pass, per crate, with
 the workspace's target directory — see [Clone and Build](#clone-and-build)
-above, or run `make lint-capi-modular` to cover all five at once.
+above, or run `make lint-capi-modular` to cover all of them at once.
 
-**The five leaves also carry their own `[lints]`, `[profile.release]` and `[profile.profiling]`
+**The leaves also carry their own `[lints]`, `[profile.release]` and `[profile.profiling]`
 tables, hand-copied from the root `Cargo.toml`, and must be kept in sync by
 hand.** Being excluded from the workspace (see the root `Cargo.toml`'s
 `[workspace] exclude` comment) means they inherit *nothing* from it — not
@@ -254,7 +254,7 @@ of each leaf's manifest stops cargo's upward search), and `lints.workspace =
 true` only works for an actual member of the workspace it names. Cargo has
 no mechanism to propagate either table across that boundary automatically.
 Concretely: if you change `[workspace.lints.rust]` or either profile at
-the root, update all five leaves' copies in the same commit, or they will
+the root, update every leaf's copy in the same commit, or they will
 silently drift — a leaf built with a stale profile is exactly how this
 project ended up shipping an unstripped, non-LTO `.so` with 17,035 symbols
 alongside a workspace built with LTO and stripping.
@@ -344,7 +344,7 @@ python -m pytest tests/ -v
 cargo install cargo-llvm-cov --locked
 cargo llvm-cov nextest --workspace --exclude edgefirst-python-tensor \
   --exclude edgefirst-python-codec --exclude edgefirst-python-image \
-  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker \
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels \
   --lcov --output-path target/rust-coverage.lcov -j 1
 
 # With coverage (Python, after building with instrumentation)
@@ -353,9 +353,9 @@ python -m slipcover -m pytest tests/
 ```
 
 The Python crate is excluded from workspace Rust runs because it needs a live
-Python interpreter. The five C-API leaves are excluded from `cargo test
+Python interpreter. The C-API leaves are excluded from `cargo test
 --workspace` too — see [Clone and Build](#clone-and-build) for the per-crate
-invocation, or run `make test-capi-modular` to cover all five at once, as CI
+invocation, or run `make test-capi-modular` to cover all of them at once, as CI
 does. [TESTING.md](TESTING.md) covers cross-compilation, on-target
 runs, and the hardware gating rules.
 

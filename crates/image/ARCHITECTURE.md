@@ -1415,6 +1415,8 @@ Mali / desktop GPUs, switching back to the fused `draw_proto_masks`
 is straightforward — the data flow is the same up to the choice of
 render call.
 
+On aarch64 the CPU materialize kernels take their dot products from `edgefirst_kernels::prim::neon_mask`, shared with the decoder's materialized masks, one proto-crop row at a time. `i8` coefficients with `i8` NHWC protos (per-tensor zero points) get the exact i32 logit `Σ (c − zp_c)(p − zp_p)`, `sdot` on CPUs with FEAT_DotProd (detected at run time) and `smull` + `sadalp` otherwise, with no per-frame proto-sum pass, so every mask value is the exact sign of the integer logit; zero points outside i8 or more than 32767 channels take the scalar i32 loop, exact only while the logit and its partial terms fit in i32. `f32` and `f16` protos (and `i8` protos with float coefficients) get an f32 FMA dot product, `f16` widened with `FCVTL`; a mask value can then differ from the x86 build's sequential sum only where the exact logit is within `(3K + 12)·2⁻²⁴·Σ|c·p|` of the threshold. `i16` coefficients with `i8` NHWC protos and a coefficient zero point take the shared exact wide kernel (`mask_dot_wide_nhwc_neon`, i64) at proto resolution, and sum each pixel's protos inside the image's own NEON dot product when scaled, so neither path sums every proto pixel per call; symmetric `i16` coefficients and NCHW protos keep their own NEON and channel-major kernels.
+
 ## Process-Shutdown Resource Cleanup
 
 The OpenGL headless renderer

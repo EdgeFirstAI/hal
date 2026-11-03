@@ -41,8 +41,10 @@ use crate::configs::DimName;
 use crate::schema::{self, padding_axes, squeeze_padding_dims, LogicalOutput, SchemaV2};
 // `squeeze_padding_dims` is re-used by plan_channel_concat below.
 use super::tensor_bridge::{padded_strides, strided_view};
-use crate::{dequantize_cpu_chunked, DecoderError, DecoderResult, Quantization};
+use crate::neon_dispatch::Isa;
+use crate::{dequantize_cpu_on, DecoderError, DecoderResult, Quantization};
 use edgefirst_tensor::{DType, TensorDyn, TensorMapTrait, TensorTrait};
+use num_traits::AsPrimitive;
 
 /// Compiled merge program for one schema v2 document.
 ///
@@ -467,6 +469,7 @@ fn dequantize_integer_tensor(
     let quant = quant.unwrap_or(Quantization::new(1.0, 0));
     let total: usize = shape.iter().product();
     let mut out = vec![0.0_f32; total];
+    let isa = Isa::current()?;
     macro_rules! dq {
         ($ty:ty) => {{
             let tensor = t
@@ -482,14 +485,12 @@ fn dequantize_integer_tensor(
                             "tensor maps fewer than {total} elements"
                         ))
                     })?;
-                    dequantize_cpu_chunked(src, quant, &mut out);
+                    dequantize_cpu_on(isa, src, quant, &mut out);
                 }
-                Some(_) => {
-                    let packed: Vec<$ty> = strided_view(shape, strides, m.as_slice())?
-                        .iter()
-                        .copied()
-                        .collect();
-                    dequantize_cpu_chunked(&packed, quant, &mut out);
+                Some(s) => {
+                    // Rejects a shape and strides that do not fit the map.
+                    strided_view(shape, strides, m.as_slice())?;
+                    dequantize_strided(isa, m.as_slice(), shape, s, quant, &mut out)?;
                 }
             }
         }};
@@ -509,6 +510,54 @@ fn dequantize_integer_tensor(
     }
     let arr = Array::from_shape_vec(IxDyn(shape), out)?;
     Ok(arr)
+}
+
+/// Dequantizes `src`, addressed through `strides`, into the packed `out` one run of contiguous
+/// trailing dimensions at a time.
+fn dequantize_strided<T: AsPrimitive<f32>>(
+    isa: Isa,
+    src: &[T],
+    shape: &[usize],
+    strides: &[usize],
+    quant: Quantization,
+    out: &mut [f32],
+) -> DecoderResult<()> {
+    let mut split = shape.len().min(strides.len());
+    let mut inner = 1usize;
+    while let (Some(&s), Some(&d)) = (
+        strides.get(split.wrapping_sub(1)),
+        shape.get(split.wrapping_sub(1)),
+    ) {
+        if s != inner {
+            break;
+        }
+        split -= 1;
+        inner = inner.saturating_mul(d);
+    }
+    if inner == 0 || out.is_empty() {
+        return Ok(());
+    }
+    let short = || DecoderError::InvalidShape(format!("tensor maps fewer elements than {shape:?}"));
+    let mut index = vec![0usize; split];
+    for chunk in out.chunks_exact_mut(inner) {
+        let start = index
+            .iter()
+            .zip(strides)
+            .map(|(&i, &s)| i.saturating_mul(s))
+            .fold(0usize, usize::saturating_add);
+        let run = src
+            .get(start..start.saturating_add(inner))
+            .ok_or_else(short)?;
+        dequantize_cpu_on(isa, run, quant, chunk);
+        for (i, &n) in index.iter_mut().zip(shape).rev() {
+            *i += 1;
+            if *i < n {
+                break;
+            }
+            *i = 0;
+        }
+    }
+    Ok(())
 }
 
 /// Concatenate children along a channel axis.
@@ -668,6 +717,68 @@ mod tests {
         let got = super::tensor_to_f32(&padded, None).unwrap();
         assert_eq!(got.shape(), &[2, 3, 1]);
         assert_eq!(got.iter().copied().collect::<Vec<_>>(), values);
+    }
+
+    /// The strided dequantize equals gathering the view and dequantizing it, on every tier,
+    /// for padded rows over several dimension splits; a short source is an error.
+    #[test]
+    fn dequantize_strided_matches_the_gathered_view_on_every_tier() {
+        let src: Vec<i16> = (0..400).map(|v| (v * 37 % 2001) as i16 - 1000).collect();
+        let q = Quantization::new(0.01, -5);
+        let cases: [(&[usize], &[usize]); 5] = [
+            (&[3, 2, 5], &[13, 5, 1]),
+            (&[2, 3, 1], &[4, 1, 1]),
+            (&[1, 2, 40, 1], &[200, 40, 1, 1]),
+            (&[4, 3], &[1, 4]),
+            (&[2, 2, 2, 7], &[97, 31, 7, 1]),
+        ];
+        for (features, isa) in crate::neon_dispatch::tiers() {
+            for (shape, strides) in cases {
+                let view = strided_view(shape, Some(strides), &src).unwrap();
+                let want: Vec<f32> = view
+                    .iter()
+                    .map(|&d| d as f32 * q.scale + -(q.zero_point as f32) * q.scale)
+                    .collect();
+                let mut got = vec![f32::NAN; want.len()];
+                super::dequantize_strided(isa, &src, shape, strides, q, &mut got).unwrap();
+                assert_eq!(got, want, "{shape:?} {strides:?} on {features}");
+            }
+            let mut out = vec![0.0f32; 30];
+            assert!(super::dequantize_strided(
+                isa,
+                &src[..20],
+                &[3, 2, 5],
+                &[13, 5, 1],
+                q,
+                &mut out
+            )
+            .is_err());
+        }
+    }
+
+    /// An integer tensor's dequantize fails with `ForcedKernelUnavailable` under a tier the CPU
+    /// lacks or does not know, padded rows or not.
+    #[test]
+    fn integer_tensor_dequantize_fails_on_an_unavailable_forced_tier() {
+        use crate::per_scale::kernels::{decoder_cpu_features_from, forced_for_test};
+        let values: [u8; 6] = [10, 20, 30, 40, 50, 60];
+        let tensors = [
+            padded_grey!(u8, values, 0xEE),
+            make_u8_tensor(&[2, 3, 1], &values),
+        ];
+        let q = Some(Quantization::new(0.5, 10));
+        let bad = ["wibble", "neon", "neon_fp16", "neon_dotprod"]
+            .into_iter()
+            .filter(|t| decoder_cpu_features_from(Some(t)).is_err());
+        for tier in bad {
+            for t in &tensors {
+                let r = forced_for_test::with(tier, || super::tensor_to_f32(t, q));
+                assert!(
+                    matches!(r, Err(DecoderError::ForcedKernelUnavailable { .. })),
+                    "{tier}: {r:?}"
+                );
+            }
+        }
     }
 
     fn per_tensor_q(scale: f32, zp: i32, dt: DType) -> SchemaQuant {

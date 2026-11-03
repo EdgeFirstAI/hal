@@ -316,6 +316,35 @@ fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (Proto
     (proto_f32, proto_f16)
 }
 
+/// `proto_data_i8` with its i8 mask coefficients widened to i16 times 100, at zero point `zp`.
+fn i16_coefficients(proto_data_i8: &ProtoData, zp: i32) -> ProtoData {
+    let TensorDyn::I8(t) = &proto_data_i8.mask_coefficients else {
+        panic!("expected i8 mask coefficients in fixture");
+    };
+    let shape = TensorTrait::shape(t).to_vec();
+    let m = t.map().unwrap();
+    let coeffs: Vec<i16> = m.as_slice().iter().map(|&v| i16::from(v) * 100).collect();
+    let coeffs = Tensor::<i16>::from_slice(&coeffs, &shape)
+        .unwrap()
+        .with_quantization(edgefirst_tensor::Quantization::per_tensor(0.0002, zp))
+        .unwrap();
+    let TensorDyn::I8(p) = &proto_data_i8.protos else {
+        panic!("expected i8 protos in fixture");
+    };
+    let protos = Tensor::<i8>::from_slice(p.map().unwrap().as_slice(), TensorTrait::shape(p))
+        .unwrap()
+        .with_quantization(edgefirst_tensor::Quantization::per_tensor(
+            PROTOS_SCALE,
+            PROTOS_ZP,
+        ))
+        .unwrap();
+    ProtoData {
+        mask_coefficients: TensorDyn::I16(coeffs),
+        protos: TensorDyn::I8(protos),
+        layout: proto_data_i8.layout,
+    }
+}
+
 fn bench_materialize_dtype(suite: &mut BenchSuite) {
     println!("\n== materialize_masks: dtype dispatch (f32 vs f16) ==\n");
     println!("  Same workload through fused_*_f32_slice and fused_*_f16_slice.");
@@ -396,6 +425,24 @@ fn bench_materialize_dtype(suite: &mut BenchSuite) {
         });
         result.print_summary();
         suite.record(&result);
+    }
+
+    // i16 coefficients (i8 × 100) over i8 protos, with and without a coefficient zero point.
+    for zp in [0, 20] {
+        let data = i16_coefficients(&proto_data_i8, zp);
+        for (res, scaled) in [("proto_res", false), ("scaled_640x640", true)] {
+            let name = format!("materialize_masks/{res}/i16xi8_zp{zp}");
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                let _ = if scaled {
+                    cpu.materialize_scaled_segmentations(&detect, &data, None, 640, 640)
+                } else {
+                    cpu.materialize_segmentations(&detect, &data, None)
+                }
+                .unwrap();
+            });
+            result.print_summary();
+            suite.record(&result);
+        }
     }
 
     // Reference the unused MaskResolution import to avoid a warning when

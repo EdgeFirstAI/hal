@@ -7,15 +7,17 @@
 //! is element-wise so the layout is preserved → output is anchor-major
 //! `[a0c0, a0c1, …, a0cNC-1, a1c0, …]`, exactly what NMS consumes.
 
-use super::dequant::{
+use crate::per_scale::plan::LevelPlan;
+use crate::per_scale::Activation;
+use crate::Quantization;
+use edgefirst_kernels::prim::dequant::{
     dequant_f16_to_f16, dequant_f16_to_f32, dequant_f32_to_f16, dequant_f32_to_f32,
     dequant_i16_to_f16, dequant_i16_to_f32, dequant_i8_to_f16, dequant_i8_to_f32,
     dequant_u16_to_f16, dequant_u16_to_f32, dequant_u8_to_f16, dequant_u8_to_f32,
 };
-use super::sigmoid::{sigmoid_slice_f16, sigmoid_slice_f32};
-use crate::per_scale::plan::LevelPlan;
-use crate::per_scale::Activation;
-use crate::Quantization;
+use edgefirst_kernels::prim::sigmoid::{sigmoid_slice_f16, sigmoid_slice_f32};
+#[cfg(target_arch = "aarch64")]
+use edgefirst_kernels::Quant;
 use half::f16;
 
 macro_rules! impl_score_level_f32 {
@@ -32,7 +34,7 @@ macro_rules! impl_score_level_f32 {
             let n = level.h * level.w * num_classes;
             debug_assert_eq!(input.len(), n);
             debug_assert_eq!(dst.len(), n);
-            $dequant(input, q, dst);
+            $dequant(input, q.into(), dst);
             if activation == Activation::Sigmoid {
                 sigmoid_slice_f32(dst);
             }
@@ -54,7 +56,7 @@ macro_rules! impl_score_level_f16 {
             let n = level.h * level.w * num_classes;
             debug_assert_eq!(input.len(), n);
             debug_assert_eq!(dst.len(), n);
-            $dequant(input, q, dst);
+            $dequant(input, q.into(), dst);
             if activation == Activation::Sigmoid {
                 sigmoid_slice_f16(dst);
             }
@@ -76,17 +78,7 @@ impl_score_level_f16!(decode_score_level_u16_to_f16, u16, dequant_u16_to_f16);
 impl_score_level_f16!(decode_score_level_f16_to_f16, f16, dequant_f16_to_f16);
 impl_score_level_f16!(decode_score_level_f32_to_f16, f32, dequant_f32_to_f16);
 
-// ────────────────────────────────────────────────────────────────────────
-// NEON-baseline (Tier 1) score level kernels
-//
-// Same shape as the scalar variants above but call the NEON dequant
-// primitives in `kernels::neon_baseline`, AND use NEON sigmoid for the
-// activation step (`sigmoid_slice_f32_neon` / `sigmoid_slice_f16_neon`,
-// see the `$sigmoid` macro parameter). Both the dequant and the
-// sigmoid are NEON-vectorised at this point; the polynomial NEON
-// `expf` (The NEON `N-13` polynomial) backs the sigmoid for the bulk of the
-// speedup over the original scalar libm path.
-// ────────────────────────────────────────────────────────────────────────
+// NEON score levels: the exact `neon_convert` dequantize, then `$sigmoid` in place.
 
 #[cfg(target_arch = "aarch64")]
 macro_rules! impl_score_level_f32_neon {
@@ -109,9 +101,9 @@ macro_rules! impl_score_level_f32_neon {
             // use the FP16 sigmoid additionally require f.neon_fp16
             // (gated upstream in dispatch::select).
             unsafe {
-                crate::per_scale::kernels::neon_baseline::$dequant_neon(input, q, dst);
+                edgefirst_kernels::prim::neon_convert::$dequant_neon(input, q.into(), dst);
                 if activation == Activation::Sigmoid {
-                    crate::per_scale::kernels::neon_baseline::$sigmoid(dst);
+                    edgefirst_kernels::prim::neon_baseline::$sigmoid(dst);
                 }
             }
         }
@@ -122,28 +114,28 @@ macro_rules! impl_score_level_f32_neon {
 impl_score_level_f32_neon!(
     decode_score_level_i8_to_f32_neon,
     i8,
-    dequant_i8_to_f32_neon,
+    dequant_i8_to_f32_exact_neon,
     sigmoid_slice_f32_neon
 );
 #[cfg(target_arch = "aarch64")]
 impl_score_level_f32_neon!(
     decode_score_level_u8_to_f32_neon,
     u8,
-    dequant_u8_to_f32_neon,
+    dequant_u8_to_f32_exact_neon,
     sigmoid_slice_f32_neon
 );
 #[cfg(target_arch = "aarch64")]
 impl_score_level_f32_neon!(
     decode_score_level_i16_to_f32_neon,
     i16,
-    dequant_i16_to_f32_neon,
+    dequant_i16_to_f32_exact_neon,
     sigmoid_slice_f32_neon
 );
 #[cfg(target_arch = "aarch64")]
 impl_score_level_f32_neon!(
     decode_score_level_u16_to_f32_neon,
     u16,
-    dequant_u16_to_f32_neon,
+    dequant_u16_to_f32_exact_neon,
     sigmoid_slice_f32_neon
 );
 
@@ -174,9 +166,9 @@ macro_rules! impl_score_level_f32_neon_fused {
             // SAFETY: NEON is mandatory on aarch64; dispatch contract.
             unsafe {
                 if activation == Activation::Sigmoid {
-                    crate::per_scale::kernels::neon_baseline::$fused(input, q, dst);
+                    edgefirst_kernels::prim::neon_baseline::$fused(input, q.into(), dst);
                 } else {
-                    crate::per_scale::kernels::neon_baseline::$dequant_neon(input, q, dst);
+                    edgefirst_kernels::prim::neon_convert::$dequant_neon(input, q.into(), dst);
                 }
             }
         }
@@ -188,34 +180,225 @@ impl_score_level_f32_neon_fused!(
     decode_score_level_i8_to_f32_neon_fused,
     i8,
     dequant_sigmoid_i8_to_f32_neon,
-    dequant_i8_to_f32_neon
+    dequant_i8_to_f32_exact_neon
 );
 #[cfg(target_arch = "aarch64")]
 impl_score_level_f32_neon_fused!(
     decode_score_level_u8_to_f32_neon_fused,
     u8,
     dequant_sigmoid_u8_to_f32_neon,
-    dequant_u8_to_f32_neon
+    dequant_u8_to_f32_exact_neon
 );
 #[cfg(target_arch = "aarch64")]
 impl_score_level_f32_neon_fused!(
     decode_score_level_i16_to_f32_neon_fused,
     i16,
     dequant_sigmoid_i16_to_f32_neon,
-    dequant_i16_to_f32_neon
+    dequant_i16_to_f32_exact_neon
 );
 #[cfg(target_arch = "aarch64")]
 impl_score_level_f32_neon_fused!(
     decode_score_level_u16_to_f32_neon_fused,
     u16,
     dequant_sigmoid_u16_to_f32_neon,
-    dequant_u16_to_f32_neon
+    dequant_u16_to_f32_exact_neon
 );
+
+// NEON cells for f16 outputs and for float inputs into f32.
+
+/// One input element type's NEON kernels for f16 outputs.
+#[cfg(target_arch = "aarch64")]
+pub(crate) trait NeonToF16: Copy {
+    /// `prim::dequant` into f16, bit for bit.
+    ///
+    /// # Safety
+    /// The CPU must support NEON.
+    unsafe fn dequant_f16(src: &[Self], q: Quant, dst: &mut [f16]);
+    /// The f32 NEON sigmoid rounded once to f16.
+    ///
+    /// # Safety
+    /// The CPU must support NEON.
+    unsafe fn sigmoid_f16(src: &[Self], q: Quant, dst: &mut [f16]);
+    /// The native FP16 sigmoid.
+    ///
+    /// # Safety
+    /// The CPU must support FEAT_FP16.
+    unsafe fn sigmoid_f16_fp16(src: &[Self], q: Quant, dst: &mut [f16]);
+}
+
+/// A float input type's NEON kernels for f32 outputs.
+#[cfg(target_arch = "aarch64")]
+pub(crate) trait NeonFloatToF32: Copy {
+    /// `prim::dequant` into f32, bit for bit.
+    ///
+    /// # Safety
+    /// The CPU must support NEON.
+    unsafe fn dequant_f32(src: &[Self], q: Quant, dst: &mut [f32]);
+    /// The f32 NEON sigmoid of the dequantized value.
+    ///
+    /// # Safety
+    /// The CPU must support NEON.
+    unsafe fn sigmoid_f32(src: &[Self], q: Quant, dst: &mut [f32]);
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! neon_to_f16 {
+    ($t:ty, $dequant:ident, $sigmoid:ident, $fp16:ident) => {
+        impl NeonToF16 for $t {
+            #[inline]
+            unsafe fn dequant_f16(src: &[Self], q: Quant, dst: &mut [f16]) {
+                // SAFETY: the caller guarantees NEON.
+                unsafe { edgefirst_kernels::prim::neon_convert::$dequant(src, q, dst) }
+            }
+            #[inline]
+            unsafe fn sigmoid_f16(src: &[Self], q: Quant, dst: &mut [f16]) {
+                // SAFETY: the caller guarantees NEON.
+                unsafe { edgefirst_kernels::prim::neon_sigmoid::$sigmoid(src, q, dst) }
+            }
+            #[inline]
+            unsafe fn sigmoid_f16_fp16(src: &[Self], q: Quant, dst: &mut [f16]) {
+                // SAFETY: the caller guarantees FEAT_FP16.
+                unsafe { edgefirst_kernels::prim::neon_fp16::$fp16(src, q, dst) }
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+neon_to_f16!(
+    i8,
+    dequant_i8_to_f16_exact_neon,
+    dequant_sigmoid_i8_to_f16_neon,
+    dequant_sigmoid_i8_to_f16_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+neon_to_f16!(
+    u8,
+    dequant_u8_to_f16_exact_neon,
+    dequant_sigmoid_u8_to_f16_neon,
+    dequant_sigmoid_u8_to_f16_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+neon_to_f16!(
+    i16,
+    dequant_i16_to_f16_exact_neon,
+    dequant_sigmoid_i16_to_f16_neon,
+    dequant_sigmoid_i16_to_f16_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+neon_to_f16!(
+    u16,
+    dequant_u16_to_f16_exact_neon,
+    dequant_sigmoid_u16_to_f16_neon,
+    dequant_sigmoid_u16_to_f16_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+neon_to_f16!(
+    f16,
+    dequant_f16_to_f16_neon,
+    dequant_sigmoid_f16_to_f16_neon,
+    dequant_sigmoid_f16_to_f16_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+neon_to_f16!(
+    f32,
+    dequant_f32_to_f16_neon,
+    dequant_sigmoid_f32_to_f16_neon,
+    dequant_sigmoid_f32_to_f16_neon_fp16
+);
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! neon_float_to_f32 {
+    ($t:ty, $dequant:ident, $sigmoid:ident) => {
+        impl NeonFloatToF32 for $t {
+            #[inline]
+            unsafe fn dequant_f32(src: &[Self], q: Quant, dst: &mut [f32]) {
+                // SAFETY: the caller guarantees NEON.
+                unsafe { edgefirst_kernels::prim::neon_convert::$dequant(src, q, dst) }
+            }
+            #[inline]
+            unsafe fn sigmoid_f32(src: &[Self], q: Quant, dst: &mut [f32]) {
+                // SAFETY: the caller guarantees NEON.
+                unsafe { edgefirst_kernels::prim::neon_sigmoid::$sigmoid(src, q, dst) }
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+neon_float_to_f32!(
+    f16,
+    dequant_f16_to_f32_neon,
+    dequant_sigmoid_f16_to_f32_neon
+);
+#[cfg(target_arch = "aarch64")]
+neon_float_to_f32!(
+    f32,
+    dequant_f32_to_f32_neon,
+    dequant_sigmoid_f32_to_f32_neon
+);
+
+/// Score level into f16 on the `neon` tier.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn decode_score_level_to_f16_neon<T: NeonToF16>(
+    input: &[T],
+    q: Quantization,
+    activation: Activation,
+    dst: &mut [f16],
+) {
+    // SAFETY: NEON is part of the aarch64 baseline.
+    unsafe {
+        if activation == Activation::Sigmoid {
+            T::sigmoid_f16(input, q.into(), dst);
+        } else {
+            T::dequant_f16(input, q.into(), dst);
+        }
+    }
+}
+
+/// Score level into f16 on the `neon_fp16` tier.
+///
+/// # Safety
+/// The CPU must support FEAT_FP16.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn decode_score_level_to_f16_neon_fp16<T: NeonToF16>(
+    input: &[T],
+    q: Quantization,
+    activation: Activation,
+    dst: &mut [f16],
+) {
+    // SAFETY: the caller guarantees FEAT_FP16, which implies NEON.
+    unsafe {
+        if activation == Activation::Sigmoid {
+            T::sigmoid_f16_fp16(input, q.into(), dst);
+        } else {
+            T::dequant_f16(input, q.into(), dst);
+        }
+    }
+}
+
+/// Float score level into f32 on NEON.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn decode_score_level_float_to_f32_neon<T: NeonFloatToF32>(
+    input: &[T],
+    q: Quantization,
+    activation: Activation,
+    dst: &mut [f32],
+) {
+    // SAFETY: NEON is part of the aarch64 baseline.
+    unsafe {
+        if activation == Activation::Sigmoid {
+            T::sigmoid_f32(input, q.into(), dst);
+        } else {
+            T::dequant_f32(input, q.into(), dst);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_scale::kernels::grids::make_anchor_grid;
+    use edgefirst_kernels::prim::grids::make_anchor_grid;
 
     fn level_2x2(num_classes: usize) -> LevelPlan {
         let (gx, gy) = make_anchor_grid(2, 2);

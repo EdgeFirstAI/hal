@@ -63,6 +63,10 @@ yuv = { workspace = true }
 edgefirst-decoder = { workspace = true, optional = true }
 edgefirst-tracker = { workspace = true, optional = true, default-features = false }
 
+# The shared NEON mask kernels; other targets keep the crate's own loops.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+edgefirst-kernels = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
 # Portable DRM FourCC enum (the type `gbm` re-exports), used directly so the

@@ -94,7 +94,7 @@ find_implib() {
 }
 
 ran=0
-for leaf in tensor image codec decoder tracker; do
+for leaf in tensor image codec decoder tracker kernels; do
   src="${WORKDIR}/${leaf}.c"
   exe="${WORKDIR}/${leaf}.exe"
   printf '#include <edgefirst/%s.h>\nint main(void){return 0;}\n' "${leaf}" > "${src}"
@@ -161,8 +161,8 @@ for leaf in tensor image codec decoder tracker; do
   echo "ok ${leaf}"
 done
 
-if [[ "${ran}" -ne 5 ]]; then
-  echo "FAIL: only ${ran}/5 libraries smoked" >&2
+if [[ "${ran}" -ne 6 ]]; then
+  echo "FAIL: only ${ran}/6 libraries smoked" >&2
   exit 1
 fi
 if [[ -f "${BIN}/libEGL.dll" && -f "${BIN}/libGLESv2.dll" ]]; then

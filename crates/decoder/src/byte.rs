@@ -15,217 +15,28 @@
 //! `_extra` payload-carrying variants handle suppression. Boxes are
 //! dequantized only after suppression.
 
-#[cfg(target_arch = "aarch64")]
-use crate::arg_max_i8;
+use crate::float::jaccard;
+use crate::neon_dispatch::{
+    column_argmax, column_hits, ge_indices_kernel, keep_unflagged, nms_dead, nms_isa, row_arg_max,
+    score_columns, Isa, Ran, ROWS_PER_TASK,
+};
 use crate::{
-    arg_max, float::jaccard, BBoxTypeTrait, BoundingBox, DecoderError, DecoderResult,
-    DetectBoxQuantized, Quantization,
+    BBoxTypeTrait, BoundingBox, DecoderError, DecoderResult, DetectBoxQuantized, Quantization,
 };
 use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
-    Array1, ArrayView1, ArrayView2, Zip,
+    ArrayView2, Zip,
 };
 use num_traits::{AsPrimitive, PrimInt};
 use rayon::slice::ParallelSliceMut;
-
-/// NEON-accelerated column max update for the column-major argmax path.
-///
-/// Processes 16 elements per iteration using SIMD max + bitwise select.
-/// Handles both unsigned (u8) and signed (i8) comparison semantics.
-///
-/// # Safety
-///
-/// - `col_ptr` must point to at least `n` valid bytes.
-/// - `max_ptr` must point to at least `n` valid mutable bytes.
-/// - `class_ptr` must point to at least `n` valid mutable bytes.
-#[cfg(target_arch = "aarch64")]
-unsafe fn column_max_update_neon(
-    col_ptr: *const u8,
-    max_ptr: *mut u8,
-    class_ptr: *mut u8,
-    n: usize,
-    class_idx: u8,
-    signed: bool,
-) {
-    unsafe {
-        use std::arch::aarch64::*; // NOSONAR
-
-        let class_vec = vdupq_n_u8(class_idx);
-        let chunks = n / 16;
-        let remainder = n % 16;
-
-        if signed {
-            // Signed i8 comparison: interpret bytes as i8.
-            for chunk in 0..chunks {
-                let offset = chunk * 16;
-                let col = vld1q_s8(col_ptr.add(offset) as *const i8);
-                let cur_max = vld1q_s8(max_ptr.add(offset) as *const i8);
-                // mask[i] = 0xFF where col[i] >= cur_max[i], else 0x00
-                let mask = vcgeq_s8(col, cur_max);
-                // new_max = max(col, cur_max)
-                let new_max = vmaxq_s8(col, cur_max);
-                vst1q_s8(max_ptr.add(offset) as *mut i8, new_max);
-                // Select class_idx where mask is set, keep old class otherwise.
-                let cur_class = vld1q_u8(class_ptr.add(offset));
-                let new_class = vbslq_u8(mask, class_vec, cur_class);
-                vst1q_u8(class_ptr.add(offset), new_class);
-            }
-            // Scalar tail.
-            for i in (chunks * 16)..n {
-                let val = *(col_ptr.add(i) as *const i8);
-                let cur = *(max_ptr.add(i) as *const i8);
-                if val >= cur {
-                    *(max_ptr.add(i) as *mut i8) = val;
-                    *class_ptr.add(i) = class_idx;
-                }
-            }
-        } else {
-            // Unsigned u8 comparison.
-            for chunk in 0..chunks {
-                let offset = chunk * 16;
-                let col = vld1q_u8(col_ptr.add(offset));
-                let cur_max = vld1q_u8(max_ptr.add(offset));
-                let mask = vcgeq_u8(col, cur_max);
-                let new_max = vmaxq_u8(col, cur_max);
-                vst1q_u8(max_ptr.add(offset), new_max);
-                let cur_class = vld1q_u8(class_ptr.add(offset));
-                let new_class = vbslq_u8(mask, class_vec, cur_class);
-                vst1q_u8(class_ptr.add(offset), new_class);
-            }
-            // Scalar tail.
-            for i in (chunks * 16)..n {
-                let val = *col_ptr.add(i);
-                let cur = *max_ptr.add(i);
-                if val >= cur {
-                    *max_ptr.add(i) = val;
-                    *class_ptr.add(i) = class_idx;
-                }
-            }
-        }
-        let _ = remainder; // suppress unused warning
-    }
-}
-
-/// NEON-accelerated column max update with software prefetch for DMA-BUF.
-///
-/// Adds PRFM (prefetch for load, L1 data cache, streaming) hints 2 cache
-/// lines ahead of the current read position to hide CMA memory latency.
-/// On Cortex-A55 (64B cache lines) this prefetches 128 bytes ahead; on
-/// Cortex-A76 (64B L1, 128B L2 lines) the same offset covers one L2 line.
-///
-/// # Safety
-///
-/// - `col_ptr` must point to at least `n` valid bytes.
-/// - `max_ptr` must point to at least `n` valid mutable bytes.
-/// - `class_ptr` must point to at least `n` valid mutable bytes.
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)] // Reserved for DMA-BUF CMA paths where latency hiding helps.
-unsafe fn column_max_update_neon_prefetch(
-    col_ptr: *const u8,
-    max_ptr: *mut u8,
-    class_ptr: *mut u8,
-    n: usize,
-    class_idx: u8,
-    signed: bool,
-) {
-    unsafe {
-        use std::arch::aarch64::*; // NOSONAR
-
-        const PREFETCH_AHEAD: usize = 128; // 2 cache lines on A55 (64B each)
-
-        let class_vec = vdupq_n_u8(class_idx);
-        let chunks = n / 16;
-
-        if signed {
-            for chunk in 0..chunks {
-                let offset = chunk * 16;
-                // Software prefetch: hint the next read 2 cache lines ahead.
-                if offset + PREFETCH_AHEAD < n {
-                    core::arch::asm!(
-                        "prfm pldl1strm, [{ptr}]",
-                        ptr = in(reg) col_ptr.add(offset + PREFETCH_AHEAD),
-                        options(nostack, preserves_flags),
-                    );
-                }
-                let col = vld1q_s8(col_ptr.add(offset) as *const i8);
-                let cur_max = vld1q_s8(max_ptr.add(offset) as *const i8);
-                let mask = vcgeq_s8(col, cur_max);
-                let new_max = vmaxq_s8(col, cur_max);
-                vst1q_s8(max_ptr.add(offset) as *mut i8, new_max);
-                let cur_class = vld1q_u8(class_ptr.add(offset));
-                let new_class = vbslq_u8(mask, class_vec, cur_class);
-                vst1q_u8(class_ptr.add(offset), new_class);
-            }
-            for i in (chunks * 16)..n {
-                let val = *(col_ptr.add(i) as *const i8);
-                let cur = *(max_ptr.add(i) as *const i8);
-                if val >= cur {
-                    *(max_ptr.add(i) as *mut i8) = val;
-                    *class_ptr.add(i) = class_idx;
-                }
-            }
-        } else {
-            for chunk in 0..chunks {
-                let offset = chunk * 16;
-                if offset + PREFETCH_AHEAD < n {
-                    core::arch::asm!(
-                        "prfm pldl1strm, [{ptr}]",
-                        ptr = in(reg) col_ptr.add(offset + PREFETCH_AHEAD),
-                        options(nostack, preserves_flags),
-                    );
-                }
-                let col = vld1q_u8(col_ptr.add(offset));
-                let cur_max = vld1q_u8(max_ptr.add(offset));
-                let mask = vcgeq_u8(col, cur_max);
-                let new_max = vmaxq_u8(col, cur_max);
-                vst1q_u8(max_ptr.add(offset), new_max);
-                let cur_class = vld1q_u8(class_ptr.add(offset));
-                let new_class = vbslq_u8(mask, class_vec, cur_class);
-                vst1q_u8(class_ptr.add(offset), new_class);
-            }
-            for i in (chunks * 16)..n {
-                let val = *col_ptr.add(i);
-                let cur = *max_ptr.add(i);
-                if val >= cur {
-                    *max_ptr.add(i) = val;
-                    *class_ptr.add(i) = class_idx;
-                }
-            }
-        }
-    }
-}
-
-/// Fast argmax dispatching to NEON-optimized path for i8 on aarch64.
-#[inline(always)]
-fn fast_arg_max<T: PrimInt + Copy>(score: ArrayView1<T>) -> (T, usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Check if this is an i8 slice and contiguous.
-        if std::mem::size_of::<T>() == 1 && score.as_slice().is_some() {
-            let slice = score.as_slice().unwrap();
-            // Safety: T is i8 when size_of::<T>() == 1 and PrimInt.
-            // PrimInt covers i8, u8, i16, etc. We only want to use the
-            // i8 NEON path for signed i8.
-            let ptr = slice.as_ptr() as *const i8;
-            let i8_slice = unsafe { std::slice::from_raw_parts(ptr, slice.len()) };
-            // Only valid for signed i8 (not u8). Check sign bit behavior:
-            // PrimInt for i8 means min_value() is negative.
-            if T::min_value() < T::zero() {
-                let (max_val, idx) = arg_max_i8(i8_slice);
-                // Safety: transmute i8 back to T (they have the same size and
-                // representation for i8).
-                let result: T = unsafe { std::mem::transmute_copy(&max_val) };
-                return (result, idx);
-            }
-        }
-    }
-    arg_max(score)
-}
 
 /// Post processes boxes and scores tensors into quantized detection boxes,
 /// filtering out any boxes below the score threshold. The boxes tensor
 /// is converted to XYXY using the given BBoxTypeTrait. The order of the boxes
 /// is preserved.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[doc(hidden)]
 pub fn postprocess_boxes_quant<
     B: BBoxTypeTrait,
@@ -239,155 +50,8 @@ pub fn postprocess_boxes_quant<
 ) -> Vec<DetectBoxQuantized<Scores>> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-
-    // Use column-major path for transposed DMA-BUF views (see postprocess_boxes_index_quant).
-    if scores.strides()[0] == 1 && scores.as_slice().is_none() {
-        return postprocess_boxes_quant_column_major::<B, _, _>(
-            threshold,
-            boxes,
-            scores,
-            quant_boxes,
-        );
-    }
-
-    Zip::from(scores.rows())
-        .and(boxes.rows())
-        .into_par_iter()
-        .filter_map(|(score, bbox)| {
-            let (score_, label) = fast_arg_max(score);
-            if score_ < threshold {
-                return None;
-            }
-
-            let bbox_quant = B::ndarray_to_xyxy_dequant(bbox.view(), quant_boxes);
-            Some(DetectBoxQuantized {
-                label,
-                score: score_,
-                bbox: BoundingBox::from(bbox_quant),
-            })
-        })
-        .collect()
-}
-
-/// Column-major optimized path for `postprocess_boxes_quant`.
-fn postprocess_boxes_quant_column_major<
-    B: BBoxTypeTrait,
-    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
-    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
->(
-    threshold: Scores,
-    boxes: ArrayView2<Boxes>,
-    scores: ArrayView2<Scores>,
-    quant_boxes: Quantization,
-) -> Vec<DetectBoxQuantized<Scores>> {
-    let (n_candidates, n_classes) = scores.dim();
-
-    // Column-major NEON path uses u8 class indices; fall back for >255 classes.
-    if n_classes > 255 {
-        return Zip::from(scores.rows())
-            .and(boxes.rows())
-            .into_par_iter()
-            .filter_map(|(score, bbox)| {
-                let (score_, label) = fast_arg_max(score);
-                if score_ < threshold {
-                    return None;
-                }
-                let bbox_quant = B::ndarray_to_xyxy_dequant(bbox.view(), quant_boxes);
-                Some(DetectBoxQuantized {
-                    label,
-                    score: score_,
-                    bbox: BoundingBox::from(bbox_quant),
-                })
-            })
-            .collect();
-    }
-    let mut max_scores = vec![Scores::min_value(); n_candidates];
-    let mut max_classes = vec![0u8; n_candidates];
-
-    for class_idx in 0..n_classes {
-        let col = scores.column(class_idx);
-        if let Some(slice) = col.as_slice() {
-            #[cfg(target_arch = "aarch64")]
-            {
-                if std::mem::size_of::<Scores>() == 1 {
-                    unsafe {
-                        // Non-prefetch variant for heap-backed tensors;
-                        // prefetch variant reserved for DMA-BUF CMA paths.
-                        column_max_update_neon(
-                            slice.as_ptr() as *const u8,
-                            max_scores.as_mut_ptr() as *mut u8,
-                            max_classes.as_mut_ptr(),
-                            n_candidates,
-                            class_idx as u8,
-                            Scores::min_value() < Scores::zero(),
-                        );
-                    }
-                    continue;
-                }
-            }
-            for (i, &val) in slice.iter().enumerate() {
-                if val >= max_scores[i] {
-                    max_scores[i] = val;
-                    max_classes[i] = class_idx as u8;
-                }
-            }
-        } else {
-            for (i, &val) in col.iter().enumerate() {
-                if val >= max_scores[i] {
-                    max_scores[i] = val;
-                    max_classes[i] = class_idx as u8;
-                }
-            }
-        }
-    }
-
-    // Copy boxes column-by-column if also transposed.
-    let boxes_buf: [Vec<Boxes>; 4] = if boxes.strides()[0] == 1 && boxes.as_slice().is_none() {
-        let mut cols: [Vec<Boxes>; 4] = [
-            vec![Boxes::zero(); n_candidates],
-            vec![Boxes::zero(); n_candidates],
-            vec![Boxes::zero(); n_candidates],
-            vec![Boxes::zero(); n_candidates],
-        ];
-        for (dim, col_buf) in cols.iter_mut().enumerate() {
-            let col = boxes.column(dim);
-            if let Some(slice) = col.as_slice() {
-                col_buf.copy_from_slice(slice);
-            } else {
-                for (i, &val) in col.iter().enumerate() {
-                    col_buf[i] = val;
-                }
-            }
-        }
-        cols
-    } else {
-        [vec![], vec![], vec![], vec![]]
-    };
-    let boxes_copied = !boxes_buf[0].is_empty();
-
-    let mut result = Vec::new();
-    for i in 0..n_candidates {
-        if max_scores[i] >= threshold {
-            let bbox_quant = if boxes_copied {
-                let raw = [
-                    boxes_buf[0][i],
-                    boxes_buf[1][i],
-                    boxes_buf[2][i],
-                    boxes_buf[3][i],
-                ];
-                B::to_xyxy_dequant(&raw, quant_boxes)
-            } else {
-                B::ndarray_to_xyxy_dequant(boxes.row(i), quant_boxes)
-            };
-            result.push(DetectBoxQuantized {
-                label: max_classes[i] as usize,
-                score: max_scores[i],
-                bbox: BoundingBox::from(bbox_quant),
-            });
-        }
-    }
-
-    result
+    let isa = Isa::current_or_scalar();
+    argmax_candidates_quant_with::<B, _, _, _>(isa, threshold, boxes, scores, quant_boxes, |b, _| b)
 }
 
 /// Post processes boxes and scores tensors into quantized detection boxes,
@@ -401,6 +65,9 @@ fn postprocess_boxes_quant_column_major<
 /// When scores originate from a transposed DMA-BUF view (stride-1 along axis 0),
 /// an optimized column-major scan is used to avoid catastrophic strided reads on
 /// uncacheable memory.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[doc(hidden)]
 pub fn postprocess_boxes_index_quant<
     B: BBoxTypeTrait,
@@ -414,48 +81,139 @@ pub fn postprocess_boxes_index_quant<
 ) -> Vec<(DetectBoxQuantized<Scores>, usize)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
+    argmax_candidates_quant::<B, _, _>(
+        Isa::current_or_scalar(),
+        threshold,
+        boxes,
+        scores,
+        quant_boxes,
+    )
+}
 
+/// [`postprocess_boxes_index_quant`] on `isa`.
+pub(crate) fn argmax_candidates_quant<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+>(
+    isa: Isa,
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+) -> Vec<(DetectBoxQuantized<Scores>, usize)> {
+    argmax_candidates_quant_with::<B, _, _, _>(
+        isa,
+        threshold,
+        boxes,
+        scores,
+        quant_boxes,
+        |b, i| (b, i),
+    )
+}
+
+/// [`argmax_candidates_quant`] with each candidate and its anchor index mapped through `emit`.
+pub(crate) fn argmax_candidates_quant_with<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+    O: Send,
+>(
+    isa: Isa,
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+    emit: impl Fn(DetectBoxQuantized<Scores>, usize) -> O + Sync + Send,
+) -> Vec<O> {
     // Detect transposed C-contiguous layout (e.g., from reversed_axes() on DMA-BUF).
     // In this layout columns are contiguous (stride-1 along axis 0) but rows are not.
     // The column-major path reads memory sequentially, avoiding cache-hostile strides.
     if scores.strides()[0] == 1 && scores.as_slice().is_none() {
-        return postprocess_boxes_index_quant_column_major::<B, _, _>(
+        return argmax_candidates_quant_column_major::<B, _, _, _>(
+            isa,
             threshold,
             boxes,
             scores,
             quant_boxes,
+            emit,
         );
     }
+    argmax_candidates_quant_rows::<B, _, _, _>(isa, threshold, boxes, scores, quant_boxes, emit)
+}
 
-    let indices: Array1<usize> = (0..boxes.dim().0).collect();
-    Zip::from(scores.rows())
+/// The row-major scan of [`argmax_candidates_quant_with`].
+fn argmax_candidates_quant_rows<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+    O: Send,
+>(
+    isa: Isa,
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+    emit: impl Fn(DetectBoxQuantized<Scores>, usize) -> O + Sync + Send,
+) -> Vec<O> {
+    Zip::indexed(scores.rows())
         .and(boxes.rows())
-        .and(&indices)
         .into_par_iter()
-        .filter_map(|(score, bbox, index)| {
-            let (score_, label) = fast_arg_max(score);
+        .with_min_len(ROWS_PER_TASK)
+        .filter_map(|(index, score, bbox)| {
+            let (score_, label) = row_arg_max(isa, score);
             if score_ < threshold {
                 return None;
             }
 
             let bbox_quant = B::ndarray_to_xyxy_dequant(bbox.view(), quant_boxes);
 
-            Some((
+            Some(emit(
                 DetectBoxQuantized {
                     label,
                     score: score_,
                     bbox: BoundingBox::from(bbox_quant),
                 },
-                *index,
+                index,
             ))
         })
         .collect()
+}
+
+/// The argmax or multi-label candidates of a decode on `isa`, each with its anchor index mapped
+/// through `emit`; an error for mismatched shapes.
+pub(crate) fn decode_candidates_quant<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+    O: Send,
+>(
+    isa: Isa,
+    multi_label: bool,
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+    emit: impl Fn(DetectBoxQuantized<Scores>, usize) -> O + Sync + Send,
+) -> DecoderResult<Vec<O>> {
+    check_candidate_shapes(boxes.dim(), scores.dim())?;
+    Ok(if multi_label {
+        multilabel_candidates_quant::<B, _, _>(isa, threshold, boxes, scores, quant_boxes)
+            .into_iter()
+            .map(|(b, i)| emit(b, i))
+            .collect()
+    } else {
+        argmax_candidates_quant_with::<B, _, _, _>(isa, threshold, boxes, scores, quant_boxes, emit)
+    })
 }
 
 /// Multi-label variant of [`postprocess_boxes_index_quant`]: one entry per
 /// class at or above `threshold`, sharing the anchor's bbox and index.
 ///
 /// Intended for validation decode; deployment uses the argmax variant.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 ///
 /// # Errors
 /// [`DecoderError::InvalidShape`] unless boxes are `[N, 4]` and scores `[N, C]`.
@@ -470,31 +228,73 @@ pub fn postprocess_boxes_multilabel_index_quant<
     quant_boxes: Quantization,
 ) -> DecoderResult<Vec<(DetectBoxQuantized<Scores>, usize)>> {
     check_candidate_shapes(boxes.dim(), scores.dim())?;
+    Ok(multilabel_candidates_quant::<B, _, _>(
+        Isa::current_or_scalar(),
+        threshold,
+        boxes,
+        scores,
+        quant_boxes,
+    ))
+}
+
+/// [`postprocess_boxes_multilabel_index_quant`] on `isa`, shapes already checked.
+pub(crate) fn multilabel_candidates_quant<
+    B: BBoxTypeTrait,
+    Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+>(
+    isa: Isa,
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant_boxes: Quantization,
+) -> Vec<(DetectBoxQuantized<Scores>, usize)> {
     if scores.strides()[0] == 1 && scores.as_slice().is_none() {
-        return Ok(postprocess_boxes_multilabel_index_quant_column_major::<
-            B,
-            _,
-            _,
-        >(threshold, boxes, scores, quant_boxes));
+        return multilabel_candidates_quant_column_major::<B, _, _>(
+            isa,
+            threshold,
+            boxes,
+            scores,
+            quant_boxes,
+        );
     }
-    let indices: Array1<usize> = (0..boxes.dim().0).collect();
-    Ok(Zip::from(scores.rows())
+    Zip::indexed(scores.rows())
         .and(boxes.rows())
-        .and(&indices)
         .into_par_iter()
-        .flat_map(|(score_row, bbox_row, &anchor_idx)| {
+        .with_min_len(ROWS_PER_TASK)
+        .flat_map(|(anchor_idx, score_row, bbox_row)| {
+            let mut classes = Vec::new();
+            let ran = score_row.as_slice().map_or(Ran::Scalar, |r| {
+                ge_indices_kernel(isa, r, threshold, |c| classes.push(c))
+            });
+            if ran == Ran::Scalar {
+                classes.extend(
+                    score_row
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &s)| s >= threshold)
+                        .map(|(c, _)| c),
+                );
+            }
+            if classes.is_empty() {
+                return Vec::new();
+            }
             let bbox = BoundingBox::from(B::ndarray_to_xyxy_dequant(bbox_row.view(), quant_boxes));
-            score_row
-                .iter()
-                .enumerate()
-                .filter(|(_, &s)| s >= threshold)
-                .map(move |(label, &score)| (DetectBoxQuantized { label, score, bbox }, anchor_idx))
+            classes
+                .into_iter()
+                .filter_map(|label| {
+                    let &score = score_row.get(label)?;
+                    Some((DetectBoxQuantized { label, score, bbox }, anchor_idx))
+                })
                 .collect::<Vec<_>>()
         })
-        .collect())
+        .collect()
 }
 
 /// [`postprocess_boxes_multilabel_index_quant`] without anchor indices.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 ///
 /// # Errors
 /// [`DecoderError::InvalidShape`] unless boxes are `[N, 4]` and scores `[N, C]`.
@@ -521,32 +321,47 @@ pub fn postprocess_boxes_multilabel_quant<
 /// Reads each class column contiguously (the transposed DMA-BUF layout),
 /// then orders hits by `(anchor, class)` to match the row-major output and
 /// dequantizes each anchor's bbox once.
-fn postprocess_boxes_multilabel_index_quant_column_major<
+fn multilabel_candidates_quant_column_major<
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
     Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
+    isa: Isa,
     threshold: Scores,
     boxes: ArrayView2<Boxes>,
     scores: ArrayView2<Scores>,
     quant_boxes: Quantization,
 ) -> Vec<(DetectBoxQuantized<Scores>, usize)> {
-    let mut hits: Vec<(usize, usize, Scores)> = (0..scores.dim().1)
-        .into_par_iter()
-        .flat_map_iter(|class_idx| {
-            let col = scores.column(class_idx);
-            let above = |(i, &s): (usize, &Scores)| (s >= threshold).then_some((i, class_idx, s));
-            match col.as_slice() {
-                Some(slice) => slice
-                    .iter()
-                    .enumerate()
-                    .filter_map(above)
-                    .collect::<Vec<_>>(),
-                None => col.iter().enumerate().filter_map(above).collect(),
-            }
-        })
-        .collect();
-    hits.par_sort_unstable_by_key(|&(anchor, class, _)| (anchor, class));
+    let neon = (!isa.is_scalar())
+        .then(|| score_columns(&scores))
+        .flatten()
+        .and_then(|cols| column_hits(isa, &cols, threshold));
+    let hits: Vec<(usize, usize, Scores)> = match neon {
+        Some(hits) => hits
+            .into_iter()
+            .filter_map(|(a, c)| scores.get((a, c)).map(|&s| (a, c, s)))
+            .collect(),
+        None => {
+            let mut hits: Vec<(usize, usize, Scores)> = (0..scores.dim().1)
+                .into_par_iter()
+                .flat_map_iter(|class_idx| {
+                    let col = scores.column(class_idx);
+                    let above =
+                        |(i, &s): (usize, &Scores)| (s >= threshold).then_some((i, class_idx, s));
+                    match col.as_slice() {
+                        Some(slice) => slice
+                            .iter()
+                            .enumerate()
+                            .filter_map(above)
+                            .collect::<Vec<_>>(),
+                        None => col.iter().enumerate().filter_map(above).collect(),
+                    }
+                })
+                .collect();
+            hits.par_sort_unstable_by_key(|&(anchor, class, _)| (anchor, class));
+            hits
+        }
+    };
 
     let mut out = Vec::with_capacity(hits.len());
     let mut current: Option<(usize, BoundingBox)> = None;
@@ -578,95 +393,80 @@ pub(crate) fn check_candidate_shapes(
     Ok(())
 }
 
-/// Column-major optimized path for `postprocess_boxes_index_quant`.
+/// Column-major path for [`argmax_candidates_quant`].
 ///
 /// When scores come from a transposed DMA-BUF view ([N_candidates, N_classes]
 /// with strides [1, N_candidates]), row iteration causes N_classes reads each
 /// N_candidates bytes apart — catastrophic on uncacheable memory. Instead, this
-/// iterates over classes (columns, which are contiguous), maintaining a running
-/// argmax per candidate in cacheable heap buffers.
-fn postprocess_boxes_index_quant_column_major<
+/// iterates over classes (columns, which are contiguous): on NEON tiers in
+/// register tiles that keep each anchor's running argmax across every class,
+/// otherwise with a running argmax per candidate in heap buffers.
+fn argmax_candidates_quant_column_major<
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
     Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
+    O: Send,
 >(
+    isa: Isa,
     threshold: Scores,
     boxes: ArrayView2<Boxes>,
     scores: ArrayView2<Scores>,
     quant_boxes: Quantization,
-) -> Vec<(DetectBoxQuantized<Scores>, usize)> {
+    emit: impl Fn(DetectBoxQuantized<Scores>, usize) -> O + Sync + Send,
+) -> Vec<O> {
     let (n_candidates, n_classes) = scores.dim();
 
-    // Step 1: Column-based argmax — sequential reads over contiguous columns.
-    // Use u8 for class indices (max 255 classes) for optimal NEON vectorization.
-    // Fall back to row-major path for models with >255 classes.
-    if n_classes > 255 {
-        let indices: Array1<usize> = (0..n_candidates).collect();
-        return Zip::from(scores.rows())
-            .and(boxes.rows())
-            .and(&indices)
-            .into_par_iter()
-            .filter_map(|(score, bbox, index)| {
-                let (score_, label) = fast_arg_max(score);
-                if score_ < threshold {
-                    return None;
-                }
-                let bbox_quant = B::ndarray_to_xyxy_dequant(bbox.view(), quant_boxes);
-                Some((
-                    DetectBoxQuantized {
-                        label,
-                        score: score_,
-                        bbox: BoundingBox::from(bbox_quant),
-                    },
-                    *index,
-                ))
-            })
-            .collect();
-    }
-    let mut max_scores = vec![Scores::min_value(); n_candidates];
-    let mut max_classes = vec![0u8; n_candidates];
-    for class_idx in 0..n_classes {
-        let col = scores.column(class_idx);
-        if let Some(slice) = col.as_slice() {
-            // Use NEON-accelerated column max update on aarch64 for u8 scores.
-            #[cfg(target_arch = "aarch64")]
-            {
-                if std::mem::size_of::<Scores>() == 1 {
-                    // SAFETY: Scores is u8 or i8 (size == 1). We transmute the
-                    // slice pointers to the concrete byte type for NEON processing.
-                    unsafe {
-                        column_max_update_neon(
-                            slice.as_ptr() as *const u8,
-                            max_scores.as_mut_ptr() as *mut u8,
-                            max_classes.as_mut_ptr(),
-                            n_candidates,
-                            class_idx as u8,
-                            Scores::min_value() < Scores::zero(), // signed flag
-                        );
+    // Step 1: the anchors that pass, with their best class.
+    let columns = (!isa.is_scalar()).then(|| score_columns(&scores)).flatten();
+    let neon = columns.and_then(|cols| column_argmax(isa, &cols, threshold));
+    let mut kept: Vec<(usize, usize, Scores)> = neon
+        .iter()
+        .flatten()
+        .filter_map(|&(i, c)| scores.get((i, c)).map(|&s| (i, c, s)))
+        .collect();
+    if neon.is_none() {
+        // u8 class indices; beyond 255 classes the row-major scan runs instead.
+        if n_classes > 255 {
+            return argmax_candidates_quant_rows::<B, _, _, _>(
+                isa,
+                threshold,
+                boxes,
+                scores,
+                quant_boxes,
+                emit,
+            );
+        }
+        let mut max_scores = vec![Scores::min_value(); n_candidates];
+        let mut max_classes = vec![0u8; n_candidates];
+        for class_idx in 0..n_classes {
+            let col = scores.column(class_idx);
+            if let Some(slice) = col.as_slice() {
+                for (i, &val) in slice.iter().enumerate() {
+                    if val >= max_scores[i] {
+                        max_scores[i] = val;
+                        max_classes[i] = class_idx as u8;
                     }
-                    continue;
                 }
-            }
-            for (i, &val) in slice.iter().enumerate() {
-                if val >= max_scores[i] {
-                    max_scores[i] = val;
-                    max_classes[i] = class_idx as u8;
-                }
-            }
-        } else {
-            for (i, &val) in col.iter().enumerate() {
-                if val >= max_scores[i] {
-                    max_scores[i] = val;
-                    max_classes[i] = class_idx as u8;
+            } else {
+                for (i, &val) in col.iter().enumerate() {
+                    if val >= max_scores[i] {
+                        max_scores[i] = val;
+                        max_classes[i] = class_idx as u8;
+                    }
                 }
             }
         }
+        kept = (0..n_candidates)
+            .filter(|&i| max_scores[i] >= threshold)
+            .map(|i| (i, usize::from(max_classes[i]), max_scores[i]))
+            .collect();
     }
 
     // Step 2: Copy boxes column-by-column into contiguous heap buffer.
     // Boxes view is also transposed [N_candidates, 4] with strides [1, N_candidates],
     // so column reads are sequential while row reads are strided.
-    let boxes_buf: [Vec<Boxes>; 4] = if boxes.strides()[0] == 1 && boxes.as_slice().is_none() {
+    let copy = !kept.is_empty() && boxes.strides()[0] == 1 && boxes.as_slice().is_none();
+    let boxes_buf: [Vec<Boxes>; 4] = if copy {
         let mut cols: [Vec<Boxes>; 4] = [
             vec![Boxes::zero(); n_candidates],
             vec![Boxes::zero(); n_candidates],
@@ -690,30 +490,28 @@ fn postprocess_boxes_index_quant_column_major<
     };
     let boxes_copied = !boxes_buf[0].is_empty();
 
-    // Step 3: Threshold filter — collect candidates that pass.
-    let mut result = Vec::new();
-    for i in 0..n_candidates {
-        if max_scores[i] >= threshold {
-            let bbox_quant = if boxes_copied {
-                let raw = [
-                    boxes_buf[0][i],
-                    boxes_buf[1][i],
-                    boxes_buf[2][i],
-                    boxes_buf[3][i],
-                ];
-                B::to_xyxy_dequant(&raw, quant_boxes)
-            } else {
-                B::ndarray_to_xyxy_dequant(boxes.row(i), quant_boxes)
-            };
-            result.push((
-                DetectBoxQuantized {
-                    label: max_classes[i] as usize,
-                    score: max_scores[i],
-                    bbox: BoundingBox::from(bbox_quant),
-                },
-                i,
-            ));
-        }
+    // Step 3: build the candidates that pass.
+    let mut result = Vec::with_capacity(kept.len());
+    for (i, label, score) in kept {
+        let bbox_quant = if boxes_copied {
+            let raw = [
+                boxes_buf[0][i],
+                boxes_buf[1][i],
+                boxes_buf[2][i],
+                boxes_buf[3][i],
+            ];
+            B::to_xyxy_dequant(&raw, quant_boxes)
+        } else {
+            B::ndarray_to_xyxy_dequant(boxes.row(i), quant_boxes)
+        };
+        result.push(emit(
+            DetectBoxQuantized {
+                label,
+                score,
+                bbox: BoundingBox::from(bbox_quant),
+            },
+            i,
+        ));
     }
 
     result
@@ -721,9 +519,23 @@ fn postprocess_boxes_index_quant_column_major<
 
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
 /// then greedily selects a subset of boxes in descending order of score.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[doc(hidden)]
 #[must_use]
 pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<DetectBoxQuantized<SCORE>>,
+) -> Vec<DetectBoxQuantized<SCORE>> {
+    nms_int_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_int`] on `isa`.
+#[must_use]
+pub(crate) fn nms_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    isa: Isa,
     iou: f32,
     max_det: Option<usize>,
     mut boxes: Vec<DetectBoxQuantized<SCORE>>,
@@ -747,6 +559,18 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 
     let min_val = SCORE::min_value();
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.bbox,
+        false,
+        |b| b.label,
+        |b| b.score <= min_val,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.score > min_val, cap);
+    }
     let mut survivors: usize = 0;
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -786,9 +610,23 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 ///
 /// This is same as `nms_int` but will also include extra information along
 /// with each box, such as the index
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[doc(hidden)]
 #[must_use]
 pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
+) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
+    nms_extra_int_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_extra_int`] on `isa`.
+#[must_use]
+pub(crate) fn nms_extra_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
+    isa: Isa,
     iou: f32,
     max_det: Option<usize>,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
@@ -811,6 +649,18 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
 
     let min_val = SCORE::min_value();
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.0.bbox,
+        false,
+        |b| b.0.label,
+        |b| b.0.score <= min_val,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.0.score > min_val, cap);
+    }
     let mut survivors: usize = 0;
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -850,9 +700,23 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
 /// Sorts boxes by score, then greedily selects a subset of boxes in descending
 /// order of score. Unlike class-agnostic NMS, boxes are only suppressed if they
 /// have the same class label AND overlap above the IoU threshold.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[doc(hidden)]
 #[must_use]
 pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<DetectBoxQuantized<SCORE>>,
+) -> Vec<DetectBoxQuantized<SCORE>> {
+    nms_class_aware_int_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_class_aware_int`] on `isa`.
+#[must_use]
+pub(crate) fn nms_class_aware_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    isa: Isa,
     iou: f32,
     max_det: Option<usize>,
     mut boxes: Vec<DetectBoxQuantized<SCORE>>,
@@ -873,6 +737,18 @@ pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 
     let min_val = SCORE::min_value();
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.bbox,
+        true,
+        |b| b.label,
+        |b| b.score <= min_val,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.score > min_val, cap);
+    }
     let mut survivors: usize = 0;
     for i in 0..boxes.len() {
         if boxes[i].score <= min_val {
@@ -904,12 +780,29 @@ pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 ///
 /// This is same as `nms_class_aware_int` but will also include extra
 /// information along with each box, such as the index.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 #[doc(hidden)]
 #[must_use]
 pub fn nms_extra_class_aware_int<
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
     E: Send + Sync,
 >(
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
+) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
+    nms_extra_class_aware_int_on(nms_isa(boxes.len()), iou, max_det, boxes)
+}
+
+/// [`nms_extra_class_aware_int`] on `isa`.
+#[must_use]
+pub(crate) fn nms_extra_class_aware_int_on<
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
+    E: Send + Sync,
+>(
+    isa: Isa,
     iou: f32,
     max_det: Option<usize>,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
@@ -930,6 +823,18 @@ pub fn nms_extra_class_aware_int<
 
     let min_val = SCORE::min_value();
     let cap = max_det.unwrap_or(usize::MAX);
+    if let Some(dead) = nms_dead(
+        isa,
+        &boxes,
+        |b| &b.0.bbox,
+        true,
+        |b| b.0.label,
+        |b| b.0.score <= min_val,
+        iou,
+        cap,
+    ) {
+        return keep_unflagged(boxes, dead, |b| b.0.score > min_val, cap);
+    }
     let mut survivors: usize = 0;
     for i in 0..boxes.len() {
         if boxes[i].0.score <= min_val {
@@ -1339,9 +1244,9 @@ mod tests {
         assert_eq!(kept[0].1, 0);
     }
 
-    /// Class indices in the column-major scan are `u8`, so beyond 255 classes
-    /// it has to hand over to the row-major scan. Running the column scan
-    /// anyway wraps the label: class 260 comes back as 4.
+    /// Class indices in the scalar column-major scan are `u8`, so beyond 255
+    /// classes it has to hand over to the row-major scan. Running the column
+    /// scan anyway wraps the label: class 260 comes back as 4.
     #[test]
     fn column_major_falls_back_beyond_255_classes() {
         let n_classes = 300usize;
@@ -1350,25 +1255,20 @@ mod tests {
         scores[[0, 260]] = 200;
         scores[[1, 3]] = 10;
 
-        let kept = postprocess_boxes_quant_column_major::<XYXY, _, _>(
-            200_u8,
-            boxes.view(),
-            scores.view(),
-            probe_quant(),
-        );
-        assert_eq!(kept.len(), 1, "{kept:?}");
-        assert_eq!(kept[0].label, 260);
-        assert_eq!(kept[0].score, 200);
-
-        let kept = postprocess_boxes_index_quant_column_major::<XYXY, _, _>(
-            200_u8,
-            boxes.view(),
-            scores.view(),
-            probe_quant(),
-        );
-        assert_eq!(kept.len(), 1, "{kept:?}");
-        assert_eq!(kept[0].0.label, 260);
-        assert_eq!(kept[0].1, 0);
+        for (_, isa) in crate::neon_dispatch::tiers() {
+            let kept = argmax_candidates_quant_column_major::<XYXY, _, _, _>(
+                isa,
+                200_u8,
+                boxes.view(),
+                scores.view(),
+                probe_quant(),
+                |b, i| (b, i),
+            );
+            assert_eq!(kept.len(), 1, "{isa:?} {kept:?}");
+            assert_eq!(kept[0].0.label, 260, "{isa:?}");
+            assert_eq!(kept[0].0.score, 200, "{isa:?}");
+            assert_eq!(kept[0].1, 0, "{isa:?}");
+        }
     }
 
     /// Driving the column-major scan with an ordinary row-major array: its
@@ -1382,28 +1282,22 @@ mod tests {
         // is never class 0, so a comparison that keeps the minimum is visible.
         let scores = ndarray::array![[10_u8, 90, 30, 40], [5, 6, 7, 200], [1, 2, 3, 4]];
 
-        let kept = postprocess_boxes_quant_column_major::<XYXY, _, _>(
-            50_u8,
-            boxes.view(),
-            scores.view(),
-            probe_quant(),
-        );
-        assert_eq!(kept.len(), 2, "{kept:?}");
-        assert_eq!((kept[0].label, kept[0].score), (1, 90));
-        assert_eq!((kept[1].label, kept[1].score), (3, 200));
-        // Boxes were read in place, so row 1's values must line up with it.
-        assert_eq!(kept[1].bbox.xmin, 10.0);
-
-        let kept = postprocess_boxes_index_quant_column_major::<XYXY, _, _>(
-            50_u8,
-            boxes.view(),
-            scores.view(),
-            probe_quant(),
-        );
-        assert_eq!(kept.len(), 2, "{kept:?}");
-        assert_eq!(kept[0].1, 0);
-        assert_eq!(kept[1].1, 1);
-        assert_eq!(kept[1].0.label, 3);
+        for (_, isa) in crate::neon_dispatch::tiers() {
+            let kept = argmax_candidates_quant_column_major::<XYXY, _, _, _>(
+                isa,
+                50_u8,
+                boxes.view(),
+                scores.view(),
+                probe_quant(),
+                |b, i| (b, i),
+            );
+            assert_eq!(kept.len(), 2, "{isa:?} {kept:?}");
+            assert_eq!((kept[0].0.label, kept[0].0.score), (1, 90));
+            assert_eq!((kept[1].0.label, kept[1].0.score), (3, 200));
+            // Boxes were read in place, so row 1's values must line up with it.
+            assert_eq!(kept[1].0.bbox.xmin, 10.0);
+            assert_eq!((kept[0].1, kept[1].1), (0, 1));
+        }
     }
 
     /// Two overlapping same-class boxes. `SCORE::min_value()` is the

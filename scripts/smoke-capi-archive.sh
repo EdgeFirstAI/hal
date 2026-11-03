@@ -81,7 +81,7 @@ export LD_LIBRARY_PATH="${PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export DYLD_LIBRARY_PATH="${PREFIX}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
 
 ran=0
-for leaf in tensor image codec decoder tracker; do
+for leaf in tensor image codec decoder tracker kernels; do
   src="${WORKDIR}/${leaf}.c"
   bin="${WORKDIR}/${leaf}.bin"
   printf '#include <edgefirst/%s.h>\nint main(void){return 0;}\n' "${leaf}" > "${src}"
@@ -99,8 +99,8 @@ for leaf in tensor image codec decoder tracker; do
   echo "ok ${leaf}"
 done
 
-if [[ "${ran}" -ne 5 ]]; then
-  echo "FAIL: only ${ran}/5 libraries smoked" >&2
+if [[ "${ran}" -ne 6 ]]; then
+  echo "FAIL: only ${ran}/6 libraries smoked" >&2
   exit 1
 fi
 echo "ALL PACKAGED HEADERS COMPILE AND ALL LIBRARIES RUN"

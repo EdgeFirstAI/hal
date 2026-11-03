@@ -1057,6 +1057,135 @@ fn bbox_to_proto_roi(
     (x0, y0, x1, y1, roi_w, roi_h)
 }
 
+/// The mask dot products shared with the decoder (`edgefirst_kernels::prim::neon_mask`).
+#[cfg(target_arch = "aarch64")]
+mod shared {
+    use edgefirst_kernels::prim::neon_mask as nm;
+
+    /// Logits per kernel call: one stack buffer.
+    const CHUNK: usize = 64;
+
+    /// Whether the exact i8 x i8 kernel takes these zero points and channel count.
+    pub(super) fn i8_ok(zp_c: i32, zp_p: i32, k: usize) -> bool {
+        (-128..=127).contains(&zp_c) && (-128..=127).contains(&zp_p) && k <= nm::MAX_K
+    }
+
+    /// The exact `Σ (c − zp_c)(p − zp_p)` of every NHWC pixel of `px` into `dst`.
+    ///
+    /// # Safety
+    /// `dotprod` must be true only when FEAT_DotProd was detected at run time.
+    pub(super) unsafe fn dot_i8(
+        dotprod: bool,
+        coeff: &[i8],
+        zp_c: i32,
+        px: &[i8],
+        zp_p: i32,
+        dst: &mut [i32],
+    ) -> bool {
+        // SAFETY: NEON is part of the aarch64 baseline; the caller vouches for `dotprod`.
+        unsafe {
+            if dotprod {
+                nm::mask_dot8_nhwc_dotprod(coeff, zp_c, px, zp_p, dst)
+            } else {
+                nm::mask_dot8_nhwc_neon(coeff, zp_c, px, zp_p, dst)
+            }
+        }
+    }
+
+    /// Whether the exact wide kernel takes these i16 x i8 zero points and channel count.
+    pub(super) fn i16_ok(zp_c: i32, zp_p: i32, k: usize) -> bool {
+        i16::try_from(zp_c).is_ok() && i8::try_from(zp_p).is_ok() && k <= nm::MAX_K
+    }
+
+    /// The exact `Σ (c − zp_c)(p − zp_p)` of every NHWC pixel of `px`, rounded to f32, into `dst`.
+    pub(super) fn dot_i16(coeff: &[i16], zp_c: i32, px: &[i8], zp_p: i32, dst: &mut [f32]) -> bool {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { nm::mask_dot_wide_nhwc_neon(coeff, zp_c, px, zp_p, dst) }
+    }
+
+    /// `Σ c·p` in f32 of every NHWC pixel of `px` into `dst`.
+    pub(super) fn dot_f32<P: nm::MaskFloatIn>(coeff: &[f32], px: &[P], dst: &mut [f32]) -> bool {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { nm::mask_dot_f32_nhwc_neon(coeff, px, dst) }
+    }
+
+    /// Sets `out` (rows of `roi_w`) to 255 where a crop pixel's logit exceeds `bias`;
+    /// `dot(y, x, logits)` writes the logits of row `y` from column `x` on.
+    pub(super) fn sign_rows<L: Copy + Default + PartialOrd>(
+        out: &mut [u8],
+        roi_w: usize,
+        bias: L,
+        mut dot: impl FnMut(usize, usize, &mut [L]) -> bool,
+    ) -> bool {
+        let mut buf = [L::default(); CHUNK];
+        for (y, row) in out.chunks_exact_mut(roi_w.max(1)).enumerate() {
+            let mut x = 0;
+            for chunk in row.chunks_mut(CHUNK) {
+                let logits = &mut buf[..chunk.len()];
+                if !dot(y, x, logits) {
+                    return false;
+                }
+                for (o, &v) in chunk.iter_mut().zip(logits.iter()) {
+                    if v > bias {
+                        *o = 255;
+                    }
+                }
+                x += chunk.len();
+            }
+        }
+        true
+    }
+
+    /// [`sign_rows`] of `Σ c·p > bias` over an NHWC crop of `protos`; `None` when the crop
+    /// leaves `protos`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sign_f32<P: nm::MaskFloatIn>(
+        protos: &[P],
+        coeff: &[f32],
+        bias: f32,
+        proto_w: usize,
+        y0: usize,
+        x0: usize,
+        roi_h: usize,
+        roi_w: usize,
+        k: usize,
+    ) -> Option<ndarray::Array3<u8>> {
+        let mut out = vec![0u8; roi_h * roi_w];
+        let ok = sign_rows(&mut out, roi_w, bias, |y, x, d: &mut [f32]| {
+            let base = ((y0 + y) * proto_w + x0 + x) * k;
+            protos
+                .get(base..base + d.len() * k)
+                .is_some_and(|p| dot_f32(coeff, p, d))
+        });
+        ok.then(|| ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), out).ok())?
+    }
+}
+
+/// Whether the shared exact i8 x i8 kernel serves this call.
+#[cfg(target_arch = "aarch64")]
+fn shared_i8(zp_c: i32, zp_p: i32, k: usize, layout: edgefirst_tensor::ProtoLayout) -> bool {
+    layout == edgefirst_tensor::ProtoLayout::Nhwc && shared::i8_ok(zp_c, zp_p, k)
+}
+
+/// Whether the shared exact i8 x i8 kernel serves this call.
+#[cfg(not(target_arch = "aarch64"))]
+fn shared_i8(_: i32, _: i32, _: usize, _: edgefirst_tensor::ProtoLayout) -> bool {
+    false
+}
+
+/// Whether the shared exact wide kernel serves this i16 x i8 sign-only call: NHWC protos with a
+/// coefficient zero point, where the image kernel would sum every proto pixel first.
+#[cfg(target_arch = "aarch64")]
+fn shared_i16(zp_c: i32, zp_p: i32, k: usize, layout: edgefirst_tensor::ProtoLayout) -> bool {
+    zp_c != 0 && layout == edgefirst_tensor::ProtoLayout::Nhwc && shared::i16_ok(zp_c, zp_p, k)
+}
+
+/// Whether the shared exact wide kernel serves this i16 x i8 sign-only call.
+#[cfg(not(target_arch = "aarch64"))]
+fn shared_i16(_: i32, _: i32, _: usize, _: edgefirst_tensor::ProtoLayout) -> bool {
+    false
+}
+
 /// Build a `Segmentation` from a per-detection mask + the ROI bounds in
 /// proto coords. Applies the inverse letterbox transform to express the
 /// segmentation bbox in original-image-content normalised space.
@@ -1150,9 +1279,10 @@ fn proto_segmentations_i8_i8(
     };
 
     let hw = proto_h * proto_w;
+    let use_shared = shared_i8(zp_c, zp_p, num_protos, layout);
 
     // Precompute per-pixel proto sums for zero-point correction.
-    let proto_sums: Vec<i32> = if zp_c != 0 {
+    let proto_sums: Vec<i32> = if zp_c != 0 && !use_shared {
         match layout {
             edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
@@ -1179,143 +1309,105 @@ fn proto_segmentations_i8_i8(
     };
 
     #[cfg(target_arch = "aarch64")]
-    let use_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+    let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
 
-    detect
-        .par_iter()
-        .enumerate()
-        .map(|(i, det)| {
-            let coeff = &coeff_all[i * num_protos..(i + 1) * num_protos];
-            let (x0, y0, x1, y1, roi_w, roi_h) = bbox_to_proto_roi(det, proto_w, proto_h);
+    // `logits` is the scalar loop's buffer, one per worker; the shared kernel needs none.
+    let segment = |logits: &mut Vec<i32>, (i, det): (usize, &crate::DetectBox)| {
+        let coeff = &coeff_all[i * num_protos..(i + 1) * num_protos];
+        let (x0, y0, x1, y1, roi_w, roi_h) = bbox_to_proto_roi(det, proto_w, proto_h);
 
-            // Per-detection bias: zp_p·Σc_raw - N·zp_c·zp_p
-            let coeff_sum: i32 = coeff.iter().map(|&c| c as i32).sum();
-            let bias = zp_p * coeff_sum - (num_protos as i32) * zp_c * zp_p;
+        // Per-detection bias: zp_p·Σc_raw - N·zp_c·zp_p
+        let coeff_sum: i32 = coeff.iter().map(|&c| c as i32).sum();
+        let bias = zp_p * coeff_sum - (num_protos as i32) * zp_c * zp_p;
 
-            let mut mask_buf = vec![0u8; roi_h * roi_w];
+        let mut mask_buf = vec![0u8; roi_h * roi_w];
 
-            match layout {
-                edgefirst_tensor::ProtoLayout::Nhwc => {
-                    let stride_y = proto_w * num_protos;
+        match layout {
+            edgefirst_tensor::ProtoLayout::Nhwc => {
+                if use_shared {
                     #[cfg(target_arch = "aarch64")]
                     {
-                        if use_dotprod {
-                            for ly in 0..roi_h {
-                                let py = y0 + ly;
-                                let row_base = py * stride_y + x0 * num_protos;
-                                for lx in 0..roi_w {
-                                    let pix_base = row_base + lx * num_protos;
-                                    let proto_px = &protos[pix_base..pix_base + num_protos];
-                                    let raw_dot = unsafe {
-                                        dot_i8_neon_dotprod(
-                                            coeff.as_ptr(),
-                                            proto_px.as_ptr(),
-                                            num_protos,
-                                        )
-                                    };
-                                    let correction = if zp_c != 0 {
-                                        zp_c * proto_sums[py * proto_w + x0 + lx]
-                                    } else {
-                                        0
-                                    };
-                                    let logit = raw_dot - correction - bias;
-                                    if logit > 0 {
-                                        mask_buf[ly * roi_w + lx] = 255;
-                                    }
-                                }
-                            }
-                        } else {
-                            for ly in 0..roi_h {
-                                let py = y0 + ly;
-                                let row_base = py * stride_y + x0 * num_protos;
-                                for lx in 0..roi_w {
-                                    let pix_base = row_base + lx * num_protos;
-                                    let proto_px = &protos[pix_base..pix_base + num_protos];
-                                    let raw_dot = unsafe {
-                                        dot_i8_neon_base(
-                                            coeff.as_ptr(),
-                                            proto_px.as_ptr(),
-                                            num_protos,
-                                        )
-                                    };
-                                    let correction = if zp_c != 0 {
-                                        zp_c * proto_sums[py * proto_w + x0 + lx]
-                                    } else {
-                                        0
-                                    };
-                                    let logit = raw_dot - correction - bias;
-                                    if logit > 0 {
-                                        mask_buf[ly * roi_w + lx] = 255;
-                                    }
-                                }
-                            }
+                        let ok = shared::sign_rows(&mut mask_buf, roi_w, 0, |y, x, d| {
+                            let base = ((y0 + y) * proto_w + x0 + x) * num_protos;
+                            protos
+                                .get(base..base + d.len() * num_protos)
+                                .is_some_and(|p| {
+                                    // SAFETY: `dotprod` comes from runtime detection.
+                                    unsafe { shared::dot_i8(dotprod, coeff, zp_c, p, zp_p, d) }
+                                })
+                        });
+                        if !ok {
+                            return Err(crate::Error::InvalidShape(
+                                "proto crop outside the proto buffer".into(),
+                            ));
                         }
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        for ly in 0..roi_h {
-                            let py = y0 + ly;
-                            let row_base = py * stride_y + x0 * num_protos;
-                            for lx in 0..roi_w {
-                                let pix_base = row_base + lx * num_protos;
-                                let proto_px = &protos[pix_base..pix_base + num_protos];
-                                let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
-                                let correction = if zp_c != 0 {
-                                    zp_c * proto_sums[py * proto_w + x0 + lx]
-                                } else {
-                                    0
-                                };
-                                let logit = raw_dot - correction - bias;
-                                if logit > 0 {
-                                    mask_buf[ly * roi_w + lx] = 255;
-                                }
-                            }
-                        }
-                    }
-                }
-                edgefirst_tensor::ProtoLayout::Nchw => {
-                    // Channel-major accumulation: for each channel, accumulate
-                    // coeff[c] * proto[c, py, px] across the ROI. Each channel
-                    // plane is contiguous, giving excellent sequential read access.
-                    let mut accum = vec![0i32; roi_h * roi_w];
-                    for c in 0..num_protos {
-                        let plane = &protos[c * hw..];
-                        let coeff_c = coeff[c] as i32;
-                        for ly in 0..roi_h {
-                            let py = y0 + ly;
-                            let row_start = py * proto_w + x0;
-                            let out_row_start = ly * roi_w;
-                            for lx in 0..roi_w {
-                                accum[out_row_start + lx] += coeff_c * plane[row_start + lx] as i32;
-                            }
-                        }
-                    }
-                    // Apply zero-point correction and threshold.
-                    for ly in 0..roi_h {
-                        let py = y0 + ly;
-                        for lx in 0..roi_w {
-                            let idx = ly * roi_w + lx;
-                            let correction = if zp_c != 0 {
-                                zp_c * proto_sums[py * proto_w + x0 + lx]
-                            } else {
-                                0
-                            };
-                            let logit = accum[idx] - correction - bias;
-                            if logit > 0 {
-                                mask_buf[idx] = 255;
-                            }
+                } else {
+                    logits.clear();
+                    logits.resize(roi_h * roi_w, 0);
+                    let crop = NhwcCrop {
+                        proto_w,
+                        num_protos,
+                        x0,
+                        y0,
+                        roi_w,
+                    };
+                    nhwc_i8_logits_scalar(coeff, zp_c, protos, zp_p, &proto_sums, crop, logits);
+                    for (m, &l) in mask_buf.iter_mut().zip(logits.iter()) {
+                        if l > 0 {
+                            *m = 255;
                         }
                     }
                 }
             }
+            edgefirst_tensor::ProtoLayout::Nchw => {
+                // Channel-major accumulation: for each channel, accumulate
+                // coeff[c] * proto[c, py, px] across the ROI. Each channel
+                // plane is contiguous, giving excellent sequential read access.
+                let mut accum = vec![0i32; roi_h * roi_w];
+                for c in 0..num_protos {
+                    let plane = &protos[c * hw..];
+                    let coeff_c = coeff[c] as i32;
+                    for ly in 0..roi_h {
+                        let py = y0 + ly;
+                        let row_start = py * proto_w + x0;
+                        let out_row_start = ly * roi_w;
+                        for lx in 0..roi_w {
+                            accum[out_row_start + lx] += coeff_c * plane[row_start + lx] as i32;
+                        }
+                    }
+                }
+                // Apply zero-point correction and threshold.
+                for ly in 0..roi_h {
+                    let py = y0 + ly;
+                    for lx in 0..roi_w {
+                        let idx = ly * roi_w + lx;
+                        let correction = if zp_c != 0 {
+                            zp_c * proto_sums[py * proto_w + x0 + lx]
+                        } else {
+                            0
+                        };
+                        let logit = accum[idx] - correction - bias;
+                        if logit > 0 {
+                            mask_buf[idx] = 255;
+                        }
+                    }
+                }
+            }
+        }
 
-            let mask = ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
-                .expect("mask_buf length matches roi_h * roi_w");
-            seg_from_roi(
-                mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
-            )
-        })
-        .collect()
+        let mask = ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+            .expect("mask_buf length matches roi_h * roi_w");
+        seg_from_roi(
+            mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+        )
+    };
+    let detections = detect.par_iter().enumerate();
+    if use_shared {
+        detections.map(|d| segment(&mut Vec::new(), d)).collect()
+    } else {
+        detections.map_init(Vec::new, segment).collect()
+    }
 }
 
 // =============================================================================
@@ -1367,9 +1459,10 @@ fn proto_segmentations_i16_i8(
     };
 
     let hw = proto_h * proto_w;
+    let use_shared = shared_i16(zp_c, zp_p, num_protos, layout);
 
     // Precompute per-pixel proto sums for zero-point correction.
-    let proto_sums: Vec<i32> = if zp_c != 0 {
+    let proto_sums: Vec<i32> = if zp_c != 0 && !use_shared {
         match layout {
             edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
@@ -1409,6 +1502,22 @@ fn proto_segmentations_i16_i8(
             let mut mask_buf = vec![0u8; roi_h * roi_w];
 
             match layout {
+                edgefirst_tensor::ProtoLayout::Nhwc if use_shared => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let ok = shared::sign_rows(&mut mask_buf, roi_w, 0.0, |y, x, d| {
+                            let base = ((y0 + y) * proto_w + x0 + x) * num_protos;
+                            protos
+                                .get(base..base + d.len() * num_protos)
+                                .is_some_and(|p| shared::dot_i16(coeff, zp_c, p, zp_p, d))
+                        });
+                        if !ok {
+                            return Err(crate::Error::InvalidShape(
+                                "proto crop outside the proto buffer".into(),
+                            ));
+                        }
+                    }
+                }
                 edgefirst_tensor::ProtoLayout::Nhwc => {
                     let stride_y = proto_w * num_protos;
                     #[cfg(target_arch = "aarch64")]
@@ -1523,6 +1632,12 @@ fn fused_dot_sign_f32_slice(
     roi_w: usize,
     num_protos: usize,
 ) -> ndarray::Array3<u8> {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(mask) = shared::sign_f32(
+        protos, coeff, 0.0, proto_w, y0, x0, roi_h, roi_w, num_protos,
+    ) {
+        return mask;
+    }
     let stride_y = proto_w * num_protos;
     let mut mask_buf = vec![0u8; roi_h * roi_w];
     for y in 0..roi_h {
@@ -1590,6 +1705,12 @@ fn fused_dot_sign_f16_slice(
         target_feature = "fma"
     )))]
     {
+        #[cfg(target_arch = "aarch64")]
+        if let Some(mask) = shared::sign_f32(
+            protos, coeff, 0.0, proto_w, y0, x0, roi_h, roi_w, num_protos,
+        ) {
+            return mask;
+        }
         fused_dot_sign_f16_slice_scalar(protos, coeff, proto_w, y0, x0, roi_h, roi_w, num_protos)
     }
 }
@@ -1788,6 +1909,20 @@ fn fused_dequant_dot_sign_i8_slice(
         }
     };
 
+    #[cfg(target_arch = "aarch64")]
+    if let Some(mask) = shared::sign_f32(
+        protos,
+        &scaled_coeff[..num_protos],
+        zp_offset,
+        proto_w,
+        y0,
+        x0,
+        roi_h,
+        roi_w,
+        num_protos,
+    ) {
+        return Ok(mask);
+    }
     let mut mask_buf = vec![0u8; roi_h * roi_w];
     for y in 0..roi_h {
         let row_base = (y0 + y) * stride_y + (x0) * num_protos;
@@ -1845,6 +1980,7 @@ fn scaled_segmentations_f32_slice(
         height,
         1.0,
         |p, _| *p,
+        row_dot_f32,
     )
 }
 
@@ -1872,6 +2008,7 @@ fn scaled_segmentations_f16_slice(
         height,
         1.0,
         |p: &half::f16, _| p.to_f32(),
+        row_dot_f32,
     )
 }
 
@@ -1914,7 +2051,36 @@ fn scaled_segmentations_i8_slice(
         height,
         scale,
         move |p: &i8, _| *p as f32 - zp,
+        move |c: &[f32], p: &[i8], out: &mut [f32]| row_dot_i8_shifted(zp, c, p, out),
     )
+}
+
+/// `Σ c·(p − zp)` of every NHWC pixel of `px` into `out`, as `Σ c·p − zp·Σ c` with the shared
+/// NEON kernel; `false` off aarch64, where the caller's loop runs.
+fn row_dot_i8_shifted(zp: f32, coeff: &[f32], px: &[i8], out: &mut [f32]) -> bool {
+    let shift = zp * coeff.iter().sum::<f32>();
+    row_dot_f32(coeff, px, out) && {
+        out.iter_mut().for_each(|v| *v -= shift);
+        true
+    }
+}
+
+/// `Σ c·p` of every NHWC pixel of `px` into `out` with the shared NEON kernel; `false` off
+/// aarch64, where the caller's loop runs.
+#[cfg(target_arch = "aarch64")]
+fn row_dot_f32<P: edgefirst_kernels::prim::neon_mask::MaskFloatIn>(
+    coeff: &[f32],
+    px: &[P],
+    out: &mut [f32],
+) -> bool {
+    shared::dot_f32(coeff, px, out)
+}
+
+/// `Σ c·p` of every NHWC pixel of `px` into `out` with the shared NEON kernel; `false` off
+/// aarch64, where the caller's loop runs.
+#[cfg(not(target_arch = "aarch64"))]
+fn row_dot_f32<P>(_: &[f32], _: &[P], _: &mut [f32]) -> bool {
+    false
 }
 
 // =============================================================================
@@ -1932,7 +2098,6 @@ fn scaled_segmentations_i8_slice(
 
 /// Compute i8×i8 dot product (32 elements) → i32.
 /// Platform-agnostic scalar fallback.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 fn dot_i8_scalar(coeff: &[i8], proto: &[i8], n: usize) -> i32 {
     let mut acc: i32 = 0;
@@ -1950,82 +2115,6 @@ fn dot_i8_scalar(coeff: &[i8], proto: &[i8], n: usize) -> i32 {
         k += 1;
     }
     acc
-}
-
-/// NEON i8×i8→i32 dot product using smull+sadalp (works on ALL aarch64, A53+).
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn dot_i8_neon_base(coeff: *const i8, proto: *const i8, n: usize) -> i32 {
-    unsafe {
-        use std::arch::aarch64::*; // NOSONAR
-        let mut acc = vdupq_n_s32(0);
-        let full_chunks = n / 16;
-        let mut offset = 0usize;
-        for _ in 0..full_chunks {
-            let c = vld1q_s8(coeff.add(offset));
-            let p = vld1q_s8(proto.add(offset));
-            // Widening multiply + pairwise accumulate (all aarch64).
-            let lo = vmull_s8(vget_low_s8(c), vget_low_s8(p));
-            let hi = vmull_high_s8(c, p);
-            acc = vpadalq_s16(acc, lo);
-            acc = vpadalq_s16(acc, hi);
-            offset += 16;
-        }
-        // Handle remaining elements (for num_protos=32, full_chunks=2, remainder=0)
-        let remainder = n - offset;
-        if remainder >= 8 {
-            let c = vld1_s8(coeff.add(offset));
-            let p = vld1_s8(proto.add(offset));
-            let prod = vmull_s8(c, p);
-            acc = vpadalq_s16(acc, prod);
-            offset += 8;
-        }
-        let mut scalar_acc = vaddvq_s32(acc);
-        while offset < n {
-            scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
-            offset += 1;
-        }
-        scalar_acc
-    }
-}
-
-/// NEON i8×i8→i32 dot product using sdot (ARMv8.2-A dotprod, A55+).
-/// Each `sdot` processes 16 i8 lanes → 4 i32 partial sums in one instruction,
-/// replacing the 3-instruction smull+smull2+sadalp sequence.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn dot_i8_neon_dotprod(coeff: *const i8, proto: *const i8, n: usize) -> i32 {
-    unsafe {
-        use std::arch::aarch64::*; // NOSONAR
-        let mut acc = vdupq_n_s32(0);
-        let full_chunks = n / 16;
-        let mut offset = 0usize;
-        for _ in 0..full_chunks {
-            let c = vld1q_s8(coeff.add(offset));
-            let p = vld1q_s8(proto.add(offset));
-            // Enable dotprod extension locally so the assembler accepts sdot
-            // even when compiling for baseline aarch64 (A53). At runtime we only
-            // reach this path when HWCAP confirms dotprod support.
-            let result: int32x4_t;
-            core::arch::asm!(
-                ".arch_extension dotprod",
-                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-                acc = inout(vreg) acc => result,
-                a = in(vreg) c,
-                b = in(vreg) p,
-                options(pure, nomem, nostack),
-            );
-            acc = result;
-            offset += 16;
-        }
-        let mut scalar_acc = vaddvq_s32(acc);
-        // Tail: handle remainder (unlikely for num_protos=32, but correct)
-        while offset < n {
-            scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
-            offset += 1;
-        }
-        scalar_acc
-    }
 }
 
 /// Compute i16×i8 dot product → i32. Platform-agnostic scalar fallback.
@@ -2076,80 +2165,97 @@ unsafe fn dot_i16_i8_neon(coeff: *const i16, proto: *const i8, n: usize) -> i32 
     }
 }
 
-/// Compute the logit grid using the dotprod (sdot) path.
-/// Separated into its own function so the compiler inlines the sdot asm fully.
+/// [`dot_i16_i8_neon`] and the sum of the `n` protos, from the same loads.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn compute_logits_dotprod(
-    logits: &mut [i32],
-    coeff: &[i8],
-    protos: &[i8],
-    proto_sums: &[i32],
+unsafe fn dot_sum_i16_i8_neon(coeff: *const i16, proto: *const i8, n: usize) -> (i32, i32) {
+    unsafe {
+        use std::arch::aarch64::*; // NOSONAR
+        let (mut acc, mut sum) = (vdupq_n_s32(0), vdupq_n_s32(0));
+        let mut offset = 0usize;
+        for _ in 0..n / 8 {
+            let c = vld1q_s16(coeff.add(offset));
+            let p = vmovl_s8(vld1_s8(proto.add(offset)));
+            acc = vmlal_s16(acc, vget_low_s16(c), vget_low_s16(p));
+            acc = vmlal_high_s16(acc, c, p);
+            sum = vpadalq_s16(sum, p);
+            offset += 8;
+        }
+        let (mut dot, mut psum) = (vaddvq_s32(acc), vaddvq_s32(sum));
+        while offset < n {
+            let p = *proto.add(offset) as i32;
+            dot += *coeff.add(offset) as i32 * p;
+            psum += p;
+            offset += 1;
+        }
+        (dot, psum)
+    }
+}
+
+/// Where an NHWC crop lies in the proto buffer: rows of `roi_w` pixels from `(x0, y0)`.
+#[derive(Clone, Copy)]
+struct NhwcCrop {
     proto_w: usize,
-    proto_x0: usize,
-    proto_y0: usize,
-    roi_w: usize,
-    roi_h: usize,
-    stride_y: usize,
     num_protos: usize,
+    x0: usize,
+    y0: usize,
+    roi_w: usize,
+}
+
+/// `logits` (rows of `roi_w`) = `Σ (c − zp_c)(p − zp_p)` over an NHWC i8 crop, in i32 through
+/// the per-pixel proto sums; the path for zero points or channel counts the shared kernel rejects.
+fn nhwc_i8_logits_scalar(
+    coeff: &[i8],
     zp_c: i32,
-    bias: i32,
+    protos: &[i8],
+    zp_p: i32,
+    proto_sums: &[i32],
+    crop: NhwcCrop,
+    logits: &mut [i32],
 ) {
-    for ly_idx in 0..roi_h {
-        let py = proto_y0 + ly_idx;
-        let row_base = py * stride_y + proto_x0 * num_protos;
-        for lx_idx in 0..roi_w {
-            let pix_base = row_base + lx_idx * num_protos;
-            let proto_px = &protos[pix_base..pix_base + num_protos];
-            let raw_dot =
-                unsafe { dot_i8_neon_dotprod(coeff.as_ptr(), proto_px.as_ptr(), num_protos) };
-            let correction = if zp_c != 0 {
-                zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
-            } else {
-                0
-            };
-            logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
+    let k = crop.num_protos;
+    let coeff_sum: i32 = coeff.iter().map(|&c| c as i32).sum();
+    let bias = zp_p * coeff_sum - (k as i32) * zp_c * zp_p;
+    for (ly, row) in logits.chunks_exact_mut(crop.roi_w.max(1)).enumerate() {
+        let py = crop.y0 + ly;
+        for (lx, out) in row.iter_mut().enumerate() {
+            let px = py * crop.proto_w + crop.x0 + lx;
+            let raw_dot = dot_i8_scalar(coeff, &protos[px * k..(px + 1) * k], k);
+            let correction = if zp_c != 0 { zp_c * proto_sums[px] } else { 0 };
+            *out = raw_dot - correction - bias;
         }
     }
 }
 
-/// Compute the logit grid using the base NEON path (smull+sadalp).
-/// Separated into its own function so the compiler inlines the NEON code fully.
+/// `logits` (rows of `roi_w`) = `Σ (c − zp_c)(p − zp_p)` over an NHWC i8 crop with the shared
+/// NEON kernel, exactly as [`nhwc_i8_logits_scalar`] computes it.
+///
+/// # Safety
+/// `dotprod` must be true only when FEAT_DotProd was detected at run time.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn compute_logits_base(
-    logits: &mut [i32],
+unsafe fn nhwc_i8_logits_shared(
+    dotprod: bool,
     coeff: &[i8],
-    protos: &[i8],
-    proto_sums: &[i32],
-    proto_w: usize,
-    proto_x0: usize,
-    proto_y0: usize,
-    roi_w: usize,
-    roi_h: usize,
-    stride_y: usize,
-    num_protos: usize,
     zp_c: i32,
-    bias: i32,
-) {
-    for ly_idx in 0..roi_h {
-        let py = proto_y0 + ly_idx;
-        let row_base = py * stride_y + proto_x0 * num_protos;
-        for lx_idx in 0..roi_w {
-            let pix_base = row_base + lx_idx * num_protos;
-            let proto_px = &protos[pix_base..pix_base + num_protos];
-            let raw_dot =
-                unsafe { dot_i8_neon_base(coeff.as_ptr(), proto_px.as_ptr(), num_protos) };
-            let correction = if zp_c != 0 {
-                zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
-            } else {
-                0
-            };
-            logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
+    protos: &[i8],
+    zp_p: i32,
+    crop: NhwcCrop,
+    logits: &mut [i32],
+) -> crate::Result<()> {
+    let k = crop.num_protos;
+    for (ly, row) in logits.chunks_exact_mut(crop.roi_w.max(1)).enumerate() {
+        let base = ((crop.y0 + ly) * crop.proto_w + crop.x0) * k;
+        let ok = protos
+            .get(base..base + row.len() * k)
+            // SAFETY: the caller vouches for `dotprod`.
+            .is_some_and(|p| unsafe { shared::dot_i8(dotprod, coeff, zp_c, p, zp_p, row) });
+        if !ok {
+            return Err(crate::Error::InvalidShape(
+                "proto crop outside the proto buffer".into(),
+            ));
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2218,9 +2324,10 @@ fn scaled_segmentations_i8_i8(
     let out_w = width as usize;
     let out_h = height as usize;
     let hw = proto_h * proto_w;
+    let use_shared = shared_i8(zp_c, zp_p, num_protos, layout);
 
     // Precompute proto_sum for the entire proto tensor (zero-point correction).
-    let proto_sums: Vec<i32> = if zp_c != 0 {
+    let proto_sums: Vec<i32> = if zp_c != 0 && !use_shared {
         match layout {
             edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
@@ -2249,10 +2356,7 @@ fn scaled_segmentations_i8_i8(
 
     // Detect dotprod support once, outside the hot loop.
     #[cfg(target_arch = "aarch64")]
-    let use_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-
-    // For NHWC layout, stride for row navigation.
-    let stride_y = proto_w * num_protos;
+    let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
 
     detect
         .par_iter()
@@ -2303,59 +2407,37 @@ fn scaled_segmentations_i8_i8(
             let mut logits = vec![0_i32; roi_h * roi_w];
             match layout {
                 edgefirst_tensor::ProtoLayout::Nhwc => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        if use_dotprod {
-                            compute_logits_dotprod(
-                                &mut logits,
+                    let crop = NhwcCrop {
+                        proto_w,
+                        num_protos,
+                        x0: proto_x0,
+                        y0: proto_y0,
+                        roi_w,
+                    };
+                    if use_shared {
+                        // SAFETY: `dotprod` comes from runtime detection.
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            nhwc_i8_logits_shared(
+                                dotprod,
                                 coeff,
-                                protos,
-                                &proto_sums,
-                                proto_w,
-                                proto_x0,
-                                proto_y0,
-                                roi_w,
-                                roi_h,
-                                stride_y,
-                                num_protos,
                                 zp_c,
-                                bias,
-                            );
-                        } else {
-                            compute_logits_base(
+                                protos,
+                                zp_p,
+                                crop,
                                 &mut logits,
-                                coeff,
-                                protos,
-                                &proto_sums,
-                                proto_w,
-                                proto_x0,
-                                proto_y0,
-                                roi_w,
-                                roi_h,
-                                stride_y,
-                                num_protos,
-                                zp_c,
-                                bias,
-                            );
-                        }
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        for ly_idx in 0..roi_h {
-                            let py = proto_y0 + ly_idx;
-                            let row_base = py * stride_y + proto_x0 * num_protos;
-                            for lx_idx in 0..roi_w {
-                                let pix_base = row_base + lx_idx * num_protos;
-                                let proto_px = &protos[pix_base..pix_base + num_protos];
-                                let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
-                                let correction = if zp_c != 0 {
-                                    zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
-                                } else {
-                                    0
-                                };
-                                logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
-                            }
-                        }
+                            )?
+                        };
+                    } else {
+                        nhwc_i8_logits_scalar(
+                            coeff,
+                            zp_c,
+                            protos,
+                            zp_p,
+                            &proto_sums,
+                            crop,
+                            &mut logits,
+                        );
                     }
                 }
                 edgefirst_tensor::ProtoLayout::Nchw => {
@@ -2528,8 +2610,11 @@ fn scaled_segmentations_i16_i8(
     let out_h = height as usize;
     let hw = proto_h * proto_w;
 
+    // NHWC on aarch64 sums each pixel's protos inside its dot product instead.
+    let fused_sums = cfg!(target_arch = "aarch64") && layout == edgefirst_tensor::ProtoLayout::Nhwc;
+
     // Precompute proto_sum for the entire proto tensor (zero-point correction).
-    let proto_sums: Vec<i32> = if zp_c != 0 {
+    let proto_sums: Vec<i32> = if zp_c != 0 && !fused_sums {
         match layout {
             edgefirst_tensor::ProtoLayout::Nhwc => (0..hw)
                 .map(|px_idx| {
@@ -2616,13 +2701,15 @@ fn scaled_segmentations_i16_i8(
                             for lx_idx in 0..roi_w {
                                 let pix_base = row_base + lx_idx * num_protos;
                                 let proto_px = &protos[pix_base..pix_base + num_protos];
-                                let raw_dot = unsafe {
-                                    dot_i16_i8_neon(coeff.as_ptr(), proto_px.as_ptr(), num_protos)
-                                };
-                                let correction = if zp_c != 0 {
-                                    zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
-                                } else {
-                                    0
+                                // SAFETY: `proto_px` and `coeff` hold `num_protos` elements.
+                                let (raw_dot, correction) = unsafe {
+                                    let (c, p) = (coeff.as_ptr(), proto_px.as_ptr());
+                                    if zp_c != 0 {
+                                        let (d, sum) = dot_sum_i16_i8_neon(c, p, num_protos);
+                                        (d, zp_c * sum)
+                                    } else {
+                                        (dot_i16_i8_neon(c, p, num_protos), 0)
+                                    }
                                 };
                                 logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
                             }
@@ -2763,6 +2850,7 @@ fn scaled_run<P: Copy + Sync>(
     height: u32,
     acc_scale: f32,
     load_f32: impl Fn(&P, f32) -> f32 + Copy + Sync,
+    row_dot: impl Fn(&[f32], &[P], &mut [f32]) -> bool + Copy + Sync,
 ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     let (lx0, lw, ly0, lh) = match content_region {
         Some([lx0, ly0, lx1, ly1]) => {
@@ -2869,6 +2957,11 @@ fn scaled_run<P: Copy + Sync>(
             for ly_idx in 0..roi_h {
                 let py = proto_y0 + ly_idx;
                 let row_base = py * stride_y + proto_x0 * num_protos;
+                let row = protos.get(row_base..row_base + roi_w * num_protos);
+                let out = &mut logits[ly_idx * roi_w..(ly_idx + 1) * roi_w];
+                if row.is_some_and(|p| row_dot(coeff, p, out)) {
+                    continue;
+                }
                 for lx_idx in 0..roi_w {
                     let pix_base = row_base + lx_idx * num_protos;
                     let mut acc = 0.0_f32;
@@ -3321,6 +3414,318 @@ mod tests {
         assert_eq!(result.unwrap().len(), 1);
     }
 
+    #[test]
+    fn materialize_proto_i8_i8_is_the_exact_integer_sign() {
+        use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+        let cpu = CPUProcessor::new();
+        let (h, w) = (13usize, 29usize);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as i64
+        };
+        let detect = vec![
+            det(0.0, 0.0, 1.0, 1.0),
+            det(0.1, 0.2, 0.7, 0.9),
+            det(0.9, 0.9, 1.0, 1.0),
+            det(0.31, 0.4, 0.33, 0.45),
+        ];
+        for k in [32usize, 7] {
+            let protos: Vec<i8> = (0..h * w * k).map(|_| (next() % 256 - 128) as i8).collect();
+            let coeffs: Vec<i8> = (0..detect.len() * k)
+                .map(|_| (next() % 256 - 128) as i8)
+                .collect();
+            let mut nchw = vec![0i8; protos.len()];
+            for (i, &v) in protos.iter().enumerate() {
+                nchw[(i % k) * h * w + i / k] = v;
+            }
+            // (200, -300) lies outside i8: the shared kernel rejects it and the scalar loop runs.
+            for (zc, zp) in [(20, -115), (0, 0), (-128, 127), (200, -300)] {
+                for (layout, data, shape) in [
+                    (ProtoLayout::Nhwc, &protos, [h, w, k]),
+                    (ProtoLayout::Nchw, &nchw, [k, h, w]),
+                ] {
+                    let proto_data = ProtoData {
+                        mask_coefficients: make_i8_quant(&[detect.len(), k], &coeffs, 0.01, zc),
+                        protos: make_i8_quant(&shape, data, 0.02, zp),
+                        layout,
+                    };
+                    let segs = cpu
+                        .materialize_segmentations(&detect, &proto_data, None)
+                        .unwrap();
+                    for (i, (d, seg)) in detect.iter().zip(&segs).enumerate() {
+                        let (x0, y0, _, _, roi_w, roi_h) = super::bbox_to_proto_roi(d, w, h);
+                        let c = &coeffs[i * k..(i + 1) * k];
+                        let m = seg
+                            .segmentation
+                            .as_typed::<u8>()
+                            .unwrap()
+                            .map_read()
+                            .unwrap();
+                        let got = m.as_slice();
+                        assert_eq!(got.len(), roi_h * roi_w);
+                        for (j, &g) in got.iter().enumerate() {
+                            let px = (y0 + j / roi_w) * w + x0 + j % roi_w;
+                            let logit: i64 = c
+                                .iter()
+                                .enumerate()
+                                .map(|(q, &cv)| {
+                                    (i64::from(cv) - i64::from(zc))
+                                        * (i64::from(protos[px * k + q]) - i64::from(zp))
+                                })
+                                .sum();
+                            let want = if logit > 0 { 255 } else { 0 };
+                            assert_eq!(g, want, "{layout:?} k {k} zc {zc} zp {zp} det {i} px {j}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deterministic xorshift values for the sweep tests.
+    struct Sweep(u64);
+
+    impl Sweep {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+
+        fn i8(&mut self) -> i8 {
+            (self.next() >> 56) as u8 as i8
+        }
+    }
+
+    #[test]
+    fn nhwc_i8_logits_shared_equal_the_scalar_loop() {
+        let (h, w) = (9usize, 23usize);
+        let mut rng = Sweep(0x9e37_79b9_7f4a_7c15);
+        for k in [32usize, 7, 40] {
+            let protos: Vec<i8> = (0..h * w * k).map(|_| rng.i8()).collect();
+            let coeff: Vec<i8> = (0..k).map(|_| rng.i8()).collect();
+            let sums: Vec<i32> = protos
+                .chunks_exact(k)
+                .map(|p| p.iter().map(|&v| i32::from(v)).sum())
+                .collect();
+            for (zp_c, zp_p) in [(20, -115), (0, 0), (-128, 127), (127, -128)] {
+                for (x0, y0, roi_w, roi_h) in [(0, 0, w, h), (3, 2, 17, 5), (22, 8, 1, 1)] {
+                    let crop = super::NhwcCrop {
+                        proto_w: w,
+                        num_protos: k,
+                        x0,
+                        y0,
+                        roi_w,
+                    };
+                    let mut want = vec![0i32; roi_w * roi_h];
+                    super::nhwc_i8_logits_scalar(
+                        &coeff, zp_c, &protos, zp_p, &sums, crop, &mut want,
+                    );
+                    #[cfg(target_arch = "aarch64")]
+                    for dotprod in [false, std::arch::is_aarch64_feature_detected!("dotprod")] {
+                        let mut got = vec![i32::MIN; roi_w * roi_h];
+                        // SAFETY: `dotprod` is true only when FEAT_DotProd was detected.
+                        unsafe {
+                            super::nhwc_i8_logits_shared(
+                                dotprod, &coeff, zp_c, &protos, zp_p, crop, &mut got,
+                            )
+                        }
+                        .unwrap();
+                        assert_eq!(
+                            got, want,
+                            "k {k} zp ({zp_c}, {zp_p}) crop ({x0}, {y0}) dotprod {dotprod}"
+                        );
+                    }
+                    for (j, &l) in want.iter().enumerate() {
+                        let px = (y0 + j / roi_w) * w + x0 + j % roi_w;
+                        let exact: i64 = coeff
+                            .iter()
+                            .zip(&protos[px * k..(px + 1) * k])
+                            .map(|(&c, &p)| {
+                                (i64::from(c) - i64::from(zp_c)) * (i64::from(p) - i64::from(zp_p))
+                            })
+                            .sum();
+                        assert_eq!(i64::from(l), exact);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A sign flip between two f32 dot products of the same data: `|margin|` (exact, float64) in
+    /// units of `2⁻²⁴ · mag`, where `mag` bounds what either sum's rounding scales with.
+    struct Flips {
+        count: usize,
+        total: usize,
+        worst: f64,
+    }
+
+    impl Flips {
+        /// A flip needs `|margin| ≤ (3K + 12)·u·M`, the sum of every path's rounding bound.
+        fn bound(k: usize) -> f64 {
+            (3 * k + 12) as f64
+        }
+
+        fn record(&mut self, name: &str, k: usize, new: bool, old: bool, margin: f64, mag: f64) {
+            self.total += 1;
+            if new == old {
+                return;
+            }
+            self.count += 1;
+            let units = margin.abs() / (mag * f64::from(f32::EPSILON) / 2.0);
+            self.worst = self.worst.max(units / Self::bound(k));
+            assert!(
+                units <= Self::bound(k),
+                "{name} k {k}: flip at margin {margin} = {units:.1} units > {}",
+                Self::bound(k)
+            );
+        }
+    }
+
+    /// The sequential four-term loop the float sign paths ran before the shared kernel.
+    fn sequential(coeff: &[f32], p: impl Fn(usize) -> f32) -> f32 {
+        let k = coeff.len();
+        let mut acc = 0.0_f32;
+        let mut i = 0;
+        while i + 4 <= k {
+            acc += coeff[i] * p(i)
+                + coeff[i + 1] * p(i + 1)
+                + coeff[i + 2] * p(i + 2)
+                + coeff[i + 3] * p(i + 3);
+            i += 4;
+        }
+        while i < k {
+            acc += coeff[i] * p(i);
+            i += 1;
+        }
+        acc
+    }
+
+    #[test]
+    fn float_sign_paths_flip_only_near_zero() {
+        use edgefirst_tensor::QuantMode;
+        let mut rng = Sweep(0x2545_f491_4f6c_dd1d);
+        let mut flips = Flips {
+            count: 0,
+            total: 0,
+            worst: 0.0,
+        };
+        let px = 8usize;
+        for k in [32usize, 7, 40] {
+            for _ in 0..400 {
+                // f32 and f16 protos: each pixel's last channel cancels the rest, so sums sit at
+                // the rounding level of the threshold.
+                let coeff: Vec<f32> = (0..k).map(|_| rng.unit() * 2.0).collect();
+                let c_last = if coeff[k - 1] == 0.0 {
+                    1.0
+                } else {
+                    coeff[k - 1]
+                };
+                let mut coeff = coeff;
+                coeff[k - 1] = c_last;
+                let mut pf = vec![0f32; px * k];
+                for row in pf.chunks_exact_mut(k) {
+                    let mut s = 0f64;
+                    for (v, &c) in row.iter_mut().zip(&coeff).take(k - 1) {
+                        *v = rng.unit() * 3.0;
+                        s += f64::from(c) * f64::from(*v);
+                    }
+                    row[k - 1] = (-s / f64::from(c_last)) as f32;
+                }
+                let ph: Vec<half::f16> = pf.iter().map(|&v| half::f16::from_f32(v)).collect();
+                let new_f32 = super::fused_dot_sign_f32_slice(&pf, &coeff, 1, px, 0, 0, 1, px, k);
+                let new_f16 = super::fused_dot_sign_f16_slice(&ph, &coeff, 1, px, 0, 0, 1, px, k);
+                let old_f16 =
+                    super::fused_dot_sign_f16_slice_scalar(&ph, &coeff, px, 0, 0, 1, px, k);
+                let mut scaled = vec![0f32; px];
+                let scaled_ok = super::row_dot_f32(&coeff, &pf, &mut scaled);
+                for j in 0..px {
+                    let pj = |i: usize| pf[j * k + i];
+                    let hj = |i: usize| ph[j * k + i].to_f32();
+                    let exact = |p: &dyn Fn(usize) -> f32| -> (f64, f64) {
+                        coeff
+                            .iter()
+                            .enumerate()
+                            .fold((0.0, 0.0), |(s, m), (i, &c)| {
+                                let t = f64::from(c) * f64::from(p(i));
+                                (s + t, m + t.abs())
+                            })
+                    };
+                    let (m32, a32) = exact(&pj);
+                    let old32 = sequential(&coeff, pj) > 0.0;
+                    flips.record("f32", k, new_f32[[0, j, 0]] == 255, old32, m32, a32);
+                    if scaled_ok {
+                        flips.record("scaled f32", k, scaled[j] > 0.0, old32, m32, a32);
+                    }
+                    let (m16, a16) = exact(&hj);
+                    flips.record(
+                        "f16",
+                        k,
+                        new_f16[[0, j, 0]] == 255,
+                        old_f16[[0, j, 0]] == 255,
+                        m16,
+                        a16,
+                    );
+                }
+
+                // i8 protos with float coefficients: the last coefficient cancels the rest.
+                let p8: Vec<i8> = (0..k).map(|_| rng.i8()).collect();
+                let zp = (rng.next() % 41) as i32 - 20;
+                let scale = 0.0213_f32;
+                let last = i32::from(p8[k - 1]) - zp;
+                if last == 0 {
+                    continue;
+                }
+                let mut c8: Vec<f32> = (0..k).map(|_| rng.unit() * 2.0).collect();
+                let s: f64 = (0..k - 1)
+                    .map(|i| f64::from(c8[i]) * f64::from(i32::from(p8[i]) - zp))
+                    .sum();
+                c8[k - 1] = (-s / f64::from(last)) as f32;
+                let quant = edgefirst_tensor::Quantization::per_tensor(scale, zp);
+                assert!(matches!(quant.mode(), QuantMode::PerTensor { .. }));
+                let new_dq =
+                    super::fused_dequant_dot_sign_i8_slice(&p8, &c8, &quant, 1, 1, 0, 0, 1, 1, k)
+                        .unwrap();
+                let sc: Vec<f32> = c8.iter().map(|&c| c * scale).collect();
+                let zp_offset = zp as f32 * sc.iter().take(k).sum::<f32>();
+                let old_dq = sequential(&sc, |i| p8[i] as f32) > zp_offset;
+                let (mut mdq, mut adq) = (-f64::from(zp_offset), f64::from(zp_offset).abs());
+                for (&c, &p) in sc.iter().zip(&p8) {
+                    mdq += f64::from(c) * f64::from(p);
+                    adq += (f64::from(c) * f64::from(p)).abs();
+                }
+                flips.record("i8 dequant", k, new_dq[[0, 0, 0]] == 255, old_dq, mdq, adq);
+
+                let mut shifted = [0f32];
+                let zpf = zp as f32;
+                if super::row_dot_i8_shifted(zpf, &c8, &p8, &mut shifted) {
+                    let old = sequential(&c8, |i| p8[i] as f32 - zpf) > 0.0;
+                    let (mut m, mut a) = (0f64, 0f64);
+                    for (&c, &p) in c8.iter().zip(&p8) {
+                        m += f64::from(c) * (f64::from(p) - f64::from(zpf));
+                        a += (f64::from(c) * f64::from(p)).abs()
+                            + (f64::from(c) * f64::from(zpf)).abs();
+                    }
+                    flips.record("scaled i8", k, shifted[0] > 0.0, old, m, a);
+                }
+            }
+        }
+        println!(
+            "float sign paths: {} of {} values flip, worst margin {:.3} of (3K + 12)·2⁻²⁴·M",
+            flips.count, flips.total, flips.worst
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert!(flips.count > 0, "no near-threshold value flipped");
+    }
+
     // ── Non-zero zero_point ────────────────────────────────────────
 
     #[test]
@@ -3369,5 +3774,85 @@ mod tests {
             result.err()
         );
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    /// Every mask of `segs` as bytes.
+    fn mask_bytes(segs: &[edgefirst_tensor::Segmentation]) -> Vec<Vec<u8>> {
+        use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+        segs.iter()
+            .map(|s| {
+                let m = s.segmentation.as_typed::<u8>().unwrap().map_read().unwrap();
+                m.as_slice().to_vec()
+            })
+            .collect()
+    }
+
+    /// `i16` coefficients over NHWC `i8` protos give the masks of the same data in NCHW, whose
+    /// path sums every proto pixel first, at both resolutions and with or without zero points.
+    #[test]
+    fn i16_masks_match_between_nhwc_and_nchw() {
+        let (h, w, k) = (24usize, 20usize, 32usize);
+        let mut rng = Sweep(0x6a09_e667_f3bc_c908);
+        let nhwc: Vec<i8> = (0..h * w * k).map(|_| rng.i8()).collect();
+        let mut nchw = vec![0i8; nhwc.len()];
+        for (p, px) in nhwc.chunks_exact(k).enumerate() {
+            for (c, &v) in px.iter().enumerate() {
+                nchw[c * h * w + p] = v;
+            }
+        }
+        let detect = vec![
+            det(0.1, 0.1, 0.9, 0.9),
+            det(0.0, 0.0, 0.4, 0.6),
+            det(0.55, 0.3, 1.0, 1.0),
+            det(0.3, 0.45, 0.35, 0.5),
+        ];
+        let coeffs: Vec<i16> = (0..detect.len() * k)
+            .map(|_| (rng.i8() as i16) * 100 + rng.i8() as i16)
+            .collect();
+        let cpu = CPUProcessor::new();
+        for (zp_c, zp_p) in [(20, -115), (0, -115), (-300, 0), (0, 0), (40000, 3)] {
+            let data = |layout: ProtoLayout| {
+                let (shape, src) = match layout {
+                    ProtoLayout::Nhwc => ([h, w, k], &nhwc),
+                    ProtoLayout::Nchw => ([k, h, w], &nchw),
+                };
+                ProtoData {
+                    mask_coefficients: make_i16_quant(&[detect.len(), k], &coeffs, 0.01, zp_c),
+                    protos: make_i8_quant(&shape, src, 0.02, zp_p),
+                    layout,
+                }
+            };
+            let (a, b) = (data(ProtoLayout::Nhwc), data(ProtoLayout::Nchw));
+            let ctx = format!("zp ({zp_c}, {zp_p})");
+            let proto = |d: &ProtoData| cpu.materialize_segmentations(&detect, d, None);
+            let (pa, pb) = (proto(&a).unwrap(), proto(&b).unwrap());
+            assert_eq!(mask_bytes(&pa), mask_bytes(&pb), "proto {ctx}");
+            let scaled = |d: &ProtoData| {
+                cpu.materialize_scaled_segmentations(&detect, d, None, 97, 61)
+                    .unwrap()
+            };
+            assert_eq!(
+                mask_bytes(&scaled(&a)),
+                mask_bytes(&scaled(&b)),
+                "scaled {ctx}"
+            );
+        }
+    }
+
+    /// The fused dot product and proto sum equal the dot product and a separate sum.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn dot_sum_i16_i8_is_the_dot_and_the_sum() {
+        let mut rng = Sweep(0xbb67_ae85_84ca_a73b);
+        for k in [0usize, 1, 7, 8, 9, 32, 40, 100] {
+            let c: Vec<i16> = (0..k).map(|_| (rng.next() >> 48) as i16).collect();
+            let p: Vec<i8> = (0..k).map(|_| rng.i8()).collect();
+            // SAFETY: both slices hold `k` elements.
+            let (dot, sum) = unsafe { super::dot_sum_i16_i8_neon(c.as_ptr(), p.as_ptr(), k) };
+            // SAFETY: as above.
+            let want = unsafe { super::dot_i16_i8_neon(c.as_ptr(), p.as_ptr(), k) };
+            assert_eq!(dot, want, "k {k}");
+            assert_eq!(sum, p.iter().map(|&v| i32::from(v)).sum::<i32>(), "k {k}");
+        }
     }
 }
