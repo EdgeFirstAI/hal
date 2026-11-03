@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# One-time bootstrap for each new PyPI distribution.
+# Optional upload of each new PyPI distribution with a local API token.
 #
-# PyPI Trusted Publishing can only be configured on a project that already
-# exists, so each new name needs one manual upload with a local API token.
-# After this runs, configure the Trusted Publisher for each project and the
-# release workflow takes over — no token is needed again.
+# A new distribution normally needs no upload: add a pending publisher at
+# https://pypi.org/manage/account/publishing/ and the first tagged release
+# creates the project. A pending publisher does not reserve the name, so run
+# this only to claim a name before that release, then configure the project's
+# Trusted Publisher; the release workflow needs no token after that.
 #
 #   Owner: EdgeFirstAI   Repository: hal
 #   Workflow: publish.yml   Environment: pypi
@@ -14,7 +15,7 @@
 #   export TWINE_PASSWORD=pypi-...        # account-scoped token; project-scoped
 #                                         # tokens cannot create a new project
 #   scripts/bootstrap_pypi_projects.sh [--dry-run]
-#   PACKAGES=kernels scripts/bootstrap_pypi_projects.sh   # only the new project
+#   PACKAGES=<pkg> scripts/bootstrap_pypi_projects.sh   # one distribution, e.g. kernels
 set -euo pipefail
 
 DRY=0
