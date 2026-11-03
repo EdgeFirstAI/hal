@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-11-03
+
 ### Added
 
 - **`edgefirst-kernels` crate (EDGEAI-2348).** Framework-neutral CPU kernels over caller-owned strided views, depending only on `half` and `tracing`: each plan validates in `new` (`KernelError::Unsupported` doubles as a capability check), then `run`s without allocating, from several threads at once, on the calling thread or a caller-supplied `Pool`, emitting one `kernels.<op>` tracing span per call.
