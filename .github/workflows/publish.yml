@@ -23,30 +23,26 @@
 # nothing -- a complete rehearsal at no cost and with no tag. Run it before the
 # first tag after any change here.
 #
-# Trusted Publisher Configuration (one per distribution, since 0.29):
+# Trusted Publisher Configuration (one per distribution):
 # - PyPI: https://pypi.org/manage/project/<name>/settings/publishing/
 #   for edgefirst-tensor, edgefirst-codec, edgefirst-image, edgefirst-decoder,
 #   edgefirst-tracker, edgefirst-kernels
 #   Owner: EdgeFirstAI, Repository: hal, Workflow: publish.yml, Environment: pypi
 #
-#   THESE MOVED WITH THIS SPLIT. Both PyPI and crates.io match a publisher on
-#   the workflow FILENAME, so all six PyPI publishers and all eleven crates.io
-#   publishers must be re-pointed from release.yml to publish.yml before the
-#   first tag, or the upload fails on a claim mismatch. A rehearsal does NOT
-#   catch this, because a rehearsal skips the upload.
-#
-#   BOOTSTRAP: Trusted Publishing requires the project to already exist, so each
-#   new distribution needs one manual upload with a local API token before this
-#   workflow can publish it. See scripts/bootstrap_pypi_projects.sh.
+#   A new distribution needs only a pending publisher with the same fields,
+#   added at https://pypi.org/manage/account/publishing/ before its first tag:
+#   that release's upload creates the project. No token or manual upload.
 # - crates.io: Owner: EdgeFirstAI, Repository: hal, Workflow: publish.yml,
 #   Environment: crates-io
 #
-#   BOOTSTRAP: crates.io Trusted Publishing cannot create a crate either, so a
-#   new crate (edgefirst-kernels) needs one manual `cargo publish` with an API
-#   token, and its trusted publisher configured, before the first tag. Without
-#   it the crate loop below publishes every crate up to edgefirst-tracker, then
-#   fails at edgefirst-kernels, leaving decoder and image unpublished: a partial
-#   release.
+#   crates.io cannot create a crate through Trusted Publishing, so a new crate
+#   needs one manual `cargo publish` with a `publish-new` API token, then its
+#   trusted publisher, before its first tag. Otherwise the crate loop below
+#   stops at that crate and the crates after it stay unpublished.
+#
+# Both registries match a publisher on the workflow FILENAME, so renaming this
+# file breaks every upload; a rehearsal does not catch it, because it skips
+# the upload.
 #
 # Action Versions (hash-pinned for security per Au-Zone SPS v2.1):
 # - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
