@@ -3465,6 +3465,7 @@ outputs:
         let mut output_boxes = Vec::new();
 
         let proto_data = extract_proto_data_quant(
+            crate::instance_mask::Isa::current_or_scalar(),
             det_indices,
             mask_tensor.view(),
             Quantization::new(0.25, -7),
@@ -3526,6 +3527,7 @@ outputs:
         let (scale, zp) = (1.168e-4_f32, 2_383);
         let mut output_boxes = Vec::new();
         let proto_data = extract_proto_data_quant(
+            crate::instance_mask::Isa::current_or_scalar(),
             det(),
             coeffs.view(),
             coeff_quant,
@@ -3557,6 +3559,7 @@ outputs:
         // u8 protos with a non-zero zero point: 200 must not wrap to -56.
         let protos_u8 = ndarray::Array3::from_shape_vec((1, 1, 2), vec![200_u8, 10]).unwrap();
         let proto_data = extract_proto_data_quant(
+            crate::instance_mask::Isa::current_or_scalar(),
             det(),
             coeffs.view(),
             coeff_quant,
@@ -3570,6 +3573,7 @@ outputs:
         // A frame with no detections keeps the same dtypes and shapes.
         let mut output_boxes = vec![det()[0].0];
         let empty = extract_proto_data_quant(
+            crate::instance_mask::Isa::current_or_scalar(),
             Vec::new(),
             coeffs.view(),
             coeff_quant,
@@ -4943,11 +4947,12 @@ mod per_scale_prefilter_tests {
         threshold: f32,
         multi_label: bool,
     ) -> (usize, Vec<DetectBox>, Option<Vec<f32>>) {
-        let decoded = decoder.run(inputs, prefilter).unwrap();
+        let (decoded, widen) = decoder.run_with_widen(inputs, prefilter).unwrap();
         let anchors = decoded.total_anchors;
         let mut boxes = Vec::new();
         let proto = per_scale_to_proto_data(
             &decoded,
+            widen,
             &mut boxes,
             0.7,
             threshold,
@@ -5010,6 +5015,29 @@ mod per_scale_prefilter_tests {
                 }
             }
         }
+    }
+
+    /// f16 outputs widen into the decoder's scratch, which later frames
+    /// reuse without reallocating, and decode the same detections.
+    #[test]
+    fn f16_widen_reuses_the_decoder_scratch() {
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F16)
+            .unwrap()
+            .unwrap();
+        let owned = inputs_for(&plan);
+        let inputs: Vec<&TensorDyn> = owned.iter().collect();
+        let mut decoder = PerScaleDecoder::new(plan);
+        let first = decode(&mut decoder, &inputs, Some(0.25), 0.25, false);
+        let protos = decoder.widen.protos.as_ptr();
+        let second = decode(&mut decoder, &inputs, Some(0.25), 0.25, false);
+        assert_eq!(decoder.widen.protos.as_ptr(), protos);
+        assert_eq!(decoder.widen.protos.len(), 160 * 160 * 32);
+        assert!(!first.1.is_empty());
+        assert_eq!(first.1, second.1);
+        assert_eq!(first.2, second.2);
     }
 
     /// Levels whose anchor count is not a whole number of packs, such as

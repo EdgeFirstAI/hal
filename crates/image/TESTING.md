@@ -264,26 +264,16 @@ cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
 
 The default build does **not** enable `+fp16` (aarch64) or `+f16c`
 (x86_64) — distributed HAL binaries stay on each target triple's baseline
-ISA so they run on older CPUs within the same triple. Benchmarks that need
-to exercise the native f16 mask kernel
-(`fused_dot_sign_f16_slice` in
+ISA so they run on older CPUs within the same triple. On aarch64 the CPU
+mask kernels need no flags: the f32, f16 and i8 proto paths call the
+shared NEON dot products in `edgefirst_kernels::prim::neon_mask` (f16
+protos widened with the baseline `FCVTL`, `sdot` selected at run time).
+On x86_64, benchmarks that need to exercise the f16 mask kernel's AVX2
+intrinsic path (`fused_dot_sign_f16_slice_f16c` in
 [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs))
-must set `RUSTFLAGS` explicitly on the host that supports the extension.
-The relevant kernel symbol is `fused_dot_sign_f16_slice` (see
-[`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs)
-— search for `fused_dot_sign_*`); the `_f16c` variant is the AVX2
-intrinsic path enabled by `+f16c,+fma`.
+must set `RUSTFLAGS` explicitly on a host that supports `+f16c,+fma`.
 
 ```bash
-# Orin Nano (Cortex-A78AE)
-RUSTFLAGS="-C target-cpu=cortex-a78ae" \
-  cargo bench -p edgefirst-image --bench mask_benchmark
-
-# Generic aarch64 with FEAT_FP16 (verify the host first —
-# imx8mp / Cortex-A53 will SIGILL!)
-RUSTFLAGS="-C target-feature=+fp16" \
-  cargo bench -p edgefirst-image --bench mask_benchmark
-
 # x86_64 Haswell+ (enables the explicit _mm256_cvtph_ps intrinsic kernel
 # in addition to the scalar path)
 RUSTFLAGS="-C target-feature=+f16c,+fma,+avx2" \

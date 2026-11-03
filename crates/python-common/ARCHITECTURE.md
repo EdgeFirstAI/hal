@@ -20,12 +20,14 @@ crates/python-common/          rlib — all binding code, feature-gated
   src/tiling.rs                SAHI tiling bindings
   src/decoder.rs               PyDecoder
   src/tracker.rs               PyTracker
+  src/kernels.rs               PySoftmaxI8Plan, PySigmoidPlan, PyDflBoxPlan, … (kernel plans)
 
 crates/python-tensor/          cdylib -> edgefirst.tensor      (_tensor.so)
 crates/python-codec/           cdylib -> edgefirst.codec       (_codec.so)
 crates/python-image/           cdylib -> edgefirst.image       (_image.so)
 crates/python-decoder/         cdylib -> edgefirst.decoder     (_decoder.so)
 crates/python-tracker/         cdylib -> edgefirst.tracker     (_tracker.so)
+crates/python-kernels/         cdylib -> edgefirst.kernels     (_kernels.so)
 ```
 
 Each sibling extension **links `libedgefirst_tensor.so`**. Tensor
@@ -33,7 +35,8 @@ implementation lives in that one shared library; the other wheels do not
 embed a second copy. `edgefirst-tensor`'s wheel ships it under its SONAME
 (`libedgefirst_tensor.so.0`) only; codec/image/decoder set `DT_NEEDED` +
 `RUNPATH=$ORIGIN/../tensor`. Tracker does not link tensor: it consumes
-plain detection values. On Windows the same library is `edgefirst_tensor.dll`
+plain detection values. Kernels does not either: its plans read and write
+borrowed numpy buffers through the buffer protocol and release the GIL for `run`. On Windows the same library is `edgefirst_tensor.dll`
 (no `lib` prefix, no SONAME) and there is no rpath: codec/image/decoder's
 `__init__.py` call `os.add_dll_directory()` on `edgefirst/tensor/` before
 importing their `.pyd`.

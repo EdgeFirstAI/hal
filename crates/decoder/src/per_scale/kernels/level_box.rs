@@ -6,17 +6,17 @@
 //! Each function decodes one level's box tensor into 4*H*W floats
 //! `[xc, yc, w, h]` per anchor, anchor-major.
 
-use super::box_primitives::{
+use crate::per_scale::plan::LevelPlan;
+use crate::Quantization;
+use edgefirst_kernels::prim::box_primitives::{
     dist2bbox_anchor_f16, dist2bbox_anchor_f32, weighted_sum_4sides_f16, weighted_sum_4sides_f32,
 };
-use super::dequant::{
+use edgefirst_kernels::prim::dequant::{
     dequant_f16_to_f16, dequant_f16_to_f32, dequant_f32_to_f16, dequant_f32_to_f32,
     dequant_i16_to_f16, dequant_i16_to_f32, dequant_i8_to_f16, dequant_i8_to_f32,
     dequant_u16_to_f16, dequant_u16_to_f32, dequant_u8_to_f16, dequant_u8_to_f32,
 };
-use super::softmax::{softmax_inplace_f16, softmax_inplace_f32};
-use crate::per_scale::plan::LevelPlan;
-use crate::Quantization;
+use edgefirst_kernels::prim::softmax::{softmax_inplace_f16, softmax_inplace_f32};
 use half::f16;
 
 const MAX_REG_MAX: usize = 64;
@@ -40,7 +40,7 @@ macro_rules! impl_dfl_level_f32 {
                 let in_base = anchor * 4 * reg_max;
                 $dequant(
                     &input[in_base..in_base + 4 * reg_max],
-                    q,
+                    q.into(),
                     &mut deq[..4 * reg_max],
                 );
                 for side in 0..4 {
@@ -73,7 +73,7 @@ macro_rules! impl_dfl_level_f16 {
                 let in_base = anchor * 4 * reg_max;
                 $dequant(
                     &input[in_base..in_base + 4 * reg_max],
-                    q,
+                    q.into(),
                     &mut deq[..4 * reg_max],
                 );
                 for side in 0..4 {
@@ -240,7 +240,7 @@ macro_rules! impl_ltrb_level_f32 {
             let mut deq: [f32; 4] = [0.0_f32; 4];
             for anchor in 0..(h * w) {
                 let in_base = anchor * 4;
-                $dequant(&input[in_base..in_base + 4], q, &mut deq);
+                $dequant(&input[in_base..in_base + 4], q.into(), &mut deq);
                 let gx = level.grid_x[anchor];
                 let gy = level.grid_y[anchor];
                 let xywh = dist2bbox_anchor_f32(deq, gx, gy, level.stride);
@@ -263,7 +263,7 @@ macro_rules! impl_ltrb_level_f16 {
             let mut deq: [f16; 4] = [f16::ZERO; 4];
             for anchor in 0..(h * w) {
                 let in_base = anchor * 4;
-                $dequant(&input[in_base..in_base + 4], q, &mut deq);
+                $dequant(&input[in_base..in_base + 4], q.into(), &mut deq);
                 let gx = f16::from_f32(level.grid_x[anchor]);
                 let gy = f16::from_f32(level.grid_y[anchor]);
                 let stride = f16::from_f32(level.stride);
@@ -290,332 +290,338 @@ impl_ltrb_level_f16!(decode_box_level_ltrb_u16_to_f16, u16, dequant_u16_to_f16);
 impl_ltrb_level_f16!(decode_box_level_ltrb_f16_to_f16, f16, dequant_f16_to_f16);
 impl_ltrb_level_f16!(decode_box_level_ltrb_f32_to_f16, f32, dequant_f32_to_f16);
 
-// ────────────────────────────────────────────────────────────────────────
-// NEON-baseline (Tier 1) DFL + LTRB box level kernels
-//
-// **DFL** keeps the per-anchor structure: each anchor's `4 * reg_max`
-// channels (typically 64) is exactly 4 chunks of 16 i8 lanes — perfect
-// shape for the chunked NEON dequant. Per-anchor: NEON dequant + scalar
-// softmax + scalar weighted-sum + scalar dist2bbox. NEON softmax lands
-// in task N-10 and replaces the per-side softmax inline.
-//
-// **LTRB** has only 4 channels per anchor — too few for NEON to amortize
-// loop overhead. Instead the NEON variant **batch-dequants** the whole
-// `(h * w * 4)` tensor into a heap scratch (sized 25600 f32 max for
-// 80x80 LTRB, well under any per-frame budget), then runs a scalar
-// per-anchor dist2bbox loop reading from the scratch.
-// ────────────────────────────────────────────────────────────────────────
+// ── NEON (aarch64) ───────────────────────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
-macro_rules! impl_dfl_level_f32_neon {
-    ($name:ident, $i:ty, $dequant_neon:ident, $softmax:ident) => {
-        #[allow(dead_code)]
-        pub(crate) fn $name(input: &[$i], q: Quantization, level: &LevelPlan, dst: &mut [f32]) {
-            let h = level.h;
-            let w = level.w;
-            let reg_max = level.reg_max;
-            debug_assert_eq!(input.len(), h * w * 4 * reg_max);
-            debug_assert_eq!(dst.len(), 4 * h * w);
-            debug_assert!(reg_max <= MAX_REG_MAX);
+pub(crate) use neon::{dfl_f16_neon_fp16, dfl_neon, dfl_per_channel_neon, ltrb_neon, Exp};
 
-            let mut deq: [f32; 4 * MAX_REG_MAX] = [0.0_f32; 4 * MAX_REG_MAX];
-            for anchor in 0..(h * w) {
-                let in_base = anchor * 4 * reg_max;
-                // SAFETY: NEON mandatory on aarch64; dispatch contract.
-                // FP16-suffixed variants additionally require f.neon_fp16.
-                unsafe {
-                    crate::per_scale::kernels::neon_baseline::$dequant_neon(
-                        &input[in_base..in_base + 4 * reg_max],
-                        q,
-                        &mut deq[..4 * reg_max],
-                    );
-                    for side in 0..4 {
-                        crate::per_scale::kernels::neon_baseline::$softmax(
-                            &mut deq[side * reg_max..(side + 1) * reg_max],
-                        );
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::{dist2bbox_anchor_f32, f16, LevelPlan, Quantization, MAX_REG_MAX};
+    use edgefirst_kernels::prim::neon_convert::PerChannelIn;
+    use edgefirst_kernels::prim::neon_ltrb::LtrbIn;
+    use edgefirst_kernels::prim::{neon_baseline, neon_convert, neon_fp16, neon_ltrb};
+    use edgefirst_kernels::Quant;
+
+    /// The exp of the NEON fused softmax and weighted sum.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Exp {
+        /// `softmax_weighted_sum_4sides_f32_neon`.
+        F32,
+        /// `softmax_weighted_sum_4sides_f32_neon_fp16`, the fp16 exp; needs FEAT_FP16.
+        Fp16,
+    }
+
+    /// An f32 or f16 box output of the NEON cells: `f16` boxes are the f32 boxes rounded once,
+    /// except where a native FP16 kernel is named.
+    pub(crate) trait BoxOut: Copy {
+        /// Four anchors' boxes from their distances (`ltrb`, 16 values) into `out` (16 values),
+        /// through `dist2bbox_4anchors_f32_neon`.
+        fn boxes4(ltrb: &[f32; 16], gx: &[f32], gy: &[f32], stride: f32, out: &mut [Self]);
+
+        /// One anchor's f32 box.
+        fn store4(out: &mut [Self], b: [f32; 4]);
+
+        /// One level's LTRB boxes through `prim::neon_ltrb`.
+        fn ltrb<T: LtrbIn>(input: &[T], q: Quant, level: &LevelPlan, dst: &mut [Self]);
+
+        /// One level's per-channel DFL boxes from the logits `deq` writes: the f32 path, or for
+        /// `f16` boxes with `fp16` the native FP16 distances and boxes.
+        ///
+        /// # Safety
+        /// `fp16` needs FEAT_FP16.
+        unsafe fn per_channel<T>(
+            input: &[T],
+            level: &LevelPlan,
+            fp16: bool,
+            dst: &mut [Self],
+            deq: impl FnMut(&[T], &mut [f32]),
+        );
+    }
+
+    impl BoxOut for f32 {
+        #[inline(always)]
+        fn boxes4(ltrb: &[f32; 16], gx: &[f32], gy: &[f32], stride: f32, out: &mut [Self]) {
+            if gx.len() >= 4 && gy.len() >= 4 && out.len() >= 16 {
+                // SAFETY: NEON is part of the aarch64 baseline; the lengths are checked.
+                unsafe { neon_baseline::dist2bbox_4anchors_f32_neon(ltrb, gx, gy, stride, out) };
+            }
+        }
+
+        #[inline(always)]
+        fn store4(out: &mut [Self], b: [f32; 4]) {
+            out.iter_mut().zip(b).for_each(|(o, v)| *o = v);
+        }
+
+        #[inline(always)]
+        fn ltrb<T: LtrbIn>(input: &[T], q: Quant, level: &LevelPlan, dst: &mut [Self]) {
+            let (gx, gy, s) = (&level.grid_x[..], &level.grid_y[..], level.stride);
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe { neon_ltrb::ltrb_boxes_f32_neon(input, q, gx, gy, s, false, dst) };
+        }
+
+        #[inline(always)]
+        unsafe fn per_channel<T>(
+            input: &[T],
+            level: &LevelPlan,
+            _fp16: bool,
+            dst: &mut [Self],
+            deq: impl FnMut(&[T], &mut [f32]),
+        ) {
+            // SAFETY: the f32 exp runs on every NEON CPU.
+            unsafe { dfl_level(input, level, Exp::F32, dst, deq) };
+        }
+    }
+
+    impl BoxOut for f16 {
+        #[inline(always)]
+        fn boxes4(ltrb: &[f32; 16], gx: &[f32], gy: &[f32], stride: f32, out: &mut [Self]) {
+            let mut b = [0.0f32; 16];
+            <f32 as BoxOut>::boxes4(ltrb, gx, gy, stride, &mut b);
+            if let Some(out) = out.get_mut(..16) {
+                // SAFETY: NEON is part of the aarch64 baseline; both slices hold 16 values.
+                unsafe { neon_convert::narrow_f32_to_f16_neon(&b, out) };
+            }
+        }
+
+        #[inline(always)]
+        fn store4(out: &mut [Self], b: [f32; 4]) {
+            out.iter_mut()
+                .zip(b)
+                .for_each(|(o, v)| *o = f16::from_f32(v));
+        }
+
+        #[inline(always)]
+        fn ltrb<T: LtrbIn>(input: &[T], q: Quant, level: &LevelPlan, dst: &mut [Self]) {
+            let (gx, gy, s) = (&level.grid_x[..], &level.grid_y[..], level.stride);
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe { neon_ltrb::ltrb_boxes_f16_neon(input, q, gx, gy, s, false, dst) };
+        }
+
+        #[inline(always)]
+        unsafe fn per_channel<T>(
+            input: &[T],
+            level: &LevelPlan,
+            fp16: bool,
+            dst: &mut [Self],
+            deq: impl FnMut(&[T], &mut [f32]),
+        ) {
+            // SAFETY: the caller guarantees FEAT_FP16 when `fp16`.
+            unsafe {
+                if fp16 {
+                    dfl_level_f16(input, level, dst, deq);
+                } else {
+                    dfl_level(input, level, Exp::F32, dst, deq);
+                }
+            }
+        }
+    }
+
+    /// The anchor count of a DFL level call, or `None` when the slices do not match the level.
+    #[inline(always)]
+    fn dfl_anchors<T, O>(input: &[T], level: &LevelPlan, dst: &[O]) -> Option<usize> {
+        let rm = level.reg_max;
+        let n = dst.len() / 4;
+        let ok = rm > 0
+            && rm <= MAX_REG_MAX
+            && dst.len().is_multiple_of(4)
+            && Some(input.len()) == n.checked_mul(4 * rm)
+            && level.grid_x.len() >= n
+            && level.grid_y.len() >= n;
+        ok.then_some(n)
+    }
+
+    /// One level's DFL boxes: `deq` writes an anchor's `4 · reg_max` logits in f32, the fused
+    /// softmax and weighted sum (`exp`) gives its distances, and dist2bbox runs four anchors per
+    /// NEON step, the last `n % 4` scalar. Writes nothing unless the slices match the level.
+    ///
+    /// # Safety
+    /// [`Exp::Fp16`] needs FEAT_FP16.
+    #[inline(always)]
+    unsafe fn dfl_level<T, O: BoxOut>(
+        input: &[T],
+        level: &LevelPlan,
+        exp: Exp,
+        dst: &mut [O],
+        mut deq: impl FnMut(&[T], &mut [f32]),
+    ) {
+        let Some(n) = dfl_anchors(input, level, dst) else {
+            return;
+        };
+        let rm = level.reg_max;
+        let per = 4 * rm;
+        let mut store = [0.0f32; 4 * MAX_REG_MAX];
+        let Some(logits) = store.get_mut(..per) else {
+            return;
+        };
+        let mut ltrb = |bins: &[T]| -> [f32; 4] {
+            deq(bins, logits);
+            // SAFETY: the caller guarantees FEAT_FP16 for `Exp::Fp16`; `logits` holds 4·reg_max.
+            unsafe {
+                match exp {
+                    Exp::F32 => neon_baseline::softmax_weighted_sum_4sides_f32_neon(logits, rm),
+                    Exp::Fp16 => {
+                        neon_baseline::softmax_weighted_sum_4sides_f32_neon_fp16(logits, rm)
                     }
                 }
-                // NEON vectorized weighted-sum + scalar dist2bbox.
-                let ltrb = unsafe {
-                    crate::per_scale::kernels::neon_baseline::weighted_sum_4sides_f32_neon(
-                        &deq[..4 * reg_max],
-                        reg_max,
-                    )
-                };
-                let gx = level.grid_x[anchor];
-                let gy = level.grid_y[anchor];
-                let xywh = dist2bbox_anchor_f32(ltrb, gx, gy, level.stride);
-                let out_base = anchor * 4;
-                dst[out_base..out_base + 4].copy_from_slice(&xywh);
             }
+        };
+        let (gx, gy, stride) = (&level.grid_x[..], &level.grid_y[..], level.stride);
+        let quads = input
+            .chunks_exact(4 * per)
+            .zip(dst.chunks_exact_mut(16))
+            .zip(gx.chunks_exact(4).zip(gy.chunks_exact(4)))
+            .take(n / 4);
+        for ((bins, out), (x, y)) in quads {
+            let mut d = [0.0f32; 16];
+            for (d, a) in d.chunks_exact_mut(4).zip(bins.chunks_exact(per)) {
+                d.copy_from_slice(&ltrb(a));
+            }
+            O::boxes4(&d, x, y, stride, out);
         }
-    };
-}
-
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_i8_to_f32_neon,
-    i8,
-    dequant_i8_to_f32_neon,
-    softmax_inplace_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_u8_to_f32_neon,
-    u8,
-    dequant_u8_to_f32_neon,
-    softmax_inplace_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_i16_to_f32_neon,
-    i16,
-    dequant_i16_to_f32_neon,
-    softmax_inplace_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_u16_to_f32_neon,
-    u16,
-    dequant_u16_to_f32_neon,
-    softmax_inplace_f32_neon
-);
-
-// FP16 DFL variants — same dequant, FP16 softmax. Reached only when
-// CpuFeatures::neon_fp16 is true (gated upstream by dispatch::select).
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_i8_to_f32_neon_fp16,
-    i8,
-    dequant_i8_to_f32_neon,
-    softmax_inplace_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_u8_to_f32_neon_fp16,
-    u8,
-    dequant_u8_to_f32_neon,
-    softmax_inplace_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_i16_to_f32_neon_fp16,
-    i16,
-    dequant_i16_to_f32_neon,
-    softmax_inplace_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon!(
-    decode_box_level_dfl_u16_to_f32_neon_fp16,
-    u16,
-    dequant_u16_to_f32_neon,
-    softmax_inplace_f32_neon_fp16
-);
-
-#[cfg(target_arch = "aarch64")]
-macro_rules! impl_ltrb_level_f32_neon {
-    ($name:ident, $i:ty, $dequant_neon:ident) => {
-        #[allow(dead_code)]
-        pub(crate) fn $name(input: &[$i], q: Quantization, level: &LevelPlan, dst: &mut [f32]) {
-            let h = level.h;
-            let w = level.w;
-            debug_assert_eq!(input.len(), h * w * 4);
-            debug_assert_eq!(dst.len(), 4 * h * w);
-
-            let n = h * w * 4;
-            let mut deq: Vec<f32> = vec![0.0_f32; n];
-            // SAFETY: NEON mandatory on aarch64; dispatch contract.
-            unsafe {
-                crate::per_scale::kernels::neon_baseline::$dequant_neon(input, q, &mut deq);
-            }
-
-            // Batch-4 NEON dist2bbox for the bulk of anchors.
-            let n_anchors = h * w;
-            let batch4 = n_anchors / 4;
-            for b in 0..batch4 {
-                let a0 = b * 4;
-                let ltrb_base = a0 * 4;
-                let gx_batch = [
-                    level.grid_x[a0],
-                    level.grid_x[a0 + 1],
-                    level.grid_x[a0 + 2],
-                    level.grid_x[a0 + 3],
-                ];
-                let gy_batch = [
-                    level.grid_y[a0],
-                    level.grid_y[a0 + 1],
-                    level.grid_y[a0 + 2],
-                    level.grid_y[a0 + 3],
-                ];
-                // SAFETY: NEON mandatory on aarch64. deq is contiguous
-                // [l0,t0,r0,b0, l1,t1,r1,b1, ...] — 16 floats per batch.
-                unsafe {
-                    crate::per_scale::kernels::neon_baseline::dist2bbox_4anchors_f32_neon(
-                        &deq[ltrb_base..ltrb_base + 16],
-                        &gx_batch,
-                        &gy_batch,
-                        level.stride,
-                        &mut dst[ltrb_base..ltrb_base + 16],
-                    );
-                }
-            }
-            // Scalar tail for remaining anchors.
-            for anchor in (batch4 * 4)..n_anchors {
-                let base = anchor * 4;
-                let dq = [deq[base], deq[base + 1], deq[base + 2], deq[base + 3]];
-                let gx = level.grid_x[anchor];
-                let gy = level.grid_y[anchor];
-                let xywh = dist2bbox_anchor_f32(dq, gx, gy, level.stride);
-                dst[base..base + 4].copy_from_slice(&xywh);
-            }
+        for a in n / 4 * 4..n {
+            let (Some(bins), Some(out), Some(&x), Some(&y)) = (
+                input.get(a * per..(a + 1) * per),
+                dst.get_mut(a * 4..a * 4 + 4),
+                gx.get(a),
+                gy.get(a),
+            ) else {
+                return;
+            };
+            O::store4(out, dist2bbox_anchor_f32(ltrb(bins), x, y, stride));
         }
-    };
-}
+    }
 
-#[cfg(target_arch = "aarch64")]
-impl_ltrb_level_f32_neon!(
-    decode_box_level_ltrb_i8_to_f32_neon,
-    i8,
-    dequant_i8_to_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_ltrb_level_f32_neon!(
-    decode_box_level_ltrb_u8_to_f32_neon,
-    u8,
-    dequant_u8_to_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_ltrb_level_f32_neon!(
-    decode_box_level_ltrb_i16_to_f32_neon,
-    i16,
-    dequant_i16_to_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_ltrb_level_f32_neon!(
-    decode_box_level_ltrb_u16_to_f32_neon,
-    u16,
-    dequant_u16_to_f32_neon
-);
-
-// ────────────────────────────────────────────────────────────────────────
-// Fused DFL box level kernels (online-softmax inspired)
-//
-// Replaces the separate softmax + weighted_sum calls with a single
-// fused kernel that computes Σ(exp(x-m)×i)/Σ(exp(x-m)) in-register.
-// Eliminates 256 memory ops per anchor (64 per side × 4 sides):
-//   - No intermediate probability store/reload
-//   - No normalize pass
-//   - Single scalar divide at the end
-//
-// Used as the default NEON DFL path (replaces the separate-pass version).
-// ────────────────────────────────────────────────────────────────────────
-
-#[cfg(target_arch = "aarch64")]
-macro_rules! impl_dfl_level_f32_neon_fused {
-    ($name:ident, $i:ty, $dequant_neon:ident, $fused_ws:ident) => {
-        #[allow(dead_code)]
-        pub(crate) fn $name(input: &[$i], q: Quantization, level: &LevelPlan, dst: &mut [f32]) {
-            let h = level.h;
-            let w = level.w;
-            let reg_max = level.reg_max;
-            debug_assert_eq!(input.len(), h * w * 4 * reg_max);
-            debug_assert_eq!(dst.len(), 4 * h * w);
-            debug_assert!(reg_max <= MAX_REG_MAX);
-
-            let mut deq: [f32; 4 * MAX_REG_MAX] = [0.0_f32; 4 * MAX_REG_MAX];
-            for anchor in 0..(h * w) {
-                let in_base = anchor * 4 * reg_max;
-                // SAFETY: NEON mandatory on aarch64; dispatch contract.
-                unsafe {
-                    crate::per_scale::kernels::neon_baseline::$dequant_neon(
-                        &input[in_base..in_base + 4 * reg_max],
-                        q,
-                        &mut deq[..4 * reg_max],
-                    );
-                }
-                // Fused softmax+weighted_sum — no intermediate store.
-                let ltrb = unsafe {
-                    crate::per_scale::kernels::neon_baseline::$fused_ws(
-                        &deq[..4 * reg_max],
-                        reg_max,
-                    )
-                };
-                let gx = level.grid_x[anchor];
-                let gy = level.grid_y[anchor];
-                let xywh = dist2bbox_anchor_f32(ltrb, gx, gy, level.stride);
-                let out_base = anchor * 4;
-                dst[out_base..out_base + 4].copy_from_slice(&xywh);
+    /// One level's DFL `f16` boxes in native FP16: `deq` writes an anchor's f32 logits,
+    /// `dfl_softmax_ltrb_f16_neon_fp16` its f16 distances, then `dist2bbox_f16_neon_fp16` runs
+    /// over blocks of 64 anchors. Writes nothing unless the slices match the level.
+    ///
+    /// # Safety
+    /// The CPU must support FEAT_FP16.
+    #[inline(always)]
+    unsafe fn dfl_level_f16<T>(
+        input: &[T],
+        level: &LevelPlan,
+        dst: &mut [f16],
+        mut deq: impl FnMut(&[T], &mut [f32]),
+    ) {
+        const BLOCK: usize = 64;
+        let Some(n) = dfl_anchors(input, level, dst) else {
+            return;
+        };
+        let rm = level.reg_max;
+        let per = 4 * rm;
+        let mut store = [0.0f32; 4 * MAX_REG_MAX];
+        let (Some(logits), Some(gx), Some(gy)) = (
+            store.get_mut(..per),
+            level.grid_x.get(..n),
+            level.grid_y.get(..n),
+        ) else {
+            return;
+        };
+        let mut ltrb = [f16::ZERO; 4 * BLOCK];
+        let blocks = input
+            .chunks(BLOCK * per)
+            .zip(dst.chunks_mut(4 * BLOCK))
+            .zip(gx.chunks(BLOCK).zip(gy.chunks(BLOCK)));
+        for ((bins, out), (x, y)) in blocks {
+            let Some(l) = ltrb.get_mut(..out.len()) else {
+                return;
+            };
+            for (a, d) in bins.chunks_exact(per).zip(l.chunks_exact_mut(4)) {
+                deq(a, logits);
+                // SAFETY: the caller guarantees FEAT_FP16; `d` holds four values.
+                unsafe { neon_fp16::dfl_softmax_ltrb_f16_neon_fp16(logits, rm, d) };
             }
+            // SAFETY: as above; `l`, `out` and the grids cover the block's anchors.
+            unsafe { neon_fp16::dist2bbox_f16_neon_fp16(l, x, y, level.stride, false, out) };
         }
-    };
+    }
+
+    /// Per-tensor DFL boxes on NEON: the decoder's NEON dequantize (`LtrbIn::dequant_neon`: the
+    /// fused FMA for integers, exact for floats), then [`dfl_level`].
+    ///
+    /// # Safety
+    /// [`Exp::Fp16`] needs FEAT_FP16.
+    #[inline]
+    pub(crate) unsafe fn dfl_neon<T: LtrbIn, O: BoxOut>(
+        input: &[T],
+        q: Quantization,
+        level: &LevelPlan,
+        exp: Exp,
+        dst: &mut [O],
+    ) {
+        let q = q.into();
+        // SAFETY: the caller's guarantee.
+        unsafe { dfl_level(input, level, exp, dst, |b, d| T::dequant_neon(b, q, d)) };
+    }
+
+    /// Per-tensor DFL `f16` boxes in native FP16 after the decoder's NEON dequantize.
+    ///
+    /// # Safety
+    /// The CPU must support FEAT_FP16.
+    #[inline]
+    pub(crate) unsafe fn dfl_f16_neon_fp16<T: LtrbIn>(
+        input: &[T],
+        q: Quantization,
+        level: &LevelPlan,
+        dst: &mut [f16],
+    ) {
+        let q = q.into();
+        // SAFETY: the caller's guarantee.
+        unsafe { dfl_level_f16(input, level, dst, |b, d| T::dequant_neon(b, q, d)) };
+    }
+
+    /// Per-channel DFL boxes on NEON: the scalar cell's exact per-bin dequantize, with the zero
+    /// points and scales converted once per call, then [`BoxOut::per_channel`]. Returns `false`,
+    /// writing nothing, unless there is one scale per bin and no zero points or one per bin.
+    ///
+    /// # Safety
+    /// `fp16` needs FEAT_FP16.
+    #[inline]
+    pub(crate) unsafe fn dfl_per_channel_neon<T: PerChannelIn, O: BoxOut>(
+        input: &[T],
+        scales: &[f32],
+        zps: &[i32],
+        level: &LevelPlan,
+        fp16: bool,
+        dst: &mut [O],
+    ) -> bool {
+        let ch = 4 * level.reg_max;
+        if ch > 4 * MAX_REG_MAX || scales.len() != ch || !(zps.is_empty() || zps.len() == ch) {
+            return false;
+        }
+        let (mut z, mut s) = ([0.0f32; 4 * MAX_REG_MAX], [0.0f32; 4 * MAX_REG_MAX]);
+        z.iter_mut().zip(zps).for_each(|(d, &v)| *d = v as f32);
+        s.iter_mut().zip(scales).for_each(|(d, &v)| *d = v);
+        let (Some(z), Some(s)) = (z.get(..ch), s.get(..ch)) else {
+            return false;
+        };
+        let deq = |b: &[T], d: &mut [f32]| T::dequant_per_channel_neon(b, z, s, d);
+        // SAFETY: the caller's guarantee.
+        unsafe { O::per_channel(input, level, fp16, dst, deq) };
+        true
+    }
+
+    /// One level's LTRB boxes on NEON: `prim::neon_ltrb`'s fused dequantize and dist2bbox, f32
+    /// or the f32 boxes rounded once to f16.
+    #[inline]
+    pub(crate) fn ltrb_neon<T: LtrbIn, O: BoxOut>(
+        input: &[T],
+        q: Quantization,
+        level: &LevelPlan,
+        dst: &mut [O],
+    ) {
+        O::ltrb(input, q.into(), level, dst);
+    }
 }
-
-// Fused f32 variants (Tier-1 NEON baseline).
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_i8_to_f32_neon_fused,
-    i8,
-    dequant_i8_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_u8_to_f32_neon_fused,
-    u8,
-    dequant_u8_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_i16_to_f32_neon_fused,
-    i16,
-    dequant_i16_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_u16_to_f32_neon_fused,
-    u16,
-    dequant_u16_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon
-);
-
-// Fused FP16 variants (Tier-2 FP16 exp path).
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_i8_to_f32_neon_fused_fp16,
-    i8,
-    dequant_i8_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_u8_to_f32_neon_fused_fp16,
-    u8,
-    dequant_u8_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_i16_to_f32_neon_fused_fp16,
-    i16,
-    dequant_i16_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon_fp16
-);
-#[cfg(target_arch = "aarch64")]
-impl_dfl_level_f32_neon_fused!(
-    decode_box_level_dfl_u16_to_f32_neon_fused_fp16,
-    u16,
-    dequant_u16_to_f32_neon,
-    softmax_weighted_sum_4sides_f32_neon_fp16
-);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_scale::kernels::grids::make_anchor_grid;
     use crate::per_scale::plan::LevelPlan;
     use crate::Quantization;
+    use edgefirst_kernels::prim::grids::make_anchor_grid;
 
     fn level_1x1(reg_max: usize, stride: f32, box_channels: usize) -> LevelPlan {
         let (gx, gy) = make_anchor_grid(1, 1);

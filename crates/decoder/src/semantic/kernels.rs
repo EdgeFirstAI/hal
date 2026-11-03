@@ -7,15 +7,24 @@
 //! scale preserves both the argmax and bilinear interpolation (the weights
 //! sum to 1), so integer inputs are never dequantized except where a real
 //! value is needed: the single-channel threshold and the confidence map.
+//!
+//! Each kernel takes the decode's [`Isa`]: on the NEON tiers rows run the shared kernels in
+//! `edgefirst_kernels::prim::neon_semantic` (through `neon_dispatch::semantic`), bit-identical to
+//! the scalar code here except the sigmoid confidence (within `2^-21` relative); layouts and
+//! types without a kernel, and the scalar tier, run the scalar code.
 
+use edgefirst_kernels::prim::softmax::exp_nonpositive;
 use half::f16;
 use rayon::prelude::*;
+
+use crate::neon_dispatch::semantic::{self as nd, ScoreRow, Taps};
+use crate::neon_dispatch::{Isa, Ran};
 
 /// Output rows handed to one rayon task at minimum.
 const MIN_ROWS_PER_TASK: usize = 8;
 
 /// A score element the kernels can compare and interpolate.
-pub(super) trait Score: Copy + Send + Sync + PartialOrd {
+pub(super) trait Score: Copy + Send + Sync + PartialOrd + 'static {
     fn to_f32(self) -> f32;
 }
 
@@ -39,7 +48,7 @@ impl Score for f16 {
 }
 
 /// A class-map output element.
-pub(super) trait ClassOut: Copy + Send + Sync + Default {
+pub(super) trait ClassOut: Copy + Send + Sync + Default + 'static {
     /// Number of distinct classes the type holds.
     const CAPACITY: usize;
     fn from_class(c: u16) -> Self;
@@ -62,7 +71,7 @@ impl ClassOut for u16 {
 }
 
 /// A confidence-map output element.
-pub(super) trait ConfOut: Copy + Send + Sync {
+pub(super) trait ConfOut: Copy + Send + Sync + 'static {
     fn from_conf(v: f32) -> Self;
 }
 
@@ -170,13 +179,32 @@ pub(super) fn nearest_taps(out: usize, len: usize, roi0: f32, roi_len: f32) -> V
         .collect()
 }
 
+/// The scores from row `y`'s first one to the end of `data`.
+fn row_scores<T>(data: &[T], g: Grid, y: usize) -> &[T] {
+    data.get(y * g.ys..).unwrap_or_default()
+}
+
+/// Row `y` of a single channel when its pixels are contiguous.
+fn contiguous_row<T>(data: &[T], g: Grid, y: usize) -> Option<&[T]> {
+    (g.xs == 1)
+        .then(|| row_scores(data, g, y).get(..g.width))
+        .flatten()
+}
+
 /// Per-pixel argmax over the class axis; ties go to the lowest index.
-pub(super) fn argmax_map<T: Score>(data: &[T], g: Grid) -> Vec<u16> {
+pub(super) fn argmax_map<T: Score>(isa: Isa, data: &[T], g: Grid) -> Vec<u16> {
     let mut out = vec![0u16; g.height * g.width];
+    let layout = ScoreRow::of(g.classes, g.cs, g.xs);
     out.par_chunks_mut(g.width)
         .enumerate()
         .with_min_len(MIN_ROWS_PER_TASK)
         .for_each(|(y, row)| {
+            if let Some(layout) = layout {
+                let src = row_scores(data, g, y);
+                if nd::argmax_row(isa, src, layout, g.classes, row) != Ran::Scalar {
+                    return;
+                }
+            }
             if g.xs == 1 {
                 argmax_row_planar(data, g, y, row)
             } else {
@@ -218,9 +246,14 @@ fn argmax_pixel<T: Score>(data: &[T], g: Grid, base: usize) -> u16 {
 }
 
 /// Single-channel foreground map: 1 where the stored value exceeds `cut`.
-pub(super) fn threshold_map<T: Score>(data: &[T], g: Grid, cut: f32) -> Vec<u16> {
+pub(super) fn threshold_map<T: Score>(isa: Isa, data: &[T], g: Grid, cut: f32) -> Vec<u16> {
     let mut out = vec![0u16; g.height * g.width];
     for (y, row) in out.chunks_mut(g.width).enumerate() {
+        if let Some(src) = contiguous_row(data, g, y) {
+            if nd::threshold_row(isa, src, cut, row) != Ran::Scalar {
+                continue;
+            }
+        }
         for (x, slot) in row.iter_mut().enumerate() {
             *slot = u16::from(data[y * g.ys + x * g.xs].to_f32() > cut);
         }
@@ -243,23 +276,9 @@ pub(super) enum ConfKind {
     BinaryProbability,
 }
 
-/// `e^x` for `x <= 0`, within 1e-5 relative error; inputs below -87
-/// clamp to `e^-87`. Branch-free so the softmax loops vectorize.
-#[inline(always)]
-fn exp_nonpositive(x: f32) -> f32 {
-    let t = x.max(-87.0) * std::f32::consts::LOG2_E;
-    // Truncating `t - 0.5` rounds `t <= 0` to nearest without a libm call.
-    let i = (t - 0.5) as i32 as f32;
-    let f = t - i;
-    // Taylor series of 2^f on [-0.5, 0.5].
-    let p = 1.0
-        + f * (std::f32::consts::LN_2
-            + f * (0.240_226_5 + f * (0.055_504_11 + f * (0.009_618_13 + f * 0.001_333_36))));
-    f32::from_bits(((i as i32 + 127) as u32) << 23) * p
-}
-
 /// Confidence of the per-pixel winner at the score map's resolution.
 pub(super) fn confidence_map<T: Score>(
+    isa: Isa,
     data: &[T],
     g: Grid,
     winners: &[u16],
@@ -276,6 +295,9 @@ pub(super) fn confidence_map<T: Score>(
                 let win = &winners[y * g.width..][..g.width];
                 let at =
                     |c: usize, x: usize| dq.real(data[c * g.cs + y * g.ys + x * g.xs].to_f32());
+                if confidence_row_neon(isa, data, g, y, win, dq, kind, scratch, row) {
+                    return;
+                }
                 match kind {
                     ConfKind::Probability => winner_row(row, win, at),
                     ConfKind::Sigmoid => winner_row(row, win, |c, x| sigmoid(at(c, x))),
@@ -286,6 +308,52 @@ pub(super) fn confidence_map<T: Score>(
             },
         );
     out
+}
+
+/// [`confidence_map`]'s row `y` on a NEON tier; `false` when the scalar code computes it.
+#[allow(clippy::too_many_arguments)]
+fn confidence_row_neon<T: Score>(
+    isa: Isa,
+    data: &[T],
+    g: Grid,
+    y: usize,
+    win: &[u16],
+    dq: Dequant,
+    kind: ConfKind,
+    (values, _): &mut (Vec<f32>, Vec<f32>),
+    row: &mut [f32],
+) -> bool {
+    if isa.is_scalar() {
+        return false;
+    }
+    let stored = |x: usize, c: u16| data[c as usize * g.cs + y * g.ys + x * g.xs].to_f32();
+    let ran = match kind {
+        ConfKind::Softmax => {
+            let Some(layout) = ScoreRow::of(g.classes, g.cs, g.xs) else {
+                return false;
+            };
+            for (x, (t, &c)) in values.iter_mut().zip(win).enumerate() {
+                *t = stored(x, c);
+            }
+            let src = row_scores(data, g, y);
+            nd::softmax_row(isa, src, layout, g.classes, values, dq.scale, row)
+        }
+        ConfKind::Sigmoid => {
+            for (x, (v, &c)) in values.iter_mut().zip(win).enumerate() {
+                *v = dq.real(stored(x, c));
+            }
+            nd::sigmoid_row(isa, values, row)
+        }
+        ConfKind::BinaryLogit | ConfKind::BinaryProbability => {
+            let Some(src) = contiguous_row(data, g, y) else {
+                return false;
+            };
+            let logit = matches!(kind, ConfKind::BinaryLogit);
+            nd::binary_row(isa, src, dq.zero_point, dq.scale, logit, row)
+        }
+        ConfKind::Probability => Ran::Scalar,
+    };
+    ran != Ran::Scalar
 }
 
 #[inline(always)]
@@ -343,8 +411,61 @@ fn softmax_row<T: Score>(
     }
 }
 
+/// Nearest-neighbour upsample of a low-resolution class map.
+pub(super) fn upsample_classes<O: ClassOut>(
+    isa: Isa,
+    map: &[u16],
+    width: usize,
+    ys: &[u32],
+    xs: &[u32],
+    dst: &mut [O],
+) {
+    if !nd::nearest_classes(isa, map, width, ys, xs, dst) {
+        upsample_nearest(map, width, ys, xs, dst, O::from_class);
+    }
+}
+
+/// Nearest-neighbour upsample of a low-resolution confidence map.
+pub(super) fn upsample_conf_nearest<C: ConfOut>(
+    isa: Isa,
+    map: &[f32],
+    width: usize,
+    ys: &[u32],
+    xs: &[u32],
+    dst: &mut [C],
+) {
+    if !nd::nearest_confidence(isa, map, width, ys, xs, dst) {
+        upsample_nearest(map, width, ys, xs, dst, C::from_conf);
+    }
+}
+
+/// The lower and upper positions and weights of a tap list, as separate arrays.
+struct SplitTaps {
+    lo: Vec<u32>,
+    hi: Vec<u32>,
+    frac: Vec<f32>,
+}
+
+impl SplitTaps {
+    fn new(taps: &[Tap]) -> Self {
+        Self {
+            lo: taps.iter().map(|t| t.lo).collect(),
+            hi: taps.iter().map(|t| t.hi).collect(),
+            frac: taps.iter().map(|t| t.frac).collect(),
+        }
+    }
+
+    fn view(&self) -> Taps<'_> {
+        Taps {
+            lo: &self.lo,
+            hi: &self.hi,
+            frac: &self.frac,
+        }
+    }
+}
+
 /// Nearest-neighbour upsample of a low-resolution map, converting each value.
-pub(super) fn upsample_nearest<S: Copy + Sync, O: Send>(
+fn upsample_nearest<S: Copy + Sync, O: Send>(
     map: &[S],
     width: usize,
     ys: &[u32],
@@ -365,12 +486,19 @@ pub(super) fn upsample_nearest<S: Copy + Sync, O: Send>(
 
 /// Bilinear upsample of a low-resolution confidence map.
 pub(super) fn upsample_conf_bilinear<C: ConfOut>(
+    isa: Isa,
     map: &[f32],
     width: usize,
     ys: &[Tap],
     xs: &[Tap],
     dst: &mut [C],
 ) {
+    if !isa.is_scalar() {
+        let (ty, tx) = (SplitTaps::new(ys), SplitTaps::new(xs));
+        if nd::bilinear_confidence(isa, map, width, ty.view(), tx.view(), dst) {
+            return;
+        }
+    }
     dst.par_chunks_mut(xs.len())
         .zip(ys.par_iter())
         .with_min_len(MIN_ROWS_PER_TASK)
@@ -401,6 +529,7 @@ fn lerp2(fy: f32, fx: f32, v00: f32, v01: f32, v10: f32, v11: f32) -> f32 {
 /// Bilinear upsample of a single score channel, thresholded at `cut`
 /// (in stored units).
 pub(super) fn upsample_threshold<T: Score, O: ClassOut>(
+    isa: Isa,
     data: &[T],
     g: Grid,
     cut: f32,
@@ -408,6 +537,17 @@ pub(super) fn upsample_threshold<T: Score, O: ClassOut>(
     xs: &[Tap],
     dst: &mut [O],
 ) {
+    if !isa.is_scalar() {
+        let (ty, tx) = (SplitTaps::new(ys), SplitTaps::new(xs));
+        let fill = |y: usize, row: &mut [f32]| {
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = data[y * g.ys + x * g.xs].to_f32();
+            }
+        };
+        if nd::bilinear_threshold(isa, g.width, fill, ty.view(), tx.view(), cut, dst) {
+            return;
+        }
+    }
     dst.par_chunks_mut(xs.len())
         .zip(ys.par_iter())
         .with_min_len(MIN_ROWS_PER_TASK)
@@ -440,6 +580,7 @@ pub(super) fn upsample_threshold<T: Score, O: ClassOut>(
 /// one class plane at a time, since gathering a class vector across planes of
 /// a power-of-two-like stride thrashes the cache.
 pub(super) fn upsample_argmax<T: Score, O: ClassOut>(
+    isa: Isa,
     data: &[T],
     g: Grid,
     winners: &[u16],
@@ -467,9 +608,10 @@ pub(super) fn upsample_argmax<T: Score, O: ClassOut>(
             _ => runs.push((tx.lo as usize, dx, dx + 1)),
         }
     }
+    let fx: Vec<f32> = xs.iter().map(|t| t.frac).collect();
     bands.into_par_iter().for_each_init(
-        || Band::new(g),
-        |cells, (first, band)| {
+        || (Band::new(g, isa), vec![0u16; out_w]),
+        |(cells, picks), (first, band)| {
             let y0 = ys[first].lo as usize;
             cells.prepare(data, winners, y0, (y0 + 1).min(g.height - 1));
             for (r, row) in band.chunks_mut(out_w).enumerate() {
@@ -478,6 +620,17 @@ pub(super) fn upsample_argmax<T: Score, O: ClassOut>(
                     match cells.uniform[x0] {
                         Some(class) => row[start..end].fill(O::from_class(class)),
                         None => {
+                            let (classes, corners) = cells.candidates(x0);
+                            let picks = &mut picks[start..end];
+                            let fx = &fx[start..end];
+                            if nd::cell_argmax(isa, classes, corners, ty.frac, fx, picks)
+                                != Ran::Scalar
+                            {
+                                for (o, &c) in row[start..end].iter_mut().zip(picks.iter()) {
+                                    *o = O::from_class(c);
+                                }
+                                continue;
+                            }
                             for (o, tx) in row[start..end].iter_mut().zip(&xs[start..end]) {
                                 *o = O::from_class(cells.argmax(x0, ty.frac, tx.frac));
                             }
@@ -489,14 +642,32 @@ pub(super) fn upsample_argmax<T: Score, O: ClassOut>(
     );
 }
 
+/// Appends to `classes` and `out` each class (by its position in `corners`) whose largest corner
+/// reaches `floor`, the best smallest corner of any class, in class order.
+fn push_candidates(
+    corners: &[[f32; 4]],
+    floor: f32,
+    classes: &mut Vec<u16>,
+    out: &mut Vec<[f32; 4]>,
+) {
+    for (c, v) in corners.iter().enumerate() {
+        if v[0].max(v[1]).max(v[2]).max(v[3]) >= floor {
+            classes.push(c as u16);
+            out.push(*v);
+        }
+    }
+}
+
 /// Candidate classes and their corner scores for the boundary cells of one
 /// band (a pair of source rows).
 struct Band {
     g: Grid,
+    isa: Isa,
     /// Per source column: index into `cols` once gathered.
     col_slot: Vec<u32>,
     cols: Vec<usize>,
-    /// Gathered scores, `[class][slot]`, for the band's two source rows.
+    /// Gathered scores, `[class][slot]`, for the band's two source rows; `[slot][class]` when
+    /// gathered on a NEON tier.
     rows: [Vec<f32>; 2],
     /// Per cell (left source column): the class of a cell whose corners
     /// agree, `None` for a boundary cell.
@@ -505,13 +676,15 @@ struct Band {
     spans: Vec<(u32, u32)>,
     classes: Vec<u16>,
     corners: Vec<[f32; 4]>,
+    /// One cell's corner scores per class, before candidate selection; sized on first use.
     scratch: Vec<[f32; 4]>,
 }
 
 impl Band {
-    fn new(g: Grid) -> Self {
+    fn new(g: Grid, isa: Isa) -> Self {
         Self {
             g,
+            isa,
             col_slot: vec![u32::MAX; g.width],
             cols: Vec::with_capacity(g.width),
             rows: [Vec::new(), Vec::new()],
@@ -519,7 +692,7 @@ impl Band {
             spans: vec![(0, 0); g.width],
             classes: Vec::new(),
             corners: Vec::new(),
-            scratch: vec![[0.0; 4]; g.classes],
+            scratch: Vec::new(),
         }
     }
 
@@ -551,6 +724,12 @@ impl Band {
             return;
         }
         let n = self.cols.len();
+        if self.gather_by_slot(data, y0, y1) {
+            for x in boundary {
+                self.build_by_slot(x);
+            }
+            return;
+        }
         for (row, y) in self.rows.iter_mut().zip([y0, y1]) {
             row.clear();
             row.resize(g.classes * n, 0.0);
@@ -567,25 +746,67 @@ impl Band {
         }
     }
 
+    /// The `[slot][class]` gather of both source rows on a NEON tier; `false` when the scalar
+    /// `[class][slot]` gather runs instead.
+    fn gather_by_slot<T: Score>(&mut self, data: &[T], y0: usize, y1: usize) -> bool {
+        if self.isa.is_scalar() {
+            return false;
+        }
+        let g = self.g;
+        let cols: Vec<u32> = self.cols.iter().map(|&x| x as u32).collect();
+        let layout = (g.cs, g.xs, g.classes);
+        self.rows.iter_mut().zip([y0, y1]).all(|(row, y)| {
+            row.clear();
+            row.resize(g.classes * cols.len(), 0.0);
+            let src = row_scores(data, g, y);
+            nd::gather_columns(self.isa, src, layout, &cols, row) != Ran::Scalar
+        })
+    }
+
+    /// [`Self::build`] from `[slot][class]` rows.
+    fn build_by_slot(&mut self, x0: usize) {
+        let g = self.g;
+        let a = self.col_slot[x0] as usize;
+        let b = self.col_slot[(x0 + 1).min(g.width - 1)] as usize;
+        let slot = |r: usize, s: usize| &self.rows[r][s * g.classes..][..g.classes];
+        let corners = [slot(0, a), slot(0, b), slot(1, a), slot(1, b)];
+        let start = self.classes.len() as u32;
+        let (classes, out) = (&mut self.classes, &mut self.corners);
+        if nd::cell_candidates(self.isa, corners, classes, out) == Ran::Scalar {
+            self.scratch.resize(g.classes, [0.0; 4]);
+            let mut floor = f32::NEG_INFINITY;
+            for (c, v) in self.scratch.iter_mut().enumerate() {
+                *v = corners.map(|k| k[c]);
+                floor = floor.max(v[0].min(v[1]).min(v[2]).min(v[3]));
+            }
+            push_candidates(&self.scratch, floor, classes, out);
+        }
+        self.spans[x0] = (start, self.classes.len() as u32 - start);
+    }
+
     fn build(&mut self, x0: usize) {
         let g = self.g;
         let n = self.cols.len();
         let a = self.col_slot[x0] as usize;
         let b = self.col_slot[(x0 + 1).min(g.width - 1)] as usize;
+        let start = self.classes.len() as u32;
+        self.scratch.resize(g.classes, [0.0; 4]);
         let mut floor = f32::NEG_INFINITY;
         for (c, v) in self.scratch.iter_mut().enumerate() {
             let (r0, r1) = (&self.rows[0][c * n..], &self.rows[1][c * n..]);
             *v = [r0[a], r0[b], r1[a], r1[b]];
             floor = floor.max(v[0].min(v[1]).min(v[2]).min(v[3]));
         }
-        let start = self.classes.len() as u32;
-        for (c, v) in self.scratch.iter().enumerate() {
-            if v[0].max(v[1]).max(v[2]).max(v[3]) >= floor {
-                self.classes.push(c as u16);
-                self.corners.push(*v);
-            }
-        }
+        push_candidates(&self.scratch, floor, &mut self.classes, &mut self.corners);
         self.spans[x0] = (start, self.classes.len() as u32 - start);
+    }
+
+    /// Candidate classes and their corner scores of the boundary cell whose
+    /// left column is `x0`.
+    fn candidates(&self, x0: usize) -> (&[u16], &[[f32; 4]]) {
+        let (start, len) = self.spans[x0];
+        let range = start as usize..(start + len) as usize;
+        (&self.classes[range.clone()], &self.corners[range])
     }
 
     /// Argmax of the interpolated scores at weights `(fy, fx)` in the
@@ -694,16 +915,6 @@ mod tests {
     }
 
     #[test]
-    fn exp_nonpositive_is_accurate() {
-        for i in 0..=1740 {
-            let x = -(i as f32) * 0.05;
-            let (fast, exact) = (exp_nonpositive(x), x.exp());
-            assert!((fast - exact).abs() <= exact * 1e-5, "x={x} {fast} {exact}");
-        }
-        assert_eq!(exp_nonpositive(-1000.0), exp_nonpositive(-87.0));
-    }
-
-    #[test]
     fn argmax_ties_take_lowest_index() {
         // NCHW, 3 classes, 1x2: pixel 0 ties classes 1 and 2, pixel 1 ties all.
         let data: [f32; 6] = [0.0, 5.0, 3.0, 5.0, 3.0, 5.0];
@@ -715,7 +926,7 @@ mod tests {
             ys: 2,
             xs: 1,
         };
-        assert_eq!(argmax_map(&data, g), vec![1, 0]);
+        assert_eq!(argmax_map(Isa::SCALAR, &data, g), vec![1, 0]);
         let nhwc = Grid {
             cs: 1,
             ys: 6,
@@ -723,6 +934,6 @@ mod tests {
             ..g
         };
         let data: [f32; 6] = [0.0, 3.0, 3.0, 5.0, 5.0, 5.0];
-        assert_eq!(argmax_map(&data, nhwc), vec![1, 0]);
+        assert_eq!(argmax_map(Isa::SCALAR, &data, nhwc), vec![1, 0]);
     }
 }

@@ -18,7 +18,7 @@ WORKDIR="${TMPDIR:-/tmp}/check-headers.$$"
 mkdir -p "${WORKDIR}" || { echo "FAIL: cannot create scratch dir ${WORKDIR}"; exit 1; }
 trap 'rm -rf "${WORKDIR}"' EXIT
 INCS="-Icrates/decoder-abi/include"
-for l in tensor image codec decoder tracker; do INCS="${INCS} -Icrates/${l}-capi/include"; done
+for l in tensor image codec decoder tracker kernels; do INCS="${INCS} -Icrates/${l}-capi/include"; done
 
 # G4: detect.h has one home. Copies under *-capi/include are the duplication
 # this split exists to remove, and they are not packaged.
@@ -47,7 +47,7 @@ if ! command -v "${CXX}" >/dev/null 2>&1; then
 fi
 
 ran_link=0
-for l in tensor image codec decoder tracker; do
+for l in tensor image codec decoder tracker kernels; do
   h="crates/${l}-capi/include/edgefirst/${l}.h"
   if [[ ! -s "${h}" ]] || [[ ! -r "${h}" ]]; then
     echo "FAIL ${h} is missing, empty, or unreadable -- cannot measure"
@@ -95,9 +95,9 @@ done
 # cannot double as proof the link-and-run step ran at all -- a loop body that
 # silently skipped every library (e.g. every `[ -f "${src}" ]` check failing
 # open) would also leave `fails` at 0. `ran_link` is independent of pass/fail
-# outcome and must be exactly 5 (one per library) for this run to count.
-if [[ "${ran_link}" -ne 5 ]]; then
-  echo "FAIL: only ${ran_link}/5 libraries were actually linked and run -- cannot measure the rest"
+# outcome and must be exactly 6 (one per library) for this run to count.
+if [[ "${ran_link}" -ne 6 ]]; then
+  echo "FAIL: only ${ran_link}/6 libraries were actually linked and run -- cannot measure the rest"
   fails=$((fails+1))
 fi
 

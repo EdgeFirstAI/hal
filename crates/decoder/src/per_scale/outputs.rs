@@ -10,6 +10,7 @@
 //! the decoder.
 
 use super::kernels::dispatch::DstSliceMut;
+use super::kernels::CpuFeatures;
 use super::DecodeDtype;
 use half::f16;
 use ndarray::{Array4, ArrayView2, ArrayView4};
@@ -42,7 +43,7 @@ pub(crate) struct DecodedOutputBuffers {
 
     /// Per-level exp tables for the 8-bit DFL box kernels, built on the
     /// first frame and rebuilt when a level's box scale changes.
-    pub(crate) dfl_tables: Vec<super::kernels::dfl_lut::DflExpTable>,
+    pub(crate) dfl_tables: Vec<edgefirst_kernels::prim::dfl_lut::DflExpTable>,
 
     /// The dense parallel path's pieces and the thread count they were cut
     /// for, rebuilt when the count changes.
@@ -376,6 +377,45 @@ mod _doc_only {
     }
 }
 
+/// Reused f32 storage for widening f16 per-scale outputs for the f32 NMS
+/// and mask kernels, and the tier to widen on.
+#[derive(Debug, Default)]
+pub(crate) struct WidenScratch {
+    pub(crate) features: CpuFeatures,
+    pub(crate) boxes: Vec<f32>,
+    pub(crate) scores: Vec<f32>,
+    pub(crate) mask_coefs: Vec<f32>,
+    pub(crate) protos: Vec<f32>,
+}
+
+/// `v` cut or grown to `n` elements; only grown elements are written.
+pub(crate) fn staging(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
+    if v.len() < n {
+        v.resize(n, 0.0);
+    } else {
+        v.truncate(n);
+    }
+    v.as_mut_slice()
+}
+
+/// `f16::to_f32` of every element of `src` into `dst` (the shorter length).
+pub(crate) fn widen_f16_into(features: &CpuFeatures, src: &[f16], dst: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    if features.neon_baseline {
+        let n = src.len().min(dst.len());
+        if let (Some(s), Some(d)) = (src.get(..n), dst.get_mut(..n)) {
+            // SAFETY: NEON is part of the aarch64 baseline; the lengths are equal.
+            unsafe { edgefirst_kernels::prim::neon_convert::widen_f16_to_f32_neon(s, d) };
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = features;
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = s.to_f32();
+    }
+}
+
 /// Zero-copy view returned to the caller; borrows from the decoder's buffers.
 #[derive(Debug)]
 #[allow(dead_code)] // Consumed by Task 24's decoder integration.
@@ -437,6 +477,35 @@ impl<'a> BufferRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The widen is `f16::to_f32` bit for bit on every tier, NaN payloads included, for
+    /// every f16 and a tail off a vector.
+    #[test]
+    fn widen_is_to_f32_on_every_tier() {
+        let mut src: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+        src.extend((0..7).map(|i| f16::from_bits(0x7c01 + i)));
+        let want: Vec<u32> = src.iter().map(|v| v.to_f32().to_bits()).collect();
+        for tier in ["scalar", "neon", "neon_fp16", "neon_dotprod"] {
+            let Ok(f) = crate::per_scale::kernels::decoder_cpu_features_from(Some(tier)) else {
+                continue;
+            };
+            let mut dst = vec![0f32; src.len()];
+            widen_f16_into(&f, &src, &mut dst);
+            let got: Vec<u32> = dst.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got, want, "{tier}");
+        }
+    }
+
+    /// Scratch storage is cut to the length asked for and keeps its allocation.
+    #[test]
+    fn widen_scratch_reuses_its_storage() {
+        let mut v = Vec::new();
+        assert_eq!(staging(&mut v, 100).len(), 100);
+        let p = v.as_ptr();
+        assert_eq!(staging(&mut v, 40).len(), 40);
+        assert_eq!(staging(&mut v, 100).len(), 100);
+        assert_eq!(v.as_ptr(), p);
+    }
 
     #[test]
     fn buffers_alloc_f32_correct_sizes() {

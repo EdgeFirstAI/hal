@@ -21,7 +21,7 @@ import sys
 import zipfile
 from collections import Counter
 
-EXPECTED = {"tensor", "codec", "image", "decoder", "tracker"}
+EXPECTED = {"tensor", "codec", "image", "decoder", "tracker", "kernels"}
 
 
 def _pkg_from_wheel_name(name: str) -> str:
@@ -110,7 +110,7 @@ def _check_wheel_contents(wheel: pathlib.Path) -> list[str]:
 
 
 def _check_tag_uniformity(wheels: list[pathlib.Path]) -> list[str]:
-    # Tag-set uniformity across the five distributions.
+    # Tag-set uniformity across the distributions.
     #
     # The release builds both abi3-py311 and abi3-py38. If one package fails to
     # produce a cp311-abi3 wheel for some platform while the others succeed, pip

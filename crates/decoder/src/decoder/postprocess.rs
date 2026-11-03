@@ -10,11 +10,13 @@ use num_traits::{AsPrimitive, Float};
 use super::configs::{self};
 use super::{ArrayViewDQuantized, Decoder};
 use crate::{
-    dequantize_ndarray,
+    dequantize_ndarray_on,
+    instance_mask::{dequant_array, Isa},
     modelpack::{
         decode_modelpack_det, decode_modelpack_float, decode_modelpack_split_float,
-        ModelPackDetectionConfig,
+        impl_modelpack_split_boxes, ModelPackDetectionConfig,
     },
+    neon_dispatch::{seg_normalize_array, seg_to_u8_array, SplitDecode},
     yolo::FloatProtoElem,
     yolo::{
         decode_yolo_det, decode_yolo_det_float, decode_yolo_split_det_float,
@@ -29,10 +31,7 @@ macro_rules! dequant_3d {
         with_quantized!($tensor, t, {
             let t = Self::swap_axes_if_needed(t, $config.into());
             let t = t.slice(s![0, .., ..]);
-            t.map(|v| {
-                let val: f32 = v.as_();
-                (val - $quant.zero_point as f32) * $quant.scale
-            })
+            dequant_array(t, $quant, Isa::current()?)
         })
     }};
 }
@@ -41,10 +40,7 @@ macro_rules! dequant_4d {
         with_quantized!($tensor, t, {
             let t = Self::swap_axes_if_needed(t, $config.into());
             let t = t.slice(s![0, .., .., ..]);
-            t.map(|v| {
-                let val: f32 = v.as_();
-                (val - $quant.zero_point as f32) * $quant.scale
-            })
+            dequant_array(t, $quant, Isa::current()?)
         })
     }};
 }
@@ -102,12 +98,13 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
         let (seg, _) = Self::find_outputs_with_shape_quantized(&segmentation.shape, outputs, &[])?;
+        let isa = Isa::current()?;
 
         macro_rules! modelpack_seg {
             ($seg:expr, $body:expr) => {{
                 let seg = Self::swap_axes_if_needed($seg, segmentation.into());
                 let seg = seg.slice(s![0, .., .., ..]);
-                seg.mapv($body)
+                seg_to_u8_array(isa, &seg).unwrap_or_else(|| seg.mapv($body))
             }};
         }
         use ArrayViewDQuantized::*;
@@ -162,13 +159,54 @@ impl Decoder {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let new_outputs = Self::match_outputs_to_detect_quantized(detection, outputs)?;
+        let isa = Isa::current()?;
+
+        let layers: Vec<_> = new_outputs
+            .iter()
+            .zip(detection)
+            .map(|(t, d)| {
+                let anchors = d.anchors.as_ref().map_or(0, Vec::len);
+                with_quantized!(t, t, {
+                    let t = Self::swap_axes_if_needed(t, d.into());
+                    (t.slice(s![0, .., .., ..]).dim(), anchors)
+                })
+            })
+            .collect();
+        if let Some(mut split) = SplitDecode::new(isa, &layers) {
+            let decoded = new_outputs.iter().zip(detection).all(|(t, d)| {
+                let anchors = d.anchors.as_deref().unwrap_or_default();
+                // The scale and bias `dequantize_ndarray` applies.
+                let dequant = d.quantization.map(|q| {
+                    let q = Quantization::from(q);
+                    let (zero_point, scale) = (q.zero_point as f32, q.scale);
+                    (scale, (zero_point != 0.0).then(|| -zero_point * scale))
+                });
+                with_quantized!(t, t, {
+                    let t = Self::swap_axes_if_needed(t, d.into());
+                    split.push(t.slice(s![0, .., .., ..]), anchors, dequant)
+                })
+            });
+            if let Some(decoded) = decoded.then(|| split.finish()).flatten() {
+                return impl_modelpack_split_boxes::<XYWH>(
+                    isa,
+                    decoded,
+                    self.score_threshold,
+                    self.iou_threshold,
+                    self.nms,
+                    self.pre_nms_top_k_for(multi_label),
+                    self.max_det,
+                    multi_label,
+                    output_boxes,
+                );
+            }
+        }
 
         macro_rules! dequant_output {
             ($det_tensor:expr, $detection:expr) => {{
                 let det_tensor = Self::swap_axes_if_needed($det_tensor, $detection.into());
                 let det_tensor = det_tensor.slice(s![0, .., .., ..]);
                 if let Some(q) = $detection.quantization {
-                    dequantize_ndarray(det_tensor, q.into())
+                    dequantize_ndarray_on(isa, det_tensor, q.into())
                 } else {
                     det_tensor.map(|x| *x as f32)
                 }
@@ -188,6 +226,7 @@ impl Decoder {
             .map(|d: &Array3<f32>| d.view())
             .collect::<Vec<_>>();
         decode_modelpack_split_float(
+            isa,
             &new_outputs_view,
             &new_detection,
             self.score_threshold,
@@ -562,7 +601,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError>
     where
-        D: AsPrimitive<f32>,
+        D: AsPrimitive<f32> + Send + Sync + 'static,
     {
         let new_detection = detection
             .iter()
@@ -584,6 +623,7 @@ impl Decoder {
             .collect::<Vec<_>>();
 
         decode_modelpack_split_float(
+            Isa::current()?,
             &new_outputs,
             &new_detection,
             self.score_threshold,
@@ -611,10 +651,15 @@ impl Decoder {
 
         let seg = Self::swap_axes_if_needed(seg, segmentation.into());
         let seg = seg.slice(s![0, .., .., ..]);
-        let u8_max = 255.0_f32.as_();
-        let max = *seg.max().unwrap_or(&u8_max);
-        let min = *seg.min().unwrap_or(&0.0_f32.as_());
-        let seg = seg.mapv(|x| ((x - min) / (max - min) * u8_max).as_());
+        let seg = match seg_normalize_array(Isa::current()?, &seg) {
+            Some((seg, _)) => seg,
+            None => {
+                let u8_max = 255.0_f32.as_();
+                let max = *seg.max().unwrap_or(&u8_max);
+                let min = *seg.min().unwrap_or(&0.0_f32.as_());
+                seg.mapv(|x| ((x - min) / (max - min) * u8_max).as_())
+            }
+        };
         output_masks.push(Segmentation {
             xmin: 0.0,
             ymin: 0.0,
@@ -1356,6 +1401,7 @@ impl Decoder {
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
 
                 crate::yolo::extract_proto_data_quant(
+                    Isa::current()?,
                     det_indices,
                     mask_tensor,
                     quant_masks,
@@ -1491,6 +1537,7 @@ impl Decoder {
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
 
                 crate::yolo::extract_proto_data_quant(
+                    Isa::current()?,
                     det_indices,
                     mask_tensor,
                     quant_masks,
@@ -2414,7 +2461,7 @@ impl Decoder {
             classes,
             self.score_threshold,
             self.max_det,
-        );
+        )?;
 
         // No NMS — model output is already post-NMS
         Ok(Self::finish_tracked_yolo_segdet_with_masks(
@@ -2526,7 +2573,7 @@ impl Decoder {
             classes,
             self.score_threshold,
             self.max_det,
-        );
+        )?;
 
         // No NMS — model output is already post-NMS
         Ok(Self::finish_tracked_yolo_segdet_with_masks(
@@ -2658,7 +2705,7 @@ impl Decoder {
             classes,
             self.score_threshold,
             self.max_det,
-        );
+        )?;
 
         Ok(Self::finish_tracked_yolo_segdet_with_masks(
             tracker,
@@ -2804,7 +2851,7 @@ impl Decoder {
             classes,
             self.score_threshold,
             self.max_det,
-        );
+        )?;
 
         Ok(Self::finish_tracked_yolo_segdet_with_masks(
             tracker,
@@ -2876,6 +2923,7 @@ impl Decoder {
         let mut output_masks: Vec<Segmentation> = Vec::new();
         let output_masks = &mut output_masks;
 
+        let isa = Isa::current()?;
         let protos = process_tracked_yolo_segmentation!(
             self,
             tracker,
@@ -2888,6 +2936,7 @@ impl Decoder {
             output_tracks,
             |new_boxes, mask_tensor, quant_masks, protos_tensor, quant_protos, output_boxes, _| {
                 extract_proto_data_quant(
+                    isa,
                     new_boxes,
                     mask_tensor,
                     quant_masks,
@@ -2918,6 +2967,7 @@ impl Decoder {
         let mut output_masks: Vec<Segmentation> = Vec::new();
         let output_masks = &mut output_masks;
 
+        let isa = Isa::current()?;
         let proto = process_tracked_yolo_segmentation_split!(
             self,
             tracker,
@@ -2932,6 +2982,7 @@ impl Decoder {
             output_tracks,
             |new_boxes, mask_t, quant_masks, protos_t, quant_protos, output_boxes, _| {
                 crate::yolo::extract_proto_data_quant(
+                    isa,
                     new_boxes,
                     mask_t,
                     quant_masks,
@@ -3152,6 +3203,7 @@ impl Decoder {
         let mut output_masks: Vec<Segmentation> = Vec::new();
         let output_masks = &mut output_masks;
 
+        let isa = Isa::current()?;
         let proto = process_tracked_yolo_segmentation_2way!(
             self,
             tracker,
@@ -3165,6 +3217,7 @@ impl Decoder {
             output_tracks,
             |new_boxes, mask_t, quant_masks, protos_t, quant_protos, output_boxes, _| {
                 extract_proto_data_quant(
+                    isa,
                     new_boxes,
                     mask_t,
                     quant_masks,

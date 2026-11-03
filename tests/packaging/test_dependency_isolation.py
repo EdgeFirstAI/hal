@@ -1,4 +1,4 @@
-"""Isolation of the five libraries: Rust crates via cargo tree, Python
+"""Isolation of the libraries: Rust crates via cargo tree, Python
 wheels via the DT_NEEDED / otool of the installed extension.
 
 A coupling can be re-added by one unconditional reference and shrink to
@@ -45,6 +45,7 @@ INTERNAL = (
     "edgefirst-image",
     "edgefirst-decoder",
     "edgefirst-tracker",
+    "edgefirst-kernels",
 )
 
 CARGO_TREE = [
@@ -126,6 +127,7 @@ SIBLING_C_LIBS = (
     "libedgefirst_image",
     "libedgefirst_decoder",
     "libedgefirst_tracker",
+    "libedgefirst_kernels",
 )
 
 
@@ -253,16 +255,23 @@ def test_python_wheel_dt_needed_libedgefirst_tensor(leaf):
     )
 
 
-def test_tracker_wheel_does_not_link_tensor():
-    """Tracker detections cross as a plain array; _tracker.so must not
-    DT_NEEDED libedgefirst_tensor.
+@pytest.mark.parametrize("leaf", ["tracker", "kernels"])
+def test_tensor_free_wheel_does_not_link_tensor(leaf):
+    """Tracker detections cross as a plain array and kernels read borrowed
+    numpy buffers, so neither extension may DT_NEEDED libedgefirst_tensor.
     """
-    so = _wheel_extension("tracker")
+    so = _wheel_extension(leaf)
     assert not _links_libedgefirst_tensor(so), (
         f"{so} unexpectedly links libedgefirst_tensor"
     )
     siblings = _embedded_sibling_c_libs(so)
     assert not siblings, f"{so} dynamically links sibling C libraries {siblings}"
+
+
+@needs_cargo
+def test_kernels_crate_links_no_other_hal_crate():
+    """edgefirst-kernels sits at the bottom of the graph; a sibling edge would pull tensor into every kernels consumer."""
+    assert links("edgefirst-kernels") == {"edgefirst-kernels"}
 
 
 # `edgefirst-tensor`'s optional features.

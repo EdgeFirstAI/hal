@@ -6,61 +6,56 @@
 //! materialisation).
 //!
 //! The downstream NMS and mask kernels are f32-native, so this layer is
-//! responsible for widening `DecodeDtype::F16` outputs to f32. The widen
-//! is hybrid:
+//! responsible for widening `DecodeDtype::F16` outputs to f32:
 //!
 //! - **`DecodeDtype::F32`** (default): zero-copy. The widened views
-//!   borrow directly from the per-scale buffers — no allocation, no
-//!   memcpy. For a yolov8-seg model that's ~7 MB/decode of allocation
-//!   we used to do unconditionally.
-//! - **`DecodeDtype::F16`**: allocate-and-convert. There is no f32
-//!   storage to borrow; we materialise into a fresh `Vec<f32>` (or
-//!   `Array3<f32>`) for each decode. A future revision can hoist these
-//!   buffers into the [`crate::per_scale::PerScaleDecoder`] for reuse
-//!   across calls.
+//!   borrow directly from the per-scale buffers.
+//! - **`DecodeDtype::F16`**: widen into the decoder's
+//!   [`WidenScratch`], whose storage is reused frame to frame, on NEON
+//!   where the plan's CPU features allow it.
 
-use std::borrow::Cow;
-
-use ndarray::{Array3, ArrayView2, ArrayView3, Axis};
+use ndarray::{ArrayView2, ArrayView3, Axis};
 use tracing::trace_span;
 
-use crate::per_scale::outputs::{BufferRef, DecodedOutputsRef, ProtosView};
+use crate::per_scale::kernels::CpuFeatures;
+use crate::per_scale::outputs::{
+    staging, widen_f16_into, BufferRef, DecodedOutputsRef, ProtosView, WidenScratch,
+};
 use crate::yolo::{
     extract_proto_data_float, impl_yolo_segdet_get_boxes, impl_yolo_split_segdet_process_masks,
 };
 use crate::{DecoderError, DetectBox, Nms, ProtoData, Segmentation, XYWH};
 
-/// f32 protos: borrowed view (zero-copy) or owned array (f16→f32 widen).
-enum ProtosF32<'a> {
-    Borrowed(ArrayView3<'a, f32>),
-    Owned(Array3<f32>),
-}
-
-impl ProtosF32<'_> {
-    fn view(&self) -> ArrayView3<'_, f32> {
-        match self {
-            Self::Borrowed(v) => v.reborrow(),
-            Self::Owned(a) => a.view(),
-        }
-    }
-}
-
 /// f32-typed views of the per-scale outputs ready for the legacy NMS/mask
-/// kernels. Each field is either a zero-copy borrow (the per-scale path
-/// already produced f32) or a freshly-widened owned buffer (the per-scale
-/// path produced f16). Boxes are in `(xc, yc, w, h)` order — see
-/// `per_scale::kernels::box_primitives::dist2bbox_anchor_f32`.
+/// kernels, borrowed from the per-scale buffers (f32 outputs) or from the
+/// widen scratch (f16 outputs). Boxes are in `(xc, yc, w, h)` order — see
+/// `edgefirst_kernels::prim::box_primitives::dist2bbox_anchor_f32`.
 struct WidenedF32<'a> {
-    boxes: Cow<'a, [f32]>,
-    scores: Cow<'a, [f32]>,
-    mask_coefs: Option<Cow<'a, [f32]>>,
-    protos: Option<ProtosF32<'a>>,
+    boxes: &'a [f32],
+    scores: &'a [f32],
+    mask_coefs: Option<&'a [f32]>,
+    protos: Option<ArrayView3<'a, f32>>,
     n: usize,
     nc: usize,
     nm: usize,
 }
 
-fn widen_to_f32<'a>(decoded: &'a DecodedOutputsRef<'a>) -> WidenedF32<'a> {
+/// `buf` as f32: borrowed, or widened into `store`.
+fn widen_buffer<'a>(f: &CpuFeatures, buf: &BufferRef<'a>, store: &'a mut Vec<f32>) -> &'a [f32] {
+    match buf {
+        BufferRef::F32(s) => s,
+        BufferRef::F16(s) => {
+            let out = staging(store, s.len());
+            widen_f16_into(f, s, out);
+            out
+        }
+    }
+}
+
+fn widen_to_f32<'a>(
+    decoded: &'a DecodedOutputsRef<'a>,
+    scratch: &'a mut WidenScratch,
+) -> Result<WidenedF32<'a>, DecoderError> {
     // Trace stage so the f32 zero-copy vs f16 widen split is visible to
     // callers profiling decode latency. The `kind` attribute also makes
     // it easy to spot accidental f16 selection on f32-only hardware.
@@ -70,39 +65,52 @@ fn widen_to_f32<'a>(decoded: &'a DecodedOutputsRef<'a>) -> WidenedF32<'a> {
     };
     let _span = trace_span!("decoder.per_scale_run.widen_f32", kind = kind).entered();
 
-    let n = decoded.total_anchors;
-    let nc = decoded.num_classes;
-    let nm = decoded.num_mask_coefs;
-
-    let boxes: Cow<'a, [f32]> = match &decoded.boxes {
-        BufferRef::F32(s) => Cow::Borrowed(*s),
-        BufferRef::F16(s) => Cow::Owned(s.iter().map(|v| v.to_f32()).collect()),
-    };
-    let scores: Cow<'a, [f32]> = match &decoded.scores {
-        BufferRef::F32(s) => Cow::Borrowed(*s),
-        BufferRef::F16(s) => Cow::Owned(s.iter().map(|v| v.to_f32()).collect()),
-    };
-    let mask_coefs = decoded.mask_coefs.as_ref().map(|b| match b {
-        BufferRef::F32(s) => Cow::Borrowed(*s),
-        BufferRef::F16(s) => Cow::Owned(s.iter().map(|v| v.to_f32()).collect()),
-    });
+    let WidenScratch {
+        features,
+        boxes: boxes_store,
+        scores: scores_store,
+        mask_coefs: mc_store,
+        protos: protos_store,
+    } = scratch;
+    let f = *features;
+    let boxes = widen_buffer(&f, &decoded.boxes, boxes_store);
+    let scores = widen_buffer(&f, &decoded.scores, scores_store);
+    let mask_coefs = decoded
+        .mask_coefs
+        .as_ref()
+        .map(|b| widen_buffer(&f, b, mc_store));
     // Protos are `Array4<F>` shape `[1, H, W, NM]` (NHWC). The legacy
     // yolo path expects `ArrayView3<PROTO>` of shape `(H, W, NM)`, so
     // drop the leading batch axis.
-    let protos = decoded.protos.as_ref().map(|p| match p {
-        ProtosView::F32(a) => ProtosF32::Borrowed(a.index_axis(Axis(0), 0)),
-        ProtosView::F16(a) => ProtosF32::Owned(a.index_axis(Axis(0), 0).mapv(|v| v.to_f32())),
-    });
+    let protos = match decoded.protos.as_ref() {
+        None => None,
+        Some(ProtosView::F32(a)) => Some(a.index_axis(Axis(0), 0)),
+        Some(ProtosView::F16(a)) => {
+            let v = a.index_axis(Axis(0), 0);
+            let out = staging(protos_store, v.len());
+            match v.as_slice() {
+                Some(s) => widen_f16_into(&f, s, out),
+                None => {
+                    for (o, x) in out.iter_mut().zip(v.iter()) {
+                        *o = x.to_f32();
+                    }
+                }
+            }
+            let view = ArrayView3::from_shape(v.raw_dim(), &*out)
+                .map_err(|e| DecoderError::Internal(format!("per_scale protos view: {e}")))?;
+            Some(view)
+        }
+    };
 
-    WidenedF32 {
+    Ok(WidenedF32 {
         boxes,
         scores,
         mask_coefs,
         protos,
-        n,
-        nc,
-        nm,
-    }
+        n: decoded.total_anchors,
+        nc: decoded.num_classes,
+        nm: decoded.num_mask_coefs,
+    })
 }
 
 /// Bridge: per-scale outputs → optional `ProtoData`, with `output_boxes`
@@ -110,6 +118,7 @@ fn widen_to_f32<'a>(decoded: &'a DecodedOutputsRef<'a>) -> WidenedF32<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn per_scale_to_proto_data<'a>(
     decoded: &'a DecodedOutputsRef<'a>,
+    widen: &'a mut WidenScratch,
     output_boxes: &mut Vec<DetectBox>,
     iou_threshold: f32,
     score_threshold: f32,
@@ -121,14 +130,14 @@ pub(super) fn per_scale_to_proto_data<'a>(
     multi_label: bool,
 ) -> Result<Option<ProtoData>, DecoderError> {
     let _span = trace_span!("decoder.decode_proto.per_scale_to_proto_data").entered();
-    let widened = widen_to_f32(decoded);
+    let widened = widen_to_f32(decoded, widen)?;
     let n = widened.n;
     let nc = widened.nc;
     let nm = widened.nm;
 
-    let boxes_view = ArrayView2::<f32>::from_shape((n, 4), widened.boxes.as_ref())
+    let boxes_view = ArrayView2::<f32>::from_shape((n, 4), widened.boxes)
         .map_err(|e| DecoderError::Internal(format!("per_scale boxes view: {e}")))?;
-    let scores_view = ArrayView2::<f32>::from_shape((n, nc), widened.scores.as_ref())
+    let scores_view = ArrayView2::<f32>::from_shape((n, nc), widened.scores)
         .map_err(|e| DecoderError::Internal(format!("per_scale scores view: {e}")))?;
 
     output_boxes.clear();
@@ -151,12 +160,11 @@ pub(super) fn per_scale_to_proto_data<'a>(
     // canonical [0, 1] range expected by Decoder callers.
     crate::yolo::maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
-    match (widened.mask_coefs.as_ref(), widened.protos.as_ref()) {
-        (Some(mc), Some(pr)) => {
+    match (widened.mask_coefs, widened.protos) {
+        (Some(mc), Some(pr_view)) => {
             let _s = trace_span!("decoder.decode_proto.per_scale_to_proto_data.extract").entered();
-            let mc_view = ArrayView2::<f32>::from_shape((n, nm), mc.as_ref())
+            let mc_view = ArrayView2::<f32>::from_shape((n, nm), mc)
                 .map_err(|e| DecoderError::Internal(format!("per_scale mc view: {e}")))?;
-            let pr_view = pr.view();
             let proto_data = extract_proto_data_float(det_indices, mc_view, pr_view, output_boxes);
             Ok(Some(proto_data))
         }
@@ -176,6 +184,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn per_scale_to_masks<'a>(
     decoded: &'a DecodedOutputsRef<'a>,
+    widen: &'a mut WidenScratch,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
     iou_threshold: f32,
@@ -188,14 +197,14 @@ pub(super) fn per_scale_to_masks<'a>(
     multi_label: bool,
 ) -> Result<(), DecoderError> {
     let _span = trace_span!("decoder.decode.per_scale_to_masks").entered();
-    let widened = widen_to_f32(decoded);
+    let widened = widen_to_f32(decoded, widen)?;
     let n = widened.n;
     let nc = widened.nc;
     let nm = widened.nm;
 
-    let boxes_view = ArrayView2::<f32>::from_shape((n, 4), widened.boxes.as_ref())
+    let boxes_view = ArrayView2::<f32>::from_shape((n, 4), widened.boxes)
         .map_err(|e| DecoderError::Internal(format!("per_scale boxes view: {e}")))?;
-    let scores_view = ArrayView2::<f32>::from_shape((n, nc), widened.scores.as_ref())
+    let scores_view = ArrayView2::<f32>::from_shape((n, nc), widened.scores)
         .map_err(|e| DecoderError::Internal(format!("per_scale scores view: {e}")))?;
 
     output_boxes.clear();
@@ -220,12 +229,11 @@ pub(super) fn per_scale_to_masks<'a>(
     // (EDGEAI-1303 + Copilot review feedback on PR #63).
     crate::yolo::maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
-    match (widened.mask_coefs.as_ref(), widened.protos.as_ref()) {
-        (Some(mc), Some(pr)) => {
+    match (widened.mask_coefs, widened.protos) {
+        (Some(mc), Some(pr_view)) => {
             let _s = trace_span!("decoder.decode.per_scale_to_masks.process_masks").entered();
-            let mc_view = ArrayView2::<f32>::from_shape((n, nm), mc.as_ref())
+            let mc_view = ArrayView2::<f32>::from_shape((n, nm), mc)
                 .map_err(|e| DecoderError::Internal(format!("per_scale mc view: {e}")))?;
-            let pr_view = pr.view();
             impl_yolo_split_segdet_process_masks(
                 det_indices,
                 mc_view,

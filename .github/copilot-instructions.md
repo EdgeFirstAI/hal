@@ -4,8 +4,8 @@ Process, CI tiers, release chain, and runner policy live in the canonical
 [EdgeFirstAI/.github copilot-instructions](https://github.com/EdgeFirstAI/.github/blob/main/.github/copilot-instructions.md).
 This file keeps only HAL-specific workspace, testing, and platform notes.
 
-**Version:** 1.8
-**Last Updated:** October 2026
+**Version:** 1.9
+**Last Updated:** November 2026
 
 ---
 
@@ -32,6 +32,7 @@ crates/
 ├── image/          # Hardware-accelerated image processing (GL / G2D / CPU)
 ├── decoder/        # YOLO and model output decoding
 ├── tracker/        # Object tracking algorithms
+├── kernels/        # Framework-neutral CPU kernels (softmax, sigmoid, LUT, DFL); no tensor dep
 ├── tensor-abi/     # Layout-only C types for tensors
 ├── decoder-abi/    # Layout-only C types for detections (detect.h)
 ├── tensor-ffi/     # Declarations-only extern "C" to libedgefirst_tensor.so
@@ -41,12 +42,14 @@ crates/
 ├── image-capi/     # cdylib: libedgefirst_image.so (workspace-excluded)
 ├── decoder-capi/   # cdylib: libedgefirst_decoder.so (workspace-excluded)
 ├── tracker-capi/   # cdylib: libedgefirst_tracker.so (workspace-excluded)
+├── kernels-capi/   # cdylib: libedgefirst_kernels.so (workspace-excluded)
 ├── python-common/  # Shared PyO3 binding code (rlib)
 ├── python-tensor/  # edgefirst.tensor wheel
 ├── python-codec/   # edgefirst.codec wheel
 ├── python-image/   # edgefirst.image wheel
 ├── python-decoder/ # edgefirst.decoder wheel
 ├── python-tracker/ # edgefirst.tracker wheel
+├── python-kernels/ # edgefirst.kernels wheel
 ├── egl/            # Vendored khronos-egl fork (dynamic loading)
 ├── gl/             # Vendored trimmed GLES bindings
 ├── bench/          # Shared benchmark harness + testdata helpers
@@ -92,6 +95,7 @@ All public APIs return `Result<T, E>` with specific error types:
 - `TensorError` for tensor operations
 - `ImageError` for image processing
 - `DecoderError` for model decoding
+- `KernelError` for kernel plans (`InvalidArgument`, `Unsupported`, `ForcedTierUnavailable`)
 
 ### Hardware Acceleration Pattern
 
@@ -138,7 +142,7 @@ cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release --workspace
 cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
     --workspace --exclude edgefirst-python-tensor --exclude edgefirst-python-codec \
     --exclude edgefirst-python-image --exclude edgefirst-python-decoder \
-    --exclude edgefirst-python-tracker
+    --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
 
 # Run tests on target hardware (after scp to the device)
 ssh <target> 'cd /tmp/hal-tests && ./edgefirst_image-<hash> --test-threads=1'
@@ -209,7 +213,7 @@ This runs, in order:
    cargo check --features opengl,ndarray --workspace \
        --exclude edgefirst-python-common --exclude edgefirst-python-tensor \
        --exclude edgefirst-python-codec --exclude edgefirst-python-image \
-       --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker
+       --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
    ```
 
    **The excludes are load-bearing — do not "simplify" them away.** The
@@ -281,6 +285,9 @@ cargo bench -p edgefirst_image
 3. Update format conversion logic in `crates/image/src/cpu/` (convert.rs, mod.rs dispatch tables)
 4. Add G2D support (if hardware supports it) — update `pixelfmt_to_fourcc()` in g2d.rs
 5. Add CPU fallback and Python tests
+
+**Adding a Kernel Operator:**
+Follow the seven-step recipe in [`crates/kernels/ARCHITECTURE.md` § Adding an operator](../crates/kernels/ARCHITECTURE.md#adding-an-operator): portable kernel, NEON tiers with a parity test, plan type, TFLite fixture, C entry points, Python class and stub, benchmark and docs. `run` never allocates, locks or touches the global rayon pool; bad input is a `KernelError`, never a panic.
 
 ### Code Style
 
@@ -428,6 +435,8 @@ MUST update the affected documents to stay in sync with the implementation.
 | [`crates/image/ARCHITECTURE.md`](../crates/image/ARCHITECTURE.md) | GL/G2D/CPU backend chain, `GlPlatform` porting seam (Linux / macOS-ANGLE / Android), EGL image cache, zero-copy telemetry counters, `GL_MUTEX`, Vivante workarounds, shutdown safety |
 | [`crates/decoder/ARCHITECTURE.md`](../crates/decoder/ARCHITECTURE.md) | Model-type selection, `dshape` contract, per-scale framework, fused proto path, NMS modes |
 | [`crates/tracker/ARCHITECTURE.md`](../crates/tracker/ARCHITECTURE.md) | ByteTrack two-pass association, Kalman state, `DetectionBox` trait |
+| [`crates/kernels/ARCHITECTURE.md`](../crates/kernels/ARCHITECTURE.md) | Plan/run contract, strided views, `Pool`, CPU tiers, numerics per op, adding an operator |
+| [`crates/kernels-capi/ARCHITECTURE.md`](../crates/kernels-capi/ARCHITECTURE.md) | Kernel C ABI: `ef_kernel_view`, plan handles, errno, no sibling `DT_NEEDED` |
 | [`crates/tensor-capi/ARCHITECTURE.md`](../crates/tensor-capi/ARCHITECTURE.md) | Opaque-handle C ABI; siblings link `libedgefirst_tensor.so` |
 | [`crates/python-common/ARCHITECTURE.md`](../crates/python-common/ARCHITECTURE.md) | PyO3 bindings; extensions link one `libedgefirst_tensor.so` |
 | [`crates/python-common/ARCHITECTURE.md`](../crates/python-common/ARCHITECTURE.md) | PyO3 bindings, numpy 3-path copy strategy, abi3 wheels |
@@ -442,6 +451,7 @@ MUST update the affected documents to stay in sync with the implementation.
 | [`crates/image/TESTING.md`](../crates/image/TESTING.md) | GL gating via OnceLock probe, G2D gating on `/dev/galcore`, fp16 benchmarks |
 | [`crates/decoder/TESTING.md`](../crates/decoder/TESTING.md) | Builder/segmentation/parity tests, per-scale NEON kernel tests, integration suites |
 | [`crates/tracker/TESTING.md`](../crates/tracker/TESTING.md) | ByteTrack association tests, Kalman filter math |
+| [`crates/kernels/TESTING.md`](../crates/kernels/TESTING.md) | TFLite fixture parity, forced-tier matrix, view/pool/concurrency tests, `kernels_benchmark` |
 | [`crates/tensor-capi/`](../crates/tensor-capi/) | C-side integration suite per modular library |
 | [`crates/python-common/TESTING.md`](../crates/python-common/TESTING.md) | maturin develop workflow, pytest/slipcover coverage |
 
@@ -526,6 +536,7 @@ See [README.md § Benchmarking](../README.md#benchmarking) for full instructions
 | `mask_benchmark` | `edgefirst-image` | Mask rendering paths (GL, CPU, hybrid) |
 | `image_benchmark` | `edgefirst-image` | JPEG loading, convert, and resize operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequantization |
+| `kernels_benchmark` | `edgefirst-kernels` | Softmax i8/i16, sigmoid and fused DFL+box decode per CPU tier |
 | `opencv_benchmark` | `edgefirst-image` | Cross-library comparison (requires `--features opencv`) |
 
 The standalone `benchmarks/` workspace (excluded from the root workspace and CI
@@ -535,7 +546,7 @@ arms `hal_v4l2_gl`, `hal_v4l2_cpu`, `hal_nvjpeg` and the `hal_gl`/`hal_g2d`
 pipeline arms — see `benchmarks/README.md` for the module map, protocol rules,
 and corpus tooling.
 
-**Key env vars:** `EDGEFIRST_FORCE_BACKEND={cpu,opengl,g2d}`, `EDGEFIRST_FORCE_TRANSFER=pbo`
+**Key env vars:** `EDGEFIRST_FORCE_BACKEND={cpu,opengl,g2d}`, `EDGEFIRST_FORCE_TRANSFER=pbo`, `EDGEFIRST_KERNELS_FORCE_TIER={scalar,neon,neon_fp16,neon_dotprod}`
 
 **JSON convention:** `benchmarks/<platform>/<name>.json` (platforms: `imx8mp-frdm`, `imx95-frdm`, `rpi5-hailo`, `x86-desktop`)
 

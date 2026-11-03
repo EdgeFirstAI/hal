@@ -36,6 +36,8 @@ decoder = ["tensor", "dep:edgefirst-decoder", "dep:edgefirst-decoder-abi"]
 # Tracker consumes plain boxes; it does not enable tensor, so _tracker.so
 # has no DT_NEEDED on libedgefirst_tensor.
 tracker = ["dep:edgefirst-tracker"]
+# Kernels operate on borrowed numpy buffers; like tracker, no tensor.
+kernels = ["dep:edgefirst-kernels"]
 abi3-py38 = ["pyo3/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311"]
 
@@ -50,6 +52,7 @@ edgefirst-image = { workspace = true, optional = true, default-features = false,
 # `model-files` reads model configs from ZIP trailers (TFLite associated files).
 edgefirst-decoder = { workspace = true, optional = true, default-features = false, features = ["model-files"] }
 edgefirst-decoder-abi = { workspace = true, optional = true }
+edgefirst-kernels = { workspace = true, optional = true }
 edgefirst-tracker = { workspace = true, optional = true, default-features = false }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }

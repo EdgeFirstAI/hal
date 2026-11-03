@@ -182,15 +182,8 @@ pub(crate) fn resolve_bindings<'a>(
     Ok(FrameBindings { levels, protos })
 }
 
-use crate::per_scale::kernels::dfl_lut::DflExpTable;
+use crate::per_scale::kernels::dispatch::TransposeDispatch;
 use crate::per_scale::kernels::dispatch::{DstSliceMut, InputView};
-use crate::per_scale::kernels::level_box::{
-    decode_box_level_dfl_i16_to_f16_per_channel, decode_box_level_dfl_i16_to_f32_per_channel,
-    decode_box_level_dfl_i8_to_f16_per_channel, decode_box_level_dfl_i8_to_f32_per_channel,
-    decode_box_level_dfl_u16_to_f16_per_channel, decode_box_level_dfl_u16_to_f32_per_channel,
-    decode_box_level_dfl_u8_to_f16_per_channel, decode_box_level_dfl_u8_to_f32_per_channel,
-};
-use crate::per_scale::kernels::transpose::nchw_to_nhwc;
 use crate::per_scale::outputs::{
     boxes_level_slice_of, mask_coefs_level_slice_of, scores_level_slice_of, Buffer, BufferRef,
     DecodedOutputBuffers, DecodedOutputsRef, ProtoStorage, ProtosView,
@@ -199,6 +192,7 @@ use crate::per_scale::plan::Layout;
 use crate::per_scale::prefilter::{
     gather_rows, raw_score_floor, select_anchors, LevelScratch, PACK_ANCHORS,
 };
+use edgefirst_kernels::prim::dfl_lut::DflExpTable;
 use edgefirst_tensor::{CpuAccess, TensorMapTrait, TensorTrait};
 
 /// Run the per-scale decode pipeline for one frame's inputs. Writes
@@ -293,6 +287,7 @@ pub(crate) fn run<'a>(
                 w,
                 c,
                 layout_scratch,
+                plan.transpose,
                 |input| proto_dispatch.run(input, q, dst),
             )?;
         } else {
@@ -330,57 +325,6 @@ fn update_dfl_tables(
     Ok(())
 }
 
-/// Dispatch the per-channel DFL kernel for the given `(input, dst)` dtype pair.
-/// Does NOT use `BoxLevelDispatch` (which carries only per-tensor `Quantization`).
-/// Only integer input types are matched — float inputs fall through to a
-/// `KernelDispatchUnreachable` error because NPUs never emit per-channel quant
-/// on float outputs.
-fn dispatch_dfl_per_channel(
-    input: InputView<'_>,
-    scales: &[f32],
-    zps: &[i32],
-    level: &crate::per_scale::plan::LevelPlan,
-    dst: DstSliceMut<'_>,
-) -> DecoderResult<()> {
-    match (input, dst) {
-        (InputView::I8(i), DstSliceMut::F32(d)) => {
-            decode_box_level_dfl_i8_to_f32_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        (InputView::U8(i), DstSliceMut::F32(d)) => {
-            decode_box_level_dfl_u8_to_f32_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        (InputView::I16(i), DstSliceMut::F32(d)) => {
-            decode_box_level_dfl_i16_to_f32_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        (InputView::U16(i), DstSliceMut::F32(d)) => {
-            decode_box_level_dfl_u16_to_f32_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        (InputView::I8(i), DstSliceMut::F16(d)) => {
-            decode_box_level_dfl_i8_to_f16_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        (InputView::U8(i), DstSliceMut::F16(d)) => {
-            decode_box_level_dfl_u8_to_f16_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        (InputView::I16(i), DstSliceMut::F16(d)) => {
-            decode_box_level_dfl_i16_to_f16_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        (InputView::U16(i), DstSliceMut::F16(d)) => {
-            decode_box_level_dfl_u16_to_f16_per_channel(i, scales, zps, level, d);
-            Ok(())
-        }
-        _ => Err(DecoderError::KernelDispatchUnreachable(
-            "dispatch_dfl_per_channel: float inputs do not support per-channel quant".into(),
-        )),
-    }
-}
-
 /// Run the box kernel for one level, choosing the per-channel DFL kernel
 /// when the box tensor carries per-channel quantization.
 fn run_box_kernel(
@@ -394,7 +338,7 @@ fn run_box_kernel(
 ) -> DecoderResult<()> {
     if plan.box_encoding == crate::schema::BoxEncoding::Dfl {
         if let Some((scales, zps)) = box_per_channel_quant_from_tensor(boxes, li)? {
-            return dispatch_dfl_per_channel(input, scales, zps, level, dst);
+            return plan.box_per_channel.run(input, scales, zps, level, dst);
         }
     }
     let q = quant_from_tensor(boxes, "boxes", li)?;
@@ -422,7 +366,6 @@ fn run_levels_prefiltered(
     if buffers.prefilter.len() != plan.levels.len() {
         buffers.prefilter = plan.levels.iter().map(LevelScratch::for_level).collect();
     }
-    let mut floors = Vec::with_capacity(bind.levels.len());
     for (li, lvl_bind) in bind.levels.iter().enumerate() {
         let dtype = lvl_bind.scores.dtype();
         if !matches!(dtype, DType::I8 | DType::U8 | DType::I16 | DType::U16) {
@@ -439,7 +382,7 @@ fn run_levels_prefiltered(
             threshold,
         )?;
         match floor {
-            Some(floor) => floors.push((q, floor)),
+            Some(floor) => buffers.prefilter[li].frame_floor = (q, floor),
             None => return Ok(None),
         }
     }
@@ -473,7 +416,7 @@ fn run_levels_prefiltered(
     for (li, lvl_bind) in bind.levels.iter().enumerate() {
         let lvl = &plan.levels[li];
         let scratch = &mut prefilter[li];
-        let (score_q, floor) = floors[li];
+        let (score_q, floor) = scratch.frame_floor;
         let body = scratch.body;
         let tail = scratch.tail.w;
         let _level_span = tracing::trace_span!(
@@ -494,8 +437,15 @@ fn run_levels_prefiltered(
             lvl.w,
             nc,
             layout_scratch,
+            plan.transpose,
             |input| {
-                select_anchors(&input.slice(0..body * nc), nc, floor, &mut scratch.anchors)?;
+                select_anchors(
+                    &input.slice(0..body * nc),
+                    nc,
+                    floor,
+                    &mut scratch.anchors,
+                    &plan.cpu_features,
+                )?;
                 let kept = scratch.pack(lvl);
                 if kept > 0 {
                     let packed = gather_rows(&input, nc, &scratch.anchors, &mut scratch.scores);
@@ -541,6 +491,7 @@ fn run_levels_prefiltered(
             lvl.w,
             box_channels,
             layout_scratch,
+            plan.transpose,
             |input| {
                 if kept > 0 {
                     let packed =
@@ -573,6 +524,7 @@ fn run_levels_prefiltered(
                     lvl.w,
                     nm,
                     layout_scratch,
+                    plan.transpose,
                     |input| {
                         if kept > 0 {
                             let packed =
@@ -658,7 +610,8 @@ fn run_levels_sequential(
                             lvl.w,
                             box_channels,
                             layout_scratch,
-                            |input| dispatch_dfl_per_channel(input, scales, zps, lvl, dst),
+                            plan.transpose,
+                            |input| plan.box_per_channel.run(input, scales, zps, lvl, dst),
                         )?;
                     }
                     None => {
@@ -673,6 +626,7 @@ fn run_levels_sequential(
                             lvl.w,
                             box_channels,
                             layout_scratch,
+                            plan.transpose,
                             |input| plan.box_dispatch.run(input, q, lvl, tables.get(li), dst),
                         )?;
                     }
@@ -688,6 +642,7 @@ fn run_levels_sequential(
                     lvl.w,
                     box_channels,
                     layout_scratch,
+                    plan.transpose,
                     |input| plan.box_dispatch.run(input, q, lvl, tables.get(li), dst),
                 )?;
             }
@@ -710,6 +665,7 @@ fn run_levels_sequential(
                 lvl.w,
                 plan.num_classes,
                 layout_scratch,
+                plan.transpose,
                 |input| {
                     plan.score_dispatch.run(
                         input,
@@ -748,6 +704,7 @@ fn run_levels_sequential(
                 lvl.w,
                 num_mc_gt0,
                 layout_scratch,
+                plan.transpose,
                 |input| mc_dispatch.run(input, q, num_mc_gt0, lvl, dst),
             )?;
         }
@@ -1028,10 +985,8 @@ fn box_channel_count_for_level(lvl: &crate::per_scale::plan::LevelPlan) -> usize
 /// `layout_scratch` and pass an NHWC `InputView` over the scratch to
 /// the closure. NHWC inputs pass through unchanged (zero overhead).
 ///
-/// The transpose runs the scalar `nchw_to_nhwc` helper from
-/// `kernels::transpose`; NEON tile-transpose can lift the
-/// `tiled_proto_transpose_nchw_to_nhwc` pattern from `main`'s mask
-/// pipeline as a drop-in replacement.
+/// The transpose is the plan's [`TransposeDispatch`]: NEON on NEON tiers, the element loop on
+/// the scalar tier.
 #[allow(clippy::too_many_arguments)]
 fn with_mapped_or_transposed_input<F>(
     t: &TensorDyn,
@@ -1042,6 +997,7 @@ fn with_mapped_or_transposed_input<F>(
     w: usize,
     c: usize,
     scratch: &mut crate::per_scale::outputs::LayoutScratch,
+    transpose: TransposeDispatch,
     f: F,
 ) -> DecoderResult<()>
 where
@@ -1068,7 +1024,7 @@ where
                 )));
             }
             let dst = scratch.$ensure(n);
-            nchw_to_nhwc(src, h, w, c, dst);
+            transpose.run(src, h, w, c, dst);
             f(InputView::$variant(dst))
         }};
     }
@@ -1458,6 +1414,7 @@ mod tests {
             1,
             2,
             &mut scratch,
+            TransposeDispatch::Scalar,
             |_| Ok(()),
         );
         assert!(matches!(r, Err(DecoderError::NotSupported(_))), "{r:?}");

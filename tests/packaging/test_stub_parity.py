@@ -31,7 +31,7 @@ import types
 
 import pytest
 
-PACKAGES = ("tensor", "codec", "image", "decoder", "tracker")
+PACKAGES = ("tensor", "codec", "image", "decoder", "tracker", "kernels")
 
 
 def stub_path(pkg: str) -> pathlib.Path:

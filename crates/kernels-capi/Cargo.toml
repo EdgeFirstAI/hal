@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-kernels-capi"
+description = "C API for EdgeFirst quantized compute kernels"
+version = "0.38.2"
+edition = "2021"
+rust-version = "1.94.0"
+authors = ["Au-Zone Technologies <support@au-zone.com>"]
+homepage = "https://edgefirst.ai"
+repository = "https://github.com/EdgeFirstAI/hal"
+license = "Apache-2.0"
+publish = false # C library - distributed via GitHub Releases, not crates.io
+
+[lib]
+# The shipped artifact is libedgefirst_kernels.{a,so,dylib} -- NOT `..._capi`.
+# `rlib` is deliberately absent: it would collide with the edgefirst-kernels
+# crate's own libedgefirst_kernels.rlib, and nothing needs it.
+crate-type = ["staticlib", "cdylib"]
+# Shares its lib name with the library crate it wraps; rustdoc output would collide.
+doc = false
+name = "edgefirst_kernels"
+
+[features]
+default = []
+
+# Kernels operate on caller-owned buffers. This library does not link
+# libedgefirst_tensor, libedgefirst_decoder or any other sibling.
+[dependencies]
+edgefirst-kernels = { version = "0.38.2", path = "../kernels" }
+half = "2.7.1"
+errno = "0.3"
+libc = "0.2.186"
+
+[dev-dependencies]
+safetensors = "0.8.0"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+# Excluded from the workspace (see the root Cargo.toml's [workspace.exclude]
+# comment), so this crate inherits NEITHER the root's [workspace.lints] NOR
+# its [profile.release]/[profile.profiling] -- both are restated here by hand. CONTRIBUTING.md
+# documents why and says to keep this in sync with the root manually.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+
+# Shipped artifacts only (release branches): whole-program LTO in one codegen unit.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = false
+
+# Every test and CI build: release optimisation without the fat-LTO link time.
+[profile.profiling]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+debug = "line-tables-only"
+
+# Standalone package: stops cargo's upward workspace search. The resolver is
+# pinned to match the root workspace's behavior.
+[workspace]
+resolver = "3"

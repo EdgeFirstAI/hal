@@ -86,9 +86,9 @@ pub use infer::{
 };
 
 mod decoder;
+mod instance_mask;
+mod neon_dispatch;
 pub use decoder::*;
-#[cfg(test)]
-mod test_support;
 
 // The detection vocabulary lives in edgefirst-tensor so edgefirst-image can
 // render from it without depending on this crate. Re-exported here so the
@@ -336,6 +336,23 @@ where
     }
 }
 
+impl From<Quantization> for edgefirst_kernels::Quant {
+    /// Converts to the kernels crate's per-tensor quantization.
+    /// # Examples
+    /// ```
+    /// # use edgefirst_decoder::Quantization;
+    /// let quant = edgefirst_kernels::Quant::from(Quantization::new(0.1, -128));
+    /// assert_eq!(quant, edgefirst_kernels::Quant::new(0.1, -128));
+    /// ```
+    #[inline]
+    fn from(q: Quantization) -> Self {
+        Self {
+            scale: q.scale,
+            zero_point: q.zero_point,
+        }
+    }
+}
+
 impl Default for Quantization {
     /// Creates a default Quantization struct with scale 1.0 and zero_point 0
     /// # Examples
@@ -399,6 +416,9 @@ pub struct DetectBoxQuantized<
 /// Dequantizes an ndarray from quantized values to f32 values using the given
 /// quantization parameters
 ///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
+///
 /// # Examples
 /// ```
 /// # use edgefirst_decoder::{dequantize_ndarray, Quantization};
@@ -416,18 +436,36 @@ where
     i32: num_traits::AsPrimitive<F>,
     f32: num_traits::AsPrimitive<F>,
 {
+    dequantize_ndarray_on(neon_dispatch::Isa::current_or_scalar(), input, quant)
+}
+
+/// [`dequantize_ndarray`] on `isa`.
+pub(crate) fn dequantize_ndarray_on<T: AsPrimitive<F>, D: Dimension, F: Float + 'static>(
+    isa: neon_dispatch::Isa,
+    input: ArrayView<T, D>,
+    quant: Quantization,
+) -> Array<F, D>
+where
+    i32: num_traits::AsPrimitive<F>,
+    f32: num_traits::AsPrimitive<F>,
+{
     let zero_point = quant.zero_point.as_();
     let scale = quant.scale.as_();
-    if zero_point != F::zero() {
-        let scaled_zero = -zero_point * scale;
-        input.mapv(|d| d.as_() * scale + scaled_zero)
-    } else {
-        input.mapv(|d| d.as_() * scale)
+    let bias = (zero_point != F::zero()).then(|| -zero_point * scale);
+    if let Some(out) = neon_dispatch::scale_bias_array(isa, &input, scale, bias) {
+        return out;
+    }
+    match bias {
+        Some(scaled_zero) => input.mapv(|d| d.as_() * scale + scaled_zero),
+        None => input.mapv(|d| d.as_() * scale),
     }
 }
 
 /// Dequantizes a slice from quantized values to float values using the given
 /// quantization parameters
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 ///
 /// # Examples
 /// ```
@@ -447,10 +485,37 @@ pub fn dequantize_cpu<T: AsPrimitive<F>, F: Float + 'static>(
     i32: num_traits::AsPrimitive<F>,
 {
     assert!(input.len() == output.len());
+    dequantize_cpu_on(
+        neon_dispatch::Isa::current_or_scalar(),
+        input,
+        quant,
+        output,
+    );
+}
+
+/// [`dequantize_cpu`] on `isa`; writes nothing when the slices differ in length.
+pub(crate) fn dequantize_cpu_on<T: AsPrimitive<F>, F: Float + 'static>(
+    isa: neon_dispatch::Isa,
+    input: &[T],
+    quant: Quantization,
+    output: &mut [F],
+) where
+    f32: num_traits::AsPrimitive<F>,
+    i32: num_traits::AsPrimitive<F>,
+{
+    if input.len() != output.len() {
+        return;
+    }
     let zero_point = quant.zero_point.as_();
     let scale = quant.scale.as_();
-    if zero_point != F::zero() {
-        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
+    let bias = (zero_point != F::zero()).then(|| -zero_point * scale);
+    // SAFETY: `scale_bias` writes only initialized values.
+    let out = unsafe { neon_dispatch::as_uninit(output) };
+    if neon_dispatch::scale_bias(isa, input, scale, bias, out) != neon_dispatch::Ran::Scalar {
+        return;
+    }
+    if let Some(scaled_zero) = bias {
+        // scale * (d - zero_point) = d * scale - zero_point * scale
         input
             .iter()
             .zip(output)
@@ -466,6 +531,9 @@ pub fn dequantize_cpu<T: AsPrimitive<F>, F: Float + 'static>(
 /// Dequantizes a slice from quantized values to float values using the given
 /// quantization parameters, using chunked processing. This is around 5% faster
 /// than `dequantize_cpu` for large slices.
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 ///
 /// # Examples
 /// ```
@@ -487,6 +555,13 @@ pub fn dequantize_cpu_chunked<T: AsPrimitive<F>, F: Float + 'static>(
     assert!(input.len() == output.len());
     let zero_point = quant.zero_point.as_();
     let scale = quant.scale.as_();
+    let bias = (zero_point != F::zero()).then(|| -zero_point * scale);
+    let isa = neon_dispatch::Isa::current_or_scalar();
+    // SAFETY: `scale_bias` writes only initialized values.
+    let out = unsafe { neon_dispatch::as_uninit(output) };
+    if neon_dispatch::scale_bias(isa, input, scale, bias, out) != neon_dispatch::Ran::Scalar {
+        return;
+    }
 
     let input = input.as_chunks::<4>();
     let output = output.as_chunks_mut::<4>();
@@ -535,6 +610,9 @@ pub fn dequantize_cpu_chunked<T: AsPrimitive<F>, F: Float + 'static>(
 /// let mask = segmentation_to_mask(segmentation.view()).unwrap();
 /// assert_eq!(mask, ndarray::array![[0, 1], [1, 0]]);
 /// ```
+///
+/// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
+/// code, which gives the same result.
 pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Result<Array2<u8>, DecoderError> {
     if segmentation.shape()[2] == 0 {
         return Err(DecoderError::InvalidShape(
@@ -548,7 +626,7 @@ pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Result<Array2<u8>, 
     }
 }
 
-/// Returns the maximum value and its index from a 1D array
+/// Returns the maximum value and its index from a 1D array; the last index wins on ties
 fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
     score
         .iter()
@@ -562,60 +640,6 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
         })
 }
 
-/// NEON-accelerated argmax for i8 slices on aarch64.
-///
-/// Finds the maximum value and its index (last index wins on ties, matching
-/// the semantics of [`arg_max`]).  Falls back to the scalar implementation
-/// on non-aarch64 targets or when the slice is too short to benefit from NEON.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn arg_max_i8(scores: &[i8]) -> (i8, usize) {
-    use std::arch::aarch64::*; // NOSONAR
-
-    let n = scores.len();
-    if n < 16 {
-        // Scalar fallback for very short slices.
-        let mut max = scores[0];
-        let mut idx = 0;
-        for (i, &s) in scores.iter().enumerate().skip(1) {
-            if s >= max {
-                max = s;
-                idx = i;
-            }
-        }
-        return (max, idx);
-    }
-
-    unsafe {
-        // Step 1: Find the global max value using NEON horizontal max.
-        let chunks = n / 16;
-        let mut vmax = vld1q_s8(scores.as_ptr());
-        for i in 1..chunks {
-            let v = vld1q_s8(scores.as_ptr().add(i * 16));
-            vmax = vmaxq_s8(vmax, v);
-        }
-        let global_max = vmaxvq_s8(vmax);
-
-        // Handle remainder with scalar
-        let remainder_start = chunks * 16;
-        let mut final_max = global_max;
-        for &s in &scores[remainder_start..] {
-            if s > final_max {
-                final_max = s;
-            }
-        }
-
-        // Step 2: Find the LAST index of `final_max` (preserves tie semantics).
-        // Scan backwards for the last occurrence.
-        let mut idx = 0;
-        for i in (0..n).rev() {
-            if scores[i] == final_max {
-                idx = i;
-                break;
-            }
-        }
-        (final_max, idx)
-    }
-}
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod decoder_tests {
@@ -2409,7 +2433,7 @@ mod decoder_tests {
     }
 
     /// `arg_max` documents that the last index wins on ties, which is the
-    /// semantics `arg_max_i8` mirrors on aarch64. A strict `>` is what makes
+    /// semantics the NEON row kernels mirror on aarch64. A strict `>` is what makes
     /// the fold take the later index; `>=` would keep the earlier one.
     #[test]
     fn arg_max_returns_the_last_index_on_a_tie() {

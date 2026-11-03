@@ -6,8 +6,8 @@
 #   tag-release.yml  release PR merged   -> annotated vX.Y.Z tag
 #   publish.yml   push of a vX.Y.Z tag   -> publish what was built
 #
-# This file builds the five Python wheel distributions across four platforms
-# and the five modular C API archives across five targets, verifies them, and
+# This file builds the Python wheel distributions across four platforms and
+# one modular C API archive per target across five targets, verifies them, and
 # uploads them with 30-day retention. It publishes nothing.
 #
 # It runs on `push` to the release branch, not on `pull_request`. A
@@ -134,7 +134,7 @@ jobs:
           cargo package --no-verify \
             -p edgefirst-decoder-abi -p edgefirst-tensor-abi -p edgefirst-tensor-ffi \
             -p edgefirst-egl -p edgefirst-gl -p edgefirst-tensor \
-            -p edgefirst-codec -p edgefirst-image -p edgefirst-decoder -p edgefirst-tracker
+            -p edgefirst-kernels -p edgefirst-codec -p edgefirst-image -p edgefirst-decoder -p edgefirst-tracker
           ls -la target/package/*.crate
 
       # Kept as artifacts because Section 4.5.3 asks for it: publish.yml runs
@@ -170,7 +170,7 @@ jobs:
         include:
           # `sdist` is per lane because an sdist is architecture-independent:
           # one is needed, and four would be four uploads of the same file.
-          # It is per package too -- see the tracker entry in the build list.
+          # It is per package too -- see the tracker and kernels entries in the build list.
           #
           # No maturin-deps: the shared action derives the specification from
           # the runner OS, which is what it is a property of. `zig` produces
@@ -257,16 +257,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/fetch-angle.sh --windows
 
-      # Two passes over the same five distributions, abi3-py311 and abi3-py38,
+      # Two passes over the same distributions, abi3-py311 and abi3-py38,
       # in one job so they share a target directory and a warm cargo cache.
       #
-      # --sdist is on tracker alone. tensor/codec/image/decoder's build.rs
+      # --sdist is on tracker and kernels alone. tensor/codec/image/decoder's build.rs
       # nested-builds the workspace-excluded edgefirst-tensor-capi through a
       # `../tensor-capi` relative path, and maturin builds the wheel FROM the
       # generated sdist whenever --sdist is passed; its sdist can never include
       # a sibling outside the crate directory, so --sdist against those four
       # always fails with "manifest path .../tensor-capi/Cargo.toml does not
-      # exist". tracker has no nested build and is the only one safe to sdist.
+      # exist". tracker and kernels have no nested build, so only they are safe to sdist.
       #
       # attest: false on both. The shared action attests immediately after it
       # builds, and hal's wheels are not shippable until the layout and Mach-O
@@ -284,7 +284,8 @@ jobs:
              {"manifest": "crates/python-codec/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
              {"manifest": "crates/python-image/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
              {"manifest": "crates/python-decoder/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
-             {"manifest": "crates/python-tracker/Cargo.toml", "args": "${{ matrix.sdist }}"}]
+             {"manifest": "crates/python-tracker/Cargo.toml", "args": "${{ matrix.sdist }}"},
+             {"manifest": "crates/python-kernels/Cargo.toml", "args": "${{ matrix.sdist }}"}]
           attest: false
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
@@ -300,7 +301,8 @@ jobs:
              {"manifest": "crates/python-codec/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
              {"manifest": "crates/python-image/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
              {"manifest": "crates/python-decoder/Cargo.toml", "args": "--config .cargo/tensor-dynamic.toml"},
-             {"manifest": "crates/python-tracker/Cargo.toml"}]
+             {"manifest": "crates/python-tracker/Cargo.toml"},
+             {"manifest": "crates/python-kernels/Cargo.toml"}]
           attest: false
 
       - name: Assert wheel layout
@@ -323,7 +325,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p staged
-          for pkg in tensor codec image decoder tracker; do
+          for pkg in tensor codec image decoder tracker kernels; do
             mkdir -p "staged/$pkg"
             mv target/wheels/edgefirst_${pkg}-*.whl "staged/$pkg/" 2>/dev/null || true
           done
@@ -368,9 +370,13 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with: {retention-days: 30, name: "wheels-${{ matrix.name }}-tracker", path: staged/tracker/*}
 
+      - name: Upload kernels wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with: {retention-days: 30, name: "wheels-${{ matrix.name }}-kernels", path: staged/kernels/*}
+
   # THE C RELEASE PATH SHIPS ONE ARCHIVE PER TARGET.
   #
-  # One archive, not five (tar.gz on Linux, zip on Windows and macOS).
+  # One archive, not one per library (tar.gz on Linux, zip on Windows and macOS).
   # Modularity is the pkg-config graph and DT_NEEDED, both of which survive
   # inside a single relocatable prefix. A consumer who needs only JPEG decode
   # still links only tensor + codec; they just extract one archive instead of
@@ -457,14 +463,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lld build-essential
 
-      - name: Build the five modular C API libraries
+      - name: Build the modular C API libraries
         shell: bash
         run: |
           EXTRA=()
           if [[ -n "${{ matrix.rust_target }}" ]]; then
             EXTRA+=(--target "${{ matrix.rust_target }}")
           fi
-          for leaf in tensor image codec decoder tracker; do
+          for leaf in tensor image codec decoder tracker kernels; do
             echo "==> ${leaf}"
             # Relative: the step runs from the repo root, and Git Bash paths need no conversion.
             CFG=()

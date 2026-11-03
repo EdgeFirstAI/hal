@@ -1,0 +1,4 @@
+ai-edge-litert==2.1.2
+flatbuffers
+numpy
+safetensors

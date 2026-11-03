@@ -26,11 +26,11 @@
 # Trusted Publisher Configuration (one per distribution, since 0.29):
 # - PyPI: https://pypi.org/manage/project/<name>/settings/publishing/
 #   for edgefirst-tensor, edgefirst-codec, edgefirst-image, edgefirst-decoder,
-#   edgefirst-tracker
+#   edgefirst-tracker, edgefirst-kernels
 #   Owner: EdgeFirstAI, Repository: hal, Workflow: publish.yml, Environment: pypi
 #
 #   THESE MOVED WITH THIS SPLIT. Both PyPI and crates.io match a publisher on
-#   the workflow FILENAME, so all five PyPI publishers and all ten crates.io
+#   the workflow FILENAME, so all six PyPI publishers and all eleven crates.io
 #   publishers must be re-pointed from release.yml to publish.yml before the
 #   first tag, or the upload fails on a claim mismatch. A rehearsal does NOT
 #   catch this, because a rehearsal skips the upload.
@@ -40,6 +40,13 @@
 #   workflow can publish it. See scripts/bootstrap_pypi_projects.sh.
 # - crates.io: Owner: EdgeFirstAI, Repository: hal, Workflow: publish.yml,
 #   Environment: crates-io
+#
+#   BOOTSTRAP: crates.io Trusted Publishing cannot create a crate either, so a
+#   new crate (edgefirst-kernels) needs one manual `cargo publish` with an API
+#   token, and its trusted publisher configured, before the first tag. Without
+#   it the crate loop below publishes every crate up to edgefirst-tracker, then
+#   fails at edgefirst-kernels, leaving decoder and image unpublished: a partial
+#   release.
 #
 # Action Versions (hash-pinned for security per Au-Zone SPS v2.1):
 # - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
@@ -182,9 +189,9 @@ jobs:
           fail=0
           note() { echo "::error::$1"; fail=1; }
 
-          # Five distributions, four platforms each. A package with no wheel at
+          # Every distribution, four platforms each. A package with no wheel at
           # all is the failure that used to reach PyPI as a partial release.
-          for pkg in tensor codec image decoder tracker; do
+          for pkg in tensor codec image decoder tracker kernels; do
             n="$(find dist -name "edgefirst_${pkg}-${VERSION}-*.whl" | wc -l | tr -d ' ')"
             if [[ "$n" -eq 0 ]]; then
               note "no edgefirst_${pkg} wheels at ${VERSION}"
@@ -279,7 +286,7 @@ jobs:
       max-parallel: 1
       fail-fast: false
       matrix:
-        pkg: [codec, image, decoder, tracker]
+        pkg: [codec, image, decoder, tracker, kernels]
     environment:
       name: pypi
       url: https://pypi.org/project/edgefirst-${{ matrix.pkg }}/
@@ -316,7 +323,7 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          for p in edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker; do
+          for p in edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker edgefirst-kernels; do
             python -m venv "/tmp/v-$p"
             ok=0
             # PyPI's index is eventually consistent; a fresh release can 404 for
@@ -437,7 +444,8 @@ jobs:
           # tag push had image third-from-last but decoder and tracker after
           # it, and failed packaging image with "failed to select a version
           # for the requirement `edgefirst-decoder = \"^0.29.3\"`" before
-          # either had been published.
+          # either had been published. edgefirst-decoder depends on
+          # edgefirst-kernels, so kernels publishes before decoder.
           for crate in \
             edgefirst-decoder-abi \
             edgefirst-tensor-abi \
@@ -447,6 +455,7 @@ jobs:
             edgefirst-tensor \
             edgefirst-codec \
             edgefirst-tracker \
+            edgefirst-kernels \
             edgefirst-decoder \
             edgefirst-image
           do
@@ -476,7 +485,7 @@ jobs:
           # every released version, not just the one being tagged.
           fetch-depth: 0
 
-      - name: Download wheel artifacts (all five packages)
+      - name: Download wheel artifacts (all six packages)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           run-id: ${{ needs.resolve.outputs.run-id }}

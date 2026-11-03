@@ -445,6 +445,7 @@ dependencies = [
  "edgefirst-egl",
  "edgefirst-gbm",
  "edgefirst-gl",
+ "edgefirst-kernels",
  "edgefirst-tensor",
  "enum_dispatch",
  "fast_image_resize",
@@ -478,6 +479,14 @@ dependencies = [
  "errno",
  "libc",
  "log",
+]
+
+[[package]]
+name = "edgefirst-kernels"
+version = "0.38.2"
+dependencies = [
+ "half",
+ "tracing",
 ]
 
 [[package]]

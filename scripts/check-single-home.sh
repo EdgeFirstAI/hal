@@ -68,6 +68,8 @@ else
 fi
 
 SIBS="image codec decoder tracker"
+# C libraries with no tensor dependency at all, checked by G2t.
+TENSOR_FREE="kernels"
 # The five modular Python extensions, by their cdylib stem (`[lib] name` in
 # each crates/python-*/Cargo.toml, so `_tensor` -> `lib_tensor.so`).
 PY_EXTS="tensor image codec decoder tracker"
@@ -677,6 +679,25 @@ for l in $SIBS; do
   fi
 done
 
+echo "== G2t: tensor-free libraries link no sibling library and no ef_tensor_* symbol =="
+# Liveness is the NEEDED count: every real shared object needs at least libc, so 0 means readelf read nothing.
+for l in ${TENSOR_FREE}; do
+  so="${DEBUG_LIBDIR}/libedgefirst_${l}.so"
+  if [[ ! -s "${so}" ]] || [[ ! -r "${so}" ]]; then
+    cannot_measure "G2t" "${so} is missing, empty, or unreadable"
+    continue
+  fi
+  all_need=$(readelf -d "${so}" 2>/dev/null | grep -c '(NEEDED)' || true)
+  if [[ "${all_need}" -eq 0 ]]; then
+    cannot_measure "G2t" "${so}: readelf found no DT_NEEDED entries at all"
+    continue
+  fi
+  need=$(readelf -d "${so}" 2>/dev/null | grep '(NEEDED)' | grep -c 'libedgefirst_' || true)
+  und=$(nm -D -u "${so}" 2>/dev/null | grep -c ' ef_tensor_' || true)
+  gate "G2t" "libedgefirst_${l}.so: DT_NEEDED on libedgefirst_*=${need} undefined ef_tensor_*=${und} (want 0 and 0)" \
+       "$([[ "${need}" -eq 0 ]] && [[ "${und}" -eq 0 ]] && echo 0 || echo 1)"
+done
+
 echo "== G4: the transition vtable is gone =="
 # Repo-wide, not scoped to crates/*-capi/src -- task 10's own report caught
 # the earlier, narrower version of this gate: its message read "0 files
@@ -978,7 +999,7 @@ else
 fi
 
 echo "== G11: header/library alignment =="
-for l in tensor image codec decoder tracker; do
+for l in tensor image codec decoder tracker kernels; do
   hdr="crates/${l}-capi/include/edgefirst/${l}.h"
   so="${DEBUG_LIBDIR}/libedgefirst_${l}.so"
   if [[ ! -s "${hdr}" ]] || [[ ! -r "${hdr}" ]]; then

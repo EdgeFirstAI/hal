@@ -551,6 +551,7 @@ dependencies = [
  "argminmax",
  "edgefirst-bench",
  "edgefirst-decoder-abi",
+ "edgefirst-kernels",
  "edgefirst-tensor",
  "edgefirst-tracker",
  "env_logger",
@@ -631,6 +632,7 @@ dependencies = [
  "edgefirst-egl",
  "edgefirst-gbm",
  "edgefirst-gl",
+ "edgefirst-kernels",
  "edgefirst-tensor",
  "edgefirst-tracker",
  "enum_dispatch",
@@ -660,6 +662,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefirst-kernels"
+version = "0.38.2"
+dependencies = [
+ "edgefirst-bench",
+ "half",
+ "rand 0.10.3",
+ "safetensors",
+ "tracing",
+]
+
+[[package]]
 name = "edgefirst-python-codec"
 version = "0.38.2"
 dependencies = [
@@ -680,6 +693,7 @@ dependencies = [
  "edgefirst-decoder",
  "edgefirst-decoder-abi",
  "edgefirst-image",
+ "edgefirst-kernels",
  "edgefirst-tensor",
  "edgefirst-tracker",
  "env_logger",
@@ -718,6 +732,17 @@ dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
  "edgefirst-tensor",
+ "numpy",
+ "pyo3",
+ "pyo3-build-config",
+]
+
+[[package]]
+name = "edgefirst-python-kernels"
+version = "0.38.2"
+dependencies = [
+ "edgefirst-build-support",
+ "edgefirst-python-common",
  "numpy",
  "pyo3",
  "pyo3-build-config",

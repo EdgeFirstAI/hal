@@ -46,6 +46,8 @@ use edgefirst_tensor::{CpuAccess, DType, QuantMode, TensorDyn, TensorMapTrait, T
 use half::f16;
 
 use crate::configs::DimName;
+use crate::neon_dispatch::semantic::{self as nd, Planes};
+use crate::neon_dispatch::{Isa, Ran};
 use crate::schema::{
     Activation, DecodeMode, DecoderKind, LogicalOutput, LogicalType, Upsample, UpsampleMethod,
 };
@@ -650,6 +652,9 @@ pub fn select_output<'a>(
 ///   [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied) when
 ///   `input` is not declared CPU-readable, or `dst` or `confidence` not
 ///   CPU-writable.
+/// - [`DecoderError::ForcedKernelUnavailable`] when
+///   `EDGEFIRST_DECODER_FORCE_KERNEL` names a tier this CPU lacks or an
+///   unknown one.
 pub fn decode_semantic(
     input: &TensorDyn,
     config: &SemanticConfig,
@@ -702,10 +707,11 @@ pub fn decode_semantic(
         conf.cpu_access().require(CpuAccess::Write)?;
     }
 
+    let isa = Isa::current()?;
     let geometry = Geometry::new(config, options, out_h, out_w)?;
     match config.input {
-        SemanticInput::ClassMap => decode_class_map(input, config, &geometry, dst),
-        SemanticInput::Scores => decode_scores(input, config, &geometry, dst, confidence),
+        SemanticInput::ClassMap => decode_class_map(isa, input, config, &geometry, dst),
+        SemanticInput::Scores => decode_scores(isa, input, config, &geometry, dst, confidence),
     }
 }
 
@@ -896,6 +902,7 @@ fn map_err(what: &str) -> impl FnOnce(edgefirst_tensor::Error) -> DecoderError +
 }
 
 fn decode_scores(
+    isa: Isa,
     input: &TensorDyn,
     config: &SemanticConfig,
     geometry: &Geometry,
@@ -913,15 +920,24 @@ fn decode_scores(
                 .map_err(map_err("semantic input"))?;
             check_extent(map.as_slice().len(), g, "semantic input")?;
             match resolve_quant(input, config, needs_real)? {
-                Quant::PerTensor(dq) => {
-                    scores_into(map.as_slice(), g, config, dq, geometry, dst, confidence)
-                }
+                Quant::PerTensor(dq) => scores_into(
+                    isa,
+                    map.as_slice(),
+                    g,
+                    config,
+                    dq,
+                    geometry,
+                    dst,
+                    confidence,
+                ),
                 Quant::PerChannel {
                     scales,
                     zero_points,
                 } => {
-                    let real = dequantize_per_channel(map.as_slice(), g, &scales, &zero_points);
+                    let real =
+                        dequantize_per_channel(isa, map.as_slice(), g, &scales, &zero_points);
                     scores_into(
+                        isa,
                         &real,
                         g,
                         config,
@@ -948,12 +964,24 @@ fn decode_scores(
 }
 
 fn dequantize_per_channel<T: Score>(
+    isa: Isa,
     data: &[T],
     g: Grid,
     scales: &[f32],
     zero_points: &[i32],
 ) -> Vec<f32> {
     let mut out = vec![0f32; data.len()];
+    let planes = Planes {
+        classes: g.classes,
+        height: g.height,
+        width: g.width,
+        cs: g.cs,
+        ys: g.ys,
+        xs: g.xs,
+    };
+    if nd::dequantize_per_channel(isa, data, planes, scales, zero_points, &mut out) {
+        return out;
+    }
     for (c, (&s, &z)) in scales.iter().zip(zero_points).enumerate() {
         let z = z as f32;
         for y in 0..g.height {
@@ -966,7 +994,9 @@ fn dequantize_per_channel<T: Score>(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scores_into<T: Score>(
+    isa: Isa,
     data: &[T],
     g: Grid,
     config: &SemanticConfig,
@@ -983,14 +1013,15 @@ fn scores_into<T: Score>(
     let needs_winners = !single || !geometry.bilinear_scores() || confidence.is_some();
     let winners = needs_winners.then(|| {
         if single {
-            kernels::threshold_map(data, g, cut)
+            kernels::threshold_map(isa, data, g, cut)
         } else {
-            kernels::argmax_map(data, g)
+            kernels::argmax_map(isa, data, g)
         }
     });
+    let winners = winners.as_deref();
     match dst.dtype() {
-        DType::U8 => write_classes::<T, u8>(data, g, cut, winners.as_deref(), geometry, dst)?,
-        _ => write_classes::<T, u16>(data, g, cut, winners.as_deref(), geometry, dst)?,
+        DType::U8 => write_classes::<T, u8>(isa, data, g, cut, winners, geometry, dst)?,
+        _ => write_classes::<T, u16>(isa, data, g, cut, winners, geometry, dst)?,
     }
     let (Some(conf), Some(winners)) = (confidence, winners) else {
         return Ok(());
@@ -1002,10 +1033,10 @@ fn scores_into<T: Score>(
         (false, None, Some(Activation::Sigmoid)) => ConfKind::Sigmoid,
         (false, None, _) => ConfKind::Softmax,
     };
-    let low = kernels::confidence_map(data, g, &winners, dq, kind);
+    let low = kernels::confidence_map(isa, data, g, winners, dq, kind);
     match conf.dtype() {
-        DType::F32 => write_confidence::<f32>(&low, g.width, geometry, conf),
-        DType::U8 => write_confidence::<u8>(&low, g.width, geometry, conf),
+        DType::F32 => write_confidence::<f32>(isa, &low, g.width, geometry, conf),
+        DType::U8 => write_confidence::<u8>(isa, &low, g.width, geometry, conf),
         other => Err(DecoderError::NotSupported(format!(
             "confidence dtype {other:?}; use f32 or u8"
         ))),
@@ -1013,6 +1044,7 @@ fn scores_into<T: Score>(
 }
 
 fn write_classes<T: Score, O: ClassOut + edgefirst_tensor::Element>(
+    isa: Isa,
     data: &[T],
     g: Grid,
     cut: f32,
@@ -1029,15 +1061,15 @@ fn write_classes<T: Score, O: ClassOut + edgefirst_tensor::Element>(
     match (geometry.bilinear_scores(), winners) {
         (true, Some(winners)) if g.classes > 1 => {
             let (ys, xs) = geometry.bilinear();
-            kernels::upsample_argmax(data, g, winners, &ys, &xs, out);
+            kernels::upsample_argmax(isa, data, g, winners, &ys, &xs, out);
         }
         (true, _) => {
             let (ys, xs) = geometry.bilinear();
-            kernels::upsample_threshold(data, g, cut, &ys, &xs, out);
+            kernels::upsample_threshold(isa, data, g, cut, &ys, &xs, out);
         }
         (false, Some(winners)) => {
             let (ys, xs) = geometry.nearest();
-            kernels::upsample_nearest(winners, g.width, &ys, &xs, out, O::from_class);
+            kernels::upsample_classes(isa, winners, g.width, &ys, &xs, out);
         }
         (false, None) => {
             return Err(DecoderError::Internal(
@@ -1049,6 +1081,7 @@ fn write_classes<T: Score, O: ClassOut + edgefirst_tensor::Element>(
 }
 
 fn write_confidence<C: ConfOut + edgefirst_tensor::Element>(
+    isa: Isa,
     low: &[f32],
     width: usize,
     geometry: &Geometry,
@@ -1062,16 +1095,17 @@ fn write_confidence<C: ConfOut + edgefirst_tensor::Element>(
     let out = map.as_mut_slice();
     if geometry.bilinear_scores() {
         let (ys, xs) = geometry.bilinear();
-        kernels::upsample_conf_bilinear(low, width, &ys, &xs, out);
+        kernels::upsample_conf_bilinear(isa, low, width, &ys, &xs, out);
     } else {
         let (ys, xs) = geometry.nearest();
-        kernels::upsample_nearest(low, width, &ys, &xs, out, C::from_conf);
+        kernels::upsample_conf_nearest(isa, low, width, &ys, &xs, out);
     }
     Ok(())
 }
 
 /// Resizes a class map the model already computed; always nearest.
 fn decode_class_map(
+    isa: Isa,
     input: &TensorDyn,
     config: &SemanticConfig,
     geometry: &Geometry,
@@ -1086,7 +1120,7 @@ fn decode_class_map(
                 .map_read()
                 .map_err(map_err("class map input"))?;
             check_extent(map.as_slice().len(), g, "class map input")?;
-            class_map_into(map.as_slice(), g, geometry, dst)
+            class_map_into(isa, map.as_slice(), g, geometry, dst)
         }};
     }
     match input.dtype() {
@@ -1102,32 +1136,23 @@ fn decode_class_map(
 }
 
 fn class_map_into<T>(
+    isa: Isa,
     data: &[T],
     g: Grid,
     geometry: &Geometry,
     dst: &mut TensorDyn,
 ) -> DecoderResult<()>
 where
-    T: Copy + TryInto<u16> + std::fmt::Display,
+    T: Copy + TryInto<u16> + std::fmt::Display + 'static,
 {
     let limit = match dst.dtype() {
         DType::U8 => u8::CAPACITY,
         _ => u16::CAPACITY,
     };
-    let classes = (0..g.height)
-        .flat_map(|y| (0..g.width).map(move |x| data[y * g.ys + x * g.xs]))
-        .map(|v| {
-            v.try_into()
-                .ok()
-                .filter(|&c: &u16| (c as usize) < limit)
-                .ok_or_else(|| {
-                    DecoderError::InvalidConfig(format!(
-                        "class index {v} does not fit a {:?} class map",
-                        dst.dtype()
-                    ))
-                })
-        })
-        .collect::<DecoderResult<Vec<u16>>>()?;
+    let classes = match class_indices_neon(isa, data, g, limit) {
+        Some(classes) => classes,
+        None => class_indices(data, g, limit, dst.dtype())?,
+    };
     let (ys, xs) = geometry.nearest();
     macro_rules! write {
         ($o:ty) => {{
@@ -1136,14 +1161,8 @@ where
                 .ok_or_else(|| DecoderError::Internal("class map dtype".to_string()))?
                 .map_for_write()
                 .map_err(map_err("class map"))?;
-            kernels::upsample_nearest(
-                &classes,
-                geometry.src_w,
-                &ys,
-                &xs,
-                map.as_mut_slice(),
-                <$o>::from_class,
-            );
+            let out = map.as_mut_slice();
+            kernels::upsample_classes(isa, &classes, geometry.src_w, &ys, &xs, out);
         }};
     }
     match dst.dtype() {
@@ -1151,4 +1170,40 @@ where
         _ => write!(u16),
     }
     Ok(())
+}
+
+/// The class map's values as `u16` on a NEON tier when its rows are contiguous; `None` when
+/// the scalar code converts them, as it does when a value does not fit.
+fn class_indices_neon<T: 'static>(isa: Isa, data: &[T], g: Grid, limit: usize) -> Option<Vec<u16>> {
+    if isa.is_scalar() || g.xs != 1 {
+        return None;
+    }
+    let mut classes = vec![0u16; g.height * g.width];
+    for (y, row) in classes.chunks_mut(g.width).enumerate() {
+        let src = data.get(y * g.ys..)?.get(..g.width)?;
+        if nd::class_index_row(isa, src, limit, row) == Ran::Scalar {
+            return None;
+        }
+    }
+    Some(classes)
+}
+
+/// The class map's values as `u16`, or the error naming the first that does not fit.
+fn class_indices<T>(data: &[T], g: Grid, limit: usize, dtype: DType) -> DecoderResult<Vec<u16>>
+where
+    T: Copy + TryInto<u16> + std::fmt::Display,
+{
+    (0..g.height)
+        .flat_map(|y| (0..g.width).map(move |x| data[y * g.ys + x * g.xs]))
+        .map(|v| {
+            v.try_into()
+                .ok()
+                .filter(|&c: &u16| (c as usize) < limit)
+                .ok_or_else(|| {
+                    DecoderError::InvalidConfig(format!(
+                        "class index {v} does not fit a {dtype:?} class map"
+                    ))
+                })
+        })
+        .collect()
 }

@@ -8,17 +8,40 @@
 //! here is crate-private and reached through [`crate::Decoder`], which picks
 //! the variant from the output shapes at builder time.
 
+use edgefirst_kernels::prim::sigmoid::fast_sigmoid;
 use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    byte::{postprocess_boxes_multilabel_quant, postprocess_boxes_quant, quantize_score_threshold},
+    byte::{decode_candidates_quant, quantize_score_threshold},
     configs::{Detection, Nms},
     dequant_detect_box,
-    float::{postprocess_boxes_float, postprocess_boxes_multilabel_float},
+    float::decode_candidates,
+    neon_dispatch::{channel_argmax, Isa, SplitDecode},
     yolo::nms_and_cap,
     BBoxTypeTrait, DecoderError, DecoderResult, DetectBox, Quantization, XYWH, XYXY,
 };
+
+/// The argmax or multi-label float candidates of a ModelPack decode on `isa`, the decode's
+/// tier.
+fn float_candidates<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    isa: Isa,
+    multi_label: bool,
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+) -> DecoderResult<Vec<DetectBox>> {
+    Ok(
+        decode_candidates::<B, _, _>(isa, multi_label, threshold, boxes, scores)?
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect(),
+    )
+}
 
 /// Configuration for ModelPack split detection decoder. The quantization is
 /// ignored when decoding float models.
@@ -48,9 +71,6 @@ impl TryFrom<&Detection> for ModelPackDetectionConfig {
 /// Expected shapes of inputs:
 /// - boxes: (num_boxes, 4)
 /// - scores: (num_boxes, num_classes)
-///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`]
@@ -92,9 +112,6 @@ where
 /// Expected shapes of inputs:
 /// - boxes: (num_boxes, 4)
 /// - scores: (num_boxes, num_classes)
-///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`]
@@ -185,7 +202,8 @@ pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
 /// Returns [`DecoderError::InvalidShape`]
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
+pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32> + Send + Sync + 'static>(
+    isa: Isa,
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
@@ -197,6 +215,7 @@ pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()> {
     impl_modelpack_split_float::<XYWH, D>(
+        isa,
         outputs,
         configs,
         score_threshold,
@@ -213,9 +232,6 @@ pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
 /// Expected shapes of inputs:
 /// - boxes: (num_boxes, 4)
 /// - scores: (num_boxes, num_classes)
-///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`]
@@ -241,25 +257,20 @@ where
 {
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
+    let isa = Isa::current()?;
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
-        if multi_label {
-            postprocess_boxes_multilabel_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )?
-        } else {
-            postprocess_boxes_quant::<B, _, _>(
-                score_threshold,
-                boxes_tensor,
-                scores_tensor,
-                quant_boxes,
-            )
-        }
+        decode_candidates_quant::<B, _, _, _>(
+            isa,
+            multi_label,
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+            |b, _| b,
+        )?
     };
-    let boxes = nms_and_cap(boxes, nms, iou_threshold, pre_nms_top_k, max_det);
+    let boxes = nms_and_cap(isa, boxes, nms, iou_threshold, pre_nms_top_k, max_det);
     output_boxes.clear();
     output_boxes.extend(boxes.iter().map(|b| dequant_detect_box(b, quant_scores)));
     Ok(())
@@ -270,9 +281,6 @@ where
 /// Expected shapes of inputs:
 /// - boxes: (num_boxes, 4)
 /// - scores: (num_boxes, num_classes)
-///
-/// # Panics
-/// Panics if shapes don't match the expected dimensions (argmax path).
 ///
 /// # Errors
 /// Returns [`DecoderError::InvalidShape`]
@@ -296,17 +304,17 @@ pub(crate) fn impl_modelpack_float<
 where
     f32: AsPrimitive<SCORE>,
 {
-    let boxes = if multi_label {
-        postprocess_boxes_multilabel_float::<B, _, _>(
-            score_threshold.as_(),
-            boxes_tensor,
-            scores_tensor,
-        )?
-    } else {
-        postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
-    };
+    let isa = Isa::current()?;
+    let boxes = float_candidates::<B, _, _>(
+        isa,
+        multi_label,
+        score_threshold.as_(),
+        boxes_tensor,
+        scores_tensor,
+    )?;
     output_boxes.clear();
     output_boxes.extend(nms_and_cap(
+        isa,
         boxes,
         nms,
         iou_threshold,
@@ -341,29 +349,17 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()> {
-    let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_quant(outputs, configs);
-    let boxes = if multi_label {
-        postprocess_boxes_multilabel_float::<B, _, _>(
-            score_threshold,
-            boxes_tensor.view(),
-            scores_tensor.view(),
-        )?
-    } else {
-        postprocess_boxes_float::<B, _, _>(
-            score_threshold,
-            boxes_tensor.view(),
-            scores_tensor.view(),
-        )
-    };
-    output_boxes.clear();
-    output_boxes.extend(nms_and_cap(
-        boxes,
-        nms,
+    impl_modelpack_split_boxes::<B>(
+        Isa::current()?,
+        postprocess_modelpack_split_quant(outputs, configs),
+        score_threshold,
         iou_threshold,
+        nms,
         pre_nms_top_k,
         max_det,
-    ));
-    Ok(())
+        multi_label,
+        output_boxes,
+    )
 }
 
 /// Implementation of ModelPack split detection decoding for float tensors.
@@ -380,7 +376,11 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 /// Returns [`DecoderError::InvalidShape`]
 /// when boxes are not `[N, 4]` or scores do not have one row per box.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
+pub(crate) fn impl_modelpack_split_float<
+    B: BBoxTypeTrait,
+    D: AsPrimitive<f32> + Send + Sync + 'static,
+>(
+    isa: Isa,
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
@@ -391,22 +391,44 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> DecoderResult<()> {
-    let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_float(outputs, configs);
-    let boxes = if multi_label {
-        postprocess_boxes_multilabel_float::<B, _, _>(
-            score_threshold,
-            boxes_tensor.view(),
-            scores_tensor.view(),
-        )?
-    } else {
-        postprocess_boxes_float::<B, _, _>(
-            score_threshold,
-            boxes_tensor.view(),
-            scores_tensor.view(),
-        )
-    };
+    let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_float(isa, outputs, configs);
+    impl_modelpack_split_boxes::<B>(
+        isa,
+        (boxes_tensor, scores_tensor),
+        score_threshold,
+        iou_threshold,
+        nms,
+        pre_nms_top_k,
+        max_det,
+        multi_label,
+        output_boxes,
+    )
+}
+
+/// The candidates, NMS and cap of a ModelPack split decode from its decoded `(boxes, scores)`,
+/// on `isa`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn impl_modelpack_split_boxes<B: BBoxTypeTrait>(
+    isa: Isa,
+    (boxes_tensor, scores_tensor): (Array2<f32>, Array2<f32>),
+    score_threshold: f32,
+    iou_threshold: f32,
+    nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
+    multi_label: bool,
+    output_boxes: &mut Vec<DetectBox>,
+) -> DecoderResult<()> {
+    let boxes = float_candidates::<B, _, _>(
+        isa,
+        multi_label,
+        score_threshold,
+        boxes_tensor.view(),
+        scores_tensor.view(),
+    )?;
     output_boxes.clear();
     output_boxes.extend(nms_and_cap(
+        isa,
         boxes,
         nms,
         iou_threshold,
@@ -450,9 +472,9 @@ pub(crate) fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
         );
         let p_sigmoid = if let Some(quant) = &detail.quantization {
             let scaled_zero = -quant.zero_point as f32 * quant.scale;
-            p.mapv(|x| fast_sigmoid_impl(x.as_() * quant.scale + scaled_zero))
+            p.mapv(|x| fast_sigmoid(x.as_() * quant.scale + scaled_zero))
         } else {
-            p.mapv(|x| fast_sigmoid_impl(x.as_()))
+            p.mapv(|x| fast_sigmoid(x.as_()))
         };
         let p_sigmoid = p_sigmoid.as_standard_layout();
 
@@ -516,10 +538,29 @@ pub(crate) fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
 /// Post processes ModelPack split detection into detection boxes,
 /// filtering out any boxes below the score threshold. Returns the boxes and
 /// scores tensors. Boxes are in XYWH format.
-pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
+///
+/// On a NEON tier, standard-layout `f32` and `f16` outputs sharing one class count run
+/// [`SplitDecode`], with the same bits.
+pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32> + Send + Sync + 'static>(
+    isa: Isa,
     outputs: &[ArrayView3<T>],
     config: &[ModelPackDetectionConfig],
 ) -> (Array2<f32>, Array2<f32>) {
+    let layers: Vec<_> = outputs
+        .iter()
+        .zip(config)
+        .map(|(p, c)| (p.dim(), c.anchors.len()))
+        .collect();
+    if let Some(mut split) = SplitDecode::new(isa, &layers) {
+        let decoded = outputs.len() == config.len()
+            && outputs
+                .iter()
+                .zip(config)
+                .all(|(p, c)| split.push(p.view(), &c.anchors, None));
+        if let Some(out) = decoded.then(|| split.finish()).flatten() {
+            return out;
+        }
+    }
     let mut total_capacity = 0;
     let mut nc = 0;
     for (p, detail) in outputs.iter().zip(config) {
@@ -544,7 +585,7 @@ pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
             p.len(),
             "Shape product doesn't match tensor length"
         );
-        let p_sigmoid = p.mapv(|x| fast_sigmoid_impl(x.as_()));
+        let p_sigmoid = p.mapv(|x| fast_sigmoid(x.as_()));
         let p_sigmoid = p_sigmoid.as_standard_layout();
 
         // Safe to unwrap since we ensured standard layout above
@@ -604,42 +645,6 @@ pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
     (bboxes, bscores)
 }
 
-/// Fast approximation of `eˣ`, vendored bit-for-bit from the (abandoned)
-/// `fast-math` crate by Huon Wilson (MIT/Apache-2.0). Inlining the ~10-line
-/// Schraudolph float-bit-trick lets us drop the unmaintained dependency while
-/// keeping decoder outputs bit-identical to prior releases. Valid for roughly
-/// -88 ≤ x ≤ 88 (kept in range by the guard in `fast_sigmoid_impl`); max
-/// relative error < ~0.011.
-#[inline(always)]
-// Constants are reproduced verbatim from `fast-math` to stay bit-identical;
-// keep the upstream literals rather than rounding them to f32 precision.
-#[allow(clippy::excessive_precision)]
-fn exp_raw(x: f32) -> f32 {
-    const A: f32 = (1u32 << 23) as f32; // 2^SIGNIF for f32
-    const MASK: i32 = 0xff800000u32 as i32;
-    const EXP2_23: f32 = 1.1920929e-7;
-    const C0: f32 = 0.3371894346 * EXP2_23 * EXP2_23;
-    const C1: f32 = 0.657636276 * EXP2_23;
-    const C2: f32 = 1.00172476;
-
-    let a = A * core::f32::consts::LOG2_E;
-    let mul = (a * x) as i32;
-    let floor = mul & MASK;
-    let frac = (mul - floor) as f32;
-    let approx = (C0 * frac + C1) * frac + C2;
-    f32::from_bits(approx.to_bits().wrapping_add(floor as u32))
-}
-
-#[inline(always)]
-fn fast_sigmoid_impl(f: f32) -> f32 {
-    if f.abs() > 80.0 {
-        f.signum() * 0.5 + 0.5
-    } else {
-        // exp_raw is only valid for -88 < x < 88; the guard above keeps us in range
-        1.0 / (1.0 + exp_raw(-f))
-    }
-}
-
 /// Converts ModelPack segmentation into a 2D mask.
 /// The input segmentation is expected to have shape (H, W, num_classes).
 ///
@@ -662,10 +667,11 @@ pub(crate) fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Ar
     let seg = segmentation
         .as_slice()
         .expect("Segmentation is not in standard layout");
-    let argmax = seg
-        .chunks_exact(channels)
-        .map(|x| x.argmax() as u8)
-        .collect::<Vec<_>>();
+    let argmax = channel_argmax(Isa::current_or_scalar(), seg, channels).unwrap_or_else(|| {
+        seg.chunks_exact(channels)
+            .map(|x| x.argmax() as u8)
+            .collect::<Vec<_>>()
+    });
 
     Array2::from_shape_vec((height, width), argmax).expect("Failed to create mask array")
 }
@@ -729,7 +735,7 @@ mod modelpack_tests {
         }
         for i in -2550..=2550 {
             let x = i as f32 * 0.1;
-            let fast = fast_sigmoid_impl(x);
+            let fast = fast_sigmoid(x);
             let full = full_sigmoid(x);
             let diff = (fast - full).abs();
             assert!(
@@ -747,12 +753,12 @@ mod modelpack_tests {
     #[test]
     fn fast_sigmoid_saturates_beyond_the_cutoff_not_at_it() {
         assert!(
-            fast_sigmoid_impl(-80.0) > 0.0,
+            fast_sigmoid(-80.0) > 0.0,
             "-80.0 is inside the smooth range, got {}",
-            fast_sigmoid_impl(-80.0)
+            fast_sigmoid(-80.0)
         );
-        assert_eq!(fast_sigmoid_impl(-80.5), 0.0);
-        assert_eq!(fast_sigmoid_impl(80.5), 1.0);
+        assert_eq!(fast_sigmoid(-80.5), 0.0);
+        assert_eq!(fast_sigmoid(80.5), 1.0);
     }
 
     /// Exercises the float split decode end to end on one 1x1 cell with two
@@ -772,7 +778,8 @@ mod modelpack_tests {
             quantization: None,
         }];
 
-        let (boxes, scores) = postprocess_modelpack_split_float(&[raw.view()], &config);
+        let (boxes, scores) =
+            postprocess_modelpack_split_float(Isa::SCALAR, &[raw.view()], &config);
 
         assert_eq!(boxes.shape(), &[1, 4]);
         assert_eq!(scores.shape(), &[1, 2]);
@@ -788,7 +795,7 @@ mod modelpack_tests {
         ];
         let expected_scores = [full_sigmoid(1.0) * obj, full_sigmoid(-1.0) * obj];
 
-        // fast_sigmoid_impl is accurate to 5e-4; the width and height terms
+        // fast_sigmoid is accurate to 5e-4; the width and height terms
         // square it and scale by 4 * anchor, so the box tolerance is looser
         // than the score tolerance by exactly that factor.
         for (i, want) in expected_box.iter().enumerate() {
@@ -818,7 +825,8 @@ mod modelpack_tests {
             quantization: None,
         }];
 
-        let (boxes, scores) = postprocess_modelpack_split_float(&[raw.view()], &config);
+        let (boxes, scores) =
+            postprocess_modelpack_split_float(Isa::SCALAR, &[raw.view()], &config);
 
         assert_eq!(boxes.shape(), &[1, 4]);
         assert_eq!(scores.shape(), &[1, 1]);
@@ -866,6 +874,7 @@ mod modelpack_tests {
         let run = |nms: Nms, multi_label: bool| {
             let mut out = Vec::with_capacity(8);
             decode_modelpack_split_float(
+                Isa::current_or_scalar(),
                 &[p.view()],
                 std::slice::from_ref(&cfg),
                 0.5,

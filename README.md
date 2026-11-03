@@ -36,6 +36,7 @@ pip install edgefirst-codec     # JPEG/PNG decode (needs tensor)
 pip install edgefirst-image     # convert/resize/draw (needs tensor, not decoder)
 pip install edgefirst-decoder   # YOLO/ModelPack post-processing
 pip install edgefirst-tracker   # ByteTrack (standalone)
+pip install edgefirst-kernels   # quantized CPU kernels: softmax, sigmoid, DFL (standalone)
 ```
 
 Each is a self-contained wheel under the `edgefirst.` namespace; they
@@ -53,10 +54,11 @@ C: download `edgefirst-hal-<version>-<target>.tar.gz` (Linux) or `.zip`
 [GitHub Releases](https://github.com/EdgeFirstAI/hal/releases). The archive is
 relocatable — see [`packaging/c/INSTALL.txt`](packaging/c/INSTALL.txt) for
 pkg-config, runtime search path, and a JPEG→tensor example. Link
-`libedgefirst_tensor` plus any of codec / image / decoder / tracker. Headers
+`libedgefirst_tensor` plus any of codec / image / decoder / tracker;
+`libedgefirst_kernels` links alone. Headers
 live under `include/edgefirst/` (`tensor.h`, `codec.h`, `image.h`, `decoder.h`,
-`tracker.h`, `detect.h`). Windows ships `bin/*.dll` and `lib/*.lib` import
-libraries. **Before 1.0 the C ABI is stable across patch releases but may break across minors** — any `0.N.z` is drop-in for any other `0.N.z`, and `0.N` to `0.N+1` may not be. While pre-1.0, mix the five libraries only within one minor; from 1.0 the boundary becomes the major. See [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
+`tracker.h`, `kernels.h`, `detect.h`). Windows ships `bin/*.dll` and `lib/*.lib` import
+libraries. **Before 1.0 the C ABI is stable across patch releases but may break across minors** — any `0.N.z` is drop-in for any other `0.N.z`, and `0.N` to `0.N+1` may not be. While pre-1.0, mix the libraries only within one minor; from 1.0 the boundary becomes the major. See [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
 
 ### Basic usage
 
@@ -364,12 +366,14 @@ graph TB
         PyI["edgefirst-image<br/>wheel"]
         PyD["edgefirst-decoder<br/>wheel"]
         PyK["edgefirst-tracker<br/>wheel"]
+        PyKn["edgefirst-kernels<br/>wheel"]
 
         TensorSo["libedgefirst_tensor.so"]
         CodecSo["libedgefirst_codec.so"]
         ImageSo["libedgefirst_image.so"]
         DecoderSo["libedgefirst_decoder.so"]
         TrackerSo["libedgefirst_tracker.so"]
+        KernelsSo["libedgefirst_kernels.so"]
 
         PyT --> TensorSo
         PyC --> CodecSo
@@ -379,6 +383,7 @@ graph TB
         PyD --> DecoderSo
         PyD --> TensorSo
         PyK --> TrackerSo
+        PyKn --> KernelsSo
 
         CodecSo --> TensorSo
         ImageSo --> TensorSo
@@ -395,12 +400,14 @@ graph TB
 | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | OpenGL / G2D / CPU image processor + mask rendering | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md) |
 | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | YOLO + ModelPack post-processing, NMS, proto-mask APIs | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md) |
 | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) | ByteTrack multi-object tracking | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/TESTING.md) |
+| [`edgefirst-kernels`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/) | Framework-neutral CPU kernels (int8/int16 softmax, sigmoid, 8-bit LUT, DFL, dist2bbox) with NEON tiers; no tensor dependency | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/TESTING.md) |
 | [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) | C ABI: `libedgefirst_tensor.so` + `edgefirst/tensor.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/tests/c/) |
 | [`edgefirst-codec-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec-capi/) | C ABI: `libedgefirst_codec.so` + `edgefirst/codec.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec-capi/tests/c/) |
 | [`edgefirst-image-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/) | C ABI: `libedgefirst_image.so` + `edgefirst/image.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/tests/c/) |
 | [`edgefirst-decoder-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/) | C ABI: `libedgefirst_decoder.so` + `edgefirst/decoder.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/tests/c/) |
 | [`edgefirst-tracker-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/) | C ABI: `libedgefirst_tracker.so` + `edgefirst/tracker.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/tests/c/) |
-| `crates/python-*` (five PyPI wheels) | PyO3 bindings; each links `libedgefirst_tensor.so` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md) |
+| [`edgefirst-kernels-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels-capi/) | C ABI: `libedgefirst_kernels.so` + `edgefirst/kernels.h` | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels-capi/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels-capi/tests/c/) |
+| `crates/python-*` (six PyPI wheels) | PyO3 bindings; tensor, codec, image and decoder link `libedgefirst_tensor.so`, tracker and kernels link no sibling | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/TESTING.md) |
 
 The deep dive on each component (class diagrams, supported operations,
 backend dispatch, performance considerations) lives in the per-crate
@@ -606,7 +613,7 @@ For local benchmarking on supporting hosts, enable them via `RUSTFLAGS`:
 RUSTFLAGS="-C target-cpu=cortex-a78ae" cargo build --release \
   --target aarch64-unknown-linux-gnu --workspace --exclude edgefirst-python-tensor \
   --exclude edgefirst-python-codec --exclude edgefirst-python-image \
-  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
 
 # Generic aarch64 with FEAT_FP16 (do NOT use on Cortex-A53 / imx8mp)
 RUSTFLAGS="-C target-feature=+fp16" cargo build --release \
@@ -1388,6 +1395,8 @@ and the sibling `*-capi` READMEs.
 | `EDGEFIRST_ANGLE_PATH` | macOS and Windows: directory containing `libEGL.dylib` / `libGLESv2.dylib` (macOS) or `libEGL.dll` / `libGLESv2.dll` (Windows). Overrides the default search (macOS: Homebrew → `@loader_path` → `@executable_path` → `libEGL.dylib` on dyld; Windows: next to the loading module → next to the executable → the default DLL search path). Set this when deploying a bundled or custom-signed ANGLE alongside the binary. |
 | `EDGEFIRST_D3D11_ADAPTER` | Windows only: which Direct3D 11 adapter the HAL creates its device on, and therefore the one ANGLE renders with — `hardware` (default), `warp` (software; needs `EDGEFIRST_ALLOW_SOFTWARE_GL=1`), `discrete`, an adapter LUID `<high>:<low>`, or a substring of the adapter description (see [Windows GPU Acceleration](#windows-gpu-acceleration)) |
 | `EDGEFIRST_ANGLE_ADAPTER` | Windows only: alias of `EDGEFIRST_D3D11_ADAPTER`, kept from before the device moved into the tensor crate. Both names are read; if both are set and differ, `EDGEFIRST_D3D11_ADAPTER` wins and the disagreement is logged once |
+| `EDGEFIRST_KERNELS_FORCE_TIER` | Force the CPU tier every `edgefirst-kernels` plan is built for: `scalar`, `neon` (alias `neon_baseline`), `neon_fp16` or `neon_dotprod`. A tier the CPU lacks, or an unknown name, makes plan creation fail rather than fall back. Does not affect the decoder, which reads `EDGEFIRST_DECODER_FORCE_KERNEL` |
+| `EDGEFIRST_DECODER_FORCE_KERNEL` | Force the CPU tier of every `edgefirst-decoder` kernel (per-scale plans, YOLO, ModelPack, semantic segmentation, instance masks, NMS): `scalar`, `neon` (alias `neon_baseline`), `neon_fp16` or `neon_dotprod`. A tier the CPU lacks, or an unknown name, makes `Decoder::decode*` (and building a per-scale decoder) fail with `ForcedKernelUnavailable`; the public helper functions (`dequantize_cpu*`, `postprocess_boxes_*`, `nms_*`, `jaccard_batch4`, `segmentation_to_mask`) run the scalar code instead |
 | `EDGEFIRST_TESTDATA_DIR` | Override testdata location (used by benches and CI) |
 | `RUST_LOG` | Standard `env_logger` filter — `RUST_LOG=edgefirst_image=debug` for backend dispatch + cache stats |
 
@@ -1422,6 +1431,7 @@ testing detail lives in each crate's `TESTING.md` — links in the
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequant |
 | `tracker_benchmark` | `edgefirst-tracker` | ByteTrack throughput vs. simultaneous tracks |
+| `kernels_benchmark` | `edgefirst-kernels` | int8/int16 softmax, sigmoid and fused DFL+box decode per CPU tier (`EDGEFIRST_KERNELS_FORCE_TIER`) |
 
 Run on host:
 
@@ -1486,8 +1496,8 @@ types, etc.) to a file.
 ### Span coverage
 
 The tracing surface covers decode, image conversion, GL multi-pass, mask
-materialization, tensor lifecycle, tracker association, and the Python
-entry points. Each span carries structured fields — see the per-crate
+materialization, tensor lifecycle, tracker association, the CPU kernel
+plans, and the Python entry points. Each span carries structured fields — see the per-crate
 ARCHITECTURE.md files for the authoritative list of spans and fields per
 component.
 
@@ -1569,6 +1579,7 @@ graph TD
     Image[edgefirst-image]
     Decoder[edgefirst-decoder]
     Tracker[edgefirst-tracker]
+    Kernels[edgefirst-kernels]
     G2D[g2d-sys<br/>Linux only]
 
     Image --> Tensor
@@ -1577,29 +1588,34 @@ graph TD
     Image -.->|decode feature, off by default| Decoder
     Image -.->|Linux target only| G2D
     Image -.->|tracker feature| Tracker
+    Image -.->|aarch64 target only| Kernels
     Decoder --> Tensor
     Decoder --> DetectAbi
+    Decoder --> Kernels
     Decoder -.->|tracker feature| Tracker
     Codec --> Tensor
     Tracker -.->|static or tensor-boxes feature| Tensor
 
-    Python[edgefirst.{tensor,codec,image,decoder,tracker}<br/>PyO3]
+    Python[edgefirst.{tensor,codec,image,decoder,tracker,kernels}<br/>PyO3]
     TensorC[libedgefirst_tensor]
     ImageC[libedgefirst_image]
     CodecC[libedgefirst_codec]
     DecoderC[libedgefirst_decoder]
     TrackerC[libedgefirst_tracker]
+    KernelsC[libedgefirst_kernels]
 
     Python --> Tensor
     Python --> Codec
     Python --> Image
     Python --> Decoder
     Python --> Tracker
+    Python --> Kernels
     TensorC --> Tensor
     ImageC --> Image
     CodecC --> Codec
     DecoderC --> Decoder
     TrackerC --> Tracker
+    KernelsC --> Kernels
 
     style Python fill:#e1f5ff
     style TensorC fill:#e1f5ff
@@ -1607,7 +1623,9 @@ graph TD
     style CodecC fill:#e1f5ff
     style DecoderC fill:#e1f5ff
     style TrackerC fill:#e1f5ff
+    style KernelsC fill:#e1f5ff
     style Tracker fill:#e8f5e9
+    style Kernels fill:#e8f5e9
 ```
 
 ## Future Considerations

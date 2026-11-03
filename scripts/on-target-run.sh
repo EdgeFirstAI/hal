@@ -159,18 +159,18 @@ for bin in "${bins[@]}"; do
   fi
 done
 
-# G1/G2/G4/G9/G11 via check-single-home.sh. G5 (footprint) and G7 (Miri) read
+# G1/G2/G2t/G4/G9/G11 via check-single-home.sh. G5 (footprint) and G7 (Miri) read
 # `cannot_measure` on a board: no target/release build and no scripts/miri.sh
 # are bundled, on purpose. That is an attributable gap for those two gates
-# only, so it is not a failure; a FAIL on any of G1/G1b/G2/G4/G9/G11 is.
-echo "  -- check-single-home.sh (G1/G2/G4/G9/G11)"
+# only, so it is not a failure; a FAIL on any of G1/G1b/G2/G2t/G4/G9/G11 is.
+echo "  -- check-single-home.sh (G1/G2/G2t/G4/G9/G11)"
 ghlog="${RESULTS}/check-single-home.log"
 ./scripts/check-single-home.sh > "${ghlog}" 2>&1
-gh_real_fail="$(grep -cE '^\s*(G1|G1b|G2|G4|G9|G11)\s+FAIL' "${ghlog}")"
+gh_real_fail="$(grep -cE '^\s*(G1|G1b|G2|G2t|G4|G9|G11)\s+FAIL' "${ghlog}")"
 gh_expected_gap="$(grep -cE '^\s*(G5|G7)\s+FAIL' "${ghlog}")"
 if [[ "${gh_real_fail}" -eq 0 ]]; then
   pass=$((pass + 1))
-  echo "     ok -- G1/G1b/G2/G4/G9/G11 clean; ${gh_expected_gap} expected gap(s) (G5/G7 need the build host)"
+  echo "     ok -- G1/G1b/G2/G2t/G4/G9/G11 clean; ${gh_expected_gap} expected gap(s) (G5/G7 need the build host)"
 else
   fail=$((fail + 1)); failed_bins+=("check-single-home.sh")
   echo "     FAILED: ${gh_real_fail} real gate failure(s)"
@@ -207,5 +207,5 @@ elif [[ ${ran_nothing} -eq ${#bins[@]} ]]; then
 fi
 detail="${pass} binaries, ${skipped} tests skipped"
 [[ ${ran_nothing} -gt 0 ]] && detail="${detail}, ${ran_nothing} ran 0 tests"
-write_summary PASS "${detail}, G1/G2/G3/G4/G9/G11 clean"
+write_summary PASS "${detail}, G1/G2/G2t/G3/G4/G9/G11 clean"
 exit 0

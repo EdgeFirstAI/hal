@@ -1,38 +1,20 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.14
-**Last Updated:** August 14, 2026
-**Status:** two capture generations coexist in this file — read the scope note
-below before quoting any number.
+**Version:** 3.16
+**Last Updated:** November 3, 2026
+**Status:** two capture generations coexist in this file — read the scope note below before quoting any number.
 
-**GL / preprocessing matrix (Buffer Infrastructure, Image Preprocessing,
-Format Conversion, Mask Rendering, `bench_preproc`, `decode_pipeline_benchmark`
-sections): 0.25.0 release refresh.** The full bench matrix was re-collected on
-the 0.25.0 converged-GL-engine code across imx8mp-frdm (Vivante GC7000UL +
-G2D), imx95-frdm (Mali-G310 + DPU-G2D), rpi5-hailo (V3D 7.1), and
-jetson-orin-nano (NVIDIA Tegra Orin, PBO/CUDA path), plus the existing
-`mbp-m2-max` (ANGLE + IOSurface). The re-collected matrix confirms the recent
-GL-convergence captures within measurement noise (e.g. imx95 GL 1080p
-YUYV→RGBA letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no
-regressions were observed on any GPU class. The Allocation table is updated
-for the notable imx8mp DMA-alloc improvement (38 ms → 1.8 ms at 720p); other
-tables are unchanged within noise. Raw per-board JSON lives in the
-(git-ignored) `benchmarks/<platform>/` working tree and is regenerated into
-these tables via `.github/scripts/generate_benchmark_tables.py`. The macOS GL
-rows here are still the pre-convergence capture — 0.25.0 also moved macOS onto
-the shared GL engine, which lifted the old YUYV→RGBA-only limit, but the
-macOS matrix has not been re-collected since (Known Gap #17). YUYV→RGBA
-same-size convert vs the Apple Silicon CPU path: **1.32×** at 1080p, **4.76×**
-at 4K.
+**Current-code capture, November 3, 2026.** The following sections were collected with every case of `scripts/on-target-bench.sh`, from a fat-LTO bench bundle of the `edgefirst-kernels` branch (workspace 0.38.2):
+- Buffer Infrastructure (Allocation and Map/Unmap);
+- Image Preprocessing: Letterbox Pipeline;
+- Format Conversion;
+- Decoder Post-Processing;
+- Decoder NEON Tiers and `edgefirst-kernels`;
+- Mask Rendering.
 
-> **The GL/preprocessing matrix above is two minor releases behind the
-> workspace.** It was collected on 0.25.0; the workspace is now on 0.28.x.
-> Treat it as the last known-good baseline rather than a description of
-> current performance, and re-collect before using it to argue a regression
-> either way. **This does not apply to the JPEG Decode, AWS cloud baseline,
-> or Hardware decoders sections below** — those are current-code captures
-> (see their own capture dates) and supersede the older, narrower `Image
-> Codec Decode` section further down this file (marked superseded in place).
+The boards were imx8mp-frdm, imx8mp-evk, imx95-frdm, imx95-evk, rpi5-hailo, jetson-orin-nano and iq9075-evk, plus the x86-desktop host. Two extra cases were collected on the same date: a forced-G2D `pipeline_benchmark` on the i.MX boards (`pipeline-g2d.json`) and an unforced `mask_benchmark` (`mask-auto.json`). Raw per-board JSON lives in the git-ignored `benchmarks/<platform>/` working tree. The generated tables are rendered from it by `.github/scripts/generate_benchmark_tables.py`. The `mbp-m2-max` rows in those tables come from that board's committed JSON, an older capture whose GL rows predate the shared GL engine (Known Gap #17). The Memcpy Throughput table is that older mbp-m2-max capture too.
+
+> **Every other section is an older capture, and each one states its own capture date.** That covers JPEG Decode, Control corpora, AWS cloud baselines, Hardware decoders, Image Codec Decode (superseded in place), EXIF Orientation Overhead, the materialize_masks Batched-GEMM tables, NumPy Interop, `bench_preproc` and `decode_pipeline_benchmark`, along with the NV12/NV16/NV24 sampler-vs-shader and Packed RGB Sources notes. Re-collect those sections before using them to argue a regression either way.
 
 ---
 
@@ -304,6 +286,7 @@ See [README.md § Benchmarking](README.md#benchmarking) for full instructions on
 | `parallel_processors_benchmark` | `edgefirst-image` | Multi-processor GL throughput scaling; shows where the serialization policy binds |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
+| `kernels_benchmark` | `edgefirst-kernels` | Softmax, sigmoid, DFL, dist2bbox and mask-dot kernels on every CPU tier (`scalar`, `neon`, `neon_fp16`, `neon_dotprod`) |
 | `codec_benchmark` | `edgefirst-codec` | JPEG/PNG decode into pre-allocated tensors vs. image crate and zune-png; NEON tiers on AArch64, `IntelTier` (SSE2/SSE4.1/AVX2) on x86-64, vectorised type conversion |
 | `tracker_benchmark` | `edgefirst-tracker` | ByteTrack association and track lifecycle |
 
@@ -335,53 +318,81 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | Property | Value |
 |----------|-------|
 | **Platform ID** | `imx8mp-frdm` |
-| **SoC** | NXP i.MX 8M Plus |
-| **CPU** | 4× Cortex-A53 @ 1.6 GHz |
-| **GPU** | Vivante GC7000UL (OpenGL ES 3.1) |
-| **RAM** | 2 GB LPDDR4 |
-| **OS** | NXP BSP (Linux 6.12) |
+| **SoC** | NXP i.MX 8M Plus (FRDM-IMX8MPLUS) |
+| **CPU** | 4× Cortex-A53 @ 1.8 GHz (no FP16 arithmetic, no dot product) |
+| **GPU** | Vivante GC7000UL (OpenGL ES 3.1, galcore) |
+| **RAM** | 4 GB LPDDR4 (MemTotal 3.5 GiB, 960 MiB CMA) |
+| **OS** | EdgeFirst Yocto 2026.10.0~dev, NXP i.MX BSP 6.18.37-2.1.0 (Linux 6.18.37) |
 | **G2D** | Yes (Vivante) |
 | **DMA-buf** | Yes (CMA) |
-| **Notes** | NXP evaluation board; same SoC as maivin, latest NXP BSP. **NV12→planar blocked on GL** (GPU hang, see Known Issues §9). |
+| **Notes** | NXP evaluation board; same SoC as maivin. **NV12→planar blocked on GL** (GPU hang, see Known Issues §9). |
+
+### imx8mp-evk
+
+| Property | Value |
+|----------|-------|
+| **Platform ID** | `imx8mp-evk` |
+| **SoC** | NXP i.MX 8M Plus (i.MX8MPlus EVK; fleet unit `imx8mpevk-06`) |
+| **CPU** | 4× Cortex-A53 @ 1.8 GHz (no FP16 arithmetic, no dot product) |
+| **GPU** | Vivante GC7000UL (OpenGL ES 3.1, galcore) |
+| **RAM** | 6 GB LPDDR4 (MemTotal 5.5 GiB, 960 MiB CMA) |
+| **OS** | EdgeFirst Yocto 2026.10.0~dev, NXP i.MX BSP 6.18.37-2.1.0 (Linux 6.18.37) |
+| **G2D** | Yes (Vivante) |
+| **DMA-buf** | Yes (CMA) |
+| **Notes** | The `imx8mp-evk` runner identity the hardware-bench workflow targets by default; same SoC and BSP as imx8mp-frdm. |
 
 ### imx95-frdm
 
 | Property | Value |
 |----------|-------|
 | **Platform ID** | `imx95-frdm` |
-| **SoC** | NXP i.MX 95 |
-| **CPU** | 6× Cortex-A55 @ 1.8 GHz |
-| **GPU** | Mali G310 (Panfrost, OpenGL ES 3.1) |
-| **RAM** | 8 GB LPDDR5 |
-| **OS** | NXP BSP (Linux 6.12) |
-| **G2D** | Yes (NXP PXP backend) |
+| **SoC** | NXP i.MX 95 (FRDM-IMX95) |
+| **CPU** | 6× Cortex-A55 @ 1.8 GHz (FP16 arithmetic and dot product) |
+| **GPU** | Mali-G310 (Arm Mali driver, `/dev/mali0`; OpenGL ES 3.1) |
+| **RAM** | 8 GB (MemTotal 7.5 GiB, 960 MiB CMA) |
+| **OS** | EdgeFirst Yocto 2026.10.0~dev, NXP i.MX BSP 6.18.37-2.1.0 (Linux 6.18.37) |
+| **G2D** | Yes (`libg2d.so.2`, DPU backend) |
 | **DMA-buf** | Yes (CMA) |
 | **Notes** | Next-gen NXP platform; Mali GPU replaces Vivante |
+
+### imx95-evk
+
+| Property | Value |
+|----------|-------|
+| **Platform ID** | `imx95-evk` |
+| **SoC** | NXP i.MX 95 (i.MX95 19X19 EVK) |
+| **CPU** | 6× Cortex-A55 @ 1.8 GHz (FP16 arithmetic and dot product) |
+| **GPU** | Mali-G310 (Arm Mali driver, `/dev/mali0`; OpenGL ES 3.1) |
+| **RAM** | 16 GB LPDDR5 (MemTotal 15.3 GiB, 960 MiB CMA) |
+| **OS** | EdgeFirst Yocto 2026.10.0~dev, NXP i.MX BSP 6.18.37-2.1.0 (Linux 6.18.37) |
+| **G2D** | Yes (`libg2d.so.2`, DPU backend) |
+| **DMA-buf** | Yes (CMA) |
+| **Notes** | The `imx95-evk` runner identity the hardware-bench workflow targets by default |
 
 ### jetson-orin-nano
 
 | Property | Value |
 |----------|-------|
 | **Platform ID** | `jetson-orin-nano` |
-| **SoC** | NVIDIA Jetson Orin Nano |
-| **CPU** | 6× Cortex-A78AE @ 1.5 GHz |
+| **SoC** | NVIDIA Jetson Orin Nano (Engineering Reference Developer Kit Super, tegra234) |
+| **CPU** | 6× Cortex-A78AE @ 1.7 GHz (FP16 arithmetic and dot product) |
 | **GPU** | NVIDIA Ampere (1024 CUDA cores) |
-| **RAM** | 8 GB LPDDR5 |
-| **OS** | JetPack / L4T |
+| **RAM** | 8 GB LPDDR5 (MemTotal 7.4 GiB) |
+| **OS** | Ubuntu 22.04.5 LTS, L4T R36.4.7 (Linux 5.15.148-tegra) |
 | **G2D** | No |
-| **DMA-buf** | Yes (system heap, DMA roundtrip may fail — PBO path likely) |
-| **Notes** | NVIDIA EGL may not import DMA-buf from system heap; PBO path expected |
+| **DMA-buf** | No `/dev/dma_heap` (NVIDIA `nvmap` allocator); GL sources and destinations use the PBO path |
+| **Notes** | NVIDIA EGL does not import system-heap DMA-buf; PBO is the GL transfer path |
 
 ### rpi5-hailo
 
 | Property | Value |
 |----------|-------|
 | **Platform ID** | `rpi5-hailo` |
-| **SoC** | Broadcom BCM2712 |
-| **CPU** | 4× Cortex-A76 @ 2.4 GHz |
+| **SoC** | Broadcom BCM2712 (Raspberry Pi 5 Model B Rev 1.1, Hailo-8L on PCIe) |
+| **CPU** | 4× Cortex-A76 @ 2.4 GHz (FP16 arithmetic and dot product) |
 | **GPU** | VideoCore VII (OpenGL ES 3.1 via Mesa V3D) |
-| **RAM** | 8 GB LPDDR4X |
-| **OS** | Raspberry Pi OS (Debian 12) |
+| **RAM** | 8 GB LPDDR4X (MemTotal 7.9 GiB) |
+| **OS** | Raspberry Pi OS, Debian 13 (trixie) (Linux 6.18.33+rpt-rpi-2712) |
 | **G2D** | No |
 | **DMA-buf** | Yes (64 MB CMA; system heap when CMA is full) |
 | **Notes** | Mesa V3D driver; RGB/RGB_i8 packed GL via two-pass packing shader |
@@ -392,13 +403,27 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 |----------|-------|
 | **Platform ID** | `x86-desktop` |
 | **SoC** | — |
-| **CPU** | (varies — document specific CPU at collection time) |
-| **GPU** | NVIDIA (desktop, proprietary driver) |
-| **RAM** | (varies) |
-| **OS** | Ubuntu 24.04+ |
+| **CPU** | Intel Core i9-11900K (Rocket Lake, 8 cores / 16 threads, up to 5.3 GHz; `powersave` governor under intel_pstate) |
+| **GPU** | NVIDIA GeForce RTX 3090 (proprietary driver 580.178.04) |
+| **RAM** | 64 GB |
+| **OS** | Ubuntu 22.04.5 LTS (Linux 5.15.0-198-generic) |
 | **G2D** | No |
 | **DMA-buf** | DMA allocation works but NVIDIA EGL cannot import — PBO path |
-| **Notes** | Development platform; PBO backend primary, DMA-buf roundtrip fails |
+| **Notes** | Development platform; PBO backend primary, DMA-buf roundtrip fails. The decoder and kernels run their portable (scalar-tier) code on x86-64 |
+
+### iq9075-evk
+
+| Property | Value |
+|----------|-------|
+| **Platform ID** | `iq9075-evk` |
+| **SoC** | Qualcomm IQ-9075 (QCS9075 / SA8775P family; Qualcomm IQ 9075 EVK) |
+| **CPU** | 8× Cortex-A78C @ 2.36 GHz, two 4-core clusters (FP16 arithmetic and dot product) |
+| **GPU** | Adreno 663 (KGSL) |
+| **RAM** | 36 GB (MemTotal 34.4 GiB) |
+| **OS** | Ubuntu 24.04.5 LTS (Linux 6.8.0-1084-qcom) |
+| **G2D** | No |
+| **DMA-buf** | Yes (`system` heap, 164 MiB CMA) |
+| **Notes** | The `iq9075-evk` runner identity. Runs as a non-root user. Its multi-threaded decoder cells vary several-fold between runs (for example `per_scale/640x640/dense` 301–1867 µs), so single-cell comparisons on this board need many rounds |
 
 ### mbp-m2-max
 
@@ -1473,11 +1498,7 @@ cargo run --release -p edgefirst-codec --example dump_rgb420 -- in.jpg out.ppm
 > claim with no measurement behind it. To change a number, re-collect and re-run
 > the generator. Surrounding prose is hand-written and safe to edit.
 
-**Data collected:** March 30, 2026 (v0.15.0, per-texture EGL binding
-optimization) unless a section states otherwise — the GL convert,
-letterbox, and mask-rendering tables were re-collected June 2026 after
-the GL convergence engine (PR #109/#110, issue #106); each carries its
-own capture note.
+**Data collected:** November 3, 2026 for the Buffer Infrastructure, Image Preprocessing, Format Conversion, Decoder Post-Processing, Decoder NEON Tiers and Mask Rendering tables (see the scope note at the top of this file). Later sections carry their own capture dates.
 
 ### Buffer Infrastructure
 
@@ -1487,26 +1508,33 @@ Measures `Tensor::new()` latency for each buffer type and resolution.
 
 | Platform | Buffer | 720p (3.5 MB) | 1080p (7.9 MB) | 4K (31.6 MB) |
 |----------|--------|---------------|-----------------|---------------|
-| imx8mp-frdm | MEM | 311 us | 698 us | 2.8 ms |
-| imx8mp-frdm | SHM | 26 us | 26 us | 26 us |
-| imx8mp-frdm | DMA | 1.8 ms | 2.8 ms | 10.3 ms |
-| imx95-frdm | MEM | 263 us | 594 us | 2.4 ms |
+| imx8mp-frdm | MEM | 312 us | 703 us | 2.8 ms |
+| imx8mp-frdm | SHM | 25 us | 25 us | 25 us |
+| imx8mp-frdm | DMA | 1.6 ms | 3.0 ms | 18.8 ms |
+| imx8mp-evk | MEM | 315 us | 708 us | 2.8 ms |
+| imx8mp-evk | SHM | 25 us | 25 us | 25 us |
+| imx8mp-evk | DMA | 1.6 ms | 2.8 ms | 10.7 ms |
+| imx95-frdm | MEM | 262 us | 594 us | 2.4 ms |
 | imx95-frdm | SHM | 31 us | 31 us | 31 us |
-| imx95-frdm | DMA | 983 us | 2.1 ms | 8.4 ms |
-| rpi5-hailo | MEM | 285 us | 790 us | 3.5 ms |
-| rpi5-hailo | SHM | 5.0 us | 5.0 us | 6.0 us |
-| rpi5-hailo | DMA | 714 us | 1.6 ms | 6.2 ms |
-| jetson-orin-nano | MEM | 140 us | 330 us | 1.3 ms |
+| imx95-frdm | DMA | 1.1 ms | 2.2 ms | 8.4 ms |
+| imx95-evk | MEM | 240 us | 543 us | 2.2 ms |
+| imx95-evk | SHM | 31 us | 31 us | 31 us |
+| imx95-evk | DMA | 1.2 ms | 2.3 ms | 8.3 ms |
+| rpi5-hailo | MEM | 241 us | 703 us | 3.3 ms |
+| rpi5-hailo | SHM | 5.0 us | 5.0 us | 5.0 us |
+| rpi5-hailo | DMA | 676 us | 1.5 ms | 5.9 ms |
+| jetson-orin-nano | MEM | 138 us | 320 us | 1.3 ms |
 | jetson-orin-nano | SHM | 12 us | 12 us | 12 us |
+| iq9075-evk | MEM | 108 us | 227 us | 920 us |
+| iq9075-evk | SHM | 10 us | 9.0 us | 9.0 us |
+| iq9075-evk | DMA | 373 us | 873 us | 3.1 ms |
+| x86-desktop | MEM | 207 us | 242 us | 1.2 ms |
+| x86-desktop | SHM | 2.0 us | 2.0 us | 2.0 us |
 | mbp-m2-max | MEM | 28 us | 65 us | 323 us |
 | mbp-m2-max | SHM | 2.0 us | 2.0 us | 2.0 us |
 | mbp-m2-max | DMA | 16 us | 16 us | 16 us |
 
-Apple Silicon DMA-row is IOSurface: allocation cost is dominated by the
-`IOSurfaceCreate` round-trip into the kernel, not the buffer size, so it
-stays at ~16 µs from 720p to 4K. The Linux DMA-buf path scales linearly
-with size because the kernel zeros the buffer pages on allocation; macOS
-defers initialization to first touch.
+Apple Silicon DMA-row is IOSurface: allocation cost is dominated by the `IOSurfaceCreate` round-trip into the kernel, not the buffer size, so it stays at 16 µs from 720p to 4K. The Linux DMA-buf path grows with size because the kernel zeros the buffer pages on allocation: 4K is 9× the bytes of 720p and costs 6.7–11.8× as long across the Linux boards (1.6 → 10.7 ms on imx8mp-evk, 1.6 → 18.8 ms on imx8mp-frdm). macOS defers initialization to first touch.
 
 #### Map/Unmap Latency
 
@@ -1514,20 +1542,22 @@ Measures `tensor.map()` round-trip latency.
 
 | Platform | Buffer | 720p | 1080p | 4K |
 |----------|--------|------|-------|-----|
-| imx8mp-frdm | SHM | 13 us | 14 us | 13 us |
-| imx8mp-frdm | DMA | 349 us | 767 us | 3.0 ms |
+| imx8mp-frdm | SHM | 12 us | 13 us | 12 us |
+| imx8mp-frdm | DMA | 345 us | 764 us | 3.2 ms |
+| imx8mp-evk | SHM | 14 us | 14 us | 14 us |
+| imx8mp-evk | DMA | 347 us | 766 us | 3.0 ms |
 | imx95-frdm | SHM | 12 us | 12 us | 12 us |
-| imx95-frdm | DMA | 278 us | 625 us | 2.5 ms |
+| imx95-frdm | DMA | 274 us | 622 us | 2.5 ms |
+| imx95-evk | SHM | 14 us | 14 us | 14 us |
+| imx95-evk | DMA | 276 us | 624 us | 2.5 ms |
 | rpi5-hailo | SHM | 2.0 us | 2.0 us | 3.0 us |
-| rpi5-hailo | DMA | 99 us | 220 us | 869 us |
+| rpi5-hailo | DMA | 99 us | 219 us | 868 us |
 | jetson-orin-nano | SHM | 3.0 us | 3.0 us | 3.0 us |
-| x86-desktop | SHM | 1.0 us | 1.0 us | 1.0 us |
-| mbp-m2-max | SHM | 0.5 us | 0.5 us | 0.5 us |
-| mbp-m2-max | DMA | 0.5 us | 0.5 us | 0.5 us |
+| iq9075-evk | SHM | 3.0 us | 3.0 us | 3.0 us |
+| iq9075-evk | DMA | 213 us | 475 us | 1.9 ms |
+| x86-desktop | SHM | 0.0 us | 0.0 us | 1.0 us |
 
-IOSurface map on macOS is a `IOSurfaceLock` call on a buffer the kernel
-already owns; it stays sub-microsecond across all sizes. SHM is a single
-`fstat` + cached `mmap` of an already-open file descriptor.
+SHM map is a single `fstat` + cached `mmap` of an already-open file descriptor, so it stays flat across sizes (0–14 µs). DMA-buf map grows with buffer size, from 99 µs at 720p on rpi5-hailo to 3.2 ms at 4K on imx8mp-frdm.
 
 #### Memcpy Throughput
 
@@ -1549,82 +1579,94 @@ macOS when you need a backing tensor that the GL backend can also import.**
 
 ### Image Preprocessing: Letterbox Pipeline (Camera → Model Input)
 
-**GL rows re-collected:** June 2026 (GL convergence engine, PR #109/#110;
-median of 3 runs × n=100, `pipeline_benchmark`). G2D/CPU rows are the
-v0.15.0 capture (those backends were not changed).
+**Data collected:** November 3, 2026. The data comes from `pipeline-opengl`, `pipeline-cpu` and the forced-G2D `pipeline-g2d` case, one run per board at n=100 per cell. The G2D rows are the i.MX boards only.
 
 **1080p → 640×640:**
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | YUYV→8BPi | NV12→RGBA | VYUY→RGBA |
 |----------|---------|--------|-----------|----------|-----------|-----------|-----------|
-| imx8mp-frdm | G2D | DMA | 2.7 ms | 4.0 ms | — | 4.1 ms | — |
-| imx8mp-frdm | GL | DMA | 1.8 ms | 11.3 ms | — | 3.2 ms | — |
-| imx8mp-frdm | CPU | Heap | 17.4 ms | 17.6 ms | — | 33.9 ms | 17.5 ms |
-| imx95-frdm | G2D | DMA | 3.9 ms | 4.6 ms | — | 3.7 ms | — |
-| imx95-frdm | GL | DMA | 1.2 ms | 2.6 ms | — | 1.2 ms | — |
-| imx95-frdm | CPU | Heap | 14.5 ms | 14.9 ms | — | 16.6 ms | 14.5 ms |
-| rpi5-hailo | GL | DMA | 3.3 ms | 4.0 ms | — | 1.2 ms | — |
-| rpi5-hailo | CPU | Heap | 7.6 ms | 7.2 ms | — | 8.1 ms | 7.6 ms |
-| jetson-orin-nano | GL | PBO | 4.3 ms | 4.6 ms | — | 4.3 ms | — |
-| jetson-orin-nano | CPU | Heap | 6.1 ms | 5.9 ms | — | 5.3 ms | 6.2 ms |
-| x86-desktop | CPU | Heap | 3.0 ms | 1.5 ms | — | 1.8 ms | 5.4 ms |
-| mbp-m2-max | CPU | Heap | 1.5 ms | 1.7 ms | 2.0 ms | 1.3 ms | — |
+| imx8mp-frdm | G2D | DMA | 3.6 ms | 4.6 ms | — | 4.7 ms | — |
+| imx8mp-frdm | GL | DMA | 2.6 ms | 11.1 ms | — | 4.5 ms | — |
+| imx8mp-frdm | CPU | Heap | 14.1 ms | 14.9 ms | — | 18.8 ms | 14.0 ms |
+| imx8mp-evk | G2D | DMA | 3.9 ms | 5.1 ms | — | 4.8 ms | — |
+| imx8mp-evk | GL | DMA | 2.8 ms | 11.7 ms | — | 4.5 ms | — |
+| imx8mp-evk | CPU | Heap | 13.9 ms | 14.9 ms | — | 19.0 ms | 13.6 ms |
+| imx95-frdm | G2D | DMA | 3.8 ms | 4.3 ms | — | 3.7 ms | — |
+| imx95-frdm | GL | DMA | 1.2 ms | 2.6 ms | — | 1.6 ms | — |
+| imx95-frdm | CPU | Heap | 10.9 ms | 11.6 ms | — | 15.1 ms | 11.4 ms |
+| imx95-evk | G2D | DMA | 3.9 ms | 4.3 ms | — | 3.7 ms | — |
+| imx95-evk | GL | DMA | 1.2 ms | 2.6 ms | — | 1.5 ms | — |
+| imx95-evk | CPU | Heap | 10.6 ms | 11.4 ms | — | 14.1 ms | 10.6 ms |
+| rpi5-hailo | GL | DMA | 3.1 ms | 3.8 ms | — | 1.1 ms | — |
+| rpi5-hailo | CPU | Heap | 4.9 ms | 4.1 ms | — | 5.3 ms | 4.9 ms |
+| jetson-orin-nano | GL | PBO | 500 us | 515 us | — | 616 us | — |
+| jetson-orin-nano | CPU | Heap | 3.2 ms | 3.5 ms | — | 4.5 ms | 3.2 ms |
+| iq9075-evk | GL | DMA | 2.3 ms | 2.7 ms | — | 2.6 ms | — |
+| iq9075-evk | CPU | Heap | 7.7 ms | 8.9 ms | — | 8.6 ms | 7.4 ms |
+| x86-desktop | GL | PBO | 96 us | 137 us | — | 115 us | — |
+| x86-desktop | CPU | Heap | 879 us | 892 us | — | 747 us | 884 us |
+| mbp-m2-max | CPU | Heap | 1.5 ms | 1.7 ms | — | 1.3 ms | 1.5 ms |
 
 **4K → 640×640:**
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA |
 |----------|---------|--------|-----------|----------|-----------|
-| imx8mp-frdm | G2D | DMA | 4.0 ms | 5.3 ms | 5.8 ms |
-| imx8mp-frdm | GL | DMA | 2.3 ms | 12.4 ms | 9.4 ms |
-| imx8mp-frdm | CPU | Heap | 59.9 ms | 50.6 ms | 125 ms |
-| imx95-frdm | G2D | DMA | 15.8 ms | 16.5 ms | 13.3 ms |
-| imx95-frdm | GL | DMA | 1.6 ms | 3.6 ms | 4.8 ms |
-| imx95-frdm | CPU | Heap | 46.5 ms | 41.9 ms | 55.3 ms |
-| rpi5-hailo | GL | DMA | 18.5 ms | 19.3 ms | 5.0 ms |
-| rpi5-hailo | CPU | Heap | 24.0 ms | 19.7 ms | 24.4 ms |
-| jetson-orin-nano | GL | DMA | — | — | — |
-| jetson-orin-nano | CPU | Heap | 18.4 ms | 20.0 ms | 14.9 ms |
-| x86-desktop | CPU | Heap | 9.5 ms | 6.7 ms | 9.0 ms |
+| imx8mp-frdm | G2D | DMA | 5.2 ms | 6.1 ms | 6.8 ms |
+| imx8mp-frdm | GL | DMA | 3.7 ms | 12.2 ms | 10.1 ms |
+| imx8mp-frdm | CPU | Heap | 40.8 ms | 37.4 ms | 41.1 ms |
+| imx8mp-evk | G2D | DMA | 4.8 ms | 5.9 ms | 6.9 ms |
+| imx8mp-evk | GL | DMA | 3.7 ms | 12.2 ms | 10.0 ms |
+| imx8mp-evk | CPU | Heap | 41.2 ms | 37.8 ms | 41.2 ms |
+| imx95-frdm | G2D | DMA | 15.9 ms | 16.3 ms | 13.2 ms |
+| imx95-frdm | GL | DMA | 1.5 ms | 2.9 ms | 2.2 ms |
+| imx95-frdm | CPU | Heap | 33.1 ms | 31.1 ms | 50.6 ms |
+| imx95-evk | G2D | DMA | 13.8 ms | 16.3 ms | 13.2 ms |
+| imx95-evk | GL | DMA | 1.5 ms | 2.9 ms | 2.1 ms |
+| imx95-evk | CPU | Heap | 32.3 ms | 30.8 ms | 47.0 ms |
+| rpi5-hailo | GL | DMA | 11.4 ms | 12.2 ms | 4.6 ms |
+| rpi5-hailo | CPU | Heap | 14.3 ms | 12.3 ms | 15.4 ms |
+| jetson-orin-nano | GL | PBO | 962 us | 980 us | 1.4 ms |
+| jetson-orin-nano | CPU | Heap | 11.4 ms | 11.1 ms | 14.4 ms |
+| iq9075-evk | GL | DMA | 2.6 ms | 2.7 ms | 2.4 ms |
+| iq9075-evk | CPU | Heap | 12.8 ms | 13.3 ms | 14.5 ms |
+| x86-desktop | GL | PBO | 164 us | 212 us | 219 us |
+| x86-desktop | CPU | Heap | 4.2 ms | 3.7 ms | 3.9 ms |
 | mbp-m2-max | CPU | Heap | 4.6 ms | 4.4 ms | 3.7 ms |
 
 ### Format Conversion (Same Size, No Resize)
 
-**imx8mp/imx95 GL rows re-collected:** June 11, 2026
-(`image_benchmark`, PR #110 head, n=100). This closes the issue #106
-drift: the 2026-06-09 capture had imx8mp RGBA→BGRA at 13.8 ms (+79%)
-and RGBA→GREY at 14.9 ms (+91%) versus this table; the GL convergence
-engine (PR #109) reclaimed both to the v0.15.0 numbers, and the
-RGBA→BGRA / RGBA→GREY cells are now permanent `image_benchmark`
-sentinels so same-size drift cannot go unmeasured again. Orin YUYV GL
-cells are the 2026-06-10 PR #109 capture; remaining GL cells and all
-G2D/CPU rows are the v0.15.0 capture.
+**Data collected:** November 3, 2026, from the same `pipeline-*` runs as the letterbox tables. The RGBA→BGRA and RGBA→GREY cells are `image_benchmark` sentinels for same-size drift.
 
 **1080p → 1080p:**
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA | RGB→RGBA | RGBA→BGRA | RGBA→GREY |
 |----------|---------|--------|-----------|----------|-----------|----------|-----------|-----------|
-| imx8mp-frdm | G2D | DMA | 6.0 ms | 10.5 ms | 6.3 ms | — | — | — |
-| imx8mp-frdm | GL | DMA | 7.3 ms | 49.0 ms | 6.1 ms | — | 7.7 ms | 7.9 ms |
-| imx8mp-frdm | CPU | Heap | 13.5 ms | 11.8 ms | 25.7 ms | 13.7 ms | 30.2 ms | 10.0 ms |
+| imx8mp-frdm | G2D | DMA | 6.8 ms | 11.4 ms | 6.3 ms | — | — | — |
+| imx8mp-frdm | GL | DMA | 8.0 ms | 49.2 ms | 7.2 ms | 24.7 ms | 8.1 ms | 12.1 ms |
+| imx8mp-frdm | CPU | Heap | 13.2 ms | 11.7 ms | 14.2 ms | 13.8 ms | 30.9 ms | 10.2 ms |
+| imx8mp-evk | G2D | DMA | 7.4 ms | 11.6 ms | 6.9 ms | — | — | — |
+| imx8mp-evk | GL | DMA | 8.1 ms | 49.4 ms | 6.9 ms | 25.0 ms | 8.2 ms | 11.9 ms |
+| imx8mp-evk | CPU | Heap | 13.6 ms | 11.9 ms | 14.4 ms | 14.5 ms | 31.4 ms | 10.4 ms |
 | imx95-frdm | G2D | DMA | 4.6 ms | 4.3 ms | 4.5 ms | — | — | — |
-| imx95-frdm | GL | DMA | 3.0 ms | 5.7 ms | 3.2 ms | — | 3.1 ms | 2.2 ms |
-| imx95-frdm | CPU | Heap | 12.4 ms | 11.0 ms | 16.1 ms | 11.1 ms | 24.8 ms | 9.0 ms |
-| rpi5-hailo | GL | DMA | 7.2 ms | 10.4 ms | 5.4 ms | — | 8.4 ms | 6.2 ms |
-| rpi5-hailo | CPU | Heap | 6.8 ms | 5.4 ms | 8.0 ms | 6.6 ms | 12.2 ms | 2.5 ms |
-| jetson-orin-nano | GL | PBO | 2.3 ms | 2.2 ms | — | 1.5 ms | 4.2 ms | 1.5 ms |
-| jetson-orin-nano | CPU | Heap | 3.0 ms | 2.8 ms | 2.1 ms | 789 us | 3.2 ms | 1.4 ms |
-| x86-desktop | CPU | Heap | 516 us | 559 us | 256 us | 261 us | 758 us | 219 us |
+| imx95-frdm | GL | DMA | 3.6 ms | 5.8 ms | 3.2 ms | 2.3 ms | 2.8 ms | 3.9 ms |
+| imx95-frdm | CPU | Heap | 12.3 ms | 10.5 ms | 17.3 ms | 11.2 ms | 24.9 ms | 9.0 ms |
+| imx95-evk | G2D | DMA | 4.6 ms | 4.3 ms | 4.5 ms | — | — | — |
+| imx95-evk | GL | DMA | 2.3 ms | 5.8 ms | 3.2 ms | 1.9 ms | 1.9 ms | 3.9 ms |
+| imx95-evk | CPU | Heap | 12.4 ms | 10.9 ms | 16.8 ms | 11.3 ms | 24.2 ms | 8.9 ms |
+| rpi5-hailo | GL | DMA | 7.0 ms | 9.0 ms | 4.4 ms | 4.9 ms | 5.0 ms | 6.7 ms |
+| rpi5-hailo | CPU | Heap | 6.1 ms | 4.7 ms | 6.9 ms | 6.0 ms | 12.0 ms | 2.4 ms |
+| jetson-orin-nano | GL | PBO | 1.0 ms | 1.4 ms | 1.1 ms | 1.1 ms | 5.5 ms | 1.2 ms |
+| jetson-orin-nano | CPU | Heap | 2.3 ms | 2.0 ms | 3.1 ms | 693 us | 2.7 ms | 1.1 ms |
+| iq9075-evk | GL | DMA | 2.7 ms | 3.1 ms | 2.6 ms | 2.7 ms | 2.6 ms | 3.1 ms |
+| iq9075-evk | CPU | Heap | 2.5 ms | 2.2 ms | 3.1 ms | 1.4 ms | 3.6 ms | 1.5 ms |
+| x86-desktop | GL | PBO | 137 us | 278 us | 143 us | 135 us | 2.6 ms | 164 us |
+| x86-desktop | CPU | Heap | 570 us | 549 us | 416 us | 288 us | 928 us | 264 us |
 | mbp-m2-max | GL | IOSurface | 409 us | — | — | — | — | — |
-| mbp-m2-max | CPU | Heap | 541 us | 499 us | 329 us | 141 us | 784 us | 314 us |
+| mbp-m2-max | CPU | Heap | 541 us | 496 us | 329 us | 141 us | 784 us | 314 us |
 
-The imx8mp YUYV→RGB / RGBA→RGB cells (~49 ms) are the Vivante two-pass
-packed-RGB path (GL has no 3-byte render format); imx95 YUYV→RGB halved
-versus v0.15.0 (11.8 → 5.7 ms) from the engine's single-finish two-pass.
+The imx8mp GL YUYV→RGB cells (49.2 ms on imx8mp-frdm, 49.4 ms on imx8mp-evk) are the Vivante two-pass packed-RGB path (GL has no 3-byte render format); G2D does the same conversion in 11.4–11.6 ms. imx95 GL YUYV→RGB reads 5.8 ms on both boards.
 
-The macOS GL row only covers YUYV→RGBA today; other format pairs fall
-through to CPU. Even with that single working pair the speedup is **1.3×**
-at 1080p, and (see the 4K convert below) **4.8×** at 3840×2160 because the
-GPU path is essentially bandwidth-bound while CPU scales with pixel count.
+The mbp-m2-max GL row is the older capture (Known Gap #17) and measures only YUYV→RGBA; its other cells are not measured. On that pair GL is **1.3×** faster than the CPU at 1080p (409 vs 541 µs), and (see the 4K convert below) **4.8×** at 3840×2160 (458 µs vs 2.2 ms), because the GPU path is essentially bandwidth-bound while CPU scales with pixel count.
 
 **3840×2160 → 3840×2160 (4K convert):**
 
@@ -1635,22 +1677,28 @@ GPU path is essentially bandwidth-bound while CPU scales with pixel count.
 
 ### Decoder Post-Processing
 
-All CPU-only (decoder is not GPU-accelerated).
+**Data collected:** November 3, 2026 (`decoder` case, branch build). All of it runs on the CPU, because the decoder is not GPU-accelerated. The next section compares these cells with `main`.
 
 **YOLOv8 Detection (84×8400, 80 classes):**
 
 | Platform | Data Type | Decode + NMS | Decode Only | NMS Only | Dequantize |
 |----------|-----------|-------------|-------------|----------|------------|
-| imx8mp-frdm | i8 (quant) | 1.0 ms | 998 us | 20 us | 3.7 ms |
-| imx8mp-frdm | f32 | 6.1 ms | — | — | — |
-| imx95-frdm | i8 (quant) | 847 us | 778 us | 19 us | 2.9 ms |
-| imx95-frdm | f32 | 6.0 ms | — | — | — |
-| rpi5-hailo | i8 (quant) | 243 us | 257 us | 4.0 us | 2.1 ms |
-| rpi5-hailo | f32 | 2.9 ms | — | — | — |
-| jetson-orin-nano | i8 (quant) | 343 us | 331 us | 7.0 us | 2.0 ms |
-| jetson-orin-nano | f32 | 2.2 ms | — | — | — |
-| x86-desktop | i8 (quant) | 82 us | 189 us | 4.0 us | 383 us |
-| x86-desktop | f32 | 460 us | — | — | — |
+| imx8mp-frdm | i8 (quant) | 280 us | 253 us | 14 us | 2.9 ms |
+| imx8mp-frdm | f32 | 841 us | — | — | — |
+| imx8mp-evk | i8 (quant) | 290 us | 259 us | 14 us | 2.9 ms |
+| imx8mp-evk | f32 | 869 us | — | — | — |
+| imx95-frdm | i8 (quant) | 227 us | 195 us | 13 us | 2.7 ms |
+| imx95-frdm | f32 | 588 us | — | — | — |
+| imx95-evk | i8 (quant) | 214 us | 176 us | 13 us | 2.6 ms |
+| imx95-evk | f32 | 502 us | — | — | — |
+| rpi5-hailo | i8 (quant) | 23 us | 22 us | 3.0 us | 1.3 ms |
+| rpi5-hailo | f32 | 277 us | — | — | — |
+| jetson-orin-nano | i8 (quant) | 68 us | 40 us | 4.0 us | 1.6 ms |
+| jetson-orin-nano | f32 | 98 us | — | — | — |
+| iq9075-evk | i8 (quant) | 47 us | 34 us | 3.0 us | 1.1 ms |
+| iq9075-evk | f32 | 136 us | — | — | — |
+| x86-desktop | i8 (quant) | 281 us | 282 us | 2.0 us | 592 us |
+| x86-desktop | f32 | 58 us | — | — | — |
 | mbp-m2-max | i8 (quant) | 29 us | 25 us | 2.0 us | 376 us |
 | mbp-m2-max | f32 | 221 us | — | — | — |
 
@@ -1658,18 +1706,900 @@ All CPU-only (decoder is not GPU-accelerated).
 
 | Platform | Data Type | Masks Decode |
 |----------|-----------|-------------|
-| imx8mp-frdm | i8 (quant) | 3.1 ms |
-| imx8mp-frdm | f32 | 5.9 ms |
-| imx95-frdm | i8 (quant) | 3.4 ms |
-| imx95-frdm | f32 | 6.6 ms |
-| rpi5-hailo | i8 (quant) | 974 us |
-| rpi5-hailo | f32 | 2.5 ms |
-| jetson-orin-nano | i8 (quant) | 1.1 ms |
-| jetson-orin-nano | f32 | 2.2 ms |
-| x86-desktop | i8 (quant) | 352 us |
-| x86-desktop | f32 | 663 us |
+| imx8mp-frdm | i8 (quant) | 705 us |
+| imx8mp-frdm | f32 | 1.5 ms |
+| imx8mp-evk | i8 (quant) | 673 us |
+| imx8mp-evk | f32 | 1.5 ms |
+| imx95-frdm | i8 (quant) | 667 us |
+| imx95-frdm | f32 | 1.6 ms |
+| imx95-evk | i8 (quant) | 589 us |
+| imx95-evk | f32 | 1.4 ms |
+| rpi5-hailo | i8 (quant) | 98 us |
+| rpi5-hailo | f32 | 577 us |
+| jetson-orin-nano | i8 (quant) | 121 us |
+| jetson-orin-nano | f32 | 235 us |
+| iq9075-evk | i8 (quant) | 129 us |
+| iq9075-evk | f32 | 314 us |
+| x86-desktop | i8 (quant) | 405 us |
+| x86-desktop | f32 | 437 us |
 | mbp-m2-max | i8 (quant) | 246 us |
 | mbp-m2-max | f32 | 413 us |
+
+### Decoder NEON Tiers and `edgefirst-kernels`
+
+**Data collected:** November 3, 2026. The `edgefirst-kernels` branch is compared with `main` at 8a898def, both as fat-LTO bench bundles (`scripts/on-target-bundle.sh bench aarch64|x86_64`). x86-desktop and rpi5-hailo are re-measured on the final decoder code: 5 interleaved main/branch rounds of the full `decoder_benchmark` on each, and on rpi5-hailo 9 further rounds of the semantic section, with the arm order rotated each round, which supply its `semantic/*` cells. The other boards run the same NEON decoder code; each ran 3 interleaved main/branch rounds of the full `decoder_benchmark`, and any section with a cell more than 2% slower got a further 6–12 interleaved rounds of that section. The tables report the median, across rounds, of each run's median; the rounds column says how many rounds each case has. For the kernels, the tables report the median of 3 `kernels_benchmark` runs of the branch (`main` has no `kernels_benchmark`).
+
+The decoder's post-processing kernels (softmax, sigmoid, DFL, dist2bbox, NMS, the mask dot products and dequantize) are in the `edgefirst-kernels` crate. Each kernel picks its instruction set at run time from `CpuFeatures::probe()`, which reads the CPU's FP16 (`fphp`/`asimdhp`) and dot-product (`asimddp`) support:
+
+| Platform | CPU | `/proc/cpuinfo` SIMD flags | Tier (`CpuFeatures::tier()`) | What the kernels use |
+|---|---|---|---|---|
+| imx8mp-frdm, imx8mp-evk | Cortex-A53 | `asimd` | `neon` | baseline NEON; f16 outputs are narrowed from f32 |
+| imx95-frdm, imx95-evk | Cortex-A55 | `asimd fphp asimdhp asimddp` | `neon_dotprod` (FP16 also detected) | FP16 arithmetic for f16 outputs, `sdot` for the 8-bit mask dot product, baseline NEON elsewhere |
+| rpi5-hailo | Cortex-A76 | `asimd fphp asimdhp asimddp` | `neon_dotprod` (FP16 also detected) | as Cortex-A55 |
+| jetson-orin-nano | Cortex-A78AE | `asimd fphp asimdhp asimddp` | `neon_dotprod` (FP16 also detected) | as Cortex-A55 |
+| iq9075-evk | Cortex-A78C | `asimd fphp asimdhp asimddp` | `neon_dotprod` (FP16 also detected) | as Cortex-A55 |
+| x86-desktop | Core i9-11900K | — | `scalar` | the portable code |
+
+`EDGEFIRST_KERNELS_FORCE_TIER` (kernels plans) and `EDGEFIRST_DECODER_FORCE_KERNEL` (decoder) each accept `scalar`, `neon`, `neon_fp16` or `neon_dotprod`. If the CPU lacks the forced tier, that is an error and not a fallback. A forced `neon_fp16` or `neon_dotprod` enables only that tier's own feature, so the `kernels_benchmark` tier columns separate the FP16 gain from the dot-product gain. An unforced run uses both features, which is what the best-NEON column below approximates.
+
+**Decoder, branch vs `main` (Δ = branch median vs `main` median; negative is faster):**
+
+| Case | imx8mp-frdm (A53) | imx8mp-evk (A53) | imx95-frdm (A55) | imx95-evk (A55) | rpi5-hailo (A76) | jetson-orin-nano (A78AE) | iq9075-evk (A78C) | x86-desktop (x86-64) |
+|---|---|---|---|---|---|---|---|---|
+| `yolo/quant` | -24.4% | -32.9% | -42.2% | -45.4% | -64.3% | -56.0% | -50.6% | -2.1% |
+| `yolo/f32` | -60.5% | -64.3% | -70.4% | -72.1% | -39.8% | -74.7% | -53.2% | -18.3% |
+| `quant/decode_boxes` | -41.8% | -44.1% | -49.5% | -52.7% | -62.1% | -55.4% | -46.7% | -3.2% |
+| `quant/decode_boxes_multilabel` | -71.7% | -68.9% | -50.9% | -52.1% | -77.0% | -41.8% | -4.4% | +0.0% |
+| `quant/decode_boxes_multilabel_val` | -60.4% | -59.4% | -43.0% | -43.3% | -66.1% | -33.8% | -18.0% | +0.0% |
+| `quant/nms` | -30.0% | -30.0% | -31.6% | -31.6% | -25.0% | -20.0% | -25.0% | +0.0% |
+| `dequantize/i8` | +0.4% | -1.6% | +0.9% | -0.3% | -2.1% | -0.7% | +0.9% | +0.0% |
+| `dequantize/i8_chunked` | -0.4% | +0.3% | +0.2% | +0.5% | -0.0% | -0.1% | +0.4% | -2.2% |
+| `dequantize/i16` | -0.2% | -0.4% | +0.2% | +0.2% | +0.4% | -1.0% | -1.1% | -0.2% |
+| `dequantize/i16_chunked` | +0.1% | -0.0% | +0.3% | +1.7% | +0.0% | -0.7% | +0.3% | -0.2% |
+| `f32/decode_boxes` | +1.9% | -6.4% | +2.0% | -0.0% | +0.7% | +3.1% | +10.0% | +0.8% |
+| `f32/nms` | -27.3% | -31.8% | -33.3% | -30.0% | -20.0% | -33.3% | -40.0% | +0.0% |
+| `modelpack/u8` | -12.0% | -10.2% | -16.4% | +0.0% | -13.3% | -71.9% | -45.7% | -60.0% |
+| `modelpack/split_u8` | -57.6% | -61.7% | -50.0% | -60.9% | -45.0% | -40.9% | -53.3% | -6.1% |
+| `masks/f32` | -66.8% | -66.3% | -61.5% | -63.3% | -55.0% | -72.5% | -83.7% | -14.2% |
+| `masks/i8` | -72.2% | -81.4% | -74.5% | -75.9% | -86.3% | -78.0% | -35.7% | -12.1% |
+| `semantic/f32_nchw/accurate` | -47.4% | -47.6% | -56.9% | -54.9% | +0.4% | -41.7% | -16.3% | +1.0% |
+| `semantic/f32_nchw/fast` | -43.0% | -43.6% | -40.1% | -40.1% | -10.9% | -56.7% | +1.5% | +0.4% |
+| `semantic/i8_nchw/accurate` | -48.3% | -48.3% | -54.2% | -53.6% | -47.4% | -56.5% | -49.2% | -2.9% |
+| `semantic/i8_nchw/fast` | -69.3% | -69.2% | -63.7% | -64.5% | -65.7% | -77.1% | -62.2% | -0.6% |
+| `semantic/u8_nhwc/accurate` | -51.2% | -50.8% | -48.4% | -50.3% | -61.8% | -69.2% | -65.7% | -1.1% |
+| `semantic/u8_nhwc/fast` | -43.6% | -43.6% | -41.7% | -45.3% | -72.9% | -78.7% | -75.2% | +0.0% |
+| `semantic/f32_nchw/accurate_confidence` | -52.2% | -52.2% | -54.0% | -53.6% | -13.4% | -36.2% | -24.9% | +0.2% |
+| `per_scale/dfl_i8_to_f32` | -5.4% | -5.8% | -7.8% | -7.9% | -4.2% | -9.0% | -2.5% | -2.8% |
+| `per_scale/dfl_i8_to_f16` | -82.1% | -81.9% | -83.6% | -84.1% | -72.9% | -74.4% | -51.8% | +4.5% |
+| `per_scale/ltrb_i8_to_f32` | -14.8% | -14.3% | -15.9% | -18.4% | -9.4% | -15.3% | +14.8% | -2.4% |
+| `per_scale/960x544/dense` | -1.8% | -1.8% | -6.4% | -1.8% | -3.9% | -3.1% | -1.8% | +0.0% |
+| `per_scale/960x544/prefilter` | -4.9% | -4.9% | -5.4% | -5.4% | -10.0% | -9.1% | -12.5% | +0.0% |
+| `per_scale/960x544/decode` | -9.7% | -9.7% | -6.9% | -8.6% | -13.3% | -17.6% | -16.7% | +0.0% |
+| `per_scale/640x640/dense` | +0.0% | -0.2% | -0.6% | -1.0% | -0.7% | -0.6% | +35.6% | +0.2% |
+| `per_scale/640x640/prefilter` | -15.2% | -17.9% | -20.9% | -20.4% | -27.1% | -17.9% | +13.7% | -1.8% |
+| `per_scale/640x640/decode` | -13.8% | -13.9% | -16.8% | -17.2% | -31.6% | -21.2% | -6.1% | -1.8% |
+| `per_scale/dfl_kernel/Softmax` | +0.0% | +0.1% | -0.1% | +0.1% | -0.6% | +0.9% | +1.0% | -0.2% |
+| `per_scale/dfl_kernel/Lut` | -0.0% | +0.4% | +0.4% | +0.8% | -0.1% | +0.1% | +0.0% | -2.3% |
+| `per_scale/dfl_kernel/LutNeon` | -1.7% | -2.0% | -0.9% | +1.1% | -3.8% | -4.9% | -5.2% | — |
+| `per_scale/dfl_kernel/NeonFusedFp16` | — | — | +1.5% | +1.5% | +2.2% | -0.3% | -0.3% | — |
+
+- Cells that only one build measures are left out of this table. The branch drops `main`'s `per_scale/dfl_kernel/NeonFused` hook. It adds per-tier `per_scale/cell/*` and `per_scale/box/*` cells, along with other new cells, that `main` has no counterpart for. Those cells are in `benchmarks/<platform>/decoder.json`. `NeonFusedFp16` needs FP16 arithmetic, so it does not run on the Cortex-A53. `LutNeon` and `NeonFusedFp16` are AArch64-only.
+- On every AArch64 board, detection decode, NMS, ModelPack, mask and semantic decode are faster on the branch or within ±2% of `main`, apart from the exceptions listed here. Dequantize is within ±2% on every AArch64 board. `f32/decode_boxes` reads between −6% and +3% on the boards other than iq9075-evk, and its main and branch ranges overlap on each of them. For example, imx8mp-frdm reads +1.9% over 29 rounds, with `main` at 5986–7113 µs and the branch at 5994–6977 µs. The last 20 of those rounds also ran the same branch binary with the scalar tier forced: over those 20, the branch reads +0.8% and the scalar tier −0.7%.
+- **rpi5-hailo `semantic/f32_nchw/accurate` is within noise of `main`: +0.4% over 9 rotated rounds, with overlapping ranges** (3906–3944 µs on `main`, 3917–3967 µs on the branch). Over the 5 full rounds it reads +1.2%, again with overlapping ranges. The other accurate cells are faster on this core: `i8_nchw` −47.4%, `u8_nhwc` −61.8% and `f32_nchw/accurate_confidence` −13.4%. The same f32 cell is 42–57% faster on the Cortex-A53, A55 and A78AE. `per_scale/dfl_kernel/NeonFusedFp16`, a benchmark-only kernel hook, reads +2.2% (1922 → 1965 µs).
+- **x86-desktop runs the portable code on both builds; SIMD for x86 is to follow.** Over 5 rounds, the `semantic/*`, `per_scale/960x544/*` and `quant/decode_boxes_multilabel` cells are at `main`, within −3% to +1%. `per_scale/dfl_i8_to_f16` reads +4.5% (4458 → 4657 µs, no overlap). On this CPU the `decode_dfl_lut` cells (`per_scale/dfl_kernel/Lut`, `per_scale/dfl_i8_to_f16` and the `per_scale/box/dfl*/*_f16/scalar` cells) vary by ±25–30% between builds of identical machine code, following where the function lands within a 64-byte block; in this build `per_scale/dfl_kernel/Lut` reads −2.3%. x86-desktop is faster on several cells: `masks/f32` −14%, `masks/i8` −12%, `modelpack/u8` −60% and `yolo/f32` −18%.
+- Cells flagged in the fixed-order rounds are re-run with the arm order rotated each round, since a fixed main-then-branch order biases the last arm by 2–5% on the Cortex-A53. The rpi5-hailo `semantic/*` cells come from 9 such rounds. On imx95-frdm (9 rounds of the ModelPack section) and imx8mp-frdm (6 rounds each of the ModelPack, mask, YOLO and semantic sections), the rotated rounds show no cell more than 2% slower than `main`.
+- iq9075-evk's multi-threaded cells vary several-fold from run to run on both builds. For example, `per_scale/640x640/dense` reads 307–1728 µs on `main` and 301–1867 µs on the branch over 21 rounds. Its `per_scale/*` and `f32/decode_boxes` Δ values in the table are within that spread. Its single-threaded and kernel-bound cells agree with the other Cortex-A7x boards.
+
+<details><summary>imx8mp-frdm (A53): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 401 us | 303 us | -24.4% | 3 |
+| `yolo/f32` | 2.1 ms | 829 us | -60.5% | 3 |
+| `quant/decode_boxes` | 447 us | 260 us | -41.8% | 3 |
+| `quant/decode_boxes_multilabel` | 601 us | 170 us | -71.7% | 3 |
+| `quant/decode_boxes_multilabel_val` | 702 us | 278 us | -60.4% | 3 |
+| `quant/nms` | 20 us | 14 us | -30.0% | 3 |
+| `dequantize/i8` | 3.3 ms | 3.3 ms | +0.4% | 3 |
+| `dequantize/i8_chunked` | 3.9 ms | 3.9 ms | -0.4% | 3 |
+| `dequantize/i16` | 3.4 ms | 3.4 ms | -0.2% | 3 |
+| `dequantize/i16_chunked` | 3.8 ms | 3.8 ms | +0.1% | 3 |
+| `f32/decode_boxes` | 6.2 ms | 6.4 ms | +1.9% | 29 |
+| `f32/nms` | 22 us | 16 us | -27.3% | 29 |
+| `modelpack/u8` | 50 us | 44 us | -12.0% | 9 |
+| `modelpack/split_u8` | 290 us | 123 us | -57.6% | 9 |
+| `masks/f32` | 4.7 ms | 1.6 ms | -66.8% | 3 |
+| `masks/i8` | 2.4 ms | 665 us | -72.2% | 3 |
+| `semantic/f32_nchw/accurate` | 14.0 ms | 7.4 ms | -47.4% | 3 |
+| `semantic/f32_nchw/fast` | 5.6 ms | 3.2 ms | -43.0% | 3 |
+| `semantic/i8_nchw/accurate` | 8.8 ms | 4.5 ms | -48.3% | 3 |
+| `semantic/i8_nchw/fast` | 3.9 ms | 1.2 ms | -69.3% | 3 |
+| `semantic/u8_nhwc/accurate` | 7.2 ms | 3.5 ms | -51.2% | 3 |
+| `semantic/u8_nhwc/fast` | 3.3 ms | 1.9 ms | -43.6% | 3 |
+| `semantic/f32_nchw/accurate_confidence` | 28.4 ms | 13.6 ms | -52.2% | 3 |
+| `per_scale/dfl_i8_to_f32` | 10.1 ms | 9.6 ms | -5.4% | 3 |
+| `per_scale/dfl_i8_to_f16` | 57.7 ms | 10.4 ms | -82.1% | 3 |
+| `per_scale/ltrb_i8_to_f32` | 10.1 ms | 8.6 ms | -14.8% | 3 |
+| `per_scale/960x544/dense` | 604 us | 593 us | -1.8% | 3 |
+| `per_scale/960x544/prefilter` | 41 us | 39 us | -4.9% | 3 |
+| `per_scale/960x544/decode` | 62 us | 56 us | -9.7% | 3 |
+| `per_scale/640x640/dense` | 2.0 ms | 2.0 ms | +0.0% | 3 |
+| `per_scale/640x640/prefilter` | 250 us | 212 us | -15.2% | 3 |
+| `per_scale/640x640/decode` | 290 us | 250 us | -13.8% | 3 |
+| `per_scale/dfl_kernel/Softmax` | 23.0 ms | 23.0 ms | +0.0% | 3 |
+| `per_scale/dfl_kernel/Lut` | 7.2 ms | 7.2 ms | -0.0% | 3 |
+| `per_scale/dfl_kernel/LutNeon` | 1.0 ms | 1.0 ms | -1.7% | 3 |
+
+</details>
+
+<details><summary>imx8mp-evk (A53): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 423 us | 284 us | -32.9% | 3 |
+| `yolo/f32` | 2.1 ms | 757 us | -64.3% | 3 |
+| `quant/decode_boxes` | 472 us | 264 us | -44.1% | 3 |
+| `quant/decode_boxes_multilabel` | 599 us | 186 us | -68.9% | 3 |
+| `quant/decode_boxes_multilabel_val` | 705 us | 286 us | -59.4% | 3 |
+| `quant/nms` | 20 us | 14 us | -30.0% | 3 |
+| `dequantize/i8` | 3.4 ms | 3.3 ms | -1.6% | 3 |
+| `dequantize/i8_chunked` | 3.9 ms | 3.9 ms | +0.3% | 3 |
+| `dequantize/i16` | 3.5 ms | 3.5 ms | -0.4% | 3 |
+| `dequantize/i16_chunked` | 3.8 ms | 3.8 ms | -0.0% | 3 |
+| `f32/decode_boxes` | 6.9 ms | 6.5 ms | -6.4% | 3 |
+| `f32/nms` | 22 us | 15 us | -31.8% | 3 |
+| `modelpack/u8` | 49 us | 44 us | -10.2% | 9 |
+| `modelpack/split_u8` | 290 us | 111 us | -61.7% | 9 |
+| `masks/f32` | 4.6 ms | 1.6 ms | -66.3% | 3 |
+| `masks/i8` | 3.7 ms | 685 us | -81.4% | 3 |
+| `semantic/f32_nchw/accurate` | 14.1 ms | 7.4 ms | -47.6% | 3 |
+| `semantic/f32_nchw/fast` | 5.7 ms | 3.2 ms | -43.6% | 3 |
+| `semantic/i8_nchw/accurate` | 8.8 ms | 4.6 ms | -48.3% | 3 |
+| `semantic/i8_nchw/fast` | 3.9 ms | 1.2 ms | -69.2% | 3 |
+| `semantic/u8_nhwc/accurate` | 7.3 ms | 3.6 ms | -50.8% | 3 |
+| `semantic/u8_nhwc/fast` | 3.3 ms | 1.9 ms | -43.6% | 3 |
+| `semantic/f32_nchw/accurate_confidence` | 28.6 ms | 13.7 ms | -52.2% | 3 |
+| `per_scale/dfl_i8_to_f32` | 10.2 ms | 9.6 ms | -5.8% | 3 |
+| `per_scale/dfl_i8_to_f16` | 57.7 ms | 10.4 ms | -81.9% | 3 |
+| `per_scale/ltrb_i8_to_f32` | 10.1 ms | 8.6 ms | -14.3% | 3 |
+| `per_scale/960x544/dense` | 597 us | 586 us | -1.8% | 3 |
+| `per_scale/960x544/prefilter` | 41 us | 39 us | -4.9% | 3 |
+| `per_scale/960x544/decode` | 62 us | 56 us | -9.7% | 3 |
+| `per_scale/640x640/dense` | 2.0 ms | 2.0 ms | -0.2% | 3 |
+| `per_scale/640x640/prefilter` | 257 us | 211 us | -17.9% | 3 |
+| `per_scale/640x640/decode` | 295 us | 254 us | -13.9% | 3 |
+| `per_scale/dfl_kernel/Softmax` | 23.0 ms | 23.0 ms | +0.1% | 3 |
+| `per_scale/dfl_kernel/Lut` | 7.2 ms | 7.2 ms | +0.4% | 3 |
+| `per_scale/dfl_kernel/LutNeon` | 1.0 ms | 1.0 ms | -2.0% | 3 |
+
+</details>
+
+<details><summary>imx95-frdm (A55): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 403 us | 233 us | -42.2% | 3 |
+| `yolo/f32` | 2.0 ms | 590 us | -70.4% | 3 |
+| `quant/decode_boxes` | 392 us | 198 us | -49.5% | 3 |
+| `quant/decode_boxes_multilabel` | 379 us | 186 us | -50.9% | 3 |
+| `quant/decode_boxes_multilabel_val` | 519 us | 296 us | -43.0% | 3 |
+| `quant/nms` | 19 us | 13 us | -31.6% | 3 |
+| `dequantize/i8` | 2.7 ms | 2.8 ms | +0.9% | 3 |
+| `dequantize/i8_chunked` | 3.1 ms | 3.1 ms | +0.2% | 3 |
+| `dequantize/i16` | 2.6 ms | 2.6 ms | +0.2% | 3 |
+| `dequantize/i16_chunked` | 3.0 ms | 3.0 ms | +0.3% | 3 |
+| `f32/decode_boxes` | 4.6 ms | 4.7 ms | +2.0% | 9 |
+| `f32/nms` | 21 us | 14 us | -33.3% | 9 |
+| `modelpack/u8` | 61 us | 51 us | -16.4% | 3 |
+| `modelpack/split_u8` | 280 us | 140 us | -50.0% | 3 |
+| `masks/f32` | 4.3 ms | 1.7 ms | -61.5% | 3 |
+| `masks/i8` | 2.6 ms | 667 us | -74.5% | 3 |
+| `semantic/f32_nchw/accurate` | 16.4 ms | 7.1 ms | -56.9% | 3 |
+| `semantic/f32_nchw/fast` | 6.1 ms | 3.7 ms | -40.1% | 3 |
+| `semantic/i8_nchw/accurate` | 8.1 ms | 3.7 ms | -54.2% | 3 |
+| `semantic/i8_nchw/fast` | 3.5 ms | 1.3 ms | -63.7% | 3 |
+| `semantic/u8_nhwc/accurate` | 5.2 ms | 2.7 ms | -48.4% | 3 |
+| `semantic/u8_nhwc/fast` | 2.5 ms | 1.5 ms | -41.7% | 3 |
+| `semantic/f32_nchw/accurate_confidence` | 28.5 ms | 13.1 ms | -54.0% | 3 |
+| `per_scale/dfl_i8_to_f32` | 8.3 ms | 7.7 ms | -7.8% | 3 |
+| `per_scale/dfl_i8_to_f16` | 45.6 ms | 7.5 ms | -83.6% | 3 |
+| `per_scale/ltrb_i8_to_f32` | 8.1 ms | 6.8 ms | -15.9% | 3 |
+| `per_scale/960x544/dense` | 471 us | 441 us | -6.4% | 3 |
+| `per_scale/960x544/prefilter` | 37 us | 35 us | -5.4% | 3 |
+| `per_scale/960x544/decode` | 58 us | 54 us | -6.9% | 3 |
+| `per_scale/640x640/dense` | 1.2 ms | 1.2 ms | -0.6% | 3 |
+| `per_scale/640x640/prefilter` | 230 us | 182 us | -20.9% | 3 |
+| `per_scale/640x640/decode` | 273 us | 227 us | -16.8% | 3 |
+| `per_scale/dfl_kernel/Softmax` | 20.7 ms | 20.7 ms | -0.1% | 3 |
+| `per_scale/dfl_kernel/Lut` | 6.8 ms | 6.9 ms | +0.4% | 3 |
+| `per_scale/dfl_kernel/LutNeon` | 958 us | 949 us | -0.9% | 3 |
+| `per_scale/dfl_kernel/NeonFusedFp16` | 6.2 ms | 6.3 ms | +1.5% | 3 |
+
+</details>
+
+<details><summary>imx95-evk (A55): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 401 us | 219 us | -45.4% | 3 |
+| `yolo/f32` | 1.8 ms | 511 us | -72.1% | 3 |
+| `quant/decode_boxes` | 389 us | 184 us | -52.7% | 3 |
+| `quant/decode_boxes_multilabel` | 382 us | 183 us | -52.1% | 3 |
+| `quant/decode_boxes_multilabel_val` | 506 us | 287 us | -43.3% | 3 |
+| `quant/nms` | 19 us | 13 us | -31.6% | 3 |
+| `dequantize/i8` | 2.6 ms | 2.6 ms | -0.3% | 3 |
+| `dequantize/i8_chunked` | 2.9 ms | 2.9 ms | +0.5% | 3 |
+| `dequantize/i16` | 2.4 ms | 2.4 ms | +0.2% | 3 |
+| `dequantize/i16_chunked` | 2.8 ms | 2.8 ms | +1.7% | 3 |
+| `f32/decode_boxes` | 4.0 ms | 4.0 ms | -0.0% | 3 |
+| `f32/nms` | 20 us | 14 us | -30.0% | 3 |
+| `modelpack/u8` | 48 us | 48 us | +0.0% | 3 |
+| `modelpack/split_u8` | 279 us | 109 us | -60.9% | 3 |
+| `masks/f32` | 4.0 ms | 1.5 ms | -63.3% | 3 |
+| `masks/i8` | 2.5 ms | 600 us | -75.9% | 3 |
+| `semantic/f32_nchw/accurate` | 14.3 ms | 6.4 ms | -54.9% | 3 |
+| `semantic/f32_nchw/fast` | 5.5 ms | 3.3 ms | -40.1% | 3 |
+| `semantic/i8_nchw/accurate` | 7.6 ms | 3.5 ms | -53.6% | 3 |
+| `semantic/i8_nchw/fast` | 3.4 ms | 1.2 ms | -64.5% | 3 |
+| `semantic/u8_nhwc/accurate` | 5.1 ms | 2.5 ms | -50.3% | 3 |
+| `semantic/u8_nhwc/fast` | 2.5 ms | 1.4 ms | -45.3% | 3 |
+| `semantic/f32_nchw/accurate_confidence` | 25.9 ms | 12.0 ms | -53.6% | 3 |
+| `per_scale/dfl_i8_to_f32` | 8.2 ms | 7.5 ms | -7.9% | 3 |
+| `per_scale/dfl_i8_to_f16` | 45.7 ms | 7.2 ms | -84.1% | 3 |
+| `per_scale/ltrb_i8_to_f32` | 7.9 ms | 6.5 ms | -18.4% | 3 |
+| `per_scale/960x544/dense` | 442 us | 434 us | -1.8% | 9 |
+| `per_scale/960x544/prefilter` | 37 us | 35 us | -5.4% | 9 |
+| `per_scale/960x544/decode` | 58 us | 53 us | -8.6% | 9 |
+| `per_scale/640x640/dense` | 1.1 ms | 1.1 ms | -1.0% | 9 |
+| `per_scale/640x640/prefilter` | 225 us | 179 us | -20.4% | 9 |
+| `per_scale/640x640/decode` | 267 us | 221 us | -17.2% | 9 |
+| `per_scale/dfl_kernel/Softmax` | 20.7 ms | 20.7 ms | +0.1% | 3 |
+| `per_scale/dfl_kernel/Lut` | 6.8 ms | 6.9 ms | +0.8% | 3 |
+| `per_scale/dfl_kernel/LutNeon` | 973 us | 984 us | +1.1% | 3 |
+| `per_scale/dfl_kernel/NeonFusedFp16` | 6.2 ms | 6.3 ms | +1.5% | 3 |
+
+</details>
+
+<details><summary>rpi5-hailo (A76): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 98 us | 35 us | -64.3% | 5 |
+| `yolo/f32` | 488 us | 294 us | -39.8% | 5 |
+| `quant/decode_boxes` | 87 us | 33 us | -62.1% | 5 |
+| `quant/decode_boxes_multilabel` | 187 us | 43 us | -77.0% | 5 |
+| `quant/decode_boxes_multilabel_val` | 221 us | 75 us | -66.1% | 5 |
+| `quant/nms` | 4.0 us | 3.0 us | -25.0% | 5 |
+| `dequantize/i8` | 1.3 ms | 1.3 ms | -2.1% | 5 |
+| `dequantize/i8_chunked` | 2.1 ms | 2.1 ms | -0.0% | 5 |
+| `dequantize/i16` | 1.1 ms | 1.1 ms | +0.4% | 5 |
+| `dequantize/i16_chunked` | 1.3 ms | 1.3 ms | +0.0% | 5 |
+| `f32/decode_boxes` | 2.4 ms | 2.4 ms | +0.7% | 5 |
+| `f32/nms` | 5.0 us | 4.0 us | -20.0% | 5 |
+| `modelpack/u8` | 15 us | 13 us | -13.3% | 5 |
+| `modelpack/split_u8` | 60 us | 33 us | -45.0% | 5 |
+| `masks/f32` | 1.3 ms | 570 us | -55.0% | 5 |
+| `masks/i8` | 685 us | 94 us | -86.3% | 5 |
+| `semantic/f32_nchw/accurate` | 3.9 ms | 3.9 ms | +0.4% | 9 |
+| `semantic/f32_nchw/fast` | 1.8 ms | 1.6 ms | -10.9% | 9 |
+| `semantic/i8_nchw/accurate` | 2.2 ms | 1.1 ms | -47.4% | 9 |
+| `semantic/i8_nchw/fast` | 1.1 ms | 373 us | -65.7% | 9 |
+| `semantic/u8_nhwc/accurate` | 1.9 ms | 742 us | -61.8% | 9 |
+| `semantic/u8_nhwc/fast` | 1.2 ms | 331 us | -72.9% | 9 |
+| `semantic/f32_nchw/accurate_confidence` | 7.0 ms | 6.0 ms | -13.4% | 9 |
+| `per_scale/dfl_i8_to_f32` | 3.3 ms | 3.1 ms | -4.2% | 5 |
+| `per_scale/dfl_i8_to_f16` | 11.3 ms | 3.1 ms | -72.9% | 5 |
+| `per_scale/ltrb_i8_to_f32` | 3.1 ms | 2.8 ms | -9.4% | 5 |
+| `per_scale/960x544/dense` | 153 us | 147 us | -3.9% | 5 |
+| `per_scale/960x544/prefilter` | 10 us | 9.0 us | -10.0% | 5 |
+| `per_scale/960x544/decode` | 15 us | 13 us | -13.3% | 5 |
+| `per_scale/640x640/dense` | 569 us | 565 us | -0.7% | 5 |
+| `per_scale/640x640/prefilter` | 48 us | 35 us | -27.1% | 5 |
+| `per_scale/640x640/decode` | 57 us | 39 us | -31.6% | 5 |
+| `per_scale/dfl_kernel/Softmax` | 5.2 ms | 5.1 ms | -0.6% | 5 |
+| `per_scale/dfl_kernel/Lut` | 1.9 ms | 1.9 ms | -0.1% | 5 |
+| `per_scale/dfl_kernel/LutNeon` | 315 us | 303 us | -3.8% | 5 |
+| `per_scale/dfl_kernel/NeonFusedFp16` | 1.9 ms | 2.0 ms | +2.2% | 5 |
+
+</details>
+
+<details><summary>jetson-orin-nano (A78AE): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 84 us | 37 us | -56.0% | 3 |
+| `yolo/f32` | 336 us | 85 us | -74.7% | 3 |
+| `quant/decode_boxes` | 83 us | 37 us | -55.4% | 3 |
+| `quant/decode_boxes_multilabel` | 98 us | 57 us | -41.8% | 3 |
+| `quant/decode_boxes_multilabel_val` | 136 us | 90 us | -33.8% | 3 |
+| `quant/nms` | 5.0 us | 4.0 us | -20.0% | 3 |
+| `dequantize/i8` | 1.6 ms | 1.6 ms | -0.7% | 3 |
+| `dequantize/i8_chunked` | 1.7 ms | 1.7 ms | -0.1% | 3 |
+| `dequantize/i16` | 1.2 ms | 1.1 ms | -1.0% | 3 |
+| `dequantize/i16_chunked` | 1.6 ms | 1.6 ms | -0.7% | 3 |
+| `f32/decode_boxes` | 1.0 ms | 1.1 ms | +3.1% | 9 |
+| `f32/nms` | 6.0 us | 4.0 us | -33.3% | 9 |
+| `modelpack/u8` | 64 us | 18 us | -71.9% | 3 |
+| `modelpack/split_u8` | 66 us | 39 us | -40.9% | 3 |
+| `masks/f32` | 823 us | 226 us | -72.5% | 3 |
+| `masks/i8` | 558 us | 123 us | -78.0% | 3 |
+| `semantic/f32_nchw/accurate` | 2.8 ms | 1.6 ms | -41.7% | 3 |
+| `semantic/f32_nchw/fast` | 1.6 ms | 703 us | -56.7% | 3 |
+| `semantic/i8_nchw/accurate` | 1.4 ms | 624 us | -56.5% | 3 |
+| `semantic/i8_nchw/fast` | 828 us | 190 us | -77.1% | 3 |
+| `semantic/u8_nhwc/accurate` | 1.7 ms | 530 us | -69.2% | 3 |
+| `semantic/u8_nhwc/fast` | 1.2 ms | 252 us | -78.7% | 3 |
+| `semantic/f32_nchw/accurate_confidence` | 5.4 ms | 3.4 ms | -36.2% | 3 |
+| `per_scale/dfl_i8_to_f32` | 3.5 ms | 3.2 ms | -9.0% | 3 |
+| `per_scale/dfl_i8_to_f16` | 11.2 ms | 2.9 ms | -74.4% | 3 |
+| `per_scale/ltrb_i8_to_f32` | 3.4 ms | 2.9 ms | -15.3% | 3 |
+| `per_scale/960x544/dense` | 130 us | 126 us | -3.1% | 3 |
+| `per_scale/960x544/prefilter` | 11 us | 10 us | -9.1% | 3 |
+| `per_scale/960x544/decode` | 17 us | 14 us | -17.6% | 3 |
+| `per_scale/640x640/dense` | 508 us | 505 us | -0.6% | 3 |
+| `per_scale/640x640/prefilter` | 56 us | 46 us | -17.9% | 3 |
+| `per_scale/640x640/decode` | 66 us | 52 us | -21.2% | 3 |
+| `per_scale/dfl_kernel/Softmax` | 4.9 ms | 4.9 ms | +0.9% | 3 |
+| `per_scale/dfl_kernel/Lut` | 2.4 ms | 2.4 ms | +0.1% | 3 |
+| `per_scale/dfl_kernel/LutNeon` | 370 us | 352 us | -4.9% | 3 |
+| `per_scale/dfl_kernel/NeonFusedFp16` | 2.2 ms | 2.2 ms | -0.3% | 3 |
+
+</details>
+
+<details><summary>iq9075-evk (A78C): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 81 us | 40 us | -50.6% | 3 |
+| `yolo/f32` | 222 us | 104 us | -53.2% | 3 |
+| `quant/decode_boxes` | 60 us | 32 us | -46.7% | 3 |
+| `quant/decode_boxes_multilabel` | 68 us | 65 us | -4.4% | 3 |
+| `quant/decode_boxes_multilabel_val` | 111 us | 91 us | -18.0% | 3 |
+| `quant/nms` | 4.0 us | 3.0 us | -25.0% | 3 |
+| `dequantize/i8` | 1.1 ms | 1.2 ms | +0.9% | 3 |
+| `dequantize/i8_chunked` | 1.2 ms | 1.2 ms | +0.4% | 3 |
+| `dequantize/i16` | 846 us | 837 us | -1.1% | 3 |
+| `dequantize/i16_chunked` | 1.2 ms | 1.2 ms | +0.3% | 3 |
+| `f32/decode_boxes` | 1.1 ms | 1.2 ms | +10.0% | 9 |
+| `f32/nms` | 5.0 us | 3.0 us | -40.0% | 9 |
+| `modelpack/u8` | 35 us | 19 us | -45.7% | 3 |
+| `modelpack/split_u8` | 60 us | 28 us | -53.3% | 3 |
+| `masks/f32` | 2.8 ms | 451 us | -83.7% | 3 |
+| `masks/i8` | 656 us | 422 us | -35.7% | 3 |
+| `semantic/f32_nchw/accurate` | 2.0 ms | 1.7 ms | -16.3% | 3 |
+| `semantic/f32_nchw/fast` | 795 us | 807 us | +1.5% | 3 |
+| `semantic/i8_nchw/accurate` | 1.2 ms | 611 us | -49.2% | 3 |
+| `semantic/i8_nchw/fast` | 468 us | 177 us | -62.2% | 3 |
+| `semantic/u8_nhwc/accurate` | 1.1 ms | 384 us | -65.7% | 3 |
+| `semantic/u8_nhwc/fast` | 610 us | 151 us | -75.2% | 3 |
+| `semantic/f32_nchw/accurate_confidence` | 2.9 ms | 2.2 ms | -24.9% | 3 |
+| `per_scale/dfl_i8_to_f32` | 5.5 ms | 5.3 ms | -2.5% | 9 |
+| `per_scale/dfl_i8_to_f16` | 10.1 ms | 4.8 ms | -51.8% | 9 |
+| `per_scale/ltrb_i8_to_f32` | 4.5 ms | 5.2 ms | +14.8% | 9 |
+| `per_scale/960x544/dense` | 109 us | 107 us | -1.8% | 21 |
+| `per_scale/960x544/prefilter` | 8.0 us | 7.0 us | -12.5% | 21 |
+| `per_scale/960x544/decode` | 12 us | 10 us | -16.7% | 21 |
+| `per_scale/640x640/dense` | 734 us | 995 us | +35.6% | 21 |
+| `per_scale/640x640/prefilter` | 51 us | 58 us | +13.7% | 21 |
+| `per_scale/640x640/decode` | 66 us | 62 us | -6.1% | 21 |
+| `per_scale/dfl_kernel/Softmax` | 3.6 ms | 3.7 ms | +1.0% | 3 |
+| `per_scale/dfl_kernel/Lut` | 1.8 ms | 1.8 ms | +0.0% | 3 |
+| `per_scale/dfl_kernel/LutNeon` | 271 us | 257 us | -5.2% | 3 |
+| `per_scale/dfl_kernel/NeonFusedFp16` | 1.6 ms | 1.6 ms | -0.3% | 3 |
+
+</details>
+
+<details><summary>x86-desktop (x86-64): main and branch medians</summary>
+
+| Case | main | branch | Δ | rounds |
+|---|---|---|---|---|
+| `yolo/quant` | 287 us | 281 us | -2.1% | 5 |
+| `yolo/f32` | 71 us | 58 us | -18.3% | 5 |
+| `quant/decode_boxes` | 280 us | 271 us | -3.2% | 5 |
+| `quant/decode_boxes_multilabel` | 26 us | 26 us | +0.0% | 5 |
+| `quant/decode_boxes_multilabel_val` | 50 us | 50 us | +0.0% | 5 |
+| `quant/nms` | 2.0 us | 2.0 us | +0.0% | 5 |
+| `dequantize/i8` | 591 us | 591 us | +0.0% | 5 |
+| `dequantize/i8_chunked` | 588 us | 575 us | -2.2% | 5 |
+| `dequantize/i16` | 592 us | 591 us | -0.2% | 5 |
+| `dequantize/i16_chunked` | 580 us | 579 us | -0.2% | 5 |
+| `f32/decode_boxes` | 478 us | 482 us | +0.8% | 5 |
+| `f32/nms` | 2.0 us | 2.0 us | +0.0% | 5 |
+| `modelpack/u8` | 20 us | 8.0 us | -60.0% | 5 |
+| `modelpack/split_u8` | 33 us | 31 us | -6.1% | 5 |
+| `masks/f32` | 466 us | 400 us | -14.2% | 5 |
+| `masks/i8` | 462 us | 406 us | -12.1% | 5 |
+| `semantic/f32_nchw/accurate` | 495 us | 500 us | +1.0% | 5 |
+| `semantic/f32_nchw/fast` | 224 us | 225 us | +0.4% | 5 |
+| `semantic/i8_nchw/accurate` | 415 us | 403 us | -2.9% | 5 |
+| `semantic/i8_nchw/fast` | 177 us | 176 us | -0.6% | 5 |
+| `semantic/u8_nhwc/accurate` | 529 us | 523 us | -1.1% | 5 |
+| `semantic/u8_nhwc/fast` | 296 us | 296 us | +0.0% | 5 |
+| `semantic/f32_nchw/accurate_confidence` | 1.5 ms | 1.5 ms | +0.2% | 5 |
+| `per_scale/dfl_i8_to_f32` | 3.8 ms | 3.7 ms | -2.8% | 5 |
+| `per_scale/dfl_i8_to_f16` | 4.5 ms | 4.7 ms | +4.5% | 5 |
+| `per_scale/ltrb_i8_to_f32` | 3.3 ms | 3.2 ms | -2.4% | 5 |
+| `per_scale/960x544/dense` | 136 us | 136 us | +0.0% | 5 |
+| `per_scale/960x544/prefilter` | 11 us | 11 us | +0.0% | 5 |
+| `per_scale/960x544/decode` | 13 us | 13 us | +0.0% | 5 |
+| `per_scale/640x640/dense` | 525 us | 526 us | +0.2% | 5 |
+| `per_scale/640x640/prefilter` | 56 us | 55 us | -1.8% | 5 |
+| `per_scale/640x640/decode` | 56 us | 55 us | -1.8% | 5 |
+| `per_scale/dfl_kernel/Softmax` | 1.8 ms | 1.8 ms | -0.2% | 5 |
+| `per_scale/dfl_kernel/Lut` | 604 us | 590 us | -2.3% | 5 |
+
+</details>
+
+**`edgefirst-kernels`: best NEON tier vs the scalar tier, same binary:**
+
+| Kernel case | imx8mp-frdm (A53) | imx8mp-evk (A53) | imx95-frdm (A55) | imx95-evk (A55) | rpi5-hailo (A76) | jetson-orin-nano (A78AE) | iq9075-evk (A78C) |
+|---|---|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous` | 7.1× | 7.1× | 7.3× | 7.3× | 5.5× | 4.8× | 4.9× |
+| `softmax_i8/1x2x1008x1008/contiguous` | 7.5× | 7.7× | 7.9× | 7.9× | 5.8× | 5.3× | 5.3× |
+| `softmax_i8/1x2x1008x1008/threads2` | 7.0× | 6.7× | 7.0× | 7.1× | 5.6× | 5.0× | 5.1× |
+| `softmax_i16/1x2x400x400/contiguous` | 3.6× | 3.6× | 3.8× | 3.8× | 3.0× | 2.4× | 2.4× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 3.6× | 3.6× | 3.8× | 3.8× | 3.1× | 2.3× | 2.3× |
+| `sigmoid/1x80x8400/i8_i8` | 2.3× | 2.3× | 1.7× | 1.7× | 2.0× | 1.9× | 1.9× |
+| `sigmoid/1x10x21168/i8_f32` | 5.3× | 5.3× | 6.2× | 6.2× | 4.2× | 3.4× | 3.5× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 7.5× | 7.4× | 7.7× | 7.7× | 8.3× | 9.4× | 9.4× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 3.7× | 3.7× | 3.6× | 3.6× | 2.7× | 3.0× | 3.0× |
+| `sigmoid/1x80x8400/i16_f16` | 7.2× | 7.1× | 8.9× | 8.9× | 7.1× | 5.6× | 5.8× |
+| `sigmoid/1x80x8400/i8_f16` | 6.6× | 6.6× | 8.8× | 8.8× | 6.8× | 5.2× | 5.5× |
+| `sigmoid/1x80x8400/i8_u8` | 4.8× | 4.8× | 5.3× | 5.3× | 3.8× | 3.2× | 3.4× |
+| `sigmoid/1x80x8400/f32_f32` | 6.2× | 6.2× | 6.7× | 6.7× | 5.1× | 4.3× | 4.5× |
+| `sigmoid/1x80x8400/f32_f16` | 7.6× | 7.6× | 9.5× | 9.4× | 8.3× | 6.8× | 7.0× |
+| `sigmoid/1x80x8400/f16_f16` | 8.3× | 8.3× | 14.1× | 14.1× | 12.1× | 10.0× | 10.4× |
+| `sigmoid/1x80x8400/f16_f32` | 6.8× | 6.8× | 7.4× | 7.4× | 5.5× | 4.5× | 4.7× |
+| `dfl_box/8400/i8_f32_anchor_major` | 7.0× | 6.9× | 7.0× | 7.0× | 6.2× | 6.9× | 7.0× |
+| `dfl_box/8400/i8_f32_channel_major` | 2.9× | 2.9× | 2.7× | 2.8× | 2.6× | 3.0× | 3.0× |
+| `dfl_box/8400/i8_f16_anchor_major` | 7.4× | 7.3× | 7.2× | 7.2× | 6.3× | 6.8× | 6.9× |
+| `dfl_box/8400/i8_f16_channel_major` | 3.0× | 3.0× | 2.9× | 2.9× | 2.7× | 3.0× | 3.0× |
+| `dfl_box/8400/i8_i8_anchor_major` | 6.9× | 7.0× | 6.8× | 6.7× | 6.0× | 6.7× | 6.7× |
+| `dfl_box/8400/i8_i8_channel_major` | 2.9× | 2.9× | 2.8× | 2.9× | 2.6× | 3.0× | 3.0× |
+| `dfl_box/21168/i8_f32_anchor_major` | 6.7× | 6.6× | 6.9× | 6.9× | 6.2× | 6.9× | 6.9× |
+| `dfl_box/21168/i8_f32_channel_major` | 2.8× | 2.8× | 2.5× | 2.6× | 2.6× | 3.0× | 3.0× |
+| `dfl_box/21168/i8_i8_anchor_major` | 6.7× | 6.6× | 6.7× | 6.7× | 6.0× | 6.7× | 6.6× |
+| `dfl_box/21168/i8_i8_channel_major` | 2.8× | 2.8× | 2.5× | 2.6× | 2.6× | 3.0× | 3.0× |
+| `dfl_box/8400/i16_f32_anchor_major` | 2.3× | 2.3× | 3.3× | 3.3× | 2.8× | 2.2× | 2.3× |
+| `dfl_box/8400/f32_f32_anchor_major` | 2.3× | 2.3× | 2.6× | 2.6× | 2.5× | 2.0× | 2.0× |
+| `dfl_box/8400/i16_f16_anchor_major` | 2.3× | 2.3× | 4.1× | 4.1× | 3.9× | 3.2× | 3.3× |
+| `dfl_box/8400/f32_f16_anchor_major` | 2.3× | 2.4× | 4.3× | 4.3× | 4.0× | 3.3× | 3.3× |
+| `dfl/8400/reg_max_8/i8_f32` | 4.7× | 4.7× | 4.8× | 4.8× | 4.4× | 4.7× | 4.7× |
+| `dfl/8400/reg_max_8/i8_f16` | 5.0× | 5.0× | 4.8× | 4.9× | 4.4× | 4.7× | 4.8× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 1.1× | 1.1× | 1.1× | 1.1× | 1.0× | 1.0× | 1.0× |
+| `dist2bbox/21168/i8_f32_channel_major` | 1.1× | 1.0× | 1.0× | 1.0× | 1.0× | 1.0× | 1.0× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 1.2× | 1.2× | 1.2× | 1.2× | 1.3× | 1.3× | 1.3× |
+| `dist2bbox/21168/i8_i8_channel_major` | 1.1× | 1.1× | 1.1× | 1.1× | 1.2× | 1.2× | 1.2× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 2.2× | 2.2× | 1.8× | 1.7× | 1.4× | 1.5× | 1.4× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 6.3× | 6.1× | 4.9× | 4.9× | 5.7× | 4.2× | 4.2× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 7.4× | 7.2× | 4.3× | 4.2× | 4.0× | 2.8× | 2.8× |
+| `mask/sigmoid_u8/160x160` | 4.0× | 4.0× | 4.4× | 4.4× | 2.7× | 2.1× | 2.4× |
+
+- **FP16 arithmetic** pays off on f16 outputs. For example, on the Cortex-A55 `sigmoid` f16→f16 reads 2.46 ms on `neon_fp16` against 4.18 ms on `neon`, and `dfl_box` i16→f16 reads 5.2 ms against 8.0 ms. The Cortex-A53 has no FP16 arithmetic, so it runs these on `neon` with a narrowing pass.
+- **`dist2bbox`** with 8-bit inputs and f32 or 8-bit outputs is memory-bound (1.0–1.3×). Its f16-output and f32-input variants gain 1.4–7.4×.
+
+**Mask dot products (`neon` / `neon_dotprod`; the dot-product tier applies to the 8-bit kernel only):**
+
+| Mask kernel (160×160 protos, 32 channels) | imx8mp-frdm (A53) | imx8mp-evk (A53) | imx95-frdm (A55) | imx95-evk (A55) | rpi5-hailo (A76) | jetson-orin-nano (A78AE) | iq9075-evk (A78C) |
+|---|---|---|---|---|---|---|---|
+| `mask/dot8_i8_i8/160x160x32/zm0` | 377 us | 381 us | 354 us / 254 us | 351 us / 252 us | 79 us / 43 us | 87 us / 40 us | 64 us / 30 us |
+| `mask/dot8_i8_i8/160x160x32/zm20` | 380 us | 385 us | 357 us / 257 us | 355 us / 256 us | 80 us / 44 us | 89 us / 40 us | 65 us / 30 us |
+| `mask/dot_wide_i16_i8/160x160x32` | 796 us | 799 us | 782 us | 780 us | 250 us | 296 us | 217 us |
+| `mask/dot_f32_f32/160x160x32` | 1.7 ms | 1.3 ms | 2.2 ms | 1.8 ms | 181 us | 144 us | 112 us |
+| `mask/dot_f32_f16/160x160x32` | 1.1 ms | 1.1 ms | 987 us | 982 us | 273 us | 285 us | 209 us |
+| `mask/dot_f32_f16/hot4x160x32` | 1.0 ms | 1.0 ms | 956 us | 953 us | 269 us | 286 us | 209 us |
+| `mask/dot_f32_f32/hot4x160x32` | 822 us | 820 us | 756 us | 747 us | 124 us | 129 us | 94 us |
+
+<details><summary>imx8mp-frdm (A53): every kernels_benchmark cell, median of 3 runs</summary>
+
+| Kernel case | scalar | neon | neon_fp16 | neon_dotprod | best NEON vs scalar |
+|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous (TFLite loop)` | 6.6 ms | — | — | — | — |
+| `softmax_i8/1x2x400x400/contiguous` | 6.5 ms | 912 us | — | — | 7.1× |
+| `softmax_i8/1x2x1008x1008/contiguous (TFLite loop)` | 42.0 ms | — | — | — | — |
+| `softmax_i8/1x2x1008x1008/contiguous` | 41.0 ms | 5.4 ms | — | — | 7.5× |
+| `softmax_i8/1x2x1008x1008/threads2` | 21.3 ms | 3.1 ms | — | — | 7.0× |
+| `softmax_i16/1x2x400x400/contiguous` | 9.6 ms | 2.7 ms | — | — | 3.6× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 60.4 ms | 16.9 ms | — | — | 3.6× |
+| `sigmoid/1x80x8400/i8_i8` | 1.6 ms | 712 us | — | — | 2.3× |
+| `sigmoid/1x10x21168/i8_f32` | 9.7 ms | 1.8 ms | — | — | 5.3× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 31.0 ms | 4.2 ms | — | — | 7.5× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 10.4 ms | 2.8 ms | — | — | 3.7× |
+| `sigmoid/1x80x8400/i16_f16` | 40.9 ms | 5.7 ms | — | — | 7.2× |
+| `sigmoid/1x80x8400/i8_f16` | 39.2 ms | 5.9 ms | — | — | 6.6× |
+| `sigmoid/1x80x8400/i8_u8` | 31.4 ms | 6.5 ms | — | — | 4.8× |
+| `sigmoid/1x80x8400/f32_f32` | 32.1 ms | 5.2 ms | — | — | 6.2× |
+| `sigmoid/1x80x8400/f32_f16` | 39.8 ms | 5.3 ms | — | — | 7.6× |
+| `sigmoid/1x80x8400/f16_f16` | 44.5 ms | 5.3 ms | — | — | 8.3× |
+| `sigmoid/1x80x8400/f16_f32` | 36.4 ms | 5.4 ms | — | — | 6.8× |
+| `nchw_to_nhwc/i16_80x8400` | 4.3 ms | | | | |
+| `nchw_to_nhwc/u8_c3_640x640` | 760 us | | | | |
+| `dfl_box/8400/i8_f32_anchor_major` | 7.5 ms | 1.1 ms | — | — | 7.0× |
+| `dfl_box/8400/i8_f32_channel_major` | 9.8 ms | 3.4 ms | — | — | 2.9× |
+| `dfl_box/8400/i8_f16_anchor_major` | 7.9 ms | 1.1 ms | — | — | 7.4× |
+| `dfl_box/8400/i8_f16_channel_major` | 10.2 ms | 3.4 ms | — | — | 3.0× |
+| `dfl_box/8400/i8_i8_anchor_major` | 7.5 ms | 1.1 ms | — | — | 6.9× |
+| `dfl_box/8400/i8_i8_channel_major` | 9.8 ms | 3.4 ms | — | — | 2.9× |
+| `dfl_box/21168/i8_f32_anchor_major` | 19.0 ms | 2.8 ms | — | — | 6.7× |
+| `dfl_box/21168/i8_f32_channel_major` | 24.8 ms | 8.8 ms | — | — | 2.8× |
+| `dfl_box/21168/i8_i8_anchor_major` | 19.5 ms | 2.9 ms | — | — | 6.7× |
+| `dfl_box/21168/i8_i8_channel_major` | 24.8 ms | 8.9 ms | — | — | 2.8× |
+| `dfl_box/8400/i16_f32_anchor_major` | 23.6 ms | 10.2 ms | — | — | 2.3× |
+| `dfl_box/8400/f32_f32_anchor_major` | 23.5 ms | 10.2 ms | — | — | 2.3× |
+| `dfl_box/8400/i16_f16_anchor_major` | 24.1 ms | 10.3 ms | — | — | 2.3× |
+| `dfl_box/8400/f32_f16_anchor_major` | 23.9 ms | 10.2 ms | — | — | 2.3× |
+| `dfl/8400/reg_max_8/i8_f32` | 4.1 ms | 877 us | — | — | 4.7× |
+| `dfl/8400/reg_max_8/i8_f16` | 4.5 ms | 906 us | — | — | 5.0× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 265 us | 245 us | — | — | 1.1× |
+| `dist2bbox/21168/i8_f32_channel_major` | 566 us | 536 us | — | — | 1.1× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 359 us | 307 us | — | — | 1.2× |
+| `dist2bbox/21168/i8_i8_channel_major` | 620 us | 568 us | — | — | 1.1× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 371 us | 169 us | — | — | 2.2× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 1.6 ms | 253 us | — | — | 6.3× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 1.3 ms | 177 us | — | — | 7.4× |
+| `mask/dot8_i8_i8/160x160x32/zm0` | — | 377 us | — | — | — |
+| `mask/dot8_i8_i8/160x160x32/zm20` | — | 380 us | — | — | — |
+| `mask/dot_wide_i16_i8/160x160x32` | — | 796 us | — | — | — |
+| `mask/dot_f32_f32/160x160x32` | — | 1.7 ms | — | — | — |
+| `mask/dot_f32_f16/160x160x32` | — | 1.1 ms | — | — | — |
+| `mask/dot_f32_f16/hot4x160x32` | — | 1.0 ms | — | — | — |
+| `mask/dot_f32_f32/hot4x160x32` | — | 822 us | — | — | — |
+| `mask/sigmoid_u8/160x160` | 827 us | 208 us | — | — | 4.0× |
+
+</details>
+
+<details><summary>imx8mp-evk (A53): every kernels_benchmark cell, median of 3 runs</summary>
+
+| Kernel case | scalar | neon | neon_fp16 | neon_dotprod | best NEON vs scalar |
+|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous (TFLite loop)` | 6.6 ms | — | — | — | — |
+| `softmax_i8/1x2x400x400/contiguous` | 6.5 ms | 909 us | — | — | 7.1× |
+| `softmax_i8/1x2x1008x1008/contiguous (TFLite loop)` | 42.0 ms | — | — | — | — |
+| `softmax_i8/1x2x1008x1008/contiguous` | 41.0 ms | 5.3 ms | — | — | 7.7× |
+| `softmax_i8/1x2x1008x1008/threads2` | 21.1 ms | 3.1 ms | — | — | 6.7× |
+| `softmax_i16/1x2x400x400/contiguous` | 9.6 ms | 2.7 ms | — | — | 3.6× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 60.4 ms | 16.8 ms | — | — | 3.6× |
+| `sigmoid/1x80x8400/i8_i8` | 1.6 ms | 714 us | — | — | 2.3× |
+| `sigmoid/1x10x21168/i8_f32` | 9.7 ms | 1.8 ms | — | — | 5.3× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 31.0 ms | 4.2 ms | — | — | 7.4× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 10.4 ms | 2.8 ms | — | — | 3.7× |
+| `sigmoid/1x80x8400/i16_f16` | 40.9 ms | 5.7 ms | — | — | 7.1× |
+| `sigmoid/1x80x8400/i8_f16` | 39.2 ms | 5.9 ms | — | — | 6.6× |
+| `sigmoid/1x80x8400/i8_u8` | 31.4 ms | 6.5 ms | — | — | 4.8× |
+| `sigmoid/1x80x8400/f32_f32` | 32.1 ms | 5.2 ms | — | — | 6.2× |
+| `sigmoid/1x80x8400/f32_f16` | 39.8 ms | 5.3 ms | — | — | 7.6× |
+| `sigmoid/1x80x8400/f16_f16` | 44.5 ms | 5.4 ms | — | — | 8.3× |
+| `sigmoid/1x80x8400/f16_f32` | 36.4 ms | 5.4 ms | — | — | 6.8× |
+| `nchw_to_nhwc/i16_80x8400` | 4.3 ms | | | | |
+| `nchw_to_nhwc/u8_c3_640x640` | 753 us | | | | |
+| `dfl_box/8400/i8_f32_anchor_major` | 7.5 ms | 1.1 ms | — | — | 6.9× |
+| `dfl_box/8400/i8_f32_channel_major` | 9.8 ms | 3.4 ms | — | — | 2.9× |
+| `dfl_box/8400/i8_f16_anchor_major` | 7.9 ms | 1.1 ms | — | — | 7.3× |
+| `dfl_box/8400/i8_f16_channel_major` | 10.2 ms | 3.4 ms | — | — | 3.0× |
+| `dfl_box/8400/i8_i8_anchor_major` | 7.6 ms | 1.1 ms | — | — | 7.0× |
+| `dfl_box/8400/i8_i8_channel_major` | 9.8 ms | 3.4 ms | — | — | 2.9× |
+| `dfl_box/21168/i8_f32_anchor_major` | 19.0 ms | 2.9 ms | — | — | 6.6× |
+| `dfl_box/21168/i8_f32_channel_major` | 25.0 ms | 9.0 ms | — | — | 2.8× |
+| `dfl_box/21168/i8_i8_anchor_major` | 19.3 ms | 2.9 ms | — | — | 6.6× |
+| `dfl_box/21168/i8_i8_channel_major` | 25.0 ms | 9.0 ms | — | — | 2.8× |
+| `dfl_box/8400/i16_f32_anchor_major` | 23.7 ms | 10.2 ms | — | — | 2.3× |
+| `dfl_box/8400/f32_f32_anchor_major` | 23.6 ms | 10.2 ms | — | — | 2.3× |
+| `dfl_box/8400/i16_f16_anchor_major` | 24.2 ms | 10.4 ms | — | — | 2.3× |
+| `dfl_box/8400/f32_f16_anchor_major` | 24.1 ms | 10.2 ms | — | — | 2.4× |
+| `dfl/8400/reg_max_8/i8_f32` | 4.1 ms | 881 us | — | — | 4.7× |
+| `dfl/8400/reg_max_8/i8_f16` | 4.5 ms | 910 us | — | — | 5.0× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 280 us | 260 us | — | — | 1.1× |
+| `dist2bbox/21168/i8_f32_channel_major` | 580 us | 559 us | — | — | 1.0× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 362 us | 308 us | — | — | 1.2× |
+| `dist2bbox/21168/i8_i8_channel_major` | 628 us | 574 us | — | — | 1.1× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 385 us | 174 us | — | — | 2.2× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 1.6 ms | 267 us | — | — | 6.1× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 1.3 ms | 181 us | — | — | 7.2× |
+| `mask/dot8_i8_i8/160x160x32/zm0` | — | 381 us | — | — | — |
+| `mask/dot8_i8_i8/160x160x32/zm20` | — | 385 us | — | — | — |
+| `mask/dot_wide_i16_i8/160x160x32` | — | 799 us | — | — | — |
+| `mask/dot_f32_f32/160x160x32` | — | 1.3 ms | — | — | — |
+| `mask/dot_f32_f16/160x160x32` | — | 1.1 ms | — | — | — |
+| `mask/dot_f32_f16/hot4x160x32` | — | 1.0 ms | — | — | — |
+| `mask/dot_f32_f32/hot4x160x32` | — | 820 us | — | — | — |
+| `mask/sigmoid_u8/160x160` | 827 us | 208 us | — | — | 4.0× |
+
+</details>
+
+<details><summary>imx95-frdm (A55): every kernels_benchmark cell, median of 3 runs</summary>
+
+| Kernel case | scalar | neon | neon_fp16 | neon_dotprod | best NEON vs scalar |
+|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous (TFLite loop)` | 6.0 ms | — | — | — | — |
+| `softmax_i8/1x2x400x400/contiguous` | 6.1 ms | 841 us | 841 us | 840 us | 7.3× |
+| `softmax_i8/1x2x1008x1008/contiguous (TFLite loop)` | 37.9 ms | — | — | — | — |
+| `softmax_i8/1x2x1008x1008/contiguous` | 38.6 ms | 4.9 ms | 4.9 ms | 4.9 ms | 7.9× |
+| `softmax_i8/1x2x1008x1008/threads2` | 19.8 ms | 2.8 ms | 2.8 ms | 2.8 ms | 7.0× |
+| `softmax_i16/1x2x400x400/contiguous` | 9.2 ms | 2.5 ms | 2.5 ms | 2.5 ms | 3.8× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 58.5 ms | 15.4 ms | 15.4 ms | 15.4 ms | 3.8× |
+| `sigmoid/1x80x8400/i8_i8` | 1.2 ms | 691 us | 691 us | 691 us | 1.7× |
+| `sigmoid/1x10x21168/i8_f32` | 8.6 ms | 1.4 ms | 1.4 ms | 1.4 ms | 6.2× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 30.7 ms | 4.0 ms | 4.0 ms | 4.0 ms | 7.7× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 9.9 ms | 2.7 ms | 2.7 ms | 2.8 ms | 3.6× |
+| `sigmoid/1x80x8400/i16_f16` | 31.3 ms | 4.4 ms | 3.5 ms | 4.4 ms | 8.9× |
+| `sigmoid/1x80x8400/i8_f16` | 31.1 ms | 4.7 ms | 3.5 ms | 4.7 ms | 8.8× |
+| `sigmoid/1x80x8400/i8_u8` | 28.2 ms | 5.3 ms | 5.3 ms | 5.3 ms | 5.3× |
+| `sigmoid/1x80x8400/f32_f32` | 27.8 ms | 4.1 ms | 4.1 ms | 4.1 ms | 6.7× |
+| `sigmoid/1x80x8400/f32_f16` | 31.0 ms | 4.1 ms | 3.3 ms | 4.1 ms | 9.5× |
+| `sigmoid/1x80x8400/f16_f16` | 34.6 ms | 4.2 ms | 2.5 ms | 4.2 ms | 14.1× |
+| `sigmoid/1x80x8400/f16_f32` | 30.8 ms | 4.1 ms | 4.1 ms | 4.1 ms | 7.4× |
+| `nchw_to_nhwc/i16_80x8400` | 4.5 ms | | | | |
+| `nchw_to_nhwc/u8_c3_640x640` | 478 us | | | | |
+| `dfl_box/8400/i8_f32_anchor_major` | 7.1 ms | 1.0 ms | 1.0 ms | 1.0 ms | 7.0× |
+| `dfl_box/8400/i8_f32_channel_major` | 9.8 ms | 3.6 ms | 3.6 ms | 3.6 ms | 2.7× |
+| `dfl_box/8400/i8_f16_anchor_major` | 7.3 ms | 1.0 ms | 1.0 ms | 1.0 ms | 7.2× |
+| `dfl_box/8400/i8_f16_channel_major` | 9.9 ms | 3.5 ms | 3.5 ms | 3.4 ms | 2.9× |
+| `dfl_box/8400/i8_i8_anchor_major` | 7.1 ms | 1.1 ms | 1.1 ms | 1.1 ms | 6.8× |
+| `dfl_box/8400/i8_i8_channel_major` | 9.7 ms | 3.5 ms | 3.5 ms | 3.5 ms | 2.8× |
+| `dfl_box/21168/i8_f32_anchor_major` | 17.8 ms | 2.6 ms | 2.6 ms | 2.6 ms | 6.9× |
+| `dfl_box/21168/i8_f32_channel_major` | 25.3 ms | 10.0 ms | 10.0 ms | 10.0 ms | 2.5× |
+| `dfl_box/21168/i8_i8_anchor_major` | 17.9 ms | 2.7 ms | 2.7 ms | 2.7 ms | 6.7× |
+| `dfl_box/21168/i8_i8_channel_major` | 25.4 ms | 10.1 ms | 10.1 ms | 10.1 ms | 2.5× |
+| `dfl_box/8400/i16_f32_anchor_major` | 21.2 ms | 8.0 ms | 6.4 ms | 8.0 ms | 3.3× |
+| `dfl_box/8400/f32_f32_anchor_major` | 20.9 ms | 8.2 ms | 8.2 ms | 8.2 ms | 2.6× |
+| `dfl_box/8400/i16_f16_anchor_major` | 21.4 ms | 8.1 ms | 5.2 ms | 8.1 ms | 4.1× |
+| `dfl_box/8400/f32_f16_anchor_major` | 21.1 ms | 8.2 ms | 4.9 ms | 8.2 ms | 4.3× |
+| `dfl/8400/reg_max_8/i8_f32` | 4.0 ms | 833 us | 833 us | 833 us | 4.8× |
+| `dfl/8400/reg_max_8/i8_f16` | 4.2 ms | 863 us | 863 us | 863 us | 4.8× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 212 us | 187 us | 187 us | 187 us | 1.1× |
+| `dist2bbox/21168/i8_f32_channel_major` | 456 us | 438 us | 437 us | 436 us | 1.0× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 344 us | 277 us | 277 us | 277 us | 1.2× |
+| `dist2bbox/21168/i8_i8_channel_major` | 608 us | 541 us | 540 us | 542 us | 1.1× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 382 us | 219 us | 218 us | 219 us | 1.8× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 855 us | 178 us | 176 us | 177 us | 4.9× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 682 us | 160 us | 160 us | 160 us | 4.3× |
+| `mask/dot8_i8_i8/160x160x32/zm0` | — | 354 us | — | 254 us | — |
+| `mask/dot8_i8_i8/160x160x32/zm20` | — | 357 us | — | 257 us | — |
+| `mask/dot_wide_i16_i8/160x160x32` | — | 782 us | — | — | — |
+| `mask/dot_f32_f32/160x160x32` | — | 2.2 ms | — | — | — |
+| `mask/dot_f32_f16/160x160x32` | — | 987 us | — | — | — |
+| `mask/dot8_i8_i8/hot4x160x32/zm20` | — | — | — | 235 us | — |
+| `mask/dot_f32_f16/hot4x160x32` | — | 956 us | — | — | — |
+| `mask/dot_f32_f32/hot4x160x32` | — | 756 us | — | — | — |
+| `mask/sigmoid_u8/160x160` | 760 us | 172 us | — | — | 4.4× |
+
+</details>
+
+<details><summary>imx95-evk (A55): every kernels_benchmark cell, median of 3 runs</summary>
+
+| Kernel case | scalar | neon | neon_fp16 | neon_dotprod | best NEON vs scalar |
+|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous (TFLite loop)` | 6.0 ms | — | — | — | — |
+| `softmax_i8/1x2x400x400/contiguous` | 6.1 ms | 840 us | 840 us | 840 us | 7.3× |
+| `softmax_i8/1x2x1008x1008/contiguous (TFLite loop)` | 37.9 ms | — | — | — | — |
+| `softmax_i8/1x2x1008x1008/contiguous` | 38.6 ms | 4.9 ms | 4.9 ms | 4.9 ms | 7.9× |
+| `softmax_i8/1x2x1008x1008/threads2` | 19.7 ms | 2.8 ms | 2.8 ms | 2.8 ms | 7.1× |
+| `softmax_i16/1x2x400x400/contiguous` | 9.2 ms | 2.4 ms | 2.4 ms | 2.4 ms | 3.8× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 58.5 ms | 15.3 ms | 15.3 ms | 15.3 ms | 3.8× |
+| `sigmoid/1x80x8400/i8_i8` | 1.2 ms | 689 us | 689 us | 689 us | 1.7× |
+| `sigmoid/1x10x21168/i8_f32` | 8.6 ms | 1.4 ms | 1.4 ms | 1.4 ms | 6.2× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 30.7 ms | 4.0 ms | 4.0 ms | 4.0 ms | 7.7× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 9.9 ms | 2.8 ms | 2.8 ms | 2.8 ms | 3.6× |
+| `sigmoid/1x80x8400/i16_f16` | 31.3 ms | 4.4 ms | 3.5 ms | 4.4 ms | 8.9× |
+| `sigmoid/1x80x8400/i8_f16` | 31.1 ms | 4.7 ms | 3.5 ms | 4.7 ms | 8.8× |
+| `sigmoid/1x80x8400/i8_u8` | 28.2 ms | 5.3 ms | 5.4 ms | 5.3 ms | 5.3× |
+| `sigmoid/1x80x8400/f32_f32` | 27.6 ms | 4.1 ms | 4.1 ms | 4.1 ms | 6.7× |
+| `sigmoid/1x80x8400/f32_f16` | 31.0 ms | 4.1 ms | 3.3 ms | 4.1 ms | 9.4× |
+| `sigmoid/1x80x8400/f16_f16` | 34.6 ms | 4.2 ms | 2.5 ms | 4.2 ms | 14.1× |
+| `sigmoid/1x80x8400/f16_f32` | 30.8 ms | 4.2 ms | 4.2 ms | 4.2 ms | 7.4× |
+| `nchw_to_nhwc/i16_80x8400` | 3.9 ms | | | | |
+| `nchw_to_nhwc/u8_c3_640x640` | 444 us | | | | |
+| `dfl_box/8400/i8_f32_anchor_major` | 7.1 ms | 1.0 ms | 1.0 ms | 1.0 ms | 7.0× |
+| `dfl_box/8400/i8_f32_channel_major` | 9.6 ms | 3.5 ms | 3.5 ms | 3.5 ms | 2.8× |
+| `dfl_box/8400/i8_f16_anchor_major` | 7.3 ms | 1.1 ms | 1.0 ms | 1.0 ms | 7.2× |
+| `dfl_box/8400/i8_f16_channel_major` | 9.8 ms | 3.4 ms | 3.4 ms | 3.4 ms | 2.9× |
+| `dfl_box/8400/i8_i8_anchor_major` | 7.1 ms | 1.1 ms | 1.1 ms | 1.1 ms | 6.7× |
+| `dfl_box/8400/i8_i8_channel_major` | 9.6 ms | 3.3 ms | 3.4 ms | 3.4 ms | 2.9× |
+| `dfl_box/21168/i8_f32_anchor_major` | 17.7 ms | 2.6 ms | 2.6 ms | 2.5 ms | 6.9× |
+| `dfl_box/21168/i8_f32_channel_major` | 24.8 ms | 9.6 ms | 9.6 ms | 9.6 ms | 2.6× |
+| `dfl_box/21168/i8_i8_anchor_major` | 17.9 ms | 2.7 ms | 2.7 ms | 2.7 ms | 6.7× |
+| `dfl_box/21168/i8_i8_channel_major` | 25.0 ms | 9.7 ms | 9.6 ms | 9.7 ms | 2.6× |
+| `dfl_box/8400/i16_f32_anchor_major` | 21.2 ms | 8.0 ms | 6.4 ms | 8.0 ms | 3.3× |
+| `dfl_box/8400/f32_f32_anchor_major` | 20.9 ms | 8.2 ms | 8.2 ms | 8.2 ms | 2.6× |
+| `dfl_box/8400/i16_f16_anchor_major` | 21.4 ms | 8.0 ms | 5.2 ms | 8.0 ms | 4.1× |
+| `dfl_box/8400/f32_f16_anchor_major` | 21.1 ms | 8.2 ms | 4.9 ms | 8.2 ms | 4.3× |
+| `dfl/8400/reg_max_8/i8_f32` | 4.0 ms | 832 us | 832 us | 832 us | 4.8× |
+| `dfl/8400/reg_max_8/i8_f16` | 4.2 ms | 862 us | 863 us | 863 us | 4.9× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 210 us | 186 us | 186 us | 186 us | 1.1× |
+| `dist2bbox/21168/i8_f32_channel_major` | 455 us | 437 us | 434 us | 434 us | 1.0× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 346 us | 280 us | 280 us | 279 us | 1.2× |
+| `dist2bbox/21168/i8_i8_channel_major` | 608 us | 539 us | 540 us | 540 us | 1.1× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 376 us | 223 us | 225 us | 225 us | 1.7× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 851 us | 173 us | 173 us | 172 us | 4.9× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 683 us | 161 us | 162 us | 161 us | 4.2× |
+| `mask/dot8_i8_i8/160x160x32/zm0` | — | 351 us | — | 252 us | — |
+| `mask/dot8_i8_i8/160x160x32/zm20` | — | 355 us | — | 256 us | — |
+| `mask/dot_wide_i16_i8/160x160x32` | — | 780 us | — | — | — |
+| `mask/dot_f32_f32/160x160x32` | — | 1.8 ms | — | — | — |
+| `mask/dot_f32_f16/160x160x32` | — | 982 us | — | — | — |
+| `mask/dot8_i8_i8/hot4x160x32/zm20` | — | — | — | 236 us | — |
+| `mask/dot_f32_f16/hot4x160x32` | — | 953 us | — | — | — |
+| `mask/dot_f32_f32/hot4x160x32` | — | 747 us | — | — | — |
+| `mask/sigmoid_u8/160x160` | 760 us | 172 us | — | — | 4.4× |
+
+</details>
+
+<details><summary>rpi5-hailo (A76): every kernels_benchmark cell, median of 3 runs</summary>
+
+| Kernel case | scalar | neon | neon_fp16 | neon_dotprod | best NEON vs scalar |
+|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous (TFLite loop)` | 1.6 ms | — | — | — | — |
+| `softmax_i8/1x2x400x400/contiguous` | 1.3 ms | 244 us | 244 us | 244 us | 5.5× |
+| `softmax_i8/1x2x1008x1008/contiguous (TFLite loop)` | 7.6 ms | — | — | — | — |
+| `softmax_i8/1x2x1008x1008/contiguous` | 8.3 ms | 1.4 ms | 1.4 ms | 1.4 ms | 5.8× |
+| `softmax_i8/1x2x1008x1008/threads2` | 4.2 ms | 759 us | 756 us | 757 us | 5.6× |
+| `softmax_i16/1x2x400x400/contiguous` | 2.9 ms | 944 us | 944 us | 944 us | 3.0× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 18.2 ms | 5.9 ms | 5.9 ms | 5.9 ms | 3.1× |
+| `sigmoid/1x80x8400/i8_i8` | 442 us | 218 us | 218 us | 218 us | 2.0× |
+| `sigmoid/1x10x21168/i8_f32` | 2.3 ms | 548 us | 548 us | 548 us | 4.2× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 15.3 ms | 1.9 ms | 1.9 ms | 1.9 ms | 8.3× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 4.2 ms | 1.5 ms | 1.5 ms | 1.5 ms | 2.7× |
+| `sigmoid/1x80x8400/i16_f16` | 9.0 ms | 1.8 ms | 1.3 ms | 1.8 ms | 7.1× |
+| `sigmoid/1x80x8400/i8_f16` | 8.6 ms | 1.8 ms | 1.3 ms | 1.8 ms | 6.8× |
+| `sigmoid/1x80x8400/i8_u8` | 7.6 ms | 2.0 ms | 2.0 ms | 2.0 ms | 3.8× |
+| `sigmoid/1x80x8400/f32_f32` | 7.5 ms | 1.5 ms | 1.5 ms | 1.5 ms | 5.1× |
+| `sigmoid/1x80x8400/f32_f16` | 8.7 ms | 1.5 ms | 1.1 ms | 1.5 ms | 8.3× |
+| `sigmoid/1x80x8400/f16_f16` | 10.1 ms | 1.6 ms | 832 us | 1.6 ms | 12.1× |
+| `sigmoid/1x80x8400/f16_f32` | 8.7 ms | 1.6 ms | 1.6 ms | 1.6 ms | 5.5× |
+| `nchw_to_nhwc/i16_80x8400` | 285 us | | | | |
+| `nchw_to_nhwc/u8_c3_640x640` | 105 us | | | | |
+| `dfl_box/8400/i8_f32_anchor_major` | 2.0 ms | 314 us | 314 us | 314 us | 6.2× |
+| `dfl_box/8400/i8_f32_channel_major` | 2.7 ms | 1.0 ms | 1.0 ms | 1.0 ms | 2.6× |
+| `dfl_box/8400/i8_f16_anchor_major` | 2.0 ms | 323 us | 334 us | 323 us | 6.3× |
+| `dfl_box/8400/i8_f16_channel_major` | 2.7 ms | 1.0 ms | 1.0 ms | 1.0 ms | 2.7× |
+| `dfl_box/8400/i8_i8_anchor_major` | 2.0 ms | 329 us | 329 us | 329 us | 6.0× |
+| `dfl_box/8400/i8_i8_channel_major` | 2.7 ms | 1.0 ms | 1.0 ms | 1.0 ms | 2.6× |
+| `dfl_box/21168/i8_f32_anchor_major` | 5.0 ms | 799 us | 799 us | 800 us | 6.2× |
+| `dfl_box/21168/i8_f32_channel_major` | 6.8 ms | 2.6 ms | 2.6 ms | 2.6 ms | 2.6× |
+| `dfl_box/21168/i8_i8_anchor_major` | 5.0 ms | 831 us | 832 us | 831 us | 6.0× |
+| `dfl_box/21168/i8_i8_channel_major` | 6.8 ms | 2.7 ms | 2.7 ms | 2.7 ms | 2.6× |
+| `dfl_box/8400/i16_f32_anchor_major` | 5.5 ms | 2.4 ms | 2.0 ms | 2.4 ms | 2.8× |
+| `dfl_box/8400/f32_f32_anchor_major` | 5.3 ms | 2.2 ms | 2.2 ms | 2.2 ms | 2.5× |
+| `dfl_box/8400/i16_f16_anchor_major` | 5.5 ms | 2.4 ms | 1.4 ms | 2.4 ms | 3.9× |
+| `dfl_box/8400/f32_f16_anchor_major` | 5.4 ms | 2.2 ms | 1.3 ms | 2.2 ms | 4.0× |
+| `dfl/8400/reg_max_8/i8_f32` | 1.1 ms | 256 us | 256 us | 256 us | 4.4× |
+| `dfl/8400/reg_max_8/i8_f16` | 1.2 ms | 269 us | 267 us | 267 us | 4.4× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 62 us | 62 us | 62 us | 62 us | 1.0× |
+| `dist2bbox/21168/i8_f32_channel_major` | 172 us | 170 us | 170 us | 170 us | 1.0× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 128 us | 97 us | 97 us | 97 us | 1.3× |
+| `dist2bbox/21168/i8_i8_channel_major` | 235 us | 204 us | 204 us | 204 us | 1.2× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 62 us | 44 us | 44 us | 44 us | 1.4× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 249 us | 44 us | 44 us | 44 us | 5.7× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 249 us | 62 us | 62 us | 62 us | 4.0× |
+| `mask/dot8_i8_i8/160x160x32/zm0` | — | 79 us | — | 43 us | — |
+| `mask/dot8_i8_i8/160x160x32/zm20` | — | 80 us | — | 44 us | — |
+| `mask/dot_wide_i16_i8/160x160x32` | — | 250 us | — | — | — |
+| `mask/dot_f32_f32/160x160x32` | — | 181 us | — | — | — |
+| `mask/dot_f32_f16/160x160x32` | — | 273 us | — | — | — |
+| `mask/dot8_i8_i8/hot4x160x32/zm20` | — | — | — | 44 us | — |
+| `mask/dot_f32_f16/hot4x160x32` | — | 269 us | — | — | — |
+| `mask/dot_f32_f32/hot4x160x32` | — | 124 us | — | — | — |
+| `mask/sigmoid_u8/160x160` | 189 us | 69 us | — | — | 2.7× |
+
+</details>
+
+<details><summary>jetson-orin-nano (A78AE): every kernels_benchmark cell, median of 3 runs</summary>
+
+| Kernel case | scalar | neon | neon_fp16 | neon_dotprod | best NEON vs scalar |
+|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous (TFLite loop)` | 1.2 ms | — | — | — | — |
+| `softmax_i8/1x2x400x400/contiguous` | 1.4 ms | 298 us | 298 us | 299 us | 4.8× |
+| `softmax_i8/1x2x1008x1008/contiguous (TFLite loop)` | 7.5 ms | — | — | — | — |
+| `softmax_i8/1x2x1008x1008/contiguous` | 9.1 ms | 1.7 ms | 1.7 ms | 1.7 ms | 5.3× |
+| `softmax_i8/1x2x1008x1008/threads2` | 4.6 ms | 920 us | 925 us | 925 us | 5.0× |
+| `softmax_i16/1x2x400x400/contiguous` | 2.7 ms | 1.1 ms | 1.1 ms | 1.1 ms | 2.4× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 17.3 ms | 7.5 ms | 7.4 ms | 7.5 ms | 2.3× |
+| `sigmoid/1x80x8400/i8_i8` | 498 us | 264 us | 264 us | 264 us | 1.9× |
+| `sigmoid/1x10x21168/i8_f32` | 2.4 ms | 713 us | 713 us | 713 us | 3.4× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 20.9 ms | 2.2 ms | 2.2 ms | 2.2 ms | 9.4× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 5.0 ms | 1.7 ms | 1.7 ms | 1.7 ms | 3.0× |
+| `sigmoid/1x80x8400/i16_f16` | 9.3 ms | 2.3 ms | 1.7 ms | 2.3 ms | 5.6× |
+| `sigmoid/1x80x8400/i8_f16` | 8.8 ms | 2.3 ms | 1.7 ms | 2.3 ms | 5.2× |
+| `sigmoid/1x80x8400/i8_u8` | 8.3 ms | 2.6 ms | 2.6 ms | 2.6 ms | 3.2× |
+| `sigmoid/1x80x8400/f32_f32` | 8.2 ms | 1.9 ms | 1.9 ms | 1.9 ms | 4.3× |
+| `sigmoid/1x80x8400/f32_f16` | 9.3 ms | 2.0 ms | 1.4 ms | 2.0 ms | 6.8× |
+| `sigmoid/1x80x8400/f16_f16` | 10.1 ms | 2.1 ms | 1.0 ms | 2.1 ms | 10.0× |
+| `sigmoid/1x80x8400/f16_f32` | 9.0 ms | 2.0 ms | 2.0 ms | 2.0 ms | 4.5× |
+| `nchw_to_nhwc/i16_80x8400` | 324 us | | | | |
+| `nchw_to_nhwc/u8_c3_640x640` | 96 us | | | | |
+| `dfl_box/8400/i8_f32_anchor_major` | 2.5 ms | 365 us | 365 us | 365 us | 6.9× |
+| `dfl_box/8400/i8_f32_channel_major` | 3.2 ms | 1.1 ms | 1.1 ms | 1.1 ms | 3.0× |
+| `dfl_box/8400/i8_f16_anchor_major` | 2.6 ms | 377 us | 421 us | 377 us | 6.8× |
+| `dfl_box/8400/i8_f16_channel_major` | 3.3 ms | 1.1 ms | 1.1 ms | 1.1 ms | 3.0× |
+| `dfl_box/8400/i8_i8_anchor_major` | 2.6 ms | 382 us | 383 us | 383 us | 6.7× |
+| `dfl_box/8400/i8_i8_channel_major` | 3.3 ms | 1.1 ms | 1.1 ms | 1.1 ms | 3.0× |
+| `dfl_box/21168/i8_f32_anchor_major` | 6.4 ms | 920 us | 920 us | 920 us | 6.9× |
+| `dfl_box/21168/i8_f32_channel_major` | 8.2 ms | 2.7 ms | 2.7 ms | 2.7 ms | 3.0× |
+| `dfl_box/21168/i8_i8_anchor_major` | 6.4 ms | 966 us | 966 us | 966 us | 6.7× |
+| `dfl_box/21168/i8_i8_channel_major` | 8.2 ms | 2.8 ms | 2.8 ms | 2.8 ms | 3.0× |
+| `dfl_box/8400/i16_f32_anchor_major` | 5.1 ms | 2.9 ms | 2.3 ms | 2.9 ms | 2.2× |
+| `dfl_box/8400/f32_f32_anchor_major` | 5.0 ms | 2.5 ms | 2.5 ms | 2.5 ms | 2.0× |
+| `dfl_box/8400/i16_f16_anchor_major` | 5.2 ms | 2.9 ms | 1.6 ms | 2.9 ms | 3.2× |
+| `dfl_box/8400/f32_f16_anchor_major` | 5.2 ms | 2.5 ms | 1.6 ms | 2.5 ms | 3.3× |
+| `dfl/8400/reg_max_8/i8_f32` | 1.3 ms | 284 us | 283 us | 283 us | 4.7× |
+| `dfl/8400/reg_max_8/i8_f16` | 1.4 ms | 294 us | 294 us | 294 us | 4.7× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 77 us | 78 us | 78 us | 78 us | 1.0× |
+| `dist2bbox/21168/i8_f32_channel_major` | 165 us | 165 us | 166 us | 166 us | 1.0× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 151 us | 116 us | 116 us | 116 us | 1.3× |
+| `dist2bbox/21168/i8_i8_channel_major` | 239 us | 204 us | 204 us | 205 us | 1.2× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 76 us | 52 us | 52 us | 52 us | 1.5× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 218 us | 52 us | 52 us | 52 us | 4.2× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 220 us | 78 us | 78 us | 78 us | 2.8× |
+| `mask/dot8_i8_i8/160x160x32/zm0` | — | 87 us | — | 40 us | — |
+| `mask/dot8_i8_i8/160x160x32/zm20` | — | 89 us | — | 40 us | — |
+| `mask/dot_wide_i16_i8/160x160x32` | — | 296 us | — | — | — |
+| `mask/dot_f32_f32/160x160x32` | — | 144 us | — | — | — |
+| `mask/dot_f32_f16/160x160x32` | — | 285 us | — | — | — |
+| `mask/dot8_i8_i8/hot4x160x32/zm20` | — | — | — | 40 us | — |
+| `mask/dot_f32_f16/hot4x160x32` | — | 286 us | — | — | — |
+| `mask/dot_f32_f32/hot4x160x32` | — | 129 us | — | — | — |
+| `mask/sigmoid_u8/160x160` | 185 us | 89 us | — | — | 2.1× |
+
+</details>
+
+<details><summary>iq9075-evk (A78C): every kernels_benchmark cell, median of 3 runs</summary>
+
+| Kernel case | scalar | neon | neon_fp16 | neon_dotprod | best NEON vs scalar |
+|---|---|---|---|---|---|
+| `softmax_i8/1x2x400x400/contiguous (TFLite loop)` | 916 us | — | — | — | — |
+| `softmax_i8/1x2x400x400/contiguous` | 1.1 ms | 219 us | 219 us | 219 us | 4.9× |
+| `softmax_i8/1x2x1008x1008/contiguous (TFLite loop)` | 5.5 ms | — | — | — | — |
+| `softmax_i8/1x2x1008x1008/contiguous` | 6.7 ms | 1.3 ms | 1.3 ms | 1.3 ms | 5.3× |
+| `softmax_i8/1x2x1008x1008/threads2` | 4.4 ms | 882 us | 858 us | 894 us | 5.1× |
+| `softmax_i16/1x2x400x400/contiguous` | 2.0 ms | 842 us | 842 us | 842 us | 2.4× |
+| `softmax_i16/1x2x1008x1008/contiguous` | 12.7 ms | 5.5 ms | 5.5 ms | 5.5 ms | 2.3× |
+| `sigmoid/1x80x8400/i8_i8` | 364 us | 193 us | 193 us | 193 us | 1.9× |
+| `sigmoid/1x10x21168/i8_f32` | 1.9 ms | 528 us | 528 us | 528 us | 3.5× |
+| `sigmoid/1x80x8400/i16_i16_pot` | 15.3 ms | 1.6 ms | 1.6 ms | 1.6 ms | 9.4× |
+| `sigmoid/1x80x8400/i16_i16_reference` | 3.7 ms | 1.2 ms | 1.2 ms | 1.2 ms | 3.0× |
+| `sigmoid/1x80x8400/i16_f16` | 7.2 ms | 1.7 ms | 1.2 ms | 1.7 ms | 5.8× |
+| `sigmoid/1x80x8400/i8_f16` | 6.8 ms | 1.7 ms | 1.2 ms | 1.7 ms | 5.5× |
+| `sigmoid/1x80x8400/i8_u8` | 6.4 ms | 1.9 ms | 1.9 ms | 1.9 ms | 3.4× |
+| `sigmoid/1x80x8400/f32_f32` | 6.4 ms | 1.4 ms | 1.4 ms | 1.4 ms | 4.5× |
+| `sigmoid/1x80x8400/f32_f16` | 7.2 ms | 1.5 ms | 1.0 ms | 1.5 ms | 7.0× |
+| `sigmoid/1x80x8400/f16_f16` | 7.7 ms | 1.5 ms | 747 us | 1.5 ms | 10.4× |
+| `sigmoid/1x80x8400/f16_f32` | 6.9 ms | 1.5 ms | 1.5 ms | 1.5 ms | 4.7× |
+| `nchw_to_nhwc/i16_80x8400` | 225 us | | | | |
+| `nchw_to_nhwc/u8_c3_640x640` | 63 us | | | | |
+| `dfl_box/8400/i8_f32_anchor_major` | 1.9 ms | 266 us | 266 us | 266 us | 7.0× |
+| `dfl_box/8400/i8_f32_channel_major` | 2.4 ms | 795 us | 795 us | 795 us | 3.0× |
+| `dfl_box/8400/i8_f16_anchor_major` | 1.9 ms | 276 us | 308 us | 277 us | 6.9× |
+| `dfl_box/8400/i8_f16_channel_major` | 2.4 ms | 802 us | 833 us | 802 us | 3.0× |
+| `dfl_box/8400/i8_i8_anchor_major` | 1.9 ms | 280 us | 280 us | 280 us | 6.7× |
+| `dfl_box/8400/i8_i8_channel_major` | 2.4 ms | 806 us | 806 us | 806 us | 3.0× |
+| `dfl_box/21168/i8_f32_anchor_major` | 4.7 ms | 680 us | 680 us | 680 us | 6.9× |
+| `dfl_box/21168/i8_f32_channel_major` | 6.0 ms | 2.0 ms | 2.0 ms | 2.0 ms | 3.0× |
+| `dfl_box/21168/i8_i8_anchor_major` | 4.7 ms | 713 us | 713 us | 713 us | 6.6× |
+| `dfl_box/21168/i8_i8_channel_major` | 6.0 ms | 2.0 ms | 2.0 ms | 2.0 ms | 3.0× |
+| `dfl_box/8400/i16_f32_anchor_major` | 3.8 ms | 2.1 ms | 1.7 ms | 2.1 ms | 2.3× |
+| `dfl_box/8400/f32_f32_anchor_major` | 3.7 ms | 1.8 ms | 1.8 ms | 1.8 ms | 2.0× |
+| `dfl_box/8400/i16_f16_anchor_major` | 3.9 ms | 2.1 ms | 1.2 ms | 2.1 ms | 3.3× |
+| `dfl_box/8400/f32_f16_anchor_major` | 3.8 ms | 1.8 ms | 1.1 ms | 1.8 ms | 3.3× |
+| `dfl/8400/reg_max_8/i8_f32` | 981 us | 207 us | 207 us | 207 us | 4.7× |
+| `dfl/8400/reg_max_8/i8_f16` | 1.0 ms | 215 us | 215 us | 215 us | 4.8× |
+| `dist2bbox/21168/i8_f32_anchor_major` | 56 us | 57 us | 57 us | 57 us | 1.0× |
+| `dist2bbox/21168/i8_f32_channel_major` | 120 us | 121 us | 121 us | 121 us | 1.0× |
+| `dist2bbox/21168/i8_i8_anchor_major` | 110 us | 85 us | 85 us | 85 us | 1.3× |
+| `dist2bbox/21168/i8_i8_channel_major` | 175 us | 149 us | 149 us | 149 us | 1.2× |
+| `dist2bbox/21168/f32_f32_anchor_major` | 55 us | 38 us | 38 us | 38 us | 1.4× |
+| `dist2bbox/21168/f32_f16_anchor_major` | 159 us | 38 us | 38 us | 38 us | 4.2× |
+| `dist2bbox/21168/i8_f16_anchor_major` | 162 us | 57 us | 57 us | 57 us | 2.8× |
+| `mask/dot8_i8_i8/160x160x32/zm0` | — | 64 us | — | 30 us | — |
+| `mask/dot8_i8_i8/160x160x32/zm20` | — | 65 us | — | 30 us | — |
+| `mask/dot_wide_i16_i8/160x160x32` | — | 217 us | — | — | — |
+| `mask/dot_f32_f32/160x160x32` | — | 112 us | — | — | — |
+| `mask/dot_f32_f16/160x160x32` | — | 209 us | — | — | — |
+| `mask/dot8_i8_i8/hot4x160x32/zm20` | — | — | — | 29 us | — |
+| `mask/dot_f32_f16/hot4x160x32` | — | 209 us | — | — | — |
+| `mask/dot_f32_f32/hot4x160x32` | — | 94 us | — | — | — |
+| `mask/sigmoid_u8/160x160` | 157 us | 65 us | — | — | 2.4× |
+
+</details>
 
 ### Image Codec Decode (`edgefirst-codec`) — JPEG rows superseded
 
@@ -1950,50 +2880,60 @@ done
 
 ### Mask Rendering
 
-**Data re-collected:** June 11, 2026 (GL proto-dispatch convergence;
-median of 3 runs × n=100; imx8mp/imx95/rpi5 at PR #110 head,
-jetson-orin-nano at PR #109 head). CPU / x86 / macOS rows retain the
-v0.15.0 capture — those paths are measured by the batched-GEMM tables
-below.
+**Data collected:** November 3, 2026, from `mask-opengl`, `mask-cpu`, and the unforced `mask-auto` run for the Auto column, at n=100 per cell. The mbp-m2-max rows are its older committed capture.
 
 **640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**
 
 | Platform | Compute | Buffer | draw_decoded_masks (pre-decoded) | draw_proto_masks (fused) | hybrid_materialize_and_draw |
 |----------|---------|--------|-------------------------------|------------------------|---------------------------|
-| imx8mp-frdm | GL | DMA | 2.7 ms | 274 ms | 6.1 ms |
-| imx8mp-frdm | CPU | Heap | 5.3 ms | 77.8 ms | 8.3 ms |
-| imx95-frdm | GL | DMA | 1.2 ms | 24.4 ms | 4.8 ms |
-| imx95-frdm | CPU | Heap | 5.3 ms | 76.2 ms | 8.4 ms |
-| rpi5-hailo | GL | DMA | 1.3 ms | 7.7 ms | 2.4 ms |
-| rpi5-hailo | CPU | Heap | 885 us | 14.5 ms | 1.7 ms |
-| jetson-orin-nano | GL | DMA | 518 us | 3.0 ms | 1.4 ms |
-| jetson-orin-nano | CPU | Heap | 873 us | 22.1 ms | 1.9 ms |
-| x86-desktop | CPU | Heap | 648 us | 5.1 ms | 635 us |
+| imx8mp-frdm | GL | DMA | 3.9 ms | 289 ms | 7.7 ms |
+| imx8mp-frdm | CPU | Heap | 5.5 ms | 73.2 ms | 8.5 ms |
+| imx8mp-evk | GL | DMA | 4.3 ms | 289 ms | 8.4 ms |
+| imx8mp-evk | CPU | Heap | 5.5 ms | 73.3 ms | 8.6 ms |
+| imx95-frdm | GL | DMA | 1.1 ms | 22.2 ms | 4.7 ms |
+| imx95-frdm | CPU | Heap | 5.8 ms | 72.4 ms | 8.6 ms |
+| imx95-evk | GL | DMA | 1.1 ms | 21.8 ms | 4.5 ms |
+| imx95-evk | CPU | Heap | 5.8 ms | 72.3 ms | 8.6 ms |
+| rpi5-hailo | GL | DMA | 1.3 ms | 7.5 ms | 2.3 ms |
+| rpi5-hailo | CPU | Heap | 1.0 ms | 19.2 ms | 2.0 ms |
+| jetson-orin-nano | GL | PBO | 417 us | 2.1 ms | 1.3 ms |
+| jetson-orin-nano | CPU | Heap | 588 us | 20.5 ms | 1.4 ms |
+| iq9075-evk | GL | DMA | 1.4 ms | 4.6 ms | 4.3 ms |
+| iq9075-evk | CPU | Heap | 878 us | 15.4 ms | 1.4 ms |
+| x86-desktop | GL | PBO | 102 us | 663 us | 552 us |
+| x86-desktop | CPU | Heap | 405 us | 10.3 ms | 822 us |
 | mbp-m2-max | CPU | Heap | 215 us | 6.9 ms | 419 us |
 
 **Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**
 
-The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms — dramatically so on Vivante, whose fragment scheduling falls off a cliff on the per-quad sigmoid work (see the eager-materialize guidance in `crates/image/ARCHITECTURE.md`). The auto-selection in `ImageProcessor::draw_proto_masks()` prefers the hybrid path when both CPU and OpenGL backends are available. The hybrid column is ~3× faster than the v0.15.0 capture across the boards thanks to the v0.22 batched-GEMM materialise.
+The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms — dramatically so on Vivante, whose fragment scheduling falls off a cliff on the per-quad sigmoid work (see the eager-materialize guidance in `crates/image/ARCHITECTURE.md`). The auto-selection in `ImageProcessor::draw_proto_masks()` prefers the hybrid path when both CPU and OpenGL backends are available.
 
-**New in v0.15.0:** The `materialize_masks()` API exposes the CPU materialization step as a first-class operation, enabling a three-stage pipeline (`decode_proto` → `materialize_masks` → `draw_decoded_masks`) where users can inspect, export, or fork the intermediate masks for analytics before rendering. Mask values are continuous sigmoid confidence (u8 0-255), not binary thresholded.
+The `materialize_masks()` API exposes the CPU materialization step as a first-class operation, enabling a three-stage pipeline (`decode_proto` → `materialize_masks` → `draw_decoded_masks`) where users can inspect, export, or fork the intermediate masks for analytics before rendering. Mask values are continuous sigmoid confidence (u8 0-255), not binary thresholded.
 
 | Platform | Full GPU (GL draw_proto_masks) | Hybrid (GL) | Speedup | Auto draw_proto_masks |
 |----------|-------------------------------|-------------|---------|----------------------|
-| imx8mp-frdm | 274 ms | 6.1 ms | **44.9×** | 4.0 ms |
-| imx95-frdm | 24.4 ms | 4.8 ms | **5.1×** | 3.7 ms |
-| rpi5-hailo | 7.7 ms | 2.4 ms | **3.2×** | 1.6 ms |
-| jetson-orin-nano | 3.0 ms | 1.4 ms | **2.1×** | 1.2 ms |
+| imx8mp-frdm | 289 ms | 7.7 ms | **37.4×** | 4.6 ms |
+| imx8mp-evk | 289 ms | 8.4 ms | **34.6×** | 4.5 ms |
+| imx95-frdm | 22.2 ms | 4.7 ms | **4.7×** | 1.7 ms |
+| imx95-evk | 21.8 ms | 4.5 ms | **4.9×** | 1.8 ms |
+| rpi5-hailo | 7.5 ms | 2.3 ms | **3.3×** | 1.3 ms |
+| jetson-orin-nano | 2.1 ms | 1.3 ms | **1.7×** | 477 us |
+| iq9075-evk | 4.6 ms | 4.3 ms | **1.1×** | 412 us |
+| x86-desktop | 663 us | 552 us | **1.2×** | 307 us |
 
 **Mask Decode Cost (CPU-only, measured in mask_benchmark):**
 
 | Platform | Proto Decode (NMS+coefficients) | Full Materialize (NMS+coefficients+pixels) |
 |----------|-------------------------------|-------------------------------------------|
-| imx8mp-frdm | 916 us | 4.0 ms |
-| imx95-frdm | 712 us | 3.6 ms |
-| rpi5-hailo | 186 us | 1.2 ms |
-| jetson-orin-nano | 194 us | 1.1 ms |
-| x86-desktop | 381 us | 903 us |
-| mbp-m2-max | 222 us | 862 us |
+| imx8mp-frdm | 806 us | 4.0 ms |
+| imx8mp-evk | 886 us | 4.1 ms |
+| imx95-frdm | 552 us | 3.5 ms |
+| imx95-evk | 511 us | 4.1 ms |
+| rpi5-hailo | 198 us | 1.1 ms |
+| jetson-orin-nano | 161 us | 995 us |
+| iq9075-evk | 281 us | 2.7 ms |
+| x86-desktop | 326 us | 714 us |
+| mbp-m2-max | 48 us | 245 us |
 
 ### materialize_masks Batched-GEMM Optimisation
 
@@ -2360,7 +3300,7 @@ allocation.
 1. **maivin** — Primary production target (Torizon 7, same SoC as imx8mp-frdm).
    Pending Torizon image with benchmark tooling.
 
-2. **jetson-orin-nano** — CPU and GL benchmarks collected. Tegra has no DMA-buf import, so YUYV/NV12 sources are PBOs; the GL backend now converts them on the GPU (4K YUYV→RGB pipeline to 640×640: 1.0 ms against 14.6 ms on the CPU), and tables captured before that show "—" in those rows until re-collected. DMA-buf allocation benchmarks show anomalous scaling (720p slower than 4K) — likely CMA fragmentation during collection, needs re-run.
+2. **jetson-orin-nano** — CPU and GL benchmarks collected. Tegra has no `/dev/dma_heap` and no DMA-buf import, so YUYV/NV12 sources are PBOs and the GL backend converts them on the GPU: the 4K YUYV→RGBA letterbox to 640×640 reads 962 µs, against 11.4 ms on the CPU. For the same reason the tensor tables have no Jetson DMA rows.
 
 ### Missing Buffer Strategy Coverage
 
@@ -2372,15 +3312,15 @@ allocation.
 
 5. ~~**x86-desktop OpenGL cannot import YUV textures**~~ — Resolved for YUYV and NV12: on the NVIDIA PBO transfer backend they are uploaded from the PBO or host memory and converted by the same shaders as an import. VYUY remains CPU-only.
 
-6. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_proto_masks`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
+6. **imx95-frdm GL letterbox and mask rendering on DMA-buf** — GL on imx95-frdm uses true DMA-buf import. The 1080p→640×640 YUYV→RGBA letterbox reads 1.2 ms on GL DMA-buf and 3.8 ms on G2D, and fused mask rendering (`draw_proto_masks`) reads 22.2 ms on GL. This file has no imx95-frdm PBO capture, so DMA-buf vs PBO is not measured here.
 
-7. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
+7. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. In the 1080p same-size table, RGBA→BGRA is the slowest GL cell on both PBO boards: 2.6 ms on x86-desktop against 135–278 µs for its other GL cells, and 5.5 ms on jetson-orin-nano against 1.0–1.4 ms. On imx95-frdm GL DMA-buf it reads 2.8 ms, against 24.9 ms on the CPU backend.
 
 8. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL never issues the single-pass shader: NV\* → planar always renders NV → RGBA intermediate → planar, which is now the plan on every GPU rather than a Vivante carve-out. See [crates/image/ARCHITECTURE.md § NV12/NV16/NV24 → PlanarRgb two-pass render](crates/image/ARCHITECTURE.md#nv12nv16nv24--planarrgb-two-pass-render) (EDGEAI-1180).
 
 9. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPS_i8 at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
 
-10. **imx8mp-frdm GL packed RGB uses two-pass approach** — Vivante GC7000UL OpenGL does not support packed RGB output natively; the two-pass packed RGB packing shader renders to an RGBA intermediate then packs to RGB using a dedicated shader. This two-pass approach is now enabled but is 3-4× slower than G2D's hardware blitter for packed RGB output on Vivante (see footnote ¹ in 720p tables).
+10. **imx8mp-frdm GL packed RGB uses two-pass approach** — Vivante GC7000UL OpenGL does not support packed RGB output natively; the two-pass packed RGB packing shader renders to an RGBA intermediate then packs to RGB using a dedicated shader. This two-pass approach is enabled and is slower than G2D's hardware blitter for packed RGB output on Vivante: on imx8mp-frdm the 1080p YUYV→RGB letterbox to 640×640 reads 11.1 ms on GL against 4.6 ms on G2D (2.4×), and the same-size 1080p YUYV→RGB convert reads 49.2 ms against 11.4 ms (4.3×).
 
 11. **rpi5-hailo GL packed RGB uses two-pass approach** — Same as imx8mp-frdm: Mesa V3D uses the two-pass packed RGB packing shader (RGBA intermediate then dedicated RGB packing shader). Now enabled but may be slower than CPU for some conversions on VideoCore.
 
@@ -2430,6 +3370,7 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.16 | 2026-11-03 | Fleet re-collection on the `edgefirst-kernels` branch (fat LTO) across imx8mp-frdm, imx8mp-evk, imx95-frdm, imx95-evk, rpi5-hailo, jetson-orin-nano, iq9075-evk and x86-desktop. The Buffer Infrastructure, Letterbox, Format Conversion, Decoder Post-Processing and Mask Rendering tables were regenerated from that JSON. Added Target Platforms entries for imx8mp-evk, imx95-evk and iq9075-evk, and refreshed the OS, BSP, RAM and GPU-driver entries of the existing boards from the boards themselves. New section, Decoder NEON Tiers and `edgefirst-kernels`, covering the CPU tier per board, a branch-vs-`main` decoder table and `kernels_benchmark` tables per board. Added `kernels_benchmark` to Benchmark Binaries. |
 | 3.15 | 2026-08-15 | Response to this round's review: standardize accuracy measurement on TurboJPEG `islow` and remove `djpeg` from the measurement path. Blocking: `djpeg` retired entirely — `stb_bench`/`wuffs_bench` gained a `--parity` mode (dlopen'd `islow`, no CLI, shared via `cbench.h`) replacing the old ad hoc "measured against djpeg" doc-comment claims with real, reproducible, in-process numbers across all six corpora (stb: max&#124;Δ&#124; 3, mean 0.012–0.058; Wuffs: bit-exact on every corpus); `rgb_parity` generalized (`--engine edgefirst-accurate&#124;edgefirst-fast&#124;zune&#124;image&#124;turbo-ifast`, `--reference matched&#124;accurate`, `--yplane`) so `islow` is the single accuracy reference for every arm, `islow` never measured against itself. New Table A (conformance, matched filter class) / Table B (accuracy cost, always vs accurate `islow`) close the two previously-unmeasured coverage gaps the review flagged: EdgeFirst's 4:4:4 direct-write RGB path (52.0 dB vs `islow`, isolated to colour-conversion rounding — no chroma resampling involved on a 4:4:4 source, so this also reframes the box-upsample path's ~51 dB figure as mostly a colour-conversion cost, not a chroma-upsample one) and EdgeFirst's native YUV/Y-plane path (57.3 dB, tighter than RGB as expected with colour conversion removed). Confirmed decisions: zune-jpeg and the `image` crate both stay as separate arms (measured wrapper overhead 5.3–22.7% across all six boards, exceeding round-to-round spread on five of six); `make-coco-yuv420.sh`'s corpus-generation `djpeg&#124;cjpeg` use is out of scope (one-time, not a measurement path). **Fast-class matched sweep completed**: extended from 3 boards × 2 corpora to all 6 boards × 3 native-4:2:0 corpora — confirms the single loss cell (`imx8mp-frdm`/CLIC 4:2:0, 0.96×) and, newly measured, its recovery on the DRI corpus (1.09×), exactly the outcome predicted but not yet checked in v3.14. `orin-nano` reachable directly again (missing `libturbojpeg`, fixed via `apt install libturbojpeg0-dev`) — no longer needs the stand-in unit; re-confirmed within noise against the existing published board table. Full AWS Batch 30-job matrix re-run (fresh instances, same image, no codec change) — re-confirms the published cloud table within measurement noise on every spot-checked cell. Medium: qualified "no loss cell" inline (one clause: "against turbo's default configuration"); reframed the in-order/out-of-order discussion as two distinct mechanisms (in-order-ARM headroom; x86's mature SIMD closing the gap from the comparator's side) rather than one axis with an exception; added an explicit RGB quoting rule (matched tables, not the fancy-upsample ones, are what claims should cite) alongside the existing IDCT one. |
 | 3.14 | 2026-08-14 | Response to `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md` — the pre-tag release checklist. Blocking: built a pixel-parity harness (`benchmarks/modules/rgb_parity`, dlopen-linked against libjpeg-turbo) comparing EdgeFirst's box-upsample RGB against turbo `TJFLAG_FASTUPSAMPLE`, including a phase-shift diagnostic (does a ±1px shift ever score better than zero-shift, the direct signature of a replication-phase bug); across all four local native-4:2:0 corpora, 0 images out of 720 total show a shift beating zero-shift, and worst-case PSNR is 51.2–51.3 dB (max|Δ| 3) — the phase is confirmed correct, closing the item as measured rather than assumed. Also fixed: `set_output_format(Some(Rgb))` on a source that is neither 4:4:4-equivalent nor native 4:2:0 (4:2:2, 4:1:1, greyscale) now returns `CodecError::UnsupportedFormat` instead of silently substituting the native NV12/NV16/Grey format — closes a real silent-substitution gap the review identified (item #3), covered by a new integration test. Added `expand_row_2x`/`write_rgb_rows_420` unit tests at `1×1`, odd×even, even×odd, and odd×odd (item #2). Added `ChromaUpsample` (`#[non_exhaustive]`, `Box` only for now) and `ImageDecoder::set_chroma_upsample` so a future fancy-upsample mode is an additive enum variant, not a breaking API change (item #4). Added direct (non-dispatch) parity tests for the SSE4.1 and NEON fused-RGB block kernels — the prior test only ever exercised whichever tier the CI/dev host's own CPU happened to select (item #5). Measurement gating the tag: re-ran the fast-class RGB comparison against matched `ifast + TJFLAG_FASTUPSAMPLE` (item #6, 3 boards × 2 corpora, targeted at where the accurate class already showed a loss) — found a real loss cell on `imx8mp-frdm`/CLIC 4:2:0 (**0.96×**, non-overlapping round spreads), the largest matched-comparator loss either accuracy class has shown; the same in-order-core effect already accepted for the accurate class, published as-is rather than treated as a pre-tag blocker, per the review's own "publish as-is" option. |
 | 3.13 | 2026-08-14 | Response to `docs/BENCHMARKS_JPEG_REVIEW_v3.12.md`. Blocking: added the matched-accuracy-class turbo comparison the review asked for — a `TJFLAG_FASTUPSAMPLE` (box/nearest-neighbour, same IDCT accuracy class) column alongside every RGB-arm `islow`/fancy-upsample table, boards and AWS. This surfaces a real, previously-hidden result: on the two in-order cores (A53, A55), EdgeFirst's RGB lead over turbo collapses to near-parity or a narrow **loss** (0.97×–0.98×) on two of three native-4:2:0 corpora once turbo's own box upsample is the comparison, though EdgeFirst stays ahead on the DRI corpus on those same boards and on every out-of-order core (boards and all five AWS queues) throughout. High: resolved the turbo-version "confound" the review flagged (packaged-turbo-version appeared correlated with EdgeFirst's lead size) by source-building libjpeg-turbo 3.1.2 and A/B-testing it same-host, same-kernel against the packaged build via a new `EDGEFIRST_TURBOJPEG_LIB` override — on 4 physical boards plus an AWS Graviton4 control, the source build is within measurement noise of packaged turbo everywhere (largest delta 2.7%, on the one board already close to target version); documented the better-supported explanation (in-order vs out-of-order core class, consistent with this project's existing JPEG entropy-decode tier-gating). Medium: added a macOS QoS scheduling hint (`pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)`, advisory-only — macOS has no accessible core-affinity API) plus a 5-round default (up from 3) to the mbp-m2-max local runner, cutting its worst observed cross-round spread from 7.7% to 6.6% (7.0%→2.9% on the specific arm the review flagged); re-captured mbp-m2-max's full six-corpus sweep under the new protocol. Also: added container/build provenance capture (compiler, rustc, packaged-turbo package+version, base-image OS release) to every AWS Batch job's output, confirming the container's packaged turbo (2.1.5-2, Debian bookworm) is a distinct dimension from the AL2023 EC2 host AMI the review asked to disambiguate. |

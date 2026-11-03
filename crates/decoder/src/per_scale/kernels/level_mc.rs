@@ -7,13 +7,15 @@
 //! protos tensor (no per-scale structure — but the same kernel cells
 //! apply since it's also pure dequant).
 
-use super::dequant::{
+#[cfg(target_arch = "aarch64")]
+use super::level_score::{NeonFloatToF32, NeonToF16};
+use crate::per_scale::plan::LevelPlan;
+use crate::Quantization;
+use edgefirst_kernels::prim::dequant::{
     dequant_f16_to_f16, dequant_f16_to_f32, dequant_f32_to_f16, dequant_f32_to_f32,
     dequant_i16_to_f16, dequant_i16_to_f32, dequant_i8_to_f16, dequant_i8_to_f32,
     dequant_u16_to_f16, dequant_u16_to_f32, dequant_u8_to_f16, dequant_u8_to_f32,
 };
-use crate::per_scale::plan::LevelPlan;
-use crate::Quantization;
 use half::f16;
 
 /// Per-FPN-level mask-coef dequant. NHWC `[1, h, w, num_mc]`.
@@ -30,7 +32,7 @@ macro_rules! impl_mc_level {
             let n = level.h * level.w * num_mc;
             debug_assert_eq!(input.len(), n);
             debug_assert_eq!(dst.len(), n);
-            $dequant(input, q, dst);
+            $dequant(input, q.into(), dst);
         }
     };
 }
@@ -55,7 +57,7 @@ macro_rules! impl_proto {
         #[allow(dead_code)]
         pub(crate) fn $name(input: &[$i], q: Quantization, dst: &mut [$f]) {
             debug_assert_eq!(input.len(), dst.len());
-            $dequant(input, q, dst);
+            $dequant(input, q.into(), dst);
         }
     };
 }
@@ -73,15 +75,7 @@ impl_proto!(decode_proto_u16_to_f16, u16, f16, dequant_u16_to_f16);
 impl_proto!(decode_proto_f16_to_f16, f16, f16, dequant_f16_to_f16);
 impl_proto!(decode_proto_f32_to_f16, f32, f16, dequant_f32_to_f16);
 
-// ────────────────────────────────────────────────────────────────────────
-// NEON-baseline (Tier 1) mc + proto kernels
-//
-// MC and protos are pure dequant — no sigmoid, no DFL machinery — so the
-// NEON variants just call the bandwidth-optimised dequant primitives in
-// `kernels::neon_baseline`. Same dispatch contract as score: only
-// reachable via the *NeonBase variant when CpuFeatures::neon_baseline
-// is true at probe time.
-// ────────────────────────────────────────────────────────────────────────
+// NEON mc + proto cells: the exact `prim::neon_convert` dequantize, bit-identical to scalar.
 
 #[cfg(target_arch = "aarch64")]
 macro_rules! impl_mc_level_neon {
@@ -101,27 +95,35 @@ macro_rules! impl_mc_level_neon {
             // ensures this is only called when select() picked the
             // *NeonBase variant.
             unsafe {
-                crate::per_scale::kernels::neon_baseline::$dequant_neon(input, q, dst);
+                edgefirst_kernels::prim::neon_convert::$dequant_neon(input, q.into(), dst);
             }
         }
     };
 }
 
 #[cfg(target_arch = "aarch64")]
-impl_mc_level_neon!(decode_mc_level_i8_to_f32_neon, i8, dequant_i8_to_f32_neon);
+impl_mc_level_neon!(
+    decode_mc_level_i8_to_f32_neon,
+    i8,
+    dequant_i8_to_f32_exact_neon
+);
 #[cfg(target_arch = "aarch64")]
-impl_mc_level_neon!(decode_mc_level_u8_to_f32_neon, u8, dequant_u8_to_f32_neon);
+impl_mc_level_neon!(
+    decode_mc_level_u8_to_f32_neon,
+    u8,
+    dequant_u8_to_f32_exact_neon
+);
 #[cfg(target_arch = "aarch64")]
 impl_mc_level_neon!(
     decode_mc_level_i16_to_f32_neon,
     i16,
-    dequant_i16_to_f32_neon
+    dequant_i16_to_f32_exact_neon
 );
 #[cfg(target_arch = "aarch64")]
 impl_mc_level_neon!(
     decode_mc_level_u16_to_f32_neon,
     u16,
-    dequant_u16_to_f32_neon
+    dequant_u16_to_f32_exact_neon
 );
 
 #[cfg(target_arch = "aarch64")]
@@ -132,25 +134,59 @@ macro_rules! impl_proto_neon {
             debug_assert_eq!(input.len(), dst.len());
             // SAFETY: see impl_mc_level_neon.
             unsafe {
-                crate::per_scale::kernels::neon_baseline::$dequant_neon(input, q, dst);
+                edgefirst_kernels::prim::neon_convert::$dequant_neon(input, q.into(), dst);
             }
         }
     };
 }
 
 #[cfg(target_arch = "aarch64")]
-impl_proto_neon!(decode_proto_i8_to_f32_neon, i8, dequant_i8_to_f32_neon);
+impl_proto_neon!(
+    decode_proto_i8_to_f32_neon,
+    i8,
+    dequant_i8_to_f32_exact_neon
+);
 #[cfg(target_arch = "aarch64")]
-impl_proto_neon!(decode_proto_u8_to_f32_neon, u8, dequant_u8_to_f32_neon);
+impl_proto_neon!(
+    decode_proto_u8_to_f32_neon,
+    u8,
+    dequant_u8_to_f32_exact_neon
+);
 #[cfg(target_arch = "aarch64")]
-impl_proto_neon!(decode_proto_i16_to_f32_neon, i16, dequant_i16_to_f32_neon);
+impl_proto_neon!(
+    decode_proto_i16_to_f32_neon,
+    i16,
+    dequant_i16_to_f32_exact_neon
+);
 #[cfg(target_arch = "aarch64")]
-impl_proto_neon!(decode_proto_u16_to_f32_neon, u16, dequant_u16_to_f32_neon);
+impl_proto_neon!(
+    decode_proto_u16_to_f32_neon,
+    u16,
+    dequant_u16_to_f32_exact_neon
+);
+
+/// Mask-coefficient or proto dequantize into f16 on NEON, bit for bit as the scalar cell.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn decode_mc_to_f16_neon<T: NeonToF16>(input: &[T], q: Quantization, dst: &mut [f16]) {
+    // SAFETY: NEON is part of the aarch64 baseline.
+    unsafe { T::dequant_f16(input, q.into(), dst) }
+}
+
+/// Float mask-coefficient or proto dequantize into f32 on NEON, bit for bit as the scalar cell.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn decode_mc_float_to_f32_neon<T: NeonFloatToF32>(
+    input: &[T],
+    q: Quantization,
+    dst: &mut [f32],
+) {
+    // SAFETY: NEON is part of the aarch64 baseline.
+    unsafe { T::dequant_f32(input, q.into(), dst) }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_scale::kernels::grids::make_anchor_grid;
+    use edgefirst_kernels::prim::grids::make_anchor_grid;
 
     #[test]
     fn mc_level_i8_dequant_round_trip() {

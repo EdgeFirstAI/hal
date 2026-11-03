@@ -17,7 +17,7 @@
 #
 # tests bundle:
 #   bin/                  the Rust test binaries of CRATES
-#   target/debug/         the five C-API libraries, their .so.0 names, and
+#   target/debug/         the C-API libraries, their .so.0 names, and
 #                         the G3 two-library-user binary
 #   crates/*-capi/        src/ and include/, which check-single-home.sh reads
 #   scripts/              on-target-run.sh, check-single-home.sh,
@@ -30,8 +30,8 @@
 #   testdata/, MANIFEST   as above
 #
 # Env:
-#   CRATES        tests: cargo packages to test (default: the five with tests)
-#   CAPI_CRATES   tests: the -capi leaves to build (default: all five)
+#   CRATES        tests: cargo packages to test (default: every crate with tests)
+#   CAPI_CRATES   tests: the -capi leaves to build (default: all of them)
 #   FEATURES      tests: cargo features for the test build, space- or comma-
 #                 separated; `<pkg>/<feature>` when more than one package is
 #                 selected (default: none)
@@ -53,10 +53,10 @@ fi
 case "${MODE}" in tests|bench) ;; *) echo "unknown mode '${MODE}'" >&2; exit 2 ;; esac
 case "${ARCH}" in aarch64|x86_64) ;; *) echo "unsupported arch '${ARCH}'" >&2; exit 2 ;; esac
 
-CRATES="${CRATES:-edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker}"
+CRATES="${CRATES:-edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker edgefirst-kernels}"
 # Each -capi leaf is its own standalone `[workspace]` (see each Cargo.toml's
 # own comment), so these are built by `--manifest-path`, not `-p`.
-CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi tracker-capi}"
+CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi tracker-capi kernels-capi}"
 GLIBC="${GLIBC:-2.35}"
 FEATURES="${FEATURES:-}"
 TESTDATA="${TESTDATA:-1}"
@@ -128,7 +128,7 @@ build_benches() {
         --features opengl,ndarray --workspace \
         --exclude edgefirst-python-common --exclude edgefirst-python-tensor \
         --exclude edgefirst-python-codec --exclude edgefirst-python-image \
-        --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker \
+        --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels \
         --message-format=json > "${json}" 2>"${json}.err"; then
     echo "BUILD FAILED for ${TRIPLE}; last lines of stderr:" >&2
     tail -30 "${json}.err" >&2
@@ -139,7 +139,7 @@ build_benches() {
   return 0
 }
 
-# The five C-API libraries + the G3 two-library-user binary. G1/G2
+# The C-API libraries + the G3 two-library-user binary. G1/G2
 # (embedded-symbol/dynamic-link inspection, scripts/check-single-home.sh) and
 # G3 (the two-library JPEG user) are the ones worth re-verifying per board,
 # under that board's own toolchain -- a compiler's dead-code elimination,
@@ -155,7 +155,7 @@ build_benches() {
 # regression. Same reasoning for G7 (Miri): `scripts/miri.sh` is not
 # bundled, since Miri only ever runs on the build host.
 build_libs() {
-  echo "==> building the five C-API libraries + G3 for ${TRIPLE}"
+  echo "==> building the C-API libraries + G3 for ${TRIPLE}"
   # `--target-dir` MUST be the repo's own plain `target` dir, not a scratch
   # directory of this script's own choosing -- every sibling leaf's
   # build.rs computes its `-L` search path for libedgefirst_tensor.so as a
@@ -191,7 +191,7 @@ build_libs() {
   # never part of the on-disk directory cargo creates.
   local outdir="target/${ARCH}-unknown-linux-gnu/debug"
   local l
-  for l in tensor image codec decoder tracker; do
+  for l in tensor image codec decoder tracker kernels; do
     ln -sf "libedgefirst_${l}.so" "${outdir}/libedgefirst_${l}.so.0"
   done
 

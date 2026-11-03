@@ -56,7 +56,7 @@ WS_EXCLUDES=(
     --exclude edgefirst-python-codec
     --exclude edgefirst-python-image
     --exclude edgefirst-python-decoder
-    --exclude edgefirst-python-tracker
+    --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
     --exclude edgefirst-python-common
 )
 

@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# cbindgen configuration for edgefirst/kernels.h.
+#
+# NOTE: the include guard is written by hand in `header`/`trailer` rather than
+# via cbindgen's `include_guard`, which wraps only the *generated* body and
+# leaves `header` and `trailer` outside it.
+
+language = "C"
+autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
+include_version = true
+documentation = true
+documentation_style = "doxy"
+documentation_length = "full"
+usize_is_size_t = true
+cpp_compat = true
+
+header = """
+#ifndef EDGEFIRST_KERNELS_H
+#define EDGEFIRST_KERNELS_H
+
+/**
+ * @file kernels.h
+ * @brief EdgeFirst quantized compute kernels C API
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
+ *
+ * Softmax, sigmoid, 8-bit table lookup and DFL box decoding over caller-owned
+ * tensors. Build a plan once with ef_<op>_plan_new(), then call
+ * ef_<op>_plan_run() any number of times, concurrently if needed. A plan_new
+ * that fails with ENOTSUP means the operation is valid but not handled.
+ *
+ * Every function returns 0, or -1 with errno set (EINVAL, ENOTSUP or ENOMEM)
+ * and a message available from ef_kernels_last_error(). A plan_new failure
+ * always leaves *out NULL. A plan_run rejects with EINVAL a view whose data is
+ * not aligned to its element type, and an input and output whose memory spans
+ * overlap, interleaved views of one buffer included.
+ *
+ * Adding a field to any params struct, or any other change to a C type's
+ * layout, bumps ef_kernels_abi_version().
+ */
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** @brief An opaque int8 softmax plan. */
+typedef struct ef_softmax_i8_plan ef_softmax_i8_plan;
+
+/** @brief An opaque int16 softmax plan. */
+typedef struct ef_softmax_i16_plan ef_softmax_i16_plan;
+
+/** @brief An opaque sigmoid plan. */
+typedef struct ef_sigmoid_plan ef_sigmoid_plan;
+
+/** @brief An opaque DFL decode plan. */
+typedef struct ef_dfl_plan ef_dfl_plan;
+
+/** @brief An opaque distance-to-box decode plan. */
+typedef struct ef_dist2bbox_plan ef_dist2bbox_plan;
+
+/** @brief An opaque fused DFL plus distance-to-box plan. */
+typedef struct ef_dfl_box_plan ef_dfl_box_plan;
+
+/** @brief An opaque 8-bit table lookup plan. */
+typedef struct ef_lut_i8_plan ef_lut_i8_plan;
+"""
+
+trailer = """
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* EDGEFIRST_KERNELS_H */
+"""
+
+[export]
+prefix = ""
+include = ["EfKernelDtype", "EfKernelBoxFormat"]
+exclude = ["EfSoftmaxI8Plan", "EfSoftmaxI16Plan", "EfSigmoidPlan", "EfDflPlan", "EfDist2bboxPlan", "EfDflBoxPlan", "EfLutI8Plan"]
+
+[export.rename]
+"EfSoftmaxI8Plan" = "ef_softmax_i8_plan"
+"EfSoftmaxI16Plan" = "ef_softmax_i16_plan"
+"EfSigmoidPlan" = "ef_sigmoid_plan"
+"EfDflPlan" = "ef_dfl_plan"
+"EfDist2bboxPlan" = "ef_dist2bbox_plan"
+"EfDflBoxPlan" = "ef_dfl_box_plan"
+"EfLutI8Plan" = "ef_lut_i8_plan"
+"EfKernelQuant" = "ef_kernel_quant"
+"EfKernelDtype" = "ef_kernel_dtype"
+"EfKernelBoxFormat" = "ef_kernel_box_format"
+"EfKernelView" = "ef_kernel_view"
+"EfKernelLevel" = "ef_kernel_level"
+"EfKernelPool" = "ef_kernel_pool"
+"EfSoftmaxI8Params" = "ef_softmax_i8_params"
+"EfSoftmaxI16Params" = "ef_softmax_i16_params"
+"EfSigmoidParams" = "ef_sigmoid_params"
+"EfDflParams" = "ef_dfl_params"
+"EfDist2bboxParams" = "ef_dist2bbox_params"
+"EfDflBoxParams" = "ef_dfl_box_params"
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+
+[struct]
+rename_fields = "SnakeCase"
+
+[fn]
+rename_args = "SnakeCase"
+args = "auto"
+sort_by = "None"
+
+[parse]
+parse_deps = false
+clean = false

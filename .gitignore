@@ -61,6 +61,7 @@ env.sh
 /benchmarks/rpi*/
 /benchmarks/x86*/
 /benchmarks/orin*/
+/benchmarks/iq*/
 /benchmarks/jetson*/
 /benchmarks/maivin/
 /benchmarks/*.json

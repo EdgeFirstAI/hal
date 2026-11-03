@@ -19,9 +19,9 @@ SHELL := /bin/bash
 
 # Project configuration
 PROJECT_NAME := hal
-# Five extension modules (tensor/codec/image/decoder/tracker) since 0.29 (the single crates/python
-# and the edgefirst-hal meta-crate are both gone).
-PYTHON_PACKAGES := tensor codec image decoder tracker
+# One extension module per package (the single crates/python and the edgefirst-hal meta-crate
+# are both gone since 0.29).
+PYTHON_PACKAGES := tensor codec image decoder tracker kernels
 PYTHON_CRATES := $(addprefix crates/python-,$(PYTHON_PACKAGES))
 # cargo package names, for --exclude: these are cdylibs with no meaningful
 # line coverage of their own, and llvm-cov cannot instrument them usefully.
@@ -31,14 +31,14 @@ TEST_DIR := tests
 # Must match ci.yml ruff-paths; ruff lints Python in python-common's .md files.
 RUFF_PATHS := $(PYTHON_CRATES) crates/python-common $(TEST_DIR)
 
-# The five modular C-API leaves: standalone packages excluded from the
+# The modular C-API leaves: standalone packages excluded from the
 # workspace so each library resolves its own features and lockfile, and
 # workspace builds never re-link them over the artifacts the gates read.
 # Every invocation MUST carry --target-dir target: their artifact-reading
 # tests hardcode the shared <root>/target dir, and EF_REQUIRE_FRESH_ARTIFACTS=1
 # makes a wrong target dir a hard failure instead of a silent skip.
 # tensor-capi comes first: the dynamic leaves link the library it builds.
-CAPI_MODULAR_CRATES := tensor-capi image-capi codec-capi decoder-capi tracker-capi
+CAPI_MODULAR_CRATES := tensor-capi image-capi codec-capi decoder-capi tracker-capi kernels-capi
 
 # Selects edgefirst-tensor's dynamic backend for checks of the libraries (see
 # ARCHITECTURE.md, Tensor Backend Selection). The leaves select it themselves
@@ -60,11 +60,11 @@ DYNAMIC_LEAVES := $(addprefix crates/,$(CAPI_DYNAMIC_CRATES)) $(addprefix crates
 # Every library a shared-library leaf compiles in, checked under both backends.
 BACKEND_CHECK_CRATES := edgefirst-tensor edgefirst-codec edgefirst-image \
 	edgefirst-decoder edgefirst-tracker edgefirst-python-common
-BACKEND_CHECK_FEATURES := edgefirst-python-common/codec,edgefirst-python-common/image,edgefirst-python-common/decoder,edgefirst-python-common/tracker
+BACKEND_CHECK_FEATURES := edgefirst-python-common/codec,edgefirst-python-common/image,edgefirst-python-common/decoder,edgefirst-python-common/tracker,edgefirst-python-common/kernels
 
 # The crates.io packages, each checked on its own as a dependent builds it, without workspace feature unification.
 PUBLISHED_CRATES := edgefirst-tensor-abi edgefirst-tensor-ffi edgefirst-tensor edgefirst-egl edgefirst-gl \
-	edgefirst-codec edgefirst-decoder-abi edgefirst-decoder edgefirst-tracker edgefirst-image
+	edgefirst-codec edgefirst-kernels edgefirst-decoder-abi edgefirst-decoder edgefirst-tracker edgefirst-image
 
 # Use profiling profile for testing (optimized with debug symbols)
 CARGO_PROFILE := --profile profiling
@@ -183,7 +183,7 @@ format-python:
 
 .PHONY: format-capi-modular
 format-capi-modular:
-	@echo "Formatting the five modular C-API crates..."
+	@echo "Formatting the modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
 		cargo fmt --manifest-path crates/$$c/Cargo.toml || exit 1; \
 	done
@@ -230,7 +230,7 @@ lint-python:
 
 .PHONY: lint-capi-modular
 lint-capi-modular:
-	@echo "Running clippy on the five modular C-API crates..."
+	@echo "Running clippy on the modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
 		(cd crates/$$c && cargo clippy --all-targets --target-dir $(CURDIR)/target -- -D warnings) || exit 1; \
 	done
@@ -311,7 +311,7 @@ check-backend-guards:
 
 .PHONY: check-capi-modular
 check-capi-modular:
-	@echo "Running cargo check on the five modular C-API crates..."
+	@echo "Running cargo check on the modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
 		(cd crates/$$c && cargo check --target-dir $(CURDIR)/target) || exit 1; \
 	done
@@ -341,7 +341,7 @@ build: capi-libs
 
 .PHONY: capi-libs
 capi-libs:
-	@echo "Building the five modular C-API crates..."
+	@echo "Building the modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
 		(cd crates/$$c && cargo build --target-dir $(CURDIR)/target) || exit 1; \
 	done
@@ -355,7 +355,7 @@ capi-libs:
 # plain `make capi-libs` (used by test-capi-modular and friends) stays fast.
 .PHONY: capi-libs-release capi-libs-profiling
 capi-libs-release capi-libs-profiling: capi-libs-%:
-	@echo "Building the five modular C-API crates ($*)..."
+	@echo "Building the modular C-API crates ($*)..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
 		(cd crates/$$c && cargo build --profile $* $(if $(TARGET),--target $(TARGET)) --target-dir $(CURDIR)/target) || exit 1; \
 	done
@@ -369,7 +369,7 @@ capi-libs-release capi-libs-profiling: capi-libs-%:
 # it next to each leaf.
 .PHONY: capi-symlinks
 capi-symlinks:
-	@for l in tensor image codec decoder tracker; do \
+	@for l in tensor image codec decoder tracker kernels; do \
 		for d in target/debug target/release target/profiling; do \
 			[ -f $$d/libedgefirst_$$l.so ] && \
 				ln -sf libedgefirst_$$l.so $$d/libedgefirst_$$l.so.0 || true; \
@@ -585,12 +585,12 @@ test-python: install-python
 	fi
 	@echo "✓ Python tests passed"
 
-# The five modular C-API leaves (tensor/image/codec/decoder/tracker-capi).
+# The modular C-API leaves (CAPI_MODULAR_CRATES).
 # Each leaf is a standalone package excluded from the workspace, so it is
 # built and tested via --manifest-path/--target-dir rather than picked up
 # by the workspace-wide test-rust run.
 #
-# Coverage note, made consciously: these five leave `cargo llvm-cov nextest
+# Coverage note, made consciously: these leaves leave `cargo llvm-cov nextest
 # --workspace`'s lcov (test-rust above). Their tests still RUN here (plain
 # `cargo test`); doctests do not apply -- each leaf's crate-type is
 # staticlib/cdylib only (no rlib), so cargo never compiles or runs doctests
@@ -599,7 +599,7 @@ test-python: install-python
 # the coverage denominator.
 .PHONY: test-capi-modular
 test-capi-modular: capi-libs
-	@echo "Running tests for the five modular C-API crates..."
+	@echo "Running tests for the modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
 		(cd crates/$$c && EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --target-dir $(CURDIR)/target -- --test-threads=1) || exit 1; \
 	done
@@ -901,7 +901,7 @@ SBOM_TARGETS := \
 	aarch64-linux-android \
 	x86_64-linux-android
 
-# The five C-API leaves are excluded from the workspace, so `cargo cyclonedx
+# The C-API leaves are excluded from the workspace, so `cargo cyclonedx
 # --all` never sees them, yet they are the shipped libraries. Each carries its
 # own lockfile, resolving independently of the workspace's, so each is scanned
 # from its own manifest. ci.yml's sbom job passes the same list.

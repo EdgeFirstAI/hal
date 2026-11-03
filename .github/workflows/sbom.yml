@@ -52,6 +52,7 @@ jobs:
         crates/codec-capi/Cargo.toml
         crates/decoder-capi/Cargo.toml
         crates/tracker-capi/Cargo.toml
+        crates/kernels-capi/Cargo.toml
       project-name: hal
       project-type: library
       version-file: Cargo.toml

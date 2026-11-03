@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Package the five modular C libraries into one relocatable archive:
+# Package the modular C libraries into one relocatable archive:
 #
 #   edgefirst-hal-<version>-<target>.tar.gz   (Linux)
 #   edgefirst-hal-<version>-<target>.zip      (Windows, macOS)
@@ -21,7 +21,7 @@ VERSION=""
 TARGET=""
 LIBDIR=""
 OUTDIR="dist"
-LEAVES="tensor image codec decoder tracker"
+LEAVES="tensor image codec decoder tracker kernels"
 
 usage() {
   sed -n '2,16p' "$0" | sed 's/^# \?//'
