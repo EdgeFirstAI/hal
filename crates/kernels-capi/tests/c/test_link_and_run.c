@@ -193,6 +193,149 @@ int main(void) {
         ef_lut_i8_plan_free(plan);
     }
 
+    /* binary ADD, quant (0.5, 0) + (0.5, 0) -> (1, 0): 1 + 1 = 2, 2 + 1 = 3, -3 + 1 = -2. */
+    {
+        ef_binary_i8_params p = {EF_BINARY_OP_ADD, {0.5f, 0}, {0.5f, 0}, {1.0f, 0},
+                                 EF_KERNEL_ACTIVATION_NONE, EF_TFLITE_KERNELS_NEON_RUY};
+        ef_binary_i8_plan *plan = NULL;
+        int8_t x[3] = {2, 4, -6}, y[3] = {2, 2, 2}, out[3] = {0};
+        size_t shape[1] = {3};
+        ef_kernel_view xv = make_view(x, EF_KERNEL_DTYPE_I8, 1, shape);
+        ef_kernel_view yv = make_view(y, EF_KERNEL_DTYPE_I8, 1, shape);
+        ef_kernel_view ov = make_view(out, EF_KERNEL_DTYPE_I8, 1, shape);
+        CHECK(ef_binary_i8_plan_new(&p, &plan) == 0);
+        CHECK(ef_binary_i8_plan_run(plan, &xv, &yv, &ov, NULL) == 0);
+        CHECK(out[0] == 2 && out[1] == 3 && out[2] == -2);
+        /* The output may not share memory with an input. */
+        errno = 0;
+        CHECK(ef_binary_i8_plan_run(plan, &xv, &yv, &yv, NULL) == -1 && errno == EINVAL);
+        ef_binary_i8_plan_free(plan);
+    }
+
+    /* binary SUB with RELU: 1 - 1 = 0, 2 - 1 = 1, -3 - 1 = -4 clamped to 0. */
+    {
+        ef_binary_i8_params p = {EF_BINARY_OP_SUB, {0.5f, 0}, {0.5f, 0}, {1.0f, 0},
+                                 EF_KERNEL_ACTIVATION_RELU, EF_TFLITE_KERNELS_REFERENCE};
+        ef_binary_i8_plan *plan = NULL;
+        int8_t x[3] = {2, 4, -6}, y[3] = {2, 2, 2}, out[3] = {9, 9, 9};
+        size_t shape[1] = {3};
+        ef_kernel_view xv = make_view(x, EF_KERNEL_DTYPE_I8, 1, shape);
+        ef_kernel_view yv = make_view(y, EF_KERNEL_DTYPE_I8, 1, shape);
+        ef_kernel_view ov = make_view(out, EF_KERNEL_DTYPE_I8, 1, shape);
+        CHECK(ef_binary_i8_plan_new(&p, &plan) == 0);
+        CHECK(ef_binary_i8_plan_run(plan, &xv, &yv, &ov, NULL) == 0);
+        CHECK(out[0] == 0 && out[1] == 1 && out[2] == 0);
+        ef_binary_i8_plan_free(plan);
+    }
+
+    /* binary MUL by a broadcast scalar (zero stride), (0.5, 0) * (0.5, 0) -> (0.25, 0):
+     * q = x * y, so 2 * 3 = 6, 4 * 3 = 12, -6 * 3 = -18. */
+    {
+        ef_binary_i8_params p = {EF_BINARY_OP_MUL, {0.5f, 0}, {0.5f, 0}, {0.25f, 0},
+                                 EF_KERNEL_ACTIVATION_NONE, EF_TFLITE_KERNELS_RUY};
+        ef_binary_i8_plan *plan = NULL;
+        int8_t x[3] = {2, 4, -6}, y[1] = {3}, out[3] = {0};
+        size_t shape[1] = {3};
+        ptrdiff_t zero[1] = {0};
+        ef_kernel_view xv = make_view(x, EF_KERNEL_DTYPE_I8, 1, shape);
+        ef_kernel_view yv = make_view(y, EF_KERNEL_DTYPE_I8, 1, shape);
+        yv.strides = zero;
+        ef_kernel_view ov = make_view(out, EF_KERNEL_DTYPE_I8, 1, shape);
+        CHECK(ef_binary_i8_plan_new(&p, &plan) == 0);
+        CHECK(ef_binary_i8_plan_run(plan, &xv, &yv, &ov, NULL) == 0);
+        CHECK(out[0] == 6 && out[1] == 12 && out[2] == -18);
+        /* The same product as a table: entry for raw byte 0xfa (-6) is -18. */
+        uint8_t table[256];
+        CHECK(ef_binary_i8_plan_table_for_rhs(plan, 3, 3, table) == 0);
+        CHECK((int8_t)table[0xfa] == -18 && table[2] == 6);
+        ef_binary_i8_plan_free(plan);
+    }
+
+    /* matmul [[0.5, 1], [1.5, 2]] x [[2, 4], [6, 8]] = [[7, 10], [15, 22]]
+     * (quant (0.5, 0) twice, output (1, 0)). */
+    {
+        ef_kernel_requant r;
+        CHECK(ef_kernel_requant_tflite_batch_matmul(0.5f, 0.5f, 1.0f, &r) == 0);
+        ef_matmul_i8_params p = {0, 0, {1.0f, 0}, &r, 1, NULL, 0, EF_KERNEL_ACTIVATION_NONE,
+                                 EF_TFLITE_KERNELS_NEON_RUY};
+        ef_matmul_i8_plan *plan = NULL;
+        int8_t lhs[4] = {1, 2, 3, 4}, rhs[4] = {4, 8, 12, 16}, out[4] = {0};
+        size_t shape[2] = {2, 2};
+        ef_kernel_view lv = make_view(lhs, EF_KERNEL_DTYPE_I8, 2, shape);
+        ef_kernel_view rv = make_view(rhs, EF_KERNEL_DTYPE_I8, 2, shape);
+        ef_kernel_view ov = make_view(out, EF_KERNEL_DTYPE_I8, 2, shape);
+        CHECK(ef_matmul_i8_plan_new(&p, &plan) == 0);
+        CHECK(ef_matmul_i8_plan_run(plan, &lv, &rv, &ov, NULL) == 0);
+        CHECK(out[0] == 7 && out[1] == 10 && out[2] == 15 && out[3] == 22);
+        ef_matmul_i8_plan_free(plan);
+        CHECK(ef_matmul_i8_check_depth(4096) == 0);
+        errno = 0;
+        CHECK(ef_matmul_i8_check_depth(4097) == -1 && errno == ENOTSUP);
+    }
+
+    /* softmax_dot: two equal logits give probabilities 1/2 over weights 0 and 2 (scale 1);
+     * the expectation 1 at output scale 0.25 is 4. */
+    {
+        ef_kernel_requant r;
+        CHECK(ef_kernel_requant_tflite_batch_matmul(1.0f / 256.0f, 1.0f, 0.25f, &r) == 0);
+        int8_t weights[2] = {0, 2};
+        ef_softmax_dot_i8_params p = {
+            {{0.1f, 0}, out_q, 1.0f},
+            weights,
+            2,
+            {-128, 0, {0.25f, 0}, &r, 1, NULL, 0, EF_KERNEL_ACTIVATION_NONE,
+             EF_TFLITE_KERNELS_NEON_RUY},
+        };
+        ef_softmax_dot_i8_plan *plan = NULL;
+        int8_t in[2] = {7, 7}, out[1] = {0};
+        size_t ishape[2] = {1, 2}, oshape[2] = {1, 1};
+        ef_kernel_view iv = make_view(in, EF_KERNEL_DTYPE_I8, 2, ishape);
+        ef_kernel_view ov = make_view(out, EF_KERNEL_DTYPE_I8, 2, oshape);
+        CHECK(ef_softmax_dot_i8_plan_new(&p, &plan) == 0);
+        CHECK(ef_softmax_dot_i8_plan_run(plan, &iv, &ov, NULL) == 0);
+        CHECK(out[0] == 4);
+        ef_softmax_dot_i8_plan_free(plan);
+    }
+
+    /* attention, one head, two queries over two equal keys: the scores of a query are equal, so
+     * each token gets probability 1/2 (int8 0 at (1/256, -128)) and the output is the mean of
+     * the values. Values (0.5, 0) [[1, -2], [3, 4]] average to [2, 1], i.e. [4, 2] at output
+     * scale 0.5. Q goes through a MUL by 1.0 (rhs 2 at scale 0.5): the identity table. */
+    {
+        ef_binary_i8_params mp = {EF_BINARY_OP_MUL, {0.1f, 0}, {0.5f, 0}, {0.1f, 0},
+                                  EF_KERNEL_ACTIVATION_NONE, EF_TFLITE_KERNELS_REFERENCE};
+        ef_binary_i8_plan *mul = NULL;
+        ef_attention_q_mul q_mul;
+        q_mul.output.scale = 0.1f;
+        q_mul.output.zero_point = 0;
+        CHECK(ef_binary_i8_plan_new(&mp, &mul) == 0);
+        CHECK(ef_binary_i8_plan_table_for_rhs(mul, 2, 4, q_mul.table) == 0);
+        CHECK(q_mul.table[1] == 1 && q_mul.table[0xff] == 0xff);
+        ef_binary_i8_plan_free(mul);
+
+        ef_attention_i8_params p = {{0.1f, 0}, &q_mul, {0.1f, 0}, {0.5f, 0}, {0.05f, 0}, 1.0f,
+                                    out_q, {0.5f, 0}, EF_TFLITE_KERNELS_NEON_RUY};
+        ef_attention_i8_plan *plan = NULL;
+        ef_attention_scratch *scratch = NULL;
+        int8_t q[4] = {1, 2, 3, 4}, k[4] = {5, 5, 5, 5}, v[4] = {2, -4, 6, 8}, out[4] = {0};
+        size_t shape[3] = {1, 2, 2};
+        ef_kernel_view qv = make_view(q, EF_KERNEL_DTYPE_I8, 3, shape);
+        ef_kernel_view kv = make_view(k, EF_KERNEL_DTYPE_I8, 3, shape);
+        ef_kernel_view vv = make_view(v, EF_KERNEL_DTYPE_I8, 3, shape);
+        ef_kernel_view ov = make_view(out, EF_KERNEL_DTYPE_I8, 3, shape);
+        CHECK(ef_attention_i8_check_shape(2048, 256, 256) == 0);
+        CHECK(ef_attention_i8_plan_new(&p, &plan) == 0);
+        CHECK(ef_attention_scratch_new(plan, 1, 2, 2, 2, 2, &scratch) == 0 && scratch != NULL);
+        CHECK(ef_attention_i8_plan_run(plan, &qv, &kv, &vv, &ov, scratch, NULL) == 0);
+        CHECK(out[0] == 4 && out[1] == 2 && out[2] == 4 && out[3] == 2);
+        /* The scratch serves the next call of the same shape. */
+        memset(out, 0, sizeof out);
+        CHECK(ef_attention_i8_plan_run(plan, &qv, &kv, &vv, &ov, scratch, NULL) == 0);
+        CHECK(out[0] == 4 && out[1] == 2 && out[2] == 4 && out[3] == 2);
+        ef_attention_scratch_free(scratch);
+        ef_attention_i8_plan_free(plan);
+    }
+
     CHECK(ef_kernels_abi_version() == 1);
     printf("OK\n");
     return 0;

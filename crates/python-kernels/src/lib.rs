@@ -17,6 +17,10 @@ fn _kernels(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kernels::PyDist2BboxPlan>()?;
     m.add_class::<kernels::PyDflBoxPlan>()?;
     m.add_class::<kernels::PyLutI8Plan>()?;
+    m.add_class::<kernels::PyBinaryI8Plan>()?;
+    m.add_class::<kernels::PyMatMulI8Plan>()?;
+    m.add_class::<kernels::PySoftmaxDotI8Plan>()?;
+    m.add_class::<kernels::PyAttentionI8Plan>()?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

@@ -18,10 +18,15 @@ crates/kernels/
 │   └── prim/                                           # Primitives moved from the decoder, with
 │                                                       #   their scalar vs NEON / FP16 parity tests
 ├── tests/
-│   ├── common/mod.rs        # Fixture loader, tier matrix, misbehaving pools, pool/concurrency check
+│   ├── common/mod.rs        # Fixture loaders, tier matrix, misbehaving pools, pool/concurrency check
 │   ├── softmax.rs           # softmax_i8 / softmax_i16 against the TFLite fixtures
 │   ├── sigmoid_lut.rs       # LOGISTIC fixtures, SigmoidPlan paths, LutI8Plan
-│   └── decode_ops.rs        # DFL / dist2bbox / DFL box against a float64 reference and the decoder
+│   ├── decode_ops.rs        # DFL / dist2bbox / DFL box against a float64 reference and the decoder
+│   ├── binary.rs            # int8 ADD / SUB / MUL fixtures, NEON-block vs scalar discrimination
+│   ├── matmul.rs            # BATCH_MATMUL and 1×1 CONV_2D fixtures, ruy vs reference rounding
+│   ├── softmax_dot.rs       # the DFL head fixture against its float definition and TFLite
+│   ├── attention.rs         # the attention chain fixtures, limits, scratch, the crate's own chain
+│   └── neon_coverage.rs     # every op path's tier on aarch64
 └── benches/
     └── kernels_benchmark.rs # Per-tier softmax, sigmoid, DFL, dist2bbox and DFL box timings
 ```
@@ -54,7 +59,9 @@ The NEON paths only run on aarch64. Cross-compile and run them on a board with `
 
 ## Fixtures
 
-`testdata/kernels/*.safetensors` (Git LFS) are single-op TFLite reference cases: a seeded input, the LiteRT interpreter's output, and the op, dtype and quantization in the file's metadata. `common::load` reads them through `edgefirst_bench::testdata`, so `EDGEFIRST_TESTDATA_DIR` relocates them; the suite never needs TFLite at test time.
+`testdata/kernels/*.safetensors` (Git LFS) are TFLite reference cases: seeded inputs and constant operands, the LiteRT interpreter's output, and the op, quantization and resolver in the file's metadata. The single-op `SOFTMAX` and `LOGISTIC` fixtures hold `input` and `output` and load through `common::load`; the int8 arithmetic, matrix and chain fixtures hold named tensors (`lhs`/`rhs`, `input`/`filter`/`bias`, `q`/`k`/`v`, then `output`) with `<role>_scale` / `<role>_zero_point` metadata and load through `common::load_graph`. Both read through `edgefirst_bench::testdata`, so `EDGEFIRST_TESTDATA_DIR` relocates them; the suite never needs TFLite at test time.
+
+The int8 arithmetic and matrix fixtures run TFLite's own builtin kernels: the optimized resolver without the default delegates (the default resolver hands int8 `MUL`, `BATCH_MATMUL` and `CONV_2D` to XNNPACK, whose bytes differ), and the reference resolver for the `_ref` fixtures (metadata `kernels`: `optimized` or `reference`). They come from LiteRT's x86_64 wheel, which defines `USE_NEON` (SSE4.1 through `NEON_2_SSE`): its optimized `ADD` and `MUL` run the NEON-block arithmetic of an aarch64 build, so they equal `TfliteKernels::NeonRuy` and the `_ref` fixtures equal `TfliteKernels::Reference`. Its optimized `BATCH_MATMUL` and `CONV_2D`, though, requantize like the reference kernels (two roundings), not with ruy's single rounding, so every matrix fixture equals `TfliteKernels::Reference`. The `add_i8_pairs`, `mul_i8_odd_wide`, `batch_matmul_*` and `conv1x1_*` fixtures each separate the two variants, which the tests assert. The same models run through the TFLite 2.19.0 of the i.MX 8M Plus and i.MX 95 BSPs give `TfliteKernels::NeonRuy` bit for bit for every op, ruy's single rounding included, and the fused attention gives that TFLite's bytes on every tier; those outputs are not fixtures.
 
 | Fixture | Op | Shape | Covers |
 |---------|----|-------|--------|
@@ -65,6 +72,17 @@ The NEON paths only run on aarch64. Cross-compile and run them on a board with `
 | `softmax_i16_scale_small`, `softmax_i16_scale_large` | int16 `SOFTMAX` | `[6,257]` | input scales 1e-5 (rescale shift ≤ 0) and 4.5 (the largest accepted left shift) |
 | `logistic_i8_scores`, `logistic_u8_scores` | int8 / uint8 `LOGISTIC` | `[1,80,8400]` | the score-head table |
 | `logistic_i16_pot`, `logistic_i16_nonpot` | int16 `LOGISTIC` | `[1,80,8400]` | gemmlowp (scale 2⁻¹²) and reference-table paths |
+| `add_i8`, `add_i8_odd` | int8 `ADD` | `[4,1024]`, `[3,1001]` | whole 16-element blocks; a tail of 11 and `RELU` |
+| `add_i8_pairs`, `add_i8_pairs_ref` | int8 `ADD` | `[256,256]` | every input pair, at a quantization where the NEON-block and scalar `ADD` differ on one |
+| `sub_i8_odd` | int8 `SUB` | `[3,1001]` | the scalar-only kernel |
+| `mul_i8_odd`, `mul_i8_odd_relu6` | int8 `MUL` | `[3,1001]` | a small multiplier, `RELU6` |
+| `mul_i8_odd_wide`, `mul_i8_odd_wide_ref` | int8 `MUL` | `[3,1001]` | a multiplier above one: the NEON blocks' int16 saturation and wrapping zero point |
+| `mul_i8_scalar`, `mul_i8_scalar_odd` | int8 `MUL` | `[1,2,400,32]`, `[1,3,1001]` by `[1]` | a broadcast scalar (the attention Q scale), and its odd-length tail |
+| `batch_matmul_i8`, `batch_matmul_i8_ref` | int8 `BATCH_MATMUL` | `[2,64,48]·[2,48,37]` | both zero points non-zero, `N` not a multiple of 4 |
+| `batch_matmul_i8_adj` | int8 `BATCH_MATMUL` | `adj_x`, `adj_y` | transposed operands as strided views |
+| `conv1x1_i8`, `conv1x1_i8_ref` | int8 `CONV_2D` 1×1 | `[1,10,13,24]` to 40 channels | per-channel filter scales, int32 bias, `RELU6` |
+| `attention_i8_yolo26`, `attention_i8_odd` | `MUL` → `BATCH_MATMUL` (`adj_y`) → `SOFTMAX` → `BATCH_MATMUL` | h=2 n=400 dk=32 dv=64; h=3 n=37 dk=12 dv=9 | the YOLO26 attention block and a shape with no whole tiles |
+| `dfl_head_i8` | `SOFTMAX` → 1×1 `CONV_2D` | `[1,4,2100,16]` to one channel | the DFL head `SoftmaxDotI8Plan` fuses: weights `round(i·127/15)` |
 
 Regenerate them with the pinned LiteRT from the repo venv:
 
@@ -82,6 +100,10 @@ The inputs and outputs are seeded and reproduce exactly, but the safetensors hea
 |----|-----|
 | `softmax_i8` | scalar tier bit for bit against the fixture (glibc `expf`); NEON tiers within ±1 LSB |
 | `softmax_i16`, int16 `LOGISTIC` | bit for bit on every tier |
+| `binary_i8` (`ADD`, `SUB`, `MUL`) | bit for bit on every tier against the fixture's kernels (`NeonGemmlowp` and `NeonRuy` for the optimized resolver of the x86 wheel, `Reference` and `Ruy` for the reference one), contiguous and with the scalar broadcast as zero strides; the broadcast `MUL` through `table_for_rhs` and `LutI8Plan` too |
+| `matmul_i8` (`BATCH_MATMUL`, 1×1 `CONV_2D`) | bit for bit on every tier with `TfliteKernels::Reference`; every tier and layout equal (exact accumulation) and within one LSB of the f64 requantization |
+| `softmax_dot_i8` | every tier within one LSB of the float definition (exact exponentials, the expectation requantized in f64) on every row; within `⌈|TFLite − float|⌉ + 1` of TFLite; a smaller total error than TFLite's `SOFTMAX` → `CONV_2D` (measured: mean 0.25 LSB against 0.55); the crate's `SoftmaxI8Plan` and `MatMulI8Plan` reproduce the fixture bit for bit |
+| `attention_i8` | every tier equal to the crate's own chain (`table` → `MatMulI8Plan` → `SoftmaxI8Plan` → `MatMulI8Plan`) on that tier, bit for bit, on the fixtures and at the limits (2048 tokens with `dk = dv = 256`, 2047 with 255, `dk = dv = 1`, one token, `dk = 0`); the scalar tier bit for bit against TFLite; NEON tiers within one LSB of TFLite (the NEON softmax's ±1 LSB; none differ on the Cortex-A53 and Cortex-A55 boards) |
 | int8 / uint8 `LOGISTIC` (`LutI8Plan::sigmoid`, `SigmoidPlan`) | bit for bit (glibc `expf`) |
 | DFL / dist2bbox / DFL box, integer outputs | within ±1 LSB of a float64 reference, for each integer input type, both input layouts and the real 3-level anchor lists |
 | DFL / dist2bbox / DFL box, `f32` outputs | integer inputs: the decoder's level kernels bit for bit on a one-level call; float inputs on NEON within the f32 bar of the scalar tier; the 8-bit table kernels bit for bit with the portable kernel for every `reg_max` |
@@ -107,6 +129,8 @@ The inputs and outputs are seeded and reproduce exactly, but the safetensors hea
 - **Views** (`strided_views_match_contiguous`, `zero_sized_and_rank_zero_views`, `zero_anchor_views_are_a_no_op`): a transposed last axis, output strides different from the input's, zero-sized dimensions, overlapping output rows (`run_rejects_aliasing_output_rows`).
 - **Pools and concurrency** (`pool_and_concurrent_runs_match_single_thread`, through `common::assert_pool_and_concurrency_match`): no pool, `ScopedThreads` with more threads than rows, a sequential pool, pools that repeat, skip, invent or never run indices, and one plan run from two threads at once; the output must be byte-identical to the no-pool run.
 - **Send + Sync** (`plans_are_send_and_sync`).
+- **Several inputs.** `binary_i8`, `matmul_i8` and `attention_i8` take two or three inputs: broadcast operands as zero strides, transposed operands (`adj_x`, `adj_y`, transposed K) as swapped strides, and Q, K and V as head slices of one token-major tensor.
+- **Attention scratch** (`scratch_is_reused_and_mismatches_are_rejected`): one scratch serves many calls; a scratch built for other heads, queries, tokens or dims, or by a plan whose kernel packs another layout (a `neon` plan on a dotprod CPU), is `InvalidArgument` with the output untouched.
 
 Skips follow the repo policy: a test that cannot run (an FP16 test on a CPU without FP16, a tier the host lacks in the benchmark) prints `WARNING: SKIPPED: <reason>` to stderr through `test_support::report_skip`, never silently.
 

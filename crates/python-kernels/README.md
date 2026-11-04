@@ -1,6 +1,6 @@
 # edgefirst-kernels
 
-Quantized and floating-point compute kernels (softmax, sigmoid, DFL, dist2bbox) for edge AI inference. Installs alone — it does not require the tensor, image, or decoder wheels.
+Quantized and floating-point compute kernels (softmax, sigmoid, DFL, dist2bbox, int8 arithmetic, matrix products and attention) for edge AI inference. Installs alone — it does not require the tensor, image, or decoder wheels.
 
 [![PyPI](https://img.shields.io/pypi/v/edgefirst-kernels.svg)](https://pypi.org/project/edgefirst-kernels/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -65,8 +65,12 @@ plan.run(logits, boxes)
 | `DflPlan` | Distribution focal loss: `[anchors, 4 * reg_max]` to `[anchors, 4]` distances |
 | `Dist2BboxPlan` | Distances to boxes over a multi-level anchor axis |
 | `DflBoxPlan` | Fused DFL and dist2bbox |
+| `BinaryI8Plan` | int8 `ADD`, `SUB` and `MUL`, matching TFLite's int8 kernels bit for bit |
+| `MatMulI8Plan` | int8 matrix multiplication with TFLite's requantization: `BATCH_MATMUL` and 1×1 `CONV_2D` |
+| `SoftmaxDotI8Plan` | int8 softmax fused with a one-column projection (a DFL head), closer to float than TFLite's pair |
+| `AttentionI8Plan` | Fused int8 attention, TFLite's `MUL` → `BATCH_MATMUL` → `SOFTMAX` → `BATCH_MATMUL` chain |
 
-A quantization of `None` means identity, and float tensors ignore theirs. `run` raises `ValueError` when the input and output overlap in memory, interleaved views of one array included. Every plan has `run(input, output, *, threads=None)` and a read-only `tier` property (`scalar`, `neon`, `neon_fp16` or `neon_dotprod`). Set `EDGEFIRST_KERNELS_FORCE_TIER` to force a tier.
+A quantization of `None` means identity, and float tensors ignore theirs. `run` raises `ValueError` when the output overlaps an input in memory, interleaved views of one array included; inputs may share memory. Every plan has `run(input, output, *, threads=None)` (`run(lhs, rhs, output, ...)` for the binary and matrix plans, `run(q, k, v, output, ...)` for attention) and a read-only `tier` property (`scalar`, `neon`, `neon_fp16` or `neon_dotprod`). Set `EDGEFIRST_KERNELS_FORCE_TIER` to force a tier.
 
 ## Errors
 

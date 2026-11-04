@@ -27,8 +27,9 @@ header = """
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
  *
- * Softmax, sigmoid, 8-bit table lookup and DFL box decoding over caller-owned
- * tensors. Build a plan once with ef_<op>_plan_new(), then call
+ * Softmax, sigmoid, 8-bit table lookup, DFL box decoding, TFLite-exact int8
+ * ADD/SUB/MUL and matrix multiplication, a fused DFL softmax-and-projection
+ * head and fused int8 attention over caller-owned tensors. Build a plan once with ef_<op>_plan_new(), then call
  * ef_<op>_plan_run() any number of times, concurrently if needed. A plan_new
  * that fails with ENOTSUP means the operation is valid but not handled.
  *
@@ -73,6 +74,21 @@ typedef struct ef_dfl_box_plan ef_dfl_box_plan;
 
 /** @brief An opaque 8-bit table lookup plan. */
 typedef struct ef_lut_i8_plan ef_lut_i8_plan;
+
+/** @brief An opaque int8 ADD/SUB/MUL plan. */
+typedef struct ef_binary_i8_plan ef_binary_i8_plan;
+
+/** @brief An opaque int8 matrix multiplication plan. */
+typedef struct ef_matmul_i8_plan ef_matmul_i8_plan;
+
+/** @brief An opaque int8 softmax-then-dot (DFL head) plan. */
+typedef struct ef_softmax_dot_i8_plan ef_softmax_dot_i8_plan;
+
+/** @brief An opaque fused int8 attention plan. */
+typedef struct ef_attention_i8_plan ef_attention_i8_plan;
+
+/** @brief Opaque packing scratch for one attention call shape. */
+typedef struct ef_attention_scratch ef_attention_scratch;
 """
 
 trailer = """
@@ -85,8 +101,8 @@ trailer = """
 
 [export]
 prefix = ""
-include = ["EfKernelDtype", "EfKernelBoxFormat"]
-exclude = ["EfSoftmaxI8Plan", "EfSoftmaxI16Plan", "EfSigmoidPlan", "EfDflPlan", "EfDist2bboxPlan", "EfDflBoxPlan", "EfLutI8Plan"]
+include = ["EfKernelDtype", "EfKernelBoxFormat", "EfTfliteKernels", "EfKernelActivation", "EfBinaryOp"]
+exclude = ["EfSoftmaxI8Plan", "EfSoftmaxI16Plan", "EfSigmoidPlan", "EfDflPlan", "EfDist2bboxPlan", "EfDflBoxPlan", "EfLutI8Plan", "EfBinaryI8Plan", "EfMatmulI8Plan", "EfSoftmaxDotI8Plan", "EfAttentionI8Plan", "EfAttentionScratch"]
 
 [export.rename]
 "EfSoftmaxI8Plan" = "ef_softmax_i8_plan"
@@ -108,6 +124,20 @@ exclude = ["EfSoftmaxI8Plan", "EfSoftmaxI16Plan", "EfSigmoidPlan", "EfDflPlan", 
 "EfDflParams" = "ef_dfl_params"
 "EfDist2bboxParams" = "ef_dist2bbox_params"
 "EfDflBoxParams" = "ef_dfl_box_params"
+"EfBinaryI8Plan" = "ef_binary_i8_plan"
+"EfMatmulI8Plan" = "ef_matmul_i8_plan"
+"EfSoftmaxDotI8Plan" = "ef_softmax_dot_i8_plan"
+"EfAttentionI8Plan" = "ef_attention_i8_plan"
+"EfAttentionScratch" = "ef_attention_scratch"
+"EfTfliteKernels" = "ef_tflite_kernels"
+"EfKernelActivation" = "ef_kernel_activation"
+"EfBinaryOp" = "ef_binary_op"
+"EfKernelRequant" = "ef_kernel_requant"
+"EfBinaryI8Params" = "ef_binary_i8_params"
+"EfMatmulI8Params" = "ef_matmul_i8_params"
+"EfSoftmaxDotI8Params" = "ef_softmax_dot_i8_params"
+"EfAttentionQMul" = "ef_attention_q_mul"
+"EfAttentionI8Params" = "ef_attention_i8_params"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

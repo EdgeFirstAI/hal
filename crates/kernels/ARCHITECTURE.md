@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-`edgefirst-kernels` is the HAL's framework-neutral CPU kernel library. It takes plain slices plus a shape, element strides and per-tensor quantization, and runs NEON-first kernels on them through a plan/run API. It knows nothing about TFLite, ONNX, models or schemas, and it depends only on `half` and `tracing`, never on `edgefirst-tensor`, GL/EGL or PyO3. The same kernels serve the decoder, an inference-framework delegate, and anyone calling the Rust, C (`libedgefirst_kernels`) or Python (`edgefirst.kernels`) API directly.
+`edgefirst-kernels` is the HAL's framework-neutral CPU kernel library. It takes plain slices plus a shape, element strides and per-tensor quantization, and runs NEON-first kernels on them through a plan/run API. It knows nothing about models, schemas or any framework's graph; where a plan reproduces an inference runtime's integer arithmetic (TFLite's int8 softmax, logistic, elementwise, matrix and fused attention kernels), that arithmetic is ported into `tflite.rs` and the plan names the TFLite kernels it matches (`TfliteKernels`). It depends only on `half` and `tracing`, never on `edgefirst-tensor`, GL/EGL or PyO3. The same kernels serve the decoder, an inference-framework delegate, and anyone calling the Rust, C (`libedgefirst_kernels`) or Python (`edgefirst.kernels`) API directly.
 
 ## Layering
 
@@ -24,14 +24,14 @@ The crate sits at the bottom of the graph. Because it never touches `edgefirst-t
 
 | Module | Responsibility |
 |--------|----------------|
-| [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/lib.rs) | Re-exports: plans, params, views, `ByteSpan`, `Quant`, `DType`, `Pool`, `CpuFeatures`, `KernelError` |
+| [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/lib.rs) | Re-exports: plans, params, views, `ByteSpan`, `Quant`, `DType`, `Activation`, `TfliteKernels`, `AttentionScratch`, `Pool`, `CpuFeatures`, `KernelError` |
 | [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/error.rs) | `KernelError` (`Unsupported`, `InvalidArgument`, `ForcedTierUnavailable`) |
-| [`quant.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/quant.rs) | `Quant`, `DType` (C ABI discriminants), sealed `QuantInt`, `quantize` (round half away from zero, clamp), and the crate-internal params checks that make a float tensor's `Quant` the identity |
+| [`quant.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/quant.rs) | `Quant`, `DType` (C ABI discriminants), `Activation` (a fused TFLite activation), `TfliteKernels` (which TFLite kernels a plan reproduces: optimized, with or without the NEON blocks of int8 `ADD`/`MUL`, or reference), sealed `QuantInt`, `quantize` (round half away from zero, clamp), and the crate-internal params checks that make a float tensor's `Quant` the identity |
 | [`view.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/view.rs) | `View` / `ViewMut` strided views, `TensorRef` / `TensorMut` type-erased tensors, `ByteSpan` (a raw view's byte range, for the bindings' overlap check), `MAX_RANK` |
 | [`pool.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/pool.rs) | `Pool` trait, `ScopedThreads`, crate-internal `for_each_block` |
 | [`cpu.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/cpu.rs) | `CpuFeatures` probe, `Tier`, `EDGEFIRST_KERNELS_FORCE_TIER` |
 | [`tflite.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/tflite.rs) | TFLite v2.19.0 integer helpers ported bit for bit: `quantize_multiplier`, `multiply_by_quantized_multiplier`, `lut_populate_i16`, `lut_lookup_i16`, the gemmlowp pieces int16 logistic uses |
-| [`ops/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/ops/) | The plans: `softmax_i8` (+ `_neon`), `softmax_i16` (+ `_neon`), `lut_i8` (+ `_neon`), `sigmoid` (+ `sigmoid_i16_neon`), `dfl`, `dist2bbox`, `dfl_box`; `rows.rs` (row walking, staging, overlap check) and `levels.rs` (`Level`, `BoxFormat`, anchor grids, the decode block loop) |
+| [`ops/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/ops/) | The plans: `softmax_i8` (+ `_neon`), `softmax_i16` (+ `_neon`), `lut_i8` (+ `_neon`), `sigmoid` (+ `sigmoid_i16_neon`), `dfl`, `dist2bbox`, `dfl_box`, `binary_i8` (+ `_neon`), `matmul_i8` (+ `_neon`), `softmax_dot_i8` (+ `_neon`), `attention_i8` (+ `_neon` for dotprod CPUs, `_neon_base` for the others); `rows.rs` (row walking, staging, overlap check) and `levels.rs` (`Level`, `BoxFormat`, anchor grids, the decode block loop) |
 | [`convert.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/convert.rs) | The public slice conversions: `dequant_*_to_f32` / `_to_f16` (the `neon_convert` kernels on aarch64, the `prim::dequant` loops elsewhere, the same bits on every input) and `nchw_to_nhwc` over the sealed `TransposeElement` (u8, i8, u16, i16, f16, u32, i32, f32), re-exported from `prim` |
 | [`prim/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/prim/) | `#[doc(hidden)]`, not covered by semver. Slice primitives shared with the decoder: dequant, softmax, sigmoid, box primitives (weighted sum, dist2bbox), anchor grids, the DFL exp table (`dfl_lut.rs`), NCHW→NHWC transpose (NEON interleave and register tiles for 1-, 2- and 4-byte elements), `neon_baseline.rs` (NEON and inline-asm FP16 kernels), `neon_candidates.rs` (detection candidate selection: the argmax over class columns in register tiles or over a contiguous row, ties to the last class, with the score threshold, and the positions at or above a threshold, bit-identical to the scalar fold; `f16` compared widened or with FP16 instructions), `neon_convert.rs` (NEON quantize, f16 narrow/widen and dequantize, and the decoder's generic `x · scale + bias` dequantize, bit-identical to the scalar conversions), `neon_sigmoid.rs` (one-pass NEON dequantize+sigmoid into f32 or f16), `neon_ltrb.rs` (LTRB dequantize fused with dist2bbox, sixteen anchors per step, into f32 or f16), `neon_mask.rs` (instance-mask dot products of a detection's coefficients with a crop row of NHWC or NCHW protos: exact integer logits, `sdot` on dotprod CPUs, and f32 FMA logits; the sigmoid to `u8`, the mask threshold and NCHW→NHWC proto dequantize; used by the decoder and `edgefirst-image`), `neon_nms.rs` (greedy NMS over padded coordinate arrays, four later boxes per vector against each kept box, with the decoder's `jaccard` decisions bit for bit), `neon_modelpack.rs` (ModelPack split rows: dequantize, the decoder's fast sigmoid vectorized bit for bit, box transform and objectness-weighted scores), `neon_seg.rs` (ModelPack segmentation maps: integer top byte to `u8`, float min/max normalization to `u8` in f32 or f16 arithmetic, the per-pixel first-max argmax), `neon_semantic.rs` (the semantic decoder's per-pixel class argmax over planar or interleaved scores, softmax and binary confidence, threshold, `TBL` row gathers, bilinear row blends, boundary-cell candidates and argmax, and class-index narrowing, bit-identical to the decoder's scalar code except the sigmoid) and `neon_fp16.rs` (FP16-arithmetic dequantize+sigmoid, DFL softmax, dist2bbox and `x · scale + bias` into f16). `sigmoid.rs` also holds the decoder's ModelPack fast sigmoid (`fast_sigmoid`, the Schraudolph exponent), and `softmax.rs` the semantic decoder's branch-free `exp_nonpositive` |
 | [`test_support.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels/src/test_support.rs) | `#[cfg(test)]` `report_skip` (`WARNING: SKIPPED:` on stderr) |
@@ -44,7 +44,8 @@ Every operator is a plan type with a params struct: `SoftmaxI8Plan::new(SoftmaxI
 - **`new` selects the tier.** `new` reads `CpuFeatures::from_env_or_probe()`; `with_features(params, features)` takes them explicitly (tests, benchmarks) and reads no environment. `LutI8Plan` has two constructors, so it has two pairs: `from_table` / `from_table_with_features` and `sigmoid` / `sigmoid_with_features`. `plan.tier()` reports the kernel the plan will actually run.
 - **Float tensors ignore their `Quant`.** In every op, a `Quant` applies only to an integer input or output; an `f16` or `f32` tensor's is ignored (the identity), so a delegate can pass `{0, 0}`.
 - **`run` validates before it writes.** Wrong dtype, a shape mismatch, an output view too small for its shape, overlapping output strides, or (for the decode ops) level anchors that do not add up to the anchor axis return `InvalidArgument` with the output untouched.
-- **`run` never allocates, takes no lock and never touches the global rayon pool.** Scratch is fixed-size stack staging (`ops::rows::STAGE` elements per row, `ops::levels::BLOCK` anchors per decode block) or lives in the plan, read-only after `new`.
+- **`run` never allocates, takes no lock and never touches the global rayon pool.** Scratch is fixed-size stack staging (`ops::rows::STAGE` elements per row, `ops::levels::BLOCK` anchors per decode block) or lives in the plan, read-only after `new`. The one exception is attention's packed operands, which the caller owns: `AttentionI8Plan::scratch` builds an `AttentionScratch` once for a shape, and `run` takes it `&mut`, so each concurrent `run` needs its own. A scratch serves any plan whose kernel shares its layout and is rejected by the others.
+- **Shape limits are checked, not exported.** `MatMulI8Plan::check_depth` and `AttentionI8Plan::check_shape` say whether the kernels' fixed stack buffers take a shape, so a delegate can decide before it claims a node.
 - **Plans are `Send + Sync`** and `run(&self)` may be called on one plan from several threads at once.
 - **Library code never panics.** Bad inputs are `KernelError`s; assertions moved from the decoder are unreachable from the plan API because the plans validate first.
 - **One tracing span per `run`**, `kernels.<op>` with field `tier`, never per row or block (see [Tracing Spans](#tracing-spans)).
@@ -63,7 +64,7 @@ Every operator is a plan type with a params struct: `SoftmaxI8Plan::new(SoftmaxI
 
 `for_each_block` splits the work into at most 64 disjoint blocks and gives each one a claim flag, so a block runs exactly once whatever the pool does: a pool that repeats an index, calls indices out of range, skips some or runs nothing still yields the same output, because unclaimed blocks run on the calling thread after `Pool::run` returns. Because `Pool` is a safe trait taking a borrowed task, a sound implementation cannot keep the task past `run`, so every block it ran has finished and its writes are visible when `run` returns. Results never depend on the pool or the number of threads.
 
-Tasks keep staging buffers of up to 32 KiB on the stack (`ops::rows` stages an input and an output row of up to 4096 elements), so pool worker threads need about 64 KiB of stack headroom beyond the pool's own use.
+Tasks keep staging buffers of up to about 48 KiB on the stack (attention on CPUs without FEAT_DotProd; `ops::rows` stages an input and an output row of up to 4096 elements and the matmul panels four rows of up to 4096, 32 KiB each), so pool worker threads need about 96 KiB of stack headroom beyond the pool's own use.
 
 ## CPU tiers
 
@@ -93,8 +94,12 @@ Tasks keep staging buffers of up to 32 KiB on the stack (`ops::rows` stages an i
 | `dfl` | 16-bit and float inputs → `f16` on FP16 CPUs | `prim::neon_fp16` DFL softmax | `neon_fp16` |
 | `dist2bbox` | every output (`f16` the f32 boxes rounded once, which beats native FP16 boxes on Cortex-A55) | `prim::neon_ltrb`: the decoder's NEON dequantize and four-anchor dist2bbox fused, sixteen anchors per step; NEON quantize | `neon` |
 | `dfl_box` | as `dfl` for the distances, as `dist2bbox` for the boxes; `f16` outputs of 8-bit inputs on FP16 CPUs run the table distances and the f16 box math | as above | `neon`, `neon_fp16` for `f16` outputs on FP16 CPUs |
+| `binary_i8` | `ADD`, `SUB`, `MUL`, every `TfliteKernels` and activation | `ops/binary_i8_neon.rs` | `neon` |
+| `matmul_i8` | `BATCH_MATMUL`, 1×1 `CONV_2D`, per-tensor or per-column requantization, bias | `ops/matmul_i8_neon.rs` (`sdot` on dotprod CPUs) | `neon_dotprod` on dotprod CPUs, else `neon` |
+| `softmax_dot_i8` | 16-bin rows in groups of 16 (YOLO DFL heads); other bin counts and the last rows short of a group run the portable row | `ops/softmax_dot_i8_neon.rs` | `neon` |
+| `attention_i8` | with or without the Q `MUL`, every `TfliteKernels` | `ops/attention_i8_neon.rs` on dotprod CPUs, `ops/attention_i8_neon_base.rs` otherwise | `neon_dotprod` on dotprod CPUs, else `neon` |
 
-`convert::dequant_*` and `nchw_to_nhwc` are NEON for every element size and have no plan or tier; `prim::transpose::nchw_to_nhwc_scalar` is the element loop, for the decoder's scalar tier. No plan reports `neon_dotprod` yet.
+`convert::dequant_*` and `nchw_to_nhwc` are NEON for every element size and have no plan or tier; `prim::transpose::nchw_to_nhwc_scalar` is the element loop, for the decoder's scalar tier. `matmul_i8` and `attention_i8` report `neon_dotprod` on CPUs with `sdot`.
 
 ## Numerics
 
@@ -105,7 +110,7 @@ Reproduces TFLite's default int8 kernel, `optimized_ops::Softmax<int8_t, int8_t>
 - Table: `table[255 − v] = expf(−input_scale · beta · v)` for `v` in 0..=255, built in `new`.
 - Per row: `max = max(x)`; `sum = Σ table[255 − max + x]` in f32; `inv = 1 / (sum · output_scale)`; `q = round(table[255 − max + x] · inv) + output_zp` (half away from zero), clamped to [−128, 127]. The index spans exactly 0..=255.
 - The output quantization must be scale 1/256 (±0.1%) and zero point −128, as TFLite's Prepare enforces; anything else is `Unsupported`. The input zero point is unused (softmax is shift-invariant).
-- The scalar tier sums in element order, as TFLite does, and is bit-exact where `f32::exp` is glibc's `expf` (the Linux targets the fixtures come from; another libm can move a table entry by an ulp). The NEON kernel sums in four interleaved lanes and builds a per-row 256-entry output table mapped with `tbl`/`tbx`; reordering the sum can move a value on a rounding boundary, so NEON is within ±1 LSB. Strided rows longer than `ops::rows::STAGE` take the portable kernel.
+- The scalar tier sums in element order, as TFLite does, and is bit-exact where `f32::exp` is glibc's `expf` (the Linux targets the fixtures come from; another libm can move a table entry by an ulp). The NEON kernel sums in four interleaved lanes and builds a per-row 256-entry output table mapped with `tbl`/`tbx`; reordering the sum can move a value on a rounding boundary, so NEON is within ±1 LSB. Rows of exactly 16 elements, sixteen at a time, take their exponentials as exact products of two 16-entry 16-bit fixed-point tables and sum them in integers; they are within ±1 LSB of the scalar tier too, without bias. Strided rows longer than `ops::rows::STAGE` take the portable kernel.
 
 ### `softmax_i16` (TFLite int16 `SOFTMAX`)
 
@@ -148,12 +153,42 @@ Inputs are `i8`, `u8`, `i16`, `u16`, `f16` or `f32`; outputs `f32`, `f16` or any
 
 They are tested against the float64 result rounded to f16, in f16 ulps of the value or of the output's full scale (640 px for boxes, `reg_max − 1` grid units for distances), whichever is larger: within 1 ulp up to `reg_max` 32, and at `reg_max` 64 within 2 ulps for distances and 3 for boxes, at fixed and seeded random quantizations.
 
+### `binary_i8` (TFLite int8 `ADD`, `SUB`, `MUL`)
+
+Bit for bit with the TFLite kernels the plan's `TfliteKernels` names, on every tier:
+
+- `MUL`: `clamp(zo + MultiplyByQuantizedMultiplier((x − zx)·(y − zy), M, s))`, the multiplier from `sx·sy/so` in f32.
+- `ADD` and `SUB`: both inputs shifted left by 20 and rescaled by `s/(2·max(sx, sy))`, then the sum or difference rescaled by `2·max(sx, sy)/(2^20·so)`.
+- Under `TfliteKernels::NeonRuy` (every aarch64 build, and x86 builds with SSE4.1 through `NEON_2_SSE`), whole 16-element blocks take TFLite's NEON arithmetic (`MUL` saturates the rescaled product to int16 before adding `zo`; `ADD` applies the shifts as one exact shift before a single `vqrdmulh` and keeps the low 16 bits) and the last `n % 16` elements its scalar code. `SUB` always runs the scalar code, as do the reference kernels.
+- `table_for_rhs(rhs, len)` is the 256-entry table of `x op rhs` for a call of `len` elements, or `None` when that call's NEON blocks and scalar tail would disagree for this `rhs`.
+
+### `matmul_i8` (TFLite int8 `BATCH_MATMUL` and 1×1 `CONV_2D`)
+
+- Accumulation is exact in i32: `Σ (l − zl)(r − zr) = Σ l·r − zr·Σ l − zl·Σ r + K·zl·zr`, so every tier and pool gives the same bytes.
+- Requantization as TFLite: ruy's single rounding under `NeonRuy` and `Ruy` (multipliers below 0.5 only; ruy's NEON kernels truncate above), `MultiplyByQuantizedMultiplier` under `NeonGemmlowp` (gemmlowp rounds as the reference kernels) and `Reference`; per-column multipliers and an optional bias for `CONV_2D`; the fused activation clamp.
+- The reduction axis is at most 4096 (`check_depth`). The NEON kernel computes 4×4 tiles with `sdot` on dotprod CPUs and `smull`/`sadalp` otherwise; operands not contiguous along the reduction axis are packed four rows at a time.
+
+### `attention_i8` (fused `[MUL] → BATCH_MATMUL → SOFTMAX → BATCH_MATMUL`)
+
+Reproduces the four TFLite int8 ops in one kernel, bit for bit except that the int8 softmax rows on NEON are within ±1 LSB, as `softmax_i8`'s:
+
+- The optional Q `MUL` through its 256-entry table (`BinaryI8Plan::table_for_rhs`), the scores requantized as the first `BATCH_MATMUL`, the int8 softmax row by row, the outputs requantized as the second.
+- Q, K and V are packed once per call into the caller's `AttentionScratch`, in tasks on the pool, with the sums that let the zero points start the accumulators.
+- Dotprod CPUs run 4×4 `sdot` tiles over 4-byte-interleaved blocks, the step loop scheduled for in-order cores such as the Cortex-A55. Other NEON CPUs run a widening kernel: the scores as `smlal` by element over 8-token key groups, the outputs as u8×u8 `umlal` into 16-bit accumulators on `p + 128` and `v + 128`. That is exact because `Σ P·V ≤ 255·Σ P` and tokens run in chunks where every row's `Σ P ≤ 257`, after tokens whose probability is zero in all four rows are dropped. Both kernels end at the same integers.
+- At most 2048 tokens and head dims of 256 (`check_shape`). Each task keeps about 25 KB of stack, 22 KB more on CPUs without FEAT_DotProd.
+
+### `softmax_dot_i8` (YOLO DFL softmax and projection)
+
+The softmax over each side's bins and the 1×1 projection onto the bin indices, without TFLite's 8-bit probabilities between them: the expectation comes from the exponentials and is requantized once, so it sits closer to the float model than TFLite's two-op chain, within a few LSB of it. The scalar tier takes the exponentials from the int8 softmax's f32 table and sums in f32; the NEON kernel (rows of 16) takes them as 12-bit fixed-point products of two 16-entry tables and sums exactly in integers, within ±1 LSB of the scalar tier.
+
 ## C and Python surfaces
 
 Every plan has the same shape in all three languages, with typed per-operator symbols and no string-keyed registry.
 
 - **C** ([`../kernels-capi/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/kernels-capi/ARCHITECTURE.md)): `ef_<op>_params`, `ef_<op>_plan_new(params, &plan)`, `ef_<op>_plan_run(plan, &in, &out, pool)`, `ef_<op>_plan_free(plan)`. Tensors are `ef_kernel_view { data, dtype, ndim, shape, strides }` with element strides (`NULL` is contiguous), levels a pointer plus a count, pools `ef_kernel_pool { ctx, run }` or `NULL`. Calls return 0, or −1 with `errno` `EINVAL` / `ENOTSUP` and a thread-local `ef_kernels_last_error()` message; every entry point catches panics.
 - **Python** ([`../python-kernels/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-kernels/README.md)): one class per plan (`SoftmaxI8Plan(...)`), `run(input, output, *, threads=None)` over NumPy arrays of any non-negative strides, writing into the caller's array with the GIL released; `ValueError` for bad arguments, `NotImplementedError` for `Unsupported`.
+
+Operators with two inputs take both views; the output may not overlap either, the inputs may overlap each other. Attention's scratch is an `ef_attention_scratch` handle built from a plan in C, and cached per shape inside the Python class.
 
 ## Adding an operator
 
@@ -179,6 +214,10 @@ Every plan's `run` opens one `tracing::trace_span!` named `kernels.<op>`, with f
 | `kernels.dfl` | `DflPlan` | DFL over the whole anchor axis |
 | `kernels.dist2bbox` | `Dist2BboxPlan` | dist2bbox over the whole anchor axis |
 | `kernels.dfl_box` | `DflBoxPlan` | fused DFL and dist2bbox over the whole anchor axis |
+| `kernels.binary_i8` | `BinaryI8Plan` | int8 `ADD`, `SUB` or `MUL` over the tensor (field `op`) |
+| `kernels.matmul_i8` | `MatMulI8Plan` | int8 matrix product over every batch |
+| `kernels.softmax_dot_i8` | `SoftmaxDotI8Plan` | DFL softmax and projection over every row |
+| `kernels.attention_i8` | `AttentionI8Plan` | fused attention over every head, packing included |
 
 ## Inter-Crate Interfaces
 

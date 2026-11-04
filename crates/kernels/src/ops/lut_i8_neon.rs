@@ -3,15 +3,75 @@
 
 //! NEON 256-entry byte table lookup.
 //!
-//! The table sits in four `uint8x16x4_t` registers of 64 bytes each. `tbl` on the first block
-//! zeroes lanes whose index is 64 or more; `tbx` on each later block, with the index lowered by
-//! another 64, fills only the lanes that land in that block and leaves the rest.
+//! The table sits in up to four `uint8x16x4_t` registers of 64 bytes each. `tbl` on the first
+//! block zeroes lanes whose index is 64 or more; `tbx` on each later block `b`, with the index
+//! lowered by `64·b`, fills only the lanes that land in that block and leaves the rest.
 
 #![cfg(target_arch = "aarch64")]
 
 use std::arch::aarch64::*; // NOSONAR
 
-use super::lut_i8::{lut_portable, Byte};
+use super::lut_i8::{lut_portable, Byte, Window};
+use super::rows::for_each_transposed_vector;
+use crate::error::Result;
+use crate::pool::Pool;
+use crate::view::{View, ViewMut};
+
+/// The first `B` (at most 4) 64-byte blocks of `table`, for [`lookup`].
+#[inline]
+#[target_feature(enable = "neon")]
+pub(super) fn table_blocks<const B: usize>(table: &[u8; 256]) -> [uint8x16x4_t; B] {
+    // SAFETY: `B <= 4` blocks of 64 lie in the 256-byte table.
+    core::array::from_fn(|b| unsafe { vld1q_u8_x4(table.as_ptr().add(64 * (b % 4))) })
+}
+
+/// Each lane of `idx` looked up in `blocks`; lanes at `64·B` or more come out 0.
+#[inline]
+#[target_feature(enable = "neon")]
+pub(super) fn lookup<const B: usize>(blocks: &[uint8x16x4_t; B], idx: uint8x16_t) -> uint8x16_t {
+    let mut r = vqtbl4q_u8(blocks[0], idx);
+    for (b, block) in blocks.iter().enumerate().skip(1) {
+        // Indices below the block wrap past 191 and leave their lanes unchanged.
+        r = vqtbx4q_u8(r, *block, vsubq_u8(idx, vdupq_n_u8((64 * b) as u8)));
+    }
+    r
+}
+
+/// `f` over whole 16-byte vectors of the first `min(src.len(), dst.len())` elements, then
+/// `tail` over the rest.
+#[inline]
+#[target_feature(enable = "neon")]
+fn map_vectors<T: Byte>(
+    src: &[T],
+    dst: &mut [T],
+    f: impl Fn(uint8x16_t) -> uint8x16_t,
+    tail: impl FnOnce(&[T], &mut [T]),
+) {
+    let n = src.len().min(dst.len());
+    let (Some(src), Some(dst)) = (src.get(..n), dst.get_mut(..n)) else {
+        return;
+    };
+    let body = n - n % 16;
+    let s = src.as_ptr().cast::<u8>();
+    let d = dst.as_mut_ptr().cast::<u8>();
+    // SAFETY: `T` is one byte, any bit pattern valid; every access stays below `body <= n`.
+    unsafe {
+        let mut i = 0usize;
+        while i + 32 <= body {
+            let a = vld1q_u8(s.add(i));
+            let b = vld1q_u8(s.add(i + 16));
+            vst1q_u8(d.add(i), f(a));
+            vst1q_u8(d.add(i + 16), f(b));
+            i += 32;
+        }
+        if i < body {
+            vst1q_u8(d.add(i), f(vld1q_u8(s.add(i))));
+        }
+    }
+    if let (Some(s), Some(d)) = (src.get(body..), dst.get_mut(body..)) {
+        tail(s, d);
+    }
+}
 
 /// Looks up `min(src.len(), dst.len())` elements through `table`.
 ///
@@ -19,47 +79,55 @@ use super::lut_i8::{lut_portable, Byte};
 /// The CPU must support NEON, which every aarch64 CPU does.
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn lut_neon<T: Byte>(table: &[u8; 256], src: &[T], dst: &mut [T]) {
-    let n = src.len().min(dst.len());
-    let (Some(src), Some(dst)) = (src.get(..n), dst.get_mut(..n)) else {
-        return;
-    };
-    let body = n - n % 16;
-    // SAFETY: `T` is one byte, any bit pattern valid; accesses stay below `body <= n` and within `table`.
-    unsafe {
-        let t = table.as_ptr();
-        let (t0, t1, t2, t3) = (
-            vld1q_u8_x4(t),
-            vld1q_u8_x4(t.add(64)),
-            vld1q_u8_x4(t.add(128)),
-            vld1q_u8_x4(t.add(192)),
-        );
-        let step = vdupq_n_u8(64);
-        let s = src.as_ptr().cast::<u8>();
-        let d = dst.as_mut_ptr().cast::<u8>();
-        let lookup = |x: uint8x16_t| -> uint8x16_t {
-            let x1 = vsubq_u8(x, step);
-            let x2 = vsubq_u8(x1, step);
-            let x3 = vsubq_u8(x2, step);
-            let r = vqtbl4q_u8(t0, x);
-            let r = vqtbx4q_u8(r, t1, x1);
-            let r = vqtbx4q_u8(r, t2, x2);
-            vqtbx4q_u8(r, t3, x3)
-        };
-        let mut i = 0usize;
-        while i + 32 <= body {
-            let a = vld1q_u8(s.add(i));
-            let b = vld1q_u8(s.add(i + 16));
-            vst1q_u8(d.add(i), lookup(a));
-            vst1q_u8(d.add(i + 16), lookup(b));
-            i += 32;
-        }
-        if i < body {
-            vst1q_u8(d.add(i), lookup(vld1q_u8(s.add(i))));
-        }
+    let blocks = table_blocks::<4>(table);
+    map_vectors(
+        src,
+        dst,
+        |x| lookup(&blocks, x),
+        |s, d| lut_portable(table, s, d),
+    );
+}
+
+/// `w`'s lookup of 16 values: each clamped into the window, then mapped through `B` blocks.
+#[inline]
+#[target_feature(enable = "neon")]
+fn window_lookup<const B: usize>(w: &Window) -> impl Fn(uint8x16_t) -> uint8x16_t + Copy {
+    let blocks = table_blocks::<B>(&w.table);
+    let (flip, lo, hi) = (vdupq_n_u8(w.flip), vdupq_n_u8(w.lo), vdupq_n_u8(w.hi));
+    move |x| {
+        lookup(
+            &blocks,
+            vsubq_u8(vminq_u8(vmaxq_u8(veorq_u8(x, flip), lo), hi), lo),
+        )
     }
-    if let (Some(s), Some(d)) = (src.get(body..), dst.get_mut(body..)) {
-        lut_portable(table, s, d);
-    }
+}
+
+/// Looks up `min(src.len(), dst.len())` elements through `w`: each value clamped into the
+/// window and mapped through `B` 64-byte blocks instead of four.
+///
+/// # Safety
+/// The CPU must support NEON, which every aarch64 CPU does; `B` must be `w.blocks()` (1 to 3).
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn lut_window<const B: usize, T: Byte>(w: &Window, src: &[T], dst: &mut [T]) {
+    map_vectors(src, dst, window_lookup::<B>(w), |s, d| {
+        w.lookup_portable(s, d)
+    });
+}
+
+/// [`lut_window`] over transposed views: each 16×16 tile is transposed in registers, looked up
+/// and stored straight to the output (see [`for_each_transposed_vector`]); `None`, touching
+/// nothing, when the views do not suit it.
+///
+/// # Safety
+/// The CPU must support NEON, which every aarch64 CPU does; `B` must be `w.blocks()` (1 to 4).
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn lut_window_transposed<const B: usize, T: Byte + Send + Sync>(
+    w: &Window,
+    input: &View<'_, T>,
+    output: &mut ViewMut<'_, T>,
+    pool: Option<&dyn Pool>,
+) -> Option<Result<()>> {
+    for_each_transposed_vector(input, output, pool, &window_lookup::<B>(w))
 }
 
 #[cfg(test)]
@@ -101,5 +169,59 @@ mod tests {
         // SAFETY: as above.
         unsafe { lut_neon(&table, &all, &mut got) };
         assert_eq!(got, want, "all bytes");
+    }
+
+    /// Windowed lookups equal the full table on every byte, for windows of one to four blocks.
+    #[test]
+    fn window_lut_matches_portable() {
+        use crate::quant::DType;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x3a1d_0007);
+        let windows = [
+            (100, 140),
+            (10, 200),
+            (0, 63),
+            (64, 127),
+            (5, 5),
+            (30, 160),
+            (0, 255),
+        ];
+        for dtype in [DType::I8, DType::U8] {
+            let flip = if dtype == DType::I8 { 0x80u8 } else { 0 };
+            for &(lo, hi) in &windows {
+                let mut table = [0u8; 256];
+                for v in 0..256usize {
+                    table[usize::from(v as u8 ^ flip)] = if v < lo {
+                        7
+                    } else if v > hi {
+                        200
+                    } else {
+                        rng.random()
+                    };
+                }
+                let w = Window::new(&table, dtype);
+                let all: Vec<u8> = (0..=255u8).cycle().take(256 * 3 + 9).collect();
+                let mut want = vec![0u8; all.len()];
+                lut_portable(&table, &all, &mut want);
+                let mut got = vec![0x55u8; all.len()];
+                w.lookup_portable(&all, &mut got);
+                assert_eq!(got, want, "portable window {dtype:?} {lo}..={hi}");
+                let mut got = vec![0x55u8; all.len()];
+                // SAFETY: NEON is part of the aarch64 baseline; `B` matches `blocks()`.
+                unsafe {
+                    match w.blocks() {
+                        1 => lut_window::<1, u8>(&w, &all, &mut got),
+                        2 => lut_window::<2, u8>(&w, &all, &mut got),
+                        3 => lut_window::<3, u8>(&w, &all, &mut got),
+                        _ => lut_neon(&table, &all, &mut got),
+                    }
+                }
+                assert_eq!(
+                    got,
+                    want,
+                    "neon window {dtype:?} {lo}..={hi} ({} blocks)",
+                    w.blocks()
+                );
+            }
+        }
     }
 }

@@ -32,7 +32,7 @@ crates/
 ├── image/          # Hardware-accelerated image processing (GL / G2D / CPU)
 ├── decoder/        # YOLO and model output decoding
 ├── tracker/        # Object tracking algorithms
-├── kernels/        # Framework-neutral CPU kernels (softmax, sigmoid, LUT, DFL); no tensor dep
+├── kernels/        # Framework-neutral CPU kernels (softmax, sigmoid, LUT, DFL, int8 matmul/attention); no tensor dep
 ├── tensor-abi/     # Layout-only C types for tensors
 ├── decoder-abi/    # Layout-only C types for detections (detect.h)
 ├── tensor-ffi/     # Declarations-only extern "C" to libedgefirst_tensor.so

@@ -5,14 +5,18 @@
 //! aarch64; only a CPU without NEON runs the scalar tier.
 //!
 //! A new operator adds its plan, every (input, output) dtype pair it accepts, every quant
-//! variant and its expected tier to `neon_coverage_of_every_op_path`.
+//! variant and its expected tier to `neon_coverage_of_every_op_path`. The int8-only ops
+//! (`binary_i8`, `matmul_i8`, `softmax_dot_i8`, `attention_i8`) enumerate their rounding
+//! (`TfliteKernels`), fused activation and requantization variants instead.
 
 #![cfg(target_arch = "aarch64")]
 
 use edgefirst_kernels::{
-    BoxFormat, CpuFeatures, DType, DflBoxParams, DflBoxPlan, DflParams, DflPlan, Dist2BboxParams,
-    Dist2BboxPlan, KernelError, Level, LutI8Plan, Quant, SigmoidParams, SigmoidPlan,
-    SoftmaxI16Params, SoftmaxI16Plan, SoftmaxI8Params, SoftmaxI8Plan, Tier,
+    Activation, AttentionI8Params, AttentionI8Plan, AttentionQMul, BinaryI8Params, BinaryI8Plan,
+    BinaryOp, BoxFormat, CpuFeatures, DType, DflBoxParams, DflBoxPlan, DflParams, DflPlan,
+    Dist2BboxParams, Dist2BboxPlan, KernelError, Level, LutI8Plan, MatMulI8Params, MatMulI8Plan,
+    Quant, Requant, SigmoidParams, SigmoidPlan, SoftmaxDotI8Params, SoftmaxDotI8Plan,
+    SoftmaxI16Params, SoftmaxI16Plan, SoftmaxI8Params, SoftmaxI8Plan, TfliteKernels, Tier,
 };
 
 const DTYPES: [DType; 6] = [
@@ -25,6 +29,24 @@ const DTYPES: [DType; 6] = [
 ];
 
 const REG_MAX: [usize; 5] = [1, 8, 16, 17, 64];
+
+const TFLITE_KERNELS: [TfliteKernels; 3] = [
+    TfliteKernels::NeonRuy,
+    TfliteKernels::Ruy,
+    TfliteKernels::Reference,
+];
+
+const ACTIVATIONS: [Activation; 4] = [
+    Activation::None,
+    Activation::Relu,
+    Activation::ReluN1To1,
+    Activation::Relu6,
+];
+
+const PROBS: Quant = Quant {
+    scale: 1.0 / 256.0,
+    zero_point: -128,
+};
 
 /// Plans checked so far, to catch an enumeration that silently shrinks.
 #[derive(Default)]
@@ -47,6 +69,78 @@ fn fp16_or_neon(fp16: bool) -> Tier {
     } else {
         Tier::Neon
     }
+}
+
+/// `matmul_i8` and `attention_i8`: the `sdot` kernels on dotprod CPUs.
+fn dotprod_or_neon(dotprod: bool) -> Tier {
+    if dotprod {
+        Tier::NeonDotprod
+    } else {
+        Tier::Neon
+    }
+}
+
+/// `matmul_i8` variants: per-tensor and per-column requantization, with and without a bias,
+/// under every fused activation and rounding.
+fn matmul_variants() -> Vec<MatMulI8Params> {
+    let mut out = Vec::new();
+    for kernels in TFLITE_KERNELS {
+        for activation in ACTIVATIONS {
+            out.push(MatMulI8Params {
+                activation,
+                ..MatMulI8Params::tflite_batch_matmul(
+                    Quant::new(0.05, -3),
+                    Quant::new(0.04, 7),
+                    Quant::new(0.5, 1),
+                    kernels,
+                )
+                .expect("batch matmul params")
+            });
+            for bias in [Vec::new(), vec![5, -7, 9]] {
+                out.push(
+                    MatMulI8Params::tflite_conv(
+                        Quant::new(0.05, -3),
+                        &[0.01, 0.02, 0.03],
+                        Quant::new(0.5, 1),
+                        bias,
+                        activation,
+                        kernels,
+                    )
+                    .expect("conv params"),
+                );
+            }
+        }
+    }
+    out
+}
+
+fn attention_variants() -> Vec<AttentionI8Params> {
+    let base = AttentionI8Params {
+        q: Quant::new(0.1251, -15),
+        q_mul: None,
+        k: Quant::new(0.1251, -15),
+        v: Quant::new(0.1251, -15),
+        scores: Quant::new(0.1279, -9),
+        beta: 1.0,
+        probs: PROBS,
+        output: Quant::new(0.063_33, 2),
+        kernels: TfliteKernels::NeonRuy,
+    };
+    let q_mul = AttentionQMul {
+        table: core::array::from_fn(|i| i as u8),
+        output: Quant::new(0.010_18, 6),
+    };
+    let mut out = Vec::new();
+    for kernels in TFLITE_KERNELS {
+        for q_mul in [None, Some(q_mul)] {
+            out.push(AttentionI8Params {
+                q_mul,
+                kernels,
+                ..base
+            });
+        }
+    }
+    out
 }
 
 /// `sigmoid`: `f16` outputs take the FP16 kernel on FP16 CPUs; every other pair is `neon`.
@@ -255,9 +349,95 @@ fn neon_coverage_of_every_op_path() {
         );
     }
 
+    for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
+        for kernels in TFLITE_KERNELS {
+            for activation in ACTIVATIONS {
+                let p = BinaryI8Params {
+                    op,
+                    lhs: Quant::new(0.05, -3),
+                    rhs: Quant::new(0.04, 7),
+                    output: Quant::new(0.08, 1),
+                    activation,
+                    kernels,
+                };
+                g.check(
+                    &format!("binary_i8 {p:?}"),
+                    BinaryI8Plan::with_features(p, neon)
+                        .expect("binary probe")
+                        .tier(),
+                    Tier::Neon,
+                    BinaryI8Plan::with_features(p, none)
+                        .expect("binary scalar")
+                        .tier(),
+                );
+            }
+        }
+    }
+
+    let dotprod = neon.dotprod_usable();
+    for p in matmul_variants() {
+        g.check(
+            &format!("matmul_i8 {p:?}"),
+            MatMulI8Plan::with_features(p.clone(), neon)
+                .expect("matmul probe")
+                .tier(),
+            dotprod_or_neon(dotprod),
+            MatMulI8Plan::with_features(p, none)
+                .expect("matmul scalar")
+                .tier(),
+        );
+    }
+
+    for kernels in TFLITE_KERNELS {
+        for bias in [Vec::new(), vec![3]] {
+            let p = SoftmaxDotI8Params {
+                softmax: SoftmaxI8Params {
+                    input: Quant::new(0.0947, 3),
+                    output: PROBS,
+                    beta: 1.0,
+                },
+                weights: (0..16).map(|i| i * 8).collect(),
+                projection: MatMulI8Params::tflite_conv(
+                    PROBS,
+                    &[15.0 / 127.0],
+                    Quant::new(0.0579, -128),
+                    bias,
+                    Activation::None,
+                    kernels,
+                )
+                .expect("softmax_dot projection"),
+            };
+            g.check(
+                &format!("softmax_dot_i8 {p:?}"),
+                SoftmaxDotI8Plan::with_features(p.clone(), neon)
+                    .expect("softmax_dot probe")
+                    .tier(),
+                Tier::Neon,
+                SoftmaxDotI8Plan::with_features(p, none)
+                    .expect("softmax_dot scalar")
+                    .tier(),
+            );
+        }
+    }
+
+    for p in attention_variants() {
+        g.check(
+            &format!("attention_i8 {p:?}"),
+            AttentionI8Plan::with_features(p, neon)
+                .expect("attention probe")
+                .tier(),
+            dotprod_or_neon(dotprod),
+            AttentionI8Plan::with_features(p, none)
+                .expect("attention scalar")
+                .tier(),
+        );
+    }
+
     // sigmoid: 36 pairs + 3 int16 variants; dfl and dfl_box: 36 pairs x 5 reg_max;
-    // dist2bbox: 36 pairs x 2 formats; softmax 2; lut 4.
-    assert_eq!(g.cases, 39 + 180 + 180 + 72 + 2 + 4);
+    // dist2bbox: 36 pairs x 2 formats; softmax 2; lut 4; binary_i8: 3 ops x 3 kernels x 4
+    // activations; matmul_i8: 3 kernels x 4 activations x 3 (per-tensor, per-column with and
+    // without bias); softmax_dot_i8: 3 kernels x 2 biases; attention_i8: 3 kernels x 2.
+    assert_eq!(g.cases, 39 + 180 + 180 + 72 + 2 + 4 + 36 + 36 + 6 + 6);
 }
 
 #[test]
@@ -286,6 +466,19 @@ fn neon_coverage_rejections_are_errors() {
     ));
     assert!(matches!(
         DflPlan::with_features(dfl(65), neon),
+        Err(KernelError::Unsupported(_))
+    ));
+    // Ruy rounding takes multipliers below 0.5 only.
+    let wide = MatMulI8Params {
+        requant: vec![Requant::from_real(0.75).expect("requant")],
+        ..matmul_variants().remove(0)
+    };
+    assert!(matches!(
+        MatMulI8Plan::with_features(wide, neon),
+        Err(KernelError::Unsupported(_))
+    ));
+    assert!(matches!(
+        AttentionI8Plan::check_shape(2049, 64, 64),
         Err(KernelError::Unsupported(_))
     ));
 }

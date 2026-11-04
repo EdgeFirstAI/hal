@@ -24,6 +24,72 @@ impl Quant {
     }
 }
 
+/// A fused activation of a quantized TFLite operator, applied as the output clamp TFLite's
+/// `CalculateActivationRangeQuantized` derives from the output quantization.
+///
+/// The discriminants are TFLite's `TfLiteFusedActivation` values and the C ABI values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Activation {
+    #[default]
+    None = 0,
+    Relu = 1,
+    ReluN1To1 = 2,
+    Relu6 = 3,
+}
+
+/// Which of TFLite's int8 kernels a plan reproduces, where they round differently.
+///
+/// Two build settings decide it for the default op resolver (without its XNNPACK delegate):
+/// `USE_NEON`, defined on every aarch64 build and on x86 builds with SSE4.1 (through
+/// `NEON_2_SSE`), makes int8 `ADD` and `MUL` compute whole 16-element blocks with NEON
+/// arithmetic that rounds differently from the scalar code that handles the rest; and integer
+/// matrix products run through ruy (one rounding) on builds with `TFLITE_WITH_RUY`, the Arm
+/// default, and on builds without NEON, but through gemmlowp, which rounds as the reference
+/// kernels, on x86 builds with SSE4.1. The reference op resolver runs the scalar arithmetic and
+/// `MultiplyByQuantizedMultiplier` everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TfliteKernels {
+    /// NEON blocks and ruy: every aarch64 build, such as the NXP BSP runtimes.
+    NeonRuy,
+    /// NEON blocks and gemmlowp: x86 builds with SSE4.1, such as the LiteRT Python wheels.
+    NeonGemmlowp,
+    /// Scalar arithmetic and ruy: builds without `USE_NEON`.
+    Ruy,
+    /// The reference kernels (`BuiltinRefOpResolver`).
+    Reference,
+}
+
+impl TfliteKernels {
+    /// Whether int8 `ADD` and `MUL` run whole 16-element blocks with NEON arithmetic, so an
+    /// element's result depends on whether it falls in a block or in the last `n % 16`.
+    #[must_use]
+    pub fn neon_blocks(self) -> bool {
+        matches!(self, Self::NeonRuy | Self::NeonGemmlowp)
+    }
+
+    /// How matrix products requantize.
+    pub(crate) fn rounding(self) -> Rounding {
+        match self {
+            Self::NeonRuy | Self::Ruy => Rounding::Ruy,
+            Self::NeonGemmlowp | Self::Reference => Rounding::Reference,
+        }
+    }
+}
+
+/// How a requantization rounds an accumulator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rounding {
+    /// TFLite's optimized int8 matrix kernels (ruy): one rounding, ties toward +∞,
+    /// `(acc·multiplier + 2^(30 − shift)) >> (31 − shift)`. Only negative shifts (multipliers
+    /// below 0.5) are accepted: ruy's NEON kernels truncate instead of rounding otherwise.
+    Ruy,
+    /// TFLite's reference kernels and gemmlowp: `MultiplyByQuantizedMultiplier`, two roundings
+    /// (`vqrdmulh`, then a rounding shift with ties away from zero).
+    Reference,
+}
+
 /// Element type tag; the discriminants are the C ABI values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]

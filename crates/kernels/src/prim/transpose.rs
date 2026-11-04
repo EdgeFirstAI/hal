@@ -602,25 +602,38 @@ mod neon {
     #[inline(always)]
     unsafe fn tile_u8_at(ld: impl Fn(usize) -> *const u8, st: impl Fn(usize) -> *mut u8) {
         // SAFETY: forwarded from the caller.
-        unsafe {
-            // 16 source rows: 16 positions of one channel each.
-            let r0 = vld1q_u8(ld(0));
-            let r1 = vld1q_u8(ld(1));
-            let r2 = vld1q_u8(ld(2));
-            let r3 = vld1q_u8(ld(3));
-            let r4 = vld1q_u8(ld(4));
-            let r5 = vld1q_u8(ld(5));
-            let r6 = vld1q_u8(ld(6));
-            let r7 = vld1q_u8(ld(7));
-            let r8 = vld1q_u8(ld(8));
-            let r9 = vld1q_u8(ld(9));
-            let r10 = vld1q_u8(ld(10));
-            let r11 = vld1q_u8(ld(11));
-            let r12 = vld1q_u8(ld(12));
-            let r13 = vld1q_u8(ld(13));
-            let r14 = vld1q_u8(ld(14));
-            let r15 = vld1q_u8(ld(15));
+        let r: [uint8x16_t; 16] = core::array::from_fn(|k| unsafe { vld1q_u8(ld(k)) });
+        for (j, t) in transpose16(r).into_iter().enumerate() {
+            // SAFETY: forwarded from the caller.
+            unsafe { vst1q_u8(st(j), t) };
+        }
+    }
 
+    /// Four rows of 16 bytes interleaved byte by byte: output byte `4d + r` (counting through
+    /// the four vectors) is row `r`'s byte `d`. `ZIP1`/`ZIP2` on bytes, then on halfwords.
+    #[inline(always)]
+    pub(crate) fn interleave4(r: [int8x16_t; 4]) -> [int8x16_t; 4] {
+        // SAFETY: register-only NEON, part of the aarch64 baseline.
+        unsafe {
+            let h = |x: int8x16_t| vreinterpretq_s16_s8(x);
+            let (a, c) = (vzip1q_s8(r[0], r[1]), vzip2q_s8(r[0], r[1]));
+            let (b, d) = (vzip1q_s8(r[2], r[3]), vzip2q_s8(r[2], r[3]));
+            [
+                vreinterpretq_s8_s16(vzip1q_s16(h(a), h(b))),
+                vreinterpretq_s8_s16(vzip2q_s16(h(a), h(b))),
+                vreinterpretq_s8_s16(vzip1q_s16(h(c), h(d))),
+                vreinterpretq_s8_s16(vzip2q_s16(h(c), h(d))),
+            ]
+        }
+    }
+
+    /// The 16×16 byte transpose of `r` in registers: lane `j` of row `k` becomes lane `k` of
+    /// row `j`. Four `TRN1`/`TRN2` stages (`.16b`, `.8h`, `.4s`, `.2d`).
+    #[inline(always)]
+    pub(crate) fn transpose16(r: [uint8x16_t; 16]) -> [uint8x16_t; 16] {
+        let [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15] = r;
+        // SAFETY: register-only NEON, part of the aarch64 baseline.
+        unsafe {
             // Stage 1: pair-wise byte interleave (TRN1/TRN2 .16b).
             let a0 = vtrn1q_u8(r0, r1);
             let a1 = vtrn2q_u8(r0, r1);
@@ -716,24 +729,9 @@ mod neon {
             let t13 = trn_d!(d5, d13, vtrn2q_u64);
             let t14 = trn_d!(d6, d14, vtrn2q_u64);
             let t15 = trn_d!(d7, d15, vtrn2q_u64);
-
-            // 16 destination rows: 16 channels of one position each.
-            vst1q_u8(st(0), t0);
-            vst1q_u8(st(1), t1);
-            vst1q_u8(st(2), t2);
-            vst1q_u8(st(3), t3);
-            vst1q_u8(st(4), t4);
-            vst1q_u8(st(5), t5);
-            vst1q_u8(st(6), t6);
-            vst1q_u8(st(7), t7);
-            vst1q_u8(st(8), t8);
-            vst1q_u8(st(9), t9);
-            vst1q_u8(st(10), t10);
-            vst1q_u8(st(11), t11);
-            vst1q_u8(st(12), t12);
-            vst1q_u8(st(13), t13);
-            vst1q_u8(st(14), t14);
-            vst1q_u8(st(15), t15);
+            [
+                t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15,
+            ]
         }
     }
 
@@ -796,6 +794,9 @@ mod neon {
         }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) use neon::{interleave4, transpose16};
 
 #[cfg(test)]
 mod tests {

@@ -49,7 +49,7 @@ pub(crate) fn quantize_multiplier(real: f64) -> (i32, i32) {
 /// gemmlowp `SaturatingRoundingDoublingHighMul`: `round(a * b / 2^31)`, ties toward +inf; the
 /// same computation as `vqrdmulh`.
 #[inline(always)]
-fn saturating_rounding_doubling_high_mul(a: i32, b: i32) -> i32 {
+pub(crate) fn saturating_rounding_doubling_high_mul(a: i32, b: i32) -> i32 {
     if a == b && a == i32::MIN {
         return i32::MAX;
     }
@@ -65,7 +65,7 @@ fn saturating_rounding_doubling_high_mul(a: i32, b: i32) -> i32 {
 
 /// gemmlowp `RoundingDivideByPOT`: `x / 2^exponent` rounded half away from zero; `exponent <= 31`.
 #[inline(always)]
-fn rounding_divide_by_pot(x: i32, exponent: u32) -> i32 {
+pub(crate) fn rounding_divide_by_pot(x: i32, exponent: u32) -> i32 {
     let e = exponent.min(31);
     let mask = ((1i64 << e) - 1) as i32;
     let remainder = x & mask;
@@ -360,9 +360,115 @@ pub(crate) fn logistic_i16_pot(x: i16) -> i16 {
     }
 }
 
+/// gemmlowp's NEON `RoundingDivideByPOT(int32x4_t, int)`: `vqaddq` of a −1 fix-up for negative
+/// `x`, then the rounding shift `vrshlq`. It equals [`rounding_divide_by_pot`] except at
+/// `x = i32::MIN`, where the fix-up saturates.
+#[inline(always)]
+pub(crate) fn rounding_divide_by_pot_neon(x: i32, exponent: u32) -> i32 {
+    let e = exponent.min(31);
+    if e == 0 {
+        return x;
+    }
+    let fixed = if x < 0 { x.saturating_sub(1) } else { x };
+    ((i64::from(fixed) + (1i64 << (e - 1))) >> e) as i32
+}
+
+/// `QuantizeMultiplierSmallerThanOneExp`: `(multiplier, shift)` with `shift <= 0`, or `None`
+/// for a `real` outside (0, 1), where TFLite's `CHECK` fails.
+pub(crate) fn quantize_multiplier_smaller_than_one(real: f64) -> Option<(i32, i32)> {
+    if !(real > 0.0 && real < 1.0) {
+        return None;
+    }
+    let (m, shift) = quantize_multiplier(real);
+    (shift <= 0).then_some((m, shift))
+}
+
+/// `Quantize(scale, zero_point, f)` of `kernel_util.cc`: `zero_point + round(f / scale)`, the
+/// division and rounding in f32.
+fn quantize_activation_bound(scale: f32, zero_point: i32, f: f32) -> i32 {
+    zero_point.saturating_add((f / scale).round() as i32)
+}
+
+/// `CalculateActivationRangeQuantized` for an int8 output: the clamp bounds of a fused
+/// activation, given the output's scale and zero point.
+pub(crate) fn activation_range_i8(
+    act: crate::Activation,
+    scale: f32,
+    zero_point: i32,
+) -> (i32, i32) {
+    let (qmin, qmax) = (i32::from(i8::MIN), i32::from(i8::MAX));
+    let q = |f: f32| quantize_activation_bound(scale, zero_point, f);
+    match act {
+        crate::Activation::None => (qmin, qmax),
+        crate::Activation::Relu => (qmin.max(q(0.0)), qmax),
+        crate::Activation::Relu6 => (qmin.max(q(0.0)), qmax.min(q(6.0))),
+        crate::Activation::ReluN1To1 => (qmin.max(q(-1.0)), qmax.min(q(1.0))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neon_rounding_divide_matches_scalar_except_at_min() {
+        let xs = [
+            i32::MIN + 1,
+            -1_000_001,
+            -96,
+            -65,
+            -64,
+            -63,
+            -1,
+            0,
+            1,
+            63,
+            64,
+            65,
+            96,
+            1_000_001,
+            i32::MAX,
+        ];
+        for e in 0..=31u32 {
+            for x in xs {
+                assert_eq!(
+                    rounding_divide_by_pot_neon(x, e),
+                    rounding_divide_by_pot(x, e),
+                    "x={x} e={e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smaller_than_one_rejects_out_of_range() {
+        assert_eq!(quantize_multiplier_smaller_than_one(0.0), None);
+        assert_eq!(quantize_multiplier_smaller_than_one(1.0), None);
+        assert_eq!(quantize_multiplier_smaller_than_one(f64::NAN), None);
+        assert_eq!(
+            quantize_multiplier_smaller_than_one(0.25),
+            Some((1 << 30, -1))
+        );
+    }
+
+    #[test]
+    fn activation_ranges_follow_tflite() {
+        use crate::Activation;
+        assert_eq!(activation_range_i8(Activation::None, 0.1, 3), (-128, 127));
+        assert_eq!(activation_range_i8(Activation::Relu, 0.1, -10), (-10, 127));
+        assert_eq!(
+            activation_range_i8(Activation::Relu6, 0.05, -128),
+            (-128, -8)
+        );
+        assert_eq!(
+            activation_range_i8(Activation::ReluN1To1, 0.01, 0),
+            (-100, 100)
+        );
+        assert_eq!(
+            activation_range_i8(Activation::Relu6, 0.01, -128),
+            (-128, 127)
+        );
+    }
 
     #[test]
     fn int16_constants_are_rescaled_int32_constants() {
