@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-11-05
+
 ### Added
 
 - **int8 TFLite operator plans (`edgefirst-kernels`).** `BinaryI8Plan` (`ADD`, `SUB`, `MUL`), `MatMulI8Plan` (`BATCH_MATMUL`, 1×1 `CONV_2D`) and `AttentionI8Plan` (fused `MUL → BATCH_MATMUL → SOFTMAX → BATCH_MATMUL`, with a caller-owned `AttentionScratch`) reproduce TFLite's int8 kernels; `SoftmaxDotI8Plan` fuses a YOLO DFL softmax with its projection. NEON kernels on every tier, with `sdot` on dotprod CPUs.
