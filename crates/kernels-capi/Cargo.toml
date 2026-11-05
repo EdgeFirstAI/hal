@@ -4,7 +4,7 @@
 [package]
 name = "edgefirst-kernels-capi"
 description = "C API for EdgeFirst quantized compute kernels"
-version = "0.39.0"
+version = "0.40.0"
 edition = "2021"
 rust-version = "1.94.0"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]
@@ -28,7 +28,7 @@ default = []
 # Kernels operate on caller-owned buffers. This library does not link
 # libedgefirst_tensor, libedgefirst_decoder or any other sibling.
 [dependencies]
-edgefirst-kernels = { version = "0.39.0", path = "../kernels" }
+edgefirst-kernels = { version = "0.40.0", path = "../kernels" }
 half = "2.7.1"
 errno = "0.3"
 libc = "0.2.186"

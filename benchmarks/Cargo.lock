@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-codec"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "edgefirst-tensor",
  "edgefirst-v4l2",
@@ -421,11 +421,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.39.0"
+version = "0.40.0"
 
 [[package]]
 name = "edgefirst-egl"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "libc",
  "libloading",
@@ -456,14 +456,14 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gl"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "edgefirst-image"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "dma-heap",
  "drm-fourcc",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-kernels"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "half",
  "tracing",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "dma-heap",
  "edgefirst-tensor-abi",
@@ -524,11 +524,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.39.0"
+version = "0.40.0"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "edgefirst-tensor-abi",
 ]
@@ -864,9 +864,9 @@ dependencies = [
 
 [[package]]
 name = "kamadak-exif"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
+checksum = "8772c92c0f41c4a672cbdee6728253e5ae8fcc1c5eb5c6c676579565684bbf68"
 dependencies = [
  "mutate_once",
 ]
