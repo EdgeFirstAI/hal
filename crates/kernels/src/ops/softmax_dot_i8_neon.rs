@@ -129,4 +129,62 @@ mod tests {
             "bias {net} over {off}"
         );
     }
+
+    /// The widest weights (−128 and 127) and every projection gain the error bound still
+    /// admits for NEON, on rows with one maximum and the rest anywhere below it: within ±1
+    /// LSB throughout.
+    #[test]
+    fn plans_at_the_error_bound_stay_within_one_lsb() {
+        use crate::cpu::Tier;
+        use crate::ops::matmul_i8::Requant;
+        use crate::quant::Quant;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xB0_0D);
+        let neon_tier = CpuFeatures::from_forced_tier(Some("neon")).unwrap();
+        let rows = 2048;
+        let mut admitted = 0;
+        for &scale in &[0.02f32, 0.0947, 0.3, 0.6] {
+            let weights: Vec<i8> = (0..16)
+                .map(|i| if i % 2 == 0 { -128 } else { 127 })
+                .collect();
+            let mut p = params(scale, weights);
+            p.projection.rhs_zero_point = 0;
+            p.projection.output = Quant::new(1.0, 0);
+            for gain in (1..=64).map(|g| f64::from(g) * 1.0e-4) {
+                p.projection.requant = vec![Requant::from_real(gain).unwrap()];
+                let plan = SoftmaxDotI8Plan::with_features(p.clone(), neon_tier).unwrap();
+                if plan.tier() != Tier::Neon {
+                    continue;
+                }
+                admitted += 1;
+                let scalar =
+                    SoftmaxDotI8Plan::with_features(p.clone(), CpuFeatures::default()).unwrap();
+                let x: Vec<i8> = (0..rows * 16)
+                    .map(|i| {
+                        if i % 16 == (i / 16) % 16 {
+                            127
+                        } else {
+                            rng.random_range(-128..=127)
+                        }
+                    })
+                    .collect();
+                let run = |plan: &SoftmaxDotI8Plan| {
+                    let mut out = vec![0i8; rows];
+                    plan.run(
+                        TensorRef::I8(View::contiguous(&x, &[rows, 16]).unwrap()),
+                        TensorMut::I8(ViewMut::contiguous(&mut out, &[rows, 1]).unwrap()),
+                        None,
+                    )
+                    .unwrap();
+                    out
+                };
+                for (r, (&a, &b)) in run(&plan).iter().zip(&run(&scalar)).enumerate() {
+                    assert!(
+                        (i32::from(a) - i32::from(b)).abs() <= 1,
+                        "scale {scale} gain {gain} row {r}: neon {a} scalar {b}"
+                    );
+                }
+            }
+        }
+        assert!(admitted > 0, "no plan admitted");
+    }
 }

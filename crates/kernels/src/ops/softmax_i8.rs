@@ -201,6 +201,10 @@ impl SoftmaxI8Plan {
                 softmax_row_i8_portable(&self.table, self.output_scale, self.output_zp, src, dst)
             }
             #[cfg(target_arch = "aarch64")]
+            Kernel::Neon if src.len() == ROW_GROUP && dst.len() == ROW_GROUP => {
+                softmax_row16_split(&self.exp16, self.output_scale, src, dst)
+            }
+            #[cfg(target_arch = "aarch64")]
             // SAFETY: NEON is part of the aarch64 baseline.
             Kernel::Neon => unsafe {
                 super::softmax_i8_neon::softmax_row_i8_neon(
@@ -262,6 +266,36 @@ pub(super) fn slice_max(table: &[f32; 256]) -> [f32; 4] {
 /// `−input_scale·beta`.
 pub(super) fn exp16_tables(scale: f32) -> [[u8; 16]; 4] {
     split_exp_tables(scale, 65535.0)
+}
+
+/// One 16-element row with the arithmetic of the 16-row NEON kernel
+/// (`softmax_i8_neon::rows16`), lane for lane. On NEON tiers every 16-element row takes this
+/// result, alone or in a group of sixteen, so the op and the fused kernels that call
+/// [`SoftmaxI8Plan::row`] agree. Each `exp` is the exact product `A·B` of the
+/// [`exp16_tables`] entries (1.0 is 65535²); the sum adds each product shifted right by 4 with
+/// rounding; the output is `e / (16·sum·out_scale)` rounded half away from zero, saturated to
+/// `0..=255`, less 128 (the plan's output zero point).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(super) fn softmax_row16_split(
+    exp16: &[[u8; 16]; 4],
+    out_scale: f32,
+    src: &[i8],
+    dst: &mut [i8],
+) {
+    let max = src.iter().copied().max().unwrap_or(i8::MIN);
+    let entry = |lo: &[u8; 16], hi: &[u8; 16], i: usize| u32::from(lo[i]) | u32::from(hi[i]) << 8;
+    let mut e = [0u32; 16];
+    let mut sum = 0u32;
+    for (e, &x) in e.iter_mut().zip(src) {
+        let d = usize::from((i16::from(max) - i16::from(x)) as u8);
+        *e = entry(&exp16[0], &exp16[1], d >> 4) * entry(&exp16[2], &exp16[3], d & 15);
+        sum += ((u64::from(*e) + 8) >> 4) as u32;
+    }
+    let c = 1.0f32 / (sum as f32 * (16.0 * out_scale));
+    for (d, &e) in dst.iter_mut().zip(&e) {
+        let q = (e as f32 * c).round() as i32;
+        *d = (q.clamp(0, 255) - 128) as i8;
+    }
 }
 
 /// `exp(scale·d)` for `d = 16·hi + lo` (`hi`, `lo` below 16) as `A[hi]` and `B[lo]`, each

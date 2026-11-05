@@ -110,7 +110,7 @@ Reproduces TFLite's default int8 kernel, `optimized_ops::Softmax<int8_t, int8_t>
 - Table: `table[255 − v] = expf(−input_scale · beta · v)` for `v` in 0..=255, built in `new`.
 - Per row: `max = max(x)`; `sum = Σ table[255 − max + x]` in f32; `inv = 1 / (sum · output_scale)`; `q = round(table[255 − max + x] · inv) + output_zp` (half away from zero), clamped to [−128, 127]. The index spans exactly 0..=255.
 - The output quantization must be scale 1/256 (±0.1%) and zero point −128, as TFLite's Prepare enforces; anything else is `Unsupported`. The input zero point is unused (softmax is shift-invariant).
-- The scalar tier sums in element order, as TFLite does, and is bit-exact where `f32::exp` is glibc's `expf` (the Linux targets the fixtures come from; another libm can move a table entry by an ulp). The NEON kernel sums in four interleaved lanes and builds a per-row 256-entry output table mapped with `tbl`/`tbx`; reordering the sum can move a value on a rounding boundary, so NEON is within ±1 LSB. Rows of exactly 16 elements, sixteen at a time, take their exponentials as exact products of two 16-entry 16-bit fixed-point tables and sum them in integers; they are within ±1 LSB of the scalar tier too, without bias. Strided rows longer than `ops::rows::STAGE` take the portable kernel.
+- The scalar tier sums in element order, as TFLite does, and is bit-exact where `f32::exp` is glibc's `expf` (the Linux targets the fixtures come from; another libm can move a table entry by an ulp). The NEON kernel sums in four interleaved lanes and builds a per-row 256-entry output table mapped with `tbl`/`tbx`; reordering the sum can move a value on a rounding boundary, so NEON is within ±1 LSB. Rows of exactly 16 elements take their exponentials as exact products of two 16-entry 16-bit fixed-point tables and sum them in integers, sixteen rows at a time where they come in groups and one at a time otherwise, with the same arithmetic, so the op and the fused attention agree on them; they are within ±1 LSB of the scalar tier too, without bias. Strided rows longer than `ops::rows::STAGE` take the portable kernel.
 
 ### `softmax_i16` (TFLite int16 `SOFTMAX`)
 
@@ -161,12 +161,13 @@ Bit for bit with the TFLite kernels the plan's `TfliteKernels` names, on every t
 - `ADD` and `SUB`: both inputs shifted left by 20 and rescaled by `s/(2·max(sx, sy))`, then the sum or difference rescaled by `2·max(sx, sy)/(2^20·so)`.
 - Under `TfliteKernels::NeonRuy` (every aarch64 build, and x86 builds with SSE4.1 through `NEON_2_SSE`), whole 16-element blocks take TFLite's NEON arithmetic (`MUL` saturates the rescaled product to int16 before adding `zo`; `ADD` applies the shifts as one exact shift before a single `vqrdmulh` and keeps the low 16 bits) and the last `n % 16` elements its scalar code. `SUB` always runs the scalar code, as do the reference kernels.
 - `table_for_rhs(rhs, len)` is the 256-entry table of `x op rhs` for a call of `len` elements, or `None` when that call's NEON blocks and scalar tail would disagree for this `rhs`.
+- Output multipliers that need a left shift beyond 30 (`sx·sy/so` of 2³⁰ or more) are refused (`Unsupported`): TFLite's shift overflows there and its NEON and scalar code disagree.
 
 ### `matmul_i8` (TFLite int8 `BATCH_MATMUL` and 1×1 `CONV_2D`)
 
 - Accumulation is exact in i32: `Σ (l − zl)(r − zr) = Σ l·r − zr·Σ l − zl·Σ r + K·zl·zr`, so every tier and pool gives the same bytes.
 - Requantization as TFLite: ruy's single rounding under `NeonRuy` and `Ruy` (multipliers below 0.5 only; ruy's NEON kernels truncate above), `MultiplyByQuantizedMultiplier` under `NeonGemmlowp` (gemmlowp rounds as the reference kernels) and `Reference`; per-column multipliers and an optional bias for `CONV_2D`; the fused activation clamp.
-- The reduction axis is at most 4096 (`check_depth`). The NEON kernel computes 4×4 tiles with `sdot` on dotprod CPUs and `smull`/`sadalp` otherwise; operands not contiguous along the reduction axis are packed four rows at a time.
+- The reduction axis is at most 4096 (`check_depth`). An empty reduction (`K = 0`) writes each column's requantized bias on every tier. The NEON kernel computes 4×4 tiles with `sdot` on dotprod CPUs and `smull`/`sadalp` otherwise; operands not contiguous along the reduction axis are packed four rows at a time.
 
 ### `attention_i8` (fused `[MUL] → BATCH_MATMUL → SOFTMAX → BATCH_MATMUL`)
 
@@ -179,7 +180,7 @@ Reproduces the four TFLite int8 ops in one kernel, bit for bit except that the i
 
 ### `softmax_dot_i8` (YOLO DFL softmax and projection)
 
-The softmax over each side's bins and the 1×1 projection onto the bin indices, without TFLite's 8-bit probabilities between them: the expectation comes from the exponentials and is requantized once, so it sits closer to the float model than TFLite's two-op chain, within a few LSB of it. The scalar tier takes the exponentials from the int8 softmax's f32 table and sums in f32; the NEON kernel (rows of 16) takes them as 12-bit fixed-point products of two 16-entry tables and sums exactly in integers, within ±1 LSB of the scalar tier.
+The softmax over each side's bins and the 1×1 projection onto the bin indices, without TFLite's 8-bit probabilities between them: the expectation comes from the exponentials and is requantized once, so it sits closer to the float model than TFLite's two-op chain, within a few LSB of it. The scalar tier takes the exponentials from the int8 softmax's f32 table and sums in f32; the NEON kernel (rows of 16) takes them as 12-bit fixed-point products of two 16-entry tables and sums exactly in integers, within ±1 LSB of the scalar tier. A plan whose weight spread and requantization could carry the 12-bit rounding past one output step (a bound computed when the plan is built) runs the scalar tier instead; YOLO DFL heads are well inside it.
 
 ## C and Python surfaces
 

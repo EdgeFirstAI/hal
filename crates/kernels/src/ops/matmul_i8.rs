@@ -425,9 +425,16 @@ impl MatMulI8Plan {
         let dst = OutPtr(out.data_mut().as_mut_ptr());
         let row_blocks = s.m.div_ceil(TILE);
         let tasks = s.batches() * row_blocks;
+        // An empty reduction reads nothing: its outputs are the requantized biases, which the
+        // portable rows write without touching either operand.
+        let kernel = if s.k == 0 {
+            Kernel::Portable
+        } else {
+            self.kernel
+        };
         // A narrow right-hand side over rows contiguous along K: one call per batch's run of
         // row blocks, which packs the columns once.
-        let narrow = s.n < TILE && s.strides().0 .1 == 1 && self.kernel != Kernel::Portable;
+        let narrow = s.n < TILE && s.strides().0 .1 == 1 && kernel != Kernel::Portable;
         for_each_block(tasks, pool, &|range| {
             #[cfg(target_arch = "aarch64")]
             let mut panels = super::matmul_i8_neon::Panels::new();
@@ -442,7 +449,7 @@ impl MatMulI8Plan {
                     // only when `sdot` is usable; `n < TILE`, the lhs is contiguous along K, and
                     // output rows of different tasks are disjoint.
                     unsafe {
-                        if self.kernel == Kernel::NeonDotprod {
+                        if kernel == Kernel::NeonDotprod {
                             super::matmul_i8_neon::narrow::<true>(
                                 self,
                                 &s,
@@ -475,7 +482,7 @@ impl MatMulI8Plan {
             for t in range {
                 let (b, rb) = (t / row_blocks, t % row_blocks);
                 let rows = rb * TILE..(rb * TILE + TILE).min(s.m);
-                match self.kernel {
+                match kernel {
                     Kernel::Portable => portable_rows(self, &s, l, r, dst, b, rows),
                     #[cfg(target_arch = "aarch64")]
                     // SAFETY: NEON is part of the aarch64 baseline; output rows of different
@@ -769,6 +776,38 @@ mod tests {
                         assert_eq!(out[bi * m * n + j * m + i], want[bi * m * n + i * n + j]);
                     }
                 }
+            }
+        }
+    }
+
+    /// `K = 0`: every output is its column's requantized bias, on every tier and whatever
+    /// the operands' strides.
+    #[test]
+    fn empty_reductions_write_the_requantized_bias() {
+        for n in [1usize, 3, 40] {
+            let mut p = MatMulI8Params::tflite_batch_matmul(
+                Quant::new(0.05, 3),
+                Quant::new(0.02, -4),
+                Quant::new(0.07, 5),
+                TfliteKernels::NeonRuy,
+            )
+            .unwrap();
+            p.requant = (0..n)
+                .map(|j| Requant::from_real(0.001 + j as f64 * 0.0003).unwrap())
+                .collect();
+            p.bias = (0..n).map(|j| j as i32 * 1000 - 3000).collect();
+            let want = naive(&p, &[], &[], 2, 0, n, false, false);
+            for f in tiers() {
+                let plan = MatMulI8Plan::with_features(p.clone(), f).unwrap();
+                let mut out = vec![0x55i8; 2 * n];
+                plan.run(
+                    TensorRef::I8(View::strided(&[], &[2, 0], &[10, 1]).unwrap()),
+                    TensorRef::I8(View::contiguous(&[], &[0, n]).unwrap()),
+                    TensorMut::I8(ViewMut::contiguous(&mut out, &[2, n]).unwrap()),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(out, want, "n {n} {:?}", plan.tier());
             }
         }
     }

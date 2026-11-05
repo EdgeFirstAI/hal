@@ -179,6 +179,13 @@ impl Arith {
                 };
             }
         }
+        // TFLite's left shift by `out_shift` overflows past 30 and its NEON and scalar kernels
+        // then disagree, so such multipliers are refused.
+        if a.out_shift > 30 {
+            return Err(KernelError::Unsupported(Cow::Borrowed(
+                "binary_i8 output multiplier needs a left shift beyond 30",
+            )));
+        }
         Ok(a)
     }
 
@@ -295,6 +302,9 @@ impl Arith {
 ///   apply the left shift and each input's right shift as one exact shift before a single
 ///   `vqrdmulh`, and keep the low 16 bits before adding `zo`; `SUB` always runs the scalar code.
 /// - The fused activation clamps as `CalculateActivationRangeQuantized`.
+/// - An output multiplier that needs a left shift beyond 30 (`sx·sy/so` of 2³⁰ or more) is
+///   refused (`Unsupported`): TFLite's shift overflows there and its NEON and scalar code
+///   disagree.
 ///
 /// Under `TfliteKernels::NeonRuy` and `NeonGemmlowp`, flat elements in whole 16-element blocks take TFLite's NEON
 /// arithmetic and the last `n % 16` its scalar code, as TFLite's loops do for an elementwise
@@ -596,5 +606,20 @@ mod tests {
         assert!(matches!(Arith::new(&p), Err(KernelError::Unsupported(_))));
         p.op = BinaryOp::Sub;
         assert!(Arith::new(&p).is_ok());
+    }
+
+    /// Left shifts up to 30 are TFLite's defined range; beyond it the plan is refused.
+    #[test]
+    fn rejects_output_shifts_beyond_30() {
+        let mut p = params(BinaryOp::Mul, TfliteKernels::NeonRuy);
+        p.lhs = Quant::new(65536.0, 0);
+        p.rhs = Quant::new(65536.0, 0);
+        p.output = Quant::new(1.0, 0);
+        assert!(matches!(Arith::new(&p), Err(KernelError::Unsupported(_))));
+        // 2³⁰ is 0.5·2³¹, a shift of 31; 1.5·2²⁹ is 0.75·2³⁰, a shift of 30.
+        p.rhs = Quant::new(16384.0, 0);
+        assert!(matches!(Arith::new(&p), Err(KernelError::Unsupported(_))));
+        p.rhs = Quant::new(8192.0 * 1.5, 0);
+        assert_eq!(Arith::new(&p).unwrap().out_shift, 30);
     }
 }

@@ -408,7 +408,8 @@ impl SplitExp {
 /// from the split tables of [`super::softmax_i8::exp16_tables`] as an exact `A·B` product
 /// (1.0 is 65535²), and the quantized outputs transposed back. Each `exp` is within about
 /// 2⁻¹⁶ of the float table's and the products are rounded, not truncated, so outputs stay
-/// within ±1 LSB of the row kernel without bias.
+/// within ±1 LSB of the float-table row kernel without bias. Each lane computes exactly what
+/// [`super::softmax_i8::softmax_row16_split`] computes for its row.
 ///
 /// Does nothing unless the group is 16 rows of 16.
 ///
@@ -649,5 +650,42 @@ mod tests {
             signed.unsigned_abs() as usize * 4 <= off.max(8),
             "biased: net {signed} of {off}"
         );
+    }
+
+    /// The 16-row kernel gives each row exactly what the plan's single-row path gives it, so a
+    /// 16-element row's result does not depend on whether it was grouped.
+    #[test]
+    fn row_groups_equal_single_rows() {
+        use super::super::softmax_i8::{SoftmaxI8Params, SoftmaxI8Plan};
+        use crate::quant::Quant;
+        use crate::view::{TensorMut, TensorRef, View, ViewMut};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x16_0016);
+        for &scale in &[0.0125f32, 0.05, 0.0947, 0.128, 0.5, 2.0] {
+            let plan = SoftmaxI8Plan::new(SoftmaxI8Params {
+                input: Quant::new(scale, 0),
+                output: Quant::new(1.0 / 256.0, -128),
+                beta: 1.0,
+            })
+            .unwrap();
+            let rows = 16 * 8;
+            for span in [1i32, 16, 64, 256] {
+                let base = rng.random_range(-128..=(128 - span));
+                let src: Vec<i8> = (0..rows * 16)
+                    .map(|_| (base + rng.random_range(0..span)) as i8)
+                    .collect();
+                let mut grouped = vec![0x55i8; rows * 16];
+                plan.run(
+                    TensorRef::I8(View::contiguous(&src, &[rows, 16]).unwrap()),
+                    TensorMut::I8(ViewMut::contiguous(&mut grouped, &[rows, 16]).unwrap()),
+                    None,
+                )
+                .unwrap();
+                let mut single = vec![0x55i8; rows * 16];
+                for (s, d) in src.chunks_exact(16).zip(single.chunks_exact_mut(16)) {
+                    plan.row(s, d);
+                }
+                assert_eq!(grouped, single, "scale {scale} span {span}");
+            }
+        }
     }
 }

@@ -54,7 +54,9 @@ enum Kernel {
 ///
 /// The scalar tier takes the exponentials from TFLite's f32 softmax table and sums in f32. The
 /// NEON kernel (rows of 16) takes them as 12-bit fixed-point products of two 16-entry tables
-/// and sums them exactly in integers; it agrees with the scalar tier within ±1 LSB.
+/// and sums them exactly in integers; it agrees with the scalar tier within ±1 LSB. Plans
+/// whose weight spread and requantization could carry the 12-bit rounding past one output
+/// step run the scalar tier instead, as [`SoftmaxDotI8Plan::tier`] reports.
 ///
 /// ```
 /// use edgefirst_kernels::{
@@ -110,6 +112,28 @@ fn exp12_tables(scale: f32) -> [[u8; 16]; 4] {
     split_exp_tables(scale, EXP12_ONE)
 }
 
+/// The largest error of one 12-bit exponential, in its units (4095 is 1): each table entry
+/// is within 0.5 of `EXP12_ONE` times its factor, which moves `2·A·B / 2¹⁶` by at most
+/// `2·(EXP12_ONE + 0.25) / 2¹⁶`, and the product rounds by up to 0.5.
+const EXP12_ERROR: f64 = 2.0 * (EXP12_ONE + 0.25) / 65536.0 + 0.5;
+
+/// Whether the 12-bit exponentials keep a result within ±1 LSB of the f32 ones for these
+/// weights (less their zero point) and this projection. A row's maximum contributes 4095 to
+/// its sum, so the expectation moves by at most `n·EXP12_ERROR·(max w − min w) / 4095`. Both
+/// paths round it to the accumulator (up to one unit apart besides), and the requantization,
+/// monotone, stays within one output step while that gap times its multiplier, plus the
+/// rounding of a double-rounding right shift, stays below 1.
+fn exp12_within_one_lsb(weights: &[i16], unit: f32, requant: Requant) -> bool {
+    let (lo, hi) = weights
+        .iter()
+        .fold((i16::MAX, i16::MIN), |(lo, hi), &w| (lo.min(w), hi.max(w)));
+    let spread = f64::from(i32::from(hi) - i32::from(lo));
+    let expectation = weights.len() as f64 * EXP12_ERROR * spread / 4095.0;
+    let gap = expectation * f64::from(unit) + 1.0;
+    let real = f64::from(requant.multiplier) * 2f64.powi(requant.shift - 31);
+    gap * real + 2f64.powi(requant.shift.min(0)) < 1.0
+}
+
 impl SoftmaxDotI8Plan {
     /// Builds a plan for the CPU this process runs on, honouring `EDGEFIRST_KERNELS_FORCE_TIER`.
     pub fn new(p: SoftmaxDotI8Params) -> Result<Self> {
@@ -139,19 +163,27 @@ impl SoftmaxDotI8Plan {
         }
         let softmax = SoftmaxI8Plan::with_features(p.softmax, CpuFeatures::default())?;
         let zr = p.projection.rhs_zero_point;
+        let requant = p.projection.requant[0];
         let projection = MatMulI8Plan::with_features(p.projection, CpuFeatures::default())?;
         let scale = -p.softmax.input.scale * p.softmax.beta;
+        let unit = 1.0 / p.softmax.output.scale;
+        let weights: Vec<i16> = p
+            .weights
+            .iter()
+            .map(|&w| (i32::from(w) - zr) as i16)
+            .collect();
+        let kernel = if exp12_within_one_lsb(&weights, unit, requant) {
+            select_kernel(f)
+        } else {
+            Kernel::Portable
+        };
         Ok(Self {
             table: softmax.table,
-            unit: 1.0 / p.softmax.output.scale,
+            unit,
             projection,
             exp12: exp12_tables(scale),
-            weights: p
-                .weights
-                .iter()
-                .map(|&w| (i32::from(w) - zr) as i16)
-                .collect(),
-            kernel: select_kernel(f),
+            weights,
+            kernel,
         })
     }
 
@@ -429,6 +461,59 @@ pub(super) mod tests {
             err_fused < err_pair,
             "fused {err_fused:.0} vs pair {err_pair:.0} from float"
         );
+    }
+
+    /// A projection that magnifies one probability step: weights 0 and 127, multiplier ¼.
+    fn magnifying_params() -> SoftmaxDotI8Params {
+        let mut weights = vec![127i8; 16];
+        weights[0] = 0;
+        let mut p = params(0.3, weights);
+        p.projection.rhs_zero_point = 0;
+        p.projection.output = Quant::new(1.0, 0);
+        p.projection.requant = vec![Requant {
+            multiplier: 1 << 30,
+            shift: -1,
+        }];
+        p
+    }
+
+    #[test]
+    fn the_12_bit_kernel_runs_only_within_its_error_bound() {
+        let dfl = params(0.0947, dfl_weights());
+        let dfl_w: Vec<i16> = dfl.weights.iter().map(|&w| i16::from(w)).collect();
+        assert!(exp12_within_one_lsb(
+            &dfl_w,
+            256.0,
+            dfl.projection.requant[0]
+        ));
+        let wide = magnifying_params();
+        let wide_w: Vec<i16> = wide.weights.iter().map(|&w| i16::from(w)).collect();
+        assert!(!exp12_within_one_lsb(
+            &wide_w,
+            256.0,
+            wide.projection.requant[0]
+        ));
+        // A row whose small probabilities the 12-bit exponentials round away.
+        let mut row = [-31i8; 16];
+        row[0] = 0;
+        let scalar = SoftmaxDotI8Plan::with_features(wide.clone(), CpuFeatures::default()).unwrap();
+        let want = scalar.row(&row);
+        assert_eq!(want, 11);
+        if let Ok(f) = CpuFeatures::from_forced_tier(Some("neon")) {
+            let plan = SoftmaxDotI8Plan::with_features(wide, f).unwrap();
+            assert_eq!(plan.tier(), Tier::Scalar);
+            let x = row.repeat(16);
+            let mut out = [0i8; 16];
+            plan.run(
+                TensorRef::I8(View::contiguous(&x, &[16, 16]).unwrap()),
+                TensorMut::I8(ViewMut::contiguous(&mut out, &[16, 1]).unwrap()),
+                None,
+            )
+            .unwrap();
+            assert_eq!(out, [want; 16]);
+            let dfl_plan = SoftmaxDotI8Plan::with_features(dfl, f).unwrap();
+            assert_eq!(dfl_plan.tier(), Tier::Neon);
+        }
     }
 
     #[test]

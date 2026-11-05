@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Faster NEON int8 softmax and 8-bit lookup tables.** `SoftmaxI8Plan` runs 16-element rows sixteen at a time and builds only the needed part of each row's output table; `LutI8Plan` handles windowed tables and transposed views by tiles. Results are unchanged.
+- **Faster NEON int8 softmax and 8-bit lookup tables.** `SoftmaxI8Plan` runs 16-element rows sixteen at a time and builds only the needed part of each row's output table; `LutI8Plan` handles windowed tables and transposed views by tiles. Results stay within the NEON tier's ±1 LSB; `LutI8Plan` results are unchanged.
 
 ## [0.39.0] - 2026-11-03
 

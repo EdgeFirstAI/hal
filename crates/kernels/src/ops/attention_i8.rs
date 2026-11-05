@@ -998,6 +998,43 @@ mod tests {
         }
     }
 
+    /// Sixteen tokens: the chain's softmax runs its rows in groups of sixteen, the fused
+    /// kernels one row at a time, and both take the same 16-element arithmetic.
+    #[test]
+    fn sixteen_tokens_equal_the_tflite_chain() {
+        let (p, _) = params();
+        for (sh, seed) in [
+            (
+                Shape {
+                    h: 3,
+                    n: 16,
+                    dk: 32,
+                    dv: 64,
+                },
+                3,
+            ),
+            (
+                Shape {
+                    h: 1,
+                    n: 16,
+                    dk: 8,
+                    dv: 16,
+                },
+                5,
+            ),
+        ] {
+            let x = input(sh, seed);
+            for f in tiers() {
+                assert_eq!(
+                    run_attention(sh, p, f, &x),
+                    run_chain(sh, p, f, &x),
+                    "{sh:?} {:?}",
+                    f.tier()
+                );
+            }
+        }
+    }
+
     /// Every query aligned with the `hot` tokens' keys and opposed to the others', so the
     /// scores saturate and the probability splits evenly over the hot tokens; every other value
     /// dim at 127, so a sum of probabilities past 257 overflows 16 bits.
