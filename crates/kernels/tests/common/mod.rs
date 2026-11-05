@@ -76,6 +76,103 @@ pub fn load(name: &str) -> Fixture {
     }
 }
 
+/// A multi-tensor TFLite reference case: named tensors with their shapes, and string metadata.
+pub struct Graph {
+    pub name: String,
+    meta: std::collections::HashMap<String, String>,
+    tensors: std::collections::HashMap<String, (Vec<usize>, Vec<u8>)>,
+}
+
+impl Graph {
+    /// A metadata entry.
+    pub fn meta(&self, key: &str) -> &str {
+        self.meta
+            .get(key)
+            .unwrap_or_else(|| panic!("{}: missing metadata `{key}`", self.name))
+    }
+
+    /// The `<role>_scale` and `<role>_zero_point` metadata.
+    pub fn quant(&self, role: &str) -> Quant {
+        let scale = self.meta(&format!("{role}_scale"));
+        let zp = self.meta(&format!("{role}_zero_point"));
+        Quant::new(
+            scale
+                .parse()
+                .unwrap_or_else(|_| panic!("{}: bad {role} scale", self.name)),
+            zp.parse()
+                .unwrap_or_else(|_| panic!("{}: bad {role} zero point", self.name)),
+        )
+    }
+
+    /// A metadata entry holding a JSON list of numbers.
+    pub fn f32_list(&self, key: &str) -> Vec<f32> {
+        self.meta(key)
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(',')
+            .map(|v| {
+                v.trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{}: bad `{key}`", self.name))
+            })
+            .collect()
+    }
+
+    pub fn shape(&self, key: &str) -> &[usize] {
+        &self.raw(key).0
+    }
+
+    pub fn i8(&self, key: &str) -> Vec<i8> {
+        self.raw(key).1.iter().map(|&b| b as i8).collect()
+    }
+
+    pub fn i32(&self, key: &str) -> Vec<i32> {
+        self.raw(key)
+            .1
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn raw(&self, key: &str) -> &(Vec<usize>, Vec<u8>) {
+        self.tensors
+            .get(key)
+            .unwrap_or_else(|| panic!("{}: missing tensor `{key}`", self.name))
+    }
+}
+
+/// Loads `testdata/kernels/<name>.safetensors` with every tensor and metadata entry.
+pub fn load_graph(name: &str) -> Graph {
+    let path = edgefirst_bench::testdata::path(format!("kernels/{name}.safetensors"));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let (_, header) = safetensors::SafeTensors::read_metadata(&bytes)
+        .unwrap_or_else(|e| panic!("metadata {name}: {e}"));
+    let meta = header
+        .metadata()
+        .clone()
+        .unwrap_or_else(|| panic!("{name}: no metadata"));
+    let st = safetensors::SafeTensors::deserialize(&bytes)
+        .unwrap_or_else(|e| panic!("deserialize {name}: {e}"));
+    let tensors = st
+        .tensors()
+        .into_iter()
+        .map(|(k, v)| (k, (v.shape().to_vec(), v.data().to_vec())))
+        .collect();
+    Graph {
+        name: name.to_string(),
+        meta: meta.into_iter().collect(),
+        tensors,
+    }
+}
+
+/// Elements of `a` and `b` that differ, and the largest difference.
+pub fn diff_i8(a: &[i8], b: &[i8]) -> (usize, i32) {
+    assert_eq!(a.len(), b.len(), "lengths differ");
+    a.iter().zip(b).fold((0, 0), |(n, worst), (&x, &y)| {
+        let d = (i32::from(x) - i32::from(y)).abs();
+        (n + usize::from(d != 0), worst.max(d))
+    })
+}
+
 /// Scalar plus every NEON tier the probed CPU supports.
 pub fn tiers() -> Vec<CpuFeatures> {
     ["scalar", "neon", "neon_fp16", "neon_dotprod"]

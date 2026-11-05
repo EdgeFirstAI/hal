@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **int8 TFLite operator plans (`edgefirst-kernels`).** `BinaryI8Plan` (`ADD`, `SUB`, `MUL`), `MatMulI8Plan` (`BATCH_MATMUL`, 1×1 `CONV_2D`) and `AttentionI8Plan` (fused `MUL → BATCH_MATMUL → SOFTMAX → BATCH_MATMUL`, with a caller-owned `AttentionScratch`) reproduce TFLite's int8 kernels; `SoftmaxDotI8Plan` fuses a YOLO DFL softmax with its projection. NEON kernels on every tier, with `sdot` on dotprod CPUs.
+- **`TfliteKernels` and `Activation`.** Which TFLite kernels a plan reproduces (`NeonRuy`, `NeonGemmlowp`, `Ruy`, `Reference`), and a fused TFLite activation.
+- **C and Python bindings for the new plans.** `ef_binary_i8_plan_*`, `ef_matmul_i8_plan_*`, `ef_softmax_dot_i8_plan_*`, `ef_attention_i8_plan_*` and `ef_attention_scratch_*`, and the matching `edgefirst.kernels` classes.
+
+### Changed
+
+- **Faster NEON int8 softmax and 8-bit lookup tables.** `SoftmaxI8Plan` runs 16-element rows sixteen at a time and builds only the needed part of each row's output table; `LutI8Plan` handles windowed tables and transposed views by tiles. Results stay within the NEON tier's ±1 LSB; `LutI8Plan` results are unchanged.
+
 ## [0.39.0] - 2026-11-03
 
 ### Added

@@ -6,7 +6,7 @@
 
 **Quantized and floating-point CPU kernels for edge AI inference.**
 
-Softmax, sigmoid, 8-bit lookup tables and YOLO box decode (DFL, dist2bbox) over caller-owned slices, with NEON kernels selected at runtime on aarch64 and portable scalar kernels everywhere else. The int8 and int16 softmax and logistic reproduce TFLite's kernels, so a delegate can run them in place of the stock CPU ops.
+Softmax, sigmoid, 8-bit lookup tables, int8 elementwise and matrix products, fused attention and YOLO box decode (DFL, dist2bbox) over caller-owned slices, with NEON kernels selected at runtime on aarch64 and portable scalar kernels everywhere else. The int8 and int16 softmax and logistic, the int8 `ADD`/`SUB`/`MUL`, `BATCH_MATMUL`, 1×1 `CONV_2D` and the fused attention block reproduce TFLite's kernels, so a delegate can run them in place of the stock CPU ops.
 
 ## Role in edgefirst-hal
 
@@ -23,10 +23,14 @@ Softmax, sigmoid, 8-bit lookup tables and YOLO box decode (DFL, dist2bbox) over 
 | `DflPlan` | `[anchors, 4·reg_max]` logits to `[anchors, 4]` distances | `f32` outputs of integer inputs as the decoder; `f16` outputs within 1 f16 ulp on FP16 CPUs (2 at `reg_max` 64; ulps of max(value, `reg_max` − 1)), the `f32` result rounded once elsewhere and for 8-bit inputs; integer outputs one rounding, ±1 LSB |
 | `Dist2BboxPlan` | distances to boxes over a multi-level anchor axis | `f32` outputs of integer inputs as the decoder; `f16` outputs the `f32` result rounded once on every tier; integer outputs one rounding, ±1 LSB |
 | `DflBoxPlan` | fused DFL and dist2bbox | `f32` outputs of integer inputs as the decoder; `f16` boxes native FP16 on FP16 CPUs for every input, within 1 f16 ulp (3 at `reg_max` 64), the `f32` boxes rounded once elsewhere; integer outputs one rounding, ±1 LSB |
+| `BinaryI8Plan` | int8 `ADD`, `SUB`, `MUL` (broadcast inputs as zero-stride views) | TFLite bit for bit, for the optimized (with or without NEON blocks) or reference kernels (`TfliteKernels`) |
+| `MatMulI8Plan` | int8 matrix product over the last two axes (`BATCH_MATMUL`, 1×1 `CONV_2D`) | exact accumulation; TFLite's ruy or reference requantization, bit for bit |
+| `SoftmaxDotI8Plan` | YOLO DFL softmax fused with its projection | the expectation requantized once: within a few LSB of TFLite's two-op chain, closer to the float model |
+| `AttentionI8Plan` | fused `[MUL] → BATCH_MATMUL → SOFTMAX → BATCH_MATMUL` per head, with a caller-owned `AttentionScratch` | TFLite bit for bit except the int8 softmax rows on NEON, within ±1 LSB |
 
 The `convert` module adds the per-tensor dequantization (`dequant_*_to_f32` / `_to_f16`) and NCHW→NHWC transpose slice kernels the decoder uses.
 
-Every plan validates its parameters in `new` (returning `KernelError::Unsupported` for a valid configuration it does not handle, so `new` doubles as a capability check), then `run`s any number of times, concurrently, without allocating. Views take any non-negative element strides, so transposed and sliced tensors need no copy. Work can be split across a caller-supplied `Pool`; by default it runs on the calling thread.
+Every plan validates its parameters in `new` (returning `KernelError::Unsupported` for a valid configuration it does not handle, so `new` doubles as a capability check), then `run`s any number of times, concurrently, without allocating (attention packs into a scratch the caller builds once with `AttentionI8Plan::scratch`, one per concurrent call). Views take any non-negative element strides, so transposed and sliced tensors need no copy. Work can be split across a caller-supplied `Pool`; by default it runs on the calling thread.
 
 ## Quick Start
 

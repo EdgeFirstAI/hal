@@ -541,7 +541,6 @@ where
         return Ok(());
     }
     let shape = input.shape();
-    let in_strides = input.strides();
     let mut out_strides = [0isize; MAX_RANK];
     for (d, &s) in out_strides.iter_mut().zip(output.strides()) {
         *d = s;
@@ -549,7 +548,6 @@ where
     let out_strides = out_strides.get(..shape.len()).unwrap_or(&[]);
     let src_dense = input.as_contiguous();
     let out_dense = output.as_contiguous_mut().is_some();
-    let src = input.data();
     let data = output.data_mut();
     let cap = data.len();
     let out = RowsPtr(data.as_mut_ptr());
@@ -561,43 +559,823 @@ where
                 return;
             }
             let len = CHUNK.min(n - lo);
-            let mut in_store;
-            let chunk_in: &[I] = match src_dense {
-                Some(s) => s.get(lo..lo + len).unwrap_or(&[]),
-                None => {
-                    in_store = [I::default(); CHUNK];
-                    let mut at = Offsets::new(shape, in_strides, lo);
-                    for b in in_store.iter_mut().take(len) {
-                        *b = src.get(at.step()).copied().unwrap_or_default();
-                    }
-                    in_store.get(..len).unwrap_or(&[])
-                }
-            };
+            let mut in_store = [I::default(); CHUNK];
+            let chunk_in = gather_chunk(src_dense, input, &mut in_store, lo, len);
             if chunk_in.len() != len {
                 return;
             }
-            if out_dense {
-                if lo + len > cap {
+            write_chunk(out, cap, out_dense, shape, out_strides, lo, len, |dst| {
+                chunk(chunk_in, dst);
+            });
+        }
+    });
+    Ok(())
+}
+
+/// For kernels whose result for an element does not depend on its position: when some axis
+/// has unit stride in both views, calls `chunk(input run, output run)` on every run along it
+/// (the longest such axis); runs may go concurrently on `pool`.
+///
+/// Returns `None`, touching nothing, when no axis is contiguous in both views.
+pub(crate) fn for_each_unit_run<T>(
+    input: &View<'_, T>,
+    output: &mut ViewMut<'_, T>,
+    pool: Option<&dyn Pool>,
+    chunk: &(dyn Fn(&[T], &mut [T]) + Sync),
+) -> Option<Result<()>>
+where
+    T: Copy + Send + Sync,
+{
+    if input.shape() != output.shape() {
+        return None;
+    }
+    let shape = input.shape();
+    let (is, os) = (input.strides(), output.strides());
+    let rank = shape.len();
+    let axis = (0..rank)
+        .filter(|&a| is[a] == 1 && os[a] == 1)
+        .max_by_key(|&a| shape[a])?;
+    if let Err(e) = check_no_overlap(shape, os) {
+        return Some(Err(e));
+    }
+    let len = shape[axis];
+    let mut others = [(1usize, 0usize, 0usize); MAX_RANK];
+    let mut n_others = 0;
+    for a in (0..rank).filter(|&a| a != axis) {
+        if let Some(o) = others.get_mut(n_others) {
+            *o = (shape[a], is[a].unsigned_abs(), os[a].unsigned_abs());
+        }
+        n_others += 1;
+    }
+    let others = others.get(..n_others).unwrap_or(&[]);
+    let runs: usize = others.iter().map(|o| o.0).product();
+    if len == 0 || runs == 0 {
+        return Some(Ok(()));
+    }
+    let src = input.data();
+    let data = output.data_mut();
+    let cap = data.len();
+    let out = RowsPtr(data.as_mut_ptr());
+    let axes = axes_of(others);
+    let axes = axes.get(..others.len()).unwrap_or(&[]);
+    for_each_block(runs, pool, &|r: Range<usize>| {
+        for (bi, bo, _) in outer_items(r, axes, 1) {
+            let Some(s) = src.get(bi..bi + len) else {
+                return;
+            };
+            if bo + len > cap {
+                return;
+            }
+            // SAFETY: the run lies in the output view (checked above), runs of different
+            // indices are disjoint (the output does not overlap itself), and only this task
+            // writes run `t`.
+            let d = unsafe { core::slice::from_raw_parts_mut(out.get().add(bo), len) };
+            chunk(s, d);
+        }
+    });
+    Some(Ok(()))
+}
+
+/// Rows (input-contiguous axis) per tile of [`for_each_transposed_tile`]; one NEON transpose.
+const TILE_EDGE: usize = 16;
+
+/// Columns (output-contiguous axis) per tile of [`for_each_transposed_tile`].
+const TILE_COLS: usize = 64;
+
+/// For kernels whose result for an element does not depend on its position: when the input
+/// is contiguous along one axis and the output along another (a transpose), calls
+/// `chunk(input tile, output tile)` on 16×64 tiles of those two axes, transposed from the
+/// input into a stack buffer in output order and written back as output row segments.
+///
+/// A task owns one 64-wide column block and walks every input block of it, so each source
+/// row is read once while cached and the output is written in whole 64-element runs; tasks
+/// may run concurrently on `pool`.
+///
+/// Returns `None`, touching nothing, when the views are not such a pair; the caller then takes
+/// [`for_each_chunk`].
+pub(crate) fn for_each_transposed_tile<T>(
+    input: &View<'_, T>,
+    output: &mut ViewMut<'_, T>,
+    pool: Option<&dyn Pool>,
+    chunk: &(dyn Fn(&[T], &mut [T]) + Sync),
+) -> Option<Result<()>>
+where
+    T: Copy + Default + Send + Sync,
+{
+    if input.shape() != output.shape() {
+        return None;
+    }
+    let shape = input.shape();
+    let (is, os) = (input.strides(), output.strides());
+    let rank = shape.len();
+    let ai = (0..rank).find(|&a| shape[a] > 1 && is[a] == 1)?;
+    let ao = (0..rank).find(|&a| a != ai && shape[a] > 1 && os[a] == 1)?;
+    if let Err(e) = check_no_overlap(shape, os) {
+        return Some(Err(e));
+    }
+    // The other axes: (extent, input stride, output stride).
+    let mut others = [(1usize, 0usize, 0usize); MAX_RANK];
+    let mut n_others = 0;
+    for a in (0..rank).filter(|&a| a != ai && a != ao) {
+        if let Some(o) = others.get_mut(n_others) {
+            *o = (shape[a], is[a].unsigned_abs(), os[a].unsigned_abs());
+        }
+        n_others += 1;
+    }
+    let others = others.get(..n_others).unwrap_or(&[]);
+    let outer: usize = others.iter().map(|o| o.0).product();
+    let (ni, no) = (shape[ai], shape[ao]);
+    let (in_step, out_step) = (is[ao].unsigned_abs(), os[ai].unsigned_abs());
+    let col_blocks = no.div_ceil(TILE_COLS);
+    let axes = axes_of(others);
+    let axes = axes.get(..others.len()).unwrap_or(&[]);
+    let src = input.data();
+    let data = output.data_mut();
+    let cap = data.len();
+    let out = RowsPtr(data.as_mut_ptr());
+    for_each_block(outer * col_blocks, pool, &|r: Range<usize>| {
+        let mut tile_in = [T::default(); TILE_EDGE * TILE_COLS];
+        let mut tile_out = [T::default(); TILE_EDGE * TILE_COLS];
+        for (bi, bo, ob) in outer_items(r, axes, col_blocks) {
+            let o0 = ob * TILE_COLS;
+            let to = (no - o0).min(TILE_COLS);
+            for i0 in (0..ni).step_by(TILE_EDGE) {
+                let ti = (ni - i0).min(TILE_EDGE);
+                let first = bi + i0 + o0 * in_step;
+                if first + (to - 1) * in_step + ti > src.len() {
                     return;
                 }
-                // SAFETY: `lo..lo + len` lies in the dense output and is this chunk's alone.
-                let dst = unsafe { core::slice::from_raw_parts_mut(out.get().add(lo), len) };
-                chunk(chunk_in, dst);
-            } else {
-                let mut out_store = [O::default(); CHUNK];
-                let Some(buf) = out_store.get_mut(..len) else {
+                let n = ti * to;
+                let (Some(tin), Some(tout)) = (tile_in.get_mut(..n), tile_out.get_mut(..n)) else {
                     return;
                 };
-                chunk(chunk_in, buf);
-                let mut at = Offsets::new(shape, out_strides, lo);
-                for &v in buf.iter() {
-                    let off = at.step();
-                    if off < cap {
-                        // SAFETY: `off` addresses an element of the view that only this chunk owns.
-                        unsafe { out.get().add(off).write(v) };
+                for o in 0..to {
+                    let base = first + o * in_step;
+                    let Some(row) = src.get(base..base + ti) else {
+                        return;
+                    };
+                    for (i, &v) in row.iter().enumerate() {
+                        if let Some(b) = tin.get_mut(i * to + o) {
+                            *b = v;
+                        }
+                    }
+                }
+                chunk(tin, tout);
+                for i in 0..ti {
+                    let base = bo + (i0 + i) * out_step + o0;
+                    if base + to > cap {
+                        return;
+                    }
+                    // SAFETY: row `i0 + i`, columns `o0..o0 + to`, lies in the output view (the
+                    // check above) and only this task writes columns `o0..o0 + to` of this
+                    // outer index; the tile buffer does not alias the output.
+                    unsafe { copy_row(tout.as_ptr().add(i * to), out.get().add(base), to) };
+                }
+            }
+        }
+    });
+    Some(Ok(()))
+}
+
+/// For byte kernels that map 16-byte vectors independently of position: the transposed views
+/// of [`for_each_transposed_tile`] when both tile axes are multiples of 16, as 16×16 tiles
+/// transposed in registers with each of the 16 vectors passed through `f`; and when the input
+/// axis is two or four long, sixteen of its runs at a time deinterleaved with `ld2`/`ld4`.
+/// Axes contiguous on both sides are merged first, so a channel slice of an NHWC tensor
+/// written channel-major is one long transpose. A 16×64 strip is
+/// staged on the stack so every output row is written as one 64-byte run: with output rows far
+/// apart, short scattered stores cost more than the arithmetic. Tasks own 64-wide column
+/// blocks as there.
+///
+/// Returns `None`, touching nothing, when the views are not such a pair, the elements are not
+/// bytes, or an axis does not suit either path.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn for_each_transposed_vector<T, F>(
+    input: &View<'_, T>,
+    output: &mut ViewMut<'_, T>,
+    pool: Option<&dyn Pool>,
+    f: &F,
+) -> Option<Result<()>>
+where
+    T: Copy + Send + Sync,
+    F: Fn(core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint8x16_t + Sync,
+{
+    use core::arch::aarch64::{uint8x16_t, vdupq_n_u8, vld1q_u8, vld2q_u8, vld4q_u8, vst1q_u8};
+    if core::mem::size_of::<T>() != 1 || input.shape() != output.shape() {
+        return None;
+    }
+    // Axes of length one dropped, and neighbours that are contiguous on both sides merged.
+    let (mut shape, mut is, mut os) = ([0usize; MAX_RANK], [0isize; MAX_RANK], [0isize; MAX_RANK]);
+    let mut rank = 0;
+    for ((&d, &si), &so) in input
+        .shape()
+        .iter()
+        .zip(input.strides())
+        .zip(output.strides())
+    {
+        if d == 1 {
+            continue;
+        }
+        let w = d as isize;
+        if rank > 0 && is[rank - 1] == si * w && os[rank - 1] == so * w {
+            shape[rank - 1] *= d;
+            is[rank - 1] = si;
+            os[rank - 1] = so;
+        } else if rank < MAX_RANK {
+            (shape[rank], is[rank], os[rank]) = (d, si, so);
+            rank += 1;
+        }
+    }
+    let (shape, is, os) = (&shape[..rank], &is[..rank], &os[..rank]);
+    let ai = (0..rank).find(|&a| shape[a] > 1 && is[a] == 1)?;
+    let ao = (0..rank).find(|&a| a != ai && shape[a] > 1 && os[a] == 1)?;
+    let (ni, no) = (shape[ai], shape[ao]);
+    // Input runs of two or four bytes: sixteen of them deinterleaved by `ld2`/`ld4`.
+    let narrow = matches!(ni, 2 | 4);
+    if (!narrow && ni % TILE_EDGE != 0) || no % TILE_EDGE != 0 {
+        return None;
+    }
+    if let Err(e) = check_no_overlap(output.shape(), output.strides()) {
+        return Some(Err(e));
+    }
+    let mut others = [(1usize, 0usize, 0usize); MAX_RANK];
+    let mut n_others = 0;
+    for a in (0..rank).filter(|&a| a != ai && a != ao) {
+        if let Some(o) = others.get_mut(n_others) {
+            *o = (shape[a], is[a].unsigned_abs(), os[a].unsigned_abs());
+        }
+        n_others += 1;
+    }
+    let others = others.get(..n_others).unwrap_or(&[]);
+    let outer: usize = others.iter().map(|o| o.0).product();
+    let (in_step, out_step) = (is[ao].unsigned_abs(), os[ai].unsigned_abs());
+    let col_blocks = no.div_ceil(TILE_COLS);
+    let axes = axes_of(others);
+    let axes = axes.get(..others.len()).unwrap_or(&[]);
+    let src = input.data();
+    let data = output.data_mut();
+    let cap = data.len();
+    let out = RowsPtr(data.as_mut_ptr());
+    for_each_block(outer * col_blocks, pool, &|r: Range<usize>| {
+        for (bi, bo, ob) in outer_items(r, axes, col_blocks) {
+            let o0 = ob * TILE_COLS;
+            let to = (no - o0).min(TILE_COLS);
+            // One 16-row strip of the block, staged so each output row is written as one run.
+            let mut strip = [0u8; TILE_EDGE * TILE_COLS];
+            if narrow {
+                let first = bi + o0 * in_step;
+                let last_out = bo + (ni - 1) * out_step + o0 + to;
+                if first + (to - 1) * in_step + ni > src.len() || last_out > cap {
+                    return;
+                }
+                let s = src.as_ptr().cast::<u8>();
+                let d = out.get().cast::<u8>();
+                let sp = strip.as_mut_ptr();
+                // SAFETY: the `to` source runs hold `ni` readable bytes each and the `ni` output
+                // rows `to` writable bytes each (both checked above); `strip` holds `ni <= 16`
+                // rows of `to <= 64`; only this task writes columns `o0..o0 + to` of this outer
+                // index; `T` is one byte.
+                unsafe {
+                    for o in (0..to).step_by(TILE_EDGE) {
+                        let mut runs = [0u8; 4 * TILE_EDGE];
+                        let rp = runs.as_mut_ptr();
+                        for k in 0..TILE_EDGE {
+                            let at = s.add(first + (o + k) * in_step);
+                            if ni == 4 {
+                                rp.add(4 * k)
+                                    .cast::<u32>()
+                                    .write_unaligned(at.cast::<u32>().read_unaligned());
+                            } else {
+                                rp.add(2 * k)
+                                    .cast::<u16>()
+                                    .write_unaligned(at.cast::<u16>().read_unaligned());
+                            }
+                        }
+                        let zero = vdupq_n_u8(0);
+                        let lanes: [uint8x16_t; 4] = if ni == 4 {
+                            let v = vld4q_u8(rp);
+                            [v.0, v.1, v.2, v.3]
+                        } else {
+                            let v = vld2q_u8(rp);
+                            [v.0, v.1, zero, zero]
+                        };
+                        for (c, x) in lanes.into_iter().take(ni).enumerate() {
+                            vst1q_u8(sp.add(c * TILE_COLS + o), f(x));
+                        }
+                    }
+                    for c in 0..ni {
+                        copy_row(sp.add(c * TILE_COLS), d.add(bo + c * out_step + o0), to);
+                    }
+                }
+                continue;
+            }
+            for i0 in (0..ni).step_by(TILE_EDGE) {
+                let first = bi + i0 + o0 * in_step;
+                let last_out = bo + (i0 + TILE_EDGE - 1) * out_step + o0 + to;
+                if first + (to - 1) * in_step + TILE_EDGE > src.len() || last_out > cap {
+                    return;
+                }
+                let s = src.as_ptr().cast::<u8>();
+                let d = out.get().cast::<u8>();
+                let sp = strip.as_mut_ptr();
+                // SAFETY: the `to` source rows hold 16 readable bytes each and the 16 output rows
+                // `to` writable bytes each (both checked above); `strip` holds 16 rows of `to ≤
+                // 64`; only this task writes columns `o0..o0 + to` of this outer index; `T` is
+                // one byte.
+                unsafe {
+                    for o in (0..to).step_by(TILE_EDGE) {
+                        let rows =
+                            core::array::from_fn(|k| vld1q_u8(s.add(first + (o + k) * in_step)));
+                        let v = crate::prim::transpose::transpose16(rows);
+                        for (i, x) in v.into_iter().enumerate() {
+                            vst1q_u8(sp.add(i * TILE_COLS + o), f(x));
+                        }
+                    }
+                    for i in 0..TILE_EDGE {
+                        copy_row(
+                            sp.add(i * TILE_COLS),
+                            d.add(bo + (i0 + i) * out_step + o0),
+                            to,
+                        );
                     }
                 }
             }
+        }
+    });
+    Some(Ok(()))
+}
+
+/// Copies `n` elements; a full row of one-byte elements moves as four 16-byte registers rather
+/// than through a `memcpy` call.
+///
+/// # Safety
+/// As [`core::ptr::copy_nonoverlapping`].
+#[inline(always)]
+unsafe fn copy_row<T>(src: *const T, dst: *mut T, n: usize) {
+    #[cfg(target_arch = "aarch64")]
+    if core::mem::size_of::<T>() == 1 && n == TILE_COLS {
+        use core::arch::aarch64::{vld1q_u8_x4, vst1q_u8_x4};
+        // SAFETY: 64 bytes on each side, forwarded from the caller.
+        unsafe { vst1q_u8_x4(dst.cast(), vld1q_u8_x4(src.cast())) };
+        return;
+    }
+    // SAFETY: forwarded from the caller.
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };
+}
+
+/// Rows per group of [`for_each_row_group`].
+pub(crate) const ROW_GROUP: usize = 16;
+
+/// Up to [`ROW_GROUP`] rows, unit-stride on both sides, each at its own offset: what
+/// [`for_each_row_group`] hands its kernel. Input rows share one length and output rows
+/// another. Every row was bounds-checked by the walk and the output rows belong to this group
+/// alone.
+pub(crate) struct RowGroup<'a, T> {
+    src: &'a [T],
+    dst: RowsPtr<T>,
+    len: usize,
+    dst_len: usize,
+    count: usize,
+    dst_contiguous: bool,
+    src_at: [usize; ROW_GROUP],
+    dst_at: [usize; ROW_GROUP],
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+impl<'a, T> RowGroup<'a, T> {
+    /// Rows in the group, 1 to [`ROW_GROUP`].
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Elements per input row.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Elements per output row.
+    pub(crate) fn dst_len(&self) -> usize {
+        self.dst_len
+    }
+
+    /// Whether the output rows follow one another in memory, row `k` at `dst_ptr(0) + k·dst_len`.
+    pub(crate) fn dst_contiguous(&self) -> bool {
+        self.dst_contiguous
+    }
+
+    /// Start of input row `k`, readable for [`Self::len`] elements when `k < count()`.
+    pub(crate) fn src_ptr(&self, k: usize) -> *const T {
+        let at = self.src_at.get(k).copied().unwrap_or(0);
+        self.src.as_ptr().wrapping_add(at)
+    }
+
+    /// Start of output row `k`, writable for [`Self::dst_len`] elements when `k < count()` and
+    /// written by nothing else while the kernel runs.
+    pub(crate) fn dst_ptr(&self, k: usize) -> *mut T {
+        let at = self.dst_at.get(k).copied().unwrap_or(0);
+        self.dst.get().wrapping_add(at)
+    }
+
+    /// Input row `k` (empty past the group).
+    pub(crate) fn input(&self, k: usize) -> &'a [T] {
+        if k >= self.count {
+            return &[];
+        }
+        let at = self.src_at.get(k).copied().unwrap_or(0);
+        self.src.get(at..at + self.len).unwrap_or(&[])
+    }
+
+    /// Output row `k` (empty past the group).
+    pub(crate) fn output(&mut self, k: usize) -> &mut [T] {
+        if k >= self.count {
+            return &mut [];
+        }
+        // SAFETY: row `k` lies in the output (checked by the walk), output rows do not overlap
+        // and this group alone writes them; `&mut self` keeps the slice unique.
+        unsafe { core::slice::from_raw_parts_mut(self.dst_ptr(k), self.dst_len) }
+    }
+}
+
+/// For row kernels that run several rows at once: when every row is unit-stride on both
+/// sides, calls `group` on consecutive groups of [`ROW_GROUP`] rows (fewer for the last);
+/// groups may run concurrently on `pool`.
+///
+/// Rows are walked in output memory order (outer axes sorted by output stride, largest first),
+/// so consecutive groups write consecutive memory.
+///
+/// The views agree on every axis but the last, which holds the rows; input and output rows may
+/// differ in length. Returns `None`, touching nothing, when the outer axes differ or a row is
+/// not unit-stride.
+pub(crate) fn for_each_row_group<T>(
+    input: &View<'_, T>,
+    output: &mut ViewMut<'_, T>,
+    pool: Option<&dyn Pool>,
+    group: &(dyn Fn(&mut RowGroup<'_, T>) + Sync),
+) -> Option<Result<()>>
+where
+    T: Copy + Send + Sync,
+{
+    let (&n, outer) = input.shape().split_last()?;
+    let (&m, out_outer) = output.shape().split_last()?;
+    if outer != out_outer {
+        return None;
+    }
+    let rank = input.rank();
+    let (is, os) = (
+        unsigned_strides(input.strides()),
+        unsigned_strides(output.strides()),
+    );
+    if (n > 1 && is.get(rank - 1) != Some(&1)) || (m > 1 && os.get(rank - 1) != Some(&1)) {
+        return None;
+    }
+    if let Err(e) = check_no_overlap(output.shape(), output.strides()) {
+        return Some(Err(e));
+    }
+    let rows: usize = outer.iter().product();
+    if rows == 0 || n == 0 || m == 0 {
+        return Some(Ok(()));
+    }
+    // Unit axes never move; dropping them keeps the innermost walked axis a real one.
+    let mut axes = [Axis::default(); MAX_RANK];
+    let mut n_axes = 0;
+    for (a, &extent) in outer.iter().enumerate().filter(|&(_, &d)| d > 1) {
+        if let Some(x) = axes.get_mut(n_axes) {
+            *x = Axis {
+                extent,
+                src: is.get(a).copied().unwrap_or(0),
+                dst: os.get(a).copied().unwrap_or(0),
+            };
+        }
+        n_axes += 1;
+    }
+    let axes = axes.get_mut(..n_axes)?;
+    axes.sort_by_key(|x| core::cmp::Reverse(x.dst));
+    let axes: &[Axis] = axes;
+    let src = input.data();
+    let data = output.data_mut();
+    let cap = data.len();
+    let dst = RowsPtr(data.as_mut_ptr());
+    for_each_block(rows.div_ceil(ROW_GROUP), pool, &|blocks: Range<usize>| {
+        let mut walk = Odometer::new(blocks.start * ROW_GROUP, axes);
+        for blk in blocks {
+            let count = (rows - blk * ROW_GROUP).min(ROW_GROUP);
+            let mut g = RowGroup {
+                src,
+                dst,
+                len: n,
+                dst_len: m,
+                count,
+                dst_contiguous: false,
+                src_at: [0; ROW_GROUP],
+                dst_at: [0; ROW_GROUP],
+            };
+            let (src_end, dst_end) = if let Some((s0, d0)) = walk.take_run(axes, count) {
+                // One run along the innermost axis: offsets are affine in the row.
+                let (ss, ds) = (walk.inner.src, walk.inner.dst);
+                for (k, (s, d)) in g.src_at.iter_mut().zip(g.dst_at.iter_mut()).enumerate() {
+                    (*s, *d) = (s0 + k * ss, d0 + k * ds);
+                }
+                g.dst_contiguous = ds == m;
+                (s0 + (count - 1) * ss, d0 + (count - 1) * ds)
+            } else {
+                let (mut src_end, mut dst_end) = (0usize, 0usize);
+                for (s, d) in g.src_at.iter_mut().zip(g.dst_at.iter_mut()).take(count) {
+                    (*s, *d) = walk.next(axes);
+                    src_end = src_end.max(*s);
+                    dst_end = dst_end.max(*d);
+                }
+                let first = g.dst_at[0];
+                g.dst_contiguous = g.dst_at[..count]
+                    .iter()
+                    .enumerate()
+                    .all(|(k, &at)| at == first + k * m);
+                (src_end, dst_end)
+            };
+            if src_end + n > src.len() || dst_end + m > cap {
+                return;
+            }
+            group(&mut g);
+        }
+    });
+    Some(Ok(()))
+}
+
+/// An outer axis of a row walk: extent and the two element strides.
+#[derive(Clone, Copy, Default)]
+struct Axis {
+    extent: usize,
+    src: usize,
+    dst: usize,
+}
+
+/// Items `range` of `outer × inner`, inner fastest, the outer index walking `axes`: each item's
+/// input and output offsets and inner index, stepped without division.
+fn outer_items(
+    range: Range<usize>,
+    axes: &[Axis],
+    inner: usize,
+) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    let inner = inner.max(1);
+    let mut odo = Odometer::new(range.start / inner, axes);
+    let mut cur = odo.next(axes);
+    let mut j = range.start % inner;
+    range.map(move |_| {
+        let item = (cur.0, cur.1, j);
+        j += 1;
+        if j == inner {
+            j = 0;
+            cur = odo.next(axes);
+        }
+        item
+    })
+}
+
+/// The axes of `others` (extent, input stride, output stride) as [`Axis`] values.
+fn axes_of(others: &[(usize, usize, usize)]) -> [Axis; MAX_RANK] {
+    core::array::from_fn(|i| {
+        others.get(i).map_or(
+            Axis {
+                extent: 1,
+                src: 0,
+                dst: 0,
+            },
+            |&(extent, src, dst)| Axis {
+                extent: extent.max(1),
+                src,
+                dst,
+            },
+        )
+    })
+}
+
+/// Row offsets in both views, stepped row by row without division; the innermost axis steps
+/// without touching the others.
+struct Odometer {
+    idx: [usize; MAX_RANK],
+    at: (usize, usize),
+    inner: Axis,
+}
+
+impl Odometer {
+    /// Starts at row `r` of `axes` (outermost first; none means a single row).
+    fn new(mut r: usize, axes: &[Axis]) -> Self {
+        let mut idx = [0usize; MAX_RANK];
+        let mut at = (0usize, 0usize);
+        for (i, x) in idx.iter_mut().zip(axes).rev() {
+            *i = r % x.extent;
+            r /= x.extent;
+            at.0 += *i * x.src;
+            at.1 += *i * x.dst;
+        }
+        let inner = axes.last().copied().unwrap_or(Axis {
+            extent: 1,
+            src: 0,
+            dst: 0,
+        });
+        Self { idx, at, inner }
+    }
+
+    /// The current row's (input, output) offsets; then advances to the next row.
+    #[inline(always)]
+    fn next(&mut self, axes: &[Axis]) -> (usize, usize) {
+        let cur = self.at;
+        let last = axes.len().saturating_sub(1);
+        if let Some(i) = self.idx.get_mut(last) {
+            if *i + 1 < self.inner.extent {
+                *i += 1;
+                self.at.0 += self.inner.src;
+                self.at.1 += self.inner.dst;
+                return cur;
+            }
+        }
+        self.carry(axes);
+        cur
+    }
+
+    /// The step that wraps the innermost axis.
+    #[cold]
+    fn carry(&mut self, axes: &[Axis]) {
+        for (i, x) in self.idx.iter_mut().zip(axes).rev() {
+            *i += 1;
+            self.at.0 += x.src;
+            self.at.1 += x.dst;
+            if *i < x.extent {
+                break;
+            }
+            self.at.0 -= x.extent * x.src;
+            self.at.1 -= x.extent * x.dst;
+            *i = 0;
+        }
+    }
+
+    /// When the next `count ≥ 1` rows all lie along the innermost axis, the first one's offsets,
+    /// advancing past them; otherwise `None`, touching nothing.
+    #[inline(always)]
+    fn take_run(&mut self, axes: &[Axis], count: usize) -> Option<(usize, usize)> {
+        let last = axes.len().checked_sub(1)?;
+        let i = self.idx.get_mut(last)?;
+        let end = i.checked_add(count)?;
+        if count == 0 || end > self.inner.extent {
+            return None;
+        }
+        let cur = self.at;
+        let steps = count - 1;
+        *i += steps;
+        self.at.0 += steps * self.inner.src;
+        self.at.1 += steps * self.inner.dst;
+        self.next(axes);
+        Some(cur)
+    }
+}
+
+/// Runs `f` on output elements `lo..lo + len` in row-major order: in place when the output is
+/// dense, else on a staged copy that is then scattered.
+#[allow(clippy::too_many_arguments)]
+fn write_chunk<O: Copy + Default>(
+    out: RowsPtr<O>,
+    cap: usize,
+    dense: bool,
+    shape: &[usize],
+    strides: &[isize],
+    lo: usize,
+    len: usize,
+    f: impl FnOnce(&mut [O]),
+) {
+    if dense {
+        if lo + len > cap {
+            return;
+        }
+        // SAFETY: `lo..lo + len` lies in the dense output and is this chunk's alone.
+        f(unsafe { core::slice::from_raw_parts_mut(out.get().add(lo), len) });
+        return;
+    }
+    let mut store = [O::default(); CHUNK];
+    let Some(buf) = store.get_mut(..len) else {
+        return;
+    };
+    f(buf);
+    let mut at = Offsets::new(shape, strides, lo);
+    for &v in buf.iter() {
+        let off = at.step();
+        if off < cap {
+            // SAFETY: `off` addresses an element of the view that only this chunk owns.
+            unsafe { out.get().add(off).write(v) };
+        }
+    }
+}
+
+/// A chunk of `src` in row-major order: the elements themselves when the view is dense, else a
+/// copy in `store`.
+fn gather_chunk<'s, T: Copy + Default>(
+    dense: Option<&'s [T]>,
+    view: &View<'_, T>,
+    store: &'s mut [T; CHUNK],
+    lo: usize,
+    len: usize,
+) -> &'s [T] {
+    if let Some(s) = dense {
+        return s.get(lo..lo + len).unwrap_or(&[]);
+    }
+    let src = view.data();
+    let mut at = Offsets::new(view.shape(), view.strides(), lo);
+    for b in store.iter_mut().take(len) {
+        *b = src.get(at.step()).copied().unwrap_or_default();
+    }
+    store.get(..len).unwrap_or(&[])
+}
+
+/// What [`for_each_chunk2`] calls on each run: its flat start, the two input runs and the output
+/// run.
+type Chunk2<'a, A, B, O> = dyn Fn(usize, &[A], &[B], &mut [O]) + Sync + 'a;
+
+/// [`for_each_chunk`] over two inputs: calls `chunk(start, lhs, rhs, output)` on consecutive
+/// runs of at most [`CHUNK`] elements in row-major order, `start` being the run's flat index.
+///
+/// All three views must have the same shape; a broadcast input is a view with zero strides.
+/// Runs never cross a multiple of [`CHUNK`], and when every view's last axis has unit stride
+/// they are row segments read and written in place, so they may start anywhere; a kernel
+/// whose result depends on the flat index must go by `start`. The output must pass
+/// [`check_no_overlap`]. Everything is validated before the first write. `chunk` must write
+/// every element of its output slice.
+pub(crate) fn for_each_chunk2<A, B, O>(
+    lhs: &View<'_, A>,
+    rhs: &View<'_, B>,
+    output: &mut ViewMut<'_, O>,
+    pool: Option<&dyn Pool>,
+    chunk: &Chunk2<'_, A, B, O>,
+) -> Result<()>
+where
+    A: Copy + Default + Sync,
+    B: Copy + Default + Sync,
+    O: Copy + Default + Send,
+{
+    if lhs.shape() != output.shape() || rhs.shape() != output.shape() {
+        return Err(KernelError::InvalidArgument(
+            "input and output shapes differ",
+        ));
+    }
+    check_no_overlap(output.shape(), output.strides())?;
+    let n = output.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let mut shape = [0usize; MAX_RANK];
+    shape[..output.shape().len()].copy_from_slice(output.shape());
+    let shape = shape.get(..output.shape().len()).unwrap_or(&[]);
+    let mut out_strides = [0isize; MAX_RANK];
+    out_strides[..shape.len()].copy_from_slice(output.strides());
+    let out_strides = out_strides.get(..shape.len()).unwrap_or(&[]);
+    let (lhs_dense, rhs_dense) = (lhs.as_contiguous(), rhs.as_contiguous());
+    let out_dense = output.as_contiguous_mut().is_some();
+    // Row segments in place, unless the dense path below already passes whole chunks.
+    let row_runs = !(lhs_dense.is_some() && rhs_dense.is_some() && out_dense)
+        && [lhs.strides(), rhs.strides(), out_strides]
+            .iter()
+            .all(|s| s.last() == Some(&1));
+    let row_len = shape.last().copied().unwrap_or(1).max(1);
+    let data = output.data_mut();
+    let cap = data.len();
+    let out = RowsPtr(data.as_mut_ptr());
+
+    for_each_block(n.div_ceil(CHUNK), pool, &|r: Range<usize>| {
+        for c in r {
+            let lo = c.saturating_mul(CHUNK);
+            if lo >= n {
+                return;
+            }
+            let len = CHUNK.min(n - lo);
+            if row_runs {
+                let (end, mut at) = (lo + len, lo);
+                while at < end {
+                    let seg = (row_len - at % row_len).min(end - at);
+                    let ao = Offsets::new(shape, lhs.strides(), at).off;
+                    let bo = Offsets::new(shape, rhs.strides(), at).off;
+                    let oo = Offsets::new(shape, out_strides, at).off;
+                    let (Some(a), Some(b)) =
+                        (lhs.data().get(ao..ao + seg), rhs.data().get(bo..bo + seg))
+                    else {
+                        return;
+                    };
+                    if oo + seg > cap {
+                        return;
+                    }
+                    // SAFETY: the segment's `seg` output elements are consecutive (unit last
+                    // stride), lie in the buffer (checked) and belong to this chunk alone.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(out.get().add(oo), seg) };
+                    chunk(at, a, b, dst);
+                    at += seg;
+                }
+                continue;
+            }
+            let (mut a_store, mut b_store) = ([A::default(); CHUNK], [B::default(); CHUNK]);
+            let a = gather_chunk(lhs_dense, lhs, &mut a_store, lo, len);
+            let b = gather_chunk(rhs_dense, rhs, &mut b_store, lo, len);
+            if a.len() != len || b.len() != len {
+                return;
+            }
+            write_chunk(out, cap, out_dense, shape, out_strides, lo, len, |dst| {
+                chunk(lo, a, b, dst);
+            });
         }
     });
     Ok(())

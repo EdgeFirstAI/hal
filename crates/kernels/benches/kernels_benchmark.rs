@@ -7,8 +7,9 @@ use std::num::NonZeroUsize;
 use edgefirst_bench::{run_bench, BenchSuite};
 use edgefirst_kernels::convert::nchw_to_nhwc;
 use edgefirst_kernels::{
-    BoxFormat, CpuFeatures, DType, DflBoxParams, DflBoxPlan, DflParams, DflPlan, Dist2BboxParams,
-    Dist2BboxPlan, Level, Quant, ScopedThreads, SigmoidParams, SigmoidPlan, SoftmaxI16Params,
+    AttentionI8Params, AttentionI8Plan, AttentionQMul, BoxFormat, CpuFeatures, DType, DflBoxParams,
+    DflBoxPlan, DflParams, DflPlan, Dist2BboxParams, Dist2BboxPlan, Level, MatMulI8Params,
+    MatMulI8Plan, Quant, ScopedThreads, SigmoidParams, SigmoidPlan, SoftmaxI16Params,
     SoftmaxI16Plan, SoftmaxI8Params, SoftmaxI8Plan, TensorMut, TensorRef, View, ViewMut,
 };
 use half::f16;
@@ -814,16 +815,139 @@ fn bench_masks(suite: &mut BenchSuite) {
 #[cfg(not(target_arch = "aarch64"))]
 fn bench_masks(_: &mut BenchSuite) {}
 
+/// YOLO26 attention (2 heads, 32-wide queries and keys, 64-wide values) over a token-major
+/// `[tokens, 256]` input: the fused plan, and the MATMUL → SOFTMAX → MATMUL
+/// chain of single-op plans it replaces.
+fn bench_attention(suite: &mut BenchSuite) {
+    const H: usize = 2;
+    const DK: usize = 32;
+    const DV: usize = 64;
+    const C: usize = 2 * DK + DV;
+    let x_q = Quant::new(0.1251, -15);
+    let scores = Quant::new(0.1279, -9);
+    let probs = Quant::new(1.0 / 256.0, -128);
+    let out_q = Quant::new(0.063_33, 2);
+    let mut r = rng();
+    for n in SOFTMAX_SIZES {
+        let x: Vec<i8> = (0..n * H * C).map(|_| r.random_range(-40i8..=40)).collect();
+        let st = [C as isize, (H * C) as isize, 1];
+        let q = View::strided(&x, &[H, n, DK], &st).expect("q");
+        let k = View::strided(&x[DK..], &[H, n, DK], &st).expect("k");
+        let v = View::strided(&x[2 * DK..], &[H, n, DV], &st).expect("v");
+        let mut out = vec![0i8; n * H * DV];
+        let out_st = [DV as isize, (H * DV) as isize, 1];
+        let case = format!("kernels/attention_i8/2x{n}x32x64");
+        for (tier, features) in tier_features(&case) {
+            let plan = AttentionI8Plan::with_features(
+                AttentionI8Params {
+                    q: x_q,
+                    q_mul: Some(AttentionQMul {
+                        table: core::array::from_fn(|i| i as u8),
+                        output: x_q,
+                    }),
+                    k: x_q,
+                    v: x_q,
+                    scores,
+                    beta: 1.0,
+                    probs,
+                    output: out_q,
+                    kernels: edgefirst_kernels::TfliteKernels::NeonRuy,
+                },
+                features,
+            )
+            .expect("attention plan");
+            let mut scratch = plan.scratch(H, n, n, DK, DV).expect("scratch");
+            let name = format!("{case}/fused/{tier}");
+            let res = run_bench(&name, WARMUP, ITERATIONS, || {
+                let o = ViewMut::strided(&mut out, &[H, n, DV], &out_st).expect("out");
+                plan.run(
+                    TensorRef::I8(q),
+                    TensorRef::I8(k),
+                    TensorRef::I8(v),
+                    TensorMut::I8(o),
+                    &mut scratch,
+                    None,
+                )
+                .expect("attention run");
+                black_box(&out);
+            });
+            report(suite, &res);
+            let bmm1 = MatMulI8Plan::with_features(
+                MatMulI8Params::tflite_batch_matmul(
+                    x_q,
+                    x_q,
+                    scores,
+                    edgefirst_kernels::TfliteKernels::NeonRuy,
+                )
+                .expect("bmm1"),
+                features,
+            )
+            .expect("bmm1 plan");
+            let softmax = SoftmaxI8Plan::with_features(
+                SoftmaxI8Params {
+                    input: scores,
+                    output: probs,
+                    beta: 1.0,
+                },
+                features,
+            )
+            .expect("softmax plan");
+            let bmm2 = MatMulI8Plan::with_features(
+                MatMulI8Params::tflite_batch_matmul(
+                    probs,
+                    x_q,
+                    out_q,
+                    edgefirst_kernels::TfliteKernels::NeonRuy,
+                )
+                .expect("bmm2"),
+                features,
+            )
+            .expect("bmm2 plan");
+            let mut s = vec![0i8; H * n * n];
+            let mut p = vec![0i8; H * n * n];
+            let kt = View::strided(&x[DK..], &[H, DK, n], &[C as isize, 1, (H * C) as isize])
+                .expect("kt");
+            let name = format!("{case}/chain/{tier}");
+            let res = run_bench(&name, WARMUP, ITERATIONS, || {
+                bmm1.run(
+                    TensorRef::I8(q),
+                    TensorRef::I8(kt),
+                    TensorMut::I8(ViewMut::contiguous(&mut s, &[H, n, n]).expect("s")),
+                    None,
+                )
+                .expect("bmm1 run");
+                softmax
+                    .run(
+                        TensorRef::I8(View::contiguous(&s, &[H, n, n]).expect("s")),
+                        TensorMut::I8(ViewMut::contiguous(&mut p, &[H, n, n]).expect("p")),
+                        None,
+                    )
+                    .expect("softmax run");
+                bmm2.run(
+                    TensorRef::I8(View::contiguous(&p, &[H, n, n]).expect("p")),
+                    TensorRef::I8(v),
+                    TensorMut::I8(ViewMut::strided(&mut out, &[H, n, DV], &out_st).expect("out")),
+                    None,
+                )
+                .expect("bmm2 run");
+                black_box(&out);
+            });
+            report(suite, &res);
+        }
+    }
+}
+
 fn main() {
     let mut suite = BenchSuite::from_args();
-    // `--section <name>` runs one group: softmax, sigmoid, transpose, dfl, dist2bbox or mask.
+    // `--section <name>` runs one group: attention, softmax, sigmoid, transpose, dfl, dist2bbox or mask.
     let only = std::env::args()
         .collect::<Vec<_>>()
         .windows(2)
         .find(|w| w[0] == "--section")
         .map(|w| w[1].to_ascii_lowercase());
     type Group<'a> = (&'a str, &'a [fn(&mut BenchSuite)]);
-    let groups: [Group; 6] = [
+    let groups: [Group; 7] = [
+        ("attention", &[bench_attention]),
         ("softmax", &[bench_softmax_i8, bench_softmax_i16]),
         ("sigmoid", &[bench_sigmoid, bench_sigmoid_paths]),
         ("transpose", &[bench_transpose]),

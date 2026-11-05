@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! The C API for `edgefirst-kernels`: quantized softmax, sigmoid, table lookup and DFL decode.
+//! The C API for `edgefirst-kernels`: quantized softmax, sigmoid, table lookup, DFL decode,
+//! TFLite-exact int8 arithmetic and matrix multiplication, and fused DFL and attention blocks.
 //!
 //! Plans are built once with `ef_<op>_plan_new` and run any number of times, from any number
 //! of threads, with `ef_<op>_plan_run`. Tensors are caller-owned `ef_kernel_view`s, so this

@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # edgefirst-kernels (C API)
 
-Quantized compute kernels for edge inference: int8/int16 softmax, sigmoid, 8-bit table lookup, DFL and dist2bbox box decoding.
+Quantized compute kernels for edge inference: int8/int16 softmax, sigmoid, 8-bit table lookup, DFL and dist2bbox box decoding, TFLite-exact int8 `ADD`/`SUB`/`MUL` and matrix multiplication (`BATCH_MATMUL`, 1×1 `CONV_2D`), a fused DFL softmax-and-projection head, and fused int8 attention.
 Ships as `libedgefirst_kernels` with `edgefirst/kernels.h`.
 
 ```sh
@@ -37,4 +37,5 @@ ef_softmax_i8_plan_free(plan);
 Plans are immutable once built; `ef_<op>_plan_run` may be called on one plan from several threads at once.
 A plan builder returning `ENOTSUP` is how a caller asks whether a node can run here.
 Pass an `ef_kernel_pool` to split a run across the caller's own worker threads; give them about 64 KiB of stack headroom for the kernels' staging buffers.
-A view's `data` must be aligned to its element type, and the input and output must not overlap in memory (interleaved views of one buffer included); `plan_run` rejects either with `EINVAL`.
+A view's `data` must be aligned to its element type, and the output must not overlap any input in memory (interleaved views of one buffer included); `plan_run` rejects either with `EINVAL`. Inputs may share memory, so attention's Q, K and V can be head slices of one fused buffer.
+`ef_attention_i8_plan_run` takes a caller-owned `ef_attention_scratch` from `ef_attention_scratch_new` for its call shape; reuse it across calls, but give each concurrent call its own.

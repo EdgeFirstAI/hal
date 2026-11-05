@@ -74,7 +74,7 @@ pub(crate) fn for_each_block(
         if i < tasks
             && claimed
                 .get(i)
-                .is_some_and(|c| !c.swap(true, Ordering::AcqRel))
+                .is_some_and(|c| !c.load(Ordering::Acquire) && !c.swap(true, Ordering::AcqRel))
         {
             let start = i * base + i.min(rem);
             f(start..start + base + usize::from(i < rem));

@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 
 use super::rows::{for_each_row, StridedRow, StridedRowMut};
+#[cfg(target_arch = "aarch64")]
+use super::rows::{for_each_row_group, RowGroup, ROW_GROUP};
 use crate::cpu::{CpuFeatures, Tier};
 use crate::error::{KernelError, Result};
 use crate::pool::Pool;
@@ -56,7 +58,15 @@ enum Kernel {
 /// ```
 #[derive(Clone, Debug)]
 pub struct SoftmaxI8Plan {
-    table: [f32; 256],
+    /// `exp(scale·d)` at index `255 − d`, `scale` being `−input_scale·beta`.
+    pub(super) table: [f32; 256],
+    /// `exp(scale·d)` for `d = 16·hi + lo` as `A[hi]·B[lo]` in 16-bit fixed point: the byte
+    /// planes `A` low, `A` high, `B` low, `B` high, for the 16-row NEON kernel.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    exp16: [[u8; 16]; 4],
+    /// The largest entry of each 64-entry slice of `table`.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    slice_max: [f32; 4],
     output_scale: f32,
     output_zp: i32,
     kernel: Kernel,
@@ -110,8 +120,12 @@ impl SoftmaxI8Plan {
         for (v, t) in table.iter_mut().rev().enumerate() {
             *t = (scale * v as f32).exp();
         }
+        let exp16 = exp16_tables(scale);
+        let slice_max = slice_max(&table);
         Ok(Self {
             table,
+            exp16,
+            slice_max,
             output_scale: p.output.scale,
             output_zp: p.output.zero_point,
             kernel: select_kernel(f),
@@ -152,6 +166,25 @@ impl SoftmaxI8Plan {
                 "softmax_i8 input and output shapes differ",
             ));
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.kernel == Kernel::Neon && input.shape().last() == Some(&ROW_GROUP) {
+            let group = |g: &mut RowGroup<'_, i8>| {
+                if g.count() == ROW_GROUP {
+                    // SAFETY: NEON is part of the aarch64 baseline; rows are 16 long.
+                    unsafe {
+                        super::softmax_i8_neon::rows16(&self.exp16, self.output_scale, g);
+                    }
+                    return;
+                }
+                for k in 0..g.count() {
+                    let s = g.input(k);
+                    self.row(s, g.output(k));
+                }
+            };
+            if let Some(r) = for_each_row_group(&input, &mut output, pool, &group) {
+                return r;
+            }
+        }
         for_each_row(
             &input,
             &mut output,
@@ -162,16 +195,21 @@ impl SoftmaxI8Plan {
     }
 
     #[inline]
-    fn row(&self, src: &[i8], dst: &mut [i8]) {
+    pub(super) fn row(&self, src: &[i8], dst: &mut [i8]) {
         match self.kernel {
             Kernel::Portable => {
                 softmax_row_i8_portable(&self.table, self.output_scale, self.output_zp, src, dst)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Kernel::Neon if src.len() == ROW_GROUP && dst.len() == ROW_GROUP => {
+                softmax_row16_split(&self.exp16, self.output_scale, src, dst)
             }
             #[cfg(target_arch = "aarch64")]
             // SAFETY: NEON is part of the aarch64 baseline.
             Kernel::Neon => unsafe {
                 super::softmax_i8_neon::softmax_row_i8_neon(
                     &self.table,
+                    &self.slice_max,
                     self.output_scale,
                     self.output_zp,
                     src,
@@ -211,6 +249,69 @@ fn select_kernel(f: CpuFeatures) -> Kernel {
 #[cfg(not(target_arch = "aarch64"))]
 fn select_kernel(_: CpuFeatures) -> Kernel {
     Kernel::Portable
+}
+
+/// The largest entry of each 64-entry slice of `table`.
+pub(super) fn slice_max(table: &[f32; 256]) -> [f32; 4] {
+    let (slices, _) = table.as_chunks::<64>();
+    core::array::from_fn(|k| {
+        slices
+            .get(k)
+            .map_or(0.0, |s| s.iter().fold(0.0f32, |m, &t| m.max(t)))
+    })
+}
+
+/// `exp(scale·d)` for `d = 16·hi + lo` as `A[hi]·B[lo]`, each rounded to 16-bit fixed point
+/// (65535 is 1), split into byte planes: `A` low, `A` high, `B` low, `B` high. `scale` is
+/// `−input_scale·beta`.
+pub(super) fn exp16_tables(scale: f32) -> [[u8; 16]; 4] {
+    split_exp_tables(scale, 65535.0)
+}
+
+/// One 16-element row with the arithmetic of the 16-row NEON kernel
+/// (`softmax_i8_neon::rows16`), lane for lane. On NEON tiers every 16-element row takes this
+/// result, alone or in a group of sixteen, so the op and the fused kernels that call
+/// [`SoftmaxI8Plan::row`] agree. Each `exp` is the exact product `A·B` of the
+/// [`exp16_tables`] entries (1.0 is 65535²); the sum adds each product shifted right by 4 with
+/// rounding; the output is `e / (16·sum·out_scale)` rounded half away from zero, saturated to
+/// `0..=255`, less 128 (the plan's output zero point).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(super) fn softmax_row16_split(
+    exp16: &[[u8; 16]; 4],
+    out_scale: f32,
+    src: &[i8],
+    dst: &mut [i8],
+) {
+    let max = src.iter().copied().max().unwrap_or(i8::MIN);
+    let entry = |lo: &[u8; 16], hi: &[u8; 16], i: usize| u32::from(lo[i]) | u32::from(hi[i]) << 8;
+    let mut e = [0u32; 16];
+    let mut sum = 0u32;
+    for (e, &x) in e.iter_mut().zip(src) {
+        let d = usize::from((i16::from(max) - i16::from(x)) as u8);
+        *e = entry(&exp16[0], &exp16[1], d >> 4) * entry(&exp16[2], &exp16[3], d & 15);
+        sum += ((u64::from(*e) + 8) >> 4) as u32;
+    }
+    let c = 1.0f32 / (sum as f32 * (16.0 * out_scale));
+    for (d, &e) in dst.iter_mut().zip(&e) {
+        let q = (e as f32 * c).round() as i32;
+        *d = (q.clamp(0, 255) - 128) as i8;
+    }
+}
+
+/// `exp(scale·d)` for `d = 16·hi + lo` (`hi`, `lo` below 16) as `A[hi]` and `B[lo]`, each
+/// `exp` times `one` rounded to a u16, split into byte planes: `A` low, `A` high, `B` low,
+/// `B` high.
+pub(super) fn split_exp_tables(scale: f32, one: f64) -> [[u8; 16]; 4] {
+    let a: [u16; 16] =
+        core::array::from_fn(|i| ((f64::from(scale) * 16.0 * i as f64).exp() * one).round() as u16);
+    let b: [u16; 16] =
+        core::array::from_fn(|i| ((f64::from(scale) * i as f64).exp() * one).round() as u16);
+    [
+        a.map(|v| v as u8),
+        a.map(|v| (v >> 8) as u8),
+        b.map(|v| v as u8),
+        b.map(|v| (v >> 8) as u8),
+    ]
 }
 
 /// The table offset `255 - max` as a byte, so `x as u8 + offset` (wrapping) is `255 - max + x`.
