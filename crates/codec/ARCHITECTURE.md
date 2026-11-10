@@ -119,6 +119,11 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 | `v4l2/mod.rs`   | Capability-based discovery of stateful M2M nodes (env override, then `/dev/video*`), `M2mDevice` |
 | `v4l2/encoder.rs` | `V4l2Encoder` (Linux + `v4l2` feature): format and control setup, DMA-BUF import of the source planes and crops, PTS mapping, header caching, `ENCODER_CMD` drain and stream reset |
 | `v4l2/decoder.rs` | `V4l2Decoder` (Linux + `v4l2` feature): bitstream queue, `SOURCE_CHANGE` handling, CAPTURE pool by DMA-BUF import or export, NV12 frame tensors over the padded buffers, one access unit in flight, `DECODER_CMD` drain and queue restart, reopen on reset |
+| `mf/mod.rs`     | Media Foundation platform (Windows + `media-foundation` feature): `mfplat.dll` resolved at run time, COM apartment per thread, `MFStartup` hold, transform enumeration with the environment filter, media type helpers |
+| `mf/transform.rs` | `Transform`: one synchronous or asynchronous MFT driven from the caller's thread (event polling, input credits, output sample allocation, stream-change renegotiation, drain and restart) |
+| `mf/encoder.rs` | `MfEncoder`: output and input types with the profile and level fallbacks, `ICodecAPI` rate control, tight copy of the source into a sample, forced key frames, PTS by sample time, header caching |
+| `mf/decoder.rs` | `MfDecoder`: NV12 output, layout from the output type (aperture, stride, colorimetry), pictures waiting in Media Foundation memory, copy into the D3D11 or host pool, pool growth for drain bursts |
+| `mf/copy.rs`    | Plane geometry and strided copies of NV12 and YUYV pictures |
 
 ## Key Design Decisions
 
@@ -640,7 +645,8 @@ The UAPI structs must match the kernel's `sizeof`: a wrong size yields the wrong
 ## Video Encoder (`video`)
 
 `video::VideoEncoder` is a thin front over an internal `EncoderBackend` trait,
-so VideoToolbox and Media Foundation backends can follow. The Linux backend
+with a V4L2 backend on Linux and a Media Foundation backend on Windows (see
+[Media Foundation backend](#media-foundation-backend-windows)). The Linux backend
 (`video/v4l2/encoder.rs`) drives a V4L2 stateful encoder
 (`dev-encoder.rst`) through `edgefirst-v4l2`.
 
@@ -676,6 +682,55 @@ so VideoToolbox and Media Foundation backends can follow. The Linux backend
   a drained encoder resumes (Wave6 ignores `V4L2_ENC_CMD_START`), so the
   backend tears the queues down and the next frame starts a new stream, which
   also opens it with an IDR.
+
+## Media Foundation backend (Windows)
+
+`video/mf/` implements `EncoderBackend` and `DecoderBackend` with the Media
+Foundation H.264 transforms. The traits are unchanged.
+
+- **Loading.** `mfplat.dll` is opened from System32 at run time and its six
+  flat functions resolved, so the crate has no load-time Media Foundation
+  import (checked with `dumpbin /imports`). Windows N without the Media Feature
+  Pack loads it and reports `NoDevice`. COM interfaces come from the `windows`
+  crate, at the version the tensor crate uses.
+- **Threads.** Every call runs on the caller's thread, joined to the COM MTA
+  once per thread. Hardware encoders are asynchronous MFTs: their
+  `METransformNeedInput`/`METransformHaveOutput` events are polled with
+  `MF_EVENT_FLAG_NO_WAIT` rather than delivered to callbacks, so no D3D11
+  readback or upload ever runs on a Media Foundation work queue (on the camera
+  backend that held callbacks back for seconds). After a drain an asynchronous
+  MFT asks for input again only after `MFT_MESSAGE_NOTIFY_START_OF_STREAM`.
+- **Memory.** The transforms are given no DXGI device manager. Their D3D11
+  textures are `DXGI_FORMAT_NV12` without NT-handle sharing and come from a
+  pool of two or three samples, while an NV12 D3D11 tensor is an `R8` texture
+  1.5 times the height, so neither side can wrap the other's textures. The
+  encoder maps each source for reading (a D3D11 tensor reads back through its
+  staging texture) and copies the picture, tightly packed, into a
+  system-memory sample; a crop is a plane offset in that copy. The decoder
+  writes system-memory NV12, which is copied into the pool's D3D11 tensors.
+- **Encoder.** Hardware transforms are tried first, then Microsoft's
+  software encoder; the first that takes the output and input types wins.
+  Rate control (CBR, mean bitrate), GOP, no B-frames and low-latency mode go
+  through `ICodecAPI` before the output type, as Microsoft's encoder requires.
+  A refused level, then a refused profile, falls back to the transform's
+  default unless the caller set it. Sample times are sequence numbers in frame
+  periods, mapped back to the caller's PTS. SPS and PPS cached from the stream
+  (or the output type's `MF_MT_MPEG_SEQUENCE_HEADER`) are inserted after the
+  access unit delimiter of any IDR sent without them.
+- **Decoder.** Microsoft's decoder only, unless the environment filter picks
+  another: hardware decoder MFTs expect a device manager.
+  `CODECAPI_AVLowLatencyMode` (a `VT_UI4`) makes it release each picture as
+  soon as reordering allows; without it, it holds every picture until drained.
+  Output type changes (`MF_E_TRANSFORM_STREAM_CHANGE`) queue a format marker
+  before the next picture, and `Reconfigured` is sent when the visible size,
+  stride or colorimetry differs. Pictures without a free pool buffer wait in
+  Media Foundation memory; the next `decode()` fails with `PoolExhausted`
+  before taking its access unit until they have one. If the caller holds no
+  frame and a drain releases more pictures than the pool has free, an
+  allocated pool grows by one rather than fail on every call.
+- **Provided pools** must be NV12 images of the visible size: a D3D11 texture
+  cannot be described as a smaller image, so the pool cannot follow a size
+  change.
 
 ## nvJPEG GPU Backend
 

@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Hardware H.264 encoding. Each test skips (prints `SKIPPED` and passes)
-//! where there is no encoder or no DMA-BUF heap; under
-//! `HAL_TEST_REQUIRE_DMA=1` a missing heap fails instead.
+//! where there is no encoder or no GPU buffer allocator (a DMA-BUF heap on
+//! Linux, D3D11 on Windows); under `HAL_TEST_REQUIRE_DMA=1` a missing one
+//! fails instead.
 //!
 //! Setting `EDGEFIRST_VIDEO_OUT` to a directory writes each test's stream
 //! there as `<test>.h264`, with the source pictures of the first frame as
@@ -29,7 +30,7 @@ mod dma_require;
 /// Opens an encoder, or `None` (after printing why) when the platform has
 /// none.
 fn open(test: &str, config: EncoderConfig) -> Option<VideoEncoder> {
-    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), test) {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), test) {
         return None;
     }
     match VideoEncoder::new(config) {
@@ -122,7 +123,7 @@ fn sps_profile_and_level(au: &[u8]) -> Option<(u8, u8)> {
 #[test]
 fn the_stream_carries_the_requested_profile_and_level() {
     const TEST: &str = "the_stream_carries_the_requested_profile_and_level";
-    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), TEST) {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), TEST) {
         return;
     }
     let src = nv12(1920, 1080);
@@ -300,15 +301,17 @@ fn rejects_a_16_bit_source() {
     ) else {
         return;
     };
+    // Any memory: the element type is checked first. D3D11 has no 16-bit
+    // NV12 texture.
     let src = TensorDyn::image(
         640,
         480,
         PixelFormat::Nv12,
         DType::U16,
-        Some(TensorMemory::DmaBuf),
+        None,
         CpuAccess::ReadWrite,
     )
-    .expect("DMA-BUF 16-bit NV12 image");
+    .expect("16-bit NV12 image");
     let err = enc.encode(&src, &FrameOptions::default()).unwrap_err();
     assert!(matches!(err, CodecError::InvalidInput(_)), "{err}");
 }

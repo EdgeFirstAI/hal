@@ -18,8 +18,11 @@ documentation = "https://docs.rs/edgefirst-codec"
 # `#[cfg(all(target_os = "linux", feature = "..."))]`, so off Linux they compile
 # to nothing. nvjpeg is pure dlopen (no link-time CUDA dependency) — it loads
 # libnvjpeg.so.12 at runtime and degrades to the V4L2/CPU decoders when absent.
-default = ["v4l2", "nvjpeg", "png"]
+# media-foundation is likewise Windows-only, and loads mfplat.dll at runtime so
+# Windows N editions without the Media Feature Pack still load the crate.
+default = ["v4l2", "nvjpeg", "png", "media-foundation"]
 v4l2 = ["dep:edgefirst-v4l2"]
+media-foundation = ["dep:windows", "dep:libloading"]
 png = ["dep:zune-png"]
 nvjpeg = ["dep:libloading"]
 opencv = ["dep:opencv"]
@@ -40,6 +43,17 @@ zune-png = { workspace = true, optional = true }
 # device discovery, the buffer queues and events.
 [target.'cfg(target_os = "linux")'.dependencies]
 edgefirst-v4l2 = { workspace = true, optional = true }
+
+# H.264 encode and decode through the Media Foundation transforms
+# (media-foundation feature). Interfaces only: the flat mfplat.dll functions
+# are resolved at runtime.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, optional = true, features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
 
 [dev-dependencies]
 edgefirst-bench = { workspace = true }

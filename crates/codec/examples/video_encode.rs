@@ -15,7 +15,9 @@
 //!   --input FILE         read raw NV12 frames from FILE instead of drawing
 //!                        a moving test pattern
 //!
-//! `EDGEFIRST_CODEC_V4L2_ENCODER=/dev/videoN` picks the encoder node.
+//! `EDGEFIRST_CODEC_V4L2_ENCODER=/dev/videoN` picks the encoder node on
+//! Linux, and `EDGEFIRST_CODEC_MF_ENCODER=<name>|hardware|software` the
+//! Media Foundation transform on Windows.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
