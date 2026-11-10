@@ -111,7 +111,7 @@ fn semi_planar_width(format: PixelFormat, shape: Option<&[usize]>, tex_w: usize)
 fn native_nv12_geometry(format: PixelFormat, tex_w: usize, tex_h: usize) -> Result<(usize, usize)> {
     if format != PixelFormat::Nv12 {
         return Err(Error::InvalidArgument(format!(
-            "d3d11 texture geometry: a DXGI_FORMAT_NV12 texture holds an Nv12 image, not              {format:?}"
+            "d3d11 texture geometry: a DXGI_FORMAT_NV12 texture holds an Nv12 image, not {format:?}"
         )));
     }
     Ok((tex_w, tex_h))
