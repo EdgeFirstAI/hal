@@ -644,7 +644,11 @@ recorded fence value and then copies level 0 into a linear device buffer the
 handle owns.
 
 That copy is what fixes the layout every consumer sees. The buffer is **tight
-rows** of `width * bytes_per_texel` and `CudaMap::len()` is their sum;
+rows** of `width * bytes_per_texel` and `CudaMap::len()` is their sum; a
+native NV12 texture is mapped as a CUDA NV12 array and its two planes
+(`cudaArrayGetPlane`, CUDA 11.2 and later; an older runtime declines the
+import) are copied one after the other, luma then chroma, so its buffer is
+the combined plane at the image width;
 `row_stride()` reports the D3D11 staging pitch a CPU map sees and does not
 apply to the device pointer. `cuda_map_mut()` returns the same buffer for
 writing and copies it back into the texture when the guard is released,
@@ -892,9 +896,26 @@ on one process-wide D3D11 device. The module is `src/d3d11/`:
   no texture layout and falls to PBO or `Mem` in the allocation chain.
 - `d3d11/texture.rs` allocates, validates externally created textures, and
   owns the staging texture a CPU map goes through. Its pitch becomes the
-  tensor's `row_stride`. Semi-planar layouts are widened to that pitch at
-  allocation so the plane's row stride and the sampled texture's width are
-  one number.
+  tensor's `row_stride`. Combined-plane semi-planar layouts are widened to
+  that pitch at allocation so the plane's row stride and the sampled
+  texture's width are one number.
+
+**NV12 is a native two-plane texture.** An NV12 image of even width and
+height is a `DXGI_FORMAT_NV12` texture of exactly the image's size, the
+surface video encoders, decoders and capture pipelines produce and consume,
+so a producer's NV12 texture wraps without a copy (`from_d3d11_texture`,
+`from_d3d11_shared_handle`) and an HAL-allocated one can be handed to a video
+API directly. The tensor model is unchanged: an NV12 tensor is still one
+plane whose CPU map is luma rows then chroma rows at one pitch, which is how
+a mapped NV12 staging texture is laid out, so `D3d11ImageLayout::mapped_rows`
+(1.5 times `texture_height`) rather than `texture_height` counts the rows of
+the staging copy and the host buffer. A write-only native texture is
+published whole (a `D3D11_BOX` names luma rows only), so a writable map of
+part of one is refused. D3D11 has no NV12 texture of odd width or height;
+those, and NV16 and NV24, keep the combined-plane `R8` texture, and a
+producer's combined-plane `R8` texture is still accepted for an even NV12
+image. The image crate imports a native texture's planes as two EGLImages
+(`EGL_D3D11_TEXTURE_PLANE_ANGLE` 0 as `R8`, 1 as `RG8`).
 - `d3d11/geometry.rs` inverts a texture description back to `(width, height)`
   for the descriptor and blob import paths.
 

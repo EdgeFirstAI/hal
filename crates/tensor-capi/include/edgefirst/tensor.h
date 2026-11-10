@@ -491,18 +491,26 @@ typedef void (*EfCudaUnregisterFnNullable)(const void *ctx, void *resource);
  * D3d11ImageLayout`.
  *
  * The dimensions are the texture's, in texels and rows, not the image's in
- * pixels: a semi-planar image is one texture whose row count covers both
- * planes, and a YUYV image is one texel per two pixels, so
+ * pixels: a combined-plane semi-planar image is one texture whose row count
+ * covers both planes, and a YUYV image is one texel per two pixels, so
  * `texture_width`/`texture_height` do not match `ef_tensor_shape` for
  * either. Read the image's own dimensions from the shape.
  *
- * For a semi-planar format (`nv12`, `nv16`, `nv24`) `texture_width` is the
- * driver's row pitch -- at least `even(width)`, and on a discrete adapter
- * commonly more (128 bytes on NVIDIA, so a 64-wide NV12 image is a 128-wide
- * texture). It is the pitch the combined plane's rows are spaced by and the
- * width a sampler must address the texture at. Never derive it from the
- * image width: read this field, or `ef_tensor_row_stride`, which carries the
- * same number.
+ * An NV12 image of even width and height is a native two-plane texture,
+ * `dxgi_format` 103 (`DXGI_FORMAT_NV12`): `texture_width` x
+ * `texture_height` is the luma grid, the image's own size, and the chroma
+ * plane is a second plane of the same texture at half each dimension, which
+ * GL and video APIs address by plane index. A CPU map of it is still laid
+ * out as luma rows then chroma rows at `ef_tensor_row_stride`.
+ *
+ * Every other semi-planar image (`nv16`, `nv24`, and `nv12` at an odd size)
+ * is the combined-plane `R8` texture, whose `texture_width` is the driver's
+ * row pitch -- at least `even(width)`, and on a discrete adapter commonly
+ * more (128 bytes on NVIDIA, so a 64-wide NV16 image is a 128-wide texture).
+ * It is the pitch the combined plane's rows are spaced by and the width a
+ * sampler must address the texture at. Never derive it from the image
+ * width: read this field, or `ef_tensor_row_stride`, which carries the same
+ * number.
  *
  * By-value and frozen forever: a consumer bakes this size and these offsets
  * into its call sites, so the struct evolves by a suffixed successor, never

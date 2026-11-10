@@ -16,6 +16,7 @@ pub const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
 pub const DXGI_FORMAT_R8G8_UNORM: u32 = 49;
 pub const DXGI_FORMAT_R8_UNORM: u32 = 61;
 pub const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+pub const DXGI_FORMAT_NV12: u32 = 103;
 
 /// Values accepted for `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` by ANGLE's D3D11
 /// client-buffer validation (`Renderer11::getD3DTextureInfo`).
@@ -26,8 +27,14 @@ pub const GL_RG_EXT: u32 = 0x8227;
 
 /// One texture's format and geometry for a HAL image. `texture_width` and
 /// `texture_height` are texels and rows, not image pixels: the packed rows
-/// fold several pixels or several planes into one texel, and a semi-planar
-/// row is the image's row *stride* rather than its width.
+/// fold several pixels or several planes into one texel, and a combined
+/// semi-planar row is the image's row *stride* rather than its width.
+///
+/// A native NV12 texture (`DXGI_FORMAT_NV12`) is the exception: its grid is
+/// the image's luma grid, and the chroma plane is a second plane of the same
+/// texture. A CPU map of it is laid out like the combined plane -- luma rows,
+/// then chroma rows, at one row pitch -- so it has
+/// [`mapped_rows`](Self::mapped_rows) rows rather than `texture_height`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct D3d11ImageLayout {
     pub dxgi_format: u32,
@@ -50,9 +57,27 @@ impl D3d11ImageLayout {
         self.texture_width * self.bytes_per_texel
     }
     /// Bytes in the whole texture, padding-free: `tight_row_bytes` over every
-    /// row, with the same semi-planar caveat.
+    /// mapped row, with the same semi-planar caveat.
     pub fn tight_bytes(&self) -> usize {
-        self.tight_row_bytes() * self.texture_height
+        self.tight_row_bytes() * self.mapped_rows()
+    }
+
+    /// The texture is a native two-plane `DXGI_FORMAT_NV12` picture: plane 0
+    /// is luma (`R8`), plane 1 interleaved chroma (`R8G8`) at half the width
+    /// and height. GL imports each plane as its own image.
+    pub fn is_native_nv12(&self) -> bool {
+        self.dxgi_format == DXGI_FORMAT_NV12
+    }
+
+    /// Rows of a CPU map of the texture: `texture_height`, plus the chroma
+    /// rows for a native NV12 texture, whose chroma plane a map lays out
+    /// after the luma rows at the same pitch.
+    pub fn mapped_rows(&self) -> usize {
+        if self.is_native_nv12() {
+            self.texture_height + self.texture_height / 2
+        } else {
+            self.texture_height
+        }
     }
 
     /// This layout with its rows widened to `texture_width` texels.
@@ -96,10 +121,62 @@ pub fn image_d3d11_layout(
     width: usize,
     height: usize,
 ) -> Option<D3d11ImageLayout> {
-    use PixelFormat::*;
     if width == 0 || height == 0 {
         return None;
     }
+    match (format, dtype) {
+        // NV12 at an even size is the native two-plane texture video encoders
+        // and decoders read and write. D3D11 refuses an NV12 texture with an
+        // odd width or height, so those keep the combined plane.
+        // `gl_internal_format` is plane 0's; plane 1 is `GL_RG_EXT`.
+        (PixelFormat::Nv12, DType::U8) if width.is_multiple_of(2) && height.is_multiple_of(2) => {
+            lay(DXGI_FORMAT_NV12, width, height, 1, GL_RED_EXT)
+        }
+        (_, DType::U8) if format.layout() == crate::PixelLayout::SemiPlanar => {
+            combined_semi_planar_layout(format, width, height)
+        }
+        _ => other_layout(format, dtype, width, height),
+    }
+}
+
+/// The HAL's combined luma + interleaved chroma plane as one `R8` texture,
+/// the layout the Path B shader decodes on every GL platform: every NV16 and
+/// NV24 image, and NV12 at an odd size. An externally created texture in
+/// this layout is still accepted for an even NV12 image.
+///
+/// The texture row is the plane's row *stride*, not the image width:
+/// producers write luma and chroma lines at the stride and the shader wraps
+/// chroma addressing at the sampled texture's width, so the two have to be
+/// one number or a chroma line lands on the wrong row. The even rounding is
+/// the floor -- an interleaved chroma pair cannot straddle a row edge -- and
+/// the Windows allocator widens it further to the driver's row pitch through
+/// [`D3d11ImageLayout::widened_to`].
+pub fn combined_semi_planar_layout(
+    format: PixelFormat,
+    width: usize,
+    height: usize,
+) -> Option<D3d11ImageLayout> {
+    if width == 0 || height == 0 || format.layout() != crate::PixelLayout::SemiPlanar {
+        return None;
+    }
+    let shape = format.allocation_shape(width, height)?;
+    lay(
+        DXGI_FORMAT_R8_UNORM,
+        shape[1].next_multiple_of(2),
+        shape[0],
+        1,
+        GL_RED_EXT,
+    )
+}
+
+/// The packed, planar and float layouts: every pair that is not semi-planar.
+fn other_layout(
+    format: PixelFormat,
+    dtype: DType,
+    width: usize,
+    height: usize,
+) -> Option<D3d11ImageLayout> {
+    use PixelFormat::*;
     // Four contiguous values per texel: three RGB bytes or floats per pixel
     // and four planar values per texel both need a width divisible by 4.
     let quarter = |n: usize| {
@@ -120,27 +197,6 @@ pub fn image_d3d11_layout(
             GL_RGBA,
         ),
         (Grey, DType::U8) => lay(DXGI_FORMAT_R8_UNORM, width, height, 1, GL_RED_EXT),
-        // The HAL's combined luma + interleaved chroma plane, the layout the
-        // Path B shader already decodes on Linux and macOS.
-        //
-        // The texture row is the plane's row *stride*, not the image width:
-        // producers write luma and chroma lines at the stride and the shader
-        // wraps chroma addressing at the sampled texture's width, so the two
-        // have to be one number or a chroma line lands on the wrong row. The
-        // even rounding is the floor -- an interleaved chroma pair cannot
-        // straddle a row edge -- and the Windows allocator widens it further
-        // to the driver's row pitch through
-        // [`D3d11ImageLayout::widened_to`].
-        (Nv12 | Nv16 | Nv24, DType::U8) => {
-            let shape = format.allocation_shape(width, height)?;
-            lay(
-                DXGI_FORMAT_R8_UNORM,
-                shape[1].next_multiple_of(2),
-                shape[0],
-                1,
-                GL_RED_EXT,
-            )
-        }
         (Yuyv, DType::U8) => lay(DXGI_FORMAT_R8G8_UNORM, width, height, 2, GL_RG_EXT),
         (PlanarRgb | PlanarRgba, DType::F16) => lay(
             DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -230,8 +286,32 @@ mod tests {
     }
 
     #[test]
-    fn semi_planar_is_the_combined_r8_plane() {
+    fn even_nv12_is_a_native_two_plane_texture() {
         let l = image_d3d11_layout(PixelFormat::Nv12, DType::U8, 128, 64).unwrap();
+        assert_eq!(
+            (
+                l.dxgi_format,
+                l.texture_width,
+                l.texture_height,
+                l.gl_internal_format
+            ),
+            (DXGI_FORMAT_NV12, 128, 64, GL_RED_EXT)
+        );
+        assert!(l.is_native_nv12());
+        assert_eq!(l.mapped_rows(), 96, "luma rows, then chroma rows");
+        assert_eq!(l.tight_bytes(), 128 * 96);
+        // An odd width or height has no NV12 texture.
+        for (w, h) in [(127, 64), (128, 63)] {
+            let l = image_d3d11_layout(PixelFormat::Nv12, DType::U8, w, h).unwrap();
+            assert_eq!(l.dxgi_format, DXGI_FORMAT_R8_UNORM, "{w}x{h}");
+            assert!(!l.is_native_nv12());
+            assert_eq!(l.mapped_rows(), l.texture_height);
+        }
+    }
+
+    #[test]
+    fn semi_planar_is_the_combined_r8_plane() {
+        let l = combined_semi_planar_layout(PixelFormat::Nv12, 128, 64).unwrap();
         assert_eq!(
             (
                 l.dxgi_format,
@@ -241,6 +321,8 @@ mod tests {
             ),
             (DXGI_FORMAT_R8_UNORM, 128, 96, GL_RED_EXT)
         );
+        assert!(combined_semi_planar_layout(PixelFormat::Rgba, 128, 64).is_none());
+        assert!(combined_semi_planar_layout(PixelFormat::Nv12, 0, 64).is_none());
         let l = image_d3d11_layout(PixelFormat::Nv16, DType::U8, 128, 64).unwrap();
         assert_eq!((l.texture_width, l.texture_height), (128, 128));
         let l = image_d3d11_layout(PixelFormat::Nv24, DType::U8, 128, 64).unwrap();
@@ -273,8 +355,8 @@ mod tests {
             );
         }
         // An even width is untouched, so nothing that already fit changes.
-        let l = image_d3d11_layout(PixelFormat::Nv12, DType::U8, 640, 480).unwrap();
-        assert_eq!((l.texture_width, l.texture_height), (640, 720));
+        let l = image_d3d11_layout(PixelFormat::Nv16, DType::U8, 640, 480).unwrap();
+        assert_eq!((l.texture_width, l.texture_height), (640, 960));
     }
 
     /// The allocator widens a semi-planar entry to the driver's row pitch and

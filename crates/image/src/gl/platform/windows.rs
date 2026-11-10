@@ -703,6 +703,51 @@ fn import_texture(
     layout: &edgefirst_tensor::d3d11_layout::D3d11ImageLayout,
     what: &str,
 ) -> Result<D3d11EglImage> {
+    import_plane(
+        display,
+        texture,
+        layout.gl_internal_format,
+        None,
+        (layout.texture_width as u32, layout.texture_height as u32),
+        what,
+    )
+}
+
+/// Wrap plane `plane` of a native NV12 texture: plane 0 is its luma as
+/// `GL_RED_EXT` at the full grid, plane 1 its interleaved chroma as
+/// `GL_RG_EXT` at half the width and height.
+fn import_nv12_plane(
+    display: &D3d11Display,
+    texture: *mut c_void,
+    layout: &edgefirst_tensor::d3d11_layout::D3d11ImageLayout,
+    plane: u32,
+) -> Result<D3d11EglImage> {
+    let (w, h) = (layout.texture_width as u32, layout.texture_height as u32);
+    let (format, extent, what) = match plane {
+        0 => (
+            edgefirst_tensor::d3d11_layout::GL_RED_EXT,
+            (w, h),
+            "NV12 luma plane",
+        ),
+        _ => (
+            edgefirst_tensor::d3d11_layout::GL_RG_EXT,
+            (w / 2, h / 2),
+            "NV12 chroma plane",
+        ),
+    };
+    import_plane(display, texture, format, Some(plane), extent, what)
+}
+
+/// Wrap `texture`, or one plane of it, as an EGLImage sampled as
+/// `gl_internal_format` over `extent` texels.
+fn import_plane(
+    display: &D3d11Display,
+    texture: *mut c_void,
+    gl_internal_format: u32,
+    plane: Option<u32>,
+    extent: (u32, u32),
+    what: &str,
+) -> Result<D3d11EglImage> {
     let _span =
         tracing::trace_span!("image.convert.gl.egl_import", target = "d3d11_texture").entered();
     let shared = display.shared;
@@ -713,7 +758,7 @@ fn import_texture(
                 .into(),
         )
     })?;
-    let attribs = super::super::d3d11_import::d3d11_image_attribs(layout.gl_internal_format, None);
+    let attribs = super::super::d3d11_import::d3d11_image_attribs(gl_internal_format, plane);
     // The image ANGLE returns holds its own reference to `texture`: that is
     // what makes a cached import outliving its tensor sound, and what the
     // pool-recycle tier tests exercise every run.
@@ -741,7 +786,7 @@ fn import_texture(
     Ok(D3d11EglImage {
         shared,
         image,
-        extent: (layout.texture_width as u32, layout.texture_height as u32),
+        extent,
     })
 }
 
@@ -1017,6 +1062,12 @@ impl GlPlatform for AngleD3d11 {
     ) -> Result<D3d11EglImage> {
         super::refuse_offset_source(img, "NV source", "EGL_ANGLE_image_d3d11_texture")?;
         let (texture, layout) = texture_of(img, "NV source")?;
+        // A native NV12 texture has no combined plane: the luma import is its
+        // plane 0, and the engine reads chroma from plane 1
+        // (`nv_native_planes`).
+        if layout.is_native_nv12() {
+            return import_nv12_plane(display, texture, &layout, 0);
+        }
         // The HAL's own semi-planar allocations are always R8, and so is any
         // externally wrapped one the tensor crate accepted. That acceptance
         // is a contract this whole path rests on: `d3d11/texture.rs`'s
@@ -1032,6 +1083,30 @@ impl GlPlatform for AngleD3d11 {
             )));
         }
         import_texture(display, texture, &layout, "NV combined plane")
+    }
+
+    /// Only a native NV12 texture has a chroma plane of its own; the
+    /// combined-plane textures keep the shader-filtered program, as
+    /// `NV_CHROMA_IMPORT` (false) tells the engine.
+    fn import_buffer_nv_chroma(
+        display: &D3d11Display,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> Result<D3d11EglImage> {
+        super::refuse_offset_source(img, "NV source", "EGL_ANGLE_image_d3d11_texture")?;
+        let (texture, layout) = texture_of(img, "NV chroma source")?;
+        if !layout.is_native_nv12() {
+            return Err(Error::NotSupported(format!(
+                "{fmt:?} in a combined-plane texture has no chroma plane of its own"
+            )));
+        }
+        import_nv12_plane(display, texture, &layout, 1)
+    }
+
+    fn nv_native_planes(img: &Tensor<u8>) -> Option<(usize, usize)> {
+        img.d3d11_layout()
+            .filter(|l| l.is_native_nv12())
+            .map(|l| (l.texture_width, l.texture_height))
     }
 
     fn import_buffer_packed<T>(
