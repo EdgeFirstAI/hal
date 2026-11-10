@@ -758,10 +758,18 @@ mod gl_tests {
                 steady.dst.hits - warm.dst.hits >= FRAMES as u64,
                 "the destination must hit every frame: warm={warm:?} steady={steady:?}"
             );
-            assert!(
-                steady.total_misses() - warm.total_misses() <= FRAMES as u64,
-                "source imports must be bounded by the loop: warm={warm:?} steady={steady:?}"
-            );
+            // A native NV12 source imports its two planes, luma and chroma,
+            // so each import cache is bounded by the loop on its own.
+            for (name, warm_misses, steady_misses) in [
+                ("src", warm.src.misses, steady.src.misses),
+                ("nv_r8", warm.nv_r8.misses, steady.nv_r8.misses),
+                ("nv_uv", warm.nv_uv.misses, steady.nv_uv.misses),
+            ] {
+                assert!(
+                    steady_misses - warm_misses <= FRAMES as u64,
+                    "{name} imports must be bounded by the loop: warm={warm:?} steady={steady:?}"
+                );
+            }
         }
     }
 

@@ -223,7 +223,8 @@ cargo test -p edgefirst-tensor cuda -- --test-threads=1
 has three tests exercising CUDA's external-memory import of a D3D11 texture
 tensor (`cuda_map_matches_the_cpu_map_and_map_mut_writes_back`,
 `cuda_map_covers_a_texture_whose_allocation_the_driver_padded`,
-`cuda_map_reads_the_nv12_combined_plane`). Each self-skips on the WARP
+`cuda_map_reads_the_nv12_combined_plane`, which covers a native NV12
+texture and an odd-height combined one, reading and writing back). Each self-skips on the WARP
 adapter (`cudaD3D11GetDevice` has no ordinal for it — that skip is correct by
 design), and then when `edgefirst_tensor::is_cuda_available()` is false. The
 order matters: the WARP skip is a property of the adapter that no runtime can

@@ -103,7 +103,10 @@ if sys.platform == "win32":
             Windows.
 
         The dimensions are the texture's, not the image's: a packed row
-        folds several pixels or several planes into one texel.
+        folds several pixels or several planes into one texel. An NV12
+        image of even width and height is a native two-plane texture
+        (``dxgi_format`` 103, ``DXGI_FORMAT_NV12``) whose dimensions are the
+        luma grid; its chroma is the texture's second plane.
         """
 
         dxgi_format: int

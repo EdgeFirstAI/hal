@@ -82,6 +82,12 @@ pub(crate) struct CudaTable {
         unsafe extern "C" fn(*mut CudaArray, MipmappedArray, c_uint) -> CudaError,
     #[cfg(target_os = "windows")]
     pub free_mipmapped_array: unsafe extern "C" fn(MipmappedArray) -> CudaError,
+    /// `cudaArrayGetPlane`, CUDA 11.2 and later: one plane of a multi-planar
+    /// (NV12) array. `None` on an older runtime, which then declines native
+    /// NV12 textures.
+    #[cfg(target_os = "windows")]
+    pub array_get_plane:
+        Option<unsafe extern "C" fn(*mut CudaArray, CudaArray, c_uint) -> CudaError>,
     // The async spellings, not the plain ones: a device-to-device
     // `cudaMemcpy2D*` runs on the legacy default stream, and synchronising
     // that is a device-wide barrier that also waits behind every other stream
@@ -328,6 +334,10 @@ fn load_table(lib: Library, runtime_path: std::path::PathBuf) -> Option<CudaTabl
         get_mipmapped_array_level: sym!("cudaGetMipmappedArrayLevel"),
         #[cfg(target_os = "windows")]
         free_mipmapped_array: sym!("cudaFreeMipmappedArray"),
+        #[cfg(target_os = "windows")]
+        // SAFETY: a fixed symbol-name literal looked up in the module `load()`
+        // just opened, read as the function type its CUDA declaration has.
+        array_get_plane: unsafe { lib.get(b"cudaArrayGetPlane\0") }.ok().map(|s| *s),
         #[cfg(target_os = "windows")]
         memcpy_2d_from_array_async: sym!("cudaMemcpy2DFromArrayAsync"),
         #[cfg(target_os = "windows")]
@@ -692,6 +702,9 @@ pub(crate) const CUDA_CHANNEL_FORMAT_KIND_UNSIGNED: c_int = 1;
 /// `cudaChannelFormatKindFloat` — float texture formats (F16, F32).
 #[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
 pub(crate) const CUDA_CHANNEL_FORMAT_KIND_FLOAT: c_int = 2;
+/// `cudaChannelFormatKindNV12`: an 8-bit 4:2:0 array of two planes.
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
+pub(crate) const CUDA_CHANNEL_FORMAT_KIND_NV12: c_int = 4;
 
 /// `cudaExternalMemoryHandleDesc` with the `win32` arm of the handle union
 /// populated (`type_`, `win32_handle`/`win32_name`, `size`, `flags`), laid
@@ -824,17 +837,47 @@ pub(crate) struct CudaExternalSemaphoreWaitParams {
 /// every tensor call to the C ABI and never constructs a texture storage, so
 /// nothing there can produce this backing.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
+/// One CUDA array the linear buffer is copied from and back to: the level-0
+/// array of a single-plane texture, or one plane of a native NV12 one.
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
+#[derive(Clone, Copy)]
+struct ArrayPlane {
+    array: CudaArray,
+    /// Bytes of one row of the plane, which is also its row in the linear
+    /// buffer.
+    row_bytes: usize,
+    rows: usize,
+    /// Where the plane's rows start in the linear buffer.
+    offset: usize,
+}
+
+/// The arrays of an imported texture in the order its linear buffer lays
+/// them out: one plane, or NV12's luma then its interleaved chroma, which is
+/// the combined-plane layout a CPU map of the texture has.
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
+#[derive(Clone, Copy)]
+struct ArrayPlanes {
+    planes: [ArrayPlane; 2],
+    count: usize,
+}
+
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
+impl ArrayPlanes {
+    fn iter(&self) -> impl Iterator<Item = &ArrayPlane> {
+        self.planes[..self.count].iter()
+    }
+}
+
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 struct D3d11External {
     ext_mem: ExternalMemory,
     mipmapped: MipmappedArray,
-    level0: CudaArray,
+    planes: ArrayPlanes,
     /// The linear buffer, allocated on first use: `map` takes `&self`, so the
     /// slot is behind a lock, which also serialises two concurrent maps that
     /// would otherwise copy into one buffer at once.
     linear: std::sync::Mutex<Option<*mut c_void>>,
     bytes: usize,
-    row_bytes: usize,
-    rows: usize,
     stream: CudaStream,
     /// The CUDA device the D3D11 adapter maps to. Set again before every copy
     /// and before the release: `cudaSetDevice` is per-thread state, so a
@@ -909,6 +952,11 @@ pub(crate) fn import_d3d11_texture(
     // `crate::d3d11_layout` allocates are listed; anything else declines the
     // import rather than guessing a description the driver would reject.
     let (bits, kind, channels) = match layout.dxgi_format {
+        // An NV12 array is described as three 8-bit channels of kind NV12;
+        // its planes are split out below.
+        crate::d3d11_layout::DXGI_FORMAT_NV12 if t.array_get_plane.is_some() => {
+            (8, CUDA_CHANNEL_FORMAT_KIND_NV12, 3)
+        }
         crate::d3d11_layout::DXGI_FORMAT_R8_UNORM => (8, CUDA_CHANNEL_FORMAT_KIND_UNSIGNED, 1),
         crate::d3d11_layout::DXGI_FORMAT_R8G8_UNORM => (8, CUDA_CHANNEL_FORMAT_KIND_UNSIGNED, 2),
         crate::d3d11_layout::DXGI_FORMAT_R8G8B8A8_UNORM
@@ -971,22 +1019,87 @@ pub(crate) fn import_d3d11_texture(
         }
         return None;
     };
+    let Some(planes) = array_planes(t, level0, layout) else {
+        // SAFETY: as in the failure arm above: created here, held by nothing
+        // else, the stream first and the array before its memory.
+        unsafe {
+            (t.stream_destroy)(stream);
+            (t.free_mipmapped_array)(mm);
+            (t.destroy_external_memory)(ext);
+        }
+        return None;
+    };
     let semaphore = fence_handle.and_then(|fh| shared_semaphore(t, fh));
     Some(CudaHandle {
         size: layout.tight_bytes(),
         kind: CudaBacking::D3d11(D3d11External {
             ext_mem: ext,
             mipmapped: mm,
-            level0,
+            planes,
             linear: std::sync::Mutex::new(None),
             bytes: layout.tight_bytes(),
-            row_bytes: layout.tight_row_bytes(),
-            rows: layout.texture_height,
             stream,
             device,
             semaphore,
             last_write,
         }),
+    })
+}
+
+/// The arrays the linear buffer of `layout`'s texture is copied through:
+/// `level0` itself, or for a native NV12 texture its luma plane (one 8-bit
+/// channel, the full grid) and its chroma plane (two 8-bit channels at half
+/// the width and height, so as many bytes per row as luma).
+#[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
+fn array_planes(
+    t: &CudaTable,
+    level0: CudaArray,
+    layout: crate::d3d11_layout::D3d11ImageLayout,
+) -> Option<ArrayPlanes> {
+    let row_bytes = layout.tight_row_bytes();
+    if !layout.is_native_nv12() {
+        let only = ArrayPlane {
+            array: level0,
+            row_bytes,
+            rows: layout.texture_height,
+            offset: 0,
+        };
+        return Some(ArrayPlanes {
+            planes: [only; 2],
+            count: 1,
+        });
+    }
+    let get_plane = t.array_get_plane?;
+    let mut planes = [std::ptr::null_mut(); 2];
+    for (i, plane) in planes.iter_mut().enumerate() {
+        // SAFETY: `level0` is the live NV12 array just mapped, which has two
+        // planes, and `plane` is a valid out-parameter.
+        let rc = unsafe { get_plane(plane, level0, i as c_uint) };
+        if rc != 0 || plane.is_null() {
+            log::debug!(
+                "cudaArrayGetPlane({i}) of an NV12 texture: {}",
+                err_str(t, rc)
+            );
+            return None;
+        }
+    }
+    let luma_rows = layout.texture_height;
+    Some(ArrayPlanes {
+        planes: [
+            ArrayPlane {
+                array: planes[0],
+                row_bytes,
+                rows: luma_rows,
+                offset: 0,
+            },
+            ArrayPlane {
+                array: planes[1],
+                row_bytes,
+                rows: luma_rows / 2,
+                offset: row_bytes * luma_rows,
+            },
+        ],
+        count: 2,
     })
 }
 
@@ -1367,9 +1480,7 @@ impl CudaHandle {
                 ptr: self.d3d11_copy_in(x)?,
                 len: x.bytes,
                 release: Release::D3d11Writeback {
-                    level0: x.level0,
-                    row_bytes: x.row_bytes,
-                    rows: x.rows,
+                    planes: x.planes,
                     stream: x.stream,
                     device: x.device,
                 },
@@ -1459,28 +1570,31 @@ impl CudaHandle {
             );
             return None;
         }
-        // One device copy turns the tiled array into the tensor's tight rows,
-        // on the same stream as the wait above so it runs behind it.
-        // SAFETY: `dptr` holds `x.rows * x.row_bytes == x.bytes` bytes,
-        // `x.level0` is the live level-0 array of the imported texture, which
-        // is `x.row_bytes` wide and `x.rows` tall, and `x.stream` is this
-        // backing's live stream.
-        let rc = unsafe {
-            (t.memcpy_2d_from_array_async)(
-                dptr,
-                x.row_bytes,
-                x.level0,
-                0,
-                0,
-                x.row_bytes,
-                x.rows,
-                CUDA_MEMCPY_DEVICE_TO_DEVICE,
-                x.stream,
-            )
-        };
-        if rc != 0 {
-            log::warn!("cudaMemcpy2DFromArrayAsync: {}", err_str(t, rc));
-            return None;
+        // One device copy per plane turns the tiled arrays into the tensor's
+        // tight rows, on the same stream as the wait above so they run
+        // behind it.
+        for plane in x.planes.iter() {
+            // SAFETY: `dptr` holds `x.bytes` bytes, which covers every plane's
+            // `offset + rows * row_bytes`; `plane.array` is a live array of the
+            // imported texture, `row_bytes` wide and `rows` tall; and
+            // `x.stream` is this backing's live stream.
+            let rc = unsafe {
+                (t.memcpy_2d_from_array_async)(
+                    dptr.cast::<u8>().add(plane.offset).cast(),
+                    plane.row_bytes,
+                    plane.array,
+                    0,
+                    0,
+                    plane.row_bytes,
+                    plane.rows,
+                    CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    x.stream,
+                )
+            };
+            if rc != 0 {
+                log::warn!("cudaMemcpy2DFromArrayAsync: {}", err_str(t, rc));
+                return None;
+            }
         }
         // SAFETY: `x.stream` is this backing's live stream.
         let rc = unsafe { (t.stream_synchronize)(x.stream) };
@@ -1686,9 +1800,7 @@ enum Release {
     FfiUnmap(*mut c_void),
     #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
     D3d11Writeback {
-        level0: CudaArray,
-        row_bytes: usize,
-        rows: usize,
+        planes: ArrayPlanes,
         stream: CudaStream,
         device: c_int,
     },
@@ -1796,9 +1908,7 @@ impl Drop for CudaMap<'_> {
             }
             #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
             Release::D3d11Writeback {
-                level0,
-                row_bytes,
-                rows,
+                planes,
                 stream,
                 device,
             } => {
@@ -1818,25 +1928,28 @@ impl Drop for CudaMap<'_> {
                     );
                     return;
                 }
-                // SAFETY: `self.ptr` is the linear buffer this map was built
-                // over, holding `rows * row_bytes` bytes, `level0` the live
-                // level-0 array of the same geometry, and `stream` the
-                // backing's live stream, which outlives this map.
-                let rc = unsafe {
-                    (t.memcpy_2d_to_array_async)(
-                        level0,
-                        0,
-                        0,
-                        self.ptr,
-                        row_bytes,
-                        row_bytes,
-                        rows,
-                        CUDA_MEMCPY_DEVICE_TO_DEVICE,
-                        stream,
-                    )
-                };
-                if rc != 0 {
-                    log::warn!("cudaMemcpy2DToArrayAsync: {}", err_str(t, rc));
+                for plane in planes.iter() {
+                    // SAFETY: `self.ptr` is the linear buffer this map was
+                    // built over, which holds every plane's rows at its
+                    // `offset`; `plane.array` is a live array of the same
+                    // geometry; and `stream` is the backing's live stream,
+                    // which outlives this map.
+                    let rc = unsafe {
+                        (t.memcpy_2d_to_array_async)(
+                            plane.array,
+                            0,
+                            0,
+                            self.ptr.cast::<u8>().add(plane.offset).cast_const().cast(),
+                            plane.row_bytes,
+                            plane.row_bytes,
+                            plane.rows,
+                            CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                            stream,
+                        )
+                    };
+                    if rc != 0 {
+                        log::warn!("cudaMemcpy2DToArrayAsync: {}", err_str(t, rc));
+                    }
                 }
                 // Synchronised here, not left in flight: the copy above is
                 // asynchronous, and later D3D11 and GL work on the immediate

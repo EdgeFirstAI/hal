@@ -7845,7 +7845,25 @@ impl GLProcessorST {
         // luma copy does, so footroom does not drag a blend below black.
         let hw_filter = self.nv_hw_filter
             && !(luma_only && colorimetry.1 == edgefirst_tensor::ColorRange::Limited);
-        let uv_import = if bilinear && hw_filter && r8_src.is_some() {
+        // A two-plane import's luma texture holds no chroma rows: its chroma
+        // is plane 1 alone, so the hardware-filtered program draws it whether
+        // or not the draw rescales, with NEAREST filtering when it does not.
+        // Without the chroma plane, it is uploaded through `map()` instead,
+        // which lays it out as the combined plane.
+        let mut r8_src = r8_src;
+        let native_extent = r8_src.and_then(|_| Platform::nv_native_planes(src));
+        let mut native_planes = native_extent.is_some();
+        let uv_import = if native_planes {
+            match self.get_or_create_nv_uv_egl_image(src, src_fmt) {
+                Ok(import) => Some(import),
+                Err(e) => {
+                    log::debug!("NV12 chroma plane import failed ({e}); uploading the planes");
+                    native_planes = false;
+                    r8_src = None;
+                    None
+                }
+            }
+        } else if bilinear && hw_filter && r8_src.is_some() {
             self.get_or_create_nv_uv_egl_image(src, src_fmt)
                 .inspect_err(|e| log::debug!("NV chroma view unavailable ({e}); shader-filtered"))
                 .ok()
@@ -7854,16 +7872,20 @@ impl GLProcessorST {
         };
         // Only NV12 has a full-image DMA-BUF import for the Y2Y programs,
         // whose matrix comes with the external sampler, never luma-only.
-        let mut sampling = NvSampling::choose(NvSamplingInputs {
-            bilinear,
-            hw_filter,
-            imported: r8_src.is_some(),
-            chroma_view: uv_import.is_some(),
-            y2y: self.nv_y2y_programs.is_some()
-                && !luma_only
-                && src_fmt == PixelFormat::Nv12
-                && y2y_pays_off(src_w * src_h, src_rect.dst_pixels),
-        });
+        let mut sampling = if native_planes {
+            NvSampling::Hardware
+        } else {
+            NvSampling::choose(NvSamplingInputs {
+                bilinear,
+                hw_filter,
+                imported: r8_src.is_some(),
+                chroma_view: uv_import.is_some(),
+                y2y: self.nv_y2y_programs.is_some()
+                    && !luma_only
+                    && src_fmt == PixelFormat::Nv12
+                    && y2y_pays_off(src_w * src_h, src_rect.dst_pixels),
+            })
+        };
         if sampling == NvSampling::HardwareYuv {
             match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
                 Ok(img) => {
@@ -7888,10 +7910,17 @@ impl GLProcessorST {
             }
         }
         let program = sampling.program(is_int8);
-        let r8_filter = if sampling == NvSampling::Hardware {
+        let r8_filter = if sampling == NvSampling::Hardware && (bilinear || !native_planes) {
             edgefirst_gl::gl::LINEAR
         } else {
             edgefirst_gl::gl::NEAREST
+        };
+        // A combined-plane source's chroma view only exists for bilinear
+        // draws; a two-plane source's follows its luma.
+        let chroma_filter = if native_planes {
+            r8_filter
+        } else {
+            edgefirst_gl::gl::LINEAR
         };
         let (shift_x, shift_y) = (layout.shift_x, layout.shift_y);
         let chroma_w = src_w.div_ceil(1 << shift_x);
@@ -7995,7 +8024,8 @@ impl GLProcessorST {
 
             if sampling == NvSampling::Hardware {
                 edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE1);
-                let bound = self.bind_nv_chroma(src, src_key, uv_import, chroma_w, chroma_h);
+                let bound =
+                    self.bind_nv_chroma(src, src_key, uv_import, chroma_w, chroma_h, chroma_filter);
                 edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
                 bound?;
             }
@@ -8009,8 +8039,13 @@ impl GLProcessorST {
             if sampling == NvSampling::Hardware {
                 // The crop's half-texel-inset rectangle on each texture, so
                 // the LINEAR kernel never reaches past the crop (or, for luma,
-                // into the chroma rows below the image).
-                let (tw, th) = (tex_width as f32, combined_h as f32);
+                // into the chroma rows below the image). A two-plane luma
+                // texture is the image's own grid.
+                let native_extent = native_extent.filter(|_| native_planes);
+                let (tw, th) = match native_extent {
+                    Some((w, h)) => (w as f32, h as f32),
+                    None => (tex_width as f32, combined_h as f32),
+                };
                 edgefirst_gl::gl::Uniform2f(locs.luma_scale, src_w as f32 / tw, src_h as f32 / th);
                 edgefirst_gl::gl::Uniform4f(
                     locs.luma_clamp,
@@ -8019,11 +8054,17 @@ impl GLProcessorST {
                     (src_rect.right as f32 - 0.5) / tw,
                     (src_rect.bottom as f32 - 0.5) / th,
                 );
-                let (cw, ch) = (chroma_w as f32, chroma_h as f32);
+                // A two-plane chroma texture is half the luma plane, which can
+                // be larger than the logical image of a narrowed pool tensor.
+                let (chroma_tex_w, chroma_tex_h) = match native_extent {
+                    Some((w, h)) => (w >> shift_x, h >> shift_y),
+                    None => (chroma_w, chroma_h),
+                };
+                let (cw, ch) = (chroma_tex_w as f32, chroma_tex_h as f32);
                 edgefirst_gl::gl::Uniform2f(
                     locs.chroma_scale,
-                    src_w as f32 / (chroma_w << shift_x) as f32,
-                    src_h as f32 / (chroma_h << shift_y) as f32,
+                    src_w as f32 / (chroma_tex_w << shift_x) as f32,
+                    src_h as f32 / (chroma_tex_h << shift_y) as f32,
                 );
                 edgefirst_gl::gl::Uniform4f(
                     locs.chroma_clamp,
@@ -8473,6 +8514,7 @@ impl GLProcessorST {
         import: Option<PlatformHandle>,
         chroma_w: usize,
         chroma_h: usize,
+        filter: u32,
     ) -> Result<(), Error> {
         if self.is_adreno && import.is_none() {
             // As for the R8 plane: a texture that held an import keeps
@@ -8481,10 +8523,7 @@ impl GLProcessorST {
         }
         unsafe {
             edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.nv_uv_texture.id);
-            super::core::set_tex_filter_clamp(
-                edgefirst_gl::gl::TEXTURE_2D,
-                edgefirst_gl::gl::LINEAR,
-            );
+            super::core::set_tex_filter_clamp(edgefirst_gl::gl::TEXTURE_2D, filter);
         }
         if let Some(handle) = import {
             // SAFETY: `handle` comes from `nv_uv_egl_cache`, which owns the
@@ -8533,7 +8572,11 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
     ) -> Result<PlatformHandle, crate::Error> {
-        if !Platform::NV_CHROMA_IMPORT || self.nv_uv_import_refused {
+        // A two-plane source's chroma plane is the only chroma it has, so it
+        // is imported whatever an earlier combined-plane refusal recorded,
+        // and its own refusal is not remembered for those.
+        let native = Platform::nv_native_planes(img).is_some();
+        if !native && (!Platform::NV_CHROMA_IMPORT || self.nv_uv_import_refused) {
             return Err(crate::Error::NotSupported(
                 "no chroma-plane import on this platform or driver".into(),
             ));
@@ -8562,8 +8605,12 @@ impl GLProcessorST {
         // remembered so the next resize does not repeat the attempt.
         let egl_image_obj = Platform::import_buffer_nv_chroma(&self.gl_context, img, img_fmt)
             .inspect_err(|e| {
-                log::info!("NV chroma-plane import refused ({e}); resizing with the shader filter");
-                self.nv_uv_import_refused = true;
+                if !native {
+                    log::info!(
+                        "NV chroma-plane import refused ({e}); resizing with the shader filter"
+                    );
+                    self.nv_uv_import_refused = true;
+                }
             })?;
         self.nv_uv_egl_cache.misses += 1;
         self.nv_uv_texture.invalidate_egl_binding();
