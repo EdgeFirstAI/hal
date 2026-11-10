@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **H.264 encode and decode on Windows (`edgefirst-codec`, `media-foundation` feature, on by default).** `VideoEncoder` and `VideoDecoder` run on the Media Foundation H.264 transforms: the GPU's encoder (NVENC, Quick Sync, AMF, or Microsoft's DX12 encoder) where the driver registers one, otherwise Microsoft's software encoder, and Microsoft's decoder on the GPU (DXVA). Pixels stay on the GPU: an encoder reads native NV12 D3D11 tensors in place, or a GPU copy of them when the source is cropped or the encoder holds frames, and each decoded picture is copied GPU to GPU into a pool of NV12 D3D11 tensors with a recorded fence value. Without DXVA or a D3D11 device the transforms fall back to system memory. `EDGEFIRST_CODEC_MF_ENCODER` and `EDGEFIRST_CODEC_MF_DECODER` select transforms by name, `hardware` or `software`. `mfplat.dll` is loaded at run time, so the crate still loads on Windows N editions, where the codecs report `NoDevice`. On Windows a provided decoder pool must hold NV12 images of the stream's visible size.
+
 - **`D3d11ImageLayout::is_native_nv12()` and `mapped_rows()` (`edgefirst-tensor`).** Whether a texture tensor is a native two-plane NV12 texture, and how many rows a CPU map of it has (1.5 times `texture_height` for native NV12); with `d3d11_layout::DXGI_FORMAT_NV12` and `d3d11_layout::combined_semi_planar_layout`.
 
 ### Changed

@@ -253,6 +253,50 @@ fn encodes_a_crop_of_a_larger_source() {
     assert!(out[0].keyframe);
 }
 
+/// A source in host memory: Media Foundation encoders copy it into a texture
+/// of their own, while a V4L2 encoder imports DMA-BUFs only and refuses it.
+#[test]
+fn encodes_a_host_memory_source_where_the_encoder_copies() {
+    let Some(mut enc) = open(
+        "encodes_a_host_memory_source_where_the_encoder_copies",
+        EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),
+    ) else {
+        return;
+    };
+    let src = TensorDyn::image(
+        640,
+        480,
+        PixelFormat::Nv12,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        CpuAccess::ReadWrite,
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    for i in 0..10 {
+        paint(&src, i);
+        let opts = FrameOptions {
+            pts: i as u64,
+            ..FrameOptions::default()
+        };
+        match enc.encode(&src, &opts) {
+            Ok(au) => out.extend(au),
+            Err(CodecError::InvalidInput(why)) if !cfg!(windows) => {
+                return skip(
+                    "encodes_a_host_memory_source_where_the_encoder_copies",
+                    &format!("{} imports DMA-BUFs only: {why}", enc.device()),
+                );
+            }
+            Err(e) => panic!("encode: {e}"),
+        }
+    }
+    out.extend(enc.flush().unwrap());
+    assert_eq!(out.len(), 10);
+    assert!(out[0].keyframe);
+    let pts: Vec<u64> = out.iter().map(|f| f.pts).collect();
+    assert_eq!(pts, (0..10).collect::<Vec<_>>());
+}
+
 #[test]
 fn encoder_is_reusable_after_flush() {
     let Some(mut enc) = open(

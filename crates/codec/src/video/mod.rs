@@ -14,8 +14,9 @@
 //! On Windows both are Media Foundation transforms (feature
 //! `media-foundation`): a hardware encoder where the GPU driver registers
 //! one, otherwise Microsoft's software encoder, and Microsoft's decoder.
-//! Pixels are copied: the encoder reads each source through a CPU map, and
-//! decoded pictures are copied into the decoder's pool of D3D11 tensors.
+//! Pixels stay on the GPU: a hardware encoder reads native NV12 D3D11 tensors
+//! in place, and the decoder (DXVA) copies each picture, GPU to GPU, into a
+//! pool of D3D11 tensors.
 //!
 //! ```rust,no_run
 //! use edgefirst_codec::video::{EncoderConfig, FrameOptions, VideoEncoder};
@@ -490,9 +491,9 @@ pub enum OutputPool {
     },
     /// Pictures are decoded into these DMA-BUF tensors, one buffer each.
     ///
-    /// On Windows pictures are copied into the pool, and each tensor must be
-    /// an NV12 image of exactly the stream's visible size; such a pool
-    /// cannot follow a change of size. The rest of this description is about
+    /// On Windows pictures are copied into the pool (on the GPU), and each
+    /// tensor must be an NV12 image of exactly the stream's visible size;
+    /// such a pool cannot follow a change of size. The rest of this description is about
     /// devices that decode in place.
     ///
     /// There must be at least one more than the device keeps for reference
@@ -569,7 +570,7 @@ pub struct StreamInfo {
 pub enum OutputMemory {
     /// The pool's DMA-BUFs (allocated by the decoder or provided by the
     /// caller), imported by the device, or on Windows written by copying
-    /// each picture out of the decoder.
+    /// each picture out of the decoder, on the GPU where it decodes there.
     Imported,
     /// The device's own buffers, exported as DMA-BUFs because it would not
     /// import the pool's. CPU reads of these may be uncached and slow.

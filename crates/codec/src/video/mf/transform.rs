@@ -16,14 +16,15 @@ use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, MEError,
-    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    IMFActivate, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+    IMFTransform, MEError, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING,
-    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE,
+    MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
 };
 
 use super::{com, error, Candidate, Platform};
@@ -136,6 +137,33 @@ impl Transform {
 
     pub(crate) fn hardware(&self) -> bool {
         self.hardware
+    }
+
+    /// Gives the transform `manager`, so it reads and writes D3D11 textures on
+    /// HAL's device. Returns false, leaving the transform on system memory,
+    /// when it is not D3D11-aware or refuses the manager.
+    pub(crate) fn set_device_manager(&self, manager: &IMFDXGIDeviceManager) -> bool {
+        // SAFETY: a live transform.
+        let aware = unsafe { self.mft.GetAttributes() }
+            .ok()
+            // SAFETY: a live attribute store.
+            .and_then(|a| unsafe { a.GetUINT32(&MF_SA_D3D11_AWARE) }.ok())
+            .is_some_and(|v| v != 0);
+        if !aware {
+            return false;
+        }
+        // SAFETY: a live transform; the message takes the manager's pointer,
+        // and the transform keeps its own reference.
+        match unsafe {
+            self.mft
+                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+        } {
+            Ok(()) => true,
+            Err(e) => {
+                log::debug!("{}: D3D11 device manager refused: {e}", self.name);
+                false
+            }
+        }
     }
 
     /// Sets the input type.

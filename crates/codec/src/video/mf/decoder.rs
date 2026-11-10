@@ -3,12 +3,21 @@
 
 //! H.264 decoding with a Media Foundation decoder transform.
 //!
-//! The decoder writes each picture to a system-memory sample, which is
-//! copied into a free tensor of the pool and returned as a
-//! [`DecodedFrame`]. Pictures the decoder finishes while every tensor is
-//! held wait, in Media Foundation's memory, for a frame to drop; the next
-//! call fails with [`CodecError::PoolExhausted`] without taking its access
-//! unit until one has.
+//! Microsoft's decoder is given a DXGI device manager on HAL's D3D11 device,
+//! so it decodes on the GPU (DXVA) into a texture array of its own. Each
+//! picture is copied, GPU to GPU, into a free native NV12 tensor of the pool
+//! and returned as a [`DecodedFrame`], whose recorded fence value orders a
+//! consumer behind the copy. The decoder's sample is released at once: its
+//! array has a handful of slices, and a decoder whose samples are all held
+//! stops for good.
+//!
+//! A picture finished while every pool tensor is held is copied into a
+//! parking texture and waits there for a frame to drop; the next call fails
+//! with [`CodecError::PoolExhausted`] without taking its access unit until
+//! one has.
+//!
+//! Without DXVA (no D3D11 device, or an adapter without video decoding) the
+//! decoder writes system memory, which is copied into the pool on the CPU.
 //!
 //! The pool is allocated at the stream's visible size: D3D11 tensors where
 //! the process has a D3D11 device, host memory otherwise. A provided pool
@@ -42,8 +51,14 @@ use windows::Win32::Media::MediaFoundation::{
 
 use windows::Win32::System::Variant::VARIANT;
 
+use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX};
+use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
+
 use super::copy::{self, Plane};
-use super::{com, error, pair, Output, Platform, Transform};
+use super::{
+    com, error, hal_device, is_native_nv12, pair, sample_texture, tensor_texture, Output, Platform,
+    Transform,
+};
 use crate::video::{
     DecodeEvent, DecodedFrame, DecoderBackend, DecoderConfig, OutputMemory, OutputPool, Returns,
     StreamInfo,
@@ -171,11 +186,29 @@ fn colorimetry(attrs: &IMFAttributes) -> Option<Colorimetry> {
 /// What the decoder has finished, in order, not yet given to the caller.
 enum Ready {
     Format(Layout),
-    Picture(IMFSample),
+    Picture(Picture),
+}
+
+/// A finished picture waiting for a pool buffer.
+enum Picture {
+    /// Still in the decoder's sample: system memory, or a texture-array
+    /// slice that is moved to a parking texture before the call returns.
+    Sample(IMFSample),
+    /// Copied out of the decoder into a parking texture of the picture's
+    /// size, with the decoder's sample time.
+    Parked {
+        tensor: Box<TensorDyn>,
+        time: Option<i64>,
+    },
 }
 
 pub(crate) struct MfDecoder {
     transform: Transform,
+    /// The immediate context of HAL's device, when the decoder writes D3D11
+    /// textures.
+    context: Option<ID3D11DeviceContext>,
+    /// Parking textures no picture occupies, reused while their size fits.
+    parking: Vec<TensorDyn>,
     device: String,
     output: OutputPool,
     pool: Vec<Arc<TensorDyn>>,
@@ -192,6 +225,8 @@ pub(crate) struct MfDecoder {
     next_seq: i64,
     /// The caller's PTS by sample time.
     times: BTreeMap<i64, u64>,
+    /// Kept for the transform, which holds its own reference.
+    _manager: Option<IMFDXGIDeviceManager>,
     /// Last, so Media Foundation stays started until the samples above are
     /// released.
     platform: Platform,
@@ -218,14 +253,29 @@ impl MfDecoder {
                 "no Media Foundation H.264 decoder".into(),
             ));
         }
+        let manager = platform.device_manager();
         let mut last = None;
         for candidate in candidates {
             let name = candidate.name.clone();
-            match Transform::activate(candidate).and_then(|t| Self::configure(&platform, t)) {
-                Ok(transform) => {
+            match Transform::activate(candidate)
+                .and_then(|t| Self::configure(&platform, t, manager.as_ref()))
+            {
+                Ok((transform, dxva)) => {
+                    let context = if dxva {
+                        // SAFETY: a live device; its immediate context lives
+                        // as long as it does.
+                        Some(
+                            unsafe { hal_device()?.GetImmediateContext() }
+                                .map_err(|e| error(e, "ID3D11Device::GetImmediateContext"))?,
+                        )
+                    } else {
+                        None
+                    };
                     let device = format!(
                         "Media Foundation: {name} ({})",
-                        if transform.hardware() {
+                        if dxva {
+                            "DXVA"
+                        } else if transform.hardware() {
                             "hardware"
                         } else {
                             "software"
@@ -234,6 +284,9 @@ impl MfDecoder {
                     log::info!("h264 decoder {device}");
                     return Ok(Self {
                         transform,
+                        context,
+                        parking: Vec::new(),
+                        _manager: manager,
                         platform,
                         device,
                         output: config.output,
@@ -259,7 +312,16 @@ impl MfDecoder {
         Err(last.expect("at least one candidate was tried"))
     }
 
-    fn configure(platform: &Platform, mut transform: Transform) -> Result<Transform> {
+    /// Sets the decoder up for H.264 in and NV12 out, on the GPU when it
+    /// takes `manager`. Returns whether it does.
+    fn configure(
+        platform: &Platform,
+        mut transform: Transform,
+        manager: Option<&IMFDXGIDeviceManager>,
+    ) -> Result<(Transform, bool)> {
+        // Before the media types: the decoder chooses its output
+        // allocation from whether it has a device.
+        let dxva = manager.is_some_and(|m| transform.set_device_manager(m));
         if let Ok(api) = transform.mft().cast::<ICodecAPI>() {
             // SAFETY: a live codec interface and a VT_UI4 value.
             if let Err(e) =
@@ -289,7 +351,7 @@ impl MfDecoder {
             .set_output_type(&nv12)
             .map_err(|e| error(e, "set the NV12 output type"))?;
         transform.begin()?;
-        Ok(transform)
+        Ok((transform, dxva))
     }
 
     /// Gives back the buffers of frames the caller has dropped.
@@ -315,7 +377,8 @@ impl MfDecoder {
                         self.queued_layout = Some(layout.clone());
                         self.ready.push_back(Ready::Format(layout));
                     }
-                    self.ready.push_back(Ready::Picture(sample));
+                    self.ready
+                        .push_back(Ready::Picture(Picture::Sample(sample)));
                 }
             }
         }
@@ -341,10 +404,10 @@ impl MfDecoder {
                             None => break,
                         },
                     };
-                    let Some(Ready::Picture(sample)) = self.ready.pop_front() else {
+                    let Some(Ready::Picture(picture)) = self.ready.pop_front() else {
                         unreachable!("the front is a picture");
                     };
-                    match self.picture(&sample, slot) {
+                    match self.picture(picture, slot) {
                         Ok(frame) => self.pending.push(DecodeEvent::Frame(frame)),
                         Err(e) => {
                             self.free.push(slot);
@@ -354,6 +417,7 @@ impl MfDecoder {
                 }
             }
         }
+        self.park_waiting()?;
         let waiting = self.ready.iter().any(|r| matches!(r, Ready::Picture(_)));
         if all && waiting {
             return Err(CodecError::PoolExhausted {
@@ -419,14 +483,14 @@ impl MfDecoder {
                 OutputPool::Provided(pool) => {
                     if pool.is_empty() {
                         return Err(CodecError::InvalidConfig(format!(
-                            "the provided pool holds {}x{} pictures; on Windows a provided                              pool cannot follow the stream to {w}x{h}",
+                            "the provided pool holds {}x{} pictures; on Windows a provided pool cannot follow the stream to {w}x{h}",
                             self.info.as_ref().map_or(0, |i| i.width),
                             self.info.as_ref().map_or(0, |i| i.height),
                         )));
                     }
                     if let Some(t) = pool.iter().find(|t| !fits(t, w, h)) {
                         return Err(CodecError::InvalidConfig(format!(
-                            "a provided {:?} {:?}x{:?} tensor cannot hold the stream's {w}x{h}                              NV12 pictures: on Windows each must be an NV12 image of that size",
+                            "a provided {:?} {:?}x{:?} tensor cannot hold the stream's {w}x{h} NV12 pictures: on Windows each must be an NV12 image of that size",
                             t.format(),
                             t.width(),
                             t.height()
@@ -460,16 +524,61 @@ impl MfDecoder {
         Ok(())
     }
 
-    /// Copies `sample` into pool buffer `slot`.
-    fn picture(&mut self, sample: &IMFSample, slot: u32) -> Result<DecodedFrame> {
+    /// Moves every decoder texture still waiting for a pool buffer into a
+    /// parking texture, so the decoder gets its sample back. A picture whose
+    /// size has no native NV12 texture stays in its sample.
+    fn park_waiting(&mut self) -> Result<()> {
+        let Some(context) = self.context.clone() else {
+            return Ok(());
+        };
+        let mut layout = self.layout.clone();
+        for i in 0..self.ready.len() {
+            let sample = match &self.ready[i] {
+                Ready::Format(l) => {
+                    layout = Some(l.clone());
+                    continue;
+                }
+                Ready::Picture(Picture::Sample(s)) => s.clone(),
+                Ready::Picture(Picture::Parked { .. }) => continue,
+            };
+            let Some(layout) = layout.as_ref() else {
+                continue;
+            };
+            let Some((texture, subresource)) = sample_texture(&sample) else {
+                continue;
+            };
+            let (w, h) = layout.frame_size();
+            let tensor = match self.parking.iter().position(|t| fits(t, w, h)) {
+                Some(at) => self.parking.swap_remove(at),
+                None => allocate(1, w, h)?.pop().expect("one tensor was allocated"),
+            };
+            if !is_native_nv12(&tensor) {
+                continue;
+            }
+            copy_texture(&context, &texture, subresource, layout, &tensor)?;
+            // SAFETY: a live sample.
+            let time = unsafe { sample.GetSampleTime() }.ok();
+            self.ready[i] = Ready::Picture(Picture::Parked {
+                tensor: Box::new(tensor),
+                time,
+            });
+        }
+        Ok(())
+    }
+
+    /// Copies `picture` into pool buffer `slot`.
+    fn picture(&mut self, picture: Picture, slot: u32) -> Result<DecodedFrame> {
         let layout = self
             .layout
             .as_ref()
             .expect("a format precedes every picture");
         let size = layout.frame_size();
         let tensor = &self.pool[slot as usize];
-        // SAFETY: a live sample.
-        let time = unsafe { sample.GetSampleTime() }.ok();
+        let time = match &picture {
+            // SAFETY: a live sample.
+            Picture::Sample(sample) => unsafe { sample.GetSampleTime() }.ok(),
+            Picture::Parked { time, .. } => *time,
+        };
         let pts = match time.and_then(|t| self.times.remove(&t)) {
             Some(pts) => pts,
             None => {
@@ -477,7 +586,29 @@ impl MfDecoder {
                 0
             }
         };
-        copy_picture(sample, layout, tensor, size)?;
+        let gpu = self.context.as_ref().filter(|_| is_native_nv12(tensor));
+        match (picture, gpu) {
+            (Picture::Sample(sample), Some(context)) => match sample_texture(&sample) {
+                Some((texture, subresource)) => {
+                    copy_texture(context, &texture, subresource, layout, tensor)?
+                }
+                None => copy_picture(&sample, layout, tensor, size)?,
+            },
+            (Picture::Sample(sample), None) => copy_picture(&sample, layout, tensor, size)?,
+            (Picture::Parked { tensor: parked, .. }, Some(context)) => {
+                copy_parked(context, &parked, tensor)?;
+                self.parking.push(*parked);
+            }
+            (Picture::Parked { tensor: parked, .. }, None) => {
+                return Err(CodecError::InvalidConfig(format!(
+                    "{}: a parked {:?}x{:?} picture cannot be copied into a pool tensor that is \
+                     not a native NV12 texture",
+                    self.device,
+                    parked.width(),
+                    parked.height()
+                )));
+            }
+        }
         Ok(DecodedFrame::new(
             Arc::clone(tensor),
             pts,
@@ -599,6 +730,61 @@ fn allocate(count: usize, w: usize, h: usize) -> Result<Vec<TensorDyn>> {
             make(TensorMemory::Mem).map_err(CodecError::Tensor)
         }
     }
+}
+
+/// Copies the visible picture of `subresource` of the decoder's `texture`
+/// into `dst`, a native NV12 texture of the picture's size, on the GPU.
+fn copy_texture(
+    context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+    subresource: u32,
+    layout: &Layout,
+    dst: &TensorDyn,
+) -> Result<()> {
+    let (w, h) = layout.frame_size();
+    let (x, y) = (layout.visible.x as u32, layout.visible.y as u32);
+    let region = D3D11_BOX {
+        left: x,
+        top: y,
+        front: 0,
+        right: x + w as u32,
+        bottom: y + h as u32,
+        back: 1,
+    };
+    let target = tensor_texture(dst)?;
+    // SAFETY: both textures are live NV12 textures on HAL's device, the box
+    // is inside the decoded picture and on even coordinates, and the
+    // destination is exactly its size.
+    unsafe {
+        context.CopySubresourceRegion(&target, 0, 0, 0, 0, texture, subresource, Some(&region))
+    };
+    record_write(dst);
+    Ok(())
+}
+
+/// Copies a parked picture into a pool tensor of the same size, on the GPU.
+fn copy_parked(context: &ID3D11DeviceContext, parked: &TensorDyn, dst: &TensorDyn) -> Result<()> {
+    let (source, target) = (tensor_texture(parked)?, tensor_texture(dst)?);
+    // SAFETY: both are live native NV12 textures of one size on HAL's device.
+    unsafe { context.CopyResource(&target, &source) };
+    record_write(dst);
+    Ok(())
+}
+
+/// Records a fence value on `t` behind the copy just queued, so CPU maps,
+/// CUDA and other devices wait for it.
+fn record_write(t: &TensorDyn) {
+    #[cfg(not(edgefirst_tensor_dynamic))]
+    if let Some(value) = edgefirst_tensor::d3d11::device()
+        .ok()
+        .and_then(|d| d.signal())
+    {
+        if let Err(e) = t.set_gpu_write(value) {
+            log::debug!("recording the decoded picture's completion: {e}");
+        }
+    }
+    #[cfg(edgefirst_tensor_dynamic)]
+    let _ = t;
 }
 
 /// Whether a provided tensor can hold a `w`x`h` decoded picture.

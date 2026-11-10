@@ -700,33 +700,50 @@ Foundation H.264 transforms. The traits are unchanged.
   readback or upload ever runs on a Media Foundation work queue (on the camera
   backend that held callbacks back for seconds). After a drain an asynchronous
   MFT asks for input again only after `MFT_MESSAGE_NOTIFY_START_OF_STREAM`.
-- **Memory.** The transforms are given no DXGI device manager. Their D3D11
-  textures are `DXGI_FORMAT_NV12` without NT-handle sharing and come from a
-  pool of two or three samples, while an NV12 D3D11 tensor is an `R8` texture
-  1.5 times the height, so neither side can wrap the other's textures. The
-  encoder maps each source for reading (a D3D11 tensor reads back through its
-  staging texture) and copies the picture, tightly packed, into a
-  system-memory sample; a crop is a plane offset in that copy. The decoder
-  writes system-memory NV12, which is copied into the pool's D3D11 tensors.
+- **Memory.** A transform that is D3D11-aware gets a DXGI device manager over
+  HAL's own D3D11 device (`MFT_MESSAGE_SET_D3D_MANAGER`, before the media
+  types), so pixels stay on the GPU; NV12 D3D11 tensors are native
+  `DXGI_FORMAT_NV12` textures (see `edgefirst-tensor`), the surface the
+  transforms read and write. A transform without D3D11 support (Microsoft's
+  software encoder; Microsoft's decoder on an adapter without video decoding,
+  such as WARP) moves pixels through system memory instead: an API-level
+  software fallback, never software in HAL.
 - **Encoder.** Hardware transforms are tried first, then Microsoft's
   software encoder; the first that takes the output and input types wins.
   Rate control (CBR, mean bitrate), GOP, no B-frames and low-latency mode go
   through `ICodecAPI` before the output type, as Microsoft's encoder requires.
   A refused level, then a refused profile, falls back to the transform's
-  default unless the caller set it. Sample times are sequence numbers in frame
-  periods, mapped back to the caller's PTS. SPS and PPS cached from the stream
-  (or the output type's `MF_MT_MPEG_SEQUENCE_HEADER`) are inserted after the
-  access unit delimiter of any IDR sent without them.
+  default unless the caller set it. On a D3D11 encoder every frame is a
+  texture sample (`MFCreateDXGISurfaceBuffer`). A native NV12 source of the
+  configured size is read in place when the encoder returns each frame's
+  access unit at once (NVENC): `encode` waits for it, so the encoder has read
+  the source when the call returns. Otherwise -- a crop, a host tensor, or an
+  encoder that holds frames until more input arrives (Microsoft's AVC DX12
+  encoder) -- the source is copied into one of a ring of native NV12 textures,
+  on the GPU (`CopySubresourceRegion`) or by a CPU write, and that texture
+  stays the encoder's until its access unit comes back; the ring grows to the
+  encoder's depth. The first frame always takes the copy and decides which
+  kind of encoder this is; an in-place frame that does not come back within
+  50 ms switches the encoder to copying. Sample times are sequence numbers in
+  frame periods, mapped back to the caller's PTS. SPS and PPS cached from the
+  stream (or the output type's `MF_MT_MPEG_SEQUENCE_HEADER`) are inserted
+  after the access unit delimiter of any IDR sent without them.
 - **Decoder.** Microsoft's decoder only, unless the environment filter picks
-  another: hardware decoder MFTs expect a device manager.
-  `CODECAPI_AVLowLatencyMode` (a `VT_UI4`) makes it release each picture as
-  soon as reordering allows; without it, it holds every picture until drained.
-  Output type changes (`MF_E_TRANSFORM_STREAM_CHANGE`) queue a format marker
-  before the next picture, and `Reconfigured` is sent when the visible size,
-  stride or colorimetry differs. Pictures without a free pool buffer wait in
-  Media Foundation memory; the next `decode()` fails with `PoolExhausted`
-  before taking its access unit until they have one. If the caller holds no
-  frame and a drain releases more pictures than the pool has free, an
+  another. With the device manager it decodes on the GPU (DXVA) into a
+  texture array of its own: about nine `DECODER`-bound slices, no NT handle,
+  and it ignores `MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT`. Holding its output
+  samples stops it for good, so each picture is copied
+  (`CopySubresourceRegion`, about 47 us at 1080p on the RTX 3070) into a free
+  native NV12 pool tensor, the tensor records a fence value behind the copy,
+  and the sample is released at once. A picture finished while every pool
+  tensor is held is copied into a parking texture until one is free; the next
+  `decode()` fails with `PoolExhausted` before taking its access unit until
+  then. `CODECAPI_AVLowLatencyMode` (a `VT_UI4`) makes the decoder release
+  each picture as soon as reordering allows; without it, it holds every
+  picture until drained. Output type changes (`MF_E_TRANSFORM_STREAM_CHANGE`)
+  queue a format marker before the next picture, and `Reconfigured` is sent
+  when the visible size, stride or colorimetry differs. If the caller holds
+  no frame and a drain releases more pictures than the pool has free, an
   allocated pool grows by one rather than fail on every call.
 - **Provided pools** must be NV12 images of the visible size: a D3D11 texture
   cannot be described as a smaller image, so the pool cannot follow a size

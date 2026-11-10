@@ -3,18 +3,32 @@
 
 //! H.264 encoding with a Media Foundation encoder transform.
 //!
-//! Each source is copied, tightly packed, into a system-memory sample; the
-//! encoder reads it once the call returns, so the caller may reuse the
-//! source at once. Sample times are the frame's sequence number in frame
-//! periods, and the caller's PTS is looked up again by the time of the
-//! access unit that comes back. B-frames are disabled, so access units come
-//! back in the order their sources went in.
+//! A hardware encoder that takes D3D11 textures is given a DXGI device
+//! manager on HAL's device, and always reads a texture. A native NV12
+//! texture source of the configured size is handed to it in place when the
+//! encoder returns each frame's access unit at once: `encode` then waits for
+//! it, so the encoder has read the source by the time the call returns.
+//! Otherwise the source is copied into one of a ring of scratch textures --
+//! on the GPU from a texture (a crop, or a source for an encoder that holds
+//! frames), on the CPU from a host tensor -- which stays the encoder's until
+//! its access unit comes back. The first frame takes the copy and measures
+//! which kind of encoder this is.
+//!
+//! An encoder without D3D11 support (Microsoft's software encoder) gets each
+//! source copied, tightly packed, into a system-memory sample instead.
+//!
+//! Sample times are the frame's sequence number in frame periods, and the
+//! caller's PTS is looked up again by the time of the access unit that comes
+//! back. B-frames are disabled, so access units come back in the order their
+//! sources went in.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn};
+use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 use windows::core::{Interface, GUID};
+use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, D3D11_BOX};
+use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
@@ -29,7 +43,10 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Variant::VARIANT;
 
 use super::copy::{self, Plane};
-use super::{com, error, frame_duration, frame_rate_ratio, set_pair, Output, Platform, Transform};
+use super::{
+    com, error, frame_duration, frame_rate_ratio, hal_device, is_native_nv12, set_pair,
+    tensor_texture, Output, Platform, Transform,
+};
 use crate::video::h264::{self, AccessUnit};
 use crate::video::{
     chroma_subsampling, EncodedFrame, EncoderBackend, EncoderConfig, FrameOptions, H264Level,
@@ -47,6 +64,9 @@ const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 const OUTPUT_GRACE: Duration = Duration::from_millis(100);
 /// How long a drain may take.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a D3D11 encoder may take to return a frame's access unit and
+/// still read its sources in place.
+const IN_PLACE_WAIT: Duration = Duration::from_millis(50);
 
 /// The Media Foundation subtype that carries `format`.
 fn input_subtype(format: PixelFormat) -> Option<GUID> {
@@ -118,9 +138,27 @@ fn tight_pitch(format: PixelFormat, width: usize) -> usize {
     }
 }
 
+/// What an encoder reading D3D11 textures needs.
+struct TextureInput {
+    context: ID3D11DeviceContext,
+    /// Native NV12 textures of the configured size for sources that are not
+    /// read in place, each with the sample time of the frame it holds while
+    /// that frame's access unit has not come back. Grown when every one is
+    /// still the encoder's.
+    ring: Vec<(TensorDyn, Option<i64>)>,
+    /// Whether whole texture sources are read in place: `None` until the
+    /// first frame has shown whether the encoder returns access units at
+    /// once.
+    in_place: Option<bool>,
+}
+
 pub(crate) struct MfEncoder {
     transform: Transform,
     codec_api: Option<ICodecAPI>,
+    /// `Some` when the encoder reads D3D11 textures.
+    textures: Option<TextureInput>,
+    /// Kept for the transform, which holds its own reference.
+    _manager: Option<IMFDXGIDeviceManager>,
     config: EncoderConfig,
     device: String,
     /// One frame period in 100 ns units.
@@ -183,13 +221,30 @@ impl MfEncoder {
             }
             return Err(CodecError::UnsupportedFormat(config.input_format));
         }
+        // Only NV12 has a texture an encoder reads in place.
+        let manager = (subtype == MFVideoFormat_NV12)
+            .then(|| platform.device_manager())
+            .flatten();
         let mut rejected = None;
         for candidate in candidates {
             let name = candidate.name.clone();
             match Transform::activate(candidate)
-                .and_then(|t| Self::configure(&platform, t, &config, subtype))
+                .and_then(|t| Self::configure(&platform, t, &config, subtype, manager.as_ref()))
             {
-                Ok((transform, codec_api)) => {
+                Ok((transform, codec_api, d3d)) => {
+                    let textures = if d3d {
+                        // SAFETY: a live device; its immediate context lives
+                        // as long as it does.
+                        let context = unsafe { hal_device()?.GetImmediateContext() }
+                            .map_err(|e| error(e, "ID3D11Device::GetImmediateContext"))?;
+                        Some(TextureInput {
+                            context,
+                            ring: Vec::new(),
+                            in_place: None,
+                        })
+                    } else {
+                        None
+                    };
                     let (w, h) = (config.width as usize, config.height as usize);
                     let pitch = tight_pitch(config.input_format, w);
                     let frame_bytes = copy::plane_shapes(config.input_format, w, h)
@@ -199,10 +254,10 @@ impl MfEncoder {
                         .sum();
                     let device = format!(
                         "Media Foundation: {name} ({})",
-                        if transform.hardware() {
-                            "hardware"
-                        } else {
-                            "software"
+                        match (transform.hardware(), textures.is_some()) {
+                            (true, true) => "hardware, D3D11",
+                            (true, false) => "hardware",
+                            (false, _) => "software",
                         }
                     );
                     log::info!(
@@ -215,6 +270,8 @@ impl MfEncoder {
                     let mut enc = Self {
                         transform,
                         codec_api,
+                        textures,
+                        _manager: manager.clone(),
                         duration: frame_duration(config.frame_rate),
                         planes: copy::contiguous(config.input_format, pitch, h),
                         frame_bytes,
@@ -245,12 +302,18 @@ impl MfEncoder {
         Err(rejected.expect("at least one candidate was tried"))
     }
 
+    /// Applies `config` to `transform`, on HAL's device when it takes
+    /// `manager`. Returns whether it reads D3D11 textures.
     fn configure(
         platform: &Platform,
         mut transform: Transform,
         config: &EncoderConfig,
         subtype: GUID,
-    ) -> Result<(Transform, Option<ICodecAPI>)> {
+        manager: Option<&IMFDXGIDeviceManager>,
+    ) -> Result<(Transform, Option<ICodecAPI>, bool)> {
+        // Before the media types, which the encoder checks against its
+        // device.
+        let d3d = manager.is_some_and(|m| transform.set_device_manager(m));
         let codec_api = transform.mft().cast::<ICodecAPI>().ok();
         // Rate control has to be chosen before the output type is set.
         if let Some(api) = &codec_api {
@@ -314,7 +377,7 @@ impl MfEncoder {
         let (w, h) = (config.width as usize, config.height as usize);
         transform.set_min_output_size((w * h * 3 / 2).max(1 << 16));
         transform.begin()?;
-        Ok((transform, codec_api))
+        Ok((transform, codec_api, d3d))
     }
 
     /// The SPS and PPS the output type carries, if the encoder sets them
@@ -401,9 +464,6 @@ impl MfEncoder {
         let stride = src
             .effective_row_stride()
             .ok_or_else(|| CodecError::InvalidInput("source has no row stride".into()))?;
-        let read_error = |e: edgefirst_tensor::Error| {
-            CodecError::InvalidInput(format!("the source cannot be read: {e}"))
-        };
         let (sample, buffer) = self.platform.sample(self.frame_bytes)?;
         let mut ptr = std::ptr::null_mut();
         // SAFETY: a live buffer; unlocked below.
@@ -411,56 +471,7 @@ impl MfEncoder {
             .map_err(|e| error(e, "IMFMediaBuffer::Lock"))?;
         // SAFETY: the buffer is locked and was created `frame_bytes` long.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, self.frame_bytes) };
-        let copied = (|| -> Result<()> {
-            let shapes = copy::plane_shapes(format, size.0, size.1)
-                .ok_or(CodecError::UnsupportedFormat(format))?;
-            let luma = src.map_bytes(CpuAccess::Read).map_err(read_error)?;
-            let sh = src.height().unwrap_or(0);
-            let copied = if src.is_multiplane() {
-                let chroma = src.chroma_dyn().ok_or_else(|| {
-                    CodecError::InvalidInput("multi-plane source has no chroma plane".into())
-                })?;
-                let cstride = chroma.effective_row_stride().unwrap_or(stride);
-                let cmap = chroma.map_bytes(CpuAccess::Read).map_err(read_error)?;
-                let planes = copy::offset(
-                    format,
-                    &[
-                        Plane {
-                            offset: 0,
-                            pitch: stride,
-                        },
-                        Plane {
-                            offset: 0,
-                            pitch: cstride,
-                        },
-                    ],
-                    origin,
-                );
-                copy::copy_plane(&luma, planes[0], dst, self.planes[0], shapes[0]).and_then(|()| {
-                    copy::copy_plane(&cmap, planes[1], dst, self.planes[1], shapes[1])
-                })
-            } else {
-                let table = format
-                    .plane_table(src.width().unwrap_or(0), sh, stride)
-                    .ok_or(CodecError::UnsupportedFormat(format))?;
-                let planes: Vec<Plane> = table
-                    .iter()
-                    .map(|p| Plane {
-                        offset: p.offset as usize,
-                        pitch: p.stride as usize,
-                    })
-                    .collect();
-                copy::copy(
-                    format,
-                    size,
-                    &luma,
-                    &copy::offset(format, &planes, origin),
-                    dst,
-                    &self.planes,
-                )
-            };
-            copied.map_err(CodecError::InvalidInput)
-        })();
+        let copied = copy_source(format, size, src, origin, stride, dst, &self.planes);
         // SAFETY: locked above.
         let unlocked = unsafe { buffer.Unlock() };
         copied?;
@@ -469,6 +480,126 @@ impl MfEncoder {
         unsafe { buffer.SetCurrentLength(self.frame_bytes as u32) }
             .map_err(|e| error(e, "IMFMediaBuffer::SetCurrentLength"))?;
         Ok(sample)
+    }
+
+    /// A sample over a texture holding the region of `src` at `origin` for
+    /// the frame at sample `time`, and whether it is the source's own
+    /// texture, read in place.
+    fn fill_texture(
+        &mut self,
+        src: &TensorDyn,
+        origin: (usize, usize),
+        time: i64,
+    ) -> Result<(IMFSample, bool)> {
+        let format = self.config.input_format;
+        let size = (self.config.width as usize, self.config.height as usize);
+        let in_flight = &self.in_flight;
+        let textures = self
+            .textures
+            .as_mut()
+            .expect("the texture path runs on a D3D11 encoder");
+        let texture_source = is_native_nv12(src) && src.view_origin().is_none();
+        let whole = origin == (0, 0) && src.width() == Some(size.0) && src.height() == Some(size.1);
+        if texture_source && whole && textures.in_place == Some(true) {
+            let texture = tensor_texture(src)?;
+            // Submits whatever the source's producer queued, which the
+            // encoder reads behind on the same device.
+            // SAFETY: a live context.
+            unsafe { textures.context.Flush() };
+            return Ok((self.platform.texture_sample(&texture)?, true));
+        }
+        // A ring texture whose frame has come back, or a new one.
+        let free = textures
+            .ring
+            .iter()
+            .position(|(_, held)| !held.is_some_and(|t| in_flight.iter().any(|&(f, _)| f == t)));
+        let slot = match free {
+            Some(slot) => slot,
+            None => {
+                let texture = TensorDyn::image(
+                    size.0,
+                    size.1,
+                    PixelFormat::Nv12,
+                    DType::U8,
+                    Some(TensorMemory::DmaBuf),
+                    CpuAccess::Write,
+                )?;
+                textures.ring.push((texture, None));
+                log::debug!("{}: {} source textures", self.device, textures.ring.len());
+                textures.ring.len() - 1
+            }
+        };
+        let scratch = &textures.ring[slot].0;
+        let target = tensor_texture(scratch)?;
+        if texture_source {
+            let (x, y) = (origin.0 as u32, origin.1 as u32);
+            let region = D3D11_BOX {
+                left: x,
+                top: y,
+                front: 0,
+                right: x + size.0 as u32,
+                bottom: y + size.1 as u32,
+                back: 1,
+            };
+            let source = tensor_texture(src)?;
+            // SAFETY: both are live NV12 textures on HAL's device, the box is
+            // inside the source on even coordinates (`check_source`), and the
+            // ring texture is exactly its size.
+            unsafe {
+                textures.context.CopySubresourceRegion(
+                    &target,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &source,
+                    0,
+                    Some(&region),
+                )
+            };
+        } else {
+            let stride = src
+                .effective_row_stride()
+                .ok_or_else(|| CodecError::InvalidInput("source has no row stride".into()))?;
+            let pitch = scratch.effective_row_stride().ok_or_else(|| {
+                CodecError::InvalidInput("a source texture has no row stride".into())
+            })?;
+            let to: Vec<Plane> = format
+                .plane_table(size.0, size.1, pitch)
+                .ok_or(CodecError::UnsupportedFormat(format))?
+                .iter()
+                .map(|p| Plane {
+                    offset: p.offset as usize,
+                    pitch: p.stride as usize,
+                })
+                .collect();
+            let mut map = scratch.map_bytes(CpuAccess::Write)?;
+            copy_source(format, size, src, origin, stride, &mut map, &to)?;
+        }
+        textures.ring[slot].1 = Some(time);
+        // SAFETY: a live context.
+        unsafe { textures.context.Flush() };
+        Ok((self.platform.texture_sample(&target)?, false))
+    }
+
+    /// Waits, up to [`IN_PLACE_WAIT`], for the access unit of the frame at
+    /// sample `time`. Returns whether it came.
+    fn wait_for_frame(&mut self, time: i64) -> Result<bool> {
+        let deadline = Instant::now() + IN_PLACE_WAIT;
+        while self.in_flight.iter().any(|&(t, _)| t == time) {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let mut out = Vec::new();
+            self.transform.collect(
+                &self.platform,
+                Duration::from_millis(2),
+                &mut out,
+                |out, _| !out.is_empty(),
+            )?;
+            self.take(out)?;
+        }
+        Ok(true)
     }
 
     /// Asks for the next frame to be an IDR picture.
@@ -597,11 +728,15 @@ impl EncoderBackend for MfEncoder {
     fn encode(&mut self, src: &TensorDyn, opts: &FrameOptions) -> Result<Option<EncodedFrame>> {
         com();
         let origin = self.check_source(src, opts)?;
-        let sample = self.fill(src, origin)?;
+        let time = self.next_seq * self.duration;
+        let (sample, in_place) = if self.textures.is_some() {
+            self.fill_texture(src, origin, time)?
+        } else {
+            (self.fill(src, origin)?, false)
+        };
         if opts.keyframe || self.restart {
             self.force_keyframe(opts.keyframe)?;
         }
-        let time = self.next_seq * self.duration;
         // SAFETY: a live sample.
         unsafe { sample.SetSampleTime(time) }.map_err(|e| error(e, "IMFSample::SetSampleTime"))?;
         // SAFETY: as above.
@@ -620,7 +755,38 @@ impl EncoderBackend for MfEncoder {
             return Err(e);
         }
         self.restart = false;
-        if self.pending.is_empty() {
+        let measure = self.textures.as_ref().is_some_and(|t| t.in_place.is_none());
+        if in_place || measure {
+            // An encoder reads a texture after `ProcessInput` returns, so the
+            // frame's own access unit is what says it has.
+            let returned = match self.wait_for_frame(time) {
+                Ok(returned) => returned,
+                Err(e) => {
+                    self.reset();
+                    return Err(e);
+                }
+            };
+            let textures = self.textures.as_mut().expect("a D3D11 encoder");
+            if measure {
+                textures.in_place = Some(returned);
+                log::info!(
+                    "{}: {}",
+                    self.device,
+                    if returned {
+                        "returns access units at once; texture sources are read in place"
+                    } else {
+                        "holds frames; texture sources are copied on the GPU"
+                    }
+                );
+            } else if !returned {
+                textures.in_place = Some(false);
+                log::warn!(
+                    "{}: no access unit for a frame read in place within {IN_PLACE_WAIT:?}; \
+                     the encoder may still read that source, and sources are copied from now on",
+                    self.device
+                );
+            }
+        } else if self.pending.is_empty() {
             let collected = self.transform.collect(
                 &self.platform,
                 OUTPUT_GRACE,
@@ -664,6 +830,68 @@ impl EncoderBackend for MfEncoder {
     fn device(&self) -> String {
         self.device.clone()
     }
+}
+
+/// Copies the `size` region of `src` at `origin`, whose rows are `stride`
+/// bytes apart, into the planes `to` of `dst`.
+fn copy_source(
+    format: PixelFormat,
+    size: (usize, usize),
+    src: &TensorDyn,
+    origin: (usize, usize),
+    stride: usize,
+    dst: &mut [u8],
+    to: &[Plane],
+) -> Result<()> {
+    let read_error = |e: edgefirst_tensor::Error| {
+        CodecError::InvalidInput(format!("the source cannot be read: {e}"))
+    };
+    let shapes =
+        copy::plane_shapes(format, size.0, size.1).ok_or(CodecError::UnsupportedFormat(format))?;
+    let luma = src.map_bytes(CpuAccess::Read).map_err(read_error)?;
+    let copied = if src.is_multiplane() {
+        let chroma = src.chroma_dyn().ok_or_else(|| {
+            CodecError::InvalidInput("multi-plane source has no chroma plane".into())
+        })?;
+        let cstride = chroma.effective_row_stride().unwrap_or(stride);
+        let cmap = chroma.map_bytes(CpuAccess::Read).map_err(read_error)?;
+        let planes = copy::offset(
+            format,
+            &[
+                Plane {
+                    offset: 0,
+                    pitch: stride,
+                },
+                Plane {
+                    offset: 0,
+                    pitch: cstride,
+                },
+            ],
+            origin,
+        );
+        copy::copy_plane(&luma, planes[0], dst, to[0], shapes[0])
+            .and_then(|()| copy::copy_plane(&cmap, planes[1], dst, to[1], shapes[1]))
+    } else {
+        let table = format
+            .plane_table(src.width().unwrap_or(0), src.height().unwrap_or(0), stride)
+            .ok_or(CodecError::UnsupportedFormat(format))?;
+        let planes: Vec<Plane> = table
+            .iter()
+            .map(|p| Plane {
+                offset: p.offset as usize,
+                pitch: p.stride as usize,
+            })
+            .collect();
+        copy::copy(
+            format,
+            size,
+            &luma,
+            &copy::offset(format, &planes, origin),
+            dst,
+            to,
+        )
+    };
+    copied.map_err(CodecError::InvalidInput)
 }
 
 /// Sets the rate control, GOP, B-frame and latency properties `config`

@@ -9,12 +9,13 @@
 //! transform is driven by polling its event queue rather than through
 //! callbacks, so no D3D11 work ever runs on a Media Foundation thread.
 //!
-//! Pixels move through system memory. Source tensors are read and copied into
-//! Media Foundation buffers, and decoded pictures are copied into the
-//! decoder's pool: D3D11 tensors where the process has a D3D11 device, host
-//! memory otherwise. The transforms' own textures cannot be wrapped as
-//! tensors: they are `DXGI_FORMAT_NV12`, while an NV12 D3D11 tensor is an
-//! `R8` texture 1.5 times the picture height.
+//! Pixels stay on the GPU where the transform takes a DXGI device manager,
+//! which is given HAL's own D3D11 device. An encoder reads a native NV12
+//! tensor's texture directly; a decoder writes into its own texture array,
+//! from which each picture is copied, GPU to GPU, into a native NV12 tensor
+//! of the pool. A transform without D3D11 support (Microsoft's software
+//! encoder, a decoder on an adapter without video decoding) moves pixels
+//! through system memory instead.
 //!
 //! The flat Media Foundation functions are resolved from `mfplat.dll` at
 //! run time, so the crate loads on a system without Media Foundation
@@ -31,10 +32,12 @@ use std::sync::OnceLock;
 
 use libloading::os::windows::{Library, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::core::{Interface, GUID, HRESULT, PWSTR};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSample, MFMediaType_Video,
-    MFT_FRIENDLY_NAME_Attribute, MFSTARTUP_LITE, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_REGISTER_TYPE_INFO, MF_VERSION,
+    IMFActivate, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
+    IMFSample, MFMediaType_Video, MFT_FRIENDLY_NAME_Attribute, MFSTARTUP_LITE,
+    MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_REGISTER_TYPE_INFO, MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
@@ -43,6 +46,51 @@ use windows::Win32::System::Com::{
 use crate::{CodecError, Result};
 
 pub(crate) use transform::{Output, Transform};
+
+/// HAL's process D3D11 device, which tensors' textures live on.
+pub(crate) fn hal_device() -> Result<ID3D11Device> {
+    let raw = edgefirst_tensor::d3d11::backend_device()
+        .map_err(|e| CodecError::NoDevice(format!("no D3D11 device for Media Foundation: {e}")))?;
+    // SAFETY: the tensor crate's device lives for the process; borrowing
+    // takes no reference and `cloned` takes the one this keeps.
+    unsafe { ID3D11Device::from_raw_borrowed(&raw) }
+        .cloned()
+        .ok_or_else(|| CodecError::NoDevice("the tensor crate reported a null D3D11 device".into()))
+}
+
+/// Whether `t` is a native two-plane NV12 texture, which Media Foundation
+/// reads and writes on the GPU.
+pub(crate) fn is_native_nv12(t: &edgefirst_tensor::TensorDyn) -> bool {
+    t.d3d11_layout().is_some_and(|l| l.is_native_nv12())
+}
+
+/// The D3D11 texture behind a texture tensor.
+pub(crate) fn tensor_texture(t: &edgefirst_tensor::TensorDyn) -> Result<ID3D11Texture2D> {
+    let raw = t
+        .d3d11_texture()
+        .ok_or_else(|| CodecError::InvalidInput("the tensor is not a D3D11 texture".into()))?;
+    // SAFETY: the tensor keeps its texture alive while it lives, which spans
+    // every use of the returned reference; `cloned` takes its own.
+    unsafe { ID3D11Texture2D::from_raw_borrowed(&raw) }
+        .cloned()
+        .ok_or_else(|| CodecError::InvalidInput("the tensor has a null texture".into()))
+}
+
+/// The texture behind a sample's first buffer and the subresource it names,
+/// when the sample holds a D3D11 texture rather than system memory.
+pub(crate) fn sample_texture(sample: &IMFSample) -> Option<(ID3D11Texture2D, u32)> {
+    // SAFETY: a live sample.
+    let buffer = unsafe { sample.GetBufferByIndex(0) }.ok()?;
+    let dxgi: IMFDXGIBuffer = buffer.cast().ok()?;
+    let mut p = std::ptr::null_mut();
+    // SAFETY: valid out-pointer; a success transfers one reference.
+    unsafe { dxgi.GetResource(&ID3D11Texture2D::IID, &mut p) }.ok()?;
+    // SAFETY: `p` is an `ID3D11Texture2D` whose reference this takes.
+    let texture = unsafe { ID3D11Texture2D::from_raw(p) };
+    // SAFETY: a live buffer.
+    let subresource = unsafe { dxgi.GetSubresourceIndex() }.ok()?;
+    Some((texture, subresource))
+}
 
 type FnStartup = unsafe extern "system" fn(u32, u32) -> HRESULT;
 type FnShutdown = unsafe extern "system" fn() -> HRESULT;
@@ -56,6 +104,9 @@ type FnTEnumEx = unsafe extern "system" fn(
 ) -> HRESULT;
 type FnCreateObject = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
 type FnCreateMemoryBuffer = unsafe extern "system" fn(u32, *mut *mut c_void) -> HRESULT;
+type FnCreateDxgiDeviceManager = unsafe extern "system" fn(*mut u32, *mut *mut c_void) -> HRESULT;
+type FnCreateDxgiSurfaceBuffer =
+    unsafe extern "system" fn(*const GUID, *mut c_void, u32, i32, *mut *mut c_void) -> HRESULT;
 
 /// The `mfplat.dll` entry points the codecs use.
 struct Api {
@@ -65,6 +116,8 @@ struct Api {
     create_media_type: FnCreateObject,
     create_sample: FnCreateObject,
     create_memory_buffer: FnCreateMemoryBuffer,
+    create_dxgi_device_manager: FnCreateDxgiDeviceManager,
+    create_dxgi_surface_buffer: FnCreateDxgiSurfaceBuffer,
 }
 
 static API: OnceLock<std::result::Result<Api, String>> = OnceLock::new();
@@ -103,6 +156,8 @@ fn load() -> std::result::Result<Api, String> {
         create_media_type: get(lib, "MFCreateMediaType")?,
         create_sample: get(lib, "MFCreateSample")?,
         create_memory_buffer: get(lib, "MFCreateMemoryBuffer")?,
+        create_dxgi_device_manager: get(lib, "MFCreateDXGIDeviceManager")?,
+        create_dxgi_surface_buffer: get(lib, "MFCreateDXGISurfaceBuffer")?,
     })
 }
 
@@ -181,6 +236,60 @@ impl Platform {
         // SAFETY: live objects.
         unsafe { sample.AddBuffer(&buffer) }.map_err(|e| error(e, "IMFSample::AddBuffer"))?;
         Ok((sample, buffer))
+    }
+
+    /// A DXGI device manager over HAL's process D3D11 device, for transforms
+    /// that take D3D11 textures. `None` when there is no HAL device.
+    pub(crate) fn device_manager(&self) -> Option<IMFDXGIDeviceManager> {
+        let device = hal_device().ok()?;
+        let mut token = 0u32;
+        let mut p = std::ptr::null_mut();
+        // SAFETY: valid out-pointers; a success transfers one reference.
+        if let Err(e) = unsafe { (self.0.create_dxgi_device_manager)(&mut token, &mut p) }.ok() {
+            log::debug!("MFCreateDXGIDeviceManager: {e}");
+            return None;
+        }
+        // SAFETY: `p` is an `IMFDXGIDeviceManager` whose reference this takes.
+        let manager = unsafe { IMFDXGIDeviceManager::from_raw(p) };
+        // SAFETY: live objects; the token is the one the manager returned.
+        match unsafe { manager.ResetDevice(&device, token) } {
+            Ok(()) => Some(manager),
+            Err(e) => {
+                log::debug!("IMFDXGIDeviceManager::ResetDevice: {e}");
+                None
+            }
+        }
+    }
+
+    /// A sample over subresource 0 of `texture`, which Media Foundation reads
+    /// in place.
+    pub(crate) fn texture_sample(&self, texture: &ID3D11Texture2D) -> Result<IMFSample> {
+        let mut p = std::ptr::null_mut();
+        // SAFETY: valid out-pointer; the buffer takes its own reference to
+        // the live texture.
+        unsafe {
+            (self.0.create_dxgi_surface_buffer)(
+                &ID3D11Texture2D::IID,
+                texture.as_raw(),
+                0,
+                0,
+                &mut p,
+            )
+        }
+        .ok()
+        .map_err(|e| error(e, "MFCreateDXGISurfaceBuffer"))?;
+        // SAFETY: `p` is an `IMFMediaBuffer` whose reference this takes.
+        let buffer = unsafe { IMFMediaBuffer::from_raw(p) };
+        let mut p = std::ptr::null_mut();
+        // SAFETY: valid out-pointer; a success transfers one reference.
+        unsafe { (self.0.create_sample)(&mut p) }
+            .ok()
+            .map_err(|e| error(e, "MFCreateSample"))?;
+        // SAFETY: `p` is an `IMFSample` whose reference this takes.
+        let sample = unsafe { IMFSample::from_raw(p) };
+        // SAFETY: live objects.
+        unsafe { sample.AddBuffer(&buffer) }.map_err(|e| error(e, "IMFSample::AddBuffer"))?;
+        Ok(sample)
     }
 
     /// The transforms that convert video `input` (any subtype when `None`)

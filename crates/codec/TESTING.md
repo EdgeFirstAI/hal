@@ -321,10 +321,13 @@ $env:EDGEFIRST_CODEC_MF_ENCODER = "software"; $env:EDGEFIRST_D3D11_ADAPTER = "wa
 cargo test -p edgefirst-codec --test video_encode --test video_decode -- --test-threads=1
 ```
 
-| Machine | Encoder | 1080p NV12 per frame |
-|---------|---------|----------------------|
-| RTX 3070, Windows 11 | NVIDIA H.264 Encoder MFT | 5.2 ms |
-| RTX 3070, Windows 11 | H264 Encoder MFT (software) | 4.1 ms |
+| Machine | Encoder | Source | 1080p NV12 per `encode()` |
+|---------|---------|--------|---------------------------|
+| RTX 3070, Windows 11 | NVIDIA H.264 Encoder MFT | read in place | 3.2 ms |
+| RTX 3070, Windows 11 | Microsoft AVC DX12 Encoder | GPU copy into its ring | 2.6 ms |
+| RTX 3070, Windows 11 | H264 Encoder MFT (software) | CPU copy | 3.0 ms |
+
+`EDGEFIRST_CODEC_MF_ENCODER=nvidia|dx12|software` runs the suite against each; the decoder suite runs on DXVA on a GPU and in system memory on WARP.
 
 ## Benchmarks
 
