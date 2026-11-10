@@ -6892,7 +6892,7 @@ mod image_tests {
         }
         let fill = |t: &TensorDyn, w: usize, h: usize| {
             let stride = t.effective_row_stride().unwrap();
-            let mut m = t.map_bytes(edgefirst_tensor::CpuAccess::Write).unwrap();
+            let mut m = t.map_bytes(edgefirst_tensor::CpuAccess::ReadWrite).unwrap();
             let buf = m.as_mut_slice();
             for y in 0..h {
                 for x in 0..w {
@@ -7014,6 +7014,58 @@ mod image_tests {
                 );
             }
         }
+
+        // A pool texture reconfigured for a smaller frame samples inside its
+        // logical image: the planes are wider and taller than the picture,
+        // whose chroma sits at the top of the texture's chroma plane.
+        let (w, h) = (640usize, 480usize);
+        let mut src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let (iw, ih) = (w / 2, h / 2);
+        src.configure_image(iw, ih, PixelFormat::Nv12).unwrap();
+        let host = TensorDyn::image(
+            iw,
+            ih,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill(&src, iw, ih);
+        fill(&host, iw, ih);
+        let rgba = |memory| {
+            TensorDyn::image(
+                iw,
+                ih,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(memory),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let (mut dst_gpu, mut dst_cpu) = (rgba(TensorMemory::DmaBuf), rgba(TensorMemory::Mem));
+        let before = gpu.convert_fallback_count();
+        gpu.convert(&src, &mut dst_gpu, None).unwrap();
+        assert_eq!(
+            gpu.convert_fallback_count(),
+            before,
+            "narrowed source fell back"
+        );
+        cpu.convert(&host, &mut dst_cpu, None).unwrap();
+        let (max, mean) = diff(&dst_gpu, &dst_cpu);
+        assert!(
+            max <= 1 && mean <= 0.05,
+            "narrowed: max {max}, mean {mean:.3}"
+        );
     }
 
     // The tests below wait on a Windows completion fence directly, so they

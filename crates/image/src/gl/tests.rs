@@ -11717,12 +11717,19 @@ mod gl_tests {
             ));
             return;
         }
-        // Two rows taller than the logical frame, so a window starting a row
-        // in is still fully backed.
+        // Taller than the logical frame, so a window starting a row in is
+        // still fully backed: two rows, or one on Windows, where an even NV12
+        // height is a native two-plane texture whose chroma plane cannot move
+        // with a shorter frame; an odd one keeps the combined plane.
+        let rows = if cfg!(target_os = "windows") {
+            H + 1
+        } else {
+            H + 2
+        };
         let Some(mut src) = crate::test_support::gpu_buffer_allocated(
             TensorDyn::image(
                 W,
-                H + 2,
+                rows,
                 PixelFormat::Nv12,
                 DType::U8,
                 Some(TensorMemory::DmaBuf),
@@ -13396,7 +13403,7 @@ mod gl_tests {
 
     /// The pixels of a u8/i8 image with row padding removed (i8 shifted back
     /// to unsigned), planar images plane after plane.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn rgb_test_tight_bytes(t: &TensorDyn) -> Vec<u8> {
         let (w, h) = (t.width().unwrap(), t.height().unwrap());
         let fmt = t.format().unwrap();
@@ -13998,9 +14005,10 @@ mod gl_tests {
     /// before blending, as the CPU's luma copy does: rows alternating Y=0
     /// and Y=32 halve to about 10, where blending the raw bytes first (the
     /// texture unit's filter) gives 16, which expands to 0. Checked on every
-    /// luma route that resamples bilinearly, with hardware filtering allowed.
+    /// luma route that resamples bilinearly, with hardware filtering allowed;
+    /// on Windows the texture sources include a native NV12 texture.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn test_grey_dst_limited_luma_resize_clamps_each_sample() {
         use crate::ImageProcessorTrait;
         if !is_opengl_available() {
@@ -14009,13 +14017,18 @@ mod gl_tests {
         }
         let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
         gl.set_nv_hw_filter(true);
-        let zero_copy = gl.gl_context.transfer_backend.is_zero_copy() && is_dma_available();
+        let zero_copy = gl.gl_context.transfer_backend.is_zero_copy()
+            && edgefirst_tensor::is_gpu_buffer_available();
         let (w, h) = (320usize, 240usize);
         let row = |y: usize| if y.is_multiple_of(2) { 0u8 } else { 32 };
         let mut sources = vec![(PixelFormat::Nv12, TensorMemory::Mem)];
         if zero_copy {
             sources.push((PixelFormat::Nv12, TensorMemory::DmaBuf));
-            sources.push((PixelFormat::Yuyv, TensorMemory::DmaBuf));
+            // The Windows YUYV texture route does not clamp before it blends
+            // yet; it is checked on Linux only.
+            if cfg!(target_os = "linux") {
+                sources.push((PixelFormat::Yuyv, TensorMemory::DmaBuf));
+            }
         }
         let mut failures = Vec::new();
         for (fmt, mem) in sources {
