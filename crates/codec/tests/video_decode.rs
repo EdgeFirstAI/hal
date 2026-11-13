@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Hardware H.264 decoding. Each test skips (prints `SKIPPED` and passes)
-//! where there is no decoder or no DMA-BUF heap; under
-//! `HAL_TEST_REQUIRE_DMA=1` a missing heap fails instead.
+//! where there is no decoder or no GPU buffer allocator (a DMA-BUF heap on
+//! Linux, D3D11 on Windows); under `HAL_TEST_REQUIRE_DMA=1` a missing one
+//! fails instead.
 //!
 //! The expected pictures are FNV-1a hashes of the visible NV12 bytes of
 //! each frame as FFmpeg decodes the fixture, in presentation order: H.264
@@ -108,7 +109,7 @@ fn testdata(name: &str) -> Vec<u8> {
 /// none.
 fn open(test: &str, config: DecoderConfig) -> Option<VideoDecoder> {
     let _ = env_logger::builder().is_test(true).try_init();
-    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), test) {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), test) {
         return None;
     }
     match VideoDecoder::new(config) {
@@ -122,7 +123,8 @@ fn open(test: &str, config: DecoderConfig) -> Option<VideoDecoder> {
 }
 
 /// FNV-1a over the visible NV12 bytes of a frame: luma rows, then chroma
-/// rows, without row padding.
+/// rows, without row padding. The chroma plane is a tensor of its own, or
+/// follows the luma rows in the same buffer.
 fn picture_hash(t: &TensorDyn) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325_u64;
     let mut eat = |bytes: &[u8]| {
@@ -136,13 +138,45 @@ fn picture_hash(t: &TensorDyn) -> u64 {
     for y in 0..rows {
         eat(&luma[y * stride..y * stride + w]);
     }
-    let chroma = t.chroma_dyn().expect("NV12 frames have a chroma plane");
+    let Some(chroma) = t.chroma_dyn() else {
+        let planes = PixelFormat::Nv12.plane_table(w, rows, stride).unwrap();
+        let start = planes[1].offset as usize;
+        for y in 0..rows.div_ceil(2) {
+            eat(&luma[start + y * stride..start + y * stride + w]);
+        }
+        return h;
+    };
     let cstride = chroma.effective_row_stride().unwrap();
     let cmap = chroma.map_bytes(CpuAccess::Read).unwrap();
     for y in 0..rows.div_ceil(2) {
         eat(&cmap[y * cstride..y * cstride + w]);
     }
     h
+}
+
+/// `n` buffers for a provided pool that holds `w`x`h` pictures. A device
+/// that decodes in place takes plain DMA-BUFs larger than its NV12 buffer
+/// (1.5 bytes per pixel of a padded picture). On Windows, where pictures
+/// are copied into the pool, each is an NV12 image of exactly that size.
+fn provided_pool(n: usize, (w, h): (usize, usize)) -> Vec<TensorDyn> {
+    (0..n)
+        .map(|_| {
+            if cfg!(windows) {
+                TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Nv12,
+                    DType::U8,
+                    Some(TensorMemory::DmaBuf),
+                    CpuAccess::ReadWrite,
+                )
+            } else {
+                let size = w.next_multiple_of(128) * h.next_multiple_of(32) * 2;
+                TensorDyn::new(&[size], DType::U8, Some(TensorMemory::DmaBuf), None)
+            }
+            .unwrap()
+        })
+        .collect()
 }
 
 /// Everything a decode run produced.
@@ -262,17 +296,12 @@ fn follows_a_mid_stream_resolution_change() {
 #[test]
 fn decodes_into_a_provided_pool() {
     if !dma_require::available_or_skip(
-        edgefirst_tensor::is_dma_available(),
+        edgefirst_tensor::is_gpu_buffer_available(),
         "decodes_into_a_provided_pool",
     ) {
         return;
     }
-    // Larger than any device's NV12 1080p buffer (1.5 bytes per pixel of a
-    // padded picture).
-    let size = 2048 * 1088 * 2;
-    let pool: Vec<TensorDyn> = (0..12)
-        .map(|_| TensorDyn::new(&[size], DType::U8, Some(TensorMemory::DmaBuf), None).unwrap())
-        .collect();
+    let pool = provided_pool(12, (1920, 1080));
     let config = DecoderConfig::h264().with_output(OutputPool::Provided(pool));
     let Some(mut decoder) = open("decodes_into_a_provided_pool", config) else {
         return;
@@ -288,13 +317,16 @@ fn decodes_into_a_provided_pool() {
 #[test]
 fn frames_held_across_a_resolution_change_keep_their_provided_buffers() {
     let test = "frames_held_across_a_resolution_change_keep_their_provided_buffers";
-    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), test) {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), test) {
         return;
     }
-    let size = 2048 * 1088 * 2;
-    let pool: Vec<TensorDyn> = (0..14)
-        .map(|_| TensorDyn::new(&[size], DType::U8, Some(TensorMemory::DmaBuf), None).unwrap())
-        .collect();
+    if cfg!(windows) {
+        return skip(
+            test,
+            "a provided pool holds pictures of one size on Windows",
+        );
+    }
+    let pool = provided_pool(14, (1920, 1080));
     let config = DecoderConfig::h264().with_output(OutputPool::Provided(pool));
     let Some(mut decoder) = open(test, config) else {
         return;
@@ -340,14 +372,18 @@ fn frames_held_across_a_resolution_change_keep_their_provided_buffers() {
 #[test]
 fn rejects_a_provided_pool_too_small_for_the_stream() {
     if !dma_require::available_or_skip(
-        edgefirst_tensor::is_dma_available(),
+        edgefirst_tensor::is_gpu_buffer_available(),
         "rejects_a_provided_pool_too_small_for_the_stream",
     ) {
         return;
     }
-    let pool: Vec<TensorDyn> = (0..8)
-        .map(|_| TensorDyn::new(&[4096], DType::U8, Some(TensorMemory::DmaBuf), None).unwrap())
-        .collect();
+    let pool: Vec<TensorDyn> = if cfg!(windows) {
+        provided_pool(8, (640, 480))
+    } else {
+        (0..8)
+            .map(|_| TensorDyn::new(&[4096], DType::U8, Some(TensorMemory::DmaBuf), None).unwrap())
+            .collect()
+    };
     let config = DecoderConfig::h264().with_output(OutputPool::Provided(pool));
     let Some(mut decoder) = open("rejects_a_provided_pool_too_small_for_the_stream", config) else {
         return;
@@ -356,7 +392,7 @@ fn rejects_a_provided_pool_too_small_for_the_stream() {
     let err = access_units(&stream)
         .enumerate()
         .find_map(|(i, au)| decoder.decode(au, i as u64).err())
-        .expect("a 4 KiB pool cannot hold 1080p pictures");
+        .expect("the pool cannot hold 1080p pictures");
     assert!(matches!(err, CodecError::InvalidConfig(_)), "{err}");
 }
 
@@ -386,6 +422,21 @@ fn a_small_pool_recycles_dropped_frames() {
         "the pool ({}) must be smaller than the stream to show reuse",
         run.infos[0].buffers
     );
+}
+
+#[test]
+fn a_pool_with_nothing_to_spare_still_returns_every_picture() {
+    let Some(mut decoder) = open(
+        "a_pool_with_nothing_to_spare_still_returns_every_picture",
+        DecoderConfig::h264().with_output(OutputPool::Allocate { count: 0 }),
+    ) else {
+        return;
+    };
+    // The caller drops every frame at once; pictures the decoder releases
+    // together must still all come back.
+    let mut run = Run::default();
+    decode_all(&mut decoder, &testdata(MAIN_BFRAMES_FILE), &mut run, 0);
+    assert_eq!(run.hashes, MAIN_BFRAMES);
 }
 
 #[test]
@@ -449,7 +500,7 @@ fn decodes_again_after_a_flush() {
 #[test]
 fn decodes_what_the_hardware_encoder_produces() {
     let test = "decodes_what_the_hardware_encoder_produces";
-    if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), test) {
+    if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), test) {
         return;
     }
     let (w, h) = (640, 480);

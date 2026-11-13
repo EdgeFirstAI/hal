@@ -12,7 +12,9 @@
 //!                     works on several pictures at once would (default 0)
 //!   --pool N          frames the caller may hold (default 4)
 //!
-//! `EDGEFIRST_CODEC_V4L2_DECODER=/dev/videoN` picks the decoder node.
+//! `EDGEFIRST_CODEC_V4L2_DECODER=/dev/videoN` picks the decoder node on
+//! Linux, and `EDGEFIRST_CODEC_MF_DECODER=<name>|hardware|software` the
+//! Media Foundation transform on Windows.
 
 use std::collections::VecDeque;
 use std::io::Write;

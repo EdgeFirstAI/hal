@@ -302,6 +302,33 @@ cargo zigbuild --release -p edgefirst-codec --test video_decode \
 EDGEFIRST_TESTDATA_DIR=$HOME/testdata ./video_decode-* --test-threads=1
 ```
 
+## Windows (Media Foundation)
+
+`tests/video_encode.rs` and `tests/video_decode.rs` gate on
+`is_gpu_buffer_available()`, which on Windows creates the D3D11 device, so on
+Windows they run against the Media Foundation backend and skip only where Media
+Foundation or its H.264 transforms are missing. The decoder's FFmpeg hashes
+hold there too: Microsoft's decoder is bit-exact. On Windows a provided pool is
+NV12 images of the stream's size, and
+`frames_held_across_a_resolution_change_keep_their_provided_buffers` skips,
+since such a pool cannot follow a size change.
+
+```powershell
+cargo test --release -p edgefirst-codec --test video_encode --test video_decode -- --test-threads=1 --nocapture
+
+# Microsoft's software encoder on the WARP adapter, as on a runner without a GPU
+$env:EDGEFIRST_CODEC_MF_ENCODER = "software"; $env:EDGEFIRST_D3D11_ADAPTER = "warp"
+cargo test -p edgefirst-codec --test video_encode --test video_decode -- --test-threads=1
+```
+
+| Machine | Encoder | Source | 1080p NV12 per `encode()` |
+|---------|---------|--------|---------------------------|
+| RTX 3070, Windows 11 | NVIDIA H.264 Encoder MFT | read in place | 3.2 ms |
+| RTX 3070, Windows 11 | Microsoft AVC DX12 Encoder | GPU copy into its ring | 2.6 ms |
+| RTX 3070, Windows 11 | H264 Encoder MFT (software) | CPU copy | 3.0 ms |
+
+`EDGEFIRST_CODEC_MF_ENCODER=nvidia|dx12|software` runs the suite against each; the decoder suite runs on DXVA on a GPU and in system memory on WARP.
+
 ## Benchmarks
 
 See `crates/codec/benches/codec_benchmark.rs` for performance benchmarks.

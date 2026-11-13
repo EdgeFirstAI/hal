@@ -11,6 +11,13 @@
 //! returned in the DMA-BUF buffers the device wrote; only the compressed
 //! bitstream is copied.
 //!
+//! On Windows both are Media Foundation transforms (feature
+//! `media-foundation`): a hardware encoder where the GPU driver registers
+//! one, otherwise Microsoft's software encoder, and Microsoft's decoder.
+//! Pixels stay on the GPU: a hardware encoder reads native NV12 D3D11 tensors
+//! in place, and the decoder (DXVA) copies each picture, GPU to GPU, into a
+//! pool of D3D11 tensors.
+//!
 //! ```rust,no_run
 //! use edgefirst_codec::video::{EncoderConfig, FrameOptions, VideoEncoder};
 //! use edgefirst_tensor::{CpuAccess, PixelFormat, TensorDyn, TensorMemory};
@@ -50,8 +57,16 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-#[cfg_attr(not(all(target_os = "linux", feature = "v4l2")), allow(dead_code))] // backend use only
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "v4l2"),
+        all(windows, feature = "media-foundation")
+    )),
+    allow(dead_code)
+)] // backend use only
 pub(crate) mod h264;
+#[cfg(all(windows, feature = "media-foundation"))]
+mod mf;
 #[cfg(all(target_os = "linux", feature = "v4l2"))]
 mod v4l2;
 
@@ -397,6 +412,12 @@ impl VideoEncoder {
     /// codec and accepts the input format is used. Setting
     /// `EDGEFIRST_CODEC_V4L2_ENCODER` to a device node uses that node only.
     ///
+    /// On Windows the first Media Foundation encoder transform that takes the
+    /// input format (NV12 or YUYV) and the configuration is used, hardware
+    /// transforms first. Setting `EDGEFIRST_CODEC_MF_ENCODER` keeps only the
+    /// transforms whose name contains its value, or only the `hardware` or
+    /// `software` ones.
+    ///
     /// # Errors
     ///
     /// [`CodecError::InvalidConfig`] when `config` is invalid or the device
@@ -412,7 +433,17 @@ impl VideoEncoder {
                 backend: Box::new(backend),
             })
         }
-        #[cfg(not(all(target_os = "linux", feature = "v4l2")))]
+        #[cfg(all(windows, feature = "media-foundation"))]
+        {
+            let backend = mf::encoder::MfEncoder::open(config)?;
+            Ok(Self {
+                backend: Box::new(backend),
+            })
+        }
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "v4l2"),
+            all(windows, feature = "media-foundation")
+        )))]
         {
             let _ = config;
             Err(CodecError::NoDevice(
@@ -459,6 +490,12 @@ pub enum OutputPool {
         count: usize,
     },
     /// Pictures are decoded into these DMA-BUF tensors, one buffer each.
+    ///
+    /// On Windows pictures are copied into the pool (on the GPU), and each
+    /// tensor must be an NV12 image of exactly the stream's visible size;
+    /// such a pool cannot follow a change of size. The rest of this description is about
+    /// devices that decode in place.
+    ///
     /// There must be at least one more than the device keeps for reference
     /// pictures, and each must be large enough for the stream's coded
     /// picture at the row stride the device asks for; otherwise
@@ -532,7 +569,8 @@ pub struct StreamInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMemory {
     /// The pool's DMA-BUFs (allocated by the decoder or provided by the
-    /// caller), imported by the device.
+    /// caller), imported by the device, or on Windows written by copying
+    /// each picture out of the decoder, on the GPU where it decodes there.
     Imported,
     /// The device's own buffers, exported as DMA-BUFs because it would not
     /// import the pool's. CPU reads of these may be uncached and slow.
@@ -559,7 +597,13 @@ pub(crate) struct Returns(Mutex<Vec<(u64, u32)>>);
 impl Returns {
     /// Takes the buffer indexes returned for pool `generation`, dropping
     /// those of earlier pools.
-    #[cfg_attr(not(all(target_os = "linux", feature = "v4l2")), allow(dead_code))] // backend use only
+    #[cfg_attr(
+        not(any(
+            all(target_os = "linux", feature = "v4l2"),
+            all(windows, feature = "media-foundation")
+        )),
+        allow(dead_code)
+    )] // backend use only
     pub(crate) fn take(&self, generation: u64) -> Vec<u32> {
         let mut returned = self.0.lock().unwrap_or_else(|e| e.into_inner());
         returned
@@ -589,7 +633,13 @@ pub struct DecodedFrame {
 }
 
 impl DecodedFrame {
-    #[cfg_attr(not(all(target_os = "linux", feature = "v4l2")), allow(dead_code))] // backend use only
+    #[cfg_attr(
+        not(any(
+            all(target_os = "linux", feature = "v4l2"),
+            all(windows, feature = "media-foundation")
+        )),
+        allow(dead_code)
+    )] // backend use only
     pub(crate) fn new(
         tensor: Arc<TensorDyn>,
         pts: u64,
@@ -606,7 +656,9 @@ impl DecodedFrame {
         }
     }
 
-    /// The picture: an image tensor of the visible size in DMA-BUF memory.
+    /// The picture: an image tensor of the visible size in DMA-BUF memory
+    /// (a D3D11 texture on Windows, or host memory where the process has no
+    /// D3D11 device).
     pub fn tensor(&self) -> &TensorDyn {
         &self.tensor
     }
@@ -666,6 +718,10 @@ impl VideoDecoder {
     /// codec to NV12 is used. Setting `EDGEFIRST_CODEC_V4L2_DECODER` to a
     /// device node uses that node only.
     ///
+    /// On Windows Microsoft's Media Foundation H.264 decoder is used.
+    /// Setting `EDGEFIRST_CODEC_MF_DECODER` keeps only the transforms whose
+    /// name contains its value, or only the `hardware` or `software` ones.
+    ///
     /// # Errors
     ///
     /// [`CodecError::InvalidConfig`] when a provided pool is empty or not in
@@ -694,7 +750,17 @@ impl VideoDecoder {
                 backend: Box::new(backend),
             })
         }
-        #[cfg(not(all(target_os = "linux", feature = "v4l2")))]
+        #[cfg(all(windows, feature = "media-foundation"))]
+        {
+            let backend = mf::decoder::MfDecoder::open(config)?;
+            Ok(Self {
+                backend: Box::new(backend),
+            })
+        }
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "v4l2"),
+            all(windows, feature = "media-foundation")
+        )))]
         {
             let _ = config;
             Err(CodecError::NoDevice(

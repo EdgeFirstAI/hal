@@ -177,7 +177,7 @@ Otherwise the driver buffers are mapped and the decoded planes are copied
 `edgefirst_codec::video::VideoEncoder` encodes image tensors to an H.264 Annex B
 stream with the platform's hardware encoder. On Linux that is any V4L2 stateful
 memory-to-memory encoder, found by capability: i.MX 8M Plus `vsi_v4l2`, i.MX 95
-Wave6, and others. It needs the `v4l2` feature (on by default).
+Wave6, and others. It needs the `v4l2` feature (on by default). On Windows it is a Media Foundation encoder transform: the GPU's (NVIDIA, Intel, AMD) where the driver registers one, otherwise Microsoft's software encoder. It needs the `media-foundation` feature (on by default).
 
 ```rust,no_run
 use edgefirst_codec::video::{Bitrate, EncoderConfig, FrameOptions, VideoEncoder};
@@ -200,16 +200,18 @@ let rest = encoder.flush()?; // every access unit still in the encoder
 - **Headers:** with `EncoderConfig::repeat_headers` (the default), every IDR, forced or not, starts with the SPS and PPS, so a receiver can join at any key frame.
 - **PTS:** `FrameOptions::pts` comes back unchanged on the matching `EncodedFrame`, in any unit.
 - **Input formats** are whatever the device lists for HAL's V4L2 code of the format (`PixelFormat::to_fourcc`); NV12 and YUYV on both i.MX encoders.
+- **Windows:** sources are NV12 or YUYV tensors in any memory. On a hardware encoder a native NV12 texture of the configured size is read in place, without a copy; crops, host tensors, and sources for an encoder that holds frames are copied into a texture of the encoder's own, on the GPU where the source is a texture. Either way the caller can reuse the source as soon as `encode()` returns. B-frames are off and the transform runs in low-latency mode, so `encode()` normally returns the access unit of the frame it was given. Microsoft's software encoder, used where there is no hardware encoder, reads system memory.
 
 | Environment variable           | Effect                                     |
 |--------------------------------|--------------------------------------------|
 | `EDGEFIRST_CODEC_V4L2_ENCODER` | Use only this encoder node (e.g. `/dev/video0`) instead of searching `/dev/video*` |
+| `EDGEFIRST_CODEC_MF_ENCODER`   | Windows: use only the encoder transforms whose name contains this text (e.g. `NVIDIA`), or only the `hardware` or `software` ones |
 
 Run `cargo run --release -p edgefirst-codec --example video-encode -- out.h264 --frames 300` to encode a test pattern (or `--input frames.nv12`) and print the per-frame encode time.
 
 ## Video Decoding (H.264)
 
-`edgefirst_codec::video::VideoDecoder` decodes an H.264 Annex B stream into NV12 image tensors with the platform's hardware decoder: on Linux any V4L2 stateful memory-to-memory decoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). It needs the `v4l2` feature (on by default).
+`edgefirst_codec::video::VideoDecoder` decodes an H.264 Annex B stream into NV12 image tensors with the platform's hardware decoder: on Linux any V4L2 stateful memory-to-memory decoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). It needs the `v4l2` feature (on by default). On Windows it is Microsoft's Media Foundation H.264 decoder, with the `media-foundation` feature (on by default).
 
 ```rust,no_run
 use edgefirst_codec::video::{access_units, DecodeEvent, DecoderConfig, OutputPool, VideoDecoder};
@@ -234,10 +236,12 @@ let rest = decoder.flush()?; // every event still in the decoder
 - **The pool:** `OutputPool::Allocate { count }` lets the caller hold `count` frames at once; the decoder adds the device's minimum and one buffer for it to decode into. `OutputPool::Provided(tensors)` decodes into the caller's DMA-BUFs. When the caller holds every buffer, `decode()` fails with `CodecError::PoolExhausted` without taking the access unit: drop frames and pass it again. `StreamInfo::memory` says whether the device imports the pool or, where it will not, writes its own buffers exported as DMA-BUFs.
 - **Size changes** mid-stream (a new SPS) drain the old pictures and rebuild the pool; `DecodeEvent::Reconfigured` carries the new `StreamInfo`. Frames already returned keep their memory.
 - **`flush()`** returns the remaining pictures. The decoder then starts a new sequence, so the next access unit must be an IDR with its SPS and PPS, as after a seek.
+- **Windows:** the decoder runs on the GPU (DXVA), and each picture is copied on the GPU into a pool tensor of the visible size, a native NV12 D3D11 texture whose recorded fence value orders consumers behind the copy; without DXVA (no D3D11 device, or an adapter without video decoding) it decodes into system memory, copied into the pool on the CPU. A provided pool must hold NV12 images of exactly the stream's visible size, so it cannot follow a size change. The decoder runs in low-latency mode: a picture comes back as soon as the stream's reordering allows.
 
 | Environment variable           | Effect                                     |
 |--------------------------------|--------------------------------------------|
 | `EDGEFIRST_CODEC_V4L2_DECODER` | Use only this decoder node (e.g. `/dev/video1`) instead of searching `/dev/video*` |
+| `EDGEFIRST_CODEC_MF_DECODER`   | Windows: use only the decoder transforms whose name contains this text, or only the `hardware` or `software` ones |
 
 Run `cargo run --release -p edgefirst-codec --example video-decode -- clip.h264 --out frames.nv12` to decode a file, write the visible pictures and print the per-access-unit decode time.
 

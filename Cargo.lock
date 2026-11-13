@@ -540,6 +540,7 @@ dependencies = [
  "opencv",
  "tracing",
  "turbojpeg",
+ "windows",
  "zune-jpeg",
  "zune-png",
 ]

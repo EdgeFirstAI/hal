@@ -14,6 +14,8 @@ pub(crate) const NAL_IDR: u8 = 5;
 pub(crate) const NAL_SPS: u8 = 7;
 /// `nal_unit_type` of a picture parameter set.
 pub(crate) const NAL_PPS: u8 = 8;
+/// `nal_unit_type` of an access unit delimiter.
+const NAL_AUD: u8 = 9;
 /// `nal_unit_type` of an end of sequence.
 const NAL_END_OF_SEQUENCE: u8 = 10;
 /// `nal_unit_type` of an end of stream.
@@ -61,6 +63,36 @@ pub(crate) fn parameter_sets(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(&data[start..end]);
     }
+    out
+}
+
+/// The end of the first NAL unit at or after `from` in an Annex B buffer:
+/// where the next start code (with the zero byte of a 4-byte code) begins,
+/// or the end of the buffer.
+fn nal_end(data: &[u8], from: usize) -> usize {
+    let Some(first) = next_start_code(data, from) else {
+        return data.len();
+    };
+    match next_start_code(data, first) {
+        Some(next) => start_code_begin(data, next),
+        None => data.len(),
+    }
+}
+
+/// `au` with `parameter_sets` inserted before its first NAL unit, or after
+/// it when that is an access unit delimiter, which must come first
+/// (§7.4.1.2.3).
+#[cfg_attr(not(all(windows, feature = "media-foundation")), allow(dead_code))] // Media Foundation backend use only
+pub(crate) fn with_parameter_sets(au: &[u8], parameter_sets: &[u8]) -> Vec<u8> {
+    let at = if nal_types(au).first() == Some(&NAL_AUD) {
+        nal_end(au, 0)
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(au.len() + parameter_sets.len());
+    out.extend_from_slice(&au[..at]);
+    out.extend_from_slice(parameter_sets);
+    out.extend_from_slice(&au[at..]);
     out
 }
 
@@ -293,6 +325,33 @@ mod tests {
         assert_eq!(
             access_units(&tail).collect::<Vec<_>>(),
             vec![tail.as_slice()]
+        );
+    }
+
+    #[test]
+    fn a_nal_unit_ends_where_the_next_start_code_begins() {
+        let stream = cat(&[SPS, IDR, P_SLICE]);
+        assert_eq!(nal_end(&stream, 0), SPS.len());
+        assert_eq!(nal_end(&stream, SPS.len()), SPS.len() + IDR.len());
+        assert_eq!(nal_end(&stream, SPS.len() + IDR.len()), stream.len());
+        assert_eq!(nal_end(&[1, 2, 3], 0), 3);
+    }
+
+    #[test]
+    fn parameter_sets_follow_an_access_unit_delimiter() {
+        let sps_pps = cat(&[SPS, PPS]);
+        let aud: &[u8] = &[0, 0, 0, 1, 0x09, 0xf0];
+        let au = cat(&[aud, IDR]);
+        assert_eq!(
+            with_parameter_sets(&au, &sps_pps),
+            cat(&[aud, SPS, PPS, IDR])
+        );
+        assert_eq!(with_parameter_sets(IDR, &sps_pps), cat(&[SPS, PPS, IDR]));
+        let short_aud: &[u8] = &[0, 0, 1, 0x09, 0xf0];
+        let au = cat(&[short_aud, IDR]);
+        assert_eq!(
+            with_parameter_sets(&au, &sps_pps),
+            cat(&[short_aud, SPS, PPS, IDR])
         );
     }
 
