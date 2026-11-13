@@ -724,7 +724,8 @@ Foundation H.264 transforms. The traits are unchanged.
   stays the encoder's until its access unit comes back; the ring grows to the
   encoder's depth. The first frame always takes the copy and decides which
   kind of encoder this is; an in-place frame that does not come back within
-  50 ms switches the encoder to copying. Sample times are sequence numbers in
+  50 ms is drained out of the encoder before `encode` returns, and the encoder
+  switches to copying. Sample times are sequence numbers in
   frame periods, mapped back to the caller's PTS. SPS and PPS cached from the
   stream (or the output type's `MF_MT_MPEG_SEQUENCE_HEADER`) are inserted
   after the access unit delimiter of any IDR sent without them.

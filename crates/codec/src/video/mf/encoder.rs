@@ -782,9 +782,19 @@ impl EncoderBackend for MfEncoder {
                 textures.in_place = Some(false);
                 log::warn!(
                     "{}: no access unit for a frame read in place within {IN_PLACE_WAIT:?}; \
-                     the encoder may still read that source, and sources are copied from now on",
+                     draining it, and copying sources from now on",
                     self.device
                 );
+                // The caller may reuse the source once `encode` returns, so
+                // the encoder must be done reading it: a drained encoder has
+                // consumed every input, and a flushed one releases them.
+                let drained = self
+                    .transform
+                    .drain(&self.platform, DRAIN_TIMEOUT, &mut out);
+                if let Err(e) = drained.and_then(|()| self.take(std::mem::take(&mut out))) {
+                    self.reset();
+                    return Err(e);
+                }
             }
         } else if self.pending.is_empty() {
             let collected = self.transform.collect(
