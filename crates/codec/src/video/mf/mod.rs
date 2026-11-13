@@ -50,14 +50,21 @@ use crate::{Capability, Codec, CodecError, Direction, Engine, Result, Transfer};
 pub(crate) use transform::{Output, Transform};
 
 /// Adds the H.264 transforms present here to `out`, as the encoder and
-/// decoder would find them. A hardware encoder reads native NV12 textures in
-/// place at best; a decoder that takes HAL's D3D11 device (DXVA) decodes on
-/// the GPU and copies each picture there.
+/// decoder would find them. A transform that takes a device manager over
+/// HAL's D3D11 device works on textures: an encoder reads native NV12
+/// textures in place at best, and a decoder (DXVA) decodes on the GPU and
+/// copies each picture there. Each such candidate is activated to ask it,
+/// as opening it would.
 pub(crate) fn capabilities(out: &mut Vec<Capability>) {
     let Ok(platform) = Platform::start() else {
         return;
     };
-    let gpu = hal_device().is_ok();
+    let manager = platform.device_manager();
+    let takes_textures = |c: Candidate| {
+        manager
+            .as_ref()
+            .is_some_and(|m| Transform::activate(c).is_ok_and(|t| t.set_device_manager(m)))
+    };
     let mut encoders: Vec<Capability> = Vec::new();
     for (subtype, format) in [
         (MFVideoFormat_NV12, PixelFormat::Nv12),
@@ -73,22 +80,26 @@ pub(crate) fn capabilities(out: &mut Vec<Capability>) {
             )
             .unwrap_or_default();
         for c in candidates {
-            match encoders.iter_mut().find(|e| e.device == c.name) {
-                Some(e) => e.formats.push(format),
-                None => encoders.push(Capability {
-                    engine: Engine::MediaFoundation,
-                    device: c.name,
-                    codec: Codec::H264,
-                    direction: Direction::Encode,
-                    hardware: c.hardware,
-                    formats: vec![format],
-                    transfer: if c.hardware && gpu && format == PixelFormat::Nv12 {
-                        Transfer::ZeroCopy
-                    } else {
-                        Transfer::CpuCopy
-                    },
-                }),
+            if let Some(e) = encoders.iter_mut().find(|e| e.device == c.name) {
+                e.formats.push(format);
+                continue;
             }
+            let (name, hardware) = (c.name.clone(), c.hardware);
+            // The encoder gives a device manager only for NV12 input.
+            let textures = format == PixelFormat::Nv12 && takes_textures(c);
+            encoders.push(Capability {
+                engine: Engine::MediaFoundation,
+                device: name,
+                codec: Codec::H264,
+                direction: Direction::Encode,
+                hardware,
+                formats: vec![format],
+                transfer: if textures {
+                    Transfer::ZeroCopy
+                } else {
+                    Transfer::CpuCopy
+                },
+            });
         }
     }
     out.extend(encoders);
@@ -103,7 +114,7 @@ pub(crate) fn capabilities(out: &mut Vec<Capability>) {
         .unwrap_or_default();
     for c in decoders {
         let (name, hardware) = (c.name.clone(), c.hardware);
-        let dxva = gpu && Transform::activate(c).is_ok_and(|t| t.d3d11_aware());
+        let dxva = takes_textures(c);
         out.push(Capability {
             engine: Engine::MediaFoundation,
             device: name,

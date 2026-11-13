@@ -97,9 +97,12 @@ pub(crate) fn device_available() -> bool {
     device::probe().is_some()
 }
 
-/// The node of the V4L2 JPEG decoder, when there is one.
+/// The node of the V4L2 JPEG decoder, when there is one that this backend
+/// drives (the multi-planar API).
 pub(crate) fn probe_path() -> Option<std::path::PathBuf> {
-    device::probe().map(|d| d.path().to_owned())
+    device::probe()
+        .filter(|d| d.api == device::ApiVariant::MultiPlanar)
+        .map(|d| d.path().to_owned())
 }
 
 /// Lazily-probed V4L2 backend state, stored on the reusable decoder state so

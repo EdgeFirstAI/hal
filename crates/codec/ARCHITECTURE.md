@@ -112,7 +112,7 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 
 ### Engines (`engine.rs`)
 
-`Codec`, `Engine`, `Direction`, `Transfer`, `Capability` and `capabilities()`. Every family resolves its engine through `engines_to_try`: an explicit engine is used alone (`NoDevice` when this build lacks it), and `Engine::Auto` takes the family's own list of present engines, in the platform's order, narrowed and reordered by `EDGEFIRST_CODEC_ENGINE`. `capabilities()` asks each backend: `video::v4l2::capabilities` (encoder and decoder nodes, by the same checks `open` makes), `video::mf::capabilities` (transforms by input subtype; decoders are activated to see whether they take a D3D11 device), and `jpeg::capabilities`.
+`Codec`, `Engine`, `Direction`, `Transfer`, `Capability` and `capabilities()`. Every family resolves its engine through `engines_to_try`: an explicit engine is used alone (`NoDevice` when this build lacks it), and `Engine::Auto` takes the family's own list of present engines, in the platform's order, narrowed and reordered by `EDGEFIRST_CODEC_ENGINE`. `capabilities()` asks each backend: `video::v4l2::capabilities` (encoder and decoder nodes, by the same checks `open` makes), `video::mf::capabilities` (transforms by input subtype; each candidate that opening would give a device manager over HAL's D3D11 device is activated and given one, so a GPU transfer is reported only where the transform takes it), and `jpeg::capabilities`.
 
 ### Video Module Map (`video/`)
 

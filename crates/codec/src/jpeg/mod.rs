@@ -399,17 +399,16 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
     let explicit = state.engine != Engine::Auto;
     let engines = engines_to_try(state.engine, &decode_engines())?;
     // The CPU decoder takes every image, so engines after it are never
-    // tried; without one, nothing decodes what the others pass on.
-    let Some(cpu_at) = engines.iter().position(|&e| e == Engine::Cpu) else {
-        return Err(unsupported(Codec::Jpeg, Direction::Decode, state.engine));
-    };
-    // In a build without hardware JPEG decoders every engine before the CPU
-    // is refused, so the loop body always returns.
+    // tried. Without it in the list, an image every hardware engine passes
+    // on is refused below.
+    let mut cpu = false;
+    // In a build without hardware JPEG decoders the first engine is the CPU
+    // or refused, so the loop body always leaves it.
     #[cfg_attr(
         not(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg"))),
         allow(clippy::never_loop)
     )]
-    for &engine in &engines[..cpu_at] {
+    for engine in engines {
         match engine {
             #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
             Engine::NvJpeg => {
@@ -469,8 +468,15 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
                     return Err(unsupported(Codec::Jpeg, Direction::Decode, engine));
                 }
             }
+            Engine::Cpu => {
+                cpu = true;
+                break;
+            }
             other => return Err(unsupported(Codec::Jpeg, Direction::Decode, other)),
         }
+    }
+    if !cpu {
+        return Err(unsupported(Codec::Jpeg, Direction::Decode, state.engine));
     }
 
     // CPU decode: MCU loop writes NV12/GREY u8 directly into the tensor.

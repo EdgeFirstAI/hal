@@ -310,7 +310,8 @@ pub fn capabilities() -> Vec<Capability> {
         direction: Direction::Decode,
         hardware: false,
         formats: vec![PixelFormat::Rgb, PixelFormat::Rgba, PixelFormat::Grey],
-        transfer: Transfer::ZeroCopy,
+        // Rows are decoded into scratch memory, then copied into the tensor.
+        transfer: Transfer::CpuCopy,
     });
     found
 }
