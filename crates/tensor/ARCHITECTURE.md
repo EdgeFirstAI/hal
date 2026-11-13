@@ -911,7 +911,13 @@ a mapped NV12 staging texture is laid out, so `D3d11ImageLayout::mapped_rows`
 (1.5 times `texture_height`) rather than `texture_height` counts the rows of
 the staging copy and the host buffer. A write-only native texture is
 published whole (a `D3D11_BOX` names luma rows only), so a writable map of
-part of one is refused. D3D11 has no NV12 texture of odd width or height;
+a window at an offset is refused. A native texture reconfigured for a
+smaller NV12 frame (`configure_image`, as decode pools do) holds the image
+in its top-left corner with the image's chroma at the top of the texture's
+chroma plane; CPU views move those chroma rows to where the image's own
+combined plane has them after a map and back before a write is copied out
+(`ChromaRepack`), so producers and consumers keep addressing the image by
+`row_stride` alone, and GL samples the planes at the image's extent. D3D11 has no NV12 texture of odd width or height;
 those, and NV16 and NV24, keep the combined-plane `R8` texture, and a
 producer's combined-plane `R8` texture is still accepted for an even NV12
 image. The image crate imports a native texture's planes as two EGLImages

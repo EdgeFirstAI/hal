@@ -7851,7 +7851,16 @@ impl GLProcessorST {
         // Without the chroma plane, it is uploaded through `map()` instead,
         // which lays it out as the combined plane.
         let mut r8_src = r8_src;
-        let native_extent = r8_src.and_then(|_| Platform::nv_native_planes(src));
+        let mut native_extent = r8_src.and_then(|_| Platform::nv_native_planes(src));
+        // A resize the texture units may not filter (a limited-range luma
+        // draw, which clamps each sample first, or `nv_hw_filter` off) needs
+        // the shader filter, which reads the combined plane: upload it from
+        // the CPU map when the source can be read, and otherwise filter in
+        // the texture units.
+        if native_extent.is_some() && bilinear && !hw_filter && src.cpu_access().reads() {
+            native_extent = None;
+            r8_src = None;
+        }
         let mut native_planes = native_extent.is_some();
         let uv_import = if native_planes {
             match self.get_or_create_nv_uv_egl_image(src, src_fmt) {
