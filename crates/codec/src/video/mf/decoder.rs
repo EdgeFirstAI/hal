@@ -772,9 +772,10 @@ fn copy_parked(context: &ID3D11DeviceContext, parked: &TensorDyn, dst: &TensorDy
 }
 
 /// Records a fence value on `t` behind the copy just queued, so CPU maps,
-/// CUDA and other devices wait for it.
+/// CUDA and other devices wait for it. Every copy of the tensor crate in the
+/// process shares one device and fence, so the value means the same thing to
+/// the copy that allocated `t`.
 fn record_write(t: &TensorDyn) {
-    #[cfg(not(edgefirst_tensor_dynamic))]
     if let Some(value) = edgefirst_tensor::d3d11::device()
         .ok()
         .and_then(|d| d.signal())
@@ -783,8 +784,6 @@ fn record_write(t: &TensorDyn) {
             log::debug!("recording the decoded picture's completion: {e}");
         }
     }
-    #[cfg(edgefirst_tensor_dynamic)]
-    let _ = t;
 }
 
 /// Whether a provided tensor can hold a `w`x`h` decoded picture.
