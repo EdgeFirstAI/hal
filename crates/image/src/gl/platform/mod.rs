@@ -341,6 +341,16 @@ pub(super) trait GlPlatform {
     /// program without attempting the import.
     const NV_CHROMA_IMPORT: bool = false;
 
+    /// The luma plane's texel extent when `img` is a two-plane NV12 buffer
+    /// whose imports are its planes: [`Self::import_buffer_nv_r8`] then holds
+    /// the luma plane alone, not the combined plane, and the chroma plane
+    /// (half the extent) comes only from [`Self::import_buffer_nv_chroma`].
+    /// Such a source is always drawn by the hardware-filtered program,
+    /// whatever the draw rescales. `None` for a combined-plane buffer.
+    fn nv_native_planes(_img: &Tensor<u8>) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Import the chroma plane of a single-plane NV12/NV16/NV24 tensor as a
     /// two-channel (U, V) texture of one texel per chroma sample, for the
     /// hardware-filtered bilinear NV program. Platforms without it return

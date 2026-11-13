@@ -585,9 +585,10 @@ fn cuda_map_covers_a_texture_whose_allocation_the_driver_padded() {
     assert_eq!(host, pattern);
 }
 
-/// The semi-planar arm: NV12 is one R8 texture of the combined plane, whose
-/// texture width *is* the row stride, so the CUDA mapping and the CPU map are
-/// laid out identically and the whole plane round-trips byte for byte.
+/// CUDA reads an NV12 texture tensor as the combined plane a CPU map shows:
+/// luma rows, then interleaved chroma rows. An even NV12 image is a native
+/// two-plane texture, imported as a CUDA NV12 array whose planes are copied
+/// one after the other; `map_mut` writes both planes back.
 #[test]
 fn cuda_map_reads_the_nv12_combined_plane() {
     if warp_has_no_cuda_device("cuda_map_reads_the_nv12_combined_plane") {
@@ -596,46 +597,64 @@ fn cuda_map_reads_the_nv12_combined_plane() {
     if !cuda_require::cuda_available_or_skip("cuda_map_reads_the_nv12_combined_plane") {
         return;
     }
-    let (w, h) = (640usize, 480usize);
-    let t = Tensor::<u8>::image(
-        w,
-        h,
-        PixelFormat::Nv12,
-        Some(TensorMemory::DmaBuf),
-        CpuAccess::ReadWrite,
-    )
-    .unwrap();
-    // The texture's own row, which for a semi-planar backing is also the row
-    // a CPU map sees -- the allocator widens the texture to the driver's pitch
-    // precisely so the two are one number, and `row_stride()` is only recorded
-    // when it exceeds the natural stride.
-    let layout = t.d3d11_layout().unwrap();
-    let stride = layout.tight_row_bytes();
-    assert_eq!(t.row_stride().unwrap_or(stride), stride);
-    let rows = layout.texture_height;
-    assert_eq!(rows, PixelFormat::Nv12.allocation_shape(w, h).unwrap()[0]);
-    let pattern: Vec<u8> = (0..stride * rows).map(|i| (i % 253) as u8).collect();
-    {
-        let mut m = t.map().unwrap();
-        copy_rows(m.as_mut_slice(), &pattern, stride, stride);
-    }
-    let cm = t.cuda_map().expect("the combined plane imports");
-    assert_eq!(
-        cm.len(),
-        stride * rows,
-        "the mapping is the whole combined plane at the texture's own row"
-    );
-    let mut host = vec![0u8; cm.len()];
-    // SAFETY: `host` holds `cm.len()` writable bytes and `cm.device_ptr()` is
-    // the live CUDA buffer of exactly that size while `cm` lives.
-    assert!(unsafe {
-        edgefirst_tensor::memcpy_device_to_host(
-            host.as_mut_ptr().cast(),
-            cm.device_ptr(),
-            host.len(),
+    for (w, h) in [(640usize, 480usize), (640, 481)] {
+        let t = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
         )
-    });
-    assert_eq!(host, pattern);
+        .unwrap();
+        let layout = t.d3d11_layout().unwrap();
+        assert_eq!(layout.is_native_nv12(), h % 2 == 0, "{w}x{h}");
+        // The CUDA mapping's rows are tight; the CPU map's are at the pitch.
+        let row = layout.tight_row_bytes();
+        let rows = layout.mapped_rows();
+        assert_eq!(rows, PixelFormat::Nv12.allocation_shape(w, h).unwrap()[0]);
+        let pitch = t.effective_row_stride().unwrap();
+        let pattern: Vec<u8> = (0..row * rows).map(|i| (i % 253) as u8).collect();
+        {
+            let mut m = t.map().unwrap();
+            copy_rows(m.as_mut_slice(), &pattern, row, pitch);
+        }
+        let cm = t.cuda_map().expect("the texture imports");
+        assert_eq!(cm.len(), row * rows, "{w}x{h}: the whole combined plane");
+        let mut host = vec![0u8; cm.len()];
+        // SAFETY: `host` holds `cm.len()` writable bytes and `cm.device_ptr()`
+        // is the live CUDA buffer of exactly that size while `cm` lives.
+        assert!(unsafe {
+            edgefirst_tensor::memcpy_device_to_host(
+                host.as_mut_ptr().cast(),
+                cm.device_ptr(),
+                host.len(),
+            )
+        });
+        assert_eq!(host, pattern, "{w}x{h}: CUDA reads what the CPU wrote");
+        drop(cm);
+
+        // Both planes go back through a writable map.
+        let inverted: Vec<u8> = pattern.iter().map(|b| !b).collect();
+        {
+            let cm = t.cuda_map_mut().expect("a writable mapping");
+            // SAFETY: as above, in the other direction.
+            assert!(unsafe {
+                edgefirst_tensor::memcpy_host_to_device(
+                    cm.device_ptr(),
+                    inverted.as_ptr().cast(),
+                    inverted.len(),
+                )
+            });
+        }
+        let m = t.map().unwrap();
+        for r in 0..rows {
+            assert_eq!(
+                &m.as_slice()[r * pitch..r * pitch + row],
+                &inverted[r * row..(r + 1) * row],
+                "{w}x{h}: row {r} after the CUDA write-back"
+            );
+        }
+    }
 }
 
 /// Reference-mode blob transport of a texture, in one process: there is no fd

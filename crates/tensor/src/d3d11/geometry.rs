@@ -52,7 +52,9 @@ fn geometry_of(
     let (tex_w, tex_h) = (desc.Width as usize, desc.Height as usize);
     let dxgi = desc.Format.0 as u32;
 
-    if format.layout() == PixelLayout::SemiPlanar {
+    if dxgi == crate::d3d11_layout::DXGI_FORMAT_NV12 {
+        native_nv12_geometry(format, tex_w, tex_h)
+    } else if format.layout() == PixelLayout::SemiPlanar {
         semi_planar_geometry(format, shape, tex_w, tex_h, dxgi)
     } else {
         // Every other format's dimensions are in the description alone, so a
@@ -103,6 +105,18 @@ fn semi_planar_width(format: PixelFormat, shape: Option<&[usize]>, tex_w: usize)
     Ok(width)
 }
 
+/// The image dimensions of a native NV12 texture, which is the luma grid
+/// exactly. As for packed formats, a `shape` is the caller's consistency
+/// check and stays theirs (see [`geometry_of`]).
+fn native_nv12_geometry(format: PixelFormat, tex_w: usize, tex_h: usize) -> Result<(usize, usize)> {
+    if format != PixelFormat::Nv12 {
+        return Err(Error::InvalidArgument(format!(
+            "d3d11 texture geometry: a DXGI_FORMAT_NV12 texture holds an Nv12 image, not {format:?}"
+        )));
+    }
+    Ok((tex_w, tex_h))
+}
+
 /// The image dimensions of a semi-planar texture: the width from the shape,
 /// the height inverted from the combined plane's row count.
 fn semi_planar_geometry(
@@ -122,13 +136,15 @@ fn semi_planar_geometry(
              height, so this texture does not hold a {format:?} image"
         ))
     })?;
-    // Semi-planar is `DType::U8` alone in the layout table, so there is one
-    // entry to check rather than a search.
-    let l = image_d3d11_layout(format, DType::U8, width, height).ok_or_else(|| {
-        Error::InvalidArgument(format!(
-            "d3d11 texture geometry: {format:?} has no D3D11 layout at {width}x{height}"
-        ))
-    })?;
+    // Not a native NV12 texture (the caller routed that elsewhere), so the
+    // combined plane is the one layout to check rather than a search.
+    let l = crate::d3d11_layout::combined_semi_planar_layout(format, width, height).ok_or_else(
+        || {
+            Error::InvalidArgument(format!(
+                "d3d11 texture geometry: {format:?} has no D3D11 layout at {width}x{height}"
+            ))
+        },
+    )?;
     if l.dxgi_format != dxgi {
         return Err(Error::InvalidArgument(format!(
             "d3d11 texture geometry: a {tex_w}x{tex_h} texture in DXGI format {dxgi} does not \

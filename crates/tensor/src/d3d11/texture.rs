@@ -14,7 +14,9 @@ use super::com::hr;
 use super::device::{
     device, duplicate_handle, duplicate_raw_handle, wait_cpu_for, D3d11Device, GpuCompletion,
 };
-use crate::d3d11_layout::{image_d3d11_layout, D3d11ImageLayout};
+use crate::d3d11_layout::{
+    combined_semi_planar_layout, image_d3d11_layout, D3d11ImageLayout, DXGI_FORMAT_R8_UNORM,
+};
 use crate::{
     BufferIdentity, CpuAccess, DType, Error, IdentityKind, PixelFormat, PixelLayout, Result,
     TensorMemory, TensorTrait,
@@ -196,6 +198,57 @@ impl HostBuffer {
     }
 }
 
+/// Where a CPU view of a native NV12 texture holding a shorter image keeps
+/// the image's chroma rows.
+///
+/// The texture's chroma plane starts at row `texture_row` of a mapped copy
+/// (its own height), while the image's combined plane -- what producers
+/// write and consumers read through `row_stride` -- has them right after
+/// its own luma rows, at `image_row`. A map moves them up after the texture
+/// is copied in, and a write moves them back down before it is copied out.
+/// Rows between the two belong to neither image and are not preserved.
+#[derive(Debug, Clone, Copy)]
+struct ChromaRepack {
+    texture_row: usize,
+    image_row: usize,
+    rows: usize,
+    pitch: usize,
+}
+
+impl ChromaRepack {
+    /// Moves the chroma rows from the texture's plane to the image's.
+    ///
+    /// # Safety
+    ///
+    /// `base` must address `pitch * (texture_row + rows)` writable bytes.
+    unsafe fn move_to_image(&self, base: *mut u8) {
+        // SAFETY: both ranges are inside that span; `copy` allows overlap.
+        unsafe {
+            std::ptr::copy(
+                base.add(self.texture_row * self.pitch),
+                base.add(self.image_row * self.pitch),
+                self.rows * self.pitch,
+            )
+        };
+    }
+
+    /// Moves the chroma rows from the image's plane to the texture's.
+    ///
+    /// # Safety
+    ///
+    /// As [`move_to_image`](Self::move_to_image).
+    unsafe fn move_to_texture(&self, base: *mut u8) {
+        // SAFETY: as in `move_to_image`.
+        unsafe {
+            std::ptr::copy(
+                base.add(self.image_row * self.pitch),
+                base.add(self.texture_row * self.pitch),
+                self.rows * self.pitch,
+            )
+        };
+    }
+}
+
 pub struct D3d11TextureTensor<T> {
     device: &'static D3d11Device,
     texture: ID3D11Texture2D,
@@ -319,7 +372,7 @@ fn create_staging(d: &D3d11Device, layout: &D3d11ImageLayout) -> Result<Staging>
     Ok(Staging {
         tex,
         row_pitch,
-        rows: layout.texture_height,
+        rows: layout.mapped_rows(),
         state: Mutex::new(MapState::default()),
     })
 }
@@ -422,6 +475,18 @@ fn validate_external(
             desc.SampleDesc.Count
         )));
     }
+    // An even NV12 image is allocated as a native two-plane texture, but a
+    // producer may still hand over the combined-plane R8 texture the HAL used
+    // to allocate; that one keeps the combined layout and its rules.
+    let layout = if layout.is_native_nv12() && desc.Format.0 as u32 == DXGI_FORMAT_R8_UNORM {
+        combined_semi_planar_layout(format, width, height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "external D3D11 texture: no combined-plane layout for {format:?} {width}x{height}"
+            ))
+        })?
+    } else {
+        layout
+    };
     if desc.Format.0 as u32 != layout.dxgi_format {
         return Err(Error::InvalidArgument(format!(
             "external D3D11 texture: Format is {} but {format:?}/{dtype:?} needs DXGI format {}",
@@ -435,11 +500,12 @@ fn validate_external(
             desc.Height, layout.texture_height
         )));
     }
-    // A semi-planar texture carries the image's row stride as its width, so a
-    // width above the image's even row is padding the host allocated, and it
-    // becomes the tensor's backing pitch. Every other format's texture row is
-    // its image row exactly, so a different width is a different image.
-    let layout = if format.layout() == PixelLayout::SemiPlanar {
+    // A combined-plane texture carries the image's row stride as its width,
+    // so a width above the image's even row is padding the host allocated, and
+    // it becomes the tensor's backing pitch. Every other texture's row --
+    // native NV12's luma row included -- is its image row exactly, so a
+    // different width is a different image.
+    let layout = if format.layout() == PixelLayout::SemiPlanar && !layout.is_native_nv12() {
         let texture_width = desc.Width as usize;
         if texture_width < layout.texture_width {
             return Err(Error::InvalidArgument(format!(
@@ -527,9 +593,11 @@ where
             ))
         })?;
         let d = device()?;
-        // A semi-planar texture has to be as wide as the row pitch a CPU map
-        // sees; every other format's texture row already is its image row.
-        let layout = if format.layout() == PixelLayout::SemiPlanar {
+        // A combined-plane texture has to be as wide as the row pitch a CPU
+        // map sees; every other texture's row already is its image row. A
+        // native NV12 texture is sampled per plane, so its luma row is the
+        // image row and the map's pitch is only the CPU's business.
+        let layout = if format.layout() == PixelLayout::SemiPlanar && !layout.is_native_nv12() {
             widen_semi_planar_to_pitch(d, layout)?
         } else {
             layout
@@ -760,6 +828,24 @@ where
         })
     }
 
+    /// How CPU views at `pitch` move this tensor's chroma rows, when it is a
+    /// native NV12 texture holding a shorter image; `None` otherwise.
+    fn chroma_repack(&self, pitch: usize) -> Option<ChromaRepack> {
+        if !self.layout.is_native_nv12() {
+            return None;
+        }
+        let [combined, _] = self.shape[..] else {
+            return None;
+        };
+        let image_row = PixelFormat::Nv12.image_height_from_combined(combined)?;
+        (image_row < self.layout.texture_height).then_some(ChromaRepack {
+            texture_row: self.layout.texture_height,
+            image_row,
+            rows: combined - image_row,
+            pitch,
+        })
+    }
+
     fn require_access(&self, access: CpuAccess) -> Result<()> {
         if self.access == CpuAccess::None {
             return Err(Error::InvalidOperation(
@@ -806,14 +892,14 @@ where
     /// space, because `Tensor::row_stride()` reports the same pitch and
     /// callers compute offsets from it.
     fn backing_bytes(&self) -> usize {
-        self.backing_pitch() * self.layout.texture_height
+        self.backing_pitch() * self.layout.mapped_rows()
     }
 
     /// The persistent host buffer, allocated on first use and shared by every
     /// view of this tensor.
     fn host_buffer(&self) -> &HostBuffer {
         self.host
-            .get_or_init(|| HostBuffer::new(self.backing_pitch(), self.layout.texture_height))
+            .get_or_init(|| HostBuffer::new(self.backing_pitch(), self.layout.mapped_rows()))
     }
 
     /// Orders the reads queued after this call behind the GPU write
@@ -923,7 +1009,7 @@ where
         let src_pitch = mapped.RowPitch as usize;
         let (base, _) = buffer.span();
         let span = src_pitch.min(buffer.row_pitch);
-        for row in 0..self.layout.texture_height {
+        for row in 0..self.layout.mapped_rows() {
             // SAFETY: the mapping spans `rows * src_pitch` bytes and the
             // buffer `rows * row_pitch`; `span` is within both.
             unsafe {
@@ -936,6 +1022,10 @@ where
         }
         // SAFETY: `st.tex` is the texture mapped above.
         unsafe { self.device.ctx().Unmap(&st.tex, 0) };
+        if let Some(repack) = self.chroma_repack(buffer.row_pitch) {
+            // SAFETY: the buffer holds every mapped row at its pitch.
+            unsafe { repack.move_to_image(base) };
+        }
         Ok(())
     }
 
@@ -1005,14 +1095,21 @@ where
             // `host_pin` hands out the whole backing, never a window, so this
             // publishes every row -- unlike the windowed publish a scoped
             // write map's `HostBufferGuard` does.
-            (true, Some(buffer)) => upload_buffer_window(
-                self.device,
-                &self.texture,
-                buffer,
-                self.layout.texture_width,
-                0,
-                self.layout.texture_height,
-            ),
+            (true, Some(buffer)) => {
+                if let Some(repack) = self.chroma_repack(buffer.row_pitch) {
+                    // SAFETY: the buffer holds every mapped row at its pitch,
+                    // and both claims are held, so nothing maps it meanwhile.
+                    unsafe { repack.move_to_texture(buffer.span().0) };
+                }
+                upload_buffer_window(
+                    self.device,
+                    &self.texture,
+                    buffer,
+                    &self.layout,
+                    0,
+                    self.layout.mapped_rows(),
+                )
+            }
             _ => match &self.staging {
                 // SAFETY: both textures are live and identically described,
                 // and `_staging_claim` is held across this call, so the
@@ -1216,6 +1313,7 @@ where
             texture: self.texture.clone(),
             staging: Arc::clone(st),
             writer: writes,
+            repack: self.chroma_repack(st.row_pitch).filter(|_| writes),
         };
         Ok(self.pin_over(base as *mut u8, st.bytes(), guard))
     }
@@ -1280,6 +1378,13 @@ where
         // The map consumed the queued copy.
         state.refresh_pending = false;
         state.base = mapped.pData as usize;
+        if access.reads() {
+            if let Some(repack) = self.chroma_repack(st.row_pitch) {
+                // SAFETY: the mapping is `st.bytes()` long, which covers the
+                // texture's every mapped row at `st.row_pitch`.
+                unsafe { repack.move_to_image(mapped.pData.cast()) };
+            }
+        }
         Ok(state.base)
     }
 
@@ -1292,7 +1397,22 @@ where
         // already refuses a `CpuAccess::Write` request this cannot express;
         // this also covers a `ReadWrite` request, which that check does not.
         let write_region = if access.writes() {
-            Some(self.row_window().ok_or_else(|| {
+            // A native NV12 texture is published whole. A shorter image in
+            // one (`configure_image`) owns the whole texture, but a window at
+            // an offset is part of a frame it does not own.
+            let window = if self.layout.is_native_nv12() {
+                if self.view_offset != 0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "writable map of a native NV12 D3D11 texture tensor window ({} bytes                          at offset {}): a write-only NV12 texture is published whole, so map                          the tensor from its origin, or allocate it with CpuAccess::ReadWrite",
+                        self.pitched_extent(),
+                        self.view_offset
+                    )));
+                }
+                Some((0, self.layout.mapped_rows()))
+            } else {
+                self.row_window()
+            };
+            Some(window.ok_or_else(|| {
                 Error::InvalidArgument(format!(
                     "writable map of a D3D11 texture tensor window ({} bytes at offset {}) not \
                      aligned to the {}-byte backing pitch: the host-buffer path can only \
@@ -1323,7 +1443,10 @@ where
             device: self.device,
             texture: self.texture.clone(),
             host: Arc::clone(&self.host),
-            texture_width: self.layout.texture_width,
+            layout: self.layout,
+            repack: self
+                .chroma_repack(buffer.row_pitch)
+                .filter(|_| write_region.is_some()),
             writeback: write_region,
         };
         Ok(self.pin_over(base, len, guard))
@@ -1532,7 +1655,7 @@ where
     /// image's rows, not the texture's, which differ when a semi-planar
     /// texture was widened to the driver's pitch.
     pub(crate) fn tight_bytes(&self) -> usize {
-        self.image_row_bytes() * self.layout.texture_height
+        self.image_row_bytes() * self.layout.mapped_rows()
     }
 
     /// Imports this texture into CUDA, for `Tensor::try_init_d3d11_cuda` to
@@ -1605,17 +1728,39 @@ fn publish(device: &D3d11Device) {
 ///
 /// `row_offset`/`row_count` name a sub-range for `buffer_pin`'s windowed
 /// write (derived from `row_window`, itself bounded by `check_view_offset`),
-/// or `(0, texture_height)` for `sync_for_device`'s unwindowed `host_pin`
+/// or `(0, mapped_rows)` for `sync_for_device`'s unwindowed `host_pin`
 /// republish -- 0 is trivially in range regardless of `view_offset`.
+///
+/// A native NV12 texture is always uploaded whole, with no box: a box names
+/// luma rows only, and the chroma plane is read from the source after the
+/// luma rows at the same pitch. `buffer_pin` only lets a whole-tensor window
+/// write one.
 fn upload_buffer_window(
     device: &D3d11Device,
     texture: &ID3D11Texture2D,
     buffer: &HostBuffer,
-    texture_width: usize,
+    layout: &D3d11ImageLayout,
     row_offset: usize,
     row_count: usize,
 ) {
     let (base, _) = buffer.span();
+    if layout.is_native_nv12() {
+        // SAFETY: the buffer holds every mapped row at `row_pitch`, which is
+        // what a whole-resource update of an NV12 texture reads, and both
+        // objects are live for the call.
+        unsafe {
+            device.ctx().UpdateSubresource(
+                texture,
+                0,
+                None,
+                base.cast_const().cast(),
+                buffer.row_pitch as u32,
+                (buffer.row_pitch * layout.mapped_rows()) as u32,
+            );
+        }
+        return;
+    }
+    let texture_width = layout.texture_width;
     // SAFETY: `row_offset` rows are within the buffer's own span for both
     // callers -- `buffer_pin`'s window is bounded by `check_view_offset`,
     // and `sync_for_device` always passes `row_offset = 0`.
@@ -1651,14 +1796,23 @@ struct StagingGuard {
     texture: ID3D11Texture2D,
     staging: Arc<Staging>,
     writer: bool,
+    /// For a writer of a shorter image in a native NV12 texture: the chroma
+    /// rows to move back to the texture's plane before the copy out.
+    repack: Option<ChromaRepack>,
 }
 
 impl Drop for StagingGuard {
     fn drop(&mut self) {
         let mut state = self.staging.state();
+        let base = state.base;
         if !state.release(self.writer) {
             // Another reader still holds the mapping.
             return;
+        }
+        if let Some(repack) = self.repack {
+            // SAFETY: a writer holds the mapping alone and it is still
+            // mapped: `base` addresses `staging.bytes()`, every mapped row.
+            unsafe { repack.move_to_texture(base as *mut u8) };
         }
         // SAFETY: the staging texture is live and mapped by this guard.
         unsafe { self.device.ctx().Unmap(&self.staging.tex, 0) };
@@ -1682,7 +1836,10 @@ struct HostBufferGuard {
     device: &'static D3d11Device,
     texture: ID3D11Texture2D,
     host: Arc<OnceLock<HostBuffer>>,
-    texture_width: usize,
+    layout: D3d11ImageLayout,
+    /// For a writer of a shorter image in a native NV12 texture: the chroma
+    /// rows to move back to the texture's plane before the upload.
+    repack: Option<ChromaRepack>,
     writeback: Option<(usize, usize)>,
 }
 
@@ -1698,11 +1855,16 @@ impl Drop for HostBufferGuard {
         // `UpdateSubresource`.
         let mut state = buffer.state();
         if let Some((row_offset, row_count)) = self.writeback {
+            if let Some(repack) = self.repack {
+                // SAFETY: the writer's claim is held, and the buffer holds
+                // every mapped row at its pitch.
+                unsafe { repack.move_to_texture(buffer.span().0) };
+            }
             upload_buffer_window(
                 self.device,
                 &self.texture,
                 buffer,
-                self.texture_width,
+                &self.layout,
                 row_offset,
                 row_count,
             );
@@ -1792,6 +1954,23 @@ where
         let capacity = self.tight_bytes();
         if needed > capacity {
             return Err(Error::InsufficientCapacity { needed, capacity });
+        }
+        // A native NV12 texture holds a smaller NV12 image as its top-left
+        // corner, with the image's chroma at the top of the texture's chroma
+        // plane; CPU views move those rows to where the image's own combined
+        // plane has them (`ChromaRepack`). Only an NV12 shape describes that.
+        if self.layout.is_native_nv12() {
+            let rows = match shape {
+                [rows, _] => PixelFormat::Nv12.image_height_from_combined(*rows),
+                _ => None,
+            };
+            if rows.is_none_or(|h| h > self.layout.texture_height) {
+                return Err(Error::InvalidArgument(format!(
+                    "a native NV12 D3D11 texture {}x{} holds an NV12 image of at most that \
+                     size, not a {shape:?} shape",
+                    self.layout.texture_width, self.layout.texture_height
+                )));
+            }
         }
         self.shape = shape.to_vec();
         Ok(())
@@ -2255,12 +2434,13 @@ mod tests {
         }
     }
 
-    /// The sizes the semi-planar stride rule is proved at: three formats at
-    /// one even size, plus an odd size whose chroma pairs need the even
-    /// rounding on top of whatever the driver pads to.
+    /// The sizes the combined-plane stride rule is proved at: NV16 and NV24
+    /// at an even size, and NV12 at the odd sizes that have no native NV12
+    /// texture, one of them needing the even rounding on top of whatever the
+    /// driver pads to.
     fn nv_sizes() -> [(PixelFormat, usize, usize); 4] {
         [
-            (PixelFormat::Nv12, 64, 64),
+            (PixelFormat::Nv12, 64, 63),
             (PixelFormat::Nv16, 64, 64),
             (PixelFormat::Nv24, 64, 64),
             (PixelFormat::Nv12, 321, 241),
@@ -2451,16 +2631,16 @@ mod tests {
     fn an_external_semi_planar_texture_is_wrapped_at_its_own_width() {
         // 128 is a multiple of every staging alignment either adapter uses, so
         // this texture is 128 texels wide on both.
-        let backing = nv_tensor(PixelFormat::Nv12, 128, 64, CpuAccess::None);
+        let backing = nv_tensor(PixelFormat::Nv16, 128, 64, CpuAccess::None);
         assert_eq!(backing.layout().texture_width, 128);
-        let shape = PixelFormat::Nv12.allocation_shape(100, 64).unwrap();
+        let shape = PixelFormat::Nv16.allocation_shape(100, 64).unwrap();
         // SAFETY: `backing` holds the texture live across this call.
         let t = unsafe {
             D3d11TextureTensor::<u8>::from_d3d11_texture(
                 backing.texture_ptr(),
                 100,
                 64,
-                PixelFormat::Nv12,
+                PixelFormat::Nv16,
                 DType::U8,
                 &shape,
                 CpuAccess::Read,
@@ -2481,7 +2661,8 @@ mod tests {
     /// does not address by.
     ///
     /// A raw 100-wide R8 texture is the shape a third party would hand over
-    /// for a 100x64 NV12 image. Whether it is legal depends on the adapter,
+    /// for a 100x64 NV12 image in the combined layout, which is still accepted
+    /// for an even NV12 image although the HAL now allocates native NV12. Whether it is legal depends on the adapter,
     /// not on the HAL: this NVIDIA adapter gives it a 128-byte staging pitch
     /// and it is refused, while WARP's pitch is tight and it is accepted. The
     /// test measures the pitch and asserts the matching outcome rather than
@@ -2495,7 +2676,7 @@ mod tests {
         // exactly the image's own width.
         let raw = D3d11ImageLayout {
             texture_width: w,
-            ..image_d3d11_layout(fmt, DType::U8, w, h).unwrap()
+            ..combined_semi_planar_layout(fmt, w, h).unwrap()
         };
         assert_eq!(raw.texture_height, 96, "NV12 64 rows plus 32 chroma rows");
         let tex =
@@ -2530,7 +2711,7 @@ mod tests {
     /// as one passed by pointer.
     #[test]
     fn wrapped_nv_tensors_record_the_textures_width_as_their_row_stride() {
-        for (w, h) in [(321usize, 241usize), (64, 64)] {
+        for (w, h) in [(321usize, 241usize), (64, 63)] {
             let fmt = PixelFormat::Nv12;
             let src = nv_tensor(fmt, w, h, CpuAccess::None);
             let texture_width = src.layout().texture_width;
@@ -2573,6 +2754,262 @@ mod tests {
                 "{fmt:?} {w}x{h} wrapped by shared handle"
             );
         }
+    }
+
+    /// An even NV12 image is a native two-plane texture, and a CPU map lays it
+    /// out as the combined plane: luma rows, then chroma rows, at one pitch.
+    /// What a write map puts there, a second wrapper of the same texture
+    /// reads back at the same offsets -- through staging for a readable
+    /// tensor and through the whole-texture upload for a write-only one.
+    #[test]
+    fn native_nv12_round_trips_luma_and_chroma_through_the_cpu() {
+        let (w, h) = (640usize, 480usize);
+        let fmt = PixelFormat::Nv12;
+        for access in [CpuAccess::ReadWrite, CpuAccess::Write] {
+            let t =
+                crate::Tensor::<u8>::image(w, h, fmt, Some(crate::TensorMemory::DmaBuf), access)
+                    .unwrap();
+            let layout = t.d3d11_layout().unwrap();
+            assert!(layout.is_native_nv12(), "{access:?}: {layout:?}");
+            assert_eq!(
+                (layout.texture_width, layout.texture_height),
+                (w, h),
+                "{access:?}: the texture is the luma grid"
+            );
+            let stride = t.effective_row_stride().unwrap();
+            assert!(stride >= w, "{access:?}: stride {stride}");
+            let byte = |r: usize, x: usize| ((r * 7 + x * 3) % 253) as u8;
+            {
+                let mut m = t.map_write().unwrap();
+                let dst = m.as_mut_slice();
+                for r in 0..h + h / 2 {
+                    for x in 0..w {
+                        dst[r * stride + x] = byte(r, x);
+                    }
+                }
+            }
+            let shape = fmt.allocation_shape(w, h).unwrap();
+            // SAFETY: `t` holds the texture alive across this call.
+            let r = unsafe {
+                D3d11TextureTensor::<u8>::from_d3d11_texture(
+                    t.d3d11_texture().unwrap(),
+                    w,
+                    h,
+                    fmt,
+                    DType::U8,
+                    &shape,
+                    CpuAccess::Read,
+                    None,
+                )
+            }
+            .unwrap();
+            let rstride = r.image_backing_row_stride().unwrap();
+            let m = r.map_with(CpuAccess::Read).unwrap();
+            let src = m.as_slice();
+            for row in 0..h + h / 2 {
+                for x in 0..w {
+                    assert_eq!(
+                        src[row * rstride + x],
+                        byte(row, x),
+                        "{access:?}: row {row} column {x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A producer's own NV12 texture -- what a video decoder or capture
+    /// pipeline creates -- wraps without a copy, by pointer and by shared
+    /// handle, and the geometry helpers read its image size straight from the
+    /// texture.
+    #[test]
+    fn an_external_native_nv12_texture_wraps_by_pointer_and_by_handle() {
+        let (w, h) = (1920usize, 1080usize);
+        let fmt = PixelFormat::Nv12;
+        let d = device().unwrap();
+        let layout = image_d3d11_layout(fmt, DType::U8, w, h).unwrap();
+        assert!(layout.is_native_nv12());
+        let tex = create_texture(
+            d,
+            &texture_desc(&layout, D3D11_USAGE_DEFAULT, BIND, 0, MISC),
+        )
+        .unwrap();
+
+        // SAFETY: `tex` is live for the whole call.
+        let by_ptr = unsafe {
+            crate::Tensor::<u8>::from_d3d11_texture(tex.as_raw(), w, h, fmt, CpuAccess::Read, None)
+        }
+        .unwrap();
+        assert!(by_ptr.d3d11_layout().unwrap().is_native_nv12());
+        assert_eq!((by_ptr.width(), by_ptr.height()), (Some(w), Some(h)));
+        // SAFETY: `tex` is live for the call.
+        let geometry = unsafe {
+            crate::d3d11::d3d11_texture_geometry(tex.as_raw(), fmt, Some(&[h * 3 / 2, w]))
+        }
+        .unwrap();
+        assert_eq!(geometry, (w, h));
+
+        let handle = create_nt_handle(&tex).unwrap();
+        // SAFETY: `handle` is a shared NT handle this test owns.
+        let by_handle = unsafe {
+            crate::Tensor::<u8>::from_d3d11_shared_handle(
+                handle.as_raw_handle(),
+                w,
+                h,
+                fmt,
+                CpuAccess::Read,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        assert!(by_handle.d3d11_layout().unwrap().is_native_nv12());
+        // SAFETY: `handle` is valid for the call.
+        let geometry = unsafe {
+            crate::d3d11::d3d11_shared_handle_geometry(handle.as_raw_handle(), fmt, None)
+        }
+        .unwrap();
+        assert_eq!(geometry, (w, h), "an NV12 texture needs no shape");
+
+        // A native NV12 texture of another size is another image.
+        // SAFETY: `tex` is live for the call.
+        let other = unsafe {
+            crate::Tensor::<u8>::from_d3d11_texture(
+                tex.as_raw(),
+                w,
+                h - 2,
+                fmt,
+                CpuAccess::Read,
+                None,
+            )
+        };
+        assert!(matches!(other, Err(Error::InvalidArgument(_))), "{other:?}");
+    }
+
+    /// A native NV12 texture holding a shorter image (a pool tensor
+    /// reconfigured for a smaller frame) keeps the image's chroma at the top
+    /// of its chroma plane, while CPU views lay it out as the image's own
+    /// combined plane. Written through one view, read back through the same
+    /// one and through a full-size wrapper of the texture, for a readable and
+    /// a write-only tensor.
+    #[test]
+    fn a_shorter_image_in_a_native_nv12_texture_keeps_its_chroma_in_the_plane() {
+        let (w, h) = (640usize, 480usize);
+        let (iw, ih) = (320usize, 240usize);
+        for access in [CpuAccess::ReadWrite, CpuAccess::Write] {
+            let mut t = crate::Tensor::<u8>::image(
+                w,
+                h,
+                PixelFormat::Nv12,
+                Some(crate::TensorMemory::DmaBuf),
+                access,
+            )
+            .unwrap();
+            assert!(t.d3d11_layout().unwrap().is_native_nv12());
+            t.configure_image(iw, ih, PixelFormat::Nv12).unwrap();
+            assert_eq!((t.width(), t.height()), (Some(iw), Some(ih)));
+            let stride = t.effective_row_stride().unwrap();
+            let byte = |r: usize, x: usize| ((r * 11 + x * 5) % 251) as u8;
+            {
+                let mut m = t.map_for_write().unwrap();
+                let dst = m.as_mut_slice();
+                for r in 0..ih + ih / 2 {
+                    for x in 0..iw {
+                        dst[r * stride + x] = byte(r, x);
+                    }
+                }
+            }
+            if access == CpuAccess::ReadWrite {
+                let m = t.map_read().unwrap();
+                for r in 0..ih + ih / 2 {
+                    for x in 0..iw {
+                        assert_eq!(m.as_slice()[r * stride + x], byte(r, x), "row {r}");
+                    }
+                }
+            }
+            let shape = PixelFormat::Nv12.allocation_shape(w, h).unwrap();
+            // SAFETY: `t` holds the texture alive across this call.
+            let whole = unsafe {
+                D3d11TextureTensor::<u8>::from_d3d11_texture(
+                    t.d3d11_texture().unwrap(),
+                    w,
+                    h,
+                    PixelFormat::Nv12,
+                    DType::U8,
+                    &shape,
+                    CpuAccess::Read,
+                    None,
+                )
+            }
+            .unwrap();
+            let pitch = whole.image_backing_row_stride().unwrap();
+            let m = whole.map_with(CpuAccess::Read).unwrap();
+            for r in 0..ih {
+                for x in 0..iw {
+                    assert_eq!(
+                        m.as_slice()[r * pitch + x],
+                        byte(r, x),
+                        "{access:?} luma {r}"
+                    );
+                }
+            }
+            for r in 0..ih / 2 {
+                for x in 0..iw {
+                    assert_eq!(
+                        m.as_slice()[(h + r) * pitch + x],
+                        byte(ih + r, x),
+                        "{access:?} chroma {r} at the top of the texture's plane"
+                    );
+                }
+            }
+        }
+        let mut t = crate::Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            Some(crate::TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        assert!(
+            t.configure_image(w, h + 2, PixelFormat::Nv12).is_err(),
+            "taller"
+        );
+        assert!(
+            t.configure_image(w, h, PixelFormat::Rgba).is_err(),
+            "not NV12"
+        );
+    }
+
+    /// A write-only native NV12 texture is uploaded whole, so a writable map
+    /// of part of it is refused rather than publishing rows it does not own.
+    #[test]
+    fn a_partial_write_window_of_a_write_only_native_nv12_tensor_is_refused() {
+        let (w, h) = (64usize, 64usize);
+        let fmt = PixelFormat::Nv12;
+        let shape = fmt.allocation_shape(w, h).unwrap();
+        let t = D3d11TextureTensor::<u8>::new_image(
+            w,
+            h,
+            fmt,
+            DType::U8,
+            &shape,
+            None,
+            CpuAccess::Write,
+        )
+        .unwrap();
+        assert!(t.layout().is_native_nv12());
+        let pitch = t.image_backing_row_stride().unwrap();
+        let view = t.view(pitch * 8, &[8, w]).unwrap();
+        let err = view.map_with(CpuAccess::Write).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)) && err.to_string().contains("NV12"),
+            "{err}"
+        );
+        assert!(
+            t.map_with(CpuAccess::Write).is_ok(),
+            "the whole tensor maps"
+        );
     }
 
     /// A texture narrower than an even image row cannot hold the image, so it

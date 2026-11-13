@@ -6871,6 +6871,230 @@ mod image_tests {
         }
     }
 
+    /// An even NV12 texture source on Windows is a native two-plane texture:
+    /// the GL backend imports its luma and chroma planes and draws it with the
+    /// hardware-filtered program. At 1:1 the result matches the CPU
+    /// converter to rounding; through a crop and a bilinear resize it stays
+    /// within a filtering tolerance. None of it may fall back to the CPU.
+    #[test]
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn windows_native_nv12_sources_convert_through_their_planes() {
+        if !windows_gl_textures_or_skip(function!()) {
+            return;
+        }
+        let mut gpu = ImageProcessor::new().unwrap();
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        for (w, h) in [(640usize, 480usize), (1920, 1080), (64, 62)] {
+            let src = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            if !texture_or_skip(&src, function!()) {
+                return;
+            }
+            assert!(
+                src.as_typed::<u8>()
+                    .unwrap()
+                    .d3d11_layout()
+                    .unwrap()
+                    .is_native_nv12(),
+                "{w}x{h} is a native NV12 texture"
+            );
+            let host = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            fill_nv12_gradient(&src, w, h);
+            fill_nv12_gradient(&host, w, h);
+            let crop = Region::new((w / 8) & !1, (h / 8) & !1, w / 2, h / 2);
+            // At 1:1 and through a crop the draw samples each texel once and
+            // matches the CPU converter to rounding. A bilinear resize is
+            // checked against the same convert of a host copy, which GL
+            // draws from an upload of the combined plane: the GPU's bilinear
+            // kernel is not the CPU's, but the two plane imports must sample
+            // exactly what the combined plane does.
+            for (label, (dw, dh), region, cpu_reference) in [
+                ("1:1", (w, h), None, true),
+                ("crop", (w / 2, h / 2), Some(crop), true),
+                ("resize", (w / 2 + 6, h / 3 + 4), None, false),
+            ] {
+                let rgba = |memory| {
+                    TensorDyn::image(
+                        dw,
+                        dh,
+                        PixelFormat::Rgba,
+                        DType::U8,
+                        Some(memory),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap()
+                };
+                let options = || ConvertOptions::default().source(region);
+                let mut dst_gpu = rgba(TensorMemory::DmaBuf);
+                let before = gpu.convert_fallback_count();
+                gpu.convert(&src, &mut dst_gpu, Some(options())).unwrap();
+                assert_eq!(
+                    gpu.convert_fallback_count(),
+                    before,
+                    "{w}x{h} {label} fell back to the CPU"
+                );
+                let mut reference = rgba(TensorMemory::Mem);
+                if cpu_reference {
+                    cpu.convert(&host, &mut reference, Some(options())).unwrap();
+                } else {
+                    gpu.convert(&host, &mut reference, Some(options())).unwrap();
+                }
+                let (max, mean) = rgba_difference(&dst_gpu, &reference);
+                assert!(
+                    max <= 1 && mean <= 0.05,
+                    "{w}x{h} {label}: max {max}, mean {mean:.3} against the {} reference",
+                    if cpu_reference {
+                        "CPU"
+                    } else {
+                        "combined-plane GL"
+                    }
+                );
+            }
+        }
+    }
+
+    /// A native NV12 pool texture reconfigured for a smaller frame samples
+    /// inside its logical image: the planes are wider and taller than the
+    /// picture, whose chroma sits at the top of the texture's chroma plane.
+    #[test]
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn windows_native_nv12_pool_reconfigured_for_a_smaller_frame_converts() {
+        if !windows_gl_textures_or_skip(function!()) {
+            return;
+        }
+        let mut gpu = ImageProcessor::new().unwrap();
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let (w, h) = (640usize, 480usize);
+        let mut src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let (iw, ih) = (w / 2, h / 2);
+        src.configure_image(iw, ih, PixelFormat::Nv12).unwrap();
+        let host = TensorDyn::image(
+            iw,
+            ih,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        fill_nv12_gradient(&src, iw, ih);
+        fill_nv12_gradient(&host, iw, ih);
+        let rgba = |memory| {
+            TensorDyn::image(
+                iw,
+                ih,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(memory),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let (mut dst_gpu, mut dst_cpu) = (rgba(TensorMemory::DmaBuf), rgba(TensorMemory::Mem));
+        let before = gpu.convert_fallback_count();
+        gpu.convert(&src, &mut dst_gpu, None).unwrap();
+        assert_eq!(
+            gpu.convert_fallback_count(),
+            before,
+            "narrowed source fell back"
+        );
+        cpu.convert(&host, &mut dst_cpu, None).unwrap();
+        let (max, mean) = rgba_difference(&dst_gpu, &dst_cpu);
+        assert!(
+            max <= 1 && mean <= 0.05,
+            "narrowed: max {max}, mean {mean:.3}"
+        );
+    }
+
+    /// Fills a `w`x`h` NV12 image with a gradient: luma rows, then
+    /// interleaved chroma rows, at the tensor's row stride.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn fill_nv12_gradient(t: &TensorDyn, w: usize, h: usize) {
+        let stride = t.effective_row_stride().unwrap();
+        let mut m = t.map_bytes(edgefirst_tensor::CpuAccess::ReadWrite).unwrap();
+        let buf = m.as_mut_slice();
+        for y in 0..h {
+            for x in 0..w {
+                buf[y * stride + x] = (16 + (x * 7 + y * 3) % 220) as u8;
+            }
+        }
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
+                let at = (h + y) * stride + 2 * x;
+                buf[at] = (64 + (x * 5) % 128) as u8;
+                buf[at + 1] = (64 + (y * 9) % 128) as u8;
+            }
+        }
+    }
+
+    /// The largest difference of any channel of two RGBA images, and the mean
+    /// over all of them.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn rgba_difference(a: &TensorDyn, b: &TensorDyn) -> (u8, f64) {
+        let (w, h) = (a.width().unwrap(), a.height().unwrap());
+        let (sa, sb) = (
+            a.effective_row_stride().unwrap(),
+            b.effective_row_stride().unwrap(),
+        );
+        let ma = a.map_bytes(edgefirst_tensor::CpuAccess::Read).unwrap();
+        let mb = b.map_bytes(edgefirst_tensor::CpuAccess::Read).unwrap();
+        let (mut max, mut sum) = (0u8, 0u64);
+        for y in 0..h {
+            for x in 0..w * 4 {
+                let d = ma.as_slice()[y * sa + x].abs_diff(mb.as_slice()[y * sb + x]);
+                max = max.max(d);
+                sum += u64::from(d);
+            }
+        }
+        (max, sum as f64 / (w * h * 4) as f64)
+    }
+
+    /// The skip checks every Windows native NV12 GL test makes. Returns
+    /// whether to run.
+    #[cfg(all(target_os = "windows", feature = "opengl"))]
+    fn windows_gl_textures_or_skip(test: &str) -> bool {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{test} - OpenGL not available"));
+            return false;
+        }
+        if !crate::test_support::is_gpu_buffer_available() {
+            crate::test_support::report_skip(&format!("{test} - no zero-copy GPU buffers"));
+            return false;
+        }
+        true
+    }
+
     // The tests below wait on a Windows completion fence directly, so they
     // need the raw wait call — no crate in this workspace wraps it.
     #[cfg(target_os = "windows")]
