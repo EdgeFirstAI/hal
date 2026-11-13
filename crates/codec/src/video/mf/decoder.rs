@@ -213,6 +213,9 @@ pub(crate) struct MfDecoder {
     output: OutputPool,
     pool: Vec<Arc<TensorDyn>>,
     free: Vec<u32>,
+    /// Slots of the current pool given back by frames whose tensor reference
+    /// has not dropped yet.
+    releasing: Vec<u32>,
     generation: u64,
     returns: Arc<Returns>,
     /// The layout of the pictures the pool holds.
@@ -292,6 +295,7 @@ impl MfDecoder {
                         output: config.output,
                         pool: Vec::new(),
                         free: Vec::new(),
+                        releasing: Vec::new(),
                         generation: 0,
                         returns: Arc::new(Returns::default()),
                         layout: None,
@@ -354,10 +358,20 @@ impl MfDecoder {
         Ok((transform, dxva))
     }
 
-    /// Gives back the buffers of frames the caller has dropped.
+    /// Gives back the buffers of frames the caller has dropped. A frame
+    /// returns its slot before it drops its tensor, so a slot becomes free
+    /// only once the pool holds the tensor's last reference: a free slot's
+    /// tensor can then always be updated in place.
     fn reclaim(&mut self) {
-        let generation = self.generation;
-        self.free.extend(self.returns.take(generation));
+        let mut returned = std::mem::take(&mut self.releasing);
+        returned.extend(self.returns.take(self.generation));
+        for slot in returned {
+            if Arc::strong_count(&self.pool[slot as usize]) == 1 {
+                self.free.push(slot);
+            } else {
+                self.releasing.push(slot);
+            }
+        }
     }
 
     /// Queues the transform's outputs as pictures and format changes.
@@ -429,12 +443,13 @@ impl MfDecoder {
     }
 
     /// Pool buffers in frames the caller has, not counting frames this call
-    /// is about to return.
+    /// is about to return. Frames of an earlier pool, before a format change
+    /// in the same call, hold none of this pool's buffers.
     fn held_by_caller(&self) -> usize {
         let returning = self
             .pending
             .iter()
-            .filter(|e| matches!(e, DecodeEvent::Frame(_)))
+            .filter(|e| matches!(e, DecodeEvent::Frame(f) if f.slot.0 == self.generation))
             .count();
         self.pool.len() - self.free.len() - returning
     }
@@ -469,15 +484,11 @@ impl MfDecoder {
     /// Makes the pool fit `layout` and reports the new stream format.
     fn apply(&mut self, layout: Layout) -> Result<()> {
         let (w, h) = layout.frame_size();
+        // A pool of the same size is kept: a tensor a held frame still shows
+        // keeps its colorimetry, and each takes the new one when `picture`
+        // reuses its slot.
         let same_size = self.layout.as_ref().map(Layout::frame_size) == Some((w, h));
-        if same_size && !self.pool.is_empty() {
-            for t in &mut self.pool {
-                // A tensor a held frame still shows keeps its colorimetry.
-                if let Some(t) = Arc::get_mut(t) {
-                    t.set_colorimetry(layout.colorimetry);
-                }
-            }
-        } else {
+        if !same_size || self.pool.is_empty() {
             let mut tensors = match &mut self.output {
                 OutputPool::Allocate { count } => allocate(*count + 1, w, h)?,
                 OutputPool::Provided(pool) => {
@@ -505,6 +516,7 @@ impl MfDecoder {
             self.generation += 1;
             self.pool = tensors.into_iter().map(Arc::new).collect();
             self.free = (0..self.pool.len() as u32).rev().collect();
+            self.releasing.clear();
         }
         let info = StreamInfo {
             width: w,
@@ -573,6 +585,13 @@ impl MfDecoder {
             .as_ref()
             .expect("a format precedes every picture");
         let size = layout.frame_size();
+        let colorimetry = layout.colorimetry;
+        let tensor = &mut self.pool[slot as usize];
+        if tensor.colorimetry() != colorimetry {
+            Arc::get_mut(tensor)
+                .expect("a free slot's tensor has no other reference")
+                .set_colorimetry(colorimetry);
+        }
         let tensor = &self.pool[slot as usize];
         let time = match &picture {
             // SAFETY: a live sample.
@@ -600,13 +619,8 @@ impl MfDecoder {
                 self.parking.push(*parked);
             }
             (Picture::Parked { tensor: parked, .. }, None) => {
-                return Err(CodecError::InvalidConfig(format!(
-                    "{}: a parked {:?}x{:?} picture cannot be copied into a pool tensor that is \
-                     not a native NV12 texture",
-                    self.device,
-                    parked.width(),
-                    parked.height()
-                )));
+                copy_mapped(&parked, tensor, size)?;
+                self.parking.push(*parked);
             }
         }
         Ok(DecodedFrame::new(
@@ -795,6 +809,41 @@ fn fits(t: &TensorDyn, w: usize, h: usize) -> bool {
         && !t.is_multiplane()
 }
 
+/// Where the planes of a `size` NV12 image are in a CPU map of `t`.
+fn mapped_planes(t: &TensorDyn, size: (usize, usize)) -> Result<Vec<Plane>> {
+    let stride = t
+        .effective_row_stride()
+        .ok_or_else(|| CodecError::InvalidConfig("an NV12 tensor has no row stride".into()))?;
+    Ok(PixelFormat::Nv12
+        .plane_table(size.0, size.1, stride)
+        .ok_or(CodecError::UnsupportedFormat(PixelFormat::Nv12))?
+        .iter()
+        .map(|p| Plane {
+            offset: p.offset as usize,
+            pitch: p.stride as usize,
+        })
+        .collect())
+}
+
+/// A CPU map of `t` for writing a whole picture.
+fn write_map(t: &TensorDyn) -> Result<edgefirst_tensor::HostView<'static, u8>> {
+    Ok(match t.map_bytes(CpuAccess::Write) {
+        Err(edgefirst_tensor::Error::PartialWriteRequiresReadWrite(_)) => {
+            t.map_bytes(CpuAccess::ReadWrite)
+        }
+        other => other,
+    }?)
+}
+
+/// Copies a parked picture into a pool tensor the GPU cannot copy it into,
+/// through CPU maps.
+fn copy_mapped(parked: &TensorDyn, dst: &TensorDyn, size: (usize, usize)) -> Result<()> {
+    let (from, to) = (mapped_planes(parked, size)?, mapped_planes(dst, size)?);
+    let src = parked.map_bytes(CpuAccess::Read)?;
+    let mut map = write_map(dst)?;
+    copy::copy(PixelFormat::Nv12, size, &src, &from, &mut map, &to).map_err(CodecError::InvalidData)
+}
+
 /// Copies the visible picture of `sample` into `tensor`.
 fn copy_picture(
     sample: &IMFSample,
@@ -805,24 +854,8 @@ fn copy_picture(
     // SAFETY: a live sample.
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }
         .map_err(|e| error(e, "IMFSample::ConvertToContiguousBuffer"))?;
-    let stride = tensor
-        .effective_row_stride()
-        .ok_or_else(|| CodecError::InvalidConfig("a pool tensor has no row stride".into()))?;
-    let to: Vec<Plane> = PixelFormat::Nv12
-        .plane_table(size.0, size.1, stride)
-        .ok_or(CodecError::UnsupportedFormat(PixelFormat::Nv12))?
-        .iter()
-        .map(|p| Plane {
-            offset: p.offset as usize,
-            pitch: p.stride as usize,
-        })
-        .collect();
-    let mut map = match tensor.map_bytes(CpuAccess::Write) {
-        Err(edgefirst_tensor::Error::PartialWriteRequiresReadWrite(_)) => {
-            tensor.map_bytes(CpuAccess::ReadWrite)
-        }
-        other => other,
-    }?;
+    let to = mapped_planes(tensor, size)?;
+    let mut map = write_map(tensor)?;
     let origin = (layout.visible.x, layout.visible.y);
     let into = |bytes: &[u8], top: usize, pitch: usize, map: &mut [u8]| {
         let planes = copy::contiguous(PixelFormat::Nv12, pitch, layout.coded.1);
@@ -945,5 +978,49 @@ mod tests {
         assert!(!fits(&image(640, 480, PixelFormat::Yuyv), 640, 480));
         let raw = TensorDyn::new(&[4096], DType::U8, Some(TensorMemory::Mem), None).unwrap();
         assert!(!fits(&raw, 640, 480));
+    }
+
+    /// A parked picture reaches a pool tensor the GPU cannot copy into, such
+    /// as one in host memory, plane by plane through CPU maps.
+    #[test]
+    fn a_parked_picture_is_copied_into_a_host_pool_tensor() {
+        let size = (64usize, 48usize);
+        let parked = allocate(1, size.0, size.1).unwrap().pop().unwrap();
+        let dst = TensorDyn::image(
+            size.0,
+            size.1,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let value = |plane: usize, x: usize, y: usize| (plane * 100 + x * 3 + y * 7) as u8;
+        let rows = [size.1, size.1 / 2];
+        {
+            let planes = mapped_planes(&parked, size).unwrap();
+            let mut map = parked.map_bytes(CpuAccess::ReadWrite).unwrap();
+            for (i, p) in planes.iter().enumerate() {
+                for y in 0..rows[i] {
+                    for x in 0..size.0 {
+                        map[p.offset + y * p.pitch + x] = value(i, x, y);
+                    }
+                }
+            }
+        }
+        copy_mapped(&parked, &dst, size).unwrap();
+        let planes = mapped_planes(&dst, size).unwrap();
+        let map = dst.map_bytes(CpuAccess::Read).unwrap();
+        for (i, p) in planes.iter().enumerate() {
+            for y in 0..rows[i] {
+                for x in 0..size.0 {
+                    assert_eq!(
+                        map[p.offset + y * p.pitch + x],
+                        value(i, x, y),
+                        "plane {i} ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 }
