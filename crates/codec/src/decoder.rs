@@ -3,6 +3,9 @@
 
 //! [`ImageDecoder`] — reusable decoder state for zero-allocation hot loops.
 
+use crate::engine::Engine;
+#[cfg(feature = "png")]
+use crate::engine::{engines_to_try, unsupported, Codec, Direction};
 use crate::error::CodecError;
 #[cfg(not(feature = "png"))]
 use crate::error::UnsupportedFeature;
@@ -148,6 +151,25 @@ impl ImageDecoder {
         self.jpeg_state.chroma_upsample = mode;
     }
 
+    /// Selects the engine that decodes.
+    ///
+    /// [`Engine::Auto`] (the default) tries nvJPEG (when enabled with
+    /// `EDGEFIRST_ENABLE_NVJPEG`), V4L2, then the CPU for JPEG, each hardware
+    /// decoder passing an image it cannot take to the next, and the CPU for
+    /// PNG; [`ENGINE_ENV`](crate::ENGINE_ENV) narrows that list. Any other
+    /// engine decodes alone: an image it cannot take fails with
+    /// [`CodecError::Unsupported`] carrying
+    /// [`UnsupportedFeature::Codec`](crate::UnsupportedFeature::Codec), and an engine this platform does not
+    /// have with [`CodecError::NoDevice`].
+    pub fn set_engine(&mut self, engine: Engine) {
+        self.jpeg_state.engine = engine;
+    }
+
+    /// The engine selected with [`set_engine`](Self::set_engine).
+    pub fn engine(&self) -> Engine {
+        self.jpeg_state.engine
+    }
+
     /// Decode image data into a typed tensor, configuring its dimensions and
     /// pixel format to the decoded output format — the source's native format
     /// unless [`set_output_format`](Self::set_output_format) selected a fused
@@ -172,24 +194,7 @@ impl ImageDecoder {
         data: &[u8],
         dst: &mut Tensor<T>,
     ) -> crate::Result<ImageInfo> {
-        if is_jpeg(data) {
-            crate::jpeg::decode_jpeg_into(data, dst, &mut self.jpeg_state)
-        } else if is_png(data) {
-            {
-                #[cfg(feature = "png")]
-                {
-                    crate::png::decode_png_into(data, dst, &mut self.scratch)
-                }
-                #[cfg(not(feature = "png"))]
-                {
-                    Err(CodecError::Unsupported(UnsupportedFeature::PngNotEnabled))
-                }
-            }
-        } else {
-            Err(CodecError::InvalidData(
-                "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
-            ))
-        }
+        decode_into_inner(&mut self.jpeg_state, &mut self.scratch, data, dst)
     }
 
     /// Decode image data into a type-erased tensor.
@@ -258,6 +263,15 @@ pub(crate) fn decode_into_inner<T: ImagePixel>(
         {
             #[cfg(feature = "png")]
             {
+                // PNG has only the CPU decoder.
+                let engines = engines_to_try(jpeg_state.engine, &[Engine::Cpu])?;
+                if engines.first() != Some(&Engine::Cpu) {
+                    return Err(unsupported(
+                        Codec::Png,
+                        Direction::Decode,
+                        jpeg_state.engine,
+                    ));
+                }
                 crate::png::decode_png_into(data, dst, scratch)
             }
             #[cfg(not(feature = "png"))]

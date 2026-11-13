@@ -36,10 +36,10 @@ use crate::video::{
     DecodeEvent, DecodedFrame, DecoderBackend, DecoderConfig, OutputMemory, OutputPool, Returns,
     StreamInfo,
 };
-use crate::{CodecError, Result};
+use crate::{CodecError, Engine, Result, Transfer};
 
 /// Environment variable naming the decoder node to use.
-const ENV_DECODER: &str = "EDGEFIRST_CODEC_V4L2_DECODER";
+pub(crate) const ENV_DECODER: &str = "EDGEFIRST_CODEC_V4L2_DECODER";
 /// Bitstream (OUTPUT) buffers to ask for. One access unit is in the device
 /// at a time (see `submit`); a driver may grant more.
 const BITSTREAM_BUFFERS: u32 = 2;
@@ -63,6 +63,14 @@ const CAPTURE_FORMATS: [(u32, bool); 2] = [
     (uapi::V4L2_PIX_FMT_NV12, false),
     (uapi::V4L2_PIX_FMT_NV12M, true),
 ];
+
+/// Whether `device` decodes H.264 to NV12.
+pub(crate) fn decodes(device: &M2mDevice) -> bool {
+    device.lists(device.output, uapi::V4L2_PIX_FMT_H264)
+        && CAPTURE_FORMATS.iter().any(|&(fourcc, two)| {
+            (!two || device.multiplanar()) && device.lists(device.capture, fourcc)
+        })
+}
 
 /// How the pictures of one stream format are laid out in the buffers.
 #[derive(Debug, Clone, PartialEq)]
@@ -542,6 +550,8 @@ impl V4l2Decoder {
                 Some(Backing::Export) => OutputMemory::Exported,
                 _ => OutputMemory::Imported,
             },
+            engine: Engine::V4l2,
+            transfer: Transfer::ZeroCopy,
         };
         log::info!(
             "{}: {}x{} (coded {}x{}, {} {:?} buffers)",
@@ -1112,6 +1122,10 @@ impl DecoderBackend for V4l2Decoder {
 
     fn device(&self) -> String {
         self.path.clone()
+    }
+
+    fn engine(&self) -> Engine {
+        Engine::V4l2
     }
 }
 

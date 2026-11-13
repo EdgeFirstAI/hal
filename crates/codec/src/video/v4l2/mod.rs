@@ -14,7 +14,39 @@ use std::path::PathBuf;
 use edgefirst_v4l2::device::{self, Device};
 use edgefirst_v4l2::queue::BufType;
 
-use crate::CodecError;
+use edgefirst_tensor::PixelFormat;
+
+use crate::{Capability, Codec, CodecError, Direction, Engine, Transfer};
+
+/// Adds the H.264 encoders and decoders present here to `out`, as the
+/// encoder and decoder would find them.
+pub(crate) fn capabilities(out: &mut Vec<Capability>) {
+    let entry = |path: &std::path::Path, direction, formats| Capability {
+        engine: Engine::V4l2,
+        device: path.display().to_string(),
+        codec: Codec::H264,
+        direction,
+        hardware: true,
+        formats,
+        transfer: Transfer::ZeroCopy,
+    };
+    for path in candidates(encoder::ENV_ENCODER) {
+        let Some(device) = M2mDevice::open(&path) else {
+            continue;
+        };
+        if device.lists(device.capture, edgefirst_v4l2::uapi::V4L2_PIX_FMT_H264) {
+            let formats = encoder::input_formats(&device);
+            if !formats.is_empty() {
+                out.push(entry(&path, Direction::Encode, formats));
+            }
+        }
+    }
+    for path in candidates(decoder::ENV_DECODER) {
+        if M2mDevice::open(&path).is_some_and(|d| decoder::decodes(&d)) {
+            out.push(entry(&path, Direction::Decode, vec![PixelFormat::Nv12]));
+        }
+    }
+}
 
 /// Maps a V4L2 error to [`CodecError::Device`], keeping the errno.
 pub(crate) fn device_error(e: edgefirst_v4l2::Error) -> CodecError {

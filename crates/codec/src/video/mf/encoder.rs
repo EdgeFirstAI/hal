@@ -49,14 +49,14 @@ use super::{
 };
 use crate::video::h264::{self, AccessUnit};
 use crate::video::{
-    chroma_subsampling, EncodedFrame, EncoderBackend, EncoderConfig, FrameOptions, H264Level,
-    H264Profile,
+    chroma_subsampling, EncodedFrame, EncoderBackend, EncoderConfig, EncoderInfo, FrameOptions,
+    H264Level, H264Profile,
 };
-use crate::{CodecError, Result};
+use crate::{CodecError, Engine, Result, Transfer};
 
 /// Environment variable keeping only the encoders whose friendly name
 /// contains its value (or `hardware`, or `software`).
-const ENV_ENCODER: &str = "EDGEFIRST_CODEC_MF_ENCODER";
+pub(crate) const ENV_ENCODER: &str = "EDGEFIRST_CODEC_MF_ENCODER";
 /// How long the encoder may take to accept one source frame.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long an asynchronous encoder may take, once a source is accepted,
@@ -161,6 +161,9 @@ pub(crate) struct MfEncoder {
     _manager: Option<IMFDXGIDeviceManager>,
     config: EncoderConfig,
     device: String,
+    /// The transform's name.
+    name: String,
+    hardware: bool,
     /// One frame period in 100 ns units.
     duration: i64,
     /// Planes of the packed input sample.
@@ -267,8 +270,11 @@ impl MfEncoder {
                         config.input_format,
                         config.target_bitrate()
                     );
+                    let hardware = transform.hardware();
                     let mut enc = Self {
                         transform,
+                        name,
+                        hardware,
                         codec_api,
                         textures,
                         _manager: manager.clone(),
@@ -839,6 +845,20 @@ impl EncoderBackend for MfEncoder {
 
     fn device(&self) -> String {
         self.device.clone()
+    }
+
+    fn info(&self) -> EncoderInfo {
+        let transfer = match &self.textures {
+            None => Transfer::CpuCopy,
+            Some(t) if t.in_place == Some(true) => Transfer::ZeroCopy,
+            Some(_) => Transfer::GpuCopy,
+        };
+        EncoderInfo {
+            engine: Engine::MediaFoundation,
+            device: self.name.clone(),
+            hardware: self.hardware,
+            transfer,
+        }
     }
 }
 

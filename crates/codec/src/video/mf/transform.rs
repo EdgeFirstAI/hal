@@ -139,17 +139,21 @@ impl Transform {
         self.hardware
     }
 
+    /// Whether the transform takes a D3D11 device manager.
+    pub(crate) fn d3d11_aware(&self) -> bool {
+        // SAFETY: a live transform.
+        unsafe { self.mft.GetAttributes() }
+            .ok()
+            // SAFETY: a live attribute store.
+            .and_then(|a| unsafe { a.GetUINT32(&MF_SA_D3D11_AWARE) }.ok())
+            .is_some_and(|v| v != 0)
+    }
+
     /// Gives the transform `manager`, so it reads and writes D3D11 textures on
     /// HAL's device. Returns false, leaving the transform on system memory,
     /// when it is not D3D11-aware or refuses the manager.
     pub(crate) fn set_device_manager(&self, manager: &IMFDXGIDeviceManager) -> bool {
-        // SAFETY: a live transform.
-        let aware = unsafe { self.mft.GetAttributes() }
-            .ok()
-            // SAFETY: a live attribute store.
-            .and_then(|a| unsafe { a.GetUINT32(&MF_SA_D3D11_AWARE) }.ok())
-            .is_some_and(|v| v != 0);
-        if !aware {
+        if !self.d3d11_aware() {
             return false;
         }
         // SAFETY: a live transform; the message takes the manager's pointer,

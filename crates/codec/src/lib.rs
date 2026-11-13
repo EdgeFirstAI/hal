@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Image codec for decoding JPEG/PNG into pre-allocated EdgeFirst tensors,
-//! and hardware video encoding in [`video`].
+//! and hardware video encoding and decoding in [`video`].
+//!
+//! Every codec runs on an [`Engine`]; [`Engine::Auto`] picks one for the
+//! platform, and [`capabilities`] lists what the engines here can do.
 //!
 //! This crate provides the [`ImageDecoder`] struct and [`ImageLoad`] extension
 //! trait for decoding image files directly into existing tensor buffers —
@@ -48,6 +51,7 @@
 //! is exposed to the caller.
 
 mod decoder;
+mod engine;
 mod error;
 mod exif;
 mod jpeg;
@@ -61,6 +65,7 @@ mod traits;
 pub mod video;
 
 pub use decoder::{peek_info, ChromaUpsample, DctMethod, ImageDecoder};
+pub use engine::{capabilities, Capability, Codec, Direction, Engine, Transfer, ENGINE_ENV};
 pub use error::{CodecError, UnsupportedFeature};
 pub use options::ImageInfo;
 pub use pixel::ImagePixel;

@@ -29,13 +29,13 @@ use edgefirst_v4l2::uapi;
 use super::{candidates, device_error, M2mDevice};
 use crate::video::h264::{self, AccessUnit};
 use crate::video::{
-    chroma_subsampling, Bitrate, EncodedFrame, EncoderBackend, EncoderConfig, FrameOptions,
-    H264Level, H264Profile,
+    chroma_subsampling, Bitrate, EncodedFrame, EncoderBackend, EncoderConfig, EncoderInfo,
+    FrameOptions, H264Level, H264Profile,
 };
-use crate::{CodecError, Result};
+use crate::{CodecError, Engine, Result, Transfer};
 
 /// Environment variable naming the encoder node to use.
-const ENV_ENCODER: &str = "EDGEFIRST_CODEC_V4L2_ENCODER";
+pub(crate) const ENV_ENCODER: &str = "EDGEFIRST_CODEC_V4L2_ENCODER";
 /// How long the device may take to read one source frame.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long to wait, once a source is read, for its access unit.
@@ -74,6 +74,20 @@ fn input_candidates(format: PixelFormat) -> Vec<(u32, Layout)> {
             fourcc => vec![(fourcc, Layout::Packed)],
         },
     }
+}
+
+/// The pixel formats `device`, an H.264 encoder, takes as sources.
+pub(crate) fn input_formats(device: &M2mDevice) -> Vec<PixelFormat> {
+    PixelFormat::all()
+        .iter()
+        .copied()
+        .filter(|&format| {
+            input_candidates(format).iter().any(|&(fourcc, layout)| {
+                (layout != Layout::Split || device.multiplanar())
+                    && device.lists(device.output, fourcc)
+            })
+        })
+        .collect()
 }
 
 /// One plane of a source as the device will read it.
@@ -981,6 +995,15 @@ impl EncoderBackend for V4l2Encoder {
 
     fn device(&self) -> String {
         self.path.clone()
+    }
+
+    fn info(&self) -> EncoderInfo {
+        EncoderInfo {
+            engine: Engine::V4l2,
+            device: self.path.clone(),
+            hardware: true,
+            transfer: Transfer::ZeroCopy,
+        }
     }
 }
 

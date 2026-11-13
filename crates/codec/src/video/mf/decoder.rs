@@ -63,11 +63,11 @@ use crate::video::{
     DecodeEvent, DecodedFrame, DecoderBackend, DecoderConfig, OutputMemory, OutputPool, Returns,
     StreamInfo,
 };
-use crate::{CodecError, Result};
+use crate::{CodecError, Engine, Result, Transfer};
 
 /// Environment variable keeping only the decoders whose friendly name
 /// contains its value (or `hardware`, or `software`).
-const ENV_DECODER: &str = "EDGEFIRST_CODEC_MF_DECODER";
+pub(crate) const ENV_DECODER: &str = "EDGEFIRST_CODEC_MF_DECODER";
 /// How long the decoder may take to accept one access unit.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long an asynchronous decoder may take, once an access unit is
@@ -528,6 +528,12 @@ impl MfDecoder {
             colorimetry: layout.colorimetry,
             buffers: self.pool.len(),
             memory: OutputMemory::Imported,
+            engine: Engine::MediaFoundation,
+            transfer: if self.context.is_some() && self.pool.iter().all(|t| is_native_nv12(t)) {
+                Transfer::GpuCopy
+            } else {
+                Transfer::CpuCopy
+            },
         };
         log::debug!("{}: {info:?}", self.device);
         self.layout = Some(layout);
@@ -717,6 +723,10 @@ impl DecoderBackend for MfDecoder {
 
     fn device(&self) -> String {
         self.device.clone()
+    }
+
+    fn engine(&self) -> Engine {
+        Engine::MediaFoundation
     }
 }
 

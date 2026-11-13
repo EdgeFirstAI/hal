@@ -110,6 +110,10 @@ reconfigures the destination to `Rgb` itself.
 
 V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v4l2-rs) crate, shared with the EdgeFirst camera SDK: `device` for discovery and formats, `m2m` for the OUTPUT and CAPTURE queues (allocation, the mapped OUTPUT buffer, DMABUF import, waits), `events` for the source-change wait and drain, and `uapi` for the format structs. The crate's queues track which buffers the driver holds, so the decoder refuses to stage a JPEG into an OUTPUT buffer that is still queued.
 
+### Engines (`engine.rs`)
+
+`Codec`, `Engine`, `Direction`, `Transfer`, `Capability` and `capabilities()`. Every family resolves its engine through `engines_to_try`: an explicit engine is used alone (`NoDevice` when this build lacks it), and `Engine::Auto` takes the family's own list of present engines, in the platform's order, narrowed and reordered by `EDGEFIRST_CODEC_ENGINE`. `capabilities()` asks each backend: `video::v4l2::capabilities` (encoder and decoder nodes, by the same checks `open` makes), `video::mf::capabilities` (transforms by input subtype; decoders are activated to see whether they take a D3D11 device), and `jpeg::capabilities`.
+
 ### Video Module Map (`video/`)
 
 | Module          | Purpose                                              |
@@ -204,6 +208,14 @@ the source's native, unrotated pixels and dimensions. The caller applies the
 reported transform downstream (typically via the same `convert()` call that
 does colour conversion and resize). This avoids a redundant in-place rotation
 pass in the decode hot loop.
+
+### One Engine Vocabulary, No CPU Video
+
+The image and video families share `Codec` and `Engine`, so a caller can ask any codec object for an engine and get the same answer shape: success, `Unsupported(UnsupportedFeature::Codec)` when the engine cannot run the codec, or `NoDevice` when the engine is absent. Video runs only on platform engines (V4L2, Media Foundation, VideoToolbox): HAL carries no CPU video codec, so a codec the platform cannot run is an error rather than a slow fallback. A platform engine may use software of its own (Microsoft's H.264 encoder where the GPU has none), which `EncoderInfo::hardware` reports. Still images keep HAL's CPU decoder as an engine of their own (`Engine::Cpu`), last in `Auto`'s order.
+
+Under `Auto` a hardware JPEG decoder passes an image it cannot take (a fused output format, a destination it cannot write) to the next engine; named explicitly, the same case is `Unsupported`. `EDGEFIRST_CODEC_ENGINE` is a list rather than a single engine so that one setting can steer video (`media-foundation`) without leaving JPEG with no engine (`media-foundation,cpu`).
+
+Transfer is reported twice: `Capability::transfer` is the best case for an engine and device, known without a stream; `EncoderInfo::transfer` and `StreamInfo::transfer` are what the open stream does, which can depend on the source or pool (a host-memory pool, an encoder that holds frames).
 
 ### Hardware Decode Tried Before CPU (Linux)
 

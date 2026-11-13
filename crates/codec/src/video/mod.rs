@@ -5,6 +5,11 @@
 //!
 //! [`VideoEncoder`] compresses image tensors with the platform's video
 //! encoder, and [`VideoDecoder`] turns access units back into image tensors.
+//! Both run on a platform [`Engine`]: [`Engine::Auto`] picks the platform's
+//! own, and [`capabilities`](crate::capabilities) lists what each engine here
+//! can do. There is no CPU video codec in HAL: a codec the platform cannot
+//! run fails with [`CodecError::Unsupported`].
+//!
 //! On Linux both are V4L2 stateful memory-to-memory devices (i.MX 8M Plus
 //! `vsi_v4l2`, i.MX 95 Wave6, …), discovered by capability. Source tensors in
 //! DMA-BUF memory are imported without a copy, and decoded pictures are
@@ -66,9 +71,9 @@
 )] // backend use only
 pub(crate) mod h264;
 #[cfg(all(windows, feature = "media-foundation"))]
-mod mf;
+pub(crate) mod mf;
 #[cfg(all(target_os = "linux", feature = "v4l2"))]
-mod v4l2;
+pub(crate) mod v4l2;
 
 use std::sync::{Arc, Mutex};
 
@@ -76,14 +81,50 @@ use edgefirst_tensor::{Colorimetry, PixelFormat, Region, TensorDyn};
 
 pub use h264::{access_units, AccessUnits};
 
-use crate::{CodecError, Result};
+use crate::engine::{compiled, engines_to_try, unsupported};
+use crate::{Codec, CodecError, Direction, Engine, Result, Transfer};
 
-/// A compressed video format.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VideoCodec {
-    /// ITU-T H.264 / MPEG-4 AVC, as an Annex B byte stream.
-    H264,
+/// The video formats of [`Codec`].
+#[deprecated(note = "use edgefirst_codec::Codec, which names the video and still-image formats")]
+pub type VideoCodec = Codec;
+
+/// The engines this build has for video, in the order [`Engine::Auto`] tries
+/// them.
+fn video_engines() -> Vec<Engine> {
+    [Engine::V4l2, Engine::MediaFoundation]
+        .into_iter()
+        .filter(|&e| compiled(e))
+        .collect()
+}
+
+/// Whether `engine` runs `codec` in this build.
+fn runs(engine: Engine, codec: Codec) -> bool {
+    compiled(engine)
+        && matches!(
+            (engine, codec),
+            (Engine::V4l2 | Engine::MediaFoundation, Codec::H264)
+        )
+}
+
+/// The engine that opens a `direction` stream of `codec` for `requested`:
+/// the first engine to try that runs the codec.
+///
+/// # Errors
+///
+/// [`CodecError::NoDevice`] when this platform has no video engine, or
+/// `requested` names one it does not have; [`CodecError::Unsupported`] when
+/// no engine to try runs the codec.
+fn pick(requested: Engine, codec: Codec, direction: Direction) -> Result<Engine> {
+    let able = video_engines();
+    if requested == Engine::Auto && able.is_empty() {
+        return Err(CodecError::NoDevice(format!(
+            "no video {direction} engine on this platform or in this build"
+        )));
+    }
+    engines_to_try(requested, &able)?
+        .into_iter()
+        .find(|&e| runs(e, codec))
+        .ok_or_else(|| unsupported(codec, direction, requested))
 }
 
 /// Bits per pixel [`Bitrate::Auto`] targets: about 10 Mbps at 1080p30.
@@ -230,14 +271,39 @@ impl H264Level {
     }
 }
 
+/// Opens `engine`'s encoder for `config`.
+fn open_encoder(engine: Engine, config: EncoderConfig) -> Result<Box<dyn EncoderBackend>> {
+    match engine {
+        #[cfg(all(target_os = "linux", feature = "v4l2"))]
+        Engine::V4l2 => Ok(Box::new(v4l2::encoder::V4l2Encoder::open(config)?)),
+        #[cfg(all(windows, feature = "media-foundation"))]
+        Engine::MediaFoundation => Ok(Box::new(mf::encoder::MfEncoder::open(config)?)),
+        other => Err(unsupported(config.codec, Direction::Encode, other)),
+    }
+}
+
+/// Opens `engine`'s decoder for `config`.
+fn open_decoder(engine: Engine, config: DecoderConfig) -> Result<Box<dyn DecoderBackend>> {
+    match engine {
+        #[cfg(all(target_os = "linux", feature = "v4l2"))]
+        Engine::V4l2 => Ok(Box::new(v4l2::decoder::V4l2Decoder::open(config)?)),
+        #[cfg(all(windows, feature = "media-foundation"))]
+        Engine::MediaFoundation => Ok(Box::new(mf::decoder::MfDecoder::open(config)?)),
+        other => Err(unsupported(config.codec, Direction::Decode, other)),
+    }
+}
+
 /// Configuration of a [`VideoEncoder`].
 ///
-/// Start from [`EncoderConfig::h264`] and set the fields to change.
+/// Start from [`EncoderConfig::new`] or [`EncoderConfig::h264`] and set the
+/// fields to change.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncoderConfig {
     /// Output codec.
-    pub codec: VideoCodec,
+    pub codec: Codec,
+    /// The engine that encodes; [`Engine::Auto`] by default.
+    pub engine: Engine,
     /// Width of the encoded picture in pixels.
     pub width: u32,
     /// Height of the encoded picture in pixels.
@@ -265,11 +331,19 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
-    /// An H.264 configuration with an automatic bitrate, profile and level,
-    /// the device's default GOP, and headers repeated on every key frame.
-    pub fn h264(width: u32, height: u32, input_format: PixelFormat, frame_rate: f64) -> Self {
+    /// A configuration for `codec` on [`Engine::Auto`] with an automatic
+    /// bitrate, profile and level, the device's default GOP, and headers
+    /// repeated on every key frame.
+    pub fn new(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        input_format: PixelFormat,
+        frame_rate: f64,
+    ) -> Self {
         Self {
-            codec: VideoCodec::H264,
+            codec,
+            engine: Engine::Auto,
             width,
             height,
             input_format,
@@ -280,6 +354,17 @@ impl EncoderConfig {
             profile: None,
             level: None,
         }
+    }
+
+    /// An H.264 configuration; see [`EncoderConfig::new`].
+    pub fn h264(width: u32, height: u32, input_format: PixelFormat, frame_rate: f64) -> Self {
+        Self::new(Codec::H264, width, height, input_format, frame_rate)
+    }
+
+    /// Sets [`engine`](Self::engine).
+    pub fn with_engine(mut self, engine: Engine) -> Self {
+        self.engine = engine;
+        self
     }
 
     /// The target bitrate in bits per second: the [`Bitrate::Bps`] value, or
@@ -381,11 +466,32 @@ pub struct EncodedFrame {
     pub pts: u64,
 }
 
+/// What runs an open [`VideoEncoder`], and how its sources reach it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderInfo {
+    /// The engine.
+    pub engine: Engine,
+    /// The device within the engine: a device node, or a transform's name.
+    pub device: String,
+    /// Whether the encoder is dedicated hardware rather than software the
+    /// platform provides.
+    pub hardware: bool,
+    /// How a whole source of the configured size, in the memory the engine
+    /// prefers (DMA-BUF; a D3D11 texture on Windows), reaches the encoder.
+    /// Crops and host-memory sources may take a copy where this says none.
+    /// A Media Foundation hardware encoder decides on its first frame
+    /// whether it can read sources in place, and reports
+    /// [`Transfer::GpuCopy`] until then.
+    pub transfer: Transfer,
+}
+
 /// What a video encoder backend implements.
 pub(crate) trait EncoderBackend: Send {
     fn encode(&mut self, src: &TensorDyn, opts: &FrameOptions) -> Result<Option<EncodedFrame>>;
     fn flush(&mut self) -> Result<Vec<EncodedFrame>>;
     fn device(&self) -> String;
+    fn info(&self) -> EncoderInfo;
 }
 
 /// A hardware video encoder.
@@ -406,7 +512,8 @@ impl std::fmt::Debug for VideoEncoder {
 }
 
 impl VideoEncoder {
-    /// Opens an encoder for `config`.
+    /// Opens an encoder for `config`, on the first engine to try (see
+    /// [`EncoderConfig::engine`]) that runs the codec.
     ///
     /// On Linux the first V4L2 memory-to-memory device that produces the
     /// codec and accepts the input format is used. Setting
@@ -422,34 +529,15 @@ impl VideoEncoder {
     ///
     /// [`CodecError::InvalidConfig`] when `config` is invalid or the device
     /// rejects it, [`CodecError::UnsupportedFormat`] when no device accepts
-    /// the input format, and [`CodecError::NoDevice`] when there is no
-    /// encoder.
+    /// the input format, [`CodecError::Unsupported`] when the engine (or, for
+    /// [`Engine::Auto`], every engine here) does not encode the codec, and
+    /// [`CodecError::NoDevice`] when there is no encoder.
     pub fn new(config: EncoderConfig) -> Result<Self> {
         config.validate()?;
-        #[cfg(all(target_os = "linux", feature = "v4l2"))]
-        {
-            let backend = v4l2::encoder::V4l2Encoder::open(config)?;
-            Ok(Self {
-                backend: Box::new(backend),
-            })
-        }
-        #[cfg(all(windows, feature = "media-foundation"))]
-        {
-            let backend = mf::encoder::MfEncoder::open(config)?;
-            Ok(Self {
-                backend: Box::new(backend),
-            })
-        }
-        #[cfg(not(any(
-            all(target_os = "linux", feature = "v4l2"),
-            all(windows, feature = "media-foundation")
-        )))]
-        {
-            let _ = config;
-            Err(CodecError::NoDevice(
-                "no video encoder backend in this build".into(),
-            ))
-        }
+        let engine = pick(config.engine, config.codec, Direction::Encode)?;
+        Ok(Self {
+            backend: open_encoder(engine, config)?,
+        })
     }
 
     /// Encodes `src`.
@@ -475,6 +563,11 @@ impl VideoEncoder {
     /// The device that encodes, for logs (a device node on Linux).
     pub fn device(&self) -> String {
         self.backend.device()
+    }
+
+    /// The engine and device that encode, and how sources reach them.
+    pub fn info(&self) -> EncoderInfo {
+        self.backend.info()
     }
 }
 
@@ -518,18 +611,33 @@ impl Default for OutputPool {
 #[derive(Debug)]
 pub struct DecoderConfig {
     /// Input codec.
-    pub codec: VideoCodec,
+    pub codec: Codec,
+    /// The engine that decodes; [`Engine::Auto`] by default.
+    pub engine: Engine,
     /// Where pictures are decoded to.
     pub output: OutputPool,
 }
 
 impl DecoderConfig {
-    /// An H.264 configuration with a decoder-allocated pool.
-    pub fn h264() -> Self {
+    /// A configuration for `codec` on [`Engine::Auto`] with a
+    /// decoder-allocated pool.
+    pub fn new(codec: Codec) -> Self {
         Self {
-            codec: VideoCodec::H264,
+            codec,
+            engine: Engine::Auto,
             output: OutputPool::default(),
         }
+    }
+
+    /// An H.264 configuration; see [`DecoderConfig::new`].
+    pub fn h264() -> Self {
+        Self::new(Codec::H264)
+    }
+
+    /// Sets [`engine`](Self::engine).
+    pub fn with_engine(mut self, engine: Engine) -> Self {
+        self.engine = engine;
+        self
     }
 
     /// Sets [`output`](Self::output).
@@ -562,6 +670,13 @@ pub struct StreamInfo {
     pub buffers: usize,
     /// Whose memory the pictures are decoded into.
     pub memory: OutputMemory,
+    /// The engine that decodes.
+    pub engine: Engine,
+    /// How each picture reaches its pool tensor: written in place
+    /// ([`Transfer::ZeroCopy`], V4L2), or copied out of the decoder's own
+    /// surfaces on the GPU ([`Transfer::GpuCopy`], Media Foundation with
+    /// D3D11) or through CPU memory ([`Transfer::CpuCopy`]).
+    pub transfer: Transfer,
 }
 
 /// Whose memory a decoder writes its pictures to. Either way the frames are
@@ -691,6 +806,7 @@ pub(crate) trait DecoderBackend: Send {
     fn flush(&mut self) -> Result<Vec<DecodeEvent>>;
     fn stream_info(&self) -> Option<&StreamInfo>;
     fn device(&self) -> String;
+    fn engine(&self) -> Engine;
 }
 
 /// A hardware video decoder.
@@ -712,7 +828,8 @@ impl std::fmt::Debug for VideoDecoder {
 }
 
 impl VideoDecoder {
-    /// Opens a decoder for `config`.
+    /// Opens a decoder for `config`, on the first engine to try (see
+    /// [`DecoderConfig::engine`]) that runs the codec.
     ///
     /// On Linux the first V4L2 memory-to-memory device that decodes the
     /// codec to NV12 is used. Setting `EDGEFIRST_CODEC_V4L2_DECODER` to a
@@ -725,7 +842,9 @@ impl VideoDecoder {
     /// # Errors
     ///
     /// [`CodecError::InvalidConfig`] when a provided pool is empty or not in
-    /// DMA-BUF memory, and [`CodecError::NoDevice`] when there is no decoder.
+    /// DMA-BUF memory, [`CodecError::Unsupported`] when the engine (or, for
+    /// [`Engine::Auto`], every engine here) does not decode the codec, and
+    /// [`CodecError::NoDevice`] when there is no decoder.
     pub fn new(config: DecoderConfig) -> Result<Self> {
         if let OutputPool::Provided(pool) = &config.output {
             if pool.is_empty() {
@@ -743,30 +862,10 @@ impl VideoDecoder {
                 )));
             }
         }
-        #[cfg(all(target_os = "linux", feature = "v4l2"))]
-        {
-            let backend = v4l2::decoder::V4l2Decoder::open(config)?;
-            Ok(Self {
-                backend: Box::new(backend),
-            })
-        }
-        #[cfg(all(windows, feature = "media-foundation"))]
-        {
-            let backend = mf::decoder::MfDecoder::open(config)?;
-            Ok(Self {
-                backend: Box::new(backend),
-            })
-        }
-        #[cfg(not(any(
-            all(target_os = "linux", feature = "v4l2"),
-            all(windows, feature = "media-foundation")
-        )))]
-        {
-            let _ = config;
-            Err(CodecError::NoDevice(
-                "no video decoder backend in this build".into(),
-            ))
-        }
+        let engine = pick(config.engine, config.codec, Direction::Decode)?;
+        Ok(Self {
+            backend: open_decoder(engine, config)?,
+        })
     }
 
     /// Decodes one access unit (see [`access_units`]), whose picture is
@@ -816,6 +915,11 @@ impl VideoDecoder {
     pub fn device(&self) -> String {
         self.backend.device()
     }
+
+    /// The engine that decodes.
+    pub fn engine(&self) -> Engine {
+        self.backend.engine()
+    }
 }
 
 #[cfg(test)]
@@ -830,7 +934,7 @@ mod tests {
     fn default_h264_config_is_valid() {
         let c = nv12_1080p();
         assert!(c.validate().is_ok());
-        assert_eq!(c.codec, VideoCodec::H264);
+        assert_eq!((c.codec, c.engine), (Codec::H264, Engine::Auto));
         assert_eq!(c.bitrate, Bitrate::Auto);
         assert!(c.repeat_headers);
         assert!(c.gop.is_none() && c.profile.is_none() && c.level.is_none());
@@ -981,6 +1085,47 @@ mod tests {
             "a buffer of an earlier pool is not returned"
         );
         assert!(returns.take(1).is_empty(), "take drains every generation");
+    }
+
+    #[test]
+    fn only_platform_engines_run_video() {
+        assert!(!runs(Engine::Cpu, Codec::H264));
+        assert!(!runs(Engine::NvJpeg, Codec::H264));
+        for codec in [Codec::Hevc, Codec::Vp8, Codec::Vp9, Codec::Av1, Codec::Jpeg] {
+            for engine in [Engine::V4l2, Engine::MediaFoundation, Engine::VideoToolbox] {
+                assert!(!runs(engine, codec), "{engine} {codec}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_engine_that_cannot_run_the_codec_is_unsupported() {
+        let refused = |engine, codec| {
+            pick(engine, codec, Direction::Encode)
+                .map(|_| ())
+                .unwrap_err()
+        };
+        assert!(matches!(
+            refused(Engine::Cpu, Codec::H264),
+            CodecError::Unsupported(crate::UnsupportedFeature::Codec {
+                codec: Codec::H264,
+                direction: Direction::Encode,
+                engine: Engine::Cpu,
+            })
+        ));
+        assert!(matches!(
+            refused(Engine::VideoToolbox, Codec::H264),
+            CodecError::NoDevice(_)
+        ));
+        if !video_engines().is_empty() {
+            assert!(matches!(
+                refused(Engine::Auto, Codec::Hevc),
+                CodecError::Unsupported(crate::UnsupportedFeature::Codec {
+                    engine: Engine::Auto,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

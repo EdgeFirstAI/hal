@@ -30,22 +30,95 @@ mod transform;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+use edgefirst_tensor::PixelFormat;
 use libloading::os::windows::{Library, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::core::{Interface, GUID, HRESULT, PWSTR};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
-    IMFSample, MFMediaType_Video, MFT_FRIENDLY_NAME_Attribute, MFSTARTUP_LITE,
-    MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_ENUM_FLAG_SYNCMFT, MFT_REGISTER_TYPE_INFO, MF_VERSION,
+    IMFSample, MFMediaType_Video, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoFormat_YUY2, MFSTARTUP_LITE, MFT_CATEGORY_VIDEO_DECODER,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_REGISTER_TYPE_INFO, MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
 };
 
-use crate::{CodecError, Result};
+use crate::{Capability, Codec, CodecError, Direction, Engine, Result, Transfer};
 
 pub(crate) use transform::{Output, Transform};
+
+/// Adds the H.264 transforms present here to `out`, as the encoder and
+/// decoder would find them. A hardware encoder reads native NV12 textures in
+/// place at best; a decoder that takes HAL's D3D11 device (DXVA) decodes on
+/// the GPU and copies each picture there.
+pub(crate) fn capabilities(out: &mut Vec<Capability>) {
+    let Ok(platform) = Platform::start() else {
+        return;
+    };
+    let gpu = hal_device().is_ok();
+    let mut encoders: Vec<Capability> = Vec::new();
+    for (subtype, format) in [
+        (MFVideoFormat_NV12, PixelFormat::Nv12),
+        (MFVideoFormat_YUY2, PixelFormat::Yuyv),
+    ] {
+        let candidates = platform
+            .transforms(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                Some(subtype),
+                MFVideoFormat_H264,
+                true,
+                encoder::ENV_ENCODER,
+            )
+            .unwrap_or_default();
+        for c in candidates {
+            match encoders.iter_mut().find(|e| e.device == c.name) {
+                Some(e) => e.formats.push(format),
+                None => encoders.push(Capability {
+                    engine: Engine::MediaFoundation,
+                    device: c.name,
+                    codec: Codec::H264,
+                    direction: Direction::Encode,
+                    hardware: c.hardware,
+                    formats: vec![format],
+                    transfer: if c.hardware && gpu && format == PixelFormat::Nv12 {
+                        Transfer::ZeroCopy
+                    } else {
+                        Transfer::CpuCopy
+                    },
+                }),
+            }
+        }
+    }
+    out.extend(encoders);
+    let decoders = platform
+        .transforms(
+            MFT_CATEGORY_VIDEO_DECODER,
+            Some(MFVideoFormat_H264),
+            MFVideoFormat_NV12,
+            false,
+            decoder::ENV_DECODER,
+        )
+        .unwrap_or_default();
+    for c in decoders {
+        let (name, hardware) = (c.name.clone(), c.hardware);
+        let dxva = gpu && Transform::activate(c).is_ok_and(|t| t.d3d11_aware());
+        out.push(Capability {
+            engine: Engine::MediaFoundation,
+            device: name,
+            codec: Codec::H264,
+            direction: Direction::Decode,
+            hardware: hardware || dxva,
+            formats: vec![PixelFormat::Nv12],
+            transfer: if dxva {
+                Transfer::GpuCopy
+            } else {
+                Transfer::CpuCopy
+            },
+        });
+    }
+}
 
 /// HAL's process D3D11 device, which tensors' textures live on.
 pub(crate) fn hal_device() -> Result<ID3D11Device> {
