@@ -169,8 +169,11 @@ and selects one of the `YoloEndToEnd*` variants. NMS is bypassed entirely;
 the model emits post-NMS `[B, N, 6+]` rows of `(x1, y1, x2, y2, conf,
 class, ...)`.
 
-For non-end-to-end YOLO26 exports (`end2end=false`), use
-`decoder_version: "yolov8"` with an explicit `nms` configuration.
+The tag alone does not make a head end-to-end: a YOLO26 model exported with `end2end=false` keeps the tag and the YOLOv8 head. `DecoderBuilder::get_model_type_yolo` therefore decides in this order:
+
+1. The schema's `model.end2end` (`schema::ModelSpec`), when stated. `false` takes the NMS path whatever the tag. `true` leaves the choice to the tag and dshape, and makes a tagged head that fails the end-to-end checks an error.
+2. Otherwise the tag, provided the head passes the end-to-end checks (`verify_yolo_det_26` / `verify_yolo_seg_det_26`: 6 features, or 6 plus the proto count). A tagged head that fails them cannot be end-to-end and is decoded as the pre-NMS export. A two-class pre-NMS head passes them (4 + 2 features is the end-to-end row width, with or without protos), so it is taken as end-to-end unless the schema states `end2end: false`. Nothing else in a schema separates the two: `test_decoder_version_yolo26_end_to_end` pins a tagged `[1, 6, 8400]` head as end-to-end, and an end-to-end head can have as many rows as the model has anchors (see `infer::find_e2e_candidate`).
+3. With no tag, the dshape `(batch, num_boxes, num_features)`.
 
 ### Ultralytics schema inference
 
@@ -291,6 +294,22 @@ Common physical layouts by framework:
 | ONNX / PyTorch | `[1, C, H, W]` NCHW | `shape=[1,C,H,W]`, `dshape=[batch,num_protos,height,width]` |
 | Ara-2 DVM | `[1, N, 1, 4]` anchor-first | `shape=[1,N,1,4]`, `dshape=[batch,num_boxes,padding,box_coords]` |
 | Ultralytics flat | already canonical | `shape=[1,C,N]`, `dshape` may be omitted |
+
+### Output tensor binding
+
+The decode functions in `decoder/postprocess.rs` find each role's tensor by shape, taking the first that fits. That is exact while every configured output has its own shape. It is wrong when two share one: a split detector with four classes has scores shaped like its boxes (`[1, 4, N]`), and a segmentation model with as many classes as protos has scores shaped like its mask coefficients.
+
+`decoder/binding.rs` handles those models, and only those: `OutputBinding::new` returns `None` when no decoded output shares its shape with another configured output, decoded or not, and `decode` then passes the caller's tensors through untouched. Otherwise each role's tensor is chosen by the rule `semantic::select_output` uses:
+
+1. the tensor named like the output (schema outputs carry names; `Tensor` names are set by the caller), else
+2. the only remaining tensor with the output's shape, else
+3. the tensor at the output's configured position, when the caller passed exactly as many tensors as the configuration lists.
+
+Anything else is an error that names the role, the shape and the outputs sharing it (`InvalidConfig`), or the role whose tensor is missing (`InvalidShape`). The decoder never guesses.
+
+The bound tensors are handed on in role order (`binding::Role`, declared in the order the decode functions look roles up: detection or boxes, scores, classes, mask coefficients, protos, segmentation). Every decode function that reads two roles reads them in that order, so each first-fit lookup lands on the bound tensor and the roughly 120 lookup sites stay as they are. A new decode function has to keep to that order.
+
+Schemas with physical children go through the merge program, which emits one logical tensor per decoded output in schema order; `binding::lookup_order` reorders those by role for the same reason. The children themselves are still bound by shape in schema order (`merge::find_and_dequantize`), and the per-scale subsystem binds its own.
 
 ### Quantization on output tensors
 

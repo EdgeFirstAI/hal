@@ -108,6 +108,38 @@ pub struct SchemaV2 {
     /// end-to-end (embedded NMS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<DecoderVersion>,
+
+    /// The part of the schema's `model` block the decoder reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSpec>,
+}
+
+/// The fields of a schema's `model` block that the decoder reads. The block's
+/// other fields (name, task, size, ...) describe the model and are ignored.
+///
+/// ```
+/// use edgefirst_decoder::schema::SchemaV2;
+///
+/// let schema: SchemaV2 = serde_json::from_str(
+///     r#"{"schema_version": 2, "decoder_version": "yolo26",
+///         "model": {"name": "yolo26n-seg", "end2end": false}}"#,
+/// )
+/// .unwrap();
+/// assert_eq!(schema.model.unwrap().end2end, Some(false));
+/// ```
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ModelSpec {
+    /// Whether the exported graph embeds NMS. `false` on a `yolo26` model
+    /// marks the export made without it, whose head is the YOLOv8 one and
+    /// is decoded with the HAL's NMS. `true` leaves the choice to
+    /// `decoder_version` and makes a `yolo26` head that is not end-to-end
+    /// an error. Unset leaves the choice to `decoder_version` and the
+    /// head's layout, which cannot tell a two-class pre-NMS head (`4 + 2`
+    /// features) from an end-to-end one (6): such a model must state
+    /// `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end2end: Option<bool>,
 }
 
 impl SchemaV2 {
@@ -126,6 +158,7 @@ impl Default for SchemaV2 {
             nms: None,
             nms_multi_label: None,
             decoder_version: None,
+            model: None,
         }
     }
 }
@@ -1206,6 +1239,7 @@ impl SchemaV2 {
             nms: v1.nms.as_ref().and_then(NmsMode::from_v1),
             nms_multi_label: v1.nms_multi_label,
             decoder_version: v1.decoder_version.as_ref().map(DecoderVersion::from_v1),
+            model: None,
         })
     }
 }
@@ -2619,6 +2653,7 @@ mod tests {
             nms: Some(NmsMode::ClassAgnostic),
             nms_multi_label: None,
             decoder_version: Some(DecoderVersion::Yolov8),
+            model: None,
         };
         let j = serde_json::to_string(&original).unwrap();
         let parsed: SchemaV2 = serde_json::from_str(&j).unwrap();
@@ -2832,6 +2867,7 @@ mod tests {
             nms: None,
             nms_multi_label: None,
             decoder_version: None,
+            model: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
         assert_eq!(
@@ -2875,6 +2911,7 @@ mod tests {
             nms: None,
             nms_multi_label: None,
             decoder_version: None,
+            model: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
         assert!(legacy.outputs.is_empty());
@@ -2920,6 +2957,7 @@ mod tests {
             nms: None,
             nms_multi_label: None,
             decoder_version: None,
+            model: None,
         };
         schema.validate().expect(
             "typed + typeless children with equal shape must not trigger \

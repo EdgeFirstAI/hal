@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use super::binding::{self, ConfiguredOutput, OutputBinding};
 use super::config::ConfigOutputRef;
 use super::configs::{self, DecoderType, DecoderVersion, DimName, ModelType};
 use super::merge::DecodeProgram;
@@ -1136,6 +1137,9 @@ impl DecoderBuilder {
             schema_input_dims,
             semantic,
             semantic_only,
+            end2end,
+            binding,
+            merged_order,
         } = match self.config_src {
             Some(ConfigSource::Json(s)) => {
                 Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
@@ -1226,7 +1230,7 @@ impl DecoderBuilder {
         } else if semantic_only {
             ModelType::Semantic
         } else {
-            Self::get_model_type(config)?
+            Self::get_model_type(config, end2end)?
         };
 
         let per_scale = per_scale_plan
@@ -1250,6 +1254,8 @@ impl DecoderBuilder {
             multi_label_source,
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
             decode_program,
+            binding,
+            merged_order,
             per_scale,
             semantic,
         })
@@ -1280,6 +1286,9 @@ impl DecoderBuilder {
                 schema_input_dims: input_dims,
                 semantic: Some(semantic),
                 semantic_only: true,
+                end2end: None,
+                binding: None,
+                merged_order: None,
             });
         }
         // The per-scale subsystem claims per-scale schemas in full and owns
@@ -1300,6 +1309,16 @@ impl DecoderBuilder {
         // EDGEAI-1303). `None` is fine when the schema omits the input
         // spec — the decoder falls back to the protobox `>2.0` reject.
         let legacy = schema.to_legacy_config_outputs()?;
+        // Per-scale outputs are bound by that subsystem. Merged outputs are
+        // produced one per decoded logical, so only their order is open.
+        let (binding, merged_order) = match (&per_scale, &program) {
+            (Some(_), _) => (None, None),
+            (None, Some(_)) => (None, binding::lookup_order(&legacy.outputs)),
+            (None, None) => (
+                OutputBinding::new(&configured_outputs(&schema, &legacy)),
+                None,
+            ),
+        };
         Ok(Lowered {
             config: legacy,
             decode_program: program,
@@ -1307,6 +1326,9 @@ impl DecoderBuilder {
             schema_input_dims: input_dims,
             semantic: Self::modelpack_semantic_from_schema(&schema),
             semantic_only: false,
+            end2end: schema.model.as_ref().and_then(|m| m.end2end),
+            binding,
+            merged_order,
         })
     }
 
@@ -1328,13 +1350,17 @@ impl DecoderBuilder {
             }
             _ => None,
         });
+        let configured: Vec<_> = c.outputs.iter().map(ConfiguredOutput::unnamed).collect();
         Ok(Lowered {
+            binding: OutputBinding::new(&configured),
+            merged_order: None,
             config: c,
             decode_program: None,
             per_scale_plan: None,
             schema_input_dims: None,
             semantic,
             semantic_only: false,
+            end2end: None,
         })
     }
 
@@ -1389,7 +1415,10 @@ impl DecoderBuilder {
         None // not specified
     }
 
-    fn get_model_type(configs: ConfigOutputs) -> Result<ModelType, DecoderError> {
+    fn get_model_type(
+        configs: ConfigOutputs,
+        end2end: Option<bool>,
+    ) -> Result<ModelType, DecoderError> {
         // yolo or modelpack
         let mut yolo = false;
         let mut modelpack = false;
@@ -1409,14 +1438,17 @@ impl DecoderBuilder {
                 "Both ModelPack and Yolo outputs found in config".to_string(),
             )),
             (true, false) => Self::get_model_type_modelpack(configs),
-            (false, true) => Self::get_model_type_yolo(configs),
+            (false, true) => Self::get_model_type_yolo(configs, end2end),
             (false, false) => Err(DecoderError::InvalidConfig(
                 "No outputs found in config".to_string(),
             )),
         }
     }
 
-    fn get_model_type_yolo(configs: ConfigOutputs) -> Result<ModelType, DecoderError> {
+    fn get_model_type_yolo(
+        configs: ConfigOutputs,
+        end2end: Option<bool>,
+    ) -> Result<ModelType, DecoderError> {
         let mut boxes = None;
         let mut protos = None;
         let mut split_boxes = None;
@@ -1444,28 +1476,42 @@ impl DecoderBuilder {
             }
         }
 
-        // Use end-to-end model types when:
-        // 1. decoder_version is explicitly set to Yolo26 (definitive), OR
+        // Use end-to-end model types unless the schema states
+        // `end2end: false`, when:
+        // 1. decoder_version is set to Yolo26, OR
         //    decoder_version is not set but the dshapes are (batch, num_boxes,
         //    num_features)
         let is_end_to_end_dshape = boxes.as_ref().is_some_and(|b| {
             let dims = b.dshape.iter().map(|(d, _)| *d).collect::<Vec<_>>();
             dims == vec![DimName::Batch, DimName::NumBoxes, DimName::NumFeatures]
         });
-
-        let is_end_to_end = configs
-            .decoder_version
-            .map(|v| v.is_end_to_end())
-            .unwrap_or(is_end_to_end_dshape);
+        let tagged = configs.decoder_version.map(|v| v.is_end_to_end());
+        let is_end_to_end = end2end != Some(false) && tagged.unwrap_or(is_end_to_end_dshape);
+        // The Yolo26 tag alone does not make a head end-to-end: an export
+        // made without the embedded NMS keeps the tag and the YOLOv8 head.
+        // Where the schema does not state `end2end`, a head that cannot be
+        // end-to-end is decoded as that export.
+        let tag_only = end2end.is_none() && tagged == Some(true);
 
         if is_end_to_end {
-            if let Some(boxes) = boxes {
-                if let Some(protos) = protos {
-                    Self::verify_yolo_seg_det_26(&boxes, &protos)?;
-                    return Ok(ModelType::YoloEndToEndSegDet { boxes, protos });
-                } else {
-                    Self::verify_yolo_det_26(&boxes)?;
-                    return Ok(ModelType::YoloEndToEndDet { boxes });
+            if let Some(detection) = boxes.take() {
+                let verified = match &protos {
+                    Some(protos) => Self::verify_yolo_seg_det_26(&detection, protos),
+                    None => Self::verify_yolo_det_26(&detection),
+                };
+                match (verified, protos.take()) {
+                    (Ok(()), Some(protos)) => {
+                        return Ok(ModelType::YoloEndToEndSegDet {
+                            boxes: detection,
+                            protos,
+                        });
+                    }
+                    (Ok(()), None) => return Ok(ModelType::YoloEndToEndDet { boxes: detection }),
+                    (Err(e), _) if !tag_only => return Err(e),
+                    (Err(_), unused) => {
+                        boxes = Some(detection);
+                        protos = unused;
+                    }
                 }
             } else if let (Some(split_boxes), Some(split_scores), Some(split_classes)) =
                 (split_boxes, split_scores, split_classes)
@@ -2442,6 +2488,29 @@ struct Lowered {
     semantic: Option<SemanticConfig>,
     /// The model is decoded only by `Decoder::decode_semantic`.
     semantic_only: bool,
+    /// The schema's `model.end2end`, when it states one.
+    end2end: Option<bool>,
+    binding: Option<OutputBinding>,
+    merged_order: Option<Vec<usize>>,
+}
+
+/// Every output of `schema` in schema order. A decoded output takes its
+/// shape and role from `legacy`, which holds one entry per typed logical
+/// output in the same order.
+fn configured_outputs(schema: &SchemaV2, legacy: &ConfigOutputs) -> Vec<ConfiguredOutput> {
+    let mut decoded = legacy.outputs.iter();
+    schema
+        .outputs
+        .iter()
+        .map(|logical| {
+            let decoded = logical.type_.is_some().then(|| decoded.next()).flatten();
+            ConfiguredOutput {
+                name: logical.name.clone(),
+                shape: decoded.map_or_else(|| logical.shape.clone(), |o| o.shape().to_vec()),
+                role: decoded.map(binding::Role::of),
+            }
+        })
+        .collect()
 }
 
 /// A ModelPack model whose segmentation output has no semantic view still

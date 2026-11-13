@@ -94,6 +94,12 @@ pub struct Decoder {
     /// physical children. Absent for flat configurations (v1 and
     /// flat-v2).
     pub(crate) decode_program: Option<merge::DecodeProgram>,
+    /// How roles find their tensors when the model's outputs share shapes;
+    /// `None` when lookup by shape is exact. Flat configurations only.
+    binding: Option<binding::OutputBinding>,
+    /// The order `decode_program`'s logical outputs are handed to the
+    /// decode functions in, when it is not the schema's.
+    merged_order: Option<Vec<usize>>,
     /// When `true`, emit one detection per (anchor, class) pair for every
     /// class whose score meets the threshold — matching Ultralytics `val`
     /// multi-label decode.  **OFF by default.**
@@ -148,6 +154,8 @@ impl PartialEq for Decoder {
             && self.input_dims == other.input_dims
             && self.multi_label == other.multi_label
             && self.decode_program.is_some() == other.decode_program.is_some()
+            && self.binding == other.binding
+            && self.merged_order == other.merged_order
             && self.per_scale.is_some() == other.per_scale.is_some()
             && self.semantic == other.semantic
     }
@@ -174,6 +182,8 @@ impl Clone for Decoder {
             multi_label_source: self.multi_label_source,
             tracked_multi_label_warned: std::sync::atomic::AtomicBool::new(false),
             decode_program: self.decode_program.clone(),
+            binding: self.binding.clone(),
+            merged_order: self.merged_order.clone(),
             per_scale: None,
             semantic: self.semantic.clone(),
         }
@@ -295,6 +305,7 @@ macro_rules! with_quantized {
     };
 }
 
+mod binding;
 mod builder;
 mod helpers;
 mod merge;
@@ -1374,6 +1385,27 @@ impl Decoder {
     }
 
     /// [`Self::decode`] with an explicit multi-label setting.
+    /// `outputs` as the decode functions look them up: each role's tensor,
+    /// in lookup order, when the model's outputs share shapes; as passed
+    /// otherwise.
+    fn bound<'a, 'b>(
+        &self,
+        outputs: &'b [&'a edgefirst_tensor::TensorDyn],
+    ) -> Result<std::borrow::Cow<'b, [&'a edgefirst_tensor::TensorDyn]>, DecoderError> {
+        Ok(match &self.binding {
+            Some(binding) => binding.bind(outputs)?.into(),
+            None => outputs.into(),
+        })
+    }
+
+    /// Views of the merge program's logical outputs, in lookup order.
+    fn merged_views<'a>(&self, merged: &'a [ndarray::ArrayD<f32>]) -> Vec<ArrayViewD<'a, f32>> {
+        match &self.merged_order {
+            Some(order) => order.iter().map(|&index| merged[index].view()).collect(),
+            None => merged.iter().map(|a| a.view()).collect(),
+        }
+    }
+
     fn decode_impl(
         &self,
         outputs: &[&edgefirst_tensor::TensorDyn],
@@ -1411,11 +1443,12 @@ impl Decoder {
         // logical float32 tensors, then feed through the float dispatch.
         if let Some(program) = &self.decode_program {
             let merged = program.execute(outputs)?;
-            let views: Vec<_> = merged.iter().map(|a| a.view()).collect();
+            let views = self.merged_views(&merged);
             return self.decode_float_impl(&views, output_boxes, output_masks, multi_label);
         }
 
-        let mapped = tensor_bridge::map_tensors(outputs)?;
+        let outputs = self.bound(outputs)?;
+        let mapped = tensor_bridge::map_tensors(&outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
@@ -1509,11 +1542,12 @@ impl Decoder {
         // logical float32 tensors, then feed through the float dispatch.
         if let Some(program) = &self.decode_program {
             let merged = program.execute(outputs)?;
-            let views: Vec<_> = merged.iter().map(|a| a.view()).collect();
+            let views = self.merged_views(&merged);
             return self.decode_float_proto_impl(&views, output_boxes, multi_label);
         }
 
-        let mapped = tensor_bridge::map_tensors(outputs)?;
+        let outputs = self.bound(outputs)?;
+        let mapped = tensor_bridge::map_tensors(&outputs)?;
         let result = match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
@@ -2076,7 +2110,8 @@ impl Decoder {
             return Ok(());
         }
 
-        let mapped = tensor_bridge::map_tensors(outputs)?;
+        let outputs = self.bound(outputs)?;
+        let mapped = tensor_bridge::map_tensors(&outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
@@ -2168,7 +2203,8 @@ impl Decoder {
             return Ok(proto);
         }
 
-        let mapped = tensor_bridge::map_tensors(outputs)?;
+        let outputs = self.bound(outputs)?;
+        let mapped = tensor_bridge::map_tensors(&outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;

@@ -177,11 +177,25 @@ When `decoder_version` is `"yolo26"`, the decoder:
 - Expects post-NMS output format: `[batch, N, 6+]` where columns are `[x1, y1, x2, y2, conf, class, ...]`
 - Supports both detection-only and detection+segmentation variants
 
-For non-end-to-end YOLO26 exports (`end2end=false`), use `decoder_version: "yolov8"` with explicit NMS configuration.
+A YOLO26 model exported with `end2end=false` keeps the YOLOv8 head and needs the decoder's NMS. Its schema says so in the `model` block, and the decoder then ignores the `yolo26` tag:
+
+```json
+{
+  "schema_version": 2,
+  "decoder_version": "yolo26",
+  "model": { "end2end": false },
+  "nms": "class_agnostic",
+  "outputs": [ ... ]
+}
+```
+
+Without the flag, a `yolo26` head that cannot be end-to-end (its feature count is not 6, or 6 plus the proto count) is decoded the same way.
+
+A two-class model needs the flag. Its pre-NMS head has 4 + 2 = 6 features, the width of an end-to-end row, so the shape cannot tell the two apart: without `"end2end": false` it is taken as end-to-end and decodes to wrong boxes with no error. `"end2end": true` on a `yolo26` model holds the head to the end-to-end layout and rejects any other.
 
 ### Non-End-to-End Mode
 
-Models exported with `end2end=false` require external NMS, configurable via the `nms` field:
+Models without embedded NMS use the decoder's, configurable via the `nms` field:
 
 ```json
 {
