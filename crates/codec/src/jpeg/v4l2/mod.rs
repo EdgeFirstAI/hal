@@ -121,6 +121,13 @@ pub(crate) enum V4l2Probe {
 }
 
 impl V4l2Probe {
+    /// Whether the last picture was decoded straight into its destination
+    /// rather than copied out of the codec's own buffer.
+    pub(crate) fn wrote_in_place(&self) -> bool {
+        matches!(self, V4l2Probe::Ready(ctx)
+            if matches!(&ctx.stream, Some(s) if matches!(s.cap.target, CaptureTarget::DstDma)))
+    }
+
     fn ensure_probed(&mut self) -> Option<&mut V4l2Context> {
         if matches!(self, V4l2Probe::Unprobed) {
             *self = match device::probe().and_then(V4l2Context::new) {

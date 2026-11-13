@@ -214,9 +214,9 @@ jobs:
       #
       # The selection is the routing test.yml used: the image and tensor lib
       # binaries filtered to the hardware tests, plus the integration binaries
-      # that are whole-binary GPU/DMA tests, plus the codec's V4L2 JPEG tests,
-      # which need a mem2mem decoder (i.MX 95 mxc-jpeg) and fall back to the
-      # CPU or skip elsewhere. Everything else is CPU-only and already covered
+      # that are whole-binary GPU/DMA tests, plus the codec's V4L2 JPEG and
+      # MJPEG tests, which need a mem2mem JPEG decoder or encoder (i.MX 95
+      # mxc-jpeg) and fall back to the CPU or skip elsewhere. Everything else is CPU-only and already covered
       # by the aarch64 host lane.
       board-binaries: |
         edgefirst_image=g2d,opengl
@@ -234,6 +234,8 @@ jobs:
         odd_dim_cpu
         video_encode
         video_decode
+        mjpeg_encode
+        mjpeg_decode
         decoded_video_import
         pin
         protocol

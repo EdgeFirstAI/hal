@@ -220,6 +220,11 @@ fn encode_jpeg_cpu(src: &TensorDyn, quality: u8, out: &mut Vec<u8>) -> Result<()
             "a {w}x{h} image cannot be a JPEG (1 to 65535 pixels a side)"
         )));
     };
+    if format == PixelFormat::Yuyv && w % 2 != 0 {
+        return Err(CodecError::InvalidInput(format!(
+            "a YUYV image is whole pixel pairs; {w} pixels wide is not"
+        )));
+    }
     let stride = src
         .effective_row_stride()
         .ok_or_else(|| CodecError::InvalidInput("the source has no row stride".into()))?;

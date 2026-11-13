@@ -69,6 +69,11 @@ impl V4l2MjpegDecoder {
     }
 
     /// Makes the pool hold `w`x`h` pictures in `format` and describes them.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::PoolExhausted`] when a provided pool must follow a new
+    /// size while frames still hold some of its tensors; nothing changes.
     fn reconfigure(&mut self, w: usize, h: usize, format: PixelFormat) -> Result<StreamInfo> {
         let tensors = match &mut self.output {
             OutputPool::Allocate { count } => (0..*count + 1)
@@ -86,31 +91,28 @@ impl V4l2MjpegDecoder {
             // Provided tensors are kept across sizes: each decode configures
             // its tensor to the picture, within the tensor's capacity.
             OutputPool::Provided(pool) if !pool.is_empty() => std::mem::take(pool),
-            OutputPool::Provided(_) => self
-                .pool
-                .iter_mut()
-                .map(|t| {
-                    Arc::get_mut(t)
-                        .map(|t| std::mem::replace(t, placeholder()))
-                        .ok_or_else(|| {
-                            CodecError::InvalidConfig(
-                                "a provided buffer is still held by a frame of the old size".into(),
-                            )
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?,
+            OutputPool::Provided(_) => {
+                let held = self
+                    .pool
+                    .iter()
+                    .filter(|t| Arc::strong_count(t) > 1)
+                    .count();
+                if held > 0 {
+                    return Err(CodecError::PoolExhausted {
+                        held,
+                        pool: self.pool.len(),
+                    });
+                }
+                std::mem::take(&mut self.pool)
+                    .into_iter()
+                    .map(|t| Arc::try_unwrap(t).expect("no frame holds the tensor"))
+                    .collect()
+            }
         };
         self.generation += 1;
         self.pool = tensors.into_iter().map(Arc::new).collect();
         self.free = (0..self.pool.len() as u32).rev().collect();
         self.releasing.clear();
-        // The hardware writes straight into a tensor whose size is whole
-        // 16-pixel blocks; other sizes are copied out of its buffers.
-        let transfer = if w.is_multiple_of(16) && h.is_multiple_of(16) {
-            Transfer::ZeroCopy
-        } else {
-            Transfer::CpuCopy
-        };
         Ok(StreamInfo {
             width: w,
             height: h,
@@ -122,15 +124,11 @@ impl V4l2MjpegDecoder {
             buffers: self.pool.len(),
             memory: OutputMemory::Imported,
             engine: Engine::V4l2,
-            transfer,
+            // Set from the first picture, which shows where the hardware
+            // writes.
+            transfer: Transfer::ZeroCopy,
         })
     }
-}
-
-/// A one-byte host tensor, standing in for a provided tensor while it moves
-/// between pools.
-fn placeholder() -> TensorDyn {
-    TensorDyn::new(&[1], DType::U8, Some(TensorMemory::Mem), None).expect("a one-byte host tensor")
 }
 
 impl DecoderBackend for V4l2MjpegDecoder {
@@ -141,16 +139,17 @@ impl DecoderBackend for V4l2MjpegDecoder {
         self.reclaim();
         let picture = peek_info(access_unit)?;
         let (w, h, format) = (picture.width, picture.height, picture.format);
-        let mut events = Vec::new();
         let same = self
             .info
             .as_ref()
             .is_some_and(|i| (i.width, i.height, i.format) == (w, h, format));
-        if !same {
-            let info = self.reconfigure(w, h, format)?;
-            self.info = Some(info.clone());
-            events.push(DecodeEvent::Reconfigured(info));
-        }
+        // A picture that then fails to decode leaves `info` as it was, so
+        // the next picture of this size reports the new pool.
+        let reconfigured = if same {
+            None
+        } else {
+            Some(self.reconfigure(w, h, format)?)
+        };
         let Some(slot) = self.free.pop() else {
             return Err(CodecError::PoolExhausted {
                 held: self.pool.len() - self.free.len(),
@@ -162,6 +161,20 @@ impl DecoderBackend for V4l2MjpegDecoder {
         if let Err(e) = self.decoder.decode_into_dyn(access_unit, tensor) {
             self.free.push(slot);
             return Err(e);
+        }
+        // The hardware writes straight into a tensor it can take as its
+        // capture buffer; otherwise the picture is copied out of its own.
+        let transfer = if self.decoder.v4l2_wrote_in_place() {
+            Transfer::ZeroCopy
+        } else {
+            Transfer::CpuCopy
+        };
+        let mut events = Vec::new();
+        let changed = reconfigured.or_else(|| self.info.clone().filter(|i| i.transfer != transfer));
+        if let Some(mut info) = changed {
+            info.transfer = transfer;
+            self.info = Some(info.clone());
+            events.push(DecodeEvent::Reconfigured(info));
         }
         events.push(DecodeEvent::Frame(DecodedFrame::new(
             Arc::clone(&self.pool[slot as usize]),

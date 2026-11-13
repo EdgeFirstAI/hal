@@ -136,19 +136,13 @@ fn each_source_format_round_trips_through_a_jpeg() {
 
 #[test]
 fn a_padded_row_stride_is_followed() {
+    // A 128-pixel-wide allocation narrowed to 100 keeps its 128-byte rows.
     let (w, h) = (100usize, 60usize);
-    let src = TensorDyn::image_with_stride(
-        w,
-        h,
-        PixelFormat::Nv12,
-        DType::U8,
-        128,
-        Some(TensorMemory::Mem),
-        CpuAccess::ReadWrite,
-    );
-    let Ok(src) = src else {
-        return eprintln!("WARNING: SKIPPED: a_padded_row_stride_is_followed - no strided images");
-    };
+    let mut src = image(128, h, PixelFormat::Nv12);
+    src.configure_image(w, h, PixelFormat::Nv12).unwrap();
+    src.set_row_stride(128).unwrap();
+    assert_eq!(src.effective_row_stride(), Some(128));
+    assert_eq!(src.width(), Some(w));
     fill(&src);
     let jpeg = ImageEncoder::new(Codec::Jpeg)
         .unwrap()
@@ -159,6 +153,15 @@ fn a_padded_row_stride_is_followed() {
         .flat_map(|y| (0..w).map(move |x| luma(x, y)))
         .collect();
     assert!(mean_abs_diff(&got, &want) < 3.0);
+}
+
+#[test]
+fn an_odd_width_yuyv_source_is_refused() {
+    let src = image(63, 8, PixelFormat::Yuyv);
+    assert!(matches!(
+        ImageEncoder::new(Codec::Jpeg).unwrap().encode(&src),
+        Err(CodecError::InvalidInput(_))
+    ));
 }
 
 #[test]

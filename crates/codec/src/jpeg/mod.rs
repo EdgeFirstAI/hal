@@ -165,6 +165,13 @@ pub struct JpegDecoderState {
 }
 
 impl JpegDecoderState {
+    /// Whether the V4L2 decoder wrote the last picture straight into its
+    /// destination.
+    #[cfg(all(target_os = "linux", feature = "v4l2"))]
+    pub(crate) fn v4l2_wrote_in_place(&self) -> bool {
+        self.v4l2.wrote_in_place()
+    }
+
     pub fn new() -> Self {
         Self {
             mcu_scratch: None,
