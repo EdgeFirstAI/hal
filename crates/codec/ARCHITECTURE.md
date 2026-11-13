@@ -876,7 +876,8 @@ Span names follow `<crate>.<function>[.<operation>]`:
 
 - **`<crate>.<function>`** — top-level span: the public function the user
   invoked. The codec exposes format-specific entry points (`codec.decode_jpeg`,
-  `codec.decode_png`) selected automatically from the magic bytes.
+  `codec.decode_png`) selected automatically from the magic bytes, and
+  `codec.encode_jpeg` for `ImageEncoder`.
 - **`<crate>.<function>.<operation>`** — meaningful internal work
   (`codec.decode_jpeg.parse_markers`, `codec.decode_jpeg.mcu_loop`).
 
@@ -911,6 +912,8 @@ codec.decode_png                                        [user-facing fn]
 │
 └── codec.decode_png.zune_decode                        ← delegate to zune-png
     field: path = "u8" | "native_u16"
+
+codec.encode_jpeg                                       [user-facing fn: ImageEncoder::encode_into]
 ```
 
 The `nvjpeg*`, `v4l2_*`, and `mcu_loop` spans are mutually exclusive — exactly
