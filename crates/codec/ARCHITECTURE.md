@@ -114,6 +114,10 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 
 `Codec`, `Engine`, `Direction`, `Transfer`, `Capability` and `capabilities()`. Every family resolves its engine through `engines_to_try`: an explicit engine is used alone (`NoDevice` when this build lacks it), and `Engine::Auto` takes the family's own list of present engines, in the platform's order, narrowed and reordered by `EDGEFIRST_CODEC_ENGINE`. `capabilities()` asks each backend: `video::v4l2::capabilities` (encoder and decoder nodes, by the same checks `open` makes), `video::mf::capabilities` (transforms by input subtype; each candidate that opening would give a device manager over HAL's D3D11 device is activated and given one, so a GPU transfer is reported only where the transform takes it), and `jpeg::capabilities`.
 
+### Still-Image Encoder (`encoder.rs`)
+
+`ImageEncoder` encodes JPEG. The CPU path feeds `jpeg-encoder` through its `ImageBuffer` trait straight from the mapped tensor: each row is handed over as full-resolution Y, Cb and Cr, chroma repeated across its subsampled block, and the encoder's sampling factor (2x2 for NV12, 2x1 for NV16 and YUYV) averages it back, so the file keeps the source's chroma without an intermediate image. Limited-range sources go through two 256-entry tables to full range. On Linux the V4L2 path opens an MJPEG `VideoEncoder` on the V4L2 engine for the source's geometry and quality and keeps it until they change; under `Auto` any failure there (a host-memory source, a format the device does not take) passes the image to the CPU.
+
 ### Video Module Map (`video/`)
 
 | Module          | Purpose                                              |
@@ -694,6 +698,10 @@ with a V4L2 backend on Linux and a Media Foundation backend on Windows (see
   a drained encoder resumes (Wave6 ignores `V4L2_ENC_CMD_START`), so the
   backend tears the queues down and the next frame starts a new stream, which
   also opens it with an IDR.
+
+## MJPEG
+
+MJPEG reuses the H.264 backends where the platform's model fits. On V4L2 the stateful encoder takes a JPEG CAPTURE format (`V4L2_PIX_FMT_JPEG`, else `MJPEG`): the H.264 controls and access-unit parsing are skipped, `V4L2_CID_JPEG_COMPRESSION_QUALITY` is set, and every CAPTURE buffer is one key-frame picture. Decoding goes through `video::v4l2::mjpeg`, a thin `DecoderBackend` over the image path's V4L2 JPEG decoder (`ImageDecoder` on `Engine::V4l2`) that decodes each picture into a pool tensor and returns it at once; a size or format change rebuilds an allocated pool. On Media Foundation the decoder takes `MFVideoFormat_MJPG`, hardware transforms first (NVIDIA's MJPEG decoder is D3D11-aware, so its pictures take the same GPU copy as DXVA H.264). MJPEG decoders need a frame size on the input type, so the decoder opens with a placeholder size and, when a picture of another size arrives, drains and sets the picture's size (`Transform::change_input_type`). Windows has no MJPEG encoder transform, so MJPEG encoding is `Unsupported` there.
 
 ## Media Foundation backend (Windows)
 

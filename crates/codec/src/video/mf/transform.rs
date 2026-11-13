@@ -176,6 +176,24 @@ impl Transform {
         unsafe { self.mft.SetInputType(self.input_id, t, 0) }
     }
 
+    /// Replaces the input type mid-stream: drains what the transform holds
+    /// into `out`, sets `t`, chooses the output subtype again and reports
+    /// the new output type as an [`Output::Format`].
+    pub(crate) fn change_input_type(
+        &mut self,
+        platform: &Platform,
+        t: &IMFMediaType,
+        timeout: Duration,
+        out: &mut Vec<Output>,
+    ) -> Result<()> {
+        self.drain(platform, timeout, out)?;
+        self.set_input_type(t)
+            .map_err(|e| error(e, "IMFTransform::SetInputType"))?;
+        self.renegotiate()?;
+        out.push(Output::Format(self.output_type()?));
+        Ok(())
+    }
+
     /// Sets the output type; a later change of output type selects the
     /// same subtype again.
     pub(crate) fn set_output_type(&mut self, t: &IMFMediaType) -> windows::core::Result<()> {

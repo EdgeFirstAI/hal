@@ -51,6 +51,7 @@
 //! is exposed to the caller.
 
 mod decoder;
+mod encoder;
 mod engine;
 mod error;
 mod exif;
@@ -65,6 +66,7 @@ mod traits;
 pub mod video;
 
 pub use decoder::{peek_info, ChromaUpsample, DctMethod, ImageDecoder};
+pub use encoder::{ImageEncoder, DEFAULT_JPEG_QUALITY};
 pub use engine::{capabilities, Capability, Codec, Direction, Engine, Transfer, ENGINE_ENV};
 pub use error::{CodecError, UnsupportedFeature};
 pub use options::ImageInfo;

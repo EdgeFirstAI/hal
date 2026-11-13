@@ -533,6 +533,7 @@ dependencies = [
  "edgefirst-v4l2",
  "env_logger",
  "image",
+ "jpeg-encoder",
  "kamadak-exif",
  "libloading",
  "log",

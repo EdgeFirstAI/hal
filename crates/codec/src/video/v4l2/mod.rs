@@ -8,6 +8,7 @@
 
 pub(crate) mod decoder;
 pub(crate) mod encoder;
+pub(crate) mod mjpeg;
 
 use std::path::PathBuf;
 
@@ -34,10 +35,15 @@ pub(crate) fn capabilities(out: &mut Vec<Capability>) {
         let Some(device) = M2mDevice::open(&path) else {
             continue;
         };
-        if device.lists(device.capture, edgefirst_v4l2::uapi::V4L2_PIX_FMT_H264) {
-            let formats = encoder::input_formats(&device);
-            if !formats.is_empty() {
-                out.push(entry(&path, Direction::Encode, formats));
+        for codec in [Codec::H264, Codec::Mjpeg] {
+            let coded = encoder::coded_fourccs(codec);
+            if coded.iter().any(|&f| device.lists(device.capture, f)) {
+                let formats = encoder::input_formats(&device);
+                if !formats.is_empty() {
+                    let mut c = entry(&path, Direction::Encode, formats);
+                    c.codec = codec;
+                    out.push(c);
+                }
             }
         }
     }
@@ -45,6 +51,14 @@ pub(crate) fn capabilities(out: &mut Vec<Capability>) {
         if M2mDevice::open(&path).is_some_and(|d| decoder::decodes(&d)) {
             out.push(entry(&path, Direction::Decode, vec![PixelFormat::Nv12]));
         }
+    }
+    if let Some(device) = crate::jpeg::v4l2_device() {
+        out.push(Capability {
+            device,
+            codec: Codec::Mjpeg,
+            formats: vec![PixelFormat::Nv12, PixelFormat::Grey],
+            ..entry(std::path::Path::new(""), Direction::Decode, Vec::new())
+        });
     }
 }
 

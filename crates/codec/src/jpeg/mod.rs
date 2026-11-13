@@ -44,6 +44,12 @@ pub(crate) fn v4l2_available() -> bool {
     v4l2::device_available()
 }
 
+/// The node of the V4L2 JPEG decoder this backend drives, when there is one.
+#[cfg(all(target_os = "linux", feature = "v4l2"))]
+pub(crate) fn v4l2_device() -> Option<String> {
+    v4l2::probe_path().map(|p| p.display().to_string())
+}
+
 /// Parse a boolean backend-gate environment variable: `true` only for
 /// `1`/`true`/`yes` (case-insensitive, trimmed); absent or anything else is
 /// `false`. Shared by the V4L2 opt-out (`EDGEFIRST_DISABLE_V4L2`) and the nvJPEG
