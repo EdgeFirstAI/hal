@@ -302,9 +302,9 @@ pub(crate) fn padded_dma_pitch_for(
         None if edgefirst_tensor::is_dma_available() => {}
         _ => return None,
     }
-    // Padding only applies to packed layouts — `Tensor::image_with_stride`
-    // rejects semi-planar / planar formats, and those take their own
-    // per-plane pitches on import anyway.
+    // Only packed layouts are padded through this helper:
+    // `Tensor::image_with_stride` rejects semi-planar / planar formats, whose
+    // rows `Tensor::image` pads itself.
     if fmt.layout() != PixelLayout::Packed {
         return None;
     }
@@ -316,6 +316,19 @@ pub(crate) fn padded_dma_pitch_for(
     } else {
         None
     }
+}
+
+/// Whether a G2D initialisation failure only says the host has no G2D: its
+/// library could not be opened. G2D ships with NXP i.MX BSPs alone, so that
+/// is the ordinary case on every other Linux host.
+#[cfg(target_os = "linux")]
+fn g2d_is_absent(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::G2D(g2d_sys::Error::LibraryError(
+            libloading::Error::DlOpen { .. } | libloading::Error::DlOpenUnknown
+        ))
+    )
 }
 
 pub use cpu::CPUProcessor;
@@ -2104,6 +2117,10 @@ impl ImageProcessor {
         } else {
             match G2DProcessor::new() {
                 Ok(g2d_converter) => Some(g2d_converter),
+                Err(err) if g2d_is_absent(&err) => {
+                    log::debug!("G2D is not available on this host: {err:?}");
+                    None
+                }
                 Err(err) => {
                     log::warn!("Failed to initialize G2D converter: {err:?}");
                     None
@@ -2576,6 +2593,13 @@ impl ImageProcessor {
     /// stride, not `width × bytes_per_pixel`; the CPU mapping spans the
     /// full `stride × height` bytes.
     ///
+    /// This holds for every layout. A planar image pads each row of each
+    /// plane, so a plane is `stride × height` bytes and the next plane
+    /// starts there, not at `width × height`: a 672×512 `PlanarRgb` image
+    /// has a 704-byte pitch and three 704×512 planes. A consumer that needs
+    /// the tight `[C, H, W]` bytes copies them out with
+    /// [`TensorDyn::copy_to_flat`].
+    ///
     /// Pre-aligned widths (640, 1280, 1920, 3008, 3840 …) allocate
     /// exactly `width × bpp × height` bytes with no padding. PBO and
     /// Mem fallbacks never pad — they don't go through EGLImage import.
@@ -2600,12 +2624,13 @@ impl ImageProcessor {
     }
 
     /// A DMA image for [`create_image_with`](Self::create_image_with), its
-    /// packed rows padded to the GPU pitch alignment when that exceeds the
-    /// natural pitch.
+    /// rows padded to the GPU pitch alignment when that exceeds the natural
+    /// pitch.
     ///
-    /// Semi-planar and planar formats keep their natural layout: they are
-    /// imported from camera capture via `from_fd` far more often than
-    /// allocated here, and `Tensor::image_with_stride` rejects them.
+    /// Every layout is padded. Packed rows are padded here, through
+    /// `Tensor::image_with_stride`, which rejects the other layouts;
+    /// `Tensor::image` pads planar and semi-planar rows itself. Either way
+    /// the tensor's `row_stride()` reports the pitch.
     #[cfg(target_os = "linux")]
     fn create_dma_image(
         &self,
@@ -5640,6 +5665,24 @@ mod image_tests {
             assert_eq!(loaded.width(), Some(w as usize));
             assert_eq!(loaded.height(), Some(333));
         }
+    }
+
+    /// A host without the G2D library is told apart from a G2D that is
+    /// present and fails to start: only the second is worth a warning.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_missing_g2d_library_is_not_a_g2d_failure() {
+        let missing = unsafe { libloading::Library::new("libedgefirst-no-such-library.so.0") }
+            .expect_err("the library does not exist");
+        assert!(crate::g2d_is_absent(&Error::G2D(
+            g2d_sys::Error::LibraryError(missing)
+        )));
+        assert!(!crate::g2d_is_absent(&Error::G2D(g2d_sys::Error::IoError(
+            std::io::Error::from_raw_os_error(libc::ENODEV)
+        ))));
+        assert!(!crate::g2d_is_absent(&Error::G2D(
+            g2d_sys::Error::InvalidFormat("XR24".to_string())
+        )));
     }
 
     /// `padded_dma_pitch_for` must respect the caller's memory choice and

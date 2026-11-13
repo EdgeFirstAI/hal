@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **NV12 D3D11 tensors are native two-plane textures (`edgefirst-tensor`, Windows).** An NV12 image of even width and height is allocated as a `DXGI_FORMAT_NV12` texture of the image's size instead of a combined-plane `R8` texture 1.5 times its height, so textures from Media Foundation and other D3D11 video producers wrap without a copy, and the HAL's can be handed to them. The shape, `row_stride()` and CPU maps are unchanged: a map still shows luma rows, then chroma rows, at one pitch. `d3d11_layout()` and `ef_tensor_d3d11_layout` report `dxgi_format` 103 with the luma grid as the texture size. `from_d3d11_texture` and `from_d3d11_shared_handle` accept native NV12 textures and still accept a combined-plane `R8` texture for an even NV12 image; odd sizes, NV16 and NV24 keep the combined plane. A native NV12 tensor reconfigured for a smaller frame (`configure_image`) keeps the frame's chroma at the top of the texture's chroma plane, and CPU maps still show the frame's own combined plane. A writable map of a window at an offset in a write-only native NV12 tensor is refused, because such a texture is uploaded whole. `cuda_map` and `cuda_map_mut` cover both planes (CUDA 11.2 or later), laid out as the combined plane.
 - **GL samples native NV12 textures plane by plane (`edgefirst-image`, Windows).** The luma and chroma planes are imported as separate images and drawn with the hardware-filtered NV program; converts that do not resize match the CPU converter as before.
 
+- **A missing G2D library is logged at debug level (`edgefirst-image`).** `ImageProcessor::new()` no longer warns on hosts without `libg2d.so.2`; a G2D that is present and fails to start still warns. GL errors raised while the processor probes DMA-BUF support are logged at debug level as well.
+
+### Fixed
+
+- **`create_image` documentation on padded planar DMA-BUF images (`edgefirst-image`).** The docs said only packed images are padded to the 64-byte GPU pitch. Planar and semi-planar DMA-BUF images are padded too, and report the pitch through `row_stride()`: a 672-wide `PlanarRgb` image has 704-byte rows. A consumer that needs tight planes reads at the stride or uses `copy_to_flat`.
+
 ## [0.40.0] - 2026-11-05
 
 ### Added

@@ -2837,6 +2837,9 @@ impl GLProcessorST {
     /// This catches GPUs like NVIDIA discrete where `eglCreateImage` from
     /// `dma_heap` fds succeeds but the rendered data is all zeros.
     fn verify_dma_buf_roundtrip(&mut self) -> bool {
+        // A driver that refuses the import or the render answers the
+        // question this asks; its GL errors are not faults.
+        let _probe = super::shaders::ProbeScope::enter();
         // Allocate a 64x64 RGBA DMA source tensor and fill it with solid red
         let src = match Tensor::<u8>::image(
             64,
