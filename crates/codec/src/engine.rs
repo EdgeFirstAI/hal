@@ -302,6 +302,27 @@ pub fn capabilities() -> Vec<Capability> {
     #[cfg(all(windows, feature = "media-foundation"))]
     crate::video::mf::capabilities(&mut found);
     crate::jpeg::capabilities(&mut found);
+    // The V4L2 MJPEG encoders also encode still JPEG.
+    let still: Vec<Capability> = found
+        .iter()
+        .filter(|c| {
+            c.engine == Engine::V4l2 && c.codec == Codec::Mjpeg && c.direction == Direction::Encode
+        })
+        .map(|c| Capability {
+            codec: Codec::Jpeg,
+            ..c.clone()
+        })
+        .collect();
+    found.extend(still);
+    found.push(Capability {
+        engine: Engine::Cpu,
+        device: "cpu".into(),
+        codec: Codec::Jpeg,
+        direction: Direction::Encode,
+        hardware: false,
+        formats: crate::encoder::CPU_JPEG_FORMATS.to_vec(),
+        transfer: Transfer::ZeroCopy,
+    });
     #[cfg(feature = "png")]
     found.push(Capability {
         engine: Engine::Cpu,

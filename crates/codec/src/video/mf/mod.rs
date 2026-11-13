@@ -103,31 +103,34 @@ pub(crate) fn capabilities(out: &mut Vec<Capability>) {
         }
     }
     out.extend(encoders);
-    let decoders = platform
-        .transforms(
-            MFT_CATEGORY_VIDEO_DECODER,
-            Some(MFVideoFormat_H264),
-            MFVideoFormat_NV12,
-            false,
-            decoder::ENV_DECODER,
-        )
-        .unwrap_or_default();
-    for c in decoders {
-        let (name, hardware) = (c.name.clone(), c.hardware);
-        let dxva = takes_textures(c);
-        out.push(Capability {
-            engine: Engine::MediaFoundation,
-            device: name,
-            codec: Codec::H264,
-            direction: Direction::Decode,
-            hardware: hardware || dxva,
-            formats: vec![PixelFormat::Nv12],
-            transfer: if dxva {
-                Transfer::GpuCopy
-            } else {
-                Transfer::CpuCopy
-            },
-        });
+    for codec in [Codec::H264, Codec::Mjpeg] {
+        let subtype = decoder::input_subtype(codec).expect("a decoder codec");
+        let decoders = platform
+            .transforms(
+                MFT_CATEGORY_VIDEO_DECODER,
+                Some(subtype),
+                MFVideoFormat_NV12,
+                decoder::hardware_first(codec),
+                decoder::ENV_DECODER,
+            )
+            .unwrap_or_default();
+        for c in decoders {
+            let (name, hardware) = (c.name.clone(), c.hardware);
+            let dxva = takes_textures(c);
+            out.push(Capability {
+                engine: Engine::MediaFoundation,
+                device: name,
+                codec,
+                direction: Direction::Decode,
+                hardware: hardware || dxva,
+                formats: vec![PixelFormat::Nv12],
+                transfer: if dxva {
+                    Transfer::GpuCopy
+                } else {
+                    Transfer::CpuCopy
+                },
+            });
+        }
     }
 }
 

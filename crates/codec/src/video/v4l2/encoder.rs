@@ -32,7 +32,7 @@ use crate::video::{
     chroma_subsampling, Bitrate, EncodedFrame, EncoderBackend, EncoderConfig, EncoderInfo,
     FrameOptions, H264Level, H264Profile,
 };
-use crate::{CodecError, Engine, Result, Transfer};
+use crate::{Codec, CodecError, Engine, Result, Transfer};
 
 /// Environment variable naming the encoder node to use.
 pub(crate) const ENV_ENCODER: &str = "EDGEFIRST_CODEC_V4L2_ENCODER";
@@ -47,6 +47,17 @@ const CAPTURE_BUFFERS: u32 = 4;
 /// OUTPUT (source) buffer slots, at least. A source is in flight only
 /// until the device has read it, so few are needed.
 const OUTPUT_BUFFERS: u32 = 2;
+/// `V4L2_CID_JPEG_COMPRESSION_QUALITY`: `V4L2_CID_JPEG_CLASS_BASE` + 3.
+const CID_JPEG_COMPRESSION_QUALITY: u32 = 0x009d_0903;
+
+/// The CAPTURE formats that carry `codec`, in the order they are tried.
+pub(crate) fn coded_fourccs(codec: Codec) -> &'static [u32] {
+    match codec {
+        Codec::H264 => &[uapi::V4L2_PIX_FMT_H264],
+        Codec::Mjpeg | Codec::Jpeg => &[uapi::V4L2_PIX_FMT_JPEG, uapi::V4L2_PIX_FMT_MJPEG],
+        _ => &[],
+    }
+}
 
 /// How a source's pixels are handed to the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +158,8 @@ pub(crate) struct V4l2Encoder {
     device: M2mDevice,
     config: EncoderConfig,
     path: String,
+    /// The CAPTURE format: H.264, or JPEG pictures.
+    coded_fourcc: u32,
     input_fourcc: u32,
     layout: Layout,
     controls: Vec<ControlInfo>,
@@ -172,15 +185,19 @@ impl V4l2Encoder {
         if formats.is_empty() {
             return Err(CodecError::UnsupportedFormat(config.input_format));
         }
+        let codec = config.codec;
         let mut found_encoder = false;
         let mut last_err = None;
         for path in candidates(ENV_ENCODER) {
             let Some(device) = M2mDevice::open(&path) else {
                 continue;
             };
-            if !device.lists(device.capture, uapi::V4L2_PIX_FMT_H264) {
+            let Some(&coded_fourcc) = coded_fourccs(codec)
+                .iter()
+                .find(|&&f| device.lists(device.capture, f))
+            else {
                 continue;
-            }
+            };
             found_encoder = true;
             let Some(&(fourcc, layout)) = formats.iter().find(|&&(fourcc, layout)| {
                 (layout != Layout::Split || device.multiplanar())
@@ -197,6 +214,7 @@ impl V4l2Encoder {
                 device,
                 config: config.clone(),
                 path: path.display().to_string(),
+                coded_fourcc,
                 input_fourcc: fourcc,
                 layout,
                 controls: Vec::new(),
@@ -211,7 +229,7 @@ impl V4l2Encoder {
             match enc.configure() {
                 Ok(()) => {
                     log::info!(
-                        "h264 encoder {} ({}, {:?})",
+                        "{codec} encoder {} ({}, {:?})",
                         enc.path,
                         uapi::fourcc_str(fourcc),
                         layout
@@ -227,7 +245,7 @@ impl V4l2Encoder {
         Err(match (last_err, found_encoder) {
             (Some(e), _) => e,
             (None, true) => CodecError::UnsupportedFormat(config.input_format),
-            (None, false) => CodecError::NoDevice("no V4L2 H.264 encoder found".into()),
+            (None, false) => CodecError::NoDevice(format!("no V4L2 {codec} encoder found")),
         })
     }
 
@@ -241,28 +259,37 @@ impl V4l2Encoder {
         // Constrained Baseline when the CAPTURE format is set, and does not
         // take a profile set afterwards, so the controls go first.
         self.controls = controls::query_all(dev).map_err(device_error)?;
-        self.apply_controls()?;
+        if self.is_h264() {
+            self.apply_controls()?;
+        } else {
+            let quality = i32::from(self.config.jpeg_quality());
+            if !self.set_control(CID_JPEG_COMPRESSION_QUALITY, quality)? {
+                log::debug!("{}: no JPEG quality control", self.path);
+            }
+        }
 
         let mut cap = dev.format(self.device.capture).map_err(device_error)?;
         // SAFETY: the buffer type selects the union member.
         unsafe {
             if self.device.multiplanar() {
                 let p = cap.pix_mp();
-                p.pixelformat = uapi::V4L2_PIX_FMT_H264;
+                p.pixelformat = self.coded_fourcc;
                 p.width = w;
                 p.height = h;
                 p.num_planes = 1;
                 p.plane_fmt[0].sizeimage = 0;
             } else {
                 let p = cap.pix();
-                p.pixelformat = uapi::V4L2_PIX_FMT_H264;
+                p.pixelformat = self.coded_fourcc;
                 p.width = w;
                 p.height = h;
                 p.sizeimage = 0;
             }
         }
         dev.set_format(&mut cap).map_err(device_error)?;
-        self.confirm_coding_controls()?;
+        if self.is_h264() {
+            self.confirm_coding_controls()?;
+        }
 
         let mut out = dev.format(self.device.output).map_err(device_error)?;
         self.fill_output_format(&mut out, None);
@@ -295,6 +322,11 @@ impl V4l2Encoder {
         }
         .is_ok();
         Ok(())
+    }
+
+    /// Whether the stream is H.264 rather than JPEG pictures.
+    fn is_h264(&self) -> bool {
+        self.coded_fourcc == uapi::V4L2_PIX_FMT_H264
     }
 
     /// Writes the OUTPUT format for the configured size, with `stride` as
@@ -754,7 +786,8 @@ impl V4l2Encoder {
             }
         }
 
-        if opts.keyframe {
+        // Every JPEG picture stands alone.
+        if opts.keyframe && self.coded_fourcc == uapi::V4L2_PIX_FMT_H264 {
             let info = self
                 .controls
                 .iter()
@@ -851,6 +884,15 @@ impl V4l2Encoder {
     /// Queues an access unit, or holds a header-only buffer for the next
     /// one.
     fn accept(&mut self, bytes: Vec<u8>, keyframe_flag: bool, timestamp: Duration) {
+        if !self.is_h264() {
+            let pts = self.take_pts(timestamp.as_micros() as u64);
+            self.pending.push_back(EncodedFrame {
+                keyframe: true,
+                data: bytes,
+                pts,
+            });
+            return;
+        }
         let au = AccessUnit::parse(&bytes);
         if au.ends_previous() {
             match self.pending.back_mut() {

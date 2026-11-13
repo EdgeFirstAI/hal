@@ -170,6 +170,13 @@ impl ImageDecoder {
         self.jpeg_state.engine
     }
 
+    /// Whether the V4L2 decoder wrote the last JPEG straight into its
+    /// destination, rather than copying it out of its own buffer.
+    #[cfg(all(target_os = "linux", feature = "v4l2"))]
+    pub(crate) fn v4l2_wrote_in_place(&self) -> bool {
+        self.jpeg_state.v4l2_wrote_in_place()
+    }
+
     /// Decode image data into a typed tensor, configuring its dimensions and
     /// pixel format to the decoded output format — the source's native format
     /// unless [`set_output_format`](Self::set_output_format) selected a fused

@@ -51,22 +51,38 @@ fn is_codec_refusal(e: &CodecError, codec: Codec, engine: Engine) -> bool {
 }
 
 #[test]
-fn video_capabilities_are_the_platform_engine_and_h264() {
+fn video_capabilities_are_the_platform_engine() {
     let caps = capabilities();
     let video: Vec<_> = caps.iter().filter(|c| c.codec.is_video()).collect();
     for c in &video {
         assert_eq!(Some(c.engine), video_engine(), "{c:?}");
-        assert_eq!(c.codec, Codec::H264, "{c:?}");
+        assert!(matches!(c.codec, Codec::H264 | Codec::Mjpeg), "{c:?}");
         assert!(!c.formats.is_empty(), "{c:?}");
     }
     if video.is_empty() {
         return skip(
-            "video_capabilities_are_the_platform_engine_and_h264",
+            "video_capabilities_are_the_platform_engine",
             "no video engine here",
         );
     }
     for c in video.iter().filter(|c| c.direction == Direction::Decode) {
-        assert_eq!(c.formats, vec![PixelFormat::Nv12], "{c:?}");
+        assert!(c.formats.contains(&PixelFormat::Nv12), "{c:?}");
+    }
+    // Media Foundation has no MJPEG encoder, so it lists none and refuses.
+    if video_engine() == Some(Engine::MediaFoundation) {
+        assert!(!video
+            .iter()
+            .any(|c| c.codec == Codec::Mjpeg && c.direction == Direction::Encode));
+        let e = VideoEncoder::new(EncoderConfig::new(
+            Codec::Mjpeg,
+            640,
+            480,
+            PixelFormat::Nv12,
+            30.0,
+        ))
+        .map(|_| ())
+        .unwrap_err();
+        assert!(is_codec_refusal(&e, Codec::Mjpeg, Engine::Auto), "{e}");
     }
 }
 

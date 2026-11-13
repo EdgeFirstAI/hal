@@ -97,12 +97,14 @@ fn video_engines() -> Vec<Engine> {
         .collect()
 }
 
-/// Whether `engine` runs `codec` in this build.
-fn runs(engine: Engine, codec: Codec) -> bool {
+/// Whether `engine` runs `direction` of `codec` in this build.
+fn runs(engine: Engine, codec: Codec, direction: Direction) -> bool {
     compiled(engine)
         && matches!(
-            (engine, codec),
-            (Engine::V4l2 | Engine::MediaFoundation, Codec::H264)
+            (engine, codec, direction),
+            (Engine::V4l2 | Engine::MediaFoundation, Codec::H264, _)
+                | (Engine::V4l2, Codec::Mjpeg, _)
+                | (Engine::MediaFoundation, Codec::Mjpeg, Direction::Decode)
         )
 }
 
@@ -123,7 +125,7 @@ fn pick(requested: Engine, codec: Codec, direction: Direction) -> Result<Engine>
     }
     engines_to_try(requested, &able)?
         .into_iter()
-        .find(|&e| runs(e, codec))
+        .find(|&e| runs(e, codec, direction))
         .ok_or_else(|| unsupported(codec, direction, requested))
 }
 
@@ -286,6 +288,10 @@ fn open_encoder(engine: Engine, config: EncoderConfig) -> Result<Box<dyn Encoder
 fn open_decoder(engine: Engine, config: DecoderConfig) -> Result<Box<dyn DecoderBackend>> {
     match engine {
         #[cfg(all(target_os = "linux", feature = "v4l2"))]
+        Engine::V4l2 if config.codec == Codec::Mjpeg => {
+            Ok(Box::new(v4l2::mjpeg::V4l2MjpegDecoder::open(config)?))
+        }
+        #[cfg(all(target_os = "linux", feature = "v4l2"))]
         Engine::V4l2 => Ok(Box::new(v4l2::decoder::V4l2Decoder::open(config)?)),
         #[cfg(all(windows, feature = "media-foundation"))]
         Engine::MediaFoundation => Ok(Box::new(mf::decoder::MfDecoder::open(config)?)),
@@ -328,6 +334,9 @@ pub struct EncoderConfig {
     /// the device offers it, and keeps the device default where it does not.
     /// See [`EncoderConfig::target_level`].
     pub level: Option<H264Level>,
+    /// JPEG quality of MJPEG pictures, 1 (smallest) to 100 (best). `None`
+    /// uses [`DEFAULT_JPEG_QUALITY`](crate::DEFAULT_JPEG_QUALITY).
+    pub quality: Option<u8>,
 }
 
 impl EncoderConfig {
@@ -353,6 +362,7 @@ impl EncoderConfig {
             repeat_headers: true,
             profile: None,
             level: None,
+            quality: None,
         }
     }
 
@@ -404,6 +414,12 @@ impl EncoderConfig {
         })
     }
 
+    /// The JPEG quality of MJPEG pictures: [`quality`](Self::quality), or
+    /// [`DEFAULT_JPEG_QUALITY`](crate::DEFAULT_JPEG_QUALITY).
+    pub fn jpeg_quality(&self) -> u8 {
+        self.quality.unwrap_or(crate::DEFAULT_JPEG_QUALITY)
+    }
+
     /// Checks the values that do not depend on a device.
     pub fn validate(&self) -> Result<()> {
         let invalid = |what: String| Err(CodecError::InvalidConfig(what));
@@ -422,6 +438,12 @@ impl EncoderConfig {
         }
         if self.bitrate == Bitrate::Bps(0) {
             return invalid("bitrate is 0".into());
+        }
+        if self.quality.is_some_and(|q| !(1..=100).contains(&q)) {
+            return invalid(format!(
+                "JPEG quality {} is not within 1 to 100",
+                self.quality.unwrap_or_default()
+            ));
         }
         if self.gop == Some(0) {
             return invalid("GOP is 0".into());
@@ -1089,11 +1111,14 @@ mod tests {
 
     #[test]
     fn only_platform_engines_run_video() {
-        assert!(!runs(Engine::Cpu, Codec::H264));
-        assert!(!runs(Engine::NvJpeg, Codec::H264));
+        for direction in [Direction::Encode, Direction::Decode] {
+            assert!(!runs(Engine::Cpu, Codec::H264, direction));
+            assert!(!runs(Engine::NvJpeg, Codec::H264, direction));
+            assert!(!runs(Engine::Cpu, Codec::Mjpeg, direction));
+        }
         for codec in [Codec::Hevc, Codec::Vp8, Codec::Vp9, Codec::Av1, Codec::Jpeg] {
             for engine in [Engine::V4l2, Engine::MediaFoundation, Engine::VideoToolbox] {
-                assert!(!runs(engine, codec), "{engine} {codec}");
+                assert!(!runs(engine, codec, Direction::Decode), "{engine} {codec}");
             }
         }
     }
