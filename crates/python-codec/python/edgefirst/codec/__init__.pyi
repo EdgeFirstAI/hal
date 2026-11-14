@@ -6,6 +6,7 @@ mirrors the pymodule registrations in crates/python-codec/src/lib.rs.
 
 import enum
 from collections.abc import Sequence
+from typing import NoReturn
 
 # Re-exported from `edgefirst.tensor` (a hard dependency of this package), so
 # `edgefirst.codec.PixelFormat` names the same enum a caller already has. The
@@ -663,9 +664,13 @@ class Frame(Tensor):
     The buffer goes back to the decoder once the frame is no longer
     referenced. Hold frames only as long as their pictures are needed: the
     pool is bounded, and a decoder whose every buffer is held raises
-    ``PoolExhaustedError``. A ``view()`` or ``batch()`` taken from a frame
-    does not keep the buffer. A writable CPU map of a frame raises
-    ``RuntimeError``: the decoder still shares its buffer.
+    ``PoolExhaustedError``. A map or pin of a frame keeps the buffer until it
+    is released; a ``view()`` or ``batch()`` does not.
+
+    A frame is read-only: its buffer and metadata belong to the decoder.
+    Changing its shape, format, quantization or colorimetry, or decoding or
+    writing into it, raises ``TypeError``, and a writable CPU map raises
+    ``RuntimeError``. Copy the picture to change it.
     """
 
     @property
@@ -676,6 +681,38 @@ class Frame(Tensor):
     def corrupted(self) -> bool:
         """Whether the decoder reported the picture damaged (missing
         references, for example after a lost access unit)."""
+
+    @property
+    def colorimetry(self) -> Colorimetry | None:  # type: ignore[override]
+        """The stream's colorimetry for this picture. Read-only on a frame."""
+
+    # The changes a Tensor allows and a Frame refuses, each raising TypeError.
+    def reshape(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def set_format(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def configure_image(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def from_numpy(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def decode_image(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def decode_image_file(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def set_quantization_per_tensor(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def set_quantization_per_tensor_symmetric(
+        self, *args: object, **kwargs: object
+    ) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def set_quantization_per_channel(self, *args: object, **kwargs: object) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def set_quantization_per_channel_symmetric(
+        self, *args: object, **kwargs: object
+    ) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
+    def clear_quantization(self) -> NoReturn:
+        """Raises ``TypeError``: a frame is read-only."""
 
 class VideoDecoder:
     """Decodes an H.264 or MJPEG stream on hardware into frames whose

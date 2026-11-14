@@ -13,9 +13,9 @@ use edgefirst_codec::video::{
 use edgefirst_codec::{Codec, CodecError as RsCodecError, Direction, Engine, Transfer};
 use edgefirst_tensor::{PixelFormat, TensorDyn};
 use pyo3::create_exception;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict, PyTuple};
 
 use crate::colorimetry::PyColorimetry;
 use crate::interop::{RawKeepalive, TensorArg};
@@ -89,6 +89,14 @@ pub(crate) fn to_pyerr(e: RsCodecError) -> PyErr {
         RsCodecError::InvalidData(_) => InvalidDataError::new_err(msg),
         _ => CodecError::new_err(msg),
     }
+}
+
+/// The refusal of a change to a decoded frame, whose buffer and metadata
+/// belong to its decoder.
+pub(crate) fn read_only(what: &str) -> PyErr {
+    PyTypeError::new_err(format!(
+        "{what}: a Frame is read-only; its buffer and metadata belong to its decoder, so copy the picture to change it"
+    ))
 }
 
 fn unknown(what: &str, value: impl std::fmt::Debug) -> PyErr {
@@ -886,8 +894,13 @@ type Returned = Mutex<Vec<DecodedFrame>>;
 /// The buffer goes back to the decoder once this frame is no longer
 /// referenced. Hold frames only as long as their pictures are needed: the
 /// pool is bounded, and a decoder whose every buffer is held raises
-/// ``PoolExhaustedError``. A ``view()`` or ``batch()`` taken from a frame
-/// does not keep the buffer.
+/// ``PoolExhaustedError``. A map or pin of a frame keeps the buffer until it
+/// is released; a ``view()`` or ``batch()`` does not.
+///
+/// A frame is read-only: its buffer and metadata belong to the decoder.
+/// Changing its shape, format, quantization or colorimetry, or decoding or
+/// writing into it, raises ``TypeError``, and a writable CPU map raises
+/// ``RuntimeError``. Copy the picture to change it.
 #[pyclass(name = "Frame", extends = PyTensor, module = "edgefirst.codec")]
 pub struct PyFrame {
     frame: Option<DecodedFrame>,
@@ -917,7 +930,13 @@ impl PyFrame {
         // Sharing the handle keeps everything the decoder set on the
         // tensor, a separate chroma plane included. Where tensors are not
         // shared handles, the memory is reconstructed from its descriptor.
-        let (base, pin) = match frame.tensor().share() {
+        //
+        // SAFETY: neither owner changes the metadata while both are alive.
+        // `Frame` refuses every metadata change and every mutable extraction
+        // (`read_only`, `TensorArg::extract_mut`), and the decoder changes a
+        // buffer's metadata only once it has it back, which is after this
+        // frame and its base tensor are gone (see `Returned`).
+        let (base, pin) = match unsafe { frame.tensor().share() } {
             Ok(shared) => (shared, None),
             Err(_) => {
                 crate::interop::reconstruct(frame.tensor(), edgefirst_tensor::CpuAccess::Read)?
@@ -951,6 +970,112 @@ impl PyFrame {
     #[getter]
     fn corrupted(&self) -> bool {
         self.inner().corrupted()
+    }
+
+    /// The stream's colorimetry for this picture. Read-only on a frame.
+    #[getter]
+    fn colorimetry(slf: PyRef<'_, Self>) -> Option<PyColorimetry> {
+        slf.as_super().0.colorimetry().map(Into::into)
+    }
+
+    #[setter]
+    fn set_colorimetry(&self, _colorimetry: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(read_only("colorimetry"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn reshape(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("reshape"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn set_format(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("set_format"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn configure_image(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("configure_image"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    #[allow(clippy::wrong_self_convention, reason = "overrides Tensor.from_numpy")]
+    fn from_numpy(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("from_numpy"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn decode_image(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("decode_image"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn decode_image_file(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("decode_image_file"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn set_quantization_per_tensor(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("set_quantization_per_tensor"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn set_quantization_per_tensor_symmetric(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("set_quantization_per_tensor_symmetric"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn set_quantization_per_channel(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("set_quantization_per_channel"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn set_quantization_per_channel_symmetric(
+        &self,
+        _args: &Bound<'_, PyTuple>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        Err(read_only("set_quantization_per_channel_symmetric"))
+    }
+
+    fn clear_quantization(&self) -> PyResult<()> {
+        Err(read_only("clear_quantization"))
     }
 
     fn __repr__(slf: PyRef<'_, Self>) -> String {

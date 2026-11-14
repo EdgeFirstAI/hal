@@ -641,11 +641,15 @@ impl TensorDyn {
     /// A second owner of the same tensor. Only the dynamic backend, whose
     /// tensors are reference-counted handles, can make one.
     ///
+    /// # Safety
+    /// As the dynamic backend's `share`, whose contract this keeps so that
+    /// callers need not name the backend.
+    ///
     /// # Errors
     /// Always `NotImplemented` in this backend; a caller that needs the
     /// tensor's memory reconstructs it from
     /// [`descriptor_pinned`](Self::descriptor_pinned) instead.
-    pub fn share(&self) -> crate::Result<TensorDyn> {
+    pub unsafe fn share(&self) -> crate::Result<TensorDyn> {
         Err(crate::Error::NotImplemented(
             "sharing a tensor needs the dynamic tensor backend".into(),
         ))

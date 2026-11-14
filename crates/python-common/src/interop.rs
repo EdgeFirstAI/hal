@@ -447,6 +447,10 @@ impl<'py> TensorArg<'py> {
     /// [`Self::extract`], an explicit `access` request is never retried:
     /// the caller already asked for exactly what it needs.
     pub fn extract_mut(obj: &Bound<'py, PyAny>, access: Option<&str>) -> PyResult<Self> {
+        #[cfg(feature = "codec")]
+        if obj.cast::<crate::codec::PyFrame>().is_ok() {
+            return Err(crate::codec::read_only("writing into it"));
+        }
         if let Ok(native) = obj.cast::<crate::tensor::PyTensor>() {
             return Ok(Self::NativeMut(native.try_borrow_mut()?));
         }

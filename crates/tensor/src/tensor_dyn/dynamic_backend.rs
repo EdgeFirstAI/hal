@@ -336,9 +336,16 @@ impl TensorDyn {
     /// tensor lives until both are dropped. While both are alive the handle
     /// is shared, so writable CPU maps through either are refused.
     ///
+    /// # Safety
+    /// The handle's metadata (shape, format, row stride, plane offset,
+    /// quantization) is not synchronized between owners. While both are
+    /// alive, no metadata change through one may overlap any use of the
+    /// other, and neither may rely on the other leaving the metadata alone:
+    /// each keeps its own cached copy.
+    ///
     /// # Errors
     /// `NotImplemented` when the library refuses the reference.
-    pub fn share(&self) -> Result<TensorDyn> {
+    pub unsafe fn share(&self) -> Result<TensorDyn> {
         // SAFETY: `self.handle` is live.
         let rc = unsafe { edgefirst_tensor_ffi::ef_tensor_retain(self.handle.as_ptr()) };
         if rc != 0 {

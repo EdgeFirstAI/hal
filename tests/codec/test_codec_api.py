@@ -90,8 +90,8 @@ def test_a_grey_image_encodes_to_a_jpeg_and_decodes_back():
     dst = grey(64, 48)
     codec.decode_into(dst, jpeg)
     with dst.map("read") as m:
-        pixels = np.asarray(m)
-    assert abs(int(pixels.mean()) - 200) <= 2
+        mean = float(np.asarray(m).mean())
+    assert abs(mean - 200) <= 2
 
 
 def test_image_encoder_refusals():
@@ -161,9 +161,35 @@ def test_frames_hold_the_pool_until_released():
         for pts, unit in enumerate(units):
             held += [e for e in decoder.decode(unit, pts) if isinstance(e, Frame)]
     stuck = pts
+    # Maps keep their frames' buffers leased after the frames are dropped.
+    views = [f.map("read") for f in held]
     held.clear()
     gc.collect()
+    with pytest.raises(codec.PoolExhaustedError):
+        decoder.decode(units[stuck], stuck)
+    for v in views:
+        v.unmap()
+    del views
+    gc.collect()
     decoder.decode(units[stuck], stuck)
+
+
+def test_a_frame_is_read_only():
+    units = codec.access_units((TESTDATA / "h264_1080p_main_bframes.h264").read_bytes())
+    decoder = open_or_skip(lambda: VideoDecoder(Codec.H264))
+    frame = next(e for e in decode_all(decoder, units[:4]) if isinstance(e, Frame))
+    shape, colorimetry = frame.shape, repr(frame.colorimetry)
+    for change in (
+        lambda: frame.reshape([1]),
+        lambda: frame.set_format(PixelFormat.Grey),
+        lambda: frame.clear_quantization(),
+        lambda: setattr(frame, "colorimetry", None),
+        lambda: codec.decode_into(frame, b"\xff\xd8"),
+    ):
+        with pytest.raises(TypeError, match="read-only"):
+            change()
+    assert frame.shape == shape
+    assert repr(frame.colorimetry) == colorimetry
 
 
 def test_a_pool_holding_one_buffer_twice_is_refused():
@@ -186,7 +212,8 @@ def test_an_h264_stream_round_trips_through_the_hardware():
     encoder = open_or_skip(
         lambda: VideoEncoder(Codec.H264, w, h, PixelFormat.Nv12, 30.0, gop=count)
     )
-    assert encoder.info.hardware
+    if not encoder.info.hardware:
+        pytest.skip(f"no hardware H.264 encoder here: {encoder.info.device}")
     packets = []
     for pts in range(count):
         src = nv12(w, h, 16 + pts * 24)
@@ -210,7 +237,7 @@ def test_an_h264_stream_round_trips_through_the_hardware():
     assert not any(f.corrupted for f in frames)
     for f in frames:
         with f.map("read") as m:
-            luma = np.asarray(m)[:h, :w]
-        assert abs(float(luma.mean()) - (16 + f.pts * 24)) < 4, f.pts
+            mean = float(np.asarray(m)[:h, :w].mean())
+        assert abs(mean - (16 + f.pts * 24)) < 4, f.pts
     with pytest.raises(RuntimeError):
         frames[0].map("write")
