@@ -166,6 +166,7 @@ dependencies = [
  "log",
  "num-traits",
  "tracing",
+ "windows",
  "zune-png",
 ]
 

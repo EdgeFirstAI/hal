@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# cbindgen configuration for edgefirst/tensor.h.
+# cbindgen configuration for edgefirst/codec.h.
 #
 # NOTE: the include guard is written by hand in `header`/`trailer` rather than
 # via cbindgen's `include_guard`, which wraps only the *generated* body and
@@ -15,6 +15,11 @@
 # hand-written `trailer` below, not in generated output.
 
 language = "C"
+# C++ callers include this header too. Without `cpp_compat`, each
+# `#[repr(u32)]` enum is followed by `typedef uint32_t <name>;` under C++
+# (where `__STDC_VERSION__` is undefined), which redefines the enum tag that
+# C++ already made a type. With it, C++ gets the fixed-type enum and no typedef.
+cpp_compat = true
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
 include_version = true
 documentation = true
@@ -27,16 +32,37 @@ header = """
 
 /**
  * @file codec.h
- * @brief EdgeFirst image decode/encode C API
+ * @brief EdgeFirst image and video encode/decode C API
  *
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
  *
- * Decode JPEG and PNG into a tensor, and encode a tensor back out.
+ * Still images: decode JPEG and PNG into a tensor (ef_image_decoder), and
+ * encode a tensor as JPEG (ef_image_encoder). Video: encode tensors to H.264
+ * or MJPEG access units (ef_video_encoder), and decode access units into
+ * frames whose pictures are tensors (ef_video_decoder).
  *
- * Decoding writes *into* a tensor you already have, rather than allocating one:
- * that is what lets a decode target be a DMA buffer the GPU will read next,
- * with no copy in between. The tensor may come from any EdgeFirst library.
+ * Image decoding writes *into* a tensor you already have, rather than
+ * allocating one: that is what lets a decode target be a DMA buffer the GPU
+ * will read next, with no copy in between. The tensor may come from any
+ * EdgeFirst library.
+ *
+ * Every codec runs on an engine (ef_codec_engine): V4L2 on Linux, Media
+ * Foundation on Windows, nvJPEG on Linux with CUDA, or the CPU for still
+ * images. EF_CODEC_ENGINE_AUTO takes the first engine that can do the
+ * request; ef_codec_capabilities_new lists what this machine's engines do.
+ * There is no software video codec: where no engine runs a codec, opening
+ * it fails with ENOTSUP or ENODEV.
+ *
+ * Calls return 0 or an errno. Functions that create an object return NULL
+ * and set errno (on Windows, the thread's last-error code, read with
+ * GetLastError). ef_codec_last_error says why the calling thread's last
+ * call failed. Each object is used from one thread at a time.
+ *
+ * Platform-specific entry points are declared on every platform and fail at
+ * run time where no engine runs them; a "Platforms:" line says where:
+ *   - Linux, Windows: ef_video_encoder_new, ef_video_decoder_new,
+ *     ef_video_decoder_new_with_pool, and the calls on their objects
  */
 
 #include <stdarg.h>
@@ -74,11 +100,40 @@ prefix = ""
 # which this header includes; excluding them here avoids emitting a second,
 # conflicting definition.
 exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfImageDecoder"]
+# Entry points take these enums as uint32_t, so nothing references them by
+# type; listed so their constants are emitted.
+include = [
+    "EfCodec",
+    "EfCodecEngine",
+    "EfCodecDirection",
+    "EfCodecTransfer",
+    "EfH264Profile",
+    "EfVideoEvent",
+    "EfVideoMemory",
+]
 
 
 [export.rename]
 "EfTensor" = "ef_tensor"
 "EfImageDecoder" = "ef_image_decoder"
+"EfImageEncoder" = "ef_image_encoder"
+"EfCodec" = "ef_codec"
+"EfCodecEngine" = "ef_codec_engine"
+"EfCodecDirection" = "ef_codec_direction"
+"EfCodecTransfer" = "ef_codec_transfer"
+"EfCodecCapability" = "ef_codec_capability"
+"EfCodecCapabilities" = "ef_codec_capabilities"
+"EfCodecRegion" = "ef_codec_region"
+"EfH264Profile" = "ef_h264_profile"
+"EfVideoEvent" = "ef_video_event"
+"EfVideoMemory" = "ef_video_memory"
+"EfVideoEncoderConfig" = "ef_video_encoder_config"
+"EfVideoEncoder" = "ef_video_encoder"
+"EfVideoEncoderInfo" = "ef_video_encoder_info"
+"EfVideoPacket" = "ef_video_packet"
+"EfVideoDecoder" = "ef_video_decoder"
+"EfVideoStreamInfo" = "ef_video_stream_info"
+"EfVideoFrame" = "ef_video_frame"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"
