@@ -1145,6 +1145,7 @@ fn infer_from_meta(
         },
         nms_multi_label: None,
         decoder_version: Some(version),
+        model: None,
     };
 
     let version_label = if version == DecoderVersion::Yolo26 {

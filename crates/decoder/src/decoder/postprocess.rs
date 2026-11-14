@@ -46,6 +46,7 @@ macro_rules! dequant_4d {
 }
 
 impl Decoder {
+    /// Returns the indices in `outputs` of the boxes and scores tensors.
     pub(super) fn decode_modelpack_det_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
@@ -53,11 +54,11 @@ impl Decoder {
         scores: &configs::Scores,
         multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), DecoderError> {
-        let (boxes_tensor, ind) =
+    ) -> Result<[usize; 2], DecoderError> {
+        let (boxes_tensor, boxes_index) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
-        let (scores_tensor, _) =
-            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &[ind])?;
+        let (scores_tensor, scores_index) =
+            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &[boxes_index])?;
         let quant_boxes = boxes
             .quantization
             .map(Quantization::from)
@@ -88,16 +89,19 @@ impl Decoder {
             });
         });
 
-        Ok(())
+        Ok([boxes_index, scores_index])
     }
 
+    /// `skip` holds the indices in `outputs` of the tensors the model's
+    /// detection outputs were decoded from.
     pub(super) fn decode_modelpack_seg_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
         segmentation: &configs::Segmentation,
+        skip: &[usize],
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
-        let (seg, _) = Self::find_outputs_with_shape_quantized(&segmentation.shape, outputs, &[])?;
+        let (seg, _) = Self::find_outputs_with_shape_quantized(&segmentation.shape, outputs, skip)?;
         let isa = Isa::current()?;
 
         macro_rules! modelpack_seg {
@@ -139,13 +143,14 @@ impl Decoder {
         Ok(())
     }
 
+    /// Returns the indices in `outputs` of the detection heads' tensors.
     pub(super) fn decode_modelpack_det_split_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
         detection: &[configs::Detection],
         multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), DecoderError> {
+    ) -> Result<Vec<usize>, DecoderError> {
         let new_detection = detection
             .iter()
             .map(|x| match &x.anchors {
@@ -158,7 +163,7 @@ impl Decoder {
                 }),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let new_outputs = Self::match_outputs_to_detect_quantized(detection, outputs)?;
+        let (new_outputs, indices) = Self::match_outputs_to_detect_quantized(detection, outputs)?;
         let isa = Isa::current()?;
 
         let layers: Vec<_> = new_outputs
@@ -187,7 +192,7 @@ impl Decoder {
                 })
             });
             if let Some(decoded) = decoded.then(|| split.finish()).flatten() {
-                return impl_modelpack_split_boxes::<XYWH>(
+                impl_modelpack_split_boxes::<XYWH>(
                     isa,
                     decoded,
                     self.score_threshold,
@@ -197,7 +202,8 @@ impl Decoder {
                     self.max_det,
                     multi_label,
                     output_boxes,
-                );
+                )?;
+                return Ok(indices);
             }
         }
 
@@ -237,7 +243,7 @@ impl Decoder {
             multi_label,
             output_boxes,
         )?;
-        Ok(())
+        Ok(indices)
     }
 
     pub(super) fn decode_yolo_det_quantized(
@@ -593,13 +599,14 @@ impl Decoder {
         )
     }
 
+    /// Returns the indices in `outputs` of the detection heads' tensors.
     pub(super) fn decode_modelpack_det_split_float<D>(
         &self,
         outputs: &[ArrayViewD<D>],
         detection: &[configs::Detection],
         multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), DecoderError>
+    ) -> Result<Vec<usize>, DecoderError>
     where
         D: AsPrimitive<f32> + Send + Sync + 'static,
     {
@@ -616,7 +623,7 @@ impl Decoder {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let new_outputs = Self::match_outputs_to_detect(detection, outputs)?;
+        let (new_outputs, indices) = Self::match_outputs_to_detect(detection, outputs)?;
         let new_outputs = new_outputs
             .into_iter()
             .map(|x| x.slice(s![0, .., .., ..]))
@@ -634,20 +641,23 @@ impl Decoder {
             multi_label,
             output_boxes,
         )?;
-        Ok(())
+        Ok(indices)
     }
 
+    /// `skip` holds the indices in `outputs` of the tensors the model's
+    /// detection outputs were decoded from.
     pub(super) fn decode_modelpack_seg_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
         segmentation: &configs::Segmentation,
+        skip: &[usize],
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
     {
-        let (seg, _) = Self::find_outputs_with_shape(&segmentation.shape, outputs, &[])?;
+        let (seg, _) = Self::find_outputs_with_shape(&segmentation.shape, outputs, skip)?;
 
         let seg = Self::swap_axes_if_needed(seg, segmentation.into());
         let seg = seg.slice(s![0, .., .., ..]);
@@ -670,6 +680,7 @@ impl Decoder {
         Ok(())
     }
 
+    /// Returns the indices in `outputs` of the boxes and scores tensors.
     pub(super) fn decode_modelpack_det_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
@@ -677,17 +688,19 @@ impl Decoder {
         scores: &configs::Scores,
         multi_label: bool,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), DecoderError>
+    ) -> Result<[usize; 2], DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
     {
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
+        let (boxes_tensor, boxes_index) =
+            Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
 
         let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
         let boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
 
-        let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
+        let (scores_tensor, scores_index) =
+            Self::find_outputs_with_shape(&scores.shape, outputs, &[boxes_index])?;
         let scores_tensor = Self::swap_axes_if_needed(scores_tensor, scores.into());
         let scores_tensor = scores_tensor.slice(s![0, .., ..]);
 
@@ -702,7 +715,7 @@ impl Decoder {
             multi_label,
             output_boxes,
         )?;
-        Ok(())
+        Ok([boxes_index, scores_index])
     }
 
     pub(super) fn decode_yolo_det_float<T>(

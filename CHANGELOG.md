@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **H.264 encode and decode on Windows (`edgefirst-codec`, `media-foundation` feature, on by default).** `VideoEncoder` and `VideoDecoder` run on the Media Foundation H.264 transforms: the GPU's encoder (NVENC, Quick Sync, AMF, or Microsoft's DX12 encoder) where the driver registers one, otherwise Microsoft's software encoder, and Microsoft's decoder on the GPU (DXVA). Pixels stay on the GPU: an encoder reads native NV12 D3D11 tensors in place, or a GPU copy of them when the source is cropped or the encoder holds frames, and each decoded picture is copied GPU to GPU into a pool of NV12 D3D11 tensors with a recorded fence value. Without DXVA or a D3D11 device the transforms fall back to system memory. `EDGEFIRST_CODEC_MF_ENCODER` and `EDGEFIRST_CODEC_MF_DECODER` select transforms by name, `hardware` or `software`. `mfplat.dll` is loaded at run time, so the crate still loads on Windows N editions, where the codecs report `NoDevice`. On Windows a provided decoder pool must hold NV12 images of the stream's visible size.
 
+- **`model.end2end` in the decoder schema (`edgefirst-decoder`).** `SchemaV2` reads `end2end` from the schema's `model` block (`schema::ModelSpec`). `false` on a `decoder_version: yolo26` model selects the decoder's NMS path for the export made without embedded NMS, whose head is the YOLOv8 one; `true` makes a `yolo26` head that is not end-to-end an error.
+
 - **`D3d11ImageLayout::is_native_nv12()` and `mapped_rows()` (`edgefirst-tensor`).** Whether a texture tensor is a native two-plane NV12 texture, and how many rows a CPU map of it has (1.5 times `texture_height` for native NV12); with `d3d11_layout::DXGI_FORMAT_NV12` and `d3d11_layout::combined_semi_planar_layout`.
 
 ### Changed
@@ -37,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`create_image` documentation on padded planar DMA-BUF images (`edgefirst-image`).** The docs said only packed images are padded to the 64-byte GPU pitch. Planar and semi-planar DMA-BUF images are padded too, and report the pitch through `row_stride()`: a 672-wide `PlanarRgb` image has 704-byte rows. A consumer that needs tight planes reads at the stride or uses `copy_to_flat`.
+
+- **Outputs that share a shape are bound by name or configured position (`edgefirst-decoder`).** When two configured outputs have the same shape, each role takes the tensor named like its output, else the only tensor of that shape, else the tensor at its configured position when every configured output was passed. Callers that passed same-shape tensors in role order (boxes before scores, scores before classes) against a configuration listing them otherwise must now pass them in configured order or name them. Models whose outputs all differ in shape are unaffected.
+
+### Fixed
+
+- **Decoder no longer swaps outputs that share a shape (`edgefirst-decoder`).** A split detector with four classes (scores shaped like the boxes) or a segmentation model with as many classes as protos (scores shaped like the mask coefficients) had whichever tensor came first bound to both lookups' first role, decoding garbage without an error. Same-shape outputs that neither a name nor a full set in configured order settles are now refused with an error naming the roles and the shape, and one that is missing is reported by role. A schema with split children that lists two same-shape logical outputs out of role order decodes correctly too. ModelPack detection heads of one shape are each decoded from their own tensor instead of all from the first, and a ModelPack segmentation output shaped like a detection output no longer reads that output's tensor.
+
+- **`decoder_version: yolo26` with a pre-NMS head builds (`edgefirst-decoder`).** Such a schema failed with `Yolo26 Segmentation Detection must have num_features be 6 + num_protos`. The decoder now follows `model.end2end` when the schema states it, and otherwise decodes a tagged head that cannot be end-to-end with its own NMS. A two-class model must state `"end2end": false`: its pre-NMS head is as wide as an end-to-end row and is otherwise taken as end-to-end.
 
 ## [0.40.0] - 2026-11-05
 
