@@ -1,6 +1,6 @@
 # edgefirst-codec
 
-JPEG and PNG decoding straight into pre-allocated tensors — no per-frame allocations, with optional hardware acceleration on Linux.
+JPEG and PNG decoding straight into pre-allocated tensors, JPEG encoding, and hardware H.264 and MJPEG video with tensors as the pictures — no per-frame allocations, zero-copy where the platform allows.
 
 [![PyPI](https://img.shields.io/pypi/v/edgefirst-codec.svg)](https://pypi.org/project/edgefirst-codec/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -14,7 +14,7 @@ JPEG and PNG decoding straight into pre-allocated tensors — no per-frame alloc
 | Package | Provides |
 |---|---|
 | [`edgefirst-tensor`](https://pypi.org/project/edgefirst-tensor/) | Zero-copy tensor allocation and host/GPU/CUDA mapping |
-| [`edgefirst-codec`](https://pypi.org/project/edgefirst-codec/) | JPEG and PNG decoding directly into pre-allocated tensors (this package) |
+| [`edgefirst-codec`](https://pypi.org/project/edgefirst-codec/) | JPEG and PNG decoding into pre-allocated tensors, JPEG encoding, and H.264 and MJPEG video (this package) |
 | [`edgefirst-image`](https://pypi.org/project/edgefirst-image/) | GPU-accelerated colour conversion, resize, letterbox, tiling and drawing |
 | [`edgefirst-decoder`](https://pypi.org/project/edgefirst-decoder/) | YOLO and ModelPack output decoding |
 | [`edgefirst-tracker`](https://pypi.org/project/edgefirst-tracker/) | ByteTrack multi-object tracking |
@@ -82,6 +82,60 @@ Both settings are **thread-local** — apply them on every thread that decodes. 
 
 `PixelFormat` and the other value types (`TensorMemory`, `Region`, the colour axis enums) are accepted from any `edgefirst.*` package, not just this one — they compare and hash equal across packages by value, so `==`, dict keys and set membership all work regardless of which package's copy you pass. Tensors, `Decoder` and `ProtoData` cross packages too, through the capsule protocols. Importing `PixelFormat` from `edgefirst.codec` when calling into this package is still good style for readability, not a requirement. See the Interoperability section below for the one thing that does not cross: `isinstance` against a concrete class.
 
+## Encoding JPEG
+
+```python
+from edgefirst.codec import ImageEncoder
+
+encoder = ImageEncoder(quality=90)
+jpeg = encoder.encode(image)  # bytes; image is a tensor from any edgefirst.* package
+```
+
+The CPU encodes `uint8` NV12, NV16, YUYV, GREY, RGB and RGBA images at any row stride; under `Engine.Auto` a V4L2 JPEG encoder takes the DMA-BUF sources it can read.
+
+## Video
+
+H.264 and MJPEG streams are encoded and decoded on the platform's hardware: V4L2 memory-to-memory devices on Linux, Media Foundation on Windows. There is no software video codec, so where no engine runs a codec, opening it raises `NoDeviceError` or `UnsupportedError`.
+
+```python
+from edgefirst.codec import (
+    Codec,
+    PixelFormat,
+    StreamInfo,
+    VideoDecoder,
+    VideoEncoder,
+    access_units,
+)
+
+encoder = VideoEncoder(
+    Codec.H264, 1920, 1080, PixelFormat.Nv12, 30.0, bitrate=8_000_000
+)
+for pts, picture in enumerate(pictures):
+    packet = encoder.encode(picture, pts, keyframe=pts == 0)
+    if packet is not None:
+        out.write(packet.data)
+for packet in encoder.flush():
+    out.write(packet.data)
+
+decoder = VideoDecoder(Codec.H264)
+for pts, unit in enumerate(access_units(stream)):
+    for event in decoder.decode(unit, pts):
+        if isinstance(event, StreamInfo):
+            print(event.width, event.height, event.transfer)
+        else:
+            use(event)  # a Frame: a Tensor with .pts, read in place
+```
+
+Sources are read in place where the engine can (DMA-BUF on Linux, D3D11 textures on Windows), and `encoder.info` says how they reach it. A decoded `Frame` is a `Tensor` over a buffer of the decoder's pool: pass it to `ImageProcessor.convert()` or `map()` it like any tensor. The buffer goes back to the decoder when the frame is no longer referenced, so hold frames only as long as their pictures are needed; a decoder whose every buffer is held raises `PoolExhaustedError`. `VideoDecoder(..., pool=[...])` decodes into the caller's own tensors instead. Feed H.264 as Annex B access units in decode order (`access_units()` splits a byte stream) and MJPEG as one JPEG picture per call.
+
+## Engines and capabilities
+
+Every codec runs on an `Engine`. `Engine.Auto` takes the first engine that can do the request; the environment variable `EDGEFIRST_CODEC_ENGINE` (for example `v4l2,cpu`) narrows and orders that choice. An engine passed explicitly is used alone. `capabilities()` lists what this machine's engines do, with each one's device, pixel formats and how pictures move (`Transfer.ZeroCopy`, `GpuCopy`, `CpuCopy`). Probing opens devices, so call it once.
+
+## Errors
+
+Codec failures raise `CodecError`, a `RuntimeError`, through one subclass per kind: `NoDeviceError`, `UnsupportedError`, `PoolExhaustedError`, `CodecTimeoutError`, `InvalidConfigError`, `InvalidInputError` and `InvalidDataError`. A CPU access a tensor's declaration does not cover raises `PermissionError`, as it does across every `edgefirst.*` package.
+
 ## What this package provides
 
 | API | Purpose |
@@ -93,6 +147,12 @@ Both settings are **thread-local** — apply them on every thread that decodes. 
 | `set_dct_method()` / `DctMethod` | IDCT accuracy/speed selection |
 | `set_output_format()` | Fused `Rgb` / `Nv12` decode output |
 | `is_v4l2_available()` | Whether a V4L2 hardware JPEG decoder is present |
+| `ImageEncoder` | JPEG encoding from a tensor |
+| `VideoEncoder` / `EncodedFrame` / `EncoderInfo` | H.264 and MJPEG encoding on hardware |
+| `VideoDecoder` / `Frame` / `StreamInfo` | H.264 and MJPEG decoding on hardware into tensor frames |
+| `access_units()` | Split an H.264 Annex B byte stream into access units |
+| `capabilities()` / `Capability` / `Engine` / `Codec` / `Transfer` | What this machine's codec engines do |
+| `CodecError` and its subclasses | Typed codec failures |
 
 ### Hardware acceleration
 

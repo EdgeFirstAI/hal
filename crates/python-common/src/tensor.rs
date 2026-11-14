@@ -30,6 +30,9 @@ pub enum Error {
     /// A CPU access refusal the image crate reported, kept typed.
     #[cfg(feature = "image")]
     Image(edgefirst_image::Error),
+    /// A codec failure, raised as its `edgefirst.codec` exception.
+    #[cfg(feature = "codec")]
+    Codec(edgefirst_codec::CodecError),
     /// A Python exception raised underneath, passed through unchanged.
     Py(PyErr),
 }
@@ -49,6 +52,8 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "IO error: {e:?}"),
             #[cfg(feature = "image")]
             Error::Image(e) => write!(f, "{e}"),
+            #[cfg(feature = "codec")]
+            Error::Codec(e) => write!(f, "{e}"),
             Error::Py(e) => write!(f, "{e}"),
         }
     }
@@ -104,6 +109,8 @@ impl Error {
             Error::Tensor(e) => e.cpu_access_denied().is_some(),
             #[cfg(feature = "image")]
             Error::Image(e) => e.cpu_access_denied().is_some(),
+            #[cfg(feature = "codec")]
+            Error::Codec(e) => e.cpu_access_denied().is_some(),
             _ => false,
         }
     }
@@ -113,6 +120,8 @@ impl From<Error> for PyErr {
     fn from(err: Error) -> PyErr {
         match err {
             Error::Py(e) => e,
+            #[cfg(feature = "codec")]
+            Error::Codec(e) => crate::codec::to_pyerr(e),
             other => runtime_or_permission_error(other.is_cpu_access_denied(), other.to_string()),
         }
     }
@@ -121,12 +130,7 @@ impl From<Error> for PyErr {
 #[cfg(feature = "codec")]
 impl From<edgefirst_codec::CodecError> for Error {
     fn from(err: edgefirst_codec::CodecError) -> Self {
-        match err {
-            edgefirst_codec::CodecError::Tensor(e) if e.cpu_access_denied().is_some() => {
-                Error::Tensor(e)
-            }
-            err => Error::Format(format!("{err}")),
-        }
+        Error::Codec(err)
     }
 }
 
@@ -1493,7 +1497,9 @@ fn copy_numpy_via_contiguous_array<T: numpy::Element + Copy + Send + Sync>(
 
 // ─── PyTensor ───────────────────────────────────────────────────────────────
 
-#[pyclass(name = "Tensor", str, module = "edgefirst.tensor")]
+/// `subclass`: `edgefirst.codec.Frame` is a `Tensor` that also holds its
+/// decoder's buffer.
+#[pyclass(name = "Tensor", str, subclass, module = "edgefirst.tensor")]
 pub struct PyTensor(pub(crate) TensorDyn);
 
 impl Display for PyTensor {
@@ -2100,9 +2106,11 @@ impl PyTensor {
     ///     RuntimeError: if the backend cannot pin. PBO and AHardwareBuffer
     ///         have no host address outside their map/lock, so use
     ///         :meth:`map` there; the error says so.
-    fn pin_host(&self, access: &str) -> Result<PyHostPin> {
+    fn pin_host(slf: &Bound<'_, Self>, access: &str) -> Result<PyHostPin> {
+        let pin = slf.borrow().0.pin_host(parse_cpu_access(access)?)?;
         Ok(PyHostPin {
-            pin: Some(self.0.pin_host(parse_cpu_access(access)?)?),
+            pin: Some(pin),
+            _owner: Some(slf.clone().into_any().unbind()),
         })
     }
 
@@ -2152,7 +2160,8 @@ impl PyTensor {
     ///         ``"none"`` is rejected -- a mapping is CPU access by
     ///         definition.
     #[pyo3(signature = (access=None))]
-    fn map(&self, access: Option<&str>) -> Result<PyTensorMap> {
+    fn map(slf: &Bound<'_, Self>, access: Option<&str>) -> Result<PyTensorMap> {
+        let this = slf.borrow();
         let access = parse_cpu_access(access.unwrap_or("readwrite"))?;
         if access == tensor::CpuAccess::None {
             return Err(Error::Format(
@@ -2166,9 +2175,9 @@ impl PyTensor {
         // Only image tensors (pixel format set) have a row pitch: a formatless
         // DMA tensor's plane-0 stride is the whole allocation, and treating
         // that as strides[0] makes numpy `.fill` walk off the mapping.
-        let row_stride = self.0.format().and(self.0.effective_row_stride());
-        let layout = self.0.format().map(|f| f.layout());
-        let mapped = map_tensor_dyn(&self.0, access, MapWait::Block)?;
+        let row_stride = this.0.format().and(this.0.effective_row_stride());
+        let layout = this.0.format().map(|f| f.layout());
+        let mapped = map_tensor_dyn(&this.0, access, MapWait::Block)?;
         Ok(PyTensorMap {
             // Derived from the mapping, not from `access`: see
             // `TensorMapT::is_writable`.
@@ -2176,6 +2185,7 @@ impl PyTensor {
             mapped: Some(mapped),
             row_stride,
             layout,
+            _owner: Some(slf.clone().into_any().unbind()),
         })
     }
 
@@ -2195,7 +2205,8 @@ impl PyTensor {
     ///     BlockingIOError: While a GPU copy the map depends on is in
     ///         flight.
     #[pyo3(signature = (access = None))]
-    fn try_map(&self, access: Option<&str>) -> PyResult<PyTensorMap> {
+    fn try_map(slf: &Bound<'_, Self>, access: Option<&str>) -> PyResult<PyTensorMap> {
+        let this = slf.borrow();
         let access = parse_cpu_access(access.unwrap_or("readwrite"))?;
         if access == tensor::CpuAccess::None {
             return Err(Error::Format(
@@ -2205,14 +2216,15 @@ impl PyTensor {
             )
             .into());
         }
-        let row_stride = self.0.format().and(self.0.effective_row_stride());
-        let layout = self.0.format().map(|f| f.layout());
-        let mapped = map_tensor_dyn(&self.0, access, MapWait::Fail).map_err(would_block_err)?;
+        let row_stride = this.0.format().and(this.0.effective_row_stride());
+        let layout = this.0.format().map(|f| f.layout());
+        let mapped = map_tensor_dyn(&this.0, access, MapWait::Fail).map_err(would_block_err)?;
         Ok(PyTensorMap {
             readonly: !mapped.is_writable(),
             mapped: Some(mapped),
             row_stride,
             layout,
+            _owner: Some(slf.clone().into_any().unbind()),
         })
     }
 
@@ -2858,6 +2870,10 @@ impl PyCudaMap {
 #[pyclass(name = "HostPin", module = "edgefirst.tensor")]
 pub struct PyHostPin {
     pin: Option<edgefirst_tensor::HostPin<'static>>,
+    /// The tensor object the pin came from, kept alive while the pin is: a
+    /// decoded frame's buffer stays leased until then. After `pin`, so it is
+    /// released after the pin.
+    pub(crate) _owner: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -2894,6 +2910,7 @@ impl PyHostPin {
     /// Release the pin. Idempotent.
     fn release(&mut self) {
         self.pin = None;
+        self._owner = None;
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
@@ -2994,6 +3011,10 @@ pub struct PyTensorMap {
     /// pads: `[H, W, C]` and `[H*k, W]` pad dim 0, planar `[C, H, W]` pads
     /// dim 1 and makes each plane `row_stride * H` bytes.
     pub(crate) layout: Option<tensor::PixelLayout>,
+    /// The tensor object the map came from, kept alive while the map is: a
+    /// decoded frame's buffer stays leased until then. After `mapped`, so it
+    /// is released after the mapping.
+    pub(crate) _owner: Option<Py<PyAny>>,
 }
 
 unsafe impl Send for PyTensorMap {}
@@ -3035,6 +3056,7 @@ impl PyTensorMap {
             map.unmap();
             self.mapped = None;
         }
+        self._owner = None;
     }
 
     fn __repr__(&self) -> String {
@@ -3174,6 +3196,7 @@ impl PyTensorMap {
 
     fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
         self.mapped = None; // Release the mapped buffer
+        self._owner = None;
     }
 
     /// Zero-copy NumPy array over the mapped buffer, honouring DMA row
