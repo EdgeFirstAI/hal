@@ -10,8 +10,8 @@
 //! `union = (area_j + area_i) − inter`, overlap when `inter > iou · union`, every step rounded
 //! and none fused, so each decision equals the scalar one on every input, NaN, infinite and
 //! zero-area boxes included. [`nms_greedy_neon`] and [`jaccard4_neon`] use only ARMv8.0 Advanced
-//! SIMD instructions; [`nms_greedy_neon_fp16`] runs the same test in FP16, eight boxes per
-//! vector, for boxes already rounded to f16.
+//! SIMD instructions; [`nms_greedy_neon_fp16`] runs the test in FP16 on centre and size, eight
+//! boxes per vector.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -20,7 +20,7 @@ use std::arch::aarch64::*; // NOSONAR
 use half::f16;
 
 use super::fp16_asm::{
-    fadd_f16x8, fcmgt_f16x8, fmaxnm_f16x8, fminnm_f16x8, fmul_f16x8, fsub_f16x8,
+    fabd_f16x8, fadd_f16x8, fcmgt_f16x8, fmax_f16x8, fmin_f16x8, fmul_f16x8, fsub_f16x8,
 };
 
 /// Boxes per vector.
@@ -237,49 +237,55 @@ unsafe fn load_f16x8(p: *const f16) -> uint16x8_t {
     unsafe { vld1q_u16(p.cast::<u16>()) }
 }
 
-/// Greedy NMS with every overlap test in FP16, eight boxes per vector: in index order, each box
-/// `i` not flagged in `dead` flags every later box `j` with
-/// `inter > iou · (area_j + area_i − inter)`, stopping once `cap` boxes have survived. On return
-/// `dead[j] != 0` marks the boxes flagged before the call and those suppressed.
+/// Greedy NMS with every overlap test in FP16, eight boxes per vector, over boxes given as
+/// `[cx, cy, w, h]` (centre and size): in index order, each box `i` not flagged in `dead` flags
+/// every later box `j` with `inter > iou · (area_j + area_i − inter)`, stopping once `cap`
+/// boxes have survived. On return `dead[j] != 0` marks the boxes flagged before the call and
+/// those suppressed.
 ///
-/// Each step is rounded to f16, so a pair within about 2⁻⁹ of the threshold may be decided
-/// differently than [`nms_greedy_neon`] decides it. Coordinates must be scaled so that areas
-/// and their sums stay finite in f16 (edges of at most 128 do); a NaN coordinate never
-/// suppresses and is never suppressed.
+/// The overlap along an axis is `max(min(w_j/2 + w_i/2 − |c_j − c_i|, w_j, w_i), 0)`, which
+/// keeps a box's extent at f16 relative precision wherever its centre lies. Each step is
+/// rounded to f16, so a pair within about 2⁻⁹ of the threshold may be decided differently than
+/// [`nms_greedy_neon`] decides it. Sizes must be scaled so that areas and their sums stay finite
+/// and normal in f16; a box with a NaN field never suppresses and is never suppressed.
 ///
-/// The coordinate slices, `area` (scratch, overwritten) and `dead` must share one length, a
-/// multiple of [`LANES_FP16`]; padding boxes must be flagged dead. Returns `false` and writes
-/// nothing otherwise.
+/// The box slices and `dead` must share one length `n`, a multiple of [`LANES_FP16`], and
+/// `scratch` (overwritten) must hold `3 · n` values; padding boxes must be flagged dead.
+/// Returns `false` and writes nothing otherwise.
 ///
 /// # Safety
 /// The CPU must support FEAT_FP16.
 #[target_feature(enable = "neon")]
 pub unsafe fn nms_greedy_neon_fp16(
-    coords: [&[f16]; 4],
-    area: &mut [f16],
+    boxes: [&[f16]; 4],
+    scratch: &mut [f16],
     iou: f16,
     cap: usize,
     dead: &mut [u16],
 ) -> bool {
     const L: usize = LANES_FP16;
     let n = dead.len();
-    if !n.is_multiple_of(L) || coords.iter().any(|c| c.len() != n) || area.len() != n {
+    if !n.is_multiple_of(L) || boxes.iter().any(|c| c.len() != n) || scratch.len() != 3 * n {
         return false;
     }
-    let [xmin, ymin, xmax, ymax] = coords.map(<[f16]>::as_ptr);
-    let (area, d) = (area.as_mut_ptr(), dead.as_mut_ptr());
+    let [cx, cy, w, h] = boxes.map(<[f16]>::as_ptr);
+    let (ex, rest) = scratch.split_at_mut(n);
+    let (ey, area) = rest.split_at_mut(n);
+    let (ex, ey, area) = (ex.as_mut_ptr(), ey.as_mut_ptr(), area.as_mut_ptr());
+    let d = dead.as_mut_ptr();
     // SAFETY: every block `j..j + 8` lies below `n`, a multiple of eight and the length of
-    // every slice; the caller guarantees FEAT_FP16.
+    // every array; the caller guarantees FEAT_FP16.
     unsafe {
+        let half = vdupq_n_u16(f16::from_f32_const(0.5).to_bits());
         let mut j = 0;
         while j < n {
-            let a = fmul_f16x8(
-                fsub_f16x8(load_f16x8(xmax.add(j)), load_f16x8(xmin.add(j))),
-                fsub_f16x8(load_f16x8(ymax.add(j)), load_f16x8(ymin.add(j))),
-            );
-            vst1q_u16(area.add(j).cast::<u16>(), a);
+            let (bw, bh) = (load_f16x8(w.add(j)), load_f16x8(h.add(j)));
+            vst1q_u16(ex.add(j).cast::<u16>(), fmul_f16x8(bw, half));
+            vst1q_u16(ey.add(j).cast::<u16>(), fmul_f16x8(bh, half));
+            vst1q_u16(area.add(j).cast::<u16>(), fmul_f16x8(bw, bh));
             j += L;
         }
+        let (ex, ey, area) = (ex.cast_const(), ey.cast_const(), area.cast_const());
         let zero = vdupq_n_u16(0);
         let viou = vdupq_n_u16(iou.to_bits());
         let mut survivors = 0usize;
@@ -288,36 +294,43 @@ pub unsafe fn nms_greedy_neon_fp16(
                 continue;
             }
             let splat = |p: *const f16| vdupq_n_u16((*p.add(i)).to_bits());
-            let (rx0, ry0, rx1, ry1) = (splat(xmin), splat(ymin), splat(xmax), splat(ymax));
-            let rarea = splat(area);
+            let (rcx, rcy, rw, rh) = (splat(cx), splat(cy), splat(w), splat(h));
+            let (rex, rey, rarea) = (splat(ex), splat(ey), splat(area));
             // Four blocks advance one operation at a time: an in-order core then overlaps
             // their latency chains instead of running one block's chain to its end.
             let hit4 = |j: usize| {
                 let o = [j, j + L, j + 2 * L, j + 3 * L];
-                let right = o.map(|k| fminnm_f16x8(load_f16x8(xmax.add(k)), rx1));
-                let left = o.map(|k| fmaxnm_f16x8(load_f16x8(xmin.add(k)), rx0));
-                let bottom = o.map(|k| fminnm_f16x8(load_f16x8(ymax.add(k)), ry1));
-                let top = o.map(|k| fmaxnm_f16x8(load_f16x8(ymin.add(k)), ry0));
-                let w = [0, 1, 2, 3].map(|b| fsub_f16x8(right[b], left[b]));
-                let h = [0, 1, 2, 3].map(|b| fsub_f16x8(bottom[b], top[b]));
-                let w = w.map(|v| fmaxnm_f16x8(v, zero));
-                let h = h.map(|v| fmaxnm_f16x8(v, zero));
+                let b = [0, 1, 2, 3];
+                let dx = o.map(|k| fabd_f16x8(load_f16x8(cx.add(k)), rcx));
+                let dy = o.map(|k| fabd_f16x8(load_f16x8(cy.add(k)), rcy));
+                let sx = o.map(|k| fadd_f16x8(load_f16x8(ex.add(k)), rex));
+                let sy = o.map(|k| fadd_f16x8(load_f16x8(ey.add(k)), rey));
+                let px = b.map(|b| fsub_f16x8(sx[b], dx[b]));
+                let py = b.map(|b| fsub_f16x8(sy[b], dy[b]));
+                let px = b.map(|b| fmin_f16x8(px[b], load_f16x8(w.add(o[b]))));
+                let py = b.map(|b| fmin_f16x8(py[b], load_f16x8(h.add(o[b]))));
+                let px = px.map(|v| fmin_f16x8(v, rw));
+                let py = py.map(|v| fmin_f16x8(v, rh));
+                let px = px.map(|v| fmax_f16x8(v, zero));
+                let py = py.map(|v| fmax_f16x8(v, zero));
                 let sum = o.map(|k| fadd_f16x8(load_f16x8(area.add(k)), rarea));
-                let inter = [0, 1, 2, 3].map(|b| fmul_f16x8(w[b], h[b]));
-                let union = [0, 1, 2, 3].map(|b| fsub_f16x8(sum[b], inter[b]));
+                let inter = b.map(|b| fmul_f16x8(px[b], py[b]));
+                let union = b.map(|b| fsub_f16x8(sum[b], inter[b]));
                 let bound = union.map(|u| fmul_f16x8(viou, u));
-                [0, 1, 2, 3].map(|b| fcmgt_f16x8(inter[b], bound[b]))
+                b.map(|b| fcmgt_f16x8(inter[b], bound[b]))
             };
             let hit = |j: usize| {
-                let w = fsub_f16x8(
-                    fminnm_f16x8(load_f16x8(xmax.add(j)), rx1),
-                    fmaxnm_f16x8(load_f16x8(xmin.add(j)), rx0),
+                let px = fsub_f16x8(
+                    fadd_f16x8(load_f16x8(ex.add(j)), rex),
+                    fabd_f16x8(load_f16x8(cx.add(j)), rcx),
                 );
-                let h = fsub_f16x8(
-                    fminnm_f16x8(load_f16x8(ymax.add(j)), ry1),
-                    fmaxnm_f16x8(load_f16x8(ymin.add(j)), ry0),
+                let py = fsub_f16x8(
+                    fadd_f16x8(load_f16x8(ey.add(j)), rey),
+                    fabd_f16x8(load_f16x8(cy.add(j)), rcy),
                 );
-                let inter = fmul_f16x8(fmaxnm_f16x8(w, zero), fmaxnm_f16x8(h, zero));
+                let px = fmin_f16x8(fmin_f16x8(px, load_f16x8(w.add(j))), rw);
+                let py = fmin_f16x8(fmin_f16x8(py, load_f16x8(h.add(j))), rh);
+                let inter = fmul_f16x8(fmax_f16x8(px, zero), fmax_f16x8(py, zero));
                 let union = fsub_f16x8(fadd_f16x8(load_f16x8(area.add(j)), rarea), inter);
                 fcmgt_f16x8(inter, fmul_f16x8(viou, union))
             };

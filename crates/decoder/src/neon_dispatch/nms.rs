@@ -139,6 +139,10 @@ struct Overlap {
     f16_scale: Option<f32>,
 }
 
+/// The smallest scaled box side the FP16 tests take: its half and its areas stay normal in f16.
+#[cfg(target_arch = "aarch64")]
+const F16_MIN_SIDE: f32 = 1.0 / 64.0;
+
 /// Coordinate arrays and flags of one group of boxes, reused from group to group.
 #[cfg(target_arch = "aarch64")]
 #[derive(Default)]
@@ -152,7 +156,8 @@ struct Gathered {
 #[cfg(target_arch = "aarch64")]
 impl Gathered {
     /// Greedy NMS over the boxes `group` indexes, in that order, updating `dead`, with the
-    /// tests `overlap` describes.
+    /// tests `overlap` describes. A group holding a box with a side below [`F16_MIN_SIDE`]
+    /// after scaling (or an inverted one) takes the f32 tests.
     fn suppress<T>(
         &mut self,
         boxes: &[T],
@@ -161,58 +166,73 @@ impl Gathered {
         dead: &mut [bool],
         overlap: Overlap,
     ) -> bool {
+        use edgefirst_kernels::prim::neon_convert::narrow_f32_to_f16_neon;
+        use edgefirst_kernels::prim::neon_nms::{
+            nms_greedy_neon, nms_greedy_neon_fp16, LANES, LANES_FP16,
+        };
         let Overlap {
             iou,
             cap,
             f16_scale,
         } = overlap;
-        use edgefirst_kernels::prim::neon_convert::narrow_f32_to_f16_neon;
-        use edgefirst_kernels::prim::neon_nms::{
-            nms_greedy_neon, nms_greedy_neon_fp16, LANES, LANES_FP16,
-        };
         let m = group.len();
-        let lanes = if f16_scale.is_some() {
-            LANES_FP16
-        } else {
-            LANES
-        };
-        let np = m.next_multiple_of(lanes);
-        let scale = f16_scale.unwrap_or(1.0);
-        self.coords.clear();
-        self.coords.resize(4 * np, 0.0);
-        let (xmin, rest) = self.coords.split_at_mut(np);
-        let (ymin, rest) = rest.split_at_mut(np);
-        let (xmax, ymax) = rest.split_at_mut(np);
-        for (k, i) in group.clone().enumerate() {
-            let Some(r) = boxes.get(i).map(bbox) else {
-                return false;
-            };
-            xmin[k] = r.xmin * scale;
-            ymin[k] = r.ymin * scale;
-            xmax[k] = r.xmax * scale;
-            ymax[k] = r.ymax * scale;
-        }
         let is_dead = |k: usize, i: usize| k >= m || dead.get(i).copied().unwrap_or(true);
-        let ran = if f16_scale.is_some() {
-            self.half.clear();
-            self.half.resize(5 * np, half::f16::ZERO);
-            let (coords, area) = self.half.split_at_mut(4 * np);
-            self.half_flags.clear();
-            self.half_flags.resize(np, !0);
+        let mut fp16 = false;
+        if let Some(scale) = f16_scale {
+            let np = m.next_multiple_of(LANES_FP16);
+            self.coords.clear();
+            self.coords.resize(4 * np, 0.0);
+            let (cx, rest) = self.coords.split_at_mut(np);
+            let (cy, rest) = rest.split_at_mut(np);
+            let (w, h) = rest.split_at_mut(np);
+            fp16 = true;
             for (k, i) in group.clone().enumerate() {
-                self.half_flags[k] = if is_dead(k, i) { !0 } else { 0 };
+                let Some(r) = boxes.get(i).map(bbox) else {
+                    return false;
+                };
+                cx[k] = (r.xmin + r.xmax) * (0.5 * scale);
+                cy[k] = (r.ymin + r.ymax) * (0.5 * scale);
+                w[k] = (r.xmax - r.xmin) * scale;
+                h[k] = (r.ymax - r.ymin) * scale;
+                fp16 &= w[k] >= F16_MIN_SIDE && h[k] >= F16_MIN_SIDE;
             }
-            // SAFETY: NEON is part of the aarch64 baseline, and a scale is only given on a
-            // CPU with FEAT_FP16.
-            unsafe {
-                narrow_f32_to_f16_neon(&self.coords, coords);
-                let (x0, rest) = coords.split_at(np);
-                let (y0, rest) = rest.split_at(np);
-                let (x1, y1) = rest.split_at(np);
-                let iou = half::f16::from_f32(iou);
-                nms_greedy_neon_fp16([x0, y0, x1, y1], area, iou, cap, &mut self.half_flags)
+            if fp16 {
+                self.half.clear();
+                self.half.resize(7 * np, half::f16::ZERO);
+                let (fields, scratch) = self.half.split_at_mut(4 * np);
+                self.half_flags.clear();
+                self.half_flags.resize(np, !0);
+                for (k, i) in group.clone().enumerate() {
+                    self.half_flags[k] = if is_dead(k, i) { !0 } else { 0 };
+                }
+                // SAFETY: NEON is part of the aarch64 baseline, and a scale is only given on
+                // a CPU with FEAT_FP16.
+                let ran = unsafe {
+                    narrow_f32_to_f16_neon(&self.coords, fields);
+                    let (cx, rest) = fields.split_at(np);
+                    let (cy, rest) = rest.split_at(np);
+                    let (w, h) = rest.split_at(np);
+                    let iou = half::f16::from_f32(iou);
+                    nms_greedy_neon_fp16([cx, cy, w, h], scratch, iou, cap, &mut self.half_flags)
+                };
+                if !ran {
+                    return false;
+                }
             }
-        } else {
+        }
+        if !fp16 {
+            let np = m.next_multiple_of(LANES);
+            self.coords.clear();
+            self.coords.resize(4 * np, 0.0);
+            let (xmin, rest) = self.coords.split_at_mut(np);
+            let (ymin, rest) = rest.split_at_mut(np);
+            let (xmax, ymax) = rest.split_at_mut(np);
+            for (k, i) in group.clone().enumerate() {
+                let Some(r) = boxes.get(i).map(bbox) else {
+                    return false;
+                };
+                (xmin[k], ymin[k], xmax[k], ymax[k]) = (r.xmin, r.ymin, r.xmax, r.ymax);
+            }
             self.flags.clear();
             self.flags.resize(np, !0);
             for (k, i) in group.clone().enumerate() {
@@ -220,13 +240,12 @@ impl Gathered {
             }
             let coords = [&*xmin, &*ymin, &*xmax, &*ymax];
             // SAFETY: NEON is part of the aarch64 baseline.
-            unsafe { nms_greedy_neon(coords, None, iou, cap, &mut self.flags) }
-        };
-        if !ran {
-            return false;
+            if !unsafe { nms_greedy_neon(coords, None, iou, cap, &mut self.flags) } {
+                return false;
+            }
         }
         for (k, i) in group.enumerate() {
-            let flagged = if f16_scale.is_some() {
+            let flagged = if fp16 {
                 self.half_flags[k] != 0
             } else {
                 self.flags[k] != 0
@@ -294,8 +313,10 @@ fn single_pass_dead<T>(
 /// More than [`SMALL_NMS_BOXES`] boxes that are each dead or kept run class-aware NMS one label
 /// at a time (each label's pass stopping at `cap` survivors of its own), and with
 /// [`Isa::f16_nms`] and finite coordinates a pass over more than [`SMALL_NMS_BOXES`] boxes runs
-/// its overlap tests in FP16 on coordinates scaled by a power of two. A live box the caller does not keep (a NaN score) takes a survivor's
-/// place in the scalar scan, so those boxes run the one pass over every box instead.
+/// its overlap tests in FP16 on centres and sizes scaled by a power of two (a pass holding a box
+/// too thin for f16 areas keeps the f32 tests). A live box the caller does not keep (a NaN
+/// score) takes a survivor's place in the scalar scan, so those boxes run the one pass over
+/// every box instead.
 ///
 /// `None` when the caller runs its scalar loop: the scalar tier, fewer than [`NMS_MIN_BOXES`]
 /// boxes, or a label above `u32::MAX` in the one pass over every box.

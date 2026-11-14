@@ -320,6 +320,52 @@ fn f16_nms_agrees_with_f32_away_from_the_threshold() {
     }
 }
 
+/// FP16 overlap tests keep the extent of small boxes far from the origin: 65 copies of a box a
+/// quarter pixel wide at 640 leave one, as in f32, and boxes too thin for f16 areas take the
+/// f32 tests.
+#[test]
+fn f16_nms_keeps_small_boxes_far_from_the_origin() {
+    for (name, isa) in tiers() {
+        if !isa.fp16() {
+            continue;
+        }
+        for (w, h) in [(0.25, 8.0), (8.0, 0.25), (0.001, 8.0), (0.0, 8.0)] {
+            let boxes: Vec<DetectBox> = (0..65)
+                .map(|k| DetectBox {
+                    bbox: BoundingBox::new(
+                        640.0 - w / 2.0,
+                        640.0 - h / 2.0,
+                        640.0 + w / 2.0,
+                        640.0 + h / 2.0,
+                    ),
+                    score: 1.0 - k as f32 / 100.0,
+                    label: 0,
+                })
+                .collect();
+            for class_aware in [false, true] {
+                let run = |isa: Isa| {
+                    nms_dead(
+                        isa,
+                        &boxes,
+                        |b| &b.bbox,
+                        class_aware,
+                        |b| b.label,
+                        |_| false,
+                        |_| true,
+                        0.7,
+                        usize::MAX,
+                    )
+                };
+                let f32_dead = run(isa);
+                assert_eq!(run(isa.with_f16_nms()), f32_dead, "{name} {w}x{h}");
+                let kept = f32_dead.map(|d| d.iter().filter(|&&d| !d).count());
+                let want = if w > 0.0 { 1 } else { 65 };
+                assert_eq!(kept, Some(want), "{name} {w}x{h}");
+            }
+        }
+    }
+}
+
 /// A public NMS over fewer than `NMS_LOOKUP_MIN_BOXES` boxes runs scalar without resolving the
 /// tier, and from it on the tier; the kernel declines fewer than `NMS_MIN_BOXES` boxes.
 #[test]
