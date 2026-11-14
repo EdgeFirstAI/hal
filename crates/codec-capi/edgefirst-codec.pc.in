@@ -27,7 +27,7 @@ libdir=${exec_prefix}/lib
 includedir=${prefix}/include
 
 Name: edgefirst-codec
-Description: EdgeFirst image decode and encode
+Description: EdgeFirst image and video encode and decode
 Version: @VERSION@
 Requires: edgefirst-tensor
 Libs: -L${libdir} -ledgefirst_codec

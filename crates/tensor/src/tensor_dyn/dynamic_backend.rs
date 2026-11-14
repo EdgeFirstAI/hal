@@ -319,6 +319,17 @@ impl TensorDyn {
         }
     }
 
+    /// The handle, still owned by this value and valid while it lives.
+    ///
+    /// For lending the tensor to C code that does not keep it. A borrower
+    /// that keeps it takes its own reference with `ef_tensor_retain`; that
+    /// reference makes the handle shared, so writable CPU maps of it are
+    /// refused until it is released. Changing the tensor's shape or format
+    /// through the handle leaves this value's cached copies stale.
+    pub fn as_raw(&self) -> Raw {
+        self.handle.as_ptr()
+    }
+
     /// Give up ownership, yielding the handle itself. The caches are
     /// dropped: they are derived state that `from_raw` re-derives.
     pub fn into_raw(self) -> Raw {

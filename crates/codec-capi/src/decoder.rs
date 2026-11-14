@@ -50,8 +50,10 @@ pub unsafe extern "C" fn ef_image_decoder_free(d: *mut EfImageDecoder) {
 /// a smaller allocation is an error rather than a truncated image.
 ///
 /// @return 0 on success, `ENOSPC` when `dst` is too small, `EACCES` when the
-///         CPU decoder must write a `dst` not declared CPU-writable, otherwise
-///         an errno.
+///         CPU decoder must write a `dst` not declared CPU-writable,
+///         `EBADMSG` for data that is not a decodable image, `ENOTSUP` for a
+///         feature or destination format the decoder does not support,
+///         otherwise an errno, with the reason in `ef_codec_last_error`.
 ///
 /// # Safety
 /// `data` must be readable for `len` bytes; `dst` must be a live handle.
@@ -63,17 +65,16 @@ pub unsafe extern "C" fn ef_image_decoder_decode_into(
     dst: *mut EfTensor,
 ) -> c_int {
     unsafe {
-        catch_unwind(AssertUnwindSafe(|| {
+        crate::error::guard(|| {
             if d.is_null() || data.is_null() || len == 0 || dst.is_null() {
                 return libc::EINVAL;
             }
             let bytes = std::slice::from_raw_parts(data, len);
             match TensorDyn::with_raw(dst, |t| t.load_image(&mut (*d).inner, bytes)) {
                 Ok(_) => 0,
-                Err(e) => errno_for(&e),
+                Err(e) => crate::error::fail(&e),
             }
-        }))
-        .unwrap_or(libc::EINVAL)
+        })
     }
 }
 
@@ -90,7 +91,7 @@ pub unsafe extern "C" fn ef_image_decoder_decode_file_into(
     dst: *mut EfTensor,
 ) -> c_int {
     unsafe {
-        catch_unwind(AssertUnwindSafe(|| {
+        crate::error::guard(|| {
             if d.is_null() || path.is_null() {
                 return libc::EINVAL;
             }
@@ -102,25 +103,9 @@ pub unsafe extern "C" fn ef_image_decoder_decode_file_into(
             }
             match TensorDyn::with_raw(dst, |t| t.load_image_file(&mut (*d).inner, p)) {
                 Ok(_) => 0,
-                Err(e) => errno_for(&e),
+                Err(e) => crate::error::fail(&e),
             }
-        }))
-        .unwrap_or(libc::EINVAL)
-    }
-}
-
-/// Map a codec error to an errno.
-///
-/// `InsufficientCapacity` is `ENOSPC` specifically: a caller who sized the
-/// destination from a header can act on that, whereas a generic EIO tells them
-/// nothing about what to do next.
-fn errno_for(e: &edgefirst_codec::CodecError) -> c_int {
-    if e.cpu_access_denied().is_some() {
-        return libc::EACCES;
-    }
-    match e {
-        edgefirst_codec::CodecError::InsufficientCapacity { .. } => libc::ENOSPC,
-        _ => libc::EIO,
+        })
     }
 }
 
@@ -145,6 +130,32 @@ pub extern "C" fn ef_codec_nvjpeg_available() -> c_int {
     catch_unwind(|| i32::from(edgefirst_codec::nvjpeg_available())).unwrap_or(0)
 }
 
+/// Selects the engine that decodes JPEG, an `ef_codec_engine`:
+/// `EF_CODEC_ENGINE_AUTO` (nvJPEG, V4L2, then the CPU, where present), or
+/// one engine used alone (`EF_CODEC_ENGINE_CPU`, `EF_CODEC_ENGINE_V4L2`,
+/// `EF_CODEC_ENGINE_NVJPEG`). PNG is decoded on the CPU under `AUTO` and
+/// `CPU` only.
+///
+/// @return 0, or `EINVAL`.
+///
+/// # Safety
+/// `d` must be a live decoder.
+#[no_mangle]
+pub unsafe extern "C" fn ef_image_decoder_set_engine(d: *mut EfImageDecoder, engine: u32) -> c_int {
+    crate::error::guard(|| {
+        let Some(d) = (unsafe { d.as_mut() }) else {
+            return crate::error::invalid("the decoder is NULL");
+        };
+        match crate::engine::engine_arg(engine) {
+            Ok(engine) => {
+                d.inner.set_engine(engine);
+                0
+            }
+            Err(rc) => rc,
+        }
+    })
+}
+
 /// Select the software JPEG IDCT kernel. `0` = accurate, `1` = fast.
 ///
 /// # Safety
@@ -155,7 +166,7 @@ pub unsafe extern "C" fn ef_image_decoder_set_dct_method(
     method: u32,
 ) -> c_int {
     unsafe {
-        catch_unwind(AssertUnwindSafe(|| {
+        crate::error::guard(|| {
             if d.is_null() {
                 return libc::EINVAL;
             }
@@ -166,8 +177,7 @@ pub unsafe extern "C" fn ef_image_decoder_set_dct_method(
             };
             (*d).inner.set_dct_method(m);
             0
-        }))
-        .unwrap_or(libc::EINVAL)
+        })
     }
 }
 
@@ -181,7 +191,7 @@ pub unsafe extern "C" fn ef_image_decoder_set_output_format(
     format: *const c_char,
 ) -> c_int {
     unsafe {
-        catch_unwind(AssertUnwindSafe(|| {
+        crate::error::guard(|| {
             if d.is_null() {
                 return libc::EINVAL;
             }
@@ -197,8 +207,7 @@ pub unsafe extern "C" fn ef_image_decoder_set_output_format(
             };
             (*d).inner.set_output_format(Some(fmt));
             0
-        }))
-        .unwrap_or(libc::EINVAL)
+        })
     }
 }
 
@@ -209,14 +218,13 @@ pub unsafe extern "C" fn ef_image_decoder_set_output_format(
 #[no_mangle]
 pub unsafe extern "C" fn ef_image_decoder_reset_output_format(d: *mut EfImageDecoder) -> c_int {
     unsafe {
-        catch_unwind(AssertUnwindSafe(|| {
+        crate::error::guard(|| {
             if d.is_null() {
                 return libc::EINVAL;
             }
             (*d).inner.set_output_format(None);
             0
-        }))
-        .unwrap_or(libc::EINVAL)
+        })
     }
 }
 
@@ -242,7 +250,7 @@ pub unsafe extern "C" fn ef_codec_colorimetry_from_v4l2(
     out: *mut u32,
 ) -> c_int {
     unsafe {
-        catch_unwind(AssertUnwindSafe(|| {
+        crate::error::guard(|| {
             if out.is_null() {
                 return libc::EINVAL;
             }
@@ -255,8 +263,7 @@ pub unsafe extern "C" fn ef_codec_colorimetry_from_v4l2(
             )
             .pack();
             0
-        }))
-        .unwrap_or(libc::EINVAL)
+        })
     }
 }
 
@@ -276,7 +283,7 @@ pub unsafe extern "C" fn ef_codec_save_jpeg(
     quality: c_int,
 ) -> c_int {
     unsafe {
-        catch_unwind(AssertUnwindSafe(|| {
+        crate::error::guard(|| {
             if t.is_null() || path.is_null() {
                 return libc::EINVAL;
             }
@@ -292,8 +299,7 @@ pub unsafe extern "C" fn ef_codec_save_jpeg(
                 Ok(()) => 0,
                 Err(e) => e,
             }
-        }))
-        .unwrap_or(libc::EINVAL)
+        })
     }
 }
 
