@@ -33,20 +33,21 @@ pub(crate) enum Role {
     MaskCoefficients,
     Protos,
     Segmentation,
-    Mask,
 }
 
 impl Role {
-    pub(crate) fn of(output: &ConfigOutput) -> Self {
+    /// The role `output` is decoded as, or `None` for a `masks` output,
+    /// which no decode function reads.
+    pub(crate) fn of(output: &ConfigOutput) -> Option<Self> {
         match output {
-            ConfigOutput::Detection(_) => Role::Detection,
-            ConfigOutput::Boxes(_) => Role::Boxes,
-            ConfigOutput::Scores(_) => Role::Scores,
-            ConfigOutput::Classes(_) => Role::Classes,
-            ConfigOutput::MaskCoefficients(_) => Role::MaskCoefficients,
-            ConfigOutput::Protos(_) => Role::Protos,
-            ConfigOutput::Segmentation(_) => Role::Segmentation,
-            ConfigOutput::Mask(_) => Role::Mask,
+            ConfigOutput::Detection(_) => Some(Role::Detection),
+            ConfigOutput::Boxes(_) => Some(Role::Boxes),
+            ConfigOutput::Scores(_) => Some(Role::Scores),
+            ConfigOutput::Classes(_) => Some(Role::Classes),
+            ConfigOutput::MaskCoefficients(_) => Some(Role::MaskCoefficients),
+            ConfigOutput::Protos(_) => Some(Role::Protos),
+            ConfigOutput::Segmentation(_) => Some(Role::Segmentation),
+            ConfigOutput::Mask(_) => None,
         }
     }
 
@@ -59,7 +60,6 @@ impl Role {
             Role::MaskCoefficients => "mask_coefs",
             Role::Protos => "protos",
             Role::Segmentation => "segmentation",
-            Role::Mask => "mask",
         }
     }
 }
@@ -75,12 +75,12 @@ pub(crate) struct ConfiguredOutput {
 }
 
 impl ConfiguredOutput {
-    /// A decoded output of a configuration that names none.
+    /// An output of a configuration that names none.
     pub(crate) fn unnamed(output: &ConfigOutput) -> Self {
         Self {
             name: None,
             shape: output.shape().to_vec(),
-            role: Some(Role::of(output)),
+            role: Role::of(output),
         }
     }
 }
@@ -165,28 +165,36 @@ impl OutputBinding {
         outputs: &[&'a TensorDyn],
     ) -> Result<Vec<&'a TensorDyn>, DecoderError> {
         let mut taken = vec![false; outputs.len()];
-        let mut bound = Vec::with_capacity(self.slots.len());
+        // Names are settled for every output before any falls back to shape
+        // or position, so a fallback never takes a tensor another output
+        // names.
+        let mut bound: Vec<Option<usize>> = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
-            let index = self.select(slot, outputs, &taken)?;
-            taken[index] = true;
-            bound.push(outputs[index]);
+            let index = slot.named(outputs, &taken);
+            if let Some(index) = index {
+                taken[index] = true;
+            }
+            bound.push(index);
         }
-        Ok(bound)
+        for (slot, index) in self.slots.iter().zip(&mut bound) {
+            if index.is_none() {
+                let found = self.unnamed(slot, outputs, &taken)?;
+                taken[found] = true;
+                *index = Some(found);
+            }
+        }
+        Ok(bound.into_iter().flatten().map(|i| outputs[i]).collect())
     }
 
-    fn select(
+    /// The tensor for `slot` among those no output names: the only one of
+    /// its shape, else the one at its configured position.
+    fn unnamed(
         &self,
         slot: &Slot,
         outputs: &[&TensorDyn],
         taken: &[bool],
     ) -> Result<usize, DecoderError> {
-        let fits = |index: usize| !taken[index] && outputs[index].shape() == slot.shape;
-        if let Some(name) = &slot.name {
-            let named = (0..outputs.len()).find(|&i| fits(i) && outputs[i].name() == *name);
-            if let Some(index) = named {
-                return Ok(index);
-            }
-        }
+        let fits = |index: usize| slot.fits(outputs, taken, index);
         let mut candidates = (0..outputs.len()).filter(|&i| fits(i));
         match (candidates.next(), candidates.next()) {
             (Some(index), None) => Ok(index),
@@ -213,13 +221,29 @@ impl OutputBinding {
     }
 }
 
+impl Slot {
+    fn fits(&self, outputs: &[&TensorDyn], taken: &[bool], index: usize) -> bool {
+        !taken[index] && outputs[index].shape() == self.shape
+    }
+
+    /// The free tensor of this output's shape that carries its name.
+    fn named(&self, outputs: &[&TensorDyn], taken: &[bool]) -> Option<usize> {
+        let name = self.name.as_ref()?;
+        (0..outputs.len()).find(|&i| self.fits(outputs, taken, i) && outputs[i].name() == *name)
+    }
+}
+
 /// The order in which merged logical outputs, produced in schema order, are
 /// handed to the decode functions: by role, so that two of one shape are
-/// looked up as their roles and not as the schema happens to list them.
-/// `None` when the schema already lists them that way.
+/// looked up as their roles and not as the schema happens to list them. An
+/// output no function reads goes last, behind any decoded output of its
+/// shape. `None` when the schema already lists them that way.
 pub(crate) fn lookup_order(outputs: &[ConfigOutput]) -> Option<Vec<usize>> {
     let mut order: Vec<usize> = (0..outputs.len()).collect();
-    order.sort_by_key(|&index| Role::of(&outputs[index]));
+    order.sort_by_key(|&index| {
+        let role = Role::of(&outputs[index]);
+        (role.is_none(), role)
+    });
     let reordered = order.iter().enumerate().any(|(at, &index)| at != index);
     reordered.then_some(order)
 }
@@ -257,6 +281,38 @@ mod tests {
         assert_eq!(binding.slots.len(), 1);
         assert_eq!(binding.count, 2);
         assert_eq!(binding.slots[0].shared_with, "`aux`");
+    }
+
+    /// A `masks` output is read by no decode function, so it has no slot and
+    /// its tensor is never asked for.
+    #[test]
+    fn a_masks_output_has_no_slot() {
+        let shape = vec![1, 8, 8, 4];
+        let outputs = [
+            ConfiguredOutput::unnamed(&ConfigOutput::Segmentation(crate::configs::Segmentation {
+                shape: shape.clone(),
+                ..Default::default()
+            })),
+            ConfiguredOutput::unnamed(&ConfigOutput::Mask(crate::configs::Mask {
+                shape,
+                ..Default::default()
+            })),
+        ];
+        let binding = OutputBinding::new(&outputs).expect("shapes collide");
+        assert_eq!(binding.slots.len(), 1);
+        assert_eq!(binding.slots[0].role, Role::Segmentation);
+        assert_eq!(binding.count, 2);
+    }
+
+    /// Merged outputs are looked up first-fit, so an unread `masks` output
+    /// goes behind the segmentation whose shape it may share.
+    #[test]
+    fn an_unread_merged_output_is_ordered_last() {
+        let outputs = [
+            ConfigOutput::Mask(Default::default()),
+            ConfigOutput::Segmentation(Default::default()),
+        ];
+        assert_eq!(lookup_order(&outputs), Some(vec![1, 0]));
     }
 
     /// Two undecoded outputs of one shape concern no role.

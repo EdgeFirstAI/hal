@@ -2507,7 +2507,7 @@ fn configured_outputs(schema: &SchemaV2, legacy: &ConfigOutputs) -> Vec<Configur
             ConfiguredOutput {
                 name: logical.name.clone(),
                 shape: decoded.map_or_else(|| logical.shape.clone(), |o| o.shape().to_vec()),
-                role: decoded.map(binding::Role::of),
+                role: decoded.and_then(binding::Role::of),
             }
         })
         .collect()

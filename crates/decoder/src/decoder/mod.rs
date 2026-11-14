@@ -630,43 +630,35 @@ impl Decoder {
                 scores,
                 segmentation,
             } => {
-                self.decode_modelpack_det_quantized(
+                let detected = self.decode_modelpack_det_quantized(
                     outputs,
                     boxes,
                     scores,
                     multi_label,
                     output_boxes,
                 )?;
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+                self.decode_modelpack_seg_quantized(outputs, segmentation, &detected, output_masks)
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split_quantized(
+                let detected = self.decode_modelpack_det_split_quantized(
                     outputs,
                     detection,
                     multi_label,
                     output_boxes,
                 )?;
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+                self.decode_modelpack_seg_quantized(outputs, segmentation, &detected, output_masks)
             }
-            ModelType::ModelPackDet { boxes, scores } => self.decode_modelpack_det_quantized(
-                outputs,
-                boxes,
-                scores,
-                multi_label,
-                output_boxes,
-            ),
+            ModelType::ModelPackDet { boxes, scores } => self
+                .decode_modelpack_det_quantized(outputs, boxes, scores, multi_label, output_boxes)
+                .map(drop),
             ModelType::ModelPackDetSplit { detection } => self
-                .decode_modelpack_det_split_quantized(
-                    outputs,
-                    detection,
-                    multi_label,
-                    output_boxes,
-                ),
+                .decode_modelpack_det_split_quantized(outputs, detection, multi_label, output_boxes)
+                .map(drop),
             ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+                self.decode_modelpack_seg_quantized(outputs, segmentation, &[], output_masks)
             }
             ModelType::YoloDet { boxes } => {
                 self.decode_yolo_det_quantized(outputs, boxes, multi_label, output_boxes)
@@ -799,20 +791,26 @@ impl Decoder {
                 scores,
                 segmentation,
             } => {
-                self.decode_modelpack_det_float(outputs, boxes, scores, multi_label, output_boxes)?;
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                let detected = self.decode_modelpack_det_float(
+                    outputs,
+                    boxes,
+                    scores,
+                    multi_label,
+                    output_boxes,
+                )?;
+                self.decode_modelpack_seg_float(outputs, segmentation, &detected, output_masks)?;
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split_float(
+                let detected = self.decode_modelpack_det_split_float(
                     outputs,
                     detection,
                     multi_label,
                     output_boxes,
                 )?;
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                self.decode_modelpack_seg_float(outputs, segmentation, &detected, output_masks)?;
             }
             ModelType::ModelPackDet { boxes, scores } => {
                 self.decode_modelpack_det_float(outputs, boxes, scores, multi_label, output_boxes)?;
@@ -826,7 +824,7 @@ impl Decoder {
                 )?;
             }
             ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                self.decode_modelpack_seg_float(outputs, segmentation, &[], output_masks)?;
             }
             ModelType::YoloDet { boxes } => {
                 self.decode_yolo_det_float(outputs, boxes, multi_label, output_boxes)?;

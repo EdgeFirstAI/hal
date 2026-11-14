@@ -314,3 +314,219 @@ fn merged_outputs_of_one_shape_bind_in_schema_order() {
     let (xy, wh) = (quantized(&all[..2 * N]), quantized(&all[2 * N..]));
     assert_planted(decode(&decoder, &[&scores, &xy, &wh]).unwrap(), 4, 0.01);
 }
+
+/// A tensor that carries an output's name belongs to that output, whichever
+/// role is bound first: unnamed boxes passed after the named scores are not
+/// given the scores tensor for standing at the boxes' configured position.
+#[test]
+fn a_named_tensor_is_not_taken_by_position_for_another_output() {
+    let decoder = builder()
+        .with_config_json_str(named_schema())
+        .build()
+        .unwrap();
+    let boxes = tensor(None, &[1, 4, N], &boxes_data());
+    let scores = tensor(Some("model/scores"), &[1, 4, N], &scores_data(4));
+
+    assert_planted(decode(&decoder, &[&scores, &boxes]).unwrap(), 4, 1e-4);
+}
+
+/// ModelPack's `masks` head is not decoded, so a model whose other outputs
+/// share a shape still decodes without it.
+#[test]
+fn an_unread_masks_head_is_not_required() {
+    const SIDE: usize = 8;
+    let schema = format!(
+        r#"{{
+            "schema_version": 2,
+            "outputs": [
+                {{
+                    "name": "seg", "type": "segmentation", "decoder": "modelpack",
+                    "shape": [1, {SIDE}, {SIDE}, 4],
+                    "dshape": [{{"batch": 1}}, {{"height": {SIDE}}}, {{"width": {SIDE}}}, {{"num_classes": 4}}]
+                }},
+                {{
+                    "name": "aux",
+                    "shape": [1, {SIDE}, {SIDE}, 4]
+                }},
+                {{
+                    "name": "mask", "type": "masks", "decoder": "modelpack",
+                    "shape": [1, {SIDE}, {SIDE}],
+                    "dshape": [{{"batch": 1}}, {{"height": {SIDE}}}, {{"width": {SIDE}}}]
+                }}
+            ]
+        }}"#
+    );
+    let decoder = builder().with_config_json_str(schema).build().unwrap();
+    let seg = tensor(
+        Some("seg"),
+        &[1, SIDE, SIDE, 4],
+        &one_hot_rows(SIDE * SIDE, 4),
+    );
+
+    let (mut boxes, mut masks) = (Vec::<DetectBox>::new(), Vec::<Segmentation>::new());
+    decoder.decode(&[&seg], &mut boxes, &mut masks).unwrap();
+    assert_eq!(masks.len(), 1);
+}
+
+/// `rows` rows of `classes` values, row `r` scoring 1.0 for class
+/// `r % classes`.
+fn one_hot_rows(rows: usize, classes: usize) -> Vec<f32> {
+    let mut data = vec![0.0f32; rows * classes];
+    for r in 0..rows {
+        data[r * classes + r % classes] = 1.0;
+    }
+    data
+}
+
+/// `data` in `[0, 1]` as an `f32` tensor, or as `u8` at a scale of 1/255.
+fn unit_tensor(quantized: bool, shape: &[usize], data: &[f32]) -> TensorDyn {
+    if !quantized {
+        return tensor(None, shape, data);
+    }
+    let t = Tensor::<u8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+    for (q, v) in t.map().unwrap().as_mut_slice().iter_mut().zip(data) {
+        *q = (v * 255.0).round() as u8;
+    }
+    TensorDyn::U8(t)
+}
+
+fn mask_bytes(decoder: &edgefirst_decoder::Decoder, outputs: &[&TensorDyn]) -> Vec<u8> {
+    let (mut boxes, mut masks) = (Vec::<DetectBox>::new(), Vec::<Segmentation>::new());
+    decoder.decode(outputs, &mut boxes, &mut masks).unwrap();
+    assert_eq!(masks.len(), 1);
+    match &masks[0].segmentation {
+        TensorDyn::U8(t) => t.map().unwrap().as_slice().to_vec(),
+        other => panic!("mask is not u8: {other:?}"),
+    }
+}
+
+/// A ModelPack segmentation head shaped like the boxes (`[1, rows, 1, 4]`)
+/// is decoded from its own tensor, not from the boxes found first.
+#[test]
+fn modelpack_segmentation_shaped_like_the_boxes_reads_its_own_tensor() {
+    const ROWS: usize = 16;
+    for quantized in [false, true] {
+        let quantization = quantized.then_some(configs::QuantTuple(1.0 / 255.0, 0));
+        let boxes_config = ConfigOutput::Boxes(configs::Boxes {
+            decoder: DecoderType::ModelPack,
+            quantization,
+            shape: vec![1, ROWS, 1, 4],
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::NumBoxes, ROWS),
+                (DimName::Padding, 1),
+                (DimName::BoxCoords, 4),
+            ],
+            normalized: Some(true),
+        });
+        let scores_config = ConfigOutput::Scores(configs::Scores {
+            decoder: DecoderType::ModelPack,
+            quantization,
+            shape: vec![1, ROWS, 3],
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::NumBoxes, ROWS),
+                (DimName::NumClasses, 3),
+            ],
+        });
+        let segmentation_config = ConfigOutput::Segmentation(configs::Segmentation {
+            decoder: DecoderType::ModelPack,
+            quantization,
+            shape: vec![1, ROWS, 1, 4],
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, ROWS),
+                (DimName::Width, 1),
+                (DimName::NumClasses, 4),
+            ],
+        });
+        let segmentation_only = builder()
+            .add_output(segmentation_config.clone())
+            .build()
+            .unwrap();
+        let multitask = builder()
+            .add_output(boxes_config)
+            .add_output(scores_config)
+            .add_output(segmentation_config)
+            .build()
+            .unwrap();
+
+        let boxes = unit_tensor(quantized, &[1, ROWS, 1, 4], &[0.5f32; ROWS * 4]);
+        let scores = unit_tensor(quantized, &[1, ROWS, 3], &[0.0f32; ROWS * 3]);
+        let segmentation = unit_tensor(quantized, &[1, ROWS, 1, 4], &one_hot_rows(ROWS, 4));
+
+        let want = mask_bytes(&segmentation_only, &[&segmentation]);
+        assert_ne!(
+            want,
+            mask_bytes(&segmentation_only, &[&boxes]),
+            "quantized={quantized}: the boxes must not decode to the same mask"
+        );
+        assert_eq!(
+            mask_bytes(&multitask, &[&boxes, &scores, &segmentation]),
+            want,
+            "quantized={quantized}"
+        );
+    }
+}
+
+/// Two ModelPack detection heads of one shape are each decoded from their
+/// own tensor, with their own anchors, in the configured order.
+#[test]
+fn modelpack_detection_heads_of_one_shape_bind_in_configured_order() {
+    const GRID: usize = 4;
+    const FEATURES: usize = 7;
+    const ANCHORS: [f32; 2] = [0.1, 0.3];
+    for quantized in [false, true] {
+        let head = |anchor: f32| {
+            ConfigOutput::Detection(configs::Detection {
+                anchors: Some(vec![[anchor, anchor]]),
+                decoder: DecoderType::ModelPack,
+                quantization: quantized.then_some(configs::QuantTuple(0.2, 128)),
+                shape: vec![1, GRID, GRID, FEATURES],
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::Height, GRID),
+                    (DimName::Width, GRID),
+                    (DimName::NumAnchorsXFeatures, FEATURES),
+                ],
+                normalized: Some(true),
+            })
+        };
+        let decoder = builder()
+            .add_output(head(ANCHORS[0]))
+            .add_output(head(ANCHORS[1]))
+            .build()
+            .unwrap();
+
+        // Logits: -20 scores nothing, 0 is the anchor's own size, 10 is certain.
+        let logits = |values: &[f32]| {
+            let shape = [1, GRID, GRID, FEATURES];
+            if !quantized {
+                return tensor(None, &shape, values);
+            }
+            let t = Tensor::<u8>::new(&shape, Some(TensorMemory::Mem), None).unwrap();
+            for (q, v) in t.map().unwrap().as_mut_slice().iter_mut().zip(values) {
+                *q = (v / 0.2 + 128.0).round().clamp(0.0, 255.0) as u8;
+            }
+            TensorDyn::U8(t)
+        };
+        let empty = vec![-20.0f32; GRID * GRID * FEATURES];
+        let mut planted = empty.clone();
+        let cell = (GRID + 1) * FEATURES;
+        planted[cell..cell + 6].copy_from_slice(&[0.0, 0.0, 0.0, 0.0, 10.0, 10.0]);
+        let (empty, planted) = (logits(&empty), logits(&planted));
+
+        for (outputs, anchor) in [
+            ([&planted, &empty], ANCHORS[0]),
+            ([&empty, &planted], ANCHORS[1]),
+        ] {
+            let boxes = decode(&decoder, &outputs).unwrap();
+            assert_eq!(boxes.len(), 1, "quantized={quantized}: {boxes:?}");
+            let width = boxes[0].bbox.xmax - boxes[0].bbox.xmin;
+            assert!(
+                (width - anchor).abs() < 0.02,
+                "quantized={quantized}: width {width}, anchor {anchor}"
+            );
+        }
+    }
+}

@@ -305,11 +305,13 @@ The decode functions in `decoder/postprocess.rs` find each role's tensor by shap
 2. the only remaining tensor with the output's shape, else
 3. the tensor at the output's configured position, when the caller passed exactly as many tensors as the configuration lists.
 
-Anything else is an error that names the role, the shape and the outputs sharing it (`InvalidConfig`), or the role whose tensor is missing (`InvalidShape`). The decoder never guesses.
+Names are settled for every output before any output falls back to shape or position, so a fallback never takes a tensor that another output names. Anything else is an error that names the role, the shape and the outputs sharing it (`InvalidConfig`), or the role whose tensor is missing (`InvalidShape`). The decoder never guesses.
 
-The bound tensors are handed on in role order (`binding::Role`, declared in the order the decode functions look roles up: detection or boxes, scores, classes, mask coefficients, protos, segmentation). Every decode function that reads two roles reads them in that order, so each first-fit lookup lands on the bound tensor and the roughly 120 lookup sites stay as they are. A new decode function has to keep to that order.
+A `masks` output has no role: no decode function reads it, so its tensor is never asked for. It still counts among the configured outputs, for positions and for the shapes it shares.
 
-Schemas with physical children go through the merge program, which emits one logical tensor per decoded output in schema order; `binding::lookup_order` reorders those by role for the same reason. The children themselves are still bound by shape in schema order (`merge::find_and_dequantize`), and the per-scale subsystem binds its own.
+The bound tensors are handed on in role order (`binding::Role`, declared in the order the decode functions look roles up: detection or boxes, scores, classes, mask coefficients, protos, segmentation). Every decode function that reads two roles reads them in that order and skips the tensors already taken, so each first-fit lookup lands on the bound tensor and the roughly 120 lookup sites stay as they are. A new decode function has to keep to that order and pass on what it took: ModelPack detection and segmentation are separate functions, so the detection ones return the indices of their tensors for the segmentation lookup to skip, and `match_outputs_to_detect` gives detection heads of one shape successive tensors.
+
+Schemas with physical children go through the merge program, which emits one logical tensor per decoded output in schema order; `binding::lookup_order` reorders those by role for the same reason, with an unread `masks` output last. The children themselves are still bound by shape in schema order (`merge::find_and_dequantize`), and the per-scale subsystem binds its own.
 
 ### Quantization on output tensors
 
