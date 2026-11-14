@@ -318,17 +318,27 @@ pub(crate) fn padded_dma_pitch_for(
     }
 }
 
-/// Whether a G2D initialisation failure only says the host has no G2D: its
-/// library could not be opened. G2D ships with NXP i.MX BSPs alone, so that
-/// is the ordinary case on every other Linux host.
+/// Whether a G2D initialisation failure only says the host has no G2D: the
+/// loader found no file for its library. G2D ships with NXP i.MX BSPs alone,
+/// so that is the ordinary case on every other Linux host. A library that is
+/// installed and does not load, or that lacks a dependency, is a failure.
 #[cfg(target_os = "linux")]
 fn g2d_is_absent(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::G2D(g2d_sys::Error::LibraryError(
-            libloading::Error::DlOpen { .. } | libloading::Error::DlOpenUnknown
-        ))
-    )
+    match err {
+        Error::G2D(g2d_sys::Error::LibraryError(libloading::Error::DlOpen { source })) => {
+            library_not_found(g2d::G2D_LIBRARY, &source.to_string())
+        }
+        _ => false,
+    }
+}
+
+/// Whether the loader's `message` says it found no file for `library`
+/// itself. The loader names the file it could not open before a colon, so a
+/// missing dependency is reported under the dependency's name. A message in
+/// any other form is not taken as a missing library.
+#[cfg(target_os = "linux")]
+fn library_not_found(library: &str, message: &str) -> bool {
+    message.contains(&format!("{library}: ")) && message.ends_with("No such file or directory")
 }
 
 pub use cpu::CPUProcessor;
@@ -5667,15 +5677,30 @@ mod image_tests {
         }
     }
 
-    /// A host without the G2D library is told apart from a G2D that is
-    /// present and fails to start: only the second is worth a warning.
+    /// Only a loader that found no file for the G2D library says the host has
+    /// no G2D. A library that is installed and does not load, or that lacks
+    /// a dependency, is a G2D failure and worth a warning.
     #[test]
     #[cfg(target_os = "linux")]
-    fn a_missing_g2d_library_is_not_a_g2d_failure() {
-        let missing = unsafe { libloading::Library::new("libedgefirst-no-such-library.so.0") }
-            .expect_err("the library does not exist");
-        assert!(crate::g2d_is_absent(&Error::G2D(
-            g2d_sys::Error::LibraryError(missing)
+    fn only_a_g2d_library_that_was_not_found_counts_as_absent() {
+        let dlopen = |message: &std::ffi::CStr| {
+            Error::G2D(g2d_sys::Error::LibraryError(libloading::Error::DlOpen {
+                source: message.into(),
+            }))
+        };
+        assert!(crate::g2d_is_absent(&dlopen(
+            c"libg2d.so.2: cannot open shared object file: No such file or directory"
+        )));
+        for failure in [
+            c"libGAL.so: cannot open shared object file: No such file or directory",
+            c"/usr/lib/libg2d.so.2: invalid ELF header",
+            c"/usr/lib/libg2d.so.2: wrong ELF class: ELFCLASS32",
+            c"libg2d.so.2: cannot open shared object file: Permission denied",
+        ] {
+            assert!(!crate::g2d_is_absent(&dlopen(failure)), "{failure:?}");
+        }
+        assert!(!crate::g2d_is_absent(&Error::G2D(
+            g2d_sys::Error::LibraryError(libloading::Error::DlOpenUnknown)
         )));
         assert!(!crate::g2d_is_absent(&Error::G2D(g2d_sys::Error::IoError(
             std::io::Error::from_raw_os_error(libc::ENODEV)
@@ -5683,6 +5708,36 @@ mod image_tests {
         assert!(!crate::g2d_is_absent(&Error::G2D(
             g2d_sys::Error::InvalidFormat("XR24".to_string())
         )));
+    }
+
+    /// The host's loader names the file it could not find, and reports a
+    /// file it found and could not load differently.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_loader_tells_a_missing_library_from_a_broken_one() {
+        let message = |library: &std::ffi::OsStr| match unsafe { libloading::Library::new(library) }
+        {
+            Err(libloading::Error::DlOpen { source }) => source.to_string(),
+            other => panic!("expected dlopen to fail: {other:?}"),
+        };
+
+        let missing = "libedgefirst-no-such-library.so.0";
+        let reported = message(missing.as_ref());
+        assert!(crate::library_not_found(missing, &reported), "{reported}");
+        assert!(
+            !crate::library_not_found("libg2d.so.2", &reported),
+            "a message naming another library reads as G2D's: {reported}"
+        );
+
+        let broken =
+            std::env::temp_dir().join(format!("libedgefirst-broken-{}.so", std::process::id()));
+        std::fs::write(&broken, b"not a shared object").unwrap();
+        let reported = message(broken.as_os_str());
+        std::fs::remove_file(&broken).unwrap();
+        assert!(
+            !crate::library_not_found(broken.to_str().unwrap(), &reported),
+            "{reported}"
+        );
     }
 
     /// `padded_dma_pitch_for` must respect the caller's memory choice and
