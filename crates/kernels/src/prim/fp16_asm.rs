@@ -114,6 +114,16 @@ binary!(
     "fmax"
 );
 binary!(
+    /// `FMIN`: the lane minimum; a NaN lane gives NaN.
+    fmin_f16x8,
+    "fmin"
+);
+binary!(
+    /// `FABD`: `|a − b|`.
+    fabd_f16x8,
+    "fabd"
+);
+binary!(
     /// `FCMGT`: all ones where `a > b`.
     fcmgt_f16x8,
     "fcmgt"

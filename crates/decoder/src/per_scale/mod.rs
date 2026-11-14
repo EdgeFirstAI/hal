@@ -10,23 +10,51 @@ pub(crate) mod outputs;
 pub(crate) mod pipeline;
 pub(crate) mod plan;
 pub(crate) mod prefilter;
+pub(crate) mod score_lut;
 
 pub use helper::apply_schema_quant;
 
-/// Output element type chosen by the user at `DecoderBuilder::with_decode_dtype()`.
+/// Element type the per-scale pipeline decodes boxes and scores into, set with
+/// [`DecoderBuilder::with_decode_dtype`](crate::DecoderBuilder::with_decode_dtype).
 ///
-/// The whole post-merge pipeline (boxes, scores, mask coefs, protos) is
-/// emitted in this dtype. `F16` saves ~2× memory bandwidth at the cost of
-/// 10-bit mantissa precision — empirically safe for YOLO-family models.
+/// Mask coefficients and protos are always f32, the type the mask kernels take. Detections are
+/// reported in f32 either way: with `F16` the box and score values are f16-rounded (about a
+/// quarter pixel at 640 and 1e-4 in score).
+///
+/// A builder that is not given a dtype uses [`DecodeDtype::native`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeDtype {
-    /// 32-bit float output (default).
+    /// 32-bit float boxes and scores.
     #[default]
     F32,
-    /// 16-bit float output. Halves the memory bandwidth of the decode
-    /// pipeline; on aarch64 it also keeps the NEON FP16 kernels in their
-    /// native width instead of widening.
+    /// 16-bit float boxes and scores: half the memory bandwidth of the candidate filter, and on
+    /// a CPU with FP16 arithmetic the NMS overlap tests of large candidate sets run eight boxes
+    /// per vector instead of four.
     F16,
+}
+
+impl DecodeDtype {
+    /// The dtype a [`DecoderBuilder`](crate::DecoderBuilder) decodes in when none is set:
+    /// [`F16`](Self::F16) on a CPU with native FP16 arithmetic (AArch64 `fphp`/`asimdhp`, such
+    /// as the Cortex-A55, A76 and A78), [`F32`](Self::F32) on any other (the Cortex-A53, x86).
+    ///
+    /// The probe is the decoder's, so `EDGEFIRST_DECODER_FORCE_KERNEL=neon` (or `scalar`)
+    /// selects `F32` on an FP16 CPU.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use edgefirst_decoder::DecodeDtype;
+    ///
+    /// let dtype = DecodeDtype::native();
+    /// assert!(matches!(dtype, DecodeDtype::F16 | DecodeDtype::F32));
+    /// ```
+    pub fn native() -> Self {
+        match kernels::decoder_cpu_features() {
+            Ok(f) if f.fp16_usable() => Self::F16,
+            _ => Self::F32,
+        }
+    }
 }
 
 /// Activation function applied after dequantization on a logical output.
@@ -64,8 +92,6 @@ pub(crate) use plan::PerScalePlan;
 pub(crate) struct PerScaleDecoder {
     pub(crate) plan: PerScalePlan,
     pub(crate) buffers: DecodedOutputBuffers,
-    /// f32 storage the bridge widens f16 outputs into, reused frame to frame.
-    pub(crate) widen: outputs::WidenScratch,
 }
 
 impl PerScaleDecoder {
@@ -79,15 +105,7 @@ impl PerScaleDecoder {
             plan.num_mask_coefs,
             plan.proto_nhwc_shape.as_deref(),
         );
-        let widen = outputs::WidenScratch {
-            features: plan.cpu_features,
-            ..Default::default()
-        };
-        Self {
-            plan,
-            buffers,
-            widen,
-        }
+        Self { plan, buffers }
     }
 
     /// Decode one frame's worth of inputs.
@@ -102,16 +120,6 @@ impl PerScaleDecoder {
         score_threshold: Option<f32>,
     ) -> crate::DecoderResult<DecodedOutputsRef<'a>> {
         pipeline::run(&self.plan, &mut self.buffers, inputs, score_threshold)
-    }
-
-    /// [`Self::run`], also lending the scratch the bridge widens f16 outputs into.
-    pub(crate) fn run_with_widen<'a>(
-        &'a mut self,
-        inputs: &[&edgefirst_tensor::TensorDyn],
-        score_threshold: Option<f32>,
-    ) -> crate::DecoderResult<(DecodedOutputsRef<'a>, &'a mut outputs::WidenScratch)> {
-        let decoded = pipeline::run(&self.plan, &mut self.buffers, inputs, score_threshold)?;
-        Ok((decoded, &mut self.widen))
     }
 }
 
@@ -413,11 +421,6 @@ pub mod bench {
         pub fn new(name: &str) -> DecoderResult<Self> {
             decoder_cpu_features_from(Some(name)).map(Self)
         }
-    }
-
-    /// The bridge's f16 → f32 widen of one buffer on `tier`.
-    pub fn widen_f16(tier: &Tier, src: &[f16], dst: &mut [f32]) {
-        super::outputs::widen_f16_into(&tier.0, src, dst);
     }
 
     /// The prefilter's anchor selection over `[anchors, nc]` raw scores on `tier`.

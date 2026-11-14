@@ -566,6 +566,7 @@ pub(crate) fn nms_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
         false,
         |b| b.label,
         |b| b.score <= min_val,
+        |b| b.score > min_val,
         iou,
         cap,
     ) {
@@ -656,6 +657,7 @@ pub(crate) fn nms_extra_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, 
         false,
         |b| b.0.label,
         |b| b.0.score <= min_val,
+        |b| b.0.score > min_val,
         iou,
         cap,
     ) {
@@ -744,6 +746,7 @@ pub(crate) fn nms_class_aware_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + 
         true,
         |b| b.label,
         |b| b.score <= min_val,
+        |b| b.score > min_val,
         iou,
         cap,
     ) {
@@ -830,6 +833,7 @@ pub(crate) fn nms_extra_class_aware_int_on<
         true,
         |b| b.0.label,
         |b| b.0.score <= min_val,
+        |b| b.0.score > min_val,
         iou,
         cap,
     ) {

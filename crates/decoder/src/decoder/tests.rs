@@ -116,6 +116,26 @@ mod decoder_builder_tests {
         );
     }
 
+    /// The default decode dtype follows the decoder's tier: F16 only where FP16 arithmetic
+    /// may run, F32 for a forced baseline, scalar or unknown tier.
+    #[test]
+    fn native_decode_dtype_follows_the_fp16_tier() {
+        use crate::per_scale::kernels::{decoder_cpu_features_from, forced_for_test};
+        use crate::DecodeDtype;
+        for tier in ["scalar", "neon", "not-a-tier"] {
+            let dtype = forced_for_test::with(tier, DecodeDtype::native);
+            assert_eq!(dtype, DecodeDtype::F32, "{tier}");
+        }
+        let fp16 = decoder_cpu_features_from(Some("neon_fp16")).is_ok_and(|f| f.fp16_usable());
+        let dtype = forced_for_test::with("neon_fp16", DecodeDtype::native);
+        let want = if fp16 {
+            DecodeDtype::F16
+        } else {
+            DecodeDtype::F32
+        };
+        assert_eq!(dtype, want);
+    }
+
     #[test]
     fn decoder_with_per_scale_routes_through_new_path() {
         // Smoke test: build a per-scale decoder via the inline LTRB
@@ -259,16 +279,15 @@ mod decoder_builder_tests {
         );
     }
 
+    /// A builder holds no dtype until one is set, so the default is resolved at `build`.
     #[test]
-    fn builder_default_decode_dtype_is_f32() {
-        // Default decoder construction selects F32 outputs; this is
-        // observable indirectly via the per_scale plan's chosen
-        // dispatches, but the simplest sanity check is that
-        // `with_decode_dtype` is a no-op compared to leaving the field
-        // unset for an F32-default builder.
-        let b1 = DecoderBuilder::default();
-        let b2 = DecoderBuilder::default().with_decode_dtype(crate::DecodeDtype::F32);
-        assert_eq!(b1, b2);
+    fn builder_decode_dtype_is_unset_until_chosen() {
+        let unset = DecoderBuilder::default();
+        for dtype in [crate::DecodeDtype::F32, crate::DecodeDtype::F16] {
+            let set = DecoderBuilder::default().with_decode_dtype(dtype);
+            assert_ne!(unset, set);
+            assert_eq!(set, DecoderBuilder::default().with_decode_dtype(dtype));
+        }
     }
 
     #[test]
@@ -4996,12 +5015,11 @@ mod per_scale_prefilter_tests {
         threshold: f32,
         multi_label: bool,
     ) -> (usize, Vec<DetectBox>, Option<Vec<f32>>) {
-        let (decoded, widen) = decoder.run_with_widen(inputs, prefilter).unwrap();
+        let decoded = decoder.run(inputs, prefilter).unwrap();
         let anchors = decoded.total_anchors;
         let mut boxes = Vec::new();
         let proto = per_scale_to_proto_data(
             &decoded,
-            widen,
             &mut boxes,
             0.7,
             threshold,
@@ -5066,27 +5084,39 @@ mod per_scale_prefilter_tests {
         }
     }
 
-    /// f16 outputs widen into the decoder's scratch, which later frames
-    /// reuse without reallocating, and decode the same detections.
+    /// The decode dtype covers boxes and scores only: an f16 decoder's mask
+    /// coefficients and protos are the f32 decoder's, bit for bit.
     #[test]
-    fn f16_widen_reuses_the_decoder_scratch() {
+    fn f16_decode_keeps_mask_data_in_f32() {
         let json =
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F16)
-            .unwrap()
-            .unwrap();
-        let owned = inputs_for(&plan);
-        let inputs: Vec<&TensorDyn> = owned.iter().collect();
-        let mut decoder = PerScaleDecoder::new(plan);
-        let first = decode(&mut decoder, &inputs, Some(0.25), 0.25, false);
-        let protos = decoder.widen.protos.as_ptr();
-        let second = decode(&mut decoder, &inputs, Some(0.25), 0.25, false);
-        assert_eq!(decoder.widen.protos.as_ptr(), protos);
-        assert_eq!(decoder.widen.protos.len(), 160 * 160 * 32);
-        assert!(!first.1.is_empty());
-        assert_eq!(first.1, second.1);
-        assert_eq!(first.2, second.2);
+        let mask_bits = |dtype: DecodeDtype| {
+            let plan = PerScalePlan::try_from_schema(&schema, dtype)
+                .unwrap()
+                .unwrap();
+            let owned = inputs_for(&plan);
+            let inputs: Vec<&TensorDyn> = owned.iter().collect();
+            let mut decoder = PerScaleDecoder::new(plan);
+            let out = decoder.run(&inputs, None).unwrap();
+            let is_f16 = matches!(out.boxes, crate::per_scale::outputs::BufferRef::F16(_))
+                && matches!(out.scores, crate::per_scale::outputs::BufferRef::F16(_));
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let mc = bits(out.mask_coefs.expect("mask coefficients"));
+            let protos = out.protos.expect("protos");
+            (
+                is_f16,
+                mc,
+                bits(protos.as_slice().expect("contiguous protos")),
+            )
+        };
+        let (f32_boxes_f16, f32_mc, f32_protos) = mask_bits(DecodeDtype::F32);
+        let (f16_boxes_f16, f16_mc, f16_protos) = mask_bits(DecodeDtype::F16);
+        assert!(!f32_boxes_f16 && f16_boxes_f16);
+        assert_eq!(f16_mc.len(), 8400 * 32);
+        assert_eq!(f16_protos.len(), 160 * 160 * 32);
+        assert!(f16_mc == f32_mc, "mask coefficients differ");
+        assert!(f16_protos == f32_protos, "protos differ");
     }
 
     /// Levels whose anchor count is not a whole number of packs, such as
@@ -5186,7 +5216,9 @@ mod per_scale_prefilter_tests {
                         [
                             buffer_bits(&out.boxes),
                             buffer_bits(&out.scores),
-                            out.mask_coefs.as_ref().map(buffer_bits).unwrap_or_default(),
+                            out.mask_coefs
+                                .map(|v| v.iter().map(|x| x.to_bits()).collect())
+                                .unwrap_or_default(),
                         ]
                     });
                     match &first {

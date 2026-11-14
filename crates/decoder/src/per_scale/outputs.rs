@@ -10,7 +10,6 @@
 //! the decoder.
 
 use super::kernels::dispatch::DstSliceMut;
-use super::kernels::CpuFeatures;
 use super::DecodeDtype;
 use half::f16;
 use ndarray::{Array4, ArrayView2, ArrayView4};
@@ -22,7 +21,8 @@ pub(crate) struct DecodedOutputBuffers {
     pub(crate) boxes: Buffer,
     pub(crate) scores: Buffer,
     pub(crate) mask_coefs: Option<Buffer>,
-    pub(crate) protos: Option<ProtoStorage>,
+    /// Protos, NHWC `[1, H_p, W_p, NM]`, always f32: the mask kernels take f32.
+    pub(crate) protos: Option<Array4<f32>>,
 
     /// Per-frame transpose scratch for NCHW children. Populated lazily
     /// by `pipeline::run` when at least one level is declared NCHW
@@ -44,6 +44,10 @@ pub(crate) struct DecodedOutputBuffers {
     /// Per-level exp tables for the 8-bit DFL box kernels, built on the
     /// first frame and rebuilt when a level's box scale changes.
     pub(crate) dfl_tables: Vec<edgefirst_kernels::prim::dfl_lut::DflExpTable>,
+
+    /// Per-level decoded-score tables for 8-bit score tensors, built on the
+    /// first frame and rebuilt when a level's score quantization changes.
+    pub(crate) score_tables: Vec<super::score_lut::ScoreTable>,
 
     /// The dense parallel path's pieces and the thread count they were cut
     /// for, rebuilt when the count changes.
@@ -125,14 +129,6 @@ pub(crate) enum Buffer {
     F16(Vec<f16>),
 }
 
-/// Dtype-tagged owned proto storage. Layout NHWC `[1, H_p, W_p, NM]`.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) enum ProtoStorage {
-    F32(Array4<f32>),
-    F16(Array4<f16>),
-}
-
 impl DecodedOutputBuffers {
     /// Allocate buffers sized for the plan.
     #[allow(dead_code)] // Wired by Task 21.
@@ -147,16 +143,8 @@ impl DecodedOutputBuffers {
             DecodeDtype::F32 => Buffer::F32(vec![0.0; n]),
             DecodeDtype::F16 => Buffer::F16(vec![f16::ZERO; n]),
         };
-        let alloc_proto = |s: &[usize]| -> Option<ProtoStorage> {
-            if s.len() != 4 {
-                return None;
-            }
-            Some(match out_dtype {
-                DecodeDtype::F32 => ProtoStorage::F32(Array4::zeros((s[0], s[1], s[2], s[3]))),
-                DecodeDtype::F16 => {
-                    ProtoStorage::F16(Array4::from_elem((s[0], s[1], s[2], s[3]), f16::ZERO))
-                }
-            })
+        let alloc_proto = |s: &[usize]| -> Option<Array4<f32>> {
+            (s.len() == 4).then(|| Array4::zeros((s[0], s[1], s[2], s[3])))
         };
         // The prefilter writes whole packs, so its last level can run up
         // to one pack, less an anchor, past the kept count.
@@ -164,11 +152,13 @@ impl DecodedOutputBuffers {
         Self {
             boxes: alloc_buf(4 * capacity),
             scores: alloc_buf(num_classes * capacity),
-            mask_coefs: (num_mask_coefs > 0).then(|| alloc_buf(num_mask_coefs * capacity)),
+            mask_coefs: (num_mask_coefs > 0)
+                .then(|| Buffer::F32(vec![0.0; num_mask_coefs * capacity])),
             protos: proto_shape.and_then(alloc_proto),
             layout_scratch: LayoutScratch::default(),
             prefilter: Vec::new(),
             dfl_tables: Vec::new(),
+            score_tables: Vec::new(),
             pieces: (0, Vec::new()),
         }
     }
@@ -230,10 +220,7 @@ impl DecodedOutputBuffers {
 
     #[allow(dead_code)]
     pub(crate) fn protos_dst(&mut self) -> Option<DstSliceMut<'_>> {
-        match self.protos.as_mut()? {
-            ProtoStorage::F32(a) => a.as_slice_mut().map(DstSliceMut::F32),
-            ProtoStorage::F16(a) => a.as_slice_mut().map(DstSliceMut::F16),
-        }
+        self.protos.as_mut()?.as_slice_mut().map(DstSliceMut::F32)
     }
 
     /// Snapshot the pre-NMS buffers as owned f32 ndarrays.
@@ -264,10 +251,7 @@ impl DecodedOutputBuffers {
             .mask_coefs
             .as_ref()
             .map(|b| widen(b, total_anchors, num_mc));
-        let protos = self.protos.as_ref().map(|p| match p {
-            ProtoStorage::F32(arr) => arr.clone(),
-            ProtoStorage::F16(arr) => arr.mapv(|h| h.to_f32()),
-        });
+        let protos = self.protos.clone();
         crate::per_scale::PreNmsCapture {
             boxes_xywh,
             scores,
@@ -332,98 +316,16 @@ pub(crate) fn mask_coefs_level_slice_of(
     }
 }
 
-#[cfg(any())]
-mod _doc_only {
-    //! marker so the impl block above doesn't accidentally close prematurely.
-
-    /// Snapshot the pre-NMS buffers as owned f32 ndarrays.
-    ///
-    /// Used by [`crate::Decoder::_testing_run_per_scale_pre_nms`].
-    /// Widens f16 buffers to f32 if the decoder was built with
-    /// [`crate::per_scale::DecodeDtype::F16`].
-    #[doc(hidden)]
-    pub(crate) fn snapshot_owned_f32(
-        &self,
-        total_anchors: usize,
-        num_classes: usize,
-        num_mc: usize,
-    ) -> crate::per_scale::PreNmsCapture {
-        let widen = |buf: &Buffer, n: usize, k: usize| -> ndarray::Array2<f32> {
-            match buf {
-                Buffer::F32(v) => ndarray::Array2::from_shape_vec((n, k), v[..n * k].to_vec())
-                    .expect("f32 reshape"),
-                Buffer::F16(v) => {
-                    let widened: Vec<f32> = v[..n * k].iter().map(|h| h.to_f32()).collect();
-                    ndarray::Array2::from_shape_vec((n, k), widened).expect("f16 reshape")
-                }
-            }
-        };
-        let boxes_xywh = widen(&self.boxes, total_anchors, 4);
-        let scores = widen(&self.scores, total_anchors, num_classes);
-        let mask_coefs = self
-            .mask_coefs
-            .as_ref()
-            .map(|b| widen(b, total_anchors, num_mc));
-        let protos = self.protos.as_ref().map(|p| match p {
-            ProtoStorage::F32(arr) => arr.clone(),
-            ProtoStorage::F16(arr) => arr.mapv(|h| h.to_f32()),
-        });
-        crate::per_scale::PreNmsCapture {
-            boxes_xywh,
-            scores,
-            mask_coefs,
-            protos,
-        }
-    }
-}
-
-/// Reused f32 storage for widening f16 per-scale outputs for the f32 NMS
-/// and mask kernels, and the tier to widen on.
-#[derive(Debug, Default)]
-pub(crate) struct WidenScratch {
-    pub(crate) features: CpuFeatures,
-    pub(crate) boxes: Vec<f32>,
-    pub(crate) scores: Vec<f32>,
-    pub(crate) mask_coefs: Vec<f32>,
-    pub(crate) protos: Vec<f32>,
-}
-
-/// `v` cut or grown to `n` elements; only grown elements are written.
-pub(crate) fn staging(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
-    if v.len() < n {
-        v.resize(n, 0.0);
-    } else {
-        v.truncate(n);
-    }
-    v.as_mut_slice()
-}
-
-/// `f16::to_f32` of every element of `src` into `dst` (the shorter length).
-pub(crate) fn widen_f16_into(features: &CpuFeatures, src: &[f16], dst: &mut [f32]) {
-    #[cfg(target_arch = "aarch64")]
-    if features.neon_baseline {
-        let n = src.len().min(dst.len());
-        if let (Some(s), Some(d)) = (src.get(..n), dst.get_mut(..n)) {
-            // SAFETY: NEON is part of the aarch64 baseline; the lengths are equal.
-            unsafe { edgefirst_kernels::prim::neon_convert::widen_f16_to_f32_neon(s, d) };
-        }
-        return;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = features;
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d = s.to_f32();
-    }
-}
-
 /// Zero-copy view returned to the caller; borrows from the decoder's buffers.
 #[derive(Debug)]
 #[allow(dead_code)] // Consumed by Task 24's decoder integration.
 pub(crate) struct DecodedOutputsRef<'a> {
     pub(crate) boxes: BufferRef<'a>,
     pub(crate) scores: BufferRef<'a>,
-    pub(crate) mask_coefs: Option<BufferRef<'a>>,
-    pub(crate) protos: Option<ProtosView<'a>>,
+    /// Mask coefficients `[N, NM]`, always f32.
+    pub(crate) mask_coefs: Option<&'a [f32]>,
+    /// Protos `[1, H_p, W_p, NM]`, always f32.
+    pub(crate) protos: Option<ArrayView4<'a, f32>>,
     /// Anchors held in `boxes` / `scores` / `mask_coefs`: every anchor of
     /// the plan, or only those the score prefilter kept.
     pub(crate) total_anchors: usize,
@@ -436,13 +338,6 @@ pub(crate) struct DecodedOutputsRef<'a> {
 pub(crate) enum BufferRef<'a> {
     F32(&'a [f32]),
     F16(&'a [f16]),
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) enum ProtosView<'a> {
-    F32(ArrayView4<'a, f32>),
-    F16(ArrayView4<'a, f16>),
 }
 
 impl<'a> BufferRef<'a> {
@@ -478,35 +373,6 @@ impl<'a> BufferRef<'a> {
 mod tests {
     use super::*;
 
-    /// The widen is `f16::to_f32` bit for bit on every tier, NaN payloads included, for
-    /// every f16 and a tail off a vector.
-    #[test]
-    fn widen_is_to_f32_on_every_tier() {
-        let mut src: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
-        src.extend((0..7).map(|i| f16::from_bits(0x7c01 + i)));
-        let want: Vec<u32> = src.iter().map(|v| v.to_f32().to_bits()).collect();
-        for tier in ["scalar", "neon", "neon_fp16", "neon_dotprod"] {
-            let Ok(f) = crate::per_scale::kernels::decoder_cpu_features_from(Some(tier)) else {
-                continue;
-            };
-            let mut dst = vec![0f32; src.len()];
-            widen_f16_into(&f, &src, &mut dst);
-            let got: Vec<u32> = dst.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(got, want, "{tier}");
-        }
-    }
-
-    /// Scratch storage is cut to the length asked for and keeps its allocation.
-    #[test]
-    fn widen_scratch_reuses_its_storage() {
-        let mut v = Vec::new();
-        assert_eq!(staging(&mut v, 100).len(), 100);
-        let p = v.as_ptr();
-        assert_eq!(staging(&mut v, 40).len(), 40);
-        assert_eq!(staging(&mut v, 100).len(), 100);
-        assert_eq!(v.as_ptr(), p);
-    }
-
     #[test]
     fn buffers_alloc_f32_correct_sizes() {
         let b = DecodedOutputBuffers::new(DecodeDtype::F32, 8400, 80, 32, Some(&[1, 160, 160, 32]));
@@ -523,10 +389,7 @@ mod tests {
             Buffer::F32(v) => assert_eq!(v.len(), 32 * n),
             _ => panic!(),
         }
-        match b.protos.as_ref().unwrap() {
-            ProtoStorage::F32(a) => assert_eq!(a.shape(), &[1, 160, 160, 32]),
-            _ => panic!(),
-        }
+        assert_eq!(b.protos.as_ref().unwrap().shape(), &[1, 160, 160, 32]);
     }
 
     #[test]

@@ -19,26 +19,34 @@
 
 use crate::neon_dispatch::{
     column_argmax, column_hits, ge_indices_kernel, jaccard4_kernel, keep_unflagged, nms_dead,
-    nms_isa, row_arg_max, score_columns, Isa, Ran, PAR_MIN_SCORES, ROWS_PER_TASK,
+    nms_isa, row_arg_max, score_columns, sort_by_score_desc, widen, Isa, Ran, PAR_MIN_ROW_SCORES,
+    PAR_MIN_SCORES, ROWS_PER_TASK,
 };
 use crate::{BBoxTypeTrait, BoundingBox, DetectBox};
 use ndarray::{ArrayView1, ArrayView2};
 use num_traits::{AsPrimitive, Float};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-use rayon::slice::ParallelSliceMut;
 
-/// `f` over every `(index, score row, box row)`, keeping the `Some`s in row
-/// order, on the rayon pool when the score array is large.
-fn filter_rows<BOX, SCORE, T, F>(boxes: ArrayView2<BOX>, scores: ArrayView2<SCORE>, f: F) -> Vec<T>
+/// Score elements from which a row-major filter runs on the rayon pool on `isa`.
+fn par_min_scores(isa: Isa) -> usize {
+    if isa.is_scalar() {
+        PAR_MIN_SCORES
+    } else {
+        PAR_MIN_ROW_SCORES
+    }
+}
+
+/// `f` over every `(index, score row)`, keeping the `Some`s in row order, on the rayon pool
+/// when the score array is large.
+fn filter_map_rows<SCORE, T, F>(isa: Isa, scores: ArrayView2<SCORE>, f: F) -> Vec<T>
 where
-    BOX: Sync,
     SCORE: Sync,
     T: Send,
-    F: Fn(usize, ArrayView1<SCORE>, ArrayView1<BOX>) -> Option<T> + Sync + Send,
+    F: Fn(usize, ArrayView1<SCORE>) -> Option<T> + Sync + Send,
 {
     let (n, nc) = scores.dim();
-    let row = |i: usize| f(i, scores.row(i), boxes.row(i));
-    if n * nc < PAR_MIN_SCORES {
+    let row = |i: usize| f(i, scores.row(i));
+    if n * nc < par_min_scores(isa) {
         (0..n).filter_map(row).collect()
     } else {
         (0..n)
@@ -46,6 +54,37 @@ where
             .with_min_len(ROWS_PER_TASK)
             .filter_map(row)
             .collect()
+    }
+}
+
+/// `f` over every `(index, score row, box row)`, appending its candidates to one list in row
+/// order, on the rayon pool when the score array is large.
+fn filter_rows<BOX, SCORE, T, F>(
+    isa: Isa,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+    f: F,
+) -> Vec<T>
+where
+    BOX: Sync,
+    SCORE: Sync,
+    T: Send,
+    F: Fn(usize, ArrayView1<SCORE>, ArrayView1<BOX>, &mut Vec<T>) + Sync + Send,
+{
+    let (n, nc) = scores.dim();
+    let row = |mut out: Vec<T>, i: usize| {
+        f(i, scores.row(i), boxes.row(i), &mut out);
+        out
+    };
+    if n * nc < par_min_scores(isa) {
+        (0..n).fold(Vec::new(), row)
+    } else {
+        let parts: Vec<Vec<T>> = (0..n)
+            .into_par_iter()
+            .with_min_len(ROWS_PER_TASK)
+            .fold(Vec::new, row)
+            .collect();
+        parts.into_iter().flatten().collect()
     }
 }
 
@@ -106,12 +145,16 @@ pub(crate) fn argmax_candidates<
     boxes: ArrayView2<BOX>,
     scores: ArrayView2<SCORE>,
 ) -> Vec<(DetectBox, usize)> {
+    let flat_boxes = boxes.as_slice();
     let detect = |i: usize, score: SCORE, label: usize| {
-        let bbox = B::ndarray_to_xyxy_float(boxes.row(i));
+        let bbox = match flat_boxes.and_then(|b| b.get(4 * i..4 * i + 4)) {
+            Some(&[x, y, w, h]) => B::to_xyxy_float(&[widen(x), widen(y), widen(w), widen(h)]),
+            _ => B::ndarray_to_xyxy_float(boxes.row(i)),
+        };
         (
             DetectBox {
                 label,
-                score: score.as_(),
+                score: widen(score),
                 bbox: bbox.into(),
             },
             i,
@@ -124,7 +167,7 @@ pub(crate) fn argmax_candidates<
             .filter_map(|(i, c)| scores.get((i, c)).map(|&s| detect(i, s, c)))
             .collect();
     }
-    filter_rows(boxes, scores, |i, score, _| {
+    filter_map_rows(isa, scores, |i, score| {
         let (score_, label) = row_arg_max(isa, score);
         if score_ < threshold {
             return None;
@@ -186,6 +229,9 @@ pub fn postprocess_boxes_multilabel_index_float<
     multilabel_candidates::<B, _, _>(Isa::current_or_scalar(), threshold, boxes, scores)
 }
 
+/// Candidates the flat multi-label scan reserves room for at most, one per anchor.
+const MULTILABEL_RESERVE: usize = 1 << 13;
+
 /// [`postprocess_boxes_multilabel_index_float`] on `isa`.
 pub(crate) fn multilabel_candidates<
     B: BBoxTypeTrait,
@@ -226,47 +272,86 @@ pub(crate) fn multilabel_candidates<
             return out;
         }
     }
-    filter_rows(boxes, scores, |anchor_idx, score_row, bbox_row| {
-        let mut classes = Vec::new();
-        let row = score_row.as_slice();
-        let ran = row.map_or(Ran::Scalar, |r| {
-            ge_indices_kernel(isa, r, threshold, |c| classes.push(c))
-        });
-        if ran == Ran::Scalar {
-            classes.extend(
-                score_row
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &s)| s >= threshold)
-                    .map(|(c, _)| c),
-            );
-        }
-        if classes.is_empty() {
-            return None;
-        }
-        // Compute bbox once; clone into each per-class candidate.
-        let bbox = B::ndarray_to_xyxy_float(bbox_row);
-        let bbox: crate::BoundingBox = bbox.into();
-        Some(
-            classes
-                .into_iter()
-                .filter_map(|c| {
-                    let &s = score_row.get(c)?;
-                    Some((
+    // Row-major scores below the pool's size are one array to the kernel: its hits come out
+    // ordered by anchor, then class.
+    let (n, nc) = scores.dim();
+    if !isa.is_scalar() && nc > 0 && n * nc < PAR_MIN_ROW_SCORES {
+        if let Some(flat) = scores.as_slice() {
+            let mut out = Vec::with_capacity(n.min(MULTILABEL_RESERVE));
+            // Hits ascend, so the anchor advances by whole rows instead of a division per hit.
+            let (mut anchor, mut row_end) = (0usize, nc);
+            let mut current: Option<(usize, BoundingBox)> = None;
+            let flat_boxes = boxes.as_slice();
+            let ran = ge_indices_kernel(isa, flat, threshold, |at| {
+                while at >= row_end {
+                    anchor += 1;
+                    row_end += nc;
+                }
+                let label = at - (row_end - nc);
+                let bbox = match current {
+                    Some((a, bbox)) if a == anchor => bbox,
+                    _ => {
+                        let row = flat_boxes.and_then(|b| b.get(4 * anchor..4 * anchor + 4));
+                        let bbox = match row {
+                            Some(&[x, y, w, h]) => {
+                                B::to_xyxy_float(&[widen(x), widen(y), widen(w), widen(h)])
+                            }
+                            _ => B::ndarray_to_xyxy_float(boxes.row(anchor)),
+                        }
+                        .into();
+                        current = Some((anchor, bbox));
+                        bbox
+                    }
+                };
+                if let Some(&score) = flat.get(at) {
+                    out.push((
                         DetectBox {
-                            label: c,
-                            score: s.as_(),
+                            label,
+                            score: widen(score),
+                            bbox,
+                        },
+                        anchor,
+                    ));
+                }
+            });
+            if ran != Ran::Scalar {
+                return out;
+            }
+        }
+    }
+    filter_rows(
+        isa,
+        boxes,
+        scores,
+        |anchor_idx, score_row, bbox_row, out| {
+            // The bbox is computed once, for the first class that passes.
+            let mut bbox: Option<BoundingBox> = None;
+            let mut emit = |label: usize| {
+                if let Some(&score) = score_row.get(label) {
+                    let bbox =
+                        *bbox.get_or_insert_with(|| B::ndarray_to_xyxy_float(bbox_row).into());
+                    out.push((
+                        DetectBox {
+                            label,
+                            score: score.as_(),
                             bbox,
                         },
                         anchor_idx,
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        )
-    })
-    .into_iter()
-    .flatten()
-    .collect()
+                    ));
+                }
+            };
+            let ran = score_row.as_slice().map_or(Ran::Scalar, |r| {
+                ge_indices_kernel(isa, r, threshold, &mut emit)
+            });
+            if ran == Ran::Scalar {
+                for (label, &score) in score_row.iter().enumerate() {
+                    if score >= threshold {
+                        emit(label);
+                    }
+                }
+            }
+        },
+    )
 }
 
 /// [`postprocess_boxes_multilabel_index_float`] without anchor indices.
@@ -320,7 +405,7 @@ pub(crate) fn nms_float_on(
 ) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
-    boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
+    sort_by_score_desc(&mut boxes, |b| b.score);
 
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
@@ -342,6 +427,7 @@ pub(crate) fn nms_float_on(
         false,
         |b| b.label,
         |b| b.score < 0.0,
+        |b| b.score >= 0.0,
         iou,
         cap,
     ) {
@@ -409,7 +495,7 @@ pub(crate) fn nms_extra_float_on<E: Send + Sync>(
 ) -> Vec<(DetectBox, E)> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
-    boxes.par_sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+    sort_by_score_desc(&mut boxes, |b| b.0.score);
 
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
@@ -431,6 +517,7 @@ pub(crate) fn nms_extra_float_on<E: Send + Sync>(
         false,
         |b| b.0.label,
         |b| b.0.score < 0.0,
+        |b| b.0.score >= 0.0,
         iou,
         cap,
     ) {
@@ -516,7 +603,7 @@ pub(crate) fn nms_class_aware_float_on(
     max_det: Option<usize>,
     mut boxes: Vec<DetectBox>,
 ) -> Vec<DetectBox> {
-    boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
+    sort_by_score_desc(&mut boxes, |b| b.score);
 
     if iou >= 1.0 {
         return match max_det {
@@ -536,6 +623,7 @@ pub(crate) fn nms_class_aware_float_on(
         true,
         |b| b.label,
         |b| b.score < 0.0,
+        |b| b.score >= 0.0,
         iou,
         cap,
     ) {
@@ -592,7 +680,7 @@ pub(crate) fn nms_extra_class_aware_float_on<E: Send + Sync>(
     max_det: Option<usize>,
     mut boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
-    boxes.par_sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+    sort_by_score_desc(&mut boxes, |b| b.0.score);
 
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
@@ -614,6 +702,7 @@ pub(crate) fn nms_extra_class_aware_float_on<E: Send + Sync>(
         true,
         |b| b.0.label,
         |b| b.0.score < 0.0,
+        |b| b.0.score >= 0.0,
         iou,
         cap,
     ) {

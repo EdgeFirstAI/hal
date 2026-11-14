@@ -228,3 +228,191 @@ fn jaccard4_matches_the_scalar_test() {
         }
     }
 }
+
+fn h(x: f32) -> f16 {
+    f16::from_f32(x)
+}
+
+/// `[xmin, ymin, xmax, ymax]` as the FP16 kernel's `[cx, cy, w, h]`, each rounded to f16.
+fn centre_size(b: [f32; 4], scale: f32) -> [f16; 4] {
+    let v = [
+        (b[0] + b[2]) * 0.5,
+        (b[1] + b[3]) * 0.5,
+        b[2] - b[0],
+        b[3] - b[1],
+    ];
+    // Signalling NaNs are quieted: the model's f64 detour would quiet them.
+    v.map(|x| if x.is_nan() { f16::NAN } else { h(x * scale) })
+}
+
+/// The FP16 kernel's test, one rounded operation at a time: every `+`, `−` and `×` of two f16
+/// values is exact in f64, so rounding that result to f16 rounds the exact result once.
+fn jaccard_f16(a: [f16; 4], b: [f16; 4], iou: f16) -> bool {
+    let r = |x: f64| f16::from_f64(x).to_f64();
+    // `FMIN` and `FMAX` give NaN for a NaN operand, unlike `f64::min` and `f64::max`.
+    let nan = |x: f64, y: f64| x.is_nan() || y.is_nan();
+    let fmin = |x: f64, y: f64| if nan(x, y) { f64::NAN } else { x.min(y) };
+    let fmax = |x: f64, y: f64| if nan(x, y) { f64::NAN } else { x.max(y) };
+    let [a, b] = [a, b].map(|v| v.map(f16::to_f64));
+    let overlap = |k: usize| {
+        let reach = r(r(r(a[k + 2] * 0.5) + r(b[k + 2] * 0.5)) - r((a[k] - b[k]).abs()));
+        fmax(fmin(fmin(reach, a[k + 2]), b[k + 2]), 0.0)
+    };
+    let area = |v: [f64; 4]| r(v[2] * v[3]);
+    let inter = r(overlap(0) * overlap(1));
+    let union = r(r(area(a) + area(b)) - inter);
+    inter > r(iou.to_f64() * union)
+}
+
+/// Runs the FP16 kernel on `[cx, cy, w, h]` boxes padded to a multiple of eight, `pre_dead`
+/// boxes flagged.
+fn kernel_fp16(boxes: &[[f16; 4]], iou: f16, cap: usize, pre_dead: &[bool]) -> Vec<bool> {
+    let n = boxes.len();
+    let np = n.next_multiple_of(LANES_FP16);
+    let mut fields = vec![vec![f16::ZERO; np]; 4];
+    for (k, b) in boxes.iter().enumerate() {
+        for c in 0..4 {
+            fields[c][k] = b[c];
+        }
+    }
+    let mut scratch = vec![f16::ZERO; 3 * np];
+    let mut dead: Vec<u16> = (0..np)
+        .map(|k| if k >= n || pre_dead[k] { !0 } else { 0 })
+        .collect();
+    let c = [
+        &fields[0][..],
+        &fields[1][..],
+        &fields[2][..],
+        &fields[3][..],
+    ];
+    // SAFETY: the callers checked FEAT_FP16.
+    assert!(unsafe { nms_greedy_neon_fp16(c, &mut scratch, iou, cap, &mut dead) });
+    dead[..n].iter().map(|&d| d != 0).collect()
+}
+
+/// The FP16 kernel's flags equal a scalar greedy loop over the same rounded operations, for
+/// every tail up to 333 boxes, clustered, identical, zero-area, inverted, infinite and quiet-NaN
+/// boxes at scales from 1 to 64, six thresholds, four caps and pre-flagged boxes.
+#[test]
+fn fp16_greedy_matches_the_rounded_scalar_loop() {
+    if !std::arch::is_aarch64_feature_detected!("fp16") {
+        crate::test_support::report_skip(
+            "fp16_greedy_matches_the_rounded_scalar_loop needs FEAT_FP16",
+        );
+        return;
+    }
+    let mut rng = Rng(0x0123_4567_89ab_cdef);
+    let counts = [
+        0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 41, 64, 100, 257, 300, 333,
+    ];
+    let ious = [0.0, 0.3, 0.45, 0.5, 0.7, 0.999].map(h);
+    let mut cases = 0;
+    for &n in &counts {
+        for (specials, scale) in [(false, 1.0), (false, 64.0), (true, 40.0)] {
+            let b: Vec<[f16; 4]> = boxes(&mut rng, n, specials)
+                .into_iter()
+                .map(|b| centre_size(b, scale))
+                .collect();
+            let pre_dead: Vec<bool> = (0..n).map(|_| rng.next().is_multiple_of(9)).collect();
+            for &iou in &ious {
+                for cap in [usize::MAX, 0, 1, 10] {
+                    let mut want = pre_dead.clone();
+                    let mut survivors = 0;
+                    for i in 0..n {
+                        if want[i] {
+                            continue;
+                        }
+                        for j in (i + 1)..n {
+                            want[j] |= jaccard_f16(b[j], b[i], iou);
+                        }
+                        survivors += 1;
+                        if survivors >= cap {
+                            break;
+                        }
+                    }
+                    let got = kernel_fp16(&b, iou, cap, &pre_dead);
+                    assert_eq!(got, want, "n {n} specials {specials} iou {iou} cap {cap}");
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, counts.len() * 3 * ious.len() * 4);
+}
+
+/// On boxes whose overlaps are far from the threshold, the FP16 kernel flags the boxes the f32
+/// kernel flags.
+#[test]
+fn fp16_agrees_with_f32_away_from_the_threshold() {
+    if !std::arch::is_aarch64_feature_detected!("fp16") {
+        crate::test_support::report_skip(
+            "fp16_agrees_with_f32_away_from_the_threshold needs FEAT_FP16",
+        );
+        return;
+    }
+    // A 6 x 6 grid of disjoint cells, each holding a box and two near copies of it.
+    let mut b = Vec::new();
+    for cell in 0..36 {
+        let (x, y) = ((cell % 6) as f32 * 10.0, (cell / 6) as f32 * 10.0);
+        for shift in [0.0, 0.25, 0.5] {
+            b.push([x + shift, y + shift, x + 8.0 + shift, y + 8.0 + shift]);
+        }
+    }
+    let f32_dead = kernel(&b, None, 0.5, usize::MAX, &vec![false; b.len()]);
+    let b16: Vec<[f16; 4]> = b.iter().map(|&b| centre_size(b, 1.0)).collect();
+    let fp16_dead = kernel_fp16(&b16, h(0.5), usize::MAX, &vec![false; b.len()]);
+    assert_eq!(fp16_dead, f32_dead);
+    assert_eq!(fp16_dead.iter().filter(|&&d| !d).count(), 36);
+}
+
+/// Boxes narrower than the f16 spacing at their centre keep their extent: copies of one
+/// suppress each other, and neighbours one centre spacing apart do not.
+#[test]
+fn fp16_keeps_the_extent_of_small_boxes_far_from_the_origin() {
+    if !std::arch::is_aarch64_feature_detected!("fp16") {
+        crate::test_support::report_skip(
+            "fp16_keeps_the_extent_of_small_boxes_far_from_the_origin needs FEAT_FP16",
+        );
+        return;
+    }
+    // Centres at 40 are spaced 1/32 apart in f16; the boxes are 1/64 wide.
+    let narrow = [h(40.0), h(40.0), h(0.015625), h(0.5)];
+    let copies = vec![narrow; 65];
+    let dead = kernel_fp16(&copies, h(0.7), usize::MAX, &[false; 65]);
+    assert_eq!(dead.iter().filter(|&&d| !d).count(), 1);
+    assert!(!dead[0]);
+
+    let apart: Vec<[f16; 4]> = (0..65)
+        .map(|k| [h(32.0 + k as f32 * 0.03125), h(40.0), h(0.015625), h(0.5)])
+        .collect();
+    let dead = kernel_fp16(&apart, h(0.7), usize::MAX, &[false; 65]);
+    assert!(dead.iter().all(|&d| !d));
+}
+
+/// Mismatched lengths or a length not a multiple of eight: `false`, and nothing written.
+#[test]
+fn fp16_invalid_arguments_write_nothing() {
+    if !std::arch::is_aarch64_feature_detected!("fp16") {
+        crate::test_support::report_skip("fp16_invalid_arguments_write_nothing needs FEAT_FP16");
+        return;
+    }
+    let x = [f16::ZERO; 16];
+    for (lens, scratch_len, dead_len, valid) in [
+        ([16, 16, 16, 16], 48, 16, true),
+        ([12, 12, 12, 12], 36, 12, false),
+        ([16, 8, 16, 16], 48, 16, false),
+        ([16, 16, 16, 16], 16, 16, false),
+        ([8, 8, 8, 8], 24, 16, false),
+    ] {
+        let mut scratch = vec![f16::ONE; scratch_len];
+        let mut dead = vec![7u16; dead_len];
+        let c = lens.map(|l| &x[..l]);
+        // SAFETY: FEAT_FP16 was checked above.
+        let ok = unsafe { nms_greedy_neon_fp16(c, &mut scratch, h(0.5), usize::MAX, &mut dead) };
+        assert_eq!(ok, valid, "{lens:?} {scratch_len} {dead_len}");
+        if !valid {
+            assert!(dead.iter().all(|&d| d == 7));
+            assert!(scratch.iter().all(|&a| a == f16::ONE));
+        }
+    }
+}

@@ -26,20 +26,242 @@ pub(crate) fn nms_isa(n: usize) -> Isa {
     }
 }
 
-/// Boxes whose coordinate arrays live on the stack rather than the heap.
-#[cfg(target_arch = "aarch64")]
-const STACK_BOXES: usize = 64;
+/// Boxes up to which NMS sorts in place and tests every pair in one f32 pass over stack arrays:
+/// grouping by label and FP16 only repay themselves above it.
+const SMALL_NMS_BOXES: usize = 64;
 
-/// The suppression flags of a greedy NMS over `boxes`, sorted by descending score, on `isa`.
-///
-/// Box `k` is flagged when `dead(&boxes[k])` holds (the scalar loops' "already suppressed"
-/// score) or an earlier unflagged box overlaps it (`jaccard(b_k, b_i, iou)`, and with its label
-/// when `class_aware`), the scan stopping once `cap` boxes have survived. `None` when the caller
-/// runs its scalar loop: the scalar tier, fewer than [`NMS_MIN_BOXES`] boxes, or a label above
-/// `u32::MAX`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn nms_dead<T>(
-    isa: Isa,
+/// Boxes from which the score sort runs on the rayon pool.
+const PAR_SORT_MIN_BOXES: usize = 1 << 14;
+
+/// Sort `boxes` by descending `score` in IEEE total order, equal scores keeping their order.
+pub(crate) fn sort_by_score_desc<T>(boxes: &mut Vec<T>, score: impl Fn(&T) -> f32) {
+    use rayon::slice::ParallelSliceMut;
+    let n = boxes.len();
+    if n < 2 {
+        return;
+    }
+    if n <= SMALL_NMS_BOXES || u32::try_from(n).is_err() {
+        boxes.sort_by(|a, b| score(b).total_cmp(&score(a)));
+        return;
+    }
+    // Descending score in the high half, the position in the low half: unique keys, so an
+    // unstable sort gives the stable order.
+    let mut keys: Vec<u64> = boxes
+        .iter()
+        .enumerate()
+        .map(|(k, b)| {
+            let bits = score(b).to_bits();
+            let ascending = if bits >> 31 == 0 {
+                bits | 0x8000_0000
+            } else {
+                !bits
+            };
+            (u64::from(!ascending) << 32) | k as u64
+        })
+        .collect();
+    if n >= PAR_SORT_MIN_BOXES {
+        keys.par_sort_unstable();
+    } else {
+        keys.sort_unstable();
+    }
+    let mut slots: Vec<Option<T>> = boxes.drain(..).map(Some).collect();
+    boxes.extend(
+        keys.iter()
+            .filter_map(|&key| slots.get_mut((key & 0xFFFF_FFFF) as usize)?.take()),
+    );
+}
+
+/// Labels a class-aware NMS groups with a counting sort: above it (relative to the box count)
+/// the label table would cost more than sorting the boxes.
+#[cfg(target_arch = "aarch64")]
+const COUNTING_SORT_SPARE_LABELS: usize = 1024;
+
+/// Box indices grouped by label, each group in ascending index order, and the end of each
+/// group in that list.
+#[cfg(target_arch = "aarch64")]
+fn group_by_label<T>(boxes: &[T], label: impl Fn(&T) -> usize) -> (Vec<u32>, Vec<u32>) {
+    let n = boxes.len();
+    let max = boxes.iter().map(&label).max().unwrap_or(0);
+    let mut order = vec![0u32; n];
+    let mut ends = Vec::new();
+    if max <= 4 * n + COUNTING_SORT_SPARE_LABELS {
+        let mut next = vec![0u32; max + 2];
+        for b in boxes {
+            next[label(b) + 1] += 1;
+        }
+        for l in 0..=max {
+            next[l + 1] += next[l];
+            if next[l + 1] != next[l] {
+                ends.push(next[l + 1]);
+            }
+        }
+        for (k, b) in boxes.iter().enumerate() {
+            let slot = &mut next[label(b)];
+            order[*slot as usize] = k as u32;
+            *slot += 1;
+        }
+    } else {
+        let mut keyed: Vec<(usize, u32)> = boxes
+            .iter()
+            .enumerate()
+            .map(|(k, b)| (label(b), k as u32))
+            .collect();
+        keyed.sort_unstable();
+        for (k, pair) in keyed.iter().enumerate() {
+            order[k] = pair.1;
+            if keyed.get(k + 1).is_none_or(|next| next.0 != pair.0) {
+                ends.push(k as u32 + 1);
+            }
+        }
+    }
+    (order, ends)
+}
+
+/// The power of two that brings coordinates of magnitude up to `max` into `(32, 64]`, where
+/// box areas and their sums are finite and normal in f16; `None` for a zero or non-finite `max`.
+#[cfg(target_arch = "aarch64")]
+fn f16_coordinate_scale(max: f32) -> Option<f32> {
+    if !(max.is_finite() && max >= f32::MIN_POSITIVE) {
+        return None;
+    }
+    let scale = 2f32.powi(6 - max.log2().ceil() as i32);
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
+/// How a group's overlap tests run.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct Overlap {
+    iou: f32,
+    /// Survivors after which a pass stops.
+    cap: usize,
+    /// The coordinate scale of FP16 tests; `None` for f32 tests.
+    f16_scale: Option<f32>,
+}
+
+/// The smallest scaled box side the FP16 tests take: its half and its areas stay normal in f16.
+#[cfg(target_arch = "aarch64")]
+const F16_MIN_SIDE: f32 = 1.0 / 64.0;
+
+/// Coordinate arrays and flags of one group of boxes, reused from group to group.
+#[cfg(target_arch = "aarch64")]
+#[derive(Default)]
+struct Gathered {
+    coords: Vec<f32>,
+    flags: Vec<u32>,
+    half: Vec<half::f16>,
+    half_flags: Vec<u16>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Gathered {
+    /// Greedy NMS over the boxes `group` indexes, in that order, updating `dead`, with the
+    /// tests `overlap` describes. A group holding a box with a side below [`F16_MIN_SIDE`]
+    /// after scaling (or an inverted one) takes the f32 tests.
+    fn suppress<T>(
+        &mut self,
+        boxes: &[T],
+        group: impl ExactSizeIterator<Item = usize> + Clone,
+        bbox: &impl Fn(&T) -> &BoundingBox,
+        dead: &mut [bool],
+        overlap: Overlap,
+    ) -> bool {
+        use edgefirst_kernels::prim::neon_convert::narrow_f32_to_f16_neon;
+        use edgefirst_kernels::prim::neon_nms::{
+            nms_greedy_neon, nms_greedy_neon_fp16, LANES, LANES_FP16,
+        };
+        let Overlap {
+            iou,
+            cap,
+            f16_scale,
+        } = overlap;
+        let m = group.len();
+        let is_dead = |k: usize, i: usize| k >= m || dead.get(i).copied().unwrap_or(true);
+        let mut fp16 = false;
+        if let Some(scale) = f16_scale {
+            let np = m.next_multiple_of(LANES_FP16);
+            self.coords.clear();
+            self.coords.resize(4 * np, 0.0);
+            let (cx, rest) = self.coords.split_at_mut(np);
+            let (cy, rest) = rest.split_at_mut(np);
+            let (w, h) = rest.split_at_mut(np);
+            fp16 = true;
+            for (k, i) in group.clone().enumerate() {
+                let Some(r) = boxes.get(i).map(bbox) else {
+                    return false;
+                };
+                cx[k] = (r.xmin + r.xmax) * (0.5 * scale);
+                cy[k] = (r.ymin + r.ymax) * (0.5 * scale);
+                w[k] = (r.xmax - r.xmin) * scale;
+                h[k] = (r.ymax - r.ymin) * scale;
+                fp16 &= w[k] >= F16_MIN_SIDE && h[k] >= F16_MIN_SIDE;
+            }
+            if fp16 {
+                self.half.clear();
+                self.half.resize(7 * np, half::f16::ZERO);
+                let (fields, scratch) = self.half.split_at_mut(4 * np);
+                self.half_flags.clear();
+                self.half_flags.resize(np, !0);
+                for (k, i) in group.clone().enumerate() {
+                    self.half_flags[k] = if is_dead(k, i) { !0 } else { 0 };
+                }
+                // SAFETY: NEON is part of the aarch64 baseline, and a scale is only given on
+                // a CPU with FEAT_FP16.
+                let ran = unsafe {
+                    narrow_f32_to_f16_neon(&self.coords, fields);
+                    let (cx, rest) = fields.split_at(np);
+                    let (cy, rest) = rest.split_at(np);
+                    let (w, h) = rest.split_at(np);
+                    let iou = half::f16::from_f32(iou);
+                    nms_greedy_neon_fp16([cx, cy, w, h], scratch, iou, cap, &mut self.half_flags)
+                };
+                if !ran {
+                    return false;
+                }
+            }
+        }
+        if !fp16 {
+            let np = m.next_multiple_of(LANES);
+            self.coords.clear();
+            self.coords.resize(4 * np, 0.0);
+            let (xmin, rest) = self.coords.split_at_mut(np);
+            let (ymin, rest) = rest.split_at_mut(np);
+            let (xmax, ymax) = rest.split_at_mut(np);
+            for (k, i) in group.clone().enumerate() {
+                let Some(r) = boxes.get(i).map(bbox) else {
+                    return false;
+                };
+                (xmin[k], ymin[k], xmax[k], ymax[k]) = (r.xmin, r.ymin, r.xmax, r.ymax);
+            }
+            self.flags.clear();
+            self.flags.resize(np, !0);
+            for (k, i) in group.clone().enumerate() {
+                self.flags[k] = if is_dead(k, i) { !0 } else { 0 };
+            }
+            let coords = [&*xmin, &*ymin, &*xmax, &*ymax];
+            // SAFETY: NEON is part of the aarch64 baseline.
+            if !unsafe { nms_greedy_neon(coords, None, iou, cap, &mut self.flags) } {
+                return false;
+            }
+        }
+        for (k, i) in group.enumerate() {
+            let flagged = if fp16 {
+                self.half_flags[k] != 0
+            } else {
+                self.flags[k] != 0
+            };
+            if let Some(d) = dead.get_mut(i) {
+                *d = flagged;
+            }
+        }
+        true
+    }
+}
+
+/// [`nms_dead`] in one f32 pass over every box, labels compared in the kernel, on stack arrays
+/// for at most [`SMALL_NMS_BOXES`] boxes. `None` for a label above `u32::MAX`.
+#[cfg(target_arch = "aarch64")]
+fn single_pass_dead<T>(
     boxes: &[T],
     bbox: impl Fn(&T) -> &BoundingBox,
     class_aware: bool,
@@ -48,46 +270,140 @@ pub(crate) fn nms_dead<T>(
     iou: f32,
     cap: usize,
 ) -> Option<Vec<bool>> {
-    if isa.is_scalar() || boxes.len() < NMS_MIN_BOXES {
+    use edgefirst_kernels::prim::neon_nms::{nms_greedy_neon, LANES};
+    let n = boxes.len();
+    let np = n.next_multiple_of(LANES);
+    let mut stack_coords = [0f32; 4 * SMALL_NMS_BOXES];
+    let mut stack_words = [0u32; 2 * SMALL_NMS_BOXES];
+    let (mut heap_coords, mut heap_words);
+    let (coords, words) = if np <= SMALL_NMS_BOXES {
+        (&mut stack_coords[..4 * np], &mut stack_words[..2 * np])
+    } else {
+        heap_coords = vec![0f32; 4 * np];
+        heap_words = vec![0u32; 2 * np];
+        (&mut heap_coords[..], &mut heap_words[..])
+    };
+    let (xmin, rest) = coords.split_at_mut(np);
+    let (ymin, rest) = rest.split_at_mut(np);
+    let (xmax, ymax) = rest.split_at_mut(np);
+    let (flags, labels) = words.split_at_mut(np);
+    flags.fill(!0);
+    for (k, b) in boxes.iter().enumerate() {
+        let r = bbox(b);
+        (xmin[k], ymin[k], xmax[k], ymax[k]) = (r.xmin, r.ymin, r.xmax, r.ymax);
+        flags[k] = if dead(b) { !0 } else { 0 };
+        if class_aware {
+            labels[k] = u32::try_from(label(b)).ok()?;
+        }
+    }
+    let labels = class_aware.then_some(&*labels);
+    let coords = [&*xmin, &*ymin, &*xmax, &*ymax];
+    // SAFETY: NEON is part of the aarch64 baseline.
+    let ran = unsafe { nms_greedy_neon(coords, labels, iou, cap, flags) };
+    ran.then(|| flags.iter().take(n).map(|&f| f != 0).collect())
+}
+
+/// The suppression flags of a greedy NMS over `boxes`, sorted by descending score, on `isa`.
+///
+/// Box `k` is flagged when `dead(&boxes[k])` holds (the scalar loops' "already suppressed"
+/// score) or an earlier unflagged box overlaps it (`jaccard(b_k, b_i, iou)`, and with its label
+/// when `class_aware`), the scan stopping once `cap` boxes have survived; the caller outputs
+/// the first `cap` unflagged boxes that `kept` accepts, and those equal the scalar loop's.
+///
+/// More than [`SMALL_NMS_BOXES`] boxes that are each dead or kept run class-aware NMS one label
+/// at a time (each label's pass stopping at `cap` survivors of its own), and with
+/// [`Isa::f16_nms`] and finite coordinates a pass over more than [`SMALL_NMS_BOXES`] boxes runs
+/// its overlap tests in FP16 on centres and sizes scaled by a power of two (a pass holding a box
+/// too thin for f16 areas keeps the f32 tests). A live box the caller does not keep (a NaN
+/// score) takes a survivor's place in the scalar scan, so those boxes run the one pass over
+/// every box instead.
+///
+/// `None` when the caller runs its scalar loop: the scalar tier, fewer than [`NMS_MIN_BOXES`]
+/// boxes, or a label above `u32::MAX` in the one pass over every box.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn nms_dead<T>(
+    isa: Isa,
+    boxes: &[T],
+    bbox: impl Fn(&T) -> &BoundingBox,
+    class_aware: bool,
+    label: impl Fn(&T) -> usize,
+    dead: impl Fn(&T) -> bool,
+    kept: impl Fn(&T) -> bool,
+    iou: f32,
+    cap: usize,
+) -> Option<Vec<bool>> {
+    if isa.is_scalar() || boxes.len() < NMS_MIN_BOXES || u32::try_from(boxes.len()).is_err() {
         return None;
     }
     #[cfg(target_arch = "aarch64")]
     {
-        use edgefirst_kernels::prim::neon_nms::{nms_greedy_neon, LANES};
         let n = boxes.len();
-        let np = n.next_multiple_of(LANES);
-        let mut stack_coords = [0f32; 4 * STACK_BOXES];
-        let mut stack_words = [0u32; 2 * STACK_BOXES];
-        let (mut heap_coords, mut heap_words);
-        let (coords, words) = if np <= STACK_BOXES {
-            (&mut stack_coords[..4 * np], &mut stack_words[..2 * np])
-        } else {
-            heap_coords = vec![0f32; 4 * np];
-            heap_words = vec![0u32; 2 * np];
-            (&mut heap_coords[..], &mut heap_words[..])
-        };
-        let (xmin, rest) = coords.split_at_mut(np);
-        let (ymin, rest) = rest.split_at_mut(np);
-        let (xmax, ymax) = rest.split_at_mut(np);
-        let (flags, labels) = words.split_at_mut(np);
-        flags.fill(!0);
-        for (k, b) in boxes.iter().enumerate() {
-            let r = bbox(b);
-            (xmin[k], ymin[k], xmax[k], ymax[k]) = (r.xmin, r.ymin, r.xmax, r.ymax);
-            flags[k] = if dead(b) { !0 } else { 0 };
-            if class_aware {
-                labels[k] = u32::try_from(label(b)).ok()?;
-            }
+        if n <= SMALL_NMS_BOXES || !boxes.iter().all(|b| dead(b) || kept(b)) {
+            return single_pass_dead(boxes, bbox, class_aware, label, dead, iou, cap);
         }
-        let labels = class_aware.then_some(&*labels);
-        let coords = [&*xmin, &*ymin, &*xmax, &*ymax];
-        // SAFETY: NEON is part of the aarch64 baseline.
-        let ran = unsafe { nms_greedy_neon(coords, labels, iou, cap, flags) };
-        ran.then(|| flags.iter().take(n).map(|&f| f != 0).collect())
+        // The coordinate scale of the FP16 tests, found only when a group is large enough to
+        // take them.
+        let f16_scale = || {
+            let max = boxes.iter().map(&bbox).fold(0f32, |m, r| {
+                m.max(r.xmin.abs())
+                    .max(r.ymin.abs())
+                    .max(r.xmax.abs())
+                    .max(r.ymax.abs())
+            });
+            let finite = boxes.iter().map(&bbox).all(|r| {
+                r.xmin.is_finite() && r.ymin.is_finite() && r.xmax.is_finite() && r.ymax.is_finite()
+            });
+            finite.then(|| f16_coordinate_scale(max)).flatten()
+        };
+        if !class_aware {
+            let overlap = Overlap {
+                iou,
+                cap,
+                f16_scale: isa.f16_nms().then(f16_scale).flatten(),
+            };
+            if overlap.f16_scale.is_none() {
+                // One group of f32 tests is the one pass.
+                return single_pass_dead(boxes, bbox, false, label, dead, iou, cap);
+            }
+            let mut flags: Vec<bool> = boxes.iter().map(&dead).collect();
+            let ran = Gathered::default().suppress(boxes, 0..n, &bbox, &mut flags, overlap);
+            return ran.then_some(flags);
+        }
+        let (order, ends) = group_by_label(boxes, label);
+        let mut largest = 0u32;
+        let mut start = 0u32;
+        for &end in &ends {
+            largest = largest.max(end - start);
+            start = end;
+        }
+        let fp16 = isa.f16_nms() && largest as usize > SMALL_NMS_BOXES;
+        let f16_scale = fp16.then(f16_scale).flatten();
+        let mut flags: Vec<bool> = boxes.iter().map(&dead).collect();
+        let mut gathered = Gathered::default();
+        let mut start = 0usize;
+        let ran = ends.iter().all(|&end| {
+            let group = order.get(start..end as usize).unwrap_or(&[]);
+            start = end as usize;
+            // A small group gains nothing from eight boxes per vector and keeps the f32 tests.
+            let overlap = Overlap {
+                iou,
+                cap,
+                f16_scale: f16_scale.filter(|_| group.len() > SMALL_NMS_BOXES),
+            };
+            group.len() < 2
+                || gathered.suppress(
+                    boxes,
+                    group.iter().map(|&i| i as usize),
+                    &bbox,
+                    &mut flags,
+                    overlap,
+                )
+        });
+        ran.then_some(flags)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (boxes, bbox, class_aware, label, dead, iou, cap);
+        let _ = (boxes, bbox, class_aware, label, dead, kept, iou, cap);
         None
     }
 }

@@ -2543,3 +2543,143 @@ fn tracked_per_scale_decode_proto_ignores_multi_label() {
     };
     assert_eq!(run(true), run(false));
 }
+
+/// `decode_proto` detections of a captured fixture, class-aware at IoU 0.7 with at most 300
+/// detections, in the builder's default dtype or `dtype`.
+fn decode_fixture(
+    fix: &common::per_scale_fixture::PerScaleFixture,
+    dtype: Option<DecodeDtype>,
+    score_threshold: f32,
+    multi_label: bool,
+) -> (Vec<DetectBox>, Option<DecodeDtype>) {
+    let schema: SchemaV2 = serde_json::from_str(fix.schema_json()).expect("fixture schema");
+    let mut builder = DecoderBuilder::default()
+        .with_schema(schema)
+        .with_iou_threshold(0.7)
+        .with_score_threshold(score_threshold)
+        .with_nms(Some(Nms::ClassAware))
+        .with_multi_label(multi_label)
+        .with_max_det(300);
+    if multi_label {
+        builder = builder.with_pre_nms_top_k(30_000);
+    }
+    if let Some(dtype) = dtype {
+        builder = builder.with_decode_dtype(dtype);
+    }
+    let decoder = builder.build().expect("build decoder");
+    let tensors = fix.build_tensors_with_quant().expect("fixture tensors");
+    let inputs: Vec<&TensorDyn> = tensors.iter().collect();
+    let mut boxes = Vec::with_capacity(300);
+    decoder
+        .decode_proto(&inputs, &mut boxes)
+        .expect("decode_proto");
+    (boxes, decoder.decode_dtype())
+}
+
+/// F16 decode against F32 on a captured frame, at a deployment threshold (argmax) and at the
+/// validation threshold (multi-label): the same number of detections within 1%, and at least
+/// 99% (deployment: all) and 97% (validation) of the F32 detections have an F16 detection of
+/// the same class at IoU >= 0.9 within 1e-3 in score.
+fn assert_f16_tracks_f32(model: &str) {
+    let path = fixture_path(&format!("{model}.safetensors"));
+    let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
+        Ok(f) => f,
+        Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    for (regime, threshold, multi_label, min_matched) in
+        [("deploy", 0.25, false, 1.0), ("val", 0.001, true, 0.97)]
+    {
+        let (f32_boxes, f32_dtype) =
+            decode_fixture(&fix, Some(DecodeDtype::F32), threshold, multi_label);
+        let (f16_boxes, f16_dtype) =
+            decode_fixture(&fix, Some(DecodeDtype::F16), threshold, multi_label);
+        assert_eq!(f32_dtype, Some(DecodeDtype::F32));
+        assert_eq!(f16_dtype, Some(DecodeDtype::F16));
+        assert!(!f32_boxes.is_empty(), "{model} {regime}: no detections");
+        let slack = f32_boxes.len() / 100 + usize::from(regime == "val");
+        assert!(
+            f32_boxes.len().abs_diff(f16_boxes.len()) <= slack,
+            "{model} {regime}: {} F32 detections, {} F16",
+            f32_boxes.len(),
+            f16_boxes.len()
+        );
+        let mut used = vec![false; f16_boxes.len()];
+        let mut matched = 0usize;
+        for a in &f32_boxes {
+            let best = f16_boxes
+                .iter()
+                .enumerate()
+                .filter(|(j, b)| !used[*j] && b.label == a.label)
+                .map(|(j, b)| {
+                    let iou = box_iou(
+                        [a.bbox.xmin, a.bbox.ymin, a.bbox.xmax, a.bbox.ymax],
+                        [b.bbox.xmin, b.bbox.ymin, b.bbox.xmax, b.bbox.ymax],
+                    );
+                    (j, iou, (a.score - b.score).abs())
+                })
+                .filter(|&(_, iou, score)| iou >= 0.9 && score <= 1e-3)
+                .max_by(|x, y| x.1.total_cmp(&y.1));
+            if let Some((j, ..)) = best {
+                used[j] = true;
+                matched += 1;
+            }
+        }
+        let fraction = matched as f32 / f32_boxes.len() as f32;
+        assert!(
+            fraction >= min_matched,
+            "{model} {regime}: {matched} of {} F32 detections matched in F16",
+            f32_boxes.len()
+        );
+    }
+}
+
+#[test]
+fn yolov8n_f16_decode_tracks_f32() {
+    assert_f16_tracks_f32("yolov8n-seg");
+}
+
+#[test]
+fn yolo11n_f16_decode_tracks_f32() {
+    assert_f16_tracks_f32("yolo11n-seg");
+}
+
+#[test]
+fn yolo26n_f16_decode_tracks_f32() {
+    assert_f16_tracks_f32("yolo26n-seg");
+}
+
+/// A builder given no dtype decodes in `DecodeDtype::native`, and `with_decode_dtype` overrides
+/// it either way.
+#[test]
+fn decode_dtype_defaults_to_native_and_can_be_overridden() {
+    let path = fixture_path("yolo26n-seg.safetensors");
+    let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
+        Ok(f) => f,
+        Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
+            skip_note!("fixture {path:?} not present (run `git lfs pull`)");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    let native = DecodeDtype::native();
+    #[cfg(not(target_arch = "aarch64"))]
+    assert_eq!(native, DecodeDtype::F32);
+    #[cfg(target_arch = "aarch64")]
+    if std::env::var_os("EDGEFIRST_DECODER_FORCE_KERNEL").is_none() {
+        let fp16 = std::arch::is_aarch64_feature_detected!("fp16");
+        assert_eq!(native == DecodeDtype::F16, fp16);
+    }
+    let (default_boxes, default_dtype) = decode_fixture(&fix, None, 0.25, false);
+    assert_eq!(default_dtype, Some(native));
+    for dtype in [DecodeDtype::F32, DecodeDtype::F16] {
+        let (boxes, used) = decode_fixture(&fix, Some(dtype), 0.25, false);
+        assert_eq!(used, Some(dtype));
+        if dtype == native {
+            assert_eq!(boxes, default_boxes);
+        }
+    }
+}
