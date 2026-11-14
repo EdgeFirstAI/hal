@@ -30,6 +30,10 @@
 # test_codec_api.log, python-codec.log,
 # capabilities.txt, summary.txt (`RESULT|detail`, one line) and summary.json
 # into <results-dir>. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
+#
+# The board needs bash and the POSIX tools (awk, grep, sed, sort) only.
+# python3 runs the Python codec tests and nothing else, so a board without it
+# skips those and still reports its result.
 
 set -uo pipefail
 
@@ -80,39 +84,63 @@ grep -q '^HAL_TEST_REQUIRE_DMA=1$' "${dma_env}" && extra_env+=(HAL_TEST_REQUIRE_
 rm -f "${dma_env}"
 echo "    gates: ${extra_env[*]:-none} (dma ${dma_state:-unknown})"
 
+# summary.json is written with awk, not an interpreter: the Python tests are
+# optional on a board, so the result the fleet roll-up reads must not depend
+# on python3.
 write_summary() {
   local result="$1" detail="$2"
   echo "${result}|${detail}" > "${RESULTS}/summary.txt"
-  python3 - "${RESULTS}" "${result}" "${detail}" "${arch}" "${caps}" \
-    "${dma_state:-unknown}" "${BUNDLE}/MANIFEST" <<'PY'
-import glob, json, os, re, socket, sys
-results, result, detail, arch, caps, dma, manifest = sys.argv[1:8]
-passed = failed = ignored = 0
-for log in glob.glob(os.path.join(results, "*.log")):
-    with open(log, errors="replace") as f:
-        for line in f:
-            m = re.match(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored", line)
-            if m:
-                passed += int(m[1]); failed += int(m[2]); ignored += int(m[3])
-skipped = 0
-for log in glob.glob(os.path.join(results, "*.log")):
-    with open(log, errors="replace") as f:
-        skipped += sum(1 for line in f if "SKIPPED" in line)
-meta = {}
-if os.path.exists(manifest):
-    for line in open(manifest):
-        key, _, value = line.rstrip("\n").partition("=")
-        meta[key] = value
-json.dump({
-    "result": result, "detail": detail, "arch": arch, "capabilities": caps,
-    "dma": dma, "host": socket.gethostname(),
-    "entry": os.environ.get("HAL_BOARD_ENTRY", ""),
-    "runner": os.environ.get("RUNNER_NAME", ""),
-    "tests": {"passed": passed, "failed": failed, "ignored": ignored,
-              "skipped": skipped},
-    "bundle": meta,
-}, open(os.path.join(results, "summary.json"), "w"), indent=2)
-PY
+  local logs=("${RESULTS}"/*.log)
+  [[ -e "${logs[0]}" ]] || logs=()
+  # The values reach awk through the environment; `-v` would interpret
+  # backslash escapes in them.
+  SUMMARY_RESULT="${result}" SUMMARY_DETAIL="${detail}" SUMMARY_ARCH="${arch}" \
+    SUMMARY_CAPS="${caps}" SUMMARY_DMA="${dma_state:-unknown}" \
+    SUMMARY_HOST="$(uname -n)" SUMMARY_MANIFEST="${BUNDLE}/MANIFEST" \
+    awk '
+      function json(s,    out, i, c) {
+        out = ""
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c == "\\" || c == "\"") out = out "\\" c
+          else if (c in control) out = out control[c]
+          else out = out c
+        }
+        return "\"" out "\""
+      }
+      BEGIN {
+        for (i = 1; i < 32; i++) control[sprintf("%c", i)] = sprintf("\\u%04x", i)
+        manifest = ENVIRON["SUMMARY_MANIFEST"]
+        while ((getline line < manifest) > 0) {
+          if (line == "") continue
+          eq = index(line, "=")
+          key = eq ? substr(line, 1, eq - 1) : line
+          if (!(key in bundle)) keys[++nkeys] = key
+          bundle[key] = eq ? substr(line, eq + 1) : ""
+        }
+      }
+      /^test result: [A-Za-z]+\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored/ {
+        passed += $4; failed += $6; ignored += $8
+      }
+      /SKIPPED/ { skipped++ }
+      END {
+        printf "{\n"
+        printf "  \"result\": %s,\n", json(ENVIRON["SUMMARY_RESULT"])
+        printf "  \"detail\": %s,\n", json(ENVIRON["SUMMARY_DETAIL"])
+        printf "  \"arch\": %s,\n", json(ENVIRON["SUMMARY_ARCH"])
+        printf "  \"capabilities\": %s,\n", json(ENVIRON["SUMMARY_CAPS"])
+        printf "  \"dma\": %s,\n", json(ENVIRON["SUMMARY_DMA"])
+        printf "  \"host\": %s,\n", json(ENVIRON["SUMMARY_HOST"])
+        printf "  \"entry\": %s,\n", json(ENVIRON["HAL_BOARD_ENTRY"])
+        printf "  \"runner\": %s,\n", json(ENVIRON["RUNNER_NAME"])
+        printf "  \"tests\": {\"passed\": %d, \"failed\": %d, \"ignored\": %d, \"skipped\": %d},\n",
+          passed, failed, ignored, skipped
+        printf "  \"bundle\": {"
+        for (k = 1; k <= nkeys; k++)
+          printf "%s\n    %s: %s", (k > 1 ? "," : ""), json(keys[k]), json(bundle[keys[k]])
+        printf "%s}\n}\n", (nkeys ? "\n  " : "")
+      }
+    ' /dev/null ${logs[@]+"${logs[@]}"} > "${RESULTS}/summary.json"
   return 0
 }
 
@@ -210,6 +238,9 @@ fi
 # The Python codec tests, with the bundle's own wheels and pytest on
 # PYTHONPATH. They need a python3 of 3.11 or newer with numpy; a board
 # without one, or a bundle built without wheels, skips them with the reason.
+# pytest reports the skips that share a location and reason on one
+# `SKIPPED [N]` line. The skip count and warnings.txt count lines, so that
+# line is written N times.
 echo "  -- Python codec tests"
 pylog="${RESULTS}/python-codec.log"
 py_skip=""
@@ -224,7 +255,13 @@ if [[ -n "${py_skip}" ]]; then
 else
   env PYTHONPATH="${BUNDLE}/python" ${extra_env[@]+"${extra_env[@]}"} \
     python3 -m pytest tests/codec -q -rs -p no:cacheprovider 2>&1 \
-    | sed 's/^SKIPPED \[[0-9]*\] /WARNING: SKIPPED: /' > "${pylog}"
+    | awk '
+        match($0, /^SKIPPED \[[0-9]+\] /) {
+          n = substr($0, 10, RLENGTH - 11) + 0
+          for (i = 0; i < n; i++) print "WARNING: SKIPPED: " substr($0, RLENGTH + 1)
+          next
+        }
+        { print }' > "${pylog}"
   if [[ "${PIPESTATUS[0]}" -eq 0 ]]; then
     pass=$((pass + 1))
     echo "     ok -- $(tail -n 1 "${pylog}")"
