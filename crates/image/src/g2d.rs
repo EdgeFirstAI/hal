@@ -37,6 +37,9 @@ pub(crate) fn g2d_can_handle(cm: &Colorimetry, src_is_yuv: bool) -> bool {
         && cm.encoding != Some(ColorEncoding::Bt2020)
 }
 
+/// The G2D library, as the loader is asked for it.
+pub(crate) const G2D_LIBRARY: &str = "libg2d.so.2";
+
 /// The source formats G2D blits from.
 const G2D_SOURCES: [PixelFormat; 4] = [
     PixelFormat::Rgba,
@@ -141,7 +144,7 @@ impl G2DProcessor {
     /// range control (limited-range only) and no BT.2020 matrix — so full-range
     /// YUV and BT.2020 conversions are declined and fall through to GL/CPU.
     pub fn new() -> Result<Self> {
-        let mut g2d = G2D::new("libg2d.so.2")?;
+        let mut g2d = G2D::new(G2D_LIBRARY)?;
         // Safe initial default only: every `convert()` re-programs the matrix
         // from the resolved colorimetry of that conversion (see `convert_impl`).
         // The g2d-sys API selects only the matrix, not full-vs-limited range, so

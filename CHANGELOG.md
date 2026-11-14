@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ef_codec_save_jpeg` refuses an image wider or taller than 65535 (`libedgefirst_codec`).** It answers `ENOTSUP` where it wrote a JPEG of the truncated size, and every failure of a codec C call now leaves a reason in `ef_codec_last_error`.
 - **Codec errors in Python are `edgefirst.codec.CodecError` subclasses (`edgefirst.codec`).** `decode_into`, `decode_file_into` and `Tensor.decode_image` raise `InvalidDataError` for data that is not a decodable image and `UnsupportedError` for an unsupported feature, where they raised a plain `RuntimeError` whose message began `Format error:`. `CodecError` is a `RuntimeError`, so existing handlers still catch them. `Tensor` can now be subclassed.
 
+- **A missing G2D library is logged at debug level (`edgefirst-image`).** `ImageProcessor::new()` no longer warns on hosts without `libg2d.so.2`; a G2D library that is installed and does not load (a missing dependency, a file the loader rejects) still warns, as does a G2D that loads and fails to start. GL errors raised while the processor probes DMA-BUF support are logged at debug level as well.
+
+### Fixed
+
+- **`create_image` documentation on padded planar DMA-BUF images (`edgefirst-image`).** The docs said only packed images are padded to the 64-byte GPU pitch. Planar and semi-planar DMA-BUF images are padded too, and report the pitch through `row_stride()`: a 672-wide `PlanarRgb` image has 704-byte rows. A consumer that needs tight planes reads at the stride or uses `copy_to_flat`.
+
 ## [0.40.0] - 2026-11-05
 
 ### Added

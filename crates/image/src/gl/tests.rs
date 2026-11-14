@@ -4119,6 +4119,83 @@ mod gl_tests {
         }
     }
 
+    /// A planar DMA-BUF destination carries the 64-byte GPU pitch like every
+    /// other DMA image, so at a width that is not a multiple of 64 its rows
+    /// are padded. `row_stride()` reports the pitch, both backends write at
+    /// it, and `copy_to_flat` returns the tight planes a flat consumer needs.
+    /// A reader that takes the map as `width * height` planes shears every
+    /// row after the first.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn planar_dma_destination_rows_are_padded_to_the_gpu_pitch() {
+        use crate::cpu::CPUProcessor;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
+        if !is_dma_available() {
+            crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
+            return;
+        }
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::DmaBuf),
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
+        )
+        .unwrap();
+        let options = || crate::ConvertOptions::new().crop(letterbox_crop(1280, 720, 0, 0));
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut cpu = CPUProcessor::new();
+
+        const H: usize = 512;
+        for (w, pitch) in [(672usize, 704usize), (700, 704)] {
+            let image = |memory| {
+                TensorDyn::image(
+                    w,
+                    H,
+                    PixelFormat::PlanarRgb,
+                    DType::U8,
+                    Some(memory),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap()
+            };
+            // (backend, tolerance against the same backend's tight output)
+            for (backend, tolerance) in [("cpu", 0u8), ("gl", 1)] {
+                let mut convert = |dst: &mut TensorDyn| {
+                    if backend == "cpu" {
+                        cpu.convert(&src, dst, Some(options()))
+                    } else {
+                        gl.convert(&src, dst, Some(options()))
+                    }
+                    .unwrap_or_else(|e| panic!("{backend} nv12->planar {w}x{H}: {e}"));
+                };
+                let mut tight = image(TensorMemory::Mem);
+                assert_eq!(tight.row_stride(), None, "host planar rows stay tight");
+                convert(&mut tight);
+                let want = tight.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+
+                let mut padded = image(TensorMemory::DmaBuf);
+                assert_eq!(
+                    padded.row_stride(),
+                    Some(pitch),
+                    "a {w}-wide planar DMA image reports its padded pitch"
+                );
+                convert(&mut padded);
+                assert_eq!(
+                    padded.as_u8().unwrap().map().unwrap().as_slice().len(),
+                    pitch * H * 3,
+                    "the map spans the padded planes"
+                );
+                let mut flat = vec![0u8; w * H * 3];
+                padded.copy_to_flat(&mut flat).unwrap();
+                assert_pixels_match(&want, &flat, tolerance);
+            }
+        }
+    }
+
     /// Build a heap-memory (`TensorMemory::Mem`) NV12 image from a raw fixture.
     /// Portable (no platform gate): distinct from `load_raw_image`, which is
     /// gated to the desktop platforms the `@Dma` tiers allocate on.

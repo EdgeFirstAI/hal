@@ -52,12 +52,45 @@ pub(super) fn compile_shader_from_str(
     }
 }
 
+/// While one is alive, GL errors on this thread are logged at debug level:
+/// the caller is asking what the driver supports, and a refusal is the
+/// answer, not a fault. The error is still returned.
+pub(super) struct ProbeScope {
+    outer: bool,
+}
+
+thread_local! {
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl ProbeScope {
+    pub(super) fn enter() -> Self {
+        Self {
+            outer: PROBING.replace(true),
+        }
+    }
+}
+
+impl Drop for ProbeScope {
+    fn drop(&mut self) {
+        PROBING.set(self.outer);
+    }
+}
+
+/// The level a GL error is logged at on this thread.
+fn gl_error_level() -> log::Level {
+    if PROBING.get() {
+        log::Level::Debug
+    } else {
+        log::Level::Error
+    }
+}
+
 pub(super) fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
     unsafe {
         let err = edgefirst_gl::gl::GetError();
         if err != edgefirst_gl::gl::NO_ERROR {
-            error!("GL Error: {name}:{line}: {err:#X}");
-            // panic!("GL Error: {err}");
+            log::log!(gl_error_level(), "GL Error: {name}:{line}: {err:#X}");
             return Err(Error::OpenGl(format!("{err:#X}")));
         }
     }
@@ -1634,5 +1667,24 @@ in vec2 tc;
 void main(){ /* texture(tex, tc) */ color = vec4(0.0); }
 ";
         assert_eq!(tc_precision_and_use(only_comment), Some(("mediump", false)));
+    }
+}
+
+#[cfg(test)]
+mod probe_scope_tests {
+    use super::{gl_error_level, ProbeScope};
+
+    /// A probe quiets GL errors for as long as it lasts, nested or not, and
+    /// the level comes back when it ends.
+    #[test]
+    fn gl_errors_are_logged_at_debug_inside_a_probe() {
+        assert_eq!(gl_error_level(), log::Level::Error);
+        {
+            let _probe = ProbeScope::enter();
+            assert_eq!(gl_error_level(), log::Level::Debug);
+            drop(ProbeScope::enter());
+            assert_eq!(gl_error_level(), log::Level::Debug);
+        }
+        assert_eq!(gl_error_level(), log::Level::Error);
     }
 }
